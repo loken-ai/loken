@@ -339,6 +339,7 @@ impl SamplingRequest {
             grammar: self.grammar,
             logit_bias: self.logit_bias,
             top_logprobs: self.top_logprobs.map(|v| v as usize),
+            cancel: None,
         }
     }
 }

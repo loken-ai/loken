@@ -617,7 +617,9 @@ pub(crate) async fn ollama_chat(
         let _admitted = admission;
         let energy = crate::energy_report::begin();
 
-        let _cancel = engine.cancel_guard();
+        let mut params = params;
+
+        let _cancel = engine.cancel_guard(&mut params);
         match engine
             .generate(&prompt, params)
             .await
@@ -1231,7 +1233,9 @@ pub(crate) async fn ollama_generate(
         let _admitted = admission;
         let energy = crate::energy_report::begin();
 
-        let _cancel = engine.cancel_guard();
+        let mut params = params;
+
+        let _cancel = engine.cancel_guard(&mut params);
         match engine
             .generate(&effective_prompt, params)
             .await

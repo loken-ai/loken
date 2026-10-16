@@ -173,7 +173,8 @@ pub(crate) async fn anthropic_messages(
 
     if !stream {
         let _admitted = admission;
-        let _cancel = engine.cancel_guard();
+        let mut params = params;
+        let _cancel = engine.cancel_guard(&mut params);
         match engine.generate(&prompt, params).await {
             Ok(result) => {
                 let (thinking, answer) =

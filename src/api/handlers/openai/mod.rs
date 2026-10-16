@@ -746,7 +746,8 @@ pub(crate) async fn chat_completion(
         // before the read sites, so the compiler's still happy.
         let timing_prefill_ms: Option<f64>;
         let timing_decode_ms: Option<f64>;
-        let _cancel = engine.cancel_guard();
+        let mut params = params;
+        let _cancel = engine.cancel_guard(&mut params);
         let result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
         let (content, finish_reason, completion_tokens, prompt_tokens, cached_tokens) =
             match engine.generate(&prompt, params).await {
@@ -1366,7 +1367,8 @@ pub(crate) async fn text_completions(
     }
 
     let _admitted = admission;
-    let _cancel = engine.cancel_guard();
+    let mut params = params;
+    let _cancel = engine.cancel_guard(&mut params);
     let result = engine
         .generate(&prompt, params)
         .await

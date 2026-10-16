@@ -172,7 +172,7 @@ impl LlmEngine {
             });
         }
         let model_state = self.model_state.clone();
-        let cancel = self.cancel.clone();
+        let cancel = params.cancel.clone().unwrap_or_default();
         let config = self.config.clone();
         let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
@@ -1988,7 +1988,7 @@ impl LlmEngine {
         let model_state = self.model_state.clone();
         let config = self.config.clone();
 
-        let cancel = self.cancel.clone();
+        let cancel = params.cancel.clone().unwrap_or_default();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
             let mut guard = model_state.blocking_lock();
             let state = guard

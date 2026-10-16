@@ -43,6 +43,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Server: a request that ends no longer stops another one served beside it.
 - Placement: a model the cards hold whole keeps room for whole prefill chunks.
 - Build: the cpu-only configuration compiles again.
 - Server: the [server] port of config.toml is used when --port is not given.

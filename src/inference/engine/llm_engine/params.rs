@@ -413,6 +413,9 @@ pub struct GenerationParams {
     /// Report each drawn token's log-probability with this many alternatives; `Some(0)`
     /// reports the drawn token alone. Costs a host copy of the logits per token.
     pub top_logprobs: Option<usize>,
+    /// Raised when the request's client goes away; the generation loops read it between tokens.
+    /// Each request carries its own, so a request that ends never stops another.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl GenerationParams {

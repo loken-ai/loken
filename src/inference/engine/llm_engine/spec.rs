@@ -16,7 +16,6 @@ impl LlmEngine {
             draft_engine: self.draft_engine.clone(),
             kv_disk: self.kv_disk.clone(),
             state_cache: self.state_cache.clone(),
-            cancel: self.cancel.clone(),
             logprob_queue: self.logprob_queue.clone(),
             last_error: self.last_error.clone(),
             cached_model_size: self.cached_model_size.clone(),

@@ -230,10 +230,6 @@ pub struct LlmEngine {
     /// The on-disk cache of decode states for a model that keeps one, when the configuration
     /// names a directory.
     state_cache: Option<Arc<crate::inference::cache::state_disk::StateStore>>,
-    /// Raised by a `CancelGuard` when the request that holds it goes away; the
-    /// generation loops read it between tokens. One request runs at a time on an
-    /// engine, so one flag is enough.
-    cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Log-probabilities of the tokens a stream has drawn and not yet handed out; the
     /// handler drains it after each chunk.
     logprob_queue: Arc<std::sync::Mutex<Vec<TokenLogprob>>>,
@@ -271,7 +267,6 @@ impl InferenceEngine for LlmEngine {
             draft_engine: Arc::new(Mutex::new(None)),
             kv_disk: None,
             state_cache: None,
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
@@ -315,7 +310,6 @@ impl LlmEngine {
             config,
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
@@ -832,18 +826,13 @@ impl LlmEngine {
             .unwrap_or_default()
     }
 
-    /// Arms cancellation for the request about to run: the guard lowers the flag now
-    /// and raises it when dropped, which is what happens to a handler's future when
-    /// its client disconnects. A whole-answer generation then stops at its next token.
-    pub fn cancel_guard(&self) -> CancelGuard {
-        self.cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        CancelGuard(self.cancel.clone())
-    }
-
-    /// Whether the current request's client has gone.
-    pub fn cancelled(&self) -> bool {
-        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    /// A guard for one request: dropping it, as the handler does when the client goes away or the
+    /// request ends, raises the flag the request's generation loops read. The flag is the
+    /// request's own, set in `params`, so ending one request never stops another.
+    pub fn cancel_guard(&self, params: &mut GenerationParams) -> CancelGuard {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        params.cancel = Some(flag.clone());
+        CancelGuard(flag)
     }
 
     /// Tokens the loaded model's tokenizer makes of `text`, `None` with no model loaded.
@@ -1393,5 +1382,26 @@ pub struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// A request that ends raises its own flag and leaves the flag of a request beside it down.
+    #[test]
+    fn ending_one_request_never_stops_another() {
+        let engine = <LlmEngine as InferenceEngine>::new();
+        let (mut first, mut second) = (GenerationParams::default(), GenerationParams::default());
+        let first_guard = engine.cancel_guard(&mut first);
+        let second_guard = engine.cancel_guard(&mut second);
+        let raised = |p: &GenerationParams| p.cancel.as_ref().is_some_and(|f| f.load(Relaxed));
+        drop(first_guard);
+        assert!(raised(&first));
+        assert!(!raised(&second));
+        drop(second_guard);
+        assert!(raised(&second));
     }
 }

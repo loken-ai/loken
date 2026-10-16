@@ -643,7 +643,8 @@ pub(crate) async fn conversation_handler(
                 max_tokens: max_tokens.or(Some(512)),
                 ..Default::default()
             };
-            let _cancel = engine.cancel_guard();
+            let mut params = params;
+            let _cancel = engine.cancel_guard(&mut params);
             match engine.generate(&prompt, params).await {
                 Ok(out) => conv_ok(serde_json::json!({
                     "route": if route == ConvRoute::Vision { "vision" } else { "chat" },
@@ -911,7 +912,8 @@ pub(crate) async fn voice_handler(
         max_tokens: max_tokens.or(Some(200)),
         ..Default::default()
     };
-    let cancel = engine.cancel_guard();
+    let mut params = params;
+    let cancel = engine.cancel_guard(&mut params);
     let text = match engine.generate(&prepared.prompt, params).await {
         Ok(out) => out.text,
         Err(e) => return conv_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("generate: {e}")),
