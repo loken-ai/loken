@@ -670,7 +670,7 @@ impl GenericHeteroTransformer {
             return Ok(false);
         }
         let rows = tokens.len().max(1);
-        // Every position a request can reach: the context an indexed layer's cache holds whole.
+        // Every position a request can reach.
         let cap = self.config.effective_max_context();
         if rows > VERIFY_ROWS || at + rows > cap {
             return Ok(false);
@@ -742,14 +742,15 @@ impl GenericHeteroTransformer {
                 d.layer.verify_rope_sin = Some(sin.force_contiguous()?);
             }
         }
-        // The cache holds every position a request can reach, so the recorded kernels keep
-        // reading the same buffers; the indexer's room is made the same way.
-        if d.layer.kv_cache.max_seq_len_padded() < cap {
-            d.layer.kv_cache.reserve(cap)?;
+        // The cache grows to the positions this step reaches, its room doubling as it does, and
+        // the indexer's room follows it: the buffers move seldom, and a move ends the recording.
+        if d.layer.kv_cache.max_seq_len_padded() < at + rows {
+            d.layer.kv_cache.reserve(at + rows)?;
         }
+        let room = d.layer.kv_cache.max_seq_len_padded();
         let births = match d.layer.sparse.as_mut() {
             Some(sparse) => {
-                sparse.card_room_for(cap)?;
+                sparse.card_room_for(room)?;
                 sparse.card_hold_rows(at, rows)?;
                 sparse.card_births()
             }

@@ -2124,17 +2124,13 @@ fn build_generic_layer(
         // runs out of card memory is recovered by the placement ladder.
         kv_cache: {
             use crate::inference::cache::KV_WORKING_WINDOW_TOKENS as LAZY_KV_INITIAL_CAP;
-            // An indexed layer on a card keeps its cache whole from the load on (below): the
-            // buffers a recorded step reads never move, and none of the card's memory is
-            // left for a prefill to count on and a cache to take.
-            let whole = sparse.is_some() && device.is_cuda();
-            let init_cap = match whole {
-                true => config.effective_max_context().max(512),
-                false => config
-                    .effective_max_context()
-                    .max(512)
-                    .min(LAZY_KV_INITIAL_CAP),
-            };
+            // Every layer's cache starts at the working window and grows as a request needs:
+            // a cache made whole at the declared context takes the card's room for a window
+            // nobody has opened, which the expert cache would otherwise hold.
+            let init_cap = config
+                .effective_max_context()
+                .max(512)
+                .min(LAZY_KV_INITIAL_CAP);
             let mut c = SpecKvCache::new(init_cap);
             // gemma4 bounded sliding-window attention: SWA layers only attend within
             // `sliding_window`, so the cache need keep only the last
@@ -2341,7 +2337,7 @@ fn build_generic_layer(
         // Its one cache is unquantised, and on a card that cache holds half-width values.
         layer.kv_f16 = device.is_cuda();
         // Where the card's kernels serve it, the indexer keeps its pooled keys on the card too,
-        // and the half-width cache is made whole now.
+        // and the half-width cache is allocated at its starting size.
         if layer.indexed_on_card() {
             layer.kv_cache.preallocate(
                 layer.n_kv_head,
