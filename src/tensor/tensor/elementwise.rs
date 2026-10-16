@@ -705,8 +705,14 @@ impl Tensor {
     pub fn is_contiguous(&self) -> bool {
         true
     }
+    /// A copy of the tensor in an allocation of its own: a buffer that is written in place
+    /// later never shares storage with its source, whole or a view.
     pub fn force_contiguous(&self) -> Result<Self> {
-        self.contiguous()
+        let fresh = Self::zeros_on(self.shape.clone(), self.dtype(), &self.device())?;
+        if self.elem_count() > 0 {
+            fresh.slice_set(self, 0, 0)?;
+        }
+        Ok(fresh)
     }
     pub fn detach(&self) -> Self {
         self.clone()

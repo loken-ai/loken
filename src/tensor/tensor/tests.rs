@@ -1299,6 +1299,28 @@ fn slice_set_matches_oracle() {
     assert!(nd.slice_set(&ns, 1, 4).is_err());
 }
 
+/// A forced copy of a whole tensor or of a view takes an allocation of its own: a write into it
+/// leaves the source as it was.
+#[test]
+fn a_forced_copy_owns_its_storage() {
+    let whole = Tensor::from_vec_f32(data(4 * 3, 47), vec![4, 3]).unwrap();
+    let view = whole.narrow(0, 1, 2).unwrap();
+    for src in [&whole, &view] {
+        let before = src.to_vec_f32();
+        let copy = src.force_contiguous().unwrap();
+        assert_eq!(copy.dims(), src.dims());
+        close(&copy.to_vec_f32(), &before, 0.0);
+        let row = Tensor::from_vec_f32(vec![9.0; 3], vec![1, 3]).unwrap();
+        copy.slice_set(&row, 0, 0).unwrap();
+        close(&src.to_vec_f32(), &before, 0.0);
+    }
+    let copy = whole.force_contiguous().unwrap();
+    assert!(
+        copy.slice_set(&whole, 0, 0).is_ok(),
+        "the copy shares storage with its source"
+    );
+}
+
 #[test]
 fn slice_set_int_dtypes() {
     // i64 (graph_kv_pos) and u32 storages take the same in-place path
