@@ -31,6 +31,11 @@ model_id = "qwen3:0.6b"
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit
 
+# Another instance serving the same model reads this one's long prompts: it hands back their KV
+# cache over the network and this one decodes. A prompt within a prefill chunk of what the cache
+# already holds is read here, and so is any prompt when the peer cannot answer.
+# prefill_peer = "http://192.0.2.10:11435"
+
 # DeepSeek V4.1 and models with recurrent layers keep the decode state of finished prompts and
 # turns, so a prompt that begins with one seen before skips prefilling it. Without a directory the
 # states stay in host memory for the life of the process; with one they go on disk and survive a

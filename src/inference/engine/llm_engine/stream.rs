@@ -571,6 +571,15 @@ impl LlmEngine {
                     // token on a full match). Disable for multi-tenant privacy
                     // (cross-tenant timing side-channel) with
                     // LOKEN_NO_GLOBAL_PROMPT_CACHE=1.
+                    if let Some(peer) = config.prefill_peer.as_deref() {
+                        super::handover::pull_prompt_from_peer(
+                            state.model.as_mut(),
+                            &state.name,
+                            prompt.as_str(),
+                            &prompt_tokens,
+                            peer,
+                        );
+                    }
                     kv_reuse_start(
                         state.model.as_mut(),
                         &sessions,

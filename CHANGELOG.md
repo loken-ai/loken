@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Disaggregation: prefill_peer has another instance read long prompts and hand their KV over.
 - Expert parallelism: a layer's experts split across cards where measured links make it pay.
 - CPU: AVX-512 kernels for attention, the KV cache and elementwise ops.
 - CPU: AVX-512 kernels for the quantized GEMMs and dots.
@@ -28,7 +29,6 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
-- State cache: hybrid models keep their decode states in memory when no directory is set.
 - Tests: the gate profile rebuilds a change in place, the suite runs in half the time.
 - CPU: the prompt's KV cache rows are quantized on the thread pool.
 - CPU: large matmul outputs are cleared on the thread pool.
@@ -43,7 +43,6 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
-- Experts: a prefill no longer waits forever on the cache copies it lends the slots of.
 - Placement: a model the cards hold whole keeps room for whole prefill chunks.
 - Build: the cpu-only configuration compiles again.
 - Server: the [server] port of config.toml is used when --port is not given.

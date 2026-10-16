@@ -10,6 +10,7 @@ pub mod cut_plan;
 pub mod device_manager;
 pub mod discovery;
 pub mod evidence;
+pub mod kv_handover;
 pub mod kv_tiers;
 pub mod layer_scheduler;
 pub mod link_matrix;
@@ -55,7 +56,7 @@ mod wiring_gate {
     ///
     /// One table, not two: a module that appears in neither list is the case a pair of tables
     /// lets through.
-    const MODULES: [(&str, &str, bool); 20] = [
+    const MODULES: [(&str, &str, bool); 21] = [
         ("auto_tune", "auto_distribution", true),
         ("cluster", "distributed::cluster::", true),
         ("cluster_runtime", "cluster_runtime::", true),
@@ -63,6 +64,7 @@ mod wiring_gate {
         ("device_manager", "DeviceManager", true),
         ("discovery", "discovery::bind_discovery", true),
         ("evidence", "RequestEvidence", false),
+        ("kv_handover", "kv_handover::", true),
         ("kv_tiers", "TieredKv", false),
         ("layer_scheduler", "LayerScheduler", false),
         ("link_matrix", "LinkMatrix", false),

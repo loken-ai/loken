@@ -14,7 +14,7 @@ acceptance is met and measured; until then it stays here with its state.
 | Pipeline parallelism across machines | A chain of any length, the prompt-lookup verify crossing every cut | Done |
 | Data parallelism | Copies of a model served side by side, requests spread over them | Done on one machine; across machines through the cluster's routing |
 | Context parallelism | A long context's attention split across cards | Planned |
-| Prefill and decode on different instances | A prompt read on one instance and decoded on another, its state handed over | Planned |
+| Prefill and decode on different instances | A prompt read on one instance and decoded on another, its state handed over | Done for attention models: the KV cache handed over exactly; recurrent and windowed layers still read their prompt where they decode |
 | CUDA on the published cudarc crate | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
 | CPU kernels chosen at run time | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |

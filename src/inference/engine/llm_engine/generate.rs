@@ -191,6 +191,7 @@ impl LlmEngine {
         let sessions = self.sessions.clone();
         // Owned: the meter is fed from inside the blocking closure, which cannot borrow self.
         let metered_model = self.config.model_id.clone();
+        let prefill_peer = self.config.prefill_peer.clone();
 
         let inner_result = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
             let mut guard = model_state.blocking_lock();
@@ -302,6 +303,15 @@ impl LlmEngine {
                     || audio_split.is_some();
                 let disabled = is_vision_req
                     || false;
+                if let (Some(peer), false) = (prefill_peer.as_deref(), disabled) {
+                    super::handover::pull_prompt_from_peer(
+                        state.model.as_mut(),
+                        &state.name,
+                        prompt.as_str(),
+                        &prompt_tokens,
+                        peer,
+                    );
+                }
                 kv_reuse_start(
                     state.model.as_mut(),
                     &sessions,

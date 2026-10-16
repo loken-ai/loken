@@ -98,6 +98,10 @@ pub struct InferenceConfigToml {
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
+    /// The instance that reads this one's long prompts: it hands back their KV cache and this
+    /// one decodes. Both serve the same model. None reads every prompt here.
+    #[serde(default)]
+    pub prefill_peer: Option<String>,
     /// Whether drafts (a model's own draft head, prompt lookup) are verified in recorded
     /// windows, the head guessing only where they are. Off unless set: a window is checked
     /// against the plain step at each recording, and a request whose windows are given up
@@ -331,6 +335,7 @@ impl Config {
             device_index: None,
             replicas: toml_config.replicas.max(1),
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
+            prefill_peer: toml_config.prefill_peer.clone(),
             recorded_drafts: toml_config.recorded_drafts,
             probe_dump_dir: toml_config.probe_dump_dir.clone(),
             expert_profile: toml_config.expert_profile.clone(),

@@ -77,6 +77,19 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
 
+### Prompts read by another instance
+
+An instance with `prefill_peer` set has its long prompts read by that peer, which serves the same
+model: the peer prefills the prompt and answers its KV cache over `/api/cluster/prefill`, and this
+instance imports it as a snapshot and decodes. The prefix reuse restores it in whole prefill
+chunks and reads the rest of the prompt here, so a prompt within a chunk of what the cache holds
+never leaves. A model with recurrent or windowed layers, a split layer, or a peer that cannot
+answer reads the prompt here. The rows travel as f32, about four times the cache's own size.
+
+| Key | Default | What it does |
+|---|---|---|
+| `prefill_peer` | none | URL of the instance that reads this one's long prompts. |
+
 ### Decode-state cache (DeepSeek V4.1 and recurrent hybrids)
 
 In host memory for the life of the process, or on disk when `state_cache_dir` is set. A DeepSeek

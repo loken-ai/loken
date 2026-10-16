@@ -167,6 +167,31 @@ pub(crate) async fn cluster_measure(
     }))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ClusterPrefillRequest {
+    pub model: String,
+    /// The prompt as the asking instance formatted it, which this one tokenizes alike.
+    pub prompt: String,
+}
+
+/// Read a prompt for another instance serving the same model and answer its KV cache, which
+/// that instance imports and decodes from.
+pub(crate) async fn cluster_prefill(
+    State(state): State<APIServer>,
+    Json(req): Json<ClusterPrefillRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    validate_model_id(&req.model)?;
+    let name = normalize_model_id(&req.model);
+    let bytes = state
+        .read_prompt_for_peer(&name, &req.prompt)
+        .await
+        .map_err(ApiError::Internal)?;
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
 /// Attach a speculative draft model to a target. Validates that
 /// the tokenizers are byte-identical (same fingerprint, same vocab size)
 /// before the attach succeeds; otherwise the call returns an error and

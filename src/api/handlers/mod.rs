@@ -2278,6 +2278,25 @@ impl APIServer {
         .await;
     }
 
+    /// `prompt` read by `model_id`, loaded if it is not, and the KV cache it leaves as the bytes
+    /// of a handover for the instance that asked.
+    pub(crate) async fn read_prompt_for_peer(
+        &self,
+        model_id: &str,
+        prompt: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.ensure_loaded(model_id, DEFAULT_KEEP_ALIVE_MINUTES)
+            .await?;
+        let engine = self
+            .get_engine(model_id)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        engine
+            .read_prompt_for_peer(prompt)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// What a layer of `model_id` costs on this node, measured once and kept: `(card ms, host ms,
     /// card bytes)`. A model not loaded here is measured on a sample of its first layers, as many as
     /// the cards hold and one on the host, loaded by the ladder and released, so a node that could
@@ -2671,6 +2690,7 @@ impl APIServer {
                 axum::routing::post(pipeline_tail_start),
             )
             .route("/api/cluster/measure", axum::routing::post(cluster_measure))
+            .route("/api/cluster/prefill", axum::routing::post(cluster_prefill))
             .route("/api/draft/attach", axum::routing::post(draft_attach))
             .route("/api/draft/detach", axum::routing::post(draft_detach))
             .route("/api/draft/status", axum::routing::get(draft_status))

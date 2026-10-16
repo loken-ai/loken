@@ -4,7 +4,7 @@
 use super::*;
 
 /// Default keep-alive duration in minutes (same as Ollama)
-const DEFAULT_KEEP_ALIVE_MINUTES: i64 = 5;
+pub(crate) const DEFAULT_KEEP_ALIVE_MINUTES: i64 = 5;
 
 /// Declare the engines that can still be holding weights once a request ends.
 ///

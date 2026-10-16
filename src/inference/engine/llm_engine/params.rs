@@ -174,6 +174,8 @@ pub struct InferenceConfig {
     /// own dtype, shared between sequences by prefix, one manifest per sequence. `None`
     /// keeps snapshots in memory only.
     pub kv_disk_dir: Option<String>,
+    /// The instance that reads long prompts for this one and hands back their KV cache.
+    pub prefill_peer: Option<String>,
     /// Whether drafts are verified in recorded windows, the model's draft head guessing where
     /// they are.
     pub recorded_drafts: bool,
@@ -261,6 +263,7 @@ impl Default for InferenceConfig {
             device_index: None,
             replicas: 1,
             kv_disk_dir: None,
+            prefill_peer: None,
             recorded_drafts: false,
             probe_dump_dir: None,
             expert_profile: None,
