@@ -140,14 +140,15 @@ def span(docs):
     return (days[0], days[-1]) if days else ("?", "?")
 
 
-def page(title, machine, group, merged, rows_, fam, replays):
+def page(title, machine, group, merged, rows_, fam, replays, archived):
     first, last = span(group)
     builds = sorted({e["version"] for by in merged.values() for k, e in by.items()
                      if k.startswith("loken") and e.get("version")})
     out = [f"# Benchmarks - {title}", "",
            f"{len(group)} run(s), {first} to {last}. loken builds measured: "
            f"{', '.join(builds) or 'unstated'}. A row's `Date` and `Run` name the run behind it."
-           + (f" {replays} replayable record(s) of this hardware are in the store and not tabled." if replays else ""),
+           + (f" {replays} replayable record(s) of this hardware are in the store and not tabled." if replays else "")
+           + (f" {archived} archived run(s) (superseded builds or another protocol) are held and not tabled." if archived else ""),
            "", "## Hardware", "", hardware_block(machine, group), "## Results", "",
            "Method and column definitions: [BENCHMARKS.md](../BENCHMARKS.md).", ""]
     by_family = {}
@@ -222,13 +223,17 @@ def main(argv):
         # binary; it has no peer to compare against and is not a row of these tables.
         replays = sum(1 for d, _, _ in group if d.get("replay"))
         group = [t for t in group if not t[0].get("replay")]
+        # A record taken from a named archive (superseded builds, a contended protocol, one
+        # card) stays in the store and is not a row of the current tables.
+        archived = sum(1 for d, _, _ in group if d.get("archive"))
+        group = [t for t in group if not t[0].get("archive")]
         merged = B.load_docs(group)
         rows_ = B.cells(merged)
         fam = families({r[0].strip() for r in rows_}, cache, models_dir)
         name = slug(machine, taken)
         taken.add(name)
         (OUT / f"{name}.md").write_text(page(H.label(machine), machine, group,
-                                              merged, rows_, fam, replays))
+                                              merged, rows_, fam, replays, archived))
         written.append(f"{name}.md")
         first, last = span(group)
         index_rows.append([f"[{H.label(machine)}](benchmarks/{name}.md)", hid,
