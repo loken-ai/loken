@@ -43,6 +43,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Tool calls: DeepSeek V4.1 sees its tool results and past calls as its encoder writes them.
 - Tensors: a forced contiguous copy owns its storage instead of sharing its source.
 - Attention: a decode with normed heads and a partial rotation no longer reads past its tables.
 - Tool calls: a call that names its tool under a tool key is read as a call.

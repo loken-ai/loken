@@ -303,6 +303,25 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 /// native marker syntax, so replaying conversation history reproduces what
 /// the model originally emitted.
 fn render_assistant_tool_calls(format: ToolFormat, calls: &[ToolCall]) -> String {
+    // V4.1 writes every call of a turn as one block of invokes.
+    if format == ToolFormat::DeepSeekDsml {
+        let invokes: Vec<String> = calls
+            .iter()
+            .filter_map(|c| c.function.as_ref())
+            .map(|f| {
+                let params = dsml_params(f.arguments.as_deref().unwrap_or("{}"));
+                format!(
+                    "{DSML_INVOKE_OPEN} name=\"{}\">\n{}\n{DSML_INVOKE_CLOSE}",
+                    f.name,
+                    params.trim_end_matches('\n')
+                )
+            })
+            .collect();
+        return format!(
+            "{DSML_CALLS_OPEN}\n{}\n{DSML_CALLS_CLOSE}",
+            invokes.join("\n")
+        );
+    }
     let mut out = String::new();
     for call in calls {
         let Some(func) = call.function.as_ref() else {
@@ -339,22 +358,43 @@ fn render_assistant_tool_calls(format: ToolFormat, calls: &[ToolCall]) -> String
                     "{DS_CALLS_BEGIN}{DS_CALL_BEGIN}function{DS_SEP}{name}\n```json\n{args}\n```{DS_CALL_END}{DS_CALLS_END}\n"
                 ));
             }
-            ToolFormat::DeepSeekDsml => {
-                out.push_str(&format!(
-                    "{DSML_CALLS_OPEN}\n{DSML_INVOKE_OPEN} name=\"{name}\">\n{params}{DSML_INVOKE_CLOSE}\n{DSML_CALLS_CLOSE}\n",
-                    params = dsml_params(args),
-                ));
-            }
+            ToolFormat::DeepSeekDsml => unreachable!("a DSML turn's calls are one block, above"),
         }
     }
     out
 }
 
-/// One argument object rendered as DSML parameter entries: a JSON string goes back as it is with
-/// `string="true"`; any other value goes back as JSON with `string="false"`, which is how the
-/// parser tells the two apart.
+/// A JSON object's entries in the order they were written.
+struct OrderedObject(Vec<(String, Value)>);
+
+impl<'de> serde::Deserialize<'de> for OrderedObject {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = OrderedObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<OrderedObject, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = a.next_entry::<String, Value>()? {
+                    entries.push(entry);
+                }
+                Ok(OrderedObject(entries))
+            }
+        }
+        d.deserialize_map(Entries)
+    }
+}
+
+/// One argument object rendered as DSML parameter entries, in the order the call wrote them: a
+/// JSON string goes back as it is with `string="true"`; any other value goes back as JSON with
+/// `string="false"`, which is how the parser tells the two apart.
 fn dsml_params(args_json: &str) -> String {
-    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(args_json) else {
+    let Ok(OrderedObject(map)) = serde_json::from_str::<OrderedObject>(args_json) else {
         return String::new();
     };
     let mut out = String::new();
@@ -384,7 +424,7 @@ fn render_tool_result(format: ToolFormat, content: &str) -> String {
         }
         ToolFormat::DeepSeek => format!("<｜tool▁output▁begin｜>{content}<｜tool▁output▁end｜>"),
         // V4.1 has no standalone tool role: a result is a tool_result block inside the user turn.
-        ToolFormat::DeepSeekDsml => format!("<tool_result>\n{content}\n</tool_result>"),
+        ToolFormat::DeepSeekDsml => format!("<tool_result>{content}</tool_result>"),
     }
 }
 
@@ -427,13 +467,31 @@ pub fn flatten_messages(
                 let mut content = msg.content.clone();
                 if let Some(calls) = msg.tool_calls.as_ref() {
                     if !calls.is_empty() {
-                        if !content.is_empty() {
+                        if format == ToolFormat::DeepSeekDsml {
+                            content.push_str("\n\n");
+                        } else if !content.is_empty() {
                             content.push('\n');
                         }
                         content.push_str(&render_assistant_tool_calls(format, calls));
                     }
                 }
                 out.push(Message::new("assistant".to_string(), content));
+            }
+            // V4.1 has no tool role: results, and the user text that follows them, are the
+            // parts of one user turn.
+            "tool" | "function" | "user" if format == ToolFormat::DeepSeekDsml => {
+                let part = if msg.role == "user" {
+                    msg.content.clone()
+                } else {
+                    render_tool_result(format, &msg.content)
+                };
+                match out.last_mut() {
+                    Some(last) if last.role == "user" => {
+                        last.content.push_str("\n\n");
+                        last.content.push_str(&part);
+                    }
+                    _ => out.push(Message::new("user".to_string(), part)),
+                }
             }
             "tool" | "function" => {
                 let rendered = render_tool_result(format, &msg.content);
@@ -1993,6 +2051,56 @@ mod tests {
         assert!(out
             .iter()
             .any(|m| m.role == "tool" && m.content.contains("<tool_response>")));
+    }
+
+    /// A V4.1 conversation as the checkpoint's encoder writes it: the calls of a turn in one
+    /// block after a blank line, the results and the user text after them in one user turn.
+    #[test]
+    fn flatten_writes_a_dsml_conversation_as_the_encoder_does() {
+        let m = |role: &str, content: &str| Message::new(role.to_string(), content.to_string());
+        let call = |id: &str, name: &str, args: &str| ToolCall {
+            id: id.into(),
+            r#type: "function".into(),
+            function: Some(ToolCallFunction {
+                name: name.into(),
+                arguments: Some(args.into()),
+            }),
+        };
+        let mut assistant = m("assistant", "Looking.");
+        assistant.tool_calls = Some(vec![
+            call("a", "bash", "{\"cmd\":\"ls\"}"),
+            call("b", "read", "{\"path\":\"x\",\"n\":2}"),
+        ]);
+        let out = flatten_messages(
+            &[
+                m("user", "Fix it."),
+                assistant,
+                m("tool", "a.py"),
+                m("tool", "body"),
+                m("user", "Go on."),
+            ],
+            ToolFormat::DeepSeekDsml,
+            &[tool("bash"), tool("read")],
+            None,
+        );
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        let d = |t: &str| t.replace('|', "\u{ff5c}");
+        assert_eq!(
+            out[2].content,
+            d(
+                "Looking.\n\n<|DSML| calls>\n<|DSML| invoke name=\"bash\">\n\
+               <|DSML| parameter name=\"cmd\" string=\"true\">ls</|DSML| parameter>\n\
+               </|DSML| invoke>\n<|DSML| invoke name=\"read\">\n\
+               <|DSML| parameter name=\"path\" string=\"true\">x</|DSML| parameter>\n\
+               <|DSML| parameter name=\"n\" string=\"false\">2</|DSML| parameter>\n\
+               </|DSML| invoke>\n</|DSML| calls>"
+            )
+        );
+        assert_eq!(
+            out[3].content,
+            "<tool_result>a.py</tool_result>\n\n<tool_result>body</tool_result>\n\nGo on."
+        );
     }
 
     #[test]
