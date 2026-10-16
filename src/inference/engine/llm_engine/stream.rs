@@ -25,15 +25,21 @@ impl LlmEngine {
 
     /// Counts a request as running on this engine until the returned guard drops, and
     /// moves the model between serial and batched serving as the arrivals call for it (see
-    /// `batching`). A switch waits for the model lock, so it lands between generations.
+    /// `batching`). A switch waits until no admitted request runs on the backend it replaces:
+    /// a serial generation takes the model lock a step at a time, so the lock alone would let
+    /// the switch land between two of its tokens.
     pub async fn admit_request(&self) -> super::ActiveRequest {
-        let request = super::batching::ActiveRequest::enter(&self.active);
+        let mut request = super::batching::ActiveRequest::enter(&self.active);
         let batched = self.is_continuous().await;
         let switch = self
             .batching
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .arrive(request.others(), batched);
+        let _switching = match switch {
+            super::batching::Switch::Stay => None,
+            _ => Some(self.serving.clone().write_owned().await),
+        };
         match switch {
             super::batching::Switch::Stay => {}
             super::batching::Switch::ToBatched => {
@@ -58,6 +64,8 @@ impl LlmEngine {
                 }
             }
         }
+        drop(_switching);
+        request.hold(self.serving.clone().read_owned().await);
         request
     }
 

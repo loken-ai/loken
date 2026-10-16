@@ -43,6 +43,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: a switch to batched serving waits for the generations running serially.
 - DeepSeek V4.1: a long prompt is prefilled in one pass, not decoded past its first chunk.
 - Tool calls: DeepSeek V4.1 sees its tool results and past calls as its encoder writes them.
 - Tensors: a forced contiguous copy owns its storage instead of sharing its source.

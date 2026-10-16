@@ -61,6 +61,8 @@ impl BatchingSignal {
 pub struct ActiveRequest {
     count: Arc<AtomicUsize>,
     others: usize,
+    /// The serving mode this request runs under, held until it finishes.
+    serving: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 impl ActiveRequest {
@@ -69,7 +71,13 @@ impl ActiveRequest {
         Self {
             count: Arc::clone(count),
             others,
+            serving: None,
         }
+    }
+
+    /// Holds the serving mode for as long as this request runs.
+    pub fn hold(&mut self, serving: tokio::sync::OwnedRwLockReadGuard<()>) {
+        self.serving = Some(serving);
     }
 
     /// Requests that were running when this one was admitted.
@@ -125,5 +133,21 @@ mod tests {
         assert_eq!((a.others(), b.others()), (0, 1));
         drop(a);
         assert_eq!(ActiveRequest::enter(&n).others(), 1);
+    }
+
+    /// A change of serving mode waits for the requests that hold the mode, and takes it the
+    /// moment the last of them ends.
+    #[test]
+    fn a_switch_waits_for_the_requests_running_under_the_mode() {
+        let serving = Arc::new(tokio::sync::RwLock::new(()));
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut running = ActiveRequest::enter(&n);
+        running.hold(serving.clone().try_read_owned().unwrap());
+        assert!(
+            serving.clone().try_write_owned().is_err(),
+            "a switch landed under a request"
+        );
+        drop(running);
+        assert!(serving.clone().try_write_owned().is_ok());
     }
 }
