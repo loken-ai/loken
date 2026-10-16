@@ -1161,11 +1161,21 @@ impl LayerTier {
     /// Give the memory of the extra slots back to the card: the experts they held leave the
     /// cache and the stacks are freed. Whether there was anything to give.
     pub fn lend_extra(&self) -> bool {
+        if self
+            .extra
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return false;
+        }
+        // The copies on their way look their slots up under the stacks' lock: they land before
+        // the lock is taken to free the stacks, and one queued after it finds the slots lent.
+        self.settle();
         let mut extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
         if extra.is_none() {
             return false;
         }
-        self.settle();
         if let Ok(cd) = self.dev.as_cuda_device() {
             let _ = cd.0.stream().synchronize();
         }

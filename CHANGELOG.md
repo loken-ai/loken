@@ -42,6 +42,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Experts: a prefill no longer waits forever on the cache copies it lends the slots of.
 - Placement: a model the cards hold whole keeps room for whole prefill chunks.
 - Build: the cpu-only configuration compiles again.
 - Server: the [server] port of config.toml is used when --port is not given.
