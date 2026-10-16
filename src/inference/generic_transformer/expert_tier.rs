@@ -3370,15 +3370,32 @@ mod tests {
     /// thread, gives what the host's expert loop gives it, and the cache learns as it does.
     #[test]
     fn a_token_through_the_recorded_decode_matches_the_host() {
+        recorded_decode_matches_the_host((32, 4, 64, 64), [GgmlDType::Q8_0; 2], 6);
+    }
+
+    /// The same in the k-quants and the legacy formats of a served file, at its widths.
+    #[test]
+    fn a_token_through_the_recorded_decode_matches_the_host_in_k_quants() {
+        for formats in [
+            [GgmlDType::Q4K, GgmlDType::Q5_0],
+            [GgmlDType::Q4K, GgmlDType::Q8_0],
+        ] {
+            recorded_decode_matches_the_host((32, 8, 2560, 640), formats, 12);
+        }
+    }
+
+    fn recorded_decode_matches_the_host(
+        (experts, used, hidden, ffn): (usize, usize, usize, usize),
+        formats: [GgmlDType; 2],
+        slots: usize,
+    ) {
         let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
         };
-        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
-        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
-        let mut tiered = layer(&card, experts, used, hidden, ffn);
-        let slots = 6;
+        let reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+        let mut tiered = layer_of(&card, experts, used, hidden, ffn, formats);
         let built = LayerTier::new(&tiered, &card, slots).unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
@@ -3414,7 +3431,7 @@ mod tests {
                 .fold(0f32, f32::max);
             assert!(
                 worst <= 2e-2 * peak,
-                "token {token}: max diff {worst} of {peak}"
+                "{formats:?} token {token}: max diff {worst} of {peak}"
             );
             if token == inputs.len() - 1 {
                 let (routed, hits, _) = tier.counters();
@@ -3797,13 +3814,30 @@ mod tests {
     /// give what the host's loop gives.
     #[test]
     fn a_resident_layer_matches_the_host() {
+        resident_layer_matches_the_host((32, 4, 64, 64), [GgmlDType::Q8_0; 2]);
+    }
+
+    /// The same in the k-quants and the legacy formats of a served file, at its widths.
+    #[test]
+    fn a_resident_layer_matches_the_host_in_k_quants() {
+        for formats in [
+            [GgmlDType::Q4K, GgmlDType::Q5_0],
+            [GgmlDType::Q4K, GgmlDType::Q8_0],
+        ] {
+            resident_layer_matches_the_host((32, 8, 2560, 640), formats);
+        }
+    }
+
+    fn resident_layer_matches_the_host(
+        (experts, used, hidden, ffn): (usize, usize, usize, usize),
+        formats: [GgmlDType; 2],
+    ) {
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
         };
-        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
-        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
-        let mut resident = layer(&card, experts, used, hidden, ffn);
+        let reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+        let mut resident = layer_of(&card, experts, used, hidden, ffn, formats);
         resident.tier = Some(Arc::new(LayerTier::all_on_card(&resident, &card).unwrap()));
         assert!(resident.tier.as_ref().unwrap().is_resident());
         for (rows, prefill) in [(1usize, false), (24, true), (700, true)] {
@@ -3831,8 +3865,8 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(
-                worst <= 2e-2 * peak,
-                "rows {rows}: max diff {worst} of {peak}"
+                worst.is_finite() && worst <= 2e-2 * peak,
+                "{formats:?} rows {rows}: max diff {worst} of {peak}"
             );
         }
     }
