@@ -463,6 +463,54 @@ fn a_card_decoding_one_token_at_a_time_gives_the_logits_of_the_whole_prompt() {
     }
 }
 
+/// A dense attention whose rotation covers part of the head decodes on a card, its cache in Q8,
+/// as it does on the host.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn a_card_decoding_a_partly_rotated_dense_attention_matches_the_host() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let dense = |mut m: GenericHeteroTransformer| {
+        for l in &mut m.layers {
+            l.sparse = None;
+        }
+        m
+    };
+    let mut host = dense(toy());
+    let mut card_model = dense(toy_with(Some(0), KvQuant::Q8));
+    let card = card_model.layers[0].cos.device();
+    let rotated = card_model.layers.iter().find(|l| l.attends()).unwrap();
+    assert!(rotated.rope_dim > 0 && rotated.rope_dim < rotated.head_dim);
+    let tokens = ids(&v, "b.ids");
+    for (i, t) in tokens.iter().enumerate() {
+        let want = host
+            .forward(
+                &Tensor::from_vec(vec![*t], (1, 1), &Device::Cpu).unwrap(),
+                i,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let got = card_model
+            .forward(&Tensor::from_vec(vec![*t], (1, 1), &card).unwrap(), i)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        within_rounding(
+            &got,
+            &want,
+            scale_of(&want),
+            want.len(),
+            &format!("position {i}"),
+        );
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs an idle CUDA card"]

@@ -731,12 +731,13 @@ impl GenericTransformerLayer {
             && shared_kv.is_none()
             // The fused decode kernels have no sink term.
             && self.attn_sinks.is_none();
-        // The fused kernel normalises each head; a norm over the whole projection takes
-        // the unfused path.
+        // The fused kernel normalises each head and rotates all of its lanes; a norm over the
+        // whole projection, or a rotation of part of the head, takes the unfused path.
         let want_apq_with_norm = self.flags.has_qk_norm
             && self.attn_q_norm.is_some()
             && self.attn_k_norm.is_some()
-            && !self.qk_norm_is_full();
+            && !self.qk_norm_is_full()
+            && (self.rope_dim == 0 || self.rope_dim == self.head_dim);
         let want_apq_no_norm = !self.flags.has_qk_norm
             // qwen2-family biases are added as one broadcast_add on the qkv
             // tensor before the fused norm+RoPE+cast kernel.
