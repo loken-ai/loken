@@ -43,6 +43,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Tool calls: a call that names its tool under a tool key is read as a call.
 - Tools: a call that closes a value with its key's tag, or tags its arguments, is read.
 - Server: a request that ends no longer stops another one served beside it.
 - Placement: a model the cards hold whole keeps room for whole prefill chunks.

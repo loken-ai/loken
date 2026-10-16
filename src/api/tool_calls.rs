@@ -489,9 +489,12 @@ fn make_call(name: &str, arguments: &Value) -> ToolCall {
 }
 
 /// Lift a single `{"name":..,"arguments"/"parameters":..}` object into a
-/// `ToolCall`, accepting either argument key.
+/// `ToolCall`, accepting either argument key, and `"tool"` for the name.
 fn call_from_object(obj: &Value) -> Option<ToolCall> {
-    let name = obj.get("name").and_then(|v| v.as_str())?;
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("tool"))
+        .and_then(|v| v.as_str())?;
     let args = obj
         .get("arguments")
         .or_else(|| obj.get("parameters"))
@@ -1508,6 +1511,20 @@ mod tests {
         assert_eq!(args["path"], "src/brew.rs");
         assert_eq!(args["start_line"], 2);
         assert_eq!(r.content, "I will read it.");
+    }
+
+    /// A call that names its tool under `"tool"` is read as a call.
+    #[test]
+    fn parse_hermes_call_naming_its_tool_under_tool() {
+        let raw = "<tool_call>\n{\"tool\": \"read_file\", \"parameters\": {\"path\": \"ledger/invoicing.py\"}}\n";
+        let r = parse_hermes(raw);
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "read_file");
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["path"], "ledger/invoicing.py");
+        assert!(r.content.is_empty());
     }
 
     /// A model that writes the JSON call where the XML element puts the name still calls the
