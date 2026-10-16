@@ -1,12 +1,13 @@
 # Benchmarking loken
 
 How to run a reproducible bench campaign, and where every input comes from. This page is the
-procedure; there is no other. `BENCHMARKS.md` holds the results it produces.
+procedure; there is no other. `BENCHMARKS.md` indexes the results it produces.
 
 ## The shape of it
 
 A campaign compares loken against ollama and vLLM on the models loken serves, across a matrix of
-context, prompt, streaming and device, and writes the numbers into `docs/BENCHMARKS.md`. Two layers:
+context, prompt, streaming and device, files every run in the store and writes the pages under
+`docs/benchmarks/`. Two layers:
 
 - **assay** (`../assay`) is the measurement tool. It benches one model against one engine and emits
   a result JSON. It measures every modality natively - text, vision, image generation, TTS, ASR -
@@ -22,6 +23,7 @@ Nothing about a campaign is retyped or maintained by hand:
 | model list | loken's own catalogue, `GET /api/tags` - no scan, no list to maintain |
 | matrix axes + vLLM peers | `bench/matrix.toml` - the only curated data, public HF repo ids only |
 | ollama / vLLM binaries | installed by the campaign into a bench-only compartment (see below) |
+| the store | `bench_data_dir` in `config.toml` |
 
 ## Run it
 
@@ -43,6 +45,28 @@ the bench's alone - never your `~/vllm` venv or whatever `ollama` is on `PATH`. 
 bench working tree (`~/bench-logs/engines/`), a fresh vLLM venv and a versioned ollama, and their
 versions are recorded in the run record. Isolated so the comparison is reproducible and touches no
 other environment.
+
+## Where results live
+
+Every run is a record of the assay schema, filed once in the store under the hash of its content
+(`runs/<run_id>.json`, written by `assay/scripts/store.py`). A rerun is a new file; nothing is
+overwritten, and a result file in `results/` is only the campaign's scratch copy. The store sits
+outside the repositories, at `bench_data_dir`.
+
+A record names its machine: `hardware_id` identifies the cards, processor and memory, so a card
+swap is a new hardware and the same machine keeps its `host_id`. `scripts/report.py` groups the
+store by `hardware_id` and writes one page per group, `docs/benchmarks/<hardware>.md`, with the
+hardware block, the dates and the loken builds read from its records. `benchmarks/compare.md`
+lists a cell once two hardware configurations measured it with the same answer length.
+
+```
+scripts/report.py                      # regenerate the pages from the store
+scripts/report.py file results/*.json  # file records first
+```
+
+A record taken before the runner described its machine can be attested by an operator
+(`assay/scripts/convert-archive.py --attest-machine`); the page says so. A record without a
+machine is kept and tabled nowhere.
 
 ## Modalities
 

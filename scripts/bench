@@ -312,7 +312,7 @@ PY
                 2>&1 | tail -4
             [ -s "$out" ] || { echo "no result for $m"; continue; }
             stamp_result "$out" "$stamp"
-            python3 scripts/bench_row.py docs/BENCHMARKS.md results >/dev/null 2>&1 || echo "  (bench_row not modality-aware yet for $amod)"
+            python3 scripts/report.py file "$out" >/dev/null 2>&1 || echo "  (report not modality-aware yet for $amod)"
         done; done
     done <<< "$models"
     echo "campaign done"

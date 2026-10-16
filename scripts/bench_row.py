@@ -17,7 +17,10 @@ def _measured_at(doc, p):
             return dt.timestamp(), dt.astimezone().strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
-    m = p.stat().st_mtime
+    try:
+        m = pathlib.Path(p).stat().st_mtime
+    except OSError:
+        return 0.0, ""
     return m, datetime.datetime.fromtimestamp(m).strftime("%Y-%m-%d %H:%M")
 
 # Engine version labels come from the result FILES, never from whatever happens to be installed
@@ -68,7 +71,7 @@ def engine_label(target, version=None):
 # current name would empty most of the table without saying anything was missing.
 RETIRED_TARGETS = {"llmuse": "loken", "llmserver": "loken"}
 COLS = ["Model", "Ctx", "Prompt", "Mode", "Device", "Engine", "Prefill tok/s", "Decode tok/s", "Tokens",
-        "E2E ms", "J/req", "J/token", "Δ decode", "Δ energy", "Date"]
+        "E2E ms", "J/req", "J/token", "Δ decode", "Δ energy", "Date", "Run"]
 
 def measured_prefill(r, st):
     """Prompt tokens divided by the measured time to first token, or nothing.
@@ -253,8 +256,9 @@ def energy_stat(st, prefix):
     # to remove first.
     return stat_warm(st, hits[0]), dom
 
-def rows(path, mode, device):
-    d = json.load(open(path)); out = {}
+def rows(d, mode, device):
+    path = d.get("converted_from") or d.get("timestamp")
+    out = {}
     # A run that was stopped before it measured anything writes the file with no results.
     # Saying which one is empty beats a traceback that names only the line that tripped.
     if not d.get("results"):
@@ -355,7 +359,7 @@ def cells(merged):
                 # as a cell that was not tried.
                 mark = "impossible" if v.get("impossible") else "failed"
                 out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), " - ", " - ",
-                            " - ", " - ", " - ", " - ", mark, "", v.get("day", "")])
+                            " - ", " - ", " - ", " - ", mark, "", v.get("day", ""), v.get("run", "")])
                 continue
             if not any(v[k] is not None for k in ("prefill", "decode", "ntok", "e2e", "jreq")):
                 # Nothing was measured, so there is no row. An all-dash line reads as a cell
@@ -368,7 +372,7 @@ def cells(merged):
                 # The rates are withheld rather than shown with a caveat: a number in a
                 # performance column is read as performance, whatever sits beside it.
                 out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), " - ", " - ",
-                            b(fmt(v["ntok"], 0)), " - ", " - ", " - ", "incoherent", "", v.get("day", "")])
+                            b(fmt(v["ntok"], 0)), " - ", " - ", " - ", "incoherent", "", v.get("day", ""), v.get("run", "")])
                 continue
             if v["ntok"] is not None and v["ntok"] <= 1:
                 # One token is not a rate. It divides by whatever interval the clock rounded
@@ -378,11 +382,11 @@ def cells(merged):
                 # itself cost still stands, because that part really was measured.
                 out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), b(fmt(v["prefill"])),
                             " - ", b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)), b(fmt(v["jreq"], 0)),
-                            " - ", "no answer", "", v.get("day", "")])
+                            " - ", "no answer", "", v.get("day", ""), v.get("run", "")])
                 continue
             out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), b(fmt(v["prefill"])),
                         b(fmt(v["decode"])), b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)),
-                        b(fmt(v["jreq"], 0)), b(fmt(v["j"], 3)), dd, de, v.get("day", "")])
+                        b(fmt(v["jreq"], 0)), b(fmt(v["j"], 3)), dd, de, v.get("day", ""), v.get("run", "")])
     return out
 
 def table(rows_):
@@ -392,32 +396,47 @@ def table(rows_):
     sep  = "|" + "|".join("-" * (w[i] + 2) for i in range(len(COLS))) + "|"
     return "\n".join([line(COLS), sep] + [line(r) for r in rows_])
 
+def mode_device(doc):
+    """(mode, device) of a record, from what it states: a run that asked for no streaming is
+    non-stream, one that gave the engine no card (`num_gpu` 0) is CPU. Both defaults are the
+    campaign's own."""
+    cfg = doc.get("config") or {}
+    mode = "non-stream" if cfg.get("streaming") is False else "stream"
+    return mode, "CPU" if cfg.get("num_gpu") == 0 else "GPU"
+
+
 def load_all(results_dir):
+    """The cells of every result file in a directory."""
+    docs = [(json.load(open(p)), p, "") for p in sorted(pathlib.Path(results_dir).glob("*.json"))]
+    return load_docs(docs)
+
+
+def load_docs(docs):
+    """The cells of records: (record, source, run id) triples, in any order.
+
+    When two records describe the same cell and the same engine, the newer measurement wins,
+    ranked by when it was MEASURED (the record's timestamp), not by the file's mtime - a
+    version stamp touches mtime without re-measuring. Without this a standalone vLLM
+    reconnaissance run overwrote the vLLM entry of the three-engine run measured minutes
+    earlier, silently and by four days: the console said 85.1 tok/s and the table printed 69.2.
+    """
     merged = {}
-    # When two files describe the same cell and the same engine, the newer measurement
-    # wins. They are read in name order, so without this a standalone `*_stream_vllm.json`
-    # from an older reconnaissance run overwrites the vLLM entry of the three-engine
-    # `*_stream.json` measured minutes earlier - silently, and by four days. Caught the
-    # first time a cell carried all three engines: the console said 85.1 tok/s and the
-    # table printed 69.2.
     seen_at = {}
-    for p in sorted(pathlib.Path(results_dir).glob("*.json")):
-        mode = "non-stream" if "non-stream" in p.name else "stream"
-        device = "CPU" if p.name.endswith("_cpu.json") else "GPU"
+    for doc, source, run in docs:
+        mode, device = mode_device(doc)
         # A cell measured against an older reference keeps its place beside the newer one:
         # the version column exists so both can be read, and dropping the earlier rows
         # would throw away the only evidence of what the upgrade changed.
-        doc = json.load(open(p))
-        # The version each engine was measured with, read from the file. An engine whose row is
-        # here but whose version the file did not record keeps its bare key ("ollama"/"vllm") and
-        # is labelled without a number - never with the version installed now.
+        # The version each engine was measured with, read from the record. An engine whose row
+        # is here but whose version the record did not state keeps its bare key ("ollama"/"vllm")
+        # and is labelled without a number - never with the version installed now.
         said = lambda eng: ((doc.get("subjects") or {}).get(eng) or {}).get("says") or {}
         engine_vers = (("ollama", said("ollama").get("version") or doc.get("ollama_version"), "Ollama"),
                        ("vllm", said("vllm").get("version") or doc.get("vllm_version"), "vLLM"))
         # loken keeps its key (the deltas compare against it); its version rides on the entry.
-        meas_epoch, day = _measured_at(doc, p)
+        meas_epoch, day = _measured_at(doc, source)
         loken_ver = said("loken").get("version") or _dev_version_at(meas_epoch)
-        for k, v in rows(p, mode, device).items():
+        for k, v in rows(doc, mode, device).items():
             for eng, ver, label in engine_vers:
                 if ver and eng in v:
                     tag = eng + "@" + ver
@@ -425,96 +444,14 @@ def load_all(results_dir):
                     VERS[tag] = label + " " + ver
             for e in v.values():
                 e["day"] = day
+                e["run"] = run[:8]
             for eng, e in v.items():
                 if eng.startswith("loken") and loken_ver:
                     e["version"] = loken_ver
             slot = merged.setdefault(k, {})
             for engine, entry in v.items():
-                # Newer measurement wins, ranked by when it was MEASURED (the file's timestamp),
-                # not by the file's mtime - a version stamp touches mtime without re-measuring.
                 if seen_at.get((k, engine), -1) > meas_epoch:
                     continue
                 seen_at[(k, engine)] = meas_epoch
                 slot[engine] = entry
     return merged
-
-if __name__ == "__main__":
-    md, res = sys.argv[1], sys.argv[2]
-    # A table is only readable if every row came from one build of the engine. Say so
-    # out loud when they disagree, rather than letting the rows look comparable.
-    builds = {}
-    for f in pathlib.Path(res).glob("*.json"):
-        if f.name.endswith("_vllm.json"):
-            continue  # measures vLLM; the loken build is not part of it
-        b = json.load(open(f)).get("engine_build")
-        builds.setdefault(b, []).append(f.name)
-    if len(builds) > 1:
-        print("WARNING - the table mixes %d builds of the engine:" % len(builds), file=sys.stderr)
-        for b, names in sorted(builds.items(), key=lambda x: (x[0] is None, x[0])):
-            print("  build %s : %d cells (%s...)" % (b, len(names), names[0]), file=sys.stderr)
-    # Rows go back into the sections they came from.
-    #
-    # This used to keep everything before the first "| Model" and replace the rest with one
-    # flat table, which erased the per-architecture split and left nineteen of the twenty
-    # figures pointing at nothing - once per measured cell, silently, for a whole campaign.
-    #
-    # Membership is read from the document rather than from a table kept here: which model
-    # belongs to which family is already written, once, in the file being rewritten.
-    p = pathlib.Path(md)
-    # Blank runs are folded before the split: the preamble used to keep its trailing blank
-    # lines and the join added one more, so the document grew a line per measured cell.
-    doc = re.sub(r"\n{3,}", "\n\n", p.read_text())
-    all_rows = cells(load_all(res))
-
-    lines = doc.splitlines()
-    starts = [i for i, ln in enumerate(lines) if ln.startswith("### ")]
-    if not starts:
-        # No sections: the flat form, kept working rather than turned into an error.
-        head = doc[:doc.index("| Model")]
-        p.write_text(head + table(all_rows) + "\n")
-        print(table(all_rows))
-        raise SystemExit(0)
-
-    bounds = starts + [len(lines)]
-    preamble = "\n".join(lines[:starts[0]]).rstrip("\n")
-    placed, out = set(), [preamble]
-    # There is one unfiled section, never a new one per unclassified model. Its blocks are
-    # collected here and re-emitted once at the end: a section whose only membership rule is
-    # "no family claimed it" cannot claim a model the next run measures, so appending grew a
-    # section per cell.
-    for a, b in zip(starts, bounds[1:]):
-        block = lines[a:b]
-        if block[0].strip() == "### unfiled":
-            continue
-        # Everything down to the header row is the section's own: its title, its prose, its
-        # figure. Only the rows are regenerated.
-        keep = []
-        models = []
-        for ln in block:
-            if ln.startswith("| Model") or ln.startswith("|---"):
-                continue
-            if ln.startswith("| "):
-                models.append(ln.split("|")[1].strip())
-                continue
-            keep.append(ln)
-        while keep and not keep[-1].strip():
-            keep.pop()
-        title = block[0].strip()[4:].strip()
-        named = set(models)
-        mine = [r for r in all_rows
-                if r[0].strip() in named or arch_of(r[0].strip()) == title]
-        placed.update(r[0].strip() for r in mine)
-        out.append("\n".join(keep) + "\n\n" + table(mine))
-
-    orphans = [r for r in all_rows if r[0].strip() not in placed]
-    if orphans:
-        # Named and shown rather than dropped: a model measured into no section would
-        # otherwise vanish from the report while its result file sat in results/.
-        names = sorted({r[0].strip() for r in orphans})
-        print("WARNING - %d model(s) belong to no section, filed at the end: %s"
-              % (len(names), ", ".join(names)), file=sys.stderr)
-        out.append("### unfiled\n\nMeasured, and not yet placed in a family section.\n\n"
-                   + table(orphans))
-
-    p.write_text("\n\n".join(out) + "\n")
-    print(table(all_rows))

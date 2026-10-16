@@ -6,6 +6,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Benchmarks: one page per hardware configuration, written from a store of runs.
+- Benchmarks: a cross-hardware table of the cells two machines measured alike.
 - Disaggregation: prefill_peer has another instance read long prompts and hand their KV over.
 - Expert parallelism: a layer's experts split across cards where measured links make it pay.
 - CPU: AVX-512 kernels for attention, the KV cache and elementwise ops.

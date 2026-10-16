@@ -8,7 +8,7 @@ diff shows what changed rather than that some bytes did. The graphs need graphvi
 needs nothing but the standard library.
 
 The comparison chart and the table in `docs/STATUS.md` are produced from the SAME parse of
-`docs/BENCHMARKS.md`, because they disagreed once: the status page quoted a parity for
+the primary hardware page under `docs/benchmarks/`, because they disagreed once: the status page quoted a parity for
 granite3-moe that appears nowhere in the measurements, and reasoned from it.
 """
 import re
@@ -30,12 +30,28 @@ MODE = "stream"
 RUN_CARDS = os.environ.get("RUN_CARDS", "both cards")
 
 
+def primary_page():
+    """The hardware page whose newest row is the latest of all: the machine the figures
+    describe. Pages are written by scripts/report.py, one per hardware configuration."""
+    pages = [p for p in (ROOT / "docs" / "benchmarks").glob("*.md") if p.name != "compare.md"]
+    if not pages:
+        sys.exit("no hardware page under docs/benchmarks: run scripts/report.py")
+    newest = lambda p: max(
+        (c[14][:10] for c in ([x.strip() for x in ln.strip().strip("|").split("|")]
+                              for ln in p.read_text().splitlines() if ln.startswith("| ") and not ln.startswith("| Model"))
+         if len(c) >= 15 and c[14][:4].isdigit()), default="")
+    return max(pages, key=newest)
+
+
+BENCH_PAGE = primary_page()
+
+
 def latest_run_date():
     """The most recent date on which a short/stream row exists for both engines."""
     clean = lambda s: re.sub(r"[*\s  ]", "", s)
     label = lambda s: s.replace("*", "").strip()
     seen = {}
-    for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
+    for line in BENCH_PAGE.read_text().splitlines():
         if not line.startswith("| ") or line.startswith("|--"):
             continue
         c = [x.strip() for x in line.strip().strip("|").split("|")]
@@ -67,7 +83,7 @@ def bench_rows():
     clean = lambda s: re.sub(r"[*\s  ]", "", s)
     label = lambda s: s.replace("*", "").strip()
     out = {}
-    for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
+    for line in BENCH_PAGE.read_text().splitlines():
         if not line.startswith("| ") or line.startswith("|--"):
             continue
         c = [x.strip() for x in line.strip().strip("|").split("|")]
@@ -185,7 +201,7 @@ def section_cells():
     clean = lambda s: re.sub(r"[*\s  ]", "", s)
     label = lambda s: s.replace("*", "").strip()
     section, cells, total = None, {}, {}
-    for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
+    for line in BENCH_PAGE.read_text().splitlines():
         if line.startswith("### "):
             section = line[4:].strip()
             cells.setdefault(section, {})
@@ -275,7 +291,7 @@ def main():
     IMG.mkdir(parents=True, exist_ok=True)
     rows = bench_rows()
     if not rows:
-        sys.exit(f"no {RUN_DATE} {PROMPT}/{MODE} rows in docs/BENCHMARKS.md")
+        sys.exit(f"no {RUN_DATE} {PROMPT}/{MODE} rows in {BENCH_PAGE.relative_to(ROOT)}")
     bar_chart(rows, IMG / "decode-vs-ollama.svg")
     for name in ("cluster-topology", "marlin-pipeline"):
         if (IMG / f"{name}.dot").exists():
