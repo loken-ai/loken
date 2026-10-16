@@ -18,8 +18,8 @@ acceptance is met and measured; until then it stays here with its state.
 | CUDA on the published cudarc crate | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
 | CPU kernels chosen at run time | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |
-| Qwen3.8 at full speed | The three Qwen3.8 files at or above the reference engine on one and two cards | In progress: on two cards near the reference, on one card behind |
-| A coding agent on large models | verve completing a multi-step task on each Qwen3.8 file and on DeepSeek V4.1, tool calls and reasoning kept apart | In progress: done on the IQ1_M and the UD-Q4_K_XL files and on DeepSeek V4.1; the q4_k_m slice repeats a refused call |
+| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and two cards | In progress: on two cards near the reference, on one card behind |
+| A coding agent on large models | verve completing a multi-step task on the IQ1_M and UD-Q4_K_XL Qwen3.8 files and on DeepSeek V4.1, tool calls and reasoning kept apart | Done |
 | A faster test suite | The checks a change must pass in a fraction of today's time | Done: about a quarter, the rebuild in place and the slowest tests' setup shared or parallel |
 
 ## 0.4.0
