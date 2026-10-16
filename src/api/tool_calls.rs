@@ -965,9 +965,13 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
         };
         let key = after[..key_end].trim().to_string();
         let value_area = &after[key_end + 1..];
-        let (value, consumed) = match value_area.find(P_CLOSE) {
-            Some(j) => (&value_area[..j], key_end + 1 + j + P_CLOSE.len()),
-            None => (value_area, after.len()),
+        let (value, consumed) = match (value_area.find(P_CLOSE), closed_by_key(value_area, &key)) {
+            // A one-line value the model closed with its key's own tag ends there.
+            (p, Some((k, len))) if p.is_none_or(|p| k < p) => {
+                (&value_area[..k], key_end + 1 + k + len)
+            }
+            (Some(j), _) => (&value_area[..j], key_end + 1 + j + P_CLOSE.len()),
+            (None, _) => (value_area, after.len()),
         };
         if !key.is_empty() {
             args.insert(key, json_or_string(&unframe(value)));
@@ -979,6 +983,11 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
         rest = &rest[step..];
     }
 
+    // A body with no parameter elements may name each argument by its own tag.
+    if args.is_empty() {
+        args = keyed_elements(body);
+    }
+
     Some(ToolCall {
         id: new_call_id(),
         r#type: "function".to_string(),
@@ -987,6 +996,52 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
             arguments: Some(Value::Object(args).to_string()),
         }),
     })
+}
+
+/// Where a one-line value written after `<parameter=KEY>` ends at `</KEY`, the tag of its key
+/// rather than `</parameter>`, and how many bytes the tag takes up to its `>`: what a model
+/// writes when it mixes the element and the parameter syntax. A value spanning lines may be a
+/// file's contents and is closed by `</parameter>` alone.
+fn closed_by_key(value_area: &str, key: &str) -> Option<(usize, usize)> {
+    if key.is_empty() {
+        return None;
+    }
+    let tag = format!("</{key}");
+    let at = value_area.find(&tag)?;
+    if value_area[..at].trim().contains('\n') {
+        return None;
+    }
+    let tail = &value_area[at + tag.len()..];
+    let len = tag.len() + usize::from(tail.starts_with('>'));
+    Some((at, len))
+}
+
+/// The arguments of a body written as `<KEY>value</KEY>` elements, in their order: the same
+/// framing and JSON rule as a parameter element's value.
+fn keyed_elements(body: &str) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        let Some(end) = after.find('>') else { break };
+        let key = &after[..end];
+        let named = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !named {
+            rest = &after[end + 1..];
+            continue;
+        }
+        let value_area = &after[end + 1..];
+        let close = format!("</{key}>");
+        let Some(j) = value_area.find(&close) else {
+            break;
+        };
+        args.insert(key.to_string(), json_or_string(&unframe(&value_area[..j])));
+        rest = &value_area[j + close.len()..];
+    }
+    args
 }
 
 /// A parameter value with the framing the template put around it taken back off.
@@ -1468,6 +1523,77 @@ mod tests {
             serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
         assert_eq!(args["cmd"], "ls > out");
         assert!(r.content.is_empty());
+    }
+
+    /// A model that closes a one-line value with its key's tag, as `<parameter=path>` then
+    /// `</path>`, still names the path it meant, and the next call is not swallowed into it.
+    #[test]
+    fn parse_qwen_xml_takes_a_value_closed_by_its_key() {
+        let raw = concat!(
+            "<tool_call>\n<function=read_file>\n<parameter=path>\nledger/discounts.py\n</path>\n",
+            "</function>\n</tool_call>\n",
+            "<tool_call>\n<function=read_file>\n<parameter=path>\nledger/catalogue.py\n</path\n",
+            "</function>\n</tool_call>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        let paths: Vec<String> = r
+            .calls
+            .iter()
+            .map(|c| {
+                let a: serde_json::Value = serde_json::from_str(
+                    c.function.as_ref().unwrap().arguments.as_deref().unwrap(),
+                )
+                .unwrap();
+                a["path"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(paths, ["ledger/discounts.py", "ledger/catalogue.py"]);
+    }
+
+    /// A file's contents may hold the key's tag: a value spanning lines ends at `</parameter>`.
+    #[test]
+    fn parse_qwen_xml_keeps_a_multiline_value_whole() {
+        let raw = concat!(
+            "<tool_call>\n<function=write_file>\n<parameter=path>\nicon.svg\n</parameter>\n",
+            "<parameter=content>\n<svg>\n<path d=\"M0 0\"></path>\n</content-note>\n</svg>\n</parameter>\n",
+            "</function>\n</tool_call>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        let a: serde_json::Value = serde_json::from_str(
+            r.calls[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(a["path"], "icon.svg");
+        assert_eq!(
+            a["content"],
+            "<svg>\n<path d=\"M0 0\"></path>\n</content-note>\n</svg>"
+        );
+    }
+
+    /// A body that names each argument by its own tag, with no parameter elements, calls the
+    /// tool with them.
+    #[test]
+    fn parse_qwen_xml_reads_arguments_named_by_their_tags() {
+        let raw = "<tool_call>\n<function=read_file>\n<path>\nledger/orders.py\n</path>\n<start_line>\n3\n</start_line>\n</function>\n</tool_call>";
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        let a: serde_json::Value = serde_json::from_str(
+            r.calls[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(a["path"], "ledger/orders.py");
+        assert_eq!(a["start_line"], 3);
     }
 
     /// A value that is an object or a list is written back as JSON by the template, so it
