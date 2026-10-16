@@ -686,8 +686,9 @@ impl GenericTransformerLayer {
     ) -> Result<(Tensor, bool)> {
         let (b, seq, _) = x.dims3()?;
 
+        // The fused paths read the layer's own caches; a cache cut over cards is read below.
         #[cfg(feature = "cuda")]
-        if projected.is_none() && shared_kv.is_none() {
+        if projected.is_none() && shared_kv.is_none() && self.context.is_none() {
             if let Some(done) = self.attend_split_fused(x, index_pos)? {
                 return Ok(done);
             }
@@ -729,6 +730,7 @@ impl GenericTransformerLayer {
             // RoPE from the per-step-updated graph_rope_cos/sin buffer (index 0)
             // instead of self.cos[index_pos] - see the cos/sin selection below.
             && shared_kv.is_none()
+            && self.context.is_none()
             // The fused decode kernels have no sink term.
             && self.attn_sinks.is_none();
         // The fused kernel normalises each head and rotates all of its lanes; a norm over the
@@ -1326,6 +1328,25 @@ impl GenericTransformerLayer {
             && n_head.is_multiple_of(n_kv_head);
         #[cfg(feature = "cuda")]
         let mut flash_kv = false;
+        #[cfg(feature = "cuda")]
+        // A cache cut over several cards holds the history: the rows go to the range they fall
+        // in, and each range's part of the attention is combined on this card.
+        if shared_kv.is_none() && self.context.is_some() {
+            k = self.apply_rotary_emb(&k, index_pos)?;
+            let scale = self
+                .attention_scale
+                .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
+            if let Some(shards) = self.context.as_mut() {
+                if index_pos == 0 {
+                    shards.trim_to(0)?;
+                }
+                shards.append(&k, &v)?;
+                let y = shards.attend(&q, scale, index_pos)?.to_dtype(q.dtype())?;
+                let attn_out_dim = self.n_head * self.head_dim;
+                let y = y.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
+                return Ok((y, false));
+            }
+        }
         #[cfg(feature = "cuda")]
         let (k, v) = if let Some((shared_k, shared_v)) = shared_kv {
             (shared_k, shared_v)
@@ -2040,6 +2061,9 @@ impl GenericTransformerLayer {
     /// pointers are invariant across CUDA graph replays.
     /// The positions this layer's cache holds, read from the store its attention writes.
     pub(super) fn cached_len(&self) -> usize {
+        if let Some(c) = self.context.as_ref() {
+            return c.len();
+        }
         #[cfg(feature = "cuda")]
         if let Some(c) = self.q4_kv() {
             return c.current_seq_len();

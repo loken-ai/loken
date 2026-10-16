@@ -235,6 +235,7 @@ impl LlmEngine {
         // The draft head's experts stay on its card only when the drafts run: otherwise
         // their room serves the layers.
         let draft_resident = self.config.recorded_drafts;
+        let context_parallel = self.config.context_parallel;
         crate::inference::generic_transformer::set_probe_dir(self.config.probe_dump_dir.clone());
         let load_start = std::time::Instant::now();
         crate::inference::place::device_probe::debug_vram_by_card("load-entry");
@@ -1205,7 +1206,7 @@ impl LlmEngine {
                                         Some((from, _)) => plan.shifted(from, num_layers),
                                         None => plan.clone(),
                                     };
-                                    let m = generic_weights.build(
+                                    let mut m = generic_weights.build(
                                         &on_plan,
                                         &placed,
                                         kv,
@@ -1213,6 +1214,19 @@ impl LlmEngine {
                                         stem_on_card,
                                         draft_resident,
                                     )?;
+                                    // Every card the machine shows, the plan's first, takes a
+                                    // range of each attention layer's cache.
+                                    if context_parallel {
+                                        let mut cards: Vec<Device> = on_plan.values().cloned().collect();
+                                        for (i, _) in &cuda_devices {
+                                            if !on_plan.contains_key(i) {
+                                                if let Ok(d) = Device::new_cuda(*i) {
+                                                    cards.push(d);
+                                                }
+                                            }
+                                        }
+                                        m.attach_context_shards(&cards);
+                                    }
                                     let grown: Option<u64> = cards
                                         .iter()
                                         .zip(&free_before)

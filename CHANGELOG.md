@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Context parallelism: context_parallel cuts each attention layer's cache over every card.
 - Benchmarks: one page per hardware configuration, written from a store of runs.
 - Benchmarks: a cross-hardware table of the cells two machines measured alike.
 - Benchmarks: archived runs are held in the store and left out of the tables.

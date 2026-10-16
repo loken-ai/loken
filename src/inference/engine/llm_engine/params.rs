@@ -176,6 +176,8 @@ pub struct InferenceConfig {
     pub kv_disk_dir: Option<String>,
     /// The instance that reads long prompts for this one and hands back their KV cache.
     pub prefill_peer: Option<String>,
+    /// Whether attention layers' caches are cut over every card.
+    pub context_parallel: bool,
     /// Whether drafts are verified in recorded windows, the model's draft head guessing where
     /// they are.
     pub recorded_drafts: bool,
@@ -264,6 +266,7 @@ impl Default for InferenceConfig {
             replicas: 1,
             kv_disk_dir: None,
             prefill_peer: None,
+            context_parallel: false,
             recorded_drafts: false,
             probe_dump_dir: None,
             expert_profile: None,

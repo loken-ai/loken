@@ -1451,6 +1451,9 @@ impl GenericHeteroTransformer {
             .iter()
             .find(|l| matches!(l.mixer, super::mixer::Mixer::Attention))?;
         let mut n = l.kv_cache.current_seq_len();
+        if let Some(c) = l.context.as_ref() {
+            n = n.max(c.len());
+        }
         #[cfg(feature = "cuda")]
         if let Some(c) = l.quant_kv.as_ref() {
             n = n.max(c.current_seq_len());

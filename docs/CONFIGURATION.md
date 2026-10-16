@@ -90,6 +90,20 @@ answer reads the prompt here. The rows travel as f32, about four times the cache
 |---|---|---|
 | `prefill_peer` | none | URL of the instance that reads this one's long prompts. |
 
+### A context cut over the cards
+
+With `context_parallel` set, the cache of each attention layer is cut into ranges of positions,
+one on each card the machine shows: the layer's own card first, then the others, each sized from
+the card's free memory after the load. A query attends to every range on the range's card and the
+parts are combined on the layer's card, so a context no single card holds is served whole. The
+ranges hold F16 rows; the layers so cut run outside the recorded decode step, and their prefixes
+are not kept as snapshots. Layers with a sliding window, attention sinks, indexed attention, a
+cache other layers share, or split across cards keep their own cache.
+
+| Key | Default | What it does |
+|---|---|---|
+| `context_parallel` | `false` | Cut attention layers' caches over every card. |
+
 ### Decode-state cache (DeepSeek V4.1 and recurrent hybrids)
 
 In host memory for the life of the process, or on disk when `state_cache_dir` is set. A DeepSeek

@@ -280,6 +280,9 @@ impl GenericHeteroTransformer {
         if !l.tp_shards.is_empty() && l.tp_comms.is_none() {
             return Some("its shares move their activations through copies to the host");
         }
+        if l.context.is_some() {
+            return Some("its cache is cut over several cards, whose parts it combines");
+        }
         // A recurrent mixer is recorded only where its step advances the state in place: a
         // recorded step writes the addresses it read.
         if !l.mixer.decodes_in_place(&l.cos.device()) {
@@ -1748,7 +1751,16 @@ impl GenericHeteroTransformer {
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
         // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
         // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
-        self.layers.iter().all(|l| l.cpu_q8_kv.is_none()) && !self.is_recurrent()
+        // A cache cut over cards has no snapshot form either: its prefix is read again.
+        self.layers
+            .iter()
+            .all(|l| l.cpu_q8_kv.is_none() && l.context.is_none())
+            && !self.is_recurrent()
+    }
+
+    /// Whether some layer's cache is cut over several cards.
+    pub fn has_context_shards(&self) -> bool {
+        self.layers.iter().any(|l| l.context.is_some())
     }
 
     /// Copies the resident KV aside under `tokens`, keeping at most `cap` snapshots: the
@@ -2538,6 +2550,11 @@ impl GenericTransformerLayer {
     pub(super) fn trim_kv_to(&mut self, new_len: usize) {
         for shard in &mut self.tp_shards {
             shard.trim_kv_to(new_len);
+        }
+        if let Some(c) = self.context.as_mut() {
+            if let Err(e) = c.trim_to(new_len) {
+                tracing::warn!("context ranges not cut to {new_len}: {e}");
+            }
         }
         self.kv_cache.trim_to(new_len);
         // Keep the Q8 mirror in sync with the F-dtype cache; otherwise

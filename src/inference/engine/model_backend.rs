@@ -1868,7 +1868,8 @@ impl ModelBackend for GenericBackend {
     fn kv_layout(&self) -> Option<(usize, usize, usize)> {
         // A recurrent state is not rows of KV, and a layer split across cards holds a share of its
         // heads: the disk tier stores whole layers' rows, so it has nothing to store for either.
-        (!self.0.is_recurrent() && !self.0.has_split_layers()).then(|| self.0.kv_layout())
+        (!self.0.is_recurrent() && !self.0.has_split_layers() && !self.0.has_context_shards())
+            .then(|| self.0.kv_layout())
     }
     fn kv_snapshot_ref(&self, index: usize) -> Option<(&[u32], usize)> {
         self.0.kv_snapshot_ref(index)

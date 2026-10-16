@@ -102,6 +102,10 @@ pub struct InferenceConfigToml {
     /// one decodes. Both serve the same model. None reads every prompt here.
     #[serde(default)]
     pub prefill_peer: Option<String>,
+    /// Whether the cache of each attention layer is cut into ranges of positions over every
+    /// card, so a context no single card holds is served whole. Off unless set.
+    #[serde(default)]
+    pub context_parallel: bool,
     /// Whether drafts (a model's own draft head, prompt lookup) are verified in recorded
     /// windows, the head guessing only where they are. Off unless set: a window is checked
     /// against the plain step at each recording, and a request whose windows are given up
@@ -336,6 +340,7 @@ impl Config {
             replicas: toml_config.replicas.max(1),
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             prefill_peer: toml_config.prefill_peer.clone(),
+            context_parallel: toml_config.context_parallel,
             recorded_drafts: toml_config.recorded_drafts,
             probe_dump_dir: toml_config.probe_dump_dir.clone(),
             expert_profile: toml_config.expert_profile.clone(),

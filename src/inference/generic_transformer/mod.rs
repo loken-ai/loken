@@ -50,6 +50,7 @@ mod conversion_tests;
 mod dense;
 mod draft_head;
 pub use draft_head::set_probe_dir;
+mod context_parallel;
 pub mod expert_profile;
 #[cfg(feature = "cuda")]
 pub mod expert_tier;
@@ -189,6 +190,9 @@ pub struct GenericTransformerLayer {
     pub ple_output_scale: Option<Tensor>, // [hidden_dim] per-element scale (altup_correct_scale)
     // KV cache + RoPE
     pub kv_cache: SpecKvCache,
+    /// The layer's cache cut into ranges of positions over several cards, when the context is
+    /// split: it then holds the history in place of `kv_cache` and the quantised caches.
+    pub context: Option<context_parallel::ContextShards>,
     /// The quantised KV cache (Q8_0 or Q4_0 KIVI) when `config.kv_quant` asks for one on a
     /// CUDA layer. It then holds the history: decode attends over it directly and
     /// multi-token paths dequantise it; the F-dtype `kv_cache` is only kept for donor

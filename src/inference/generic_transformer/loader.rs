@@ -2122,6 +2122,7 @@ fn build_generic_layer(
         // per layer on the card for a window nobody has used. A captured graph bound to the
         // old width is dropped and recorded again when the cache grows, and a growth that
         // runs out of card memory is recovered by the placement ladder.
+        context: None,
         kv_cache: {
             use crate::inference::cache::KV_WORKING_WINDOW_TOKENS as LAZY_KV_INITIAL_CAP;
             // Every layer's cache starts at the working window and grows as a request needs:
@@ -2593,6 +2594,7 @@ fn build_awq_layer(
         ple_proj: None,
         ple_post_norm: None,
         ple_output_scale: None,
+        context: None,
         kv_cache: SpecKvCache::new(
             config
                 .effective_max_context()
