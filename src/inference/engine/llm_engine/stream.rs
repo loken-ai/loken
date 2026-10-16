@@ -2268,7 +2268,16 @@ impl LlmEngine {
                             let replay_secs = recorded.as_ref().and_then(|r| r.1);
                             let logits_res = match recorded {
                                 Some((l, _)) => Ok(l),
-                                None => state.model.forward_all(&x, pos),
+                                None => state.model.forward_all(&x, pos).and_then(|l| {
+                                    if super::decode::rows_finite(&l)? {
+                                        return Ok(l);
+                                    }
+                                    // The rows are taken back; the token is decoded alone below.
+                                    state.model.trim_kv(pos);
+                                    Err(crate::tensor::Error::msg(
+                                        "the verify's rows are not all finite",
+                                    ))
+                                }),
                             };
                             if let Err(ref e) = logits_res {
                                 // Some architectures hit a mask broadcast bug in multi-token

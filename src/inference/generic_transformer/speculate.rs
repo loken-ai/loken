@@ -80,7 +80,8 @@ impl GenericTransformerLayer {
         }
     }
 
-    /// Return to the state before the verify's rows and take in the first `kept` of them.
+    /// Return to the state before the verify's rows and take in the first `kept` of them, none
+    /// when `kept` is zero.
     pub(super) fn spec_settle(&mut self, kept: usize) -> Result<()> {
         let Some(p) = self.spec.take() else {
             return Ok(());
@@ -90,7 +91,9 @@ impl GenericTransformerLayer {
         }
         if let (Some((state, r, emb)), Some(ple)) = (&p.ple, self.ngram.as_mut()) {
             ple.restore(state)?;
-            ple.forward(&r.narrow(1, 0, kept)?, &emb.narrow(1, 0, kept)?, p.base)?;
+            if kept > 0 {
+                ple.forward(&r.narrow(1, 0, kept)?, &emb.narrow(1, 0, kept)?, p.base)?;
+            }
         }
         let Some(input) = &p.input else {
             return Ok(());
@@ -103,15 +106,19 @@ impl GenericTransformerLayer {
             if self.mixer.restore_in_place(state).is_err() {
                 self.mixer.restore(state)?;
             }
-            let _order = crate::tensor::quantized::DecodeOrder::enter();
-            #[cfg(feature = "cuda")]
-            let _in_place = crate::inference::moe_cuda::in_place_state(true);
-            self.mixer.forward(&prefix, p.base)?;
+            if kept > 0 {
+                let _order = crate::tensor::quantized::DecodeOrder::enter();
+                #[cfg(feature = "cuda")]
+                let _in_place = crate::inference::moe_cuda::in_place_state(true);
+                self.mixer.forward(&prefix, p.base)?;
+            }
         }
         if let (Some(cache), Some(sparse)) = (&p.indexer, self.sparse.as_mut()) {
             // The cache is of the sequence the card holds: the card keeps what it covers.
             sparse.restore_cache(cache, true);
-            sparse.observe(&prefix, p.base)?;
+            if kept > 0 {
+                sparse.observe(&prefix, p.base)?;
+            }
         }
         Ok(())
     }
@@ -166,13 +173,13 @@ impl GenericHeteroTransformer {
     }
 
     /// The model is cut back to `new_len` tokens: when that is inside the rows of the verify just
-    /// recorded, every layer and the n-gram history return to the state they had and take in
-    /// only the rows that stay.
+    /// recorded, or at their start, every layer and the n-gram history return to the state they
+    /// had and take in only the rows that stay.
     pub(super) fn spec_settle(&mut self, new_len: usize) {
         let Some(w) = self.spec_window.take() else {
             return;
         };
-        if new_len <= w.base || new_len >= w.base + w.rows {
+        if new_len < w.base || new_len >= w.base + w.rows {
             for l in &mut self.layers {
                 l.spec = None;
             }

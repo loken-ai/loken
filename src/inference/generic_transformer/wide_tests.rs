@@ -1194,7 +1194,14 @@ fn verify_cut_back(ordinal: Option<usize>, kv: KvQuant) {
         1e-3
     };
     let n = tokens.len();
-    for (prefix, rows, kept) in [(3usize, 4usize, 1usize), (3, 4, 2), (2, 5, 4), (4, 3, 3)] {
+    // A verify taken back whole, none of its rows kept, leaves the state before it.
+    for (prefix, rows, kept) in [
+        (3usize, 4usize, 1usize),
+        (3, 4, 2),
+        (2, 5, 4),
+        (4, 3, 3),
+        (3, 4, 0),
+    ] {
         assert!(prefix + rows + 1 < n, "the toy's prompt is long enough");
         let mut m = toy();
         for (i, t) in tokens[..prefix].iter().enumerate() {
@@ -1232,9 +1239,12 @@ fn verify_cut_back(ordinal: Option<usize>, kv: KvQuant) {
             for (i, t) in tokens[..prefix].iter().enumerate() {
                 step(&mut alone, *t, i);
             }
-            let kept_rows =
-                Tensor::from_vec(tokens[prefix..prefix + kept].to_vec(), (1, kept), &dev).unwrap();
-            alone.forward_all(&kept_rows, prefix).unwrap();
+            if kept > 0 {
+                let kept_rows =
+                    Tensor::from_vec(tokens[prefix..prefix + kept].to_vec(), (1, kept), &dev)
+                        .unwrap();
+                alone.forward_all(&kept_rows, prefix).unwrap();
+            }
             (prefix + kept..prefix + kept + 2)
                 .map(|i| step(&mut alone, tokens[i], i))
                 .collect()

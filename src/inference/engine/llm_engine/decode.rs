@@ -347,8 +347,7 @@ pub(super) fn copy_draft(
 
 /// Whether every row of `logits` (`[.., rows, vocab]`) is finite: a row's sum is not finite
 /// when any of its values is not.
-#[cfg(feature = "cuda")]
-fn rows_finite(logits: &Tensor) -> crate::tensor::Result<bool> {
+pub(super) fn rows_finite(logits: &Tensor) -> crate::tensor::Result<bool> {
     let sums = logits
         .sum_keepdim(crate::tensor::D::Minus1)?
         .flatten_all()?

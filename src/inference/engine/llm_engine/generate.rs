@@ -1653,9 +1653,23 @@ impl LlmEngine {
                         // A cycle pays its way only when its window replayed: one recorded as it
                         // ran, or verified eagerly where windows serve, counts its acceptance alone.
                         let charged = replay_secs.is_none() && (recorded_window || !windows_served);
+                        let mut draft = draft;
                         let logits = match recorded {
                             Some((l, _)) => l,
-                            None => state.model.forward_all(&x, verify_pos)?,
+                            None => {
+                                let l = state.model.forward_all(&x, verify_pos)?;
+                                if super::decode::rows_finite(&l)? {
+                                    l
+                                } else {
+                                    // The rows are taken back and the carried token is decoded
+                                    // alone; the drafts stop for the rest of the request.
+                                    warn!("the rows of a verify at {verify_pos} are not all finite; the token is decoded alone and the drafts stop");
+                                    state.model.trim_kv(verify_pos);
+                                    pld_cooldown = u32::MAX;
+                                    draft.clear();
+                                    state.model.forward_all(&x.narrow(1, 0, 1)?, verify_pos)?
+                                }
+                            }
                         };
 
                         // Commit-delayed verification loop (shared with the
