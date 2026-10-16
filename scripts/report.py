@@ -266,7 +266,8 @@ def main(argv):
     page_md.write_text(text)
     for stale in OUT.glob("*.md"):
         if stale.name not in written:
-            print(f"note: {stale.name} has no hardware behind it any more", file=sys.stderr)
+            stale.unlink()
+            print(f"removed {stale.name}: no hardware in the store behind it", file=sys.stderr)
     print(f"wrote {len(written)} page(s) for {len(groups)} hardware configuration(s)")
     return 0
 

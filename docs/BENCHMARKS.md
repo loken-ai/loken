@@ -12,7 +12,7 @@ procedure that produces the runs is [BENCHMARKING.md](BENCHMARKING.md).
 
 | Hardware | Id | Runs from | Runs | Rows |
 |---|---|---|---|---|
-| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti | Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/rtx5060ti-rtx5070ti-i910900k.md) | 91853bdab0a9d057 | 2026-09-03 to 2026-10-05 | 711 | 1366 |
+| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/rtx5060ti-rtx5070ti-i910900k.md) | 91853bdab0a9d057 | 2026-09-03 to 2026-10-05 | 711 | 1366 |
 
 Across machines: [benchmarks/compare.md](benchmarks/compare.md).
 
