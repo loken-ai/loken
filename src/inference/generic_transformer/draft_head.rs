@@ -660,6 +660,15 @@ impl GenericHeteroTransformer {
         {
             return Ok(false);
         }
+        // A head that has read no token yet has no cache to record against: the eager draft
+        // writes its first rows.
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|d| d.layer.kv_cache.k_buffer().is_none())
+        {
+            return Ok(false);
+        }
         let rows = tokens.len().max(1);
         // Every position a request can reach: the context an indexed layer's cache holds whole.
         let cap = self.config.effective_max_context();
