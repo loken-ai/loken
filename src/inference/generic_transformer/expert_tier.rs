@@ -15,8 +15,8 @@
 //! A card with room for every expert of its layers holds them all: the layer is resident, and the
 //! tier is the stacks the kernels read, with no host in the token.
 //!
-//! The counts decay: when `n_experts` tokens have routed through a layer, each count halves, so
-//! the cache follows the routing of the text in hand rather than the routing since the load.
+//! The counts decay within a few tens of tokens (`ADAPT_DECAY` every `ADAPT_EVERY_TOKENS`), so
+//! the cache follows the routing of the text in hand rather than that of the prompt or the load.
 
 use super::moe_weights::{ExpertRouting, MoeWeights};
 use crate::tensor::quantized::{GgmlDType, QCudaStorage, QHostTensor, QTensor};
@@ -83,8 +83,8 @@ const REFILL_BELOW_HIT_RATE: f64 = 0.95;
 /// takes a slot only once its heat reaches `ADAPT_MIN_HEAT` and exceeds the coldest slot's by
 /// `ADAPT_MARGIN`, the pairs with the largest gain first, at most `ADAPT_SWAPS_A_REQUEST` for
 /// each request a layer serves: a one-off route never moves an expert the decode keeps using.
-const ADAPT_EVERY_TOKENS: usize = 256;
-const ADAPT_DECAY: f32 = 0.5;
+const ADAPT_EVERY_TOKENS: usize = 10;
+const ADAPT_DECAY: f32 = 0.7;
 const ADAPT_MIN_HEAT: f32 = 2.0;
 const ADAPT_MARGIN: f32 = 1.5;
 const ADAPT_SWAPS_A_REQUEST: usize = 2;
