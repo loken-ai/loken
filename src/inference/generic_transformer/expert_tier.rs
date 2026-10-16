@@ -296,6 +296,13 @@ pub struct CardStager {
     /// The room a wide batch fills with a layer's whole stacks, from the memory the caches lend
     /// while a prefill runs.
     full: Mutex<Option<[FullBuffer; 2]>>,
+    /// The most a decode has taken of the card between a prefill's end and the next prefill,
+    /// measured; `None` until one has run. The extra slots come back only within what it leaves.
+    decode_need: Mutex<Option<u64>>,
+    /// The card's free memory once the extra slots came back, when a prefill ended.
+    free_after_return: Mutex<Option<u64>>,
+    /// A prefill lent the slots since then: what the card lost meanwhile is the prefill's.
+    lent_since_return: std::sync::atomic::AtomicBool,
 }
 
 /// One of two sets of arenas, a stack each, that consecutive layers take turns over.
@@ -681,6 +688,9 @@ impl super::GenericHeteroTransformer {
             // The rooms of the wide batches are lent by the cache while a prefill runs, so the
             // base slots leave room for the transit room that stays and for the room those
             // batches fill, which is taken from the lent slots.
+            // The card's free memory as the load left it, before the stager takes its rooms:
+            // those are counted once, in what the slots leave free.
+            let free_at_tier = expert_cache::free_now(dev);
             let stager = CardStager::new(dev, widest, widest_mixture)?;
             let held: u64 = stager.full_bytes()
                 + stager.transit_bytes()
@@ -688,11 +698,17 @@ impl super::GenericHeteroTransformer {
             let slots = expert_cache::slots_per_layer(
                 slots_budget.saturating_sub(held),
                 before,
-                expert_cache::free_now(dev),
+                free_at_tier,
                 1,
                 bytes,
             );
             if slots == 0 {
+                tracing::warn!(
+                    "expert tier on card {ordinal}: no room for a cache slot ({:.2} GB budget, {:.2} GB taken by the load, {:.2} GB held for the stager and a prefill chunk); the experts are served from the host",
+                    slots_budget as f64 / 1e9,
+                    before.saturating_sub(free_at_tier) as f64 / 1e9,
+                    held as f64 / 1e9
+                );
                 continue;
             }
             // The room a prefill takes from the card is lent to the cache while it is not
@@ -779,6 +795,9 @@ impl super::GenericHeteroTransformer {
     /// prefill needs more than they have free: every layer's extra slots are freed. How many
     /// layers lent.
     pub fn lend_expert_cache(&mut self, tokens: usize) -> usize {
+        for stager in self.card_stagers() {
+            stager.note_lend();
+        }
         let shape = self.prefill_shape();
         if shape.target_chunk == 0 {
             return 0;
@@ -835,9 +854,29 @@ impl super::GenericHeteroTransformer {
         lent
     }
 
+    /// The stagers of the cards the layers' caches are on, each once.
+    fn card_stagers(&self) -> Vec<Arc<CardStager>> {
+        let mut out: Vec<Arc<CardStager>> = Vec::new();
+        for s in self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+            .filter_map(|t| t.stager())
+        {
+            if !out.iter().any(|t| Arc::ptr_eq(t, &s)) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
     /// Give the caches their extra slots again, filled with the experts the prefill found
-    /// hottest. How many experts were copied.
+    /// hottest, within what the decode that follows was seen to need. How many experts were
+    /// copied.
     pub fn return_expert_cache(&mut self) -> Result<usize> {
+        for stager in self.card_stagers() {
+            stager.note_decode();
+        }
         let mut copied = 0;
         let mut stagers: Vec<Arc<CardStager>> = Vec::new();
         for tier in self
@@ -858,18 +897,42 @@ impl super::GenericHeteroTransformer {
         // What the prefill left in the pools goes back to the card before the slots take theirs.
         crate::inference::place::ladder::release_pools();
         let mut moved = false;
+        // What each card's slots may take back, spent layer by layer.
+        let mut room: Vec<(Arc<CardStager>, u64)> = self
+            .card_stagers()
+            .into_iter()
+            .map(|s| {
+                let r = s.room_for_extra();
+                (s, r)
+            })
+            .collect();
         for tier in self
             .layers
             .iter()
             .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
         {
+            let Some(left) = tier
+                .stager()
+                .and_then(|s| room.iter_mut().find(|(t, _)| Arc::ptr_eq(t, &s)))
+                .map(|(_, r)| r)
+            else {
+                continue;
+            };
             let had = tier.has_extra();
+            let slot = tier.expert_bytes.iter().sum::<usize>().max(1) as u64;
+            let asked = (*left / slot).min(tier.extra_slots() as u64);
             // A layer that cannot take its slots back runs on without them.
-            match tier.restore_extra() {
+            match tier.restore_extra_within(*left) {
                 Ok(n) => copied += n,
                 Err(e) => tracing::warn!("expert tier: the extra slots did not come back: {e}"),
             }
+            if tier.has_extra() && !had {
+                *left = left.saturating_sub(slot * asked);
+            }
             moved |= had != tier.has_extra();
+        }
+        for (stager, _) in &room {
+            stager.note_return();
         }
         if moved {
             self.forget_recorded_drafts();
@@ -1116,18 +1179,15 @@ impl LayerTier {
     }
 
     /// This tier with `extra` more slots that a prefill can take the card's memory back from.
+    /// The extra slots start lent: they take their memory once a decode has shown what it
+    /// leaves (see [`CardStager::room_for_extra`]).
     pub fn with_extra(mut self, extra: usize) -> Result<Self> {
         let n = extra.min(self.n_experts.saturating_sub(self.base_slots));
         if n == 0 {
             return Ok(self);
         }
-        *self.extra.get_mut().unwrap_or_else(|e| e.into_inner()) = Some([
-            lent_experts(&self.host[0], n, &self.dev)?,
-            lent_experts(&self.host[1], n, &self.dev)?,
-            lent_experts(&self.host[2], n, &self.dev)?,
-        ]);
         let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        st.owner.resize(self.base_slots + n, -1);
+        st.owner.resize(self.base_slots + n, -3);
         Ok(self)
     }
 
@@ -1203,7 +1263,15 @@ impl LayerTier {
     /// landed, and nothing else takes them meanwhile. A card with less room than the slots took
     /// gets as many of them as fit. How many experts are on their way.
     pub fn restore_extra(self: &Arc<Self>) -> Result<usize> {
-        let n = self.extra_slots();
+        self.restore_extra_within(u64::MAX)
+    }
+
+    /// [`Self::restore_extra`] taking at most `bytes` of the card: as many slots as fit in them.
+    pub fn restore_extra_within(self: &Arc<Self>, bytes: u64) -> Result<usize> {
+        let slot = self.expert_bytes.iter().sum::<usize>().max(1) as u64;
+        let n = self
+            .extra_slots()
+            .min((bytes / slot).min(usize::MAX as u64) as usize);
         // A layer that already finds nearly every expert on the card gains nothing from more
         // slots, and a prefill takes their memory again.
         let (routed, hits, _) = self.counters();
@@ -2424,7 +2492,53 @@ impl CardStager {
             transit,
             buffers,
             full: Mutex::new(None),
+            decode_need: Mutex::new(None),
+            free_after_return: Mutex::new(None),
+            lent_since_return: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// Records what the decode since the last return took of the card: the free memory then,
+    /// less the free memory now, its transients still in the pools. Called as the slots are to
+    /// come back; a span a prefill lent in is the prefill's, and is not counted.
+    pub fn note_decode(&self) {
+        let then = self
+            .free_after_return
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let lent = self.lent_since_return.swap(false, Ordering::AcqRel);
+        let Some(then) = then.filter(|_| !lent) else {
+            return;
+        };
+        let took = then.saturating_sub(crate::inference::place::expert_cache::free_now(&self.dev));
+        let mut need = self.decode_need.lock().unwrap_or_else(|e| e.into_inner());
+        *need = Some(need.map_or(took, |n| n.max(took)));
+    }
+
+    /// The bytes the extra slots may take back now: the card's free memory less what a decode
+    /// was seen to take, nothing before a decode has been measured.
+    pub fn room_for_extra(&self) -> u64 {
+        match *self.decode_need.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(need) => {
+                crate::inference::place::expert_cache::free_now(&self.dev).saturating_sub(need)
+            }
+            None => 0,
+        }
+    }
+
+    /// Marks the span since the last return as a prefill's.
+    pub fn note_lend(&self) {
+        self.lent_since_return.store(true, Ordering::Release);
+    }
+
+    /// Records the card's free memory as a prefill ends and its decode is about to run.
+    pub fn note_return(&self) {
+        *self
+            .free_after_return
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some(crate::inference::place::expert_cache::free_now(&self.dev));
     }
 
     /// Bytes the transit room takes on the card.
@@ -3218,6 +3332,13 @@ mod tests {
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
         assert_eq!(tier.slots(), base + extra);
+        assert!(
+            !tier.has_extra(),
+            "the extra slots took memory before a decode was measured"
+        );
+        tier.restore_extra().unwrap();
+        tier.settle();
+        assert!(tier.has_extra());
         let inputs: Vec<Vec<f32>> = (0..3).map(|s| values(hidden, 100 + s, 1.0)).collect();
         let mut token = 0usize;
         let mut run = |count: usize| {
