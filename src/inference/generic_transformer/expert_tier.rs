@@ -299,8 +299,9 @@ pub struct CardStager {
     /// The most a decode has taken of the card between a prefill's end and the next prefill,
     /// measured; `None` until one has run. The extra slots come back only within what it leaves.
     decode_need: Mutex<Option<u64>>,
-    /// The card's free memory once the extra slots came back, when a prefill ended.
-    free_after_return: Mutex<Option<u64>>,
+    /// The card's free memory once the extra slots came back, when a prefill ended, and what
+    /// the card's memory pool held in use then.
+    free_after_return: Mutex<Option<(u64, u64)>>,
     /// A prefill lent the slots since then: what the card lost meanwhile is the prefill's.
     lent_since_return: std::sync::atomic::AtomicBool,
 }
@@ -933,6 +934,20 @@ impl super::GenericHeteroTransformer {
         }
         for (stager, _) in &room {
             stager.note_return();
+        }
+        let (held, of): (usize, usize) = self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+            .map(|t| {
+                (
+                    if t.has_extra() { t.extra_slots() } else { 0 },
+                    t.extra_slots(),
+                )
+            })
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        if moved {
+            tracing::info!("expert tier: the extra slots back in {held} of {of} layer-slots");
         }
         if moved {
             self.forget_recorded_drafts();
@@ -2508,12 +2523,26 @@ impl CardStager {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         let lent = self.lent_since_return.swap(false, Ordering::AcqRel);
-        let Some(then) = then.filter(|_| !lent) else {
+        let Some((then, pool_then)) = then.filter(|_| !lent) else {
             return;
         };
-        let took = then.saturating_sub(crate::inference::place::expert_cache::free_now(&self.dev));
+        // What the card lost for good, or what the pool held at the decode's peak beyond what it
+        // held at the return, whichever is more: transients go back to the pool, not the card.
+        let lost = then.saturating_sub(crate::inference::place::expert_cache::free_now(&self.dev));
+        let peak = self
+            .dev
+            .as_cuda_device()
+            .map_or(0, |d| crate::tensor::cuda::pool_peak(d.0.ordinal()))
+            .saturating_sub(pool_then);
+        let took = lost.max(peak);
         let mut need = self.decode_need.lock().unwrap_or_else(|e| e.into_inner());
-        *need = Some(need.map_or(took, |n| n.max(took)));
+        if need.is_none_or(|n| took > n) {
+            tracing::info!(
+                "expert tier: a decode took {:.2} GB of the card; the extra slots leave that free",
+                took as f64 / 1e9
+            );
+            *need = Some(took);
+        }
     }
 
     /// The bytes the extra slots may take back now: the card's free memory less what a decode
@@ -2534,11 +2563,17 @@ impl CardStager {
 
     /// Records the card's free memory as a prefill ends and its decode is about to run.
     pub fn note_return(&self) {
+        let pool = self
+            .dev
+            .as_cuda_device()
+            .map_or(0, |d| crate::tensor::cuda::pool_mark(d.0.ordinal()));
         *self
             .free_after_return
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) =
-            Some(crate::inference::place::expert_cache::free_now(&self.dev));
+            .unwrap_or_else(|e| e.into_inner()) = Some((
+            crate::inference::place::expert_cache::free_now(&self.dev),
+            pool,
+        ));
     }
 
     /// Bytes the transit room takes on the card.

@@ -65,6 +65,56 @@ pub fn trim_pool(ordinal: usize) {
     }
 }
 
+/// The device's default memory pool, when it has one.
+fn default_pool(ordinal: usize) -> Option<cudarc::driver::sys::CUmemoryPool> {
+    use cudarc::driver::sys::{cuDeviceGetDefaultMemPool, cudaError_enum, CUmemoryPool};
+    let mut pool: CUmemoryPool = std::ptr::null_mut();
+    let ok = unsafe { cuDeviceGetDefaultMemPool(&mut pool, ordinal as i32) };
+    (ok == cudaError_enum::CUDA_SUCCESS && !pool.is_null()).then_some(pool)
+}
+
+/// Starts a measure of the default pool's peak use on `ordinal`: the peak is set to what the
+/// pool holds now, which is returned.
+pub fn pool_mark(ordinal: usize) -> u64 {
+    use cudarc::driver::sys::{cuMemPoolGetAttribute, cuMemPoolSetAttribute, CUmemPool_attribute};
+    let Some(pool) = default_pool(ordinal) else {
+        return 0;
+    };
+    let mut used: u64 = 0;
+    unsafe {
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut used as *mut u64 as *mut std::ffi::c_void,
+        );
+        // The driver accepts only zero for the peak, which it then raises to the current use.
+        let zero: u64 = 0;
+        let _ = cuMemPoolSetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            &zero as *const u64 as *mut std::ffi::c_void,
+        );
+    }
+    used
+}
+
+/// The most the default pool on `ordinal` has held in use since [`pool_mark`].
+pub fn pool_peak(ordinal: usize) -> u64 {
+    use cudarc::driver::sys::{cuMemPoolGetAttribute, CUmemPool_attribute};
+    let Some(pool) = default_pool(ordinal) else {
+        return 0;
+    };
+    let mut high: u64 = 0;
+    unsafe {
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            &mut high as *mut u64 as *mut std::ffi::c_void,
+        );
+    }
+    high
+}
+
 /// Whether the device's stream is inside a CUDA-graph capture (reclaim's
 /// synchronize would abort the capture - skip the retry path then).
 pub(super) fn stream_capturing(dev: &CudaDevice) -> bool {
