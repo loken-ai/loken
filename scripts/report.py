@@ -21,6 +21,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 # The record schema and the hardware identity belong to assay, the tool that writes the records.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent / "assay" / "scripts"))
 import bench_row as B
+import classes as C
 import hardware as H
 import store as S
 
@@ -69,7 +70,7 @@ def slug(machine, taken):
     return name
 
 
-def hardware_block(machine, docs):
+def hardware_block(machine, docs, backend):
     lines = ["| | |", "|---|---|"]
     for i, g in enumerate(machine.get("gpus", [])):
         cap = f", {g['power_cap_w']} W" if g.get("power_cap_w") else ""
@@ -83,6 +84,7 @@ def hardware_block(machine, docs):
         lines.append(f"| RAM | {machine['ram_gib']} GB |")
     seen = lambda k: sorted({(d["machine"] or {}).get(k) for d, _, _ in docs
                              if (d.get("machine") or {}).get(k)})
+    lines.append(f"| Backend | {backend} |")
     if seen("driver"):
         lines.append(f"| Driver | {', '.join(seen('driver'))} |")
     if seen("kernel"):
@@ -140,7 +142,7 @@ def span(docs):
     return (days[0], days[-1]) if days else ("?", "?")
 
 
-def page(title, machine, group, merged, rows_, fam, replays, archived):
+def page(title, machine, group, merged, rows_, fam, replays, archived, backend):
     first, last = span(group)
     builds = sorted({e["version"] for by in merged.values() for k, e in by.items()
                      if k.startswith("loken") and e.get("version")})
@@ -149,7 +151,7 @@ def page(title, machine, group, merged, rows_, fam, replays, archived):
            f"{', '.join(builds) or 'unstated'}. A row's `Date` and `Run` name the run behind it."
            + (f" {replays} replayable record(s) of this hardware are in the store and not tabled." if replays else "")
            + (f" {archived} archived run(s) (superseded builds or another protocol) are held and not tabled." if archived else ""),
-           "", "## Hardware", "", hardware_block(machine, group), "## Results", "",
+           "", "## Hardware", "", hardware_block(machine, group, backend), "## Results", "",
            "Method and column definitions: [BENCHMARKS.md](../BENCHMARKS.md).", ""]
     by_family = {}
     for r in rows_:
@@ -211,13 +213,15 @@ def main(argv):
     for doc, source, rid in runs(store):
         hid = hardware_id(doc)
         if hid:
-            groups.setdefault(hid, []).append((doc, source, rid))
+            # One page per hardware and per backend loken answered on: the same card through
+            # two backends is two measurements of ours, not one.
+            groups.setdefault((hid, C.loken_backend(doc)), []).append((doc, source, rid))
         else:
             nameless += 1
     cache = read_arch_cache(store)
     OUT.mkdir(parents=True, exist_ok=True)
     taken, written, index_rows, per_hw = set(), [], [], {}
-    for hid, group in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+    for (hid, backend), group in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         machine = next(d["machine"] for d, _, _ in reversed(group) if d.get("machine"))
         # A replayable record is one engine on one prompt, kept to be played again on another
         # binary; it has no peer to compare against and is not a row of these tables.
@@ -230,13 +234,13 @@ def main(argv):
         merged = B.load_docs(group)
         rows_ = B.cells(merged)
         fam = families({r[0].strip() for r in rows_}, cache, models_dir)
-        name = slug(machine, taken)
+        name = slug(machine, taken) + (f"-{backend}" if backend != "unstated" else "")
         taken.add(name)
         (OUT / f"{name}.md").write_text(page(H.label(machine), machine, group,
-                                              merged, rows_, fam, replays, archived))
+                                              merged, rows_, fam, replays, archived, backend))
         written.append(f"{name}.md")
         first, last = span(group)
-        index_rows.append([f"[{H.label(machine)}](benchmarks/{name}.md)", hid,
+        index_rows.append([f"[{H.label(machine)}](benchmarks/{name}.md)", backend, hid,
                            f"{first} to {last}", str(len(group)), str(len(rows_))])
         per_hw[name] = merged
     write_arch_cache(store, cache)
@@ -256,7 +260,7 @@ def main(argv):
     (OUT / "compare.md").write_text("\n".join(body) + "\n")
     written.append("compare.md")
 
-    idx = [BEGIN, "", "| Hardware | Id | Runs from | Runs | Rows |", "|---|---|---|---|---|"]
+    idx = [BEGIN, "", "| Hardware | Backend | Id | Runs from | Runs | Rows |", "|---|---|---|---|---|---|"]
     idx += ["| " + " | ".join(r) + " |" for r in index_rows]
     idx += ["", "Across machines: [benchmarks/compare.md](benchmarks/compare.md)."]
     if nameless:
@@ -273,7 +277,7 @@ def main(argv):
         if stale.name not in written:
             stale.unlink()
             print(f"removed {stale.name}: no hardware in the store behind it", file=sys.stderr)
-    print(f"wrote {len(written)} page(s) for {len(groups)} hardware configuration(s)")
+    print(f"wrote {len(written)} page(s) for {len(groups)} hardware and backend group(s)")
     return 0
 
 

@@ -64,6 +64,11 @@ flowchart LR
     R --> I["BENCHMARKS.md index"]
 ```
 
+A record also names the backend loken answered on: `assay` asks the server for the devices it
+detected (`/api/distributed/devices`) and the report takes the available non-CPU types, `cuda` for
+now. A server that does not answer, ollama and vLLM included, is `unstated`, never `cpu`. The same
+card through two backends is two pages.
+
 A record names its machine: `hardware_id` identifies the cards, processor and memory, so a card
 swap is a new hardware and the same machine keeps its `host_id`. `scripts/report.py` groups the
 store by `hardware_id` and writes one page per group, `docs/benchmarks/<hardware>.md`, with the
