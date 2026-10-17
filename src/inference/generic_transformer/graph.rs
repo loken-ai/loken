@@ -1180,7 +1180,7 @@ impl GenericHeteroTransformer {
             .to_dtype(crate::tensor::DType::U32)?
             .to_device(&dev)?;
         let out = Tensor::zeros_on((1, n, dim), crate::tensor::DType::F32, &dev)?;
-        crate::inference::moe_cuda::embed_rows_iq4_xs(table, &ids, &out)?;
+        crate::inference::moe_cuda::embed_rows_gguf(table, &ids, &out)?;
         Ok(out)
     }
 

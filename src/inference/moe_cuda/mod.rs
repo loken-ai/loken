@@ -37,6 +37,10 @@ mod prefill_parity;
 /// the dequantised weights - a reference neither of them can agree with by accident.
 #[cfg(test)]
 mod imma_reference;
+
+/// The card decoders of embedding rows against the host dequantisation.
+#[cfg(test)]
+mod embed_rows_parity;
 pub use gemm::*;
 mod dense;
 pub use dense::*;
@@ -331,6 +335,7 @@ pub(crate) mod tp_local {
 cuda_launchers! {
     loken_tier_tell(counter: *mut u32, told: *mut u32);
     loken_embed_rows_iq4_xs(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
+    loken_embed_rows_q8_0(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
     loken_cast_init_f32_from_dtype(
         dst: *mut f32, src: *const c_void, n: i32, dtype: i32);
     loken_moe_gemm_gguf_down_reduce_two(
@@ -428,17 +433,36 @@ cuda_launchers! {
         normed_out: *mut f32, hidden: i32, eps: f32);
 }
 
-/// The rows `ids` (`[n]` U32 on the card) of the iq4_xs table `table` on the same card, decoded
-/// into `out` (`[.., n, dim]` F32, contiguous): one launch, no host lookup.
-pub fn embed_rows_iq4_xs(
+/// Whether `dtype` has a card decoder behind `embed_rows_gguf`.
+pub fn embed_rows_decodes(dtype: crate::tensor::quantized::GgmlDType) -> bool {
+    use crate::tensor::quantized::GgmlDType;
+    matches!(dtype, GgmlDType::Iq4Xs | GgmlDType::Q8_0)
+}
+
+/// The rows `ids` (`[n]` U32 on the card) of the table `table` on the same card, decoded into
+/// `out` (`[.., n, dim]` F32, contiguous) by the kernel of the table's format: one launch, no
+/// host lookup. A format without a decoder is an error.
+pub fn embed_rows_gguf(
     table: &crate::tensor::quantized::QTensor,
     ids: &crate::tensor::Tensor,
     out: &crate::tensor::Tensor,
 ) -> crate::tensor::Result<()> {
-    use crate::tensor::DType;
-    if table.dtype() != crate::tensor::quantized::GgmlDType::Iq4Xs {
-        crate::tensor::bail!("the embedding gather serves iq4_xs tables");
+    use crate::tensor::quantized::GgmlDType;
+    match table.dtype() {
+        GgmlDType::Iq4Xs => embed_rows_launch(table, ids, out, loken_embed_rows_iq4_xs),
+        GgmlDType::Q8_0 => embed_rows_launch(table, ids, out, loken_embed_rows_q8_0),
+        other => crate::tensor::bail!("the embedding gather has no decoder for {other:?} tables"),
     }
+}
+
+/// The rows `ids` of `table` decoded into `out` by `kernel`, a launcher of one format.
+fn embed_rows_launch(
+    table: &crate::tensor::quantized::QTensor,
+    ids: &crate::tensor::Tensor,
+    out: &crate::tensor::Tensor,
+    kernel: unsafe extern "C" fn(*const c_void, *const u32, i32, i32, *mut f32, i64),
+) -> crate::tensor::Result<()> {
+    use crate::tensor::DType;
     let dims = table.shape().dims();
     let (vocab, dim) = (dims[0], dims[1]);
     let n = ids.elem_count();
@@ -449,7 +473,7 @@ pub fn embed_rows_iq4_xs(
     let stream = dev.cuda_stream().cu_stream() as i64;
     let _ = vocab;
     unsafe {
-        loken_embed_rows_iq4_xs(
+        kernel(
             table.device_ptr()? as *const c_void,
             card_address::<u32>(ids)? as *const u32,
             n as i32,

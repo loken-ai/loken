@@ -46,6 +46,7 @@ cuda/moe/bf16_matvec.cu	0.0%	0	vllm/csrc/rocm/q_gemm_rdna3.cu
 cuda/moe/deltanet_gate.cu	0.0%	0	attention.rs/src/kernels/src/fp8_moe_cutlass.cu
 cuda/moe/dense_q4k_imma_m8.cu	0.0%	0	candle/candle-kernels/src/mmq_gguf/mmq_gguf.cuh
 cuda/moe/dense_q5k_imma_m8.cu	0.0%	0	llama.cpp/ggml/src/ggml-cuda/fwht.cu
+cuda/moe/embed_rows_q8_0.cu	0.0%	0	-
 cuda/moe/fused_conv_silu.cu	0.0%	0	candle/candle-kernels/src/quantized.cu
 cuda/moe/gate_gemv.cu	0.0%	0	llama.cpp/ggml/src/ggml-cuda/argsort.cu
 cuda/moe/gate_topk.cu	6.6%	17	llama.cpp/ggml/src/ggml-cuda/topk-moe.cu

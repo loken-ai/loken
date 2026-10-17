@@ -510,6 +510,7 @@ fn compile_imma_kernels() {
         "cuda/moe/add_rms_norm.cu",
         "cuda/moe/rms_qmatmul.cu",
         "cuda/moe/moe_gguf.cu",
+        "cuda/moe/embed_rows_q8_0.cu",
         "cuda/moe/moe_mmq.cu",
         "cuda/moe/attn_post_qkv.cu",
         "cuda/moe/kv_residual_scatter.cu",

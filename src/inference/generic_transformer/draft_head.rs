@@ -809,7 +809,7 @@ impl GenericHeteroTransformer {
         // The rows of the tokens, decoded on the card from its table where it has one.
         let gather = |ids: &Tensor, into: &Tensor| -> Result<()> {
             if let Some(table) = table.as_ref() {
-                crate::inference::moe_cuda::embed_rows_iq4_xs(table, ids, into)?;
+                crate::inference::moe_cuda::embed_rows_gguf(table, ids, into)?;
                 if let Some(scale) = embed_scale {
                     into.slice_set(&(into.clone() * scale)?, 1, 0)?;
                 }

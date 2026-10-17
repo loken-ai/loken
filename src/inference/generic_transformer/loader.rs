@@ -2944,11 +2944,15 @@ impl GenericHeteroTransformer {
             * emb_qt.dtype().type_size() as u64
             / emb_qt.dtype().block_size() as u64;
         let emb_device = Device::Cpu;
-        // An iq4_xs table also goes to every card of the plan, where a token's row is decoded
+        // A table in a format the card decodes also goes to every card of the plan, where a token's row is decoded
         // by one launch: the lookup of a decoded token and of a draft leaves the host.
         let emb_qt = Arc::new(emb_qt);
         let mut embed_cards = Vec::new();
-        if emb_qt.dtype() == crate::tensor::quantized::GgmlDType::Iq4Xs {
+        #[cfg(feature = "cuda")]
+        let decodes = crate::inference::moe_cuda::embed_rows_decodes(emb_qt.dtype());
+        #[cfg(not(feature = "cuda"))]
+        let decodes = false;
+        if decodes {
             let mut seen = std::collections::HashSet::new();
             for seg in &plan.segments {
                 let DeviceKind::Cuda(idx) = seg.kind else {
