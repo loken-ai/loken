@@ -48,7 +48,7 @@ Major, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| A backend for Apple silicon | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | Planned |
+| A Vulkan backend | One model of each family served through Vulkan by the same placement path on an NVIDIA and an AMD card, measured against the CUDA path and the reference engine on the same cards | Planned |
 | Throughput serving | Continuous batching with chunked prefill and multi-step scheduling: a concurrent load of many requests served at the reference server's throughput on the same card | Planned |
 | Video input | A video turn read by a model's vision tower, frames sampled by the model's own rule, answers matching the reference implementation | Planned |
 
@@ -111,3 +111,12 @@ Smaller, by priority:
 |---|---|---|
 | Energy-aware placement | A placement that trades speed for watts when asked, both measured | Planned |
 | Quotas per key | Token and request budgets per API key, enforced and reported | Planned |
+
+## Waiting for hardware
+
+Features that cannot be measured on the machines at hand; each moves into a version once a machine
+to measure it on is available.
+
+| Feature | Acceptance | Needs |
+|---|---|---|
+| A backend for Apple silicon | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | An M-series Mac |
