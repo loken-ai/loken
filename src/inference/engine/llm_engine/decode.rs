@@ -297,6 +297,8 @@ pub(super) fn capture_decode_graph(
 pub(super) struct VerifyGraphs {
     by_rows: std::collections::HashMap<usize, (VerifyGraph, Tensor)>,
     pub(super) disabled: bool,
+    /// Replays that named other tokens than their eager rows, this request.
+    mismatches: usize,
     /// The step's buffers were dropped with a window: the step's graph is recorded again.
     pub(super) step_stale: bool,
     /// Seconds spent readying the replays' buffers, and in the replays themselves, summed.
@@ -310,6 +312,7 @@ impl Default for VerifyGraphs {
         Self {
             by_rows: std::collections::HashMap::new(),
             disabled: false,
+            mismatches: 0,
             step_stale: false,
             prepare_secs: 0.0,
             launch_secs: 0.0,
@@ -661,6 +664,23 @@ pub(super) fn verify_recorded(
                 })
         })
     });
+    if !agrees && graphs.mismatches + 1 < REPLAY_MISMATCHES_TO_GIVE_UP {
+        // A near tie flips on the last bits of an expert computed on the host in one run and
+        // on the card in the other; a wrong replay disagrees again. This verify runs eagerly
+        // and a later window is recorded afresh.
+        graphs.mismatches += 1;
+        warn!(
+            "recorded verify of {rows} rows at pos={pos} named other tokens than its eager rows (relative distance per row: {}); recorded again at a later window",
+            distances.join(" ")
+        );
+        graphs.clear();
+        if let Err(e) = model.verify_window_settle(0) {
+            warn!("the model did not return to the rows before the verify: {e}");
+        }
+        model.invalidate_graph_state();
+        graphs.step_stale = true;
+        return None;
+    }
     if !agrees {
         give_up(
             model,
@@ -699,6 +719,10 @@ pub(super) fn verify_recorded(
     model.mark_graph_proven(rows);
     Some((logits, Some(replay_secs)))
 }
+
+/// Replays that name other tokens than their eager rows after which a request verifies eagerly.
+#[cfg(feature = "cuda")]
+const REPLAY_MISMATCHES_TO_GIVE_UP: usize = 3;
 
 /// One part of a recorded verify.
 #[cfg(feature = "cuda")]
