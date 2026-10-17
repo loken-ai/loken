@@ -35,6 +35,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Experts: read cold prefill experts directly, sparing the page cache.
 - Context parallelism: each range is attended by the card's flash kernels, read in place.
 - Context parallelism: a group of query heads reads its keys and values once.
 - Experts: the cache forgets a route within a few tens of tokens and follows the text in hand.

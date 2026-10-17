@@ -60,6 +60,7 @@ impl TierState {
     }
 }
 
+mod direct;
 mod graph;
 pub(crate) use graph::mapped;
 pub use graph::TierWorker;
@@ -332,10 +333,21 @@ struct Stage {
     ready: Mutex<Option<cudarc::driver::CudaEvent>>,
     /// Host ranges, per stack, that are page-locked: copies from them are asynchronous.
     pinned: [Option<(usize, usize)>; 3],
+    /// The direct reader for the parts of an upload the page cache does not hold.
+    #[cfg(target_os = "linux")]
+    bounce: Mutex<BounceState>,
     /// The stacks are kept for several forwards in a row (see `hold_stacks`).
     held: std::sync::atomic::AtomicBool,
     /// While held: the fill has landed and the compute stream has waited for it.
     filled: std::sync::atomic::AtomicBool,
+}
+
+/// A stage's direct reader: not opened yet, open, or given up after a failure.
+#[cfg(target_os = "linux")]
+enum BounceState {
+    Closed,
+    Open(direct::Bounce),
+    Off,
 }
 
 /// The stacks' dims with the expert axis replaced by `n`.
@@ -2755,6 +2767,8 @@ impl Stage {
             full: Mutex::new(None),
             ready: Mutex::new(None),
             pinned,
+            #[cfg(target_os = "linux")]
+            bounce: Mutex::new(BounceState::Closed),
             held: std::sync::atomic::AtomicBool::new(false),
             filled: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2911,19 +2925,114 @@ impl LayerTier {
         let pinned = self.stage.as_ref().and_then(|s| s.pinned[i]);
         let (lo, hi) = pinned.map_or((b, b), |(lo, hi)| (lo.clamp(a, b), hi.clamp(a, b)));
         let (lo, hi) = if lo < hi { (lo, hi) } else { (b, b) };
-        for (from, to) in [(a, lo), (lo, hi), (hi, b)] {
-            if to > from {
-                driver("expert to stage", unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                        dst + (from - a) as u64,
-                        from as *const std::ffi::c_void,
-                        to - from,
-                        copy.cu_stream(),
-                    )
-                })?;
-            }
+        // The locked part is copied from the mapping; the rest goes through `upload_unlocked`.
+        self.upload_unlocked(a, lo, a, dst, copy)?;
+        self.copy_mapped(lo, hi, a, dst, copy)?;
+        self.upload_unlocked(hi, b, a, dst, copy)
+    }
+
+    /// Copy the mapped bytes `[from, to)` to the card, where `a` is the address `dst` stands for.
+    fn copy_mapped(
+        &self,
+        from: usize,
+        to: usize,
+        a: usize,
+        dst: u64,
+        copy: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        if to > from {
+            driver("expert to stage", unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dst + (from - a) as u64,
+                    from as *const std::ffi::c_void,
+                    to - from,
+                    copy.cu_stream(),
+                )
+            })?;
         }
         Ok(())
+    }
+
+    /// Copy the mapped bytes `[from, to)` of a layer that is not page-locked: the parts the page
+    /// cache holds from the mapping, the others by direct reads that leave the cache alone.
+    fn upload_unlocked(
+        &self,
+        from: usize,
+        to: usize,
+        a: usize,
+        dst: u64,
+        copy: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        if to <= from {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(runs) = crate::tensor::mapped::page_size()
+            .and_then(|page| direct::residency(from, to - from, page))
+        {
+            for (f, t, resident) in runs {
+                if resident {
+                    self.copy_mapped(f, t, a, dst, copy)?;
+                } else {
+                    self.upload_direct(f, t, a, dst, copy)?;
+                }
+            }
+            return Ok(());
+        }
+        self.copy_mapped(from, to, a, dst, copy)
+    }
+
+    /// The mapped bytes `[from, to)` through the stage's direct reader; what it cannot read comes
+    /// from the mapping, after one warning.
+    #[cfg(target_os = "linux")]
+    fn upload_direct(
+        &self,
+        from: usize,
+        to: usize,
+        a: usize,
+        dst: u64,
+        copy: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Some(stage) = self.stage.as_ref() else {
+            return self.copy_mapped(from, to, a, dst, copy);
+        };
+        let mut done = 0;
+        let mut failure = None;
+        if let Some((file, off)) = crate::tensor::mapped::file_span(from, to - from) {
+            let mut state = stage.bounce.lock().unwrap_or_else(|e| e.into_inner());
+            if let BounceState::Open(b) = &*state {
+                if !b.reads(&file) {
+                    *state = BounceState::Closed;
+                }
+            }
+            if matches!(*state, BounceState::Closed) {
+                // A chunk carries at most the largest expert, so a run is read in a few chunks.
+                let unit = self.expert_bytes.iter().copied().max().unwrap_or(0);
+                let page = crate::tensor::mapped::page_size().unwrap_or(4096);
+                *state = match direct::Bounce::open(&file, unit.max(page), page) {
+                    Ok(b) => BounceState::Open(b),
+                    Err(e) => {
+                        failure = Some(e);
+                        BounceState::Off
+                    }
+                };
+            }
+            if let BounceState::Open(b) = &mut *state {
+                let (n, err) = b.upload(off, to - from, dst + (from - a) as u64, copy);
+                done = n;
+                if err.is_some() {
+                    *state = BounceState::Off;
+                }
+                failure = err;
+            }
+        }
+        if let Some(e) = failure {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("direct expert reads off, copying from the mapping: {e}");
+            }
+        }
+        self.copy_mapped(from + done, to, a, dst, copy)
     }
 
     /// The layer's experts as stacks on the card, once the fill has landed: the compute stream
