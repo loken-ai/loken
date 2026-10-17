@@ -34,6 +34,9 @@ pub(super) trait GridRun: BlockFormat<ActivationBlock = BlockQ8K32> {
         std::arch::x86_64::__m256i,
         std::arch::x86_64::__m256i,
     );
+    /// The block's eight runs of sign bits, run `ib` at word `ib`, bit `i` set where value `i`
+    /// is negated: what [`Self::grid_run`] spreads into bytes.
+    fn sign_words(&self, block: &Self::Block) -> *const u32;
 }
 
 /// The odd scales of one run out of a block's sixteen i16 lanes: lane `ib` of each 128-bit
@@ -303,18 +306,136 @@ pub(super) unsafe fn dot_grid<B: GridRun>(xs: &[B], y: &[BlockQ8K32]) -> f32 {
     out[0]
 }
 
+/// Runs `IB` and `IC = IB + 1` of block `bi` against `N` activations, both runs' products in
+/// one 512-bit pass and each run fused into the accumulators in turn, as [`run_rows`] fuses it.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn run_pair_rows_avx512<B: GridRun, const N: usize, const IB: usize, const IC: usize>(
+    x: &B,
+    block: &B::Block,
+    ys: &[&[BlockQ8K32]; N],
+    bi: usize,
+    scales: &[[f32; QK_K / 32]; N],
+    totals: &mut [std::arch::x86_64::__m256; N],
+) {
+    unsafe {
+        use std::arch::x86_64::*;
+        const { assert!(IC == IB + 1) };
+        let (mags_b, _, scale_b) = x.grid_run::<IB>(block);
+        let (mags_c, _, scale_c) = x.grid_run::<IC>(block);
+        let mags = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(mags_b), mags_c);
+        let scale = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(scale_b), scale_c);
+        let negate: __mmask64 = (x.sign_words(block).add(IB) as *const u64).read_unaligned();
+        for t in 0..N {
+            let a = _mm512_loadu_si512(ys[t][bi].qs.as_ptr().add(32 * IB) as *const _);
+            // 0 - a where the sign bit is set: the byte negation of `_mm256_sign_epi8`.
+            let signed = _mm512_mask_sub_epi8(a, negate, _mm512_setzero_si512(), a);
+            let pairs = _mm512_maddubs_epi16(mags, signed);
+            let sums = _mm512_cvtepi32_ps(_mm512_madd_epi16(pairs, scale));
+            totals[t] = _mm256_fmadd_ps(
+                _mm512_castps512_ps256(sums),
+                broadcast_f32::<IB>(scales[t].as_ptr()),
+                totals[t],
+            );
+            totals[t] = _mm256_fmadd_ps(
+                _mm512_extractf32x8_ps::<1>(sums),
+                broadcast_f32::<IC>(scales[t].as_ptr()),
+                totals[t],
+            );
+        }
+    }
+}
+
+/// [`dot_rows`] with the runs taken two at a time in 512-bit registers: the same products and
+/// the same accumulation order, so the same bits.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dot_rows_avx512<B: GridRun, const N: usize>(
+    xs: &[B],
+    ys: &[&[BlockQ8K32]],
+    out: &mut [f32],
+) {
+    unsafe {
+        use std::arch::x86_64::*;
+        let blocks = ys.iter().fold(xs.len(), |n, y| n.min(y.len()));
+        let ys: [&[BlockQ8K32]; N] = std::array::from_fn(|t| &ys[t][..blocks]);
+        let mut totals = [_mm256_setzero_ps(); N];
+        for (bi, x) in xs[..blocks].iter().enumerate() {
+            let unit = _mm256_set1_ps(x.run_unit());
+            let block = x.block();
+            let mut scales = [[0f32; QK_K / 32]; N];
+            for t in 0..N {
+                let d = _mm_loadu_si128(ys[t][bi].d.as_ptr() as *const __m128i);
+                _mm256_storeu_ps(
+                    scales[t].as_mut_ptr(),
+                    _mm256_mul_ps(unit, _mm256_cvtph_ps(d)),
+                );
+            }
+            const _: () = assert!(QK_K / 32 == 8);
+            run_pair_rows_avx512::<B, N, 0, 1>(x, &block, &ys, bi, &scales, &mut totals);
+            run_pair_rows_avx512::<B, N, 2, 3>(x, &block, &ys, bi, &scales, &mut totals);
+            run_pair_rows_avx512::<B, N, 4, 5>(x, &block, &ys, bi, &scales, &mut totals);
+            run_pair_rows_avx512::<B, N, 6, 7>(x, &block, &ys, bi, &scales, &mut totals);
+        }
+        for t in 0..N {
+            out[t] = super::iq_read::sum_ps(totals[t]);
+        }
+    }
+}
+
+/// [`dot_many_grid`] in 512-bit registers, to the bit.
+///
+/// # Safety
+/// The caller runs with AVX2, FMA, F16C, BMI2, AVX512F, AVX512BW, AVX512VL and AVX512DQ enabled.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(super) unsafe fn dot_many_grid_avx512<B: GridRun>(
+    xs: &[B],
+    ys: &[&[BlockQ8K32]],
+    out: &mut [f32],
+) {
+    unsafe {
+        let many = super::iq_read::MANY;
+        for (ys, out) in ys.chunks(many).zip(out.chunks_mut(many)) {
+            match ys.len() {
+                1 => dot_rows_avx512::<B, 1>(xs, ys, out),
+                2 => dot_rows_avx512::<B, 2>(xs, ys, out),
+                3 => dot_rows_avx512::<B, 3>(xs, ys, out),
+                4 => dot_rows_avx512::<B, 4>(xs, ys, out),
+                5 => dot_rows_avx512::<B, 5>(xs, ys, out),
+                6 => dot_rows_avx512::<B, 6>(xs, ys, out),
+                7 => dot_rows_avx512::<B, 7>(xs, ys, out),
+                _ => dot_rows_avx512::<B, 8>(xs, ys, out),
+            }
+        }
+    }
+}
+
+/// [`dot_grid`] in 512-bit registers, to the bit.
+///
+/// # Safety
+/// As [`dot_many_grid_avx512`].
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(super) unsafe fn dot_grid_avx512<B: GridRun>(xs: &[B], y: &[BlockQ8K32]) -> f32 {
+    let mut out = [0f32];
+    unsafe { dot_rows_avx512::<B, 1>(xs, &[y], &mut out) };
+    out[0]
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
-mod tests {
-    //! The grid kernels against the run-by-run kernels they replace, kept as the reference.
+pub(super) mod tests {
+    //! The grid kernels against the run-by-run kernels they replace, kept as the reference, and
+    //! the 512-bit kernels against the 256-bit ones.
 
     use super::super::iq2_s::{self, BlockIq2S};
     use super::super::iq3_xxs::{self, BlockIq3Xxs};
     use super::*;
 
     /// A deterministic stream of pseudo-random bytes.
-    struct Bytes(u64);
+    pub(in super::super) struct Bytes(pub(in super::super) u64);
     impl Bytes {
-        fn next(&mut self) -> u8 {
+        pub(in super::super) fn next(&mut self) -> u8 {
             self.0 = self
                 .0
                 .wrapping_mul(6364136223846793005)
@@ -323,9 +444,9 @@ mod tests {
         }
     }
 
-    /// `count` blocks of random codes, signs and scales under a small random block scale: every
-    /// byte pattern of these formats is a valid block.
-    fn weights<B: BlockFormat>(count: usize, rng: &mut Bytes) -> Vec<B> {
+    /// `count` blocks of random codes, signs and scales under a small random block scale, the
+    /// block's leading f16: every byte pattern of these formats is a valid block.
+    pub(in super::super) fn weights<B: BlockFormat>(count: usize, rng: &mut Bytes) -> Vec<B> {
         let size = std::mem::size_of::<B>();
         let mut bytes: Vec<u8> = (0..count * size).map(|_| rng.next()).collect();
         for chunk in bytes.chunks_exact_mut(size) {
@@ -355,43 +476,55 @@ mod tests {
             .collect()
     }
 
+    /// A kernel over one activation.
+    pub(in super::super) type One<B> = fn(&[B], &[<B as BlockFormat>::ActivationBlock]) -> f32;
     /// A kernel over every activation of a pass.
-    type Many<B> = fn(&[B], &[&[BlockQ8K32]], &mut [f32]);
+    pub(in super::super) type Many<B> =
+        fn(&[B], &[&[<B as BlockFormat>::ActivationBlock]], &mut [f32]);
+    /// What makes `count` activation blocks.
+    pub(in super::super) type Activations<B> =
+        fn(usize, &mut Bytes) -> Vec<<B as BlockFormat>::ActivationBlock>;
 
-    fn same_bits<B: BlockFormat<ActivationBlock = BlockQ8K32>>(
+    /// `got` against `want` to the bit, for 1 to `2 MANY + 1` activations over `blocks` blocks,
+    /// and the one-activation kernels against the many.
+    pub(in super::super) fn same_bits<B: BlockFormat>(
         name: &str,
-        reference_one: fn(&[B], &[BlockQ8K32]) -> f32,
-        reference_many: Many<B>,
+        blocks: usize,
+        activations: Activations<B>,
+        want: (One<B>, Many<B>),
+        got: (One<B>, Many<B>),
     ) {
         let mut rng = Bytes(0x5EED);
-        let blocks = 10;
         for rows in 1..=2 * super::super::iq_read::MANY + 1 {
             for _ in 0..8 {
                 let xs = weights::<B>(blocks, &mut rng);
-                let acts: Vec<Vec<BlockQ8K32>> =
+                let acts: Vec<Vec<B::ActivationBlock>> =
                     (0..rows).map(|_| activations(blocks, &mut rng)).collect();
-                let ys: Vec<&[BlockQ8K32]> = acts.iter().map(|a| a.as_slice()).collect();
-                let mut want = vec![0f32; rows];
-                let mut got = vec![0f32; rows];
-                reference_many(&xs, &ys, &mut want);
-                B::dot_many(&xs, &ys, &mut got);
+                let ys: Vec<&[B::ActivationBlock]> = acts.iter().map(|a| a.as_slice()).collect();
+                let mut expected = vec![0f32; rows];
+                let mut actual = vec![0f32; rows];
+                want.1(&xs, &ys, &mut expected);
+                got.1(&xs, &ys, &mut actual);
                 for t in 0..rows {
                     assert_eq!(
-                        got[t].to_bits(),
-                        want[t].to_bits(),
+                        actual[t].to_bits(),
+                        expected[t].to_bits(),
                         "{name} {rows} rows, row {t}"
                     );
-                    let one = B::dot(&xs, ys[t]);
+                    let one = got.0(&xs, ys[t]);
+                    assert_eq!(one.to_bits(), want.0(&xs, ys[t]).to_bits(), "{name} dot");
                     assert_eq!(
                         one.to_bits(),
-                        reference_one(&xs, ys[t]).to_bits(),
-                        "{name} dot"
+                        expected[t].to_bits(),
+                        "{name} dot against many"
                     );
-                    assert_eq!(one.to_bits(), want[t].to_bits(), "{name} dot against many");
                 }
             }
         }
     }
+
+    /// Blocks a row of the tested matrices.
+    const TESTED_BLOCKS: usize = 10;
 
     #[test]
     fn grid_kernels_equal_the_run_kernels_to_the_bit() {
@@ -400,97 +533,147 @@ mod tests {
         }
         same_bits::<BlockIq3Xxs>(
             "iq3_xxs",
-            |x, y| unsafe { iq3_xxs::reference_dot_avx2(x, y) },
-            |x, y, o| unsafe { iq3_xxs::reference_dot_many_avx2(x, y, o) },
+            TESTED_BLOCKS,
+            activations,
+            (
+                |x, y| unsafe { iq3_xxs::reference_dot_avx2(x, y) },
+                |x, y, o| unsafe { iq3_xxs::reference_dot_many_avx2(x, y, o) },
+            ),
+            (BlockIq3Xxs::dot, BlockIq3Xxs::dot_many),
         );
         same_bits::<BlockIq2S>(
             "iq2_s",
-            |x, y| unsafe { iq2_s::reference_dot_avx2(x, y) },
-            |x, y, o| unsafe { iq2_s::reference_dot_many_avx2(x, y, o) },
+            TESTED_BLOCKS,
+            activations,
+            (
+                |x, y| unsafe { iq2_s::reference_dot_avx2(x, y) },
+                |x, y, o| unsafe { iq2_s::reference_dot_many_avx2(x, y, o) },
+            ),
+            (BlockIq2S::dot, BlockIq2S::dot_many),
         );
     }
 
-    /// Output rows and blocks a row of the measured matrices: the gate or up projection of an
-    /// expert whose hidden width is ten blocks.
-    const ROWS: usize = 640;
-    const BLOCKS: usize = 10;
-    /// Experts a pass computes, gate and up each.
-    const EXPERTS: usize = 3;
+    /// The 512-bit grid kernels against the 256-bit ones, on a CPU that has AVX-512.
+    #[test]
+    fn grid_kernels_in_512_bits_equal_the_256_bit_ones_to_the_bit() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        same_bits::<BlockIq3Xxs>(
+            "iq3_xxs",
+            TESTED_BLOCKS,
+            activations,
+            (
+                |x, y| {
+                    let mut o = [0f32];
+                    unsafe { iq3_xxs::dot_many_avx2(x, &[y], &mut o) };
+                    o[0]
+                },
+                |x, y, o| unsafe { iq3_xxs::dot_many_avx2(x, y, o) },
+            ),
+            (
+                |x, y| {
+                    let mut o = [0f32];
+                    unsafe { iq3_xxs::dot_many_avx512(x, &[y], &mut o) };
+                    o[0]
+                },
+                |x, y, o| unsafe { iq3_xxs::dot_many_avx512(x, y, o) },
+            ),
+        );
+        same_bits::<BlockIq2S>(
+            "iq2_s",
+            TESTED_BLOCKS,
+            activations,
+            (
+                |x, y| {
+                    let mut o = [0f32];
+                    unsafe { iq2_s::dot_many_avx2(x, &[y], &mut o) };
+                    o[0]
+                },
+                |x, y, o| unsafe { iq2_s::dot_many_avx2(x, y, o) },
+            ),
+            (
+                |x, y| {
+                    let mut o = [0f32];
+                    unsafe { iq2_s::dot_many_avx512(x, &[y], &mut o) };
+                    o[0]
+                },
+                |x, y, o| unsafe { iq2_s::dot_many_avx512(x, y, o) },
+            ),
+        );
+    }
+
+    /// The matrices a pass computes.
+    pub(in super::super) struct Shape {
+        /// Output rows of a matrix.
+        pub(in super::super) rows: usize,
+        /// Blocks a row.
+        pub(in super::super) blocks: usize,
+        /// Experts a pass computes.
+        pub(in super::super) experts: usize,
+        /// Matrices an expert computes.
+        pub(in super::super) matrices: usize,
+    }
+
     /// Weight bytes the passes cycle through, past the last-level cache so that each pass reads
     /// its weights from memory as the host does.
     const COLD_BYTES: usize = 256 << 20;
 
-    /// A pass's weights: per expert, its gate and up matrices.
-    struct Pass<B>(Vec<[Vec<B>; 2]>);
-
-    fn measure<B: BlockFormat<ActivationBlock = BlockQ8K32>>(
+    /// What a pass of `shape` costs under `before` and `after`, in bytes of weight per second,
+    /// for 1, 2 and 4 activations, on one thread and through the pool.
+    pub(in super::super) fn measure<B: BlockFormat + Sync>(
         name: &str,
-        reference_one: fn(&[B], &[BlockQ8K32]) -> f32,
-        reference_many: Many<B>,
-    ) {
+        shape: &Shape,
+        activations: Activations<B>,
+        before: (&str, Many<B>),
+        after: (&str, Many<B>),
+    ) where
+        B::ActivationBlock: Sync,
+    {
         let mut rng = Bytes(0xC01D);
-        let pass_bytes = EXPERTS * 2 * ROWS * BLOCKS * std::mem::size_of::<B>();
-        let passes: Vec<Pass<B>> = (0..COLD_BYTES.div_ceil(pass_bytes))
+        let pass_bytes =
+            shape.experts * shape.matrices * shape.rows * shape.blocks * std::mem::size_of::<B>();
+        // Per pass, per expert, its matrices.
+        let passes: Vec<Vec<Vec<Vec<B>>>> = (0..COLD_BYTES.div_ceil(pass_bytes))
             .map(|_| {
-                Pass(
-                    (0..EXPERTS)
-                        .map(|_| {
-                            [
-                                weights::<B>(ROWS * BLOCKS, &mut rng),
-                                weights::<B>(ROWS * BLOCKS, &mut rng),
-                            ]
-                        })
-                        .collect(),
-                )
+                (0..shape.experts)
+                    .map(|_| {
+                        (0..shape.matrices)
+                            .map(|_| weights::<B>(shape.rows * shape.blocks, &mut rng))
+                            .collect()
+                    })
+                    .collect()
             })
             .collect();
-        let one = |x: &[B], ys: &[&[BlockQ8K32]], o: &mut [f32]| o[0] = B::dot(x, ys[0]);
-        let reference = |x: &[B], ys: &[&[BlockQ8K32]], o: &mut [f32]| {
-            if ys.len() == 1 {
-                o[0] = reference_one(x, ys[0])
-            } else {
-                reference_many(x, ys, o)
-            }
-        };
-        let grid = |x: &[B], ys: &[&[BlockQ8K32]], o: &mut [f32]| {
-            if ys.len() == 1 {
-                one(x, ys, o)
-            } else {
-                B::dot_many(x, ys, o)
-            }
-        };
         for rows in [1, 2, 4] {
-            let acts: Vec<Vec<BlockQ8K32>> =
-                (0..rows).map(|_| activations(BLOCKS, &mut rng)).collect();
-            let ys: Vec<&[BlockQ8K32]> = acts.iter().map(|a| a.as_slice()).collect();
-            let unit =
-                |pass: &Pass<B>, r: usize, kernel: &dyn Fn(&[B], &[&[BlockQ8K32]], &mut [f32])| {
-                    let mut out = [0f32; super::super::iq_read::MANY];
-                    let mut sink = 0f32;
-                    for [gate, up] in &pass.0 {
-                        let row = r * BLOCKS..(r + 1) * BLOCKS;
-                        kernel(&gate[row.clone()], &ys, &mut out[..rows]);
-                        sink += out[0];
-                        kernel(&up[row], &ys, &mut out[..rows]);
-                        sink += out[0];
-                    }
-                    sink
-                };
-            let rate = |kernel: &(dyn Fn(&[B], &[&[BlockQ8K32]], &mut [f32]) + Sync),
-                        pooled: bool| {
+            let acts: Vec<Vec<B::ActivationBlock>> = (0..rows)
+                .map(|_| activations(shape.blocks, &mut rng))
+                .collect();
+            let ys: Vec<&[B::ActivationBlock]> = acts.iter().map(|a| a.as_slice()).collect();
+            let unit = |pass: &Vec<Vec<Vec<B>>>, r: usize, kernel: Many<B>| {
+                let mut out = [0f32; super::super::iq_read::MANY];
+                let mut sink = 0f32;
+                for matrix in pass.iter().flatten() {
+                    let row = r * shape.blocks..(r + 1) * shape.blocks;
+                    kernel(&matrix[row], &ys, &mut out[..rows]);
+                    sink += out[0];
+                }
+                sink
+            };
+            let rate = |kernel: Many<B>, pooled: bool| {
                 let rounds = 4;
                 let start = std::time::Instant::now();
                 let mut sink = 0f32;
                 for _ in 0..rounds {
                     for pass in &passes {
                         if pooled {
-                            let mut units = vec![0f32; ROWS];
+                            let mut units = vec![0f32; shape.rows];
                             crate::tensor::quant_cpu::pool_for_each_mut(&mut units, 8, &|r, o| {
                                 *o = unit(pass, r, kernel)
                             });
                             sink += units[0];
                         } else {
-                            sink += (0..ROWS).map(|r| unit(pass, r, kernel)).sum::<f32>();
+                            sink += (0..shape.rows).map(|r| unit(pass, r, kernel)).sum::<f32>();
                         }
                     }
                 }
@@ -499,18 +682,29 @@ mod tests {
             };
             for pooled in [false, true] {
                 // The best of alternating trials, so that a pause of the machine weighs on neither.
-                let (mut before, mut after) = (0f64, 0f64);
+                let (mut slow, mut fast) = (0f64, 0f64);
                 for _ in 0..3 {
-                    before = before.max(rate(&reference, pooled));
-                    after = after.max(rate(&grid, pooled));
+                    slow = slow.max(rate(before.1, pooled));
+                    fast = fast.max(rate(after.1, pooled));
                 }
                 eprintln!(
-                    "{name:8} {rows} rows {:6}: {before:6.2} -> {after:6.2} GB/s of weights",
-                    if pooled { "pool" } else { "1 thr" }
+                    "{name:8} {rows} rows {:6}: {} {slow:6.2} -> {} {fast:6.2} GB/s of weights",
+                    if pooled { "pool" } else { "1 thr" },
+                    before.0,
+                    after.0,
                 );
             }
         }
     }
+
+    /// The gate and up projections of an expert whose hidden width is ten blocks, three experts
+    /// a pass.
+    const GATE_UP: Shape = Shape {
+        rows: 640,
+        blocks: 10,
+        experts: 3,
+        matrices: 2,
+    };
 
     /// What the gate and up projections of a pass cost, before and after, in bytes of weight per
     /// second. Not a gate.
@@ -522,13 +716,56 @@ mod tests {
         }
         measure::<BlockIq3Xxs>(
             "iq3_xxs",
-            |x, y| unsafe { iq3_xxs::reference_dot_avx2(x, y) },
-            |x, y, o| unsafe { iq3_xxs::reference_dot_many_avx2(x, y, o) },
+            &GATE_UP,
+            activations,
+            ("runs", |x, y, o| unsafe {
+                if y.len() == 1 {
+                    o[0] = iq3_xxs::reference_dot_avx2(x, y[0])
+                } else {
+                    iq3_xxs::reference_dot_many_avx2(x, y, o)
+                }
+            }),
+            ("grid", |x, y, o| unsafe { iq3_xxs::dot_many_avx2(x, y, o) }),
         );
         measure::<BlockIq2S>(
             "iq2_s",
-            |x, y| unsafe { iq2_s::reference_dot_avx2(x, y) },
-            |x, y, o| unsafe { iq2_s::reference_dot_many_avx2(x, y, o) },
+            &GATE_UP,
+            activations,
+            ("runs", |x, y, o| unsafe {
+                if y.len() == 1 {
+                    o[0] = iq2_s::reference_dot_avx2(x, y[0])
+                } else {
+                    iq2_s::reference_dot_many_avx2(x, y, o)
+                }
+            }),
+            ("grid", |x, y, o| unsafe { iq2_s::dot_many_avx2(x, y, o) }),
+        );
+    }
+
+    /// The grid kernels in 256 and in 512 bits, on a CPU that has AVX-512. Not a gate.
+    #[test]
+    #[ignore = "a measurement: cargo test --release --lib grid_rows_avx512_throughput -- --ignored --nocapture"]
+    fn grid_rows_avx512_throughput() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        measure::<BlockIq3Xxs>(
+            "iq3_xxs",
+            &GATE_UP,
+            activations,
+            ("avx2", |x, y, o| unsafe { iq3_xxs::dot_many_avx2(x, y, o) }),
+            ("avx512", |x, y, o| unsafe {
+                iq3_xxs::dot_many_avx512(x, y, o)
+            }),
+        );
+        measure::<BlockIq2S>(
+            "iq2_s",
+            &GATE_UP,
+            activations,
+            ("avx2", |x, y, o| unsafe { iq2_s::dot_many_avx2(x, y, o) }),
+            ("avx512", |x, y, o| unsafe {
+                iq2_s::dot_many_avx512(x, y, o)
+            }),
         );
     }
 }

@@ -83,6 +83,11 @@ impl BlockFormat for BlockIq4Nl {
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `dot_avx512` enables.
+            return unsafe { dot_avx512(xs, ys) };
+        }
+        #[cfg(target_arch = "x86_64")]
         if crate::cpu::dispatch_avx2() {
             // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
             return unsafe { dot_avx2(xs, ys) };
@@ -100,6 +105,11 @@ impl BlockFormat for BlockIq4Nl {
 
     /// [`Self::dot`] over several activations, each block's weights read from the table once.
     fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `dot_many_avx512` enables.
+            return unsafe { dot_many_avx512(xs, ys, out) };
+        }
         #[cfg(target_arch = "x86_64")]
         if crate::cpu::dispatch_avx2() {
             // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_many_avx2` enables.
@@ -131,9 +141,9 @@ impl BlockFormat for BlockIq4Nl {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_many_avx2(
+pub(super) unsafe fn reference_dot_many_avx2(
     xs: &[BlockIq4Nl],
     ys: &[&[<BlockIq4Nl as BlockFormat>::ActivationBlock]],
     out: &mut [f32],
@@ -156,6 +166,34 @@ unsafe fn dot_many_avx2(
             out.copy_from_slice(&totals[..out.len()]);
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq4Nl], ys: &[BlockQ8_0]) -> f32 {
+    let mut out = [0f32];
+    unsafe { super::iq4_nl_rows::dot_rows::<false, 1>(xs, &[ys], &mut out) };
+    out[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_many_avx2(xs: &[BlockIq4Nl], ys: &[&[BlockQ8_0]], out: &mut [f32]) {
+    unsafe { super::iq4_nl_rows::dot_many::<false>(xs, ys, out) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn dot_avx512(xs: &[BlockIq4Nl], ys: &[BlockQ8_0]) -> f32 {
+    let mut out = [0f32];
+    unsafe { super::iq4_nl_rows::dot_rows::<true, 1>(xs, &[ys], &mut out) };
+    out[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+pub(super) unsafe fn dot_many_avx512(xs: &[BlockIq4Nl], ys: &[&[BlockQ8_0]], out: &mut [f32]) {
+    unsafe { super::iq4_nl_rows::dot_many::<true>(xs, ys, out) }
 }
 
 #[cfg(test)]
@@ -209,11 +247,147 @@ mod tests {
             "{want} vs {got}"
         );
     }
+
+    #[cfg(target_arch = "x86_64")]
+    mod rows {
+        //! The block-by-block kernels, kept as the reference, against the rows kernels, and the
+        //! 512-bit rows kernel against the 256-bit one.
+
+        use super::super::*;
+        use crate::tensor::quant_cpu::format::iq_grid_rows::tests::{
+            measure, same_bits, Bytes, Shape,
+        };
+
+        fn activations(count: usize, rng: &mut Bytes) -> Vec<BlockQ8_0> {
+            (0..count)
+                .map(|_| {
+                    let mut b = BlockQ8_0::zeros();
+                    b.d = f16::from_f32(0.01 + rng.next() as f32 / 1024.0);
+                    for q in b.qs.iter_mut() {
+                        *q = (rng.next() as i8).max(-127);
+                    }
+                    b
+                })
+                .collect()
+        }
+
+        fn one_avx2(x: &[BlockIq4Nl], y: &[BlockQ8_0]) -> f32 {
+            let mut o = [0f32];
+            unsafe { dot_many_avx2(x, &[y], &mut o) };
+            o[0]
+        }
+
+        /// Blocks a row of the tested matrices: under, at and past a reduction group.
+        const TESTED_BLOCKS: [usize; 4] = [1, 7, 8, 20];
+
+        #[test]
+        fn rows_kernels_equal_the_block_kernels_to_the_bit() {
+            if !crate::cpu::dispatch_avx2() {
+                return;
+            }
+            for blocks in TESTED_BLOCKS {
+                same_bits::<BlockIq4Nl>(
+                    "iq4_nl",
+                    blocks,
+                    activations,
+                    (
+                        |x, y| unsafe { reference_dot_avx2(x, y) },
+                        |x, y, o| unsafe { reference_dot_many_avx2(x, y, o) },
+                    ),
+                    (BlockIq4Nl::dot, BlockIq4Nl::dot_many),
+                );
+                same_bits::<BlockIq4Nl>(
+                    "iq4_nl avx2",
+                    blocks,
+                    activations,
+                    (
+                        |x, y| unsafe { reference_dot_avx2(x, y) },
+                        |x, y, o| unsafe { reference_dot_many_avx2(x, y, o) },
+                    ),
+                    (one_avx2, |x, y, o| unsafe { dot_many_avx2(x, y, o) }),
+                );
+            }
+        }
+
+        #[test]
+        fn rows_kernel_in_512_bits_equals_the_256_bit_one_to_the_bit() {
+            if !crate::cpu::hardware_has_avx512() {
+                return;
+            }
+            for blocks in TESTED_BLOCKS {
+                same_bits::<BlockIq4Nl>(
+                    "iq4_nl",
+                    blocks,
+                    activations,
+                    (one_avx2, |x, y, o| unsafe { dot_many_avx2(x, y, o) }),
+                    (
+                        |x, y| {
+                            let mut o = [0f32];
+                            unsafe { dot_many_avx512(x, &[y], &mut o) };
+                            o[0]
+                        },
+                        |x, y, o| unsafe { dot_many_avx512(x, y, o) },
+                    ),
+                );
+            }
+        }
+
+        /// The down projection of an expert whose hidden width is twenty blocks, three experts a
+        /// pass.
+        const DOWN: Shape = Shape {
+            rows: 2560,
+            blocks: 20,
+            experts: 3,
+            matrices: 1,
+        };
+
+        /// What the down projections of a pass cost, before and after, in bytes of weight per
+        /// second. Not a gate.
+        #[test]
+        #[ignore = "a measurement: cargo test --release --lib iq4_nl_rows_throughput -- --ignored --nocapture"]
+        fn iq4_nl_rows_throughput() {
+            if !crate::cpu::dispatch_avx2() {
+                return;
+            }
+            measure::<BlockIq4Nl>(
+                "iq4_nl",
+                &DOWN,
+                activations,
+                ("blocks", |x, y, o| unsafe {
+                    if y.len() == 1 {
+                        o[0] = reference_dot_avx2(x, y[0])
+                    } else {
+                        reference_dot_many_avx2(x, y, o)
+                    }
+                }),
+                ("rows", |x, y, o| unsafe { dot_many_avx2(x, y, o) }),
+            );
+        }
+
+        /// The rows kernel in 256 and in 512 bits, on a CPU that has AVX-512. Not a gate.
+        #[test]
+        #[ignore = "a measurement: cargo test --release --lib iq4_nl_rows_avx512_throughput -- --ignored --nocapture"]
+        fn iq4_nl_rows_avx512_throughput() {
+            if !crate::cpu::hardware_has_avx512() {
+                return;
+            }
+            measure::<BlockIq4Nl>(
+                "iq4_nl",
+                &DOWN,
+                activations,
+                ("avx2", |x, y, o| unsafe { dot_many_avx2(x, y, o) }),
+                ("avx512", |x, y, o| unsafe { dot_many_avx512(x, y, o) }),
+            );
+        }
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_avx2(xs: &[BlockIq4Nl], ys: &[<BlockIq4Nl as BlockFormat>::ActivationBlock]) -> f32 {
+pub(super) unsafe fn reference_dot_avx2(
+    xs: &[BlockIq4Nl],
+    ys: &[<BlockIq4Nl as BlockFormat>::ActivationBlock],
+) -> f32 {
     xs.iter()
         .zip(ys)
         .map(|(x, y)| {

@@ -61,6 +61,11 @@ impl BlockFormat for BlockIq3Xxs {
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `dot_avx512` enables.
+            return unsafe { dot_avx512(xs, ys) };
+        }
+        #[cfg(target_arch = "x86_64")]
         if crate::cpu::dispatch_avx2() {
             // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
             return unsafe { dot_avx2(xs, ys) };
@@ -71,6 +76,11 @@ impl BlockFormat for BlockIq3Xxs {
     /// [`Self::dot`] over several activations, each run's magnitudes, signs and scale decoded
     /// once.
     fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `dot_many_avx512` enables.
+            return unsafe { dot_many_avx512(xs, ys, out) };
+        }
         #[cfg(target_arch = "x86_64")]
         if crate::cpu::dispatch_avx2() {
             // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_many_avx2` enables.
@@ -278,6 +288,11 @@ impl super::iq_grid_rows::GridRun for BlockIq3Xxs {
             )
         }
     }
+
+    #[inline(always)]
+    fn sign_words(&self, block: &Iq3XxsRuns) -> *const u32 {
+        block.signs.as_ptr()
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -288,6 +303,18 @@ unsafe fn dot_avx2(xs: &[BlockIq3Xxs], ys: &[BlockQ8K32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_many_avx2(xs: &[BlockIq3Xxs], ys: &[&[BlockQ8K32]], out: &mut [f32]) {
+pub(super) unsafe fn dot_many_avx2(xs: &[BlockIq3Xxs], ys: &[&[BlockQ8K32]], out: &mut [f32]) {
     unsafe { super::iq_grid_rows::dot_many_grid(xs, ys, out) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq")]
+unsafe fn dot_avx512(xs: &[BlockIq3Xxs], ys: &[BlockQ8K32]) -> f32 {
+    unsafe { super::iq_grid_rows::dot_grid_avx512(xs, ys) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq")]
+pub(super) unsafe fn dot_many_avx512(xs: &[BlockIq3Xxs], ys: &[&[BlockQ8K32]], out: &mut [f32]) {
+    unsafe { super::iq_grid_rows::dot_many_grid_avx512(xs, ys, out) }
 }

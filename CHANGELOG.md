@@ -35,6 +35,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- CPU: the IQ4_NL expert products decode each block once for every row.
+- CPU: AVX-512 kernels for the IQ2_S, IQ3_XXS and IQ4_NL expert products.
 - CPU: the IQ2_S and IQ3_XXS expert products decode each block once for every row.
 - Experts: read cold prefill experts directly, sparing the page cache.
 - Context parallelism: each range is attended by the card's flash kernels, read in place.
