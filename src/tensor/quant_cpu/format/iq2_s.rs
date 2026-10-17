@@ -126,9 +126,13 @@ impl BlockFormat for BlockIq2S {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// The run-by-run dot the grid kernel replaced, kept as its reference.
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_avx2(xs: &[BlockIq2S], ys: &[<BlockIq2S as BlockFormat>::ActivationBlock]) -> f32 {
+pub(super) unsafe fn reference_dot_avx2(
+    xs: &[BlockIq2S],
+    ys: &[<BlockIq2S as BlockFormat>::ActivationBlock],
+) -> f32 {
     unsafe {
         use std::arch::x86_64::*;
         let mut total = _mm256_setzero_ps();
@@ -169,9 +173,10 @@ unsafe fn dot_avx2(xs: &[BlockIq2S], ys: &[<BlockIq2S as BlockFormat>::Activatio
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// The run-by-run dot over several activations the grid kernel replaced, kept as its reference.
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_many_avx2(
+pub(super) unsafe fn reference_dot_many_avx2(
     xs: &[BlockIq2S],
     ys: &[&[<BlockIq2S as BlockFormat>::ActivationBlock]],
     out: &mut [f32],
@@ -209,4 +214,105 @@ unsafe fn dot_many_avx2(
             },
         )
     }
+}
+
+/// What the runs of an iq2_s block share: the ten-bit grid code of each group of eight, and the
+/// runs' odd scales, the first halves' in the low 128 bits and the second halves' in the high.
+#[cfg(target_arch = "x86_64")]
+pub(super) struct Iq2SRuns {
+    codes: [u16; QK_K / 8],
+    scales: std::arch::x86_64::__m256i,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl super::iq_grid_rows::GridRun for BlockIq2S {
+    type Block = Iq2SRuns;
+
+    #[inline(always)]
+    fn run_unit(&self) -> f32 {
+        self.d.to_f32() * 0.125
+    }
+
+    #[inline(always)]
+    unsafe fn block(&self) -> Iq2SRuns {
+        unsafe {
+            use std::arch::x86_64::*;
+            let raw = _mm_loadl_epi64(self.scales.as_ptr() as *const __m128i);
+            let wide = _mm_cvtepu8_epi16(raw);
+            let halves = _mm256_set_m128i(
+                _mm_srli_epi16(wide, 4),
+                _mm_and_si128(wide, _mm_set1_epi16(0x0F)),
+            );
+            let scales = _mm256_or_si256(_mm256_add_epi16(halves, halves), _mm256_set1_epi16(1));
+            // Code `c` is byte `c` with bits `2 (c % 4)` and `2 (c % 4) + 1` of high byte `c / 4`
+            // above it: the high byte, spread to each of its four codes, multiplied into place.
+            let high = _mm256_set1_epi64x(i64::from_le_bytes(self.qh));
+            let lift = _mm256_set1_epi64x(256 | 64 << 16 | 16 << 32 | 4 << 48);
+            let codes = |first: usize| {
+                let low = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                    self.qs.as_ptr().add(16 * first) as *const __m128i
+                ));
+                // Word `c` of the half takes high byte `4 first + c / 4`: bytes `2 first + {0, 1}`
+                // in the low 128 bits and `2 first + {2, 3}` in the high.
+                let (a, b, c, d) = (
+                    (4 * first) as i8,
+                    (4 * first + 1) as i8,
+                    (4 * first + 2) as i8,
+                    (4 * first + 3) as i8,
+                );
+                let z = -128i8;
+                let spread = _mm256_shuffle_epi8(
+                    high,
+                    _mm256_setr_epi8(
+                        a, z, a, z, a, z, a, z, b, z, b, z, b, z, b, z, c, z, c, z, c, z, c, z, d,
+                        z, d, z, d, z, d, z,
+                    ),
+                );
+                let top =
+                    _mm256_and_si256(_mm256_mullo_epi16(spread, lift), _mm256_set1_epi16(0x300));
+                _mm256_or_si256(low, top)
+            };
+            let mut runs = Iq2SRuns {
+                codes: [0; QK_K / 8],
+                scales,
+            };
+            _mm256_storeu_si256(runs.codes.as_mut_ptr() as *mut __m256i, codes(0));
+            _mm256_storeu_si256(runs.codes.as_mut_ptr().add(16) as *mut __m256i, codes(1));
+            runs
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn grid_run<const IB: usize>(
+        &self,
+        block: &Iq2SRuns,
+    ) -> (
+        std::arch::x86_64::__m256i,
+        std::arch::x86_64::__m256i,
+        std::arch::x86_64::__m256i,
+    ) {
+        unsafe {
+            let mags =
+                super::iq_grid_rows::table_u64_by_words::<IB>(&IQ2S_GRID, block.codes.as_ptr());
+            let signs = self.qs.as_ptr().add(QK_K / 8) as *const u32;
+            let signs = super::iq_grid_rows::broadcast_u32::<IB>(signs);
+            (
+                mags,
+                super::iq_grid_rows::run_negate_spread(signs),
+                super::iq_grid_rows::run_scale_lanes(block.scales, IB),
+            )
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq2S], ys: &[BlockQ8K32]) -> f32 {
+    unsafe { super::iq_grid_rows::dot_grid(xs, ys) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_many_avx2(xs: &[BlockIq2S], ys: &[&[BlockQ8K32]], out: &mut [f32]) {
+    unsafe { super::iq_grid_rows::dot_many_grid(xs, ys, out) }
 }

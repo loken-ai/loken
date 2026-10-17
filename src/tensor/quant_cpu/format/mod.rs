@@ -13,6 +13,7 @@ pub mod iq3_s;
 pub mod iq3_xxs;
 pub mod iq4_nl;
 pub mod iq4_xs;
+mod iq_grid_rows;
 mod iq_grids;
 mod iq_read;
 pub mod mxfp4;

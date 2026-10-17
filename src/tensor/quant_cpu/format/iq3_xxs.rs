@@ -119,9 +119,10 @@ impl super::iq_read::Runs for BlockIq3Xxs {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// The run-by-run dot the grid kernel replaced, kept as its reference.
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_avx2(
+pub(super) unsafe fn reference_dot_avx2(
     xs: &[BlockIq3Xxs],
     ys: &[<BlockIq3Xxs as BlockFormat>::ActivationBlock],
 ) -> f32 {
@@ -160,9 +161,10 @@ unsafe fn dot_avx2(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// The run-by-run dot over several activations the grid kernel replaced, kept as its reference.
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-unsafe fn dot_many_avx2(
+pub(super) unsafe fn reference_dot_many_avx2(
     xs: &[BlockIq3Xxs],
     ys: &[&[<BlockIq3Xxs as BlockFormat>::ActivationBlock]],
     out: &mut [f32],
@@ -197,4 +199,95 @@ unsafe fn dot_many_avx2(
             },
         )
     }
+}
+
+/// What the runs of an iq3_xxs block share: each run's 32 sign bits, the eighth of each group
+/// of eight being the parity of the seven stored, and each run's odd scale in both i16 halves
+/// of a word.
+#[cfg(target_arch = "x86_64")]
+pub(super) struct Iq3XxsRuns {
+    signs: [u32; QK_K / 32],
+    scales: [u32; QK_K / 32],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl super::iq_grid_rows::GridRun for BlockIq3Xxs {
+    type Block = Iq3XxsRuns;
+
+    #[inline(always)]
+    fn run_unit(&self) -> f32 {
+        self.d.to_f32() * 0.25
+    }
+
+    #[inline(always)]
+    unsafe fn block(&self) -> Iq3XxsRuns {
+        unsafe {
+            use std::arch::x86_64::*;
+            // Word `ib` of the tail: four seven-bit sign groups, then the run's four-bit scale.
+            let tails = _mm256_loadu_si256(self.qs.as_ptr().add(QK_K / 4) as *const __m256i);
+            let odd = _mm256_or_si256(
+                _mm256_slli_epi32(_mm256_srli_epi32(tails, 28), 1),
+                _mm256_set1_epi32(1),
+            );
+            let odd = _mm256_or_si256(odd, _mm256_slli_epi32(odd, 16));
+            // Group `l` moved to byte `l`.
+            let group = |l: i32, shifted: __m256i| {
+                _mm256_and_si256(shifted, _mm256_set1_epi32(0x7F << (8 * l)))
+            };
+            let groups = _mm256_or_si256(
+                _mm256_or_si256(group(0, tails), group(1, _mm256_slli_epi32(tails, 1))),
+                _mm256_or_si256(
+                    group(2, _mm256_slli_epi32(tails, 2)),
+                    group(3, _mm256_slli_epi32(tails, 3)),
+                ),
+            );
+            // Bit 0 of each byte becomes the parity of its byte.
+            let mut parity = _mm256_xor_si256(groups, _mm256_srli_epi32(groups, 4));
+            parity = _mm256_xor_si256(parity, _mm256_srli_epi32(parity, 2));
+            parity = _mm256_xor_si256(parity, _mm256_srli_epi32(parity, 1));
+            let parity = _mm256_and_si256(parity, _mm256_set1_epi8(1));
+            let signs = _mm256_or_si256(groups, _mm256_slli_epi32(parity, 7));
+            let mut runs = Iq3XxsRuns {
+                signs: [0; QK_K / 32],
+                scales: [0; QK_K / 32],
+            };
+            _mm256_storeu_si256(runs.signs.as_mut_ptr() as *mut __m256i, signs);
+            _mm256_storeu_si256(runs.scales.as_mut_ptr() as *mut __m256i, odd);
+            runs
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn grid_run<const IB: usize>(
+        &self,
+        block: &Iq3XxsRuns,
+    ) -> (
+        std::arch::x86_64::__m256i,
+        std::arch::x86_64::__m256i,
+        std::arch::x86_64::__m256i,
+    ) {
+        unsafe {
+            let mags =
+                super::iq_grid_rows::table_u32_by_bytes::<IB>(&IQ3XXS_GRID, self.qs.as_ptr());
+            (
+                mags,
+                super::iq_grid_rows::run_negate_spread(super::iq_grid_rows::broadcast_u32::<IB>(
+                    block.signs.as_ptr(),
+                )),
+                super::iq_grid_rows::broadcast_u32::<IB>(block.scales.as_ptr()),
+            )
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq3Xxs], ys: &[BlockQ8K32]) -> f32 {
+    unsafe { super::iq_grid_rows::dot_grid(xs, ys) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_many_avx2(xs: &[BlockIq3Xxs], ys: &[&[BlockQ8K32]], out: &mut [f32]) {
+    unsafe { super::iq_grid_rows::dot_many_grid(xs, ys, out) }
 }
