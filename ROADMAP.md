@@ -18,7 +18,7 @@ acceptance is met and measured; until then it stays here with its state.
 | CUDA on the published cudarc crate | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
 | CPU kernels chosen at run time | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |
-| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and two cards | In progress: IQ1_M on two cards 73-97 tok/s against 78-85, on one card 53-70 tok/s (83 at best) against 70-82; UD-Q4_K_XL on one card warm 15-18 tok/s against 16-18, prefill 15-18 s against 20; on two cards 14-15 tok/s, where the reference cannot load it (its expert arena needs 72 GiB of RAM) |
+| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and two cards | In progress: IQ1_M on two cards 73-97 tok/s against 78-85, on one card 53-70 tok/s (83 at best) against 70-82; UD-Q4_K_XL on one card warm 15-18 tok/s against 16-18, prefill 15-18 s against 20; on two cards 14-15 tok/s, where the reference cannot load it (its expert arena needs 72 GiB of RAM); after a full prefill on one card 5-12 tok/s against 16-18, its hottest experts of every layer to hold in host memory |
 | A coding agent on large models | verve completing a multi-step task on the IQ1_M and UD-Q4_K_XL Qwen3.8 files and on DeepSeek V4.1, tool calls and reasoning kept apart | Done |
 | A faster test suite | The checks a change must pass in a fraction of today's time | Done: about a quarter, the rebuild in place and the slowest tests' setup shared or parallel |
 
@@ -38,7 +38,6 @@ Smaller, by priority:
 |---|---|---|
 | AVX-512 host kernels for the IQ formats | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
 | The OpenCL path brought back | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial: OpenCL kernels for the image models and a speculative driver, untouched since September |
-| Hot experts held in host memory | A file larger than the host's memory keeps its most routed experts of every layer locked in RAM, by profile, and decodes after a full prefill at the reference's speed | Planned |
 | A routing profile kept per model | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
 | Qwen3.8 IQ1_M on one card at the reference | The resumed-prompt decode at or above the reference engine's on one card | Planned |
 | Context parallelism inside the recorded step | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
