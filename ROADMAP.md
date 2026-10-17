@@ -28,7 +28,7 @@ Major, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| ROCm and Vulkan backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Planned |
+| ROCm and Vulkan backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Planned; an OpenCL path exists for the image models |
 | Coding agents beyond verve | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
 | Forecasting and tabular models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
 
@@ -37,6 +37,7 @@ Smaller, by priority:
 | Feature | Acceptance | State |
 |---|---|---|
 | AVX-512 host kernels for the IQ formats | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
+| The OpenCL path brought back | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial: OpenCL kernels for the image models and a speculative driver, untouched since September |
 | Hot experts held in host memory | A file larger than the host's memory keeps its most routed experts of every layer locked in RAM, by profile, and decodes after a full prefill at the reference's speed | Planned |
 | A routing profile kept per model | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
 | Qwen3.8 IQ1_M on one card at the reference | The resumed-prompt decode at or above the reference engine's on one card | Planned |
@@ -92,7 +93,6 @@ Smaller, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| A backend for Intel GPUs | One model served on an Intel GPU through a native path by the same placement, its memory shared with the host counted once, measured against its Vulkan path | Planned |
 | Web search and fetch tools | Built-in tools a request may enable, their calls and results logged as tool turns | Planned |
 
 ## 0.8.0
