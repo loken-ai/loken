@@ -35,6 +35,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Context parallelism: each range is attended by the card's fused flash kernel.
 - Context parallelism: a group of query heads reads its keys and values once.
 - Experts: the cache forgets a route within a few tens of tokens and follows the text in hand.
 - Tests: the gate profile rebuilds a change in place, the suite runs in half the time.

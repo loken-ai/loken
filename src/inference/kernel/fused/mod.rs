@@ -84,6 +84,11 @@ cuda_launchers! {
         q: *const c_void, k: *const c_void, v: *const c_void,
         partials: *mut f32, o: *mut c_void, batch: i32, n_head: i32, n_kv: i32,
         seq_q: i32, seq_kv: i32, head_dim: i32, nsplit: i32, scale: f32, window: i32);
+    #[link_name = "flash_prefill_parts_f16"]
+    flash_prefill_parts_f16_raw(
+        q: *const c_void, k: *const c_void, v: *const c_void,
+        partials: *mut f32, n_head: i32, n_kv: i32, seq_q: i32, seq_kv: i32,
+        head_dim: i32, nsplit: i32, scale: f32, pos_off: i32);
     loken_flash_decode_devkvlen_f16(
         q: *const c_void, k: *const c_void, v: *const c_void,
         pos_dev: *const i32, out: *mut c_void, sinks: *const f32, batch: i32,

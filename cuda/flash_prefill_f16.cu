@@ -191,7 +191,7 @@ static __device__ __forceinline__ void flash_prefill_split_inner(
     const half* __restrict__ Q, const half* __restrict__ K,
     const half* __restrict__ V, float* __restrict__ partials,
     int n_head, int n_kv, int seq_q, int seq_kv, int nsplit, float scale, int window,
-    int qblk, int head, int split, int bi, int lane)
+    int pos_off, int qblk, int head, int split, int bi, int lane)
 {
     constexpr int KSTEPS = HD / 16;
     constexpr int HCHUNK = HD / 16;
@@ -199,7 +199,6 @@ static __device__ __forceinline__ void flash_prefill_split_inner(
     const int kvh     = head / groups;
     const int q_base  = qblk * 16;
     const int Mrows   = min(16, seq_q - q_base);
-    const int pos_off = seq_kv - seq_q;
 
     // This split's KV token range, clamped to the block's causal bound.
     const int kv_causal = min(seq_kv, q_base + Mrows + pos_off);
@@ -328,11 +327,12 @@ static __device__ __forceinline__ void flash_prefill_split_inner(
 extern "C" __global__ void NAME(                                               \
     const half* __restrict__ Q, const half* __restrict__ K,                    \
     const half* __restrict__ V, float* __restrict__ partials,                  \
-    int n_head, int n_kv, int seq_q, int seq_kv, int nsplit, float scale, int window) \
+    int n_head, int n_kv, int seq_q, int seq_kv, int nsplit, float scale, int window, \
+    int pos_off)                                                               \
 {                                                                              \
     flash_prefill_split_inner<HD>(                                             \
         Q, K, V, partials, n_head, n_kv, seq_q, seq_kv, nsplit, scale, window, \
-        blockIdx.x, blockIdx.y, blockIdx.z, /*bi=*/0, threadIdx.x);            \
+        pos_off, blockIdx.x, blockIdx.y, blockIdx.z, /*bi=*/0, threadIdx.x);   \
 }
 
 FLASH_PREFILL_SPLIT_KERNEL(flash_prefill_split_hd64_kernel, 64)
@@ -393,13 +393,35 @@ extern "C" void flash_prefill_split_f16(
     if (head_dim == 128) {
         flash_prefill_split_hd128_kernel<<<g1, b1, 0, stream>>>(
             (const half*)Q, (const half*)K, (const half*)V, partials,
-            n_head, n_kv, seq_q, seq_kv, nsplit, scale, window);
+            n_head, n_kv, seq_q, seq_kv, nsplit, scale, window, seq_kv - seq_q);
         flash_prefill_combine_hd128_kernel<<<g2, b2, 0, stream>>>(partials, (half*)O, nsplit);
     } else if (head_dim == 64) {
         flash_prefill_split_hd64_kernel<<<g1, b1, 0, stream>>>(
             (const half*)Q, (const half*)K, (const half*)V, partials,
-            n_head, n_kv, seq_q, seq_kv, nsplit, scale, window);
+            n_head, n_kv, seq_q, seq_kv, nsplit, scale, window, seq_kv - seq_q);
         flash_prefill_combine_hd64_kernel<<<g2, b2, 0, stream>>>(partials, (half*)O, nsplit);
+    }
+}
+
+// The split pass alone, over keys whose positions start `pos_off` before the first query
+// row's: query row i attends key j iff j <= i + pos_off. Each row's `nsplit` partials
+// (unnormalized output, max, sum) are left in `partials` for the caller to merge.
+extern "C" void flash_prefill_parts_f16(
+    const void* Q, const void* K, const void* V, float* partials,
+    int n_head, int n_kv, int seq_q, int seq_kv, int head_dim, int nsplit,
+    float scale, int pos_off, long long stream_i64)
+{
+    cudaStream_t stream = (cudaStream_t)stream_i64;
+    const int nqblk = (seq_q + 15) / 16;
+    dim3 g1(nqblk, n_head, nsplit), b1(32, 1, 1);
+    if (head_dim == 128) {
+        flash_prefill_split_hd128_kernel<<<g1, b1, 0, stream>>>(
+            (const half*)Q, (const half*)K, (const half*)V, partials,
+            n_head, n_kv, seq_q, seq_kv, nsplit, scale, 0, pos_off);
+    } else if (head_dim == 64) {
+        flash_prefill_split_hd64_kernel<<<g1, b1, 0, stream>>>(
+            (const half*)Q, (const half*)K, (const half*)V, partials,
+            n_head, n_kv, seq_q, seq_kv, nsplit, scale, 0, pos_off);
     }
 }
 

@@ -294,6 +294,97 @@ pub fn flash_dit_bf16(
     Ok(None)
 }
 
+/// The attention of `q` `[1, n_head, seq_q, hd]` over `k`, `v` `[1, n_kv, seq_kv, hd]`, the keys'
+/// positions starting `pos_off` before the first query row's (row i attends key j iff
+/// `j <= i + pos_off`), left unnormalized: each row's maximum score and sum of exponentials,
+/// `[1, n_head, seq_q, 1]`, and its weighted values `[1, n_head, seq_q, hd]`, all F32. `None`
+/// when the device or shapes are unsupported.
+pub fn flash_prefill_parts_f16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    pos_off: i64,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    use crate::tensor::StorageView::Cuda as C;
+    use core::ffi::c_void;
+    if !q.device().is_cuda() {
+        return Ok(None);
+    }
+    let (b, n_head, seq_q, hd) = q.dims4()?;
+    let (bk, n_kv, seq_kv, hdk) = k.dims4()?;
+    if b != 1
+        || bk != 1
+        || hd != hdk
+        || (hd != 64 && hd != 128)
+        || n_kv == 0
+        || !n_head.is_multiple_of(n_kv)
+        || seq_q < 1
+        || seq_kv < 1
+        || i32::try_from(pos_off).is_err()
+    {
+        return Ok(None);
+    }
+    let q = q.to_dtype(DType::F16)?.contiguous()?;
+    let k = k.to_dtype(DType::F16)?.contiguous()?;
+    let v = v.to_dtype(DType::F16)?.contiguous()?;
+    let nsplit = pick_prefill_nsplit(n_head, seq_q, seq_kv);
+    let parts = unsafe {
+        Tensor::empty(
+            (n_head * seq_q * nsplit * (hd + 2),),
+            DType::F32,
+            &q.device(),
+        )?
+    };
+    let dev = q.device().as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    {
+        let (qs, ql) = q.storage_and_layout();
+        let (ks, kl) = k.storage_and_layout();
+        let (vs, vl) = v.storage_and_layout();
+        let (pas, _) = parts.storage_and_layout();
+        let (C(qc), C(kc), C(vc), C(pac)) = (&*qs, &*ks, &*vs, &*pas) else {
+            return Ok(None);
+        };
+        let qsl = qc.as_cuda_slice::<half::f16>()?;
+        let ksl = kc.as_cuda_slice::<half::f16>()?;
+        let vsl = vc.as_cuda_slice::<half::f16>()?;
+        let pasl = pac.as_cuda_slice::<f32>()?;
+        let qp = (qsl.device_ptr(qsl.stream()).0 + (ql.start_offset() * 2) as u64) as *const c_void;
+        let kp = (ksl.device_ptr(ksl.stream()).0 + (kl.start_offset() * 2) as u64) as *const c_void;
+        let vp = (vsl.device_ptr(vsl.stream()).0 + (vl.start_offset() * 2) as u64) as *const c_void;
+        let pap = pasl.device_ptr(pasl.stream()).0 as *mut f32;
+        unsafe {
+            flash_prefill_parts_f16_raw(
+                qp,
+                kp,
+                vp,
+                pap,
+                n_head as i32,
+                n_kv as i32,
+                seq_q as i32,
+                seq_kv as i32,
+                hd as i32,
+                nsplit as i32,
+                scale,
+                pos_off as i32,
+                stream,
+            );
+        }
+    }
+    // The splits of a row merged by their maxima; a split no key reached has a maximum of minus
+    // infinity, taken as the least finite value so its weight is finite and its sum zero.
+    let parts = parts.reshape((1, n_head, seq_q, nsplit, hd + 2))?;
+    let m = parts.narrow(4, hd, 1)?;
+    let m = m.maximum(&Tensor::new(f32::MIN, &q.device())?.broadcast_as(m.shape())?)?;
+    let top = m.max_keepdim(3)?;
+    let w = m.broadcast_sub(&top)?.exp()?;
+    let sum = (parts.narrow(4, hd + 1, 1)? * &w)?.sum(3)?;
+    let out = parts.narrow(4, 0, hd)?.broadcast_mul(&w)?.sum(3)?;
+    Ok(Some((top.reshape((1, n_head, seq_q, 1))?, sum, out)))
+}
+
 /// (no repeat_kv, no mask tensor read). See cuda/flash_prefill_f16.cu.
 ///
 /// `q`: `[b, n_head, seq_q, hd]`; `k`/`v`: `[b, n_kv, seq_kv, hd]` (all F16). The

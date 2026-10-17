@@ -80,6 +80,16 @@ pub fn flash_decode_devkvlen(
     Ok(None)
 }
 
+pub fn flash_prefill_parts_f16(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _scale: f32,
+    _pos_off: i64,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    Ok(None)
+}
+
 pub fn silu_mul_f16(_g: &Tensor, _u: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
 }

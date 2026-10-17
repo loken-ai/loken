@@ -70,6 +70,25 @@ pub fn partial(
     })
 }
 
+/// The part of `q` over `k`, `v` as [`partial`] makes it, by the card's fused attention when it
+/// takes these shapes.
+fn part_of(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    q_pos: usize,
+    k_pos: usize,
+) -> Result<Part> {
+    let pos_off = q_pos as i64 - k_pos as i64;
+    if let Some((max, sum, out)) =
+        crate::inference::kernel::fused::flash_prefill_parts_f16(q, k, v, scale as f32, pos_off)?
+    {
+        return Ok(Part { max, sum, out });
+    }
+    partial(q, k, v, scale, q_pos, k_pos)
+}
+
 /// `acc` and `p` as one part on `dev`: both rescaled to the greater maximum and added.
 pub fn merge(acc: Option<Part>, p: Part, dev: &Device) -> Result<Part> {
     let p = Part {
@@ -381,9 +400,17 @@ impl ContextShards {
         let mut acc: Option<Part> = None;
         let (_, h, rows, d) = q.dims4()?;
         // The keys a block holds: the bytes a block may take over what each key costs.
-        let block = (self.scores_bytes / bytes_per_key(h, self.h_kv, d, rows)).max(1);
+        // On a card a block costs its keys and values made whole; the fallback holds its scores.
+        let per_key = |dev: &Device| {
+            if dev.is_cuda() {
+                2 * self.h_kv * d * 2
+            } else {
+                bytes_per_key(h, self.h_kv, d, rows)
+            }
+        };
         for s in self.shards.iter().filter(|s| s.len > 0) {
             let q_here = q.to_device(&s.dev)?;
+            let block = (self.scores_bytes / per_key(&s.dev)).max(1);
             let mut seg_from = 0;
             for seg in &s.segs {
                 if seg_from >= s.len {
@@ -398,7 +425,7 @@ impl ContextShards {
                     if k_pos < q_pos + rows {
                         let heads =
                             |t: &Tensor| t.narrow(1, from, n)?.transpose(1, 2)?.contiguous();
-                        let part = partial(
+                        let part = part_of(
                             &q_here,
                             &heads(&seg.k)?,
                             &heads(&seg.v)?,
@@ -446,6 +473,51 @@ mod tests {
 
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// The card's fused part matches the portable one: the attention it stands for and the
+    /// log-sum-exp of its scores, for a range before every row, one across the diagonal and a
+    /// decoded row.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_cards_part_is_the_portable_part() {
+        let Ok(card) = Device::new_cuda(0) else {
+            return;
+        };
+        let (h, h_kv, d) = (8usize, 2usize, 128usize);
+        // (query rows, keys, first row's position, first key's position)
+        for (s, t, q_pos, k_pos) in [(40, 70, 100, 10), (40, 70, 30, 0), (1, 300, 500, 200)] {
+            let q = t4([1, h, s, d], 21).to_device(&card).unwrap();
+            let k = t4([1, h_kv, t, d], 22).to_device(&card).unwrap();
+            let v = t4([1, h_kv, t, d], 23).to_device(&card).unwrap();
+            let scale = 1.0 / (d as f64).sqrt();
+            let pos_off = q_pos as i64 - k_pos as i64;
+            let ran = crate::inference::kernel::fused::flash_prefill_parts_f16(
+                &q,
+                &k,
+                &v,
+                scale as f32,
+                pos_off,
+            )
+            .unwrap();
+            assert!(ran.is_some(), "the card runs the fused part");
+            let fused = part_of(&q, &k, &v, scale, q_pos, k_pos).unwrap();
+            let portable = partial(&q, &k, &v, scale, q_pos, k_pos).unwrap();
+            let worst = |a: &Tensor, b: &Tensor| {
+                flat(&a.to_device(&Device::Cpu).unwrap())
+                    .iter()
+                    .zip(&flat(&b.to_device(&Device::Cpu).unwrap()))
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max)
+            };
+            let lse = |p: &Part| (p.max.clone() + p.sum.log().unwrap()).unwrap();
+            let att = worst(&finish(&fused).unwrap(), &finish(&portable).unwrap());
+            let lse = worst(&lse(&fused), &lse(&portable));
+            assert!(
+                att < 2e-2 && lse < 2e-2,
+                "{s}x{t} at {q_pos}/{k_pos}: attention {att}, lse {lse}"
+            );
+        }
     }
 
     /// The parts of a cache cut in three ranges make the attention of the whole cache, for a
