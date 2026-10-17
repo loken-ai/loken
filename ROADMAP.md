@@ -18,7 +18,7 @@ acceptance is met and measured; until then it stays here with its state.
 | CUDA on the published cudarc crate | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
 | CPU kernels chosen at run time | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |
-| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and two cards | In progress: IQ1_M on two cards 73-97 tok/s against 78-85, on one card 52-60 tok/s (83 at best) against 70-82; UD-Q4_K_XL on one card warm 15-18 tok/s against 16-18, prefill 15-18 s against 20; on two cards 14-15 tok/s, where the reference cannot load it (its expert arena needs 72 GiB of RAM) |
+| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and two cards | In progress: IQ1_M on two cards 73-97 tok/s against 78-85, on one card 53-70 tok/s (83 at best) against 70-82; UD-Q4_K_XL on one card warm 15-18 tok/s against 16-18, prefill 15-18 s against 20; on two cards 14-15 tok/s, where the reference cannot load it (its expert arena needs 72 GiB of RAM) |
 | A coding agent on large models | verve completing a multi-step task on the IQ1_M and UD-Q4_K_XL Qwen3.8 files and on DeepSeek V4.1, tool calls and reasoning kept apart | Done |
 | A faster test suite | The checks a change must pass in a fraction of today's time | Done: about a quarter, the rebuild in place and the slowest tests' setup shared or parallel |
 
