@@ -28,4 +28,5 @@ acceptance is met and measured; until then it stays here with its state.
 |---|---|---|
 | A backend for AMD cards | One model served on an AMD card through the same placement path, measured against the reference engine on that card | Planned |
 | Coding agents beyond verve | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
+| Hot experts held in host memory | A file larger than the host's memory keeps its most routed experts of every layer locked in RAM, by profile, and decodes after a full prefill at the reference's speed | Planned |
 | Forecasting and tabular models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
