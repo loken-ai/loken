@@ -830,7 +830,10 @@ pub(super) fn verify_recorded(
         let _ = stream.synchronize();
     }
     let g = match VerifyGraph::capture(model, rows) {
-        Ok(g) => g,
+        Ok(g) => {
+            model.note_graphs_recorded();
+            g
+        }
         Err(e) => {
             let _ = stream.synchronize();
             give_up(model, graphs, format!("capture: {e}"));

@@ -728,6 +728,7 @@ impl LlmEngine {
                     state.model.suspend_graph_captured();
                 } else {
                     state.kept_graphs.clear();
+                    state.model.note_graphs_kept(None);
                     state.model.invalidate_graph_state();
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -2916,6 +2917,7 @@ impl LlmEngine {
                             verify: verify_graphs,
                         };
                         s.kept_graphs.keep(graphs, Some(at));
+                        s.model.note_graphs_kept(Some(at.1));
                     }
                     (g, l, _) => {
                         let recorded = g.is_some() || !verify_graphs.is_empty();

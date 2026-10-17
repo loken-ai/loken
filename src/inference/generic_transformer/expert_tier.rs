@@ -343,6 +343,10 @@ pub struct CardStager {
     free_after_return: Mutex<Option<(u64, u64)>>,
     /// A prefill lent the slots since then: what the card lost meanwhile is the prefill's.
     lent_since_return: std::sync::atomic::AtomicBool,
+    /// What a decode that recorded no graph was seen to take, apart from [`Self::decode_need`].
+    replay_need: Mutex<Option<u64>>,
+    /// A graph was recorded since the slots came back.
+    recorded_since_return: std::sync::atomic::AtomicBool,
 }
 
 /// One of two sets of arenas, a stack each, that consecutive layers take turns over.
@@ -870,6 +874,18 @@ impl super::GenericHeteroTransformer {
 }
 
 impl super::GenericHeteroTransformer {
+    /// The generation of the graphs the engine keeps for the next request, `None` for none.
+    pub fn note_graphs_kept(&mut self, at: Option<u64>) {
+        self.kept_graphs_at = at;
+    }
+
+    /// A graph was recorded: the decode's room is measured as a recording one's.
+    pub fn note_graphs_recorded(&self) {
+        for s in self.card_stagers() {
+            s.note_recorded();
+        }
+    }
+
     /// Take the memory the caches lent to a prefill of `tokens` rows back to the cards, when the
     /// prefill needs more than they have free: every layer's extra slots are freed. How many
     /// layers lent.
@@ -984,11 +1000,13 @@ impl super::GenericHeteroTransformer {
         crate::inference::place::ladder::release_pools();
         let mut moved = false;
         // What each card's slots may take back, spent layer by layer.
+        // The graphs kept for the next decode are still current: it records nothing.
+        let replay = self.kept_graphs_at == Some(self.graph_generation());
         let mut room: Vec<(Arc<CardStager>, u64)> = self
             .card_stagers()
             .into_iter()
             .map(|s| {
-                let r = s.room_for_extra();
+                let r = s.room_for_extra(replay);
                 (s, r)
             })
             .collect();
@@ -2607,6 +2625,8 @@ impl CardStager {
             decode_need: Mutex::new(None),
             free_after_return: Mutex::new(None),
             lent_since_return: std::sync::atomic::AtomicBool::new(false),
+            replay_need: Mutex::new(None),
+            recorded_since_return: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -2632,20 +2652,41 @@ impl CardStager {
             .map_or(0, |d| crate::tensor::cuda::pool_peak(d.0.ordinal()))
             .saturating_sub(pool_then);
         let took = lost.max(peak);
-        let mut need = self.decode_need.lock().unwrap_or_else(|e| e.into_inner());
+        // A decode that recorded its graphs takes their buffers and the recording's transients;
+        // one that only replayed graphs kept from before takes what a replay needs.
+        let recorded = self.recorded_since_return.swap(false, Ordering::AcqRel);
+        let cell = if recorded {
+            &self.decode_need
+        } else {
+            &self.replay_need
+        };
+        let mut need = cell.lock().unwrap_or_else(|e| e.into_inner());
         if need.is_none_or(|n| took > n) {
             tracing::info!(
-                "expert tier: a decode took {:.2} GB of the card; the extra slots leave that free",
+                "expert tier: a decode {} took {:.2} GB of the card; the extra slots leave that free",
+                if recorded { "that recorded its graphs" } else { "that replayed kept graphs" },
                 took as f64 / 1e9
             );
             *need = Some(took);
         }
     }
 
+    /// Marks the span since the last return as one where a graph was recorded.
+    pub fn note_recorded(&self) {
+        self.recorded_since_return.store(true, Ordering::Release);
+    }
+
     /// The bytes the extra slots may take back now: the card's free memory less what a decode
-    /// was seen to take, nothing before a decode has been measured.
-    pub fn room_for_extra(&self) -> u64 {
-        match *self.decode_need.lock().unwrap_or_else(|e| e.into_inner()) {
+    /// was seen to take, a replaying one's when `replay` (the decode replays kept graphs and
+    /// one was measured), nothing before a decode has been measured.
+    pub fn room_for_extra(&self, replay: bool) -> u64 {
+        let replayed = *self.replay_need.lock().unwrap_or_else(|e| e.into_inner());
+        let recorded = *self.decode_need.lock().unwrap_or_else(|e| e.into_inner());
+        let need = match replay {
+            true => replayed.or(recorded),
+            false => recorded,
+        };
+        match need {
             Some(need) => {
                 crate::inference::place::expert_cache::free_now(&self.dev).saturating_sub(need)
             }

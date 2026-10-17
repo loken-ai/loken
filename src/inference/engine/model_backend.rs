@@ -844,6 +844,12 @@ pub(crate) trait ModelBackend: Send {
     /// the capture-time seq ceiling. Default no-op for non-graph backends.
     fn mark_graph_captured(&mut self) {}
 
+    /// The generation of the graphs the engine keeps for the next request, `None` for none.
+    fn note_graphs_kept(&mut self, _at: Option<u64>) {}
+
+    /// A graph of the decode was recorded.
+    fn note_graphs_recorded(&mut self) {}
+
     /// Engine hook after each graph-replayed decode token: sync host-side
     /// KV bookkeeping (`current_seq_len`) to the post-token length `_len`.
     /// Replays advance the quantized caches device-side only; without this
@@ -2112,7 +2118,20 @@ impl ModelBackend for GenericBackend {
 
     #[cfg(feature = "cuda")]
     fn mark_graph_captured(&mut self) {
+        self.0.note_graphs_recorded();
         self.0.mark_graph_captured()
+    }
+
+    fn note_graphs_kept(&mut self, at: Option<u64>) {
+        #[cfg(feature = "cuda")]
+        self.0.note_graphs_kept(at);
+        #[cfg(not(feature = "cuda"))]
+        let _ = at;
+    }
+
+    fn note_graphs_recorded(&mut self) {
+        #[cfg(feature = "cuda")]
+        self.0.note_graphs_recorded();
     }
 
     #[cfg(feature = "cuda")]

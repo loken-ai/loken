@@ -447,6 +447,8 @@ pub struct GenericHeteroTransformer {
     /// The hot experts locked in host memory, when the tiered layers do not fit it whole.
     #[cfg(feature = "cuda")]
     hot_locks: Option<Arc<expert_tier::HotLocks>>,
+    /// The graph generation of the graphs the engine keeps for the next request.
+    kept_graphs_at: Option<u64>,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     /// The stored embedding table on each card of the plan, when its format is gathered there:

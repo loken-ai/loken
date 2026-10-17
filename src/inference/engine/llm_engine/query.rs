@@ -290,6 +290,7 @@ impl LlmEngine {
         #[cfg(feature = "cuda")]
         if !s.kept_graphs.is_empty() {
             s.kept_graphs.clear();
+            s.model.note_graphs_kept(None);
             s.model.invalidate_graph_state();
         }
         let taken: BoxedModelBackend = std::mem::replace(&mut s.model, Box::new(TakenBackend));

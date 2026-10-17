@@ -765,6 +765,7 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         #[cfg(feature = "cuda")]
         if !state.kept_graphs.is_empty() {
             state.kept_graphs.clear();
+            state.model.note_graphs_kept(None);
             state.model.invalidate_graph_state();
         }
         let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));
@@ -817,6 +818,7 @@ pub(super) fn demote_to_serial(state: &mut LoadedModelState) -> bool {
         #[cfg(feature = "cuda")]
         if !state.kept_graphs.is_empty() {
             state.kept_graphs.clear();
+            state.model.note_graphs_kept(None);
             state.model.invalidate_graph_state();
         }
         let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));

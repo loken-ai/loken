@@ -295,6 +295,7 @@ impl LlmEngine {
             } else {
                 #[cfg(feature = "cuda")]
                 state.kept_graphs.clear();
+                state.model.note_graphs_kept(None);
                 state.model.invalidate_graph_state();
             }
 
@@ -1927,6 +1928,7 @@ impl LlmEngine {
                     (Some(g), Some(l), Some(at)) => {
                         let graphs = super::decode::DecodeGraphs { step: Some((g, l)), verify: verify_graphs };
                         state.kept_graphs.keep(graphs, Some(at));
+                        state.model.note_graphs_kept(Some(at.1));
                     }
                     (g, l, _) => {
                         let captured = g.is_some() || !verify_graphs.is_empty();
@@ -2194,6 +2196,7 @@ impl LlmEngine {
             // The graphs kept from it go first, with the buffers they read.
             #[cfg(feature = "cuda")]
             state.kept_graphs.clear();
+            state.model.note_graphs_kept(None);
             state.model.invalidate_graph_state();
 
             let prefill_start = std::time::Instant::now();
@@ -2417,6 +2420,7 @@ impl LlmEngine {
             // Request-start graph hygiene (see generate_with_grammar).
             #[cfg(feature = "cuda")]
             state.kept_graphs.clear();
+            state.model.note_graphs_kept(None);
             state.model.invalidate_graph_state();
 
             let x =
