@@ -1666,6 +1666,18 @@ impl LlmEngine {
                             None => Vec::new(),
                         }
                     } else {
+                        // Before the step is recorded the head drafts nothing, but reads the
+                        // step's pair so that its history follows the sequence.
+                        if head_on
+                            && !step_recorded
+                            && !graph_disabled_this_request
+                            && !head_tokens.is_empty()
+                        {
+                            if let Some(s) = model_state.blocking_lock().as_mut() {
+                                let _ = s.model.draft_head_tokens(&head_tokens, 0, 0.0);
+                            }
+                            head_tokens.clear();
+                        }
                         Vec::new()
                     };
                     let head_draft_secs = head_draft_started.elapsed().as_secs_f64();
