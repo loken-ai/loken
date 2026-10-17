@@ -28,7 +28,7 @@ Major, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| A backend for AMD cards | One model served on an AMD card through the same placement path, measured against the reference engine on that card | Planned |
+| ROCm and Vulkan backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA and an AMD card, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Planned |
 | Coding agents beyond verve | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
 | Forecasting and tabular models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
 
@@ -48,9 +48,9 @@ Major, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| A Vulkan backend | One model of each family served through Vulkan by the same placement path on an NVIDIA and an AMD card, measured against the CUDA path and the reference engine on the same cards | Planned |
 | Throughput serving | Continuous batching with chunked prefill and multi-step scheduling: a concurrent load of many requests served at the reference server's throughput on the same card | Planned |
 | Video input | A video turn read by a model's vision tower, frames sampled by the model's own rule, answers matching the reference implementation | Planned |
+| Speculation for every model | A draft model or head found or built for any served model, its windows verified as a tree, faster than plain decode on each family | Planned |
 
 Smaller, by priority:
 
@@ -86,15 +86,13 @@ Major, by priority:
 | Feature | Acceptance | State |
 |---|---|---|
 | A native Windows server | The server built, installed and run as a service on Windows with CUDA, at the Linux build's speed on the same card | Planned |
-| Speculation for every model | A draft model or head found or built for any served model, its windows verified as a tree, faster than plain decode on each family | Planned |
+| Quantisation from the command line | A checkpoint quantised to a chosen format with an importance matrix, its quality scored against the original | Planned |
 
 Smaller, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| A backend for Intel cards | One model served on an Intel GPU through the same placement path | Planned |
 | Web search and fetch tools | Built-in tools a request may enable, their calls and results logged as tool turns | Planned |
-| Quantisation from the command line | A checkpoint quantised to a chosen format with an importance matrix, its quality scored against the original | Planned |
 
 ## 0.8.0
 
@@ -120,3 +118,4 @@ to measure it on is available.
 | Feature | Acceptance | Needs |
 |---|---|---|
 | A backend for Apple silicon | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | An M-series Mac |
+| A backend for Intel cards | One model served on an Intel GPU through a native path by the same placement, measured against its Vulkan path | An Intel GPU |
