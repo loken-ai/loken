@@ -46,6 +46,9 @@ Smaller, by priority:
 | Media input limits | Per-request caps on images, pixels and audio seconds, stated in the docs, a request past one answered 400 with the reason | Planned |
 | Images by URL on the Messages API | An image block with a URL source fetched within the host allowlist and answered | Planned |
 | Multimodal parts on the Responses API | Image and audio input items answered as on chat completions, covered by a test | Planned |
+| Generated audio as mp3 and flac | The audio generations route answers the format asked, mp3 and flac besides wav, as the speech route does | Planned |
+| MIDI at the tempo asked | A MIDI render carries the tempo the request names instead of a fixed one | Planned |
+| Audio models in half precision | The Stable Audio, EzAudio and ACE-Step weights held in F16 rather than widened to F32, Stable Audio resident in 2.5 GB at most | Planned |
 
 ## 0.5.0
 
@@ -68,6 +71,10 @@ Smaller, by priority:
 | Streamed speech | The first audio chunk of a speech request within half a second, opus, flac and aac besides wav and mp3 | Planned |
 | Audio from a chat turn | A chat completion asking for text and audio modalities returns the audio in its message | Planned |
 | Concurrent media requests | Two image or speech requests on one card finish sooner together than one after the other | Planned |
+| Streamed music | A streamed music request's first audio bytes arrive before the render ends, within a fifth of its time | Planned |
+| Several takes at once | n renders with different seeds in less than n times one render's time, each listed in the answer | Planned |
+| Audio-conditioned sound | A reference clip conditions Stable Audio and EzAudio, a repaint keeping the clip outside its span (SNR above 30 dB) | Planned |
+| MIDI in | A MIDI file given as the prompt continues for the bars asked, in its tempo and key | Planned |
 
 ## 0.6.0
 
@@ -88,6 +95,9 @@ Smaller, by priority:
 | Encoder-decoder models | A sequence-to-sequence family served for text and speech, matching the reference implementation | Planned |
 | Vision and video speed | A one-megapixel image's first token within 1.2x of the reference engines, a video clip's time within 1.2x with its decoder on the card | Planned |
 | Image and sound quality measured | Image families scored by PSNR or LPIPS against their reference, music and sound families by a committed metric set | Planned |
+| Longer sound | A sound or Stable Audio request past today's caps renders its whole length without an audible seam | Planned |
+| Another music family | One more open music family rendering through the audio generations route on the placement ladder | Planned |
+| Audio speed published | The real-time factor of each music and sound family on a named card in the benchmarks | Planned |
 
 ## 0.7.0
 
