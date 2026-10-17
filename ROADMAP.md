@@ -24,9 +24,90 @@ acceptance is met and measured; until then it stays here with its state.
 
 ## 0.4.0
 
+Major, by priority:
+
 | Feature | Acceptance | State |
 |---|---|---|
 | A backend for AMD cards | One model served on an AMD card through the same placement path, measured against the reference engine on that card | Planned |
 | Coding agents beyond verve | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
-| Hot experts held in host memory | A file larger than the host's memory keeps its most routed experts of every layer locked in RAM, by profile, and decodes after a full prefill at the reference's speed | Planned |
 | Forecasting and tabular models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
+
+Smaller, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| AVX-512 host kernels for the IQ formats | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
+| Hot experts held in host memory | A file larger than the host's memory keeps its most routed experts of every layer locked in RAM, by profile, and decodes after a full prefill at the reference's speed | Planned |
+| A routing profile kept per model | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
+| Qwen3.8 IQ1_M on one card at the reference | The resumed-prompt decode at or above the reference engine's on one card | Planned |
+| Context parallelism inside the recorded step | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
+
+## 0.5.0
+
+Major, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| A backend for Apple silicon | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | Planned |
+| Throughput serving | Continuous batching with chunked prefill and multi-step scheduling: a concurrent load of many requests served at the reference server's throughput on the same card | Planned |
+| Video input | A video turn read by a model's vision tower, frames sampled by the model's own rule, answers matching the reference implementation | Planned |
+
+Smaller, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| Sleep mode | A model unloaded to host memory on idle and back on the next request, the reload time logged | Planned |
+| Per-request metrics | Queue, prefill, decode and cache figures per request on the metrics endpoint | Planned |
+| Beam search | n beams with length penalty, the result equal to the reference implementation's | Planned |
+| Prompt embeddings | A request that hands embeddings instead of tokens, answered as for the tokens they stand for | Planned |
+
+## 0.6.0
+
+Major, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| A cluster that survives a node | A node lost mid-request re-planned onto the others and the request finished, the loss reported | Planned |
+| Tensor parallelism across machines | One layer split over cards of several machines where the measured links pay, faster than the layer cut alone | Planned |
+| More weight formats | GPTQ, AWQ and BitsAndBytes checkpoints loaded through the same placement, outputs matching the reference implementation | Planned |
+
+Smaller, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| Adapters per request | Several text adapters served over one base model, each request naming its own | Planned |
+| Pooling and classification | The classify, score and pooling routes over the loaded models | Planned |
+| Encoder-decoder models | A sequence-to-sequence family served for text and speech, matching the reference implementation | Planned |
+
+## 0.7.0
+
+Major, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| A native Windows server | The server built, installed and run as a service on Windows with CUDA, at the Linux build's speed on the same card | Planned |
+| Speculation for every model | A draft model or head found or built for any served model, its windows verified as a tree, faster than plain decode on each family | Planned |
+
+Smaller, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| A backend for Intel cards | One model served on an Intel GPU through the same placement path | Planned |
+| Web search and fetch tools | Built-in tools a request may enable, their calls and results logged as tool turns | Planned |
+| Quantisation from the command line | A checkpoint quantised to a chosen format with an importance matrix, its quality scored against the original | Planned |
+
+## 0.8.0
+
+Major, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| Fine-tuning of adapters | A text adapter trained on the local cards from a dataset, served at once, its loss and quality measured | Planned |
+| loken as a tool server | loken's models and media pipelines offered to agents as MCP tools, each call within the server's limits | Planned |
+
+Smaller, by priority:
+
+| Feature | Acceptance | State |
+|---|---|---|
+| Energy-aware placement | A placement that trades speed for watts when asked, both measured | Planned |
+| Quotas per key | Token and request budgets per API key, enforced and reported | Planned |
