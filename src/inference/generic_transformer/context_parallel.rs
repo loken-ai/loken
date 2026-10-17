@@ -7,6 +7,17 @@
 
 use crate::tensor::{DType, Device, Result, Tensor, D};
 
+/// Tensors as large as a block of scores that [`partial`] keeps live at once: the products, the
+/// scaled and masked scores, and their exponentials.
+const SCORE_TEMPORARIES: usize = 3;
+
+/// Bytes [`partial`] holds for each key of a block, for `rows` query rows of `h` heads over
+/// `h_kv` key-value heads of width `d`: the scores and mask, the block's F16 view made whole,
+/// its F32 keys and values, their heads repeated and the keys transposed.
+fn bytes_per_key(h: usize, h_kv: usize, d: usize, rows: usize) -> usize {
+    SCORE_TEMPORARIES * h * rows * 4 + rows * 4 + 2 * h_kv * d * (2 + 4) + 3 * h * d * 4
+}
+
 /// What one range of the cache gives a query: per query head and row, the scores' maximum
 /// `max` `[b, h, s, 1]`, the sum of their exponentials from it `sum` `[b, h, s, 1]`, and the
 /// values weighed by them `out` `[b, h, s, d]`, not divided by the sum.
@@ -61,36 +72,48 @@ pub fn partial(
     })
 }
 
-/// The attention the parts of every range make together, `[b, h, s, d]` on `dev`.
-pub fn combine(parts: &[Part], dev: &Device) -> Result<Tensor> {
-    let first = parts
-        .first()
-        .ok_or_else(|| crate::tensor::Error::msg("context parallel: no range to combine"))?;
-    let on = |t: &Tensor| t.to_device(dev);
-    let mut max = on(&first.max)?;
-    for p in &parts[1..] {
-        max = max.maximum(&on(&p.max)?)?;
-    }
-    let mut sum: Option<Tensor> = None;
-    let mut out: Option<Tensor> = None;
-    for p in parts {
-        let scale = on(&p.max)?.broadcast_sub(&max)?.exp()?;
-        let s = on(&p.sum)?.broadcast_mul(&scale)?;
-        let o = on(&p.out)?.broadcast_mul(&scale)?;
-        sum = Some(match sum {
-            Some(acc) => (acc + s)?,
-            None => s,
-        });
-        out = Some(match out {
-            Some(acc) => (acc + o)?,
-            None => o,
-        });
-    }
-    let (sum, out) = (
-        sum.expect("one part at least"),
-        out.expect("one part at least"),
+/// `acc` and `p` as one part on `dev`: both rescaled to the greater maximum and added.
+pub fn merge(acc: Option<Part>, p: Part, dev: &Device) -> Result<Part> {
+    let p = Part {
+        max: p.max.to_device(dev)?,
+        sum: p.sum.to_device(dev)?,
+        out: p.out.to_device(dev)?,
+    };
+    let Some(acc) = acc else {
+        return Ok(p);
+    };
+    let max = acc.max.maximum(&p.max)?;
+    let (a, b) = (
+        acc.max.broadcast_sub(&max)?.exp()?,
+        p.max.broadcast_sub(&max)?.exp()?,
     );
-    out.broadcast_div(&sum)
+    Ok(Part {
+        sum: (acc.sum.broadcast_mul(&a)? + p.sum.broadcast_mul(&b)?)?,
+        out: (acc.out.broadcast_mul(&a)? + p.out.broadcast_mul(&b)?)?,
+        max,
+    })
+}
+
+/// The attention a merged part stands for, `[b, h, s, d]`.
+pub fn finish(part: &Part) -> Result<Tensor> {
+    part.out.broadcast_div(&part.sum)
+}
+
+/// The attention the parts of every range make together, `[b, h, s, d]` on `dev`.
+#[cfg(test)]
+fn combine(parts: &[Part], dev: &Device) -> Result<Tensor> {
+    let mut acc = None;
+    for p in parts {
+        let p = Part {
+            max: p.max.clone(),
+            sum: p.sum.clone(),
+            out: p.out.clone(),
+        };
+        acc = Some(merge(acc, p, dev)?);
+    }
+    let acc =
+        acc.ok_or_else(|| crate::tensor::Error::msg("context parallel: no range to combine"))?;
+    finish(&acc)
 }
 
 /// `x` `[b, h_kv, t, d]` with each head repeated `n` times in place: `[b, h_kv * n, t, d]`.
@@ -126,52 +149,86 @@ fn causal_mask(
     Ok(Some(Tensor::from_vec(m, (s, t), dev)?))
 }
 
-/// One card's range of a layer's cache: the positions `start..start + len` as F16 keys and
-/// values `[1, h_kv, len, d]`, room for `cap` positions.
+/// One block of a range: `cap` positions of F16 keys and values `[1, cap, h_kv, d]`,
+/// position-major so a run of positions is a view.
+struct Seg {
+    k: Tensor,
+    v: Tensor,
+    cap: usize,
+}
+
+/// One card's range of a layer's cache: the positions `start..start + len`, held in its blocks
+/// in order. A block is written in place and kept from request to request.
 struct Shard {
     dev: Device,
+    /// The most positions the range takes.
     cap: usize,
     start: usize,
-    k: Option<Tensor>,
-    v: Option<Tensor>,
+    len: usize,
+    segs: Vec<Seg>,
+    /// No block can be added: the card would keep less than the ranges leave it.
+    closed: bool,
 }
 
 impl Shard {
-    fn len(&self) -> usize {
-        self.k.as_ref().map_or(0, |k| k.dims()[2])
+    /// Positions the range's blocks hold.
+    fn held(&self) -> usize {
+        self.segs.iter().map(|s| s.cap).sum()
     }
 }
 
-/// A layer's cache cut into ranges of positions over several cards, filled in order: the first
-/// card's range, then the next one's once it is full.
+/// A layer's cache cut into ranges of positions over several cards, filled in order. A request
+/// reserves its blocks before its prefill (see [`ContextShards::reserve_on`]); past them, a range
+/// grows a block of `seg` positions at a time while its card keeps `keep_free` bytes and no later
+/// range has room left, then the next card's range takes the positions that follow.
 pub struct ContextShards {
     shards: Vec<Shard>,
-    /// The most bytes one block of scores may take: a range is read a block of keys at a time.
+    h_kv: usize,
+    d: usize,
+    /// Positions a block grown past the reserve holds.
+    seg: usize,
+    /// Bytes each card keeps free beside the ranges.
+    keep_free: u64,
+    /// The most bytes one block of keys may take: a range is read a block at a time.
     scores_bytes: usize,
 }
 
 impl ContextShards {
-    /// Ranges on `cards`, each with room for its count of positions, in that order; a block of
-    /// scores takes at most `scores_bytes`.
-    pub fn new(cards: Vec<(Device, usize)>, scores_bytes: usize) -> Self {
+    /// Ranges of `h_kv` heads of width `d` on `cards`, each holding at most its count of
+    /// positions; see the type for `seg` and `keep_free`. A block of scores takes at most
+    /// `scores_bytes`.
+    pub fn new(
+        cards: Vec<(Device, usize)>,
+        h_kv: usize,
+        d: usize,
+        seg: usize,
+        keep_free: u64,
+        scores_bytes: usize,
+    ) -> Self {
+        let shards = cards
+            .into_iter()
+            .map(|(dev, cap)| Shard {
+                dev,
+                cap,
+                start: 0,
+                len: 0,
+                segs: Vec::new(),
+                closed: false,
+            })
+            .collect();
         Self {
+            shards,
+            h_kv,
+            d,
+            seg: seg.max(1),
+            keep_free,
             scores_bytes,
-            shards: cards
-                .into_iter()
-                .map(|(dev, cap)| Shard {
-                    dev,
-                    cap,
-                    start: 0,
-                    k: None,
-                    v: None,
-                })
-                .collect(),
         }
     }
 
     /// Positions held.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(Shard::len).sum()
+        self.shards.iter().map(|s| s.len).sum()
     }
 
     /// Whether no position is held.
@@ -179,79 +236,140 @@ impl ContextShards {
         self.len() == 0
     }
 
-    /// Positions the ranges have room for.
-    pub fn capacity(&self) -> usize {
-        self.shards.iter().map(|s| s.cap).sum()
+    /// Positions the blocks of every range hold.
+    pub fn held(&self) -> usize {
+        self.shards.iter().map(Shard::held).sum()
+    }
+
+    /// Bytes a position takes in a range.
+    pub fn position_bytes(&self) -> u64 {
+        (2 * self.h_kv * self.d * 2) as u64
+    }
+
+    /// Bytes each card keeps free beside the ranges.
+    pub fn keep_free(&self) -> u64 {
+        self.keep_free
+    }
+
+    /// The cards of the ranges, the layer's own first.
+    pub fn cards(&self) -> Vec<Device> {
+        self.shards.iter().map(|s| s.dev.clone()).collect()
+    }
+
+    /// Add a block of `positions` to the range on `card`, the `card`-th of [`Self::cards`].
+    pub fn reserve_on(&mut self, card: usize, positions: usize) -> Result<()> {
+        let (h_kv, d) = (self.h_kv, self.d);
+        let shard = &mut self.shards[card];
+        let positions = positions.min(shard.cap.saturating_sub(shard.held()));
+        if positions == 0 {
+            return Ok(());
+        }
+        shard.segs.push(Seg {
+            k: Tensor::zeros_on((1, positions, h_kv, d), DType::F16, &shard.dev)?,
+            v: Tensor::zeros_on((1, positions, h_kv, d), DType::F16, &shard.dev)?,
+            cap: positions,
+        });
+        shard.closed = false;
+        Ok(())
     }
 
     /// Append the rows `k`, `v` `[1, h_kv, n, d]` after the positions held, each on the card
     /// whose range they fall in.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
-        let n = k.dims()[2];
+        let (_, h_kv, n, d) = k.dims4()?;
+        let (seg, keep_free) = (self.seg, self.keep_free);
+        // Whether a range after each one still has room in its blocks: a range grows only when
+        // none has.
+        let later_room: Vec<bool> = (0..self.shards.len())
+            .map(|i| self.shards[i + 1..].iter().any(|s| s.held() > s.len))
+            .collect();
         let mut done = 0;
         let mut at = self.len();
-        for i in 0..self.shards.len() {
+        for (i, shard) in self.shards.iter_mut().enumerate() {
             if done == n {
                 break;
             }
-            let start: usize = self.shards[..i].iter().map(|s| s.cap).sum();
-            let shard = &mut self.shards[i];
-            let room = (start + shard.cap).saturating_sub(at);
-            if room == 0 {
+            if shard.closed {
                 continue;
             }
-            let take = room.min(n - done);
-            let kr = k
-                .narrow(2, done, take)?
-                .to_device(&shard.dev)?
-                .to_dtype(DType::F16)?;
-            let vr = v
-                .narrow(2, done, take)?
-                .to_device(&shard.dev)?
-                .to_dtype(DType::F16)?;
-            shard.start = start;
-            let grow = |held: Option<Tensor>, rows: Tensor| -> Result<Tensor> {
-                match held {
-                    Some(h) => Tensor::cat(&[&h, &rows], 2),
-                    None => Ok(rows),
+            if shard.len == 0 {
+                shard.start = at;
+            }
+            while done < n {
+                if shard.len >= shard.cap {
+                    shard.closed = true;
+                    break;
                 }
-            };
-            shard.k = Some(grow(shard.k.take(), kr)?);
-            shard.v = Some(grow(shard.v.take(), vr)?);
-            done += take;
-            at += take;
+                if shard.len == shard.held() {
+                    // Only a card's memory is counted: the host's ranges take what they are
+                    // given.
+                    let bytes = (2 * seg * h_kv * d * 2) as u64;
+                    let short = later_room[i]
+                        || (shard.dev.is_cuda()
+                            && crate::inference::place::expert_cache::free_now(&shard.dev)
+                                < bytes.saturating_add(keep_free));
+                    if short {
+                        if !later_room[i] {
+                            tracing::info!(
+                                "context parallel: range on {:?} closed at {} positions",
+                                shard.dev.location(),
+                                shard.len
+                            );
+                        }
+                        shard.closed = true;
+                        break;
+                    }
+                    shard.segs.push(Seg {
+                        k: Tensor::zeros_on((1, seg, h_kv, d), DType::F16, &shard.dev)?,
+                        v: Tensor::zeros_on((1, seg, h_kv, d), DType::F16, &shard.dev)?,
+                        cap: seg,
+                    });
+                }
+                // The block the next position falls in, and its offset there.
+                let (mut b, mut off) = (0, shard.len);
+                while off >= shard.segs[b].cap {
+                    off -= shard.segs[b].cap;
+                    b += 1;
+                }
+                let take = (shard.segs[b].cap - off)
+                    .min(n - done)
+                    .min(shard.cap - shard.len);
+                let rows = |t: &Tensor| -> Result<Tensor> {
+                    t.narrow(2, done, take)?
+                        .to_device(&shard.dev)?
+                        .to_dtype(DType::F16)?
+                        .transpose(1, 2)?
+                        .contiguous()
+                };
+                shard.segs[b].k.slice_set(&rows(k)?, 1, off)?;
+                shard.segs[b].v.slice_set(&rows(v)?, 1, off)?;
+                shard.len += take;
+                done += take;
+                at += take;
+            }
         }
         if done < n {
             crate::tensor::bail!(
-                "context parallel: {} positions past the {} the cards hold",
+                "context parallel: no card has room for {} more positions past {}",
                 n - done,
-                self.capacity()
+                at
             );
         }
         Ok(())
     }
 
-    /// Keep the first `len` positions.
+    /// Keep the first `len` positions; the blocks stay for the positions written next.
     pub fn trim_to(&mut self, len: usize) -> Result<()> {
         for s in &mut self.shards {
-            let keep = len.saturating_sub(s.start).min(s.len());
-            if keep == 0 {
-                s.k = None;
-                s.v = None;
-            } else if keep < s.len() {
-                s.k = Some(
-                    s.k.as_ref()
-                        .expect("held")
-                        .narrow(2, 0, keep)?
-                        .contiguous()?,
-                );
-                s.v = Some(
-                    s.v.as_ref()
-                        .expect("held")
-                        .narrow(2, 0, keep)?
-                        .contiguous()?,
-                );
+            let keep = if s.len == 0 {
+                0
+            } else {
+                len.saturating_sub(s.start).min(s.len)
+            };
+            if keep < s.len {
+                s.closed = false;
             }
+            s.len = keep;
         }
         Ok(())
     }
@@ -260,31 +378,45 @@ impl ContextShards {
     /// held, on `q`'s card.
     pub fn attend(&self, q: &Tensor, scale: f64, q_pos: usize) -> Result<Tensor> {
         let home = q.device().clone();
-        let mut parts = Vec::new();
-        let (_, h, rows, _) = q.dims4()?;
-        // The keys a block of scores holds: the score bytes over a row's scores for every head.
-        let block = (self.scores_bytes / (h * rows * 4).max(1)).max(1);
-        for s in self.shards.iter().filter(|s| s.len() > 0) {
+        // The parts are merged as they come: one accumulator, whatever the context's length.
+        let mut acc: Option<Part> = None;
+        let (_, h, rows, d) = q.dims4()?;
+        // The keys a block holds: the bytes a block may take over what each key costs.
+        let block = (self.scores_bytes / bytes_per_key(h, self.h_kv, d, rows)).max(1);
+        for s in self.shards.iter().filter(|s| s.len > 0) {
             let q_here = q.to_device(&s.dev)?;
-            let (k, v) = (s.k.as_ref().expect("held"), s.v.as_ref().expect("held"));
-            let mut from = 0;
-            while from < s.len() {
-                let n = block.min(s.len() - from);
-                // A block past every row has nothing to give.
-                if s.start + from < q_pos + rows {
-                    parts.push(partial(
-                        &q_here,
-                        &k.narrow(2, from, n)?,
-                        &v.narrow(2, from, n)?,
-                        scale,
-                        q_pos,
-                        s.start + from,
-                    )?);
+            let mut seg_from = 0;
+            for seg in &s.segs {
+                if seg_from >= s.len {
+                    break;
                 }
-                from += n;
+                let in_seg = (s.len - seg_from).min(seg.cap);
+                let mut from = 0;
+                while from < in_seg {
+                    let n = block.min(in_seg - from);
+                    let k_pos = s.start + seg_from + from;
+                    // A block past every row has nothing to give.
+                    if k_pos < q_pos + rows {
+                        let heads =
+                            |t: &Tensor| t.narrow(1, from, n)?.transpose(1, 2)?.contiguous();
+                        let part = partial(
+                            &q_here,
+                            &heads(&seg.k)?,
+                            &heads(&seg.v)?,
+                            scale,
+                            q_pos,
+                            k_pos,
+                        )?;
+                        acc = Some(merge(acc, part, &home)?);
+                    }
+                    from += n;
+                }
+                seg_from += seg.cap;
             }
         }
-        combine(&parts, &home)
+        let acc = acc
+            .ok_or_else(|| crate::tensor::Error::msg("context parallel: no position to attend"))?;
+        finish(&acc)
     }
 }
 
@@ -385,11 +517,17 @@ mod tests {
     fn shards_filled_in_order_attend_as_one_cache() {
         let (h, h_kv, d) = (4usize, 2usize, 8usize);
         let dev = Device::Cpu;
-        // Blocks of three keys a row: each range is read in several blocks.
+        // A reserve of five positions on the first range, blocks of four grown past it, blocks of
+        // three keys a row: each range is read in several blocks.
         let mut shards = ContextShards::new(
             vec![(dev.clone(), 6), (dev.clone(), 6), (dev.clone(), 20)],
-            3 * h * 4,
+            h_kv,
+            d,
+            4,
+            0,
+            3 * bytes_per_key(h, h_kv, d, 1),
         );
+        shards.reserve_on(0, 5).unwrap();
         let k = t4([1, h_kv, 17, d], 11);
         let v = t4([1, h_kv, 17, d], 12);
         shards
@@ -496,9 +634,8 @@ mod tests {
 
 impl super::GenericHeteroTransformer {
     /// Cut the cache of every attention layer that can be cut over `cards`: each layer keeps a
-    /// range on its own card first, then one on each other card in their order. A card's room is
-    /// its free memory less the work a forward keeps, shared evenly by the layers, at the F16
-    /// width of a position. How many layers were cut.
+    /// range on its own card first, then one on each other card in their order, each growing while
+    /// its card keeps the work a forward needs and a block of scores. How many layers were cut.
     pub fn attach_context_shards(&mut self, cards: &[Device]) -> usize {
         if cards.len() < 2 {
             return 0;
@@ -522,45 +659,123 @@ impl super::GenericHeteroTransformer {
             self.config.embedding_length.max(self.config.ffn_dim),
             crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS,
         );
-        let position: u64 = cut
-            .iter()
-            .map(|&i| {
-                let l = &self.layers[i];
-                (2 * l.n_kv_head * l.head_dim * 2) as u64
-            })
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let room = |dev: &Device| -> usize {
-            let free = crate::inference::place::expert_cache::free_now(dev).saturating_sub(work);
-            (free / (position * cut.len() as u64)) as usize
-        };
-        let rooms: Vec<(Device, usize)> = cards.iter().map(|d| (d.clone(), room(d))).collect();
+        // Each card keeps the forward's work and a block of scores beside its ranges; a range
+        // grows a working window at a time.
+        let keep_free = 2 * work;
+        let seg = crate::inference::cache::KV_WORKING_WINDOW_TOKENS;
         for &i in &cut {
             let own = self.layers[i].cos.device();
-            let mut order: Vec<(Device, usize)> = rooms
+            let mut order: Vec<(Device, usize)> = cards
                 .iter()
-                .filter(|(d, _)| d.same_device(&own))
-                .cloned()
+                .filter(|d| d.same_device(&own))
+                .map(|d| (d.clone(), usize::MAX))
                 .collect();
-            order.extend(rooms.iter().filter(|(d, _)| !d.same_device(&own)).cloned());
+            order.extend(
+                cards
+                    .iter()
+                    .filter(|d| !d.same_device(&own))
+                    .map(|d| (d.clone(), usize::MAX)),
+            );
             let l = &mut self.layers[i];
-            l.context = Some(ContextShards::new(order, work as usize));
+            // A block of scores takes half the room left beside the forward's work, so the two
+            // never meet the card's edge together.
+            let (h_kv, d) = (l.n_kv_head, l.head_dim);
+            l.context = Some(ContextShards::new(
+                order,
+                h_kv,
+                d,
+                seg,
+                keep_free,
+                (work / 2) as usize,
+            ));
             #[cfg(feature = "cuda")]
             {
                 l.quant_kv = None;
             }
             l.kv_cache.reset();
         }
-        let positions = self.layers[cut[0]]
-            .context
-            .as_ref()
-            .map_or(0, ContextShards::capacity);
         tracing::info!(
-            "context parallel: {} attention layers cut over {} cards, room for {positions} positions",
+            "context parallel: {} attention layers cut over {} cards, each card keeping {:.2} GB beside them",
             cut.len(),
-            cards.len()
+            cards.len(),
+            keep_free as f64 / 1e9
         );
         cut.len()
+    }
+
+    /// Give every cut layer blocks for `total` positions before a prefill, while nothing else
+    /// holds its cards: each card's room past what it keeps free goes in equal shares to the
+    /// layers that still need positions, their own card first, then the others.
+    pub fn reserve_context(&mut self, total: usize) {
+        let cut: Vec<usize> = (0..self.layers.len())
+            .filter(|&i| self.layers[i].context.is_some())
+            .collect();
+        let need = |l: &super::GenericTransformerLayer| {
+            l.context
+                .as_ref()
+                .map_or(0, |c| total.saturating_sub(c.held()))
+        };
+        let mut needs: Vec<usize> = cut.iter().map(|&i| need(&self.layers[i])).collect();
+        if needs.iter().all(|&n| n == 0) {
+            return;
+        }
+        fn ctx(l: &super::GenericTransformerLayer) -> &ContextShards {
+            l.context.as_ref().expect("a cut layer")
+        }
+        let cards = ctx(&self.layers[cut[0]]).cards();
+        #[cfg(feature = "cuda")]
+        for dev in &cards {
+            if let Ok(cd) = dev.as_cuda_device() {
+                let _ = cd.0.stream().synchronize();
+                crate::tensor::cuda::trim_pool(cd.0.ordinal());
+            }
+        }
+        // The layer's own card first: position 0 of its ranges; then the others.
+        for own in [true, false] {
+            for dev in &cards {
+                let takers: Vec<(usize, usize)> = cut
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| needs[j] > 0)
+                    .filter_map(|(j, &i)| {
+                        let at = ctx(&self.layers[i])
+                            .cards()
+                            .iter()
+                            .position(|d| d.same_device(dev))?;
+                        ((at == 0) == own).then_some((j, at))
+                    })
+                    .collect();
+                let Some(&(j0, _)) = takers.first() else {
+                    continue;
+                };
+                let c = ctx(&self.layers[cut[j0]]);
+                let (keep, position) = (c.keep_free(), c.position_bytes());
+                let room = if dev.is_cuda() {
+                    crate::inference::place::expert_cache::free_now(dev).saturating_sub(keep)
+                } else {
+                    u64::MAX
+                };
+                let share = (room / (position * takers.len() as u64)) as usize;
+                for (j, at) in takers {
+                    let n = needs[j].min(share);
+                    if n == 0 {
+                        continue;
+                    }
+                    let l = &mut self.layers[cut[j]];
+                    let c = l.context.as_mut().expect("a cut layer");
+                    if let Err(e) = c.reserve_on(at, n) {
+                        tracing::warn!("context parallel: a reserve of {n} positions failed: {e}");
+                        continue;
+                    }
+                    needs[j] -= n;
+                }
+            }
+        }
+        if let Some(&short) = needs.iter().max().filter(|&&n| n > 0) {
+            tracing::warn!(
+                "context parallel: the cards hold {} of the {total} positions a layer asks for",
+                total - short
+            );
+        }
     }
 }

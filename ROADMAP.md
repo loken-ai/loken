@@ -13,7 +13,7 @@ acceptance is met and measured; until then it stays here with its state.
 | Expert parallelism | A mixture layer's experts split across cards where measured links make it pay | Done for experts that would otherwise sit on the host |
 | Pipeline parallelism across machines | A chain of any length, the prompt-lookup verify crossing every cut | Done |
 | Data parallelism | Copies of a model served side by side, requests spread over them | Done on one machine; across machines through the cluster's routing |
-| Context parallelism | A long context's attention split across cards | In progress: each attention layer's cache cut by ranges of positions over the cards, the parts combined on the layer's card; outside the recorded step, a context past one card to measure |
+| Context parallelism | A long context's attention split across cards | In progress: each attention layer's cache cut by ranges of positions over the cards, the parts combined on the layer's card; a request reserves its ranges before its prefill; a 68k-token prompt served on two cards at 1 tok/s against 10 for one cache, its attention to fuse |
 | Prefill and decode on different instances | A prompt read on one instance and decoded on another, its state handed over | Done: the KV cache handed over exactly for attention models; recurrent and windowed models hand over their whole decode state; split layers and cut caches still read their prompt where they decode |
 | CUDA on the published cudarc crate | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |

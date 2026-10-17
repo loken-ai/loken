@@ -96,8 +96,9 @@ prompt here. The rows travel as f32, about four times the cache's own size.
 ### A context cut over the cards
 
 With `context_parallel` set, the cache of each attention layer is cut into ranges of positions,
-one on each card the machine shows: the layer's own card first, then the others, each sized from
-the card's free memory after the load. A query attends to every range on the range's card and the
+one on each card the machine shows: the layer's own card first, then the others. Before its
+prefill a request reserves the positions it needs, each card's room past the work of a prefill
+shared by the layers; a decode past them grows a range a working window at a time. A query attends to every range on the range's card and the
 parts are combined on the layer's card, so a context no single card holds is served whole. The
 ranges hold F16 rows; the layers so cut run outside the recorded decode step, and their prefixes
 are not kept as snapshots. Layers with a sliding window, attention sinks, indexed attention, a

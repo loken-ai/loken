@@ -267,15 +267,15 @@ pub(crate) trait ModelBackend: Send {
         index_pos: usize,
     ) -> crate::tensor::Result<Tensor> {
         let (_, seq_len) = x.dims2()?;
-        self.prepare_prefill(seq_len);
+        self.prepare_prefill(index_pos, seq_len);
         let logits = self.forward_prefill_chunks(x, index_pos);
         self.finish_prefill();
         logits
     }
 
-    /// Called before a prefill of `tokens` rows is planned: a backend that lends card memory to
-    /// something else while it is idle takes it back here.
-    fn prepare_prefill(&mut self, _tokens: usize) {}
+    /// Called before a prefill of `tokens` rows from position `from` is planned: a backend that
+    /// lends card memory to something else while it is idle takes it back here.
+    fn prepare_prefill(&mut self, _from: usize, _tokens: usize) {}
 
     /// Called after a prefill, whether it succeeded: what [`Self::prepare_prefill`] took is given
     /// back.
@@ -1513,7 +1513,7 @@ impl GenericBackend {
         }
         // The rest of the prompt is prefilled here: the card's memory lent to the caches is
         // taken back for it, as for any prefill.
-        self.prepare_prefill(prompt.len() - covered);
+        self.prepare_prefill(covered, prompt.len() - covered);
         let chunk = adaptive_prefill_chunk(self.prefill_shape());
         // A recurrent state that failed part way through the new tokens cannot be rewound, so
         // a failure ends in the caller prefilling the whole prompt from position 0 instead,
@@ -1599,7 +1599,8 @@ impl GenericBackend {
 }
 
 impl ModelBackend for GenericBackend {
-    fn prepare_prefill(&mut self, tokens: usize) {
+    fn prepare_prefill(&mut self, from: usize, tokens: usize) {
+        self.0.reserve_context(from + tokens);
         let t = std::time::Instant::now();
         let lent = self.0.lend_expert_cache(tokens);
         if lent > 0 {
