@@ -102,6 +102,8 @@ pub fn gated_delta_net(
 
 /// [`gated_delta_net`] that also writes the state after each of the first `rows` tokens
 /// into `snaps` (`[rows, h, s_v, s_v]` F32, contiguous), what a return to a token copies back.
+/// Without snapshots, a sequence of at least one chunk runs in the chunked form; fewer rows,
+/// and every launch with snapshots, run one row after the other.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_net_with_snapshots(
     q: &Tensor,
@@ -113,8 +115,30 @@ pub fn gated_delta_net_with_snapshots(
     scale: f32,
     snaps: Option<(&Tensor, usize)>,
 ) -> Result<(Tensor, Tensor)> {
+    let chunked =
+        snaps.is_none() && q.dims3()?.0 >= unsafe { loken_gated_delta_net_chunk_rows() } as usize;
+    delta_net_launch(q, k, v, g, beta, state, scale, snaps, chunked)
+}
+
+/// [`gated_delta_net_with_snapshots`] with the form named: `chunked` runs the rows in chunks
+/// of matrix products (no snapshots), otherwise one row after the other.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delta_net_launch(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+    scale: f32,
+    snaps: Option<(&Tensor, usize)>,
+    chunked: bool,
+) -> Result<(Tensor, Tensor)> {
     let dev = q.device().as_cuda_device()?;
     let (n_tokens, h, s_v) = q.dims3()?;
+    if chunked && snaps.is_some() {
+        crate::tensor::bail!("gated_delta_net: the chunked form writes no snapshots");
+    }
     let cuptr = |t: &Tensor| -> Result<*const f32> {
         let (st, layout) = t.storage_and_layout();
         match &*st {
@@ -159,33 +183,64 @@ pub fn gated_delta_net_with_snapshots(
     let (sq1, sq2) = (s_v as i64, (h * s_v) as i64);
     let (sv1, sv2) = (s_v as i64, (h * s_v) as i64);
     let (sg1, sg2) = (1i64, h as i64);
-    unsafe {
-        loken_gated_delta_net(
-            qp,
-            kp,
-            vp,
-            gp,
-            bp,
-            sp,
-            o_slice.device_ptr(o_slice.stream()).0 as *mut f32,
-            match &ns_slice {
-                Some(ns) => ns.device_ptr(ns.stream()).0 as *mut f32,
-                None => sp as *mut f32,
-            },
-            h as i32,
-            n_tokens as i32,
-            s_v as i32,
-            sq1,
-            sq2,
-            sv1,
-            sv2,
-            sg1,
-            sg2,
-            scale,
-            snap_ptr,
-            snap_rows,
-            stream,
-        );
+    let state_out = match &ns_slice {
+        Some(ns) => ns.device_ptr(ns.stream()).0 as *mut f32,
+        None => sp as *mut f32,
+    };
+    if chunked {
+        let floats =
+            unsafe { loken_gated_delta_net_chunked_scratch(h as i32, n_tokens as i32, s_v as i32) };
+        let scratch = unsafe { dev.alloc::<f32>(floats as usize) }?;
+        unsafe {
+            loken_gated_delta_net_chunked(
+                qp,
+                kp,
+                vp,
+                gp,
+                bp,
+                sp,
+                o_slice.device_ptr(o_slice.stream()).0 as *mut f32,
+                state_out,
+                h as i32,
+                n_tokens as i32,
+                s_v as i32,
+                sq1,
+                sq2,
+                sv1,
+                sv2,
+                sg1,
+                sg2,
+                scale,
+                scratch.device_ptr(scratch.stream()).0 as *mut f32,
+                stream,
+            );
+        }
+    } else {
+        unsafe {
+            loken_gated_delta_net(
+                qp,
+                kp,
+                vp,
+                gp,
+                bp,
+                sp,
+                o_slice.device_ptr(o_slice.stream()).0 as *mut f32,
+                state_out,
+                h as i32,
+                n_tokens as i32,
+                s_v as i32,
+                sq1,
+                sq2,
+                sv1,
+                sv2,
+                sg1,
+                sg2,
+                scale,
+                snap_ptr,
+                snap_rows,
+                stream,
+            );
+        }
     }
     let o = tensor_from_cuda_storage(
         CudaStorage::wrap_cuda_slice(o_slice, dev.clone()),
@@ -407,6 +462,161 @@ mod timing {
             );
         }
         assert_eq!(flat(&state), flat(&steps), "the state after every token");
+    }
+
+    /// Inputs of the recurrence as the layer prepares them: unit-norm q and k, decay logs from
+    /// near zero (long memory) to strongly negative, gates in (0, 1), and a carried state.
+    fn delta_inputs(
+        dev: &Device,
+        n: usize,
+        h: usize,
+        s_v: usize,
+    ) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+        let unit = |t: Tensor| {
+            let norm = t.sqr().unwrap().sum_keepdim(2).unwrap().sqrt().unwrap();
+            t.broadcast_div(&norm).unwrap()
+        };
+        let q = unit(Tensor::randn(0f32, 1.0, (n, h, s_v), dev).unwrap());
+        let k = unit(Tensor::randn(0f32, 1.0, (n, h, s_v), dev).unwrap());
+        let v = Tensor::randn(0f32, 1.0, (n, h, s_v), dev).unwrap();
+        let g = Tensor::randn(0f32, 1.0, (n, h), dev)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .neg()
+            .unwrap();
+        let beta =
+            crate::tensor::ops::sigmoid(&Tensor::randn(0f32, 1.0, (n, h), dev).unwrap()).unwrap();
+        let state = Tensor::randn(0f32, 0.1, (h, s_v, s_v), dev).unwrap();
+        (q, k, v, g, beta, state)
+    }
+
+    fn worst_relative(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let peak = b.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        worst / peak
+    }
+
+    /// The chunked form gives the outputs and the final state of the row-by-row scan, across
+    /// head dims, partial last chunks and many chunks.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_chunked_delta_rule_matches_the_row_by_row_scan() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let _copy = super::super::in_place_state(false);
+        for (h, s_v) in [(4usize, 64usize), (32, 128), (4, 256)] {
+            for n in [64usize, 65, 127, 300, 1000] {
+                let (q, k, v, g, beta, state) = delta_inputs(&dev, n, h, s_v);
+                let scale = 1.0 / (s_v as f32).sqrt();
+                let (o_row, s_row) =
+                    delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, false).unwrap();
+                let (o_chunk, s_chunk) =
+                    delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, true).unwrap();
+                let (eo, es) = (
+                    worst_relative(&o_chunk, &o_row),
+                    worst_relative(&s_chunk, &s_row),
+                );
+                eprintln!("h={h} s_v={s_v} n={n}: output {eo:.2e}, state {es:.2e} of the peak");
+                assert!(eo < 1e-4 && es < 1e-4, "h={h} s_v={s_v} n={n}: {eo} {es}");
+            }
+        }
+    }
+
+    /// The convolution over many rows in one launch is, bit for bit, the rows launched one at
+    /// a time, each advancing the window the row before it left.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_rows_of_one_convolution_are_the_rows_convolved_in_turn() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let _copy = super::super::in_place_state(false);
+        let (c, taps, seq) = (96usize, 4usize, 70usize);
+        let x = Tensor::randn(0f32, 1.0, (seq, c), &dev).unwrap();
+        let w = Tensor::randn(0f32, 0.5, (c, taps), &dev).unwrap();
+        let window = Tensor::randn(0f32, 1.0, (c, taps - 1), &dev).unwrap();
+        let (all, all_window) = fused_conv_silu(&x, &window, &w, taps).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut step_window = window;
+        for t in 0..seq {
+            let (row, next) =
+                fused_conv_silu(&x.narrow(0, t, 1).unwrap(), &step_window, &w, taps).unwrap();
+            assert_eq!(flat(&row), flat(&all.narrow(0, t, 1).unwrap()), "row {t}");
+            step_window = next;
+        }
+        assert_eq!(
+            flat(&step_window),
+            flat(&all_window),
+            "the window after every row"
+        );
+    }
+
+    fn median_ms(mut runs: Vec<f64>) -> f64 {
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        runs[runs.len() / 2]
+    }
+
+    /// One layer-chunk of prefill rows through the recurrence and the convolution at the served
+    /// shapes, the state in F32: the row-by-row scan against the chunked form, the median of
+    /// seven runs.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn a_prefill_chunk_through_the_delta_rule_timed() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let cd = dev.as_cuda_device().unwrap().clone();
+        let sync = || cd.0.stream().synchronize().unwrap();
+        let time = |f: &dyn Fn()| -> f64 {
+            f();
+            sync();
+            let runs = (0..7)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    f();
+                    sync();
+                    started.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            median_ms(runs)
+        };
+        let _copy = super::super::in_place_state(false);
+        let (k_heads, h, s_v, taps) = (16usize, 32usize, 128usize, 4usize);
+        let channels = 2 * k_heads * s_v + h * s_v;
+        for n in [1000usize, 4000] {
+            let (q, k, v, g, beta, state) = delta_inputs(&dev, n, h, s_v);
+            let scale = 1.0 / (s_v as f32).sqrt();
+            let rows = time(&|| {
+                delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, false).unwrap();
+            });
+            let chunked = time(&|| {
+                delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, true).unwrap();
+            });
+            let x = Tensor::randn(0f32, 1.0, (n, channels), &dev)
+                .unwrap()
+                .to_dtype(crate::tensor::DType::F16)
+                .unwrap();
+            let w = Tensor::randn(0f32, 0.5, (channels, taps), &dev).unwrap();
+            let window =
+                Tensor::zeros_on((channels, taps - 1), crate::tensor::DType::F32, &dev).unwrap();
+            let conv = time(&|| {
+                crate::inference::moe_cuda::fused_conv_silu_f16in(&x, &window, &w, taps)
+                    .unwrap()
+                    .unwrap();
+            });
+            eprintln!(
+                "rows={n} heads={h} s_v={s_v}: scan {rows:.3} ms, chunked {chunked:.3} ms, \
+                 conv {conv:.3} ms"
+            );
+        }
     }
 
     /// What one token through the recurrence costs at the served shapes, the state advanced in

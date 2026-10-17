@@ -515,6 +515,7 @@ fn compile_imma_kernels() {
         "cuda/moe/attn_post_qkv.cu",
         "cuda/moe/kv_residual_scatter.cu",
         "cuda/moe/gated_delta_net.cu",
+        "cuda/moe/gated_delta_net_chunked.cu",
         "cuda/moe/fused_conv_silu.cu",
         "cuda/moe/zgate_rmsnorm.cu",
         "cuda/moe/hyper_residual.cu",

@@ -10,6 +10,13 @@ use crate::tensor::cuda_ext::{tensor_from_cuda_storage, CudaStorage, DevicePtr};
 use crate::tensor::{DType, Result, StorageView, Tensor};
 use core::ffi::c_void;
 
+extern "C" {
+    /// The rows of one chunk of the chunked delta-rule launch: fewer rows run row by row.
+    fn loken_gated_delta_net_chunk_rows() -> i32;
+    /// The scratch, in floats, the chunked delta-rule launch needs for these shapes.
+    fn loken_gated_delta_net_chunked_scratch(h: i32, n_tokens: i32, s_v: i32) -> i64;
+}
+
 cuda_launchers! {
     loken_topk_softmax(
         logits: *const f32, weights: *mut f32, ids: *mut u32, n_rows: i32, n_experts: i32,
@@ -98,6 +105,11 @@ cuda_launchers! {
         state_in: *const f32, o_out: *mut f32, state_out: *mut f32, h: i32, n_tokens: i32,
         s_v: i32, sq1: i64, sq2: i64, sv1: i64, sv2: i64, sg1: i64, sg2: i64, scale: f32,
         snaps: *mut f32, snap_rows: i32);
+    loken_gated_delta_net_chunked(
+        q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta: *const f32,
+        state_in: *const f32, o_out: *mut f32, state_out: *mut f32, h: i32, n_tokens: i32,
+        s_v: i32, sq1: i64, sq2: i64, sv1: i64, sv2: i64, sg1: i64, sg2: i64, scale: f32,
+        scratch: *mut f32);
     loken_fused_conv_silu(
         qkv: *const f32, conv_state: *const f32, w: *const f32, out: *mut f32,
         new_conv_state: *mut f32, c: i32, seq: i32, k: i32);

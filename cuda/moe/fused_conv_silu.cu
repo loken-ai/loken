@@ -8,7 +8,12 @@
 //   new_conv_state[c, j] = padded[c, seq + j]                   (last K-1 raw inputs)
 //
 // Row-major f32 layouts: qkv [seq, C], w [C, K], conv_state/new [C, K-1],
-// out [seq, C]. One thread per channel c; loops over the (short) sequence.
+// out [seq, C]. One thread per channel c and run of `CONV_ROWS` rows; the thread of the first
+// run also reads the old window and writes the new one, so the window may be advanced in place:
+// the later runs start past the window and never read it.
+
+// Rows one thread convolves; at least the longest window, so only the first run reads it.
+constexpr int CONV_ROWS = 32;
 
 extern "C" __global__ void loken_fused_conv_silu_kernel(
         const float * __restrict__ qkv,
@@ -20,12 +25,17 @@ extern "C" __global__ void loken_fused_conv_silu_kernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int Km1 = K - 1;
+    const int t0 = blockIdx.y * CONV_ROWS;
+    const int t1 = min(seq, t0 + CONV_ROWS);
+    const bool first = blockIdx.y == 0;
     float wl[8];
     float cs[8];
     for (int j = 0; j < K; j++)   wl[j] = w[c * K + j];
-    for (int j = 0; j < Km1; j++) cs[j] = conv_state[c * Km1 + j];
+    if (first) {
+        for (int j = 0; j < Km1; j++) cs[j] = conv_state[c * Km1 + j];
+    }
 
-    for (int t = 0; t < seq; t++) {
+    for (int t = t0; t < t1; t++) {
         float sum = 0.f;
         for (int j = 0; j < K; j++) {
             const int m = t + j;
@@ -34,6 +44,7 @@ extern "C" __global__ void loken_fused_conv_silu_kernel(
         }
         out[t * C + c] = sum / (1.f + expf(-sum));   // SiLU
     }
+    if (!first) return;
     // new conv_state = last K-1 of padded
     for (int j = 0; j < Km1; j++) {
         const int m = seq + j;
@@ -46,7 +57,7 @@ extern "C" void loken_fused_conv_silu(
         float * out, float * new_conv_state,
         int C, int seq, int K, cudaStream_t stream) {
     const int threads = 256;
-    const int blocks = (C + threads - 1) / threads;
+    const dim3 blocks((C + threads - 1) / threads, max(1, (seq + CONV_ROWS - 1) / CONV_ROWS));
     loken_fused_conv_silu_kernel<<<blocks, threads, 0, stream>>>(
         qkv, conv_state, w, out, new_conv_state, C, seq, K);
 }
@@ -65,11 +76,16 @@ extern "C" __global__ void loken_fused_conv_silu_f16in_kernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int Km1 = K - 1;
+    const int t0 = blockIdx.y * CONV_ROWS;
+    const int t1 = min(seq, t0 + CONV_ROWS);
+    const bool first = blockIdx.y == 0;
     float wl[8];
     float cs[8];
     for (int j = 0; j < K; j++)   wl[j] = w[c * K + j];
-    for (int j = 0; j < Km1; j++) cs[j] = conv_state[c * Km1 + j];
-    for (int t = 0; t < seq; t++) {
+    if (first) {
+        for (int j = 0; j < Km1; j++) cs[j] = conv_state[c * Km1 + j];
+    }
+    for (int t = t0; t < t1; t++) {
         float sum = 0.f;
         for (int j = 0; j < K; j++) {
             const int m = t + j;
@@ -78,6 +94,7 @@ extern "C" __global__ void loken_fused_conv_silu_f16in_kernel(
         }
         out[t * C + c] = sum / (1.f + expf(-sum));   // SiLU
     }
+    if (!first) return;
     for (int j = 0; j < Km1; j++) {
         const int m = seq + j;
         new_conv_state[c * Km1 + j] = (m < Km1) ? cs[m] : __half2float(qkv[(m - Km1) * C + c]);
@@ -89,7 +106,7 @@ extern "C" void loken_fused_conv_silu_f16in(
         float * out, float * new_conv_state,
         int C, int seq, int K, cudaStream_t stream) {
     const int threads = 256;
-    const int blocks = (C + threads - 1) / threads;
+    const dim3 blocks((C + threads - 1) / threads, max(1, (seq + CONV_ROWS - 1) / CONV_ROWS));
     loken_fused_conv_silu_f16in_kernel<<<blocks, threads, 0, stream>>>(
         (const __half *)qkv, conv_state, w, out, new_conv_state, C, seq, K);
 }
