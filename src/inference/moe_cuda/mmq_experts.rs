@@ -1,9 +1,10 @@
 //! The expert projections of a MoE prefill through the expert-batched tiled matmul.
 //!
 //! Grouped by expert, every expert's routed rows are one contiguous run, and every expert's
-//! weights are one slab of the stack. One launch per projection multiplies each expert against
-//! its run on the int8 tensor cores (`launch_mmq_moe_gguf_*`), reading the activation
-//! quantised once into the q8_1 tiles that kernel takes. The gate and up rows stay in sorted order; the
+//! weights are one slab of the stack. One launch for gate and up together, and one for down,
+//! multiplies each expert against its run on the int8 tensor cores (`launch_mmq_moe_gguf_*`),
+//! reading the activation quantised once into the q8_1 tiles that kernel takes. The gate and
+//! up rows stay in sorted order; the
 //! down projection writes each row back to its (token, choice) slot, and the fold sums a
 //! token's slots in slot order, so the result does not depend on scheduling.
 
@@ -64,7 +65,8 @@ pub const MMQ_X_MAX: usize = 128;
 const MMQ_X_MIN: usize = 8;
 /// The row padding the quantiser lays a row out to.
 const MMQ_ROW_PADDING: usize = 512;
-/// Grid limit on the column-tile axis.
+/// Grid limit on the column-tile axis: with the narrowest tile, the columns one launch's grid
+/// can be sized for.
 const GRID_Y_MAX: usize = 65535;
 
 /// Routed rows per expert from which the expert-batched matmul is at least as fast as the
@@ -107,6 +109,11 @@ pub struct MmqRouting {
     experts: usize,
     /// A forced tile width, 0 for the launcher's own choice.
     mmq_x: i32,
+    /// Launch as the expert-batched path first did, for the measurements and checks that
+    /// compare against it: a width chosen for the mean run, a grid sized for every token on
+    /// one expert, and gate and up as two launches.
+    #[cfg(test)]
+    first_launches: bool,
 }
 
 impl MmqRouting {
@@ -130,6 +137,8 @@ impl MmqRouting {
             topk,
             experts: n_experts,
             mmq_x: 0,
+            #[cfg(test)]
+            first_launches: false,
         })
     }
 
@@ -190,6 +199,36 @@ impl MmqRouting {
         self
     }
 
+    /// The longest run of rows any one expert is expected to hold, for routing spread evenly
+    /// over the experts: each expert's count is binomial over the tokens, and the largest of
+    /// `experts` such counts sits about `sqrt(2 ln experts)` deviations above their mean. The
+    /// tile width and the launch grid are sized for it; a longer run is still covered whole.
+    fn longest_run_expected(&self) -> usize {
+        let experts = self.experts.max(1) as f64;
+        let p = (self.topk as f64 / experts).min(1.0);
+        let mean = self.tokens as f64 * p;
+        let deviation = (mean * (1.0 - p)).sqrt();
+        let longest = mean + deviation * (2.0 * experts.ln()).sqrt();
+        (longest.ceil() as usize).clamp(1, self.tokens.max(1))
+    }
+
+    /// Launch as the expert-batched path first did (see `first_launches`).
+    #[cfg(test)]
+    pub fn with_first_launches(mut self) -> Self {
+        self.first_launches = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn first_launches(&self) -> bool {
+        self.first_launches
+    }
+
+    #[cfg(not(test))]
+    fn first_launches(&self) -> bool {
+        false
+    }
+
     fn rows(&self) -> usize {
         self.tokens * self.topk
     }
@@ -237,13 +276,15 @@ impl MmqRouting {
         let y = self.quantize(xs, Some(&self.src_rows), gate.dtype(), k)?;
         let gu = scratch::<f32>(&dev, rows * 2 * width)?;
         let gu_ptr = gu.device_ptr(gu.stream()).0;
+        // Gate and up apart are one launch: the up results land `width` floats after the
+        // gate's in each row, where a fused gate||up stack puts them.
         match up {
-            Some(u) => {
-                self.matmul(gate, &y, k, gu_ptr, 2 * width, None)?;
+            Some(u) if self.first_launches() => {
+                self.matmul(gate, None, &y, k, gu_ptr, 2 * width, None)?;
                 let up_ptr = gu_ptr + (width * std::mem::size_of::<f32>()) as u64;
-                self.matmul(u, &y, k, up_ptr, 2 * width, None)?;
+                self.matmul(u, None, &y, k, up_ptr, 2 * width, None)?;
             }
-            None => self.matmul(gate, &y, k, gu_ptr, 2 * width, None)?,
+            _ => self.matmul(gate, up.map(|u| (u, width)), &y, k, gu_ptr, 2 * width, None)?,
         }
         let out = scratch::<f32>(&dev, rows * width)?;
         let out_ptr = out.device_ptr(out.stream()).0 as *mut f32;
@@ -341,7 +382,7 @@ impl MmqRouting {
         let pairs = scratch::<f32>(&dev, rows * hidden)?;
         let pairs_ptr = pairs.device_ptr(pairs.stream()).0;
         let slots = self.slots.device_ptr(self.slots.stream()).0 as *const i32;
-        self.matmul(down, &y, k, pairs_ptr, hidden, Some(slots))?;
+        self.matmul(down, None, &y, k, pairs_ptr, hidden, Some(slots))?;
         let out = match residual {
             // A fresh buffer holding the residual: the fold adds into it in place.
             Some(r) => r
@@ -442,10 +483,13 @@ impl MmqRouting {
 
     /// One expert-batched launch of `stack` against the quantised sorted rows `y`, writing
     /// sorted row `i` to destination row `ids_dst[i]` (or `i`) of a `dst` whose rows are
-    /// `stride` floats apart.
+    /// `stride` floats apart. A `second` stack of the same shape and format is multiplied in
+    /// the same launch, its results the given number of floats after the first's in each row.
+    #[allow(clippy::too_many_arguments)]
     fn matmul(
         &self,
         stack: &QTensor,
+        second: Option<(&QTensor, usize)>,
         y: &CudaSlice<u8>,
         k: usize,
         dst: u64,
@@ -462,13 +506,28 @@ impl MmqRouting {
         let expert_bytes = n * blocks_per_row * dtype.type_size();
         let cuda = self.device.as_cuda_device()?;
         let info = cuda.native().mmq_device_info()?;
-        let ncols_hint = rows.div_ceil(self.experts.max(1)).max(1);
-        if self.tokens.div_ceil(MMQ_X_MIN) > GRID_Y_MAX {
-            crate::tensor::bail!("moe mmq: {} tokens exceed the launch grid", self.tokens);
-        }
+        let (ncols_hint, ncols_grid) = match self.first_launches() {
+            true => (rows.div_ceil(self.experts.max(1)).max(1), self.tokens),
+            // The grid's column-tile axis stays within its limit; the blocks loop over the rest.
+            false => {
+                let longest = self.longest_run_expected();
+                (longest, longest.min(GRID_Y_MAX * MMQ_X_MIN))
+            }
+        };
+        let (second_ptr, second_offset) = match second {
+            Some((s, offset)) => {
+                if s.shape().dims() != stack.shape().dims() || s.dtype() != dtype {
+                    crate::tensor::bail!("moe mmq: the two stacks of one launch differ");
+                }
+                (s.device_ptr()? as *const c_void, offset)
+            }
+            None => (std::ptr::null(), 0),
+        };
         let launched = unsafe {
             mmq_moe_launcher(dtype)?(
                 stack.device_ptr()? as *const c_void,
+                second_ptr,
+                second_offset as i64,
                 y.device_ptr(y.stream()).0 as *const c_void,
                 dst as *mut c_void,
                 self.bounds.device_ptr(self.bounds.stream()).0 as *const i32,
@@ -480,7 +539,7 @@ impl MmqRouting {
                 blocks_per_row as i64,
                 stride as i64,
                 e as i32,
-                self.tokens as i64,
+                ncols_grid as i64,
                 ncols_hint as i64,
                 self.mmq_x,
                 info.cc,

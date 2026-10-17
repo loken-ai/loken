@@ -131,6 +131,8 @@ macro_rules! mmq_formats {
         #[cfg(feature = "cuda")]
         pub(crate) type MmqMoeLauncher = unsafe extern "C" fn(
             x: *const std::ffi::c_void,
+            x_second: *const std::ffi::c_void,
+            dst_second: i64,
             y: *const std::ffi::c_void,
             dst: *mut std::ffi::c_void,
             expert_bounds: *const i32,
@@ -156,6 +158,8 @@ macro_rules! mmq_formats {
             $(
                 fn $moe(
                     x: *const std::ffi::c_void,
+                    x_second: *const std::ffi::c_void,
+                    dst_second: i64,
                     y: *const std::ffi::c_void,
                     dst: *mut std::ffi::c_void,
                     expert_bounds: *const i32,
@@ -268,6 +272,8 @@ macro_rules! expert_only_formats {
         extern "C" {
             $(fn $launcher(
                 x: *const std::ffi::c_void,
+                x_second: *const std::ffi::c_void,
+                dst_second: i64,
                 y: *const std::ffi::c_void,
                 dst: *mut std::ffi::c_void,
                 expert_bounds: *const i32,

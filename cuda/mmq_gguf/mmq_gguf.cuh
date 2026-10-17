@@ -2522,13 +2522,16 @@ static __global__ void mul_mat_q(
 ///
 /// The activation columns are sorted by expert, so expert `e` owns columns
 /// `[expert_bounds[e], expert_bounds[e + 1])` of `y`; its weights are the `e`-th slab of `x`,
-/// `stride_expert_x` bytes apart. The grid is (row tile, column tile, expert) and sized for
-/// the widest run an expert can have, so a block whose column tile lies past its expert's run
-/// has nothing to do and leaves. Each block takes a whole tile and its whole k row: no split,
-/// no fixup, and every output is written exactly once.
+/// `stride_expert_x` bytes apart. The grid is (row tile, column tile, expert): block `jt` of an
+/// expert takes its column tiles `jt`, `jt + gridDim.y`, ..., so a run longer than the grid
+/// covers is still covered whole, and a block whose first tile lies past its expert's run
+/// leaves. Each tile is taken whole with its whole k row: no split, no fixup, and every output
+/// is written exactly once.
 ///
 /// Column `c` of the result goes to destination row `ids_dst[c]` when `ids_dst` is given, and
-/// to row `c` otherwise.
+/// to row `c` otherwise. With a second stack `x_second` of the same shape (gate and up), the
+/// grid holds both stacks' experts and the second's results land `dst_second` floats after
+/// the first's in each destination row: one launch for both products of the same columns.
 template <ggml_type type, int mmq_x, bool need_check>
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
@@ -2536,10 +2539,12 @@ template <ggml_type type, int mmq_x, bool need_check>
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 __global__ void mul_mat_q_moe(
-        const char * __restrict__ x, const int * __restrict__ y, float * __restrict__ dst,
+        const char * __restrict__ x, const char * __restrict__ x_second,
+        const int * __restrict__ y, float * __restrict__ dst,
         const int * __restrict__ expert_bounds, const int * __restrict__ ids_dst,
-        const int64_t stride_expert_x, const int blocks_per_ne00, const int nrows_x,
-        const int stride_row_x, const int ncols_y, const int stride_col_dst) {
+        const int64_t stride_expert_x, const int64_t dst_second, const int n_experts,
+        const int blocks_per_ne00, const int nrows_x, const int stride_row_x,
+        const int ncols_y, const int stride_col_dst) {
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
         NO_DEVICE_CODE;
         return;
@@ -2551,35 +2556,43 @@ __global__ void mul_mat_q_moe(
     constexpr int run_ints  = sizeof(block_q8_1_mmq) / sizeof(int);
 
     const int it = blockIdx.x;
-    const int jt = blockIdx.y;
-    const int expert = blockIdx.z;
+    // The grid's expert axis runs over the first stack's experts, then the second's.
+    const bool second = blockIdx.z >= n_experts;
+    const int expert = second ? blockIdx.z - n_experts : blockIdx.z;
+    const char * __restrict__ stack = second ? x_second : x;
+    float * __restrict__ out = second ? dst + dst_second : dst;
 
     const int col_low  = expert_bounds[expert];
     const int col_high = expert_bounds[expert + 1];
-    const int col0     = col_low + jt*mmq_x;
-    if (col0 >= col_high) {
-        return;
-    }
 
-    // The destination row of every column of the tile, read once into the head of shared
-    // memory where the write-back looks it up. Columns past the run keep a harmless index:
-    // the write-back skips them.
     extern __shared__ int mmq_shared[];
-#pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
-            break;
+    for (int jt = blockIdx.y;; jt += gridDim.y) {
+        const int col0 = col_low + jt*mmq_x;
+        if (col0 >= col_high) {
+            return;
         }
-        const int col = min(col0 + j, col_high - 1);
-        mmq_shared[j] = ids_dst ? ids_dst[col] : col;
-    }
-    __syncthreads();
 
-    mul_mat_q_process_tile<type, mmq_x, need_check, false, true>(
-        x + expert*stride_expert_x, it*mmq_y*stride_row_x, y + col0*run_ints,
-        dst + it*mmq_y, nullptr, stride_row_x, ncols_y, stride_col_dst,
-        nrows_x - it*mmq_y - 1, col_high - col0 - 1, 0, blocks_per_ne00);
+        // The destination row of every column of the tile, read into the head of shared
+        // memory where the write-back looks it up. Columns past the run keep a harmless
+        // index: the write-back skips them. The barrier ahead keeps the previous tile's
+        // write-back from reading the new indices.
+        __syncthreads();
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+            const int col = min(col0 + j, col_high - 1);
+            mmq_shared[j] = ids_dst ? ids_dst[col] : col;
+        }
+        __syncthreads();
+
+        mul_mat_q_process_tile<type, mmq_x, need_check, false, true>(
+            stack + expert*stride_expert_x, it*mmq_y*stride_row_x, y + col0*run_ints,
+            out + it*mmq_y, nullptr, stride_row_x, ncols_y, stride_col_dst,
+            nrows_x - it*mmq_y - 1, col_high - col0 - 1, 0, blocks_per_ne00);
+    }
 }
 
 /// Whether this block left part of a tile for the pass below to add in.

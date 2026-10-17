@@ -36,6 +36,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Prefill: the experts' products of a chunk run in launches sized for their longest run.
 - CPU: the IQ4_NL expert products decode each block once for every row.
 - CPU: AVX-512 kernels for the IQ2_S, IQ3_XXS and IQ4_NL expert products.
 - CPU: the IQ2_S and IQ3_XXS expert products decode each block once for every row.

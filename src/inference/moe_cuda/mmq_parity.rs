@@ -50,27 +50,7 @@ impl Lcg {
 /// `topk` distinct experts per token with their router weights, and the stable sort by
 /// expert: `(slots, experts, weights)`, the weights in (token, choice) order.
 fn routing(rng: &mut Lcg, tokens: usize, topk: usize, e: usize) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
-    let mut pairs = Vec::with_capacity(tokens * topk);
-    let mut weights = Vec::with_capacity(tokens * topk);
-    for t in 0..tokens {
-        let mut chosen: Vec<usize> = Vec::with_capacity(topk);
-        while chosen.len() < topk {
-            let c = rng.below(e);
-            if !chosen.contains(&c) {
-                chosen.push(c);
-            }
-        }
-        for (s, &c) in chosen.iter().enumerate() {
-            pairs.push((c as u32, (t * topk + s) as u32));
-            weights.push(0.05 + rng.next() * 0.3);
-        }
-    }
-    pairs.sort_by_key(|p| p.0);
-    (
-        pairs.iter().map(|p| p.1).collect(),
-        pairs.iter().map(|p| p.0).collect(),
-        weights,
-    )
+    routing_with_hot(rng, tokens, topk, e, None)
 }
 
 fn random(rng: &mut Lcg, n: usize, spread: f32) -> Vec<f32> {
@@ -655,23 +635,158 @@ fn expert_batched_matmul_timings() {
     }
 }
 
-/// Kernel times of the expert-batched path on the low-bit formats of a wide mixture (256
-/// experts, ten per token, 2560 hidden, 640 intermediate), per format, token count and tile
-/// width, with the rate the int8 tensor cores would have to sustain. Run with `--ignored
-/// --nocapture`.
+/// The shape of a wide mixture: experts, experts per token, hidden width, expert width.
+const WIDE: (usize, usize, usize, usize) = (256, 10, 2560, 640);
+
+/// An `[e, rows, k]` stack of random `dtype` blocks with a finite scale, as raw bytes.
+fn random_blocks(rng: &mut Lcg, dtype: GgmlDType, e: usize, rows: usize, k: usize) -> Vec<u8> {
+    const SCALE_F16: [u8; 2] = [0x00, 0x24]; // 2^-6
+    let mut data = vec![0u8; e * rows * (k / dtype.block_size()) * dtype.type_size()];
+    for word in data.chunks_mut(3) {
+        let bits = (rng.next() * (1u32 << 24) as f32) as u32;
+        for (b, byte) in word.iter_mut().enumerate() {
+            *byte = (bits >> (8 * b)) as u8;
+        }
+    }
+    for block in data.chunks_exact_mut(dtype.type_size()) {
+        block[..2].copy_from_slice(&SCALE_F16);
+    }
+    data
+}
+
+/// [`routing`], the first expert of every token `hot` when given.
+fn routing_with_hot(
+    rng: &mut Lcg,
+    tokens: usize,
+    topk: usize,
+    e: usize,
+    hot: Option<usize>,
+) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
+    let mut pairs = Vec::with_capacity(tokens * topk);
+    let mut weights = Vec::with_capacity(tokens * topk);
+    for t in 0..tokens {
+        let mut chosen: Vec<usize> = hot.into_iter().collect();
+        while chosen.len() < topk {
+            let c = rng.below(e);
+            if !chosen.contains(&c) {
+                chosen.push(c);
+            }
+        }
+        for (s, &c) in chosen.iter().enumerate() {
+            pairs.push((c as u32, (t * topk + s) as u32));
+            weights.push(0.05 + rng.next() * 0.3);
+        }
+    }
+    pairs.sort_by_key(|p| p.0);
+    (
+        pairs.iter().map(|p| p.1).collect(),
+        pairs.iter().map(|p| p.0).collect(),
+        weights,
+    )
+}
+
+/// The routed rows of one wide-mixture layer chunk on the card.
+struct WideChunk {
+    x: Tensor,
+    slots: Tensor,
+    experts: Tensor,
+    weights: Tensor,
+}
+
+impl WideChunk {
+    fn new(dev: &Device, rng: &mut Lcg, tokens: usize, hot: Option<usize>) -> Self {
+        let (e, topk, hidden, _) = WIDE;
+        let (slots, experts, weights) = routing_with_hot(rng, tokens, topk, e, hot);
+        let m = slots.len();
+        Self {
+            x: Tensor::from_vec(random(rng, tokens * hidden, 1.0), (tokens, hidden), dev).unwrap(),
+            slots: Tensor::from_vec(slots, m, dev).unwrap(),
+            experts: Tensor::from_vec(experts, m, dev).unwrap(),
+            weights: Tensor::from_vec(weights, m, dev).unwrap(),
+        }
+    }
+
+    fn plan(&self) -> MmqRouting {
+        MmqRouting::new(&self.slots, &self.experts, WIDE.1, WIDE.0).unwrap()
+    }
+}
+
+/// The gate and up products launched together, over a grid sized for the expected longest run,
+/// against the first launches (a width for the mean run, a grid for every token on one expert,
+/// gate and up apart), a fused gate||up stack and other tile widths: every product of a column
+/// sums the same k blocks in the same order, so all of them agree bit for bit. One expert takes
+/// every token, a run far longer than the grid is sized for.
+#[test]
+fn the_grouped_launches_match_the_first_launches_bit_for_bit() {
+    let Some(dev) = card("the grouped launches are") else {
+        return;
+    };
+    let (e, _, hidden, inter) = WIDE;
+    let mut rng = Lcg(43);
+    let tokens = 1000;
+    let chunk = WideChunk::new(&dev, &mut rng, tokens, Some(7));
+    let down = random_blocks(&mut rng, GgmlDType::Iq4Nl, e, hidden, inter);
+    let down =
+        QTensor::from_ggml_bytes(GgmlDType::Iq4Nl, &down, vec![e, hidden, inter], &dev).unwrap();
+    for dtype in [GgmlDType::Iq2S, GgmlDType::Iq3Xxs] {
+        let gate = random_blocks(&mut rng, dtype, e, inter, hidden);
+        let up = random_blocks(&mut rng, dtype, e, inter, hidden);
+        let per_expert = gate.len() / e;
+        let mut gate_up = Vec::with_capacity(2 * gate.len());
+        for x in 0..e {
+            gate_up.extend_from_slice(&gate[x * per_expert..(x + 1) * per_expert]);
+            gate_up.extend_from_slice(&up[x * per_expert..(x + 1) * per_expert]);
+        }
+        let stack = |bytes: &[u8], rows: usize| {
+            QTensor::from_ggml_bytes(dtype, bytes, vec![e, rows, hidden], &dev).unwrap()
+        };
+        let (gate, up, gate_up) = (
+            stack(&gate, inter),
+            stack(&up, inter),
+            stack(&gate_up, 2 * inter),
+        );
+        let run = |plan: MmqRouting, fused: bool| -> (Vec<f32>, Vec<f32>) {
+            let h = match fused {
+                true => plan.gate_up_silu(&chunk.x, &gate_up, None).unwrap(),
+                false => plan.gate_up_silu(&chunk.x, &gate, Some(&up)).unwrap(),
+            };
+            let out = plan.down_fold(&h, &down, &chunk.weights, None).unwrap();
+            (to_vec(&h), to_vec(&out))
+        };
+        let want = run(chunk.plan().with_first_launches(), false);
+        assert!(want.1.iter().all(|v| v.is_finite()) && want.1.iter().any(|&v| v != 0.0));
+        let cases = [
+            ("grouped", run(chunk.plan(), false)),
+            ("fused stack", run(chunk.plan(), true)),
+            ("width 8", run(chunk.plan().with_tile_width(8), false)),
+            ("width 128", run(chunk.plan().with_tile_width(128), false)),
+        ];
+        for (what, got) in cases {
+            assert!(got.0 == want.0, "{dtype:?} {what}: gate and up differ");
+            assert!(
+                got.1 == want.1,
+                "{dtype:?} {what}: the folded result differs"
+            );
+        }
+    }
+}
+
+/// Kernel times of one wide-mixture layer chunk (256 experts, ten per token, 2560 hidden, 640
+/// intermediate; gate and up in a low-bit format, down in IQ4_NL), the first launches against
+/// the grouped ones, with the rate of the int8 work. Run with `--ignored --nocapture`.
 #[test]
 #[ignore = "a measurement, not a check"]
-fn low_bit_expert_batched_timings() {
+fn wide_mixture_layer_chunk_timings() {
     let Some(dev) = card("the timings are") else {
         return;
     };
     let cuda = dev.as_cuda_device().unwrap();
-    let (e, topk, hidden, inter) = (256usize, 10usize, 2560usize, 640usize);
+    let (e, topk, hidden, inter) = WIDE;
     let mut rng = Lcg(5);
     let time = |f: &dyn Fn()| -> f64 {
         f();
         cuda.synchronize().unwrap();
-        let reps = 3;
+        let reps = 10;
         let t0 = std::time::Instant::now();
         for _ in 0..reps {
             f();
@@ -679,55 +794,39 @@ fn low_bit_expert_batched_timings() {
         cuda.synchronize().unwrap();
         t0.elapsed().as_secs_f64() * 1e3 / reps as f64
     };
-    // Random blocks with a zero scale: the arithmetic and the loads are those of real weights.
     let stack = |dtype: GgmlDType, rows: usize, k: usize, rng: &mut Lcg| -> QTensor {
-        let bytes = e * rows * (k / dtype.block_size()) * dtype.type_size();
-        let mut data: Vec<u8> = (0..bytes).map(|_| (rng.next() * 256.0) as u8).collect();
-        for block in data.chunks_exact_mut(dtype.type_size()) {
-            block[0] = 0;
-            block[1] = 0;
-        }
+        let data = random_blocks(rng, dtype, e, rows, k);
         QTensor::from_ggml_bytes(dtype, &data, vec![e, rows, k], &dev).unwrap()
     };
-    for dtype in [
-        GgmlDType::Iq2S,
-        GgmlDType::Iq3S,
-        GgmlDType::Iq3Xxs,
-        GgmlDType::Iq4Nl,
-    ] {
+    let down = stack(GgmlDType::Iq4Nl, hidden, inter, &mut rng);
+    for dtype in [GgmlDType::Iq2S, GgmlDType::Iq3Xxs] {
         let gate = stack(dtype, inter, hidden, &mut rng);
         let up = stack(dtype, inter, hidden, &mut rng);
-        // The intermediate width is not a multiple of a 256-wide block: a down stack is 32-wide.
-        let down = stack(GgmlDType::Iq4Nl, hidden, inter, &mut rng);
-        for tokens in [512usize, 2048] {
-            let x = Tensor::from_vec(
-                random(&mut rng, tokens * hidden, 1.0),
-                (tokens, hidden),
-                &dev,
-            )
-            .unwrap();
-            let (slots, experts, weights) = routing(&mut rng, tokens, topk, e);
-            let m = slots.len();
-            let slots = Tensor::from_vec(slots, m, &dev).unwrap();
-            let experts = Tensor::from_vec(experts, m, &dev).unwrap();
-            let weights = Tensor::from_vec(weights, m, &dev).unwrap();
-            for tile in [0i32, 32, 64, 128] {
-                let plan = MmqRouting::new(&slots, &experts, topk, e)
-                    .unwrap()
-                    .with_tile_width(tile);
-                let h = plan.gate_up_silu(&x, &gate, Some(&up)).unwrap();
+        for tokens in [1000usize, 4000] {
+            let chunk = WideChunk::new(&dev, &mut rng, tokens, None);
+            let flops = (3 * tokens * topk * hidden * inter * 2) as f64;
+            for (what, first) in [("first", true), ("grouped", false)] {
+                let plan = || match first {
+                    true => chunk.plan().with_first_launches(),
+                    false => chunk.plan(),
+                };
+                let p = plan();
+                let h = p.gate_up_silu(&chunk.x, &gate, Some(&up)).unwrap();
                 let gu = time(&|| {
-                    plan.gate_up_silu(&x, &gate, Some(&up)).unwrap();
+                    p.gate_up_silu(&chunk.x, &gate, Some(&up)).unwrap();
                 });
                 let dn = time(&|| {
-                    plan.down_fold(&h, &down, &weights, None).unwrap();
+                    p.down_fold(&h, &down, &chunk.weights, None).unwrap();
                 });
-                let flops = (m * hidden * inter * 2) as f64;
+                let all = time(&|| {
+                    let p = plan();
+                    let h = p.gate_up_silu(&chunk.x, &gate, Some(&up)).unwrap();
+                    p.down_fold(&h, &down, &chunk.weights, None).unwrap();
+                });
                 println!(
-                    "{dtype:?} tokens={tokens:>5} tile={tile:>3}: gate_up {gu:8.3} ms ({:.1} TOPS over two matmuls) \
-                     down(iq4_nl) {dn:8.3} ms ({:.1} TOPS)",
-                    2.0 * flops / (gu * 1e-3) / 1e12,
-                    flops / (dn * 1e-3) / 1e12
+                    "{dtype:?}+Iq4Nl rows={tokens:>5} {what:>7}: gate_up {gu:7.3} ms down {dn:7.3} ms \
+                     chunk {all:7.3} ms ({:.1} TOPS)",
+                    flops / (all * 1e-3) / 1e12
                 );
             }
         }
