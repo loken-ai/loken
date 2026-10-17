@@ -158,7 +158,7 @@ impl ExpertRouting {
         xs: &Tensor,
         gate: &QTensor,
         up: &QTensor,
-        more: Option<(&QTensor, &QTensor)>,
+        more: Option<crate::inference::moe_cuda::MoreExperts<(&QTensor, &QTensor)>>,
     ) -> Result<Tensor> {
         device_timed("expert kernels: gate and up on the device", xs, || {
             crate::inference::moe_cuda::moe_gemm_gguf_gate_up_silu_mul_over(
@@ -182,7 +182,7 @@ impl ExpertRouting {
         &self,
         rows: &Tensor,
         stack: &QTensor,
-        more: Option<&QTensor>,
+        more: Option<crate::inference::moe_cuda::MoreExperts<&QTensor>>,
         weights: &Tensor,
     ) -> Result<Tensor> {
         device_timed("expert kernels: down on the device", rows, || {

@@ -293,6 +293,18 @@ pub fn moe_gemm_gguf_gate_up_silu_mul(
     )
 }
 
+/// Where a launch over a cache held in two allocations finds the second one's experts.
+#[derive(Clone, Copy)]
+pub enum MoreExperts<S> {
+    /// These stacks, their addresses taken when the launch is made.
+    Stacks(S),
+    /// `slots` experts in stacks whose card addresses the card reads at launch time from
+    /// `table`, one `u64` per stack in the order the launch reads them (gate then up, or down),
+    /// null while the stacks hold nothing: a recorded launch reads the stacks the table names
+    /// when it is replayed.
+    Table { table: u64, slots: usize },
+}
+
 /// [`moe_gemm_gguf_gate_up_silu_mul`] over the experts of the gate and up stacks and, numbered
 /// after them, those of `more` (its gate and up stacks): one launch serves a cache held in two
 /// allocations.
@@ -300,10 +312,12 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_over(
     input: &Tensor,
     gate_weights: &crate::tensor::quantized::QTensor,
     up_weights: &crate::tensor::quantized::QTensor,
-    more: Option<(
-        &crate::tensor::quantized::QTensor,
-        &crate::tensor::quantized::QTensor,
-    )>,
+    more: Option<
+        MoreExperts<(
+            &crate::tensor::quantized::QTensor,
+            &crate::tensor::quantized::QTensor,
+        )>,
+    >,
     sorted_token_ids: &Tensor,
     experts_ids: &Tensor,
     topk: usize,
@@ -323,25 +337,44 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_over(
     let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
-        if let Some((more_gate, more_up)) = more {
-            if more_gate.dtype() != gate_weights.dtype()
-                || more_up.dtype() != gate_weights.dtype()
-                || more_gate.shape().dims()[1..] != gate_weights.shape().dims()[1..]
-                || more_up.shape().dims() != more_gate.shape().dims()
-            {
-                crate::tensor::bail!("{ENTRY}: the second stacks differ in format or shape");
-            }
+        if let Some(more) = more {
+            let (alt_gate, alt_up, alt_at, more_slots) = match more {
+                MoreExperts::Stacks((more_gate, more_up)) => {
+                    if more_gate.dtype() != gate_weights.dtype()
+                        || more_up.dtype() != gate_weights.dtype()
+                        || more_gate.shape().dims()[1..] != gate_weights.shape().dims()[1..]
+                        || more_up.shape().dims() != more_gate.shape().dims()
+                    {
+                        crate::tensor::bail!(
+                            "{ENTRY}: the second stacks differ in format or shape"
+                        );
+                    }
+                    (
+                        more_gate.device_ptr()? as *const c_void,
+                        more_up.device_ptr()? as *const c_void,
+                        std::ptr::null(),
+                        more_gate.shape().dims()[0],
+                    )
+                }
+                MoreExperts::Table { table, slots } => (
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    table as *const *const c_void,
+                    slots,
+                ),
+            };
             loken_moe_gemm_gguf_gate_up_silu_mul_two(
                 dev_addr::<f32>(input, "input")? as *const f32,
                 gate_weights.device_ptr()? as *const c_void,
                 up_weights.device_ptr()? as *const c_void,
-                more_gate.device_ptr()? as *const c_void,
-                more_up.device_ptr()? as *const c_void,
+                alt_gate,
+                alt_up,
                 ext.experts,
+                alt_at,
                 slots,
                 experts,
                 output.device_ptr(output.stream()).0 as *mut f32,
-                ext.experts + more_gate.shape().dims()[0] as i32,
+                ext.experts + more_slots as i32,
                 ext.topk,
                 ext.m,
                 ext.n,
@@ -429,7 +462,7 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_live(
 pub fn moe_gemm_gguf_down_pairs_over(
     input: &Tensor,
     weights: &crate::tensor::quantized::QTensor,
-    more: Option<&crate::tensor::quantized::QTensor>,
+    more: Option<MoreExperts<&crate::tensor::quantized::QTensor>>,
     sorted_token_ids: &Tensor,
     expert_ids: &Tensor,
     topk_weights: &Tensor,
@@ -446,23 +479,35 @@ pub fn moe_gemm_gguf_down_pairs_over(
     let (pairs, hidden) = ext.out_shape();
     let out = unsafe { dev.alloc::<f32>(pairs * hidden) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
-    let (alt, alt_from) = match more {
-        Some(m) => {
+    let (alt, alt_at, alt_from, more_slots) = match more {
+        Some(MoreExperts::Stacks(m)) => {
             if m.dtype() != weights.dtype() || m.shape().dims()[1..] != weights.shape().dims()[1..]
             {
                 crate::tensor::bail!("{ENTRY}: the second stack differs in format or shape");
             }
-            (m.device_ptr()? as *const c_void, ext.experts)
+            (
+                m.device_ptr()? as *const c_void,
+                std::ptr::null(),
+                ext.experts,
+                m.shape().dims()[0],
+            )
         }
-        None => (std::ptr::null(), 0),
+        Some(MoreExperts::Table { table, slots }) => (
+            std::ptr::null(),
+            table as *const *const c_void,
+            ext.experts,
+            slots,
+        ),
+        None => (std::ptr::null(), std::ptr::null(), 0, 0),
     };
-    let experts_all = ext.experts + more.map_or(0, |m| m.shape().dims()[0] as i32);
+    let experts_all = ext.experts + more_slots as i32;
     unsafe {
         loken_moe_gemm_gguf_down_pairs_two(
             dev_addr::<f32>(input, "input")? as *const f32,
             weights.device_ptr()? as *const c_void,
             alt,
             alt_from,
+            alt_at,
             slots,
             experts,
             dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,

@@ -210,7 +210,7 @@ cuda_launchers! {
     loken_moe_gemm_gguf_gate_up_silu_mul_two(
         inputs: *const f32, gate_weights: *const c_void,
         up_weights: *const c_void, alt_gate: *const c_void, alt_up: *const c_void,
-        alt_from: i32, sorted_token_ids: *const i32,
+        alt_from: i32, alt_at: *const *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, outputs: *mut f32, num_experts: i32, topk: i32, size_m: i32,
         size_n: i32, size_k: i32, quant_type: i32);
     loken_moe_gemm_gguf_gate_up_swiglu_oai(
@@ -351,6 +351,7 @@ cuda_launchers! {
         down_bias: *const f32, add_after: *const f32);
     loken_moe_gemm_gguf_down_pairs_two(
         input: *const f32, weights: *const c_void, alt_weights: *const c_void, alt_from: i32,
+        alt_at: *const *const c_void,
         sorted_token_ids: *const i32, expert_ids: *const i32, topk_weights: *const f32,
         pair_rows: *mut f32, num_experts: i32, topk: i32, size_m: i32, size_n: i32,
         size_k: i32, gguf_dtype: i32);

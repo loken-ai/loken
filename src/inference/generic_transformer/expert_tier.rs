@@ -95,6 +95,38 @@ const ADAPT_SWAPS_A_REQUEST: usize = 2;
 /// is fixed for the run.
 const TRANSIT_PACE_SAMPLES: u64 = 16;
 
+/// A tier's table on the card of its extra stacks' addresses: three `u64`, at an address that
+/// stays for the tier's life.
+struct ExtraTable {
+    slice: Mutex<cudarc::driver::CudaSlice<u64>>,
+    addr: u64,
+}
+
+impl ExtraTable {
+    /// A table of nulls on `dev`.
+    fn new(dev: &Device) -> Result<Self> {
+        use cudarc::driver::DevicePtr;
+        let cd = dev.as_cuda_device()?;
+        let slice = cd.alloc_zeros::<u64>(3)?;
+        let addr = slice.device_ptr(slice.stream()).0;
+        Ok(Self {
+            slice: Mutex::new(slice),
+            addr,
+        })
+    }
+
+    /// Copies `addrs` into the table from the host, done before this returns: never while a
+    /// graph is being recorded.
+    fn write(&self, dev: &Device, addrs: [u64; 3]) -> Result<()> {
+        let cd = dev.as_cuda_device()?;
+        let mut slice = self.slice.lock().unwrap_or_else(|e| e.into_inner());
+        cd.memcpy_htod(&addrs[..], &mut *slice)?;
+        cd.0.stream()
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("extra slots' table: {e:?}")))
+    }
+}
+
 /// One layer's cache.
 pub struct LayerTier {
     dev: Device,
@@ -107,6 +139,10 @@ pub struct LayerTier {
     /// The slots a prefill can take the card's memory back from: the stacks that hold them, or
     /// `None` while they are lent. A lent slot holds nothing (owner `-3`).
     extra: Mutex<Option<[QTensor; 3]>>,
+    /// On the card, once the tier has extra slots: the extra stacks' addresses, gate, up and
+    /// down, each null while the slots are lent. Written whenever the stacks are lent or come
+    /// back, never moved: a recorded launch reads the extra stacks through it.
+    extra_table: Option<ExtraTable>,
     /// Bytes of one expert in each stack.
     expert_bytes: [usize; 3],
     n_experts: usize,
@@ -886,7 +922,6 @@ impl super::GenericHeteroTransformer {
                 .count()
         };
         if lent > 0 {
-            self.forget_recorded_drafts();
             crate::inference::place::ladder::release_pools();
             crate::inference::place::vram_manager::residency_changed();
         }
@@ -999,24 +1034,8 @@ impl super::GenericHeteroTransformer {
         if moved {
             tracing::info!("expert tier: the extra slots back in {held} of {of} layer-slots");
         }
-        if moved {
-            self.forget_recorded_drafts();
-        }
         crate::inference::place::vram_manager::residency_changed();
         Ok(copied)
-    }
-}
-
-impl super::GenericHeteroTransformer {
-    /// Drops the draft head's recorded guesses: their kernels name the extra slots' memory where
-    /// it was when they were recorded, and the slots were lent or came back elsewhere. The head
-    /// records them again at its next guess, and the decode's kept graphs are recorded again.
-    fn forget_recorded_drafts(&mut self) {
-        self.graph_generation = self.graph_generation.wrapping_add(1);
-        #[cfg(feature = "cuda")]
-        if let Some(d) = self.draft.as_mut() {
-            d.step = None;
-        }
     }
 }
 
@@ -1192,6 +1211,7 @@ impl LayerTier {
             card,
             base_slots: slots,
             extra: Mutex::new(None),
+            extra_table: None,
             expert_bytes,
             n_experts: moe.n_experts,
             state: Mutex::new(TierState {
@@ -1254,7 +1274,32 @@ impl LayerTier {
         }
         let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
         st.owner.resize(self.base_slots + n, -3);
+        self.extra_table = Some(ExtraTable::new(&self.dev)?);
         Ok(self)
+    }
+
+    /// The card's address of the extra stacks' entry `stack` (gate 0, up 1, down 2) in the
+    /// tier's table, `None` for a tier without extra slots.
+    pub(super) fn extra_table_at(&self, stack: usize) -> Option<u64> {
+        self.extra_table
+            .as_ref()
+            .map(|t| t.addr + (stack * std::mem::size_of::<u64>()) as u64)
+    }
+
+    /// Writes the addresses of `stacks`, or nulls, into the tier's table on the card.
+    fn write_extra_table(&self, stacks: Option<&[QTensor; 3]>) -> Result<()> {
+        let Some(t) = self.extra_table.as_ref() else {
+            return Ok(());
+        };
+        let addrs = match stacks {
+            Some(s) => [
+                s[0].device_ptr()? as u64,
+                s[1].device_ptr()? as u64,
+                s[2].device_ptr()? as u64,
+            ],
+            None => [0u64; 3],
+        };
+        t.write(&self.dev, addrs)
     }
 
     /// Whether `rows` rows read the layer's experts through the cache, as decoded tokens would:
@@ -1317,6 +1362,9 @@ impl LayerTier {
             }
         }
         *extra = None;
+        if let Err(e) = self.write_extra_table(None) {
+            tracing::warn!("expert tier: the extra slots' table: {e}");
+        }
         if let Ok(cd) = self.dev.as_cuda_device() {
             let _ = cd.0.stream().synchronize();
             crate::tensor::quantized::trim_lent_pool(cd.0.ordinal());
@@ -1376,6 +1424,7 @@ impl LayerTier {
             let Some(stacks) = stacks else {
                 return Ok(0);
             };
+            self.write_extra_table(Some(&stacks))?;
             *extra = Some(stacks);
             drop(extra);
             self.fill_extra(fit)
@@ -1732,7 +1781,7 @@ impl LayerTier {
                 xs,
                 &self.card[0],
                 &self.card[1],
-                more.map(|m| (&m[0], &m[1])),
+                more.map(|m| crate::inference::moe_cuda::MoreExperts::Stacks((&m[0], &m[1]))),
             )?;
             Some(routing.down_reduce_over(
                 &h,
@@ -3774,6 +3823,147 @@ mod tests {
             "the cache did not learn: {hits} of {routed}"
         );
         drop(worker);
+    }
+
+    /// A decoded token recorded in a graph while the extra slots hold experts replays what the
+    /// same kernels give run eagerly, to the bit, after the extra slots were lent and came back
+    /// at other addresses: the recording reads the extra stacks through the tier's table.
+    #[test]
+    fn a_recorded_token_follows_the_extra_slots_when_they_come_back_elsewhere() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let (base, extra) = (2usize, 8usize);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let built = LayerTier::new(&tiered, &card, base)
+            .unwrap()
+            .with_extra(extra)
+            .unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        tier.enable_graph(hidden, used, 1).unwrap();
+        let worker = TierWorker::start(&card, vec![tier.clone()]).unwrap();
+        let stream = card.as_cuda_device().unwrap().0.stream().clone();
+        let x = Tensor::from_vec(values(hidden, 7, 1.0), (1, 1, hidden), &card).unwrap();
+        let held = |tier: &LayerTier| {
+            let st = tier.state.lock().unwrap();
+            (tier.base_slots..st.owner.len())
+                .filter(|&s| st.owner[s] >= 0)
+                .count()
+        };
+        let reset_counters = |tier: &LayerTier| {
+            tier.routed.store(0, Ordering::Relaxed);
+            tier.hits.store(0, Ordering::Relaxed);
+        };
+        let eager = |tiered: &MoeWeights| -> Vec<f32> {
+            GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+            let out = tiered.forward(&x, &x, hidden, 1e-5, false).unwrap();
+            GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+            let out = out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            tier.settle();
+            out
+        };
+        // The token's experts heat up and fill the base slots, then the extra slots take the
+        // others: every expert the token routes to is on the card, so nothing moves after.
+        for _ in 0..8 {
+            eager(&tiered);
+        }
+        reset_counters(&tier);
+        tier.restore_extra().unwrap();
+        tier.settle();
+        assert!(held(&tier) > 0, "no expert reached the extra slots");
+        let want = eager(&tiered);
+        assert_eq!(want, eager(&tiered), "the eager token is not stable");
+        let into = Tensor::zeros_on((1, 1, hidden), DType::F32, &card).unwrap();
+        crate::tensor::cuda_ext::begin_capture(&stream).unwrap();
+        let ran = tiered
+            .forward(&x, &x, hidden, 1e-5, false)
+            .and_then(|out| into.slice_set(&out.to_dtype(DType::F32)?, 0, 0));
+        let graph = crate::tensor::cuda_ext::end_capture(&stream);
+        ran.unwrap();
+        let graph = graph.unwrap().expect("a recorded token");
+        let replay = || -> Vec<f32> {
+            graph.launch().unwrap();
+            stream.synchronize().unwrap();
+            tier.settle();
+            into.flatten_all().unwrap().to_vec1().unwrap()
+        };
+        assert_eq!(replay(), want, "the replay differs from the eager run");
+        let table = || {
+            let extra = tier.extra.lock().unwrap();
+            extra.as_ref().map(|s| s[0].device_ptr().unwrap() as u64)
+        };
+        let before = table().expect("the extra slots hold memory");
+        // Stacks held where the lent ones were, so that the slots come back elsewhere.
+        let mut blockers = Vec::new();
+        let mut moved = false;
+        for _ in 0..4 {
+            assert!(tier.lend_extra());
+            blockers.push([0, 1, 2].map(|i| lent_experts(&tier.host[i], extra, &card).unwrap()));
+            reset_counters(&tier);
+            tier.restore_extra().unwrap();
+            tier.settle();
+            if table().is_some_and(|a| a != before) {
+                moved = true;
+                break;
+            }
+        }
+        assert!(moved, "the extra slots came back where they were");
+        assert!(held(&tier) > 0, "no expert came back to the extra slots");
+        let want = eager(&tiered);
+        assert_eq!(
+            replay(),
+            want,
+            "the replay after the slots moved differs from the eager run"
+        );
+        drop(blockers);
+        drop(worker);
+    }
+
+    /// The extra slots lent and given back leave the model's graph generation where it was:
+    /// the recorded graphs read them through the tier's table, which never moves.
+    #[test]
+    fn lending_and_restoring_the_extra_slots_leave_the_graph_generation() {
+        use crate::inference::generic_transformer::tiny_model;
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let path = tiny_model::write_moe("tier-generation", 1);
+        let mut model = tiny_model::load(&path, 1);
+        tiny_model::remove(&path);
+        let moe = layer(&card, 32, 4, 64, 64);
+        let tier = Arc::new(
+            LayerTier::new(&moe, &card, 2)
+                .unwrap()
+                .with_extra(8)
+                .unwrap(),
+        );
+        model.layers[0].moe.as_mut().expect("a mixture layer").tier = Some(tier.clone());
+        let at = model.graph_generation();
+        let table = tier
+            .extra_table_at(0)
+            .expect("a tier with extra slots has a table");
+        tier.restore_extra().unwrap();
+        tier.settle();
+        assert!(tier.has_extra());
+        assert!(tier.lend_extra());
+        model.return_expert_cache().unwrap();
+        tier.restore_extra().unwrap();
+        tier.settle();
+        assert!(tier.has_extra());
+        assert_eq!(tier.extra_table_at(0), Some(table), "the table moved");
+        assert_eq!(model.graph_generation(), at, "the generation moved");
     }
 
     /// The rows of a draft verify as the kernels of the recorded decode, the host answering

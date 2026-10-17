@@ -41,6 +41,11 @@ Smaller, by priority:
 | A routing profile kept per model | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
 | Qwen3.8 IQ1_M on one card at the reference | The resumed-prompt decode at or above the reference engine's on one card | Planned |
 | Context parallelism inside the recorded step | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
+| Audio input proven on real checkpoints | Voxtral and Ultravox transcripts of a 20-clip set at or below the reference's word error rate, with their real-time factor, committed | Planned |
+| Ultravox on its own | One pull or checkpoint directory serves an audio turn with no GGUF supplied beside it | Planned |
+| Media input limits | Per-request caps on images, pixels and audio seconds, stated in the docs, a request past one answered 400 with the reason | Planned |
+| Images by URL on the Messages API | An image block with a URL source fetched within the host allowlist and answered | Planned |
+| Multimodal parts on the Responses API | Image and audio input items answered as on chat completions, covered by a test | Planned |
 
 ## 0.5.0
 
@@ -60,6 +65,9 @@ Smaller, by priority:
 | Per-request metrics | Queue, prefill, decode and cache figures per request on the metrics endpoint | Planned |
 | Beam search | n beams with length penalty, the result equal to the reference implementation's | Planned |
 | Prompt embeddings | A request that hands embeddings instead of tokens, answered as for the tokens they stand for | Planned |
+| Streamed speech | The first audio chunk of a speech request within half a second, opus, flac and aac besides wav and mp3 | Planned |
+| Audio from a chat turn | A chat completion asking for text and audio modalities returns the audio in its message | Planned |
+| Concurrent media requests | Two image or speech requests on one card finish sooner together than one after the other | Planned |
 
 ## 0.6.0
 
@@ -78,6 +86,8 @@ Smaller, by priority:
 | Adapters per request | Several text adapters served over one base model, each request naming its own | Planned |
 | Pooling and classification | The classify, score and pooling routes over the loaded models | Planned |
 | Encoder-decoder models | A sequence-to-sequence family served for text and speech, matching the reference implementation | Planned |
+| Vision and video speed | A one-megapixel image's first token within 1.2x of the reference engines, a video clip's time within 1.2x with its decoder on the card | Planned |
+| Image and sound quality measured | Image families scored by PSNR or LPIPS against their reference, music and sound families by a committed metric set | Planned |
 
 ## 0.7.0
 
@@ -93,6 +103,7 @@ Smaller, by priority:
 | Feature | Acceptance | State |
 |---|---|---|
 | Web search and fetch tools | Built-in tools a request may enable, their calls and results logged as tool turns | Planned |
+| A build with vision input alone | A build that reads images in chat without the generation pipelines | Planned |
 
 ## 0.8.0
 

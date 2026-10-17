@@ -545,18 +545,19 @@ impl LayerTier {
         } else {
             ExpertRouting::group(&slots.reshape((rows, k))?, k)?
         };
-        let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
-        let more = extra.as_ref();
-        let h = routing.gate_up_silu_over(
-            &x,
-            &self.card[0],
-            &self.card[1],
-            more.map(|m| (&m[0], &m[1])),
-        )?;
+        // The extra stacks are read through the tier's table, so that a recorded launch follows
+        // them when they are lent and come back elsewhere.
+        let slots = self.extra_slots();
+        let gate_up = self
+            .extra_table_at(0)
+            .map(|table| moe_cuda::MoreExperts::Table { table, slots });
+        let h = routing.gate_up_silu_over(&x, &self.card[0], &self.card[1], gate_up)?;
         // Each pair's row, at its weight: the merge sums a row's pairs with the late ones and
         // the host's product.
-        let card = routing.down_pairs_over(&h, &self.card[2], more.map(|m| &m[2]), &weights)?;
-        drop(extra);
+        let down = self
+            .extra_table_at(2)
+            .map(|table| moe_cuda::MoreExperts::Table { table, slots });
+        let card = routing.down_pairs_over(&h, &self.card[2], down, &weights)?;
         Ok(GraphPending {
             card,
             x,
