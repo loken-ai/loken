@@ -13,9 +13,9 @@ const SCORE_TEMPORARIES: usize = 3;
 
 /// Bytes [`partial`] holds for each key of a block, for `rows` query rows of `h` heads over
 /// `h_kv` key-value heads of width `d`: the scores and mask, the block's F16 view made whole,
-/// its F32 keys and values, their heads repeated and the keys transposed.
+/// its F32 keys and values and the keys transposed.
 fn bytes_per_key(h: usize, h_kv: usize, d: usize, rows: usize) -> usize {
-    SCORE_TEMPORARIES * h * rows * 4 + rows * 4 + 2 * h_kv * d * (2 + 4) + 3 * h * d * 4
+    SCORE_TEMPORARIES * h * rows * 4 + rows * 4 + 2 * h_kv * d * (2 + 4) + h_kv * d * 4
 }
 
 /// What one range of the cache gives a query: per query head and row, the scores' maximum
@@ -45,26 +45,24 @@ pub fn partial(
     let dev = q.device().clone();
     let k = k.to_device(&dev)?.to_dtype(DType::F32)?;
     let v = v.to_device(&dev)?.to_dtype(DType::F32)?;
-    // A query head reads the key-value head of its group.
-    let (k, v) = if group > 1 {
-        (repeat_heads(&k, group)?, repeat_heads(&v, group)?)
-    } else {
-        (k, v)
-    };
-    let q = q.to_dtype(DType::F32)?;
-    let mut scores = (q.matmul(&k.t()?)? * scale)?; // [b, h, s, t]
-    let mask = causal_mask(s, t, q_pos, k_pos, &dev)?;
-    if let Some(mask) = mask {
-        scores = scores.broadcast_add(&mask)?;
+    // The query heads of a group read one key-value head: their rows are stacked over it,
+    // `[b, h_kv, group * s, d]`, so the keys and values are read once.
+    let q = q.to_dtype(DType::F32)?.reshape((b, h_kv, group * s, d))?;
+    let mut scores = (q.matmul(&k.t()?)? * scale)?; // [b, h_kv, group * s, t]
+    if let Some(mask) = causal_mask(s, t, q_pos, k_pos, &dev)? {
+        scores = scores
+            .reshape((b, h_kv, group, s, t))?
+            .broadcast_add(&mask)?
+            .reshape((b, h_kv, group * s, t))?;
     }
     let max = scores.max_keepdim(D::Minus1)?;
     // A row with every key masked keeps a maximum of minus infinity; its exponentials are
     // taken from zero instead so they come to zero rather than to a NaN.
     let finite_max = max.maximum(&Tensor::new(f32::MIN, &dev)?.broadcast_as(max.shape())?)?;
     let weights = scores.broadcast_sub(&finite_max)?.exp()?;
-    let sum = weights.sum_keepdim(D::Minus1)?;
-    let out = weights.matmul(&v)?;
-    debug_assert_eq!(out.dims(), &[b, h, s, d]);
+    let sum = weights.sum_keepdim(D::Minus1)?.reshape((b, h, s, 1))?;
+    let out = weights.matmul(&v)?.reshape((b, h, s, d))?;
+    let finite_max = finite_max.reshape((b, h, s, 1))?;
     Ok(Part {
         max: finite_max,
         sum,
@@ -116,6 +114,7 @@ fn combine(parts: &[Part], dev: &Device) -> Result<Tensor> {
     finish(&acc)
 }
 
+#[cfg(test)]
 /// `x` `[b, h_kv, t, d]` with each head repeated `n` times in place: `[b, h_kv * n, t, d]`.
 fn repeat_heads(x: &Tensor, n: usize) -> Result<Tensor> {
     let (b, h_kv, t, d) = x.dims4()?;
