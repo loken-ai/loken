@@ -2331,7 +2331,7 @@ impl LayerTier {
             let data = self.host[i].native_qtensor().data();
             for (at, &e) in experts.iter().enumerate() {
                 let e = e as usize;
-                self.upload_mapped(data, e * eb, eb, base + (at * eb) as u64, copy)?;
+                self.upload_mapped(i, data, e * eb, eb, base + (at * eb) as u64, copy)?;
             }
         }
         end.record(copy)
@@ -2452,7 +2452,7 @@ impl LayerTier {
             let eb = self.expert_bytes[i];
             let data = self.host[i].native_qtensor().data();
             let dst = self.slot_addr(i, slot)?;
-            self.upload_mapped(data, expert * eb, eb, dst, &self.copy)?;
+            self.upload_mapped(i, data, expert * eb, eb, dst, &self.copy)?;
         }
         Ok(())
     }
@@ -2965,14 +2965,24 @@ impl LayerTier {
     /// copies of a decode, which go out between the card's kernels and take no buffer of their own.
     fn upload_mapped(
         &self,
+        i: usize,
         data: &[u8],
         start: usize,
         len: usize,
         dst: u64,
         copy: &Arc<cudarc::driver::CudaStream>,
     ) -> Result<()> {
-        let a = data.as_ptr() as usize + start;
-        self.copy_mapped(a, a + len, a, dst, copy)
+        let (a, b) = (
+            data.as_ptr() as usize + start,
+            data.as_ptr() as usize + start + len,
+        );
+        // Cut at the edges of the stack's locked pages, as `upload` does.
+        let pinned = self.stage.as_ref().and_then(|s| s.pinned[i]);
+        let (lo, hi) = pinned.map_or((b, b), |(lo, hi)| (lo.clamp(a, b), hi.clamp(a, b)));
+        let (lo, hi) = if lo < hi { (lo, hi) } else { (b, b) };
+        self.copy_mapped(a, lo, a, dst, copy)?;
+        self.copy_mapped(lo, hi, a, dst, copy)?;
+        self.copy_mapped(hi, b, a, dst, copy)
     }
 
     /// Copy the mapped bytes `[from, to)` to the card, where `a` is the address `dst` stands for.
