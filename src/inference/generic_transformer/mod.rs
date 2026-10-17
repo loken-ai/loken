@@ -590,6 +590,8 @@ pub struct KvSnapshot {
     /// The last row's logits of the forward that ended at `kv_len`: a recurrent model's
     /// prefix snapshot resumes decoding from them.
     pub(crate) logits: Option<Tensor>,
+    /// The draft head's state at `kv_len`, when the head had read the same prefix.
+    pub(crate) draft: Option<state_cache::DraftHeld>,
 }
 
 impl KvSnapshot {

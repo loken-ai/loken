@@ -1802,7 +1802,15 @@ impl GenericHeteroTransformer {
         logits: Option<crate::tensor::Tensor>,
     ) {
         self.kv_snapshot_tick += 1;
+        let draft = match self.capture_draft(kv_len) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!("kv snapshot: the draft head's state is not kept: {e}");
+                None
+            }
+        };
         let snap = super::KvSnapshot {
+            draft,
             tokens,
             kv_len,
             layers,
@@ -1898,6 +1906,8 @@ impl GenericHeteroTransformer {
         } = self;
         restore_layers(layers, &kv_snapshots[index].layers)?;
         self.rebuild_host_stores();
+        let draft = self.kv_snapshots[index].draft.clone();
+        self.restore_draft(draft.as_ref())?;
         let snap = &self.kv_snapshots[index];
         let covered = snap.kv_len;
         let logits = snap
