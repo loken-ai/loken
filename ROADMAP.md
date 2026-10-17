@@ -28,7 +28,7 @@ Major, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
-| ROCm and Vulkan backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA and an AMD card, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Planned |
+| ROCm and Vulkan backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Planned |
 | Coding agents beyond verve | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
 | Forecasting and tabular models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
 
@@ -92,6 +92,7 @@ Smaller, by priority:
 
 | Feature | Acceptance | State |
 |---|---|---|
+| A backend for Intel GPUs | One model served on an Intel GPU through a native path by the same placement, its memory shared with the host counted once, measured against its Vulkan path | Planned |
 | Web search and fetch tools | Built-in tools a request may enable, their calls and results logged as tool turns | Planned |
 
 ## 0.8.0
@@ -118,4 +119,3 @@ to measure it on is available.
 | Feature | Acceptance | Needs |
 |---|---|---|
 | A backend for Apple silicon | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | An M-series Mac |
-| A backend for Intel cards | One model served on an Intel GPU through a native path by the same placement, measured against its Vulkan path | An Intel GPU |
