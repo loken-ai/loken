@@ -1340,6 +1340,8 @@ impl LlmEngine {
                 #[cfg(feature = "cuda")]
                 moondream_graph: None,
                 moondream_decode_count: 0,
+                #[cfg(feature = "cuda")]
+                kept_graphs: Default::default(),
                 eos_token_ids_extra,
                 file_size,
                 model,

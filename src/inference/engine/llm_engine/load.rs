@@ -448,6 +448,8 @@ pub(super) fn load_deepseek_v41_checkpoint(
         #[cfg(feature = "cuda")]
         moondream_graph: None,
         moondream_decode_count: 0,
+        #[cfg(feature = "cuda")]
+        kept_graphs: Default::default(),
         eos_token_ids_extra: Vec::new(),
         file_size,
         model: backend,
@@ -759,6 +761,12 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         // by a batch of a few, so a handful is the useful width; a larger prompt set simply
         // queues behind it.
         const V41_MAX_BATCH: usize = 8;
+        // The graphs kept between requests are for the serial decode of this model as it stands.
+        #[cfg(feature = "cuda")]
+        if !state.kept_graphs.is_empty() {
+            state.kept_graphs.clear();
+            state.model.invalidate_graph_state();
+        }
         let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));
         // DeepSeek V4.1: move a card-placed model into its batch worker. A host-only load has
         // no lanes to batch and hands itself back.
@@ -804,6 +812,12 @@ pub(super) fn demote_to_serial(state: &mut LoadedModelState) -> bool {
     {
         if state.model.batched_server().is_none() {
             return true;
+        }
+        // The graphs kept between requests are for the serial decode of this model as it stands.
+        #[cfg(feature = "cuda")]
+        if !state.kept_graphs.is_empty() {
+            state.kept_graphs.clear();
+            state.model.invalidate_graph_state();
         }
         let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));
         match taken.into_serial() {
@@ -854,6 +868,9 @@ pub(crate) struct LoadedModelState {
     /// Decode tokens seen since model load. Drives moondream graph
     /// capture warmup gating (capture fires once after N warmup tokens).
     pub(super) moondream_decode_count: u32,
+    /// The decode's recorded graphs, kept between requests while nothing they read has moved.
+    #[cfg(feature = "cuda")]
+    pub(super) kept_graphs: super::decode::KeptGraphs<super::decode::DecodeGraphs>,
     /// Additional EOS-equivalent token IDs (e.g. Gemma4's
     /// `tokenizer.ggml.eos_token_ids` = [1, 106, 50] where 106 and 50
     /// are turn-end markers used in the chat template). Single

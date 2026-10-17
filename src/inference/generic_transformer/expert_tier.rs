@@ -1010,8 +1010,9 @@ impl super::GenericHeteroTransformer {
 impl super::GenericHeteroTransformer {
     /// Drops the draft head's recorded guesses: their kernels name the extra slots' memory where
     /// it was when they were recorded, and the slots were lent or came back elsewhere. The head
-    /// records them again at its next guess.
+    /// records them again at its next guess, and the decode's kept graphs are recorded again.
     fn forget_recorded_drafts(&mut self) {
+        self.graph_generation = self.graph_generation.wrapping_add(1);
         #[cfg(feature = "cuda")]
         if let Some(d) = self.draft.as_mut() {
             d.step = None;

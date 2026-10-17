@@ -50,6 +50,11 @@ pub struct KvCore {
     captured: bool,
     /// Longest sequence the live graph may replay to, frozen when it was marked.
     seq_limit: Option<usize>,
+    /// The ceiling of a graph released by a trim, which a graph kept across the trim takes
+    /// back with [`Self::resume_captured`]. Cleared by an explicit release or a new mark.
+    held_limit: Option<usize>,
+    /// Times the buffers were made anew: a graph recorded against them is stale once this moves.
+    moves: u64,
     /// Padded stride most recently used by a fixed-stride attention chain since the last
     /// capture cycle; 0 = none. Written from `&self` attention calls, hence atomic.
     chain_stride_seen: AtomicUsize,
@@ -67,6 +72,8 @@ impl KvCore {
             primed: None,
             captured: false,
             seq_limit: None,
+            held_limit: None,
+            moves: 0,
             chain_stride_seen: AtomicUsize::new(0),
             kernel_bound_seen: AtomicUsize::new(0),
         }
@@ -120,8 +127,15 @@ impl KvCore {
         need.max(self.cap + 1).min(self.max)
     }
 
+    /// The buffers were made anew at `cap` tokens.
     pub fn set_cap(&mut self, cap: usize) {
         self.cap = cap.min(self.max);
+        self.moves += 1;
+    }
+
+    /// Times the buffers were made anew since the cache was built.
+    pub fn moves(&self) -> u64 {
+        self.moves
     }
 
     /// Records `n_new` tokens written by an eager append.
@@ -136,7 +150,7 @@ impl KvCore {
         let old = self.len;
         self.len = new_len.min(old);
         self.primed = None;
-        self.clear_captured();
+        self.suspend_captured();
         old
     }
 
@@ -166,6 +180,7 @@ impl KvCore {
     /// the capacity, by the stride of a fixed-stride chain if one was recorded, and by the
     /// longest sequence its recorded kernels serve as an eager step would.
     pub fn mark_captured(&mut self) {
+        self.held_limit = None;
         self.captured = true;
         let limit = [
             self.chain_stride_seen.load(Ordering::Relaxed),
@@ -177,7 +192,33 @@ impl KvCore {
         self.seq_limit = Some(limit);
     }
 
+    /// Releases the capture bookkeeping, holding the live graph's ceiling for a graph kept
+    /// across the release: growth is allowed again until [`Self::resume_captured`].
+    pub fn suspend_captured(&mut self) {
+        if let Some(limit) = self.seq_limit {
+            self.held_limit = Some(limit);
+        }
+        self.captured = false;
+        self.seq_limit = None;
+        self.chain_stride_seen.store(0, Ordering::Relaxed);
+        self.kernel_bound_seen.store(0, Ordering::Relaxed);
+    }
+
+    /// A graph kept across a release is live again: growth is refused and replays are bounded
+    /// by the ceiling it was marked with, or by what [`Self::mark_captured`] finds when none
+    /// was held.
+    pub fn resume_captured(&mut self) {
+        match self.held_limit {
+            Some(limit) => {
+                self.captured = true;
+                self.seq_limit = Some(limit.min(self.cap));
+            }
+            None => self.mark_captured(),
+        }
+    }
+
     pub fn clear_captured(&mut self) {
+        self.held_limit = None;
         self.captured = false;
         self.seq_limit = None;
         self.chain_stride_seen.store(0, Ordering::Relaxed);
@@ -271,6 +312,35 @@ mod tests {
         assert!(!c.is_primed());
         assert!(!c.is_captured());
         assert_eq!(c.seq_limit(), None);
+    }
+
+    #[test]
+    fn a_graph_kept_across_a_trim_takes_its_ceiling_back() {
+        let mut c = KvCore::new(4096, 32768);
+        c.note_chain_stride(512);
+        c.mark_captured();
+        c.commit(300);
+        c.trim_to(0);
+        assert!(!c.is_captured());
+        assert!(c.grow_target(5000).is_ok());
+        c.resume_captured();
+        assert!(c.is_captured());
+        assert_eq!(c.seq_limit(), Some(512));
+        c.clear_captured();
+        c.resume_captured();
+        assert_eq!(c.seq_limit(), Some(4096));
+    }
+
+    #[test]
+    fn only_a_new_buffer_moves_the_cache() {
+        let mut c = KvCore::new(64, 1024);
+        c.commit(40);
+        c.trim_to(0);
+        c.mark_captured();
+        c.clear_captured();
+        assert_eq!(c.moves(), 0);
+        c.set_cap(128);
+        assert_eq!(c.moves(), 1);
     }
 
     #[test]

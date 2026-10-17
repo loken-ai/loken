@@ -284,6 +284,21 @@ impl Q4KvCache {
         self.core.clear_captured();
     }
 
+    /// A graph kept across a trim is live again over these buffers.
+    pub fn resume_graph_captured(&mut self) {
+        self.core.resume_captured();
+    }
+
+    /// Releases the capture bookkeeping while a kept graph waits for its next replay.
+    pub fn suspend_graph_captured(&mut self) {
+        self.core.suspend_captured();
+    }
+
+    /// Times the buffers were made anew.
+    pub fn buffer_moves(&self) -> u64 {
+        self.core.moves()
+    }
+
     /// Sequence-length ceiling of the live graph; `None` when no graph is live.
     pub fn graph_seq_limit(&self) -> Option<usize> {
         self.core.seq_limit()

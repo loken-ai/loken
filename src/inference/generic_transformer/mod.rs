@@ -531,6 +531,12 @@ pub struct GenericHeteroTransformer {
     /// bit `r` the verify of `r` rows. A later recording of one of them keeps the check of its
     /// replay and drops the others.
     pub(crate) graph_proven: u64,
+    /// Bumped by every explicit drop of the graph state and every move of the expert slots;
+    /// [`Self::graph_generation`] adds the layers' buffer moves to it.
+    pub(crate) graph_generation: u64,
+    /// A number no other model built in this process carries: graphs kept for one model are
+    /// never replayed over another.
+    pub(crate) graph_instance: u64,
     /// Cached layer-consolidation groups for `update_graph_state`. Derived
     /// once from immutable layer config - no need to rebuild HashMaps
     /// every token. Indexed by layer; value = leader layer index for

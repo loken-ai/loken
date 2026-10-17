@@ -115,6 +115,28 @@ impl QuantKv {
         }
     }
 
+    pub fn resume_graph_captured(&mut self) {
+        match self {
+            QuantKv::Q8(c) => c.resume_graph_captured(),
+            QuantKv::Q4(c) => c.resume_graph_captured(),
+        }
+    }
+
+    pub fn suspend_graph_captured(&mut self) {
+        match self {
+            QuantKv::Q8(c) => c.suspend_graph_captured(),
+            QuantKv::Q4(c) => c.suspend_graph_captured(),
+        }
+    }
+
+    /// Times the buffers were made anew: a graph recorded against them is stale once this moves.
+    pub fn buffer_moves(&self) -> u64 {
+        match self {
+            QuantKv::Q8(c) => c.buffer_moves(),
+            QuantKv::Q4(c) => c.buffer_moves(),
+        }
+    }
+
     pub fn graph_seq_limit(&self) -> Option<usize> {
         match self {
             QuantKv::Q8(c) => c.graph_seq_limit(),

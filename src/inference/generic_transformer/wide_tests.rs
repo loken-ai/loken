@@ -294,6 +294,14 @@ fn the_ngram_rows_stay_where_they_lie_through_a_forward_and_a_restore() {
         "a restore moved the rows"
     );
     assert_eq!(flat(ple.carried().unwrap()), before);
+    let moves = ple.buffer_moves();
+    ple.reset();
+    assert!(
+        held.shares_storage(ple.carried().unwrap()),
+        "a reset moved the rows"
+    );
+    assert!(flat(ple.carried().unwrap()).iter().all(|&v| v == 0.0));
+    assert_eq!(ple.buffer_moves(), moves);
 }
 
 #[test]

@@ -279,18 +279,24 @@ impl LlmEngine {
                     params.max_tokens.unwrap_or(0)),
             };
 
-            // Request-start graph hygiene: a prior request's graph state
-            // (per-layer rope/mask buffers, quantized-KV capture flags) must
-            // not leak into this request. The captured graph itself is
-            // request-local (dropped at the end of the generation loop), but
-            // the layer buffers persist on the model - a stale
-            // `graph_rope_cos` would make a single-token prefill delta take
-            // `use_graph_ops` with FROZEN rope values -> silent garbage, and
-            // a stale `graph_captured` flag would fail the new prefill's KV
-            // growth. Cheap (~n_layers Option resets); a graph-mode request
-            // re-primes everything on its first decode token. Does NOT touch
-            // KV contents, so prefix reuse below is unaffected.
-            state.model.invalidate_graph_state();
+            // Request-start graph hygiene: the graphs kept from the last request stay, with
+            // the buffers they read, while the model's graph generation is the one they were
+            // recorded at; the quantised caches' capture flags are released so the prefill may
+            // grow them (a growth moves the generation and drops the graphs before the decode).
+            // Otherwise the prior request's graph state (per-layer rope/mask buffers, capture
+            // flags) is dropped. Either way the decode re-primes what the graphs read on its
+            // first token. Does NOT touch KV contents, so prefix reuse below is unaffected.
+            #[cfg(feature = "cuda")]
+            let graphs_kept = state.kept_graphs.current(state.model.graph_generation());
+            #[cfg(not(feature = "cuda"))]
+            let graphs_kept = false;
+            if graphs_kept {
+                state.model.suspend_graph_captured();
+            } else {
+                #[cfg(feature = "cuda")]
+                state.kept_graphs.clear();
+                state.model.invalidate_graph_state();
+            }
 
             // -- GLOBAL prompt cache (ollama parity, non-streaming) -----------
             // A sessionless text request reuses the common prefix of the single
@@ -658,28 +664,56 @@ impl LlmEngine {
             #[cfg(feature = "opencl")]
             let mut draft_hidden_states: Vec<(Tensor, usize)> = Vec::with_capacity(8);
 
-            // CUDA graph: capture forward pass after warmup, replay for subsequent tokens
+            // CUDA graph: capture forward pass after warmup, replay for subsequent tokens. The
+            // graphs kept from the last request are taken when the prefill moved none of the
+            // buffers they read; stale ones are dropped with the graph state.
             #[cfg(feature = "cuda")]
-            let mut cuda_graph: Option<super::decode::DecodeGraph> = None;
+            let kept = {
+                let kept = state.kept_graphs.take_current(state.model.graph_generation());
+                if kept.is_none() && graphs_kept {
+                    state.model.invalidate_graph_state();
+                }
+                kept
+            };
+            #[cfg(feature = "cuda")]
+            let (kept_step, mut verify_graphs, mut graphs_at) = match kept {
+                Some((g, at)) => {
+                    let mut verify = g.verify;
+                    verify.for_next_request();
+                    state.model.resume_graph_captured();
+                    (g.step, verify, super::decode::RecordedAt::kept(at))
+                }
+                None => (None, super::decode::VerifyGraphs::default(), super::decode::RecordedAt::default()),
+            };
+            // A step kept from the last request is replayed from the first token: its first
+            // replay is held against an eager step, as the last one of a fresh capture's is.
+            #[cfg(feature = "cuda")]
+            let mut graph_kept = kept_step.is_some();
+            #[cfg(feature = "cuda")]
+            let (mut cuda_graph, kept_logits): (Option<super::decode::DecodeGraph>, Option<Tensor>) = match kept_step {
+                Some((g, l)) => (Some(g), Some(l)),
+                None => (None, None),
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (graph_kept, kept_logits): (bool, Option<Tensor>) = (false, None);
             // Reference to the output logits tensor from graph capture (same addresses on replay)
-            let mut graph_logits: Option<Tensor> = None;
+            let mut graph_logits: Option<Tensor> = kept_logits;
             // Sticky flag: once graph mode trips a fallback (e.g. seq exceeds
             // the captured kv_cache cap), don't keep calling
             // update_graph_state - the layers stay invalidated for the rest
             // of the request.
             let mut graph_disabled_this_request: bool = false;
+            // Probations of the step graph that disagreed with the eager step, this request.
+            let mut graph_mismatches: usize = 0;
             // PLD-resilient graph-mode warmup/capture triggers.
             // Set after warmup forward succeeds; checked in capture branch.
-            let mut graph_warmed: bool = false;
-            let mut graph_capture_attempted: bool = false;
+            let mut graph_warmed: bool = graph_kept;
+            let mut graph_capture_attempted: bool = graph_kept;
             // Probation counter (gptoss-style): the captured graph stays on
             // probation - each of the first replays re-validated against an
             // eager forward - until GRAPH_VALIDATIONS consecutive matches.
             #[cfg(feature = "cuda")]
-            let mut graph_validations: usize = 0;
-            // The recorded draft verifies, one graph per window size.
-            #[cfg(feature = "cuda")]
-            let mut verify_graphs = super::decode::VerifyGraphs::default();
+            let mut graph_validations: usize = if graph_kept { super::decode::GRAPH_VALIDATIONS - 1 } else { 0 };
             // Capture MUST happen on the MODEL's compute stream - the one its
             // kernels actually enqueue on. On the native substrate every
             // `Device::new_cuda` owns a fresh stream, so `state.device`'s
@@ -1140,7 +1174,8 @@ impl LlmEngine {
                         }
                         // A recurrent state advances with the replay, so the probation
                         // below, which runs the same step again, starts from a copy of it.
-                        const GRAPH_VALIDATIONS: usize = 3;
+                        use super::decode::GRAPH_VALIDATIONS;
+                        let mut kept_unchecked = false;
                         let recurrent_cp = if graph_validations < GRAPH_VALIDATIONS {
                             state.model.recurrent_checkpoint().unwrap_or_default()
                         } else {
@@ -1199,12 +1234,27 @@ impl LlmEngine {
                                                 });
                                             if agrees {
                                                 graph_validations += 1;
+                                                graph_kept = false;
                                             } else {
-                                                warn!("CUDA graph replay!=eager at pos={pos} (argmax {:?} vs {}); discarding graph, eager decode for rest of request",
+                                                warn!("CUDA graph replay!=eager at pos={pos} (argmax {:?} vs {}); the step is recorded again, the request decodes eagerly after repeated disagreements",
                                                     rep_argmax, eag_argmax);
                                                 cuda_graph = None;
                                                 graph_logits = None;
-                                                graph_disabled_this_request = true;
+                                                // A step kept from the last request is recorded
+                                                // again from here, as a fresh request records it.
+                                                graph_mismatches += usize::from(!graph_kept);
+                                                graph_disabled_this_request = graph_mismatches >= super::decode::REPLAY_MISMATCHES_TO_GIVE_UP;
+                                                if !graph_disabled_this_request {
+                                                    // A near tie flips on the last bits of an expert computed on the host in one run and on
+                                                    // the card in the other: the step is recorded again before the request gives it up.
+                                                    graph_warmed = false;
+                                                    graph_capture_attempted = false;
+                                                }
+                                                if std::mem::take(&mut graph_kept) {
+                                                    graph_warmed = false;
+                                                    graph_capture_attempted = false;
+                                                    graph_validations = 0;
+                                                }
                                                 // Drop arena-backed transients
                                                 // BEFORE freeing the arena
                                                 // (arena-range drops are no-ops
@@ -1226,12 +1276,42 @@ impl LlmEngine {
                                                 continue;
                                             }
                                         }
+                                        Err(e) if graph_kept => {
+                                            warn!("graph probation eager forward failed at pos={pos}: {e}; the kept graph is recorded again");
+                                            kept_unchecked = true;
+                                        }
                                         Err(e) => {
                                             warn!("graph probation eager forward failed at pos={pos}: {e}; trusting replay");
                                             graph_validations += 1;
                                         }
                                     }
                                 }
+                                if kept_unchecked {
+                                    // The step runs again eagerly below, from the state the
+                                    // replay started from, and is recorded anew.
+                                    cuda_graph = None;
+                                    graph_logits = None;
+                                    state.model.invalidate_graph_state();
+                                    verify_graphs.clear();
+                                    graph_kept = false;
+                                    graph_capture_attempted = false;
+                                    graph_validations = 0;
+                                    // The warm-up below reads the step's buffers, made again
+                                    // here; a model that cannot make them runs the step eagerly.
+                                    let x = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
+                                    let primed = state.model.update_graph_state(pos).and_then(|()| {
+                                        if needs_split { Ok(()) } else { state.model.embed_for_graph(&x) }
+                                    });
+                                    match primed {
+                                        Ok(()) => graph_warmed = false,
+                                        Err(e) => {
+                                            warn!("graph state not made again at pos={pos}: {e}; eager decode for rest of request");
+                                            state.model.invalidate_graph_state();
+                                            graph_disabled_this_request = true;
+                                            graph_capture_attempted = true;
+                                        }
+                                    }
+                                } else {
                                 pos += 1;
                                 // Host KV bookkeeping: the replay advanced the
                                 // quantized caches device-side only; mirror the
@@ -1261,12 +1341,18 @@ impl LlmEngine {
                                     head_tokens.push(next_token);
                                 }
                                 continue;
+                                }
                             }
                             Err(e) => {
                                 warn!("Graph replay failed: {e}, falling back to normal forward");
                                 cuda_graph = None;
                                 graph_logits = None;
-                                graph_disabled_this_request = true;
+                                graph_disabled_this_request = !graph_kept;
+                                if std::mem::take(&mut graph_kept) {
+                                    graph_warmed = false;
+                                    graph_capture_attempted = false;
+                                    graph_validations = 0;
+                                }
                                 // Same teardown order as the mismatch path:
                                 // transients first, then the arena.
                                 state.model.invalidate_graph_state();
@@ -1386,6 +1472,9 @@ impl LlmEngine {
                                                 .flatten_all().ok()
                                                 .and_then(|t| t.argmax(0).ok())
                                                 .and_then(|t| t.to_scalar::<u32>().ok());
+                                            let rep_logits: Option<Vec<f32>> = logits
+                                                .flatten_all().ok()
+                                                .and_then(|t| t.to_vec1::<f32>().ok());
                                             state.model.recurrent_restore(&recurrent_cp)?;
                                             let eager = if needs_split {
                                                 state.model.compute_all_from_kv_captured()
@@ -1397,7 +1486,13 @@ impl LlmEngine {
                                                     let _ = stream.synchronize();
                                                     let eag_argmax = eag.flatten_all()?
                                                         .argmax(0)?.to_scalar::<u32>()?;
-                                                    if rep_argmax == Some(eag_argmax) {
+                                                    let agrees = rep_argmax == Some(eag_argmax)
+                                                        || rep_logits.as_ref().is_some_and(|g| {
+                                                            eag.flatten_all()
+                                                                .and_then(|t| t.to_vec1::<f32>())
+                                                                .is_ok_and(|e| crate::inference::engine::decode_step::replay_agrees(g, &e))
+                                                        });
+                                                    if agrees {
                                                         graph_validations += 1;
                                                         pos += 1;
                                                         // Host KV sync + freeze quantized-KV
@@ -1418,13 +1513,21 @@ impl LlmEngine {
                                                             head_tokens.push(next_token);
                                                         }
                                                         graph_logits = Some(logits);
+                                                        graphs_at.note(state.model.graph_generation());
                                                         cuda_graph = Some(g);
                                                         continue;
                                                     }
-                                                    warn!("CUDA graph capture-launch!=eager at pos={pos} (argmax {:?} vs {}); discarding graph, eager decode for rest of request",
+                                                    warn!("CUDA graph capture-launch!=eager at pos={pos} (argmax {:?} vs {}); the step is recorded again, the request decodes eagerly after repeated disagreements",
                                                         rep_argmax, eag_argmax);
                                                     drop(g);
-                                                    graph_disabled_this_request = true;
+                                                    graph_mismatches += 1;
+                                                    graph_disabled_this_request = graph_mismatches >= super::decode::REPLAY_MISMATCHES_TO_GIVE_UP;
+                                                    if !graph_disabled_this_request {
+                                                        // A near tie flips on the last bits of an expert computed on the host in one run and on
+                                                        // the card in the other: the step is recorded again before the request gives it up.
+                                                        graph_warmed = false;
+                                                        graph_capture_attempted = false;
+                                                    }
                                                     pos += 1;
                                                     let logits_1d = eag.squeeze(0)?;
                                                     next_token = gpu_sample(
@@ -1460,6 +1563,7 @@ impl LlmEngine {
                                                             head_tokens.push(next_token);
                                                         }
                                                         graph_logits = Some(logits);
+                                                    graphs_at.note(state.model.graph_generation());
                                                     cuda_graph = Some(g);
                                                     continue;
                                                 }
@@ -1638,6 +1742,10 @@ impl LlmEngine {
                             graph_warmed = false;
                             graph_capture_attempted = false;
                         }
+                        #[cfg(feature = "cuda")]
+                        if recorded.as_ref().is_some_and(|r| r.1.is_some()) {
+                            graphs_at.note(state.model.graph_generation());
+                        }
                         let recorded_window = recorded.is_some();
                         #[cfg(feature = "cuda")]
                         let windows_given_up = verify_graphs.disabled;
@@ -1807,14 +1915,28 @@ impl LlmEngine {
             // transients it references must not outlive the request: the next
             // request captures anew. Order: graph first, then
             // transients/buffers.
+            //
+            // A step graph that every recording of the request shares the model's current graph
+            // generation with is kept on the loaded model, the windows with it, for the next
+            // request to replay; any other is dropped with the graph state.
             #[cfg(feature = "cuda")]
-            if graph_capture_attempted {
-                let captured = cuda_graph.is_some();
-                drop(cuda_graph.take());
-                drop(graph_logits.take());
-                if captured {
-                    state.model.invalidate_graph_state();
-                                verify_graphs.clear();
+            {
+                let now = state.model.graph_generation();
+                let keep_at = graphs_at.keepable(now).filter(|_| !graph_disabled_this_request);
+                match (cuda_graph.take(), graph_logits.take(), keep_at) {
+                    (Some(g), Some(l), Some(at)) => {
+                        let graphs = super::decode::DecodeGraphs { step: Some((g, l)), verify: verify_graphs };
+                        state.kept_graphs.keep(graphs, Some(at));
+                    }
+                    (g, l, _) => {
+                        let captured = g.is_some() || !verify_graphs.is_empty();
+                        drop(g);
+                        drop(l);
+                        verify_graphs.clear();
+                        if captured {
+                            state.model.invalidate_graph_state();
+                        }
+                    }
                 }
             }
 
@@ -2069,6 +2191,9 @@ impl LlmEngine {
             // Request-start graph hygiene: a prior graph-mode request's
             // per-layer buffers (graph_rope_cos etc.) would make this
             // path's single-token decode forwards read frozen rope values.
+            // The graphs kept from it go first, with the buffers they read.
+            #[cfg(feature = "cuda")]
+            state.kept_graphs.clear();
             state.model.invalidate_graph_state();
 
             let prefill_start = std::time::Instant::now();
@@ -2290,6 +2415,8 @@ impl LlmEngine {
                 .set_early_exit_threshold(params.early_exit_threshold);
 
             // Request-start graph hygiene (see generate_with_grammar).
+            #[cfg(feature = "cuda")]
+            state.kept_graphs.clear();
             state.model.invalidate_graph_state();
 
             let x =

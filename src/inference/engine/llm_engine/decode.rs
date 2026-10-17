@@ -291,11 +291,125 @@ pub(super) fn capture_decode_graph(
     Some((DecodeGraph { steps }, logits?))
 }
 
+/// Replays of a recorded decode step held against an eager run of the same step before the
+/// recording is trusted: the first ones after a capture, the first one in a request that
+/// replays a step kept from an earlier one.
+pub(super) const GRAPH_VALIDATIONS: usize = 3;
+
+/// Recorded graphs a loaded model keeps between requests, with the model's
+/// `ModelBackend::graph_generation` they were recorded at: they are replayed again only
+/// while the model reports the same, and dropped otherwise.
+pub(crate) struct KeptGraphs<T> {
+    held: Option<(T, (u64, u64))>,
+}
+
+impl<T> Default for KeptGraphs<T> {
+    fn default() -> Self {
+        Self { held: None }
+    }
+}
+
+impl<T> KeptGraphs<T> {
+    /// Keeps `graphs` recorded at `at`; a model that reports no generation keeps none.
+    pub(crate) fn keep(&mut self, graphs: T, at: Option<(u64, u64)>) {
+        self.held = at.map(|at| (graphs, at));
+    }
+
+    /// Whether graphs are kept and the model still reports what they were recorded at.
+    pub(crate) fn current(&self, now: Option<(u64, u64)>) -> bool {
+        matches!((&self.held, now), (Some((_, at)), Some(now)) if *at == now)
+    }
+
+    /// The kept graphs and their generation while they are current; stale ones are dropped.
+    pub(crate) fn take_current(&mut self, now: Option<(u64, u64)>) -> Option<(T, (u64, u64))> {
+        let current = self.current(now);
+        if let Some((_, at)) = &self.held {
+            tracing::debug!(
+                "kept graphs recorded at {at:?}, the model at {now:?}: {}",
+                if current {
+                    "replayed"
+                } else {
+                    "recorded again"
+                }
+            );
+        }
+        let held = self.held.take();
+        held.filter(|_| current)
+    }
+
+    /// Drops the kept graphs. Done before the buffers they read are dropped.
+    pub(crate) fn clear(&mut self) {
+        self.held = None;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held.is_none()
+    }
+}
+
+/// What a request's decode leaves recorded: the step's graph with the logits buffer it writes,
+/// and the verify windows.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(crate) struct DecodeGraphs {
+    pub(super) step: Option<(DecodeGraph, Tensor)>,
+    pub(super) verify: VerifyGraphs,
+}
+
+// The graphs are reached only through the loaded model's state, behind its mutex, and run on
+// the model's stream from whichever thread holds it, as the model itself is.
+#[cfg(feature = "cuda")]
+unsafe impl Send for DecodeGraphs {}
+
+/// Where the graphs of a request were recorded: the generation of the first recording, and
+/// whether a later one saw another. Graphs of one generation only are kept past the request.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RecordedAt {
+    at: Option<(u64, u64)>,
+    mixed: bool,
+}
+
+impl RecordedAt {
+    /// Graphs kept from an earlier request, recorded at `at`.
+    pub(super) fn kept(at: (u64, u64)) -> Self {
+        Self {
+            at: Some(at),
+            mixed: false,
+        }
+    }
+
+    /// A graph was recorded with the model at `now`.
+    pub(super) fn note(&mut self, now: Option<(u64, u64)>) {
+        match (self.at, now) {
+            (None, Some(now)) if !self.mixed => self.at = Some(now),
+            (Some(at), Some(now)) if at == now => {}
+            _ => self.mixed = true,
+        }
+    }
+
+    /// The generation the graphs may be kept at once the request ends with the model at `now`:
+    /// all of them recorded at it, and nothing moved since.
+    pub(super) fn keepable(&self, now: Option<(u64, u64)>) -> Option<(u64, u64)> {
+        tracing::debug!(
+            "graphs recorded at {:?} (mixed {}), the model at {now:?}",
+            self.at,
+            self.mixed
+        );
+        match (self.at, now) {
+            (Some(at), Some(now)) if !self.mixed && at == now => Some(at),
+            _ => None,
+        }
+    }
+}
+
 /// The recorded draft verifies of a request, one graph per window size, and whether they were
 /// given up on.
 #[cfg(feature = "cuda")]
 pub(super) struct VerifyGraphs {
     by_rows: std::collections::HashMap<usize, (VerifyGraph, Tensor)>,
+    /// Window sizes kept from an earlier request whose replay has not been held against an
+    /// eager run in this one.
+    unheld: std::collections::HashSet<usize>,
     pub(super) disabled: bool,
     /// Replays that named other tokens than their eager rows, this request.
     mismatches: usize,
@@ -311,6 +425,7 @@ impl Default for VerifyGraphs {
     fn default() -> Self {
         Self {
             by_rows: std::collections::HashMap::new(),
+            unheld: std::collections::HashSet::new(),
             disabled: false,
             mismatches: 0,
             step_stale: false,
@@ -325,6 +440,22 @@ impl VerifyGraphs {
     /// Forget the graphs: the buffers they read are gone with the step's.
     pub(super) fn clear(&mut self) {
         self.by_rows.clear();
+        self.unheld.clear();
+    }
+
+    /// The windows kept for another request: its tallies start again, and each window's first
+    /// replay in it is held against an eager run.
+    pub(super) fn for_next_request(&mut self) {
+        self.unheld = self.by_rows.keys().copied().collect();
+        self.disabled = false;
+        self.mismatches = 0;
+        self.step_stale = false;
+        self.prepare_secs = 0.0;
+        self.launch_secs = 0.0;
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.by_rows.is_empty()
     }
 }
 
@@ -462,6 +593,52 @@ pub(super) fn verify_recorded(
         give_up(model, graphs, format!("prepare: {e}"));
         return None;
     }
+    // A window kept from an earlier request is held at its first replay in this one against
+    // its eager run from the same state, as a recording is.
+    let held_rows: Option<Vec<Vec<f32>>> = if graphs.unheld.contains(&rows) {
+        let eager = match model.forward_verify_window(rows) {
+            Ok(l) => l,
+            Err(e) => {
+                give_up(model, graphs, format!("eager run of a kept window: {e}"));
+                return None;
+            }
+        };
+        let _ = stream.synchronize();
+        let want: Option<Vec<Vec<f32>>> = (0..rows)
+            .map(|r| {
+                eager
+                    .narrow(1, r, 1)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .ok()
+            })
+            .collect();
+        if let Err(e) = model
+            .verify_window_settle(0)
+            .and_then(|()| model.verify_window_prepare(pos, ids))
+        {
+            give_up(
+                model,
+                graphs,
+                format!("return before a kept window's replay: {e}"),
+            );
+            return None;
+        }
+        let _ = stream.synchronize();
+        match want {
+            Some(w) => Some(w),
+            None => {
+                give_up(
+                    model,
+                    graphs,
+                    "the eager rows of a kept window were not read".into(),
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
     if let Some((g, logits)) = graphs.by_rows.get(&rows) {
         let launching = std::time::Instant::now();
         if let Err(e) = g.launch(model, rows) {
@@ -532,7 +709,30 @@ pub(super) fn verify_recorded(
             );
             return None;
         }
-        return Some((logits.clone(), None));
+        let out = logits.clone();
+        if let Some(want) = held_rows.as_ref() {
+            let agrees = (0..rows).all(|r| {
+                out.narrow(1, r, 1)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .is_ok_and(|got| {
+                        crate::inference::engine::decode_step::replay_agrees(&got, &want[r])
+                    })
+            });
+            if !agrees {
+                // The window, the step and their buffers are recorded again from here.
+                warn!("a kept verify window of {rows} rows at pos={pos} named other tokens than its eager rows; recorded again");
+                graphs.clear();
+                if let Err(e) = model.verify_window_settle(0) {
+                    warn!("the model did not return to the rows before the verify: {e}");
+                }
+                model.invalidate_graph_state();
+                graphs.step_stale = true;
+                return None;
+            }
+            graphs.unheld.remove(&rows);
+        }
+        return Some((out, None));
     }
     // The eager run of the window: what the replay has to reproduce.
     let eager = match model.forward_verify_window(rows) {
@@ -722,7 +922,7 @@ pub(super) fn verify_recorded(
 
 /// Replays that name other tokens than their eager rows after which a request verifies eagerly.
 #[cfg(feature = "cuda")]
-const REPLAY_MISMATCHES_TO_GIVE_UP: usize = 3;
+pub(super) const REPLAY_MISMATCHES_TO_GIVE_UP: usize = 3;
 
 /// One part of a recorded verify.
 #[cfg(feature = "cuda")]
@@ -1086,5 +1286,58 @@ fn report_kernel_costs(
             "graph {whole:.0} us; cost of each kernel: {}",
             top.join("; ")
         );
+    }
+}
+
+#[cfg(test)]
+mod kept_graphs_tests {
+    use super::{KeptGraphs, RecordedAt};
+
+    #[test]
+    fn graphs_are_kept_while_the_generation_holds() {
+        let mut kept = KeptGraphs::default();
+        kept.keep(7u32, Some((1, 5)));
+        assert!(kept.current(Some((1, 5))));
+        assert_eq!(kept.take_current(Some((1, 5))), Some((7, (1, 5))));
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn graphs_are_dropped_once_a_buffer_moved_or_the_model_changed() {
+        let mut kept = KeptGraphs::default();
+        kept.keep(7u32, Some((1, 5)));
+        assert!(!kept.current(Some((1, 6))));
+        assert!(!kept.current(Some((2, 5))));
+        assert!(!kept.current(None));
+        assert_eq!(kept.take_current(Some((1, 6))), None);
+        assert!(kept.is_empty(), "stale graphs are dropped");
+        kept.keep(8, None);
+        assert!(
+            kept.is_empty(),
+            "a model without a generation keeps nothing"
+        );
+    }
+
+    #[test]
+    fn only_graphs_of_one_generation_are_kept_past_the_request() {
+        let mut at = RecordedAt::default();
+        assert_eq!(at.keepable(Some((1, 5))), None, "nothing recorded");
+        at.note(Some((1, 5)));
+        at.note(Some((1, 5)));
+        assert_eq!(at.keepable(Some((1, 5))), Some((1, 5)));
+        assert_eq!(
+            at.keepable(Some((1, 6))),
+            None,
+            "a buffer moved after the recording"
+        );
+        at.note(Some((1, 6)));
+        assert_eq!(
+            at.keepable(Some((1, 6))),
+            None,
+            "recordings of two generations"
+        );
+        let mut kept = RecordedAt::kept((1, 5));
+        kept.note(None);
+        assert_eq!(kept.keepable(Some((1, 5))), None);
     }
 }

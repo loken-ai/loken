@@ -286,6 +286,12 @@ impl LlmEngine {
             .ok_or_else(|| "no model loaded".to_string())?;
         // A generic transformer keeps layers `[0, cut)` and the rest leaves with the link; any
         // other backend forms the pipeline its own way, or declines.
+        // The graphs kept between requests are for the serial decode of this model as it stands.
+        #[cfg(feature = "cuda")]
+        if !s.kept_graphs.is_empty() {
+            s.kept_graphs.clear();
+            s.model.invalidate_graph_state();
+        }
         let taken: BoxedModelBackend = std::mem::replace(&mut s.model, Box::new(TakenBackend));
         match taken.take_generic() {
             Ok(model) => {

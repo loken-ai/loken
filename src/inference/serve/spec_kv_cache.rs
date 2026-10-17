@@ -107,6 +107,9 @@ pub struct SpecKvCache {
     window: Option<usize>,
     /// The buffers were made whole by [`Self::preallocate`] and stay when the sequence restarts.
     resident: bool,
+    /// Times the buffers were made, grown or dropped: a graph recorded against them is stale
+    /// once this moves.
+    moves: u64,
     /// Stable device-side `i32` holding `current_seq_len - 1`. Used by
     /// fused_attn_decode_f32_hd512 (and similar dev_pos kernels) so the
     /// captured graph reads the live position from device memory each
@@ -129,6 +132,7 @@ impl Clone for SpecKvCache {
             dim: self.dim,
             window: self.window,
             resident: self.resident,
+            moves: self.moves,
             // seq_kv_dev is per-instance device state; clone resets it
             // since the new clone shouldn't share the same captured-graph
             // pointer dependency.
@@ -151,6 +155,7 @@ impl SpecKvCache {
             dim: 2, // Default: 4D tensors, seq at axis 2
             window: None,
             resident: false,
+            moves: 0,
             #[cfg(feature = "cuda")]
             seq_kv_dev: None,
             #[cfg(feature = "cuda")]
@@ -183,14 +188,16 @@ impl SpecKvCache {
         self.v = Some(Tensor::zeros_on(&shape[..], dtype, device)?);
         self.dim = 2;
         self.resident = true;
+        self.moves += 1;
         Ok(())
     }
 
     /// Reset the KV cache (clears all entries).
     pub fn reset(&mut self) {
-        if !self.resident {
+        if !self.resident && self.k.is_some() {
             self.k = None;
             self.v = None;
+            self.moves += 1;
         }
         self.current_seq_len = 0;
         // Don't drop seq_kv_dev - its device address must stay stable
@@ -432,6 +439,7 @@ impl SpecKvCache {
             let v_buf = Tensor::zeros_on(&shape[..], v_new.dtype(), &v_new.device())?;
             self.k = Some(k_buf);
             self.v = Some(v_buf);
+            self.moves += 1;
         }
 
         // Bounded sliding-window (gemma4 SWA layers): instead of growing past the
@@ -482,6 +490,7 @@ impl SpecKvCache {
             let v_ext = Tensor::zeros_on(&shape[..], v_old.dtype(), &v_old.device())?;
             self.k = Some(Tensor::cat(&[&k_old, &k_ext], dim)?);
             self.v = Some(Tensor::cat(&[&v_old, &v_ext], dim)?);
+            self.moves += 1;
         }
         Ok(())
     }
@@ -505,6 +514,11 @@ impl SpecKvCache {
     /// Get the full V buffer (for graph mode - fixed pointer).
     pub fn v_buffer(&self) -> Option<Tensor> {
         self.v.clone()
+    }
+
+    /// Times the buffers were made, grown or dropped since the cache was built.
+    pub fn buffer_moves(&self) -> u64 {
+        self.moves
     }
 
     /// Get the current padded buffer size.
@@ -547,6 +561,7 @@ impl SpecKvCache {
                 v_new.dtype(),
                 &v_new.device(),
             )?);
+            self.moves += 1;
         }
 
         // Grow if needed
@@ -561,6 +576,7 @@ impl SpecKvCache {
             let v_ext = Tensor::zeros_on(&shape[..], v_old.dtype(), &v_old.device())?;
             self.k = Some(Tensor::cat(&[&k_old, &k_ext], dim)?);
             self.v = Some(Tensor::cat(&[&v_old, &v_ext], dim)?);
+            self.moves += 1;
         }
 
         let k_buf = self.k.as_mut().unwrap();
@@ -672,6 +688,25 @@ mod tests {
         lazy.append(&k, &k).unwrap();
         lazy.reset();
         assert!(lazy.k_buffer().is_none());
+    }
+
+    #[test]
+    fn only_a_new_buffer_counts_as_a_move() {
+        let dev = Device::Cpu;
+        let mut c = SpecKvCache::new(4);
+        let k = make_4d_pos(&dev, 0, 3);
+        c.append(&k, &k).unwrap();
+        assert_eq!(c.buffer_moves(), 1);
+        c.trim_to(1);
+        c.append(&make_4d_pos(&dev, 1, 2), &make_4d_pos(&dev, 1, 2))
+            .unwrap();
+        assert_eq!(c.buffer_moves(), 1);
+        c.append(&k, &k).unwrap();
+        assert_eq!(c.buffer_moves(), 2);
+        c.reset();
+        assert_eq!(c.buffer_moves(), 3);
+        c.reset();
+        assert_eq!(c.buffer_moves(), 3);
     }
 
     #[test]

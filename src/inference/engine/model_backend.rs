@@ -799,6 +799,20 @@ pub(crate) trait ModelBackend: Send {
     /// path (`forward_attn` keys on `graph_rope_cos.is_some()`).
     fn invalidate_graph_state(&mut self) {}
 
+    /// The model's instance and where the buffers the decode's recorded graphs read stand:
+    /// equal values mean the same model, none of whose buffers moved in between. `None` for a
+    /// model that does not count its moves, whose graphs are recorded again for every request.
+    fn graph_generation(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Releases the capture bookkeeping of the caches while graphs kept from an earlier request
+    /// wait for their next replay, so that a prefill may grow them.
+    fn suspend_graph_captured(&mut self) {}
+
+    /// Graphs kept from an earlier request are live again over the caches.
+    fn resume_graph_captured(&mut self) {}
+
     /// The least free memory over the model's cards, when it runs on cards.
     fn free_device_memory(&self) -> Option<u64> {
         None
@@ -2059,6 +2073,19 @@ impl ModelBackend for GenericBackend {
 
     fn invalidate_graph_state(&mut self) {
         self.0.invalidate_graph_state()
+    }
+
+    fn graph_generation(&self) -> Option<(u64, u64)> {
+        Some((self.0.graph_instance(), self.0.graph_generation()))
+    }
+
+    fn suspend_graph_captured(&mut self) {
+        self.0.suspend_graph_captured()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn resume_graph_captured(&mut self) {
+        self.0.resume_graph_captured()
     }
 
     fn free_device_memory(&self) -> Option<u64> {

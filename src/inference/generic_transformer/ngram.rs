@@ -240,6 +240,9 @@ pub struct PleBlock {
     eps: f64,
     /// The last `(taps - 1) * dilation` normalised rows, `[history, channels]` F32.
     state: Option<Tensor>,
+    /// Times the rows' buffer was made anew or dropped: a step recorded against it is stale
+    /// once this moves.
+    moves: u64,
     /// The tokens the hashes of the next forward reach back to.
     pub history: NgramHistory,
     meta: NgramMeta,
@@ -304,15 +307,29 @@ impl PleBlock {
             dim,
             eps,
             state: None,
+            moves: 0,
             history: NgramHistory::new(meta),
             meta: meta.clone(),
         })
     }
 
-    /// Forget the sequence: the convolution's rows and the token history.
+    /// Forget the sequence: the convolution's rows are zeroed where they lie, so a recorded
+    /// step keeps reading them, and the token history starts again.
     pub fn reset(&mut self) {
-        self.state = None;
+        let zeroed = self
+            .state
+            .as_ref()
+            .is_none_or(|t| t.zeros_like().and_then(|z| t.slice_set(&z, 0, 0)).is_ok());
+        if !zeroed {
+            self.state = None;
+            self.moves += 1;
+        }
         self.history.reset(&self.meta);
+    }
+
+    /// Times the rows' buffer was made anew or dropped.
+    pub fn buffer_moves(&self) -> u64 {
+        self.moves
     }
 
     /// The carried state, copied.
@@ -335,8 +352,16 @@ impl PleBlock {
                 held.slice_set(saved, 0, 0)?;
                 Some(held)
             }
-            (_, Some(saved)) => Some(saved.force_contiguous()?),
-            (_, None) => None,
+            (_, Some(saved)) => {
+                self.moves += 1;
+                Some(saved.force_contiguous()?)
+            }
+            (held, None) => {
+                if held.is_some() {
+                    self.moves += 1;
+                }
+                None
+            }
         };
         self.history = state.history.clone();
         Ok(())
@@ -374,6 +399,7 @@ impl PleBlock {
             Some(held) if held.dims() == src.dims() => held.slice_set(src, 0, 0),
             _ => {
                 self.state = Some(src.force_contiguous()?);
+                self.moves += 1;
                 Ok(())
             }
         }
@@ -386,6 +412,7 @@ impl PleBlock {
             let wide = self.streams * self.dim;
             let hist = (self.taps - 1) * self.dilation;
             self.state = Some(Tensor::zeros_on((hist, wide), DType::F32, device)?);
+            self.moves += 1;
         }
         Ok(())
     }
@@ -435,7 +462,10 @@ impl PleBlock {
             {
                 held.slice_set(&fresh, 0, 0)?
             }
-            _ => self.state = Some(fresh),
+            _ => {
+                self.state = Some(fresh);
+                self.moves += 1;
+            }
         }
         let conv = crate::tensor::ops::silu(&acc.expect("a convolution has taps"))?
             .reshape((b, seq, wide))?;

@@ -156,7 +156,7 @@ fn same_buffer(a: &Tensor, b: &Tensor) -> bool {
 
 /// `fresh` becomes the convolution's state, written into the held buffer when it matches: a
 /// recorded step reads the state where it lies, so the buffer never changes under it.
-fn hold_conv(slot: &mut Option<ConvState>, fresh: Tensor) -> Result<()> {
+fn hold_conv(slot: &mut Option<ConvState>, fresh: Tensor, moves: &mut u64) -> Result<()> {
     if let Some(ConvState::Card(held)) = slot.as_ref() {
         if same_buffer(held, &fresh) {
             return Ok(());
@@ -169,12 +169,13 @@ fn hold_conv(slot: &mut Option<ConvState>, fresh: Tensor) -> Result<()> {
         }
     }
     *slot = Some(ConvState::Card(fresh));
+    *moves += 1;
     Ok(())
 }
 
 /// `conv` and `h` become the recurrence's state, written into the held buffers when they
 /// match: a recorded step reads the state where it lies, so the buffers never change under it.
-fn hold_ssm(slot: &mut Option<SsmState>, conv: Tensor, h: Tensor) -> Result<()> {
+fn hold_ssm(slot: &mut Option<SsmState>, conv: Tensor, h: Tensor, moves: &mut u64) -> Result<()> {
     if let Some(SsmState::Card { conv: c0, h: h0 }) = slot.as_ref() {
         let same = |a: &Tensor, b: &Tensor| {
             a.dims() == b.dims() && a.dtype() == b.dtype() && a.device().same_device(&b.device())
@@ -190,7 +191,54 @@ fn hold_ssm(slot: &mut Option<SsmState>, conv: Tensor, h: Tensor) -> Result<()> 
         }
     }
     *slot = Some(SsmState::Card { conv, h });
+    *moves += 1;
     Ok(())
+}
+
+/// Writes zeros over `t` where it lies.
+fn zero_in_place(t: &Tensor) -> Result<()> {
+    t.slice_set(&t.zeros_like()?, 0, 0)
+}
+
+/// Starts the convolution's window again from zeros where it lies, so a recorded step keeps
+/// reading the same buffer. A card window of another batch than `batch`, or one that cannot be
+/// written, is dropped instead, and counted in `moves`.
+fn restart_conv(slot: &mut Option<ConvState>, batch: Option<usize>, moves: &mut u64) {
+    let kept = match slot.as_mut() {
+        None => return,
+        Some(ConvState::Host(v)) => {
+            v.fill(0.0);
+            true
+        }
+        Some(ConvState::Card(t)) => {
+            batch.is_none_or(|b| t.dims().first() == Some(&b)) && zero_in_place(t).is_ok()
+        }
+    };
+    if !kept {
+        *slot = None;
+        *moves += 1;
+    }
+}
+
+/// Starts a recurrence's state again from zeros where it lies (see [`restart_conv`]).
+fn restart_ssm(slot: &mut Option<SsmState>, batch: Option<usize>, moves: &mut u64) {
+    let kept = match slot.as_mut() {
+        None => return,
+        Some(SsmState::Host { conv, h }) => {
+            conv.fill(0.0);
+            h.fill(0.0);
+            true
+        }
+        Some(SsmState::Card { conv, h }) => {
+            batch.is_none_or(|b| conv.dims().first() == Some(&b) && h.dims().first() == Some(&b))
+                && zero_in_place(conv).is_ok()
+                && zero_in_place(h).is_ok()
+        }
+    };
+    if !kept {
+        *slot = None;
+        *moves += 1;
+    }
 }
 
 fn copy_state_in_place(dst: &MixerState, src: &MixerState) -> Result<()> {
@@ -316,13 +364,24 @@ impl Mixer {
         }
     }
 
-    /// Drops the state; the next forward starts from zeros.
+    /// Starts the state again from zeros, written where it lies: a recorded step keeps
+    /// reading the same buffers.
     pub fn reset(&mut self) {
         match self {
             Mixer::Attention | Mixer::Absent => {}
-            Mixer::ShortConv(m) => m.state = None,
-            Mixer::Ssm(m) => m.state = None,
-            Mixer::DeltaNet(m) => m.state = None,
+            Mixer::ShortConv(m) => restart_conv(&mut m.state, None, &mut m.moves),
+            Mixer::Ssm(m) => restart_ssm(&mut m.state, None, &mut m.moves),
+            Mixer::DeltaNet(m) => restart_ssm(&mut m.state, None, &mut m.moves),
+        }
+    }
+
+    /// Times the state's card buffers were made anew or dropped.
+    pub fn buffer_moves(&self) -> u64 {
+        match self {
+            Mixer::Attention | Mixer::Absent => 0,
+            Mixer::ShortConv(m) => m.moves,
+            Mixer::Ssm(m) => m.moves,
+            Mixer::DeltaNet(m) => m.moves,
         }
     }
 
@@ -347,14 +406,17 @@ impl Mixer {
         match (self, state) {
             (Mixer::ShortConv(m), MixerState::ShortConv(s)) => {
                 m.state = s.as_ref().map(ConvState::deep_copy).transpose()?;
+                m.moves += 1;
                 Ok(())
             }
             (Mixer::Ssm(m), MixerState::Ssm(s)) => {
                 m.state = s.as_ref().map(SsmState::deep_copy).transpose()?;
+                m.moves += 1;
                 Ok(())
             }
             (Mixer::DeltaNet(m), MixerState::DeltaNet(s)) => {
                 m.state = s.as_ref().map(SsmState::deep_copy).transpose()?;
+                m.moves += 1;
                 Ok(())
             }
             _ => Err(crate::tensor::Error::msg(
@@ -393,6 +455,9 @@ pub struct ShortConv {
     pub d_model: usize,
     pub l_cache: usize,
     pub state: Option<ConvState>,
+    /// Times the state's card buffer was made anew: a step recorded against it is stale once
+    /// this moves.
+    pub(super) moves: u64,
 }
 
 impl ShortConv {
@@ -414,14 +479,15 @@ impl ShortConv {
             d_model,
             l_cache,
             state: None,
+            moves: 0,
         })
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        if index_pos == 0 {
-            self.state = None;
-        }
         let (b, seq, _) = x.dims3()?;
+        if index_pos == 0 {
+            restart_conv(&mut self.state, Some(b), &mut self.moves);
+        }
         let proj = self.in_proj.forward(x)?;
         if b == 1 && !x.device().is_cuda() {
             let y = self.host_steps(&proj.to_dtype(DType::F32)?, seq)?;
@@ -454,7 +520,7 @@ impl ShortConv {
             state = next;
             rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
-        hold_conv(&mut self.state, state)?;
+        hold_conv(&mut self.state, state, &mut self.moves)?;
         if rows.len() == 1 {
             return Ok(rows.pop().unwrap());
         }
@@ -581,6 +647,9 @@ pub struct Mamba2 {
     pub dims: Mamba2Dims,
     eps: f64,
     pub state: Option<SsmState>,
+    /// Times the state's card buffers were made anew: a step recorded against them is stale
+    /// once this moves.
+    pub(super) moves: u64,
 }
 
 /// Mamba2 weights as the file stores them, before placement.
@@ -636,14 +705,15 @@ impl Mamba2 {
             dims,
             eps,
             state: None,
+            moves: 0,
         })
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        if index_pos == 0 {
-            self.state = None;
-        }
         let (b, seq, _) = x.dims3()?;
+        if index_pos == 0 {
+            restart_ssm(&mut self.state, Some(b), &mut self.moves);
+        }
         let dims = self.dims;
         let proj = self.in_proj.forward(x)?.to_dtype(DType::F32)?;
         if b == 1 && !x.device().is_cuda() {
@@ -730,7 +800,7 @@ impl Mamba2 {
             )?;
             rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
-        hold_ssm(&mut self.state, conv, h)?;
+        hold_ssm(&mut self.state, conv, h, &mut self.moves)?;
         if rows.len() == 1 {
             return Ok(rows.pop().unwrap());
         }
@@ -885,6 +955,9 @@ pub struct GatedDeltaNet {
     pub dims: DeltaDims,
     eps: f64,
     pub state: Option<SsmState>,
+    /// Times the state's card buffers were made anew: a step recorded against them is stale
+    /// once this moves.
+    pub(super) moves: u64,
     /// Where a window's rows leave the state after each of its first rows: the recurrence's
     /// `[rows, v_heads, v_dim, k_dim]`, the convolution's `[rows, conv_dim, taps - 1]`, and
     /// how many rows they hold. Set for the window's forward, cleared after.
@@ -965,6 +1038,7 @@ impl GatedDeltaNet {
             dims,
             eps,
             state: None,
+            moves: 0,
             snaps: None,
         })
     }
@@ -1033,10 +1107,10 @@ impl GatedDeltaNet {
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        if index_pos == 0 {
-            self.state = None;
-        }
         let (b, seq, _) = x.dims3()?;
+        if index_pos == 0 {
+            restart_ssm(&mut self.state, Some(b), &mut self.moves);
+        }
         let d = self.dims;
         #[cfg(feature = "cuda")]
         if b == 1 && x.device().is_cuda() && d.k_dim == d.v_dim && matches!(d.v_dim, 64 | 128 | 256)
@@ -1163,7 +1237,7 @@ impl GatedDeltaNet {
             let y = (on * gate)?.reshape((b, vg * vd))?;
             outs.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
-        hold_ssm(&mut self.state, conv, s)?;
+        hold_ssm(&mut self.state, conv, s, &mut self.moves)?;
         Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1)
     }
 
@@ -1296,7 +1370,12 @@ impl GatedDeltaNet {
                 self.snaps.as_ref().map(|(hs, _, n)| (hs, *n)),
             )
         })?;
-        hold_ssm(&mut self.state, conv, s.reshape((1, vg, vd, kd))?)?;
+        hold_ssm(
+            &mut self.state,
+            conv,
+            s.reshape((1, vg, vd, kd))?,
+            &mut self.moves,
+        )?;
         let o = o.reshape((seq * vg, vd))?;
         let z = z.reshape((seq * vg, vd))?;
         let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32, d.gate_sigmoid)?
@@ -1526,6 +1605,63 @@ impl GenericTransformerLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_zeroes_the_card_state_where_it_lies() {
+        let dev = Device::Cpu;
+        let held = Tensor::from_vec(values(12, 1, 1.0), (1, 4, 3), &dev).unwrap();
+        let mut slot = Some(ConvState::Card(held.clone()));
+        let mut moves = 0;
+        restart_conv(&mut slot, Some(1), &mut moves);
+        let Some(ConvState::Card(t)) = slot.as_ref() else {
+            panic!("the state was dropped")
+        };
+        assert!(t.shares_storage(&held));
+        assert!(t
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|&v| v == 0.0));
+        assert_eq!(moves, 0);
+
+        let conv = Tensor::from_vec(values(6, 2, 1.0), (1, 2, 3), &dev).unwrap();
+        let h = Tensor::from_vec(values(8, 3, 1.0), (1, 2, 2, 2), &dev).unwrap();
+        let mut slot = Some(SsmState::Card {
+            conv: conv.clone(),
+            h: h.clone(),
+        });
+        restart_ssm(&mut slot, None, &mut moves);
+        let Some(SsmState::Card { conv: c, h: hh }) = slot.as_ref() else {
+            panic!("the state was dropped")
+        };
+        assert!(c.shares_storage(&conv) && hh.shares_storage(&h));
+        assert!(hh
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|&v| v == 0.0));
+        assert_eq!(moves, 0);
+    }
+
+    #[test]
+    fn a_restart_for_another_batch_drops_the_state_and_counts_the_move() {
+        let dev = Device::Cpu;
+        let held = Tensor::zeros_on((1, 4, 3), DType::F32, &dev).unwrap();
+        let mut slot = Some(ConvState::Card(held));
+        let mut moves = 0;
+        restart_conv(&mut slot, Some(2), &mut moves);
+        assert!(slot.is_none());
+        assert_eq!(moves, 1);
+        let fresh = Tensor::zeros_on((2, 4, 3), DType::F32, &dev).unwrap();
+        hold_conv(&mut slot, fresh.clone(), &mut moves).unwrap();
+        assert_eq!(moves, 2);
+        hold_conv(&mut slot, fresh.affine(1.0, 1.0).unwrap(), &mut moves).unwrap();
+        assert_eq!(moves, 2);
+    }
 
     fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
         let mut s = seed

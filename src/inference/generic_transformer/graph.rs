@@ -778,7 +778,54 @@ impl GenericHeteroTransformer {
         }
     }
 
+    /// Where the buffers the recorded graphs read stand: the explicit drops of the model's
+    /// graph state and moves of its expert slots, with every time a layer's cache, indexer or
+    /// carried state was made anew. Equal values mean no buffer a graph recorded at the first
+    /// could read has moved since.
+    pub fn graph_generation(&self) -> u64 {
+        self.layers.iter().fold(self.graph_generation, |g, l| {
+            g.wrapping_add(l.buffer_moves())
+        })
+    }
+
+    /// This model's [`GenericHeteroTransformer::graph_instance`].
+    pub fn graph_instance(&self) -> u64 {
+        self.graph_instance
+    }
+
+    /// Releases the quantised caches' capture bookkeeping while graphs kept from an earlier
+    /// request wait for their next replay: a prefill may grow the caches, which moves the
+    /// generation and drops the graphs.
+    pub fn suspend_graph_captured(&mut self) {
+        #[cfg(feature = "cuda")]
+        for l in &mut self.layers {
+            let shards = l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut());
+            for c in l.quant_kv.as_mut().into_iter().chain(shards) {
+                c.suspend_graph_captured();
+            }
+        }
+    }
+
+    /// Graphs kept from an earlier request are live again over the quantised caches, with the
+    /// ceilings they were recorded with.
+    #[cfg(feature = "cuda")]
+    pub fn resume_graph_captured(&mut self) {
+        let captured: Vec<bool> = (0..self.layers.len())
+            .map(|i| self.layer_captured(i))
+            .collect();
+        for (l, captured) in self.layers.iter_mut().zip(captured) {
+            if !captured {
+                continue;
+            }
+            let shards = l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut());
+            for c in l.quant_kv.as_mut().into_iter().chain(shards) {
+                c.resume_graph_captured();
+            }
+        }
+    }
+
     pub fn invalidate_graph_state(&mut self) {
+        self.graph_generation = self.graph_generation.wrapping_add(1);
         for l in &mut self.layers {
             clear_layer_graph_state(l);
         }
@@ -2565,7 +2612,38 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// A number no model built before in this process was given.
+pub(super) fn next_graph_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl GenericTransformerLayer {
+    /// Times any buffer of this layer that a recorded step reads was made anew: the caches,
+    /// the indexer's copy on the card and the carried states, the shares of a split layer's
+    /// included.
+    pub(super) fn buffer_moves(&self) -> u64 {
+        let mut n = self
+            .kv_cache
+            .buffer_moves()
+            .wrapping_add(self.mixer.buffer_moves());
+        if let Some(p) = self.ngram.as_ref() {
+            n = n.wrapping_add(p.buffer_moves());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(c) = self.quant_kv.as_ref() {
+                n = n.wrapping_add(c.buffer_moves());
+            }
+            if let Some(sp) = self.sparse.as_ref() {
+                n = n.wrapping_add(sp.card_births());
+            }
+        }
+        self.tp_shards
+            .iter()
+            .fold(n, |n, s| n.wrapping_add(s.buffer_moves()))
+    }
+
     /// Drop `discard` positions from `from` on in every cache this layer and its shares keep, the
     /// keys behind them rotated back by `delta` positions.
     pub(super) fn shift_kv_tail(
