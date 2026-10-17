@@ -116,6 +116,21 @@ impl IndexerCache {
         *self = Self::default();
     }
 
+    /// The raw rows, the pooled keys, their lanes and the tokens held.
+    pub fn parts(&self) -> (&[f32], &[f32], &[f32], usize) {
+        (&self.raw, &self.pooled, &self.lanes, self.tokens)
+    }
+
+    /// The cache whose [`Self::parts`] are these.
+    pub fn from_parts(raw: Vec<f32>, pooled: Vec<f32>, lanes: Vec<f32>, tokens: usize) -> Self {
+        Self {
+            raw,
+            pooled,
+            lanes,
+            tokens,
+        }
+    }
+
     /// Append the raw key rows `rows` (`[n, head_dim]`); each block they complete is pooled:
     /// the mean of its rows, normalised by `k_gamma`, rotated at the position of its first
     /// token.

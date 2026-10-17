@@ -15,6 +15,10 @@
 //!   restore returns every value bit for bit). It is named by the chain hash of the tokens up to
 //!   its end, so states of one conversation, and of conversations sharing a prefix, store it once.
 //!
+//! - A model with a draft head also keeps the head's state in the manifest: its layer's rows
+//!   for the pairs it has read, its indexer, and the prompt row whose pair waits for the next
+//!   token, so a restored head drafts as if it had read the prefix.
+//!
 //! The layer kinds are read from the layers the model really has: a state is refused when the
 //! kinds, the row geometry or the placement it was written under are not the model's. Every file
 //! carries a version, the identity it was written under and a checksum; a file that fails any of
@@ -31,7 +35,7 @@ const MANIFEST_MAGIC: &[u8; 8] = b"LKHYBM01";
 const BLOCK_MAGIC: &[u8; 8] = b"LKHYBB01";
 const HANDOVER_MAGIC: &[u8; 8] = b"LKHYBH01";
 /// Bumped when the layout of a manifest or a block changes.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 const SUM_BYTES: usize = 16;
 
 /// What a layer contributes to a stored state, fixed by the layer and not by the position.
@@ -99,6 +103,23 @@ enum Held {
 pub(crate) struct Point {
     pub pos: usize,
     layers: Vec<Held>,
+    /// The draft head's state at `pos`; `None` for a model without one, or when the head did
+    /// not hold the pairs of the `pos` tokens.
+    draft: Option<DraftHeld>,
+}
+
+/// A draft head's state after the target read `pos` tokens: it has read `committed` pairs,
+/// `pos - 1`, and the last prompt row waits for the token after it.
+#[derive(Clone)]
+pub(crate) struct DraftHeld {
+    committed: usize,
+    /// The head layer's rows for positions `0..committed`.
+    rows: Rows,
+    /// The head layer's indexer with `committed` pairs read: the raw rows, the pooled keys,
+    /// their lanes and the tokens held.
+    indexer: Option<(Vec<f32>, Vec<f32>, Vec<f32>, usize)>,
+    /// The last prompt row, `[1, 1, streams * dim]`.
+    carried: Option<Tens>,
 }
 
 fn dtype_code(d: DType) -> Result<u8> {
@@ -458,7 +479,69 @@ fn encode_manifest(identity: &[u8; 32], layout: &Layout, p: &Point) -> Vec<u8> {
             }
         }
     }
+    match &p.draft {
+        Some(d) => {
+            w.u8(1);
+            write_draft(&mut w, d);
+        }
+        None => w.u8(0),
+    }
     w.seal()
+}
+
+fn write_draft(w: &mut Writer, d: &DraftHeld) {
+    w.u64(d.committed);
+    w.rows(&d.rows);
+    match &d.indexer {
+        Some((raw, pooled, lanes, tokens)) => {
+            w.u8(1);
+            w.u64(*tokens);
+            for xs in [raw, pooled, lanes] {
+                w.u64(xs.len());
+                w.raw(xs);
+            }
+        }
+        None => w.u8(0),
+    }
+    match &d.carried {
+        Some(t) => {
+            w.u8(1);
+            w.tens(t);
+        }
+        None => w.u8(0),
+    }
+}
+
+fn read_draft(r: &mut Reader) -> AnyResult<DraftHeld> {
+    let committed = r.u64()?;
+    let rows = r.rows()?;
+    if rows.n != committed {
+        bail!(
+            "state cache: the draft head holds {} rows for {committed} pairs",
+            rows.n
+        );
+    }
+    let indexer = match r.u8()? {
+        0 => None,
+        _ => {
+            let tokens = r.u64()?;
+            let mut part = || -> AnyResult<Vec<f32>> {
+                let n = r.u64()?;
+                r.raw(n)
+            };
+            Some((part()?, part()?, part()?, tokens))
+        }
+    };
+    let carried = match r.u8()? {
+        0 => None,
+        _ => Some(r.tens()?),
+    };
+    Ok(DraftHeld {
+        committed,
+        rows,
+        indexer,
+        carried,
+    })
 }
 
 fn decode_manifest(bytes: &[u8], identity: &[u8; 32], layout: &Layout) -> AnyResult<Point> {
@@ -515,8 +598,12 @@ fn decode_manifest(bytes: &[u8], identity: &[u8; 32], layout: &Layout) -> AnyRes
             }
         });
     }
+    let draft = match r.u8()? {
+        0 => None,
+        _ => Some(read_draft(&mut r)?),
+    };
     r.done()?;
-    Ok(Point { pos, layers })
+    Ok(Point { pos, layers, draft })
 }
 
 fn encode_block(rows: &[(Vec<f32>, Vec<f32>)]) -> Vec<u8> {
@@ -709,6 +796,7 @@ impl GenericHeteroTransformer {
             h.update((probe.geometry[il].0 as u64).to_le_bytes());
             h.update((probe.geometry[il].1 as u64).to_le_bytes());
         }
+        h.update([self.draft.is_some() as u8]);
         let identity: [u8; 32] = h.finalize().into();
         // What one token adds to the blocks: both rows of every global layer, at the widest
         // element a cache holds.
@@ -766,7 +854,88 @@ impl GenericHeteroTransformer {
                 StateKind::Window => Held::Window(live_rows(l, 0, resident_len(l))?),
             });
         }
-        Ok(Point { pos, layers })
+        Ok(Point {
+            pos,
+            layers,
+            draft: self.capture_draft(pos)?,
+        })
+    }
+
+    /// The draft head's state after the target read `pos` tokens; `None` without a head, or
+    /// when the head does not hold the pairs of those tokens.
+    pub(crate) fn capture_draft(&self, pos: usize) -> Result<Option<DraftHeld>> {
+        let Some(d) = self.draft.as_ref() else {
+            return Ok(None);
+        };
+        let held = resident_len(&d.layer);
+        let indexer = match (&d.layer.sparse, &d.indexer_mark) {
+            (None, _) => None,
+            (Some(_), Some((at, c))) if *at == d.committed => Some(c.clone()),
+            (Some(s), _) => Some(s.snapshot_cache()?).filter(|c| c.len() == d.committed),
+        };
+        let agrees = pos > 0
+            && d.committed + 1 == pos
+            && d.carried.is_some()
+            && held >= d.committed
+            && (d.layer.sparse.is_none() || indexer.is_some());
+        if !agrees {
+            tracing::debug!(
+                "state cache: no draft head state at token {pos}: the head holds {} pairs, {held} rows",
+                d.committed
+            );
+            return Ok(None);
+        }
+        Ok(Some(DraftHeld {
+            committed: d.committed,
+            rows: live_rows(&d.layer, 0, d.committed)?,
+            indexer: indexer.map(|c| {
+                let (raw, pooled, lanes, tokens) = c.parts();
+                (raw.to_vec(), pooled.to_vec(), lanes.to_vec(), tokens)
+            }),
+            carried: d.carried.as_ref().map(Tens::of).transpose()?,
+        }))
+    }
+
+    /// Makes `held` the draft head's state: its layer's rows, its indexer and the waiting row.
+    /// `None` leaves the head as it is.
+    pub(crate) fn restore_draft(&mut self, held: Option<&DraftHeld>) -> Result<()> {
+        let (Some(h), true) = (held, self.draft.is_some()) else {
+            return Ok(());
+        };
+        self.draft_reset();
+        let d = self.draft.as_mut().expect("checked above");
+        let err = |m: &str| crate::tensor::Error::msg(format!("state cache: {m}"));
+        if (h.rows.n_kv, h.rows.head_dim) != (d.layer.n_kv_head, d.layer.head_dim) {
+            return Err(err("the draft head has another row geometry"));
+        }
+        if h.indexer.is_some() != d.layer.sparse.is_some() {
+            return Err(err(
+                "the draft head's indexer is not the one it was written with",
+            ));
+        }
+        let snap = rows_snapshot(&d.layer, &h.rows.k, &h.rows.v, h.rows.dtype)?;
+        super::graph::restore_layers(std::slice::from_mut(&mut d.layer), &[snap])?;
+        rebuild_host_rows(&mut d.layer);
+        if let (Some(s), Some((raw, pooled, lanes, tokens))) = (d.layer.sparse.as_mut(), &h.indexer)
+        {
+            let cache = super::qsa::IndexerCache::from_parts(
+                raw.clone(),
+                pooled.clone(),
+                lanes.clone(),
+                *tokens,
+            );
+            s.restore_cache(&cache, false);
+            d.indexer_mark = Some((h.committed, cache));
+        }
+        let device = d.layer.cos.device();
+        d.carried = h.carried.as_ref().map(|t| t.tensor(&device)).transpose()?;
+        d.committed = h.committed;
+        d.len = h.committed;
+        #[cfg(feature = "cuda")]
+        {
+            d.step = None;
+        }
+        Ok(())
     }
 
     /// Block `b` of the global layers' rows, encoded.
@@ -826,18 +995,10 @@ impl GenericHeteroTransformer {
     fn restore_point(&mut self, point: &Point, blocks: &[Vec<(Vec<f32>, Vec<f32>)>]) -> Result<()> {
         let snaps = self.point_snapshots(point, blocks)?;
         super::graph::restore_layers(&mut self.layers, &snaps)?;
-        // A layer attending on the host reads its decode from a store beside the KV cache, built
-        // from the same rows as a prefill appends them: built again from the restored rows.
         for l in &mut self.layers {
-            let n = l.kv_cache.current_seq_len();
-            if matches!(l.mixer, Mixer::Attention) && n > 0 {
-                l.cpu_q8_kv = None;
-                l.cpu_f16_kv = None;
-                if let Some((k, v)) = l.kv_cache.current_kv() {
-                    l.cpu_q8_append(&k, &v, n, 0, false);
-                }
-            }
+            rebuild_host_rows(l);
         }
+        self.restore_draft(point.draft.as_ref())?;
         self.invalidate_graph_state();
         Ok(())
     }
@@ -908,8 +1069,12 @@ impl GenericHeteroTransformer {
                 StateKind::Window => Held::Window(snapshot_rows(l, s)?),
             });
         }
-        let manifest =
-            encode_manifest(&handover_identity(&layout), &layout, &Point { pos, layers });
+        let point = Point {
+            pos,
+            layers,
+            draft: None,
+        };
+        let manifest = encode_manifest(&handover_identity(&layout), &layout, &point);
         let mut w = Writer(Vec::with_capacity(manifest.len() + 64));
         w.0.extend(HANDOVER_MAGIC);
         w.0.extend(FORMAT_VERSION.to_le_bytes());
@@ -1034,6 +1199,19 @@ fn snapshot_rows(l: &GenericTransformerLayer, s: &super::LayerKvSnapshot) -> Res
     })
 }
 
+/// A layer attending on the host reads its decode from a store beside the KV cache, built from
+/// the same rows as a prefill appends them: built again from the restored rows.
+fn rebuild_host_rows(l: &mut GenericTransformerLayer) {
+    let n = l.kv_cache.current_seq_len();
+    if matches!(l.mixer, Mixer::Attention) && n > 0 {
+        l.cpu_q8_kv = None;
+        l.cpu_f16_kv = None;
+        if let Some((k, v)) = l.kv_cache.current_kv() {
+            l.cpu_q8_append(&k, &v, n, 0, false);
+        }
+    }
+}
+
 fn rows_snapshot(
     l: &GenericTransformerLayer,
     k: &[f32],
@@ -1076,11 +1254,14 @@ impl HybridStateCache {
     /// token so one is left to produce logits, and returns the tokens it covers; zero when none
     /// is usable. A stored state that proves unusable is dropped.
     pub(crate) fn restore(&self, model: &mut GenericHeteroTransformer, prompt: &[u32]) -> usize {
-        if prompt.len() < 2 {
+        // A token is left to produce logits; with a draft head, two, so the prefill of the
+        // rest is a chunk the head reads.
+        let left = 1 + model.has_draft_head() as usize;
+        if prompt.len() <= left {
             return 0;
         }
         let keys = self.store.keys(&self.identity, prompt);
-        for entry in self.store.candidates(&keys, prompt.len() - 1) {
+        for entry in self.store.candidates(&keys, prompt.len() - left) {
             let bytes = self.store.entry_bytes(&entry);
             let m = self.store.tuning().get();
             if !state_tune::restore_pays(
@@ -1243,6 +1424,18 @@ impl HybridStateCache {
             })
         });
     }
+}
+
+/// A draft head's state encoded and decoded again, for the round-trip test.
+#[cfg(test)]
+pub(crate) fn draft_round_trip(d: &DraftHeld) -> DraftHeld {
+    let mut w = Writer(Vec::new());
+    write_draft(&mut w, d);
+    let bytes = w.seal();
+    let mut r = Reader::open(&bytes).unwrap();
+    let out = read_draft(&mut r).unwrap();
+    r.done().unwrap();
+    out
 }
 
 /// A block encoded and decoded again, for the round-trip test.

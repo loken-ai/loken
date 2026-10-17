@@ -1313,7 +1313,7 @@ fn verify_cut_back(ordinal: Option<usize>, kv: KvQuant) {
 
 /// The toy with a draft head: its layer the indexed attention layer of a second copy, the
 /// projections fixed smooth matrices, the output mixer the second copy's.
-fn toy_with_head() -> GenericHeteroTransformer {
+pub(super) fn toy_with_head() -> GenericHeteroTransformer {
     use crate::tensor::layer::RmsNorm;
     use crate::tensor::quantized::{GgmlDType, QTensor};
     let mut m = toy();

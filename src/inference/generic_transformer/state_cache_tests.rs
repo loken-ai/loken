@@ -639,3 +639,79 @@ fn a_mismatched_state_handover_is_refused() {
     assert!(decoder.import_state(Vec::new(), &bytes).is_err());
     assert!(decoder.try_restore_prefix(&tokens).unwrap().is_none());
 }
+
+/// Forwards `tokens` from `from` in chunks of `chunk`, returning the last logits.
+fn forward_chunks(
+    m: &mut GenericHeteroTransformer,
+    tokens: &[u32],
+    from: usize,
+    chunk: usize,
+) -> Tensor {
+    let mut last = None;
+    let mut pos = from;
+    while pos < tokens.len() {
+        let n = chunk.min(tokens.len() - pos);
+        let x = Tensor::new(&tokens[pos..pos + n], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        last = Some(m.forward(&x, pos).unwrap());
+        pos += n;
+    }
+    last.unwrap()
+}
+
+/// The head's pair count, cache length and guesses one decode step after `prompt`.
+fn head_after(
+    m: &mut GenericHeteroTransformer,
+    logits: &Tensor,
+    at: usize,
+) -> (usize, usize, Vec<u32>) {
+    let d = m.draft.as_ref().unwrap();
+    let (committed, len) = (d.committed, d.len);
+    let next = argmax(&floats(logits)) as u32;
+    let x = Tensor::new(&[next], &Device::Cpu)
+        .unwrap()
+        .unsqueeze(0)
+        .unwrap();
+    m.forward(&x, at).unwrap();
+    (committed, len, m.draft_tokens(&[next], 3, 0.0).unwrap())
+}
+
+#[test]
+fn a_restored_draft_head_drafts_like_one_that_read_the_prompt() {
+    let chunk = 5;
+    let mut whole = super::wide_tests::toy_with_head();
+    whole.set_capture_feature(true);
+    let vocab = whole.config.vocab_size as u32;
+    let tokens: Vec<u32> = (0..30u32).map(|i| (i * 7 + 2) % vocab).collect();
+    // On a chunk boundary: every chunk of the rest is more than a token, which the head reads.
+    let cut = 20;
+    let logits = forward_chunks(&mut whole, &tokens, 0, chunk);
+    let want = head_after(&mut whole, &logits, tokens.len());
+    assert_eq!((want.0, want.1), (tokens.len() - 1, tokens.len() - 1));
+    assert_eq!(want.2.len(), 3);
+
+    // The state a store keeps at the cut, written and read again.
+    let mut writer = super::wide_tests::toy_with_head();
+    writer.set_capture_feature(true);
+    forward_chunks(&mut writer, &tokens[..cut], 0, chunk);
+    let held = writer
+        .capture_draft(cut)
+        .unwrap()
+        .expect("the head holds the cut's pairs");
+    let held = draft_round_trip(&held);
+
+    // A twin whose target read the prefix without the head: the head disagrees with the
+    // target and is not captured, then takes the stored state and reads the rest.
+    let mut restored = super::wide_tests::toy_with_head();
+    forward_chunks(&mut restored, &tokens[..cut], 0, chunk);
+    assert!(restored.capture_draft(cut).unwrap().is_none());
+    restored.draft_reset();
+    restored.restore_draft(Some(&held)).unwrap();
+    let d = restored.draft.as_ref().unwrap();
+    assert_eq!((d.committed, d.len), (cut - 1, cut - 1));
+    restored.set_capture_feature(true);
+    let logits = forward_chunks(&mut restored, &tokens, cut, chunk);
+    assert_eq!(head_after(&mut restored, &logits, tokens.len()), want);
+}
