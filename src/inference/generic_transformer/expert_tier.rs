@@ -2272,7 +2272,7 @@ impl LayerTier {
 
     /// How many of `missing` experts are copied into the card's transit room for the token, the
     /// rest being computed on the host: the split at which the two finish together, from the
-    /// time a copy and a host computation have taken on this layer. The host does at least one
+    /// time copies and host computations take on this layer lately. The host does at least one
     /// of several until its time is known.
     fn transit_share(&self, missing: usize, rows: usize) -> usize {
         if missing == 0 || self.stage.is_none() {
@@ -2280,10 +2280,6 @@ impl LayerTier {
         }
         let class = pace_class(rows);
         let room = self.stage.as_ref().map_or(0, |s| s.stager.transit);
-        let eighths = self.transit_eighths[class].load(Ordering::Relaxed);
-        if eighths > 0 {
-            return ((missing as u64 * eighths + 4) / 8).min(room as u64) as usize;
-        }
         let host = f64::from_bits(self.host_us[class].load(Ordering::Relaxed));
         let mut copy = f64::from_bits(self.upload_us[class].load(Ordering::Relaxed));
         if copy == 0.0 {
@@ -2296,8 +2292,9 @@ impl LayerTier {
         if host == 0.0 {
             return (if missing > 1 { missing - 1 } else { missing }).min(room);
         }
-        // The paces measured enough, the share is fixed: the copies and the products finish
-        // together when the room takes host / (host + copy) of the experts.
+        // Once the paces are measured, the copies and the products finish together when the room
+        // takes host / (host + copy) of the experts, from the paces as they stand now: they move
+        // with the host's load and the bus.
         if self.paced[class].load(Ordering::Relaxed) >= TRANSIT_PACE_SAMPLES {
             let share = (8.0 * host / (host + copy)).round().clamp(1.0, 7.0) as u64;
             self.transit_eighths[class].store(share, Ordering::Relaxed);

@@ -79,6 +79,35 @@ impl PrefillShape {
     }
 }
 
+/// The chunk a prefill starts at: `chunk` unless an earlier prefill had to shrink to a smaller
+/// one, which stands until the cards hold more than when it shrank by what the larger chunk
+/// needs on top of it, at `per_token` bytes a row.
+fn start_chunk(chunk: usize, per_token: usize, free_now: usize) -> usize {
+    use std::sync::atomic::Ordering;
+    match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
+        0 => chunk,
+        remembered => {
+            let remembered = remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk);
+            let gain = free_now.saturating_sub(ADAPTIVE_PREFILL_FREE.load(Ordering::Relaxed));
+            if gain >= (chunk - remembered) * per_token.max(1) {
+                ADAPTIVE_PREFILL_CHUNK.store(0, Ordering::Relaxed);
+                chunk
+            } else {
+                remembered
+            }
+        }
+    }
+}
+
+/// Remember a chunk `used` that had to shrink below `chunk` for a prompt longer than it, with
+/// the cards' free memory `free_now` when it did.
+fn remember_shrunk_chunk(used: usize, chunk: usize, rows: usize, free_now: usize) {
+    use std::sync::atomic::Ordering;
+    if used < chunk && used < rows && ADAPTIVE_PREFILL_CHUNK.swap(used, Ordering::Relaxed) == 0 {
+        ADAPTIVE_PREFILL_FREE.store(free_now, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn adaptive_prefill_chunk(shape: PrefillShape) -> usize {
     let epoch = crate::inference::place::vram_manager::residency_epoch();
     if let Ok(memo) = CHUNK_MEMO.lock() {
@@ -294,7 +323,6 @@ pub(crate) trait ModelBackend: Send {
         // shrinks the activation peak, the attention scores and the KV growth transient
         // without changing the final chunk's logits. At the floor the card is full of
         // something else, so room is asked for once before the failure surfaces.
-        use std::sync::atomic::Ordering;
         let (per_token, fixed) = {
             let sh = self.prefill_shape();
             (sh.bytes_per_token, sh.fixed_bytes)
@@ -305,22 +333,7 @@ pub(crate) trait ModelBackend: Send {
         let first = if seq_len <= chunk_start {
             seq_len
         } else {
-            match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
-                0 => chunk_start,
-                remembered => {
-                    let remembered = remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk_start);
-                    // The shrunk chunk stands until the cards hold more than when it shrank
-                    // by what the larger chunk needs on top.
-                    let gain =
-                        free_now.saturating_sub(ADAPTIVE_PREFILL_FREE.load(Ordering::Relaxed));
-                    if gain >= (chunk_start - remembered) * per_token.max(1) {
-                        ADAPTIVE_PREFILL_CHUNK.store(0, Ordering::Relaxed);
-                        chunk_start
-                    } else {
-                        remembered
-                    }
-                }
-            }
+            start_chunk(chunk_start, per_token, free_now)
         };
         let mut replay = false;
         let (logits, chunk_tokens) = crate::inference::place::recover::shrink_on_oom(
@@ -355,12 +368,7 @@ pub(crate) trait ModelBackend: Send {
             },
         )?;
         // Remember a chunk that had to shrink, so later requests start at it.
-        if chunk_tokens < chunk_start
-            && chunk_tokens < seq_len
-            && ADAPTIVE_PREFILL_CHUNK.swap(chunk_tokens, Ordering::Relaxed) == 0
-        {
-            ADAPTIVE_PREFILL_FREE.store(free_now, Ordering::Relaxed);
-        }
+        remember_shrunk_chunk(chunk_tokens, chunk_start, seq_len, free_now);
         Ok(logits)
     }
 
@@ -1525,15 +1533,14 @@ impl GenericBackend {
         // smaller chunk the cold prefill would take, from the state restored again.
         let logits = match &cache {
             Some(cache) => {
-                use std::sync::atomic::Ordering;
                 let (per_token, fixed) = {
                     let sh = self.prefill_shape();
                     (sh.bytes_per_token, sh.fixed_bytes)
                 };
-                let first = match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
-                    0 => chunk,
-                    remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk),
-                };
+                let free_now = crate::inference::place::vram_manager::free_on_cards(
+                    self.prefill_shape().cards,
+                ) as usize;
+                let first = start_chunk(chunk, per_token, free_now);
                 let mut replay = false;
                 let grid = std::cell::RefCell::new(Vec::new());
                 let started = std::time::Instant::now();
@@ -1571,9 +1578,7 @@ impl GenericBackend {
                 );
                 match walked {
                     Ok((logits, used)) => {
-                        if used < chunk && used < prompt.len() - covered {
-                            ADAPTIVE_PREFILL_CHUNK.store(used, Ordering::Relaxed);
-                        }
+                        remember_shrunk_chunk(used, chunk, prompt.len() - covered, free_now);
                         let secs = started.elapsed().as_secs_f64();
                         cache.tuning().prefilled(prompt.len() - covered, secs);
                         self.0.snapshot_prefix(prompt, &logits)?;
