@@ -1097,4 +1097,89 @@ mod tests {
             );
         }
     }
+
+    /// Time of one launch of [`selected_attention_rows`] at the shapes of a prompt chunk: 24 query
+    /// heads of 256 over 2 key-value heads, each row keeping a budget of 2048 tokens in blocks of
+    /// 4 plus the tokens of its own incomplete block, chunks of 1000 and 4000 rows ending at
+    /// contexts of 4k and 13k tokens. Prints the median of seven runs of twenty launches.
+    #[test]
+    #[ignore = "a microbenchmark on an idle CUDA card"]
+    fn bench_the_selected_attention_of_rows() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let cd = dev.as_cuda_device().unwrap();
+        let (n_head, n_kv, hd, top_k, block) = (24usize, 2usize, 256usize, 2048usize, 4usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        for (rows, ctx) in [
+            (1000usize, 4096usize),
+            (1000, 13_000),
+            (4000, 4096),
+            (4000, 13_000),
+        ] {
+            let cap = ctx.next_multiple_of(256);
+            let first = ctx - rows;
+            let ncap = top_k + block;
+            let mut sel = vec![0u32; rows * ncap];
+            let mut count = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let at = first + r;
+                let complete = (at + 1) / block;
+                let mut kept: Vec<u32> = if complete * block <= top_k {
+                    (0..(complete * block) as u32).collect()
+                } else {
+                    // the budget's blocks spread over the history, a block drawn twice kept once
+                    let stride = (2_654_435_761usize % complete) | 1;
+                    let mut b: Vec<usize> = (0..top_k / block)
+                        .map(|i| (i * stride + r / 16) % complete)
+                        .collect();
+                    b.sort_unstable();
+                    b.dedup();
+                    b.iter()
+                        .flat_map(|&b| (b * block..(b + 1) * block).map(|t| t as u32))
+                        .collect()
+                };
+                kept.extend((complete * block..=at).map(|t| t as u32));
+                sel[r * ncap..r * ncap + kept.len()].copy_from_slice(&kept);
+                count.push(kept.len() as u32);
+            }
+            let ramp =
+                |n: usize, seed: usize| (0..n).map(|i| pseudo(i, seed)).collect::<Vec<f32>>();
+            let tq =
+                Tensor::from_vec(ramp(rows * n_head * hd, 1), (rows, n_head * hd), &dev).unwrap();
+            let half = |seed| {
+                Tensor::from_vec(ramp(n_kv * cap * hd, seed), (n_kv, cap, hd), &dev)
+                    .unwrap()
+                    .to_dtype(crate::tensor::DType::F16)
+                    .unwrap()
+            };
+            let (tk, tv) = (half(2), half(3));
+            let tsel = Tensor::from_vec(sel, (rows, ncap), &dev).unwrap();
+            let tcount = Tensor::from_vec(count, (rows,), &dev).unwrap();
+            let run = || {
+                selected_attention_rows(
+                    &tq, &tk, &tv, &tsel, &tcount, n_head, n_kv, cap, hd, scale,
+                )
+                .unwrap();
+            };
+            for _ in 0..5 {
+                run();
+            }
+            cd.0.stream().synchronize().unwrap();
+            let launches = 20;
+            let mut ms: Vec<f64> = (0..7)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..launches {
+                        run();
+                    }
+                    cd.0.stream().synchronize().unwrap();
+                    t.elapsed().as_secs_f64() * 1e3 / launches as f64
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            eprintln!(
+                "{rows} rows at a context of {ctx}: {:.3} ms a launch",
+                ms[ms.len() / 2]
+            );
+        }
+    }
 }

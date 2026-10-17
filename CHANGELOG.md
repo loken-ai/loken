@@ -36,6 +36,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Prefill: indexed attention over a prompt's rows runs on tensor cores, three times faster.
 - Decode: kept graphs outlive a prefill that lends the expert slots; a replay's room is measured apart.
 - Decode: the recorded step and windows are kept for the next request while nothing they read moved.
 - Prefill: the experts' products of a chunk run in launches sized for their longest run.

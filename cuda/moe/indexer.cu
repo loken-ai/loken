@@ -768,30 +768,25 @@ extern "C" void loken_selected_attn_group(
         part_o, part_ml, out, hd, splits, n_head);
 }
 
-// Attention of the rows of a prompt chunk, each over its own kept tokens. A block takes one row and
-// one key-value head and serves the whole group of query heads that share it, so the keys and
-// values of the row's kept tokens are read once for the group: thirty-two tokens at a time are
-// gathered into shared memory, scored for every head of the group on the tensor cores, folded into
-// each head's running softmax, and their values summed on the tensor cores too. A query and a
-// probability are each split into a high and a low half, so that the products keep the precision
-// of F32 while the keys and values, F16 already, are exact. `q` is `[rows, n_head, 256]` F32,
-// already rotated; `kbuf` and `vbuf` are `[n_kv, cap, 256]` F16; row `r` keeps
-// `sel[r * ncap .. + count[r]]`; the answer is `[rows, n_head, 256]` F32.
+// The attention of `loken_selected_attn_rows_kernel` for cards without asynchronous copies: one
+// row and one key-value head a block, thirty-two tokens at a time gathered into shared memory,
+// scored and weighed through `wmma` with the same high and low halves, each head's softmax
+// folded by one thread.
 #include <mma.h>
 
-#define SELROWS_HD 256
-#define SELROWS_CELLS 32
-#define SELROWS_LD (SELROWS_HD + 8)        // halves a shared row of keys, values or queries
-#define SELROWS_PLD 36                     // floats a row of partial scores
-#define SELROWS_PHLD (SELROWS_CELLS + 8)   // halves a row of probabilities
-#define SELROWS_TLD (SELROWS_HD + 4)       // floats a row of the values' weighted sum
-#define SELROWS_GMAX 16
+#define SELROWS_W_HD 256
+#define SELROWS_W_CELLS 32
+#define SELROWS_W_LD (SELROWS_W_HD + 8)        // halves a shared row of keys, values or queries
+#define SELROWS_W_PLD 36                     // floats a row of partial scores
+#define SELROWS_W_PHLD (SELROWS_W_CELLS + 8)   // halves a row of probabilities
+#define SELROWS_W_TLD (SELROWS_W_HD + 4)       // floats a row of the values' weighted sum
+#define SELROWS_W_GMAX 16
 
 // Bytes of shared memory a block needs.
-#define SELROWS_SMEM (2 * 16 * SELROWS_LD * 2 + 2 * SELROWS_CELLS * SELROWS_LD * 2 \
-                      + 16 * SELROWS_TLD * 4 + 2 * 16 * SELROWS_PHLD * 2 + 3 * 16 * 4)
+#define SELROWS_W_SMEM (2 * 16 * SELROWS_W_LD * 2 + 2 * SELROWS_W_CELLS * SELROWS_W_LD * 2 \
+                      + 16 * SELROWS_W_TLD * 4 + 2 * 16 * SELROWS_W_PHLD * 2 + 3 * 16 * 4)
 
-extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_kernel(
+extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_wmma_kernel(
         const float * __restrict__ q, const __half * __restrict__ kbuf,
         const __half * __restrict__ vbuf, const uint32_t * __restrict__ sel,
         const uint32_t * __restrict__ count, float * __restrict__ out, int n_head, int n_kv,
@@ -800,25 +795,25 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_kerne
     extern __shared__ __align__(128) unsigned char raw[];
     const int g = n_head / n_kv;
     __half * qh = (__half *) raw;                                   // [16][LD] query, high half
-    __half * ql = qh + 16 * SELROWS_LD;                             // [16][LD] query, low half
-    __half * ks = ql + 16 * SELROWS_LD;                             // [CELLS][LD]
-    __half * vs = ks + SELROWS_CELLS * SELROWS_LD;                  // [CELLS][LD]
-    float * work = (float *) (vs + SELROWS_CELLS * SELROWS_LD);     // partial scores, then the sums
-    __half * ph = (__half *) (work + 16 * SELROWS_TLD);             // [16][PHLD] probabilities
-    __half * pl = ph + 16 * SELROWS_PHLD;
-    float * stats = (float *) (pl + 16 * SELROWS_PHLD);             // m[16], l[16], alpha[16]
+    __half * ql = qh + 16 * SELROWS_W_LD;                             // [16][LD] query, low half
+    __half * ks = ql + 16 * SELROWS_W_LD;                             // [CELLS][LD]
+    __half * vs = ks + SELROWS_W_CELLS * SELROWS_W_LD;                  // [CELLS][LD]
+    float * work = (float *) (vs + SELROWS_W_CELLS * SELROWS_W_LD);     // partial scores, then the sums
+    __half * ph = (__half *) (work + 16 * SELROWS_W_TLD);             // [16][PHLD] probabilities
+    __half * pl = ph + 16 * SELROWS_W_PHLD;
+    float * stats = (float *) (pl + 16 * SELROWS_W_PHLD);             // m[16], l[16], alpha[16]
     const int row = blockIdx.x, kvh = blockIdx.y, t = threadIdx.x;
     const int warp = t >> 5;
     const int n = (int) count[row];
-    const float * qrow = q + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_HD;
-    for (int i = t; i < 16 * SELROWS_HD; i += 256) {
-        const int h = i / SELROWS_HD, d = i % SELROWS_HD;
-        float v = h < g ? qrow[(size_t) h * SELROWS_HD + d] * scale : 0.f;
+    const float * qrow = q + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_W_HD;
+    for (int i = t; i < 16 * SELROWS_W_HD; i += 256) {
+        const int h = i / SELROWS_W_HD, d = i % SELROWS_W_HD;
+        float v = h < g ? qrow[(size_t) h * SELROWS_W_HD + d] * scale : 0.f;
         const __half hi = __float2half(v);
-        qh[h * SELROWS_LD + d] = hi;
-        ql[h * SELROWS_LD + d] = __float2half(v - __half2float(hi));
+        qh[h * SELROWS_W_LD + d] = hi;
+        ql[h * SELROWS_W_LD + d] = __float2half(v - __half2float(hi));
     }
-    for (int i = t; i < 16 * SELROWS_PHLD; i += 256) {
+    for (int i = t; i < 16 * SELROWS_W_PHLD; i += 256) {
         ph[i] = __float2half(0.f);
         pl[i] = __float2half(0.f);
     }
@@ -827,25 +822,25 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_kerne
         stats[16 + t] = 0.f;
         stats[32 + t] = 0.f;
     }
-    float acc[SELROWS_GMAX];
+    float acc[SELROWS_W_GMAX];
 #pragma unroll
-    for (int h = 0; h < SELROWS_GMAX; ++h) acc[h] = 0.f;
-    const __half * kh = kbuf + (size_t) kvh * cap * SELROWS_HD;
-    const __half * vh = vbuf + (size_t) kvh * cap * SELROWS_HD;
+    for (int h = 0; h < SELROWS_W_GMAX; ++h) acc[h] = 0.f;
+    const __half * kh = kbuf + (size_t) kvh * cap * SELROWS_W_HD;
+    const __half * vh = vbuf + (size_t) kvh * cap * SELROWS_W_HD;
     const uint32_t * mine = sel + (size_t) row * ncap;
-    for (int base = 0; base < n; base += SELROWS_CELLS) {
-        const int cnt = n - base < SELROWS_CELLS ? n - base : SELROWS_CELLS;
+    for (int base = 0; base < n; base += SELROWS_W_CELLS) {
+        const int cnt = n - base < SELROWS_W_CELLS ? n - base : SELROWS_W_CELLS;
         __syncthreads();
-        for (int i = t; i < SELROWS_CELLS * 32; i += 256) {
+        for (int i = t; i < SELROWS_W_CELLS * 32; i += 256) {
             const int c = i >> 5, v4 = i & 31;
             if (c < cnt) {
-                const size_t at = (size_t) mine[base + c] * SELROWS_HD;
-                ((uint4 *) (ks + c * SELROWS_LD))[v4] = ((const uint4 *) (kh + at))[v4];
-                ((uint4 *) (vs + c * SELROWS_LD))[v4] = ((const uint4 *) (vh + at))[v4];
+                const size_t at = (size_t) mine[base + c] * SELROWS_W_HD;
+                ((uint4 *) (ks + c * SELROWS_W_LD))[v4] = ((const uint4 *) (kh + at))[v4];
+                ((uint4 *) (vs + c * SELROWS_W_LD))[v4] = ((const uint4 *) (vh + at))[v4];
             } else {
                 // a cell the tile lacks weighs nothing; its values must still be numbers
-                ((uint4 *) (ks + c * SELROWS_LD))[v4] = make_uint4(0, 0, 0, 0);
-                ((uint4 *) (vs + c * SELROWS_LD))[v4] = make_uint4(0, 0, 0, 0);
+                ((uint4 *) (ks + c * SELROWS_W_LD))[v4] = make_uint4(0, 0, 0, 0);
+                ((uint4 *) (vs + c * SELROWS_W_LD))[v4] = make_uint4(0, 0, 0, 0);
             }
         }
         __syncthreads();
@@ -858,32 +853,32 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_kerne
             for (int step = 0; step < 4; ++step) {
                 const int d0 = (kg * 4 + step) * 16;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fb, ks + (nt * 16) * SELROWS_LD + d0, SELROWS_LD);
+                wmma::load_matrix_sync(fb, ks + (nt * 16) * SELROWS_W_LD + d0, SELROWS_W_LD);
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
-                wmma::load_matrix_sync(fa, qh + d0, SELROWS_LD);
+                wmma::load_matrix_sync(fa, qh + d0, SELROWS_W_LD);
                 wmma::mma_sync(fc, fa, fb, fc);
-                wmma::load_matrix_sync(fa, ql + d0, SELROWS_LD);
+                wmma::load_matrix_sync(fa, ql + d0, SELROWS_W_LD);
                 wmma::mma_sync(fc, fa, fb, fc);
             }
-            wmma::store_matrix_sync(work + kg * 16 * SELROWS_PLD + nt * 16, fc, SELROWS_PLD,
+            wmma::store_matrix_sync(work + kg * 16 * SELROWS_W_PLD + nt * 16, fc, SELROWS_W_PLD,
                                     wmma::mem_row_major);
         }
         __syncthreads();
         if (t < g) {
-            float s[SELROWS_CELLS];
+            float s[SELROWS_W_CELLS];
             float m = stats[t];
             for (int c = 0; c < cnt; ++c) {
                 s[c] = 0.f;
-                for (int kg = 0; kg < 4; ++kg) s[c] += work[kg * 16 * SELROWS_PLD + t * SELROWS_PLD + c];
+                for (int kg = 0; kg < 4; ++kg) s[c] += work[kg * 16 * SELROWS_W_PLD + t * SELROWS_W_PLD + c];
                 m = fmaxf(m, s[c]);
             }
             const float alpha = expf(stats[t] - m);
             float l = stats[16 + t] * alpha;
-            for (int c = 0; c < SELROWS_CELLS; ++c) {
+            for (int c = 0; c < SELROWS_W_CELLS; ++c) {
                 const float p = c < cnt ? expf(s[c] - m) : 0.f;
                 const __half hi = __float2half(p);
-                ph[t * SELROWS_PHLD + c] = hi;
-                pl[t * SELROWS_PHLD + c] = __float2half(p - __half2float(hi));
+                ph[t * SELROWS_W_PHLD + c] = hi;
+                pl[t * SELROWS_W_PHLD + c] = __float2half(p - __half2float(hi));
                 l += p;
             }
             stats[t] = m;
@@ -899,42 +894,344 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_kerne
 #pragma unroll
             for (int step = 0; step < 2; ++step) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fh, fl;
-                wmma::load_matrix_sync(fh, ph + step * 16, SELROWS_PHLD);
-                wmma::load_matrix_sync(fl, pl + step * 16, SELROWS_PHLD);
+                wmma::load_matrix_sync(fh, ph + step * 16, SELROWS_W_PHLD);
+                wmma::load_matrix_sync(fl, pl + step * 16, SELROWS_W_PHLD);
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
-                wmma::load_matrix_sync(fb, vs + (step * 16) * SELROWS_LD + warp * 32, SELROWS_LD);
+                wmma::load_matrix_sync(fb, vs + (step * 16) * SELROWS_W_LD + warp * 32, SELROWS_W_LD);
                 wmma::mma_sync(f0, fh, fb, f0);
                 wmma::mma_sync(f0, fl, fb, f0);
-                wmma::load_matrix_sync(fb, vs + (step * 16) * SELROWS_LD + warp * 32 + 16, SELROWS_LD);
+                wmma::load_matrix_sync(fb, vs + (step * 16) * SELROWS_W_LD + warp * 32 + 16, SELROWS_W_LD);
                 wmma::mma_sync(f1, fh, fb, f1);
                 wmma::mma_sync(f1, fl, fb, f1);
             }
-            wmma::store_matrix_sync(work + warp * 32, f0, SELROWS_TLD, wmma::mem_row_major);
-            wmma::store_matrix_sync(work + warp * 32 + 16, f1, SELROWS_TLD, wmma::mem_row_major);
+            wmma::store_matrix_sync(work + warp * 32, f0, SELROWS_W_TLD, wmma::mem_row_major);
+            wmma::store_matrix_sync(work + warp * 32 + 16, f1, SELROWS_W_TLD, wmma::mem_row_major);
         }
         __syncthreads();
 #pragma unroll
-        for (int h = 0; h < SELROWS_GMAX; ++h)
-            if (h < g) acc[h] = acc[h] * stats[32 + h] + work[h * SELROWS_TLD + t];
+        for (int h = 0; h < SELROWS_W_GMAX; ++h)
+            if (h < g) acc[h] = acc[h] * stats[32 + h] + work[h * SELROWS_W_TLD + t];
     }
     __syncthreads();
-    float * orow = out + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_HD;
+    float * orow = out + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_W_HD;
 #pragma unroll
-    for (int h = 0; h < SELROWS_GMAX; ++h) {
+    for (int h = 0; h < SELROWS_W_GMAX; ++h) {
         if (h < g) {
             const float l = stats[16 + h];
-            orow[h * SELROWS_HD + t] = l > 0.f ? acc[h] / l : 0.f;
+            orow[h * SELROWS_W_HD + t] = l > 0.f ? acc[h] / l : 0.f;
         }
     }
 }
 
+// Attention of the rows of a prompt chunk, each over its own kept tokens. A block takes one row and
+// one key-value head and serves the whole group of query heads that share it, so the keys and
+// values of the row's kept tokens are read once for the group. The kept tokens go by tiles of
+// SELROWS_CELLS: a tile's keys are copied to shared memory while the previous tile's values are
+// weighed, and its values while its scores are taken, both on the tensor cores; each head's running
+// softmax folds the tile in. A query and a probability are each split into a high and a low half,
+// so that the products keep the precision of F32 while the keys and values, F16 already, are exact;
+// the low half's products, small beside the high half's, are summed in F16 over one tile before
+// they join the F32 sums. `q` is `[rows, n_head, 256]` F32, already rotated; `kbuf` and `vbuf` are
+// `[n_kv, cap, 256]` F16; row `r` keeps `sel[r * ncap .. + count[r]]`; the answer is
+// `[rows, n_head, 256]` F32.
+#define SELROWS_HD 256
+#define SELROWS_CELLS 32                   // kept tokens of a tile
+#define SELROWS_M 16                       // query heads a block holds, the group padded
+#define SELROWS_THREADS 256
+#define SELROWS_LD (SELROWS_HD + 8)        // halves a shared row of keys, values or queries
+#define SELROWS_WLD (SELROWS_CELLS + 4)    // floats a row of partial scores
+#define SELROWS_PLD (SELROWS_CELLS + 8)    // halves a row of probabilities
+
+// Bytes of shared memory a block needs: keys and values of a tile, the two halves of the partial
+// scores, the probabilities' two halves, each head's rescale and total.
+#define SELROWS_SMEM (2 * SELROWS_CELLS * SELROWS_LD * 2 + 2 * SELROWS_M * SELROWS_WLD * 4 \
+                      + 2 * SELROWS_M * SELROWS_PLD * 2 + 2 * SELROWS_M * 4)
+
+// The queries' two halves are staged where a tile's values go.
+static_assert(2 * SELROWS_M <= SELROWS_CELLS, "the queries fit the values' tile");
+// Warp w scores the cells [8 (w % 4), +8) over half the dimensions, and weighs the dimensions
+// [32 w, +32): eight warps, four tiles of eight cells, eight slices of thirty-two dimensions.
+static_assert(SELROWS_THREADS == 256 && SELROWS_CELLS == 32 && SELROWS_HD == 256,
+              "the warps' share of a tile");
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ uint32_t selrows_shared(const void * p) {
+    return (uint32_t) __cvta_generic_to_shared(p);
+}
+
+__device__ __forceinline__ void selrows_ldsm(uint32_t (&r)[4], const __half * p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(selrows_shared(p)));
+}
+
+__device__ __forceinline__ void selrows_ldsm_t(uint32_t (&r)[4], const __half * p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(selrows_shared(p)));
+}
+
+// c += a b over a 16x8x16 tile, F32 sums.
+__device__ __forceinline__ void selrows_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0,
+                                            uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, "
+                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// c += a b over a 16x8x16 tile, F16 sums.
+__device__ __forceinline__ void selrows_mma_h(uint32_t (&c)[2], const uint32_t (&a)[4],
+                                              uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, "
+                 "{%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// A thread's share of a tile: the cells `t / 32 + 8 j` and the pieces `t % 32` of their rows.
+#define SELROWS_SHARE (SELROWS_CELLS * (SELROWS_HD / 8) / SELROWS_THREADS)
+static_assert(SELROWS_SHARE * SELROWS_THREADS == SELROWS_CELLS * (SELROWS_HD / 8),
+              "the threads share a tile evenly");
+
+// The kept tokens of the cells of a tile at `base` a thread copies, those past `n` read as 0.
+__device__ __forceinline__ void selrows_ids(uint32_t (&ids)[SELROWS_SHARE], const uint32_t * mine,
+                                            int base, int n, int t) {
+#pragma unroll
+    for (int j = 0; j < SELROWS_SHARE; ++j) {
+        const int c = (t + j * SELROWS_THREADS) / (SELROWS_HD / 8);
+        ids[j] = base + c < n ? mine[base + c] : 0u;
+    }
+}
+
+// The rows of the kept tokens `ids` of the tile at `base` copied from `src` to `dst`, the tile's
+// rows past `n` zeroed, as one group of asynchronous copies.
+__device__ __forceinline__ void selrows_gather(__half * dst, const __half * src,
+                                               const uint32_t (&ids)[SELROWS_SHARE], int base,
+                                               int n, int t) {
+    constexpr int pieces = SELROWS_HD / 8;
+#pragma unroll
+    for (int j = 0; j < SELROWS_SHARE; ++j) {
+        const int i = t + j * SELROWS_THREADS;
+        const int c = i / pieces, v = i % pieces;
+        const __half * from = src + (size_t) ids[j] * SELROWS_HD + v * 8;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
+                         selrows_shared(dst + c * SELROWS_LD + v * 8)),
+                     "l"(from), "r"(base + c < n ? 16 : 0));
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void selrows_commit_none() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Waits for every group of copies but the newest.
+__device__ __forceinline__ void selrows_wait_older() {
+    asm volatile("cp.async.wait_group 1;\n" ::);
+}
+#endif
+
+extern "C" __global__ void __launch_bounds__(SELROWS_THREADS, 2) loken_selected_attn_rows_kernel(
+        const float * __restrict__ q, const __half * __restrict__ kbuf,
+        const __half * __restrict__ vbuf, const uint32_t * __restrict__ sel,
+        const uint32_t * __restrict__ count, float * __restrict__ out, int n_head, int n_kv,
+        int cap, int ncap, float scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    extern __shared__ __align__(128) unsigned char raw[];
+    __half * ks = (__half *) raw;                                   // [CELLS][LD]
+    __half * vs = ks + SELROWS_CELLS * SELROWS_LD;                  // [CELLS][LD]
+    float * work = (float *) (vs + SELROWS_CELLS * SELROWS_LD);     // [2][M][WLD]
+    __half * ph = (__half *) (work + 2 * SELROWS_M * SELROWS_WLD);  // [M][PLD]
+    __half * pl = ph + SELROWS_M * SELROWS_PLD;                     // [M][PLD]
+    float * alpha = (float *) (pl + SELROWS_M * SELROWS_PLD);       // [M]
+    float * total = alpha + SELROWS_M;                              // [M]
+    const int g = n_head / n_kv;
+    const int row = blockIdx.x, kvh = blockIdx.y, t = threadIdx.x;
+    const int lane = t & 31, warp = t >> 5;
+    const int n = (int) count[row];
+    const __half * kh = kbuf + (size_t) kvh * cap * SELROWS_HD;
+    const __half * vh = vbuf + (size_t) kvh * cap * SELROWS_HD;
+    const uint32_t * mine = sel + (size_t) row * ncap;
+    uint32_t ids[SELROWS_SHARE];
+    selrows_ids(ids, mine, 0, n, t);
+    if (n > 0) selrows_gather(ks, kh, ids, 0, n, t);
+
+    // the scaled queries' two halves, staged in the values' tile, then held by the warps
+    {
+        __half * qh = vs;
+        __half * ql = vs + SELROWS_M * SELROWS_LD;
+        const float * qrow = q + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_HD;
+        for (int i = t; i < SELROWS_M * SELROWS_HD; i += SELROWS_THREADS) {
+            const int h = i / SELROWS_HD, d = i % SELROWS_HD;
+            const float v = h < g ? qrow[(size_t) h * SELROWS_HD + d] * scale : 0.f;
+            const __half hi = __float2half(v);
+            qh[h * SELROWS_LD + d] = hi;
+            ql[h * SELROWS_LD + d] = __float2half(v - __half2float(hi));
+        }
+    }
+    __syncthreads();
+    const int nt = warp & 3, kq = warp >> 2;
+    uint32_t qa[8][4], qb[8][4];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        const int at = (lane & 15) * SELROWS_LD + kq * 128 + s * 16 + (lane >> 4) * 8;
+        selrows_ldsm(qa[s], vs + at);
+        selrows_ldsm(qb[s], vs + SELROWS_M * SELROWS_LD + at);
+    }
+    __syncthreads();
+    if (n > 0) selrows_gather(vs, vh, ids, 0, n, t);
+
+    float o[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[i][j] = 0.f;
+    // the softmax of head `sr` over the cells `sc`, `sc + 1` of a tile, its state kept by each of
+    // the sixteen threads of the head
+    const int sr = t >> 4, sc = (t & 15) * 2;
+    const float neg_inf = __int_as_float(0xff800000);
+    float m_run = neg_inf, l_run = 0.f;
+    for (int base = 0; base < n; base += SELROWS_CELLS) {
+        const int cnt = n - base < SELROWS_CELLS ? n - base : SELROWS_CELLS;
+        const bool more = base + SELROWS_CELLS < n;
+        selrows_wait_older();
+        __syncthreads();
+        // the next tile's kept tokens, read while this one is weighed
+        if (more) selrows_ids(ids, mine, base + SELROWS_CELLS, n, t);
+        // the scores: warp w takes the cells [8 (w & 3), +8) and the dimensions [128 (w >> 2), +128)
+        {
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            uint32_t d[2] = {0u, 0u};
+#pragma unroll
+            for (int s2 = 0; s2 < 4; ++s2) {
+                uint32_t b[4];
+                selrows_ldsm(b, ks + (nt * 8 + (lane & 7)) * SELROWS_LD + kq * 128 + s2 * 32
+                                    + (lane >> 3) * 8);
+                selrows_mma(c, qa[2 * s2], b[0], b[1]);
+                selrows_mma_h(d, qb[2 * s2], b[0], b[1]);
+                selrows_mma(c, qa[2 * s2 + 1], b[2], b[3]);
+                selrows_mma_h(d, qb[2 * s2 + 1], b[2], b[3]);
+            }
+            const float2 d0 = __half22float2(*(const __half2 *) &d[0]);
+            const float2 d1 = __half22float2(*(const __half2 *) &d[1]);
+            float * w = work + kq * SELROWS_M * SELROWS_WLD + nt * 8 + (lane & 3) * 2;
+            const int r0 = lane >> 2;
+            *(float2 *) (w + r0 * SELROWS_WLD) = make_float2(c[0] + d0.x, c[1] + d0.y);
+            *(float2 *) (w + (r0 + 8) * SELROWS_WLD) = make_float2(c[2] + d1.x, c[3] + d1.y);
+        }
+        __syncthreads();
+        if (more) selrows_gather(ks, kh, ids, base + SELROWS_CELLS, n, t);
+        else selrows_commit_none();
+        // each head's running softmax takes in the tile
+        {
+            const float2 a = *(const float2 *) (work + sr * SELROWS_WLD + sc);
+            const float2 b = *(const float2 *) (work + (SELROWS_M + sr) * SELROWS_WLD + sc);
+            const bool in0 = sc < cnt, in1 = sc + 1 < cnt;
+            const float s0 = a.x + b.x, s1 = a.y + b.y;
+            float mx = fmaxf(in0 ? s0 : neg_inf, in1 ? s1 : neg_inf);
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            const float m_new = fmaxf(m_run, mx);
+            const float al = expf(m_run - m_new);
+            const float p0 = in0 ? expf(s0 - m_new) : 0.f;
+            const float p1 = in1 ? expf(s1 - m_new) : 0.f;
+            float ps = p0 + p1;
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, off);
+            l_run = l_run * al + ps;
+            m_run = m_new;
+            const __half h0 = __float2half(p0), h1 = __float2half(p1);
+            *(__half2 *) (ph + sr * SELROWS_PLD + sc) = __halves2half2(h0, h1);
+            *(__half2 *) (pl + sr * SELROWS_PLD + sc) = __halves2half2(
+                __float2half(p0 - __half2float(h0)), __float2half(p1 - __half2float(h1)));
+            if ((t & 15) == 0) alpha[sr] = al;
+        }
+        selrows_wait_older();
+        __syncthreads();
+        // the weighted values of the tile: warp w takes the dimensions [32 w, +32)
+        {
+            const float a0 = alpha[lane >> 2], a1 = alpha[(lane >> 2) + 8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                o[i][0] *= a0;
+                o[i][1] *= a0;
+                o[i][2] *= a1;
+                o[i][3] *= a1;
+            }
+            uint32_t e[4][2];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) e[i][0] = e[i][1] = 0u;
+#pragma unroll
+            for (int k2 = 0; k2 < 2; ++k2) {
+                uint32_t pa[4], pb[4];
+                const int at = (lane & 15) * SELROWS_PLD + k2 * 16 + (lane >> 4) * 8;
+                selrows_ldsm(pa, ph + at);
+                selrows_ldsm(pb, pl + at);
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    uint32_t b[4];
+                    selrows_ldsm_t(b, vs + (k2 * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * SELROWS_LD
+                                          + warp * 32 + j * 16 + (lane >> 4) * 8);
+                    selrows_mma(o[2 * j], pa, b[0], b[1]);
+                    selrows_mma_h(e[2 * j], pb, b[0], b[1]);
+                    selrows_mma(o[2 * j + 1], pa, b[2], b[3]);
+                    selrows_mma_h(e[2 * j + 1], pb, b[2], b[3]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 lo0 = __half22float2(*(const __half2 *) &e[i][0]);
+                const float2 lo1 = __half22float2(*(const __half2 *) &e[i][1]);
+                o[i][0] += lo0.x;
+                o[i][1] += lo0.y;
+                o[i][2] += lo1.x;
+                o[i][3] += lo1.y;
+            }
+        }
+        __syncthreads();
+        if (more) selrows_gather(vs, vh, ids, base + SELROWS_CELLS, n, t);
+        else selrows_commit_none();
+    }
+    if ((t & 15) == 0) total[sr] = l_run;
+    __syncthreads();
+    float * orow = out + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_HD;
+    const int r0 = lane >> 2;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+        const int h = r0 + part * 8;
+        if (h < g) {
+            const float l = total[h];
+            const float inv = l > 0.f ? 1.f / l : 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int d = warp * 32 + i * 8 + (lane & 3) * 2;
+                *(float2 *) (orow + (size_t) h * SELROWS_HD + d) =
+                    make_float2(o[i][2 * part] * inv, o[i][2 * part + 1] * inv);
+            }
+        }
+    }
+#endif
+}
+
+// The kernel the card runs: the asynchronous one when its code was built for compute 8.0 or later.
 extern "C" void loken_selected_attn_rows(
         const float * q, const void * kbuf, const void * vbuf, const uint32_t * sel,
         const uint32_t * count, float * out, int rows, int n_head, int n_kv, int cap, int ncap,
         float scale, cudaStream_t stream) {
-    cudaFuncSetAttribute(loken_selected_attn_rows_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SELROWS_SMEM);
-    loken_selected_attn_rows_kernel<<<dim3(rows, n_kv), 256, SELROWS_SMEM, stream>>>(
+    cudaFuncAttributes built;
+    if (cudaFuncGetAttributes(&built, loken_selected_attn_rows_kernel) == cudaSuccess
+        && built.ptxVersion >= 80) {
+        cudaFuncSetAttribute(loken_selected_attn_rows_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SELROWS_SMEM);
+        loken_selected_attn_rows_kernel<<<dim3(rows, n_kv), SELROWS_THREADS, SELROWS_SMEM, stream>>>(
+            q, (const __half *) kbuf, (const __half *) vbuf, sel, count, out, n_head, n_kv, cap,
+            ncap, scale);
+        return;
+    }
+    cudaFuncSetAttribute(loken_selected_attn_rows_wmma_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SELROWS_W_SMEM);
+    loken_selected_attn_rows_wmma_kernel<<<dim3(rows, n_kv), 256, SELROWS_W_SMEM, stream>>>(
         q, (const __half *) kbuf, (const __half *) vbuf, sel, count, out, n_head, n_kv, cap, ncap,
         scale);
 }
