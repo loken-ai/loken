@@ -644,6 +644,10 @@ pub(crate) trait ModelBackend: Send {
         Ok(0)
     }
 
+    /// At a request's end: move the experts held in host memory to what the routing uses most
+    /// now, off the caller's thread.
+    fn rerank_hot_experts(&self) {}
+
     /// Where the model's layers run, when the backend can say.
     fn placement(&self) -> Option<crate::inference::place::Placement> {
         None
@@ -1858,6 +1862,11 @@ impl ModelBackend for GenericBackend {
         profile: &crate::inference::generic_transformer::expert_profile::ExpertProfile,
     ) -> crate::tensor::Result<usize> {
         self.0.prime_expert_caches(profile)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn rerank_hot_experts(&self) {
+        self.0.rerank_hot_experts()
     }
 
     fn placement(&self) -> Option<crate::inference::place::Placement> {

@@ -62,8 +62,10 @@ impl TierState {
 
 mod direct;
 mod graph;
+mod hot;
 pub(crate) use graph::mapped;
 pub use graph::TierWorker;
+pub use hot::HotLocks;
 
 /// Set by the tests that run the kernels of a recorded decode without recording them.
 static GRAPH_WITHOUT_CAPTURE: std::sync::atomic::AtomicBool =
@@ -594,6 +596,20 @@ impl super::GenericHeteroTransformer {
         self.split_host_experts(cuda_devices, plan, free_before, draft_resident)?;
         // Locked pages cannot be reclaimed: the cards share what the host can give.
         let mut pin_left = expert_cache::host_pin_budget();
+        // When the budget cannot lock every tiered layer whole, it is spent on the most routed
+        // experts of all of them instead (`HotLocks`). A card whose layers turn out resident
+        // takes none of it; the sum counts its layers anyway.
+        let tiered_bytes: u64 = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(l, _)| matches!(self.layer_devs[*l], LayerDevice::Cuda(o) if cuda_devices.contains_key(&o)))
+            .filter_map(|(_, layer)| layer.moe.as_ref())
+            .filter(|m| m.experts_on_host() && serves(m) && m.shards.is_empty() && m.tier.is_none())
+            .map(|m| (expert_bytes(m) * m.n_experts) as u64)
+            .sum();
+        let per_expert = cfg!(target_os = "linux") && tiered_bytes > pin_left;
+        let mut hot_tiers: Vec<(usize, Arc<LayerTier>)> = Vec::new();
         let mut ordinals: Vec<_> = cuda_devices.keys().copied().collect();
         ordinals.sort_unstable();
         for ordinal in ordinals {
@@ -742,7 +758,7 @@ impl super::GenericHeteroTransformer {
                     .expect("a tiered layer has experts");
                 let mut tier = LayerTier::new(moe, dev, slots)?.with_extra(extra)?;
                 let layer_bytes = (tier.expert_bytes.iter().sum::<usize>() * tier.n_experts) as u64;
-                let pin = layer_bytes <= pin_left;
+                let pin = !per_expert && layer_bytes <= pin_left;
                 pin_left = pin_left.saturating_sub(if pin { layer_bytes } else { 0 });
                 tier.stage = Some(Stage::new(&stager, rank % 2, &tier.host, pin)?);
                 locked += usize::from(
@@ -753,7 +769,11 @@ impl super::GenericHeteroTransformer {
                 if l == first {
                     tier.leader.store(true, Ordering::Relaxed);
                 }
-                moe.tier = Some(Arc::new(tier));
+                let tier = Arc::new(tier);
+                if per_expert {
+                    hot_tiers.push((l, tier.clone()));
+                }
+                moe.tier = Some(tier);
             }
             // The head's layer runs as one loaded on the card: every expert there, no host
             // answer to wait for at a guess.
@@ -799,7 +819,17 @@ impl super::GenericHeteroTransformer {
                 ((slots + extra) * bytes) as f64 / 1e9
             );
         }
+        if !hot_tiers.is_empty() {
+            self.hot_locks = HotLocks::new(hot_tiers, pin_left).map(Arc::new);
+        }
         Ok(())
+    }
+
+    /// Move the locks of the hot experts to what the tiers route most now, off this thread.
+    pub fn rerank_hot_experts(&self) {
+        if let Some(h) = &self.hot_locks {
+            h.rerank();
+        }
     }
 }
 
@@ -2301,7 +2331,7 @@ impl LayerTier {
             let data = self.host[i].native_qtensor().data();
             for (at, &e) in experts.iter().enumerate() {
                 let e = e as usize;
-                self.upload(i, data, e * eb, eb, base + (at * eb) as u64, copy)?;
+                self.upload_mapped(data, e * eb, eb, base + (at * eb) as u64, copy)?;
             }
         }
         end.record(copy)
@@ -2422,7 +2452,7 @@ impl LayerTier {
             let eb = self.expert_bytes[i];
             let data = self.host[i].native_qtensor().data();
             let dst = self.slot_addr(i, slot)?;
-            self.upload(i, data, expert * eb, eb, dst, &self.copy)?;
+            self.upload_mapped(data, expert * eb, eb, dst, &self.copy)?;
         }
         Ok(())
     }
@@ -2931,6 +2961,20 @@ impl LayerTier {
         self.upload_unlocked(hi, b, a, dst, copy)
     }
 
+    /// Copy `len` bytes of `data` from `start` to the card at `dst`, from the mapping alone: the
+    /// copies of a decode, which go out between the card's kernels and take no buffer of their own.
+    fn upload_mapped(
+        &self,
+        data: &[u8],
+        start: usize,
+        len: usize,
+        dst: u64,
+        copy: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        let a = data.as_ptr() as usize + start;
+        self.copy_mapped(a, a + len, a, dst, copy)
+    }
+
     /// Copy the mapped bytes `[from, to)` to the card, where `a` is the address `dst` stands for.
     fn copy_mapped(
         &self,
@@ -2940,17 +2984,20 @@ impl LayerTier {
         dst: u64,
         copy: &Arc<cudarc::driver::CudaStream>,
     ) -> Result<()> {
-        if to > from {
+        if to <= from {
+            return Ok(());
+        }
+        // One copy for each piece within or between the experts held in host memory.
+        hot::for_each_piece(from, to, |lo, hi| {
             driver("expert to stage", unsafe {
                 cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                    dst + (from - a) as u64,
-                    from as *const std::ffi::c_void,
-                    to - from,
+                    dst + (lo - a) as u64,
+                    lo as *const std::ffi::c_void,
+                    hi - lo,
                     copy.cu_stream(),
                 )
-            })?;
-        }
-        Ok(())
+            })
+        })
     }
 
     /// Copy the mapped bytes `[from, to)` of a layer that is not page-locked: the parts the page

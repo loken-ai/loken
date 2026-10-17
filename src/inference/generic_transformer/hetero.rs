@@ -1424,6 +1424,9 @@ impl GenericHeteroTransformer {
                 copied += tier.prime(profile.layer(l))?;
             }
         }
+        if let Some(h) = &self.hot_locks {
+            h.prime(profile);
+        }
         Ok(copied)
     }
 

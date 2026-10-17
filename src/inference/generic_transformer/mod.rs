@@ -444,6 +444,9 @@ pub struct GenericHeteroTransformer {
     /// The threads that serve the recorded decode of the cached layers; they stop before the
     /// layers they hold go.
     tier_workers: Vec<expert_tier::TierWorker>,
+    /// The hot experts locked in host memory, when the tiered layers do not fit it whole.
+    #[cfg(feature = "cuda")]
+    hot_locks: Option<Arc<expert_tier::HotLocks>>,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     /// The stored embedding table on each card of the plan, when its format is gathered there:

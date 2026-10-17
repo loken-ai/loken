@@ -2730,6 +2730,9 @@ impl LlmEngine {
                     100.0 * b.1.saturating_sub(a.1) as f64 / routed.max(1) as f64
                 );
             }
+            if let Some(s) = model_state.blocking_lock().as_ref() {
+                s.model.rerank_hot_experts();
+            }
             if let Some(path) = config.expert_profile_save.as_deref() {
                 let profile = model_state
                     .blocking_lock()

@@ -1927,6 +1927,7 @@ impl LlmEngine {
             // paying for itself. This path was counting it and throwing it away, so a
             // drafter that had stopped helping would have looked exactly like one that
             // was - the streaming path has reported it all along.
+            state.model.rerank_hot_experts();
             if let Some(path) = config.expert_profile_save.as_deref() {
                 if let Some(profile) = state.model.expert_profile() {
                     if let Err(e) = profile.write(std::path::Path::new(path)) {

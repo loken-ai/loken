@@ -4254,6 +4254,8 @@ impl GenericHeteroTransformer {
             output_bias,
             capture_feature: false,
             tier_workers: Vec::new(),
+            #[cfg(feature = "cuda")]
+            hot_locks: None,
             verify: Default::default(),
             graph_feature: None,
             last_feature: None,
@@ -4607,6 +4609,8 @@ impl GenericHeteroTransformer {
             output_bias: None,
             capture_feature: false,
             tier_workers: Vec::new(),
+            #[cfg(feature = "cuda")]
+            hot_locks: None,
             verify: Default::default(),
             graph_feature: None,
             last_feature: None,
