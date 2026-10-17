@@ -1,6 +1,6 @@
 //! The fused post-QKV decode launchers: RMS-norm, RoPE and the split into Q/K/V in one kernel.
 //!
-//! Four variants exist because four things can be absent - the norms, the second half of the
+//! The variants exist because things can be absent - the norms, the second half of the
 //! head, or nothing at all - and each is a different kernel. What they share is the plumbing:
 //! read three or five addresses out of tensors, allocate three outputs, launch, wrap the results
 //! back into tensors. That plumbing is written once here and the variants only choose a kernel.
@@ -58,6 +58,25 @@ fn rope_addresses(
         d => crate::tensor::bail!("post-QKV decode: unsupported output dtype {d:?}"),
     };
     Ok((c as *const c_void, s as *const c_void))
+}
+
+/// The address of the rotation frequencies the kernel takes its angles from, one F32 per
+/// rotated pair (`pairs` of them) with their factors already divided in, or null when it reads
+/// the tables. The caller holds `freqs` across the launch.
+fn freqs_address(freqs: Option<&Tensor>, pairs: usize) -> Result<*const f32> {
+    let Some(t) = freqs else {
+        return Ok(std::ptr::null());
+    };
+    if t.dtype() != DType::F32 || t.elem_count() != pairs || !t.is_contiguous() {
+        crate::tensor::bail!(
+            "post-QKV decode: rope frequencies must be {pairs} contiguous F32, got {:?} {:?}",
+            t.dtype(),
+            t.dims()
+        );
+    }
+    let (storage, layout) = t.storage_and_layout();
+    let base = address_of::<f32>(&storage, "rope_freqs")? as usize;
+    Ok((base + layout.start_offset() * std::mem::size_of::<f32>()) as *const f32)
 }
 
 /// Allocate the three outputs, hand the kernel their addresses, and hand back tensors.
@@ -131,6 +150,7 @@ pub fn attn_post_qkv_decode(
     k_norm_w: &Tensor,
     rope_cos: &Tensor,
     rope_sin: &Tensor,
+    rope_freqs: Option<&Tensor>,
     n_q: usize,
     n_kv: usize,
     hd: usize,
@@ -178,6 +198,7 @@ pub fn attn_post_qkv_decode(
     let qn_ptr = address_of::<f32>(&qn_storage, "q_norm_w")? as *const f32;
     let kn_ptr = address_of::<f32>(&kn_storage, "k_norm_w")? as *const f32;
     let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+    let freqs_ptr = freqs_address(rope_freqs, hd / 2)?;
 
     outputs_in_carrier(
         out_dtype,
@@ -192,6 +213,7 @@ pub fn attn_post_qkv_decode(
                 kn_ptr,
                 rc_ptr,
                 rs_ptr,
+                freqs_ptr,
                 q_ptr,
                 k_ptr,
                 v_ptr,
@@ -217,6 +239,7 @@ pub fn attn_post_qkv_decode_qf32(
     k_norm_w: &Tensor,
     rope_cos: &Tensor,
     rope_sin: &Tensor,
+    rope_freqs: Option<&Tensor>,
     n_q: usize,
     n_kv: usize,
     hd: usize,
@@ -256,6 +279,7 @@ pub fn attn_post_qkv_decode_qf32(
     let qn_ptr = address_of::<f32>(&qn_storage, "q_norm_w")? as *const f32;
     let kn_ptr = address_of::<f32>(&kn_storage, "k_norm_w")? as *const f32;
     let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+    let freqs_ptr = freqs_address(rope_freqs, hd / 2)?;
 
     outputs_q_in_f32(
         out_dtype,
@@ -270,6 +294,7 @@ pub fn attn_post_qkv_decode_qf32(
                 kn_ptr,
                 rc_ptr,
                 rs_ptr,
+                freqs_ptr,
                 q_ptr as *mut f32,
                 k_ptr,
                 v_ptr as *mut f32,
@@ -384,6 +409,7 @@ pub fn attn_post_qkv_decode_qf32_no_norm(
     qkv: &Tensor,
     rope_cos: &Tensor,
     rope_sin: &Tensor,
+    rope_freqs: Option<&Tensor>,
     n_q: usize,
     n_kv: usize,
     hd: usize,
@@ -413,6 +439,7 @@ pub fn attn_post_qkv_decode_qf32_no_norm(
 
     let qkv_ptr = address_of::<f32>(&qkv_storage, "qkv")? as *const f32;
     let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+    let freqs_ptr = freqs_address(rope_freqs, hd / 2)?;
 
     outputs_q_in_f32(
         out_dtype,
@@ -425,9 +452,76 @@ pub fn attn_post_qkv_decode_qf32_no_norm(
                 qkv_ptr,
                 rc_ptr,
                 rs_ptr,
+                freqs_ptr,
                 q_ptr as *mut f32,
                 k_ptr,
                 v_ptr as *mut f32,
+                n_q as i32,
+                n_kv as i32,
+                hd as i32,
+                rope_pos as i32,
+                q_scale,
+                dtype_int,
+                rope_style,
+                stream_i64,
+            );
+        },
+    )
+}
+
+/// [`attn_post_qkv_decode`] for the architectures that carry no Q/K norm: Q, K and V all come
+/// back in `out_dtype`, for an F-dtype cache.
+pub fn attn_post_qkv_decode_no_norm(
+    qkv: &Tensor,
+    rope_cos: &Tensor,
+    rope_sin: &Tensor,
+    rope_freqs: Option<&Tensor>,
+    n_q: usize,
+    n_kv: usize,
+    hd: usize,
+    rope_pos: usize,
+    q_scale: f32,
+    out_dtype: DType,
+    rope_style: i32,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if qkv.dtype() != DType::F32 {
+        crate::tensor::bail!("attn_post_qkv_decode_no_norm: qkv must be F32");
+    }
+    if rope_cos.dtype() != out_dtype || rope_sin.dtype() != out_dtype {
+        crate::tensor::bail!("attn_post_qkv_decode_no_norm: rope dtype mismatch");
+    }
+
+    let dev = qkv.device().as_cuda_device()?;
+    let dtype_int = carrier_code(out_dtype)?;
+    let stream_i64 = dev.cuda_stream().cu_stream() as i64;
+
+    let qkv_c = qkv.contiguous()?;
+    let rc_c = rope_cos.contiguous()?;
+    let rs_c = rope_sin.contiguous()?;
+
+    let (qkv_storage, _) = qkv_c.storage_and_layout();
+    let (rc_storage, _) = rc_c.storage_and_layout();
+    let (rs_storage, _) = rs_c.storage_and_layout();
+
+    let qkv_ptr = address_of::<f32>(&qkv_storage, "qkv")? as *const f32;
+    let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+    let freqs_ptr = freqs_address(rope_freqs, hd / 2)?;
+
+    outputs_in_carrier(
+        out_dtype,
+        &dev,
+        n_q,
+        n_kv,
+        hd,
+        |q_ptr, k_ptr, v_ptr| unsafe {
+            loken_attn_post_qkv_decode_no_norm(
+                qkv_ptr,
+                rc_ptr,
+                rs_ptr,
+                freqs_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
                 n_q as i32,
                 n_kv as i32,
                 hd as i32,
@@ -447,6 +541,7 @@ pub fn attn_post_qkv_decode_qf32_no_norm_partial_rope(
     qkv: &Tensor,
     rope_cos: &Tensor,
     rope_sin: &Tensor,
+    rope_freqs: Option<&Tensor>,
     n_q: usize,
     n_kv: usize,
     hd: usize,
@@ -487,6 +582,7 @@ pub fn attn_post_qkv_decode_qf32_no_norm_partial_rope(
 
     let qkv_ptr = address_of::<f32>(&qkv_storage, "qkv")? as *const f32;
     let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+    let freqs_ptr = freqs_address(rope_freqs, rope_dim / 2)?;
 
     outputs_q_in_f32(
         out_dtype,
@@ -499,6 +595,7 @@ pub fn attn_post_qkv_decode_qf32_no_norm_partial_rope(
                 qkv_ptr,
                 rc_ptr,
                 rs_ptr,
+                freqs_ptr,
                 q_ptr as *mut f32,
                 k_ptr,
                 v_ptr as *mut f32,

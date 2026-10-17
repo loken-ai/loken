@@ -47,13 +47,13 @@ pub use dense::*;
 
 cuda_launchers! {
     loken_attn_post_qkv_decode(qkv: *const f32, q_norm_w: *const f32, k_norm_w: *const f32,
-        rope_cos: *const c_void, rope_sin: *const c_void,
+        rope_cos: *const c_void, rope_sin: *const c_void, rope_freqs: *const f32,
         q_out: *mut c_void, k_out: *mut c_void,
         v_out: *mut c_void, n_q: i32, n_kv: i32, hd: i32, rope_pos: i32,
         rms_eps: f32, q_scale: f32, dtype: i32, rope_style: i32);
     loken_attn_post_qkv_decode_qf32(
         qkv: *const f32, q_norm_w: *const f32, k_norm_w: *const f32,
-        rope_cos: *const c_void, rope_sin: *const c_void,
+        rope_cos: *const c_void, rope_sin: *const c_void, rope_freqs: *const f32,
         q_out: *mut f32, k_out: *mut c_void, v_out: *mut f32, n_q: i32, n_kv: i32,
         hd: i32, rope_pos: i32, rms_eps: f32, q_scale: f32, dtype: i32, rope_style: i32);
     loken_attn_post_qkv_decode_qf32_split(
@@ -63,14 +63,19 @@ cuda_launchers! {
         hd: i32, rope_pos: i32, rms_eps: f32, q_scale: f32, dtype: i32, rope_style: i32);
     loken_attn_post_qkv_decode_qf32_no_norm(
         qkv: *const f32, rope_cos: *const c_void,
-        rope_sin: *const c_void, q_out: *mut f32, k_out: *mut c_void,
+        rope_sin: *const c_void, rope_freqs: *const f32, q_out: *mut f32, k_out: *mut c_void,
         v_out: *mut f32, n_q: i32, n_kv: i32, hd: i32, rope_pos: i32, q_scale: f32, dtype: i32,
         rope_style: i32);
     loken_attn_post_qkv_decode_qf32_no_norm_partial_rope(
         qkv: *const f32, rope_cos: *const c_void,
-        rope_sin: *const c_void, q_out: *mut f32, k_out: *mut c_void,
+        rope_sin: *const c_void, rope_freqs: *const f32, q_out: *mut f32, k_out: *mut c_void,
         v_out: *mut f32, n_q: i32, n_kv: i32, hd: i32, rope_dim: i32, rope_pos: i32,
         q_scale: f32, dtype: i32, rope_style: i32);
+    loken_attn_post_qkv_decode_no_norm(
+        qkv: *const f32, rope_cos: *const c_void, rope_sin: *const c_void,
+        rope_freqs: *const f32, q_out: *mut c_void, k_out: *mut c_void, v_out: *mut c_void,
+        n_q: i32, n_kv: i32, hd: i32, rope_pos: i32, q_scale: f32, dtype: i32,
+        rope_style: i32);
 }
 cuda_launchers! {
     loken_kv_residual_scatter_f16(

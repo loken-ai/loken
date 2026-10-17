@@ -442,6 +442,20 @@ impl GenericTransformerLayer {
         self.q4_kv().is_some()
     }
 
+    /// The factored rotation frequencies the fused decode kernels take their angles from, one
+    /// F32 per rotated pair; `None` without factors or when the table does not hold one entry
+    /// per pair.
+    pub(super) fn rope_freqs_for_kernel(&self) -> Option<Tensor> {
+        let pairs = match self.rope_dim {
+            0 => self.head_dim,
+            d => d,
+        } / 2;
+        self.rope_factored_freqs
+            .as_ref()
+            .filter(|f| f.dtype() == crate::tensor::DType::F32 && f.elem_count() == pairs)
+            .and_then(|f| f.flatten_all().ok())
+    }
+
     /// Moves this layer's history from the quantised cache to the F-dtype cache and drops the
     /// quantised one. Errs when the history cannot be read back: attending over a truncated
     /// history would decode from wrong logits.
@@ -655,6 +669,82 @@ impl GenericTransformerLayer {
         self.attn_output_projection(&y, false)
     }
 
+    /// Whether the fused decode (projection, norms, rotation and cache write in one launch)
+    /// serves this step of `x` `[b, seq, hidden]`: `Some(true)` with the Q/K norms, `Some(false)`
+    /// without, `None` for the unfused chain. `own_kv` is false when the layer reads another
+    /// layer's K/V.
+    pub(super) fn fused_decode_route(&self, x: &Tensor, own_kv: bool) -> Result<Option<bool>> {
+        let (b, seq, _) = x.dims3()?;
+        let allow_partial_rope = true;
+        let rope_ok = self.rope_dim == 0
+            || self.rope_dim == self.head_dim
+            || (allow_partial_rope
+                && self.rope_dim > 0
+                && self.rope_dim < self.head_dim
+                && self.rope_dim.is_multiple_of(2));
+        let want_apq_fast = seq == 1
+            && b == 1
+            && x.device().is_cuda()
+            && self.attn_qkv.is_some()
+            && rope_ok
+            // The fused kernels rotate every head: a layer without RoPE takes the unfused path.
+            && !self.no_rope
+            && self.rope_rows.is_none()
+            // Factored frequencies hold one entry per rotated pair; factors without them
+            // take the unfused path.
+            && (self.rope_freq_factors.is_none() || self.rope_freqs_for_kernel().is_some())
+            // NOTE: graph mode is now ALLOWED here (was gated out by
+            // graph_rope_cos.is_none()). In graph mode the fused kernel reads
+            // RoPE from the per-step-updated graph_rope_cos/sin buffer (index 0)
+            // instead of self.cos[index_pos] - see the cos/sin selection below.
+            && own_kv
+            && self.context.is_none();
+        // The fused kernel normalises each head and rotates all of its lanes; a norm over the
+        // whole projection, or a rotation of part of the head, takes the unfused path.
+        let want_apq_with_norm = self.flags.has_qk_norm
+            && self.attn_q_norm.is_some()
+            && self.attn_k_norm.is_some()
+            && !self.qk_norm_is_full()
+            && (self.rope_dim == 0 || self.rope_dim == self.head_dim);
+        let want_apq_no_norm = !self.flags.has_qk_norm
+            // qwen2-family biases are added as one broadcast_add on the qkv
+            // tensor before the fused norm+RoPE+cast kernel.
+            && (!self.flags.has_qkv_bias || self.attn_qkv_bias.is_some());
+        // A no-norm layer takes the fused path over a Q8 cache or an F-dtype one; over a Q4
+        // cache it takes the unfused chain.
+        // GH_APQ enable gate. Previously had a buggy-shape exclusion for
+        // GQA hd=128 - that bug was actually a downstream DOUBLE-SCALING
+        // issue in attn_softmax_output_graph (fixed at the call site:
+        // GH_APQ pre-scales Q by q_scale, so the softmax kernel must
+        // receive scale=1.0, not q_scale). The shape exclusion is no
+        // longer needed.
+        // GH_APQ fused QKV+norm+RoPE+cast - default-on for all supported
+        // shapes after the fix (commit e23e7a6) corrected the
+        // Q8 dev_pos cur_pos_dev off-by-one that previously hid attention
+        // numerical issues for GQA hd=128. Re-enabled unconditionally.
+        let disable_apq = false;
+        // A captured decode takes the fused path wherever the eager decode does, so a
+        // replayed step computes what an eager one would. gemma4 (a V RMS-norm,
+        // attn_v_norm_ones = Some) is the exception: its graph mode keeps the unfused path.
+        let graph_fused_ok = !self.graph_step() || self.attn_v_norm_ones.is_none();
+        // The F-dtype body serves the no-norm layers that rotate the whole head, and the
+        // sink layers (whose history is F-dtype), in an eager step.
+        let f_dtype_body = !self.has_q8_cache() && !self.has_q4_cache();
+        let f_dtype_ok = !self.graph_step()
+            && (self.rope_dim == 0 || self.rope_dim == self.head_dim)
+            && (!self.flags.has_qkv_bias || self.attn_qkv_bias.is_some());
+        let served = want_apq_fast
+            && !disable_apq
+            && graph_fused_ok
+            && if self.attn_sinks.is_some() {
+                f_dtype_body && f_dtype_ok && (want_apq_with_norm || want_apq_no_norm)
+            } else {
+                want_apq_with_norm
+                    || (want_apq_no_norm && (self.has_q8_cache() || (f_dtype_body && f_dtype_ok)))
+            };
+        Ok(served.then_some(want_apq_with_norm))
+    }
+
     /// The output projection of the attention block. A decode step whose attention came
     /// through the general path lands in the graph's stable buffer when one is set.
     fn attn_output_projection(&self, y: &Tensor, via_graph_buffer: bool) -> Result<Tensor> {
@@ -697,8 +787,8 @@ impl GenericTransformerLayer {
         // --- Fused QKV+norm+RoPE fast path (Qwen3-style models) -----------
         // Single fused launch covers wqkv + q_norm + k_norm + RoPE + cast,
         // replacing ~6 ops with 1. Conditions: single-token decode, CUDA,
-        // has fused QKV, neox-style RoPE with full RoPE,
-        // no rope_freq_factors, not in graph mode.
+        // has fused QKV. Frequency factors divide each rotation's frequency
+        // inside the kernel; a sink layer attends through the sink decode.
         // Routes through Q8 fast attn path if q8_kv_cache active, else
         // through the F-dtype kv_cache + standard_attention path.
         // Two variants: with-norm (qwen3, gemma3 - has_qk_norm) and
@@ -709,67 +799,9 @@ impl GenericTransformerLayer {
         // KV auto-promote, this gives moondream decode +30 % (273 -> 355
         // tok/s) vs the dispatcher building Q/K/V separately then doing
         // partial RoPE via facade's standard chain.
-        let allow_partial_rope = true;
-        let rope_ok = self.rope_dim == 0
-            || self.rope_dim == self.head_dim
-            || (allow_partial_rope
-                && self.rope_dim > 0
-                && self.rope_dim < self.head_dim
-                && self.rope_dim.is_multiple_of(2));
-        let want_apq_fast = seq == 1
-            && b == 1
-            && x.device().is_cuda()
-            && self.attn_qkv.is_some()
-            && rope_ok
-            // The fused kernels rotate every head: a layer without RoPE takes the unfused path.
-            && !self.no_rope
-            && self.rope_rows.is_none()
-            && self.rope_freq_factors.is_none()
-            // NOTE: graph mode is now ALLOWED here (was gated out by
-            // graph_rope_cos.is_none()). In graph mode the fused kernel reads
-            // RoPE from the per-step-updated graph_rope_cos/sin buffer (index 0)
-            // instead of self.cos[index_pos] - see the cos/sin selection below.
-            && shared_kv.is_none()
-            && self.context.is_none()
-            // The fused decode kernels have no sink term.
-            && self.attn_sinks.is_none();
-        // The fused kernel normalises each head and rotates all of its lanes; a norm over the
-        // whole projection, or a rotation of part of the head, takes the unfused path.
-        let want_apq_with_norm = self.flags.has_qk_norm
-            && self.attn_q_norm.is_some()
-            && self.attn_k_norm.is_some()
-            && !self.qk_norm_is_full()
-            && (self.rope_dim == 0 || self.rope_dim == self.head_dim);
-        let want_apq_no_norm = !self.flags.has_qk_norm
-            // qwen2-family biases are added as one broadcast_add on the qkv
-            // tensor before the fused norm+RoPE+cast kernel.
-            && (!self.flags.has_qkv_bias || self.attn_qkv_bias.is_some());
-        // For the no-norm case the fast path produces F32 Q/V which the
-        // quantized cache consumes directly. The body below only has a
-        // Q8 implementation for no-norm - the Q4 + no-norm combination
-        // falls through to standard_attention (which already handles
-        // Q4 K/V append + dequant correctly) to avoid panicking on the
-        // unconditional `q_norm_w.unwrap()` in the F-dtype else branch.
-        // GH_APQ enable gate. Previously had a buggy-shape exclusion for
-        // GQA hd=128 - that bug was actually a downstream DOUBLE-SCALING
-        // issue in attn_softmax_output_graph (fixed at the call site:
-        // GH_APQ pre-scales Q by q_scale, so the softmax kernel must
-        // receive scale=1.0, not q_scale). The shape exclusion is no
-        // longer needed.
-        // GH_APQ fused QKV+norm+RoPE+cast - default-on for all supported
-        // shapes after the fix (commit e23e7a6) corrected the
-        // Q8 dev_pos cur_pos_dev off-by-one that previously hid attention
-        // numerical issues for GQA hd=128. Re-enabled unconditionally.
-        let disable_apq = false;
-        // A captured decode takes the fused path wherever the eager decode does, so a
-        // replayed step computes what an eager one would. gemma4 (a V RMS-norm,
-        // attn_v_norm_ones = Some) is the exception: its graph mode keeps the unfused path.
-        let graph_fused_ok = !self.graph_step() || self.attn_v_norm_ones.is_none();
-        let want_apq_fast = want_apq_fast
-            && !disable_apq
-            && graph_fused_ok
-            && (want_apq_with_norm || (want_apq_no_norm && self.has_q8_cache()));
-
+        let route = self.fused_decode_route(x, shared_kv.is_none())?;
+        let want_apq_fast = route.is_some();
+        let want_apq_with_norm = route == Some(true);
         if want_apq_fast {
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -835,6 +867,18 @@ impl GenericTransformerLayer {
                 (Some(gc), Some(gs)) if self.graph_step() => (gc.clone(), gs.clone(), 0usize),
                 _ => (self.cos.clone(), self.sin.clone(), index_pos),
             };
+            // The per-step row of a captured step carries the factors already; an eager step
+            // takes each angle from the factored frequencies at the position.
+            let rope_freqs = match self.graph_step() {
+                true => None,
+                false => match self.rope_freqs_for_kernel() {
+                    Some(f) if !f.device().same_device(&x.device()) => {
+                        Some(f.to_device(&x.device())?)
+                    }
+                    f => f,
+                },
+            };
+            let rope_freqs = rope_freqs.as_ref();
             let cos = if !src_cos.device().same_device(&x.device()) {
                 src_cos.to_device(&x.device())?
             } else {
@@ -861,6 +905,13 @@ impl GenericTransformerLayer {
                 .attention_scale
                 .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
             let q_scale = attn_scale as f32;
+            // The sink decode scales the scores itself, the sink term unscaled: Q stays as
+            // rotated.
+            let kernel_q_scale = if self.attn_sinks.is_some() {
+                1.0f32
+            } else {
+                q_scale
+            };
             let rope_style = if self.flags.use_rope_i { 1 } else { 0 };
 
             // A quantised cache (Q8 or Q4) holds the history: the fused kernels emit F32
@@ -890,6 +941,7 @@ impl GenericTransformerLayer {
                             k_norm_w.as_ref().unwrap(),
                             &cos,
                             &sin,
+                            rope_freqs,
                             self.n_head,
                             self.n_kv_head,
                             self.head_dim,
@@ -905,7 +957,7 @@ impl GenericTransformerLayer {
                         // softmax applies the scale.
                         q_was_pre_scaled = false;
                         let (q, k, v) = crate::inference::moe_cuda::attn_post_qkv_decode_qf32_no_norm_partial_rope(
-                        &qkv_flat, &cos, &sin,
+                        &qkv_flat, &cos, &sin, rope_freqs,
                         self.n_head, self.n_kv_head, self.head_dim,
                         self.rope_dim,
                         kernel_pos, 1.0f32, model_dtype, rope_style,
@@ -916,6 +968,7 @@ impl GenericTransformerLayer {
                             &qkv_flat,
                             &cos,
                             &sin,
+                            rope_freqs,
                             self.n_head,
                             self.n_kv_head,
                             self.head_dim,
@@ -991,29 +1044,45 @@ impl GenericTransformerLayer {
                     return Ok((y, false));
                 }
             } else {
-                // F-dtype path: with-norm variant only. Fused CUDA decode kernel;
-                // this whole Q8/fused decode region only activates with a Q8 KV
-                // cache, which is CUDA-only, so it's unreachable under --features cpu.
+                // F-dtype path, with or without the Q/K norms. The fused kernels are
+                // CUDA-only, so it is unreachable under --features cpu.
                 #[cfg(not(feature = "cuda"))]
                 #[allow(clippy::diverging_sub_expression)]
                 let (q_h, k_h, v_h): (Tensor, Tensor, Tensor) =
                     unreachable!("fused F-dtype decode (attn_post_qkv_decode) is CUDA-only");
                 #[cfg(feature = "cuda")]
-                let (q_h, k_h, v_h) = crate::inference::moe_cuda::attn_post_qkv_decode(
-                    &qkv_flat,
-                    q_norm_w.as_ref().unwrap(),
-                    k_norm_w.as_ref().unwrap(),
-                    &cos,
-                    &sin,
-                    self.n_head,
-                    self.n_kv_head,
-                    self.head_dim,
-                    index_pos,
-                    rms_eps,
-                    q_scale,
-                    model_dtype,
-                    rope_style,
-                )?;
+                let (q_h, k_h, v_h) = if want_apq_with_norm {
+                    crate::inference::moe_cuda::attn_post_qkv_decode(
+                        &qkv_flat,
+                        q_norm_w.as_ref().unwrap(),
+                        k_norm_w.as_ref().unwrap(),
+                        &cos,
+                        &sin,
+                        rope_freqs,
+                        self.n_head,
+                        self.n_kv_head,
+                        self.head_dim,
+                        kernel_pos,
+                        rms_eps,
+                        kernel_q_scale,
+                        model_dtype,
+                        rope_style,
+                    )?
+                } else {
+                    crate::inference::moe_cuda::attn_post_qkv_decode_no_norm(
+                        &qkv_flat,
+                        &cos,
+                        &sin,
+                        rope_freqs,
+                        self.n_head,
+                        self.n_kv_head,
+                        self.head_dim,
+                        kernel_pos,
+                        kernel_q_scale,
+                        model_dtype,
+                        rope_style,
+                    )?
+                };
                 let q = q_h.reshape((1, self.n_head, 1, self.head_dim))?;
                 let k_new = k_h.reshape((1, self.n_kv_head, 1, self.head_dim))?;
                 let mut v_new = v_h.reshape((1, self.n_kv_head, 1, self.head_dim))?;
@@ -1055,6 +1124,23 @@ impl GenericTransformerLayer {
                 } else {
                     (k_new, v_new)
                 };
+                // A sink layer appends as its unfused decode does and attends through the
+                // sink decode, which adds each head's sink to the softmax denominator.
+                if self.attn_sinks.is_some() {
+                    let (k_all, v_all) = if self.kv_f16 && k_new.device().is_cuda() {
+                        self.kv_cache.append_in_place(&k_new, &v_new)?;
+                        match (self.kv_cache.k_buffer(), self.kv_cache.v_buffer()) {
+                            (Some(kb), Some(vb)) => (kb, vb),
+                            _ => crate::tensor::bail!("F16 cache: KV buffers missing after append"),
+                        }
+                    } else {
+                        self.kv_cache.append(&k_new, &v_new)?
+                    };
+                    let kv_len = self.kv_cache.current_seq_len();
+                    let y = self.sink_attention(&q, k_all, v_all, kv_len, None)?;
+                    let y = y.reshape(&[b, seq, self.n_head * self.head_dim])?;
+                    return Ok((y, false));
+                }
                 // An F16 cache is attended in place by the split-K decode; Q carries the
                 // scale already.
                 let in_place = self.kv_f16
@@ -1085,6 +1171,14 @@ impl GenericTransformerLayer {
                 // standard_attention's single-token fast path but skips
                 // the redundant `affine(scale as f32, 0.0)` call.
                 let n_rep = self.n_head / self.n_kv_head;
+                // A windowed layer attends to its last `sliding_window` keys.
+                let (k_full, v_full) = match self.sliding_window {
+                    Some(w) if w > 0 && k_full.dims()[2] > w => {
+                        let start = k_full.dims()[2] - w;
+                        (k_full.narrow(2, start, w)?, v_full.narrow(2, start, w)?)
+                    }
+                    _ => (k_full, v_full),
+                };
                 let kv_dt = k_full.dtype();
                 // Cast Q down to the cache dtype so the matmuls read F16 K/V.
                 let qd = if q.dtype() == kv_dt {
@@ -1106,12 +1200,12 @@ impl GenericTransformerLayer {
                 let y = if n_rep > 1 {
                     let (bb, _n_head, _one, d) = qd.dims4()?;
                     let q_grouped = qd.reshape((bb, self.n_kv_head, n_rep, d))?;
-                    let att = q_grouped.matmul_t(&k_full)?;
+                    let att = self.softcap_scores(q_grouped.matmul_t(&k_full)?)?;
                     let att = sm(&att)?;
                     let out = att.matmul(&v_full)?;
                     out.reshape((bb, self.n_head, 1, d))?
                 } else {
-                    let att = qd.matmul_t(&k_full)?;
+                    let att = self.softcap_scores(qd.matmul_t(&k_full)?)?;
                     let att = sm(&att)?;
                     att.matmul(&v_full.contiguous()?)?
                 };
@@ -2303,3 +2397,8 @@ impl GenericTransformerLayer {
         Ok(out)
     }
 }
+
+/// The fused decode against the unfused chain on synthetic weights.
+#[cfg(all(test, feature = "cuda"))]
+#[path = "fused_decode_tests.rs"]
+mod fused_decode_parity;

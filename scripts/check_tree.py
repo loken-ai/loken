@@ -92,6 +92,9 @@ def undeclared_files():
     for mod in sorted(SRC.rglob("mod.rs")):
         body = mod.read_text()
         declared = set(re.findall(r"mod ([a-z_0-9]+);", body)) | set(PATH_ATTR.findall(body))
+        # A sibling file may declare a module of this directory through `#[path]`.
+        for f in mod.parent.glob("*.rs"):
+            declared |= {pathlib.Path(p).name for p in PATH_ATTR.findall(f.read_text())}
         for f in sorted(mod.parent.glob("*.rs")):
             if f.name != "mod.rs" and f.stem not in declared and f.name not in declared:
                 yield f"{f}: beside a mod.rs that does not declare it"

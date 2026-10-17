@@ -48,6 +48,28 @@ template<> __device__ __forceinline__ float to_float<float>(float v)            
 
 namespace loken_ll_apq {
 
+// The cosine and sine of rotation pair `idx`: read from the tables' row at `row_base`, or,
+// when `freqs` is set, taken of the angle `pos * freqs[idx]`, `freqs` holding each pair's
+// frequency already divided by its factor. The angle is rounded to F32 like the table it
+// replaces, and its sine and cosine are evaluated in F64 so the fast-math build keeps them
+// accurate at long positions.
+template <typename T>
+__device__ __forceinline__ void rope_cos_sin(
+    const T* __restrict__ rope_cos, const T* __restrict__ rope_sin,
+    const float* __restrict__ freqs, int row_base, int pos, int idx, float& c, float& s
+) {
+    if (freqs != nullptr) {
+        const float angle = (float)pos * freqs[idx];
+        double sd, cd;
+        sincos((double)angle, &sd, &cd);
+        c = (float)cd;
+        s = (float)sd;
+    } else {
+        c = to_float<T>(rope_cos[row_base + idx]);
+        s = to_float<T>(rope_sin[row_base + idx]);
+    }
+}
+
 // Block-wide reduction across `nthreads` threads (each thread holds one
 // partial value). Uses shared memory to handle blocks larger than one
 // warp. Result is broadcast to all threads.
@@ -103,6 +125,7 @@ __global__ void attn_post_qkv_decode_qf32_kernel(
     const float* __restrict__ k_norm_w,
     const T*     __restrict__ rope_cos,
     const T*     __restrict__ rope_sin,
+    const float* __restrict__ rope_freqs,  // [hd/2] or nullptr: the tables are read
     float*       __restrict__ q_out,       // [n_q, hd] FLOAT
     T*           __restrict__ k_out,
     float*       __restrict__ v_out,       // [n_kv, hd] FLOAT (used by Q4 quantize)
@@ -161,15 +184,15 @@ __global__ void attn_post_qkv_decode_qf32_kernel(
             cur = shared_v[tid];
             other = shared_v[tid + half];
             rope_idx = tid;
-            float c = to_float<T>(rope_cos[row_base + rope_idx]);
-            float s = to_float<T>(rope_sin[row_base + rope_idx]);
+            float c, s;
+            rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
             v = cur * c - other * s;
         } else {
             cur = shared_v[tid];
             other = shared_v[tid - half];
             rope_idx = tid - half;
-            float c = to_float<T>(rope_cos[row_base + rope_idx]);
-            float s = to_float<T>(rope_sin[row_base + rope_idx]);
+            float c, s;
+            rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
             v = cur * c + other * s;
         }
     } else {
@@ -177,8 +200,8 @@ __global__ void attn_post_qkv_decode_qf32_kernel(
         cur = shared_v[tid];
         other = shared_v[pair];
         rope_idx = tid >> 1;
-        float c = to_float<T>(rope_cos[row_base + rope_idx]);
-        float s = to_float<T>(rope_sin[row_base + rope_idx]);
+        float c, s;
+        rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
         if ((tid & 1) == 0) v = cur * c - other * s;
         else                v = other * s + cur * c;
     }
@@ -193,13 +216,16 @@ __global__ void attn_post_qkv_decode_qf32_kernel(
 
 // RopeStyle: 0 = "neox" (paired halves: i and i+hd/2)
 //            1 = "gpt-j" / "interleaved" (paired adjacent: 2i and 2i+1)
-template <typename T, int RopeStyle>
+// WithNorm: 1 = RMS-norm Q and K per head before the rotation, 0 = rotate them as projected
+// (the norm weights are then not read).
+template <typename T, int RopeStyle, int WithNorm = 1>
 __global__ void attn_post_qkv_decode_kernel(
     const float* __restrict__ qkv,         // [n_q*hd + 2*n_kv*hd]
     const float* __restrict__ q_norm_w,    // [hd]
     const float* __restrict__ k_norm_w,    // [hd]
     const T*     __restrict__ rope_cos,    // [max_seq, hd/2] - full table
     const T*     __restrict__ rope_sin,    // [max_seq, hd/2]
+    const float* __restrict__ rope_freqs,  // [hd/2] or nullptr: the tables are read
     T*           __restrict__ q_out,       // [n_q, hd]
     T*           __restrict__ k_out,       // [n_kv, hd]
     T*           __restrict__ v_out,       // [n_kv, hd]
@@ -239,11 +265,13 @@ __global__ void attn_post_qkv_decode_kernel(
 
     // RMS norm: rms = sqrt(mean(v^2) + eps); v = v / rms * w
     // We need a block reduction over hd threads.
-    float sq = v * v;
-    float ssum = block_reduce_sum(sq, hd, warp_tmp);
-    float inv_rms = rsqrtf(ssum / (float)hd + rms_eps);
-    const float w = (kind == 0) ? q_norm_w[tid] : k_norm_w[tid];
-    v = v * inv_rms * w;
+    if constexpr (WithNorm == 1) {
+        float sq = v * v;
+        float ssum = block_reduce_sum(sq, hd, warp_tmp);
+        float inv_rms = rsqrtf(ssum / (float)hd + rms_eps);
+        const float w = (kind == 0) ? q_norm_w[tid] : k_norm_w[tid];
+        v = v * inv_rms * w;
+    }
 
     // RoPE: pair this thread's element with its rotation partner.
     shared_v[tid] = v;
@@ -259,15 +287,15 @@ __global__ void attn_post_qkv_decode_kernel(
             cur   = shared_v[tid];
             other = shared_v[tid + half];
             rope_idx = tid;
-            float c = to_float<T>(rope_cos[row_base + rope_idx]);
-            float s = to_float<T>(rope_sin[row_base + rope_idx]);
+            float c, s;
+            rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
             v = cur * c - other * s;
         } else {
             cur   = shared_v[tid];
             other = shared_v[tid - half];
             rope_idx = tid - half;
-            float c = to_float<T>(rope_cos[row_base + rope_idx]);
-            float s = to_float<T>(rope_sin[row_base + rope_idx]);
+            float c, s;
+            rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
             v = cur * c + other * s;
         }
     } else {
@@ -276,8 +304,8 @@ __global__ void attn_post_qkv_decode_kernel(
         cur   = shared_v[tid];
         other = shared_v[pair];
         rope_idx = tid >> 1;
-        float c = to_float<T>(rope_cos[row_base + rope_idx]);
-        float s = to_float<T>(rope_sin[row_base + rope_idx]);
+        float c, s;
+        rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
         if ((tid & 1) == 0) v = cur * c - other * s;
         else                v = other * s + cur * c;
     }
@@ -306,6 +334,7 @@ __global__ void attn_post_qkv_decode_qf32_partial_rope_kernel(
     const float* __restrict__ qkv,
     const T*     __restrict__ rope_cos,
     const T*     __restrict__ rope_sin,
+    const float* __restrict__ rope_freqs,  // [rope_dim/2] or nullptr: the tables are read
     float*       __restrict__ q_out,
     T*           __restrict__ k_out,
     float*       __restrict__ v_out,
@@ -345,15 +374,15 @@ __global__ void attn_post_qkv_decode_qf32_partial_rope_kernel(
             if (tid < half) {
                 const float cur   = shared_v[tid];
                 const float other = shared_v[tid + half];
-                const float c = to_float<T>(rope_cos[row_base + tid]);
-                const float s = to_float<T>(rope_sin[row_base + tid]);
+                float c, s;
+                rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, tid, c, s);
                 v = cur * c - other * s;
             } else {
                 const float cur   = shared_v[tid];
                 const float other = shared_v[tid - half];
                 const int rope_idx = tid - half;
-                const float c = to_float<T>(rope_cos[row_base + rope_idx]);
-                const float s = to_float<T>(rope_sin[row_base + rope_idx]);
+                float c, s;
+                rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
                 v = cur * c + other * s;
             }
         } else {
@@ -361,8 +390,8 @@ __global__ void attn_post_qkv_decode_qf32_partial_rope_kernel(
             const float cur   = shared_v[tid];
             const float other = shared_v[pair];
             const int rope_idx = tid >> 1;
-            const float c = to_float<T>(rope_cos[row_base + rope_idx]);
-            const float s = to_float<T>(rope_sin[row_base + rope_idx]);
+            float c, s;
+            rope_cos_sin<T>(rope_cos, rope_sin, rope_freqs, row_base, rope_pos, rope_idx, c, s);
             if ((tid & 1) == 0) v = cur * c - other * s;
             else                v = other * s + cur * c;
         }
@@ -386,6 +415,7 @@ extern "C" void loken_attn_post_qkv_decode(
     const float* k_norm_w,
     const void*  rope_cos,
     const void*  rope_sin,
+    const float* rope_freqs,
     void*        q_out,
     void*        k_out,
     void*        v_out,
@@ -406,7 +436,7 @@ extern "C" void loken_attn_post_qkv_decode(
     loken_ll_apq::attn_post_qkv_decode_kernel<T, STYLE> \
         <<<grid, block, smem_bytes, stream>>>( \
             qkv, q_norm_w, k_norm_w, \
-            (const T*)rope_cos, (const T*)rope_sin, \
+            (const T*)rope_cos, (const T*)rope_sin, rope_freqs, \
             (T*)q_out, (T*)k_out, (T*)v_out, \
             n_q, n_kv, hd, rope_pos, rms_eps, q_scale); \
 
@@ -435,6 +465,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32(
     const float* k_norm_w,
     const void*  rope_cos,
     const void*  rope_sin,
+    const float* rope_freqs,
     float*       q_out,         // F32
     void*        k_out,
     float*       v_out,         // F32 (used by Q4 quantize)
@@ -455,7 +486,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32(
     loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE> \
         <<<grid, block, smem_bytes, stream>>>( \
             qkv, nullptr, nullptr, q_norm_w, k_norm_w, \
-            (const T*)rope_cos, (const T*)rope_sin, \
+            (const T*)rope_cos, (const T*)rope_sin, rope_freqs, \
             q_out, (T*)k_out, v_out, \
             n_q, n_kv, hd, rope_pos, rms_eps, q_scale);
 
@@ -504,7 +535,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32_split(
     loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE, 1, true> \
         <<<grid, block, smem_bytes, stream>>>( \
             q_in, k_in, v_in, q_norm_w, k_norm_w, \
-            (const T*)rope_cos, (const T*)rope_sin, \
+            (const T*)rope_cos, (const T*)rope_sin, nullptr, \
             q_out, (T*)k_out, v_out, \
             n_q, n_kv, hd, rope_pos, rms_eps, q_scale);
 
@@ -531,6 +562,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm(
     const float* qkv,
     const void*  rope_cos,
     const void*  rope_sin,
+    const float* rope_freqs,
     float*       q_out,
     void*        k_out,
     float*       v_out,
@@ -556,7 +588,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm(
     loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE, 0> \
         <<<grid, block, smem_bytes, stream>>>( \
             qkv, nullptr, nullptr, dummy_norm, dummy_norm, \
-            (const T*)rope_cos, (const T*)rope_sin, \
+            (const T*)rope_cos, (const T*)rope_sin, rope_freqs, \
             q_out, (T*)k_out, v_out, \
             n_q, n_kv, hd, rope_pos, 0.0f, q_scale);
 
@@ -583,6 +615,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm_partial_rope(
     const float* qkv,
     const void*  rope_cos,
     const void*  rope_sin,
+    const float* rope_freqs,
     float*       q_out,
     void*        k_out,
     float*       v_out,
@@ -600,7 +633,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm_partial_rope(
 #define LAUNCH_QF32_PR(T, STYLE) \
     loken_ll_apq::attn_post_qkv_decode_qf32_partial_rope_kernel<T, STYLE> \
         <<<grid, block, smem_bytes, stream>>>( \
-            qkv, (const T*)rope_cos, (const T*)rope_sin, \
+            qkv, (const T*)rope_cos, (const T*)rope_sin, rope_freqs, \
             q_out, (T*)k_out, v_out, \
             n_q, n_kv, hd, rope_dim, rope_pos, q_scale);
 
@@ -617,4 +650,49 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm_partial_rope(
         else                 { LAUNCH_QF32_PR(float, 1); }
     }
 #undef LAUNCH_QF32_PR
+}
+
+// No-norm variant of loken_attn_post_qkv_decode: RoPE, the Q scale and the cast of Q, K and V
+// to `dtype`, for the architectures that carry no Q/K norm and attend over an F-dtype cache.
+extern "C" void loken_attn_post_qkv_decode_no_norm(
+    const float* qkv,
+    const void*  rope_cos,
+    const void*  rope_sin,
+    const float* rope_freqs,
+    void*        q_out,
+    void*        k_out,
+    void*        v_out,
+    int n_q, int n_kv, int hd,
+    int rope_pos,
+    float q_scale,
+    int dtype,
+    int rope_style,
+    cudaStream_t stream
+) {
+    dim3 grid(3, max(n_q, n_kv), 1);
+    dim3 block(hd, 1, 1);
+    int n_warps = (hd + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (n_warps + hd) * sizeof(float);
+
+#define LAUNCH_NN(T, STYLE) \
+    loken_ll_apq::attn_post_qkv_decode_kernel<T, STYLE, 0> \
+        <<<grid, block, smem_bytes, stream>>>( \
+            qkv, nullptr, nullptr, \
+            (const T*)rope_cos, (const T*)rope_sin, rope_freqs, \
+            (T*)q_out, (T*)k_out, (T*)v_out, \
+            n_q, n_kv, hd, rope_pos, 0.0f, q_scale);
+
+    if (dtype == 0) {
+        if (rope_style == 0) { LAUNCH_NN(__half, 0); }
+        else                 { LAUNCH_NN(__half, 1); }
+    } else if (dtype == 1) {
+#ifndef NO_BF16_KERNEL
+        if (rope_style == 0) { LAUNCH_NN(__nv_bfloat16, 0); }
+        else                 { LAUNCH_NN(__nv_bfloat16, 1); }
+#endif
+    } else {
+        if (rope_style == 0) { LAUNCH_NN(float, 0); }
+        else                 { LAUNCH_NN(float, 1); }
+    }
+#undef LAUNCH_NN
 }
