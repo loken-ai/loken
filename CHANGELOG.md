@@ -57,6 +57,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Prefill: a prompt over an F16 cache attends through the flash kernel, not whole score matrices.
 - Serving: the move to batched serving is made under the serial gate, never mid-answer.
 - DeepSeek V4.1: a long prompt is prefilled in one pass, not decoded past its first chunk.
 - Tool calls: DeepSeek V4.1 sees its tool results and past calls as its encoder writes them.

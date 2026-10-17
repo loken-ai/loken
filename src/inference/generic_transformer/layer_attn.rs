@@ -1485,6 +1485,11 @@ impl GenericTransformerLayer {
                         _ => crate::tensor::bail!("F16 cache: KV buffers missing after append"),
                     }
                 } else {
+                    // A prompt's rows over the F16 history attend through the flash kernel,
+                    // which reads the cache in place: no scores of the whole history are made.
+                    flash_kv = flash_prefill_ok
+                        && self.attn_sinks.is_none()
+                        && self.attn_softcap.is_none();
                     self.kv_cache.append(&k16, &v16)?
                 }
             } else {

@@ -868,6 +868,14 @@ impl super::GenericHeteroTransformer {
             .saturating_mul(shape.share.max(1) as u64)
             .saturating_add(room);
         let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
+        // The prompt's own prefix is restored by now: the snapshots of other prompts give the
+        // chunk their room before the expert slots do.
+        let free = if free < need {
+            self.drop_kv_snapshots_for(need - free);
+            crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards)
+        } else {
+            free
+        };
         let lent = if free >= need {
             0
         } else {

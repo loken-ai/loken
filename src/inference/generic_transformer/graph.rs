@@ -1925,6 +1925,27 @@ impl GenericHeteroTransformer {
     /// used until they fit. The budget is the free device memory plus what the snapshots
     /// already hold, less the working window the cache may still grow by and the memory
     /// the next prefill chunk works in, for a model that declares its chunk.
+    /// Drop the least recently used snapshots until `bytes` of the cards are free of them, or
+    /// none is left; what they held goes back to the cards.
+    pub(super) fn drop_kv_snapshots_for(&mut self, bytes: u64) {
+        let mut freed = 0u64;
+        while freed < bytes && !self.kv_snapshots.is_empty() {
+            let i = self
+                .kv_snapshots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.tick)
+                .map(|(i, _)| i)
+                .unwrap();
+            freed += self.kv_snapshots[i].device_bytes();
+            self.kv_snapshots.swap_remove(i);
+        }
+        if freed > 0 {
+            tracing::debug!("kv snapshots: {freed} bytes dropped for a prefill chunk");
+            crate::inference::place::ladder::release_pools();
+        }
+    }
+
     fn enforce_kv_snapshot_budget(&mut self) {
         let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
         let budget = {
