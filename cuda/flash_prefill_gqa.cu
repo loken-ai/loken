@@ -94,7 +94,8 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
                          const half* __restrict__ V, float* __restrict__ O,
                          int n_head, int n_kv, int seq_q, int seq_kv,
                          long long kv_tok_stride, long long kv_head_stride,
-                         float scale_log2, int window) {
+                         float scale_log2, int window, int pos_off,
+                         float* __restrict__ ML) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int NT = NW * 32;
     constexpr int BM = NW * 16;
@@ -118,7 +119,6 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
     const int kvh     = blockIdx.y;
     const int rows    = seq_q * G;
     const int row0    = blockIdx.x * BM;
-    const int pos_off = seq_kv - seq_q;
 
     // This thread's two fragment rows (g and g + 8 of the warp's 16).
     int  r_tok[2], r_head[2], r_pos[2];
@@ -290,6 +290,12 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
         l += __shfl_xor_sync(0xffffffff, l, 2);
         if (!r_ok[h]) continue;
         const float inv = l > 0.f ? 1.f / l : 0.f;
+        // The row's maximum score, back from base 2, and its sum, for a caller merging ranges.
+        if (ML != nullptr && tq == 0) {
+            float* ml = ML + ((long long)r_tok[h] * n_head + r_head[h]) * 2;
+            ml[0] = m_run[h] * 0.6931471805599453f;
+            ml[1] = l;
+        }
         float* orow = O + ((long long)r_tok[h] * n_head + r_head[h]) * HD + 2 * tq;
         #pragma unroll
         for (int n = 0; n < ON; ++n) {
@@ -303,7 +309,7 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
 template <int HD, int NW>
 int launch(const float* Q, const half* K, const half* V, float* O, int n_head, int n_kv,
            int seq_q, int seq_kv, long long tok_stride, long long head_stride, float scale,
-           int window, cudaStream_t stream) {
+           int window, int pos_off, float* ML, cudaStream_t stream) {
     constexpr int BM = NW * 16;
     const size_t smem = 2 * (size_t)BN * (HD + KPAD) * sizeof(half);
     auto kern = flash_prefill_gqa_kernel<HD, NW>;
@@ -315,18 +321,17 @@ int launch(const float* Q, const half* K, const half* V, float* O, int n_head, i
     dim3 grid((seq_q * G + BM - 1) / BM, n_kv, 1);
     const float log2e = 1.4426950408889634f;
     kern<<<grid, NW * 32, smem, stream>>>(Q, K, V, O, n_head, n_kv, seq_q, seq_kv, tok_stride,
-                                          head_stride, scale * log2e, window);
+                                          head_stride, scale * log2e, window, pos_off, ML);
     return cudaGetLastError() == cudaSuccess ? 0 : 4;
 }
 
 }  // namespace
 
-// Returns 0 on launch, 1 for an unsupported head size, 2 for a device below sm_80,
-// 3/4 for a CUDA launch error.
-extern "C" int loken_flash_prefill_gqa_f16kv(
-    const void* Q, const void* K, const void* V, void* O, int n_head, int n_kv, int seq_q,
-    int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride, float scale,
-    int window, long long stream_i64) {
+namespace {
+int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, int n_head,
+             int n_kv, int seq_q, int seq_kv, int head_dim, long long kv_tok_stride,
+             long long kv_head_stride, float scale, int window, int pos_off,
+             long long stream_i64) {
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -339,16 +344,38 @@ extern "C" int loken_flash_prefill_gqa_f16kv(
     switch (head_dim) {
         case 64:
             return launch<64, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
-                                 kv_head_stride, scale, window, stream);
+                                 kv_head_stride, scale, window, pos_off, ML, stream);
         case 128:
             return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
-                                  kv_head_stride, scale, window, stream);
+                                  kv_head_stride, scale, window, pos_off, ML, stream);
         case 256:
             // Half the warps of the narrower sizes: the O accumulator and the Q fragments of a
             // 256-wide head fill the register file at four warps' worth of rows.
             return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
-                                  kv_head_stride, scale, window, stream);
+                                  kv_head_stride, scale, window, pos_off, ML, stream);
         default:
             return 1;
     }
+}
+}  // namespace
+
+// Returns 0 on launch, 1 for an unsupported head size, 2 for a device below sm_80,
+// 3/4 for a CUDA launch error.
+extern "C" int loken_flash_prefill_gqa_f16kv(
+    const void* Q, const void* K, const void* V, void* O, int n_head, int n_kv, int seq_q,
+    int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride, float scale,
+    int window, long long stream_i64) {
+    return dispatch(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, kv_tok_stride,
+                    kv_head_stride, scale, window, seq_kv - seq_q, stream_i64);
+}
+
+// The same attention over keys whose positions start `pos_off` before the first query
+// token's (token i attends key j iff j <= i + pos_off), each row's maximum score and sum of
+// exponentials written to `ML` `[seq_q, n_head, 2]` beside its normalized output.
+extern "C" int loken_flash_prefill_gqa_parts_f16kv(
+    const void* Q, const void* K, const void* V, void* O, float* ML, int n_head, int n_kv,
+    int seq_q, int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride,
+    float scale, int pos_off, long long stream_i64) {
+    return dispatch(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, kv_tok_stride,
+                    kv_head_stride, scale, 0, pos_off, stream_i64);
 }

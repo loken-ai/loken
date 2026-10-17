@@ -80,10 +80,16 @@ fn part_of(
     q_pos: usize,
     k_pos: usize,
 ) -> Result<Part> {
+    use crate::inference::kernel::fused::{flash_prefill_gqa_parts, flash_prefill_parts_f16};
     let pos_off = q_pos as i64 - k_pos as i64;
-    if let Some((max, sum, out)) =
-        crate::inference::kernel::fused::flash_prefill_parts_f16(q, k, v, scale as f32, pos_off)?
-    {
+    let fused = match flash_prefill_gqa_parts(q, k, v, scale as f32, pos_off)? {
+        Some(p) => Some(p),
+        None => flash_prefill_parts_f16(q, k, v, scale as f32, pos_off)?,
+    };
+    if let Some((max, sum, out)) = fused {
+        // A row no key reached keeps a maximum of minus infinity: the least finite value
+        // weighs its zero sum without a NaN.
+        let max = max.maximum(&Tensor::new(f32::MIN, &max.device())?.broadcast_as(max.shape())?)?;
         return Ok(Part { max, sum, out });
     }
     partial(q, k, v, scale, q_pos, k_pos)
@@ -423,8 +429,9 @@ impl ContextShards {
                     let k_pos = s.start + seg_from + from;
                     // A block past every row has nothing to give.
                     if k_pos < q_pos + rows {
-                        let heads =
-                            |t: &Tensor| t.narrow(1, from, n)?.transpose(1, 2)?.contiguous();
+                        // `[1, h_kv, n, d]` views of the block: the card's kernel reads them by
+                        // their strides, the fallbacks copy what they need.
+                        let heads = |t: &Tensor| t.narrow(1, from, n)?.transpose(1, 2);
                         let part = part_of(
                             &q_here,
                             &heads(&seg.k)?,
@@ -488,11 +495,13 @@ mod tests {
         // (query rows, keys, first row's position, first key's position)
         for (s, t, q_pos, k_pos) in [(40, 70, 100, 10), (40, 70, 30, 0), (1, 300, 500, 200)] {
             let q = t4([1, h, s, d], 21).to_device(&card).unwrap();
-            let k = t4([1, h_kv, t, d], 22).to_device(&card).unwrap();
-            let v = t4([1, h_kv, t, d], 23).to_device(&card).unwrap();
+            // F16 keys and values, as the ranges hold them.
+            let f16 = |t: Tensor| t.to_dtype(DType::F16).unwrap().to_device(&card).unwrap();
+            let k = f16(t4([1, h_kv, t, d], 22));
+            let v = f16(t4([1, h_kv, t, d], 23));
             let scale = 1.0 / (d as f64).sqrt();
             let pos_off = q_pos as i64 - k_pos as i64;
-            let ran = crate::inference::kernel::fused::flash_prefill_parts_f16(
+            let ran = crate::inference::kernel::fused::flash_prefill_gqa_parts(
                 &q,
                 &k,
                 &v,
