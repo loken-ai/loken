@@ -523,6 +523,16 @@ pub(crate) fn hub_root(hf: PathBuf) -> PathBuf {
     }
 }
 
+/// The hub id of the text model a checkpoint's `config.json` names when the checkpoint is a
+/// speech tower without one: an `audio_config` beside a `text_model_id`.
+pub(crate) fn named_text_model(config: &serde_json::Value) -> Option<&str> {
+    config.get("audio_config")?;
+    config
+        .get("text_model_id")?
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+}
+
 /// The text model of a checkpoint that is a speech tower and the name of a text model: its
 /// `config.json` declares an `audio_config` and a `text_model_id`. The directory of that
 /// model in the hub caches `roots` (by its full id, else by its name under any owner), when it
@@ -530,8 +540,7 @@ pub(crate) fn hub_root(hf: PathBuf) -> PathBuf {
 pub(crate) fn composite_text_dir(dir: &std::path::Path, roots: &[PathBuf]) -> Option<PathBuf> {
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).ok()?).ok()?;
-    config.get("audio_config")?;
-    let id = config.get("text_model_id")?.as_str()?;
+    let id = named_text_model(&config)?;
     if let Some(d) = resolve_awq_repo(id, roots) {
         return Some(PathBuf::from(d));
     }
@@ -732,6 +741,27 @@ mod hub_gguf_tests {
 #[cfg(test)]
 mod composite_tests {
     use super::*;
+
+    /// A speech tower names its text model by `text_model_id`; a config without an
+    /// `audio_config`, or with an empty id, names none.
+    #[test]
+    fn a_tower_config_names_its_text_model() {
+        let named = |text: &str| {
+            let config: serde_json::Value = serde_json::from_str(text).unwrap();
+            named_text_model(&config).map(str::to_string)
+        };
+        assert_eq!(
+            named(r#"{"audio_config": {"d_model": 8}, "text_model_id": "someone/Text-1B"}"#),
+            Some("someone/Text-1B".to_string())
+        );
+        assert_eq!(named(r#"{"text_model_id": "someone/Text-1B"}"#), None);
+        assert_eq!(named(r#"{"audio_config": {}, "text_model_id": " "}"#), None);
+        assert_eq!(
+            named(r#"{"audio_config": {}, "text_model_id": null}"#),
+            None
+        );
+        assert_eq!(named(r#"{"audio_config": {}}"#), None);
+    }
 
     /// A checkpoint that is a speech tower beside the name of a text model resolves to that
     /// model's directory, by its id or by its name under another owner; one with no such

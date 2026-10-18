@@ -44,7 +44,7 @@ argmax and the decode GEMVs of the repacked layouts stay on their AVX2 form.
 To let the compiler use the build host's whole instruction set outside the kernels, build with
 `RUSTFLAGS="-C target-cpu=native"`; that binary does not run on other hosts.
 
-A CUDA build serves without a card too: `lokend serve --cpu` places every layer on the host.
+A CUDA build serves without a card too: `lokend serve --cpu` places every layer and every tower on the host.
 
 ## Running the daemon
 

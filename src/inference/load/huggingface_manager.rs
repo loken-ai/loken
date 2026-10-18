@@ -645,7 +645,40 @@ impl HuggingFaceManager {
             "   ✅ Successfully pulled {} (revision: {})",
             model_id, revision
         );
-        Ok(())
+        self.pull_named_text_model(&snapshots_dir, progress).await
+    }
+
+    /// A speech tower that names its text model (`text_model_id` beside an `audio_config` in
+    /// its `config.json`) is served with that model: it is pulled too unless the cache already
+    /// holds it, so one pull leaves both halves of the model in place.
+    async fn pull_named_text_model(
+        &self,
+        snapshot: &Path,
+        progress: Option<ProgressCallback>,
+    ) -> Result<()> {
+        use crate::inference::engine::llm_engine::discover;
+        let Some(config) = std::fs::read_to_string(snapshot.join("config.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        else {
+            return Ok(());
+        };
+        let Some(text_id) = discover::named_text_model(&config) else {
+            return Ok(());
+        };
+        if discover::composite_text_dir(snapshot, std::slice::from_ref(&self.models_dir)).is_some()
+        {
+            return Ok(());
+        }
+        info!("   🔗 The checkpoint names its text model {text_id}; pulling it");
+        Box::pin(self.pull_model(text_id, progress))
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "the text model {text_id} the checkpoint names did not pull ({e}); \
+                     pull it, or a copy of it under another owner, to serve the checkpoint"
+                )
+            })
     }
 
     /// Delete a model

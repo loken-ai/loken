@@ -97,6 +97,9 @@ tower lists `audio` among its capabilities. The tower is either the `mmproj*.ggu
 GGUF (`clip.projector_type` names the family), or a checkpoint directory whose `config.json`
 declares an `audio_config`: Ultravox ships only the tower and the projector, and names its text
 model by `text_model_id`, which is looked up in the hub cache by id, else by name under any owner.
+Its safetensors are served through the dense checkpoint route below, so no GGUF is needed. Pulling
+the checkpoint pulls that text model too when the cache holds no copy of it; a gated id needs a
+token, or a copy pulled under another owner.
 The tower is placed after the text model, on a card the text model does not use when there is one.
 A clip arrives base64 as an `input_audio` part of `/v1/chat/completions` or in `audios` of an
 `/api/chat` message, in any container the server decodes, and is mixed down and resampled to the

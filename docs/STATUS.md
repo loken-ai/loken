@@ -136,8 +136,9 @@ log-probability given to the exact choice. It runs by hand on a real checkpoint,
 Voxtral and Ultravox towers are read from an `mmproj` GGUF or a checkpoint directory, with every
 dimension taken from the file, and spliced into a chat turn. The mel features and the towers are
 held against the reference implementation at rounding level on toy towers
-(`tests/vectors/audio_in/`). No real-checkpoint transcript or timing is committed, and the
-Ultravox language model must be supplied as a GGUF beside the tower.
+(`tests/vectors/audio_in/`). An Ultravox checkpoint serves alone: its text model is the safetensors
+checkpoint its config names, found in the hub cache or pulled with it. No real-checkpoint transcript
+or timing is committed.
 
 ## The qwen4exp family
 

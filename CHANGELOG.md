@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Ultravox: serve a checkpoint alone and pull the text model it names.
 - MIDI: render at the tempo the request names in bpm.
 - Audio: answer generated clips as mp3 or flac by response_format.
 - Messages API: read images by URL from allowed hosts.
