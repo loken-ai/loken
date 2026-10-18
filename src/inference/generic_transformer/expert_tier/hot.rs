@@ -128,9 +128,12 @@ fn span(ranges: &[Range]) -> u64 {
     ranges.iter().map(|r| (r.1 - r.0) as u64).sum()
 }
 
-/// The ranges registered now, sorted and disjoint. A copy from the mapping reads it to cut
-/// itself at their edges, for the driver refuses a copy that spans a registered range and
-/// memory outside it; the write lock is held while a range is registered or released.
+/// The ranges registered now and those on their way in or out, sorted and disjoint. A copy from
+/// the mapping reads it to cut itself at their edges, for the driver refuses a copy that spans a
+/// registered range and memory outside it. A range is listed before its registration starts and
+/// unlisted after its release ends, and the write lock is held only to edit the list: the
+/// driver's calls run without it, since a release waits for the card, and a card waiting on the
+/// tier worker waits on a copy that reads this list.
 static REGISTERED: std::sync::RwLock<Vec<Range>> = std::sync::RwLock::new(Vec::new());
 
 /// Calls `f` on the pieces of `[from, to)` cut at the edges of the registered ranges, in order,
@@ -161,7 +164,11 @@ pub(crate) fn for_each_piece(
 /// the process's locked-memory limit and lets copies from them run as transfers.
 #[cfg(feature = "cuda")]
 fn lock(r: Range) -> bool {
-    let mut reg = REGISTERED.write().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut reg = REGISTERED.write().unwrap_or_else(|e| e.into_inner());
+        let at = reg.partition_point(|x| x.0 < r.0);
+        reg.insert(at, r);
+    }
     // Read-only, the mapping being the file's; portable, every card's context seeing it pinned.
     const PORTABLE: u32 = 1;
     const READ_ONLY: u32 = 8;
@@ -174,9 +181,11 @@ fn lock(r: Range) -> bool {
         )
     };
     let ok = rc == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS;
-    if ok {
-        let at = reg.partition_point(|x| x.0 < r.0);
-        reg.insert(at, r);
+    if !ok {
+        REGISTERED
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|x| *x != r);
     }
     ok
 }
@@ -184,10 +193,12 @@ fn lock(r: Range) -> bool {
 /// Releases a range [`lock`] registered, by the address it was registered at.
 #[cfg(feature = "cuda")]
 fn unlock(r: Range) {
-    let mut reg = REGISTERED.write().unwrap_or_else(|e| e.into_inner());
-    reg.retain(|x| *x != r);
     // Safety: `r` was registered by `lock` and is released once.
     let _ = unsafe { cudarc::driver::sys::cuMemHostUnregister(r.0 as *mut std::ffi::c_void) };
+    REGISTERED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|x| *x != r);
 }
 
 #[cfg(not(feature = "cuda"))]

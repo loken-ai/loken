@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- Experts: lock and unlock host pages without holding the tier worker back.
+
 ## [0.3.0] - 2026-10-18
 
 ### Added
