@@ -64,7 +64,7 @@ pub(super) fn decode_wav_to_mono_f32_16k(bytes: &[u8]) -> anyhow::Result<(Vec<f3
 
 /// A WAV's samples, interleaved and normalised to [-1, 1] whatever the sample format
 /// (8/16/24/32-bit integer or float), with its channel count and rate.
-fn read_wav_interleaved(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, usize, u32)> {
+pub(super) fn read_wav_interleaved(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, usize, u32)> {
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
@@ -608,10 +608,16 @@ fn started_event(model: &str, node: Option<&str>) -> String {
 
 /// The terminal event: one clip, how long it took, and what it cost when that could be
 /// measured at all.
-fn done_event(b64: String, sample_rate: u32, render_ms: u64, energy_j: Option<f64>) -> String {
+fn done_event(
+    b64: String,
+    format: ClipFormat,
+    sample_rate: u32,
+    render_ms: u64,
+    energy_j: Option<f64>,
+) -> String {
     let mut done = serde_json::json!({
         "status": "done",
-        "data": [{"b64_json": b64, "content_type": "audio/wav", "sample_rate": sample_rate}],
+        "data": [{"b64_json": b64, "content_type": format.content_type(), "sample_rate": sample_rate}],
         "render_ms": render_ms,
     });
     if let Some(j) = energy_j {
@@ -666,6 +672,12 @@ pub(crate) async fn audio_generations(
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
         (code, Json(openai_error_body(code, msg))).into_response()
     };
+    // The container the clip is answered in; a MIDI render ignores it.
+    let clip_format =
+        match ClipFormat::parse(body.0.get("response_format").and_then(|v| v.as_str())) {
+            Ok(f) => f,
+            Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
+        };
 
     // Pressure protocol (vram_manager): hot demand = the biggest component the
     // requested engine will place. ACE-Step: the larger of the 4B LM / DiT
@@ -996,12 +1008,13 @@ pub(crate) async fn audio_generations(
                     } else {
                         wav
                     };
-                    use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
                     let energy_j = crate::energy_report::end_measured(
                         energy, "music", "[/v1/audio/generations]");
                     let render_ms = t0m.elapsed().as_millis() as u64;
-                    yield Ok(Event::default().data(done_event(b64, 48_000, render_ms, energy_j)));
+                    match clip_b64(wav, clip_format) {
+                        Ok(b64) => yield Ok(Event::default().data(done_event(b64, clip_format, 48_000, render_ms, energy_j))),
+                        Err(e) => yield Ok(Event::default().data(error_event(e))),
+                    }
                 }
                 Ok(Err(e)) => yield Ok(Event::default().data(error_event(e))),
                 Err(e) => yield Ok(Event::default().data(error_event(format!("render task panicked: {e}")))),
@@ -1104,12 +1117,13 @@ pub(crate) async fn audio_generations(
                             }
                         }
                     }
-                    use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
                     let energy_j = crate::energy_report::end_measured(
                         energy, "sfx", "[/v1/audio/generations]");
                     let render_ms = t0m.elapsed().as_millis() as u64;
-                    yield Ok(Event::default().data(done_event(b64, rate, render_ms, energy_j)));
+                    match clip_b64(wav, clip_format) {
+                        Ok(b64) => yield Ok(Event::default().data(done_event(b64, clip_format, rate, render_ms, energy_j))),
+                        Err(e) => yield Ok(Event::default().data(error_event(e))),
+                    }
                 }
                 Ok(Err(e)) => yield Ok(Event::default().data(error_event(e))),
                 Err(e) => yield Ok(Event::default().data(error_event(format!("render task panicked: {e}")))),
@@ -1160,11 +1174,13 @@ pub(crate) async fn audio_generations(
             _cancel_guard.disarm();
             match rendered {
                 Ok(Ok(pcm)) => {
-                    let b64 = pcm_to_wav_base64(&pcm, 24_000);
                     let energy_j = crate::energy_report::end_measured(
                         energy, "sfx", "[/v1/audio/generations]");
                     let render_ms = t0m.elapsed().as_millis() as u64;
-                    yield Ok(Event::default().data(done_event(b64, 24_000, render_ms, energy_j)));
+                    match clip_b64(pcm_to_wav_ch(&pcm, 24_000, 1), clip_format) {
+                        Ok(b64) => yield Ok(Event::default().data(done_event(b64, clip_format, 24_000, render_ms, energy_j))),
+                        Err(e) => yield Ok(Event::default().data(error_event(e))),
+                    }
                 }
                 Ok(Err(e)) => yield Ok(Event::default().data(error_event(e))),
                 Err(e) => yield Ok(Event::default().data(error_event(format!("render task panicked: {e}")))),
@@ -1175,7 +1191,7 @@ pub(crate) async fn audio_generations(
 
     let t0_all = std::time::Instant::now();
     let energy_all = crate::energy_report::begin();
-    let (b64, sr): (String, u32) = if is_music {
+    let (wav, sr): (Vec<u8>, u32) = if is_music {
         // ACE-Step text->music (48 kHz stereo). render() writes a WAV to cfg.out;
         // build MusicConfig from the request (serde fills the rest via defaults),
         // render to a unique tempfile, read it back, base64 it.
@@ -1242,11 +1258,7 @@ pub(crate) async fn audio_generations(
         } else {
             wav
         };
-        use base64::Engine;
-        (
-            base64::engine::general_purpose::STANDARD.encode(&wav),
-            48_000,
-        )
+        (wav, 48_000)
     } else if is_sao {
         // Stable Audio Open: stereo 44.1 kHz, v-diffusion, up to the ~47 s
         // training window. CFG default is the model's recipe (7), not the
@@ -1285,7 +1297,6 @@ pub(crate) async fn audio_generations(
                 )
             }
         };
-        use base64::Engine;
         let mut wav = pcm_to_wav_ch(&pcm, rate, 2);
         if loop_mode {
             match seamless_loop_wav(&wav, loop_len_secs, beat_secs, rate as usize) {
@@ -1295,7 +1306,7 @@ pub(crate) async fn audio_generations(
                 }
             }
         }
-        (base64::engine::general_purpose::STANDARD.encode(&wav), rate)
+        (wav, rate)
     } else {
         // EzAudio text->SFX. render() returns (pcm_f32, n_samples); native rate
         // 24 kHz (the 2nd value is the SAMPLE COUNT, not the rate).
@@ -1331,7 +1342,11 @@ pub(crate) async fn audio_generations(
                 )
             }
         };
-        (pcm_to_wav_base64(&pcm, 24_000), 24_000)
+        (pcm_to_wav_ch(&pcm, 24_000, 1), 24_000)
+    };
+    let b64 = match clip_b64(wav, clip_format) {
+        Ok(b) => b,
+        Err(e) => return err_resp(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e),
     };
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1347,7 +1362,7 @@ pub(crate) async fn audio_generations(
         "model": model,
         "data": [{
             "b64_json": b64,
-            "content_type": "audio/wav",
+            "content_type": clip_format.content_type(),
             "seconds": seconds,
             "sample_rate": sr,
         }],
@@ -1646,19 +1661,24 @@ pub(super) fn openai_voice_to_description(voice: &str, speed: f32) -> String {
     )
 }
 
-/// Constant bitrate of the MP3 the speech endpoint returns; the encoder snaps it to the
-/// nearest value the MPEG version of the checkpoint's sample rate allows.
+/// Constant bitrate of one channel of the MP3 the audio endpoints return; the encoder
+/// snaps the total to the nearest value the MPEG version of the sample rate allows.
 const MP3_BITRATE_KBPS: u32 = 96;
 
-/// Mono f32 samples as one MP3 stream: the whole tail padded, the info header in front.
-/// A sample rate no MPEG version carries (anything but 8 to 48 kHz on the standard
-/// ladder) is refused by the encoder, and the refusal reaches the client.
-pub(super) fn pcm_to_mp3_bytes(pcm: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
+/// Interleaved f32 samples of `channels` channels as one MP3 stream: the whole tail
+/// padded, the info header in front. A sample rate no MPEG version carries (anything but
+/// 8 to 48 kHz on the standard ladder) is refused by the encoder, and the refusal reaches
+/// the client.
+pub(super) fn pcm_to_mp3_bytes(
+    pcm: &[f32],
+    channels: u16,
+    sample_rate: u32,
+) -> anyhow::Result<Vec<u8>> {
     let mut enc = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
-        bitrate_kbps: MP3_BITRATE_KBPS,
+        bitrate_kbps: MP3_BITRATE_KBPS * u32::from(channels),
         vbr_quality: None,
     });
-    enc.push_pcm_f32(pcm, 1, sample_rate)
+    enc.push_pcm_f32(pcm, channels, sample_rate)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     enc.finish();
     let mut out = Vec::with_capacity(pcm.len() / 8);
@@ -2060,7 +2080,7 @@ pub(crate) async fn audio_speech(
             format!("audio/L16; rate={}; channels=1", result.sample_rate),
             "pcm",
         ),
-        "mp3" => match pcm_to_mp3_bytes(&result.pcm, result.sample_rate) {
+        "mp3" => match pcm_to_mp3_bytes(&result.pcm, 1, result.sample_rate) {
             Ok(bytes) => (bytes, "audio/mpeg".to_string(), "mp3"),
             Err(e) => {
                 return err_resp(
@@ -2309,7 +2329,7 @@ pub(super) async fn tts_stream_response(
                     // One MP3 stream per sentence: its frames leave as soon as the
                     // sentence is synthesised, and decoders take the streams back to back.
                     let bytes = if format == "mp3" {
-                        match pcm_to_mp3_bytes(&pcm, sample_rate) {
+                        match pcm_to_mp3_bytes(&pcm, 1, sample_rate) {
                             Ok(b) => b,
                             Err(e) => {
                                 tracing::error!("TTS streaming: mp3 encode: {e}");

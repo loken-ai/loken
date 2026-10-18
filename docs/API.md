@@ -63,7 +63,7 @@ models as unknown.
 | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` | `audio` | Speech to text. |
 | `POST /v1/audio/speech` | `audio` | Text to speech, as wav or mp3, whole or streamed per sentence. `GET /v1/audio/voices` lists the voices. |
 | `POST /v1/audio/separate` | `audio` | Split a mix into stems. |
-| `POST /v1/audio/generations` | `audio` | Music and sound effects from a description. |
+| `POST /v1/audio/generations` | `audio` | Music and sound effects from a description, as wav, mp3 or flac by `response_format` (wav when absent; another name answers 400). |
 | `POST /conversation` | `audio` | One turn of a conversation, routed by what the prompt asks for: chat, vision on an attached image, image generation, speech or sound. Rules decide the clear cases and a small classifier model the rest; the reply carries `route`, `routed_by` and the picture or clip beside the message. Takes `stream` for events, `model` as the chat model to prefer, `image_model` and `tts_model` to name the renderers. |
 | `POST /voice` | `audio` | Speech in, speech out: transcription, a chat turn, then the reply spoken. |
 | `POST /v1/images/generations`, `/edits`, `/variations` | `image` | Image generation. `response_format: url` stores the picture as a file and answers its URL on `public_url` or the request's `Host`. |

@@ -30,6 +30,8 @@ mod whisper;
 pub(crate) use whisper::*;
 mod wav;
 pub(crate) use wav::*;
+mod clip;
+pub(crate) use clip::*;
 mod transcribe;
 use transcribe::*;
 mod decode;
