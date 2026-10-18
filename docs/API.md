@@ -73,6 +73,14 @@ models as unknown.
 
 A streamed render on any of these routes sends events with `status`, `phase`, `phase_label`, `step`, `total` and `elapsed_ms`, and every event carries `node`: the name of the node that renders, so a client behind a hand-over sees where its work is, or null when the server runs alone.
 
+### Media input limits
+
+Every chat route (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses`,
+`/v1/messages`) holds a request to `max_images` images, `max_image_pixels` pixels per image and
+`max_audio_seconds` seconds of audio, set under `[inference]` in
+[CONFIGURATION.md](CONFIGURATION.md#media-input). A request past one is answered 400 with the
+cap's key and the value it carried, before the image is decoded.
+
 ## Messages API surface
 
 | Route | What it does |

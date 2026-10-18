@@ -75,6 +75,18 @@ fn default_model_id() -> String {
     DEFAULT_MODEL_ID.to_string()
 }
 
+fn default_max_images() -> usize {
+    crate::api::media_limits::DEFAULT_MAX_IMAGES
+}
+
+fn default_max_image_pixels() -> u64 {
+    crate::api::media_limits::default_max_image_pixels()
+}
+
+fn default_max_audio_seconds() -> f64 {
+    crate::api::media_limits::default_max_audio_seconds()
+}
+
 impl Default for InferenceConfigToml {
     /// Every field at its serde default, as a configuration without an `[inference]` table reads.
     fn default() -> Self {
@@ -141,6 +153,16 @@ pub struct InferenceConfigToml {
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Images one request hands the vision encoder; past it the request is refused.
+    #[serde(default = "default_max_images")]
+    pub max_images: usize,
+    /// Pixels one image may declare in its header; past it the request is refused before
+    /// the image is decoded.
+    #[serde(default = "default_max_image_pixels")]
+    pub max_image_pixels: u64,
+    /// Seconds of audio one request hands the speech tower; past it the request is refused.
+    #[serde(default = "default_max_audio_seconds")]
+    pub max_audio_seconds: f64,
     /// For a streamed model: how much exactness the output may give up for speed. `exact` (the
     /// default) keeps it identical to the full model; `balanced` accepts differences no larger
     /// than the model's own run-to-run noise; `fast` accepts a small multiple of that. The
@@ -352,6 +374,11 @@ impl Config {
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
+            media_limits: crate::api::media_limits::MediaLimits {
+                max_images: toml_config.max_images,
+                max_image_pixels: toml_config.max_image_pixels,
+                max_audio_seconds: toml_config.max_audio_seconds,
+            },
             quality: toml_config.quality,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer

@@ -229,6 +229,17 @@ on each layer's card is sized by the load. Two keys carry what a run learned to 
 | `moderation_model` | none | The classifier `/v1/moderations` asks, by tag. Recognised by name: Llama Guard, Shieldstral, ShieldGemma, Granite Guardian and gpt-oss Safeguard. Without it the endpoint answers 501. |
 | `public_url` | request `Host` | The origin clients reach this server at, for the URLs it hands out, such as image files answered as `url`. Set it behind a proxy. |
 
+### Media input
+
+Caps every chat route holds a request to before its media reach the model. A request past one
+is answered 400 naming the key and the value it carried.
+
+| Key | Default | What it does |
+|---|---|---|
+| `max_images` | 16, the most one message carries | Images one request hands the vision encoder. |
+| `max_image_pixels` | 134217728, the decoder's 512 MiB budget at RGBA8 | Pixels (width times height) an image may declare in its header, checked before it is decoded. |
+| `max_audio_seconds` | 1398, the same budget for a stereo clip at 48 kHz in f32 | Seconds of the audio clip, read from the container's header where it states them and from the decoded frames otherwise. |
+
 ## `[cpu]`
 
 | Key | Default | Meaning |

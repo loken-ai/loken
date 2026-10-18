@@ -205,6 +205,8 @@ pub struct InferenceConfig {
     /// The origin clients reach this server at, for the URLs it hands out; `None` uses
     /// the request\'s `Host`.
     pub public_url: Option<String>,
+    /// Per-request caps on images, pixels and audio seconds.
+    pub media_limits: crate::api::media_limits::MediaLimits,
     /// How much exactness a streamed model may give up for speed.
     pub quality: QualityLevel,
     /// Progress callback
@@ -279,6 +281,7 @@ impl Default for InferenceConfig {
             files_dir: None,
             moderation_model: None,
             public_url: None,
+            media_limits: crate::api::media_limits::MediaLimits::default(),
             quality: QualityLevel::Exact,
             progress_callback: None,
             models_dir: None,

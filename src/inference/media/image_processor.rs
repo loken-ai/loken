@@ -26,6 +26,12 @@ pub const ACCEPTED_IMAGE_FORMATS: &str =
     "Accepted: PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, TGA, QOI, PNM, HDR, EXR, DDS \
      (not AVIF or JPEG-XL - convert those first)";
 
+/// The widest and tallest image the decoder takes, in pixels.
+pub const DECODE_MAX_SIDE: u32 = 16384;
+
+/// The bytes one image decode may allocate.
+pub const DECODE_MAX_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+
 pub fn decode_image_oriented(bytes: &[u8]) -> Result<DynamicImage> {
     // Bound the decode so a tiny "decompression bomb" (a small file declaring
     // e.g. 60000x60000) can't OOM-abort the process - no CatchPanic covers an
@@ -40,9 +46,9 @@ pub fn decode_image_oriented(bytes: &[u8]) -> Result<DynamicImage> {
             )
         })?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16384);
-    limits.max_image_height = Some(16384);
-    limits.max_alloc = Some(512 * 1024 * 1024);
+    limits.max_image_width = Some(DECODE_MAX_SIDE);
+    limits.max_image_height = Some(DECODE_MAX_SIDE);
+    limits.max_alloc = Some(DECODE_MAX_ALLOC_BYTES);
     reader.limits(limits);
     use image::ImageDecoder as _;
     let mut decoder = reader

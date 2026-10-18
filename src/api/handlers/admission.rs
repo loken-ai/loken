@@ -123,6 +123,10 @@ impl APIServer {
         endpoint: &'static str,
         images: &[String],
     ) -> Result<Admission, ApiError> {
+        self.default_inference_config
+            .media_limits
+            .check_images(images)
+            .map_err(ApiError::Validation)?;
         let in_flight = crate::distributed::rate_meter::InFlight::enter();
         let active = engine.admit_request().await;
         let mut gate = if engine.is_continuous().await {
@@ -179,23 +183,38 @@ impl APIServer {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(crate::api::types::base64_payload(clip).trim())
             .map_err(|e| ApiError::Validation(format!("audio: not base64 ({e})")))?;
+        let limits = &self.default_inference_config.media_limits;
+        if let Some(seconds) = super::audio::audio_header_seconds(&bytes) {
+            limits
+                .check_audio_seconds(seconds)
+                .map_err(ApiError::Validation)?;
+        }
         let rate = u32::try_from(input.sample_rate).map_err(|_| {
             ApiError::Internal("the speech tower's sample rate is out of range".into())
         })?;
-        let pcm = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+        let pcm = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, f64)> {
             let (planar, channels, source_rate) = super::audio::decode_audio_planar(&bytes)?;
             let frames = planar.len() / channels;
+            let seconds = frames as f64 / f64::from(source_rate);
             // Mono: the mean of the channels.
             let mono: Vec<f32> = (0..frames)
                 .map(|i| {
                     (0..channels).map(|c| planar[c * frames + i]).sum::<f32>() / channels as f32
                 })
                 .collect();
-            crate::inference::media::audio_io::resample(&mono, source_rate, rate)
+            Ok((
+                crate::inference::media::audio_io::resample(&mono, source_rate, rate)?,
+                seconds,
+            ))
         })
         .await
         .map_err(|e| ApiError::Internal(format!("audio decode task: {e}")))?
         .map_err(|e| ApiError::Validation(format!("audio: {e}")))?;
+        // The decoded length, for a container whose header does not state it.
+        let (pcm, seconds) = pcm;
+        limits
+            .check_audio_seconds(seconds)
+            .map_err(ApiError::Validation)?;
         let embeds = engine.audio_embeds_for(pcm.len()).await;
         if let Some(window) = engine.context_window().await {
             if embeds >= window {

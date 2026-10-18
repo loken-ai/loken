@@ -92,6 +92,39 @@ fn read_wav_interleaved(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, usize, u32)> 
     Ok((normalized, channels, spec.sample_rate))
 }
 
+/// The seconds a clip lasts as its container's header states them, without decoding the
+/// samples: a WAV's frame count, or the frame count of the first audio track another
+/// container declares. `None` when the header does not state it.
+pub(crate) fn audio_header_seconds(bytes: &[u8]) -> Option<f64> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    use symphonia::core::io::MediaSourceStream;
+    if let AudioFormat::Wav = detect_audio_format(bytes) {
+        let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).ok()?;
+        let rate = reader.spec().sample_rate;
+        return (rate > 0).then(|| f64::from(reader.duration()) / f64::from(rate));
+    }
+    let mss = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
+    let probed = symphonia::default::get_probe()
+        .format(
+            &symphonia::core::probe::Hint::new(),
+            mss,
+            &Default::default(),
+            &Default::default(),
+        )
+        .ok()?;
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
+    let frames = track.codec_params.n_frames?;
+    let rate = track.codec_params.sample_rate.filter(|&r| r > 0)?;
+    Some(frames as f64 / f64::from(rate))
+}
+
 /// Any container the server reads (WAV of any sample format, MP3, FLAC, OGG, AAC,
 /// MP4), as planar f32 at the source rate with every channel kept: all of channel 0,
 /// then all of channel 1, and so on.

@@ -1464,3 +1464,25 @@ fn stereo_decode_keeps_both_channels() {
     );
     assert!(l[l.len() / 2] > 0.4 && r[r.len() / 2] < -0.4);
 }
+
+/// A WAV's length is read from its header, before its samples are decoded.
+#[test]
+fn audio_header_seconds_reads_a_wav_length() {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for _ in 0..(24_000 * 2) {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    let seconds = audio_header_seconds(cursor.get_ref()).expect("a WAV states its length");
+    assert!((seconds - 1.5).abs() < 1e-9, "{seconds}");
+    assert!(audio_header_seconds(b"not audio").is_none());
+}

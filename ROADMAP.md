@@ -46,7 +46,7 @@ Smaller, by priority:
 | Context parallelism inside the recorded step | Parallelism | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
 | Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcripts of a 20-clip set at or below the reference's word error rate, with their real-time factor, committed | Planned |
 | Ultravox on its own | Audio | One pull or checkpoint directory serves an audio turn with no GGUF supplied beside it | Planned |
-| Media input limits | API | Per-request caps on images, pixels and audio seconds, stated in the docs, a request past one answered 400 with the reason | Planned |
+| Media input limits | API | Per-request caps on images, pixels and audio seconds, stated in the docs, a request past one answered 400 with the reason | Done |
 | Images by URL on the Messages API | API | An image block with a URL source fetched within the host allowlist and answered | Planned |
 | Multimodal parts on the Responses API | API | Image and audio input items answered as on chat completions, covered by a test | Done |
 | Generated audio as mp3 and flac | Audio | The audio generations route answers the format asked, mp3 and flac besides wav, as the speech route does | Planned |
