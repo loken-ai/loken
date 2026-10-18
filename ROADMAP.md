@@ -152,6 +152,7 @@ Major, by priority:
 |---|---|---|---|
 | Routing between families | Models | One model name sends each request to the member best suited to it, logs the choice, and scores better than each member alone for less than running them all | Planned |
 | A supermodel from several families | Models | Several models of different families (for example Llama, Mistral, Qwen, DeepSeek) answer together as one model, choosing each word together, and score better than each of them alone on a fixed task set | Planned |
+| A mixture of experts built from several families | Models | Models of different families joined into one mixture of experts: one shared tokenizer, a small projection in and out of each member, a router that picks the members for each request, the new parts trained with the training of 0.8.0, and the result scoring better than each member alone | Planned |
 
 Smaller, by priority:
 
