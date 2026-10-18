@@ -98,6 +98,27 @@ pub fn pool_mark(ordinal: usize) -> u64 {
     used
 }
 
+/// The memory the recorded graphs of `ordinal` hold: in use, reserved, and their peaks since the
+/// device last reset them.
+pub fn graph_mem(ordinal: usize) -> [u64; 4] {
+    use cudarc::driver::sys::{cuDeviceGetGraphMemAttribute, CUgraphMem_attribute as A};
+    let mut out = [0u64; 4];
+    let Ok(dev) = cudarc::driver::result::device::get(ordinal as i32) else {
+        return out;
+    };
+    for (o, a) in out.iter_mut().zip([
+        A::CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT,
+        A::CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT,
+        A::CU_GRAPH_MEM_ATTR_USED_MEM_HIGH,
+        A::CU_GRAPH_MEM_ATTR_RESERVED_MEM_HIGH,
+    ]) {
+        unsafe {
+            let _ = cuDeviceGetGraphMemAttribute(dev, a, o as *mut u64 as *mut std::ffi::c_void);
+        }
+    }
+    out
+}
+
 /// The most the default pool on `ordinal` has held in use since [`pool_mark`].
 pub fn pool_peak(ordinal: usize) -> u64 {
     use cudarc::driver::sys::{cuMemPoolGetAttribute, CUmemPool_attribute};

@@ -2678,12 +2678,15 @@ impl CardStager {
 
     /// The bytes the extra slots may take back now: the card's free memory less what a decode
     /// was seen to take, a replaying one's when `replay` (the decode replays kept graphs and
-    /// one was measured), nothing before a decode has been measured.
+    /// one was measured), nothing before a decode has been measured. A replay also takes back
+    /// what the kept graphs reserved at their peak and gave back to the card since.
     pub fn room_for_extra(&self, replay: bool) -> u64 {
         let replayed = *self.replay_need.lock().unwrap_or_else(|e| e.into_inner());
         let recorded = *self.decode_need.lock().unwrap_or_else(|e| e.into_inner());
         let need = match replay {
-            true => replayed.or(recorded),
+            true => replayed
+                .map(|n| n + self.graph_reserve_given_back())
+                .or(recorded),
             false => recorded,
         };
         match need {
@@ -2692,6 +2695,15 @@ impl CardStager {
             }
             None => 0,
         }
+    }
+
+    /// The graph memory the card's recorded graphs reserved at their peak and no longer hold.
+    fn graph_reserve_given_back(&self) -> u64 {
+        let [_, reserved, _, peak] = self
+            .dev
+            .as_cuda_device()
+            .map_or([0; 4], |d| crate::tensor::cuda::graph_mem(d.0.ordinal()));
+        peak.saturating_sub(reserved)
     }
 
     /// Marks the span since the last return as a prefill's.
