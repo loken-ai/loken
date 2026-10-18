@@ -983,7 +983,7 @@ pub fn release_cuda_pools() {}
 pub fn trim_cuda_pools() {
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys::{
+        use crate::tensor::gpu_runtime::driver::sys::{
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cuMemPoolTrimTo, cudaError_enum,
             CUmemPool_attribute, CUmemoryPool,
         };
@@ -1035,14 +1035,14 @@ pub fn release_cuda_pools() {
     // is alive. Tensors and workspaces above already dropped their
     // clones - clearing the cache typically removes the last one.
     crate::tensor::cuda_ext::clear_device_cache();
-    use cudarc::driver::sys::{
+    use crate::tensor::gpu_runtime::driver::sys::{
         cuCtxPopCurrent_v2, cuCtxPushCurrent_v2, cuCtxSynchronize, cuDeviceGetDefaultMemPool,
         cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain, cuMemPoolGetAttribute,
         cuMemPoolSetAttribute, cuMemPoolTrimTo, cudaError_enum, CUcontext, CUmemPool_attribute,
         CUmemoryPool,
     };
     // Iterate over physical CUDA devices. cuDeviceGetCount is safer than
-    // querying via cudarc::driver::CudaContext (which would create a new
+    // querying via crate::tensor::gpu_runtime::driver::CudaContext (which would create a new
     // context just to count). We use the raw FFI directly.
     let device_count = match nvml_wrapper::Nvml::init() {
         Ok(nvml) => crate::inference::place::device_probe::visible_cards(&nvml).len() as i32,

@@ -106,9 +106,13 @@ with_dtype!(f64, F64, |v: f64| v);
 
 /// Device dtypes the CUDA-slice projection covers (kernel-FFI extraction).
 #[cfg(feature = "cuda")]
-pub trait CudaDType: cudarc::driver::DeviceRepr + Sized {
-    fn as_cuda_slice(cs: &super::cuda::CudaStorage) -> Result<&cudarc::driver::CudaSlice<Self>>;
-    fn wrap_cuda_slice(slice: cudarc::driver::CudaSlice<Self>) -> super::cuda::CudaStorage;
+pub trait CudaDType: crate::tensor::gpu_runtime::driver::DeviceRepr + Sized {
+    fn as_cuda_slice(
+        cs: &super::cuda::CudaStorage,
+    ) -> Result<&crate::tensor::gpu_runtime::driver::CudaSlice<Self>>;
+    fn wrap_cuda_slice(
+        slice: crate::tensor::gpu_runtime::driver::CudaSlice<Self>,
+    ) -> super::cuda::CudaStorage;
 }
 
 #[cfg(feature = "cuda")]
@@ -117,10 +121,12 @@ macro_rules! cuda_dtype {
         impl CudaDType for $ty {
             fn as_cuda_slice(
                 cs: &super::cuda::CudaStorage,
-            ) -> Result<&cudarc::driver::CudaSlice<Self>> {
+            ) -> Result<&crate::tensor::gpu_runtime::driver::CudaSlice<Self>> {
                 cs.$as()
             }
-            fn wrap_cuda_slice(slice: cudarc::driver::CudaSlice<Self>) -> super::cuda::CudaStorage {
+            fn wrap_cuda_slice(
+                slice: crate::tensor::gpu_runtime::driver::CudaSlice<Self>,
+            ) -> super::cuda::CudaStorage {
                 super::cuda::CudaStorage::$variant(slice)
             }
         }
@@ -157,7 +163,9 @@ pub struct CudaStorage {
 
 #[cfg(feature = "cuda")]
 impl CudaStorage {
-    pub fn as_cuda_slice<T: CudaDType>(&self) -> Result<&cudarc::driver::CudaSlice<T>> {
+    pub fn as_cuda_slice<T: CudaDType>(
+        &self,
+    ) -> Result<&crate::tensor::gpu_runtime::driver::CudaSlice<T>> {
         match self.storage.as_ref() {
             super::Storage::Cuda { data, .. } => T::as_cuda_slice(data),
             _ => Err(Error::msg("as_cuda_slice on non-CUDA storage")),
@@ -172,7 +180,7 @@ impl CudaStorage {
     }
 
     pub fn wrap_cuda_slice<T: CudaDType>(
-        slice: cudarc::driver::CudaSlice<T>,
+        slice: crate::tensor::gpu_runtime::driver::CudaSlice<T>,
         dev: CudaDevice,
     ) -> Self {
         let data = T::wrap_cuda_slice(slice);
@@ -295,7 +303,7 @@ impl CudaDevice {
         self.0.ordinal()
     }
 
-    pub fn cuda_stream(&self) -> Arc<cudarc::driver::CudaStream> {
+    pub fn cuda_stream(&self) -> Arc<crate::tensor::gpu_runtime::driver::CudaStream> {
         self.0.stream().clone()
     }
 
@@ -325,10 +333,13 @@ impl CudaDevice {
 
     /// Zero-filled typed device allocation (substrate CudaDevice surface used by
     /// kernel-launch helpers and tests).
-    pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    pub fn alloc_zeros<
+        T: crate::tensor::gpu_runtime::driver::DeviceRepr
+            + crate::tensor::gpu_runtime::driver::ValidAsZeroBits,
+    >(
         &self,
         len: usize,
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
+    ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<T>> {
         self.0
             .stream()
             .alloc_zeros::<T>(len)
@@ -336,9 +347,9 @@ impl CudaDevice {
     }
 
     pub fn memcpy_dtod<
-        T: cudarc::driver::DeviceRepr,
-        Src: cudarc::driver::DevicePtr<T>,
-        Dst: cudarc::driver::DevicePtrMut<T>,
+        T: crate::tensor::gpu_runtime::driver::DeviceRepr,
+        Src: crate::tensor::gpu_runtime::driver::DevicePtr<T>,
+        Dst: crate::tensor::gpu_runtime::driver::DevicePtrMut<T>,
     >(
         &self,
         src: &Src,
@@ -350,19 +361,19 @@ impl CudaDevice {
             .map_err(|e| Error::msg(format!("memcpy_dtod: {e}")))
     }
 
-    pub fn memcpy_stod<T: cudarc::driver::DeviceRepr + Clone>(
+    pub fn memcpy_stod<T: crate::tensor::gpu_runtime::driver::DeviceRepr + Clone>(
         &self,
         src: &[T],
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
+    ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<T>> {
         self.0
             .stream()
             .clone_htod(src)
             .map_err(|e| Error::msg(format!("memcpy_stod: {e}")))
     }
 
-    pub fn memcpy_dtov<T: cudarc::driver::DeviceRepr>(
+    pub fn memcpy_dtov<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
         &self,
-        src: &cudarc::driver::CudaSlice<T>,
+        src: &crate::tensor::gpu_runtime::driver::CudaSlice<T>,
     ) -> Result<Vec<T>> {
         self.0
             .stream()
@@ -373,17 +384,17 @@ impl CudaDevice {
     /// Uninitialized typed device allocation (fork-shaped; the unsafety
     /// contract is the caller's: every element must be written before read).
     #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn alloc<T: cudarc::driver::DeviceRepr>(
+    pub unsafe fn alloc<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
         &self,
         len: usize,
-    ) -> Result<cudarc::driver::CudaSlice<T>> {
+    ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<T>> {
         unsafe { self.0.stream().alloc::<T>(len) }.map_err(|e| Error::msg(format!("alloc: {e}")))
     }
 
     pub fn memcpy_htod<
-        T: cudarc::driver::DeviceRepr + 'static,
-        Src: cudarc::driver::HostSlice<T> + ?Sized,
-        Dst: cudarc::driver::DevicePtrMut<T>,
+        T: crate::tensor::gpu_runtime::driver::DeviceRepr + 'static,
+        Src: crate::tensor::gpu_runtime::driver::HostSlice<T> + ?Sized,
+        Dst: crate::tensor::gpu_runtime::driver::DevicePtrMut<T>,
     >(
         &self,
         src: &Src,
@@ -395,7 +406,10 @@ impl CudaDevice {
             .map_err(|e| Error::msg(format!("memcpy_htod: {e}")))
     }
 
-    pub fn clone_dtoh<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::DevicePtr<T>>(
+    pub fn clone_dtoh<
+        T: crate::tensor::gpu_runtime::driver::DeviceRepr,
+        Src: crate::tensor::gpu_runtime::driver::DevicePtr<T>,
+    >(
         &self,
         src: &Src,
     ) -> Result<Vec<T>> {
@@ -434,7 +448,7 @@ impl CudaDevice {
 
     /// The device's cached secondary stream (frozen overlap sites call this
     /// directly on the device).
-    pub fn alt_cuda_stream(&self) -> Result<Arc<cudarc::driver::CudaStream>> {
+    pub fn alt_cuda_stream(&self) -> Result<Arc<crate::tensor::gpu_runtime::driver::CudaStream>> {
         self.0.alt_stream().map_err(|e| Error::msg(e.0))
     }
 
@@ -450,13 +464,13 @@ impl CudaDevice {
 /// (derefs to the function for `stream.launch_builder(&func)` call sites).
 #[cfg(feature = "cuda")]
 pub struct CudaFunc {
-    pub(crate) func: cudarc::driver::CudaFunction,
-    pub(crate) stream: Arc<cudarc::driver::CudaStream>,
+    pub(crate) func: crate::tensor::gpu_runtime::driver::CudaFunction,
+    pub(crate) stream: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
 }
 
 #[cfg(feature = "cuda")]
 impl std::ops::Deref for CudaFunc {
-    type Target = cudarc::driver::CudaFunction;
+    type Target = crate::tensor::gpu_runtime::driver::CudaFunction;
     fn deref(&self) -> &Self::Target {
         &self.func
     }
@@ -464,16 +478,16 @@ impl std::ops::Deref for CudaFunc {
 
 #[cfg(feature = "cuda")]
 impl CudaFunc {
-    pub fn cuda_function(&self) -> &cudarc::driver::CudaFunction {
+    pub fn cuda_function(&self) -> &crate::tensor::gpu_runtime::driver::CudaFunction {
         &self.func
     }
 
-    pub fn stream(&self) -> &Arc<cudarc::driver::CudaStream> {
+    pub fn stream(&self) -> &Arc<crate::tensor::gpu_runtime::driver::CudaStream> {
         &self.stream
     }
 
     /// Launch builder on the device's compute stream (fork-shaped).
-    pub fn builder(&self) -> cudarc::driver::LaunchArgs<'_> {
+    pub fn builder(&self) -> crate::tensor::gpu_runtime::driver::LaunchArgs<'_> {
         self.stream.launch_builder(&self.func)
     }
 }

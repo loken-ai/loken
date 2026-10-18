@@ -60,9 +60,9 @@ macro_rules! matmul_nn_impl {
             k: usize,
             n: usize,
         ) -> Result<CudaSlice<$t>> {
-            use cudarc::cublas::sys;
-            use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            use crate::tensor::gpu_runtime::cublas::sys;
+            use crate::tensor::gpu_runtime::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+            use crate::tensor::gpu_runtime::driver::{DevicePtr, DevicePtrMut};
             let stream = dev.stream();
             let mut out =
                 with_oom_retry(dev, $ctx, || unsafe { stream.alloc::<$t>(batch * m * n) })?;
@@ -78,7 +78,7 @@ macro_rules! matmul_nn_impl {
                 let (b_ptr, _gb) = b.device_ptr(stream);
                 let (c_ptr, _gc) = out.device_ptr_mut(stream);
                 unsafe {
-                    cudarc::cublas::result::gemm_strided_batched_ex(
+                    crate::tensor::gpu_runtime::cublas::result::gemm_strided_batched_ex(
                         *blas.handle(),
                         CUBLAS_OP_N,
                         CUBLAS_OP_N,
@@ -121,7 +121,7 @@ matmul_nn_impl!(
     "matmul bf16",
     "bf16 gemm",
     |red: bool| {
-        use cudarc::cublas::sys;
+        use crate::tensor::gpu_runtime::cublas::sys;
         let ab = Box::new((1.0f32, 0.0f32));
         let ct = if red {
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
@@ -146,7 +146,7 @@ matmul_nn_impl!(
     "matmul f16",
     "hgemm",
     |red: bool| {
-        use cudarc::cublas::sys;
+        use crate::tensor::gpu_runtime::cublas::sys;
         if red {
             let ab = Box::new((half::f16::ONE, half::f16::ZERO));
             let (ap, bp) = (
@@ -181,7 +181,7 @@ matmul_nn_impl!(
 /// decode would otherwise need a multi-GB col buffer in one piece).
 pub fn im2col1d_f32(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<f32>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<f32>,
     c_in_g: usize,
     l: usize,
     k: usize,
@@ -226,7 +226,7 @@ pub fn im2col1d_f32(
 /// reduced-precision-f16 switch is off (its default).
 pub fn conv1d_im2col_f16(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<f32>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<f32>,
     w_f16: &CudaSlice<half::f16>,
     c_in: usize,
     l: usize,
@@ -296,7 +296,7 @@ pub fn convt1d_gemm_f16(
 /// im2col (2-D) for one (batch, group) slab; returns [c_in_g*kh*kw, h_out*w_out].
 pub fn im2col2d_f32(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<f32>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<f32>,
     c_in_g: usize,
     h: usize,
     w: usize,
@@ -358,7 +358,7 @@ pub fn moe_gate_up_silu_mul(
     k: usize,
     quant_code: i32,
 ) -> Result<CudaSlice<f32>> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let stream = dev.stream();
     let size_m = m * topk;
     let out = with_oom_retry(dev, "moe out", || unsafe {
@@ -391,7 +391,7 @@ mod tests {
     //! this machine; nothing about them is automatic. Run one by name with
     //!   cargo test --release -p loken --lib NAME -- --ignored --nocapture
     use super::*;
-    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
 
     fn gpu() -> Option<Arc<CudaDevice>> {
         CudaDevice::new(0).ok()
@@ -424,7 +424,7 @@ extern "C" __global__ void native_silu_f32(const float* x, float* y, int n) {
     if (i < n) { float v = x[i]; y[i] = v / (1.0f + expf(-v)); }
 }
 "#;
-        let ptx = cudarc::nvrtc::compile_ptx(SRC).unwrap();
+        let ptx = crate::tensor::gpu_runtime::nvrtc::compile_ptx(SRC).unwrap();
         let module = dev.context().load_module(ptx).unwrap();
         let func = module.load_function("native_silu_f32").unwrap();
 
@@ -1400,8 +1400,10 @@ extern "C" __global__ void native_silu_f32(const float* x, float* y, int n) {
     fn production_rmsnorm_kernel_on_native_tensors() {
         use crate::tensor::{Device, Tensor};
         let Some(dev) = gpu() else { return };
-        let ptx =
-            cudarc::nvrtc::compile_ptx(crate::inference::kernel::fused::fused_cuda_src()).unwrap();
+        let ptx = crate::tensor::gpu_runtime::nvrtc::compile_ptx(
+            crate::inference::kernel::fused::fused_cuda_src(),
+        )
+        .unwrap();
         let module = dev.context().load_module(ptx).unwrap();
         let func = module.load_function("fused_rmsnorm_f32").unwrap();
 

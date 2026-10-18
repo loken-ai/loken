@@ -89,9 +89,9 @@ pub(super) fn matmul_f32_inner(
     n: usize,
     tf32: bool,
 ) -> Result<CudaSlice<f32>> {
-    use cudarc::cublas::sys;
-    use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use crate::tensor::gpu_runtime::cublas::sys;
+    use crate::tensor::gpu_runtime::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+    use crate::tensor::gpu_runtime::driver::{DevicePtr, DevicePtrMut};
     let stream = dev.stream();
     // beta = 0 - the gemm overwrites every element, no zero-fill needed.
     let mut out = with_oom_retry(dev, "matmul", || unsafe {
@@ -111,7 +111,7 @@ pub(super) fn matmul_f32_inner(
         let (b_ptr, _gb) = b.device_ptr(stream);
         let (c_ptr, _gc) = out.device_ptr_mut(stream);
         unsafe {
-            cudarc::cublas::result::gemm_strided_batched_ex(
+            crate::tensor::gpu_runtime::cublas::result::gemm_strided_batched_ex(
                 *blas.handle(),
                 CUBLAS_OP_N,
                 CUBLAS_OP_N,
@@ -162,8 +162,8 @@ macro_rules! matmul_nt_impl {
             k: usize,
             n: usize,
         ) -> Result<CudaSlice<$t>> {
-            use cudarc::cublas::sys;
-            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            use crate::tensor::gpu_runtime::cublas::sys;
+            use crate::tensor::gpu_runtime::driver::{DevicePtr, DevicePtrMut};
             let stream = dev.stream();
             let mut out = with_oom_retry(dev, "matmul_nt", || unsafe {
                 stream.alloc::<$t>(batch * m * n)
@@ -180,7 +180,7 @@ macro_rules! matmul_nt_impl {
                 let (b_ptr, _gb) = b.device_ptr(stream);
                 let (c_ptr, _gc) = out.device_ptr_mut(stream);
                 unsafe {
-                    cudarc::cublas::result::gemm_strided_batched_ex(
+                    crate::tensor::gpu_runtime::cublas::result::gemm_strided_batched_ex(
                         *blas.handle(),
                         sys::cublasOperation_t::CUBLAS_OP_T,
                         sys::cublasOperation_t::CUBLAS_OP_N,
@@ -223,8 +223,8 @@ pub fn matmul_nt_bf16_f32(
     k: usize,
     n: usize,
 ) -> Result<CudaSlice<f32>> {
-    use cudarc::cublas::sys;
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use crate::tensor::gpu_runtime::cublas::sys;
+    use crate::tensor::gpu_runtime::driver::{DevicePtr, DevicePtrMut};
     let stream = dev.stream();
     let mut out = with_oom_retry(dev, "matmul_nt_bf16_f32", || unsafe {
         stream.alloc::<f32>(batch * m * n)
@@ -236,7 +236,7 @@ pub fn matmul_nt_bf16_f32(
         let (b_ptr, _gb) = b.device_ptr(stream);
         let (c_ptr, _gc) = out.device_ptr_mut(stream);
         unsafe {
-            cudarc::cublas::result::gemm_strided_batched_ex(
+            crate::tensor::gpu_runtime::cublas::result::gemm_strided_batched_ex(
                 *blas.handle(),
                 sys::cublasOperation_t::CUBLAS_OP_T,
                 sys::cublasOperation_t::CUBLAS_OP_N,
@@ -273,7 +273,7 @@ matmul_nt_impl!(
     CUDA_R_32F,
     gemm_reduced_precision_f32,
     |red: bool| {
-        use cudarc::cublas::sys;
+        use crate::tensor::gpu_runtime::cublas::sys;
         let alpha = Box::new((1.0f32, 0.0f32));
         let ct = if red {
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
@@ -293,7 +293,7 @@ matmul_nt_impl!(
     CUDA_R_16BF,
     gemm_reduced_precision_bf16,
     |red: bool| {
-        use cudarc::cublas::sys;
+        use crate::tensor::gpu_runtime::cublas::sys;
         let alpha = Box::new((1.0f32, 0.0f32));
         let ct = if red {
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
@@ -313,7 +313,7 @@ matmul_nt_impl!(
     CUDA_R_16F,
     gemm_reduced_precision_f16,
     |red: bool| {
-        use cudarc::cublas::sys;
+        use crate::tensor::gpu_runtime::cublas::sys;
         if red {
             let alpha = Box::new((half::f16::ONE, half::f16::ZERO));
             let (ap, bp) = (

@@ -22,19 +22,19 @@ struct Library {
 const REQUIRED: [Library; 4] = [
     Library {
         name: "libcuda",
-        present: cudarc::driver::sys::is_culib_present,
+        present: crate::tensor::gpu_runtime::driver::sys::is_culib_present,
     },
     Library {
         name: "libnvrtc",
-        present: cudarc::nvrtc::sys::is_culib_present,
+        present: crate::tensor::gpu_runtime::nvrtc::sys::is_culib_present,
     },
     Library {
         name: "libcublas",
-        present: cudarc::cublas::sys::is_culib_present,
+        present: crate::tensor::gpu_runtime::cublas::sys::is_culib_present,
     },
     Library {
         name: "libcublasLt",
-        present: cudarc::cublaslt::sys::is_culib_present,
+        present: crate::tensor::gpu_runtime::cublaslt::sys::is_culib_present,
     },
 ];
 
@@ -108,7 +108,7 @@ pub fn usable() -> bool {
 /// Whether NCCL opens, which tensor parallelism across cards requires.
 pub fn nccl_present() -> bool {
     static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| unsafe { cudarc::nccl::sys::is_culib_present() })
+    *PRESENT.get_or_init(|| unsafe { crate::tensor::gpu_runtime::nccl::sys::is_culib_present() })
 }
 
 /// The error a CUDA entry point returns when the libraries are missing, so that the caller

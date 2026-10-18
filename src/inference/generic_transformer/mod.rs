@@ -707,7 +707,7 @@ unsafe impl Send for GenericHeteroTransformer {}
 /// model's forward, which holds the model mutably.
 pub struct TpComms {
     #[cfg(feature = "cuda")]
-    comms: Vec<cudarc::nccl::safe::Comm>,
+    comms: Vec<crate::tensor::gpu_runtime::nccl::safe::Comm>,
     /// The hidden state a split layer last returned on rank 0, and its copies on the other
     /// ranks: the next split layer starts from them instead of sending its input out.
     #[cfg(feature = "cuda")]
@@ -732,7 +732,7 @@ impl TpComms {
             .iter()
             .map(|d| d.as_cuda_device().ok().map(|c| c.cuda_stream()))
             .collect::<Option<Vec<_>>>()?;
-        match cudarc::nccl::safe::Comm::from_devices(streams) {
+        match crate::tensor::gpu_runtime::nccl::safe::Comm::from_devices(streams) {
             Ok(comms) => Some(Self {
                 comms,
                 replicas: std::sync::Mutex::new(None),
@@ -753,9 +753,10 @@ impl TpComms {
     /// `x`, on rank 0's card, sent to the cards of `to`, ranks 1 onwards. The other ranks'
     /// streams wait for rank 0's first, which joins them to a step rank 0 is recording.
     fn send_out(&self, x: &Tensor, to: &[Device]) -> Result<Vec<Tensor>> {
-        use cudarc::nccl::safe::{group_end, group_start};
-        let nccl =
-            |e: cudarc::nccl::result::NcclError| crate::tensor::Error::msg(format!("nccl: {e:?}"));
+        use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start};
+        let nccl = |e: crate::tensor::gpu_runtime::nccl::result::NcclError| {
+            crate::tensor::Error::msg(format!("nccl: {e:?}"))
+        };
         let ready = crate::tensor::cuda_ext::record_event(&self.comms[0].stream())?;
         for c in &self.comms[1..] {
             crate::tensor::cuda_ext::wait_event(&c.stream(), &ready)?;
@@ -785,9 +786,10 @@ impl TpComms {
     /// Every rank's `parts[rank]` summed onto every rank's card. Each part is a contiguous F32
     /// tensor on its rank's card.
     pub(super) fn all_reduce(&self, parts: &[Tensor]) -> Result<Vec<Tensor>> {
-        use cudarc::nccl::safe::{group_end, group_start, ReduceOp};
-        let nccl =
-            |e: cudarc::nccl::result::NcclError| crate::tensor::Error::msg(format!("nccl: {e:?}"));
+        use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start, ReduceOp};
+        let nccl = |e: crate::tensor::gpu_runtime::nccl::result::NcclError| {
+            crate::tensor::Error::msg(format!("nccl: {e:?}"))
+        };
         let slices = parts
             .iter()
             .map(crate::tensor::cuda_ext::f32_slice_of)
@@ -867,9 +869,10 @@ impl TpComms {
     /// `own`, on rank 0's card, plus the partials of ranks 1 onwards, summed on rank 0's card.
     /// Rank 0's stream then waits for the others, which ends their part of a recorded step.
     fn sum_in(&self, own: &Tensor, parts: &[Tensor]) -> Result<Tensor> {
-        use cudarc::nccl::safe::{group_end, group_start, ReduceOp};
-        let nccl =
-            |e: cudarc::nccl::result::NcclError| crate::tensor::Error::msg(format!("nccl: {e:?}"));
+        use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start, ReduceOp};
+        let nccl = |e: crate::tensor::gpu_runtime::nccl::result::NcclError| {
+            crate::tensor::Error::msg(format!("nccl: {e:?}"))
+        };
         let slices = std::iter::once(own)
             .chain(parts)
             .map(crate::tensor::cuda_ext::f32_slice_of)
@@ -887,7 +890,7 @@ impl TpComms {
         for (comm, view) in self.comms[1..].iter().zip(&views[1..]) {
             comm.reduce(
                 view,
-                None::<&mut cudarc::driver::CudaSlice<f32>>,
+                None::<&mut crate::tensor::gpu_runtime::driver::CudaSlice<f32>>,
                 &ReduceOp::Sum,
                 0,
             )

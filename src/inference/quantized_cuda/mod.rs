@@ -19,7 +19,9 @@ use anyhow::{anyhow, Result};
 // driver crate directly, so a launcher here does not depend on which backing the
 // substrate was built with.
 use crate::tensor::cuda_ext::{CudaStorage, RawCudaDevice as CudaDevice};
-use cudarc::driver::{CudaSlice, CudaView, DevicePtr, LaunchConfig, PushKernelArg};
+use crate::tensor::gpu_runtime::driver::{
+    CudaSlice, CudaView, DevicePtr, LaunchConfig, PushKernelArg,
+};
 use half::f16;
 
 // The IMMA (tensor-core) GEMV kernel, compiled by NVCC into libloken_imma.a
@@ -100,8 +102,8 @@ pub(crate) fn nvrtc_arch_of_ordinal(ordinal: usize) -> Option<&'static str> {
         return Some(a);
     }
     crate::tensor::cuda::runtime::require().ok()?;
-    use cudarc::driver::result as cu;
-    use cudarc::driver::sys::CUdevice_attribute as A;
+    use crate::tensor::gpu_runtime::driver::result as cu;
+    use crate::tensor::gpu_runtime::driver::sys::CUdevice_attribute as A;
     let d = cu::device::get(ordinal as i32).ok()?;
     let maj =
         unsafe { cu::device::get_attribute(d, A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) }
@@ -122,8 +124,8 @@ pub(crate) fn nvrtc_arch() -> Option<&'static str> {
     static ARCH: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
     *ARCH.get_or_init(|| {
         crate::tensor::cuda::runtime::require().ok()?;
-        use cudarc::driver::result as cu;
-        use cudarc::driver::sys::CUdevice_attribute as A;
+        use crate::tensor::gpu_runtime::driver::result as cu;
+        use crate::tensor::gpu_runtime::driver::sys::CUdevice_attribute as A;
         cu::init().ok()?;
         let n = cu::device::get_count().ok()?;
         let mut min: Option<(i32, i32)> = None;
@@ -167,13 +169,13 @@ pub(crate) fn get_mmvq_ptx_for_ordinal(ordinal: usize) -> Result<&'static str> {
         return Ok(p);
     }
     let compiled: String = {
-        let opts = cudarc::nvrtc::safe::CompileOptions {
+        let opts = crate::tensor::gpu_runtime::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
             ..Default::default()
         };
         let src = format!("{NVRTC_COMPAT_H}\n{GGUF_BLOCKS_CUH}\n{MMVQ_CU}");
-        match cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts) {
+        match crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx_with_opts(src, opts) {
             Ok(ptx) => {
                 let s = ptx.to_src();
                 tracing::info!(

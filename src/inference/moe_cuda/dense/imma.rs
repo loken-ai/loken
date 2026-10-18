@@ -32,7 +32,7 @@ fn card_and_stream(input: &Tensor) -> Result<(crate::tensor::kernel_ffi::CudaDev
 fn device_address<T: crate::tensor::kernel_ffi::CudaDType>(
     t: &Tensor,
     what: &str,
-) -> Result<cudarc::driver::sys::CUdeviceptr> {
+) -> Result<crate::tensor::gpu_runtime::driver::sys::CUdeviceptr> {
     let (storage, _) = t.storage_and_layout();
     match &*storage {
         StorageView::Cuda(c) => {
@@ -53,7 +53,7 @@ fn q8_1_activation(
     size_k: usize,
     rows: usize,
     dev: &crate::tensor::kernel_ffi::CudaDevice,
-) -> Result<cudarc::driver::CudaSlice<u8>> {
+) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<u8>> {
     use crate::tensor::quantized::GgmlDType;
     let q8_1 = GgmlDType::Q8_1;
     let bytes = rows * (size_k / q8_1.block_size()) * q8_1.type_size();

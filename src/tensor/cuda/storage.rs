@@ -164,12 +164,12 @@ impl CudaStorage {
         *g.entry((src, dst)).or_insert_with(|| {
             let mut can: std::ffi::c_int = 0;
             let ok = unsafe {
-                cudarc::driver::sys::cuDeviceCanAccessPeer(
+                crate::tensor::gpu_runtime::driver::sys::cuDeviceCanAccessPeer(
                     &mut can,
                     src as std::ffi::c_int,
                     dst as std::ffi::c_int,
                 )
-            } == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS;
+            } == crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS;
             let can = ok && can != 0;
             if !can {
                 tracing::info!(

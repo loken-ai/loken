@@ -11,7 +11,7 @@ use super::*;
 /// `storage()` projection reuse ONE padded upload (no double VRAM).
 #[cfg(feature = "cuda")]
 pub struct QCudaStorage {
-    pub(crate) blob: Arc<cudarc::driver::CudaSlice<u8>>,
+    pub(crate) blob: Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
     /// Unpadded byte length of the block data.
     pub(crate) len: usize,
     dtype: GgmlDType,
@@ -28,7 +28,7 @@ fn padded_blob(
     device: &CudaDevice,
     what: &'static str,
     len: usize,
-) -> Result<cudarc::driver::CudaSlice<u8>> {
+) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<u8>> {
     crate::tensor::cuda::with_oom_retry(&device.0, what, || {
         device
             .0
@@ -66,14 +66,14 @@ impl QCudaStorage {
     pub(crate) fn arena(
         device: &CudaDevice,
         len: usize,
-    ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>> {
+    ) -> Result<Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>> {
         Ok(Arc::new(padded_blob(device, "expert staging arena", len)?))
     }
 
     /// This type over a blob that other storages share, whose first `len` bytes hold this one's
     /// blocks while it is the one in use.
     pub(crate) fn sharing(
-        blob: Arc<cudarc::driver::CudaSlice<u8>>,
+        blob: Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
         len: usize,
         dtype: GgmlDType,
         device: &CudaDevice,
@@ -103,13 +103,13 @@ impl QCudaStorage {
     pub(crate) fn arena_in_lent_pool(
         device: &CudaDevice,
         len: usize,
-    ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>> {
+    ) -> Result<Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>> {
         Ok(Arc::new(lent_blob(device, len + BLOB_TAIL_PAD_BYTES)?))
     }
 
     /// This type over an already-allocated blob whose first `len` bytes are the block data.
     fn over(
-        blob: cudarc::driver::CudaSlice<u8>,
+        blob: crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
         len: usize,
         dtype: GgmlDType,
         device: &CudaDevice,
@@ -151,12 +151,15 @@ impl QCudaStorage {
 
     /// Raw row-padded quantized blob (kernel launchers pair this with
     /// [`Self::dtype`]).
-    pub fn weight_cuda_slice(&self) -> &cudarc::driver::CudaSlice<u8> {
+    pub fn weight_cuda_slice(&self) -> &crate::tensor::gpu_runtime::driver::CudaSlice<u8> {
         &self.blob
     }
 
     /// First `byte_len` (unpadded) bytes as a device view.
-    pub fn data_slice_for_copy(&self, byte_len: usize) -> Result<cudarc::driver::CudaView<'_, u8>> {
+    pub fn data_slice_for_copy(
+        &self,
+        byte_len: usize,
+    ) -> Result<crate::tensor::gpu_runtime::driver::CudaView<'_, u8>> {
         if byte_len > self.len {
             return Err(Error::msg(format!(
                 "data_slice_for_copy: byte_len {byte_len} exceeds unpadded length {}",
@@ -167,7 +170,7 @@ impl QCudaStorage {
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         Ok(self.blob.device_ptr(self.blob.stream()).0 as *const u8)
     }
 
@@ -181,7 +184,7 @@ impl QCudaStorage {
         layout: L,
     ) -> Result<()> {
         let layout = layout.borrow();
-        use cudarc::driver::PushKernelArg;
+        use crate::tensor::gpu_runtime::driver::PushKernelArg;
         let offset = layout.start_offset();
         let elem_count = layout.shape().elem_count();
         let (is_q4, kname_f32, kname_f16) = match self.dtype {
@@ -266,14 +269,14 @@ impl QCudaStorage {
 
 #[cfg(feature = "cuda")]
 enum QuantizeSrc<'a> {
-    F32(cudarc::driver::CudaView<'a, f32>),
-    F16(cudarc::driver::CudaView<'a, half::f16>),
+    F32(crate::tensor::gpu_runtime::driver::CudaView<'a, f32>),
+    F16(crate::tensor::gpu_runtime::driver::CudaView<'a, half::f16>),
 }
 
 /// The memory pool of card `ordinal` that holds the blobs lent to a prefill (made on first use).
 #[cfg(feature = "cuda")]
-fn lent_pool(ordinal: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
-    use cudarc::driver::sys;
+fn lent_pool(ordinal: usize) -> Result<crate::tensor::gpu_runtime::driver::sys::CUmemoryPool> {
+    use crate::tensor::gpu_runtime::driver::sys;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static POOLS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
@@ -301,8 +304,11 @@ fn lent_pool(ordinal: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
 
 /// `bytes` zeroed bytes from the memory pool of the card that holds only what is lent.
 #[cfg(feature = "cuda")]
-fn lent_blob(device: &CudaDevice, bytes: usize) -> Result<cudarc::driver::CudaSlice<u8>> {
-    use cudarc::driver::sys;
+fn lent_blob(
+    device: &CudaDevice,
+    bytes: usize,
+) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<u8>> {
+    use crate::tensor::gpu_runtime::driver::sys;
     let pool = lent_pool(device.0.ordinal())?;
     device
         .0
@@ -332,7 +338,7 @@ fn lent_blob(device: &CudaDevice, bytes: usize) -> Result<cudarc::driver::CudaSl
 pub(crate) fn trim_lent_pool(ordinal: usize) {
     if let Ok(pool) = lent_pool(ordinal) {
         unsafe {
-            let _ = cudarc::driver::sys::cuMemPoolTrimTo(pool, 0);
+            let _ = crate::tensor::gpu_runtime::driver::sys::cuMemPoolTrimTo(pool, 0);
         }
     }
 }

@@ -259,7 +259,7 @@ impl MarlinAwqRepacked {
 #[cfg(feature = "cuda")]
 mod device {
     use super::*;
-    use cudarc::driver::{CudaSlice, CudaView, DevicePtr};
+    use crate::tensor::gpu_runtime::driver::{CudaSlice, CudaView, DevicePtr};
     use std::sync::Arc;
 
     extern "C" {
@@ -319,7 +319,9 @@ mod device {
                 return Ok(s);
             }
         }
-        let err = |e: cudarc::driver::DriverError| Error(format!("marlin scratch alloc: {e}"));
+        let err = |e: crate::tensor::gpu_runtime::driver::DriverError| {
+            Error(format!("marlin scratch alloc: {e}"))
+        };
         let scratch = Arc::new(MarlinScratch {
             c_tmp: stream
                 .alloc_zeros::<f32>(nsm * 64 * MAX_THREAD_N)
@@ -364,7 +366,9 @@ mod device {
         ) -> Result<Self> {
             let stream = dev.stream();
             let info = dev.mmq_device_info()?;
-            let err = |e: cudarc::driver::DriverError| Error(format!("marlin upload: {e}"));
+            let err = |e: crate::tensor::gpu_runtime::driver::DriverError| {
+                Error(format!("marlin upload: {e}"))
+            };
             let b_q = stream.clone_htod(&r.b_q).map_err(err)?;
             let scales = stream.clone_htod(&r.scales).map_err(err)?;
             let zp = stream.clone_htod(&r.zp).map_err(err)?;

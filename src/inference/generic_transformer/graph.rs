@@ -193,9 +193,14 @@ impl GraphHop {
             .bind_to_thread()
             .map_err(|e| crate::tensor::Error::msg(format!("graph hop: bind context: {e:?}")))?;
         let r = unsafe {
-            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(self.host, ptr, bytes, stream.cu_stream())
+            crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoHAsync_v2(
+                self.host,
+                ptr,
+                bytes,
+                stream.cu_stream(),
+            )
         };
-        if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+        if r != crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
             crate::tensor::bail!("graph hop: device to host copy failed: {r:?}");
         }
         Ok(())
@@ -230,14 +235,14 @@ impl GraphHop {
             .bind_to_thread()
             .map_err(|e| crate::tensor::Error::msg(format!("graph hop: bind context: {e:?}")))?;
         let r = unsafe {
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
                 ptr,
                 self.host,
                 self.bytes,
                 stream.cu_stream(),
             )
         };
-        if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+        if r != crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
             crate::tensor::bail!("graph hop: host to device copy failed: {r:?}");
         }
         Ok(self.dst.clone())

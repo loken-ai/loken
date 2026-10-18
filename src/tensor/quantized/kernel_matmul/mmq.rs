@@ -13,11 +13,11 @@ impl QKernelMatMul {
     pub(super) fn mmq_forward(
         &self,
         dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
-        blob: &cudarc::driver::CudaSlice<u8>,
-        x_slice: &cudarc::driver::CudaSlice<f32>,
+        blob: &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
+        x_slice: &crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
         rows: usize,
-    ) -> Result<cudarc::driver::CudaSlice<f32>> {
-        use cudarc::driver::DevicePtr;
+    ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<f32>> {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         const QK8_1: usize = 32;
         const BLOCK_Q8_1_MMQ_SIZE: usize = 4 * QK8_1 + 4 * 4; // 128 qs + 16 scale bytes
         let pad = |p: usize, q: usize| p.div_ceil(q) * q;

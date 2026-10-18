@@ -7,7 +7,7 @@ use super::*;
 /// Direct transposed 1-D conv for one batch slab (dilation 1, groups 1).
 pub fn convt1d_f32(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<f32>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<f32>,
     w: &CudaSlice<f32>,
     c_in: usize,
     c_out: usize,

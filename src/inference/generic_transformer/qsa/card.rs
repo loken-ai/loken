@@ -104,13 +104,13 @@ impl Staging {
         // is a card tensor of at least that size.
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.host, self.len);
-            let r = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            let r = crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
                 address_f32(dst)?,
                 self.host as *const std::ffi::c_void,
                 self.len * std::mem::size_of::<f32>(),
                 stream.cu_stream(),
             );
-            if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            if r != crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
                 crate::tensor::bail!("staged copy to the card failed: {r:?}");
             }
         }

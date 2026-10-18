@@ -97,7 +97,7 @@ pub fn free_now(device: &crate::tensor::Device) -> Option<u64> {
 
 /// [`free_now`] for a caller holding the card's context rather than a device.
 #[cfg(feature = "cuda")]
-pub fn free_in(ctx: &cudarc::driver::CudaContext) -> Option<u64> {
+pub fn free_in(ctx: &crate::tensor::gpu_runtime::driver::CudaContext) -> Option<u64> {
     ctx.mem_get_info().ok().map(|(free, _)| free as u64)
 }
 

@@ -193,7 +193,7 @@ impl Tensor {
     pub fn cuda_f32_slice(
         &self,
     ) -> Result<(
-        &cudarc::driver::CudaSlice<f32>,
+        &crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
         &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
     )> {
         match self.storage().as_ref() {
@@ -208,7 +208,7 @@ impl Tensor {
     pub fn cuda_f16_slice(
         &self,
     ) -> Result<(
-        &cudarc::driver::CudaSlice<half::f16>,
+        &crate::tensor::gpu_runtime::driver::CudaSlice<half::f16>,
         &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
     )> {
         match self.storage().as_ref() {
@@ -223,7 +223,7 @@ impl Tensor {
     pub fn cuda_bf16_slice(
         &self,
     ) -> Result<(
-        &cudarc::driver::CudaSlice<half::bf16>,
+        &crate::tensor::gpu_runtime::driver::CudaSlice<half::bf16>,
         &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
     )> {
         match self.storage().as_ref() {

@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cudarc::driver::sys::{self, CUresult};
+use crate::tensor::gpu_runtime::driver::sys::{self, CUresult};
 
 use super::*;
 
@@ -513,8 +513,8 @@ pub(super) struct GraphSide {
     /// The health of the worker that answers this layer, once one is started.
     health: OnceLock<Arc<Health>>,
     /// Around the copies of a request's late experts into the transit room.
-    upload_start: cudarc::driver::CudaEvent,
-    upload_end: cudarc::driver::CudaEvent,
+    upload_start: crate::tensor::gpu_runtime::driver::CudaEvent,
+    upload_end: crate::tensor::gpu_runtime::driver::CudaEvent,
 }
 
 impl LayerTier {
@@ -525,7 +525,7 @@ impl LayerTier {
         let [request, reply, abort, rows] = g.mail.words();
         let done = g.done.load(Ordering::Relaxed);
         let counter = (|| -> Result<[u32; 2]> {
-            use cudarc::driver::DevicePtr;
+            use crate::tensor::gpu_runtime::driver::DevicePtr;
             let (storage, layout) = g.counter.storage_and_layout();
             let crate::tensor::StorageView::Cuda(c) = &*storage else {
                 crate::tensor::bail!("the counter is on the card");
@@ -534,8 +534,12 @@ impl LayerTier {
             let src = slice.device_ptr(slice.stream()).0 + (layout.start_offset() * 4) as u64;
             let mut out = [0u32; 2];
             unsafe {
-                cudarc::driver::result::memcpy_dtoh_async(&mut out, src, self.copy.cu_stream())
-                    .map_err(|e| crate::tensor::Error::msg(format!("counter read: {e:?}")))?;
+                crate::tensor::gpu_runtime::driver::result::memcpy_dtoh_async(
+                    &mut out,
+                    src,
+                    self.copy.cu_stream(),
+                )
+                .map_err(|e| crate::tensor::Error::msg(format!("counter read: {e:?}")))?;
             }
             self.copy
                 .synchronize()
@@ -813,7 +817,7 @@ impl LayerTier {
             None => None,
         };
         unsafe {
-            use cudarc::driver::DevicePtr;
+            use crate::tensor::gpu_runtime::driver::DevicePtr;
             let late_ptr = match &late {
                 Some(t) => address_of::<f32>(t)? as *const f32,
                 None => std::ptr::null(),

@@ -67,7 +67,7 @@ pub(super) struct Bounce {
     /// Bytes of file a chunk carries; a chunk's aligned cover fits in one buffer.
     payload: usize,
     page: usize,
-    events: [Option<cudarc::driver::CudaEvent>; 2],
+    events: [Option<crate::tensor::gpu_runtime::driver::CudaEvent>; 2],
     next: usize,
 }
 
@@ -90,11 +90,14 @@ impl Bounce {
         let cap = payload + 2 * page;
         let mut bufs = [std::ptr::null_mut::<u8>(); 2];
         for i in 0..2 {
-            match unsafe { cudarc::driver::result::malloc_host(cap, 0) } {
+            match unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(cap, 0) } {
                 Ok(p) => bufs[i] = p as *mut u8,
                 Err(e) => {
                     for p in bufs.iter().filter(|p| !p.is_null()) {
-                        unsafe { cudarc::driver::result::free_host(*p as *mut _) }.ok();
+                        unsafe {
+                            crate::tensor::gpu_runtime::driver::result::free_host(*p as *mut _)
+                        }
+                        .ok();
                     }
                     return Err(format!("bounce buffer: {e}"));
                 }
@@ -123,7 +126,7 @@ impl Bounce {
         file_off: u64,
         len: usize,
         dst: u64,
-        stream: &cudarc::driver::CudaStream,
+        stream: &crate::tensor::gpu_runtime::driver::CudaStream,
     ) -> (usize, Option<String>) {
         use std::os::unix::fs::FileExt;
         let mut done = 0;
@@ -148,14 +151,14 @@ impl Bounce {
                 }
             }
             let r = unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
                     dst + done as u64,
                     self.bufs[i].add(skip) as *const std::ffi::c_void,
                     n,
                     stream.cu_stream(),
                 )
             };
-            if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            if r != crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
                 return (done, Some(format!("bounce to stage: {r:?}")));
             }
             match stream.record_event(None) {
@@ -175,7 +178,10 @@ impl Drop for Bounce {
             ev.synchronize().ok();
         }
         for p in self.bufs {
-            unsafe { cudarc::driver::result::free_host(p as *mut std::ffi::c_void) }.ok();
+            unsafe {
+                crate::tensor::gpu_runtime::driver::result::free_host(p as *mut std::ffi::c_void)
+            }
+            .ok();
         }
     }
 }

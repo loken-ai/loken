@@ -76,8 +76,8 @@ fn pcie_lane_gbs(generation: u32) -> f64 {
 /// driver never does. 0.0 when CUDA is absent or the query fails.
 #[cfg(feature = "cuda")]
 fn cuda_mem_bw_gbs(index: usize) -> f64 {
-    use cudarc::driver::result as cu;
-    use cudarc::driver::sys::CUdevice_attribute as A;
+    use crate::tensor::gpu_runtime::driver::result as cu;
+    use crate::tensor::gpu_runtime::driver::sys::CUdevice_attribute as A;
     if crate::tensor::cuda::runtime::require().is_err() {
         return 0.0;
     }
@@ -113,9 +113,9 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
     }
     #[cfg(feature = "cuda")]
     {
-        use cudarc::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
-        let _ = cudarc::driver::result::init();
-        if let Ok(n) = cudarc::driver::result::device::get_count() {
+        use crate::tensor::gpu_runtime::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
+        let _ = crate::tensor::gpu_runtime::driver::result::init();
+        if let Ok(n) = crate::tensor::gpu_runtime::driver::result::device::get_count() {
             let mut out = Vec::new();
             for ordinal in 0..n {
                 let mut id = [0 as std::os::raw::c_char; 64];
@@ -172,12 +172,12 @@ pub fn debug_vram_by_card(tag: &str) {
 /// retain/release argument, straight from the driver.
 #[cfg(feature = "cuda")]
 fn primary_ctx_active(ordinal: usize) -> bool {
-    use cudarc::driver::sys::{cuDevicePrimaryCtxGetState, cudaError_enum};
+    use crate::tensor::gpu_runtime::driver::sys::{cuDevicePrimaryCtxGetState, cudaError_enum};
     if crate::tensor::cuda::runtime::require().is_err() {
         return false;
     }
-    let _ = cudarc::driver::result::init();
-    let Ok(d) = cudarc::driver::result::device::get(ordinal as i32) else {
+    let _ = crate::tensor::gpu_runtime::driver::result::init();
+    let Ok(d) = crate::tensor::gpu_runtime::driver::result::device::get(ordinal as i32) else {
         return false;
     };
     let mut flags: u32 = 0;
@@ -264,7 +264,7 @@ pub fn card_pair_link(_from: usize, _to: usize) -> Option<(f64, f64)> {
 /// `None` when a card cannot be opened or NCCL does not take the group.
 #[cfg(feature = "cuda")]
 pub fn group_sum(cards: &[usize]) -> Option<(f64, f64)> {
-    use cudarc::nccl::safe::{group_end, group_start, Comm, ReduceOp};
+    use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start, Comm, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static GROUPS: OnceLock<Mutex<HashMap<Vec<usize>, Option<(f64, f64)>>>> = OnceLock::new();
@@ -614,10 +614,11 @@ mod primary_ctx_tests {
     #[ignore = "hardware probe: needs a second CUDA card and owns its context state"]
     fn a_context_releases_cleanly_until_cublas_latches_it() {
         let ord = 1usize;
-        if cudarc::driver::result::init().is_err() {
+        if crate::tensor::gpu_runtime::driver::result::init().is_err() {
             return;
         }
-        let count = cudarc::driver::result::device::get_count().unwrap_or(0) as usize;
+        let count =
+            crate::tensor::gpu_runtime::driver::result::device::get_count().unwrap_or(0) as usize;
         if count <= ord {
             return;
         }
@@ -665,7 +666,7 @@ mod visible_tests {
     /// `CUDA_VISIBLE_DEVICES` offers the cards it names and no others.
     #[test]
     fn the_probe_offers_the_cards_the_driver_numbers() {
-        if cudarc::driver::result::init().is_err() {
+        if crate::tensor::gpu_runtime::driver::result::init().is_err() {
             eprintln!("skipping: no usable CUDA driver");
             return;
         }
@@ -673,13 +674,21 @@ mod visible_tests {
             eprintln!("skipping: no NVML");
             return;
         };
-        let visible = cudarc::driver::result::device::get_count().unwrap_or(0) as usize;
+        let visible =
+            crate::tensor::gpu_runtime::driver::result::device::get_count().unwrap_or(0) as usize;
         let cards = visible_cards(&nvml);
         assert_eq!(cards.len(), visible, "every visible card and only those");
         for (ordinal, index) in cards {
-            let dev = cudarc::driver::result::device::get(ordinal as i32).unwrap();
+            let dev =
+                crate::tensor::gpu_runtime::driver::result::device::get(ordinal as i32).unwrap();
             let mut name = [0 as std::os::raw::c_char; 128];
-            unsafe { cudarc::driver::sys::cuDeviceGetName(name.as_mut_ptr(), 128, dev) };
+            unsafe {
+                crate::tensor::gpu_runtime::driver::sys::cuDeviceGetName(
+                    name.as_mut_ptr(),
+                    128,
+                    dev,
+                )
+            };
             let bytes: Vec<u8> = name
                 .iter()
                 .take_while(|&&c| c != 0)

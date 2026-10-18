@@ -472,7 +472,7 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
             .alloc_zeros::<i32>(num_experts + 1)
             .expect("alloc offsets");
         {
-            use cudarc::driver::DevicePtr;
+            use crate::tensor::gpu_runtime::driver::DevicePtr;
             let ids_ptr = ids_dev.device_ptr(stream).0 as *const i32;
             let off_ptr = offsets.device_ptr(stream).0 as *mut i32;
             unsafe {

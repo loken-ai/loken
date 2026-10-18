@@ -79,7 +79,11 @@ fn device_timed<T>(
         return crate::inference::offload::mark_stage_in_capture(name, &stream, launch);
     }
     let ctx = stream.context();
-    let event = || ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT));
+    let event = || {
+        ctx.new_event(Some(
+            crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+        ))
+    };
     let (Ok(start), Ok(end)) = (event(), event()) else {
         return launch();
     };

@@ -47,7 +47,7 @@ pub fn clear_device_cache() {}
 #[cfg(feature = "cuda")]
 mod cuda {
     use crate::tensor;
-    use cudarc::driver::sys::{
+    use crate::tensor::gpu_runtime::driver::sys::{
         CUgraphInstantiate_flags_enum, CUstreamCaptureMode, CUstreamCaptureStatus,
     };
     use std::sync::Arc;
@@ -58,21 +58,21 @@ mod cuda {
     // Re-export the raw handle types under the boundary's namespace so call sites
     // can name them without spelling out the cudarc path.
     pub use crate::tensor::cuda::{CapturedGraph, UpdateOutcome};
+    pub use crate::tensor::gpu_runtime::driver::{CudaEvent, CudaSlice, CudaStream, CudaView};
     pub use crate::tensor::kernel_ffi::CudaDevice as RawCudaDevice;
-    pub use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView};
 
     // Raw launch surface for the FFI kernel-wrapper files ( Wave 2): the
     // launch-config / kernel-arg / device-pointer traits every custom-kernel
     // launcher uses, the NVRTC compiler, and the CudaStorage wrapper for
     // kernel-produced slices.
+    pub use crate::tensor::gpu_runtime::driver::{DevicePtr, LaunchConfig, PushKernelArg};
+    pub use crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx;
     pub use crate::tensor::kernel_ffi::CudaStorage;
-    pub use cudarc::driver::{DevicePtr, LaunchConfig, PushKernelArg};
-    pub use cudarc::nvrtc::safe::compile_ptx;
 
     // Graph-introspection types for the gptoss/lfm2/engine CUDA-graph paths:
     // node-type histogram diagnostics + the cheap-update-or-
     // reinstantiate recapture outcome.
-    pub use cudarc::driver::sys::CUgraphNodeType;
+    pub use crate::tensor::gpu_runtime::driver::sys::CUgraphNodeType;
 
     fn msg<E: std::fmt::Debug>(ctx: &str) -> impl FnOnce(E) -> Error + '_ {
         move |e| Error::msg(format!("cuda_ext::{ctx}: {e:?}"))
@@ -172,9 +172,11 @@ mod cuda {
     /// Give the card back the memory its recorded graphs reserved and no longer use: a graph
     /// keeps what its allocation nodes took at their peak until the device is told to trim.
     pub fn graph_mem_trim(stream: &Arc<CudaStream>) -> Result<()> {
-        let device = cudarc::driver::result::device::get(stream.context().ordinal() as i32)
-            .map_err(msg("graph_mem_trim/device"))?;
-        unsafe { cudarc::driver::sys::cuDeviceGraphMemTrim(device) }
+        let device = crate::tensor::gpu_runtime::driver::result::device::get(
+            stream.context().ordinal() as i32,
+        )
+        .map_err(msg("graph_mem_trim/device"))?;
+        unsafe { crate::tensor::gpu_runtime::driver::sys::cuDeviceGraphMemTrim(device) }
             .result()
             .map_err(msg("graph_mem_trim"))
     }
@@ -201,8 +203,8 @@ mod cuda {
     /// capture (in-capture cuBLAS allocs invalidate the capture). Leaks the
     /// workspace by design (lives for the process).
     pub fn pin_cublas_workspace(device: &Device, bytes: usize) -> Result<()> {
-        use cudarc::cublas::sys::cublasSetWorkspace_v2;
-        use cudarc::driver::result::malloc_sync;
+        use crate::tensor::gpu_runtime::cublas::sys::cublasSetWorkspace_v2;
+        use crate::tensor::gpu_runtime::driver::result::malloc_sync;
         let cd = device.as_cuda_device()?;
         let raw = *cd.native().blas()?.handle();
         let ws = unsafe { malloc_sync(bytes) }.map_err(msg("pin_cublas_workspace/malloc"))?;
@@ -224,7 +226,10 @@ mod cuda {
     /// Safety contract is the caller's (raw pointer lifecycle).
     pub fn malloc_host(bytes: usize) -> std::result::Result<*mut std::ffi::c_void, String> {
         crate::tensor::cuda::runtime::require().map_err(|e| e.to_string())?;
-        unsafe { cudarc::driver::result::malloc_host(bytes, 0).map_err(|e| format!("{e}")) }
+        unsafe {
+            crate::tensor::gpu_runtime::driver::result::malloc_host(bytes, 0)
+                .map_err(|e| format!("{e}"))
+        }
     }
 
     /// # Safety
@@ -232,7 +237,7 @@ mod cuda {
     /// nothing may alias it afterwards.
     pub unsafe fn free_host(ptr: *mut std::ffi::c_void) {
         unsafe {
-            let _ = cudarc::driver::result::free_host(ptr);
+            let _ = crate::tensor::gpu_runtime::driver::result::free_host(ptr);
         }
     }
 

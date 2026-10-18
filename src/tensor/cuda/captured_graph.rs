@@ -7,7 +7,7 @@
 //! the first instantiation.
 //! The driver does not synchronise graph objects, so one is never used from two threads at once.
 
-use cudarc::driver::{result, sys, CudaStream, DriverError};
+use crate::tensor::gpu_runtime::driver::{result, sys, CudaStream, DriverError};
 use std::sync::Arc;
 
 /// How `end_capture_or_reinstantiate` brought the executable up to date.
@@ -208,7 +208,7 @@ impl CapturedGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cudarc::driver::CudaContext;
+    use crate::tensor::gpu_runtime::driver::CudaContext;
 
     const CAPTURE: sys::CUstreamCaptureMode =
         sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED;

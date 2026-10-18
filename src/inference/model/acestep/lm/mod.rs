@@ -1033,7 +1033,9 @@ impl Qwen3Lm {
     /// error the caller falls back to the eager `forward_b2_t`.
     #[cfg(feature = "cuda")]
     fn forward_b2_graph(&self, chosen: u32, kv: &mut CfgKv) -> Result<Tensor> {
-        use cudarc::driver::sys::{CUgraphInstantiate_flags_enum, CUstreamCaptureMode};
+        use crate::tensor::gpu_runtime::driver::sys::{
+            CUgraphInstantiate_flags_enum, CUstreamCaptureMode,
+        };
         // The decode graph is SINGLE-DEVICE by construction (its input buffers live on the
         // primary device and every captured op must run there). Under a hetero plan that
         // spilled layers onto another CUDA card, a capture attempt aborts MID-STREAM on the
@@ -1106,8 +1108,8 @@ impl Qwen3Lm {
         // cuBLAS alloc invalidates it). Guarded so recaptures don't leak a workspace.
         static CUBLAS_WS_PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         if CUBLAS_WS_PINNED.get().is_none() {
-            use cudarc::cublas::sys::cublasSetWorkspace_v2;
-            use cudarc::driver::result::malloc_sync;
+            use crate::tensor::gpu_runtime::cublas::sys::cublasSetWorkspace_v2;
+            use crate::tensor::gpu_runtime::driver::result::malloc_sync;
             // Sized from the bucket the graph is captured at: the workspace backs the
             // score GEMMs of one step, so a wider bucket means wider score matrices and
             // more split-k staging behind them. A fixed figure is right for one bucket.

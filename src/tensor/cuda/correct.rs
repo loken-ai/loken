@@ -9,9 +9,9 @@
 //! where a matrix one block wide costs nothing.
 
 use super::*;
+use crate::tensor::gpu_runtime::cublas::sys;
+use crate::tensor::gpu_runtime::driver::{DevicePtr, DevicePtrMut};
 use crate::tensor::quantized::GgmlDType;
-use cudarc::cublas::sys;
-use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 /// Values per block of the formats this carries: one block per row of a block of columns.
 const BLOCK: usize = 256;

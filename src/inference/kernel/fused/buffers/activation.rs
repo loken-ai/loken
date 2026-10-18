@@ -279,11 +279,14 @@ pub(super) fn get_ptx(cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice) -> Resu
     let ptx: &'static str = match g.get(arch) {
         Some(p) => p,
         None => {
-            let opts = cudarc::nvrtc::CompileOptions {
+            let opts = crate::tensor::gpu_runtime::nvrtc::CompileOptions {
                 arch: (arch != "generic").then_some(arch),
                 ..Default::default()
             };
-            let src = match cudarc::nvrtc::compile_ptx_with_opts(FUSED_CUDA_SRC, opts) {
+            let src = match crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(
+                FUSED_CUDA_SRC,
+                opts,
+            ) {
                 Ok(ptx) => ptx.to_src(),
                 Err(e) => {
                     tracing::error!("NVRTC compile failed for {arch}: {e}");

@@ -742,13 +742,13 @@ pub fn moe_gemm_gguf_down_reduce_over(
                     dev.cuda_stream().context().bind_to_thread()?;
                     let src = dev_addr::<f32>(&res, "residual")?;
                     unsafe {
-                        let st = cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        let st = crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoDAsync_v2(
                             dst,
                             src,
                             out_count * std::mem::size_of::<f32>(),
                             dev.cuda_stream().cu_stream(),
                         );
-                        if st != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        if st != crate::tensor::gpu_runtime::driver::sys::CUresult::CUDA_SUCCESS {
                             crate::tensor::bail!(
                                 "cuMemcpyDtoDAsync (residual init) failed: {st:?}"
                             );

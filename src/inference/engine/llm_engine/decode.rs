@@ -1063,8 +1063,11 @@ impl DecodeGraph {
         let prof = stage_prof_enabled();
         let started = prof.then(std::time::Instant::now);
         let mut last = None;
-        let mut timed: Vec<(usize, cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)> =
-            Vec::new();
+        let mut timed: Vec<(
+            usize,
+            crate::tensor::gpu_runtime::driver::CudaEvent,
+            crate::tensor::gpu_runtime::driver::CudaEvent,
+        )> = Vec::new();
         for (at, step) in self.steps.iter().enumerate() {
             let t = prof.then(std::time::Instant::now);
             match step {
@@ -1073,7 +1076,7 @@ impl DecodeGraph {
                         let ctx = s.context();
                         let new = || {
                             ctx.new_event(Some(
-                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+                                crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
                             ))
                         };
                         match (new(), new()) {
@@ -1248,7 +1251,7 @@ fn report_kernel_costs(
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let ctx = s.context();
     let time = |g: &crate::tensor::cuda_ext::CapturedGraph| -> Option<f64> {
-        let flags = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        let flags = crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
         let (a, b) = (
             ctx.new_event(Some(flags)).ok()?,
             ctx.new_event(Some(flags)).ok()?,

@@ -98,14 +98,14 @@ const TRANSIT_PACE_SAMPLES: u64 = 16;
 /// A tier's table on the card of its extra stacks' addresses: three `u64`, at an address that
 /// stays for the tier's life.
 struct ExtraTable {
-    slice: Mutex<cudarc::driver::CudaSlice<u64>>,
+    slice: Mutex<crate::tensor::gpu_runtime::driver::CudaSlice<u64>>,
     addr: u64,
 }
 
 impl ExtraTable {
     /// A table of nulls on `dev`.
     fn new(dev: &Device) -> Result<Self> {
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         let cd = dev.as_cuda_device()?;
         let slice = cd.alloc_zeros::<u64>(3)?;
         let addr = slice.device_ptr(slice.stream()).0;
@@ -158,9 +158,14 @@ pub struct LayerTier {
     resident: bool,
     /// While a prompt holds the layer's stacks: the routing of its chunks so far and the stream
     /// they ran on, ranked into the cache once, when the hold ends.
-    prompt_ids: Mutex<Option<(Arc<cudarc::driver::CudaStream>, Vec<Tensor>)>>,
+    prompt_ids: Mutex<
+        Option<(
+            Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+            Vec<Tensor>,
+        )>,
+    >,
     /// The stream this layer's copies into the cache run on.
-    copy: Arc<cudarc::driver::CudaStream>,
+    copy: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     /// A copy into the cache is queued or running.
     promoting: std::sync::atomic::AtomicBool,
     /// Microseconds a decoded token took here, smoothed: what a batch's rows cost one by one.
@@ -202,8 +207,8 @@ struct Scratch {
     transit_weights: Tensor,
     /// Recorded around the copies into the transit room, and how many experts they carried:
     /// read on the layer's next token, when they are long done.
-    upload_start: cudarc::driver::CudaEvent,
-    upload_end: cudarc::driver::CudaEvent,
+    upload_start: crate::tensor::gpu_runtime::driver::CudaEvent,
+    upload_end: crate::tensor::gpu_runtime::driver::CudaEvent,
     in_flight: std::sync::atomic::AtomicUsize,
 }
 
@@ -230,7 +235,7 @@ impl Scratch {
             .bind_to_thread()
             .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
         let bytes = 4 * (2 * hidden + 6 * k);
-        let pinned = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
+        let pinned = unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(bytes, 0) }
             .map_err(|e| crate::tensor::Error::msg(format!("pinned scratch: {e}")))?
             as *mut u8;
         let host = Device::Cpu;
@@ -274,23 +279,30 @@ impl Scratch {
 }
 
 /// An event that keeps the time it was reached at.
-fn timed_event(dev: &Device) -> Result<cudarc::driver::CudaEvent> {
+fn timed_event(dev: &Device) -> Result<crate::tensor::gpu_runtime::driver::CudaEvent> {
     dev.as_cuda_device()?
         .0
         .context()
-        .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+        .new_event(Some(
+            crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+        ))
         .map_err(|e| crate::tensor::Error::msg(format!("event: {e:?}")))
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        unsafe { cudarc::driver::result::free_host(self.pinned as *mut std::ffi::c_void) }.ok();
+        unsafe {
+            crate::tensor::gpu_runtime::driver::result::free_host(
+                self.pinned as *mut std::ffi::c_void,
+            )
+        }
+        .ok();
     }
 }
 
 /// The card's address of the first element of `t`, which a copy reads or writes.
 pub(super) fn address_of<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     match &*storage {
         crate::tensor::StorageView::Cuda(c) => {
@@ -324,7 +336,7 @@ pub struct CardStager {
     dev: Device,
     /// Bytes per microsecond the host sends to this card, measured when the stager is made.
     bandwidth: f64,
-    copy: Arc<cudarc::driver::CudaStream>,
+    copy: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     /// Bytes of the widest stack of each kind: what the arenas of a wide batch hold.
     widest: [usize; 3],
     /// How many experts the transit room holds.
@@ -351,15 +363,15 @@ pub struct CardStager {
 
 /// One of two sets of arenas, a stack each, that consecutive layers take turns over.
 struct StageBuffer {
-    arenas: [Arc<cudarc::driver::CudaSlice<u8>>; 3],
+    arenas: [Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>; 3],
 }
 
 /// [`StageBuffer`] wide enough for the whole stacks of the widest layer.
 struct FullBuffer {
-    arenas: [Arc<cudarc::driver::CudaSlice<u8>>; 3],
+    arenas: [Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>; 3],
     /// Recorded when the layer that read the buffer last has queued all its kernels: the next
     /// fill waits for it.
-    free: Mutex<Option<cudarc::driver::CudaEvent>>,
+    free: Mutex<Option<crate::tensor::gpu_runtime::driver::CudaEvent>>,
 }
 
 /// A layer's view of its buffer: the three stacks as tensors over the arenas, and the copies in
@@ -372,7 +384,7 @@ struct Stage {
     /// The whole stacks of the layer in the room of a wide batch, while there is one.
     full: Mutex<Option<Arc<[QTensor; 3]>>>,
     /// The fill's end, when one has been queued and not yet read.
-    ready: Mutex<Option<cudarc::driver::CudaEvent>>,
+    ready: Mutex<Option<crate::tensor::gpu_runtime::driver::CudaEvent>>,
     /// Host ranges, per stack, that are page-locked: copies from them are asynchronous.
     pinned: [Option<(usize, usize)>; 3],
     /// The direct reader for the parts of an upload the page cache does not hold.
@@ -1695,7 +1707,12 @@ impl LayerTier {
             ),
         ] {
             driver("choice to host", unsafe {
-                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(dst, src, bytes, stream.cu_stream())
+                crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoHAsync_v2(
+                    dst,
+                    src,
+                    bytes,
+                    stream.cu_stream(),
+                )
             })?;
         }
         let prof = crate::inference::offload::stage_prof_enabled();
@@ -1789,7 +1806,12 @@ impl LayerTier {
                 ),
             ] {
                 driver("slots to card", unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src, bytes, stream.cu_stream())
+                    crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
+                        dst,
+                        src,
+                        bytes,
+                        stream.cu_stream(),
+                    )
                 })?;
             }
             let routing = ExpertRouting {
@@ -1839,7 +1861,7 @@ impl LayerTier {
             let product = routing.host_down_reduce(&h, &self.host[2], &w, 1, None)?;
             h_out.copy_from_slice(&product.flatten_all()?.to_vec1::<f32>()?);
             driver("product to card", unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
                     address_of::<f32>(&scratch.product)?,
                     h_out.as_ptr() as *const std::ffi::c_void,
                     4 * hidden,
@@ -1881,7 +1903,12 @@ impl LayerTier {
                 ),
             ] {
                 driver("transit to card", unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src, bytes, stream.cu_stream())
+                    crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
+                        dst,
+                        src,
+                        bytes,
+                        stream.cu_stream(),
+                    )
                 })?;
             }
             stream
@@ -2214,7 +2241,7 @@ impl LayerTier {
     pub(super) fn keep_hottest_of_prompt(
         &self,
         ids: &Tensor,
-        stream: &Arc<cudarc::driver::CudaStream>,
+        stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         if self.stage.is_none() || self.resident {
             return Ok(());
@@ -2241,7 +2268,7 @@ impl LayerTier {
     fn keep_hottest_now(
         &self,
         ids: &Tensor,
-        stream: &Arc<cudarc::driver::CudaStream>,
+        stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         let ids_h: Vec<u32> = ids
             .to_dtype(crate::tensor::DType::U32)?
@@ -2284,9 +2311,9 @@ impl LayerTier {
         experts: &[u32],
         by_id: bool,
         in_use: &mut [bool],
-        stream: &Arc<cudarc::driver::CudaStream>,
+        stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         let Some(stage) = self.stage.as_ref() else {
             return Ok(());
         };
@@ -2336,7 +2363,12 @@ impl LayerTier {
                 let from = arena.device_ptr(arena.stream()).0 + (at * eb) as u64;
                 let to = self.slot_addr(i, slot)?;
                 driver("transit to slot", unsafe {
-                    cudarc::driver::sys::cuMemcpyDtoDAsync_v2(to, from, eb, stream.cu_stream())
+                    crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoDAsync_v2(
+                        to,
+                        from,
+                        eb,
+                        stream.cu_stream(),
+                    )
                 })?;
             }
             self.promotions.fetch_add(1, Ordering::Relaxed);
@@ -2391,11 +2423,11 @@ impl LayerTier {
     /// [`Self::copy_to_transit`] with the events that bracket the copies.
     pub(super) fn copy_to_transit_between(
         &self,
-        start: &cudarc::driver::CudaEvent,
-        end: &cudarc::driver::CudaEvent,
+        start: &crate::tensor::gpu_runtime::driver::CudaEvent,
+        end: &crate::tensor::gpu_runtime::driver::CudaEvent,
         experts: &[u32],
     ) -> Result<()> {
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         let stage = self.stage.as_ref().expect("a copy to transit has a stage");
         let copy = &stage.stager.copy;
         let buffer = &stage.stager.buffers[stage.buffer];
@@ -2581,8 +2613,8 @@ fn blend(cell: &AtomicU64, sample: f64) {
 }
 
 /// CUDA driver result as a tensor error.
-fn driver(what: &str, r: cudarc::driver::sys::cudaError_enum) -> Result<()> {
-    if r == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+fn driver(what: &str, r: crate::tensor::gpu_runtime::driver::sys::cudaError_enum) -> Result<()> {
+    if r == crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
         Ok(())
     } else {
         Err(crate::tensor::Error::msg(format!("{what}: {r:?}")))
@@ -2831,28 +2863,29 @@ fn host_read_bandwidth(bytes: usize) -> f64 {
 /// the best of a few.
 fn measure_upload_bandwidth(
     dev: &Device,
-    arena: &Arc<cudarc::driver::CudaSlice<u8>>,
+    arena: &Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
     arena_bytes: usize,
 ) -> Result<f64> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let cd = dev.as_cuda_device()?;
     cd.0.context()
         .bind_to_thread()
         .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
     let bytes = arena_bytes.min(64 << 20);
-    let host = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
+    let host = unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(bytes, 0) }
         .map_err(|e| crate::tensor::Error::msg(format!("pinned probe: {e}")))?;
     let dst = arena.device_ptr(arena.stream()).0;
     let mut best = f64::MAX;
     for _ in 0..3 {
         let t = std::time::Instant::now();
-        let r = unsafe { cudarc::driver::sys::cuMemcpyHtoD_v2(dst, host, bytes) };
+        let r =
+            unsafe { crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoD_v2(dst, host, bytes) };
         let us = t.elapsed().as_secs_f64() * 1e6;
-        if r == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+        if r == crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
             best = best.min(us);
         }
     }
-    unsafe { cudarc::driver::result::free_host(host) }.ok();
+    unsafe { crate::tensor::gpu_runtime::driver::result::free_host(host) }.ok();
     Ok(if best.is_finite() && best > 0.0 {
         bytes as f64 / best
     } else {
@@ -2871,9 +2904,13 @@ fn lock_pages(ptr: usize, len: usize) -> Option<(usize, usize)> {
     // Read-only: the mapping is the file's.
     const READ_ONLY: u32 = 8;
     let r = unsafe {
-        cudarc::driver::sys::cuMemHostRegister_v2(lo as *mut std::ffi::c_void, hi - lo, READ_ONLY)
+        crate::tensor::gpu_runtime::driver::sys::cuMemHostRegister_v2(
+            lo as *mut std::ffi::c_void,
+            hi - lo,
+            READ_ONLY,
+        )
     };
-    (r == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS).then_some((lo, hi))
+    (r == crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS).then_some((lo, hi))
 }
 
 impl Stage {
@@ -2922,7 +2959,11 @@ impl Stage {
 impl Drop for Stage {
     fn drop(&mut self) {
         for r in self.pinned.iter().flatten() {
-            unsafe { cudarc::driver::sys::cuMemHostUnregister(r.0 as *mut std::ffi::c_void) };
+            unsafe {
+                crate::tensor::gpu_runtime::driver::sys::cuMemHostUnregister(
+                    r.0 as *mut std::ffi::c_void,
+                )
+            };
         }
     }
 }
@@ -2998,7 +3039,7 @@ impl LayerTier {
             .unwrap_or_else(|e| e.into_inner())
             .slot_of
             .clone();
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         for i in 0..3 {
             let eb = self.expert_bytes[i];
             let arena = &buffer.arenas[i];
@@ -3008,7 +3049,7 @@ impl LayerTier {
             // with zeros: that tail is zero, as every blob's is, and not what the layer before
             // left in the arena - a scale in it that is not finite would poison the zeros.
             driver("stage tail", unsafe {
-                cudarc::driver::sys::cuMemsetD8Async(
+                crate::tensor::gpu_runtime::driver::sys::cuMemsetD8Async(
                     base + data.len() as u64,
                     0,
                     crate::tensor::quantized::BLOB_TAIL_PAD_BYTES,
@@ -3019,7 +3060,7 @@ impl LayerTier {
             while e < self.n_experts {
                 if slot_of[e] >= 0 {
                     driver("slot to stage", unsafe {
-                        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoDAsync_v2(
                             base + (e * eb) as u64,
                             self.slot_addr(i, slot_of[e] as usize)?,
                             eb,
@@ -3060,7 +3101,7 @@ impl LayerTier {
         start: usize,
         len: usize,
         dst: u64,
-        copy: &Arc<cudarc::driver::CudaStream>,
+        copy: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         let (a, b) = (
             data.as_ptr() as usize + start,
@@ -3084,7 +3125,7 @@ impl LayerTier {
         start: usize,
         len: usize,
         dst: u64,
-        copy: &Arc<cudarc::driver::CudaStream>,
+        copy: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         let (a, b) = (
             data.as_ptr() as usize + start,
@@ -3106,7 +3147,7 @@ impl LayerTier {
         to: usize,
         a: usize,
         dst: u64,
-        copy: &Arc<cudarc::driver::CudaStream>,
+        copy: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         if to <= from {
             return Ok(());
@@ -3114,7 +3155,7 @@ impl LayerTier {
         // One copy for each piece within or between the experts held in host memory.
         hot::for_each_piece(from, to, |lo, hi| {
             driver("expert to stage", unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
                     dst + (lo - a) as u64,
                     lo as *const std::ffi::c_void,
                     hi - lo,
@@ -3132,7 +3173,7 @@ impl LayerTier {
         to: usize,
         a: usize,
         dst: u64,
-        copy: &Arc<cudarc::driver::CudaStream>,
+        copy: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         if to <= from {
             return Ok(());
@@ -3162,7 +3203,7 @@ impl LayerTier {
         to: usize,
         a: usize,
         dst: u64,
-        copy: &Arc<cudarc::driver::CudaStream>,
+        copy: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let Some(stage) = self.stage.as_ref() else {
@@ -3357,14 +3398,19 @@ mod tests {
     static LENT_POOL: Mutex<()> = Mutex::new(());
 
     fn poison(stager: &CardStager) {
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         let cd = stager.dev.as_cuda_device().unwrap();
         cd.0.context().bind_to_thread().unwrap();
         for buffer in &stager.buffers {
             for arena in &buffer.arenas {
                 let base = arena.device_ptr(arena.stream()).0;
-                let r = unsafe { cudarc::driver::sys::cuMemsetD8_v2(base, 0xFF, arena.len()) };
-                assert_eq!(r, cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS);
+                let r = unsafe {
+                    crate::tensor::gpu_runtime::driver::sys::cuMemsetD8_v2(base, 0xFF, arena.len())
+                };
+                assert_eq!(
+                    r,
+                    crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS
+                );
             }
         }
         cd.0.synchronize().unwrap();

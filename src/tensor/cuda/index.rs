@@ -95,7 +95,7 @@ fn copy_rows(
     dst_off: usize,
     src_off: usize,
 ) -> Result<()> {
-    use cudarc::driver::{sys, DevicePtr};
+    use crate::tensor::gpu_runtime::driver::{sys, DevicePtr};
     if n_rows == 0 || width == 0 {
         return Ok(());
     }

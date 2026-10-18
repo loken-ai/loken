@@ -506,7 +506,7 @@ fn embed_rows_launch(
 fn card_address<T: crate::tensor::kernel_ffi::CudaDType>(
     t: &crate::tensor::Tensor,
 ) -> crate::tensor::Result<u64> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     match &*storage {
         crate::tensor::StorageView::Cuda(c) => {

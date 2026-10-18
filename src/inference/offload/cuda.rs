@@ -15,11 +15,11 @@ use crate::tensor::cuda::{
     CudaDevice, ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
     QUANT_LINEAR_TILE_BYTES,
 };
+use crate::tensor::gpu_runtime::driver::CudaSlice;
 use crate::tensor::ops::rms_norm;
 use crate::tensor::ops::softmax_last_dim;
 use crate::tensor::quantized::{matvec_rows, GgmlDType, QMatMul, QTensor};
 use crate::tensor::{Device, Error, Result, Tensor};
-use cudarc::driver::CudaSlice;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

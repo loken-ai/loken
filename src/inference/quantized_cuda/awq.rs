@@ -150,7 +150,7 @@ pub fn awq_gemv_dp4a_storage(
 thread_local! {
     /// Per-thread q8_1 activation scratch buffers, keyed by byte size, reused
     /// across dp4a decode projections to avoid a per-call device allocation.
-    static YQ_POOL: std::cell::RefCell<std::collections::HashMap<usize, cudarc::driver::CudaSlice<u8>>>
+    static YQ_POOL: std::cell::RefCell<std::collections::HashMap<usize, crate::tensor::gpu_runtime::driver::CudaSlice<u8>>>
         = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -307,12 +307,12 @@ fn quantized_source() -> String {
 /// NVRTC-compiles `src` for `arch`, or returns an empty string after logging the failure so
 /// the cache remembers it and the compile is not retried on every call.
 fn compile_or_empty(src: String, arch: Option<&'static str>, what: &str) -> String {
-    let opts = cudarc::nvrtc::safe::CompileOptions {
+    let opts = crate::tensor::gpu_runtime::nvrtc::safe::CompileOptions {
         include_paths: cuda_include_paths(),
         arch,
         ..Default::default()
     };
-    match cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts) {
+    match crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx_with_opts(src, opts) {
         Ok(ptx) => {
             let s = ptx.to_src();
             tracing::info!(
@@ -448,7 +448,7 @@ pub fn prewarm_shape(head_dim: usize, n_q_per_kv: usize) {
     if crate::tensor::cuda::runtime::require().is_err() {
         return;
     }
-    let cards = cudarc::driver::result::device::get_count()
+    let cards = crate::tensor::gpu_runtime::driver::result::device::get_count()
         .unwrap_or(0)
         .max(0) as usize;
     for ordinal in 0..cards {

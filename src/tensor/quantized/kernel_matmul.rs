@@ -68,7 +68,7 @@ pub use kat::kernel_known_answer_test;
 /// mat-vec over the same `k` on the same card.
 #[cfg(feature = "cuda")]
 pub struct QuantizedActivation {
-    q81: cudarc::driver::CudaSlice<u8>,
+    q81: crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
     k: usize,
     rows: usize,
     ordinal: usize,
@@ -145,7 +145,7 @@ pub struct QKernelMatMul {
     /// Arc-shared so the compat shim's `QCudaStorage` projection
     /// and this QKernelMatMul reuse ONE padded device upload per weight.
     #[cfg(feature = "cuda")]
-    pub(super) blob: Option<std::sync::Arc<cudarc::driver::CudaSlice<u8>>>,
+    pub(super) blob: Option<std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>>,
     /// The room a placement on a counting device would give this weight.
     ///
     /// A dry device stands in for a card, and what a card gives up for a quantised
@@ -256,7 +256,7 @@ impl QKernelMatMul {
     pub fn from_qtensor_on_with_blob(
         qt: std::sync::Arc<QHostTensor>,
         device: &crate::tensor::Device,
-        blob: Option<std::sync::Arc<cudarc::driver::CudaSlice<u8>>>,
+        blob: Option<std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>>,
     ) -> Result<Self> {
         if qt.dims.len() != 2 {
             return Err(Error(format!(
@@ -510,9 +510,9 @@ impl QKernelMatMul {
     fn mmvq_f32_rows(
         &self,
         qdev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
-        blob: &cudarc::driver::CudaSlice<u8>,
+        blob: &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
         tag: &str,
-        q81: &cudarc::driver::CudaSlice<u8>,
+        q81: &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
         rows: usize,
         odims: Vec<usize>,
     ) -> Result<crate::tensor::Tensor> {

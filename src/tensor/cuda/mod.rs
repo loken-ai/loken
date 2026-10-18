@@ -8,7 +8,7 @@
 //! on native-owned memory with no other substrate involved.
 
 use super::{CpuStorage, DType, Error, Result};
-use cudarc::driver::{
+use crate::tensor::gpu_runtime::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig,
     PushKernelArg,
 };
@@ -18,8 +18,8 @@ use std::sync::{Arc, OnceLock};
 /// stable `[oom]` marker when the driver reports out-of-memory so callers can
 /// branch on memory pressure via `Error::is_oom()` (graceful degradation) without
 /// fragile reliance on the driver's Display text. `ctx` names the failing op.
-pub(crate) fn alloc_err(ctx: &str, e: cudarc::driver::DriverError) -> Error {
-    if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+pub(crate) fn alloc_err(ctx: &str, e: crate::tensor::gpu_runtime::driver::DriverError) -> Error {
+    if e.0 == crate::tensor::gpu_runtime::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
         Error(format!("[oom] cuda {ctx}: {e}"))
     } else {
         Error(format!("cuda {ctx}: {e}"))

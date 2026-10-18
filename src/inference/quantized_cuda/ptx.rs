@@ -55,13 +55,13 @@ pub fn get_awq_gemv_ptx(dev: &CudaDevice) -> Result<&'static str> {
         return Ok(p);
     }
     let compiled: String = {
-        let opts = cudarc::nvrtc::safe::CompileOptions {
+        let opts = crate::tensor::gpu_runtime::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
             ..Default::default()
         };
         let src = format!("{NVRTC_COMPAT_H}\n{AWQ_GEMV_CU}");
-        match cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts) {
+        match crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx_with_opts(src, opts) {
             Ok(ptx) => {
                 let s = ptx.to_src();
                 tracing::info!(

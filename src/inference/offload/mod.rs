@@ -68,8 +68,8 @@ pub fn prof_record(stage: &'static str, ns: u64) {
 #[cfg(feature = "cuda")]
 pub struct StageMark {
     name: &'static str,
-    start: cudarc::driver::CudaEvent,
-    end: cudarc::driver::CudaEvent,
+    start: crate::tensor::gpu_runtime::driver::CudaEvent,
+    end: crate::tensor::gpu_runtime::driver::CudaEvent,
 }
 
 #[cfg(feature = "cuda")]
@@ -92,20 +92,21 @@ fn in_graph_name(name: &'static str) -> &'static str {
 #[cfg(feature = "cuda")]
 pub fn mark_stage_in_capture<R>(
     name: &'static str,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     f: impl FnOnce() -> R,
 ) -> R {
     let ctx = stream.context();
-    let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let flags = Some(crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
     let (Ok(start), Ok(end)) = (ctx.new_event(flags), ctx.new_event(flags)) else {
         return f();
     };
     // An external record keeps the event a node of the graph that the card stamps at each run.
-    let record = |e: &cudarc::driver::CudaEvent| unsafe {
-        cudarc::driver::sys::cuEventRecordWithFlags(
+    let record = |e: &crate::tensor::gpu_runtime::driver::CudaEvent| unsafe {
+        crate::tensor::gpu_runtime::driver::sys::cuEventRecordWithFlags(
             e.cu_event(),
             stream.cu_stream(),
-            cudarc::driver::sys::CUevent_record_flags::CU_EVENT_RECORD_EXTERNAL as u32,
+            crate::tensor::gpu_runtime::driver::sys::CUevent_record_flags::CU_EVENT_RECORD_EXTERNAL
+                as u32,
         )
         .result()
     };

@@ -131,7 +131,7 @@ impl MixerState {
 /// The card address of `t`'s first element, `None` off a card.
 #[cfg(feature = "cuda")]
 fn card_address(t: &Tensor) -> Option<u64> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     match &*storage {
         crate::tensor::StorageView::Cuda(c) => {

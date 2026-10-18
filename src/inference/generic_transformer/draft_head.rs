@@ -232,7 +232,9 @@ impl Drop for Told {
     fn drop(&mut self) {
         // SAFETY: allocated by `mapped` and freed once here.
         unsafe {
-            let _ = cudarc::driver::sys::cuMemFreeHost(self.host as *mut std::ffi::c_void);
+            let _ = crate::tensor::gpu_runtime::driver::sys::cuMemFreeHost(
+                self.host as *mut std::ffi::c_void,
+            );
         }
     }
 }
@@ -240,7 +242,7 @@ impl Drop for Told {
 /// The card address of `t`'s first element.
 #[cfg(feature = "cuda")]
 fn card_address<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     match &*storage {
         crate::tensor::StorageView::Cuda(c) => {
@@ -879,14 +881,14 @@ impl GenericHeteroTransformer {
             .ok_or_else(|| crate::tensor::Error::msg("the guess was not prepared"))?;
         let tell_copy = |from: u64, word: usize| -> Result<()> {
             let r = unsafe {
-                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoHAsync_v2(
                     host_words.add(word) as *mut std::ffi::c_void,
                     from,
                     4,
                     stream,
                 )
             };
-            if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            if r != crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
                 crate::tensor::bail!("the guess was not told to the host: {r:?}");
             }
             Ok(())
@@ -924,8 +926,8 @@ impl GenericHeteroTransformer {
             }
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(1024) {
-                use cudarc::driver::sys::cudaError_enum as E;
-                match unsafe { cudarc::driver::sys::cuStreamQuery(stream) } {
+                use crate::tensor::gpu_runtime::driver::sys::cudaError_enum as E;
+                match unsafe { crate::tensor::gpu_runtime::driver::sys::cuStreamQuery(stream) } {
                     E::CUDA_ERROR_NOT_READY => {}
                     E::CUDA_SUCCESS => {
                         step.seen = step.told.word(Told::SEQ);
@@ -1131,8 +1133,8 @@ impl GenericHeteroTransformer {
                                 if let Ok(types) = g.node_types(&nodes) {
                                     for t in types {
                                         match t {
-                                            cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => alloc += 1,
-                                            cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => free += 1,
+                                            crate::tensor::gpu_runtime::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => alloc += 1,
+                                            crate::tensor::gpu_runtime::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => free += 1,
                                             _ => {}
                                         }
                                     }
@@ -1163,8 +1165,8 @@ impl GenericHeteroTransformer {
                     if let Ok(types) = g.node_types(&nodes) {
                         for t in types {
                             match t {
-                                cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => alloc += 1,
-                                cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => free += 1,
+                                crate::tensor::gpu_runtime::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => alloc += 1,
+                                crate::tensor::gpu_runtime::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => free += 1,
                                 _ => {}
                             }
                         }

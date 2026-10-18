@@ -10,19 +10,19 @@
 
 use super::*;
 use crate::tensor::cuda_ext::tensor_from_f32_slice;
+use crate::tensor::gpu_runtime::driver::CudaSlice;
 use crate::tensor::quantized::{
     mmq_moe_launcher, mmq_moe_qk, mmq_moe_quantize_launcher, mmq_moe_supports, GgmlDType, QTensor,
 };
-use cudarc::driver::CudaSlice;
 
 /// `n` uninitialised elements on the device's stream. A card whose pool still holds what earlier
 /// chunks freed gets it back and the allocation runs once more, as every storage-level
 /// allocation does.
-fn scratch<T: cudarc::driver::DeviceRepr>(
+fn scratch<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     dev: &crate::tensor::kernel_ffi::CudaDevice,
     n: usize,
 ) -> Result<CudaSlice<T>> {
-    use cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY;
+    use crate::tensor::gpu_runtime::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY;
     let take = || unsafe { dev.native().stream().alloc::<T>(n) };
     match take() {
         Err(e) if e.0 == CUDA_ERROR_OUT_OF_MEMORY => {

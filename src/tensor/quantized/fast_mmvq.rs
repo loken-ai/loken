@@ -1,8 +1,8 @@
 use super::super::{DType, Error, Result, Shape};
 use super::QCudaStorage;
 use crate::tensor;
+use crate::tensor::gpu_runtime::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use crate::tensor::kernel_ffi::{CudaStorage, Layout};
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::MATRIX_ROW_PADDING;
@@ -31,7 +31,7 @@ fn workspace_ensure(
     dev: &tensor::cuda::CudaDevice,
     min_bytes: usize,
 ) -> Result<Arc<CudaSlice<u8>>> {
-    use cudarc::driver::sys::CUstream;
+    use crate::tensor::gpu_runtime::driver::sys::CUstream;
     let map = WORKSPACE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
     let key = (dev.ordinal(), dev.stream().cu_stream() as CUstream as usize);

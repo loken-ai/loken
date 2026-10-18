@@ -21,9 +21,9 @@
 //! dispatch site in inference/generic_transformer/ falls back to split-K otherwise.
 
 use crate::tensor::cuda_ext::{CudaStorage, RawCudaDevice as CudaDevice};
+use crate::tensor::gpu_runtime::driver::{CudaSlice, DevicePtr};
 use anyhow::Result;
 use core::ffi::c_void;
-use cudarc::driver::{CudaSlice, DevicePtr};
 use half::f16;
 
 extern "C" {

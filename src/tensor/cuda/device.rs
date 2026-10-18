@@ -33,7 +33,7 @@ pub(super) fn emergency_reclaim(dev: &CudaDevice) {
 /// cached for transients is available to a graph's allocations and to other allocators.
 pub fn trim_pool(ordinal: usize) {
     unsafe {
-        use cudarc::driver::sys::{
+        use crate::tensor::gpu_runtime::driver::sys::{
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cuMemPoolSetAttribute,
             cuMemPoolTrimTo, cudaError_enum, CUmemPool_attribute, CUmemoryPool,
         };
@@ -66,8 +66,10 @@ pub fn trim_pool(ordinal: usize) {
 }
 
 /// The device's default memory pool, when it has one.
-fn default_pool(ordinal: usize) -> Option<cudarc::driver::sys::CUmemoryPool> {
-    use cudarc::driver::sys::{cuDeviceGetDefaultMemPool, cudaError_enum, CUmemoryPool};
+fn default_pool(ordinal: usize) -> Option<crate::tensor::gpu_runtime::driver::sys::CUmemoryPool> {
+    use crate::tensor::gpu_runtime::driver::sys::{
+        cuDeviceGetDefaultMemPool, cudaError_enum, CUmemoryPool,
+    };
     let mut pool: CUmemoryPool = std::ptr::null_mut();
     let ok = unsafe { cuDeviceGetDefaultMemPool(&mut pool, ordinal as i32) };
     (ok == cudaError_enum::CUDA_SUCCESS && !pool.is_null()).then_some(pool)
@@ -76,7 +78,9 @@ fn default_pool(ordinal: usize) -> Option<cudarc::driver::sys::CUmemoryPool> {
 /// Starts a measure of the default pool's peak use on `ordinal`: the peak is set to what the
 /// pool holds now, which is returned.
 pub fn pool_mark(ordinal: usize) -> u64 {
-    use cudarc::driver::sys::{cuMemPoolGetAttribute, cuMemPoolSetAttribute, CUmemPool_attribute};
+    use crate::tensor::gpu_runtime::driver::sys::{
+        cuMemPoolGetAttribute, cuMemPoolSetAttribute, CUmemPool_attribute,
+    };
     let Some(pool) = default_pool(ordinal) else {
         return 0;
     };
@@ -101,9 +105,11 @@ pub fn pool_mark(ordinal: usize) -> u64 {
 /// The memory the recorded graphs of `ordinal` hold: in use, reserved, and their peaks since the
 /// device last reset them.
 pub fn graph_mem(ordinal: usize) -> [u64; 4] {
-    use cudarc::driver::sys::{cuDeviceGetGraphMemAttribute, CUgraphMem_attribute as A};
+    use crate::tensor::gpu_runtime::driver::sys::{
+        cuDeviceGetGraphMemAttribute, CUgraphMem_attribute as A,
+    };
     let mut out = [0u64; 4];
-    let Ok(dev) = cudarc::driver::result::device::get(ordinal as i32) else {
+    let Ok(dev) = crate::tensor::gpu_runtime::driver::result::device::get(ordinal as i32) else {
         return out;
     };
     for (o, a) in out.iter_mut().zip([
@@ -121,7 +127,7 @@ pub fn graph_mem(ordinal: usize) -> [u64; 4] {
 
 /// The most the default pool on `ordinal` has held in use since [`pool_mark`].
 pub fn pool_peak(ordinal: usize) -> u64 {
-    use cudarc::driver::sys::{cuMemPoolGetAttribute, CUmemPool_attribute};
+    use crate::tensor::gpu_runtime::driver::sys::{cuMemPoolGetAttribute, CUmemPool_attribute};
     let Some(pool) = default_pool(ordinal) else {
         return 0;
     };
@@ -140,7 +146,7 @@ pub fn pool_peak(ordinal: usize) -> u64 {
 /// synchronize would abort the capture - skip the retry path then).
 pub(super) fn stream_capturing(dev: &CudaDevice) -> bool {
     unsafe {
-        use cudarc::driver::sys::{cuStreamIsCapturing, CUstreamCaptureStatus};
+        use crate::tensor::gpu_runtime::driver::sys::{cuStreamIsCapturing, CUstreamCaptureStatus};
         let mut status = CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
         let _ = cuStreamIsCapturing(dev.stream().cu_stream(), &mut status);
         status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
@@ -164,12 +170,13 @@ pub(crate) fn stack_note() -> String {
 pub(crate) fn with_oom_retry<T>(
     dev: &CudaDevice,
     ctx: &str,
-    mut f: impl FnMut() -> std::result::Result<T, cudarc::driver::DriverError>,
+    mut f: impl FnMut() -> std::result::Result<T, crate::tensor::gpu_runtime::driver::DriverError>,
 ) -> Result<T> {
     match f() {
         Ok(v) => Ok(v),
         Err(e)
-            if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
+            if e.0
+                == crate::tensor::gpu_runtime::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
                 && !stream_capturing(dev) =>
         {
             // The call stack, when RUST_LIB_BACKTRACE asks for it, names the allocation
@@ -202,8 +209,11 @@ pub(crate) fn with_oom_retry<T>(
 /// request. `INTERNAL_ERROR` is deliberately NOT in the class: it can leave
 /// the CUDA context poisoned (every later launch fails), so "recovering" from
 /// it mid-graph only defers a worse failure - it must surface as fatal.
-pub(crate) fn cublas_err(ctx: &str, e: cudarc::cublas::result::CublasError) -> Error {
-    use cudarc::cublas::sys::cublasStatus_t as S;
+pub(crate) fn cublas_err(
+    ctx: &str,
+    e: crate::tensor::gpu_runtime::cublas::result::CublasError,
+) -> Error {
+    use crate::tensor::gpu_runtime::cublas::sys::cublasStatus_t as S;
     match e.0 {
         S::CUBLAS_STATUS_ALLOC_FAILED | S::CUBLAS_STATUS_NOT_INITIALIZED => {
             Error(format!("[oom] cublas {ctx}: {e:?}"))
@@ -222,7 +232,7 @@ pub struct CudaDevice {
     /// Native elementwise kernels (small ops with no production equivalent).
     pub(super) elementwise_module: OnceLock<Arc<CudaModule>>,
     /// cuBLAS handle for matmul (the cuBLAS handle is thread-safe per NVIDIA).
-    pub(super) blas: OnceLock<cudarc::cublas::CudaBlas>,
+    pub(super) blas: OnceLock<crate::tensor::gpu_runtime::cublas::CudaBlas>,
     /// The production mmvq quantized-GEMV module (same PTX the live decode
     /// path compiles from cuda/mmvq_gguf.cu).
     pub(super) mmvq_module: OnceLock<Arc<CudaModule>>,
@@ -366,7 +376,7 @@ impl CudaDevice {
     /// a device with no pool; use the pool's own figure to account for what a card
     /// reports.
     pub fn alloc_shape(&self) -> (u64, u64) {
-        use cudarc::driver::{result, sys};
+        use crate::tensor::gpu_runtime::driver::{result, sys};
         let cu_device = self.stream.context().cu_device();
         let align = unsafe {
             result::device::get_attribute(
@@ -412,7 +422,7 @@ impl CudaDevice {
     /// true (this allocation cost the card nothing) and should keep whatever figure it
     /// had.
     pub fn pool_chunk_bytes(&self) -> Option<u64> {
-        use cudarc::driver::sys::{
+        use crate::tensor::gpu_runtime::driver::sys::{
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cudaError_enum, CUmemPool_attribute,
             CUmemoryPool,
         };
@@ -478,7 +488,7 @@ impl CudaDevice {
         if let Some(i) = self.mmq_info.get() {
             return Ok(*i);
         }
-        use cudarc::driver::{result, sys};
+        use crate::tensor::gpu_runtime::driver::{result, sys};
         let cu_device = self.stream.context().cu_device();
         let attr = |a: sys::CUdevice_attribute, default: i32| -> i32 {
             unsafe { result::device::get_attribute(cu_device, a) }.unwrap_or(default)
@@ -508,9 +518,9 @@ impl CudaDevice {
     }
 
     /// cuBLAS handle (created once per device; thread-safe per NVIDIA docs).
-    pub fn blas(&self) -> Result<&cudarc::cublas::CudaBlas> {
+    pub fn blas(&self) -> Result<&crate::tensor::gpu_runtime::cublas::CudaBlas> {
         if self.blas.get().is_none() {
-            let b = cudarc::cublas::CudaBlas::new(self.stream.clone())
+            let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(self.stream.clone())
                 .map_err(|e| cublas_err("init", e))?;
             let _ = self.blas.set(b);
         }
@@ -522,9 +532,9 @@ impl CudaDevice {
     fn cached_fn(
         &self,
         kind: &str,
-        module: &std::sync::Arc<cudarc::driver::CudaModule>,
+        module: &std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaModule>,
         name: &str,
-    ) -> std::result::Result<CudaFunction, cudarc::driver::DriverError> {
+    ) -> std::result::Result<CudaFunction, crate::tensor::gpu_runtime::driver::DriverError> {
         let key = format!("{kind}/{name}");
         if let Some(f) = self
             .module_fns
@@ -545,13 +555,14 @@ impl CudaDevice {
     /// Load a function from the native elementwise-kernel module.
     pub fn elementwise_fn(&self, name: &str) -> Result<CudaFunction> {
         if self.elementwise_module.get().is_none() {
-            let opts = cudarc::nvrtc::CompileOptions {
+            let opts = crate::tensor::gpu_runtime::nvrtc::CompileOptions {
                 include_paths: crate::inference::quantized_cuda::cuda_include_paths(),
                 arch: crate::inference::quantized_cuda::nvrtc_arch_of_ordinal(self.ordinal()),
                 ..Default::default()
             };
-            let ptx = cudarc::nvrtc::compile_ptx_with_opts(ELEMENTWISE_SRC, opts)
-                .map_err(|e| Error(format!("elementwise nvrtc: {e}")))?;
+            let ptx =
+                crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(ELEMENTWISE_SRC, opts)
+                    .map_err(|e| Error(format!("elementwise nvrtc: {e}")))?;
             let module = self
                 .ctx
                 .load_module(ptx)
@@ -566,11 +577,11 @@ impl CudaDevice {
     /// per device from the same in-crate source the live decode path uses).
     pub fn fused_fn(&self, name: &str) -> Result<CudaFunction> {
         if self.fused_module.get().is_none() {
-            let opts = cudarc::nvrtc::CompileOptions {
+            let opts = crate::tensor::gpu_runtime::nvrtc::CompileOptions {
                 arch: crate::inference::quantized_cuda::nvrtc_arch_of_ordinal(self.ordinal()),
                 ..Default::default()
             };
-            let ptx = cudarc::nvrtc::compile_ptx_with_opts(
+            let ptx = crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(
                 crate::inference::kernel::fused::fused_cuda_src(),
                 opts,
             )
@@ -592,7 +603,7 @@ impl CudaDevice {
             let ptx_src =
                 crate::inference::quantized_cuda::get_mmvq_ptx_for_ordinal(self.ordinal())
                     .map_err(|e| Error(format!("mmvq ptx: {e}")))?;
-            let ptx = cudarc::nvrtc::Ptx::from_src(ptx_src);
+            let ptx = crate::tensor::gpu_runtime::nvrtc::Ptx::from_src(ptx_src);
             let module = self
                 .ctx
                 .load_module(ptx)
@@ -611,7 +622,7 @@ impl CudaDevice {
             let ptx_src =
                 crate::inference::quantized_cuda::get_quantized_ptx_for_ordinal(self.ordinal())
                     .map_err(|e| Error(format!("quantized ptx: {e}")))?;
-            let ptx = cudarc::nvrtc::Ptx::from_src(ptx_src);
+            let ptx = crate::tensor::gpu_runtime::nvrtc::Ptx::from_src(ptx_src);
             let module = self
                 .ctx
                 .load_module(ptx)
@@ -660,7 +671,7 @@ impl CudaDevice {
         if !g.contains_key(module_name) {
             let module = self
                 .ctx
-                .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+                .load_module(crate::tensor::gpu_runtime::nvrtc::Ptx::from_src(ptx))
                 .map_err(|e| Error(format!("custom module `{module_name}` load: {e}")))?;
             g.insert(module_name.to_string(), module);
         }
@@ -782,7 +793,7 @@ pub(crate) fn dev_const_i32(dev: &CudaDevice, vals: &[i32]) -> Result<Arc<CudaSl
         .map(|st| {
             !matches!(
                 st,
-                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+                crate::tensor::gpu_runtime::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
             )
         })
         .unwrap_or(false);

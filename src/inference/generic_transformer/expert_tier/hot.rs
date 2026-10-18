@@ -174,13 +174,13 @@ fn lock(r: Range) -> bool {
     const READ_ONLY: u32 = 8;
     // Safety: the range lies in mappings the tiers keep alive; registration only pins it.
     let rc = unsafe {
-        cudarc::driver::sys::cuMemHostRegister_v2(
+        crate::tensor::gpu_runtime::driver::sys::cuMemHostRegister_v2(
             r.0 as *mut std::ffi::c_void,
             r.1 - r.0,
             PORTABLE | READ_ONLY,
         )
     };
-    let ok = rc == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS;
+    let ok = rc == crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS;
     if !ok {
         REGISTERED
             .write()
@@ -194,7 +194,9 @@ fn lock(r: Range) -> bool {
 #[cfg(feature = "cuda")]
 fn unlock(r: Range) {
     // Safety: `r` was registered by `lock` and is released once.
-    let _ = unsafe { cudarc::driver::sys::cuMemHostUnregister(r.0 as *mut std::ffi::c_void) };
+    let _ = unsafe {
+        crate::tensor::gpu_runtime::driver::sys::cuMemHostUnregister(r.0 as *mut std::ffi::c_void)
+    };
     REGISTERED
         .write()
         .unwrap_or_else(|e| e.into_inner())

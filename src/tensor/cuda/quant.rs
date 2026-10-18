@@ -3,7 +3,7 @@
 //! `use super::*` keeps the names its items referred to before the split in reach.
 
 use super::*;
-use cudarc::driver::CudaView;
+use crate::tensor::gpu_runtime::driver::CudaView;
 
 /// F32 activations -> q8_1 blocks (row padded to MATRIX_ROW_PADDING=512),
 /// the input format every mmvq GEMV kernel consumes.
@@ -49,7 +49,7 @@ pub fn quantize_q8_1_rows_bf16(
 /// offset range in the source buffer - no materialization, perf).
 pub fn quantize_q8_1_rows_f32_view(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<'_, f32>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<'_, f32>,
     k: usize,
     rows: usize,
 ) -> Result<CudaSlice<u8>> {
@@ -58,7 +58,7 @@ pub fn quantize_q8_1_rows_f32_view(
 
 pub fn quantize_q8_1_rows_f16_view(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<'_, half::f16>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<'_, half::f16>,
     k: usize,
     rows: usize,
 ) -> Result<CudaSlice<u8>> {
@@ -67,16 +67,16 @@ pub fn quantize_q8_1_rows_f16_view(
 
 pub fn quantize_q8_1_rows_bf16_view(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<'_, half::bf16>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<'_, half::bf16>,
     k: usize,
     rows: usize,
 ) -> Result<CudaSlice<u8>> {
     quantize_q8_1_rows_view_t(dev, x, "mmvq_gguf_quantize_q8_1_bf16", k, rows)
 }
 
-pub(super) fn quantize_q8_1_rows_view_t<T: cudarc::driver::DeviceRepr>(
+pub(super) fn quantize_q8_1_rows_view_t<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     dev: &CudaDevice,
-    x: &cudarc::driver::CudaView<'_, T>,
+    x: &crate::tensor::gpu_runtime::driver::CudaView<'_, T>,
     kernel: &str,
     k: usize,
     rows: usize,
@@ -106,7 +106,7 @@ pub(super) fn quantize_q8_1_rows_view_t<T: cudarc::driver::DeviceRepr>(
     Ok(out)
 }
 
-pub(super) fn quantize_q8_1_rows_t<T: cudarc::driver::DeviceRepr>(
+pub(super) fn quantize_q8_1_rows_t<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     dev: &CudaDevice,
     x: &CudaSlice<T>,
     kernel: &str,
@@ -691,7 +691,7 @@ pub fn gpu_expert_rows_grouped(
     x: &[f32],
     limit: f32,
 ) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     if dim % 256 != 0 || inter % 256 != 0 || x.len() != dim {
         return Err(Error(format!(
             "grouped expert rows: dim {dim}, inter {inter}, {} inputs",
@@ -793,7 +793,7 @@ pub fn gpu_expert_rows_grouped_multi(
     x: &[f32],
     limit: f32,
 ) -> Result<Vec<Vec<f32>>> {
-    use cudarc::driver::DevicePtr;
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let n = experts.len();
     if dim % 256 != 0 || inter % 256 != 0 || x.len() != n * dim {
         return Err(Error(format!(
@@ -1160,9 +1160,15 @@ fn product_in_place(
 }
 
 /// The copy stream of a card, made once: weights go up on it while the compute stream runs.
-fn copy_stream(dev: &CudaDevice) -> Result<std::sync::Arc<cudarc::driver::CudaStream>> {
-    static COPY: std::sync::Mutex<Vec<(usize, std::sync::Arc<cudarc::driver::CudaStream>)>> =
-        std::sync::Mutex::new(Vec::new());
+fn copy_stream(
+    dev: &CudaDevice,
+) -> Result<std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>> {
+    static COPY: std::sync::Mutex<
+        Vec<(
+            usize,
+            std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+        )>,
+    > = std::sync::Mutex::new(Vec::new());
     let mut g = COPY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = g.iter().find(|(o, _)| *o == dev.ordinal()) {
         return Ok(s.clone());
@@ -1275,12 +1281,14 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
             if g.cap < taken {
                 if g.ptr != 0 {
                     let _ = unsafe {
-                        cudarc::driver::result::free_host(g.ptr as *mut std::ffi::c_void)
+                        crate::tensor::gpu_runtime::driver::result::free_host(
+                            g.ptr as *mut std::ffi::c_void,
+                        )
                     };
                     g.ptr = 0;
                     g.cap = 0;
                 }
-                match unsafe { cudarc::driver::result::malloc_host(taken, 0) } {
+                match unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(taken, 0) } {
                     Ok(p) => {
                         g.ptr = p as usize;
                         g.cap = taken;
@@ -1373,14 +1381,14 @@ fn staged_weight_wait(addr: usize, len: usize) -> Option<usize> {
 /// Staging buffers in use by one expert's products. Dropping them waits for the card's stream,
 /// so a buffer goes back to the pool only once no copy still reads it.
 struct Staging<'a> {
-    stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &'a std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     /// The card's copy stream: uploads run there beside the compute stream's kernels, and the
     /// compute stream waits for each one's event before it reads the weight.
-    copy: std::sync::Arc<cudarc::driver::CudaStream>,
+    copy: std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     held: Vec<Pinned>,
     /// One per upload, recorded behind its copy: waited on instead of the whole stream, which
     /// other threads' work shares.
-    copied: Vec<cudarc::driver::CudaEvent>,
+    copied: Vec<crate::tensor::gpu_runtime::driver::CudaEvent>,
 }
 
 impl Drop for Staging<'_> {
@@ -1413,8 +1421,9 @@ impl<'a> Staging<'a> {
                 Some(i) => pool.swap_remove(i),
                 None => {
                     let cap = bytes.len().next_power_of_two().max(1 << 20);
-                    let ptr = unsafe { cudarc::driver::result::malloc_host(cap, 0) }
-                        .map_err(|e| Error(format!("pinned staging buffer: {e}")))?;
+                    let ptr =
+                        unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(cap, 0) }
+                            .map_err(|e| Error(format!("pinned staging buffer: {e}")))?;
                     Pinned { ptr, cap }
                 }
             }
@@ -1473,12 +1482,18 @@ impl<'a> Staging<'a> {
         copy.context()
             .bind_to_thread()
             .map_err(|e| Error(format!("staged upload: bind context: {e:?}")))?;
-        use cudarc::driver::DevicePtr;
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
         let (dptr, guard) = dst.device_ptr(stream);
-        let r =
-            unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dptr, src, len, copy.cu_stream()) };
+        let r = unsafe {
+            crate::tensor::gpu_runtime::driver::sys::cuMemcpyHtoDAsync_v2(
+                dptr,
+                src,
+                len,
+                copy.cu_stream(),
+            )
+        };
         drop(guard);
-        if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+        if r != crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS {
             return Err(Error(format!("staged upload: {r:?}")));
         }
         let done = copy
@@ -2708,7 +2723,10 @@ pub fn mmvq_bf16(
     mmvq_t::<half::bf16>(dev, tag, "bf16", weight_blob, q8_1, k, n, b_size, false)
 }
 
-pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+pub(super) fn mmvq_t<
+    T: crate::tensor::gpu_runtime::driver::DeviceRepr
+        + crate::tensor::gpu_runtime::driver::ValidAsZeroBits,
+>(
     dev: &CudaDevice,
     tag: &str,
     dst_tag: &str,
@@ -2748,7 +2766,10 @@ pub const MMVQ_DECODE_ORDER_BATCH: usize = 4;
 /// in launches of at most [`MMVQ_DECODE_ORDER_BATCH`], and a lone row takes the kernel a
 /// one-row call would (`smallk_single`). `q8_1` holds `rows` quantised activation rows.
 #[allow(clippy::too_many_arguments)]
-pub fn mmvq_decode_order<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+pub fn mmvq_decode_order<
+    T: crate::tensor::gpu_runtime::driver::DeviceRepr
+        + crate::tensor::gpu_runtime::driver::ValidAsZeroBits,
+>(
     dev: &CudaDevice,
     tag: &str,
     dst_tag: &str,
@@ -2786,13 +2807,13 @@ pub fn mmvq_decode_order<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAs
 
 /// One mat-vec launch of `b_size` activation rows into `dst`.
 #[allow(clippy::too_many_arguments)]
-fn launch_mmvq<T: cudarc::driver::DeviceRepr>(
+fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     dev: &CudaDevice,
     tag: &str,
     dst_tag: &str,
     weight_blob: &CudaSlice<u8>,
-    q8_1: &cudarc::driver::CudaView<'_, u8>,
-    dst: &mut cudarc::driver::CudaViewMut<'_, T>,
+    q8_1: &crate::tensor::gpu_runtime::driver::CudaView<'_, u8>,
+    dst: &mut crate::tensor::gpu_runtime::driver::CudaViewMut<'_, T>,
     k: usize,
     n: usize,
     b_size: usize,

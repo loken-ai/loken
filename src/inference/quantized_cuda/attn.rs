@@ -712,7 +712,7 @@ pub fn mvq_plain_any_via_shared_q8_1_on_stream(
     ncols: usize,
     nrows: usize,
     dev: &CudaDevice,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
 ) -> Result<CudaStorage> {
     let tag = match qstor.dtype() {
         GgmlDType::Q4_0 => "q4_0",
@@ -777,7 +777,7 @@ pub fn quantize_q8_1_fast_mmvq_f32_on_stream(
     out_q8_1: &mut CudaSlice<u8>,
     k: usize,
     dev: &CudaDevice,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
 ) -> Result<()> {
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let num_blocks_x = ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE);
