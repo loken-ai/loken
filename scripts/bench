@@ -34,6 +34,8 @@ export GPU_VENDOR
 # The loken build measured: the CUDA release by default, a ROCm build for AMD cards.
 LOKEN_BIN="${LOKEN_BIN:-$LOKEN/target/release/lokend}"
 export LOKEN_BIN
+# Whatever build is measured, it reads this tree's configuration.
+export LOKEN_CWD="${LOKEN_CWD:-$LOKEN}"
 LOKEN_URL="${LOKEN_URL:-http://127.0.0.1:11435}"
 
 die() { echo "bench: $*" >&2; exit 1; }
