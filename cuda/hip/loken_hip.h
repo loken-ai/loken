@@ -88,7 +88,13 @@ typedef __hip_bfloat162 nv_bfloat162;
 
 // Device intrinsics CUDA has and HIP spells otherwise.
 #define __trap() __builtin_trap()
-#define __nanosleep(ns) __builtin_amdgcn_s_sleep(((ns) + 63) / 64 > 127 ? 127 : ((ns) + 63) / 64)
+// s_sleep takes a constant count of 64-clock units, so a time known only at run time is slept
+// in its longest step and then one unit at a time.
+static __device__ inline void __nanosleep(unsigned int ns) {
+    unsigned int units = (ns + 63) / 64;
+    for (; units >= 127; units -= 127) __builtin_amdgcn_s_sleep(127);
+    for (; units > 0; --units) __builtin_amdgcn_s_sleep(1);
+}
 
 // A wave runs all its lanes together: the participation mask of a CUDA warp function has no
 // lane to leave out, so the HIP call without a mask is the same operation.
