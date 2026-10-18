@@ -117,11 +117,12 @@ pub struct InferenceConfigToml {
     #[serde(default)]
     pub probe_dump_dir: Option<String>,
     /// A routing profile (`expert_profile_save` of an earlier run) that fills the expert
-    /// caches at the load, before any prompt has routed.
+    /// caches at the load, before any prompt has routed. With neither key set, each model
+    /// reads and writes its own in `profiles/` of the model store.
     #[serde(default)]
     pub expert_profile: Option<String>,
-    /// Where the routing counts of the run's decodes are written after each request, for a
-    /// later run's `expert_profile`.
+    /// Where the routing counts of the decodes, added to those of the profile read at the
+    /// load, are written after each request, for a later run's `expert_profile`.
     #[serde(default)]
     pub expert_profile_save: Option<String>,
     /// Directory of the on-disk cache of DeepSeek V4.1 decode states, which lets a prompt that

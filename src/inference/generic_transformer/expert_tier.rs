@@ -33,7 +33,8 @@ struct TierState {
     owner: Vec<i32>,
     /// Decayed count of the times each expert was routed to.
     heat: Vec<f32>,
-    /// The times each expert was routed to since the load, undecayed: the run's profile.
+    /// The times each expert was routed to, undecayed, from the profile read at the load on:
+    /// what the next save writes.
     counts: Vec<u32>,
     /// Tokens since the counts last halved.
     since_decay: usize,
@@ -1546,16 +1547,24 @@ impl LayerTier {
             .clone()
     }
 
-    /// Fill the slots with the experts `counts` ranks highest, hottest first, copied from the
-    /// host stacks now, and give each expert the heat its rank earns, so that the decode's
-    /// first routes do not move what the profile placed. How many experts were copied.
     /// How many experts the layer routes to.
     pub fn n_experts(&self) -> usize {
         self.n_experts
     }
 
+    /// Fill the slots with the experts `counts` ranks highest, hottest first, copied from the
+    /// host stacks now, and give each expert the heat its rank earns, so that the decode's
+    /// first routes do not move what the profile placed. The profile's counts are added to the
+    /// layer's, so the next save carries them. How many experts were copied.
     pub fn prime(&self, counts: &[u32]) -> Result<usize> {
-        if counts.len() != self.n_experts || self.resident {
+        if counts.len() != self.n_experts {
+            return Ok(0);
+        }
+        super::expert_profile::add_counts(
+            &mut self.state.lock().unwrap_or_else(|e| e.into_inner()).counts,
+            counts,
+        );
+        if self.resident {
             return Ok(0);
         }
         let top = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
@@ -1738,7 +1747,7 @@ impl LayerTier {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             for (i, (&e, &w)) in ids_h.iter().zip(&w_h).enumerate() {
                 st.heat[e as usize] += 1.0;
-                st.counts[e as usize] += 1;
+                super::expert_profile::count_route(&mut st.counts, e as usize);
                 match st.slot_of[e as usize] {
                     s if s >= 0 => {
                         slot_ids[i] = s as u32;
@@ -2017,7 +2026,7 @@ impl LayerTier {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             for (p, (&e, &w)) in ids_h.iter().zip(&w_h).enumerate() {
                 st.heat[e as usize] += 1.0;
-                st.counts[e as usize] += 1;
+                super::expert_profile::count_route(&mut st.counts, e as usize);
                 let s = st.slot_of[e as usize];
                 if s >= 0 {
                     slot_ids[p] = s as u32;

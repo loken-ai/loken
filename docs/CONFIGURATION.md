@@ -206,8 +206,8 @@ on each layer's card is sized by the load. Two keys carry what a run learned to 
 
 | Key | Default | What it does |
 |---|---|---|
-| `expert_profile` | none | A routing profile written by `expert_profile_save`; at the load it fills the slots the prefill does not borrow with the most routed experts, and gives every expert the heat its count earns. |
-| `expert_profile_save` | none | Where the routing counts of the decodes are written after each request. |
+| `expert_profile` | `profiles/` of the model store | A routing profile written by `expert_profile_save`; at the load it fills the slots the prefill does not borrow with the most routed experts, and gives every expert the heat its count earns. A missing file is skipped. With neither key set, each model reads its own profile from `profiles/` of the model store, named after the model id. |
+| `expert_profile_save` | `profiles/` of the model store | Where the routing counts are written after each request: those of the profile read at the load plus the decodes since, halved together when one would pass the 32-bit limit. With neither key set, each model writes its own profile where it reads it. |
 
 
 | Quantity | Derived from |

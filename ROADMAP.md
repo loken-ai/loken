@@ -41,7 +41,7 @@ Smaller, by priority:
 |---|---|---|---|
 | AVX-512 host kernels for the IQ formats | CPU | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
 | The OpenCL path brought back | Backends | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial |
-| A routing profile kept per model | Performance | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
+| A routing profile kept per model | Performance | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Done |
 | Qwen3.8 IQ1_M on one card at the reference | Performance | The reference engine's own bench (128-token replies, 3k and 13k prompts) at or above it on one card it runs on, measured the same day: decode and first token | Planned |
 | Context parallelism inside the recorded step | Parallelism | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
 | Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcripts of a 20-clip set at or below the reference's word error rate, with their real-time factor, committed | Planned |

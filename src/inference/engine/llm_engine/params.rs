@@ -183,9 +183,11 @@ pub struct InferenceConfig {
     pub recorded_drafts: bool,
     /// Where the model's probes write the tensors they dump; none unless configured.
     pub probe_dump_dir: Option<String>,
-    /// A routing profile that fills the expert caches at the load, before any prompt.
+    /// A routing profile that fills the expert caches at the load, before any prompt; a
+    /// missing file is skipped.
     pub expert_profile: Option<String>,
-    /// Where the routing counts of the run's decodes are written after each request.
+    /// Where the routing counts, the loaded profile's included, are written after each
+    /// request.
     pub expert_profile_save: Option<String>,
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.

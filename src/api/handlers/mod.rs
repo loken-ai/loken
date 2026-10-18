@@ -2572,6 +2572,18 @@ impl APIServer {
             config.models_dir = Some(PathBuf::from(&self.ollama_models_dir));
         }
 
+        // Without a configured profile, the model reads and writes its own in the store.
+        if config.expert_profile.is_none() && config.expert_profile_save.is_none() {
+            let path = crate::inference::generic_transformer::expert_profile::default_path(
+                std::path::Path::new(&self.ollama_models_dir),
+                model_id,
+            )
+            .to_string_lossy()
+            .into_owned();
+            config.expert_profile = Some(path.clone());
+            config.expert_profile_save = Some(path);
+        }
+
         config
     }
 

@@ -288,8 +288,11 @@ impl HotLocks {
         merge(all)
     }
 
-    /// Rank by the counts of `profile` and lock the result, off the caller's thread.
+    /// Rank by the counts of `profile` and lock the result, off the caller's thread. The tiers'
+    /// counts, seeded by the same profile, become the base the next re-rank measures from.
     pub(crate) fn prime(self: &Arc<Self>, profile: &super::super::expert_profile::ExpertProfile) {
+        let now: Vec<Vec<u32>> = self.tiers.iter().map(|(_, t)| t.routing_counts()).collect();
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).counts = now;
         let weights: Vec<Vec<f32>> = self
             .tiers
             .iter()

@@ -1315,11 +1315,12 @@ impl LlmEngine {
             let mut model = model;
             if let Some(path) = expert_profile.as_deref() {
                 use crate::inference::generic_transformer::expert_profile::ExpertProfile;
-                match ExpertProfile::read(std::path::Path::new(path)) {
-                    Ok(profile) => match model.prime_expert_caches(&profile) {
+                match ExpertProfile::read_if_present(std::path::Path::new(path)) {
+                    Ok(Some(profile)) => match model.prime_expert_caches(&profile) {
                         Ok(n) => info!("expert caches filled from {path}: {n} experts copied"),
                         Err(e) => warn!("expert caches not filled from {path}: {e}"),
                     },
+                    Ok(None) => debug!("no expert profile at {path} yet"),
                     Err(e) => warn!("expert profile not read: {e}"),
                 }
             }
