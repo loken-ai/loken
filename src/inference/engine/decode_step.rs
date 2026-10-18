@@ -321,9 +321,8 @@ pub(crate) fn pld_verify_commit(
 pub(crate) const DRAFT_MAX: usize = 8;
 /// Rows of a verify forward: the token carried forward, then the draft.
 pub(crate) const VERIFY_ROWS: usize = DRAFT_MAX + 1;
-/// Rows of a window whose state after them is kept as a snapshot: a return to one of them is
-/// a copy, and the drafts reach no further, as each new window size costs a recording.
-pub(crate) const RETURN_SNAPSHOTS: usize = 3;
+/// Rows of a recorded window through delta-rule layers: each window size costs a recording.
+pub(crate) const RECURRENT_WINDOW_ROWS: usize = 4;
 /// Weight of the newest cycle in the running cost of a draft length.
 const CYCLE_COST_WEIGHT: f64 = 0.2;
 /// How many times more a stale class's sample weighs than a current one.

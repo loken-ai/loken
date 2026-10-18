@@ -103,8 +103,7 @@ cuda_launchers! {
     loken_gated_delta_net(
         q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta: *const f32,
         state_in: *const f32, o_out: *mut f32, state_out: *mut f32, h: i32, n_tokens: i32,
-        s_v: i32, sq1: i64, sq2: i64, sv1: i64, sv2: i64, sg1: i64, sg2: i64, scale: f32,
-        snaps: *mut f32, snap_rows: i32);
+        s_v: i32, sq1: i64, sq2: i64, sv1: i64, sv2: i64, sg1: i64, sg2: i64, scale: f32);
     loken_gated_delta_net_chunked(
         q: *const f32, k: *const f32, v: *const f32, g: *const f32, beta: *const f32,
         state_in: *const f32, o_out: *mut f32, state_out: *mut f32, h: i32, n_tokens: i32,
@@ -120,7 +119,7 @@ cuda_launchers! {
         beta_in: *const c_void, a_log: *const f32, dt_bias: *const f32, q_out: *mut f32,
         k_out: *mut f32, v_out: *mut f32, g_out: *mut f32, beta_out: *mut f32,
         new_window: *mut f32, rows: i32, kg: i32, kd: i32, vg: i32, vd: i32, k: i32, tiled: i32,
-        eps: f32, in_f16: i32, window_snaps: *mut f32, snap_rows: i32);
+        eps: f32, in_f16: i32);
     loken_shexp_swiglu(gate: *const c_void, up: *const c_void, out: *mut f32, n: i32,
         gate_f16: i32, up_f16: i32);
     loken_shexp_tail(routed: *const f32, down: *const c_void, x: *const f32, w: *const f32,

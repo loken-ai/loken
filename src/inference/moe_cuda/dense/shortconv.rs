@@ -86,8 +86,8 @@ pub unsafe fn flush_k_residual_q4_dev_pos_raw(
     )
 }
 
-/// Gated DeltaNet linear-attention recurrence (qwen3.5). Returns `(output,
-/// new_state)`.rs`.
+/// Gated DeltaNet linear-attention recurrence. Returns `(output, new_state)`; a sequence of
+/// at least one chunk runs in the chunked form.
 pub fn gated_delta_net(
     q: &Tensor,
     k: &Tensor,
@@ -97,31 +97,12 @@ pub fn gated_delta_net(
     state: &Tensor,
     scale: f32,
 ) -> Result<(Tensor, Tensor)> {
-    gated_delta_net_with_snapshots(q, k, v, g, beta, state, scale, None)
+    let chunked = q.dims3()?.0 >= unsafe { loken_gated_delta_net_chunk_rows() } as usize;
+    delta_net_launch(q, k, v, g, beta, state, scale, chunked)
 }
 
-/// [`gated_delta_net`] that also writes the state after each of the first `rows` tokens
-/// into `snaps` (`[rows, h, s_v, s_v]` F32, contiguous), what a return to a token copies back.
-/// Without snapshots, a sequence of at least one chunk runs in the chunked form; fewer rows,
-/// and every launch with snapshots, run one row after the other.
-#[allow(clippy::too_many_arguments)]
-pub fn gated_delta_net_with_snapshots(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    g: &Tensor,
-    beta: &Tensor,
-    state: &Tensor,
-    scale: f32,
-    snaps: Option<(&Tensor, usize)>,
-) -> Result<(Tensor, Tensor)> {
-    let chunked =
-        snaps.is_none() && q.dims3()?.0 >= unsafe { loken_gated_delta_net_chunk_rows() } as usize;
-    delta_net_launch(q, k, v, g, beta, state, scale, snaps, chunked)
-}
-
-/// [`gated_delta_net_with_snapshots`] with the form named: `chunked` runs the rows in chunks
-/// of matrix products (no snapshots), otherwise one row after the other.
+/// [`gated_delta_net`] with the form named: `chunked` runs the rows in chunks of matrix
+/// products, otherwise one row after the other, each row's arithmetic that of a single row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delta_net_launch(
     q: &Tensor,
@@ -131,14 +112,10 @@ pub(crate) fn delta_net_launch(
     beta: &Tensor,
     state: &Tensor,
     scale: f32,
-    snaps: Option<(&Tensor, usize)>,
     chunked: bool,
 ) -> Result<(Tensor, Tensor)> {
     let dev = q.device().as_cuda_device()?;
     let (n_tokens, h, s_v) = q.dims3()?;
-    if chunked && snaps.is_some() {
-        crate::tensor::bail!("gated_delta_net: the chunked form writes no snapshots");
-    }
     let cuptr = |t: &Tensor| -> Result<*const f32> {
         let (st, layout) = t.storage_and_layout();
         match &*st {
@@ -156,17 +133,6 @@ pub(crate) fn delta_net_launch(
     };
     let (qp, kp, vp) = (cuptr(q)?, cuptr(k)?, cuptr(v)?);
     let (gp, bp, sp) = (cuptr(g)?, cuptr(beta)?, cuptr(state)?);
-    let (snap_ptr, snap_rows) = match snaps {
-        Some((t, rows)) => {
-            if t.elem_count() < rows * h * s_v * s_v || !t.is_contiguous() {
-                crate::tensor::bail!(
-                    "gated_delta_net: the snapshots hold fewer than {rows} states"
-                );
-            }
-            (cuptr(t)? as *mut f32, rows as i32)
-        }
-        None => (std::ptr::null_mut(), 0),
-    };
     let in_place = super::in_place_state_on();
     if in_place && !state.is_contiguous() {
         crate::tensor::bail!("gated_delta_net: an in-place state must be contiguous");
@@ -236,8 +202,6 @@ pub(crate) fn delta_net_launch(
                 sg1,
                 sg2,
                 scale,
-                snap_ptr,
-                snap_rows,
                 stream,
             );
         }
@@ -422,25 +386,22 @@ mod timing {
     use super::*;
     use crate::tensor::{Device, Tensor};
 
-    /// The scan over several tokens leaves, after each of them, the state the same tokens
-    /// leave one at a time: a return to a token copies the snapshot.
+    /// The scan over the first rows of a sequence leaves the state the same tokens leave one
+    /// at a time, bit for bit, for every count of rows: a window returned to its kept rows
+    /// runs them again in one launch.
     #[test]
     #[ignore = "needs an idle CUDA card"]
-    fn the_scan_snapshots_are_the_states_after_each_token() {
+    fn the_scan_over_any_first_rows_is_the_rows_one_at_a_time() {
         let Ok(dev) = Device::new_cuda(0) else {
             return;
         };
-        let (h, s_v, n) = (4usize, 64usize, 3usize);
+        let (h, s_v, n) = (4usize, 64usize, 5usize);
         let q = Tensor::randn(0f32, 1.0, (n, h, s_v), &dev).unwrap();
         let k = Tensor::randn(0f32, 1.0, (n, h, s_v), &dev).unwrap();
         let v = Tensor::randn(0f32, 1.0, (n, h, s_v), &dev).unwrap();
         let g = Tensor::randn(-1f32, 0.1, (n, h), &dev).unwrap();
         let beta = Tensor::randn(0.5f32, 0.1, (n, h), &dev).unwrap();
         let _in_place = super::super::in_place_state(true);
-        let state = Tensor::zeros_on((h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
-        let snaps = Tensor::zeros_on((n, h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
-        gated_delta_net_with_snapshots(&q, &k, &v, &g, &beta, &state, 0.1, Some((&snaps, n)))
-            .unwrap();
         let steps = Tensor::zeros_on((h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
         let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for t in 0..n {
@@ -455,13 +416,21 @@ mod timing {
                 0.1,
             )
             .unwrap();
-            assert_eq!(
-                flat(&snaps.narrow(0, t, 1).unwrap()),
-                flat(&steps),
-                "after token {t}"
-            );
+            let first = |x: &Tensor| x.narrow(0, 0, t + 1).unwrap();
+            let state = Tensor::zeros_on((h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
+            delta_net_launch(
+                &first(&q),
+                &first(&k),
+                &first(&v),
+                &first(&g),
+                &first(&beta),
+                &state,
+                0.1,
+                false,
+            )
+            .unwrap();
+            assert_eq!(flat(&state), flat(&steps), "after {} rows", t + 1);
         }
-        assert_eq!(flat(&state), flat(&steps), "the state after every token");
     }
 
     /// Inputs of the recurrence as the layer prepares them: unit-norm q and k, decay logs from
@@ -516,9 +485,9 @@ mod timing {
                 let (q, k, v, g, beta, state) = delta_inputs(&dev, n, h, s_v);
                 let scale = 1.0 / (s_v as f32).sqrt();
                 let (o_row, s_row) =
-                    delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, false).unwrap();
+                    delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, false).unwrap();
                 let (o_chunk, s_chunk) =
-                    delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, true).unwrap();
+                    delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, true).unwrap();
                 let (eo, es) = (
                     worst_relative(&o_chunk, &o_row),
                     worst_relative(&s_chunk, &s_row),
@@ -595,10 +564,10 @@ mod timing {
             let (q, k, v, g, beta, state) = delta_inputs(&dev, n, h, s_v);
             let scale = 1.0 / (s_v as f32).sqrt();
             let rows = time(&|| {
-                delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, false).unwrap();
+                delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, false).unwrap();
             });
             let chunked = time(&|| {
-                delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, None, true).unwrap();
+                delta_net_launch(&q, &k, &v, &g, &beta, &state, scale, true).unwrap();
             });
             let x = Tensor::randn(0f32, 1.0, (n, channels), &dev)
                 .unwrap()

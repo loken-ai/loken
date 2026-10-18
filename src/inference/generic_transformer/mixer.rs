@@ -269,31 +269,51 @@ fn copy_state_in_place(dst: &MixerState, src: &MixerState) -> Result<()> {
 }
 
 impl Mixer {
-    /// True for a mixer whose decode step advances its state where it lies, so a step run
-    /// again reads and writes the same buffers, and that is worth recording: the delta rule
-    /// through its fused recurrence, and the short convolution, on a card.
-    /// The shapes of a window's state snapshots a row, for a mixer that keeps them.
-    pub fn snapshot_shapes(&self) -> Option<((usize, usize, usize), (usize, usize))> {
+    /// Makes, once, the buffers a verify window of up to `rows` rows keeps its rows' inputs
+    /// in, for a mixer that returns to its kept rows by running them again from those inputs:
+    /// `false` for a mixer that does not.
+    pub fn window_rows_ready(&mut self, rows: usize, device: &Device) -> Result<bool> {
         match self {
-            Mixer::DeltaNet(m) => Some(m.snapshot_shapes()),
-            _ => None,
-        }
-    }
-
-    pub fn set_snapshots(&mut self, snaps: Option<(Tensor, Tensor, usize)>) {
-        if let Mixer::DeltaNet(m) = self {
-            m.set_snapshots(snaps);
-        }
-    }
-
-    /// The state after row `at` of the last window copied back: `false` when none holds it.
-    pub fn restore_from_snapshot(&self, at: usize) -> Result<bool> {
-        match self {
-            Mixer::DeltaNet(m) => m.restore_from_snapshot(at),
+            Mixer::DeltaNet(m) => m.window_rows_ready(rows, device),
             _ => Ok(false),
         }
     }
 
+    /// Bytes of the buffers of [`Self::window_rows_ready`].
+    pub fn window_rows_bytes(&self) -> u64 {
+        match self {
+            Mixer::DeltaNet(m) => m.window.as_ref().map_or(0, WindowRows::bytes),
+            _ => 0,
+        }
+    }
+
+    /// The row of the window the next forward's rows stand at, `None` outside a window.
+    pub fn set_window_at(&mut self, at: Option<usize>) {
+        if let Mixer::DeltaNet(m) = self {
+            m.window_at = at;
+        }
+    }
+
+    /// Advances the state over the window's first `kept` rows from the inputs it kept:
+    /// `false` when the mixer keeps none.
+    pub fn replay_window(&mut self, kept: usize) -> Result<bool> {
+        match self {
+            Mixer::DeltaNet(m) => m.replay_window(kept),
+            _ => Ok(false),
+        }
+    }
+
+    /// Forgets the buffers of [`Self::window_rows_ready`].
+    pub fn drop_window_rows(&mut self) {
+        if let Mixer::DeltaNet(m) = self {
+            m.window = None;
+            m.window_at = None;
+        }
+    }
+
+    /// True for a mixer whose decode step advances its state where it lies, so a step run
+    /// again reads and writes the same buffers, and that is worth recording: the delta rule
+    /// through its fused recurrence, and the short convolution, on a card.
     pub fn decodes_in_place(&self, device: &Device) -> bool {
         match self {
             Mixer::DeltaNet(m) => m.steps_in_place(device),
@@ -958,41 +978,95 @@ pub struct GatedDeltaNet {
     /// Times the state's card buffers were made anew: a step recorded against them is stale
     /// once this moves.
     pub(super) moves: u64,
-    /// Where a window's rows leave the state after each of its first rows: the recurrence's
-    /// `[rows, v_heads, v_dim, k_dim]`, the convolution's `[rows, conv_dim, taps - 1]`, and
-    /// how many rows they hold. Set for the window's forward, cleared after.
-    snaps: Option<(Tensor, Tensor, usize)>,
+    /// The inputs a verify window's rows give the recurrence, kept for a return to its rows.
+    window: Option<WindowRows>,
+    /// The window's row the forward's rows stand at, set for a window's forward only.
+    window_at: Option<usize>,
+}
+
+/// The inputs of the recurrence a verify window's rows give it, F32 in buffers made once:
+/// the projected `qkv` `[rows, conv_dim]` and the gates' `alpha` and `beta` `[rows, v_heads]`,
+/// with the dtypes the projection gave them, which a return gives them back exactly.
+pub struct WindowRows {
+    qkv: Tensor,
+    alpha: Tensor,
+    beta: Tensor,
+    dtypes: [DType; 3],
+}
+
+impl WindowRows {
+    fn bytes(&self) -> u64 {
+        [&self.qkv, &self.alpha, &self.beta]
+            .iter()
+            .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+            .sum()
+    }
+
+    /// Writes the forward's `seq` rows at row `at`.
+    fn store(&mut self, at: usize, seq: usize, rows: [&Tensor; 3]) -> Result<()> {
+        for (i, (buf, src)) in [&self.qkv, &self.alpha, &self.beta]
+            .into_iter()
+            .zip(rows)
+            .enumerate()
+        {
+            let width = buf.dim(1)?;
+            if at + seq > buf.dim(0)? {
+                crate::tensor::bail!("a window's rows reach past the rows kept for it");
+            }
+            buf.slice_set(&src.reshape((seq, width))?.to_dtype(DType::F32)?, 0, at)?;
+            self.dtypes[i] = src.dtype();
+        }
+        Ok(())
+    }
+
+    /// The first `kept` rows, in the dtypes they came in.
+    fn first(&self, kept: usize) -> Result<[Tensor; 3]> {
+        let cut = |t: &Tensor, dt: DType| t.narrow(0, 0, kept)?.to_dtype(dt)?.contiguous();
+        Ok([
+            cut(&self.qkv, self.dtypes[0])?,
+            cut(&self.alpha, self.dtypes[1])?,
+            cut(&self.beta, self.dtypes[2])?,
+        ])
+    }
 }
 
 impl GatedDeltaNet {
-    /// The shapes of one row's snapshots: the recurrence's state and the convolution's window.
-    pub fn snapshot_shapes(&self) -> ((usize, usize, usize), (usize, usize)) {
-        let d = self.dims;
-        (
-            (d.v_heads, d.v_dim, d.k_dim),
-            (d.conv_dim(), d.conv_kernel - 1),
-        )
-    }
-
-    pub fn set_snapshots(&mut self, snaps: Option<(Tensor, Tensor, usize)>) {
-        self.snaps = snaps;
-    }
-
-    /// Copies the snapshot after row `at` into the held state: `false` when no snapshot holds
-    /// that row or no state is held.
-    pub fn restore_from_snapshot(&self, at: usize) -> Result<bool> {
-        let Some((hs, cs, rows)) = self.snaps.as_ref() else {
-            return Ok(false);
-        };
-        let Some(SsmState::Card { conv, h }) = self.state.as_ref() else {
-            return Ok(false);
-        };
-        if at >= *rows {
+    fn window_rows_ready(&mut self, rows: usize, device: &Device) -> Result<bool> {
+        if !self.steps_in_place(device) {
             return Ok(false);
         }
-        h.slice_set(&hs.narrow(0, at, 1)?.reshape(h.dims())?, 0, 0)?;
-        conv.slice_set(&cs.narrow(0, at, 1)?.reshape(conv.dims())?, 0, 0)?;
+        if self.window.is_none() {
+            let d = self.dims;
+            let zeros = |w: usize| Tensor::zeros_on((rows, w), DType::F32, device);
+            self.window = Some(WindowRows {
+                qkv: zeros(d.conv_dim())?,
+                alpha: zeros(d.v_heads)?,
+                beta: zeros(d.v_heads)?,
+                dtypes: [DType::F32; 3],
+            });
+        }
         Ok(true)
+    }
+
+    /// Advances the held state over the window's first `kept` rows from the inputs the window
+    /// kept, through the launches the window ran them through: the state and the convolution's
+    /// window are those the rows leave decoded one at a time.
+    #[cfg(feature = "cuda")]
+    fn replay_window(&mut self, kept: usize) -> Result<bool> {
+        let Some(window) = self.window.as_ref() else {
+            return Ok(false);
+        };
+        if kept == 0 {
+            return Ok(true);
+        }
+        let [qkv, alpha, beta] = window.first(kept)?;
+        self.advance_card(&qkv, &alpha, &beta, kept, true)?;
+        Ok(true)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn replay_window(&mut self, _kept: usize) -> Result<bool> {
+        Ok(false)
     }
 
     /// The mixer over host tensors `conv_w` `[conv_dim, conv_kernel]`, `a`, `dt_bias`
@@ -1039,7 +1113,8 @@ impl GatedDeltaNet {
             eps,
             state: None,
             moves: 0,
-            snaps: None,
+            window: None,
+            window_at: None,
         })
     }
 
@@ -1245,24 +1320,59 @@ impl GatedDeltaNet {
     /// at once, then one fused recurrence launch and the fused gated norm.
     #[cfg(feature = "cuda")]
     pub(super) fn forward_card(&mut self, x: &Tensor, seq: usize) -> Result<Tensor> {
+        use super::wide::staged;
+        use crate::inference::moe_cuda as k;
+        let d = self.dims;
+        let (vg, vd) = (d.v_heads, d.v_dim);
+        let dev = x.device();
+        let (qkv, z, alpha, beta) = staged("gdn_project", &dev, false, || self.project(x))?;
+        let sequential = self.window_at.is_some();
+        if let (Some(at), Some(window)) = (self.window_at, self.window.as_mut()) {
+            window.store(at, seq, [&qkv, &alpha, &beta])?;
+        }
+        let o = self.advance_card(&qkv, &alpha, &beta, seq, sequential)?;
+        let o = o.reshape((seq * vg, vd))?;
+        let z = z.reshape((seq * vg, vd))?;
+        let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32, d.gate_sigmoid)?
+        {
+            Some(y) => y,
+            None => k::zgate_rmsnorm(
+                &o,
+                &z.to_dtype(DType::F32)?,
+                &self.norm_w,
+                self.eps as f32,
+                d.gate_sigmoid,
+            )?,
+        };
+        y.reshape((1, seq, vg * vd))?.to_dtype(x.dtype())
+    }
+
+    /// The recurrence over `seq` projected rows, `qkv` `[seq, conv_dim]`, `alpha` and `beta`
+    /// `[seq, v_heads]`: the convolution and gates, then the scan, the state held advanced.
+    /// `sequential` scans the rows one after the other, as a window's rows are, else a long
+    /// sequence takes the chunked form. Returns the scan's output `[seq, v_heads, v_dim]`.
+    #[cfg(feature = "cuda")]
+    fn advance_card(
+        &mut self,
+        qkv: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        seq: usize,
+        sequential: bool,
+    ) -> Result<Tensor> {
+        use super::wide::staged;
         use crate::inference::moe_cuda as k;
         let d = self.dims;
         let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
         let (rep, qk) = (vg / kg, kd * kg);
+        let dev = qkv.device();
         let (conv, s) = match self.state.clone() {
             Some(SsmState::Card { conv, h }) => (conv, h),
             _ => (
-                Tensor::zeros_on(
-                    (1, d.conv_dim(), d.conv_kernel - 1),
-                    DType::F32,
-                    &x.device(),
-                )?,
-                Tensor::zeros_on((1, vg, vd, kd), DType::F32, &x.device())?,
+                Tensor::zeros_on((1, d.conv_dim(), d.conv_kernel - 1), DType::F32, &dev)?,
+                Tensor::zeros_on((1, vg, vd, kd), DType::F32, &dev)?,
             ),
         };
-        use super::wide::staged;
-        let dev = x.device();
-        let (qkv, z, alpha, beta) = staged("gdn_project", &dev, false, || self.project(x))?;
         let qkv = qkv.reshape((seq, d.conv_dim()))?.contiguous()?;
         let conv = conv
             .reshape((d.conv_dim(), d.conv_kernel - 1))?
@@ -1278,12 +1388,12 @@ impl GatedDeltaNet {
             || (crate::tensor::quantized::DecodeOrder::active()
                 && crate::inference::moe_cuda::in_place_state_on())
         {
-            k::gdn_prep_with_snapshots(
+            k::gdn_prep(
                 &qkv,
                 &conv,
                 &self.conv_w,
-                &alpha,
-                &beta,
+                alpha,
+                beta,
                 &self.a,
                 &self.dt_bias,
                 k::GdnShape {
@@ -1295,7 +1405,6 @@ impl GatedDeltaNet {
                     tiled: d.v_heads_tiled,
                     eps: 1e-6,
                 },
-                self.snaps.as_ref().map(|(_, cs, n)| (cs, *n)),
             )?
         } else {
             None
@@ -1358,17 +1467,9 @@ impl GatedDeltaNet {
                 prep.elapsed().as_nanos() as u64,
             );
         }
-        let (o, s) = staged("gdn_scan", &dev, false, || {
-            k::gated_delta_net_with_snapshots(
-                &q,
-                &key,
-                &v,
-                &g,
-                &beta,
-                &s,
-                scale,
-                self.snaps.as_ref().map(|(hs, _, n)| (hs, *n)),
-            )
+        let (o, s) = staged("gdn_scan", &dev, false, || match sequential {
+            true => k::delta_net_launch(&q, &key, &v, &g, &beta, &s, scale, false),
+            false => k::gated_delta_net(&q, &key, &v, &g, &beta, &s, scale),
         })?;
         hold_ssm(
             &mut self.state,
@@ -1376,20 +1477,7 @@ impl GatedDeltaNet {
             s.reshape((1, vg, vd, kd))?,
             &mut self.moves,
         )?;
-        let o = o.reshape((seq * vg, vd))?;
-        let z = z.reshape((seq * vg, vd))?;
-        let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32, d.gate_sigmoid)?
-        {
-            Some(y) => y,
-            None => k::zgate_rmsnorm(
-                &o,
-                &z.to_dtype(DType::F32)?,
-                &self.norm_w,
-                self.eps as f32,
-                d.gate_sigmoid,
-            )?,
-        };
-        y.reshape((1, seq, vg * vd))?.to_dtype(x.dtype())
+        Ok(o)
     }
 }
 
@@ -2017,5 +2105,134 @@ mod tests {
                 assert!(resumed < 1e-5, "resumed max diff {resumed}");
             }
         }
+    }
+
+    /// A verify window over its rows, returned to every count of kept rows, eagerly and
+    /// replayed from a graph, leaves the recurrent state and the convolution window the kept
+    /// rows leave decoded one by one, bit for bit.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn a_window_returned_to_its_kept_rows_leaves_the_state_of_decoding_them() {
+        use crate::inference::engine::decode_step::VERIFY_ROWS;
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let stream = crate::tensor::cuda_ext::stream_of(&dev).unwrap();
+        let dims = DeltaDims {
+            k_heads: 2,
+            v_heads: 4,
+            k_dim: 64,
+            v_dim: 64,
+            conv_kernel: 4,
+            v_heads_tiled: true,
+            gate_sigmoid: false,
+        };
+        let (hidden, prefix) = (32usize, 2usize);
+        let host = Device::Cpu;
+        let q = |seed, rows| {
+            let w =
+                Tensor::from_vec(values(rows * hidden, seed, 0.4), (rows, hidden), &host).unwrap();
+            QMatMul::from_qtensor(
+                crate::tensor::quantized::QTensor::quantize_onto(
+                    &w,
+                    crate::tensor::quantized::GgmlDType::Q8_0,
+                    &dev,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let make = || {
+            let t = |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, &host).unwrap();
+            let a: Vec<f32> = values(dims.v_heads, 46, 0.5)
+                .iter()
+                .map(|v| -(0.3 + v.abs()))
+                .collect();
+            Mixer::DeltaNet(
+                GatedDeltaNet::new(
+                    DeltaProj::Split {
+                        qkv: q(41, dims.conv_dim()),
+                        z: q(42, dims.v_heads * dims.v_dim),
+                        alpha: q(43, dims.v_heads),
+                        beta: q(44, dims.v_heads),
+                    },
+                    t(
+                        values(dims.conv_dim() * dims.conv_kernel, 47, 0.5),
+                        &[dims.conv_dim(), dims.conv_kernel],
+                    ),
+                    t(a, &[dims.v_heads]),
+                    t(values(dims.v_heads, 48, 0.5), &[dims.v_heads]),
+                    t(values(dims.v_dim, 49, 1.0), &[dims.v_dim]),
+                    dims,
+                    1e-6,
+                    &dev,
+                )
+                .unwrap(),
+            )
+        };
+        let n = prefix + VERIFY_ROWS;
+        let x = Tensor::from_vec(values(n * hidden, 50, 1.0), (1, n, hidden), &host)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let _order = crate::tensor::quantized::DecodeOrder::enter();
+        let _in_place = crate::inference::moe_cuda::in_place_state(true);
+        let decode = |m: &mut Mixer, from: usize, to: usize| {
+            for i in from..to {
+                m.forward(&x.narrow(1, i, 1).unwrap(), i).unwrap();
+            }
+        };
+        let state = |m: &Mixer| {
+            let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            stream.synchronize().unwrap();
+            match m.checkpoint().unwrap() {
+                Some(MixerState::DeltaNet(Some(SsmState::Card { conv, h }))) => {
+                    (flat(&h), flat(&conv))
+                }
+                _ => panic!("no card state"),
+            }
+        };
+        let mut kept_bytes = 0;
+        for rows in 2..=VERIFY_ROWS {
+            for kept in 0..=rows {
+                for recorded in [false, true] {
+                    let mut m = make();
+                    decode(&mut m, 0, prefix);
+                    assert!(m.window_rows_ready(VERIFY_ROWS, &dev).unwrap());
+                    kept_bytes = m.window_rows_bytes();
+                    let keep = m.checkpoint().unwrap().unwrap();
+                    let window = x.narrow(1, prefix, rows).unwrap();
+                    m.set_window_at(Some(0));
+                    if recorded {
+                        stream.synchronize().unwrap();
+                        crate::tensor::cuda_ext::begin_capture(&stream).unwrap();
+                        m.save_in_place(&keep).unwrap();
+                        m.forward(&window, prefix).unwrap();
+                        let graph = crate::tensor::cuda_ext::end_capture(&stream)
+                            .unwrap()
+                            .expect("a window records kernels");
+                        graph.launch().unwrap();
+                    } else {
+                        m.save_in_place(&keep).unwrap();
+                        m.forward(&window, prefix).unwrap();
+                    }
+                    m.set_window_at(None);
+                    if kept < rows {
+                        m.restore_in_place(&keep).unwrap();
+                        assert!(m.replay_window(kept).unwrap());
+                    }
+                    let mut alone = make();
+                    decode(&mut alone, 0, prefix + kept);
+                    let (got, want) = (state(&m), state(&alone));
+                    let at = format!("{rows} rows, {kept} kept, recorded {recorded}");
+                    assert!(got.0 == want.0, "{at}: the recurrent state differs");
+                    assert!(got.1 == want.1, "{at}: the convolution window differs");
+                }
+            }
+        }
+        let d = dims;
+        let one = (d.v_heads * d.v_dim * d.k_dim + d.conv_dim() * (d.conv_kernel - 1)) * 4;
+        eprintln!("a state {one} bytes, the window's rows {kept_bytes} bytes");
     }
 }

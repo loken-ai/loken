@@ -9,7 +9,7 @@
 //   o[t,h,col] = (sum_i S[i][col] * q[i]) * scale
 //
 // What the kernel assumes of its caller: one sequence, GQA already tiled so q, k and v all
-// carry H heads, and no state snapshots - the final state is written once. The state is the
+// carry H heads, and the final state written once. The state is the
 // contiguous `[H, vd(col), kd(i)]` layout, so S[i][col] lives at `h*S_v*S_v + col*S_v + i`;
 // q and k are [n_tokens, H, S_v] with i contiguous, v the same, g and beta [n_tokens, H].
 //
@@ -30,10 +30,6 @@ __global__ void loken_gated_delta_net_kernel(
         const float * state_in,
         float * __restrict__ o_out,
         float * state_out,
-        // The state after each of the first `snap_rows` tokens, `[snap_rows, H, S_v, S_v]`,
-        // or null: what a return to one of those tokens copies back.
-        float * __restrict__ snaps,
-        int   snap_rows,
         int   H,
         int   n_tokens,
         long  sq1, long sq2,   // q/k strides (floats): head, token
@@ -90,11 +86,6 @@ __global__ void loken_gated_delta_net_kernel(
         if (lane == 0) {
             o_out[(long) t * H * S_v + (long) h * S_v + col] = attn_col * scale;
         }
-        if (snaps != nullptr && t < snap_rows) {
-            float * sn = snaps + ((long) t * H + h) * S_v * S_v + (long) col * S_v;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) sn[r * warp_size + lane] = s_shard[r];
-        }
     }
 
     // write the final state back
@@ -110,7 +101,7 @@ extern "C" void loken_gated_delta_net(
         float * o_out, float * state_out,
         int H, int n_tokens, int s_v,
         long sq1, long sq2, long sv1, long sv2, long sg1, long sg2,
-        float scale, float * snaps, int snap_rows, cudaStream_t stream) {
+        float scale, cudaStream_t stream) {
     const int num_warps = 4;
     dim3 grid(H, 1, ceil_div(s_v, num_warps));
     dim3 block(WARP_SIZE, num_warps, 1);
@@ -119,7 +110,7 @@ extern "C" void loken_gated_delta_net(
 #define LOKEN_GDN_LAUNCH(s)                                                     \
     case s:                                                                     \
         loken_gated_delta_net_kernel<s><<<grid, block, 0, stream>>>(            \
-            q, k, v, g, beta, state_in, o_out, state_out, snaps, snap_rows, H,  \
+            q, k, v, g, beta, state_in, o_out, state_out, H,                    \
             n_tokens, sq1, sq2, sv1, sv2, sg1, sg2, scale);                     \
         break;
     switch (s_v) {

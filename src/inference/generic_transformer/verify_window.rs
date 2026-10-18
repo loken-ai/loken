@@ -5,9 +5,9 @@
 //!
 //! What a replay reads lives in buffers of its own: the rows' embeddings, each card's row
 //! positions, each layer's rotation tables, the n-gram rows, and what a layer keeps of its state
-//! before the rows (its recurrent state, its convolution's rows, its token mixer's input), so
-//! that it can take in the kept rows again from there. The logits of each window size land in
-//! a buffer of their own.
+//! before the rows (its recurrent state, the inputs of its recurrence, its convolution's rows,
+//! its token mixer's input), so that it can take in the kept rows again from there. The logits
+//! of each window size land in a buffer of their own.
 
 use super::*;
 use crate::inference::engine::decode_step::VERIFY_ROWS;
@@ -22,11 +22,12 @@ pub(super) struct VerifyKeep {
     ngram: Option<Tensor>,
     /// The residual the layer took, `[1, rows, wide]`, for the n-gram block to read again.
     input: Option<Tensor>,
-    /// The token mixer's input, `[1, rows, hidden]`, for a recurrent mixer without
-    /// snapshots to run again over the kept rows.
+    /// The token mixer's input, `[1, rows, hidden]`, for a recurrent mixer that keeps no
+    /// inputs of its recurrence, to run again over the kept rows.
     mixed: Option<Tensor>,
-    /// The mixer's state after each of the window's first rows, for a return by copies.
-    snaps: Option<(Tensor, Tensor, usize)>,
+    /// Whether the mixer keeps the inputs its recurrence takes from the window's rows, and
+    /// returns to the kept rows by running the recurrence again over them.
+    replays: bool,
     /// Whether the buffers hold the state before the verify in flight: a layer the verify
     /// never reached keeps nothing to return to.
     saved: bool,
@@ -40,7 +41,7 @@ pub(crate) struct VerifyWindow {
     ngram: Option<ngram::NgramHistory>,
 }
 
-use crate::inference::engine::decode_step::RETURN_SNAPSHOTS;
+use crate::inference::engine::decode_step::RECURRENT_WINDOW_ROWS;
 
 /// The buffers of a recorded verify that belong to the model.
 #[derive(Default)]
@@ -98,24 +99,17 @@ impl GenericTransformerLayer {
             true => Some(Tensor::zeros_on((1, VERIFY_ROWS, s * d), DType::F32, dev)?),
             false => None,
         };
-        let mixed = match self.mixer.is_recurrent() && self.mixer.snapshot_shapes().is_none() {
+        let replays = self.mixer.window_rows_ready(VERIFY_ROWS, dev)?;
+        let mixed = match self.mixer.is_recurrent() && !replays {
             true => Some(Tensor::zeros_on((1, VERIFY_ROWS, d), mixed_dtype, dev)?),
             false => None,
-        };
-        let snaps = match self.mixer.snapshot_shapes() {
-            Some(((vg, vd, kd), (conv_dim, taps))) => Some((
-                Tensor::zeros_on((RETURN_SNAPSHOTS, vg, vd, kd), DType::F32, dev)?,
-                Tensor::zeros_on((RETURN_SNAPSHOTS, conv_dim, taps), DType::F32, dev)?,
-                RETURN_SNAPSHOTS,
-            )),
-            None => None,
         };
         self.verify_keep = Some(VerifyKeep {
             mixer,
             ngram,
             input,
             mixed,
-            snaps,
+            replays,
             saved: false,
         });
         Ok(())
@@ -238,12 +232,9 @@ impl GenericTransformerLayer {
                 Ok(o)
             }
             _ => {
-                if rows > 1 {
-                    let snaps = self.verify_keep.as_ref().and_then(|k| k.snaps.clone());
-                    self.mixer.set_snapshots(snaps);
-                }
+                self.mixer.set_window_at(Some(row0));
                 let m = self.mixer.forward(&mixed, 1);
-                self.mixer.set_snapshots(None);
+                self.mixer.set_window_at(None);
                 self.attn_output.forward(&m?)
             }
         })?;
@@ -297,14 +288,12 @@ impl GenericTransformerLayer {
             return Ok(());
         }
         let keep = self.verify_keep.as_ref().expect("checked above");
-        // The state after the kept rows copied from the window's snapshots when it holds
-        // them; put back from the keep and run again over the kept rows otherwise.
-        let snapped = kept > 0 && self.mixer.restore_from_snapshot(kept - 1)?;
-        if !snapped {
-            if let Some(state) = keep.mixer.as_ref() {
-                self.mixer.restore_in_place(state)?;
-            }
+        // The state put back from the keep, then advanced over the kept rows: from the
+        // inputs of the recurrence the window kept, or from the token mixer's input.
+        if let Some(state) = keep.mixer.as_ref() {
+            self.mixer.restore_in_place(state)?;
         }
+        let replayed = keep.replays && self.mixer.replay_window(kept)?;
         if let (Some(ple), Some(conv)) = (self.ngram.as_mut(), keep.ngram.as_ref()) {
             ple.restore_rows_from(conv)?;
             if let (Some(input), Some(table_rows), true) = (
@@ -323,7 +312,7 @@ impl GenericTransformerLayer {
             keep.mixed.as_ref(),
             self.mixer.is_recurrent(),
             kept > 0,
-            snapped,
+            replayed,
         ) {
             self.mixer.forward(&mixed.narrow(1, 0, kept)?, base)?;
         }
@@ -340,6 +329,7 @@ impl GenericTransformerLayer {
         self.verify_rope_sin = None;
         self.verify_ngram_rows = None;
         self.verify_keep = None;
+        self.mixer.drop_window_rows();
     }
 }
 
@@ -371,8 +361,7 @@ impl GenericHeteroTransformer {
         if self.verify_window_block().is_some() {
             return 0;
         }
-        // A window returns to its kept rows by a snapshot copy: the rows reach one past the
-        // snapshots kept, which also keeps the window's graphs to a few sizes.
+        // Each window size costs a recording: through delta-rule layers the rows stay few.
         let mut rows = VERIFY_ROWS;
         for l in &self.layers {
             if let Some(m) = l.moe.as_ref() {
@@ -380,8 +369,8 @@ impl GenericHeteroTransformer {
                     rows = rows.min(t.graph_rows());
                 }
             }
-            if l.mixer.snapshot_shapes().is_some() {
-                rows = rows.min(RETURN_SNAPSHOTS + 1);
+            if matches!(l.mixer, mixer::Mixer::DeltaNet(_)) {
+                rows = rows.min(RECURRENT_WINDOW_ROWS);
             }
         }
         rows
