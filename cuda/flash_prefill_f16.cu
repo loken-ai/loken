@@ -242,7 +242,7 @@ static __device__ __forceinline__ void flash_prefill_split_inner(
     __syncwarp();
 
     for (int tb = t0; tb < t1; tb += 16) {
-        const int ntok = min(16, seq_kv - tb);
+        const int ntok = min(16, t1 - tb);   // a tile ends where this split's keys do
         for (int i = lane; i < 16 * HD; i += 32) {
             const int r = i / HD, d = i % HD;
             if (r < ntok) {
