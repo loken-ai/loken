@@ -194,8 +194,10 @@ fn decode_symphonia_planar(bytes: Vec<u8>) -> anyhow::Result<(Vec<f32>, usize, u
         S: Sample,
         f32: FromSample<S>,
     {
+        // The copy holds the source's capacity, which `convert` requires; a packet shorter
+        // than the stream's largest, as a FLAC stream's last frame is, fills only part of it.
         let frames = src.frames();
-        let mut dst = AudioBuffer::<f32>::new(frames as u64, *src.spec());
+        let mut dst = AudioBuffer::<f32>::new(src.capacity() as u64, *src.spec());
         dst.render_reserved(Some(frames));
         src.convert(&mut dst);
         dst

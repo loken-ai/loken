@@ -9,6 +9,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Attention: count each key once when the flash prefill splits a long history.
 - Experts: fail a request whose tier worker stalls instead of hanging the card.
 - Experts: lock and unlock host pages without holding the tier worker back.
+- Audio: decode a FLAC file whose last frame is short.
 
 ## [0.3.0] - 2026-10-18
 
