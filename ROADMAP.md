@@ -80,6 +80,9 @@ Smaller, by priority:
 | MIDI in | Music | A MIDI file given as the prompt continues for the bars asked, in its tempo and key | Planned |
 | Expert parallelism for resident experts | Parallelism | A mixture layer whose experts all fit on the cards split across them where measured links make it pay, faster than the layer on one card | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | A layer split over cards and a cache cut by positions handed over from the prefill instance, the decode instance reading no prompt | Planned |
+| Image and text embeddings | API | A CLIP or SigLIP checkpoint served alone on the embeddings route for text and images, its vectors matching the reference implementation, measured by the bench | Planned |
+| Voice conversion | Audio | An OpenVoice checkpoint turning a recording into a reference speaker's voice through a documented route, measured by the bench | Planned |
+| Embeddings measured by the bench | Bench | Every model with the embedding capability measured by assay, inputs per second and latency, against the peers that serve it | Planned |
 
 ## 0.6.0
 
@@ -88,6 +91,7 @@ Major, by priority:
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
 | A cluster that survives a node | Cluster | A node lost mid-request re-planned onto the others and the request finished, the loss reported | Planned |
+| A cluster across networks | Cluster | Nodes on different networks, behind NAT and without a shared LAN, joined over an authenticated and encrypted link, the placement pricing the measured wide-area links | Planned |
 | Tensor parallelism across machines | Cluster | One layer split over cards of several machines where the measured links pay, faster than the layer cut alone | Planned |
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints loaded through the same placement, outputs matching the reference implementation | Planned |
 
