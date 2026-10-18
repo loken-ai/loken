@@ -245,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The compiled feature set, so an operator sees whether this is the CUDA, OpenCL or
             // CPU-only build; empty for a minimal CPU-only build.
             let feature_flags: Vec<&'static str> = [
-                ("cuda", cfg!(feature = "cuda")),
+                ("cuda", cfg!(feature = "gpu")),
                 ("opencl", cfg!(feature = "opencl")),
                 ("cpu", cfg!(feature = "cpu")),
             ]
@@ -259,16 +259,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Check CUDA availability for inference
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let cuda_available = loken::tensor::cuda::runtime::usable();
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let cuda_available = false;
 
             if cuda_available {
                 info!("🚀 CUDA Available: Yes (GPU acceleration enabled)");
             } else {
                 info!("🚀 CUDA Available: No (running in CPU-only mode)");
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 info!("   💡 To enable CUDA, build with: cargo build --features cuda");
             }
 

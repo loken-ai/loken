@@ -272,7 +272,7 @@ mod tests {
 
     /// On a card the weight is dequantised and applied at full precision: the dense matmul over the
     /// CPU's dequantisation, to rounding.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn the_card_applies_the_dequantised_weight() {
         if !crate::cpu::hardware_has_avx2() {

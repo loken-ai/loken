@@ -135,7 +135,7 @@ const MAX_HEAD_DIM: usize = 256;
 /// NeoX (non-interleaved) RoPE. `x`:[b,h,s,d], `cos`/`sin`:[>=s, d/2]. Drop-in
 /// for `rope`: pairs (j, j+d/2) rotated by cos/sin[seq,j].
 pub fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if x.device().is_cuda() && x.dtype() == DType::F32 {
             return crate::inference::kernel::fused::fused_rope_neox_f32(x, cos, sin);
@@ -184,7 +184,7 @@ pub fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 /// Interleaved (GPT-J / llama-ggml) RoPE. Drop-in for
 /// `rope_i`: pairs (2j, 2j+1) rotated by cos/sin[seq,j].
 pub fn rope_i(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if x.device().is_cuda() && x.dtype() == DType::F32 {
             return crate::inference::kernel::fused::fused_rope_interleaved_f32(x, cos, sin);
@@ -311,7 +311,7 @@ fn fused_band_softmax(
     past: usize,
     c0: usize,
 ) -> Option<(Tensor, Tensor, Tensor)> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         let (kv_rows, _) = (scores.dim(1).ok()?, ());
         match crate::inference::quantized_cuda::band_softmax_f16(
@@ -338,7 +338,7 @@ fn fused_band_softmax(
             }
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = (scores, run_max, rows, width, seq, past, c0);
         None

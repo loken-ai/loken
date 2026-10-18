@@ -108,7 +108,7 @@ impl GenericTransformerLayer {
             }
             if kept > 0 {
                 let _order = crate::tensor::quantized::DecodeOrder::enter();
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let _in_place = crate::inference::moe_cuda::in_place_state(true);
                 self.mixer.forward(&prefix, p.base)?;
             }

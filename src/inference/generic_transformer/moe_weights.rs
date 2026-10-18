@@ -33,7 +33,7 @@ fn sort_by_expert(choices: &Tensor) -> Result<(Tensor, Tensor)> {
     if n_pairs <= 4096 {
         // On a card the sort stays there: a host round trip would stop the stream at every
         // routed layer and keep the decode from being captured.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if flat.device().is_cuda() && flat.dtype() == crate::tensor::DType::U32 {
             return crate::inference::moe_cuda::stable_sort_u32(&flat);
         }
@@ -62,7 +62,7 @@ fn sort_by_expert(choices: &Tensor) -> Result<(Tensor, Tensor)> {
 /// Run `launch`, and with the stage profile on, record the time the card took between its
 /// start and its end, from events on the card's stream (a wait the profile pays for; inside a
 /// graph being recorded, the events are stamped each time the graph runs).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn device_timed<T>(
     name: &'static str,
     on: &Tensor,
@@ -118,7 +118,7 @@ impl ExpertRouting {
     /// One launch over the fused gate‖up stack: both projections, the GELU combine and the
     /// concatenation the down projection reads. `imma` picks the per-pair-tile integer-MMA
     /// kernel over the dp4a one; the arithmetic is the same either way.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn gate_up_gelu(&self, xs: &Tensor, stack: &QTensor, imma: bool) -> Result<Tensor> {
         if imma {
             crate::inference::moe_cuda::moe_q4k_imma_m8_gate_up_gelu_mul_concat(
@@ -140,7 +140,7 @@ impl ExpertRouting {
     }
 
     /// The same, against gate and up kept apart, combined by SiLU.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn gate_up_silu(&self, xs: &Tensor, gate: &QTensor, up: &QTensor) -> Result<Tensor> {
         device_timed("expert kernels: gate and up on the device", xs, || {
             crate::inference::moe_cuda::moe_gemm_gguf_gate_up_silu_mul(
@@ -156,7 +156,7 @@ impl ExpertRouting {
 
     /// [`Self::gate_up_silu`] over the experts of the two stacks and, numbered after them, those
     /// of `more`, in one launch.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn gate_up_silu_over(
         &self,
         xs: &Tensor,
@@ -179,7 +179,7 @@ impl ExpertRouting {
 
     /// The down projection and weighted fold of `n_tokens` tokens over the experts of `stack`
     /// and, numbered after them, those of `more`, in one launch.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     /// [`Self::down_reduce_over`] up to the pairs' rows, `[pairs, hidden]`: the caller sums a
     /// row's pairs with whatever else it adds.
     pub(super) fn down_pairs_over(
@@ -202,7 +202,7 @@ impl ExpertRouting {
         })
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn down_reduce_over(
         &self,
         rows: &Tensor,
@@ -230,7 +230,7 @@ impl ExpertRouting {
 
     /// Gate and up kept apart, each with its per-expert bias, combined by the clamped
     /// SwiGLU: one launch.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn gate_up_swiglu_clamped(
         &self,
         xs: &Tensor,
@@ -256,7 +256,7 @@ impl ExpertRouting {
     /// Down projection and the weighted scatter-add that ends it: each row scaled by the
     /// score its expert was chosen with, added into the token it came from. A per-expert
     /// `bias` joins each row before its score scales it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn down_reduce(
         &self,
         rows: &Tensor,
@@ -429,7 +429,7 @@ impl SharedExpert {
         routed: &Tensor,
         projected: Option<Tensor>,
     ) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let (Some(gate), Some(w)) = (&self.gate, &self.scalar_gate) {
             // A decoded token or a window's rows: the pair of projections (fused for one
             // row), the gate, the down projection and the gated sum, each over every row.
@@ -480,7 +480,7 @@ impl SharedExpert {
     /// The expert's projections for a decoded token on a card, which do not depend on the routed
     /// experts: the down projection's output, to be joined by [`Self::forward_added`]. `None`
     /// where that path does not serve the expert.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn project(&self, xs: &Tensor) -> Result<Option<Tensor>> {
         let (Some(gate), Some(_)) = (&self.gate, &self.scalar_gate) else {
             return Ok(None);
@@ -500,7 +500,7 @@ impl SharedExpert {
     }
 
     /// No card, no projections ahead of a wait.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub fn project(&self, _: &Tensor) -> Result<Option<Tensor>> {
         Ok(None)
     }
@@ -571,7 +571,7 @@ pub struct ExpertShard {
 impl ExpertShard {
     /// The experts `first..first + count` of `layer`, whose stacks are in host memory, on `dev`.
     /// The layer reads its gate and up apart.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn from_host(layer: &MoeWeights, first: usize, count: usize, dev: &Device) -> Result<Self> {
         let (Some(gate), Some(up)) = (layer.gate_exps_sep.as_ref(), layer.up_exps_sep.as_ref())
         else {
@@ -603,12 +603,12 @@ impl ExpertShard {
         })
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub fn from_host(_: &MoeWeights, _: usize, _: usize, _: &Device) -> Result<Self> {
         crate::tensor::bail!("an expert shard lives on a card")
     }
 
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn set(&self) -> ExpertSet<'_> {
         ExpertSet {
             gate: Some(&self.stacks[0]),
@@ -952,7 +952,7 @@ impl MoeWeights {
             }
         } else {
             {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     if attn_f32.device().is_cuda()
                         && attn_f32.dim(crate::tensor::D::Minus1)? <= 16384
@@ -973,7 +973,7 @@ impl MoeWeights {
                         None
                     }
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     None::<Tensor>
                 }
@@ -997,7 +997,7 @@ impl MoeWeights {
         // One kernel scores and selects for the expert widths it covers, 32 to 512; every
         // other width, and every build compiled without kernels, takes the
         // two steps as tensor ops. Which of the two ran is what the stage profile records.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let (topk_weights, topk_ids) = if let Some(sigmoid) = self.sigmoid_routing.as_ref() {
             sigmoid.select(&logits_f32, self.n_experts_used)?
         } else {
@@ -1016,7 +1016,7 @@ impl MoeWeights {
                 self.top_k(&logits_f32)?
             }
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let (topk_weights, topk_ids) = match self.sigmoid_routing.as_ref() {
             Some(sigmoid) => sigmoid.select(&logits_f32, self.n_experts_used)?,
             None => self.top_k(&logits_f32)?,
@@ -1169,7 +1169,7 @@ impl MoeWeights {
                 )
             });
             // The experts the batch used warm the cache the decode will read.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Ok(card) = dev.as_cuda_device() {
                 let stream = card.0.stream().clone();
                 if let Err(e) = tier.keep_hottest_of_prompt(topk_ids, &stream) {
@@ -1256,7 +1256,7 @@ impl MoeWeights {
             .up_exps_sep
             .as_ref()
             .ok_or_else(|| crate::tensor::Error::msg("gateless experts without an up stack"))?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if xs.device().runs_as_card() {
             let routing = ExpertRouting::group(topk_ids, self.n_experts_used)?;
             let h = crate::inference::moe_cuda::moe_gemm_gguf(
@@ -1326,7 +1326,7 @@ impl MoeWeights {
     /// The routed pairs of `topk_ids` computed by the shards that hold their experts, every shard
     /// launched before any is waited on, and summed on the layer's card. A shard reads the ids of
     /// its own experts and weighs every other pair zero.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn experts_split(
         &self,
         xs: &Tensor,
@@ -1411,7 +1411,7 @@ impl MoeWeights {
 
     /// The routed pairs of `topk_ids` this card's experts compute, every other pair at weight
     /// zero: the card's part of a split layer's sum.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[allow(clippy::too_many_arguments)]
     fn experts_local(
         &self,
@@ -1463,7 +1463,7 @@ impl MoeWeights {
         )
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     #[allow(clippy::too_many_arguments)]
     fn experts_local(
         &self,
@@ -1478,7 +1478,7 @@ impl MoeWeights {
         crate::tensor::bail!("a split layer runs on cards")
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     fn experts_split(
         &self,
         _xs: &Tensor,
@@ -1508,7 +1508,7 @@ impl MoeWeights {
 
     /// Device path: the gate‖up projections and their combine, then the down projection and
     /// the top-k weighted reduction, each as one launch over the routing plan.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_cuda(
         &self,
         xs: &Tensor,
@@ -1534,7 +1534,7 @@ impl MoeWeights {
 
     /// [`Self::forward_cuda`] over the experts `set` holds, on the device `xs` lives on: the
     /// routed ids number the set's experts.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn experts_cuda(
         &self,
@@ -1685,7 +1685,7 @@ impl MoeWeights {
     /// The routing grouped for the expert-batched tile kernels, or `None` when this call is
     /// not one they serve: a GELU mixture, a fused gate‖up stack, a weight format they do not
     /// read, or too few rows per expert to beat the decode kernels.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn batched_routing(
         &self,
         xs: &Tensor,
@@ -1718,7 +1718,7 @@ impl MoeWeights {
     }
 
     /// The SiLU expert block through the expert-batched tile kernels.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn batched_experts(
         &self,
         xs: &Tensor,
@@ -1761,7 +1761,7 @@ impl MoeWeights {
         Ok(out)
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     fn forward_cuda(
         &self,
         _xs: &Tensor,

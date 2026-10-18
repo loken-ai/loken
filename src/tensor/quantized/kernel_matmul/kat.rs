@@ -7,7 +7,7 @@
 
 use super::*;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn kat_bad(
     set: &std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>>,
     ordinal: usize,
@@ -21,7 +21,7 @@ pub(super) fn kat_bad(
         .unwrap_or(false)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn kat_gate(
     set: &std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>>,
     ordinal: usize,
@@ -39,7 +39,7 @@ fn kat_gate(
 /// that select each family - one row for the MMVQ GEMV, a wide batch for the MMQ tiled
 /// GEMM - and gates any family whose answer is non-finite or far from the reference.
 /// Returns (probe name, passed) per probe for the caller to log.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn kernel_known_answer_test(device: &crate::tensor::Device) -> Vec<(&'static str, bool)> {
     let crate::tensor::Device::Cuda(qdev) = device else {
         return Vec::new();

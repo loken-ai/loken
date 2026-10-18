@@ -9,11 +9,11 @@ use super::*;
 impl Tensor {
     /// `x^e` elementwise.
     pub fn powf(&self, e: f32) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.powf(e));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out =
                 crate::tensor::cuda::pow_f32(dev, data.as_f32_slice()?, e, self.elem_count())?;
@@ -27,7 +27,7 @@ impl Tensor {
     }
 
     pub fn broadcast_div(&self, rhs: &Self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let r = if matches!(rhs.dtype(), DType::F16 | DType::BF16) {
                 rhs.to_dtype(DType::F32)?
@@ -86,7 +86,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             if self.dtype() == DType::F32 {
                 let Storage::Cuda { data, dev } = self.storage().as_ref() else {
@@ -169,7 +169,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             // device path: non-dim dims equal (the decode-path form), idx on
             // the same device
@@ -261,7 +261,7 @@ impl Tensor {
                 }
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             if on_true.is_cuda_f16() && on_false.is_cuda_f16() && self.is_on_cuda() {
                 let back = on_true.dtype();
@@ -345,7 +345,7 @@ impl Tensor {
     /// Sort each row of the last dim; returns `(values, u32 indices)`.
     /// Stable, NaN-greater comparator (matches the previous substrate).
     pub fn sort_last_dim(&self, asc: bool) -> Result<(Self, Self)> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             // host fallback - the in-server MoE routing already falls back to
             // a host sort for large pair counts; small sorts go the same way.
@@ -405,7 +405,7 @@ impl Tensor {
 
     pub(super) fn argmax_impl<I: Dim>(&self, dim: I, keepdim: bool) -> Result<Self> {
         let d = dim.to_index(&self.shape, "argmax")?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             return self.host_bounce(move |cpu| cpu.argmax_impl(d, keepdim));
         }
@@ -510,18 +510,18 @@ impl Tensor {
         let inner: usize = dims[d + 1..].iter().product();
         let (dst_d, src_d) = (dims[d], sdims[d]);
         // On a card a view is copied from where it lies: views are contiguous ranges.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let (src_store, src_off) = match src.storage_raw.as_ref() {
             Storage::Cuda { .. } if !Arc::ptr_eq(&self.storage_raw, &src.storage_raw) => {
                 (&src.storage_raw, src.offset)
             }
             _ => (src.storage(), 0),
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let (src_store, src_off) = (src.storage(), 0usize);
         let _ = src_off;
         match (self.storage().as_ref(), src_store.as_ref()) {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             (
                 Storage::Cuda { data: dd, dev },
                 Storage::Cuda {
@@ -628,7 +628,7 @@ impl Tensor {
             source.storage().as_ref(),
             indexes.storage().as_ref(),
         ) {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             (
                 Storage::Cuda { data: dd, dev },
                 Storage::Cuda {

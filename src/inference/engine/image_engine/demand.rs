@@ -308,7 +308,7 @@ pub(super) fn zimage_native_from_plan(
 /// answer. Then every figure derived from it stays at what it counted, which is the
 /// arrangement this file has always had.
 pub(super) fn zimage_alloc_shape() -> Option<(u64, u64)> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         let crate::tensor::Device::Cuda(dev) = crate::inference::place::ladder::fastest()? else {
             return None;
@@ -316,7 +316,7 @@ pub(super) fn zimage_alloc_shape() -> Option<(u64, u64)> {
         let (_, align) = dev.alloc_shape();
         Some((dev.pool_chunk()?, align))
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         None
     }

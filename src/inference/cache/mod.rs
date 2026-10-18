@@ -25,11 +25,11 @@ pub mod kv_core;
 pub mod kv_disk;
 pub mod paged_attention;
 pub mod paged_kv;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod q4_kv;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod q8_kv;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod quant_kv;
 pub mod qvb;
 pub mod state_disk;

@@ -59,7 +59,7 @@ const HALF_PRODUCT_ROWS: usize = 64;
 
 /// The relative distance from a mixer weight, from which holding it as int8 rows is not done:
 /// the tolerance the tier's expert outputs are checked at.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const INT8_TOLERANCE: f64 = 2e-2;
 
 /// A mixer's weight: a dense one on a card is held as int8 rows with a scale each when that
@@ -77,7 +77,7 @@ enum Weight {
 }
 
 /// A two-dimensional weight stored in a dense float width, as F32 on the host.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn host_f32(w: &crate::tensor::quantized::QTensor) -> Result<Option<Tensor>> {
     use crate::tensor::quantized::GgmlDType::{BF16, F16, F32};
     if !matches!(w.dtype(), F32 | F16 | BF16) || w.shape().dims().len() != 2 {
@@ -93,7 +93,7 @@ fn host_f32(w: &crate::tensor::quantized::QTensor) -> Result<Option<Tensor>> {
 /// The rows of the dense F32 weight `t` as int8 with a scale for each group of 64 values, on
 /// `dev`; `None` when that would move the weight by more than [`INT8_TOLERANCE`], or when a row is
 /// not a whole number of groups.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn int8_rows(
     t: &Tensor,
     dev: &crate::tensor::Device,
@@ -146,7 +146,7 @@ impl Weight {
         inject: Option<QTensor>,
         dev: &Device,
     ) -> Result<(Self, Self, Option<Self>)> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if dev.is_cuda() {
             let rows = |w: &QTensor| -> Result<Option<(Tensor, Tensor)>> {
                 match host_f32(w)? {
@@ -175,7 +175,7 @@ impl Weight {
     }
 
     fn pack_exact(w: QTensor, dev: &Device) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if dev.is_cuda() {
             if let Some(t) = host_f32(&w)? {
                 // CONVERSION: a dense mixer weight is held F16 on a card when that loses nothing
@@ -202,7 +202,7 @@ impl Weight {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Weight::Plain(w) => w.forward(x),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Weight::Int8 { q, scale } => {
                 // Rows enough for the half-precision product widen the weight to F16; fewer,
                 // to the F32 the launches multiply in.
@@ -221,7 +221,7 @@ impl Weight {
                 *out.last_mut().expect("an activation has a width") = q.dims()[0];
                 y.reshape(out)
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             Weight::Int8 { .. } => crate::tensor::bail!("int8 mixer weights live on a card"),
             Weight::Half(w) => {
                 let dims = x.dims().to_vec();
@@ -253,7 +253,7 @@ impl Weight {
     }
 
     /// The weight as a dense tensor, widened from int8 rows where it is held so.
-    #[cfg(all(feature = "cuda", test))]
+    #[cfg(all(feature = "gpu", test))]
     fn widened(&self) -> Option<Tensor> {
         match self {
             Weight::Int8 { q, scale } => {
@@ -264,7 +264,7 @@ impl Weight {
     }
 
     /// The weight as the fused launches read it: dense or as int8 rows.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn mix(&self) -> Option<crate::inference::moe_cuda::MixWeight<'_>> {
         use crate::inference::moe_cuda::MixWeight;
         match self {
@@ -312,13 +312,13 @@ impl HyperMixer {
     }
 
     /// Whether this mixer's stages run as the fused launches: its weights are on a card.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn on_card(&self) -> bool {
         self.gamma.device().is_cuda()
     }
 
     /// The grouped norm of `r`, in the launch a card has for it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn normed_on_card(&self, r: &Tensor) -> Result<Tensor> {
         crate::inference::moe_cuda::hc_norm(
             &r.to_dtype(DType::F32)?,
@@ -330,7 +330,7 @@ impl HyperMixer {
     }
 
     /// The gamma and epsilon of the norm: what the previous layer's write-back fuses in.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn norm_params(&self) -> (&Tensor, f32) {
         (&self.gamma, self.eps as f32)
     }
@@ -338,7 +338,7 @@ impl HyperMixer {
     /// [`Self::mix`] from the already normalised residual `xn`, each stage a launch: the
     /// sublayer input (F16 when `f16_out`) and the raw write-back weights, which
     /// [`Self::combine_on_card`] turns into `2 sigmoid(. / streams)`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn mix_on_card(&self, xn: &Tensor, f16_out: bool) -> Result<(Tensor, Option<Tensor>)> {
         use crate::inference::moe_cuda::{hc_low, hc_mean_gate, hc_mix_fused_over};
         if let (Some(down), Some(up)) = (self.down.mix(), self.up.mix()) {
@@ -360,13 +360,13 @@ impl HyperMixer {
     }
 
     /// The `down` weight as a dense tensor, for a test of the fused launches.
-    #[cfg(all(feature = "cuda", test))]
+    #[cfg(all(feature = "gpu", test))]
     pub(super) fn down_dense(&self) -> Option<Tensor> {
         self.down.widened()
     }
 
     /// The `up` weight as a dense tensor, for a test of the fused launches.
-    #[cfg(all(feature = "cuda", test))]
+    #[cfg(all(feature = "gpu", test))]
     pub(super) fn up_dense(&self) -> Option<Tensor> {
         self.up.widened()
     }
@@ -483,9 +483,9 @@ const MIXER_LIVE_BUFFERS: usize = 8;
 /// Rows a mixer works on at once: two tiles of the grouped expert matmul, so the low-rank products
 /// still fill their tiles while the mixer's temporaries stay a fixed size however long the chunk.
 pub fn mixer_block_rows() -> usize {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     let tile = crate::inference::moe_cuda::MMQ_X_MAX;
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     let tile = 128;
     2 * tile
 }
@@ -544,7 +544,7 @@ pub fn combine(r: &Tensor, out: &Tensor, inj: &Tensor) -> Result<Tensor> {
 
 /// [`combine`] for raw write-back weights, in one launch; with `next` the norm of the result
 /// for the mixer that follows comes back too.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn combine_on_card(
     r: &Tensor,
     out: &Tensor,

@@ -151,7 +151,7 @@ impl ModelBackend for PipelineHeadBackend {
         Some(self.model.placement())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn cuda_device_ordinals(&self) -> std::collections::HashSet<usize> {
         self.model.cuda_device_ordinals()
     }

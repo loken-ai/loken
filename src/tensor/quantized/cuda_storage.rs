@@ -9,7 +9,7 @@ use super::*;
 /// Device-resident quantized blob: a `QCudaStorage`.
 /// The blob is `Arc`-shared so a weight's `QMatMul` kernels and its
 /// `storage()` projection reuse ONE padded upload (no double VRAM).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub struct QCudaStorage {
     pub(crate) blob: Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
     /// Unpadded byte length of the block data.
@@ -23,7 +23,7 @@ pub struct QCudaStorage {
 /// Every buffer this type hands to a kernel is allocated this way - a fresh blob, an upload,
 /// and a re-quantisation that outgrew its blob all want the same thing, so the tail is added
 /// in one place rather than remembered in three.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn padded_blob(
     device: &CudaDevice,
     what: &'static str,
@@ -38,7 +38,7 @@ fn padded_blob(
     .map_err(|e: crate::tensor::Error| Error::msg(e.to_string()))
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl QCudaStorage {
     /// Zeroed storage for `el_count` elements of `dtype` (KV staging).
     pub fn zeros(device: &CudaDevice, el_count: usize, dtype: GgmlDType) -> Result<Self> {
@@ -267,14 +267,14 @@ impl QCudaStorage {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 enum QuantizeSrc<'a> {
     F32(crate::tensor::gpu_runtime::driver::CudaView<'a, f32>),
     F16(crate::tensor::gpu_runtime::driver::CudaView<'a, half::f16>),
 }
 
 /// The memory pool of card `ordinal` that holds the blobs lent to a prefill (made on first use).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn lent_pool(ordinal: usize) -> Result<crate::tensor::gpu_runtime::driver::sys::CUmemoryPool> {
     use crate::tensor::gpu_runtime::driver::sys;
     use std::collections::HashMap;
@@ -303,7 +303,7 @@ fn lent_pool(ordinal: usize) -> Result<crate::tensor::gpu_runtime::driver::sys::
 }
 
 /// `bytes` zeroed bytes from the memory pool of the card that holds only what is lent.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn lent_blob(
     device: &CudaDevice,
     bytes: usize,
@@ -334,7 +334,7 @@ fn lent_blob(
 }
 
 /// Give the card `ordinal` the memory the lent pool still holds after its blobs were freed.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) fn trim_lent_pool(ordinal: usize) {
     if let Ok(pool) = lent_pool(ordinal) {
         unsafe {

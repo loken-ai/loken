@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -184,13 +184,13 @@ impl ComputeDevice {
     fn check_device_availability(device_type: &DeviceType) -> DeviceAvailability {
         match device_type {
             DeviceType::Cuda => {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     // CUDA feature is compiled in - check if runtime is available
                     // This will be verified during actual device creation
                     DeviceAvailability::Available
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     DeviceAvailability::Unavailable {
                         reason: UnavailableReason::BackendNotCompiled,
@@ -211,12 +211,12 @@ impl ComputeDevice {
             }
 
             DeviceType::Metal => {
-                #[cfg(all(feature = "cuda", target_os = "macos"))]
+                #[cfg(all(feature = "gpu", target_os = "macos"))]
                 {
                     // Metal, on macOS
                     DeviceAvailability::Available
                 }
-                #[cfg(not(all(feature = "cuda", target_os = "macos")))]
+                #[cfg(not(all(feature = "gpu", target_os = "macos")))]
                 {
                     DeviceAvailability::Unavailable {
                         reason: UnavailableReason::BackendNotSupported,
@@ -329,7 +329,7 @@ impl DeviceManager {
     }
 
     /// Detect NVIDIA CUDA devices
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn detect_cuda_devices(&mut self) -> Result<()> {
         use crate::tensor::Device;
 
@@ -366,13 +366,13 @@ impl DeviceManager {
         Ok(())
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     fn detect_cuda_devices(&mut self) -> Result<()> {
         Ok(())
     }
 
     /// Get CUDA device name
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn get_cuda_device_name(&self, _index: usize) -> Result<String> {
         // Use NVML to get device name
         use nvml_wrapper::Nvml;
@@ -385,13 +385,13 @@ impl DeviceManager {
             .map_err(|e| anyhow!("NVML name failed: {}", e))
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     fn get_cuda_device_name(&self, _index: usize) -> Result<String> {
         Ok(format!("CUDA Device {}", _index))
     }
 
     /// Get CUDA device memory
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn get_cuda_device_memory(&self, _index: usize) -> Result<u64> {
         use nvml_wrapper::Nvml;
         let nvml = Nvml::init().map_err(|e| anyhow!("NVML init failed: {}", e))?;
@@ -404,7 +404,7 @@ impl DeviceManager {
         Ok(info.total)
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     fn get_cuda_device_memory(&self, _index: usize) -> Result<u64> {
         Ok(0)
     }
@@ -833,7 +833,7 @@ impl HardwareTopology {
         info!("COMPILED FEATURES:");
         info!(
             "  CUDA support:    {}",
-            if cfg!(feature = "cuda") {
+            if cfg!(feature = "gpu") {
                 "✅ Enabled"
             } else {
                 "❌ Not compiled"

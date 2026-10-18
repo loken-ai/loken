@@ -27,14 +27,14 @@ macro_rules! cuda_launchers {
 pub(crate) use cuda_launchers;
 
 pub mod cpu_decode_exec;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod flash_decode_tc;
 // One module, two implementations chosen by the build. The CPU one answers `None` for the
 // optional fast paths so the caller falls back, and carries portable code for the rest - so a
 // caller writes `kernel::fused::...` without knowing which build it is in.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod fused;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 #[path = "fused_cpu.rs"]
 pub mod fused;
 #[cfg(feature = "opencl")]

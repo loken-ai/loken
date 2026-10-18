@@ -69,7 +69,7 @@ impl Tensor {
         let shape = shape.into();
         let len = match storage.as_ref() {
             Storage::Cpu(c) => c.len(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { data, .. } => data.len(),
             Storage::Dry(d) => d.len(),
         };
@@ -95,7 +95,7 @@ impl Tensor {
                 d.device().note_blind_read();
                 vec![0f32; self.elem_count()]
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { data, dev } => data
                 .download(dev)
                 .map(|c| c.to_f32_vec())
@@ -125,7 +125,7 @@ impl Tensor {
             (Storage::Dry(_), _) => Err(Error(
                 "a dry tensor cannot be moved to a real device".into(),
             )),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             (Storage::Cpu(c), Device::Cuda(dev)) => {
                 let data = crate::tensor::cuda::CudaStorage::upload_host_safe(dev, c)?;
                 Ok(Self::from_packed(
@@ -136,7 +136,7 @@ impl Tensor {
                     self.shape.clone(),
                 ))
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             (Storage::Cuda { data, dev }, Device::Cpu) => {
                 let c = data.download(dev)?;
                 Ok(Self::from_packed(
@@ -144,7 +144,7 @@ impl Tensor {
                     self.shape.clone(),
                 ))
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             (Storage::Cuda { data, dev }, Device::Cuda(target)) => {
                 // cross-GPU peer copy: enqueued on the DESTINATION stream, which will
                 // not otherwise wait for the in-flight source compute that produces
@@ -168,7 +168,7 @@ impl Tensor {
     }
 
     /// Wrap an existing device buffer (kernel outputs become tensors this way).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn from_cuda_storage<S: Into<Shape>>(
         data: crate::tensor::cuda::CudaStorage,
         dev: std::sync::Arc<crate::tensor::cuda::CudaDevice>,
@@ -189,7 +189,7 @@ impl Tensor {
     }
 
     /// Borrow the f32 device slice + its device (the kernel-launch boundary).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn cuda_f32_slice(
         &self,
     ) -> Result<(
@@ -204,7 +204,7 @@ impl Tensor {
     }
 
     /// Borrow the f16 device slice + its device.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn cuda_f16_slice(
         &self,
     ) -> Result<(
@@ -219,7 +219,7 @@ impl Tensor {
     }
 
     /// Borrow the bf16 device slice + its device.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn cuda_bf16_slice(
         &self,
     ) -> Result<(
@@ -236,7 +236,7 @@ impl Tensor {
     /// Run a CPU-only op on a CUDA tensor by bouncing through host memory.
     /// Correctness-first fallback; ops earn dedicated GPU kernels when the
     /// decode path needs them hot.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[track_caller]
     pub(super) fn host_bounce(&self, f: impl FnOnce(&Self) -> Result<Self>) -> Result<Self> {
         let _b = crate::tensor::bounce::start("host_bounce");
@@ -252,7 +252,7 @@ impl Tensor {
     /// Half-precision (f16/bf16) CUDA tensors run the f32 kernels via
     /// on-device casts (f32 accumulation - the standard mixed-precision
     /// recipe; dedicated half kernels arrive only where a hot path needs them).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[track_caller]
     pub(super) fn f16_unary_via_f32(&self, f: impl Fn(&Self) -> Result<Self>) -> Result<Self> {
         let _b = crate::tensor::bounce::start("f16_via_f32");
@@ -260,7 +260,7 @@ impl Tensor {
         f(&self.to_dtype(DType::F32)?)?.to_dtype(back)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn is_cuda_f16(&self) -> bool {
         self.is_on_cuda() && matches!(self.dtype(), DType::F16 | DType::BF16)
     }
@@ -270,7 +270,7 @@ impl Tensor {
         if let Some(t) = self.dry_out(self.shape.clone(), self.dtype()) {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::F16 {
             // half-precision arithmetic, like the reference f16 affine kernel
             if let Storage::Cuda { data, dev } = self.storage().as_ref() {
@@ -288,7 +288,7 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::BF16 {
             if let Storage::Cuda { data, dev } = self.storage().as_ref() {
                 let out = crate::tensor::cuda::affine_bf16(
@@ -305,11 +305,11 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.scale(alpha));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out = crate::tensor::cuda::scale_f32(
                 dev,
@@ -327,11 +327,11 @@ impl Tensor {
     }
 
     pub fn exp(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.exp());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_exp_f32")? {
             return Ok(t);
         }
@@ -350,7 +350,7 @@ impl Tensor {
         if let Some(t) = self.dry_out(self.shape.clone(), self.dtype()) {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             return match self.affine_on_device(mul, add) {
                 Err(e) if e.is_oom() => {
@@ -364,7 +364,7 @@ impl Tensor {
     }
 
     pub(super) fn affine_on_device(&self, mul: f32, add: f32) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::F16 {
             // half-precision arithmetic, like the reference f16 affine kernel
             //
@@ -383,7 +383,7 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::BF16 {
             if let Storage::Cuda { data, dev } = self.storage().as_ref() {
                 let out = crate::tensor::cuda::affine_bf16(
@@ -400,11 +400,11 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.affine(mul, add));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out = crate::tensor::cuda::affine_f32(
                 dev,

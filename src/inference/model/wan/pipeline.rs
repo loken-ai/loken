@@ -819,7 +819,7 @@ pub fn render_many_sampled(
     //
     // This trim is also WHY the encoder is free to take a card at all: it runs here, before
     // the DiT is planned, so the two never hold device memory at the same time.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     crate::inference::engine::llm_engine::release_cuda_pools();
 
     // -- (2) load the DiT ONCE, through the unified HeteroPlan: whole onto one card when
@@ -1248,7 +1248,7 @@ pub fn render_many_sampled(
         // still looks full, hits an out-of-memory, and hands the clip to the host. That
         // fallback works and it is slow: it turned a clip whose denoise took a hundred
         // seconds into one that spent ten times that in the decode.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         crate::inference::engine::llm_engine::release_cuda_pools();
         let latent = Tensor::from_vec_f32(x, (LATENT_CH, f_lat, hl, wl))?;
         // Say how far the decode has got. It walks the clip one latent frame at a time and

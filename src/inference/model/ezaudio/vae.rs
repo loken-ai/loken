@@ -9,7 +9,7 @@
 use crate::inference::model::acestep::vae::{
     fuse_weight_norm, BlockW, ConvW, OobleckDecoder, ResUnitW, SnakeW,
 };
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::tensor::DType;
 use crate::tensor::{Device as ND, Result, Tensor as NT};
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ fn conv_from_pt(
         None => vec![0.0; c_out],
     };
     let wt = if is_convt {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if matches!(dev, ND::Cuda(_)) {
             // [c_in,c_out,k] -> [k*c_out, c_in] so the convT contraction is a plain GEMM, F16.
             let mut wr = vec![0f32; k * c_out * c_in];
@@ -68,11 +68,11 @@ fn conv_from_pt(
         } else {
             NT::from_vec_f32(w, (c_in, c_out, k))?.to_device(dev)?
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         NT::from_vec_f32(w, (c_in, c_out, k))?.to_device(dev)?
     } else {
         let t = NT::from_vec_f32(w, (c_out, c_in, k))?.to_device(dev)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let t = if matches!(dev, ND::Cuda(_)) {
             t.to_dtype(DType::F16)?
         } else {

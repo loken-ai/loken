@@ -1,6 +1,6 @@
 //! CPU fallback shim for `moe_cuda` (the CUDA MoE expert-GEMM + routing helpers).
 //!
-//! Selected via `#[cfg(not(feature = "cuda"))]` in `mod.rs`. Provides tensor-op CPU
+//! Selected via `#[cfg(not(feature = "gpu"))]` in `mod.rs`. Provides tensor-op CPU
 //! implementations of the expert grouped-GEMM (the only non-optional ops the
 //! arches call directly) and returns `None` for the optional fused routing/conv
 //! helpers so the architecture falls back to its portable path.
@@ -11,7 +11,7 @@
 //! (the ids are sorted, so each expert occupies a contiguous run).
 
 /// Without a card no expert kernel serves any dtype, so every mixture takes the host path.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub mod gemm {
     pub fn expert_kernels_serve(_dtype: crate::tensor::quantized::GgmlDType) -> bool {
         false

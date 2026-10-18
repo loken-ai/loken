@@ -323,7 +323,7 @@ impl LlmEngine {
             let mut window_tail_ns = 0u64;
             let mut window_iters = 0u64;
             // Phase 1: Setup + tokenize + batched prefill (with lock)
-            #[cfg_attr(feature = "cuda", allow(unused_variables))]
+            #[cfg_attr(feature = "gpu", allow(unused_variables))]
             // The resolved sampling parameters travel as ONE value rather than as five
             // slots of this tuple. Spelled out here, spelled out again where the setup
             // block builds it and a third time where the block resolves it, the same list
@@ -723,7 +723,7 @@ impl LlmEngine {
                 // one they were recorded at, the quantised caches' capture flags released for
                 // the prefill; otherwise the stale per-layer graph buffers are dropped. Cheap;
                 // does not touch KV contents.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if state.kept_graphs.current(state.model.graph_generation()) {
                     state.model.suspend_graph_captured();
                 } else {
@@ -731,7 +731,7 @@ impl LlmEngine {
                     state.model.note_graphs_kept(None);
                     state.model.invalidate_graph_state();
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 state.model.invalidate_graph_state();
                 decode_free_start = state.model.free_device_memory();
 
@@ -1055,7 +1055,7 @@ impl LlmEngine {
             // warmup -> capture (shared `capture_decode_graph`) -> replay +
             // probation sequence into this loop. Non-split (Q4/Q8 dev-pos)
             // models only - split-path models are gated off engine-wide.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let (graph_stream, graph_eligible) = {
                 let guard = model_state.blocking_lock();
                 match guard.as_ref() {
@@ -1080,11 +1080,11 @@ impl LlmEngine {
                     _ => (None, false),
                 }
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let graph_eligible = false;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let graph_ok = false;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let graph_disabled_this_request = false;
             let pld_capable = {
                 let guard = model_state.blocking_lock();
@@ -1095,11 +1095,11 @@ impl LlmEngine {
             };
             // Each step replays the captured graph, unless the n-gram cache has a draft to
             // verify: that step runs eagerly over the draft, and the next one replays again.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let graph_ok = graph_eligible && graph_stream.is_some();
             // The graphs kept from the last request are taken when the prefill moved none of
             // the buffers they read; stale ones are dropped with the graph state.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let kept = model_state.blocking_lock().as_mut().and_then(|s| {
                 let had = !s.kept_graphs.is_empty();
                 match s.kept_graphs.take_current(s.model.graph_generation()) {
@@ -1115,7 +1115,7 @@ impl LlmEngine {
                     }
                 }
             });
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let (kept_step, mut verify_graphs, mut graphs_at) = match kept {
                 Some((g, at)) => {
                     let mut verify = g.verify;
@@ -1130,9 +1130,9 @@ impl LlmEngine {
             };
             // A step kept from the last request is replayed from the first token: its first
             // replay is held against an eager step, as the last one of a fresh capture's is.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_kept = kept_step.is_some();
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let (mut cuda_graph, mut graph_logits): (
                 Option<super::decode::DecodeGraph>,
                 Option<Tensor>,
@@ -1140,13 +1140,13 @@ impl LlmEngine {
                 Some((g, l)) => (Some(g), Some(l)),
                 None => (None, None),
             };
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_disabled_this_request: bool = false;
             // Probations of the step graph that disagreed with the eager step, this request.
             let mut graph_mismatches: usize = 0;
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_warmed: bool = graph_kept;
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_capture_attempted: bool = graph_kept;
             // Replays held against an eager step before a replay is trusted: three the first time
             // the model records its step, the capture's own once the step proved itself, one for
@@ -1160,7 +1160,7 @@ impl LlmEngine {
             } else {
                 super::decode::GRAPH_VALIDATIONS
             };
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_validations: usize = if graph_kept {
                 graph_validations_needed.saturating_sub(1)
             } else {
@@ -1695,9 +1695,9 @@ impl LlmEngine {
                         && pld_cooldown == 0
                         && pld_cost.worth_trying()
                         && !super::decode::copy_draft(&pld_cache).is_empty();
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let step_recorded = cuda_graph.is_some();
-                    #[cfg(not(feature = "cuda"))]
+                    #[cfg(not(feature = "gpu"))]
                     let step_recorded = false;
                     let head_draft: Vec<u32> = if head_on && step_recorded && !copy_ready {
                         // The head drafts as far as the window carries, each guess while it is
@@ -1741,7 +1741,7 @@ impl LlmEngine {
                     if head_on && head_draft.is_empty() && !copy_ready {
                         head_empty += 1;
                     }
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let graph_step: Option<(u32, Option<Tensor>)> = 'graph_blk: {
                         // A drafter's step, or a draft worth verifying, runs over its rows.
                         let verify_step = spec_on || !head_draft.is_empty() || copy_ready;
@@ -2196,7 +2196,7 @@ impl LlmEngine {
                         break 'graph_blk None;
                     };
                     record_logprobs(&stream_tokenizer, &mut logits_processor, &mut logprob_buf);
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if let Some((tok, dev_tok)) = graph_step {
                         next_token = tok;
                         next_token_dev = dev_tok;
@@ -2225,7 +2225,7 @@ impl LlmEngine {
                     }
                     // The graph's forwards append to the cache on the card without advancing
                     // its host length; an eager step after them starts where they left it.
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if graph_warmed {
                         if let Some(s) = model_state.blocking_lock().as_mut() {
                             s.model.sync_kv_len_for_graph(pos);
@@ -2347,7 +2347,7 @@ impl LlmEngine {
                                     .mul_add(1e9, 0.0)
                                     as u64;
                             }
-                            #[cfg(feature = "cuda")]
+                            #[cfg(feature = "gpu")]
                             let recorded = match (windows_served, graph_stream.as_ref()) {
                                 (true, Some(s)) => super::decode::verify_recorded(
                                     &mut state.model,
@@ -2358,28 +2358,28 @@ impl LlmEngine {
                                 ),
                                 _ => None,
                             };
-                            #[cfg(not(feature = "cuda"))]
+                            #[cfg(not(feature = "gpu"))]
                             let recorded: Option<(
                                 Tensor,
                                 Option<f64>,
                             )> = None;
                             // A window dropped the step's buffers: the step's graph is recorded
                             // anew from here rather than replayed over them.
-                            #[cfg(feature = "cuda")]
+                            #[cfg(feature = "gpu")]
                             if std::mem::take(&mut verify_graphs.step_stale) {
                                 cuda_graph = None;
                                 graph_logits = None;
                                 graph_warmed = false;
                                 graph_capture_attempted = false;
                             }
-                            #[cfg(feature = "cuda")]
+                            #[cfg(feature = "gpu")]
                             if recorded.as_ref().is_some_and(|r| r.1.is_some()) {
                                 graphs_at.note(state.model.graph_generation());
                             }
                             let recorded_window = recorded.is_some();
-                            #[cfg(feature = "cuda")]
+                            #[cfg(feature = "gpu")]
                             let windows_given_up = verify_graphs.disabled;
-                            #[cfg(not(feature = "cuda"))]
+                            #[cfg(not(feature = "gpu"))]
                             let windows_given_up = false;
                             if recorded_window {
                                 replay_sum += replaying.elapsed().as_secs_f64();
@@ -2444,7 +2444,7 @@ impl LlmEngine {
                                     max_tokens,
                                     &mut |row, recent| {
                                         if temperature == 0.0 {
-                                            #[cfg(feature = "cuda")]
+                                            #[cfg(feature = "gpu")]
                                             {
                                                 gpu_sample_returning_tensor(
                                                     row,
@@ -2453,7 +2453,7 @@ impl LlmEngine {
                                                     repeat_last_n,
                                                 )
                                             }
-                                            #[cfg(not(feature = "cuda"))]
+                                            #[cfg(not(feature = "gpu"))]
                                             {
                                                 let penalized = apply_repeat_penalty(
                                                     row,
@@ -2701,7 +2701,7 @@ impl LlmEngine {
                                         return;
                                     }
                                 };
-                                #[cfg(feature = "cuda")]
+                                #[cfg(feature = "gpu")]
                                 {
                                     match gpu_sample_returning_tensor(
                                         &logits_1d,
@@ -2716,7 +2716,7 @@ impl LlmEngine {
                                         }
                                     }
                                 }
-                                #[cfg(not(feature = "cuda"))]
+                                #[cfg(not(feature = "gpu"))]
                                 {
                                     match gpu_sample(
                                         &logits_1d,
@@ -2790,9 +2790,9 @@ impl LlmEngine {
                         // An eager step of a request that decodes through its recorded step
                         // ran before the recording or instead of a replay: it is not what a
                         // plain step costs in the run.
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         let replays = graph_ok && !graph_disabled_this_request;
-                        #[cfg(not(feature = "cuda"))]
+                        #[cfg(not(feature = "gpu"))]
                         let replays = false;
                         if time_plain && !probation_step && !replays {
                             spec_engine
@@ -2862,10 +2862,10 @@ impl LlmEngine {
                     s.model.draft_head_capture(false);
                 }
                 if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let (verify_prepare_secs, verify_launch_secs) =
                         (verify_graphs.prepare_secs, verify_graphs.launch_secs);
-                    #[cfg(not(feature = "cuda"))]
+                    #[cfg(not(feature = "gpu"))]
                     let (verify_prepare_secs, verify_launch_secs) = (0.0_f64, 0.0_f64);
                     info!(
                         "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; copies: {copy_windows} windows, {copy_accepted} of {copy_drafted} kept; plain step: {} launch, {} wait, {} sample ms over {plain_steps}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess; {}; loop {:.1} ms an iteration ({} iterations), before the cycle {:.1} ms, after it {:.1} ms, the head's attempt {:.1} ms; a window's iteration before the verify {:.1} ms, from its commit to the cycle's end {:.1} ms",
@@ -2893,7 +2893,7 @@ impl LlmEngine {
                 }
             }
             // A step that went through every probation proved itself for this model.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if !step_proven
                 && graph_validations >= graph_validations_needed
                 && !graph_disabled_this_request
@@ -2905,7 +2905,7 @@ impl LlmEngine {
             // A step graph that every recording of the request shares the model's current graph
             // generation with is kept on the loaded model, the windows with it, for the next
             // request to replay; any other is dropped with the graph state.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Some(s) = model_state.blocking_lock().as_mut() {
                 let keep_at = graphs_at
                     .keepable(s.model.graph_generation())

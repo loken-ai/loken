@@ -1404,7 +1404,7 @@ impl Q4KvCache {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod decode_parity_tests {
     //! The Q4 decode attention against the attention of the F32 history it was built from.
     //! The history is written as a prefill and then one row per decode step, which crosses

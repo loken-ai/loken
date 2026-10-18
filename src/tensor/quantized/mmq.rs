@@ -5,7 +5,7 @@
 
 use super::*;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[derive(Default)]
 pub(super) struct MmqWorkspace {
     pub(super) main: Option<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
@@ -17,14 +17,14 @@ pub(super) struct MmqWorkspace {
     pub(super) last_use: Option<crate::tensor::gpu_runtime::driver::CudaEvent>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) static MMQ_WORKSPACES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<usize, MmqWorkspace>>,
 > = std::sync::OnceLock::new();
 
 /// Drop the per-device MMQ scratch workspaces (model unload - returns the
 /// reserved VRAM; re-created lazily on the next batched matmul).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn release_mmq_workspaces() {
     // try_lock, NOT lock: the emergency-reclaim path runs INSIDE an OOM'd
     // `mmq_forward`, which holds this mutex across its workspace use (the
@@ -48,7 +48,7 @@ pub fn release_mmq_workspaces() {
 /// which is the other place the same thirteen arguments used to be spelled out.
 macro_rules! mmq_quantizers {
     ($($(#[$note:meta])* $name:ident;)+) => {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         pub(crate) type MmqQuantizeLauncher = unsafe extern "C" fn(
             x: *const std::ffi::c_void,
             ids: *const i32,
@@ -65,7 +65,7 @@ macro_rules! mmq_quantizers {
             stream: *mut std::ffi::c_void,
         );
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         extern "C" {
             $(
                 $(#[$note])*
@@ -109,7 +109,7 @@ macro_rules! mmq_formats {
     ($($dtype:ident => $qk:expr, $quantize:ident, $matmul:ident, $moe:ident;)+) => {
         /// The pointer type the dispatch below holds a tile kernel in - the same call the
         /// declarations under it make, said once.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         type MmqMatmulLauncher = unsafe extern "C" fn(
             tmp_fixup: *mut std::ffi::c_void,
             x: *const std::ffi::c_void,
@@ -128,7 +128,7 @@ macro_rules! mmq_formats {
         );
 
         /// The pointer type the expert-batched tile kernels are held in.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         pub(crate) type MmqMoeLauncher = unsafe extern "C" fn(
             x: *const std::ffi::c_void,
             x_second: *const std::ffi::c_void,
@@ -153,7 +153,7 @@ macro_rules! mmq_formats {
             stream: *mut std::ffi::c_void,
         ) -> i32;
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         extern "C" {
             $(
                 fn $moe(
@@ -182,7 +182,7 @@ macro_rules! mmq_formats {
             )+
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         extern "C" {
             $(
                 fn $matmul(
@@ -205,13 +205,13 @@ macro_rules! mmq_formats {
         }
 
         /// Whether a tile kernel exists for this weight format.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         pub(crate) fn mmq_supports(dtype: GgmlDType) -> bool {
             matches!(dtype, $(GgmlDType::$dtype)|+)
         }
 
         /// Values per block - what the activation must be quantised in multiples of.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         pub(crate) fn mmq_qk(dtype: GgmlDType) -> usize {
             match dtype {
                 $(GgmlDType::$dtype => $qk,)+
@@ -220,7 +220,7 @@ macro_rules! mmq_formats {
         }
 
         /// The activation quantiser whose scale layout this format's tile kernel reads.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         pub(crate) fn mmq_quantize_launcher(dtype: GgmlDType) -> Result<MmqQuantizeLauncher> {
             Ok(match dtype {
                 $(GgmlDType::$dtype => $quantize,)+
@@ -229,7 +229,7 @@ macro_rules! mmq_formats {
         }
 
         /// The expert-batched tile kernel of a format in the table.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         fn mmq_moe_launcher_listed(dtype: GgmlDType) -> Result<MmqMoeLauncher> {
             Ok(match dtype {
                 $(GgmlDType::$dtype => $moe,)+
@@ -238,7 +238,7 @@ macro_rules! mmq_formats {
         }
 
         /// The tile kernel itself.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         pub(crate) fn mmq_launcher(dtype: GgmlDType) -> Result<MmqMatmulLauncher> {
             Ok(match dtype {
                 $(GgmlDType::$dtype => $matmul,)+
@@ -265,10 +265,10 @@ mmq_formats! {
 /// The formats only a mixture stores, which have no dense entry point: each is declared once
 /// here, with the expert-batched launcher built for it and the block it quantises its
 /// activation by.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! expert_only_formats {
     ($($dtype:ident => $launcher:ident;)+) => {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         extern "C" {
             $(fn $launcher(
                 x: *const std::ffi::c_void,
@@ -296,7 +296,7 @@ macro_rules! expert_only_formats {
         }
 
         /// The expert-batched launcher of a format only mixtures store.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         fn expert_only_launcher(dtype: GgmlDType) -> Option<MmqMoeLauncher> {
             match dtype {
                 $(GgmlDType::$dtype => Some($launcher),)+
@@ -306,7 +306,7 @@ macro_rules! expert_only_formats {
     };
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 expert_only_formats! {
     MxFp4  => launch_mmq_moe_gguf_mxfp4;
     Iq4Nl  => launch_mmq_moe_gguf_iq4_nl;
@@ -319,13 +319,13 @@ expert_only_formats! {
 
 /// Whether an expert-batched tile kernel exists for this weight format: every format the
 /// table above serves, and the formats only mixtures store, which have no dense entry point.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) fn mmq_moe_supports(dtype: GgmlDType) -> bool {
     mmq_supports(dtype) || expert_only_launcher(dtype).is_some()
 }
 
 /// Values per block of an expert stack of `dtype`.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) fn mmq_moe_qk(dtype: GgmlDType) -> usize {
     if expert_only_launcher(dtype).is_some() {
         dtype.block_size()
@@ -336,7 +336,7 @@ pub(crate) fn mmq_moe_qk(dtype: GgmlDType) -> usize {
 
 /// The activation quantiser an expert stack of `dtype` reads: the formats only mixtures store
 /// are symmetric, one scale per 32 values.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) fn mmq_moe_quantize_launcher(dtype: GgmlDType) -> Result<MmqQuantizeLauncher> {
     if expert_only_launcher(dtype).is_some() {
         Ok(launch_mmq_quantize_q8_1_D4)
@@ -347,7 +347,7 @@ pub(crate) fn mmq_moe_quantize_launcher(dtype: GgmlDType) -> Result<MmqQuantizeL
 
 /// The expert-batched tile kernel: every expert of a stack against its own sorted run of
 /// activation columns in one launch.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) fn mmq_moe_launcher(dtype: GgmlDType) -> Result<MmqMoeLauncher> {
     match expert_only_launcher(dtype) {
         Some(launcher) => Ok(launcher),

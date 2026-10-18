@@ -14,18 +14,18 @@
 //! also exists as a `false` stub on non-CUDA builds so call sites can drop
 //! their own `#[cfg]` forks.
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use cuda::*;
 
 /// Non-CUDA builds: graph capture can never be active.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn capture_active(_device: &crate::tensor::Device) -> bool {
     false
 }
 
 /// Non-CUDA builds: no CUDA device type exists - error at runtime, keeping
 /// engine call sites cfg-free.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn new_device_with_stream(
     ordinal: usize,
 ) -> crate::tensor::Result<crate::tensor::kernel_ffi::NoCudaDevice> {
@@ -34,17 +34,17 @@ pub fn new_device_with_stream(
 }
 
 /// Non-CUDA builds: no cuBLAS to configure.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn set_gemm_reduced_precision(_enable: bool) {}
 
 /// Non-CUDA builds: no device registry to drop.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn clear_device_cache() {}
 
 /// The CUDA backing: the substrate's CudaDevice/Storage over
 /// cudarc - the raw handle types (`CudaSlice`/`CudaStream`/...) are exactly
 /// what every custom-kernel launcher takes.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 mod cuda {
     use crate::tensor;
     use crate::tensor::gpu_runtime::driver::sys::{
@@ -471,7 +471,7 @@ mod cuda {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod precision_tests {
     /// The switch is process-wide and nothing puts it back, so a render must not be able
     /// to leave every later generation accumulating its attention sums in half precision.

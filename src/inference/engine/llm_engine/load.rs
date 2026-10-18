@@ -445,10 +445,10 @@ pub(super) fn load_deepseek_v41_checkpoint(
         vocab_size: cfg.vocab_size,
         context_length,
         eos_token_id,
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         moondream_graph: None,
         moondream_decode_count: 0,
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         kept_graphs: Default::default(),
         eos_token_ids_extra: Vec::new(),
         file_size,
@@ -688,7 +688,7 @@ pub(super) fn sniff_projector_type(path: &std::path::Path) -> Option<String> {
 /// `ContinuousServer` worker for batched concurrent serving. The card's room is divided by
 /// `place::paged` from the model's shape. Returns the model back unchanged on any failure
 /// so the caller keeps the serial path.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn try_spawn_continuous(
     model: GenericHeteroTransformer,
     eos: Vec<u32>,
@@ -751,7 +751,7 @@ pub(super) fn try_spawn_continuous(
 /// automatic prefix caching). Returns whether the model now serves batched; a model that
 /// cannot batch stays as it was.
 pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if state.model.batched_server().is_some() {
             return true;
@@ -762,7 +762,7 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         // queues behind it.
         const V41_MAX_BATCH: usize = 8;
         // The graphs kept between requests are for the serial decode of this model as it stands.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if !state.kept_graphs.is_empty() {
             state.kept_graphs.clear();
             state.model.note_graphs_kept(None);
@@ -799,7 +799,7 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         state.model = model;
         batched
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = state;
         false
@@ -809,13 +809,13 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
 /// Takes a model served by a paged `ContinuousServer` back to serial serving, once no
 /// stream still holds the server. Returns whether the model now serves serially.
 pub(super) fn demote_to_serial(state: &mut LoadedModelState) -> bool {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if state.model.batched_server().is_none() {
             return true;
         }
         // The graphs kept between requests are for the serial decode of this model as it stands.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if !state.kept_graphs.is_empty() {
             state.kept_graphs.clear();
             state.model.note_graphs_kept(None);
@@ -833,16 +833,16 @@ pub(super) fn demote_to_serial(state: &mut LoadedModelState) -> bool {
             }
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = state;
         true
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Send for MoondreamGraphState {}
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Sync for MoondreamGraphState {}
 
 /// Full state when a model is loaded
@@ -851,7 +851,7 @@ unsafe impl Sync for MoondreamGraphState {}
 /// per-launch overhead from ~720 launches/token down to 1 graph launch.
 /// Falls back to plain forward on any replay failure (cleared on
 /// failure; recaptured on next eligible warmup).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) struct MoondreamGraphState {
     pub(super) graph: crate::tensor::cuda_ext::CapturedGraph,
 }
@@ -865,13 +865,13 @@ pub(crate) struct LoadedModelState {
     pub(super) context_length: usize,
     pub(super) eos_token_id: u32,
     /// Lazily captured CUDA graph for QuantizedMoondream decode (Step 5).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) moondream_graph: Option<MoondreamGraphState>,
     /// Decode tokens seen since model load. Drives moondream graph
     /// capture warmup gating (capture fires once after N warmup tokens).
     pub(super) moondream_decode_count: u32,
     /// The decode's recorded graphs, kept between requests while nothing they read has moved.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) kept_graphs: super::decode::KeptGraphs<super::decode::DecodeGraphs>,
     /// Additional EOS-equivalent token IDs (e.g. Gemma4's
     /// `tokenizer.ggml.eos_token_ids` = [1, 106, 50] where 106 and 50

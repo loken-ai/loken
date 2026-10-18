@@ -59,7 +59,7 @@ pub(crate) fn gpu_sample(
     logits_processor: &mut crate::inference::sample::token_sampling::LogitsProcessor,
 ) -> crate::tensor::Result<u32> {
     // A top-k draw runs on the card and returns only the token.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if logits.device().is_cuda() {
         if let Some((k, temperature, top_p, u)) =
             logits_processor.device_draw(crate::inference::kernel::fused::SAMPLE_TOPK_MAX)
@@ -96,7 +96,7 @@ pub(crate) fn gpu_sample(
         return logits_processor.sample_logits(v);
     }
     // Fused repeat penalty + argmax in a single CUDA kernel (1 launch vs 6+)
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if logits.device().is_cuda() {
         let start = recent_tokens.len().saturating_sub(repeat_last_n);
         let window = &recent_tokens[start..];
@@ -137,7 +137,7 @@ pub(crate) fn gpu_sample(
 /// device tensor and the caller must build `x` from the host token
 /// (existing behavior). Temperature > 0 needs full sampling on host
 /// logits and isn't on the Path B hot path.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn gpu_sample_returning_tensor(
     logits: &Tensor,
     recent_tokens: &[u32],
@@ -189,7 +189,7 @@ pub(super) fn gpu_sample_returning_tensor(
 /// mode; the caller should compute the token eagerly, call
 /// `invalidate_graph_state()`. Re-running the captured forward is safe - the
 /// KV write at `pos` is idempotent (dev_slot kernels write the same slot).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn capture_decode_graph(
     model: &mut BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
@@ -349,7 +349,7 @@ impl<T> KeptGraphs<T> {
 
 /// What a request's decode leaves recorded: the step's graph with the logits buffer it writes,
 /// and the verify windows.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[derive(Default)]
 pub(crate) struct DecodeGraphs {
     pub(super) step: Option<(DecodeGraph, Tensor)>,
@@ -358,7 +358,7 @@ pub(crate) struct DecodeGraphs {
 
 // The graphs are reached only through the loaded model's state, behind its mutex, and run on
 // the model's stream from whichever thread holds it, as the model itself is.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Send for DecodeGraphs {}
 
 /// Where the graphs of a request were recorded: the generation of the first recording, and
@@ -404,7 +404,7 @@ impl RecordedAt {
 
 /// The recorded draft verifies of a request, one graph per window size, and whether they were
 /// given up on.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) struct VerifyGraphs {
     by_rows: std::collections::HashMap<usize, (VerifyGraph, Tensor)>,
     /// Window sizes kept from an earlier request whose replay has not been held against an
@@ -420,7 +420,7 @@ pub(super) struct VerifyGraphs {
     pub(super) launch_secs: f64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl Default for VerifyGraphs {
     fn default() -> Self {
         Self {
@@ -435,7 +435,7 @@ impl Default for VerifyGraphs {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl VerifyGraphs {
     /// Forget the graphs: the buffers they read are gone with the step's.
     pub(super) fn clear(&mut self) {
@@ -490,7 +490,7 @@ pub(super) fn rows_finite(logits: &Tensor) -> crate::tensor::Result<bool> {
 }
 
 /// Each row's sum and the token it names, for a report.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn rows_told(logits: &Tensor) -> crate::tensor::Result<String> {
     let sums = logits
         .sum_keepdim(crate::tensor::D::Minus1)?
@@ -509,7 +509,7 @@ fn rows_told(logits: &Tensor) -> crate::tensor::Result<String> {
 
 /// Wait for the card without keeping a core busy; a wait that lasts says what every expert
 /// cache's mailbox holds, once, since a step recorded against them waits on the host there.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn wait_telling(
     model: &BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
@@ -537,7 +537,7 @@ fn wait_telling(
 
 /// After a recorded step has run: an error when an expert cache's worker released the card's
 /// waits meanwhile, the step's output then holding no host answer.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn tier_trusted(model: &BoxedModelBackend) -> crate::tensor::Result<()> {
     match model.tier_failure() {
         Some(why) => crate::tensor::bail!("expert tier: {why}"),
@@ -546,7 +546,7 @@ fn tier_trusted(model: &BoxedModelBackend) -> crate::tensor::Result<()> {
 }
 
 /// Seconds a wait on the card lasts before it says what the mailboxes hold.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const WAIT_TELLS_AFTER_SECS: f64 = 3.0;
 
 /// A draft verify of `ids` (the token carried forward, then the draft) at `pos` through a
@@ -556,7 +556,7 @@ const WAIT_TELLS_AFTER_SECS: f64 = 3.0;
 /// state as it was. The first verify of each window size runs eagerly first, is recorded,
 /// replayed, and the replay has to name the eager tokens, or recorded verifies are given up on
 /// for the request.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn verify_recorded(
     model: &mut BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
@@ -934,11 +934,11 @@ pub(super) fn verify_recorded(
 }
 
 /// Replays that name other tokens than their eager rows after which a request verifies eagerly.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) const REPLAY_MISMATCHES_TO_GIVE_UP: usize = 3;
 
 /// One part of a recorded verify.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 enum VerifyStep {
     /// A recorded graph and the stream of the card it runs on.
     Graph(
@@ -950,12 +950,12 @@ enum VerifyStep {
 }
 
 /// A recorded verify of one window size: its graphs and the eager ops between them.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) struct VerifyGraph {
     steps: Vec<VerifyStep>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl VerifyGraph {
     /// Records the prepared verify of `rows` rows, op by op on its card's stream.
     fn capture(model: &mut BoxedModelBackend, rows: usize) -> crate::tensor::Result<Self> {
@@ -1034,7 +1034,7 @@ impl VerifyGraph {
 }
 
 /// One part of a decode step.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 enum DecodeStep {
     /// A recorded graph and the stream of the card it runs on.
     Graph(
@@ -1047,12 +1047,12 @@ enum DecodeStep {
 }
 
 /// The decode step: its graphs and the eager ops between them, in order.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) struct DecodeGraph {
     steps: Vec<DecodeStep>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl DecodeGraph {
     /// Runs every part in order. The host waits for the last card's stream, which holds the
     /// logits.
@@ -1142,7 +1142,7 @@ impl DecodeGraph {
 }
 
 /// Node counts of the graphs of a step, by type.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[derive(Default)]
 struct NodeCounts {
     /// Kernel launches by kernel name.
@@ -1159,7 +1159,7 @@ struct NodeCounts {
     other: usize,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl NodeCounts {
     fn add(&mut self, g: &crate::tensor::cuda_ext::CapturedGraph) {
         use crate::tensor::cuda_ext::CUgraphNodeType;
@@ -1193,7 +1193,7 @@ impl NodeCounts {
 
 /// Records op `op` of the decode step on `stream`. Only the head's output is kept: the
 /// hidden state of the other ops stays in the step's buffers.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn capture_op(
     model: &mut BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
@@ -1243,7 +1243,7 @@ fn capture_op(
 /// With the stage profile on, say what each kernel of a graph costs the card: the graph is
 /// launched with every node of one kernel switched off, and the fall in its time is that
 /// kernel's. The launches write into the model's state, so the request is not one to keep.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn report_kernel_costs(
     g: &crate::tensor::cuda_ext::CapturedGraph,
     s: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,

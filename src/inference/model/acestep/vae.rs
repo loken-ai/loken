@@ -215,7 +215,7 @@ pub fn fuse_weight_norm(v: &[f32], g: &[f32], d0: usize, eps: f32) -> Vec<f32> {
 // (conv_transpose1d_gemm_f32); snake params pre-exp'd (`alpha=exp(α)`,
 // `inv_beta=1/exp(β)`). The GGUF loader arranges + fuses into these (next step).
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::tensor::{DType, Storage};
 use crate::tensor::{Device as ND, Tensor as NT};
 
@@ -348,7 +348,7 @@ impl ConvW {
     /// F16 on CUDA, route the contraction through the tensor-core im2col GEMM
     /// (F16 in / F32 accumulate); otherwise the generic F32/CPU `conv1d`.
     fn conv(&self, x: &NT, padding: usize, dilation: usize) -> crate::tensor::Result<NT> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.wt.dtype() == DType::F16 {
             if let (
                 Storage::Cuda { data: xd, dev },
@@ -392,7 +392,7 @@ impl ConvW {
     /// contraction through the tensor-core GEMM + col2im (F16 in / F32 accumulate)
     /// instead of the serial F32 gather kernel; otherwise the generic F32/CPU op.
     fn conv_t(&self, x: &NT, padding: usize, stride: usize) -> crate::tensor::Result<NT> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.wt.dtype() == DType::F16 {
             if let (
                 Storage::Cuda { data: xd, dev },
@@ -513,7 +513,7 @@ fn vae_load_conv(
     // (F32-accumulate) - halves the weight VRAM + bandwidth; convT weights stay
     // F32 (the convT runs the direct gather kernel, not a cuBLAS GEMM).
     let wt = if is_convt {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if matches!(dev, ND::Cuda(_)) {
             // Rearrange [c_in,c_out,k] -> [k*c_out, c_in] so the convT contraction
             // is a plain GEMM (W_r . x), stored F16 for tensor cores. wr[kk*c_out+oc, ci] = w[ci,oc,kk].
@@ -529,11 +529,11 @@ fn vae_load_conv(
         } else {
             vae_nt(w, (c_in, c_out, k), dev)?
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         vae_nt(w, (c_in, c_out, k), dev)?
     } else {
         let t = vae_nt(w, (c_out, c_in, k), dev)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let t = if matches!(dev, ND::Cuda(_)) {
             t.to_dtype(DType::F16)?
         } else {

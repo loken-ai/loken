@@ -1282,7 +1282,7 @@ mod decode_cost_probe {
     //!   cargo test -p loken --release decode_cost_probe -- --ignored --nocapture
     use crate::tensor::{Device, Tensor};
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     #[ignore]
     fn one_full_resolution_convolution() {

@@ -55,12 +55,12 @@ pub struct Streamed {
 impl Streamed {
     /// The placement for `demand`, or `None` when the model runs on the host alone.
     pub fn open(demand: &Demand) -> Option<Self> {
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         {
             let _ = demand;
             None
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         Self::open_cuda(demand)
     }
 
@@ -79,7 +79,7 @@ impl Streamed {
         })
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn open_cuda(demand: &Demand) -> Option<Self> {
         use super::cuda::{lanes, Card, Cards};
         use super::room;
@@ -220,7 +220,7 @@ mod tests {
         // The assertion is that the generic path compiles and runs for a type the offload layer has
         // never heard of. Without cards (the CPU test host) it places nothing.
         let placed = Streamed::open_for(&m, 64);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         assert!(placed.is_none());
         let _ = placed;
     }

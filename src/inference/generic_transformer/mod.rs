@@ -39,7 +39,7 @@ pub(crate) use crate::tensor::layer::{Embedding, LayerNorm};
 pub(crate) use crate::tensor::quantized::{gguf_file, QTensor};
 pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod card_host_parity;
 #[cfg(test)]
 mod wide_tests;
@@ -52,9 +52,9 @@ mod draft_head;
 pub use draft_head::set_probe_dir;
 mod context_parallel;
 pub mod expert_profile;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod expert_tier;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 #[path = "expert_tier_host.rs"]
 pub mod expert_tier;
 mod graph;
@@ -77,9 +77,9 @@ mod state_cache_tests;
 #[cfg(test)]
 pub(crate) mod tiny_model;
 mod tp_forward;
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod tp_tests;
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod verify_decode_parity;
 mod verify_window;
 mod wide;
@@ -197,7 +197,7 @@ pub struct GenericTransformerLayer {
     /// CUDA layer. It then holds the history: decode attends over it directly and
     /// multi-token paths dequantise it; the F-dtype `kv_cache` is only kept for donor
     /// layers (`populate_dual_kv`).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub quant_kv: Option<crate::inference::cache::quant_kv::QuantKv>,
     /// CPU-only Q8 KV cache: halves KV streaming bytes at dense decode.
     /// Populated alongside the F16 `kv_cache` (which stays the safe fallback);
@@ -445,7 +445,7 @@ pub struct GenericHeteroTransformer {
     /// layers they hold go.
     tier_workers: Vec<expert_tier::TierWorker>,
     /// The hot experts locked in host memory, when the tiered layers do not fit it whole.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     hot_locks: Option<Arc<expert_tier::HotLocks>>,
     /// The graph generation of the graphs the engine keeps for the next request.
     kept_graphs_at: Option<u64>,
@@ -515,7 +515,7 @@ pub struct GenericHeteroTransformer {
     /// from the embedding.
     graph_work_buffer: Option<Tensor>,
     /// The graph step's hidden-state hops between consecutive cards, one per boundary.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     graph_hops: Vec<graph::GraphHop>,
     /// Pre-allocated logits output buffer for graph replay. The graph's last
     /// op copies logits here so the output is at a stable device pointer
@@ -613,13 +613,13 @@ impl KvSnapshot {
 }
 
 /// A quantised cache's packed bytes copied aside; uninhabited on a build without CUDA.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) type QuantSnap = crate::inference::cache::quant_kv::QuantKvSnapshot;
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub(crate) enum QuantSnap {}
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 impl QuantSnap {
     pub fn len(&self) -> usize {
         match *self {}
@@ -706,18 +706,18 @@ unsafe impl Send for GenericHeteroTransformer {}
 /// stream, rank 0 on the layers' own card. They are used only by the thread that runs the
 /// model's forward, which holds the model mutably.
 pub struct TpComms {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     comms: Vec<crate::tensor::gpu_runtime::nccl::safe::Comm>,
     /// The hidden state a split layer last returned on rank 0, and its copies on the other
     /// ranks: the next split layer starts from them instead of sending its input out.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     replicas: std::sync::Mutex<Option<(Tensor, Vec<Tensor>)>>,
 }
 
 unsafe impl Send for TpComms {}
 unsafe impl Sync for TpComms {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl TpComms {
     /// Communicators over `devices`, the layers' own card first; `None` when NCCL does not
     /// open or refuses the group.
@@ -909,7 +909,7 @@ pub(super) fn tp_send_out(
     shards: &[GenericTransformerLayer],
     comms: Option<&TpComms>,
 ) -> Result<Vec<Tensor>> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if let Some(c) = comms.filter(|c| c.takes(x, shards.len() + 1)) {
         let to: Vec<Device> = shards.iter().map(|s| s.cos.device()).collect();
         return c.send_out(x, &to);
@@ -924,7 +924,7 @@ pub(super) fn tp_send_out(
 /// `own` plus every partial output of a tensor-parallel layer's other shares, on `own`'s card:
 /// reduced through the group's communicators when they take them, copied and added otherwise.
 pub(super) fn tp_sum(own: Tensor, parts: Vec<Tensor>, comms: Option<&TpComms>) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if let Some(c) = comms.filter(|c| {
         c.takes(&own, parts.len() + 1) && parts.iter().all(|p| c.takes(p, parts.len() + 1))
     }) {

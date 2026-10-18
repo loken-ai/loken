@@ -33,7 +33,7 @@ fn toy_with(ordinal: Option<usize>, kv: KvQuant) -> GenericHeteroTransformer {
     content.mmap_owner = Some(mmap.clone() as Arc<dyn std::any::Any + Send + Sync>);
     let layers = content.metadata["qwen4exp.block_count"].to_u32().unwrap() as usize;
     let cards: HashMap<usize, Device> = match ordinal {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         Some(o) => [(o, Device::new_cuda(o).expect("a card for the card test"))]
             .into_iter()
             .collect(),
@@ -402,7 +402,7 @@ fn a_prefix_snapshot_resumes_to_the_same_logits() {
     assert_eq!(first, again);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn the_toy_on_a_card_gives_the_logits_of_the_host() {
@@ -445,7 +445,7 @@ fn the_toy_on_a_card_gives_the_logits_of_the_host() {
 
 /// A card decodes the prompt one token at a time, its indexed layers on the card, and gives the
 /// reference's logits at every position.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn a_card_decoding_one_token_at_a_time_gives_the_logits_of_the_whole_prompt() {
@@ -473,7 +473,7 @@ fn a_card_decoding_one_token_at_a_time_gives_the_logits_of_the_whole_prompt() {
 
 /// A dense attention whose rotation covers part of the head decodes on a card, its cache in Q8,
 /// as it does on the host.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn a_card_decoding_a_partly_rotated_dense_attention_matches_the_host() {
@@ -519,7 +519,7 @@ fn a_card_decoding_a_partly_rotated_dense_attention_matches_the_host() {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn the_fused_card_stages_match_the_tensor_ops() {
@@ -581,7 +581,7 @@ fn the_fused_card_stages_match_the_tensor_ops() {
 
 /// The mixer of a decode step runs as two launches for one row and for a short batch, and gives
 /// what the tensor ops give; a longer chunk takes the stage-by-stage chain and gives it too.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn the_fused_mixer_matches_the_tensor_ops_for_a_decode_step() {
@@ -658,7 +658,7 @@ fn the_fused_mixer_matches_the_tensor_ops_for_a_decode_step() {
 
 /// The mixer launches read half-precision weights and give what they give on the same weights
 /// held in single precision, when the values are exact in the narrower format.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn the_fused_mixer_reads_half_weights_like_single_ones() {
@@ -709,7 +709,7 @@ fn the_fused_mixer_reads_half_weights_like_single_ones() {
 
 /// The mixer launches read int8 rows with a scale for each group of values and give what they
 /// give on the same weights widened to single precision.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn the_fused_mixer_reads_int8_rows_like_the_widened_weights() {
@@ -812,7 +812,7 @@ fn a_mixer_blocked_over_its_rows_matches_the_whole() {
 
 /// A wide model's prefill footprint grows with the streams and plans the card for the same chunk
 /// whatever the experts; a model without a routed mixture asks for no chunk.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn the_wide_prefill_footprint_follows_the_model() {
     let a = hyper::prefill_footprint(4, 2560, Some((160, 10)), 640);
@@ -870,7 +870,7 @@ fn a_prefill_at_any_pinned_chunk_gives_the_unchunked_logits() {
 
 /// The host's selected attention of an indexed layer for the decoded token `x` at `pos`: the
 /// indexer's selection on the host, the attention over the kept tokens.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn host_attention(layer: &mut GenericTransformerLayer, x: &Tensor, pos: usize) -> Tensor {
     let selection = layer
         .sparse
@@ -885,7 +885,7 @@ fn host_attention(layer: &mut GenericTransformerLayer, x: &Tensor, pos: usize) -
 /// A decoded token of an indexed layer on a card runs on the card, eagerly: it gives what the host's
 /// selected attention gives at every position, and leaves the host's counters where the host's
 /// own steps would.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn an_indexed_layer_decodes_on_the_card_as_the_host_does() {
@@ -944,7 +944,7 @@ fn an_indexed_layer_decodes_on_the_card_as_the_host_does() {
 /// The attention of an indexed layer, recorded once against the buffers of its decode step, gives
 /// at every later position what the host's selected attention gives: the indexer on the card
 /// holds the tokens, selects and attends, and the caches the two keep agree afterwards.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn a_recorded_indexed_attention_replays_at_every_position() {
@@ -1044,7 +1044,7 @@ fn a_verify_cut_back_to_the_rows_kept_leaves_the_state_of_decoding_them() {
 }
 
 /// [`a_verify_cut_back_to_the_rows_kept_leaves_the_state_of_decoding_them`] on a card.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn a_verify_cut_back_on_a_card_leaves_the_state_of_decoding_the_kept_rows() {
@@ -1052,7 +1052,7 @@ fn a_verify_cut_back_on_a_card_leaves_the_state_of_decoding_the_kept_rows() {
 }
 
 /// The same with the quantised cache a served model gets.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn a_verify_cut_back_on_a_card_with_a_quantised_cache_leaves_the_decoded_state() {
@@ -1112,7 +1112,7 @@ fn verifies_that_follow_each_other_keep_the_state_of_decoding() {
 /// A verify of a few rows through the recorded window gives the logits of decoding them one
 /// by one, eagerly and replayed from a graph, and a cut back to the rows kept leaves the state
 /// of decoding those rows alone.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
 fn a_recorded_verify_window_matches_the_decoded_rows_and_cuts_back() {
@@ -1361,7 +1361,7 @@ pub(super) fn toy_with_head() -> GenericHeteroTransformer {
         fit: (0, 0),
         indexer_mark: None,
         vocab: None,
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         step: None,
     });
     m

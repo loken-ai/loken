@@ -1,7 +1,7 @@
 //! Device + unified storage for the native tensor (CPU and, with the `cuda`
 //! feature, GPU via cudarc).
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use super::cuda::{CudaDevice, CudaStorage};
 use super::dry::{DryDevice, DryStorage};
 use super::CpuStorage;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum Device {
     Cpu,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     Cuda(Arc<CudaDevice>),
     /// Owns no memory: a forward placed here runs its real code and allocates
     /// nothing, so what it would have held can be read off afterwards. See
@@ -35,7 +35,7 @@ impl Device {
     pub fn is_cuda(&self) -> bool {
         match self {
             Self::Cpu => false,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda(_) => true,
             Self::Dry(_) => false,
         }
@@ -60,7 +60,7 @@ impl Device {
     pub fn runs_as_card(&self) -> bool {
         match self {
             Self::Cpu => false,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda(_) => true,
             Self::Dry(_) => true,
         }
@@ -89,7 +89,7 @@ impl Device {
     }
 
     /// Open CUDA device `ordinal` (a real stream, not the NULL stream).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn new_cuda(ordinal: usize) -> Result<Self> {
         // Through the per-ordinal registry, NEVER a fresh instance: every CudaDevice
         // carries its own stream, and per-slice event tracking - the thing that would
@@ -100,7 +100,7 @@ impl Device {
         // stack shared one stream.
         Ok(Self::Cuda(super::cuda::CudaDevice::get(ordinal)?))
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub fn new_cuda(_ordinal: usize) -> Result<Self> {
         Err(super::Error("cuda feature not enabled".into()))
     }
@@ -113,7 +113,7 @@ impl Device {
     pub fn location(&self) -> DeviceLocation {
         match self {
             Self::Cpu => DeviceLocation::Cpu,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda(d) => DeviceLocation::Cuda {
                 gpu_id: d.ordinal(),
             },
@@ -149,12 +149,12 @@ impl Device {
             Self::Dry(_) => Ok(()),
             // A wait on a stream being recorded into a graph would end the recording: what asks
             // for one (a profile timing a stage, a debug check) has nothing to wait for there.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda(d) if crate::tensor::cuda_ext::capture_active(self) => {
                 let _ = d;
                 Ok(())
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda(d) => d.synchronize(),
         }
     }
@@ -167,7 +167,7 @@ impl Device {
             Self::Dry(_) => Err(super::Error(
                 "expected a cuda device, got a dry one".to_string(),
             )),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda(d) => Ok(super::kernel_ffi::CudaDevice(d.clone())),
         }
     }
@@ -175,7 +175,7 @@ impl Device {
     pub fn same_device(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Cpu, Self::Cpu) => true,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             (Self::Cuda(a), Self::Cuda(b)) => a.ordinal() == b.ordinal(),
             (Self::Dry(a), Self::Dry(b)) => Arc::ptr_eq(a, b),
             _ => false,
@@ -186,7 +186,7 @@ impl Device {
 #[derive(Debug)]
 pub enum Storage {
     Cpu(CpuStorage),
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     Cuda {
         data: CudaStorage,
         dev: Arc<CudaDevice>,
@@ -199,7 +199,7 @@ impl Storage {
     pub fn dtype(&self) -> DType {
         match self {
             Self::Cpu(s) => s.dtype(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda { data, .. } => data.dtype(),
             Self::Dry(s) => s.dtype(),
         }
@@ -212,7 +212,7 @@ impl Storage {
     pub fn elem_count(&self) -> usize {
         match self {
             Self::Cpu(s) => s.len(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda { data, .. } => data.len(),
             Self::Dry(s) => s.len(),
         }
@@ -221,7 +221,7 @@ impl Storage {
     pub fn device(&self) -> Device {
         match self {
             Self::Cpu(_) => Device::Cpu,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Self::Cuda { dev, .. } => Device::Cuda(dev.clone()),
             Self::Dry(s) => Device::Dry(s.device().clone()),
         }

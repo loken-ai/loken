@@ -37,7 +37,7 @@ impl QTensor {
     /// Wrap a host-side [`QHostTensor`], placing its blob on `device`.
     pub(crate) fn from_native(inner: Arc<QHostTensor>, device: &Device) -> Result<Self> {
         let storage = match device {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Device::Cuda(d) => QStorage::Cuda(QCudaStorage::upload(
                 &CudaDevice(d.clone()),
                 inner.data(),
@@ -49,7 +49,7 @@ impl QTensor {
         // Bytes this tensor owns, now on the card, are let go: nothing on a card placement
         // reads the host copy, and the mapping of a file (a view) costs only page cache.
         // The shell keeps the weight's identity; a download serves the rare host reader.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let inner = if matches!(storage, QStorage::Cuda(_))
             && matches!(inner.storage, super::host::QHostStorage::Owned(_))
         {
@@ -69,7 +69,7 @@ impl QTensor {
 
     /// The tensor `inner` describes, held by `storage` on the card in place of an upload of its
     /// blocks: the storage is filled by the caller, as often as it likes.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(crate) fn over_card(
         inner: Arc<QHostTensor>,
         device: &Device,
@@ -88,7 +88,7 @@ impl QTensor {
     /// The first `n` rows of this 2-D weight on a card, sharing its blocks on the host and on
     /// the card: rows are whole blocks, laid out one after the other. `None` off a card or
     /// for a shape that is not rows of blocks.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(crate) fn row_prefix(&self, n: usize) -> Result<Option<Self>> {
         let dims = self.shape.dims();
         let QStorage::Cuda(card) = &self.storage else {
@@ -116,7 +116,7 @@ impl QTensor {
     }
 
     /// [`Self::row_prefix`] on a build with no cards.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub(crate) fn row_prefix(&self, _n: usize) -> Result<Option<Self>> {
         Ok(None)
     }
@@ -139,7 +139,7 @@ impl QTensor {
     /// Same device in, same tensor out (a fresh handle over the same host blocks), so
     /// callers can ask unconditionally.
     pub fn to_device(&self, device: &Device) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.inner.is_card_only() {
             if let (QStorage::Cuda(c), true) = (&self.storage, self.device.same_device(device)) {
                 return Ok(Self {
@@ -161,7 +161,7 @@ impl QTensor {
     /// The block bytes on the host: borrowed when the host holds them, downloaded from the
     /// card when the card holds the only copy.
     fn host_blocks(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.inner.is_card_only() {
             return match &self.storage {
                 QStorage::Cuda(c) => Ok(std::borrow::Cow::Owned(c.download()?)),
@@ -176,7 +176,7 @@ impl QTensor {
         let inner = QHostTensor::from_bytes(&storage.host, storage.dtype, shape.dims().to_vec())?;
         let dry = dry_blob_room(&inner, &storage.device);
         // The card holds the blocks `from_data` uploaded; the host copy is let go.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let inner = if matches!(storage.storage, QStorage::Cuda(_)) {
             inner.card_only()
         } else {
@@ -240,7 +240,7 @@ impl QTensor {
     /// Raw device pointer of the CUDA blob (fork-shaped raw-launch path).
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             QStorage::Cuda(c) => c.device_ptr(),
             _ => Err(Error::msg("QTensor::device_ptr: not on CUDA")),
         }
@@ -306,7 +306,7 @@ impl QTensor {
         if let Some(q) = self.qmm.get() {
             return Ok(q);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let q = {
             let blob = match &self.storage {
                 QStorage::Cuda(c) => Some(c.blob.clone()),
@@ -314,7 +314,7 @@ impl QTensor {
             };
             QKernelMatMul::from_qtensor_on_with_blob(self.inner.clone(), &self.device, blob)?
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let q = QKernelMatMul::from_qtensor_on(self.inner.clone(), &self.device)?;
         let _ = self.qmm.set(q);
         Ok(self.qmm.get().unwrap())

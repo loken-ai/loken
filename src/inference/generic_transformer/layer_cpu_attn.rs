@@ -605,7 +605,7 @@ impl GenericTransformerLayer {
         // A card decode runs one split-K launch over the whole buffers, the key count read
         // on the device in the graph's step and given here otherwise; the split count
         // follows the buffers' capacity, so both sum alike.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if seq == 1 && mask.is_none() && q.device().is_cuda() {
             let pos = match self.graph_step() {
                 true => self.graph_pos_i32.as_ref(),

@@ -185,7 +185,7 @@ pub fn place_aside(model_size: u64, reserve: u64) -> Device {
 /// configuration without GPU support answers `None` here rather than at each caller.
 pub fn ordinal(d: &Device) -> Option<usize> {
     match d {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         Device::Cuda(c) => Some(c.ordinal()),
         _ => None,
     }
@@ -195,7 +195,7 @@ pub fn ordinal(d: &Device) -> Option<usize> {
 /// and to detect layer->layer boundary crossings cheaply.
 pub fn dev_key(d: &Device) -> String {
     match d {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         Device::Cuda(c) => format!("cuda:{}", c.ordinal()),
         _ => "cpu".to_string(),
     }

@@ -283,7 +283,7 @@ impl Tensor {
         }
         let raw_len = match self.storage_raw.as_ref() {
             Storage::Cpu(c) => c.len(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { data, .. } => data.len(),
             Storage::Dry(s) => s.len(),
         };
@@ -344,7 +344,7 @@ impl Tensor {
                 d.dtype(),
                 n,
             )))),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { data, dev } => {
                 // device-side range copy (timed by the caller, `storage()`).
                 let es = self.dtype().size_in_bytes();
@@ -501,7 +501,7 @@ impl Tensor {
         match device {
             Device::Cpu => Self::zeros(shape, dtype),
             Device::Dry(_) => Self::dry(device, dtype, shape),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Device::Cuda(dev) => {
                 let shape = shape.into();
                 let data = super::cuda::CudaStorage::zeros(dev, dtype, shape.elem_count())?;

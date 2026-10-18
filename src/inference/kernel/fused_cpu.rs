@@ -1,6 +1,6 @@
 //! CPU fallback shim for `fused_kernels` (the CUDA fused-op launchers).
 //!
-//! Selected via `#[cfg(not(feature = "cuda"))]` in `mod.rs`, this provides the
+//! Selected via `#[cfg(not(feature = "gpu"))]` in `mod.rs`, this provides the
 //! same public API as the real CUDA `fused_kernels` so the MoE/hybrid arches
 //! (gpt-oss, nemotron, lfm2, qwen3.5) build and run on the CPU-only target.
 //!

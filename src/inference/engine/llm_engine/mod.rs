@@ -95,15 +95,15 @@ impl LoadedModelState {
         if !is_moondream || seq > 1 {
             return self.model.forward(x, pos);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         return self.forward_moondream_graph(x, pos);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         return self.model.forward(x, pos);
     }
 
     /// Moondream CUDA-graph capture/replay decode path (CUDA-only). On
     /// non-CUDA builds the caller falls back to the plain forward.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_moondream_graph(&mut self, x: &Tensor, pos: usize) -> crate::tensor::Result<Tensor> {
         // Only CUDA gets graph capture.
         let cuda_dev = match self.device.as_cuda_device() {
@@ -930,7 +930,7 @@ pub struct ModelGeometry {
 /// over-pessimistically pushes layers to CPU on the next load.
 ///
 /// Wrapped in a per-process call so we don't pay it per dropped tensor.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn trim_cuda_pools() {}
 
 /// The owner name the room held for a planned drafter is declared under.
@@ -946,7 +946,7 @@ struct PlannedDrafter {
 /// Warm one card, once per process: a tiny matmul allocates the cuBLAS handle and
 /// workspace, which latches the primary context - the deliberate cost that makes every
 /// later budget probe of this card read the same world.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) fn warm_card(ordinal: usize) {
     use std::sync::{Mutex, OnceLock};
     static WARMED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
@@ -968,10 +968,10 @@ pub(crate) fn warm_card(ordinal: usize) {
     let _ = dev.synchronize();
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn release_cuda_pools() {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 /// MINIMAL pool trim, safe to call at ANY time - including while other models are actively
 /// generating on other threads. Returns freed-but-pooled blocks to the driver so NVML probes
 /// read TRUE free VRAM. Unlike [`release_cuda_pools`], it does NOT drop the MMVQ/MMQ
@@ -981,7 +981,7 @@ pub fn release_cuda_pools() {}
 /// CUDA-graph capture mode; zeroing it mid-capture would let the pool return memory a captured
 /// graph still addresses).
 pub fn trim_cuda_pools() {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         use crate::tensor::gpu_runtime::driver::sys::{
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cuMemPoolTrimTo, cudaError_enum,
@@ -1014,7 +1014,7 @@ pub fn trim_cuda_pools() {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn release_cuda_pools() {
     crate::inference::place::vram_manager::residency_changed();
     // Drop big static workspaces from the upstream fast MMVQ/MMQ paths

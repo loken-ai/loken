@@ -9,7 +9,7 @@
 /// on drop. Without CUDA there is nothing to pin and the guard is inert.
 #[must_use = "the precision is restored when the guard drops"]
 pub struct GemmPrecision {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     was: (bool, bool, bool),
 }
 
@@ -22,7 +22,7 @@ impl GemmPrecision {
     /// `reduced` selects the tensor-core paths (TF32 for f32, fast bf16 accumulation);
     /// f16 accumulates in f32 either way, as `cuda_ext::set_gemm_reduced_precision` sets it.
     pub fn pin(reduced: bool) -> Self {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             use crate::tensor::cuda as c;
             let was = (
@@ -33,7 +33,7 @@ impl GemmPrecision {
             crate::tensor::cuda_ext::set_gemm_reduced_precision(reduced);
             Self { was }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         {
             let _ = reduced;
             Self {}
@@ -43,7 +43,7 @@ impl GemmPrecision {
 
 impl Drop for GemmPrecision {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             use crate::tensor::cuda as c;
             let (f32_reduced, bf16_reduced, f16_reduced) = self.was;
@@ -54,7 +54,7 @@ impl Drop for GemmPrecision {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
     use crate::tensor::cuda as c;

@@ -3375,7 +3375,7 @@ pub fn stack_dtype(moe: &MoeWeights) -> Option<GgmlDType> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 mod tests {
     use super::*;
     use crate::tensor::quantized::QMatMul;

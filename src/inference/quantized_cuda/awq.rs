@@ -515,7 +515,7 @@ pub(crate) fn is_shape_kernel_base(name: &str) -> bool {
         .any(|(_, base)| *base == name)
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod shape_module_tests {
     use super::*;
 

@@ -327,21 +327,21 @@ pub struct SparseAttention {
     rope: HostRope,
     pub cache: IndexerCache,
     /// The cache a recorded decode step keeps on the card.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     card: Option<CardIndexer>,
     /// How many times the card's buffers were made or grown: a step recorded against them is
     /// stale once this moves.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     card_births: u64,
     /// The budget covers every token of the cache: the attention is dense, and its kept tokens
     /// are many, read once for a group of query heads.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     every_token: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 mod card;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use card::{CardIndexer, CardPick};
 
 impl SparseAttention {
@@ -366,11 +366,11 @@ impl SparseAttention {
             eps,
             rope,
             cache: IndexerCache::default(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             card: None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             card_births: 0,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             every_token: false,
         }
     }
@@ -378,9 +378,9 @@ impl SparseAttention {
     /// The cache as a snapshot of the sequence reads it: the host's, with what a recorded step
     /// made on the card.
     pub fn snapshot_cache(&self) -> Result<IndexerCache> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         return self.current_cache();
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         Ok(self.cache.clone())
     }
 
@@ -389,19 +389,19 @@ impl SparseAttention {
     /// any other is of another sequence, and the card forgets its own.
     pub fn restore_cache(&mut self, cache: &IndexerCache, in_place: bool) {
         self.cache = cache.clone();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         match in_place {
             true => self.truncate_card(cache.len()),
             false => self.forget_card(),
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let _ = in_place;
     }
 
     /// Forget the sequence.
     pub fn reset(&mut self) {
         self.cache.clear();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.forget_card();
     }
 
@@ -478,11 +478,11 @@ impl SparseAttention {
         let m = self.meta;
         if index_pos == 0 {
             self.cache.clear();
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             self.forget_card();
         }
         // Tokens a recorded step made on the card join the host's cache first.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.sync_host_from_card(index_pos)?;
         if self.cache.len() != index_pos {
             return Err(crate::tensor::Error::msg(format!(
@@ -496,7 +496,7 @@ impl SparseAttention {
         self.cache
             .append(&keys, &m, &self.k_gamma, self.eps, &self.rope);
         // From here the host holds tokens the card may not.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.truncate_card(index_pos);
         if self.dense_for(index_pos + seq) {
             return Ok(None);

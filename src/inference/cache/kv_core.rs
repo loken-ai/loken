@@ -265,12 +265,12 @@ impl KvCore {
 
 /// The device-side position the replay-safe kernels read, at one address for the life of the
 /// cache.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub struct DevPos {
     slot: crate::tensor::cuda_ext::CudaSlice<i32>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl DevPos {
     pub fn new(dev: &crate::tensor::cuda_ext::RawCudaDevice) -> anyhow::Result<Self> {
         let slot = dev

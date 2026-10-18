@@ -4397,7 +4397,7 @@ mod oracle_gate {
 
     /// With a card taking attention, index scores and every product it can, a batched prefill gives
     /// the logits and the decode state the CPU gives, on both layouts.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn prefill_on_a_card_matches_the_cpu() {
         use crate::inference::offload::cuda::Card;
@@ -4452,7 +4452,7 @@ mod oracle_gate {
     /// With the residual stream held on a card for the whole prompt - its mixes, collapse and
     /// update done there - a batched prefill, and a continuation of a state, give the logits and
     /// the decode state the CPU gives, on both layouts and at splits inside and past the window.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn a_prefill_with_the_stream_on_a_card_matches_the_cpu() {
         use crate::inference::offload::cuda::{Card, Cards};

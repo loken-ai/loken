@@ -143,11 +143,11 @@ impl QMatMul {
                 let y = match crate::inference::moe_cuda::bf16_matvec(&x2, w)? {
                     Some(y) => y,
                     None => {
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         let y = x2
                             .to_dtype(crate::tensor::DType::BF16)?
                             .matmul_t_bf16_f32(w)?;
-                        #[cfg(not(feature = "cuda"))]
+                        #[cfg(not(feature = "gpu"))]
                         let y: Option<Tensor> = None;
                         match y {
                             Some(y) => y,
@@ -214,7 +214,7 @@ impl QMatMul {
 
     /// Dense BF16 copy of the weight, dequantized ONCE (see
     /// [`QKernelMatMul::dequant_weight_bf16`]). `Ok(None)` for dense/CPU weights.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn dequant_weight_bf16(&self) -> Result<Option<Tensor>> {
         match self {
             Self::QTensor(qt) => qt.native_qmm()?.dequant_weight_bf16(),

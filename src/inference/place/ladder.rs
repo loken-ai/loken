@@ -329,7 +329,7 @@ impl Demand {
 /// A card's memory bandwidth in GB/s, read once: what a decode step of a bandwidth-bound
 /// model is paced by. `None` where the driver does not say.
 fn card_bandwidth(idx: usize) -> Option<f64> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         static BW: std::sync::OnceLock<Vec<(usize, f64)>> = std::sync::OnceLock::new();
         BW.get_or_init(|| {
@@ -343,7 +343,7 @@ fn card_bandwidth(idx: usize) -> Option<f64> {
         .map(|(_, b)| *b)
         .filter(|b| *b > 0.0)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = idx;
         None
@@ -353,7 +353,7 @@ fn card_bandwidth(idx: usize) -> Option<f64> {
 /// A card's link to the host in GB/s, read once: what the copies of experts to it are paced by.
 /// `None` where the driver does not say.
 fn card_link(idx: usize) -> Option<f64> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         static LINK: std::sync::OnceLock<Vec<(usize, f64)>> = std::sync::OnceLock::new();
         LINK.get_or_init(|| {
@@ -367,7 +367,7 @@ fn card_link(idx: usize) -> Option<f64> {
         .map(|(_, b)| *b)
         .filter(|b| *b > 0.0)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = idx;
         None
@@ -1015,7 +1015,7 @@ pub fn halve_until_fits<T, E: std::fmt::Display>(
 
 /// Hands the pools' cached blocks back before the next rung measures the cards.
 pub(crate) fn release_pools() {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     crate::inference::engine::llm_engine::trim_cuda_pools();
 }
 

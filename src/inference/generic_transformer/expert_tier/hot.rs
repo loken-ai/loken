@@ -162,7 +162,7 @@ pub(crate) fn for_each_piece(
 
 /// Locks `r` in host memory: registered with the card's driver, which pins the pages outside
 /// the process's locked-memory limit and lets copies from them run as transfers.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn lock(r: Range) -> bool {
     {
         let mut reg = REGISTERED.write().unwrap_or_else(|e| e.into_inner());
@@ -191,7 +191,7 @@ fn lock(r: Range) -> bool {
 }
 
 /// Releases a range [`lock`] registered, by the address it was registered at.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn unlock(r: Range) {
     // Safety: `r` was registered by `lock` and is released once.
     let _ = unsafe {
@@ -203,12 +203,12 @@ fn unlock(r: Range) {
         .retain(|x| *x != r);
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 fn lock(_: Range) -> bool {
     false
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 fn unlock(_: Range) {}
 
 /// What is locked now.
@@ -359,7 +359,7 @@ impl HotLocks {
     /// the address they were made at, so a range that changes shape is registered again.
     fn apply(&self, hot: Vec<(usize, usize)>, traffic: Option<(u64, u64)>) {
         // The driver registers memory for the thread's current context: a card's, bound here.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(cd) = self
             .tiers
             .first()

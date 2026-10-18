@@ -58,7 +58,7 @@ mod cuda_storage;
 mod dtype;
 mod host;
 mod kernel_matmul;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use kernel_matmul::matvec_rows;
 pub use kernel_matmul::DecodeOrder;
 mod matmul;
@@ -72,7 +72,7 @@ pub mod gguf_file;
 pub mod gguf_source;
 
 /// The fused gate-and-up Q4_K decode entries, over the NVRTC-compiled mat-vec kernels.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod fast_mmvq;
 
 /// A quantised row is padded up to this many values.
@@ -91,21 +91,21 @@ pub fn pad_to(x: usize, q: usize) -> usize {
     x.div_ceil(q) * q
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) use cuda_storage::trim_lent_pool;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use cuda_storage::QCudaStorage;
 pub use dtype::GgmlDType;
 pub use host::{QHostTensor, BLOCK_ALIGN};
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use kernel_matmul::kernel_known_answer_test;
 pub use kernel_matmul::QKernelMatMul;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use kernel_matmul::QuantizedActivation;
 pub use matmul::QMatMul;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use mmq::release_mmq_workspaces;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) use mmq::{mmq_moe_launcher, mmq_moe_qk, mmq_moe_quantize_launcher, mmq_moe_supports};
 pub use qtensor::QTensor;
 pub use storage::{QStorage, QStorageWithHost};

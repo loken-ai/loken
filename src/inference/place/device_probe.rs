@@ -74,7 +74,7 @@ fn pcie_lane_gbs(generation: u32) -> f64 {
 /// Memory bandwidth of one CUDA device in GB/s, from the driver's own attributes
 /// (DDR memory clock x bus width). NVML lacks the bus width on recent cards, the
 /// driver never does. 0.0 when CUDA is absent or the query fails.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn cuda_mem_bw_gbs(index: usize) -> f64 {
     use crate::tensor::gpu_runtime::driver::result as cu;
     use crate::tensor::gpu_runtime::driver::sys::CUdevice_attribute as A;
@@ -93,7 +93,7 @@ fn cuda_mem_bw_gbs(index: usize) -> f64 {
     clk_khz * 1e3 * (bus_bits / 8.0) * 2.0 / 1e9
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 fn cuda_mem_bw_gbs(_index: usize) -> f64 {
     0.0
 }
@@ -107,11 +107,11 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
     let all = nvml.device_count().unwrap_or(0);
     // A driver without the toolkit libraries lists cards through NVML that CUDA cannot open:
     // the machine has no usable card.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if !crate::tensor::cuda::runtime::usable() {
         return Vec::new();
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         use crate::tensor::gpu_runtime::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
         let _ = crate::tensor::gpu_runtime::driver::result::init();
@@ -170,7 +170,7 @@ pub fn debug_vram_by_card(tag: &str) {
 
 /// Whether a device's primary context is currently alive - the ground truth on who won a
 /// retain/release argument, straight from the driver.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn primary_ctx_active(ordinal: usize) -> bool {
     use crate::tensor::gpu_runtime::driver::sys::{cuDevicePrimaryCtxGetState, cudaError_enum};
     if crate::tensor::cuda::runtime::require().is_err() {
@@ -188,7 +188,7 @@ fn primary_ctx_active(ordinal: usize) -> bool {
     ok && active != 0
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 fn primary_ctx_active(_ordinal: usize) -> bool {
     false
 }
@@ -196,7 +196,7 @@ fn primary_ctx_active(_ordinal: usize) -> bool {
 /// What a message from card `from` to card `to` costs on the path tensors take between them (a
 /// peer copy, else through host memory): microseconds for a small one and bytes per microsecond
 /// beyond it, measured once a pair. `None` when either card cannot be opened.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn card_pair_link(from: usize, to: usize) -> Option<(f64, f64)> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -254,7 +254,7 @@ pub fn card_pair_link(from: usize, to: usize) -> Option<(f64, f64)> {
 }
 
 /// No-CUDA build: no card, so no link between two.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn card_pair_link(_from: usize, _to: usize) -> Option<(f64, f64)> {
     None
 }
@@ -262,7 +262,7 @@ pub fn card_pair_link(_from: usize, _to: usize) -> Option<(f64, f64)> {
 /// What summing a message onto every card of `cards` costs through NCCL, the path split layers
 /// take: microseconds for a small one and bytes per microsecond beyond it, measured once a group.
 /// `None` when a card cannot be opened or NCCL does not take the group.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn group_sum(cards: &[usize]) -> Option<(f64, f64)> {
     use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start, Comm, ReduceOp};
     use std::collections::HashMap;
@@ -334,7 +334,7 @@ pub fn group_sum(cards: &[usize]) -> Option<(f64, f64)> {
 /// Floating point operations per microsecond card `card` runs a block of prompt rows through a
 /// projection at: a BF16 product as wide as a layer's, measured once a card. `None` when the card
 /// cannot be opened.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn card_matmul_rate(card: usize) -> Option<f64> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -378,13 +378,13 @@ pub fn card_matmul_rate(card: usize) -> Option<f64> {
 }
 
 /// No-CUDA build: no card to measure.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn card_matmul_rate(_card: usize) -> Option<f64> {
     None
 }
 
 /// No-CUDA build: no cards to sum across.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn group_sum(_cards: &[usize]) -> Option<(f64, f64)> {
     None
 }
@@ -514,7 +514,7 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
 /// applied on this path - that overhead lives only in `llm_engine`.
 ///
 /// Returns empty (-> CPU) when CUDA is unavailable; never panics.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn probe_cuda_devices(reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
     use crate::tensor::Device;
     let mut out = Vec::new();
@@ -532,7 +532,7 @@ pub fn probe_cuda_devices(reserve: u64) -> Vec<(usize, u64, crate::tensor::Devic
 }
 
 /// No-CUDA build: no GPUs -> CPU placement.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn probe_cuda_devices(_reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
     Vec::new()
 }
@@ -572,7 +572,7 @@ pub fn probe_cuda_gpus_for(owner: &str) -> Vec<CudaGpuInfo> {
 }
 
 /// [`probe_cuda_devices`], minus what other subsystems have declared they are about to use.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn probe_cuda_devices_for(
     owner: &str,
     reserve: u64,
@@ -592,7 +592,7 @@ pub fn probe_cuda_devices_for(
 }
 
 /// No-CUDA build: no GPUs, so CPU placement.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub fn probe_cuda_devices_for(
     _owner: &str,
     _reserve: u64,
@@ -600,7 +600,7 @@ pub fn probe_cuda_devices_for(
     Vec::new()
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod primary_ctx_tests {
     use super::primary_ctx_active;
 
@@ -657,7 +657,7 @@ mod primary_ctx_tests {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod visible_tests {
     use super::*;
 

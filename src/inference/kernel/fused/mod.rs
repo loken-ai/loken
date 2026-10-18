@@ -124,9 +124,9 @@ pub use buffers::*;
 mod prefill_gqa;
 pub use prefill_gqa::*;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod cuda_numerics_tests;
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod flash_prefill_gqa_parity;
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod flash_prefill_parity;

@@ -1032,7 +1032,7 @@ mod tests {
 
     /// The card's sparse attention gives the CPU's, on window slots and on gathered slots with
     /// empty ones among them.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn the_card_attends_as_the_cpu_does() {
         use crate::inference::offload::cuda::Card;
@@ -1080,7 +1080,7 @@ mod tests {
     /// with the sink, rotated back, the grouped output projection - equals the same steps on the
     /// host over the expanded weights, to rounding, in one chunk of queries, in several of an
     /// uneven size, and with the weights expanded a few rows at a time.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn a_prompts_attention_on_the_card_matches_the_host() {
         use crate::tensor::cuda::{

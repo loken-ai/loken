@@ -256,7 +256,7 @@ impl MarlinAwqRepacked {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 mod device {
     use super::*;
     use crate::tensor::gpu_runtime::driver::{CudaSlice, CudaView, DevicePtr};
@@ -514,7 +514,7 @@ mod device {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use device::{MarlinAwqLayer, MarlinScratch};
 
 #[cfg(test)]
@@ -613,7 +613,7 @@ mod tests {
     /// a kernel that dropped the zero point would fail; `s` takes three different values, so a
     /// kernel that read a neighbouring group's scale would disagree on two columns in three;
     /// `q` and `a` vary along K, so a permutation that moved a nibble or a k index would fail.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[derive(Clone)]
     struct AwqLinear {
         k: usize,
@@ -629,7 +629,7 @@ mod tests {
         qzeros: Vec<i32>,
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     impl AwqLinear {
         fn generate(k: usize, n: usize, group_size: usize, seed: u32) -> Self {
             let groups = k / group_size;
@@ -730,7 +730,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn hash(i: usize, seed: u32) -> u32 {
         (i as u32)
             .wrapping_add(seed)
@@ -741,7 +741,7 @@ mod tests {
 
     /// Activations in the range the exactness argument on [`AwqLinear`] assumes: multiples of
     /// `2^-9`, never larger than `2^-2`, and varying along K so a misread k index shows.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn activations(len: usize, seed: u32) -> Vec<f16> {
         (0..len)
             .map(|i| f16::from_f32(((hash(i, seed) >> 20) as i32 & 0xFF) as f32 / 512.0 - 0.25))
@@ -749,7 +749,7 @@ mod tests {
     }
 
     /// How many outputs disagree, and by how much at worst.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn disagreements(got: &[f16], want: &[f16]) -> (usize, f32) {
         let n = got
             .iter()
@@ -767,7 +767,7 @@ mod tests {
     /// Whether this device runs the f32-accumulating kernel. Turing accumulates in f16, which
     /// rounds every partial sum and puts the bit-identity below out of reach; the comparison
     /// there would have to be a different one, so say so rather than pretend to cover it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn accumulates_in_f32(dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>) -> bool {
         dev.mmq_device_info().is_ok_and(|i| i.cc != 750)
     }
@@ -785,7 +785,7 @@ mod tests {
     /// output tile per multiprocessor, which is the only height here that does NOT split its
     /// tiles along k. Which of them split is not asserted here; it is measured, on the device,
     /// by the test below.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn the_w4a16_gemm_matches_the_weights_it_was_given() {
         use crate::tensor::cuda::CudaDevice;
@@ -877,7 +877,7 @@ mod tests {
     ///
     /// Both directions are asserted on purpose. An instrument that can only report the split
     /// cannot distinguish a kernel that always splits from a shape that reaches it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn the_cross_block_reduction_runs_only_when_a_tile_is_split() {
         use crate::tensor::cuda::CudaDevice;

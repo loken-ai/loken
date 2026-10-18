@@ -211,10 +211,10 @@ mod band_softmax_parity;
 mod quantize;
 pub use quantize::*;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod ncu_harness;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod gqa_ratio_parity;
 
 /// What the runtime NVRTC compile of the mat-vec kernels costs, and how big it is.

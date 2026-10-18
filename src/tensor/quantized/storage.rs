@@ -7,7 +7,7 @@ pub enum QStorage {
     /// Host blocks (the native QTensor keeps them; no payload needed by
     /// any frozen match site - they all bind the Cuda arm).
     Cpu,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     Cuda(QCudaStorage),
 }
 
@@ -19,7 +19,7 @@ impl QStorage {
         dtype: GgmlDType,
     ) -> Result<QStorageWithHost> {
         let storage = match device {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Device::Cuda(d) => {
                 QStorage::Cuda(QCudaStorage::upload(&CudaDevice(d.clone()), &data, dtype)?)
             }

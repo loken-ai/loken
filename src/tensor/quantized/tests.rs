@@ -9,7 +9,7 @@
 /// with only the Rust declaration of its quantize launcher missing. Both were found
 /// from the damage rather than from the code, so pin the agreement instead of the
 /// dtypes: whatever the list says, both launchers must resolve for every entry.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn every_dtype_mmq_claims_to_support_can_actually_be_fed() {
     if !crate::cpu::hardware_has_avx2() {
@@ -219,7 +219,7 @@ fn find_ggufs() -> Vec<std::path::PathBuf> {
 /// quantize the activations to q8_1 internally, so the bound is the
 /// quantization-error envelope (~1e-2 relative), enough to catch any
 /// layout/transpose/blob-offset bug.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn qmatmul_matches_oracle() {
     if !crate::cpu::hardware_has_avx2() {
@@ -297,7 +297,7 @@ fn qmatmul_matches_oracle() {
 /// garbage logits -> garbage tokens from otherwise-correct hidden states.
 /// Q5_0 mmvq was proven correct at K=896; Q8_0 at K=896 was NOT tested.
 /// Compares the GPU GEMV to an f64 reference on a SUBSET of output rows.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn q8_0_gpu_mmvq_parity_k896() {
     if !crate::cpu::hardware_has_avx2() {
@@ -372,7 +372,7 @@ fn q8_0_gpu_mmvq_parity_k896() {
 /// isolates whether the Q5_0 decode mmvq kernel itself is wrong (vs an
 /// attention/hidden=896 issue) by comparing the GPU GEMV to an f64 reference
 /// over the dequantized weight, on a real Q5_0 weight (K=896 from the model).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn q5_0_gpu_mmvq_matches_oracle() {
     if !crate::cpu::hardware_has_avx2() {
@@ -530,7 +530,7 @@ fn cpu_qmatmul_vec_dot_matches_oracle() {
 /// right thing to pin - it is the served path - but it means this cannot be used to prove a
 /// particular file is correct. The kernel names are built with `format!`, so grep cannot
 /// answer that question either.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn every_gpu_mmvq_format_matches_the_weights_it_holds() {
     if !crate::cpu::hardware_has_avx2() {
@@ -721,7 +721,7 @@ fn every_cpu_repack_gemm_matches_the_gemv_on_the_same_weights() {
 /// left is two int8 activation quantisations of the same values. The two must land within a
 /// thousandth or so of the row's own scale. On sm_120 the tiled family is the MMA path, which
 /// no test reached before this one.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_on_the_same_weights() {
     if !crate::cpu::hardware_has_avx2() {
@@ -805,7 +805,7 @@ fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_on_the_same_weights() {
 /// looked unused, would surface on a user's first quantised attention rather than here. The
 /// names are gathered from the source rather than listed again, because a second list is the
 /// thing that goes stale.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn every_kernel_name_the_quantised_module_is_asked_for_resolves() {
     if !crate::cpu::hardware_has_avx2() {
@@ -1270,7 +1270,7 @@ fn what_a_gguf_load_and_one_forward_would_cost_a_card() {
 }
 
 /// A weight built from bytes the loader owns is not kept on the host once the card holds it.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs a CUDA device; run in a lock window"]
 fn a_weight_built_on_a_card_holds_no_host_bytes() {

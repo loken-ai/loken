@@ -13,7 +13,7 @@ impl Tensor {
         if let Some(t) = self.dry_out(self.shape.clone(), self.dtype()) {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let w = if matches!(weight.dtype(), DType::F16 | DType::BF16) {
                 weight.to_dtype(DType::F32)?
@@ -22,7 +22,7 @@ impl Tensor {
             };
             return self.f16_unary_via_f32(|t| t.rms_norm(&w, eps));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let (w_slice, w_dev) = weight.cuda_f32_slice().map_err(|_| {
                 Error("rms_norm: weight must be on the same cuda device as x".into())
@@ -94,7 +94,7 @@ impl Tensor {
             Storage::Cpu(_) | Storage::Dry(_) => kf::StorageView::Cpu(kf::CpuStorageRef {
                 storage: self.storage_raw.clone(),
             }),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { dev, .. } => kf::StorageView::Cuda(kf::CudaStorage {
                 storage: self.storage_raw.clone(),
                 device: crate::tensor::kernel_ffi::CudaDevice(dev.clone()),
@@ -146,7 +146,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let (
             Storage::Cuda { data, dev },
             Storage::Cuda {
@@ -371,7 +371,7 @@ impl Tensor {
     /// falls back to materializing.
     /// `self @ rhs^T` for two BF16 tensors on one card, `[.., m, k]` by `[.., n, k]`: summed and
     /// written in F32. `None` where the operands are not that.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn matmul_t_bf16_f32(&self, rhs: &Self) -> Result<Option<Self>> {
         let (ldims, rdims) = (self.dims(), rhs.dims());
         if self.dtype() != DType::BF16
@@ -435,7 +435,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let ldims = self.dims();
             let rdims = rhs.dims();
@@ -668,7 +668,7 @@ impl Tensor {
         // arithmetic is the f32 one and only the store is bf16. Routing it through
         // f32 tensors instead would cost two full passes over what is, in attention,
         // the largest buffer of the forward.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::BF16 {
             if let Storage::Cuda { data, dev } = self.storage().as_ref() {
                 let last = *self
@@ -689,11 +689,11 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.softmax_last_dim());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let last = *self
                 .dims()
@@ -809,11 +809,11 @@ impl Tensor {
     }
 
     pub fn tanh(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.tanh());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_tanh_f32")? {
             return Ok(t);
         }
@@ -821,11 +821,11 @@ impl Tensor {
     }
 
     pub fn abs(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.abs());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_abs_f32")? {
             return Ok(t);
         }
@@ -833,11 +833,11 @@ impl Tensor {
     }
 
     pub fn recip(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.recip());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_recip_f32")? {
             return Ok(t);
         }
@@ -845,11 +845,11 @@ impl Tensor {
     }
 
     pub fn sqrt(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.sqrt());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_sqrt_f32")? {
             return Ok(t);
         }

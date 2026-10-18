@@ -142,7 +142,7 @@ pub(crate) fn plan_step(
 /// access: the source stream copies it into page-locked host memory, the destination stream
 /// copies it from there into a buffer on its card. Both copies are graph nodes; the order
 /// between the two streams is the launcher's.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(crate) struct GraphHop {
     host: *mut std::ffi::c_void,
     bytes: usize,
@@ -152,12 +152,12 @@ pub(crate) struct GraphHop {
 
 // SAFETY: `host` is a page-locked allocation owned by this hop alone, freed once on drop;
 // the copies that touch it are ordered on the card streams.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Send for GraphHop {}
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Sync for GraphHop {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl GraphHop {
     fn new(width: usize, dst_dev: &Device) -> Result<Self> {
         Self::with_rows(width, 1, dst_dev)
@@ -249,7 +249,7 @@ impl GraphHop {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl Drop for GraphHop {
     fn drop(&mut self) {
         // SAFETY: allocated by `malloc_host` in `new` and freed only here.
@@ -258,7 +258,7 @@ impl Drop for GraphHop {
 }
 
 /// The device address of an F32 card tensor's first element.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn f32_device_ptr(t: &Tensor) -> Result<u64> {
     use crate::tensor::cuda_ext::DevicePtr;
     let (st, layout) = t.storage_and_layout();
@@ -303,9 +303,9 @@ impl GenericHeteroTransformer {
         if l.sparse.is_some() {
             // The indexer and its attention run on the card where its kernels serve the layer's
             // shapes and its cache is the card's half-width one.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let on_card = l.indexed_on_card();
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let on_card = false;
             if !on_card {
                 return Some("indexed attention selects its tokens on the host");
@@ -802,7 +802,7 @@ impl GenericHeteroTransformer {
     /// request wait for their next replay: a prefill may grow the caches, which moves the
     /// generation and drops the graphs.
     pub fn suspend_graph_captured(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for l in &mut self.layers {
             let shards = l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut());
             for c in l.quant_kv.as_mut().into_iter().chain(shards) {
@@ -813,7 +813,7 @@ impl GenericHeteroTransformer {
 
     /// Graphs kept from an earlier request are live again over the quantised caches, with the
     /// ceilings they were recorded with.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn resume_graph_captured(&mut self) {
         let captured: Vec<bool> = (0..self.layers.len())
             .map(|i| self.layer_captured(i))
@@ -838,14 +838,14 @@ impl GenericHeteroTransformer {
         self.graph_hidden_buffer = None;
         self.graph_work_buffer = None;
         self.graph_feature = None;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.clear_verify_state();
         // ROOT CAUSE FIX: drop model-level captured-region tensor handles
         // so cuMemFree can reclaim their memory now that graph is torn down.
         self.graph_alive_tensors_model.clear();
         // Release the quantised caches' capture bookkeeping: with the graph gone the
         // buffers may grow again and the frozen seq ceiling no longer applies.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for l in &mut self.layers {
             let shards = l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut());
             for c in l.quant_kv.as_mut().into_iter().chain(shards) {
@@ -854,7 +854,7 @@ impl GenericHeteroTransformer {
         }
         // The memory the dropped graphs reserved goes back to the card: a request's graphs
         // are recorded again, and the reserve of every request before would stay otherwise.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for dev in self.cuda_devices.values() {
             if let Err(e) = crate::tensor::cuda_ext::stream_of(dev)
                 .and_then(|s| crate::tensor::cuda_ext::graph_mem_trim(&s))
@@ -868,7 +868,7 @@ impl GenericHeteroTransformer {
     /// now live. Freezes each quantised cache's growth + seq ceiling (see
     /// `KvCore::mark_captured`). Paired with `invalidate_graph_state`
     /// which clears it on teardown.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn mark_graph_captured(&mut self) {
         let captured: Vec<bool> = (0..self.layers.len())
             .map(|i| self.layer_captured(i))
@@ -894,7 +894,7 @@ impl GenericHeteroTransformer {
     /// NEXT request's trim/prefix-reuse/prefill operated on wrong lengths
     /// (server repro: request 2+ broadcast-shape 500s or silent
     /// garbage). O(n_layers) host-only work.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn sync_kv_len_for_graph(&mut self, len: usize) {
         let captured: Vec<bool> = (0..self.layers.len())
             .map(|i| self.layer_captured(i))
@@ -921,7 +921,7 @@ impl GenericHeteroTransformer {
     /// What the recorded step of each indexed layer reads at `pos`: the indexer's cache on the
     /// card holds the tokens before it, the cache has room for the token and keeps the buffers
     /// the step was recorded against. A cache that outgrew those ends the step.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn prepare_indexed_layers(&mut self, pos: usize) -> Result<()> {
         for i in 0..self.layers.len() {
             if !self.layer_captured(i) || self.layers[i].sparse.is_none() {
@@ -953,7 +953,7 @@ impl GenericHeteroTransformer {
     pub(super) fn ensure_graph_workspaces(&mut self) {
         if !self.workspace_pre_grown {
             self.workspace_pre_grown = true;
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             for cuda_dev in self.cuda_devices.values() {
                 if let Ok(cd) = cuda_dev.as_cuda_device() {
                     let max_intermediate = self
@@ -1001,7 +1001,7 @@ impl GenericHeteroTransformer {
         // invalidates the graph - the request then continues on the
         // eager path (or re-captures at the wider state).
         self.graph_pos = pos;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for (i, l) in self.layers.iter().enumerate() {
             if !self.layer_captured(i) {
                 continue;
@@ -1024,9 +1024,9 @@ impl GenericHeteroTransformer {
         // then a LATER captured matmul with bigger k triggers
         // workspace_ensure to realloc, invalidating earlier captured
         // kernels' scratch pointers -> ILLEGAL_ADDRESS on replay.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.ensure_graph_hops()?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.prepare_indexed_layers(pos)?;
         // A recorded n-gram layer reads and writes its convolution's rows where they lie.
         if let Some(layer) = self.ngram.as_ref().map(|n| n.meta.layer) {
@@ -1218,7 +1218,7 @@ impl GenericHeteroTransformer {
     }
 
     /// The rows of `input_ids` (`[1, n]`) decoded from the table on the card, `[1, n, dim]` F32.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn embed_rows_on_card(
         &self,
         table: &crate::tensor::quantized::QTensor,
@@ -1236,7 +1236,7 @@ impl GenericHeteroTransformer {
         Ok(out)
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub(super) fn embed_rows_on_card(
         &self,
         _table: &crate::tensor::quantized::QTensor,
@@ -1395,7 +1395,7 @@ impl GenericHeteroTransformer {
 
     /// For each op of the step: whether it is recorded in a graph, and the stream of the card
     /// it runs on.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn step_streams(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         let streams = self.graph_segment_streams();
         self.step_plan()
@@ -1420,14 +1420,14 @@ impl GenericHeteroTransformer {
                 crate::tensor::Error::msg("forward_from_hidden: call embed_for_graph first")
             });
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             self.graph_hops
                 .get(seg - 1)
                 .map(|hop| hop.dst.clone())
                 .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         crate::tensor::bail!("a card hop needs CUDA")
     }
 
@@ -1447,7 +1447,7 @@ impl GenericHeteroTransformer {
             } => {
                 let _step = GraphStep::enter();
                 let buffer = self.step_buffer(seg)?;
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if recv {
                     self.graph_hops
                         .get(seg - 1)
@@ -1457,13 +1457,13 @@ impl GenericHeteroTransformer {
                 let mut hidden = self.step_input(op, seg)?;
                 // A wide layer followed by another in the run hands it the norm its token mixer
                 // starts from, taken in its last write-back.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let mut xn: Option<Tensor> = None;
                 // See the timer in the eager decode loop: this measures issuing the layer,
                 // which is what tells a dispatching layer from one running on the host.
                 for li in layers.clone() {
                     let _timer = crate::inference::place::layer_perf::LayerTimer::start(li);
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if self.layers[li].is_wide() {
                         let next = (li + 1 < layers.end)
                             .then(|| self.layers[li + 1].chained_attn_norm())
@@ -1481,7 +1481,7 @@ impl GenericHeteroTransformer {
                 if head {
                     return self.graph_head(hidden).map(Some);
                 }
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if send {
                     self.graph_hops
                         .get(seg)
@@ -1516,7 +1516,7 @@ impl GenericHeteroTransformer {
                     ngram.as_ref(),
                     None,
                     None,
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     None,
                 )?;
                 self.tp_forget()?;
@@ -1524,7 +1524,7 @@ impl GenericHeteroTransformer {
                 Ok(None)
             }
             StepOp::Hop { seg, send, recv } => {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     let hop = self
                         .graph_hops
@@ -1545,7 +1545,7 @@ impl GenericHeteroTransformer {
                     }
                     Ok(None)
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     let _ = (seg, send, recv);
                     crate::tensor::bail!("a card hop needs CUDA")
@@ -1586,7 +1586,7 @@ impl GenericHeteroTransformer {
             }
             let layer = &mut self.layers[li];
             layer.kv_cache.trim_to(pos);
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Some(c) = layer.quant_kv.as_mut() {
                 c.trim_to(pos);
             }
@@ -1596,7 +1596,7 @@ impl GenericHeteroTransformer {
     /// Drops the copies of the hidden state the split layers kept on their other cards: the
     /// next pass starts from its own input.
     pub(super) fn tp_forget(&self) -> Result<()> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(comms) = self.layers.iter().find_map(|l| l.tp_comms.as_ref()) {
             comms.forget()?;
         }
@@ -1627,7 +1627,7 @@ impl GenericHeteroTransformer {
     }
 
     /// The stream of each segment's card.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn graph_segment_streams(
         &self,
     ) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
@@ -1641,7 +1641,7 @@ impl GenericHeteroTransformer {
     }
 
     /// Allocates the hop buffers between consecutive cards, outside any capture.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn ensure_graph_hops(&mut self) -> Result<()> {
         let segs = self.graph_segments();
         let boundaries = segs.len().saturating_sub(1);
@@ -1682,13 +1682,13 @@ impl GenericHeteroTransformer {
         }
         self.step_feature();
         let wide_normed: Option<Tensor> = match self.output_hyper.as_ref() {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Some(oh) => {
                 let xn = oh.normed_on_card(&hidden)?;
                 let (mixed, _) = oh.mix_on_card(&xn, false)?;
                 Some(mixed.reshape((1, self.config.embedding_length))?)
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             Some(_) => crate::tensor::bail!("a wide residual's head runs on a card"),
             None => None,
         };
@@ -1777,7 +1777,7 @@ impl GenericHeteroTransformer {
                     "context shift: sliding-window layer".to_string(),
                 ));
             }
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if layer.q4_kv().is_some() {
                 return Err(crate::tensor::Error::msg(
                     "context shift: Q4 KV cache".to_string(),
@@ -2314,7 +2314,7 @@ impl GenericHeteroTransformer {
                 layer.state_reset();
                 // Nothing is mid-pass once the cache starts again: the expert transit of a
                 // pass that was cut short is forgotten.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Some(tier) = layer.moe.as_ref().and_then(|m| m.tier.as_ref()) {
                     if let Err(e) = tier.reset_stage() {
                         tracing::warn!("expert transit not reset: {e}");
@@ -2334,7 +2334,7 @@ impl GenericHeteroTransformer {
     /// rule); `cuda_devices.values().next()` is HashMap-ordered and can
     /// name an unused GPU. Graph mode is single-GPU so they coincide, but
     /// the capture stream MUST be the one the kernels enqueue on.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn cuda_stream(&self) -> Option<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
         self.layers
             .first()
@@ -2672,7 +2672,7 @@ impl GenericTransformerLayer {
         if let Some(p) = self.ngram.as_ref() {
             n = n.wrapping_add(p.buffer_moves());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             if let Some(c) = self.quant_kv.as_ref() {
                 n = n.wrapping_add(c.buffer_moves());
@@ -2701,7 +2701,7 @@ impl GenericTransformerLayer {
         let host = table.delta_host(delta)?;
         let mut rotate = |k: &crate::tensor::Tensor| table.rotate_keys_by(k, delta);
         self.kv_cache.shift_tail(from, discard, &mut rotate)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(c) = self.q8_kv_mut() {
             c.shift_tail(from, discard, &mut rotate)
                 .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
@@ -2732,7 +2732,7 @@ impl GenericTransformerLayer {
         //
         // The quantised cache moves length, device position and graph state together
         // (see `KvCore::trim_to`).
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(c) = self.quant_kv.as_mut() {
             c.trim_to(new_len);
         }
@@ -2797,7 +2797,7 @@ mod kv_snapshot_tests {
 fn quantised_layer_snapshot(
     l: &GenericTransformerLayer,
 ) -> crate::tensor::Result<Option<super::LayerKvSnapshot>> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if let Some(q) = l.quant_kv.as_ref() {
             let quant = q
@@ -2819,12 +2819,12 @@ fn quantised_layer_snapshot(
 /// Device bytes [`capture_layer`] would copy from `l` and its shares as they hold now: each
 /// KV cache's bytes for its length in the form its snapshot takes, and each recurrent state.
 fn layer_snapshot_bytes(l: &GenericTransformerLayer) -> u64 {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     let kv = match l.quant_kv.as_ref() {
         Some(q) => q.raw_bytes(q.current_seq_len()) as u64,
         None => l.kv_cache.snapshot_bytes(),
     };
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     let kv = l.kv_cache.snapshot_bytes();
     kv + l.mixer.state_device_bytes() + l.tp_shards.iter().map(layer_snapshot_bytes).sum::<u64>()
 }
@@ -2953,7 +2953,7 @@ fn restore_quantised_layer(
     l: &mut GenericTransformerLayer,
     s: &super::LayerKvSnapshot,
 ) -> crate::tensor::Result<bool> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if let Some(q) = l.quant_kv.as_mut() {
             let restored = match (&s.quant, &s.spec) {
@@ -3147,7 +3147,7 @@ fn update_layer_graph_state(
 
     // Each quantised cache names the slot this replay writes (its own device
     // position; the copy is skipped when the slot has not changed).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if let Some(c) = layer.quant_kv.as_mut() {
         c.update_graph_state(pos).map_err(|e| {
             crate::tensor::Error::msg(format!("KV update_graph_state layer {i} pos={pos}: {e}"))

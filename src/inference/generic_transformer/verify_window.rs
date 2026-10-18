@@ -55,7 +55,7 @@ pub(crate) struct VerifyBuffers {
     /// The rows' positions on each card, `[VERIFY_ROWS]` i32.
     pos_by_card: HashMap<usize, Tensor>,
     /// The rows' hops between consecutive cards, one per boundary.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     hops: Vec<super::graph::GraphHop>,
     /// The verify in flight, from its preparation to its settlement.
     pub(super) window: Option<VerifyWindow>,
@@ -76,7 +76,7 @@ enum VerifyOp {
     Hop(usize),
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl GenericTransformerLayer {
     /// The buffers this layer keeps its state in before the rows of a verify, made once.
     pub(super) fn verify_keep_ready(&mut self, dev: &Device) -> Result<()> {
@@ -333,7 +333,7 @@ impl GenericTransformerLayer {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl GenericHeteroTransformer {
     /// Why this model records no verify, `None` when it does: every layer has to be recorded,
     /// on one card, with a wide residual and the head on the card.

@@ -89,9 +89,9 @@ fn read(staging: u64) -> Vec<(usize, u64)> {
 
 /// Makes the card's context and cuBLAS workspace, once per process.
 fn warm(card: usize) {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     crate::inference::engine::llm_engine::warm_card(card);
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     let _ = card;
 }
 

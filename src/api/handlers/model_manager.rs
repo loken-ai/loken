@@ -707,7 +707,7 @@ impl APIServer {
         //
         // The bookkeeping was right and the memory was still gone, which is the failure mode
         // a unit test cannot see: it proves the path was called, not that the card came back.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if freed > 0 {
             crate::inference::engine::llm_engine::release_cuda_pools();
         }

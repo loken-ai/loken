@@ -56,14 +56,14 @@ struct GhBatched {
     // CUDA-graph cache for the batched decode step, keyed by (batch_width, ctx
     // capacity bucket). Each entry holds the captured graph + the persistent
     // input/output buffers refreshed (slice_set) before every replay.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     graphs: std::collections::HashMap<(usize, usize), CapturedDecode>,
     // Set once if capture ever fails -> permanently use the eager path.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     graph_failed: bool,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl Drop for GhBatched {
     fn drop(&mut self) {
         // The captured graphs go before the model and the paged KV stores they read.
@@ -72,7 +72,7 @@ impl Drop for GhBatched {
 }
 
 /// A captured batched-decode graph + its stable I/O buffers (one per (B,cap)).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 struct CapturedDecode {
     graph: crate::tensor::cuda_ext::CapturedGraph,
     x: Tensor,
@@ -86,7 +86,7 @@ struct CapturedDecode {
 
 /// Context capacity bucket: gather/mask are padded to the next multiple of this so
 /// the captured shapes stay fixed as context grows (recapture only on bucket cross).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const CB_GRAPH_BUCKET: usize = 256;
 
 /// Tokens per block of the paged cache.
@@ -247,7 +247,7 @@ pub(crate) fn sample_row_host(
 /// Correct top-k/top-p/temperature sampling (same distribution as `sample_row_host`); the
 /// exact token can differ (the multinomial RNG order differs), which is fine for random
 /// sampling. Deterministic given the seed.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn sampled_finish_host(
     top_logit: &[f32],
     top_idx: &[u32],
@@ -297,14 +297,14 @@ impl BatchedModel for GhBatched {
             // CUDA-graph decode is what delivers the throughput win (eager batching
             // alone roughly ties serial on big models); always on, with a safe eager
             // fallback latched via `graph_failed` on any capture/replay failure.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let graph_on = !self.graph_failed
                 && !self.model.compute_device().is_cpu()
                 && self.model.cb_eligible();
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let graph_on = false;
             let logits = if graph_on {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     // Try the captured-graph path; on ANY capture/replay failure
                     // fall back to the eager path (correct, just unaccelerated) so
@@ -327,7 +327,7 @@ impl BatchedModel for GhBatched {
                         }
                     }
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     unreachable!()
                 }
@@ -347,13 +347,13 @@ impl BatchedModel for GhBatched {
             // (profiled ~2ms/step at B=8; the per-row argmax and host paths are memory/
             // overhead-bound). The penalty only LOWERS `recent` tokens, so the raw argmax
             // is exact unless the winner is itself penalized - recompute those rare rows.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let fast_argmax = dec.iter().all(|&i| items[i].sampling.temperature <= 0.0)
                 && !self.model.compute_device().is_cpu();
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let fast_argmax = false;
             if fast_argmax {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     let raw = crate::inference::moe_cuda::batched_argmax(&logits)?;
                     for (j, &i) in dec.iter().enumerate() {
@@ -377,7 +377,7 @@ impl BatchedModel for GhBatched {
                 // small batch (underfills the SMs); it only beats the host-rayon sampler
                 // once enough rows are in flight (measured crossover ~B=12: B=8 loses, B>=16
                 // wins +19-24%). Gate on batch width.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let gpu_ok = dec.len() >= 12
                     && s0.temperature > 0.0
                     && s0.top_k.is_some()
@@ -389,10 +389,10 @@ impl BatchedModel for GhBatched {
                             && s.top_p == s0.top_p
                             && s.repeat_penalty == s0.repeat_penalty
                     });
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let gpu_ok = false;
                 if gpu_ok {
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     {
                         use rayon::prelude::*;
                         let k = s0.top_k.unwrap();
@@ -475,7 +475,7 @@ impl BatchedModel for GhBatched {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl GhBatched {
     /// Batched decode via a captured CUDA graph: capture once per (B, ctx-cap
     /// bucket), then replay (just refresh the stable input buffers + launch)  -
@@ -740,7 +740,7 @@ impl ContinuousServer {
         // Pin a cuBLAS workspace so the batched-decode GEMMs stop allocating a
         // workspace per call (per-call allocs are pure overhead in the hot loop,
         // and are also required to be absent before any future graph capture).
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if !cdev.is_cpu() {
             let _ = crate::tensor::cuda_ext::pin_cublas_workspace(&cdev, 256 << 20);
             // Disable event tracking: the CB worker is single-stream, so the
@@ -765,9 +765,9 @@ impl ContinuousServer {
         let adapter = SendWrap(GhBatched {
             model,
             stores,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             graphs: std::collections::HashMap::new(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             graph_failed: false,
         });
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();

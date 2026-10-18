@@ -111,7 +111,7 @@ fn cos_get_on_dim_contiguous() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn cuda_narrow_matches_cpu() -> Result<()> {
     let Some(dev) = crate::tensor::cuda::CudaDevice::get(0).ok() else {
@@ -422,7 +422,7 @@ fn rms_norm_matches_oracle() {
 /// identity, so that is what is asserted - a tolerance here would pass a kernel that reduces
 /// in a different order. The reference check that follows keeps two kernels agreeing on a
 /// wrong answer from reading as a pass.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn the_wide_rmsnorm_matches_the_narrow_one_bit_for_bit() {
     let Ok(dev) = crate::tensor::cuda::CudaDevice::get(0) else {
@@ -484,7 +484,7 @@ fn the_wide_rmsnorm_matches_the_narrow_one_bit_for_bit() {
 /// The narrow kernel writes the summed row to global memory and reads it back to normalise;
 /// the wide one keeps it in shared memory. Both outputs are compared, because a staging bug
 /// could leave `sum_out` right and `norm_out` wrong, or the reverse.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn the_wide_add_rmsnorm_matches_the_narrow_one_bit_for_bit() {
     use crate::inference::kernel::fused::fused_add_rmsnorm_dual;

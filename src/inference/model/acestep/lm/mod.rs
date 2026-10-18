@@ -19,7 +19,7 @@ use std::cell::RefCell;
 /// reuses one upload instead of rebuilding a host Vec per row/layer/token.
 fn dev_key(d: &Device) -> usize {
     match d {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         Device::Cuda(c) => c.ordinal(),
         _ => usize::MAX,
     }
@@ -184,7 +184,7 @@ pub struct CfgKv {
     k: Vec<[Option<Tensor>; 2]>,
     v: Vec<[Option<Tensor>; 2]>,
     cached: [usize; 2],
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     graph: Option<DecodeGraph>,
 }
 
@@ -194,7 +194,7 @@ impl CfgKv {
             k: (0..n_layers).map(|_| [None, None]).collect(),
             v: (0..n_layers).map(|_| [None, None]).collect(),
             cached: [0, 0],
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             graph: None,
         }
     }
@@ -208,7 +208,7 @@ impl CfgKv {
 /// `scatter_set` reads), and (d) the per-row additive attention mask (-inf beyond the
 /// row's current length). All four are stable buffers refreshed via `slice_set`; the
 /// graph shape is constant within the bucket, so one capture replays for ~256 tokens.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 struct DecodeGraph {
     graph: crate::tensor::cuda::CapturedGraph,
     cap: usize,     // captured context capacity (multiple of GRAPH_BUCKET)
@@ -225,7 +225,7 @@ struct DecodeGraph {
 /// Trade-off - a larger bucket means fewer recaptures (each costs an eager warmup
 /// pass) but attention over more (mostly masked) positions every step; the masked
 /// compute outweighs the recapture saving here, so a tight bucket wins.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const GRAPH_BUCKET: usize = 256;
 
 /// Rows one decode step carries: the conditioned and the unconditioned trajectory, batched
@@ -386,7 +386,7 @@ impl Qwen3Lm {
         // is disabled on the model's card before any weight, KV or scratch tensor is
         // created. Only a model whole on one card captures a graph: across cards the
         // per-tensor events order a copy from one card to the next.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let mut cards: Vec<Device> = Vec::new();
             for dv in layer_devices.iter().chain(std::iter::once(&primary)) {
@@ -635,7 +635,7 @@ impl Qwen3Lm {
     /// -inf beyond the current token) added to the scores before softmax. Attention
     /// reads the FIXED `narrow(2,0,cap)` view (constant shape). Math is identical to
     /// `attn_row` (masked-out positions contribute 0 after softmax).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attn_row_capped(
         &self,
         q_r: &Tensor,
@@ -681,7 +681,7 @@ impl Qwen3Lm {
     /// CAPTURE-SAFE decoder layer (B=2 CFG): mirrors `decode_layer_ondevice` but uses
     /// `attn_row_capped` with the per-row device buffers (`cos`/`sin`/`widx`/`mask`),
     /// so the whole op sequence is fixed-shape and graph-capturable.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn decode_layer_graph(
         &self,
         l: &LmLayer,
@@ -741,7 +741,7 @@ impl Qwen3Lm {
     /// Run the B=2 CFG decode through all layers with the capture-safe buffers, then
     /// the final norm -> hidden `[2,1,H]`. The `kc`/`vc` per-layer KV buffers must be
     /// pre-allocated (the prefill path does this) before this runs under capture.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_graph(
         &self,
         x: &Tensor,
@@ -980,7 +980,7 @@ impl Qwen3Lm {
     ///   cos/sin [2,1,1,half]   per-row RoPE row (pos-dependent)
     ///   widx [2,nkv,1,d]  per-row scatter index (all = pos_r) - the KV write offset
     ///   mask [2,1,1,cap]  additive mask, 0 for j<=pos_r else -inf (the running length)
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn graph_inputs(
         &self,
         chosen: u32,
@@ -1031,7 +1031,7 @@ impl Qwen3Lm {
     /// KV is handled by a fixed `cap` window + a refreshed length mask (see `graph_inputs`
     /// / `attn_row_capped`). Returns hidden `[2,1,H]` on-device. On ANY capture/replay
     /// error the caller falls back to the eager `forward_b2_t`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_b2_graph(&self, chosen: u32, kv: &mut CfgKv) -> Result<Tensor> {
         use crate::tensor::gpu_runtime::driver::sys::{
             CUgraphInstantiate_flags_enum, CUstreamCaptureMode,
@@ -1372,7 +1372,7 @@ impl Qwen3Lm {
         // CUDA-graph capture/replay of the steady-state decode step removes the per-token
         // kernel-launch flood that pegs a host core (36 layers x 2 CFG rows x ~15 ops).
         // Any capture or replay error falls back to eager for the rest of the run.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let mut use_graph = self.device.is_cuda() && self.on_one_card() && self.graph_enabled;
         let _prof = tracing::enabled!(tracing::Level::DEBUG);
         let (mut _t_s, mut _t_f, mut _t_l) = (0f64, 0f64, 0f64);
@@ -1410,7 +1410,7 @@ impl Qwen3Lm {
             let _pf = std::time::Instant::now();
             // both sequences feed the SAME chosen token; the hidden state stays on-device.
             let hidden = {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     if use_graph {
                         match self.forward_b2_graph(chosen, &mut kv) {
@@ -1432,7 +1432,7 @@ impl Qwen3Lm {
                         self.forward_b2_t(&rows2, &mut kv)?
                     }
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     let row = self.embed_row(chosen)?;
                     let rows2 = Tensor::cat(&[&row, &row], 0)?;
@@ -1456,7 +1456,7 @@ impl Qwen3Lm {
             tracing::debug!("[ace-lm-prof] {} codes | sample(host)={:.1}ms ({:.2}ms/c) | forward(launch)={:.1}ms ({:.2}ms/c) | logits+download(sync)={:.1}ms ({:.2}ms/c)",
                 codes.len(), _t_s*1e3, _t_s*1e3/n, _t_f*1e3, _t_f*1e3/n, _t_l*1e3, _t_l*1e3/n);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             kv.graph = None;
         }

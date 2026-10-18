@@ -2,11 +2,11 @@
 //! each sublayer reads it through a mixer and writes back to every stream, and the token mixer
 //! of an indexed-attention layer reads only the tokens its indexer keeps.
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use super::hyper::combine_on_card;
 use super::hyper::{combine, WideBlock};
 use super::*;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::inference::moe_cuda::StepPos;
 use crate::tensor::D;
 
@@ -94,7 +94,7 @@ pub(super) fn staged<R>(
         }
         return r;
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if crate::tensor::cuda_ext::capture_active(dev) {
         if let Ok(card) = dev.as_cuda_device() {
             let stream = card.0.stream().clone();
@@ -117,7 +117,7 @@ const SCORE_COPIES: usize = 3;
 
 /// Where the rotation of a token's heads comes from: the layer's tables at a position the host
 /// knows, the step's buffers a replay refreshes, or the rows of a verify's tables.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 enum RopeSource {
     Host(usize),
     Step,
@@ -126,7 +126,7 @@ enum RopeSource {
 
 /// The tables one row of a recorded verify rotates with: the heads' cosines and sines, and the
 /// indexer's.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 struct RowTables {
     cos: Tensor,
     sin: Tensor,
@@ -159,7 +159,7 @@ impl GenericTransformerLayer {
             let add = staged("ngram", &dev, settle, || ple.forward(&r, emb, index_pos))?;
             r = (r + add)?;
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if dev.is_cuda()
             && self
                 .hyper
@@ -197,7 +197,7 @@ impl GenericTransformerLayer {
     /// One layer of the captured decode step: the same stages with the recurrent mixer
     /// advancing its state where it lies and attention reading the graph's position buffers.
     /// The residual is the F32 `[1, 1, streams * dim]` the graph's hidden buffer holds.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_wide_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         self.forward_wide_graph_chained(x, None, None)
             .map(|(r, _)| r)
@@ -206,7 +206,7 @@ impl GenericTransformerLayer {
     /// The token mixer's norm of this layer, for the layer before it to hand over with its
     /// residual: the norm's gamma and epsilon, when the layer reads its residual as it comes
     /// (no n-gram rows added first) and its mixers run on the card.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn chained_attn_norm(&self) -> Option<(Tensor, f32)> {
         let h = self.hyper.as_ref()?;
         (self.ngram.is_none() && h.attn.on_card() && h.ffn.on_card()).then(|| {
@@ -218,7 +218,7 @@ impl GenericTransformerLayer {
     /// [`Self::forward_wide_graph`] with the token mixer's norm of `x` given (`xn`, from the
     /// layer before), and the residual's norm for the next layer taken in the last write-back
     /// when `next` holds that layer's gamma and epsilon: the residual and that norm.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_wide_graph_chained(
         &mut self,
         x: &Tensor,
@@ -300,7 +300,7 @@ impl GenericTransformerLayer {
 
     /// Whether this layer's indexer and attention run on its card: its kernels serve the
     /// layer's shapes and its one cache is the card's half-width one.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn indexed_on_card(&self) -> bool {
         self.sparse.as_ref().is_some_and(|sparse| {
             self.cos.device().is_cuda() && self.kv_f16 && sparse.card_serves(self.head_dim)
@@ -311,7 +311,7 @@ impl GenericTransformerLayer {
     /// the token's key into its cache on the card and keeps the tokens the query selects, the
     /// token's keys and values join the cache at the position the card holds, and one launch
     /// attends over the kept tokens. Nothing in it reads the host.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_sparse_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         let pos_dev = self
             .graph_pos_i32
@@ -322,7 +322,7 @@ impl GenericTransformerLayer {
 
     /// [`Self::forward_sparse_graph`] for a decoded token run now, at `index_pos`, whose
     /// position the host knows: the same launches, and the host's counters moved by it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_on_card_eager(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         self.kv_cache.reserve(index_pos + 1)?;
         let room = self.kv_cache.max_seq_len_padded();
@@ -340,7 +340,7 @@ impl GenericTransformerLayer {
     /// The launches of an indexed layer's decoded token: indexer, projections, cache write and
     /// attention. `eager_at` is the position of a token run now, whose rotation is taken from the
     /// layer's tables; a recorded step takes it from the buffers its replays refresh.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_on_card(
         &mut self,
         x: &Tensor,
@@ -352,7 +352,7 @@ impl GenericTransformerLayer {
 
     /// [`Self::attend_on_card`] for one row of a recorded verify: its position buffer, and
     /// `row`'s rotation tables of the rows prepared for the verify.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn attend_row_recorded(
         &mut self,
         x: &Tensor,
@@ -381,7 +381,7 @@ impl GenericTransformerLayer {
     /// and rotation, every row's indexer key and cache row in order, every row's selection and
     /// attention over what its step would see, the gate and the output projection. `None` when
     /// the rows cannot take the fused head preparation: they then run one by one.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn attend_rows_recorded(
         &mut self,
         x: &Tensor,
@@ -497,7 +497,7 @@ impl GenericTransformerLayer {
     }
 
     /// [`Self::attend_on_card`] with the rotation tables of `tables` in place of the step's.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_on_card_with(
         &mut self,
         x: &Tensor,
@@ -592,7 +592,7 @@ impl GenericTransformerLayer {
                     // A decoded token, or the rows of a verify, advance the state where it
                     // lies, as the recorded step does, so the two follow each other on the same
                     // buffers.
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let _in_place = crate::inference::moe_cuda::in_place_state(
                         index_pos > 0 && (self.spec_record || mixed.dim(1).is_ok_and(|n| n == 1)),
                     );
@@ -619,7 +619,7 @@ impl GenericTransformerLayer {
 
     /// The same layer with each elementwise stage of the wide residual one launch, the norm of
     /// the feed-forward's mixer joined to the write-back that ends the token mixer.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_wide_on_card(
         &mut self,
         r: Tensor,
@@ -705,7 +705,7 @@ impl GenericTransformerLayer {
         index_pos: usize,
     ) -> Result<Tensor> {
         // The rows of a draft verify, each through the decoded token's launches on the card.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.indexed_on_card()
             && x.dim(1)? > 1
             && index_pos > 0
@@ -721,7 +721,7 @@ impl GenericTransformerLayer {
             return Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1);
         }
         // A decoded token of a layer whose indexer runs on the card never reaches the host.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.indexed_on_card()
             && x.dim(1)? == 1
             && index_pos > 0
@@ -732,7 +732,7 @@ impl GenericTransformerLayer {
         }
         // A prompt's rows over an F16 cache of a shape the kernels serve are selected on the card
         // and attended there, their queries never leaving it.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if x.dim(1)? > 1
             && self.kv_f16
             && self.indexed_on_card()
@@ -762,7 +762,7 @@ impl GenericTransformerLayer {
                     index_pos,
                     None,
                     None,
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     None,
                 ),
             };
@@ -779,7 +779,7 @@ impl GenericTransformerLayer {
                 index_pos,
                 None,
                 None,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 None,
             ),
         }
@@ -808,7 +808,7 @@ impl GenericTransformerLayer {
     /// The queries, keys and values of the rows `x` `[1, seq, hidden]` of a prompt chunk at
     /// `index_pos`, as [`Self::attend_selected`] reads them: the queries and keys rotated, the
     /// cache started over at position 0, the keys and values in the cache's width.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn selected_inputs(
         &mut self,
         x: &Tensor,
@@ -842,7 +842,7 @@ impl GenericTransformerLayer {
 
     /// [`Self::attend_selected`] for a prompt chunk whose kept tokens the card selected:
     /// `sel` `[rows, room]` and `count` `[rows]` are on it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_selected_card(
         &mut self,
         x: &Tensor,
@@ -856,7 +856,7 @@ impl GenericTransformerLayer {
 
     /// [`Self::attend_selected`] for a prompt chunk's rows, by one launch of the kernel that
     /// attends each row over its own kept tokens in the F16 cache.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_selected_rows(
         &mut self,
         x: &Tensor,
@@ -881,7 +881,7 @@ impl GenericTransformerLayer {
 
     /// The rows' keys and values join the cache, and each row attends over the tokens `sel` and
     /// `count` give it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_rows_kept(
         &mut self,
         x: &Tensor,
@@ -951,7 +951,7 @@ impl GenericTransformerLayer {
     /// `[1, heads, 1, head_dim]`, normed and rotated by one launch; `None` where the launch does
     /// not serve this layer. `at` is the position of a token run now, whose rotation is taken
     /// from the layer's tables; a recorded step takes it from the buffers its replays refresh.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn prepared_heads(
         &self,
         x: &Tensor,
@@ -1072,7 +1072,7 @@ impl GenericTransformerLayer {
         }
         // A prompt's rows over an F16 cache of the shape the kernel serves are attended in one
         // launch, each over its own kept tokens, with no block of scores in between.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.kv_f16
             && b == 1
             && seq > 1
@@ -1099,7 +1099,7 @@ impl GenericTransformerLayer {
         let mut parts = Vec::with_capacity(seq.div_ceil(block));
         // The scores and the sums over the cache's F16 keys and values run on the tensor cores:
         // the operands carry no more than their ten bits, and the sums are F32.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let _tf32 = crate::tensor::cuda::Tf32Scope::enter();
         // The rank of a position in the union of what a block keeps, `u32::MAX` for a position
         // outside it.

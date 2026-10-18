@@ -513,7 +513,7 @@ pub(crate) async fn list_devices(
         power_limit_w: Option<f32>,
     }
     let cuda_live: std::collections::HashMap<usize, CudaLive> = {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let mut m = std::collections::HashMap::new();
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
@@ -553,7 +553,7 @@ pub(crate) async fn list_devices(
             }
             m
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         std::collections::HashMap::new()
     };
 
@@ -644,7 +644,7 @@ pub(crate) async fn list_devices(
             // a feature of this crate and so was always false, and to omit `opencl`, which
             // is the one that gates the Intel Arc backend.
             "compiled_features": {
-                "cuda": cfg!(feature = "cuda"),
+                "cuda": cfg!(feature = "gpu"),
                 "opencl": cfg!(feature = "opencl"),
                 "image": cfg!(feature = "image"),
                 "video": cfg!(feature = "video"),

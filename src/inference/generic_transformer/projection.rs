@@ -17,9 +17,9 @@ use crate::tensor::{DType, Device, Error, Result, Tensor};
 /// Slot type for the Marlin W4A16 layer. Arc'd so `Clone` shares the
 /// device-resident repacked weights; a unit stub keeps the field (and the
 /// struct literals that initialize it) identical on non-CUDA builds.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub type MarlinSlot = std::sync::Arc<crate::tensor::marlin::MarlinAwqLayer>;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 pub type MarlinSlot = std::sync::Arc<()>;
 
 /// Which layouts an AWQ linear keeps resident.
@@ -113,7 +113,7 @@ impl AwqWeight {
 
     /// One-time device->host round-trip of the raw AutoAWQ tensors, shared by
     /// the dp4a and Marlin load-time repacks.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn host_tensors(&self) -> Result<(Vec<i32>, Vec<i32>, Vec<half::f16>)> {
         let qweight = self.qweight.flatten_all()?.to_vec1::<i32>()?;
         let qzeros = self.qzeros.flatten_all()?.to_vec1::<i32>()?;
@@ -129,7 +129,7 @@ impl AwqWeight {
     /// Build the output-major repacked tensors for the dp4a decode kernel from
     /// host copies of the raw tensors (`awq::repack_awq`). Resident on the
     /// weight's device.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn build_repacked_host(
         &self,
         qweight: &[i32],
@@ -158,7 +158,7 @@ impl AwqWeight {
     /// Build the Marlin W4A16 layer from host copies. `Ok(None)` =
     /// skipped because the dual-layout VRAM headroom would drop below the
     /// reserve (the per-layer graceful-degradation path); `Err` = real failure.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn build_marlin(
         &self,
         qweight: &[i32],
@@ -188,7 +188,7 @@ impl AwqWeight {
     /// Marlin forward for any M: one f32->f16 activation convert, the Marlin
     /// GEMM (M-looped in chunks of 32 inside the launcher), one f16->f32 output
     /// convert (downstream consumers are f32, like the dp4a/GEMM paths).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_marlin(
         &self,
         xs: &Tensor,
@@ -213,7 +213,7 @@ impl AwqWeight {
         y.reshape(out_shape)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_cuda(&self, xs: &Tensor) -> Result<Tensor> {
         use crate::tensor::cuda_ext::tensor_from_cuda_storage;
         let dims = xs.dims();
@@ -476,7 +476,7 @@ impl QMatMul {
         // the repacked layout; drop K-major -> no 2x VRAM.
         // Marlin W4A16: also eager-built per `awq_marlin_policy` - the
         // tensor-core small-M GEMM that removes the speculative-verify cliff.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if w.qweight.device().is_cuda()
             && w.k.is_multiple_of(8)
             && w.k.is_multiple_of(w.group_size.max(1))
@@ -682,7 +682,7 @@ impl QMatMul {
             // dominates the small matmul).
             QMatMulKind::Gguf(inner) => inner.forward(xs),
             QMatMulKind::Awq(w) => {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if xs.device().is_cuda() {
                     return w.forward_cuda(xs);
                 }
@@ -710,7 +710,7 @@ impl QMatMul {
     /// `silu(gate . x) * (up . x)` for one row `x` `[1, k]` on a card, in the one launch the
     /// card has for a k-quant pair after the row's quantisation: `[1, n]` F32. `None` where the
     /// pair or the row is not what that launch takes; the caller runs the two projections.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn fused_silu_pair(gate: &QMatMul, up: &QMatMul, x: &Tensor) -> Result<Option<Tensor>> {
         use crate::tensor::quantized::{GgmlDType, QStorage};
         // The first pair declined says why, once.
@@ -788,7 +788,7 @@ impl QMatMul {
     }
 
     /// The kernel matmul `forward` runs when nothing is added on top of it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn bare_kernel(&self) -> Option<&crate::tensor::quantized::QKernelMatMul> {
         if self.lora_fused.is_some() {
             return None;
@@ -798,7 +798,7 @@ impl QMatMul {
 
     /// `xs` quantised once for several projections of the same input: see
     /// `QKernelMatMul::quantize_for_matvec`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn quantize_for_matvec(
         &self,
         xs: &Tensor,
@@ -811,7 +811,7 @@ impl QMatMul {
 
     /// The projections `ws` of one input `xs`, each as its own `forward` gives it, with the
     /// input quantised once when every weight takes the mat-vec kernels.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn forward_shared(ws: &[&QMatMul], xs: &Tensor) -> Result<Vec<Tensor>> {
         if xs.device().is_cuda() && ws.len() > 1 {
             if let Some(a) = ws[0].quantize_for_matvec(&xs.contiguous()?)? {
@@ -827,14 +827,14 @@ impl QMatMul {
     }
 
     /// [`Self::forward_shared`] on a build with no cards: each projection on its own.
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     pub fn forward_shared(ws: &[&QMatMul], xs: &Tensor) -> Result<Vec<Tensor>> {
         ws.iter().map(|w| w.forward(xs)).collect()
     }
 
     /// `forward` over an activation [`Self::quantize_for_matvec`] produced, bit-identical to
     /// `forward` on it; `None` where `forward` would take another path.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn forward_quantized(
         &self,
         a: &crate::tensor::quantized::QuantizedActivation,
@@ -863,7 +863,7 @@ impl Module for Mlp {
 }
 
 #[cfg(test)]
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 mod marlin_parity {
     use super::*;
 
@@ -1151,7 +1151,7 @@ mod lora_tests {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod shared_input_tests {
     use super::*;
     use crate::tensor::quantized::GgmlDType;
@@ -1215,7 +1215,7 @@ mod shared_input_tests {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod fused_pair_tests {
     use super::*;
     use crate::tensor::quantized::{GgmlDType, QTensor};

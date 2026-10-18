@@ -26,7 +26,7 @@ impl TensorMessage {
     }
 
     /// Create from a facade Tensor
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn from_tensor(tensor: &crate::tensor::Tensor) -> Result<Self, crate::tensor::Error> {
         let shape = tensor.dims().to_vec();
         let dtype = format!("{:?}", tensor.dtype());

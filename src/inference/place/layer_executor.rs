@@ -956,7 +956,7 @@ impl HeteroPlan {
     /// fallback.
     pub fn split_across_cuda(total_layers: usize, cuda_devices: &[(usize, u64)]) -> Self {
         let weights: Vec<u64> = {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             {
                 let probed = crate::inference::place::device_probe::probe_cuda_gpus();
                 cuda_devices
@@ -970,7 +970,7 @@ impl HeteroPlan {
                     })
                     .collect()
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             {
                 vec![0; cuda_devices.len()]
             }
@@ -1071,7 +1071,7 @@ impl HeteroPlan {
 /// Each listed CUDA device's measured throughput, indexed like `devices`; `None` when a card
 /// has no figure, and the fill then evens by budget.
 fn cuda_throughput(devices: &[(DeviceKind, u64, u64)], cuda: &[usize]) -> Option<Vec<u64>> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         // Cores times maximum clock: fixed per card, so probed once per process.
         static SCORES: std::sync::OnceLock<Vec<(usize, u64)>> = std::sync::OnceLock::new();
@@ -1093,7 +1093,7 @@ fn cuda_throughput(devices: &[(DeviceKind, u64, u64)], cuda: &[usize]) -> Option
         }
         Some(w)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = (devices, cuda);
         None

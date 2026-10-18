@@ -306,7 +306,7 @@ pub enum Linear {
 }
 impl Linear {
     /// Dense BF16 weight for a caller that runs several GEMMs against it.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn dequant_bf16(&self) -> Result<Option<NT>> {
         match self {
             Linear::F32 { w, .. } => Ok(Some(w.to_dtype(crate::tensor::DType::BF16)?)),
@@ -502,12 +502,12 @@ impl Block {
         // re-dequantizes the full weight for every chunk (151 MB F32 + 75 MB BF16
         // per pass on the 4x-wide MLP), which both churns the pool and dominates
         // the cost of chunking; hoisting it makes the chunk loop pure GEMM.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let dense = match (l0.dequant_bf16()?, l1.dequant_bf16()?) {
             (Some(w0), Some(w1)) => Some((w0, w1)),
             _ => None,
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let dense: Option<(NT, NT)> = None;
         let mut parts: Vec<NT> = Vec::with_capacity(s.div_ceil(CHUNK));
         let mut off = 0;

@@ -9,13 +9,13 @@
 pub mod blockscaled;
 pub mod conversion;
 mod cpu_storage;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod cuda;
 mod device;
 pub mod dry;
 mod dtype;
 pub mod gguf_write;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub mod gpu_runtime;
 pub mod heap;
 pub mod kernel_ffi;
@@ -179,7 +179,7 @@ impl From<std::io::Error> for Error {
         Self(format!("io error: {e}"))
     }
 }
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl From<crate::tensor::gpu_runtime::driver::DriverError> for Error {
     fn from(e: crate::tensor::gpu_runtime::driver::DriverError) -> Self {
         Self(format!("cuda driver error: {e}"))

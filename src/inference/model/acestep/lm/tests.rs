@@ -210,7 +210,7 @@ fn cross_card_matches_single_card() {
 // window of 256 positions and eager the real few, and the two products are rounded by
 // different kernels. The reference implementation runs in bfloat16 and carries no such
 // stability either, so this measures the gap and does not require it closed.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs LM GGUF (config.test HF hub); GPU"]
 fn graph_matches_eager() {
@@ -243,7 +243,7 @@ fn graph_matches_eager() {
 
 // The capped attention against the plain one on synthetic rows: the same query, the
 // same cache filled to the same position, the write and the read through each path.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore = "needs LM GGUF (config.test HF hub); GPU"]
 fn capped_attention_matches_plain() {

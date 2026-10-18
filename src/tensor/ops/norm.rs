@@ -89,7 +89,7 @@ pub fn fused_add_rmsnorm_f32(
 
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     // CUDA F32 fast path -> our own fused kernel (no `candle_nn`).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if x.device().is_cuda() && x.dtype() == DType::F32 && weight.dtype() == DType::F32 {
             let cols = *x.dims().last().unwrap_or(&1);

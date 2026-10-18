@@ -85,7 +85,7 @@ pub fn fastest_bandwidth_gbs() -> f64 {
 /// alone: for a component sizing work inside the room its placement already gave it.
 /// `None` for the host or a card that does not answer.
 pub fn free_now(device: &crate::tensor::Device) -> Option<u64> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if device.is_cuda() {
         return crate::tensor::cuda_ext::mem_get_info(device)
             .ok()
@@ -96,7 +96,7 @@ pub fn free_now(device: &crate::tensor::Device) -> Option<u64> {
 }
 
 /// [`free_now`] for a caller holding the card's context rather than a device.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn free_in(ctx: &crate::tensor::gpu_runtime::driver::CudaContext) -> Option<u64> {
     ctx.mem_get_info().ok().map(|(free, _)| free as u64)
 }

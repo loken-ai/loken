@@ -920,7 +920,7 @@ fn tp_share(
     let routed = raw.moe_gate_inp.is_some();
     let experts = (experts_from, layout.experts.get(rank).copied().unwrap_or(0));
     let expert_range = |qt: &Option<QTensor>| -> Result<Option<QTensor>> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         return qt
             .as_ref()
             .map(|q| {
@@ -932,7 +932,7 @@ fn tp_share(
                 )
             })
             .transpose();
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         match qt {
             Some(_) => crate::tensor::bail!("a mixture's experts split across cards need CUDA"),
             None => Ok(None),
@@ -2157,7 +2157,7 @@ fn build_generic_layer(
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         quant_kv: {
             use crate::inference::cache::quant_kv::QuantKv;
             use crate::inference::engine::llm_engine::KvQuant;
@@ -2332,7 +2332,7 @@ fn build_generic_layer(
         ngram,
     };
     // A layer that selects tokens reads its history from the one cache the selection reads.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if layer.sparse.is_some() {
         layer.quant_kv = None;
         // Its one cache is unquantised, and on a card that cache holds half-width values.
@@ -2605,7 +2605,7 @@ fn build_awq_layer(
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         quant_kv: {
             let head_dim_supported = crate::inference::cache::kv_core::kv_shape_supported(
                 head_dim,
@@ -2819,7 +2819,7 @@ impl GenericHeteroTransformer {
     ) -> Result<super::draft_head::DraftHead> {
         // The head attends to every token of its cache, not to the blocks its indexer would keep:
         // its guess reads the whole context the model's own layers selected from.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let (tokens, head_dim) = (layer.kv_cache.max_seq_len_padded(), layer.head_dim);
             let served = crate::inference::moe_cuda::grouped_attention_serves(
@@ -2877,7 +2877,7 @@ impl GenericHeteroTransformer {
             fit: (0, 0),
             indexer_mark: None,
             vocab: None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             step: None,
         })
     }
@@ -2948,9 +2948,9 @@ impl GenericHeteroTransformer {
         // by one launch: the lookup of a decoded token and of a draft leaves the host.
         let emb_qt = Arc::new(emb_qt);
         let mut embed_cards = Vec::new();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let decodes = crate::inference::moe_cuda::embed_rows_decodes(emb_qt.dtype());
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let decodes = false;
         if decodes {
             let mut seen = std::collections::HashSet::new();
@@ -3193,7 +3193,7 @@ impl GenericHeteroTransformer {
         // A machine that copies faster than it loads never loses that race, which is why this
         // stayed invisible where it was developed and appeared on a slower one. Paid once per
         // load, not on any hot path.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for dev in cuda_devices.values() {
             if let Ok(cd) = dev.as_cuda_device() {
                 cd.synchronize()?;
@@ -3789,7 +3789,7 @@ impl GenericHeteroTransformer {
         // a rayon worker could stripe across both devices, so build sequentially.
         let layer_ropes = LayerRopes::default();
         // One set of communicators for the group, shared by every split layer.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let tp_comms = plan
             .tp_cards
             .as_ref()
@@ -3801,7 +3801,7 @@ impl GenericHeteroTransformer {
                     .collect::<Option<Vec<_>>>()?;
                 super::TpComms::new(&devices).map(Arc::new)
             });
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let tp_comms: Option<Arc<super::TpComms>> = None;
         let build_one = |raw: RawGenericLayer| -> Result<(GenericTransformerLayer, LayerDevice)> {
             let (device, dev_enum) = match raw.device_kind {
@@ -3963,11 +3963,11 @@ impl GenericHeteroTransformer {
 
         // Sync CUDA streams after parallel loading (non-default stream requires explicit sync)
         for dev in cuda_devices.values() {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Ok(cd) = dev.as_cuda_device() {
                 let _ = cd.cuda_stream().synchronize();
             }
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let _ = dev;
         }
         crate::inference::place::device_probe::debug_vram_by_card("after Phase2 layer-build");
@@ -4110,11 +4110,11 @@ impl GenericHeteroTransformer {
                 .into_iter()
                 .flatten()
             {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Device::Cuda(cd) = d {
                     keep.insert(cd.ordinal());
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let _ = d;
             }
             cuda_devices
@@ -4127,9 +4127,9 @@ impl GenericHeteroTransformer {
             .iter()
             .filter(|(i, _)| !retained.contains_key(i))
         {
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let _ = (idx, d);
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Device::Cuda(cd) = d {
                 tracing::debug!(
                     "cuda ctx: dropping idle gpu{idx} handle, strong_count={} (>1 means another \
@@ -4254,7 +4254,7 @@ impl GenericHeteroTransformer {
             output_bias,
             capture_feature: false,
             tier_workers: Vec::new(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             hot_locks: None,
             kept_graphs_at: None,
             verify: Default::default(),
@@ -4276,7 +4276,7 @@ impl GenericHeteroTransformer {
             ple_dim,
             graph_hidden_buffer: None,
             graph_work_buffer: None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             graph_hops: Vec::new(),
             graph_logits_buffer,
             graph_alive_tensors_model: Vec::new(),
@@ -4309,9 +4309,9 @@ impl GenericHeteroTransformer {
         // A layer on a card whose routed experts the plan left in host memory reads them in
         // place: the host holds them because it has no room for a repacked second copy.
         {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             use crate::inference::moe_cpu as host_moe;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             use crate::inference::moe_cuda as host_moe;
             for (layer, dev) in model.layers.iter().zip(model.layer_devs.iter()) {
                 let Some(moe) = layer.moe.as_ref().filter(|m| m.experts_on_host()) else {
@@ -4339,9 +4339,9 @@ impl GenericHeteroTransformer {
             .flat_map(|moe| moe.host_prefill_stacks())
             .collect();
         if !host_prefill_stacks.is_empty() {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             use crate::inference::moe_cpu as host_moe;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             use crate::inference::moe_cuda as host_moe;
             std::thread::spawn(move || {
                 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4489,7 +4489,7 @@ impl GenericHeteroTransformer {
         // after the AWQ weights are resident fails with CUDA "named symbol not
         // found" (a facade module-cache quirk after many custom-module loads);
         // prewarming first sidesteps it.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for idx in &used {
             if let Ok(cd) = cuda_devices[idx].as_cuda_device() {
                 let _ = crate::inference::kernel::fused::prewarm_fused_kernels(&cd);
@@ -4612,7 +4612,7 @@ impl GenericHeteroTransformer {
             output_bias: None,
             capture_feature: false,
             tier_workers: Vec::new(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             hot_locks: None,
             kept_graphs_at: None,
             verify: Default::default(),
@@ -4634,7 +4634,7 @@ impl GenericHeteroTransformer {
             ple_dim: 0,
             graph_hidden_buffer: None,
             graph_work_buffer: None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             graph_hops: Vec::new(),
             graph_logits_buffer: None,
             graph_alive_tensors_model: Vec::new(),

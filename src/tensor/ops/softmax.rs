@@ -11,7 +11,7 @@ use super::*;
 /// our own kernel; the fallback promotes F16/BF16 to F32 for the reduction
 /// (matching the reference internal F32 accumulation) and casts back.
 pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if x.device().is_cuda() && x.dtype() == DType::F32 {
             return crate::inference::kernel::fused::fused_softmax_lastdim_f32(x);

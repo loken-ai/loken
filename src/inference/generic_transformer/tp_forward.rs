@@ -12,7 +12,7 @@ impl GenericTransformerLayer {
     /// and feed-forward block whose every step the split reproduces, the feed-forward dense or a
     /// mixture whose cards each hold a range of the experts and route from the normed input.
     pub(super) fn runs_split(&self, x: &Tensor) -> bool {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             !self.tp_shards.is_empty()
                 && self.tp_comms.is_some()
@@ -27,7 +27,7 @@ impl GenericTransformerLayer {
                 && !self.is_wide()
                 && !self.is_hybrid()
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         {
             let _ = x;
             false
@@ -39,7 +39,7 @@ impl GenericTransformerLayer {
     /// each, each share's feed-forward summed onto every card, the residual added again. The
     /// copies on the other cards are kept for the next split layer. `index_pos` is `None` in a
     /// recorded step, where each cache gives its own position.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_split(
         &mut self,
         x: &Tensor,
@@ -66,7 +66,7 @@ impl GenericTransformerLayer {
 }
 
 /// [`GenericTransformerLayer::forward_split`] over the ranks of the group, rank 0 first.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn split_layer(
     ranks: &mut [&mut GenericTransformerLayer],
     comms: &super::TpComms,
@@ -129,7 +129,7 @@ fn split_layer(
 
 /// The residual after attention, `a` added to `x` (normed first by the post-attention norm when
 /// the layer has one), and its norm for the feed-forward.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn residual_and_norm(
     layer: &GenericTransformerLayer,
     a: &Tensor,

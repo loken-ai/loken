@@ -287,7 +287,7 @@ impl LlmEngine {
         // A generic transformer keeps layers `[0, cut)` and the rest leaves with the link; any
         // other backend forms the pipeline its own way, or declines.
         // The graphs kept between requests are for the serial decode of this model as it stands.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if !s.kept_graphs.is_empty() {
             s.kept_graphs.clear();
             s.model.note_graphs_kept(None);

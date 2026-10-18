@@ -1538,7 +1538,7 @@ impl Q8KvCache {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 mod dev_pos_tests {
     //! Numerical equivalence tests for the Q8 KV cache graph-mode kernels
     //! (`attn_score_q8_0_f32_dev_pos`, `attn_output_q8_0_f32_dev_pos`).

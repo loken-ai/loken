@@ -7,23 +7,23 @@
 //! makes the whole chain safe: a workspace that cannot be allocated degrades instead of
 //! failing the request.
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use super::mmq::{mmq_launcher, mmq_qk, mmq_quantize_launcher, mmq_supports, MMQ_WORKSPACES};
 use super::*;
 
 mod cpu;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 mod kat;
 mod mmq;
 mod repack;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use kat::kat_bad;
 
 /// The most rows one launch of the matvec kernels takes for a `[.., k]` weight of `dtype`:
 /// the crossover past which the tiled GEMM's weight reuse wins, where that GEMM can run this
 /// storage, and the matvec family's own bound where it cannot.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn matvec_rows(dtype: GgmlDType, k: usize) -> usize {
     if mmq_supports(dtype) && k.is_multiple_of(mmq_qk(dtype)) {
         5
@@ -61,12 +61,12 @@ impl Drop for DecodeOrder {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub use kat::kernel_known_answer_test;
 
 /// An activation quantised to q8_1 by [`QKernelMatMul::quantize_for_matvec`], for every
 /// mat-vec over the same `k` on the same card.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub struct QuantizedActivation {
     q81: crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
     k: usize,
@@ -144,7 +144,7 @@ pub struct QKernelMatMul {
         std::sync::OnceLock<Vec<crate::tensor::quant_cpu::repack_q8_0_x8::BlockQ8_0x8>>,
     /// Arc-shared so the compat shim's `QCudaStorage` projection
     /// and this QKernelMatMul reuse ONE padded device upload per weight.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) blob: Option<std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>>,
     /// The room a placement on a counting device would give this weight.
     ///
@@ -165,10 +165,10 @@ pub struct QKernelMatMul {
 /// dense matmul path, which is slower and correct. The failure this exists for is an
 /// arch-mismatched kernel returning garbage without an error - twice now that garbage
 /// was NaN and cost a day each time; wrong-but-finite would be worse.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 static KAT_BAD_MMVQ: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
     std::sync::OnceLock::new();
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 static KAT_BAD_MMQ: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
     std::sync::OnceLock::new();
 
@@ -179,7 +179,7 @@ impl QKernelMatMul {
         qt: std::sync::Arc<QHostTensor>,
         device: &crate::tensor::Device,
     ) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let blob = match device {
             crate::tensor::Device::Cuda(dev) => {
                 // The MMQ/MMVQ kernels assume row lengths padded to
@@ -226,7 +226,7 @@ impl QKernelMatMul {
             cpu_repack_q8_0_x8: std::sync::OnceLock::new(),
             host: qt,
             device: device.clone(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             blob,
             dry,
         };
@@ -240,7 +240,7 @@ impl QKernelMatMul {
         Ok(qmm)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn from_qtensor(
         qt: QHostTensor,
         dev: std::sync::Arc<crate::tensor::cuda::CudaDevice>,
@@ -252,7 +252,7 @@ impl QKernelMatMul {
     /// blob was already uploaded for the `QCudaStorage` projection; sharing it
     /// avoids a second per-weight VRAM copy). The blob must be the tail-padded
     /// upload of `qt.data()`. `blob = None` on CPU placements.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn from_qtensor_on_with_blob(
         qt: std::sync::Arc<QHostTensor>,
         device: &crate::tensor::Device,
@@ -325,7 +325,7 @@ impl QKernelMatMul {
     /// The weight as a flat host `[n * k]` F32 vector: decoded from the host blocks, or from
     /// the card's copy when the card holds the only one.
     fn host_f32(&self) -> Result<Vec<f32>> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.host.is_card_only() {
             let blob = self
                 .blob
@@ -374,7 +374,7 @@ impl QKernelMatMul {
     /// MLP). `Ok(None)` when the weight is not a GPU K-quant/Q8_0 blob - the caller
     /// then falls back to per-call `forward*`. BF16 is the DiT's reference GEMM
     /// precision (holds ~1e9 activations, cuBLAS accumulates in F32).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn dequant_weight_bf16(&self) -> Result<Option<crate::tensor::Tensor>> {
         let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
         else {
@@ -420,7 +420,7 @@ impl QKernelMatMul {
     }
 
     pub fn forward_dequant_gpu(&self, x: &crate::tensor::Tensor) -> Result<crate::tensor::Tensor> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
         {
             let total = self.n * self.k;
@@ -506,7 +506,7 @@ impl QKernelMatMul {
     /// return paths (a CPU k-quant fast path and multiple CUDA kernels), and adding the
     /// delta at each one is how a family silently ends up without its adapter.
     /// The F32 mat-vec over `rows` activation rows already quantised to q8_1.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn mmvq_f32_rows(
         &self,
         qdev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
@@ -547,7 +547,7 @@ impl QKernelMatMul {
     /// `x` (F32, `[.., k]`) quantised to q8_1 the way `forward` quantises it for the
     /// mat-vec kernels, so several weights over the same activation quantise it once.
     /// `None` where `forward` would not take those kernels.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn quantize_for_matvec(
         &self,
         x: &crate::tensor::Tensor,
@@ -602,7 +602,7 @@ impl QKernelMatMul {
 
     /// `forward` over an activation [`Self::quantize_for_matvec`] produced: bit-identical
     /// to `forward` on the F32 rows. `None` where `forward` would take another path.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn forward_quantized(
         &self,
         a: &QuantizedActivation,
@@ -663,7 +663,7 @@ impl QKernelMatMul {
     }
 
     /// Whether `forward` serves `rows` F32 activation rows with the mat-vec kernels.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn takes_matvec(&self, qdev: &crate::tensor::cuda::CudaDevice, rows: usize) -> bool {
         self.blob.is_some()
             && ((1..=matvec_rows(self.dtype, self.k)).contains(&rows)
@@ -675,7 +675,7 @@ impl QKernelMatMul {
     /// Whether a one-row call over this weight takes the four-rows-per-block `smallk`
     /// mat-vec (ggml's dispatch): K-quants with an entry, `n % 4 == 0`, and a K small
     /// enough, `(k/256) < 4*vdr`, that the one-row kernel would leave threads idle.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn smallk_single(&self, k: usize) -> bool {
         let vdr: Option<i32> = match self.dtype {
             GgmlDType::Q4K | GgmlDType::Q5K => Some(2),
@@ -1029,7 +1029,7 @@ impl QKernelMatMul {
             };
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
         {
             let xdt = x.dtype();
@@ -1337,7 +1337,7 @@ impl QKernelMatMul {
     /// the activation straight from `[offset, offset + rows*k)` of the source
     /// buffer (no materialization). `Ok(None)` = shape/dtype/batch outside
     /// the MMVQ decode window - the caller materializes and uses `forward`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn forward_view(
         &self,
         src: &crate::tensor::Tensor,

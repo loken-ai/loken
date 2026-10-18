@@ -71,7 +71,7 @@ impl Tensor {
     /// uninit on CUDA (caller must overwrite before reading); CPU stays zeroed.
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn empty<S: Into<Shape>>(shape: S, dtype: DType, device: &Device) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Device::Cuda(dev) = device {
             let shape: Shape = shape.into();
             let data =

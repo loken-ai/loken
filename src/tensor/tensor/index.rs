@@ -18,13 +18,13 @@ impl Tensor {
         if let Some(t) = self.dry_out(self.shape.clone(), self.dtype()) {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let w = weight.to_dtype(DType::F32)?;
             let b = bias.map(|b| b.to_dtype(DType::F32)).transpose()?;
             return self.f16_unary_via_f32(|t| t.layer_norm(&w, b.as_ref(), eps));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let last = *self
                 .dims()
@@ -97,11 +97,11 @@ impl Tensor {
     }
 
     pub fn relu(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.relu());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_relu_f32")? {
             return Ok(t);
         }
@@ -111,7 +111,7 @@ impl Tensor {
     /// erf-based GELU (Abramowitz-Stegun 7.1.26 erf; the served encoders use
     /// the tanh form `gelu()` - this exists for config-completeness).
     pub fn gelu_erf(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             // F32 on-device via the erff kernel (no CPU round-trip). Other dtypes fall through to
             // the F32-compute-on-CPU path below (rare; big-tensor F32 is the hot case, e.g. DiT MLP).
@@ -138,7 +138,7 @@ impl Tensor {
     }
 
     pub fn silu(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::F16 {
             // half-precision silu, reference-kernel parity (x / (1 + hexp(-x)))
             if let Storage::Cuda { data, dev } = self.storage().as_ref() {
@@ -155,11 +155,11 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.silu());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_silu_f32")? {
             return Ok(t);
         }
@@ -168,7 +168,7 @@ impl Tensor {
 
     /// GELU, tanh approximation (the `gelu` the transformer MLPs use).
     pub fn gelu(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::F16 {
             // half-precision gelu chain, reference-kernel parity
             if let Storage::Cuda { data, dev } = self.storage().as_ref() {
@@ -185,11 +185,11 @@ impl Tensor {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.gelu());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_gelu_f32")? {
             return Ok(t);
         }
@@ -243,7 +243,7 @@ impl Tensor {
                 .rope_impl(&c, &s, interleaved)?
                 .to_dtype(dt);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             // Preserve the INPUT half dtype - a BF16 input must come back BF16,
             // not F16. Hardcoding F16 here silently turned BF16 activations
@@ -266,7 +266,7 @@ impl Tensor {
                 .rope_impl(&c, &sn, interleaved)?
                 .to_dtype(back);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let (c_slice, _) = cos
                 .cuda_f32_slice()
@@ -352,7 +352,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             // On-device reduction for the known ops (sum/mean/max) - the generic closure path below
             // can't run on the GPU, so it used to round-trip the whole tensor to the CPU and back
@@ -468,7 +468,7 @@ impl Tensor {
         if let Some(t) = self.dry_out(self.shape.clone(), dtype) {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let _b = crate::tensor::bounce::start("dev_cast");
             let n = self.elem_count();
@@ -582,7 +582,7 @@ impl Tensor {
         }
         let f = match self.storage().as_ref() {
             Storage::Cpu(c) => c.to_f32_vec(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { .. } => {
                 return Err(Error("to_dtype on cuda not implemented yet".into()))
             }
@@ -617,7 +617,7 @@ impl Tensor {
         dilation: usize,
         groups: usize,
     ) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             // device path: im2col + cuBLAS per batch (groups==1, f32; the
             // general cases host-bounce)
@@ -790,7 +790,7 @@ impl Tensor {
         dilation: usize,
         groups: usize,
     ) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             if groups == 1 && self.dtype() == DType::F32 && kernel.dtype() == DType::F32 {
                 if let (
@@ -964,7 +964,7 @@ impl Tensor {
         dilation: usize,
         groups: usize,
     ) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             if groups == 1
                 && dilation == 1
@@ -1101,13 +1101,13 @@ impl Tensor {
         bias: &Self,
         eps: f32,
     ) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let w = weight.to_dtype(DType::F32)?;
             let bs = bias.to_dtype(DType::F32)?;
             return self.f16_unary_via_f32(|t| t.group_norm(num_groups, &w, &bs, eps));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let dims = self.dims();
             if dims.len() < 2 {
@@ -1211,7 +1211,7 @@ impl Tensor {
                 inv_alpha.elem_count()
             )));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             if let (Ok((a_s, a_d)), Ok((i_s, i_d))) =
                 (alpha.cuda_f32_slice(), inv_alpha.cuda_f32_slice())

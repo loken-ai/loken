@@ -14,11 +14,11 @@ impl GenericTransformerLayer {
         let up = self.ffn_up.forward(x)?;
         let activated = match &self.ffn_up_bias {
             Some(b) => {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     crate::inference::kernel::fused::fused_bias_gelu_new(&up, b)?
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     up.broadcast_add(b)?.gelu()?
                 }
@@ -32,7 +32,7 @@ impl GenericTransformerLayer {
     /// using a pre-quantized Q8_1 x_norm buffer for ffn_up. Saves one
     /// quantize launch vs forward_ffn_phi2_pre_bias (which goes through
     /// QMatMul.forward and re-quantizes x_norm).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[inline]
     pub(super) fn forward_ffn_phi2_pre_bias_from_q8_1(
         &self,
@@ -85,7 +85,7 @@ impl GenericTransformerLayer {
     /// `event_q8_1_ready` is the dependency from the default stream: the
     /// alt stream waits on it so it doesn't read the q8_1 buffer before
     /// it's been populated.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn start_alt_stream_ffn_up_from_q8_1(
         &self,
         q8_1_x_norm: &crate::tensor::cuda_ext::CudaSlice<u8>,
@@ -147,7 +147,7 @@ impl GenericTransformerLayer {
 
     /// Consume an alt-stream-produced `up` tensor: wait on the alt event,
     /// then run bias_gelu + ffn_down on the default stream.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn finish_ffn_phi2_pre_bias_after_alt(
         &self,
         up: &Tensor,
@@ -170,7 +170,7 @@ impl GenericTransformerLayer {
     /// the alt CUDA stream. Returns (ffn_pre_tensor, event_after_ffn_pre).
     /// The caller MUST `default_stream.wait(&event)` before any op that
     /// reads ffn_pre.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn finish_ffn_phi2_pre_bias_after_alt_full(
         &self,
         up: &Tensor,
@@ -245,7 +245,7 @@ impl GenericTransformerLayer {
         Ok((ffn_pre, event_after))
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_ffn_phi2_pre_bias_fallback_explain(&self, msg: &str) -> Result<Tensor> {
         crate::tensor::bail!("phi2 ffn fast path bail: {msg}");
     }
@@ -310,7 +310,7 @@ impl GenericTransformerLayer {
             // no `narrow -> contiguous -> narrow -> contiguous -> fused_gelu_mul`
             // chain (the two narrow-then-contiguous copies were ~2
             // launches per layer of pure data-shuffle).
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let raw_out = if up_states.device().runs_as_card()
                 && up_states.dtype() == crate::tensor::DType::F32
                 && up_states
@@ -341,7 +341,7 @@ impl GenericTransformerLayer {
                 let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
                 crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let raw_out = {
                 // silu.mul: read the packed [gate | up] projection once and emit
                 // the activated result in a single vectorized pass, skipping the
@@ -400,7 +400,7 @@ impl GenericTransformerLayer {
             // both Q4_K QTensors and K % 256 == 0 and input is F32 multi-
             // token (prefill), fuse the three steps (gate matmul + up
             // matmul + silu.mul) into a single IMMA M=8 kernel.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let activated = {
                 use crate::tensor::quantized::GgmlDType;
                 let use_gelu = self.flags.use_gelu;
@@ -665,7 +665,7 @@ impl GenericTransformerLayer {
                     }
                 }
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let activated = {
                 let gate = self.ffn_gate.as_ref().unwrap().forward(x)?;
                 let up = self.ffn_up.forward(x)?;
@@ -682,7 +682,7 @@ impl GenericTransformerLayer {
             // downstream fused_rmsnorm_then_add reads a freed alloc =
             // ILLEGAL_ADDRESS. Decode-only (seq=1).
             let raw_down = self.ffn_down.forward(&activated)?;
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if x.dim(1).map(|d| d == 1).unwrap_or(false) {
                 if let Some(buf) = self.graph_ffn_down_buffer.as_ref() {
                     let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);

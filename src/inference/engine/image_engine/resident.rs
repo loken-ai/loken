@@ -21,7 +21,7 @@ impl ImageEngine {
         // image-gen sessions left ~17 GB of pool VRAM "held" by the
         // pool even after the model dropped - blocking subsequent
         // model loads. Mirrors LlmEngine::unload.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             // Z-Image-specific static cache clear before generic trim
             // (each cached Tensor holds a CudaSlice into the pool).

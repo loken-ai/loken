@@ -5,4 +5,8 @@
 //! `crate::tensor::gpu_runtime::...`, so a second runtime with the same surface can stand here
 //! without the callers changing.
 
+#[cfg(feature = "cuda")]
 pub use cudarc::{cublas, cublaslt, driver, nccl, nvrtc};
+
+#[cfg(not(feature = "cuda"))]
+compile_error!("the gpu feature needs a runtime feature: cuda");

@@ -421,7 +421,7 @@ fn the_expert_gemm_holds_up_when_several_threads_share_the_stream() {
 /// the wrong place - so this reaches the builder directly. The routing it is given is the
 /// awkward one: experts with no tokens at all, a run at the very start and a run at the very
 /// end, and a count that is not a multiple of the block the scan uses.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[test]
 fn the_expert_offsets_are_where_the_host_says_they_are() {
     use crate::tensor::cuda::CudaDevice;

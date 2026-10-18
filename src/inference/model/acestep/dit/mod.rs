@@ -406,7 +406,7 @@ impl DitModel {
             // Euler trajectory hands the GPU a long fixed block sequence per step and then
             // blocks on a single readback - a spinning sync would peg a core doing nothing
             // while the GPU runs. Blocking sync lets that core idle. acestep-only, no numerics.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Device::Cuda(c) = &device {
                 let _ = c.context().set_blocking_synchronize();
             }

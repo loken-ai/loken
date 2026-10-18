@@ -552,14 +552,14 @@ fn build_flux_regions(
 /// The CUDA ordinal a facade device names, or None when it is not a GPU.
 fn gpu_index_of(dev: &Device) -> Option<usize> {
     let nd = dev.clone();
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         match &nd {
             crate::tensor::Device::Cuda(cd) => Some(cd.ordinal()),
             _ => None,
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = nd;
         None

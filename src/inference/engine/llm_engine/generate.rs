@@ -54,7 +54,7 @@ impl LlmEngine {
         // the default mempool on every CUDA device to return all unused
         // bytes to the system. Safe because no tensors reference these
         // allocations anymore (we just dropped them above).
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             release_cuda_pools();
         }
@@ -64,7 +64,7 @@ impl LlmEngine {
         crate::inference::moe_cuda::clear_expert_cache();
         // CUDA build also caches CPU expert QMatMuls in the moe_cpu twin (used by
         // lfm2/nemotron MoE under `--cpu`); clear it too to avoid the same leak.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         crate::inference::moe_cpu::clear_expert_cache();
         // Return freed HEAP to the OS too. Dropping a CPU model frees its
         // buffers to glibc, but the arenas retain them - repeated
@@ -209,7 +209,7 @@ impl LlmEngine {
             // GPU - non-deterministic output across calls. Also binds the
             // primary CUDA context to the calling thread (mirrors llama.cpp's
             // `cudaSetDevice` discipline before each backend op).
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if state.device.is_cuda() {
                 if let Ok(cd) = state.device.as_cuda_device() {
                     let _ = cd.cuda_stream().context().bind_to_thread();
@@ -286,14 +286,14 @@ impl LlmEngine {
             // Otherwise the prior request's graph state (per-layer rope/mask buffers, capture
             // flags) is dropped. Either way the decode re-primes what the graphs read on its
             // first token. Does NOT touch KV contents, so prefix reuse below is unaffected.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let graphs_kept = state.kept_graphs.current(state.model.graph_generation());
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let graphs_kept = false;
             if graphs_kept {
                 state.model.suspend_graph_captured();
             } else {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 state.kept_graphs.clear();
                 state.model.note_graphs_kept(None);
                 state.model.invalidate_graph_state();
@@ -668,7 +668,7 @@ impl LlmEngine {
             // CUDA graph: capture forward pass after warmup, replay for subsequent tokens. The
             // graphs kept from the last request are taken when the prefill moved none of the
             // buffers they read; stale ones are dropped with the graph state.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let kept = {
                 let kept = state.kept_graphs.take_current(state.model.graph_generation());
                 if kept.is_none() && graphs_kept {
@@ -676,7 +676,7 @@ impl LlmEngine {
                 }
                 kept
             };
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let (kept_step, mut verify_graphs, mut graphs_at) = match kept {
                 Some((g, at)) => {
                     let mut verify = g.verify;
@@ -688,14 +688,14 @@ impl LlmEngine {
             };
             // A step kept from the last request is replayed from the first token: its first
             // replay is held against an eager step, as the last one of a fresh capture's is.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_kept = kept_step.is_some();
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let (mut cuda_graph, kept_logits): (Option<super::decode::DecodeGraph>, Option<Tensor>) = match kept_step {
                 Some((g, l)) => (Some(g), Some(l)),
                 None => (None, None),
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let (graph_kept, kept_logits): (bool, Option<Tensor>) = (false, None);
             // Reference to the output logits tensor from graph capture (same addresses on replay)
             let mut graph_logits: Option<Tensor> = kept_logits;
@@ -713,7 +713,7 @@ impl LlmEngine {
             // Probation counter (gptoss-style): the captured graph stays on
             // probation - each of the first replays re-validated against an
             // eager forward - until GRAPH_VALIDATIONS consecutive matches.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let mut graph_validations: usize = if graph_kept { super::decode::GRAPH_VALIDATIONS - 1 } else { 0 };
             // Capture MUST happen on the MODEL's compute stream - the one its
             // kernels actually enqueue on. On the native substrate every
@@ -722,7 +722,7 @@ impl LlmEngine {
             // the forward ran eagerly on the model stream - the fleet-wide
             // dead-graph root cause). Fall back to the engine
             // device's stream for backends that don't expose theirs.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             // A model spread over several cards runs its decode on theirs while the engine's
             // device is the host: its own stream is what makes it a card model.
             let cuda_stream = match state.model.model_cuda_stream() {
@@ -759,10 +759,10 @@ impl LlmEngine {
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let use_graph_mode_cached = state.model.capabilities().graph_mode
                 && cuda_stream.as_ref().is_some_and(|s| s.is_some());
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let use_graph_mode_cached = state.model.capabilities().graph_mode && device.is_cuda();
 
             // --- Unified Generation Loop ------------------------------
@@ -957,9 +957,9 @@ impl LlmEngine {
                     // The head guesses once the step is recorded: a window is held against the
                     // recorded step's kernels, which an eager step before the recording does not
                     // run (its indexed attention selects on the host).
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let step_recorded = cuda_graph.is_some();
-                    #[cfg(not(feature = "cuda"))]
+                    #[cfg(not(feature = "gpu"))]
                     let step_recorded = false;
                     let head_draft: Vec<u32> = if head_on && step_recorded {
                         // The head drafts as far as the window carries, each guess while it is
@@ -1004,11 +1004,11 @@ impl LlmEngine {
                         let prepared = match state.model.update_graph_state(pos) {
                             Ok(()) => Ok(()),
                             Err(e) => {
-                                #[cfg(feature = "cuda")]
+                                #[cfg(feature = "gpu")]
                                 { cuda_graph = None; }
                                 graph_logits = None;
                                 state.model.invalidate_graph_state();
-                                #[cfg(feature = "cuda")]
+                                #[cfg(feature = "gpu")]
                                 verify_graphs.clear();
                                 match state.model.update_graph_state(pos) {
                                     Ok(()) => {
@@ -1035,7 +1035,7 @@ impl LlmEngine {
                             }
                             Err(e) => {
                                 warn!("update_graph_state failed at pos={pos}: {e}. Disabling graph for rest of request.");
-                                #[cfg(feature = "cuda")]
+                                #[cfg(feature = "gpu")]
                                 { cuda_graph = None; }
                                 graph_logits = None;
                                 graph_disabled_this_request = true;
@@ -1047,7 +1047,7 @@ impl LlmEngine {
                                 // transients as no-ops) BEFORE freeing the
                                 // capture arena.
                                 state.model.invalidate_graph_state();
-                                #[cfg(feature = "cuda")]
+                                #[cfg(feature = "gpu")]
                                 verify_graphs.clear();
                             }
                         }
@@ -1057,7 +1057,7 @@ impl LlmEngine {
                     // Split path: prepare_all_kv must run uncaptured BEFORE
                     // borrowing cuda_graph for the replay launch. Do it
                     // here so failure can disable graph cleanly.
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if cuda_graph.is_some() {
                         if let Some(ref tok_ids) = split_token_ids {
                             if let Err(e) = state.model.prepare_all_kv(tok_ids, pos) {
@@ -1090,7 +1090,7 @@ impl LlmEngine {
                     // Per llama.cpp ggml-cuda.cu:4400-4430 pattern. Capture
                     // mode RECORDS kernel submissions; execution waits
                     // until graph.launch() below.
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if recapture {
                         if let (Some(graph), Some(Some(stream))) =
                             (cuda_graph.as_mut().and_then(|g| g.single_mut()), cuda_stream.as_ref())
@@ -1161,12 +1161,12 @@ impl LlmEngine {
                             }
                         }
                     }
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let graph_pair = match (cuda_graph.as_mut(), graph_logits.as_ref()) {
                         (Some(g), Some(l)) if graph_enabled => Some((g, l)),
                         _ => None,
                     };
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if let Some((graph, logits_ref)) = graph_pair {
                         // Sync to ensure all state updates (embed_for_graph,
                         // update_graph_state) are visible to the graph launch.
@@ -1369,7 +1369,7 @@ impl LlmEngine {
                     // -> -2.7 % (t=0). t=1 is the sweet spot - earlier
                     // captures (t=0) miss some KV-state stabilization on
                     // first decode iter.
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if graph_enabled && cuda_graph.is_none() && token_idx >= 1 && !graph_warmed && use_graph_mode {
                         let logits = if let Some(ref tok_ids) = split_token_ids {
                             // Split path: prepare_all_kv + compute_all_from_kv
@@ -1423,9 +1423,9 @@ impl LlmEngine {
                     // was `== 4`; now `graph_warmed && !attempted`
                     // so it fires on the next iter after warmup regardless of
                     // exact token_idx (see warmup comment above for PLD context).
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let should_capture = graph_enabled && cuda_graph.is_none() && graph_warmed && !graph_capture_attempted && use_graph_mode;
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if should_capture {
                         graph_capture_attempted = true;
                         // Fresh gate re-check at the moment of capture:
@@ -1621,7 +1621,7 @@ impl LlmEngine {
 
                     // The graph's forwards append to the cache on the card without advancing
                     // its host length; an eager step after them starts where they left it.
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if graph_warmed {
                         state.model.sync_kv_len_for_graph(pos);
                     }
@@ -1721,7 +1721,7 @@ impl LlmEngine {
                             && kv_safe_cached
                             && use_graph_mode
                             && !graph_disabled_this_request;
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         let recorded = match (windows_served, &cuda_stream) {
                             (true, Some(Some(s))) => super::decode::verify_recorded(
                                 &mut state.model,
@@ -1732,25 +1732,25 @@ impl LlmEngine {
                             ),
                             _ => None,
                         };
-                        #[cfg(not(feature = "cuda"))]
+                        #[cfg(not(feature = "gpu"))]
                         let recorded: Option<(Tensor, Option<f64>)> = None;
                         // A window dropped the step's buffers: the step's graph is recorded anew
                         // from here rather than replayed over them.
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         if std::mem::take(&mut verify_graphs.step_stale) {
                             cuda_graph = None;
                             graph_logits = None;
                             graph_warmed = false;
                             graph_capture_attempted = false;
                         }
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         if recorded.as_ref().is_some_and(|r| r.1.is_some()) {
                             graphs_at.note(state.model.graph_generation());
                         }
                         let recorded_window = recorded.is_some();
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         let windows_given_up = verify_graphs.disabled;
-                        #[cfg(not(feature = "cuda"))]
+                        #[cfg(not(feature = "gpu"))]
                         let windows_given_up = false;
                         let replay_secs = recorded.as_ref().and_then(|r| r.1);
                         // An eager verify costs the head more than the plain steps it stands
@@ -1920,7 +1920,7 @@ impl LlmEngine {
             // A step graph that every recording of the request shares the model's current graph
             // generation with is kept on the loaded model, the windows with it, for the next
             // request to replay; any other is dropped with the graph state.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             {
                 let now = state.model.graph_generation();
                 let keep_at = graphs_at.keepable(now).filter(|_| !graph_disabled_this_request);
@@ -2194,7 +2194,7 @@ impl LlmEngine {
             // per-layer buffers (graph_rope_cos etc.) would make this
             // path's single-token decode forwards read frozen rope values.
             // The graphs kept from it go first, with the buffers they read.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             state.kept_graphs.clear();
             state.model.note_graphs_kept(None);
             state.model.invalidate_graph_state();
@@ -2418,7 +2418,7 @@ impl LlmEngine {
                 .set_early_exit_threshold(params.early_exit_threshold);
 
             // Request-start graph hygiene (see generate_with_grammar).
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             state.kept_graphs.clear();
             state.model.note_graphs_kept(None);
             state.model.invalidate_graph_state();

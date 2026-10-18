@@ -512,13 +512,13 @@ pub(crate) trait ModelBackend: Send {
 
     /// For each op of a recorded verify: whether it is recorded in a graph, and the stream of
     /// the card it runs on. Empty when the verify is not cut in ops.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         Vec::new()
     }
 
     /// Op `op` of the prepared verify over `rows` rows; the head's op returns the logits.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn run_verify_op(&mut self, _op: usize, _rows: usize) -> crate::tensor::Result<Option<Tensor>> {
         crate::tensor::bail!("recorded verifies are not supported for this variant")
     }
@@ -729,7 +729,7 @@ pub(crate) trait ModelBackend: Send {
     }
 
     /// Get the model's actual CUDA stream (for graph capture on the right stream).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn model_cuda_stream(&self) -> Option<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
         None
     }
@@ -742,7 +742,7 @@ pub(crate) trait ModelBackend: Send {
     /// The ops of a captured decode step in order, each with whether it is recorded in a graph
     /// and the stream of the card it runs on: one graph is recorded per captured op, and the
     /// others run eagerly at every replay.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn graph_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         self.model_cuda_stream()
             .into_iter()
@@ -879,7 +879,7 @@ pub(crate) trait ModelBackend: Send {
     }
 
     /// CUDA device ordinals in this model's device map (for PTX prewarm).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn cuda_device_ordinals(&self) -> HashSet<usize> {
         HashSet::new()
     }
@@ -1821,7 +1821,7 @@ impl ModelBackend for GenericBackend {
         self.0.step_feature();
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_window_rows(&self) -> usize {
         self.0.verify_window_rows()
     }
@@ -1834,47 +1834,47 @@ impl ModelBackend for GenericBackend {
         self.0.mark_graph_proven(what)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_window_prepare(&mut self, pos: usize, ids: &[u32]) -> crate::tensor::Result<()> {
         self.0.verify_window_prepare(pos, ids)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn forward_verify_window(&mut self, rows: usize) -> crate::tensor::Result<Tensor> {
         self.0.forward_verify_window(rows)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_window_replayed(&mut self) {
         self.0.verify_window_replayed()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_states_report(&self) -> String {
         self.0.verify_states_report()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_hops_report(&self, rows: usize) -> String {
         self.0.verify_hops_report(rows)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         self.0.verify_step_ops()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn run_verify_op(&mut self, op: usize, rows: usize) -> crate::tensor::Result<Option<Tensor>> {
         self.0.run_verify_op(op, rows)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn verify_window_settle(&mut self, kept: usize) -> crate::tensor::Result<()> {
         self.0.verify_window_settle(kept)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn plain_step_held(&mut self, token: u32, pos: usize) -> crate::tensor::Result<Vec<f32>> {
         self.0.plain_step_held(token, pos)
     }
@@ -1891,14 +1891,14 @@ impl ModelBackend for GenericBackend {
         self.0.expert_cache_counters()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn expert_profile(
         &self,
     ) -> Option<crate::inference::generic_transformer::expert_profile::ExpertProfile> {
         self.0.expert_profile()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn prime_expert_caches(
         &mut self,
         profile: &crate::inference::generic_transformer::expert_profile::ExpertProfile,
@@ -1906,7 +1906,7 @@ impl ModelBackend for GenericBackend {
         self.0.prime_expert_caches(profile)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn rerank_hot_experts(&self) {
         self.0.rerank_hot_experts()
     }
@@ -2056,7 +2056,7 @@ impl ModelBackend for GenericBackend {
         self.0.embed_for_graph(x)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn model_cuda_stream(&self) -> Option<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
         self.0.cuda_stream()
     }
@@ -2065,7 +2065,7 @@ impl ModelBackend for GenericBackend {
         self.0.forward_from_hidden()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn graph_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         self.0.step_streams()
     }
@@ -2114,7 +2114,7 @@ impl ModelBackend for GenericBackend {
         self.0.suspend_graph_captured()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn resume_graph_captured(&mut self) {
         self.0.resume_graph_captured()
     }
@@ -2141,25 +2141,25 @@ impl ModelBackend for GenericBackend {
         self.0.recurrent_restore(checkpoint)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn mark_graph_captured(&mut self) {
         self.0.note_graphs_recorded();
         self.0.mark_graph_captured()
     }
 
     fn note_graphs_kept(&mut self, at: Option<u64>) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.0.note_graphs_kept(at);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let _ = at;
     }
 
     fn note_graphs_recorded(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         self.0.note_graphs_recorded();
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn sync_kv_len_for_graph(&mut self, len: usize) {
         self.0.sync_kv_len_for_graph(len)
     }
@@ -2172,7 +2172,7 @@ impl ModelBackend for GenericBackend {
         self.0.recapture_each_token()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn cuda_device_ordinals(&self) -> HashSet<usize> {
         self.0.cuda_device_ordinals()
     }
@@ -2292,7 +2292,7 @@ impl ModelBackend for GenericVisionBackend {
         self.text.embed_for_graph(x)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn model_cuda_stream(&self) -> Option<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
         self.text.cuda_stream()
     }
@@ -2301,7 +2301,7 @@ impl ModelBackend for GenericVisionBackend {
         self.text.forward_from_hidden()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn graph_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         self.text.step_streams()
     }
@@ -2364,12 +2364,12 @@ impl ModelBackend for GenericVisionBackend {
         self.text.recurrent_restore(checkpoint)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn mark_graph_captured(&mut self) {
         self.text.mark_graph_captured()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn sync_kv_len_for_graph(&mut self, len: usize) {
         self.text.sync_kv_len_for_graph(len)
     }
@@ -2382,7 +2382,7 @@ impl ModelBackend for GenericVisionBackend {
         self.text.recapture_each_token()
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn cuda_device_ordinals(&self) -> HashSet<usize> {
         self.text.cuda_device_ordinals()
     }

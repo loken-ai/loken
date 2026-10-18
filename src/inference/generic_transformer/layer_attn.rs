@@ -164,7 +164,7 @@ impl GenericTransformerLayer {
     /// would each quantise the same activation. Every output is bit-identical to the
     /// projection's own `forward`. `None` when a weight would not take the mat-vec kernels
     /// (the caller then runs the three `forward`s).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn try_qkv_shared_q8_1(&self, x: &Tensor) -> Result<Option<(Tensor, Tensor, Tensor)>> {
         let (Some(wq), Some(wk), Some(wv)) = (
             self.attn_q.as_ref(),
@@ -193,7 +193,7 @@ impl GenericTransformerLayer {
     /// normed then rotated: one launch does both norms, both rotations and the cast that the
     /// general path spends four on, reading the three projections where they were written.
     /// `None` where this layer or this step is not one it serves; nothing has run then.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn attend_split_fused(
         &mut self,
         x: &Tensor,
@@ -329,7 +329,7 @@ impl GenericTransformerLayer {
     ///
     /// Saves ~1 launch per layer (the second quantize_q8_1 that ffn_up
     /// would otherwise re-do).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[allow(clippy::type_complexity)]
     pub(super) fn try_phi2_shared_q8_1_qkv(
         &self,
@@ -426,17 +426,17 @@ impl GenericTransformerLayer {
 
     /// Whether this layer holds a (CUDA-only) Q8 KV cache. Always false on
     /// non-CUDA builds, where the quantized KV caches don't exist.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[inline]
     pub(super) fn has_q8_cache(&self) -> bool {
         self.q8_kv().is_some()
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     #[inline]
     pub(super) fn has_q8_cache(&self) -> bool {
         false
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[inline]
     pub(super) fn has_q4_cache(&self) -> bool {
         self.q4_kv().is_some()
@@ -459,7 +459,7 @@ impl GenericTransformerLayer {
     /// Moves this layer's history from the quantised cache to the F-dtype cache and drops the
     /// quantised one. Errs when the history cannot be read back: attending over a truncated
     /// history would decode from wrong logits.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn demote_quant_kv(&mut self, dtype: crate::tensor::DType) -> Result<()> {
         let Some(q) = self.quant_kv.take() else {
             return Ok(());
@@ -477,23 +477,23 @@ impl GenericTransformerLayer {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[inline]
     pub(super) fn q8_kv(&self) -> Option<&crate::inference::cache::q8_kv::Q8KvCache> {
         self.quant_kv.as_ref().and_then(|c| c.q8())
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[inline]
     pub(super) fn q8_kv_mut(&mut self) -> Option<&mut crate::inference::cache::q8_kv::Q8KvCache> {
         self.quant_kv.as_mut().and_then(|c| c.q8_mut())
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[inline]
     pub(super) fn q4_kv(&self) -> Option<&crate::inference::cache::q4_kv::Q4KvCache> {
         self.quant_kv.as_ref().and_then(|c| c.q4())
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     #[inline]
     pub(super) fn has_q4_cache(&self) -> bool {
         false
@@ -509,12 +509,12 @@ impl GenericTransformerLayer {
         index_pos: usize,
         shared_kv: Option<(Tensor, Tensor)>,
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
-        #[cfg(feature = "cuda")] shared_kv_q8: Option<&crate::inference::cache::q8_kv::Q8KvCache>,
+        #[cfg(feature = "gpu")] shared_kv_q8: Option<&crate::inference::cache::q8_kv::Q8KvCache>,
     ) -> Result<Tensor> {
         // The shared-KV-Q8 fast path (try_forward_attn_shared_q8) is
         // numerically unverified against the standard path - keep the
         // safe legacy fallback. Re-enable when validated.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let _ = shared_kv_q8;
         let own = self.forward_attn_inner(x, mask, index_pos, shared_kv, None, donor_f16)?;
         if self.tp_shards.is_empty() {
@@ -533,7 +533,7 @@ impl GenericTransformerLayer {
                 index_pos,
                 None,
                 None,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 None,
             )?);
         }
@@ -589,7 +589,7 @@ impl GenericTransformerLayer {
         match &self.attn_gate {
             Some(gate) => {
                 let logit = gate.forward(x)?;
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Some(gated) = crate::inference::kernel::fused::sigmoid_mul_f16(&logit, &y)? {
                     return Ok(gated);
                 }
@@ -639,9 +639,9 @@ impl GenericTransformerLayer {
                 .map(|r| row(&qkv, r).map(Projected::Qkv))
                 .collect::<Result<_>>()?
         } else {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let shared = self.try_qkv_shared_q8_1(x)?;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let shared: Option<(Tensor, Tensor, Tensor)> = None;
             let (q, k, v) = match shared {
                 Some(qkv) => qkv,
@@ -777,7 +777,7 @@ impl GenericTransformerLayer {
         let (b, seq, _) = x.dims3()?;
 
         // The fused paths read the layer's own caches; a cache cut over cards is read below.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if projected.is_none() && shared_kv.is_none() && self.context.is_none() {
             if let Some(done) = self.attend_split_fused(x, index_pos)? {
                 return Ok(done);
@@ -919,7 +919,7 @@ impl GenericTransformerLayer {
             // only on CUDA builds.
             let use_quant = self.has_q8_cache() || self.has_q4_cache();
             if use_quant {
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     // Quantised path: emit Q & V as F32 (skip downstream casts).
                     //
@@ -1046,11 +1046,11 @@ impl GenericTransformerLayer {
             } else {
                 // F-dtype path, with or without the Q/K norms. The fused kernels are
                 // CUDA-only, so it is unreachable under --features cpu.
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 #[allow(clippy::diverging_sub_expression)]
                 let (q_h, k_h, v_h): (Tensor, Tensor, Tensor) =
                     unreachable!("fused F-dtype decode (attn_post_qkv_decode) is CUDA-only");
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let (q_h, k_h, v_h) = if want_apq_with_norm {
                     crate::inference::moe_cuda::attn_post_qkv_decode(
                         &qkv_flat,
@@ -1148,7 +1148,7 @@ impl GenericTransformerLayer {
                     && k_new.dtype() == crate::tensor::DType::F16;
                 let (k_full, v_full) = if in_place {
                     self.kv_cache.append_in_place(&k_new, &v_new)?;
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if let (Some(kb), Some(vb)) =
                         (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
                     {
@@ -1285,9 +1285,9 @@ impl GenericTransformerLayer {
                 Some(Projected::Split(q, k, v)) => Some((q.clone(), k.clone(), v.clone())),
                 _ => None,
             };
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let shared_qkv = ahead.or_else(|| self.try_qkv_shared_q8_1(x).ok().flatten());
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let shared_qkv: Option<(Tensor, Tensor, Tensor)> = ahead;
 
             if let Some((mut q, mut k, mut v)) = shared_qkv {
@@ -1412,7 +1412,7 @@ impl GenericTransformerLayer {
         // -- KV: compute or reuse from shared layer ----------------------
         // Multi-token attention over the Q8 history runs as one flash kernel reading
         // the history dequantized to F16 in its stored order (`flash_kv` below).
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let flash_prefill_ok = seq > 1
             && b == 1
             && q.device().is_cuda()
@@ -1420,9 +1420,9 @@ impl GenericTransformerLayer {
             && crate::inference::kernel::fused::FLASH_PREFILL_GQA_HEAD_DIMS.contains(&head_dim)
             && n_kv_head > 0
             && n_head.is_multiple_of(n_kv_head);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let mut flash_kv = false;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         // A cache cut over several cards holds the history: the rows go to the range they fall
         // in, and each range's part of the attention is combined on this card.
         if shared_kv.is_none() && self.context.is_some() {
@@ -1441,7 +1441,7 @@ impl GenericTransformerLayer {
                 return Ok((y, false));
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let (k, v) = if let Some((shared_k, shared_v)) = shared_kv {
             (shared_k, shared_v)
         } else {
@@ -1455,7 +1455,7 @@ impl GenericTransformerLayer {
             }
             if index_pos == 0 {
                 self.kv_cache.reset();
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Some(c) = self.quant_kv.as_mut() {
                     c.reset();
                 }
@@ -1593,7 +1593,7 @@ impl GenericTransformerLayer {
         };
         // CPU build: no quantized KV caches - rope, optional reset, then the
         // plain (or graph-buffer) F-dtype append.
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let (k, v) = if let Some((shared_k, shared_v)) = shared_kv {
             (shared_k, shared_v)
         } else {
@@ -1646,7 +1646,7 @@ impl GenericTransformerLayer {
             return Ok((y, false));
         }
         // One query row over an F16 cache: the split-K decode over the buffers in place.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.kv_f16
             && seq == 1
             && b == 1
@@ -1674,7 +1674,7 @@ impl GenericTransformerLayer {
             true => (k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?),
             false => (k, v),
         };
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let (k, v) = if flash_kv {
             let scale = self
                 .attention_scale
@@ -1706,7 +1706,7 @@ impl GenericTransformerLayer {
         // eager or replayed from a captured graph (`q8_decode_attention`). Shared layers
         // read the donor's K/V, and donor layers of a shared cache (gemma4, whose tiny
         // K-norm weights amplify the Q8 noise) attend in F-dtype: both skip it.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let q8_decode = seq == 1
             && b == 1
             && q.device().is_cuda()
@@ -1715,7 +1715,7 @@ impl GenericTransformerLayer {
             && self
                 .q8_kv()
                 .is_some_and(|c| c.current_seq_len() < c.max_seq_padded());
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if q8_decode {
             let scale = self
                 .attention_scale
@@ -1725,7 +1725,7 @@ impl GenericTransformerLayer {
             return Ok((y, false));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let try_q8_decode = self.q8_kv().is_some()
             && seq == 1
             && b == 1
@@ -1733,7 +1733,7 @@ impl GenericTransformerLayer {
             && q.device().is_cuda()
             && !is_shared_layer
             && !self.populate_dual_kv;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if try_q8_decode {
             let cache = self.q8_kv().unwrap();
             let scale = self
@@ -1770,13 +1770,13 @@ impl GenericTransformerLayer {
         }
 
         // Q4 KIVI decode fast path - analogous to Q8 above.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let try_q4_decode = self.q4_kv().is_some()
             && seq == 1
             && b == 1
             && q.device().is_cuda()
             && !is_shared_layer;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if try_q4_decode {
             let scale = self
                 .attention_scale
@@ -1862,7 +1862,7 @@ impl GenericTransformerLayer {
     /// multiplying the scores; a windowed layer reads its last `sliding_window` keys. The
     /// split-K decode reads the buffers in place. Returns `[1, n_head, 1, hd]` in `q`'s
     /// dtype, or `None` for a head size the kernel does not serve.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn f16_decode_attention(
         &self,
         q: &Tensor,
@@ -1903,7 +1903,7 @@ impl GenericTransformerLayer {
     /// One query row `q` `[1, n_head, 1, hd]` against the Q4 history, `scale` applied to
     /// the scores. Returns `[1, n_head, 1, hd]` F32. A primed cache (captured decode) takes
     /// the device-position kernels, which read the length from the device.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn q4_decode_attention(&self, q: &Tensor, scale: f64, use_graph_ops: bool) -> Result<Tensor> {
         let cache = self.q4_kv().unwrap();
         // Graph mode: use the device-pos variants that read seq_kv
@@ -1979,7 +1979,7 @@ impl GenericTransformerLayer {
     /// Every decode step takes it, eager or replayed from a captured graph: its kernels read
     /// the position from the device, so both compute the same thing. `q` is
     /// `[1, n_head, 1, head_dim]`; `scale` multiplies the scores (1.0 for a pre-scaled Q).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn q8_decode_attention(&mut self, q: &Tensor, scale: f32) -> Result<Tensor> {
         let in_capture = crate::tensor::cuda_ext::capture_active(&q.device());
         if !in_capture {
@@ -2163,7 +2163,7 @@ impl GenericTransformerLayer {
         if let Some(c) = self.context.as_ref() {
             return c.len();
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(c) = self.q4_kv() {
             return c.current_seq_len();
         } else if let Some(c) = self.q8_kv() {
@@ -2185,7 +2185,7 @@ impl GenericTransformerLayer {
             pos,
             None,
             None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             None,
         )
     }
@@ -2239,7 +2239,7 @@ impl GenericTransformerLayer {
             //  - F32 Q/K/V/mask (kernel is F32-only)
             //  - kv_cache.seq_kv_dev_ptr() is_some (= graph mode is
             //    being prepared and the engine has called update_seq_kv_dev)
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let used_fused_hd512: Option<Tensor> = {
                 let seq_kv_dev_opt = self.kv_cache.seq_kv_dev_ptr().cloned();
                 if hd == 512
@@ -2276,7 +2276,7 @@ impl GenericTransformerLayer {
                     None
                 }
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let used_fused_hd512: Option<Tensor> = None;
             if let Some(out) = used_fused_hd512 {
                 // Kernel output is [1, n_q_heads, 1, HD] - already final shape.
@@ -2399,6 +2399,6 @@ impl GenericTransformerLayer {
 }
 
 /// The fused decode against the unfused chain on synthetic weights.
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, feature = "gpu"))]
 #[path = "fused_decode_tests.rs"]
 mod fused_decode_parity;

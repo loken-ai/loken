@@ -129,7 +129,7 @@ impl MixerState {
 /// `src` written into `dst`'s card buffers where they lie; an error when the two differ in
 /// kind or shape, or live on the host.
 /// The card address of `t`'s first element, `None` off a card.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn card_address(t: &Tensor) -> Option<u64> {
     use crate::tensor::gpu_runtime::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
@@ -144,7 +144,7 @@ fn card_address(t: &Tensor) -> Option<u64> {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 fn card_address(_t: &Tensor) -> Option<u64> {
     None
 }
@@ -326,7 +326,7 @@ impl Mixer {
     }
 
     /// One decode row through the mixer, its state advanced in place.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn step_in_place(&mut self, x: &Tensor) -> Result<Tensor> {
         let _in_place = crate::inference::moe_cuda::in_place_state(true);
         self.forward(x, 1)
@@ -1069,7 +1069,7 @@ impl GatedDeltaNet {
     /// Advances the held state over the window's first `kept` rows from the inputs the window
     /// kept, through the launches the window ran them through: the state and the convolution's
     /// window are those the rows leave decoded one at a time.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn replay_window(&mut self, kept: usize) -> Result<bool> {
         let Some(window) = self.window.as_ref() else {
             return Ok(false);
@@ -1082,7 +1082,7 @@ impl GatedDeltaNet {
         Ok(true)
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     fn replay_window(&mut self, _kept: usize) -> Result<bool> {
         Ok(false)
     }
@@ -1205,7 +1205,7 @@ impl GatedDeltaNet {
             restart_ssm(&mut self.state, Some(b), &mut self.moves);
         }
         let d = self.dims;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if b == 1 && x.device().is_cuda() && d.k_dim == d.v_dim && matches!(d.v_dim, 64 | 128 | 256)
         {
             return self.forward_card(x, seq);
@@ -1336,7 +1336,7 @@ impl GatedDeltaNet {
 
     /// The card path for one sequence: the projections and the convolution over every row
     /// at once, then one fused recurrence launch and the fused gated norm.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_card(&mut self, x: &Tensor, seq: usize) -> Result<Tensor> {
         use super::wide::staged;
         use crate::inference::moe_cuda as k;
@@ -1369,7 +1369,7 @@ impl GatedDeltaNet {
     /// `[seq, v_heads]`: the convolution and gates, then the scan, the state held advanced.
     /// `sequential` scans the rows one after the other, as a window's rows are, else a long
     /// sequence takes the chunked form. Returns the scan's output `[seq, v_heads, v_dim]`.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     fn advance_card(
         &mut self,
         qkv: &Tensor,
@@ -1614,7 +1614,7 @@ impl GenericTransformerLayer {
 
     /// The hybrid layer as the graph's decode step: attention through its graph path, a
     /// recurrent mixer stepping its state in place.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn forward_hybrid_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         let x = match self.mixer {
             Mixer::Absent => x.clone(),
@@ -1663,7 +1663,7 @@ impl GenericTransformerLayer {
                     index_pos,
                     None,
                     None,
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     None,
                 )?;
                 if let Some(b) = &self.attn_output_bias {
@@ -1675,7 +1675,7 @@ impl GenericTransformerLayer {
                 let x_norm = self.attn_norm.forward(x)?;
                 // A decoded token advances the state where it lies, the way the recorded
                 // step does, so the two can follow each other on the same buffers.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let _in_place = crate::inference::moe_cuda::in_place_state(
                     index_pos > 0 && x.dim(1).is_ok_and(|n| n == 1),
                 );
@@ -2128,7 +2128,7 @@ mod tests {
     /// A verify window over its rows, returned to every count of kept rows, eagerly and
     /// replayed from a graph, leaves the recurrent state and the convolution window the kept
     /// rows leave decoded one by one, bit for bit.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "needs an idle CUDA card"]
     fn a_window_returned_to_its_kept_rows_leaves_the_state_of_decoding_them() {

@@ -22,12 +22,12 @@ impl Tensor {
             )));
         }
         let spatial: usize = dims[2..].iter().product();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let b = bias.to_dtype(DType::F32)?;
             return self.f16_unary_via_f32(|t| t.add_channel_bias(&b));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let (b_slice, b_dev) = bias.cuda_f32_slice().map_err(|_| {
                 Error("add_channel_bias: bias must be on the same cuda device".into())
@@ -158,7 +158,7 @@ impl Tensor {
         match self.storage().as_ref() {
             Storage::Cpu(c) => Ok(std::borrow::Cow::Borrowed(c)),
             Storage::Dry(_) => Err(Error("a dry tensor has no host data to read".into())),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Storage::Cuda { data, dev } => Ok(std::borrow::Cow::Owned(data.download(dev)?)),
         }
     }
@@ -232,7 +232,7 @@ impl Tensor {
         ))
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn binary_cuda(&self, rhs: &Self, kernel: &'static str) -> Result<Option<Self>> {
         if let (
             Storage::Cuda { data, dev },
@@ -271,20 +271,20 @@ impl Tensor {
     }
 
     pub fn add(&self, rhs: &Self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_f16_direct(rhs, "native_add_f16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_bf16_direct(rhs, "native_add_bf16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() && rhs.is_cuda_f16() {
             let r = rhs.to_dtype(DType::F32)?;
             return self.f16_unary_via_f32(|t| t.add(&r));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_cuda(rhs, "native_add_f32")? {
             return Ok(t);
         }
@@ -293,7 +293,7 @@ impl Tensor {
 
     /// Direct half-precision same-shape binary kernel (f16 only).
     /// `Ok(None)` = not applicable.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn binary_f16_direct(
         &self,
         rhs: &Self,
@@ -331,7 +331,7 @@ impl Tensor {
     /// Direct bf16 same-shape binary kernel (single-kernel; bit-identical to
     /// the f32 detour for add/mul/div, minus 2 casts + allocs per op).
     /// `Ok(None)` = not applicable.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn binary_bf16_direct(
         &self,
         rhs: &Self,
@@ -369,7 +369,7 @@ impl Tensor {
     /// Elementwise division - DIRECT a/b kernels (single rounding, unlike the
     /// `bdiv` semantics; a recip-then-mul chain rounds twice).
     pub fn div(&self, rhs: &Self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.dtype() == DType::F16 && rhs.dtype() == DType::F16 {
             if let (
                 Storage::Cuda { data, dev },
@@ -395,16 +395,16 @@ impl Tensor {
                 }
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_bf16_direct(rhs, "native_div_bf16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() && rhs.is_cuda_f16() {
             let r = rhs.to_dtype(DType::F32)?;
             return self.f16_unary_via_f32(|t| t.div(&r));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_cuda(rhs, "native_div_f32")? {
             return Ok(t);
         }
@@ -412,20 +412,20 @@ impl Tensor {
     }
 
     pub fn mul(&self, rhs: &Self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_f16_direct(rhs, "native_mul_f16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_bf16_direct(rhs, "native_mul_bf16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() && rhs.is_cuda_f16() {
             let r = rhs.to_dtype(DType::F32)?;
             return self.f16_unary_via_f32(|t| t.mul(&r));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.binary_cuda(rhs, "native_mul_f32")? {
             return Ok(t);
         }
@@ -467,7 +467,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             // width-generic device gather - every dtype, no f16-cast detour
             //
@@ -603,7 +603,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage_raw.as_ref() {
             // device-side byte copy - the old host_bounce round-tripped the
             // whole tensor through the CPU per narrow. Works directly on the
@@ -709,11 +709,11 @@ impl Tensor {
         let d_in = dims[d];
         let mut odims = dims.clone();
         odims[d] = d_in + left + right;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.pad_with_zeros(d, left, right));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out = crate::tensor::cuda::pad_dim_f32(
                 dev,
@@ -746,11 +746,11 @@ impl Tensor {
     /// Nearest-neighbor upsample of the last two dims of `[b, c, h, w]`.
     pub fn upsample_nearest2d(&self, oh: usize, ow: usize) -> Result<Self> {
         let (b, c, h, w) = self.shape.dims4()?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.upsample_nearest2d(oh, ow));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out = crate::tensor::cuda::upsample2d_f32(
                 dev,
@@ -991,11 +991,11 @@ impl Tensor {
     /// drift once the result is warped back into a photograph.
     pub fn upsample_bilinear2d(&self, oh: usize, ow: usize) -> Result<Self> {
         let (b, c, h, w) = self.shape.dims4()?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.upsample_bilinear2d(oh, ow));
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out = crate::tensor::cuda::upsample_bilinear2d_f32(
                 dev,
@@ -1056,7 +1056,7 @@ impl Tensor {
                 }
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if first.is_on_cuda() {
             // device cat for ANY same-dtype/same-device operands (cat is pure
             // data movement - one width-generic strided-copy kernel per
@@ -1313,7 +1313,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_on_cuda() || rhs.is_on_cuda() {
             if let (
                 Storage::Cuda { data, dev },
@@ -1375,7 +1375,7 @@ impl Tensor {
     /// Direct half tail-aligned broadcast (f16 lhs+rhs, rhs a trailing block
     /// of lhs - the rope/mask/norm-weight decode shapes). `Ok(None)` = not
     /// applicable, caller falls back to the f32 detour.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn broadcast_tail_f16_direct(
         &self,
         rhs: &Self,
@@ -1416,7 +1416,7 @@ impl Tensor {
 
     /// Direct bf16 tail-aligned broadcast (single-kernel, bit-identical to
     /// the f32 detour for add/mul). `Ok(None)` = not applicable.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn broadcast_tail_bf16_direct(
         &self,
         rhs: &Self,
@@ -1456,15 +1456,15 @@ impl Tensor {
     }
 
     pub fn broadcast_add(&self, rhs: &Self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.broadcast_tail_f16_direct(rhs, "native_badd_tail_f16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.broadcast_tail_bf16_direct(rhs, "native_badd_tail_bf16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let r = if matches!(rhs.dtype(), DType::F16 | DType::BF16) {
                 rhs.to_dtype(DType::F32)?
@@ -1479,15 +1479,15 @@ impl Tensor {
     }
 
     pub fn broadcast_mul(&self, rhs: &Self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.broadcast_tail_f16_direct(rhs, "native_bmul_tail_f16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.broadcast_tail_bf16_direct(rhs, "native_bmul_tail_bf16")? {
             return Ok(t);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             let r = if matches!(rhs.dtype(), DType::F16 | DType::BF16) {
                 rhs.to_dtype(DType::F32)?
@@ -1513,7 +1513,7 @@ impl Tensor {
                 return Ok(t);
             }
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             // Device path: the token-embedding lookup runs through
             // here - the host bounce downloaded the WHOLE table per call
@@ -1610,7 +1610,7 @@ impl Tensor {
         ))
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn unary_cuda(&self, kernel: &'static str) -> Result<Option<Self>> {
         if let Storage::Cuda { data, dev } = self.storage().as_ref() {
             let out = crate::tensor::cuda::unary_f32(
@@ -1629,11 +1629,11 @@ impl Tensor {
     }
 
     pub fn sigmoid(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.sigmoid());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_sigmoid_f32")? {
             return Ok(t);
         }
@@ -1641,11 +1641,11 @@ impl Tensor {
     }
 
     pub fn sin(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.sin());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_sin_f32")? {
             return Ok(t);
         }
@@ -1653,11 +1653,11 @@ impl Tensor {
     }
 
     pub fn cos(&self) -> Result<Self> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_cuda_f16() {
             return self.f16_unary_via_f32(|t| t.cos());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(t) = self.unary_cuda("native_cos_f32")? {
             return Ok(t);
         }

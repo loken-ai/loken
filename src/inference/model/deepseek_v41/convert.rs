@@ -494,12 +494,12 @@ pub(super) fn bytes_per(dtype: GgmlDType, elems: usize) -> u64 {
 const WORKERS: usize = 4;
 
 /// Streams opened on each accelerator: a worker holds one, so this many experts are on a card at once.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const STREAMS_PER_CARD: usize = 4;
 
 /// The accelerators present, each opened `STREAMS_PER_CARD` times: every handle has its own stream
 /// and its own cuBLAS handle, so the workers holding them do not wait on each other.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) fn accelerators() -> Vec<Arc<crate::tensor::cuda::CudaDevice>> {
     let cards = (0..)
         .take_while(|&i| crate::tensor::cuda::CudaDevice::new(i).is_ok())
@@ -512,7 +512,7 @@ pub(super) fn accelerators() -> Vec<Arc<crate::tensor::cuda::CudaDevice>> {
 
 /// One projection with the correction's products and the blocks it has kernels for on `dev`, the rest
 /// on the CPU.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn quantize_on_device(
     dev: &crate::tensor::cuda::CudaDevice,
     dtype: GgmlDType,
@@ -700,7 +700,7 @@ pub fn convert(
     let mut writer = GgufStreamWriter::create(out, &md, &entries)?;
     let total = plan.len();
     // Opened once for the whole file: a context costs seconds and holds memory on the card.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     let devices = accelerators();
     for (i, (entry, source)) in plan.iter().enumerate() {
         match source {
@@ -778,7 +778,7 @@ pub fn convert(
                     Ok(slot)
                 };
                 // The same factors on each card, uploaded by the first worker there to need one.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let on_cards: Mutex<
                     std::collections::HashMap<(usize, usize), Arc<crate::tensor::cuda::CardFactor>>,
                 > = Mutex::default();
@@ -793,7 +793,7 @@ pub fn convert(
                         .as_ref()
                         .and_then(|s| s.get())
                         .and_then(|f| f.as_ref().ok());
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if let (Some(dev), Some(r), Some(f)) = (devices.get(device), record, factor) {
                         if matches!(dtype, GgmlDType::Iq2Xxs | GgmlDType::Q2K) {
                             use crate::inference::load::compensate::block_inverse;
@@ -827,7 +827,7 @@ pub fn convert(
                             );
                         }
                     }
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if let Some(dev) = devices.get(device) {
                         return quantize_on_device(
                             dev,
@@ -852,9 +852,9 @@ pub fn convert(
                         None,
                     )
                 };
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let cards = devices.len().max(1);
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let cards = 1;
                 std::thread::scope(|scope| {
                     for worker in 0..WORKERS.max(cards) {

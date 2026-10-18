@@ -6,7 +6,7 @@ use super::*;
 
 /// Sigmoid: `1 / (1 + exp(-x))`. Drop-in for `sigmoid`.
 pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if x.device().is_cuda() && x.dtype() == DType::F32 {
             return crate::inference::kernel::fused::fused_sigmoid_f32(x);
@@ -364,7 +364,7 @@ pub fn swiglu_oai(
 }
 
 pub fn silu(x: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         if x.device().is_cuda() && x.dtype() == DType::F32 {
             return crate::inference::kernel::fused::fused_silu_f32(x);

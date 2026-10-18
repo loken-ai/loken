@@ -105,7 +105,7 @@ with_dtype!(f32, F32, |v: f64| v as f32);
 with_dtype!(f64, F64, |v: f64| v);
 
 /// Device dtypes the CUDA-slice projection covers (kernel-FFI extraction).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub trait CudaDType: crate::tensor::gpu_runtime::driver::DeviceRepr + Sized {
     fn as_cuda_slice(
         cs: &super::cuda::CudaStorage,
@@ -115,7 +115,7 @@ pub trait CudaDType: crate::tensor::gpu_runtime::driver::DeviceRepr + Sized {
     ) -> super::cuda::CudaStorage;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 macro_rules! cuda_dtype {
     ($ty:ty, $variant:ident, $as:ident) => {
         impl CudaDType for $ty {
@@ -133,19 +133,19 @@ macro_rules! cuda_dtype {
     };
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(f32, F32, as_f32_slice);
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(half::f16, F16, as_f16_slice);
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(half::bf16, BF16, as_bf16_slice);
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(u32, U32, as_u32_slice);
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(u8, U8, as_u8_slice);
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(i32, I32, as_i32_slice);
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 cuda_dtype!(i64, I64, as_i64_slice);
 
 // -- storage projection: (StorageHandle, Layout) for kernel launches --
@@ -153,7 +153,7 @@ use std::sync::Arc;
 
 /// CUDA storage view: legacy-shaped `as_cuda_slice::<T>()` over the tensor's
 /// shared native storage (kept alive by the Arc clone inside).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub struct CudaStorage {
     pub(crate) storage: Arc<super::Storage>,
     /// Public field like the reference CudaStorage (one opencl-path site reads
@@ -161,7 +161,7 @@ pub struct CudaStorage {
     pub device: CudaDevice,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl CudaStorage {
     pub fn as_cuda_slice<T: CudaDType>(
         &self,
@@ -218,7 +218,7 @@ impl CpuStorageRef {
 /// carries the dry-run variant, neither of which a launch site can use.
 pub enum StorageView {
     Cpu(CpuStorageRef),
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     Cuda(CudaStorage),
 }
 
@@ -244,17 +244,17 @@ use crate::tensor;
 
 /// legacy-shaped CUDA device handle: a cheap-clone wrapper over the shared
 /// native per-ordinal device (context + default stream + kernel modules).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[derive(Debug, Clone)]
 pub struct CudaDevice(pub(crate) Arc<tensor::cuda::CudaDevice>);
 
 /// Non-CUDA builds: a stub so `Device::Cuda` still exists (the type is kept so the
 /// variant with a stub device too); constructors error at runtime.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 #[derive(Debug, Clone)]
 pub struct CudaDevice;
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(feature = "gpu"))]
 impl CudaDevice {
     pub fn new(_ordinal: usize) -> Result<Self> {
         Err(Error::msg("CUDA support not compiled in"))
@@ -287,7 +287,7 @@ impl CudaDevice {
 /// Alias for the cpu-build cuda_ext stub's return type.
 pub type NoCudaDevice = CudaDevice;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl CudaDevice {
     pub fn new(ordinal: usize) -> Result<Self> {
         Ok(Self(tensor::cuda::CudaDevice::get(ordinal)?))
@@ -462,13 +462,13 @@ impl CudaDevice {
 
 /// fork-shaped function handle: a `CudaFunction` + the device's stream
 /// (derefs to the function for `stream.launch_builder(&func)` call sites).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub struct CudaFunc {
     pub(crate) func: crate::tensor::gpu_runtime::driver::CudaFunction,
     pub(crate) stream: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl std::ops::Deref for CudaFunc {
     type Target = crate::tensor::gpu_runtime::driver::CudaFunction;
     fn deref(&self) -> &Self::Target {
@@ -476,7 +476,7 @@ impl std::ops::Deref for CudaFunc {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl CudaFunc {
     pub fn cuda_function(&self) -> &crate::tensor::gpu_runtime::driver::CudaFunction {
         &self.func

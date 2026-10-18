@@ -647,9 +647,9 @@ fn decode_block(bytes: &[u8], layout: &Layout) -> AnyResult<Vec<(Vec<f32>, Vec<f
 fn resident_len(l: &GenericTransformerLayer) -> usize {
     let spec = l.kv_cache.current_seq_len();
     let host = l.cpu_f16_kv.as_ref().map_or(0, |c| c.len());
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     let quant = l.quant_kv.as_ref().map_or(0, |q| q.current_seq_len());
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     let quant = 0;
     spec.max(host).max(quant)
 }
@@ -659,7 +659,7 @@ fn cache_dtype(l: &GenericTransformerLayer) -> Result<u8> {
     if l.cpu_f16_kv.as_ref().is_some_and(|c| !c.is_empty()) {
         return Ok(0);
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     if l.quant_kv.as_ref().is_some_and(|q| q.current_seq_len() > 0) {
         return Ok(1);
     }
@@ -690,7 +690,7 @@ fn live_rows(l: &GenericTransformerLayer, from: usize, to: usize) -> Result<Rows
     {
         (0, c.host_rows(from, to))
     } else {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let quant = match l
             .quant_kv
             .as_ref()
@@ -709,7 +709,7 @@ fn live_rows(l: &GenericTransformerLayer, from: usize, to: usize) -> Result<Rows
             }
             None => None,
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let quant: Option<(u8, (Vec<f32>, Vec<f32>))> = None;
         match quant {
             Some(q) => q,
@@ -931,7 +931,7 @@ impl GenericHeteroTransformer {
         d.carried = h.carried.as_ref().map(|t| t.tensor(&device)).transpose()?;
         d.committed = h.committed;
         d.len = h.committed;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             d.step = None;
         }

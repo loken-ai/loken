@@ -141,11 +141,13 @@ image = []
 audio = []
 video = ["image"]   # a clip is conditioned on an image and decoded through its VAE
 midi = ["audio"]    # rendered to sound through the audio stack
+# The GPU code paths: kernels, graphs, the expert tier. A runtime feature brings them in.
+gpu = []
 # CUDA. The kernels are compiled for a fixed architecture list ending at sm_120a, which
 # arrived in 12.8, so an older toolkit fails the build rather than skipping the arch it
 # cannot name. Built and tested against 13.3; see the README for the rest.
 # https://developer.nvidia.com/cuda-downloads
-cuda = ["dep:cudarc"]
+cuda = ["gpu", "dep:cudarc"]
 # A GET /metrics scrape endpoint. Off by default: the published default binds localhost and
 # does not authenticate, and compiling a scrape endpoint in regardless would widen that
 # surface without anyone asking. When on it sits behind the same authentication as every

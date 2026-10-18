@@ -485,7 +485,7 @@ mod tests {
     /// The card's fused part matches the portable one: the attention it stands for and the
     /// log-sum-exp of its scores, for a range before every row, one across the diagonal and a
     /// decoded row.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn the_cards_part_is_the_portable_part() {
         let Ok(card) = Device::new_cuda(0) else {
@@ -776,7 +776,7 @@ impl super::GenericHeteroTransformer {
                 keep_free,
                 (work / 2) as usize,
             ));
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             {
                 l.quant_kv = None;
             }
@@ -811,7 +811,7 @@ impl super::GenericHeteroTransformer {
             l.context.as_ref().expect("a cut layer")
         }
         let cards = ctx(&self.layers[cut[0]]).cards();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         for dev in &cards {
             if let Ok(cd) = dev.as_cuda_device() {
                 let _ = cd.0.stream().synchronize();

@@ -386,7 +386,7 @@ impl ExpertStore {
             }
         }
         // Into page-locked memory a card's uploads read from directly, where there is a card.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let spans: Vec<(usize, usize)> = todo
                 .iter()

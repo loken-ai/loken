@@ -20,7 +20,7 @@
 // The host build compiles the shapes of the device path, so what the device path alone
 // reads is left in place rather than gated site by site. The default build denies all of it.
 #![cfg_attr(
-    not(feature = "cuda"),
+    not(feature = "gpu"),
     allow(
         unused_variables,
         unused_imports,

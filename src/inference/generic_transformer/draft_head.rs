@@ -40,7 +40,7 @@ pub(super) struct DraftHead {
     /// the whole of it.
     pub(super) vocab: Option<(usize, crate::tensor::quantized::QMatMul)>,
     /// The head's guesses as the kernels of a recorded step.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) step: Option<DraftStep>,
 }
 
@@ -48,7 +48,7 @@ pub(super) struct DraftHead {
 /// the rows' positions and tables refreshed before each replay: one graph per count of pairs
 /// takes the pairs through the layer and leaves the last row; one names the token after the
 /// row; one takes a guessed token with the row through the layer and names the next.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) struct DraftStep {
     /// The tokens' embeddings, `[1, VERIFY_ROWS, dim]` F32.
     emb: Tensor,
@@ -89,7 +89,7 @@ pub(super) struct DraftStep {
 }
 
 /// Replays that may fail before the head's guesses stay eager.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const DRAFT_RECORD_FAILURES: u32 = 3;
 /// Rows of each prompt chunk the head's fit is measured over.
 const DRAFT_FIT_ROWS: usize = 32;
@@ -166,21 +166,21 @@ fn dump_u32(dir: &str, name: &str, v: &[u32]) {
 const DRAFT_REPORT_EVERY: u32 = 64;
 /// Pairs graphs the head keeps at once: a draft's pairs are the tokens the last verify kept
 /// and one more, at most a verify's rows, and every count has its graph.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 const DRAFT_PAIRS_GRAPHS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
 
 /// A recorded graph the model holds: launched only by the thread that holds the model, on the
 /// stream it was captured on, which is what its handles need.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub(super) struct HeldGraph(crate::tensor::cuda_ext::CapturedGraph);
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Send for HeldGraph {}
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Sync for HeldGraph {}
 
 /// What a recorded step of the head runs.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DraftKind {
     /// `n` pairs through the layer; the last row is left for the head.
@@ -194,18 +194,18 @@ enum DraftKind {
 
 /// What a guess costs to read: the token named, the softmax mass and the count of guesses
 /// told, written by the card into page-locked memory the host spins on.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 struct Told {
     host: *mut u32,
     device: u64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Send for Told {}
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 unsafe impl Sync for Told {}
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl Told {
     const WORDS: usize = 4;
     const TOKEN: usize = 0;
@@ -227,7 +227,7 @@ impl Told {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl Drop for Told {
     fn drop(&mut self) {
         // SAFETY: allocated by `mapped` and freed once here.
@@ -240,7 +240,7 @@ impl Drop for Told {
 }
 
 /// The card address of `t`'s first element.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn card_address<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64> {
     use crate::tensor::gpu_runtime::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
@@ -581,7 +581,7 @@ impl GenericHeteroTransformer {
         };
         let dev = feature.device().clone();
         let mut since = std::time::Instant::now();
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(out) = self.draft_tokens_recorded(tokens, &feature, committed, k, min_odds)? {
             mark("draft: recorded", &mut since, &dev);
             return Ok(out);
@@ -636,7 +636,7 @@ impl GenericHeteroTransformer {
                     _ if len == 0 => sparse.reset(),
                     _ => {}
                 }
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 sparse.card_cut(len);
             }
             d.len = d.len.min(len);
@@ -644,7 +644,7 @@ impl GenericHeteroTransformer {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 impl GenericHeteroTransformer {
     /// The card the head's layer runs on, when it runs on one and the head's logits are there.
     fn draft_card(&self) -> Option<Device> {

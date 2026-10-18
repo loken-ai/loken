@@ -390,7 +390,7 @@ mod tests {
 
     /// Held on a card from end to end, the correction leaves the output error the CPU leaves, for
     /// both formats it carries, on rows fewer and more numerous than a block is wide.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     fn the_card_carries_the_error_as_the_cpu_does() {
         use crate::tensor::cuda::{card_factor, quantize_compensated_on_card, CudaDevice};

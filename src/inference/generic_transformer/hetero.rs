@@ -531,7 +531,7 @@ impl GenericHeteroTransformer {
     /// projection lives, the card-resident quantised head when there is one.
     fn head_on_device(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.to_dtype(crate::tensor::DType::F32)?;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let (Some(proj), Some(dev)) = (
             self.output_proj_cuda_qmm.as_ref(),
             self.output_proj_dev.as_ref(),
@@ -1374,7 +1374,7 @@ impl GenericHeteroTransformer {
 
     /// The routing counts of every layer since the load, zero for a layer without an expert
     /// cache; `None` when no layer has one.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn expert_profile(&self) -> Option<super::expert_profile::ExpertProfile> {
         let experts = self.layers.iter().find_map(|l| {
             l.moe
@@ -1399,7 +1399,7 @@ impl GenericHeteroTransformer {
 
     /// Fill every layer's expert cache from `profile`: how many experts were copied. A profile
     /// of another shape is refused, naming both shapes.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn prime_expert_caches(
         &self,
         profile: &super::expert_profile::ExpertProfile,
@@ -1457,7 +1457,7 @@ impl GenericHeteroTransformer {
         if let Some(c) = l.context.as_ref() {
             n = n.max(c.len());
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let Some(c) = l.quant_kv.as_ref() {
             n = n.max(c.current_seq_len());
         }
@@ -1777,7 +1777,7 @@ impl GenericHeteroTransformer {
         }
         // The verify advances each state where it lies, as a decoded token does, so a step
         // recorded against those buffers goes on reading them.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let _in_place = recording.then(|| crate::inference::moe_cuda::in_place_state(true));
         let out = self.forward_inner(input_ids, index_pos, /*all_positions=*/ true);
         if recording {
@@ -2279,7 +2279,7 @@ impl GenericHeteroTransformer {
                 // donor index, which is always < first_kv_shared <= layer_idx).
                 if let Some(rid) = ref_idx_opt {
                     let (head, tail) = self.layers.split_at_mut(layer_idx);
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     let donor_q8 = head[rid].q8_kv();
                     // Lend the shared layer read access to the donor's F16
                     // KV store (gemma4 CPU). The donor (a real layer < layer_idx,
@@ -2297,7 +2297,7 @@ impl GenericHeteroTransformer {
                         ple_on_dev.as_ref(),
                         shared_kv,
                         donor_f16,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         donor_q8,
                     )?;
                 } else {
@@ -2309,7 +2309,7 @@ impl GenericHeteroTransformer {
                         ple_on_dev.as_ref(),
                         shared_kv,
                         None,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         None,
                     )?;
                 }
@@ -2342,7 +2342,7 @@ impl GenericHeteroTransformer {
         // Same-device output stages are stream-ordered and were never the issue - an
         // unconditional sync per token serializes CPU<->GPU launch-ahead and cost
         // moondream ~46% (434->233 tok/s, caught by a campaign).
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if let crate::tensor::DeviceLocation::Cuda { gpu_id } = hidden.device().location() {
             if self.output_proj_dev.is_none() {
                 if let Some(src) = self.cuda_devices.get(&gpu_id) {

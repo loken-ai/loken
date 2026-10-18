@@ -88,7 +88,7 @@ pub fn no_progress(_done: usize, _total: usize) {}
 
 /// Which target types have a device quantise kernel. The GPU path is taken only when every
 /// requantised tensor lands on one of these; the set grows as kernels are added (q8_0 today).
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn gpu_target_supported(t: GgmlDType) -> bool {
     matches!(
         t,
@@ -180,7 +180,7 @@ pub fn requantize_gguf(
     // workers with device launches is what this avoids. It runs on the fastest card, when there is
     // one and every requantised tensor's target has a device kernel; anything else falls to the CPU
     // pool. A copied (unchanged) tensor needs no kernel, so it never blocks the choice.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     let entries: Vec<GgufEntry> = {
         let all_on_gpu = names.iter().all(|name| {
             let info = &mapped.tensor_infos[name];
@@ -210,7 +210,7 @@ pub fn requantize_gguf(
             _ => cpu_parallel()?,
         }
     };
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     let entries: Vec<GgufEntry> = cpu_parallel()?;
 
     // Sorted by key: the source metadata is a hash map whose iteration order is not stable

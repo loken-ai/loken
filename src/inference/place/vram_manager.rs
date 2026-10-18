@@ -78,7 +78,7 @@ pub fn probe_under_pressure(reserve: u64) -> Vec<(usize, u64, crate::tensor::Dev
 }
 
 pub fn probe(reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     crate::inference::engine::llm_engine::trim_cuda_pools();
     crate::inference::place::device_probe::probe_cuda_devices(reserve)
 }
@@ -150,14 +150,14 @@ pub fn tightest_free_on_cards(cards: u64) -> u64 {
 /// includes whatever model is resident, which a request that switches models is
 /// about to give back.
 pub fn total_vram() -> u64 {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         crate::inference::place::device_probe::probe_cuda_gpus()
             .iter()
             .map(|g| g.total)
             .sum()
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         0
     }
@@ -168,7 +168,7 @@ pub fn total_vram() -> u64 {
 /// The ceiling on what any amount of waiting could deliver to ONE card, which is what
 /// separates "busy right now" from "will always need to span devices".
 pub fn largest_gpu_capacity() -> u64 {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         crate::inference::place::device_probe::probe_cuda_gpus()
             .iter()
@@ -176,7 +176,7 @@ pub fn largest_gpu_capacity() -> u64 {
             .max()
             .unwrap_or(0)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         0
     }
@@ -384,7 +384,7 @@ pub fn run_staged<T>(
                     "vram_manager: '{tag}' hit memory pressure on {:?} ({e}); trying the next device",
                     dev.location()
                 );
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 crate::inference::engine::llm_engine::release_cuda_pools();
                 last = Some(e);
             }
@@ -635,14 +635,14 @@ impl Drop for VramWatch {
 /// A watch on every card, with what each held free when it started, for reporting what a
 /// stretch of work took on each card. Empty when the platform has no watch.
 pub fn watch_every_card() -> Vec<(usize, u64, VramWatch)> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         crate::inference::place::device_probe::probe_cuda_gpus()
             .into_iter()
             .filter_map(|g| Some((g.index, g.stable_free, VramWatch::start(g.index)?)))
             .collect()
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         Vec::new()
     }
@@ -654,14 +654,14 @@ pub fn watch_every_card() -> Vec<(usize, u64, VramWatch)> {
 /// through it during a render would hand memory back a hundred times a second for a
 /// number that is only being observed.
 pub fn free_on(gpu_index: usize) -> Option<u64> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         crate::inference::place::device_probe::probe_cuda_gpus()
             .into_iter()
             .find(|g| g.index == gpu_index)
             .map(|g| g.stable_free)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = gpu_index;
         None
@@ -696,14 +696,14 @@ pub enum Headroom {
 
 /// What every card of this machine holds together, bytes.
 pub fn total_gpu_capacity() -> u64 {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         crate::inference::place::device_probe::probe_cuda_gpus()
             .iter()
             .map(|g| g.total)
             .sum()
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         0
     }
@@ -851,7 +851,7 @@ async fn reclaim_idle_for(caller: &'static str) -> u64 {
             }
         };
         let freed = fut.await;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         crate::inference::engine::llm_engine::release_cuda_pools();
         if freed > 0 {
             tracing::info!(
@@ -893,7 +893,7 @@ pub async fn ensure_gpu_headroom(caller: &'static str, hot_bytes: u64, reserve: 
         let freed = fut.await;
         // The engine just dropped its resident: the FULL release (workspaces + caches + pool
         // trim) is safe and maximally effective here - nothing of that engine is in flight.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         crate::inference::engine::llm_engine::release_cuda_pools();
         if freed > 0 {
             // `freed` is a component COUNT from the hook, not bytes.

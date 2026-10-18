@@ -5,7 +5,7 @@ use crate::tensor::Device;
 
 /// Bytes the card behind `dev` has free now, `0` for a device that is not a card.
 pub fn free_now(dev: &Device) -> u64 {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         // The reading itself: the cache is sized from it, here, with the other placement reads.
         if let Ok((free, _)) = crate::tensor::cuda_ext::mem_get_info(dev) {

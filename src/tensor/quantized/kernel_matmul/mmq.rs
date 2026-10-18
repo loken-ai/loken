@@ -9,7 +9,7 @@ impl QKernelMatMul {
     /// Batched quantized matmul through the production MMQ launchers
     /// (the same compiled kernels the current serving path uses - FFI boundary,
     /// raw pointers + stream, like the MoE family).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub(super) fn mmq_forward(
         &self,
         dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,

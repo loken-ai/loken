@@ -3,7 +3,7 @@
 //! A pre-allocated KV cache with O(1) append using slice_set.
 //! Supports trim_to for KV cache management.
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 use crate::tensor::cuda_ext::CudaSlice;
 use crate::tensor::{DType, Device, Result, Tensor};
 
@@ -116,9 +116,9 @@ pub struct SpecKvCache {
     /// replay instead of baking in a host int at capture time. Allocated
     /// lazily; updated via memcpy_htod once per token outside capture
     /// (sister of `Q8KvCache::cur_pos_dev`).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     seq_kv_dev: Option<CudaSlice<i32>>,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     seq_kv_dev_value: Option<usize>,
 }
 
@@ -136,9 +136,9 @@ impl Clone for SpecKvCache {
             // seq_kv_dev is per-instance device state; clone resets it
             // since the new clone shouldn't share the same captured-graph
             // pointer dependency.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             seq_kv_dev: None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             seq_kv_dev_value: None,
         }
     }
@@ -156,9 +156,9 @@ impl SpecKvCache {
             window: None,
             resident: false,
             moves: 0,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             seq_kv_dev: None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             seq_kv_dev_value: None,
         }
     }
@@ -203,7 +203,7 @@ impl SpecKvCache {
         // Don't drop seq_kv_dev - its device address must stay stable
         // for any captured graph that references it. The next update
         // will overwrite the value via memcpy_htod.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             self.seq_kv_dev_value = None;
         }
@@ -219,7 +219,7 @@ impl SpecKvCache {
     /// memcpy. Per-layer in a homogeneous model, every layer in the
     /// same token calls with the same value - saves N-1 redundant
     /// 4-byte H2D copies per token.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn update_seq_kv_dev(
         &mut self,
         pos: usize,
@@ -253,7 +253,7 @@ impl SpecKvCache {
     /// Returns the stable device i32 slice if it has been allocated.
     /// Engine-side gates check `is_some` to decide whether to use the
     /// device-pos-driven kernel path.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     pub fn seq_kv_dev_ptr(&self) -> Option<&CudaSlice<i32>> {
         self.seq_kv_dev.as_ref()
     }

@@ -1428,7 +1428,7 @@ mod forward_determinism {
 
     /// Ten forwards of the REAL DiT on one input: the count of distinct outputs is the
     /// race detector the op-level harness could not be (every op alone was clean).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "hardware probe: needs the stable-audio weights and a CUDA card"]
     fn ten_identical_forwards_one_output() {

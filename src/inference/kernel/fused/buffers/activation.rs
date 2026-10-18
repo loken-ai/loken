@@ -461,7 +461,7 @@ pub fn fused_bias_gelu_new(x: &Tensor, bias: &Tensor) -> Result<Tensor> {
 /// All preconditions are the same as `fused_bias_gelu_new`. No fallback
 /// - the caller is responsible for only invoking this on shapes that
 /// match.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 pub fn fused_bias_gelu_new_on_stream(
     x: &Tensor,
     bias: &Tensor,

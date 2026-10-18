@@ -618,7 +618,7 @@ impl LlmEngine {
                     && !caps_attention
                     && !has_attn_sinks;
             // Compile the shape's attention kernels now rather than on the first decoded token.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if kv_quant_supported {
                 crate::inference::quantized_cuda::prewarm_shape(head_dim, n_q_per_kv);
             }
@@ -729,10 +729,10 @@ impl LlmEngine {
                         file_size as f64 / 1e9, idx);
                     // Default stream with event tracking disabled: capturable in
                     // cudaStreamCaptureModeRelaxed, which the engine's graph capture uses.
-                    #[cfg_attr(not(feature = "cuda"), allow(clippy::map_identity))]
+                    #[cfg_attr(not(feature = "gpu"), allow(clippy::map_identity))]
                     let dev_result: crate::tensor::Result<Device> = crate::tensor::Device::new_cuda(idx)
                         .map(|d| {
-                            #[cfg(feature = "cuda")]
+                            #[cfg(feature = "gpu")]
                             if let Device::Cuda(ref cd) = d {
                                 unsafe { cd.context().disable_event_tracking(); }
                             }
@@ -757,7 +757,7 @@ impl LlmEngine {
             debug!("✓ Using device: {:?}", device);
 
             // Enable reduced precision GEMM on CUDA for better throughput
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if matches!(device, Device::Cuda(_)) {
                 crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
                 debug!("✓ Enabled reduced precision GEMM (TF32/FP16/BF16) for quantized inference");
@@ -793,7 +793,7 @@ impl LlmEngine {
                     )
                     .inspect_err(|e| error!("{e}"))?;
                     info!("Vision model loaded (Moondream v2) on {:?}", built_on.location());
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     if built_on.is_cuda() {
                         crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
                     }
@@ -1170,7 +1170,7 @@ impl LlmEngine {
                                     for idx in crate::inference::place::ladder::cards_of(plan) {
                                         if let std::collections::hash_map::Entry::Vacant(slot) = handles.entry(idx) {
                                             let d = Device::new_cuda(idx)?;
-                                            #[cfg(feature = "cuda")]
+                                            #[cfg(feature = "gpu")]
                                             if let Device::Cuda(ref cd) = d {
                                                 unsafe { cd.context().disable_event_tracking(); }
                                             }
@@ -1337,10 +1337,10 @@ impl LlmEngine {
                     .kv_capacity()
                     .map_or(context_length, |c| c.min(context_length)),
                 eos_token_id,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 moondream_graph: None,
                 moondream_decode_count: 0,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 kept_graphs: Default::default(),
                 eos_token_ids_extra,
                 file_size,
@@ -1430,7 +1430,7 @@ impl LlmEngine {
         // Forces NVRTC compilation + cuModuleLoad outside graph capture,
         // so subsequent capture-time launches hit the cached path with
         // no driver-level allocations.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         {
             let state = self.model_state.lock().await;
             if let Some(model) = state.as_ref() {

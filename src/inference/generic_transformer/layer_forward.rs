@@ -123,7 +123,7 @@ impl GenericTransformerLayer {
         // Runs OUTSIDE capture; the captured kernel reads the updated
         // value via this stable pointer each replay.
         // Skipped silently if device isn't CUDA - kernel won't fire then.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if q.device().is_cuda() {
             if let Ok(cuda_dev) = q.device().as_cuda_device() {
                 let cur = self.kv_cache.current_seq_len();
@@ -223,14 +223,14 @@ impl GenericTransformerLayer {
         // -- Phi2 / GPT-NeoX parallel-attention path -------------------
         // Mirrors forward_graph parallel_attn branch (lines 2225+).
         if self.flags.parallel_attn {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let phi2_fast = self.flags.is_phi2_simple_ffn
                 && rs.is_none()
                 && self.attn_output_bias.is_some()
                 && self.ffn_down_bias.is_some()
                 && attn_out.device().is_cuda()
                 && attn_out.dtype() == crate::tensor::DType::F32;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let phi2_fast = false;
             if !phi2_fast {
                 if let Some(b) = &self.attn_output_bias {
@@ -248,7 +248,7 @@ impl GenericTransformerLayer {
             // input) re-normed here. attn_norm is graph-safe (LayerNorm).
             let x_norm = self.attn_norm.forward(residual)?;
 
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let out = if phi2_fast {
                 // Route phi2 FFN intermediates through stable buffers
                 // for graph safety. forward_ffn_phi2_pre_bias
@@ -298,7 +298,7 @@ impl GenericTransformerLayer {
                 }
                 crate::inference::kernel::fused::fused_add_three(residual, &attn_out, &ffn_out)?
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let out = {
                 let mut ffn_out = self.forward_ffn(&x_norm)?;
                 if let Some(s) = rs {
@@ -326,7 +326,7 @@ impl GenericTransformerLayer {
         // post_norm output). Routes the fused output through
         // graph_post_attn_norm_buffer for downstream stability.
         let raw_x = if let Some(post_norm) = &self.post_attn_norm {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let fused = if attn_out.device().runs_as_card()
                 && attn_out.dtype() == crate::tensor::DType::F32
                 && residual.dtype() == crate::tensor::DType::F32
@@ -342,7 +342,7 @@ impl GenericTransformerLayer {
             } else {
                 None
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let fused: Option<Tensor> = None;
             match fused {
                 Some(t) => t,
@@ -384,7 +384,7 @@ impl GenericTransformerLayer {
         }
         // Pattern A: fuse post_ffn_norm + residual.
         let raw_x_out = if let Some(post_norm) = &self.post_ffn_norm {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let fused = if ffn_out.device().runs_as_card()
                 && ffn_out.dtype() == crate::tensor::DType::F32
                 && residual_ffn.dtype() == crate::tensor::DType::F32
@@ -400,7 +400,7 @@ impl GenericTransformerLayer {
             } else {
                 None
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let fused: Option<Tensor> = None;
             match fused {
                 Some(t) => t,
@@ -439,10 +439,10 @@ impl GenericTransformerLayer {
                 } else {
                     raw_gate
                 };
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let raw_gelu =
                     crate::inference::kernel::fused::fused_gelu_mul(&ple_state, ple_input_buf)?;
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let raw_gelu = ple_state.gelu()?.mul(ple_input_buf)?;
                 let ple_state = if let Some(buf) = self.graph_ple_gelu_buffer.as_ref() {
                     let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);
@@ -471,7 +471,7 @@ impl GenericTransformerLayer {
                 } else {
                     raw_proj
                 };
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let (raw_out, scale_applied) = {
                     let is_decode = ple_state.dim(1).map(|d| d == 1).unwrap_or(false);
                     let cuda_f32 =
@@ -510,7 +510,7 @@ impl GenericTransformerLayer {
                         ((&x_out + ple_state)?, false)
                     }
                 };
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let (raw_out, scale_applied): (Tensor, bool) = {
                     let ple_state = norm.forward(&ple_state)?;
                     ((&x_out + ple_state)?, false)
@@ -561,7 +561,7 @@ impl GenericTransformerLayer {
             None,
             None,
             None,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             None,
         )
     }
@@ -573,15 +573,15 @@ impl GenericTransformerLayer {
     /// the normal path. Caller must have refreshed `update_rope_buffers(pos)`
     /// and extended `padded_mask` before calling this.
     pub fn forward_graph(&mut self, x: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.runs_split(x) {
             return self.forward_split(x, None, None);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_wide() {
             return self.forward_wide_graph(x);
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.is_hybrid() {
             return self.forward_hybrid_graph(x);
         }
@@ -597,14 +597,14 @@ impl GenericTransformerLayer {
         // Returns early so the serial post-attn path below (which
         // requires ffn_norm) is skipped - phi2 has no ffn_norm.
         if self.flags.parallel_attn {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let phi2_fast = self.flags.is_phi2_simple_ffn
                 && rs.is_none()
                 && self.attn_output_bias.is_some()
                 && self.ffn_down_bias.is_some()
                 && attn_out.device().is_cuda()
                 && attn_out.dtype() == crate::tensor::DType::F32;
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let phi2_fast = false;
             if !phi2_fast {
                 if let Some(b) = &self.attn_output_bias {
@@ -615,7 +615,7 @@ impl GenericTransformerLayer {
                 attn_out = (attn_out * s)?;
             }
 
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let x = if phi2_fast {
                 let ffn_pre = self.forward_ffn_phi2_pre_bias(&x_norm)?;
                 let attn_bias = self.attn_output_bias.as_ref().unwrap();
@@ -630,7 +630,7 @@ impl GenericTransformerLayer {
                 }
                 crate::inference::kernel::fused::fused_add_three(residual, &attn_out, &ffn_out)?
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let x = {
                 let mut ffn_out = self.forward_ffn(&x_norm)?;
                 if let Some(s) = rs {
@@ -650,7 +650,7 @@ impl GenericTransformerLayer {
 
         // Post-attn residual, FFN, and FFN residual through the kernels the eager decode step
         // runs, so a replayed step computes what an eager one would.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let fused = match self.ffn_norm_weight.as_ref() {
             Some(w) if self.post_attn_norm.is_none() => {
                 Some(crate::inference::kernel::fused::fused_add_rmsnorm_dual(
@@ -662,7 +662,7 @@ impl GenericTransformerLayer {
             }
             _ => None,
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let fused: Option<(Tensor, Tensor)> = None;
         let (x, x_norm) = match fused {
             Some(pair) => pair,
@@ -711,7 +711,7 @@ impl GenericTransformerLayer {
             ffn_out = (ffn_out * s)?;
         }
         let mut x_out = match &self.post_ffn_norm {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             Some(post_norm) if ffn_out.dtype() == DType::F32 && residual.dtype() == DType::F32 => {
                 crate::inference::kernel::fused::fused_rmsnorm_then_add(
                     &ffn_out,
@@ -749,10 +749,10 @@ impl GenericTransformerLayer {
                     raw_gate
                 };
                 // fused_gelu_mul -> graph_ple_gelu_buffer
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let raw_gelu =
                     crate::inference::kernel::fused::fused_gelu_mul(&ple_state, ple_input_buf)?;
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let raw_gelu = ple_state.gelu()?.mul(ple_input_buf)?;
                 let ple_state = if let Some(buf) = self.graph_ple_gelu_buffer.as_ref() {
                     let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);
@@ -781,7 +781,7 @@ impl GenericTransformerLayer {
                     raw_proj
                 };
                 // rmsnorm + add (+ optional scale).
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let (raw_out, scale_applied) = {
                     let is_decode = ple_state.dim(1).map(|d| d == 1).unwrap_or(false);
                     let cuda_f32 =
@@ -820,7 +820,7 @@ impl GenericTransformerLayer {
                         ((&x_out + ple_state)?, false)
                     }
                 };
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let (raw_out, scale_applied): (Tensor, bool) = {
                     let ple_state = norm.forward(&ple_state)?;
                     ((&x_out + ple_state)?, false)
@@ -1446,9 +1446,9 @@ impl GenericTransformerLayer {
         ple_layer_input: Option<&Tensor>,
         shared_kv: Option<(Tensor, Tensor)>,
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
-        #[cfg(feature = "cuda")] shared_kv_q8: Option<&crate::inference::cache::q8_kv::Q8KvCache>,
+        #[cfg(feature = "gpu")] shared_kv_q8: Option<&crate::inference::cache::q8_kv::Q8KvCache>,
     ) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if self.runs_split(x) {
             return self.forward_split(x, mask, Some(index_pos));
         }
@@ -1532,18 +1532,18 @@ impl GenericTransformerLayer {
         // and reuse for both attn_qkv and ffn_up matmuls (saves 1
         // quantize launch/layer = ~1-2% decode). Verified correct on
         // Q4_0 weights via test_ln_qmm_gguf (max_diff=0). Default-on.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let enable_shared_q8_1 = true;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let enable_shared_q8_1 = false;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let (pre_computed_qkv, shared_q8_1_buf) = if enable_shared_q8_1 {
             self.try_phi2_shared_q8_1_qkv(&x_norm)
                 .unwrap_or((None, None))
         } else {
             (None, None)
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let (pre_computed_qkv, shared_q8_1_buf): (Option<Tensor>, Option<()>) = (None, None);
 
         // Alt-stream FFN_up overlap: while the attn chain runs on the
@@ -1557,7 +1557,7 @@ impl GenericTransformerLayer {
         // (moondream and similar) - A/B bench measured moondream:latest
         // decode 346 -> 374 tok/s (+8% with FULL variant). Non-phi2 arches
         // unaffected (the inner guard checks parallel_attn && is_phi2_simple_ffn).
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let alt_ffn_up: Option<(Tensor, crate::tensor::cuda_ext::CudaEvent)> = {
             let enabled = true;
             if enabled && self.flags.parallel_attn && self.flags.is_phi2_simple_ffn {
@@ -1595,7 +1595,7 @@ impl GenericTransformerLayer {
                 None
             }
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let alt_ffn_up: Option<()> = None;
 
         let mut attn_out = if pre_computed_qkv.is_some() {
@@ -1614,14 +1614,14 @@ impl GenericTransformerLayer {
                 index_pos,
                 shared_kv,
                 donor_f16,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 shared_kv_q8,
             )?
         };
         // Phi2 fast path: parallel-attn + simple-FFN + both biases on CUDA F32 -> defer
         // both bias adds + residual merge into a single fused kernel. When NOT on
         // the fast path, apply attn_output_bias here as before.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let phi2_residual_fast = self.flags.parallel_attn
             && self.flags.is_phi2_simple_ffn
             && rs.is_none()
@@ -1629,7 +1629,7 @@ impl GenericTransformerLayer {
             && self.ffn_down_bias.is_some()
             && attn_out.device().is_cuda()
             && attn_out.dtype() == crate::tensor::DType::F32;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let phi2_residual_fast = false;
         if !phi2_residual_fast {
             if let Some(b) = &self.attn_output_bias {
@@ -1649,7 +1649,7 @@ impl GenericTransformerLayer {
         // the SAME x_norm (computed above), then their outputs are summed
         // into the residual.
         let (mut x, prof_t_attn_res, prof_t_ffn, prof_t_ffn_res) = if self.flags.parallel_attn {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let x = if phi2_residual_fast {
                 // 5-input fused merge: residual + (attn + attn_bias) + (ffn_pre + ffn_bias)
                 // in one launch. Saves the attn_output_bias broadcast_add (which we
@@ -1699,7 +1699,7 @@ impl GenericTransformerLayer {
                 }
                 crate::inference::kernel::fused::fused_add_three(residual, &attn_out, &ffn_out)?
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let x = {
                 let mut ffn_out = self.forward_ffn(&x_norm)?;
                 if let Some(s) = rs {
@@ -1724,7 +1724,7 @@ impl GenericTransformerLayer {
             // grid layout penalizes the per-token output write path even
             // more than the unfused chain on gemma4's shapes. Kept post_attn_norm
             // out of the fused gate.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let (x, x_norm_ffn) = if self.post_attn_norm.is_none() && self.ffn_norm_weight.is_some()
             {
                 let norm_w = self.ffn_norm_weight.as_ref().unwrap();
@@ -1812,7 +1812,7 @@ impl GenericTransformerLayer {
                 };
                 (x, x_norm)
             };
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "gpu"))]
             let (x, x_norm_ffn) = {
                 let x = if let Some(post_norm) = &self.post_attn_norm {
                     (post_norm.forward(&attn_out)? + residual)?
@@ -1924,7 +1924,7 @@ impl GenericTransformerLayer {
                 // captures the perf target (per project_gemma4_latest_medium_profile)
                 // without the prefill memory cost.
                 let is_decode = combined.dim(1).map(|d| d == 1).unwrap_or(false);
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 {
                     if is_decode
                         && combined.dtype() == DType::F32
@@ -1953,7 +1953,7 @@ impl GenericTransformerLayer {
                         (post_norm.forward(&combined)? + residual_ffn)?
                     }
                 }
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     let _ = is_decode;
                     (post_norm.forward(&combined)? + residual_ffn)?
@@ -1996,10 +1996,10 @@ impl GenericTransformerLayer {
                 };
                 // GELU-gated multiplication with per-layer input  -
                 // fused single-launch (gelu(tanh) * mul) replaces 2 ops.
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let raw_gelu =
                     crate::inference::kernel::fused::fused_gelu_mul(&ple_state, ple_input)?;
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let raw_gelu = ple_state.gelu()?.mul(ple_input)?;
                 // Route PLE gelu_mul output.
                 let ple_state = if x.dim(1).map(|d| d == 1).unwrap_or(false) {
@@ -2050,7 +2050,7 @@ impl GenericTransformerLayer {
                 // launches/token. Otherwise fall back to the rmsnorm+add
                 // 2-op fuse (which itself wins over the 3-launch unfused
                 // chain).
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 let (x_after_ple, scale_applied) = {
                     let is_decode = ple_state.dim(1).map(|d| d == 1).unwrap_or(false);
                     let cuda_f32 =
@@ -2107,7 +2107,7 @@ impl GenericTransformerLayer {
                     };
                     (routed, applied)
                 };
-                #[cfg(not(feature = "cuda"))]
+                #[cfg(not(feature = "gpu"))]
                 let (x_after_ple, scale_applied): (Tensor, bool) = {
                     let ple_state = norm.forward(&ple_state)?;
                     ((&x + ple_state)?, false)
