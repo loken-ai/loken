@@ -23,6 +23,17 @@ MATRIX="$LOKEN/bench/matrix.toml"
 # against. Either can be pointed elsewhere for a one-off run.
 ASR_AUDIO="${ASR_AUDIO:-$LOKEN/bench/asr/jfk.wav}"
 ASR_REFERENCE="${ASR_REFERENCE:-$LOKEN/bench/asr/jfk.txt}"
+# Whose cards a campaign measures: NVIDIA when nvidia-smi lists one, else AMD when the PCI bus
+# holds one. GPU_VENDOR picks on a machine with both; the other vendor's cards are hidden.
+if [ -z "${GPU_VENDOR:-}" ]; then
+    if nvidia-smi -L 2>/dev/null | grep -q .; then GPU_VENDOR=nvidia
+    elif grep -qs 0x1002 /sys/bus/pci/devices/*/vendor; then GPU_VENDOR=amd
+    else GPU_VENDOR=nvidia; fi
+fi
+export GPU_VENDOR
+# The loken build measured: the CUDA release by default, a ROCm build for AMD cards.
+LOKEN_BIN="${LOKEN_BIN:-$LOKEN/target/release/lokend}"
+export LOKEN_BIN
 LOKEN_URL="${LOKEN_URL:-http://127.0.0.1:11435}"
 
 die() { echo "bench: $*" >&2; exit 1; }
@@ -249,14 +260,7 @@ provision() {
         # linux amd64 build as ollama-linux-amd64.tar.zst (no .tgz, no -rocm/-mlx). Reading the URL
         # rather than constructing it self-heals if the naming shifts again.
         local ver url dir arc
-        read -r ver url < <(curl -sf https://api.github.com/repos/ollama/ollama/releases/latest \
-            | python3 -c '
-import sys, json
-r = json.load(sys.stdin)
-ver = r["tag_name"].lstrip("v")
-want = "ollama-linux-amd64.tar.zst"
-url = next((a["browser_download_url"] for a in r["assets"] if a["name"] == want), "")
-print(ver, url)')
+        read -r ver url < <(ollama_asset ollama-linux-amd64.tar.zst)
         [ -n "$ver" ] && [ -n "$url" ] || die "cannot resolve latest ollama linux amd64 asset"
         dir="$comp/ollama-$ver"; arc="$comp/ollama-$ver.tar.zst"; mkdir -p "$dir"
         echo "provisioning ollama $ver into $dir..."
@@ -266,6 +270,19 @@ print(ver, url)')
         obin="$dir/bin/ollama"
     fi
     [ -x "$obin" ] || die "no ollama binary in the compartment"
+    # AMD cards need ollama's ROCm libraries, shipped apart and unpacked over the same tree.
+    local odir; odir="$(dirname "$(dirname "$obin")")"
+    if [ "$GPU_VENDOR" = amd ] && ! [ -d "$odir/lib/ollama/rocm" ]; then
+        local over rurl rarc
+        over="$("$obin" --version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        read -r _ rurl < <(ollama_asset ollama-linux-amd64-rocm.tar.zst "v$over")
+        [ -n "$rurl" ] || die "cannot resolve the ollama $over ROCm asset"
+        rarc="$odir.rocm.tar.zst"
+        echo "provisioning ollama $over ROCm libraries into $odir..."
+        curl -fL "$rurl" -o "$rarc" || die "ollama ROCm download failed"
+        tar -C "$odir" --zstd -xf "$rarc" || die "ollama ROCm unpack failed"
+        rm -f "$rarc"
+    fi
     export OLLAMA_BIN="$obin"
     # The versions each engine will be measured with. Stamped into every result file so the report
     # reads the version from the measurement, not from whatever is installed when it is generated.
@@ -274,6 +291,18 @@ print(ver, url)')
     echo "engines (bench compartment):"
     echo "  ollama:  ${OLLAMA_VER:-?}  [$OLLAMA_BIN]"
     echo "  vLLM:    ${VLLM_VER:-?}  [$venv]"
+}
+
+# "<version> <url>" of the ollama release asset named $1, from release $2 or the latest one.
+# Read from the release API rather than constructed, so a renamed asset is found, not guessed.
+ollama_asset() { # ollama_asset <asset> [tag]
+    local release=latest
+    [ -n "${2:-}" ] && release="tags/$2"
+    curl -sf "https://api.github.com/repos/ollama/ollama/releases/$release" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)
+url = next((a["browser_download_url"] for a in r["assets"] if a["name"] == sys.argv[1]), "")
+print(r["tag_name"].lstrip("v"), url)' "$1"
 }
 
 # --- run: sweep the matrix through the existing isolation protocol -----------------------------
@@ -285,7 +314,7 @@ print(ver, url)')
 # golden input assets and are skipped with a note until wired; HF-direct (org/name) needs the
 # loken+vllm engine selection and is likewise skipped for now.
 run() {
-    [ -x "$LOKEN/target/release/lokend" ] || die "no release binary; build it first"
+    [ -x "$LOKEN_BIN" ] || die "no loken binary at $LOKEN_BIN; build it first"
     "$LOKEN/../assert-binary-current.sh" >/dev/null 2>&1 || die "binary is stale; rebuild before measuring"
     provision
     local models; models="$(loken_models)"
@@ -305,7 +334,7 @@ PY
     else
         ctxs="4096"; prompts="short"; streams="1"
     fi
-    local stamp; stamp=$(stat -c %Y "$LOKEN/target/release/lokend")
+    local stamp; stamp=$(stat -c %Y "$LOKEN_BIN")
 
     cd "$LOKEN" || die "cannot cd $LOKEN"
     local m mod fmt engines amod vserve err ctx st out tag mctxs mstreams asrargs

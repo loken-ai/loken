@@ -84,6 +84,16 @@ A record taken before the runner described its machine can be attested by an ope
 (`assay/scripts/convert-archive.py --attest-machine`); the page says so. A record without a
 machine is kept and tabled nowhere.
 
+## AMD cards
+
+A machine whose only cards are AMD runs its campaign on them; on a machine with both, `GPU_VENDOR=amd`
+picks the AMD cards and hides the NVIDIA ones from every engine. The loken measured is then a ROCm
+build named by `LOKEN_BIN`, and ollama gets its ROCm libraries, unpacked over its release:
+
+```sh
+GPU_VENDOR=amd LOKEN_BIN=<rocm build>/lokend scripts/bench run
+```
+
 ## Modalities
 
 Each model is measured by the clock its modality warrants; the driver picks the modality from what
