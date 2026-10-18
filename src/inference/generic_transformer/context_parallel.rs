@@ -491,6 +491,14 @@ mod tests {
         let Ok(card) = Device::new_cuda(0) else {
             return;
         };
+        // The fused part runs on the tensor-core cards only; below them the portable part is
+        // the only one, and there is nothing to compare it with.
+        if !card
+            .as_cuda_device()
+            .is_ok_and(|d| d.has_ampere_tensor_cores())
+        {
+            return;
+        }
         let (h, h_kv, d) = (8usize, 2usize, 128usize);
         // (query rows, keys, first row's position, first key's position)
         for (s, t, q_pos, k_pos) in [(40, 70, 100, 10), (40, 70, 30, 0), (1, 300, 500, 200)] {
