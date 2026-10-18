@@ -31,7 +31,7 @@ Major, by priority:
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
-| ROCm and Vulkan backends | Backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Started |
+| ROCm and Vulkan backends | Backends | Everything the CUDA build runs also runs through ROCm on AMD cards (every model family and every kernel, the NVIDIA tensor-core ones ported to the AMD matrix units), with the CUDA tests passing on an AMD card; one model of each family also served through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory; all measured against the CUDA path and the reference engine on the same cards | Started |
 | Coding agents beyond verve | Agents | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
 | Forecasting and tabular models | Models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
 
