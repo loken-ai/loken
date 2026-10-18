@@ -83,6 +83,9 @@ Smaller, by priority:
 | Image and text embeddings | API | A CLIP or SigLIP checkpoint served alone on the embeddings route for text and images, its vectors matching the reference implementation, measured by the bench | Planned |
 | Voice conversion | Audio | An OpenVoice checkpoint turning a recording into a reference speaker's voice through a documented route, measured by the bench | Planned |
 | Embeddings measured by the bench | Bench | Every model with the embedding capability measured by assay, inputs per second and latency, against the peers that serve it | Planned |
+| ACE-Step at the reference speed | Performance | A song of the length asked rendered by each ACE-Step 1.5 variant within 1.2x of the reference implementation's time on the same card, each stage's time logged | Planned |
+| Music editing | Music | Repaint, extend, cover, lego, extract and complete on the audio generations route, each matching the reference implementation's task | Planned |
+| ACE-Step adapters | Models | A LoRA trained for ACE-Step applied at load or per request, its style heard against the base render | Planned |
 
 ## 0.6.0
 
