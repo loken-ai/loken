@@ -4,23 +4,26 @@ What the next releases bring, feature by feature. [`CHANGELOG.md`](CHANGELOG.md)
 done; [`docs/STATUS.md`](docs/STATUS.md) says what is measured. A feature is done when its
 acceptance is met and measured; until then it stays here with its state.
 
+A state is one word: Done, Partial (what is left is a feature of a later version), Started,
+Planned, or Waiting (for the hardware to measure it on).
+
 ## 0.3.0
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
-| One model across several machines, cut by layer | Cluster | A model no single machine serves well, cut across machines from each one's measured layer cost, faster than the best machine alone | Done: three machines, peers measured on a sample of layers |
-| Tensor parallelism in the generic path | Parallelism | A layer's dense projections split across cards inside the one placement path, any number of cards, mixtures included | Done: dense and mixture layers on any number of cards, recorded in the decode graph, chosen from measured sums and products; GELU, fused or clamped experts stay layered |
-| Expert parallelism | Parallelism | A mixture layer's experts split across cards where measured links make it pay | Done for experts that would otherwise sit on the host |
+| One model across several machines, cut by layer | Cluster | A model no single machine serves well, cut across machines from each one's measured layer cost, faster than the best machine alone | Done |
+| Tensor parallelism in the generic path | Parallelism | A layer's dense projections split across cards inside the one placement path, any number of cards, mixtures included | Done |
+| Expert parallelism | Parallelism | A mixture layer's experts split across cards where measured links make it pay | Partial |
 | Pipeline parallelism across machines | Cluster | A chain of any length, the prompt-lookup verify crossing every cut | Done |
-| Data parallelism | Parallelism | Copies of a model served side by side, requests spread over them | Done on one machine; across machines through the cluster's routing |
-| Context parallelism | Parallelism | A long context's attention split across cards | Done: each attention layer's cache cut by ranges of positions over the cards, the parts combined on the layer's card, the cut layers outside the recorded step; a request reserves its ranges before its prefill; a prompt longer than one card's cache served on two, slower than an uncut cache until the step is recorded (0.4.0) |
-| Prefill and decode on different instances | Serving | A prompt read on one instance and decoded on another, its state handed over | Done: the KV cache handed over exactly for attention models; recurrent and windowed models hand over their whole decode state; split layers and cut caches still read their prompt where they decode |
+| Data parallelism | Parallelism | Copies of a model served side by side, requests spread over them | Done |
+| Context parallelism | Parallelism | A long context's attention split across cards | Done |
+| Prefill and decode on different instances | Serving | A prompt read on one instance and decoded on another, its state handed over | Partial |
 | CUDA on the published cudarc crate | Backends | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | Packaging | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
 | CPU kernels chosen at run time | CPU | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |
-| Qwen3.8 at full speed | Performance | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on long replies, on one and on two cards of a machine where the reference runs, both measured the same day | Done: IQ1_M at or above the reference on one card and on two, UD-Q4_K_XL at it on one card and served on two where the reference cannot load it; short replies and the first token go on in 0.4.0 |
+| Qwen3.8 at full speed | Performance | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and on two cards of a machine where the reference runs, both measured the same day | Partial |
 | A coding agent on large models | Agents | verve completing a multi-step task on the IQ1_M and UD-Q4_K_XL Qwen3.8 files and on DeepSeek V4.1, tool calls and reasoning kept apart | Done |
-| A faster test suite | Tests | The checks a change must pass in a fraction of today's time | Done: about a quarter, the rebuild in place and the slowest tests' setup shared or parallel |
+| A faster test suite | Tests | The checks a change must pass in a fraction of today's time | Done |
 
 ## 0.4.0
 
@@ -28,7 +31,7 @@ Major, by priority:
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
-| ROCm and Vulkan backends | Backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Planned; an OpenCL path exists for the image models |
+| ROCm and Vulkan backends | Backends | One model of each family served through ROCm on an AMD card and through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory, by the same placement path, measured against the CUDA path and the reference engine on the same cards | Started |
 | Coding agents beyond verve | Agents | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
 | Forecasting and tabular models | Models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
 
@@ -37,9 +40,9 @@ Smaller, by priority:
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
 | AVX-512 host kernels for the IQ formats | CPU | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
-| The OpenCL path brought back | Backends | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial: OpenCL kernels for the image models and a speculative driver, untouched since September |
+| The OpenCL path brought back | Backends | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial |
 | A routing profile kept per model | Performance | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
-| Qwen3.8 IQ1_M on one card at the reference | Performance | The reference engine's own bench (128-token replies, 3k and 13k prompts) at or above it on one card it runs on, measured the same day: decode and first token | Planned: behind on both when last measured; verify windows cost nearly a step a row (host misses), the expert cache hits less often after a prefill, and the prefill's expert products run on smaller chunks |
+| Qwen3.8 IQ1_M on one card at the reference | Performance | The reference engine's own bench (128-token replies, 3k and 13k prompts) at or above it on one card it runs on, measured the same day: decode and first token | Planned |
 | Context parallelism inside the recorded step | Parallelism | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
 | Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcripts of a 20-clip set at or below the reference's word error rate, with their real-time factor, committed | Planned |
 | Ultravox on its own | Audio | One pull or checkpoint directory serves an audio turn with no GGUF supplied beside it | Planned |
@@ -75,6 +78,8 @@ Smaller, by priority:
 | Several takes at once | Music | n renders with different seeds in less than n times one render's time, each listed in the answer | Planned |
 | Audio-conditioned sound | Audio | A reference clip conditions Stable Audio and EzAudio, a repaint keeping the clip outside its span (SNR above 30 dB) | Planned |
 | MIDI in | Music | A MIDI file given as the prompt continues for the bars asked, in its tempo and key | Planned |
+| Expert parallelism for resident experts | Parallelism | A mixture layer whose experts all fit on the cards split across them where measured links make it pay, faster than the layer on one card | Planned |
+| Prefill hand-over for split layers and cut caches | Serving | A layer split over cards and a cache cut by positions handed over from the prefill instance, the decode instance reading no prompt | Planned |
 
 ## 0.6.0
 
@@ -138,4 +143,4 @@ to measure it on is available.
 
 | Feature | Acceptance | Needs |
 |---|---|---|---|
-| A backend for Apple silicon | Backends | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | An M-series Mac |
+| A backend for Apple silicon | Backends | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | Waiting |
