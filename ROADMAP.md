@@ -143,6 +143,21 @@ Smaller, by priority:
 | Energy-aware placement | Operations | A placement that trades speed for watts when asked, both measured | Planned |
 | Quotas per key | Operations | Token and request budgets per API key, enforced and reported | Planned |
 
+## 0.9.0
+
+Major, by priority:
+
+| Feature | Category | Acceptance | State |
+|---|---|---|---|
+| A supermodel from several families | Models | Models of different families and vocabularies served as one model: their next-token distributions combined at each step over an aligned vocabulary, the result scoring above each member on a committed task set | Planned |
+
+Smaller, by priority:
+
+| Feature | Category | Acceptance | State |
+|---|---|---|---|
+| Routing between families | Models | One model name answering each request with the member a measured router picks, the choice logged, scoring above each member alone at lower cost than the ensemble | Planned |
+| A supermodel distilled into one | Models | The ensemble's outputs distilled into one member through the adapter training of 0.8.0, served alone near the ensemble's score | Planned |
+
 ## Waiting for hardware
 
 Features that cannot be measured on the machines at hand; each moves into a version once a machine
