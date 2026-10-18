@@ -45,6 +45,8 @@ perf.data*
 *.webp
 *.bmp
 *.wav
+# The golden recording the ASR bench cells transcribe.
+!bench/asr/*.wav
 *.mp3
 *.flac
 *.ogg

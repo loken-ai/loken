@@ -20,6 +20,12 @@ the CUDA Toolkit EULA (`LICENSE-CUDA.txt` in the archive, Attachment A lists the
 under its own licence (`LICENSE-NCCL.txt`) when the build machine provides it. The light archive
 carries none of them.
 
+## Bench recording
+
+`bench/asr/jfk.wav`, the recording the ASR bench cells transcribe, is an excerpt of John F.
+Kennedy's inaugural address of 20 January 1961, a work of the United States federal government
+in the public domain. The file is the 16 kHz mono sample shipped with whisper.cpp (MIT).
+
 ## Borrowed code, measured
 
 Each row states what a file still shares, verbatim, with the upstream it names. Figures come

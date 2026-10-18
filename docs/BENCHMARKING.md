@@ -97,6 +97,11 @@ loken declares and passes `--modality` to assay:
 | tts | `/v1/audio/speech` | real-time factor | produced audio, not silence |
 | asr | `/v1/audio/transcriptions` | word error rate | produced a transcript |
 
+An asr cell transcribes `bench/asr/jfk.wav` and reads its word error rate against
+`bench/asr/jfk.txt` (`ASR_AUDIO` and `ASR_REFERENCE` point elsewhere for a one-off run). vLLM
+transcribes the same Hugging Face checkpoint as the peer, its context held to the decoder length
+the checkpoint declares.
+
 A model loken lists but cannot measure is an **error cell**, visible in the report - never a
 silent skip. The reason says which side lacks it: a model no engine of this build serves (it
 declares no capability), or a capability assay has no clock for (embedding, video, midi).

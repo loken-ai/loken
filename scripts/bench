@@ -19,6 +19,10 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"   # loken/scripts
 LOKEN="$(cd "$HERE/.." && pwd)"                           # loken
 CONFIG="$LOKEN/config.toml"
 MATRIX="$LOKEN/bench/matrix.toml"
+# The golden recording an ASR cell transcribes and the transcript its word error rate is read
+# against. Either can be pointed elsewhere for a one-off run.
+ASR_AUDIO="${ASR_AUDIO:-$LOKEN/bench/asr/jfk.wav}"
+ASR_REFERENCE="${ASR_REFERENCE:-$LOKEN/bench/asr/jfk.txt}"
 LOKEN_URL="${LOKEN_URL:-http://127.0.0.1:11435}"
 
 die() { echo "bench: $*" >&2; exit 1; }
@@ -92,10 +96,14 @@ plan_cell() { # plan_cell <model> <modality> <format>
         image|music|tts)
             engines="loken" ;;   # only loken speaks images/generations, audio/speech here
         asr)
-            if [ -n "${ASR_AUDIO:-}" ] && [ -s "${ASR_AUDIO:-}" ]; then
-                engines="loken"
+            if ! [ -s "$ASR_AUDIO" ]; then
+                err="asr needs a golden audio (no file at $ASR_AUDIO)"
+            elif [ "$fmt" = safetensors ]; then
+                # vLLM serves the same checkpoint on /v1/audio/transcriptions, its context held
+                # to the decoder's own length.
+                engines="loken vllm"; vserve="hf:$m --name $m$(decoder_len_arg "$m")"
             else
-                err="asr needs a golden audio (set ASR_AUDIO=<wav>)"
+                engines="loken"
             fi ;;
         unserved)
             err="not served by loken: it declares no capability" ;;
@@ -105,6 +113,19 @@ plan_cell() { # plan_cell <model> <modality> <format>
     # empty vLLM target) would collapse and shift the error into the wrong column. No field holds a
     # "|".
     printf '%s|%s|%s|%s\n' "$engines" "$amod" "$vserve" "$err"
+}
+
+# " --max-len <n>" from the decoder length a Hugging Face checkpoint declares in the store, or
+# nothing when the store does not hold its configuration.
+decoder_len_arg() { # decoder_len_arg <repo>
+    local cfg
+    cfg="$(ls -d "${HF_HOME:-}"/hub/models--"${1//\//--}"/snapshots/*/config.json 2>/dev/null | head -1)"
+    [ -n "$cfg" ] || return 0
+    python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+n = c.get("max_target_positions") or c.get("max_position_embeddings")
+print(f" --max-len {n}" if isinstance(n, int) else "", end="")' "$cfg"
 }
 
 # Write a visible ERROR cell for a model loken lists but the campaign cannot measure, so it appears
@@ -209,7 +230,15 @@ provision() {
     if [ ! -x "$venv/bin/vllm" ]; then
         echo "provisioning vLLM into $venv (uv pip install vllm)..."
         uv venv "$venv" >&2 || die "uv venv failed"
-        uv pip install --python "$venv/bin/python" vllm >&2 || die "vllm install failed"
+        uv pip install --python "$venv/bin/python" "vllm[audio]" >&2 || die "vllm install failed"
+    fi
+    # The audio extra serves the transcription route; a venv provisioned without it gets it at
+    # the vLLM version it already holds.
+    if ! "$venv/bin/python" -c 'import librosa, soundfile' 2>/dev/null; then
+        local held
+        held="$("$venv/bin/python" -c 'import vllm;print(vllm.__version__)' 2>/dev/null | tail -1)"
+        uv pip install --python "$venv/bin/python" "vllm[audio]==$held" >&2 \
+            || die "vllm audio extra install failed"
     fi
     export VLLM_VENV="$venv"
     have zstd || die "zstd is required to unpack the ollama release (.tar.zst)"
@@ -279,7 +308,7 @@ PY
     local stamp; stamp=$(stat -c %Y "$LOKEN/target/release/lokend")
 
     cd "$LOKEN" || die "cannot cd $LOKEN"
-    local m mod fmt engines amod vserve err ctx st out tag mctxs mstreams
+    local m mod fmt engines amod vserve err ctx st out tag mctxs mstreams asrargs
     while IFS=$'\t' read -r m mod fmt; do
         [ -n "$m" ] || continue
         if [ -n "${BENCH_ONLY:-}" ] && ! [[ " $BENCH_ONLY " == *" $m "* ]]; then continue; fi
@@ -306,12 +335,17 @@ PY
                 echo "kept $m ctx=$ctx stream=$st (already measured, versions current)"; continue
             fi
             echo "===== $m ctx=$ctx stream=$st modality=$amod engines=[$engines]"
+            asrargs=()
+            if [ "$amod" = asr ]; then
+                asrargs=(--audio "$ASR_AUDIO")
+                [ -s "$ASR_REFERENCE" ] && asrargs+=(--reference "$(cat "$ASR_REFERENCE")")
+            fi
             env ENGINES="$engines" STREAM="$st" BENCH_MODE=gpu OUT="$out" VLLM_SERVE="$vserve" \
-                ${ASR_AUDIO:+ASR_AUDIO="$ASR_AUDIO"} \
+                ASR_AUDIO="$ASR_AUDIO" \
                 timeout --kill-after=60 "${CELL_CAP:-7200}" \
                 scripts/fair_bench.sh --models "$m" --prompts "$prompts" --num-ctx "$ctx" \
                 --max-tokens "${MAXTOK:-128}" --iterations 3 --modality "$amod" \
-                ${ASR_AUDIO:+--audio "$ASR_AUDIO"} \
+                "${asrargs[@]}" \
                 2>&1 | tail -4
             [ -s "$out" ] || { echo "no result for $m"; continue; }
             stamp_result "$out" "$stamp"

@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Bench: measure Whisper against vLLM on a golden recording.
 - Responses API: read image and audio input parts as chat completions does.
 
 ### Changed
