@@ -149,13 +149,13 @@ Major, by priority:
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
+| Routing between families | Models | One model name sends each request to the member best suited to it, logs the choice, and scores better than each member alone for less than running them all | Planned |
 | A supermodel from several families | Models | Several models of different families (for example Llama, Mistral, Qwen, DeepSeek) answer together as one model, choosing each word together, and score better than each of them alone on a fixed task set | Planned |
 
 Smaller, by priority:
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
-| Routing between families | Models | One model name sends each request to the member best suited to it, logs the choice, and scores better than each member alone for less than running them all | Planned |
 | A supermodel distilled into one | Models | One member is trained (with the adapter training of 0.8.0) to answer like the group, and scores close to it on its own | Planned |
 
 ## Waiting for hardware
