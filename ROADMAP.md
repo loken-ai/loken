@@ -13,12 +13,12 @@ acceptance is met and measured; until then it stays here with its state.
 | Expert parallelism | A mixture layer's experts split across cards where measured links make it pay | Done for experts that would otherwise sit on the host |
 | Pipeline parallelism across machines | A chain of any length, the prompt-lookup verify crossing every cut | Done |
 | Data parallelism | Copies of a model served side by side, requests spread over them | Done on one machine; across machines through the cluster's routing |
-| Context parallelism | A long context's attention split across cards | Done: each attention layer's cache cut by ranges of positions over the cards, the parts combined on the layer's card, the cut layers outside the recorded step; a request reserves its ranges before its prefill; a 68k-token prompt served on two cards, prefill 55 s against 33 and decode 5.9 tok/s against 10 for one cache |
+| Context parallelism | A long context's attention split across cards | Done: each attention layer's cache cut by ranges of positions over the cards, the parts combined on the layer's card, the cut layers outside the recorded step; a request reserves its ranges before its prefill; a prompt longer than one card's cache served on two, slower than an uncut cache until the step is recorded (0.4.0) |
 | Prefill and decode on different instances | A prompt read on one instance and decoded on another, its state handed over | Done: the KV cache handed over exactly for attention models; recurrent and windowed models hand over their whole decode state; split layers and cut caches still read their prompt where they decode |
 | CUDA on the published cudarc crate | No patched fork, graphs still recorded and replayed | Done |
 | A Linux binary | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
 | CPU kernels chosen at run time | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |
-| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on long replies, on one and two cards | Done: IQ1_M on one card 58-59 tok/s over 600-token replies against 56.5, on two cards 72-97 against 78-85; UD-Q4_K_XL on one card 15-18 tok/s against 16-18, prefill 15-18 s against 20, and on two cards where the reference cannot load it; short replies and the first token on one card go on in 0.4.0 |
+| Qwen3.8 at full speed | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on long replies, on one and on two cards of a machine where the reference runs, both measured the same day | Done: IQ1_M at or above the reference on one card and on two, UD-Q4_K_XL at it on one card and served on two where the reference cannot load it; short replies and the first token go on in 0.4.0 |
 | A coding agent on large models | verve completing a multi-step task on the IQ1_M and UD-Q4_K_XL Qwen3.8 files and on DeepSeek V4.1, tool calls and reasoning kept apart | Done |
 | A faster test suite | The checks a change must pass in a fraction of today's time | Done: about a quarter, the rebuild in place and the slowest tests' setup shared or parallel |
 
@@ -39,7 +39,7 @@ Smaller, by priority:
 | AVX-512 host kernels for the IQ formats | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
 | The OpenCL path brought back | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial: OpenCL kernels for the image models and a speculative driver, untouched since September |
 | A routing profile kept per model | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Planned |
-| Qwen3.8 IQ1_M on one card at the reference | The reference engine's own bench (128-token replies, 3k and 13k prompts) at or above it on one card: decode and first token | Planned: 52-56 tok/s against 70-82, first token 2.7-3.0 s against 1.9 and 8.4-8.8 s against 4.5; verify windows cost nearly a step a row (host misses), the cache hits 84-86% against 89-91%, and the prefill's expert products run on chunks of about 1000 rows against 8192 |
+| Qwen3.8 IQ1_M on one card at the reference | The reference engine's own bench (128-token replies, 3k and 13k prompts) at or above it on one card it runs on, measured the same day: decode and first token | Planned: behind on both when last measured; verify windows cost nearly a step a row (host misses), the expert cache hits less often after a prefill, and the prefill's expert products run on smaller chunks |
 | Context parallelism inside the recorded step | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
 | Audio input proven on real checkpoints | Voxtral and Ultravox transcripts of a 20-clip set at or below the reference's word error rate, with their real-time factor, committed | Planned |
 | Ultravox on its own | One pull or checkpoint directory serves an audio turn with no GGUF supplied beside it | Planned |
@@ -68,7 +68,7 @@ Smaller, by priority:
 | Per-request metrics | Queue, prefill, decode and cache figures per request on the metrics endpoint | Planned |
 | Beam search | n beams with length penalty, the result equal to the reference implementation's | Planned |
 | Prompt embeddings | A request that hands embeddings instead of tokens, answered as for the tokens they stand for | Planned |
-| Streamed speech | The first audio chunk of a speech request within half a second, opus, flac and aac besides wav and mp3 | Planned |
+| Streamed speech | The first audio chunk of a speech request before a tenth of its render time, opus, flac and aac besides wav and mp3 | Planned |
 | Audio from a chat turn | A chat completion asking for text and audio modalities returns the audio in its message | Planned |
 | Concurrent media requests | Two image or speech requests on one card finish sooner together than one after the other | Planned |
 | Streamed music | A streamed music request's first audio bytes arrive before the render ends, within a fifth of its time | Planned |
