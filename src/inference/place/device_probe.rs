@@ -148,6 +148,20 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
     (0..all).map(|i| (i as usize, i)).collect()
 }
 
+/// How many cards this process can open: the ones NVML lists and the process sees on an
+/// NVIDIA runtime, the runtime's own count otherwise.
+pub fn card_count() -> usize {
+    #[cfg(feature = "gpu")]
+    if !crate::tensor::gpu_runtime::IS_NVIDIA {
+        use crate::tensor::gpu_runtime::driver::result as cu;
+        if crate::tensor::cuda::runtime::require().is_err() || cu::init().is_err() {
+            return 0;
+        }
+        return cu::device::get_count().unwrap_or(0).max(0) as usize;
+    }
+    nvml_wrapper::Nvml::init().map_or(0, |nvml| visible_cards(&nvml).len())
+}
+
 /// Per-card VRAM snapshot at debug level, tagged with the load phase that asked.
 /// The instrument task #64 calls for: a context appearing on a card that holds no
 /// layer is invisible in any log until the phase that created it is bracketed.
@@ -390,6 +404,10 @@ pub fn group_sum(_cards: &[usize]) -> Option<(f64, f64)> {
 }
 
 pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
+    #[cfg(feature = "gpu")]
+    if !crate::tensor::gpu_runtime::IS_NVIDIA {
+        return probe_runtime_gpus();
+    }
     let mut gpu_info: Vec<CudaGpuInfo> = Vec::new();
     match nvml_wrapper::Nvml::init() {
         Ok(nvml) => {
@@ -498,6 +516,92 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
         }
     }
     gpu_info
+}
+
+/// Every card the runtime lists, read through the runtime itself, for a runtime NVML does not
+/// see: name and memory from the driver, the throughput proxy from compute units times clock,
+/// the host link from the PCI device's own link in sysfs. Sorted fastest first like
+/// `probe_cuda_gpus`.
+#[cfg(feature = "gpu")]
+fn probe_runtime_gpus() -> Vec<CudaGpuInfo> {
+    use crate::tensor::gpu_runtime::driver::result as cu;
+    use crate::tensor::gpu_runtime::driver::sys::CUdevice_attribute as A;
+    if crate::tensor::cuda::runtime::require().is_err() || cu::init().is_err() {
+        return Vec::new();
+    }
+    let count = cu::device::get_count().unwrap_or(0).max(0) as usize;
+    let mut gpu_info = Vec::new();
+    for i in 0..count {
+        let Ok(d) = cu::device::get(i as i32) else {
+            continue;
+        };
+        let attr = |a| {
+            unsafe { cu::device::get_attribute(d, a) }
+                .unwrap_or(0)
+                .max(0) as u32
+        };
+        let name = cu::device::get_name(d).unwrap_or_else(|_| format!("GPU {i}"));
+        let Ok(card) = crate::tensor::cuda::CudaDevice::get(i) else {
+            continue;
+        };
+        // PLACEMENT-EXEMPT: the probe's own reading of the card it lists.
+        let Ok((free, total)) = card.context().mem_get_info() else {
+            warn!("GPU {i}: the runtime does not report its memory");
+            continue;
+        };
+        let (free, total) = (free as u64, total as u64);
+        let sm_clock = attr(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE) / 1000;
+        let num_cores = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+        let perf_score = (num_cores.max(1) as u64) * sm_clock as u64;
+        let host_link_gbs = pci_host_link_gbs(
+            attr(A::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID),
+            attr(A::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID),
+            attr(A::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID),
+        );
+        info!(
+            "GPU {i}: {name} - {:.1} GB free / {:.1} GB total, {num_cores} compute units @ {sm_clock} MHz (perf {perf_score})",
+            free as f64 / 1e9,
+            total as f64 / 1e9
+        );
+        gpu_info.push(CudaGpuInfo {
+            index: i,
+            stable_free: free,
+            available: free,
+            sm_clock,
+            num_cores,
+            perf_score,
+            total,
+            mem_bw_gbs: cuda_mem_bw_gbs(i),
+            host_link_gbs,
+        });
+    }
+    gpu_info.sort_by(|a, b| b.perf_score.cmp(&a.perf_score).then(a.index.cmp(&b.index)));
+    gpu_info
+}
+
+/// GB/s the PCI device `domain:bus:device` carries to the host: the generation its link
+/// supports at the width it negotiated, from sysfs. 0.0 when sysfs does not say.
+#[cfg(feature = "gpu")]
+fn pci_host_link_gbs(domain: u32, bus: u32, device: u32) -> f64 {
+    let dir = std::path::PathBuf::from(format!(
+        "/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{device:02x}.0"
+    ));
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let width: u32 = read("current_link_width").trim().parse().unwrap_or(0);
+    let gts: f64 = read("max_link_speed")
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    pcie_lane_gbs(pcie_generation_of_gts(gts)) * width as f64
+}
+
+/// The PCIe generation whose lane signals at `gts` GT/s.
+fn pcie_generation_of_gts(gts: f64) -> u32 {
+    [2.5, 5.0, 8.0, 16.0, 32.0, 64.0]
+        .iter()
+        .position(|g| (gts - g).abs() < 0.5)
+        .map_or(0, |p| p as u32 + 1)
 }
 
 /// ACE-Step placement probe: every visible GPU with its usable free VRAM and a

@@ -168,6 +168,73 @@ use super::*;
 /// One list, walked by each test below. Three copies of it meant a format could be added to
 /// `GgmlDType`, given an encoder and a kernel, and still be exercised by none of them - the
 /// lists were what decided, and nothing kept them in step.
+/// The tiled matmul at the shapes a prompt of a real model gives it: an output a few thousand
+/// wide, in many tiles, and a row count that fills no tile. Each row agrees with the mat-vec of
+/// that row alone.
+#[test]
+fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_at_model_shapes() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
+    use crate::tensor::{cuda::CudaDevice, quant_cpu, Device, Tensor};
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the GPU kernels are NOT covered by this run");
+        return;
+    };
+    let device = Device::Cuda(dev);
+    let (k, rows) = (1024usize, 17usize);
+    for n in [2052usize, 2048] {
+        let wf: Vec<f32> = (0..n * k)
+            .map(|i| {
+                let h = (i as u32)
+                    .wrapping_mul(2_246_822_519)
+                    .wrapping_add(374_761_393);
+                ((h >> 8) as f32 / (1 << 24) as f32 - 0.5) * 2.4
+            })
+            .collect();
+        let x: Vec<f32> = (0..rows * k)
+            .map(|i| match i % 32 {
+                0 => 1.27,
+                1 => -1.27,
+                _ => (((i * 37 + i / 32) % 255) as f32 - 127.0) * 0.01,
+            })
+            .collect();
+        for &dtype in BLOCK_QUANTISED {
+            let bytes = quant_cpu::from_float_bytes(dtype, &wf)
+                .unwrap_or_else(|e| panic!("{dtype:?}: encode: {e}"));
+            let qt = QHostTensor::from_bytes(&bytes, dtype, vec![n, k])
+                .unwrap_or_else(|e| panic!("{dtype:?}: from_bytes: {e}"));
+            let qm = QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), &device)
+                .unwrap_or_else(|e| panic!("{dtype:?}: upload: {e}"));
+            let run = |xs: &[f32], r: usize| {
+                let t = Tensor::from_vec_f32(xs.to_vec(), vec![r, k])
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+                qm.forward(&t).unwrap().to_vec_f32()
+            };
+            let tiled = run(&x, rows);
+            assert_eq!(
+                tiled.len(),
+                rows * n,
+                "{dtype:?} n={n}: wrong output length"
+            );
+            for r in [0, rows - 1] {
+                let matvec = run(&x[r * k..(r + 1) * k], 1);
+                let scale = matvec.iter().map(|v| v.abs()).fold(0f32, f32::max) as f64;
+                for o in 0..n {
+                    let (a, b) = (tiled[r * n + o] as f64, matvec[o] as f64);
+                    assert!(
+                        (a - b).abs() <= 4e-3 * scale,
+                        "{dtype:?} n={n} row {r} col {o}: tiled matmul {a} against the mat-vec \
+                         {b} (row scale {scale})"
+                    );
+                }
+            }
+        }
+    }
+}
+
 const BLOCK_QUANTISED: &[GgmlDType] = &[
     GgmlDType::Q4_0,
     GgmlDType::Q4_1,

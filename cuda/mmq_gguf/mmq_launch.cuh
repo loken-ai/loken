@@ -19,9 +19,35 @@
 
 /// How many weight rows one tile covers. Volta and later hold twice as many.
 static int mmq_rows_per_tile(const int cc) {
+    if (GGML_CUDA_CC_IS_AMD(cc)) {
+        const int gen = GGML_CUDA_CC_AMD_GEN(cc);
+        return gen >= 0x1010 && gen < 0x1030 ? 64 : 128;
+    }
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                ? 128
                : 64;
+}
+
+/// Whether the card multiplies whole tiles with AMD's matrix cores, whose operand spans the wave.
+static bool mmq_amd_matrix_cores(const int cc) {
+    return amd_mfma_available(cc) || amd_wmma_available(cc);
+}
+
+/// The widest tile the device code of this card was built for, as `get_mmq_x_max_device`.
+static int mmq_x_max_host(const int cc) {
+    return turing_mma_available(cc) || mmq_amd_matrix_cores(cc) ? 128 : 64;
+}
+
+/// The row granularity of a tile `mmq_x` wide, as `mmq_get_granularity_device`: a width the
+/// device code was not built for writes nothing.
+static int mmq_granularity_host(const int mmq_x, const int cc) {
+    if (mmq_amd_matrix_cores(cc)) {
+        return mmq_x >= 128 ? 32 : 16;
+    }
+    if (turing_mma_available(cc)) {
+        return mmq_x >= 48 ? 16 : 8;
+    }
+    return 8;
 }
 
 /// Launch one already-chosen tile width.
@@ -122,14 +148,14 @@ static void mmq_launch_tile(float *tmp_fixup, const mmq_args &args, cudaStream_t
 template <ggml_type type>
 static void mmq_launch(float *tmp_fixup, const mmq_args &args, cudaStream_t stream, const int cc,
                        const int nsm, const size_t smpbo, const int warp_size_host) {
-    const int mmq_x_max = turing_mma_available(cc) ? 128 : 64;
+    const int mmq_x_max = mmq_x_max_host(cc);
     const int mmq_y = mmq_rows_per_tile(cc);
     const int nwarps = 256 / warp_size_host;
 
     int best = 0;
     int fewest_tiles = INT_MAX;
     for (int mmq_x = 8; mmq_x <= mmq_x_max && fewest_tiles > 1; mmq_x += 8) {
-        const int granularity = (turing_mma_available(cc) && mmq_x >= 48) ? 16 : 8;
+        const int granularity = mmq_granularity_host(mmq_x, cc);
         if (mmq_x % granularity != 0) {
             continue;
         }
@@ -228,14 +254,14 @@ static int mmq_moe_launch(const char *x, const char *x_second, int64_t dst_secon
                           int64_t stride_col_dst, int n_experts, int64_t ncols_max,
                           int64_t ncols_hint, int mmq_x, cudaStream_t stream, const int cc,
                           const size_t smpbo, const int warp_size_host) {
-    const int mmq_x_max = turing_mma_available(cc) ? 128 : 64;
+    const int mmq_x_max = mmq_x_max_host(cc);
     const int mmq_y = mmq_rows_per_tile(cc);
     const int nwarps = 256 / warp_size_host;
 
     int best = 0;
     int fewest_tiles = INT_MAX;
     for (int w = 8; w <= mmq_x_max; w += 8) {
-        const int granularity = (turing_mma_available(cc) && w >= 48) ? 16 : 8;
+        const int granularity = mmq_granularity_host(w, cc);
         if (w % granularity != 0) {
             continue;
         }

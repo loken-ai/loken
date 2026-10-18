@@ -5,8 +5,17 @@
 //! `crate::tensor::gpu_runtime::...`, so a second runtime with the same surface can stand here
 //! without the callers changing.
 
+/// Whether the runtime drives NVIDIA cards: kernels written in NVIDIA's own instructions run
+/// only then, whatever a card reports about itself.
+pub const IS_NVIDIA: bool = cfg!(feature = "cuda");
+
 #[cfg(feature = "cuda")]
 pub use cudarc::{cublas, cublaslt, driver, nccl, nvrtc};
 
-#[cfg(not(feature = "cuda"))]
-compile_error!("the gpu feature needs a runtime feature: cuda");
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+mod hip;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+pub use hip::{cublas, cublaslt, driver, nccl, nvrtc};
+
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+compile_error!("the gpu feature needs a runtime feature: cuda or rocm");

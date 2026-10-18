@@ -6,6 +6,12 @@ cuda/flash_prefill_gqa.cu	0.0%	0	vllm/csrc/libtorch_stable/kimi_k3/fused_kda_dec
 cuda/flashdecode_tc/flashdecode_tc.cu	0.0%	0	llama.cpp/ggml/src/ggml-cuda/fattn-vec.cuh
 cuda/fused_norm_f16.cu	0.0%	0	vllm/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu
 cuda/gptoss_flash_decode.cu	0.0%	0	attention.rs/src/kernels/src/flash/flash_decode_paged.cuh
+cuda/hip/cuda.h	0.0%	0	-
+cuda/hip/cuda_bf16.h	0.0%	0	-
+cuda/hip/cuda_fp16.h	0.0%	0	-
+cuda/hip/cuda_runtime.h	0.0%	0	-
+cuda/hip/loken_hip.h	0.0%	0	-
+cuda/hip/mma.h	0.0%	0	-
 cuda/marlin/dequant.h	0.0%	0	-
 cuda/marlin/kernel.h	0.0%	0	-
 cuda/marlin/marlin.cuh	0.0%	0	-

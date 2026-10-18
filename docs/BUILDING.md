@@ -14,6 +14,18 @@ that list is not probed against your toolkit: one that does not know `sm_120a` f
 rather than skipping it. `CUDA_PATH` or `CUDA_HOME` says where the toolkit is if it is not where
 the build looks; `CUDNN_LIB` does the same for cuDNN.
 
+## AMD cards (ROCm)
+
+```sh
+cargo build --release --no-default-features --features rocm,cpu
+```
+
+The build wants ROCm's `hipcc` on the `PATH` or under `ROCM_PATH`. The kernels are compiled for
+the AMD targets from CDNA (gfx908) to RDNA4 (gfx1201); `LOKEN_ROCM_ARCHS` narrows the list. The
+HIP runtime, hipBLAS, hipRTC and RCCL are opened when the server starts, so the binary starts on
+a machine without them and lists no AMD card. Not yet on AMD: the replayed decode step and the
+kernels written in NVIDIA's own matrix instructions, whose callers take their other paths.
+
 ## Without CUDA
 
 ```sh

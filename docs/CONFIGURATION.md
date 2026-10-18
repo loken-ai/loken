@@ -284,6 +284,7 @@ model; the keys are:
 | Feature | Default | What it adds |
 |---|---|---|
 | `cuda`, `opencl` | on | The device backends. |
+| `rocm` | off | AMD cards through HIP, in place of `cuda`: `--no-default-features --features rocm,cpu`. |
 | `image`, `audio`, `video`, `midi`, or `media` for all | on | The generative-media families and their routes. |
 | `metrics` | off | `GET /metrics` in OpenMetrics, behind the same authentication as every other route. |
 | `cpu` | off | Language models on the host only. |

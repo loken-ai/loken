@@ -82,6 +82,202 @@ fn main() {
         compile_marlin_kernels();
         compile_flashdecode_tc_kernels();
     }
+    // The same kernels for AMD cards, through HIP, when ROCm is the runtime.
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    compile_hip_kernels();
+}
+
+/// Kernels in NVIDIA's Ampere tensor-core instructions (bf16 warp-matrix, `m16n8k32` integer MMA).
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+const KERNELS_AMPERE_ONLY: [&str; 6] = [
+    "cuda/q4k_mmvq_imma.cu",
+    "cuda/moe/dense_q4k_imma_m8.cu",
+    "cuda/moe/dense_q5k_imma_m8.cu",
+    "cuda/moe/moe_q4k_imma_m8.cu",
+    "cuda/moe/moe_q4k_imma_m8_down.cu",
+    "cuda/moe/moe_wmma_gguf.cu",
+];
+
+/// The kernel families every card serves, compiled per architecture.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+const KERNELS: [&str; 30] = [
+    "cuda/fused_norm_f16.cu",
+    "cuda/gptoss_flash_decode.cu",
+    "cuda/flash_decode_f16.cu",
+    "cuda/flash_decode_tiled_probe.cu",
+    "cuda/sampling.cu",
+    "cuda/moe/add_rms_norm.cu",
+    "cuda/moe/rms_qmatmul.cu",
+    "cuda/moe/moe_gguf.cu",
+    "cuda/moe/embed_rows_q8_0.cu",
+    "cuda/moe/moe_mmq.cu",
+    "cuda/moe/attn_post_qkv.cu",
+    "cuda/moe/kv_residual_scatter.cu",
+    "cuda/moe/gated_delta_net.cu",
+    "cuda/moe/gated_delta_net_chunked.cu",
+    "cuda/moe/fused_conv_silu.cu",
+    "cuda/moe/zgate_rmsnorm.cu",
+    "cuda/moe/hyper_residual.cu",
+    "cuda/moe/gdn_prep.cu",
+    "cuda/moe/qk_prep.cu",
+    "cuda/moe/shared_expert.cu",
+    "cuda/moe/indexer.cu",
+    "cuda/moe/deltanet_gate.cu",
+    "cuda/moe/l2norm_gqa.cu",
+    "cuda/moe/head_rmsnorm.cu",
+    "cuda/moe/gate_gemv.cu",
+    "cuda/moe/bf16_matvec.cu",
+    "cuda/moe/gate_topk.cu",
+    "cuda/moe/tier_graph.cu",
+    "cuda/moe/tp_local.cu",
+    "cuda/moe/lfm2_shortconv_f16.cu",
+];
+
+/// The quantised matrix products, one translation unit per weight format.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+const KERNELS_MMQ: [&str; 18] = [
+    "cuda/mmq_gguf/mmq_quantize.cu",
+    "cuda/mmq_gguf/mmq_instance_q4_0.cu",
+    "cuda/mmq_gguf/mmq_instance_q4_1.cu",
+    "cuda/mmq_gguf/mmq_instance_q5_0.cu",
+    "cuda/mmq_gguf/mmq_instance_q5_1.cu",
+    "cuda/mmq_gguf/mmq_instance_q8_0.cu",
+    "cuda/mmq_gguf/mmq_instance_q2_0.cu",
+    "cuda/mmq_gguf/mmq_instance_q2_k.cu",
+    "cuda/mmq_gguf/mmq_instance_q3_k.cu",
+    "cuda/mmq_gguf/mmq_instance_q4_k.cu",
+    "cuda/mmq_gguf/mmq_instance_q5_k.cu",
+    "cuda/mmq_gguf/mmq_instance_q6_k.cu",
+    "cuda/mmq_gguf/mmq_instance_mxfp4.cu",
+    "cuda/mmq_gguf/mmq_instance_iq4_nl.cu",
+    "cuda/mmq_gguf/mmq_instance_iq3_s.cu",
+    "cuda/mmq_gguf/mmq_instance_iq3_xxs.cu",
+    "cuda/mmq_gguf/mmq_instance_iq2_s.cu",
+    "cuda/mmq_gguf/mmq_instance_iq4_xs.cu",
+];
+
+/// The AMD targets a portable ROCm build carries code for, oldest first: CDNA (MFMA), RDNA2,
+/// RDNA3, RDNA3.5 and RDNA4 (WMMA from RDNA3 on). The runtime loads the object for the card it
+/// finds; a card none of them covers has no GPU code in this build.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+const ROCM_ARCHS: [&str; 11] = [
+    "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151",
+    "gfx1200", "gfx1201",
+];
+
+/// The kernel families every AMD card serves, compiled with hipcc for the targets of
+/// `LOKEN_ROCM_ARCHS` (comma separated) or, without it, every target of [`ROCM_ARCHS`]. The
+/// sources are the CUDA build's, read through `cuda/hip`, which gives the CUDA names their HIP
+/// meaning; the kernels in NVIDIA's own instructions are left out and `cuda/hip/nvidia_only.cpp`
+/// stands for their launchers. HIP has no static runtime: the binary links `libamdhip64`.
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+fn compile_hip_kernels() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=LOKEN_ROCM_ARCHS");
+    let rocm = std::env::var("ROCM_PATH")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            let out = Command::new("sh")
+                .args(["-c", "command -v hipcc"])
+                .output()
+                .ok()?;
+            let hipcc = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+            Some(
+                std::fs::canonicalize(hipcc)
+                    .ok()?
+                    .parent()?
+                    .parent()?
+                    .to_path_buf(),
+            )
+        });
+    let Some(rocm) = rocm else {
+        panic!("hipcc not found: set ROCM_PATH or put hipcc on PATH (needed for the AMD kernels)");
+    };
+    let hipcc = rocm.join("bin").join("hipcc");
+    assert!(hipcc.exists(), "hipcc not found at {hipcc:?}");
+    let archs: Vec<String> = match std::env::var("LOKEN_ROCM_ARCHS") {
+        Ok(list) => list
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect(),
+        Err(_) => ROCM_ARCHS.iter().map(|a| a.to_string()).collect(),
+    };
+    let nvidia_only: Vec<&str> = KERNELS_AMPERE_ONLY.to_vec();
+    let mut sources: Vec<&str> = KERNELS
+        .iter()
+        .chain(KERNELS_MMQ.iter())
+        .copied()
+        .filter(|s| !nvidia_only.contains(s))
+        .collect();
+    sources.extend([
+        "cuda/flashdecode_tc/flashdecode_tc.cu",
+        "cuda/flash_prefill_f16.cu",
+        "cuda/flash_prefill_gqa.cu",
+        "cuda/hip/nvidia_only.cpp",
+    ]);
+    println!("cargo:rerun-if-changed=cuda/hip");
+    let mut flags: Vec<String> = vec!["-x".into(), "hip".into()];
+    flags.extend(archs.iter().map(|a| format!("--offload-arch={a}")));
+    flags.extend(
+        [
+            "-O3",
+            "-std=c++17",
+            "-fPIC",
+            "-include",
+            "cuda/hip/loken_hip.h",
+            "-I",
+            "cuda/hip",
+            "-I",
+            "cuda",
+            "-I",
+            "cuda/moe",
+            "-I",
+            "cuda/mmq_gguf",
+        ]
+        .iter()
+        .map(|f| f.to_string()),
+    );
+    let handles: Vec<std::thread::JoinHandle<PathBuf>> = sources
+        .into_iter()
+        .map(|src| {
+            println!("cargo:rerun-if-changed={src}");
+            let (hipcc, out_dir, flags) = (hipcc.clone(), out_dir.clone(), flags.clone());
+            std::thread::spawn(move || {
+                let stem = std::path::Path::new(src)
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                let obj = out_dir.join(format!("hip_{stem}.o"));
+                compile_kernel(&hipcc, src, &flags, &obj);
+                obj
+            })
+        })
+        .collect();
+    let objs: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let lib = out_dir.join("libloken_hip_kernels.a");
+    let _ = std::fs::remove_file(&lib);
+    let mut ar_args: Vec<String> = vec!["rcs".into(), lib.to_str().unwrap().into()];
+    ar_args.extend(objs.iter().map(|o| o.to_str().unwrap().to_string()));
+    let ar = Command::new("ar")
+        .args(&ar_args)
+        .status()
+        .expect("failed to run ar");
+    assert!(ar.success(), "ar failed for libloken_hip_kernels.a");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=loken_hip_kernels");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        rocm.join("lib").display()
+    );
+    println!("cargo:rustc-link-lib=dylib=amdhip64");
 }
 
 /// With `LOKEN_STATIC_CXX` set, links the C++ runtime into the binary so it needs no
@@ -394,26 +590,7 @@ fn compile_mmq_kernels() {
     // arch >= 90 needs the 'a' (arch-specific) suffix for its full ISA.
     let gencode_list = portable_gencodes();
 
-    let sources = [
-        "cuda/mmq_gguf/mmq_quantize.cu",
-        "cuda/mmq_gguf/mmq_instance_q4_0.cu",
-        "cuda/mmq_gguf/mmq_instance_q4_1.cu",
-        "cuda/mmq_gguf/mmq_instance_q5_0.cu",
-        "cuda/mmq_gguf/mmq_instance_q5_1.cu",
-        "cuda/mmq_gguf/mmq_instance_q8_0.cu",
-        "cuda/mmq_gguf/mmq_instance_q2_0.cu",
-        "cuda/mmq_gguf/mmq_instance_q2_k.cu",
-        "cuda/mmq_gguf/mmq_instance_q3_k.cu",
-        "cuda/mmq_gguf/mmq_instance_q4_k.cu",
-        "cuda/mmq_gguf/mmq_instance_q5_k.cu",
-        "cuda/mmq_gguf/mmq_instance_q6_k.cu",
-        "cuda/mmq_gguf/mmq_instance_mxfp4.cu",
-        "cuda/mmq_gguf/mmq_instance_iq4_nl.cu",
-        "cuda/mmq_gguf/mmq_instance_iq3_s.cu",
-        "cuda/mmq_gguf/mmq_instance_iq3_xxs.cu",
-        "cuda/mmq_gguf/mmq_instance_iq2_s.cu",
-        "cuda/mmq_gguf/mmq_instance_iq4_xs.cu",
-    ];
+    let sources = KERNELS_MMQ;
     println!("cargo:rerun-if-changed=cuda/mmq_gguf");
 
     // The instance files are heavy template expansions (~20s each)  -
@@ -493,46 +670,8 @@ fn compile_imma_kernels() {
     // do not exist below sm_80. Each of these is an accelerated variant of work the generic
     // quantised path also does, so a Turing card loses speed here, not capability - provided
     // the call site declines rather than launching a kernel with no code for it.
-    let ampere_only = [
-        "cuda/q4k_mmvq_imma.cu",
-        "cuda/moe/dense_q4k_imma_m8.cu",
-        "cuda/moe/dense_q5k_imma_m8.cu",
-        "cuda/moe/moe_q4k_imma_m8.cu",
-        "cuda/moe/moe_q4k_imma_m8_down.cu",
-        "cuda/moe/moe_wmma_gguf.cu",
-    ];
-    let sources = [
-        "cuda/fused_norm_f16.cu",
-        "cuda/gptoss_flash_decode.cu",
-        "cuda/flash_decode_f16.cu",
-        "cuda/flash_decode_tiled_probe.cu",
-        "cuda/sampling.cu",
-        "cuda/moe/add_rms_norm.cu",
-        "cuda/moe/rms_qmatmul.cu",
-        "cuda/moe/moe_gguf.cu",
-        "cuda/moe/embed_rows_q8_0.cu",
-        "cuda/moe/moe_mmq.cu",
-        "cuda/moe/attn_post_qkv.cu",
-        "cuda/moe/kv_residual_scatter.cu",
-        "cuda/moe/gated_delta_net.cu",
-        "cuda/moe/gated_delta_net_chunked.cu",
-        "cuda/moe/fused_conv_silu.cu",
-        "cuda/moe/zgate_rmsnorm.cu",
-        "cuda/moe/hyper_residual.cu",
-        "cuda/moe/gdn_prep.cu",
-        "cuda/moe/qk_prep.cu",
-        "cuda/moe/shared_expert.cu",
-        "cuda/moe/indexer.cu",
-        "cuda/moe/deltanet_gate.cu",
-        "cuda/moe/l2norm_gqa.cu",
-        "cuda/moe/head_rmsnorm.cu",
-        "cuda/moe/gate_gemv.cu",
-        "cuda/moe/bf16_matvec.cu",
-        "cuda/moe/gate_topk.cu",
-        "cuda/moe/tier_graph.cu",
-        "cuda/moe/tp_local.cu",
-        "cuda/moe/lfm2_shortconv_f16.cu",
-    ];
+    let ampere_only = KERNELS_AMPERE_ONLY;
+    let sources = KERNELS;
     // These shipped as compute_80 PTX alone. PTX only ever JITs UPWARD, so that was not a
     // portable build with a slow path for older cards - it was a build from which no Turing
     // card could load a single kernel. Real SASS per architecture, like every other family.
@@ -606,7 +745,7 @@ fn compile_imma_kernels() {
 /// checkout of the same sources, takes the objects it needs from the cache.
 ///
 /// The key covers the compiler's version, the flags, the source and every header it includes.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn compile_kernel(nvcc: &std::path::Path, src: &str, flags: &[String], obj: &std::path::Path) {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -625,10 +764,13 @@ fn compile_kernel(nvcc: &std::path::Path, src: &str, flags: &[String], obj: &std
         .unwrap_or_else(|e| panic!("failed to run nvcc -MM for {src}: {e}"));
     assert!(deps.status.success(), "nvcc -MM failed for {src}");
     let rule = String::from_utf8_lossy(&deps.stdout).replace("\\\n", " ");
+    // A HIP compiler writes one rule per target with bundle markers between them: what
+    // names a file is a dependency, everything else is syntax.
     let mut inputs: Vec<&str> = rule
         .split_once(':')
         .map_or("", |(_, d)| d)
         .split_whitespace()
+        .filter(|t| std::path::Path::new(t).is_file())
         .collect();
     inputs.push(src);
     inputs.sort_unstable();

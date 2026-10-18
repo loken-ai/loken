@@ -206,6 +206,11 @@ pub fn flash_dit_bf16(
     if k.dims4()? != v.dims4()? {
         return Ok(None);
     }
+    // The kernel is written in NVIDIA's warp-matrix instructions: another runtime has no build
+    // of it.
+    if !crate::tensor::gpu_runtime::IS_NVIDIA {
+        return Ok(None);
+    }
     // This kernel ships SASS only for the architectures whose shared memory fits its
     // tile, and a missing kernel image is an ASYNC error the raw launcher cannot
     // report. The first call on each device is synchronized and checked; a card the

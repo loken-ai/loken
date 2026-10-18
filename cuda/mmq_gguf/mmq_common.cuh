@@ -97,6 +97,10 @@ GGUF_FORMATS(GGUF_TYPE_TRAITS)
 
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc) (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
+// An AMD card is this offset plus its generation, the hexadecimal digits of its gfx name.
+#define GGML_CUDA_CC_OFFSET_AMD 0x1000000
+#define GGML_CUDA_CC_IS_AMD(cc) (cc >= GGML_CUDA_CC_OFFSET_AMD)
+#define GGML_CUDA_CC_AMD_GEN(cc) ((cc) - GGML_CUDA_CC_OFFSET_AMD)
 
 /// The newest architecture this build has code for that the card can still run.
 ///
@@ -182,10 +186,22 @@ static bool fp16_mma_hardware_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA;
 }
 
-/// AMD's matrix cores, for the day this builds under a HIP toolchain. Under nvcc there are none
-/// - not "not yet compiled for", none - so these answer from the vendor and not from the list.
-static bool amd_mfma_available(const int /*cc*/) { return false; }
-static bool amd_wmma_available(const int /*cc*/) { return false; }
+/// AMD's matrix cores, from the card's generation: MFMA on the data-centre line (gfx908 and
+/// after in the gfx9 family), WMMA from RDNA3 (gfx11 and gfx12). An NVIDIA card has neither.
+static bool amd_mfma_available(const int cc) {
+    if (!GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
+    }
+    const int gen = GGML_CUDA_CC_AMD_GEN(cc);
+    return gen >= 0x908 && gen < 0x1000;
+}
+static bool amd_wmma_available(const int cc) {
+    if (!GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
+    }
+    const int gen = GGML_CUDA_CC_AMD_GEN(cc);
+    return gen >= 0x1100 && gen < 0x1300;
+}
 
 static bool turing_mma_available(const int cc) {
     return compiled_at_least(cc, GGML_CUDA_CC_TURING);
@@ -199,11 +215,15 @@ static bool blackwell_mma_available(const int cc) {
 // Device helpers
 // ============================================================
 
-/// The lanes a warp-wide exchange spans, as a constant expression. The shuffles state it
-/// directly as `WARP_SIZE`; the tile geometry and the launch bounds ask through this because
-/// they are computed at compile time.
+/// The lanes the hardware runs together, as a constant expression: 64 on the AMD generations
+/// whose waves are 64 wide (GCN and CDNA), `WARP_SIZE` otherwise. The tile geometry and the
+/// launch bounds ask through this because they are computed at compile time.
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
+#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
+    return 64;
+#else
     return WARP_SIZE;
+#endif
 }
 
 /// The body of a dispatch arm the running architecture has no instruction for.

@@ -987,10 +987,7 @@ pub fn trim_cuda_pools() {
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cuMemPoolTrimTo, cudaError_enum,
             CUmemPool_attribute, CUmemoryPool,
         };
-        let device_count = match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => crate::inference::place::device_probe::visible_cards(&nvml).len() as i32,
-            Err(_) => 0,
-        };
+        let device_count = crate::inference::place::device_probe::card_count() as i32;
         for ordinal in 0..device_count {
             unsafe {
                 let mut pool: CUmemoryPool = std::ptr::null_mut();
@@ -1044,10 +1041,7 @@ pub fn release_cuda_pools() {
     // Iterate over physical CUDA devices. cuDeviceGetCount is safer than
     // querying via crate::tensor::gpu_runtime::driver::CudaContext (which would create a new
     // context just to count). We use the raw FFI directly.
-    let device_count = match nvml_wrapper::Nvml::init() {
-        Ok(nvml) => crate::inference::place::device_probe::visible_cards(&nvml).len() as i32,
-        Err(_) => 0,
-    };
+    let device_count = crate::inference::place::device_probe::card_count() as i32;
     let mut released = 0u64;
     for ordinal in 0..device_count {
         unsafe {

@@ -345,10 +345,15 @@ impl DeviceManager {
             // Check up to 8 devices
             if let Ok(_device) = Device::new_cuda(i) {
                 // Get device properties via NVML if available
-                let name = self
-                    .get_cuda_device_name(i)
-                    .unwrap_or_else(|_| format!("CUDA Device {}", i));
-                let memory = self.get_cuda_device_memory(i).unwrap_or(0);
+                let (name, memory) = if crate::tensor::gpu_runtime::IS_NVIDIA {
+                    (
+                        self.get_cuda_device_name(i)
+                            .unwrap_or_else(|_| format!("CUDA Device {}", i)),
+                        self.get_cuda_device_memory(i).unwrap_or(0),
+                    )
+                } else {
+                    runtime_name_and_memory(i)
+                };
 
                 let device = ComputeDevice::new(self.devices.len(), DeviceType::Cuda, name, memory);
 
@@ -1212,4 +1217,16 @@ mod tests {
         let available = device.available_memory_for_model();
         assert!(available < 4 * 1024 * 1024 * 1024);
     }
+}
+
+/// A card's name and total memory as the runtime reports them, for a runtime NVML does not see.
+#[cfg(feature = "gpu")]
+fn runtime_name_and_memory(ordinal: usize) -> (String, u64) {
+    use crate::tensor::gpu_runtime::driver::result as cu;
+    let Ok(d) = cu::device::get(ordinal as i32) else {
+        return (format!("GPU {ordinal}"), 0);
+    };
+    let name = cu::device::get_name(d).unwrap_or_else(|_| format!("GPU {ordinal}"));
+    let total = unsafe { cu::device::total_mem(d) }.unwrap_or(0) as u64;
+    (name, total)
 }

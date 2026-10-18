@@ -83,6 +83,8 @@ nvml-wrapper = "0.12"
 # all models implemented in-crate (inference/native_* + generic_transformer +
 # native_sampling/native_ops); quantized GGUF + safetensors loaders included.
 # cudarc backs the CUDA device, stream and NCCL layer.
+# The HIP runtime and libraries, opened at run time by the rocm feature.
+libloading = { version = "0.9", optional = true }
 cudarc = { version = "0.19.10", package = "cudarc", optional = true, default-features = false, features = [
     "std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8",
     "cuda-version-from-build-system", "dynamic-loading", "nccl",
@@ -148,6 +150,8 @@ gpu = []
 # cannot name. Built and tested against 13.3; see the README for the rest.
 # https://developer.nvidia.com/cuda-downloads
 cuda = ["gpu", "dep:cudarc"]
+# ROCm/HIP for AMD cards: the same GPU code paths over the HIP runtime, opened at run time.
+rocm = ["gpu", "dep:libloading"]
 # A GET /metrics scrape endpoint. Off by default: the published default binds localhost and
 # does not authenticate, and compiling a scrape endpoint in regardless would widen that
 # surface without anyone asking. When on it sits behind the same authentication as every

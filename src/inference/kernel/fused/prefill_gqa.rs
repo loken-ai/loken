@@ -105,7 +105,13 @@ fn run(
 ) -> Result<Option<(Tensor, Option<Tensor>)>> {
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
-    if !q.device().is_cuda() || k.dtype() != DType::F16 || v.dtype() != DType::F16 {
+    // The kernel is written in NVIDIA's own matrix instructions; another runtime keeps the
+    // caller's path.
+    if !q.device().is_cuda()
+        || !crate::tensor::gpu_runtime::IS_NVIDIA
+        || k.dtype() != DType::F16
+        || v.dtype() != DType::F16
+    {
         return Ok(None);
     }
     let (b, n_head, seq_q, hd) = q.dims4()?;

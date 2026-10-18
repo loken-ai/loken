@@ -481,7 +481,7 @@ impl CudaDevice {
     /// sm_80, so those families ship no code for a Turing card and their callers have to
     /// decline the same way they decline an unsupported dtype - a launch would fail.
     pub fn has_ampere_tensor_cores(&self) -> bool {
-        self.mmq_device_info().is_ok_and(|i| i.cc >= 800)
+        crate::tensor::gpu_runtime::IS_NVIDIA && self.mmq_device_info().is_ok_and(|i| i.cc >= 800)
     }
 
     pub fn mmq_device_info(&self) -> Result<MmqDeviceInfo> {
@@ -501,8 +501,20 @@ impl CudaDevice {
             sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
             0,
         );
+        // An NVIDIA card's compute capability, or an AMD card's generation above the offset the
+        // kernels test, so no NVIDIA-only path opens for it.
+        #[cfg(feature = "cuda")]
+        let cc = major * 100 + minor * 10;
+        #[cfg(not(feature = "cuda"))]
+        let cc = {
+            let _ = (major, minor);
+            result::device::gcn_arch_name(cu_device)
+                .ok()
+                .and_then(|name| amd_generation(&name))
+                .map_or(AMD_CC_OFFSET, |g| AMD_CC_OFFSET + g)
+        };
         let info = MmqDeviceInfo {
-            cc: major * 100 + minor * 10,
+            cc,
             nsm: attr(
                 sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
                 1,
@@ -817,6 +829,22 @@ pub(crate) fn dev_const_i32(dev: &CudaDevice, vals: &[i32]) -> Result<Arc<CudaSl
     Ok(arc)
 }
 
+/// Where the kernels' `cc` encoding puts an AMD card: its generation is added to this, so every
+/// value at or above it is not an NVIDIA compute capability.
+#[cfg(any(not(feature = "cuda"), test))]
+pub const AMD_CC_OFFSET: i32 = 0x100_0000;
+
+/// An AMD card's generation from its architecture name: the hexadecimal digits after `gfx`, before
+/// any feature suffix (`gfx1201:sramecc-` is `0x1201`, `gfx90a` is `0x90a`).
+#[cfg(any(not(feature = "cuda"), test))]
+pub fn amd_generation(arch: &str) -> Option<i32> {
+    let digits = arch.strip_prefix("gfx")?.split(':').next()?;
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    i32::from_str_radix(digits, 16).ok()
+}
+
 /// Typed device buffer. Mirrors `CpuStorage`, holding vendored-`cudarc` slices
 /// so existing launch sites can consume them directly.
 #[derive(Debug)]
@@ -829,4 +857,21 @@ pub enum CudaStorage {
     F16(CudaSlice<half::f16>),
     BF16(CudaSlice<half::bf16>),
     F32(CudaSlice<f32>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_amd_generation_is_read_from_the_architecture_name() {
+        assert_eq!(amd_generation("gfx1201"), Some(0x1201));
+        assert_eq!(amd_generation("gfx1201:sramecc-:xnack-"), Some(0x1201));
+        assert_eq!(amd_generation("gfx90a"), Some(0x90a));
+        assert_eq!(amd_generation("gfx942"), Some(0x942));
+        assert_eq!(amd_generation("sm_120"), None);
+        assert_eq!(amd_generation("gfx"), None);
+        // Above the offset: never read as an NVIDIA compute capability.
+        assert!(AMD_CC_OFFSET + 0x1201 > 0x0100000);
+    }
 }

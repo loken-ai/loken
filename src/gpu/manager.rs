@@ -56,6 +56,9 @@ impl GPUManagerImpl {
         let nvml = if force_cpu() {
             info!("--cpu: skipping NVML init (no GPU monitoring in CPU-only mode)");
             None
+        } else if cfg!(all(feature = "gpu", not(feature = "cuda"))) {
+            // NVML lists NVIDIA cards, which this runtime does not drive.
+            None
         } else {
             match nvml_wrapper::Nvml::init() {
                 Ok(nvml) => {

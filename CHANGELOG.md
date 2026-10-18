@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- ROCm: serve language models on AMD cards through HIP.
 - Forecast: serve time series quantile forecasts on POST /v1/forecast.
 - Ultravox: serve a checkpoint alone and pull the text model it names.
 - MIDI: render at the tempo the request names in bpm.
