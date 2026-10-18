@@ -355,6 +355,19 @@ impl SpecKvCache {
         Ok(Some(SpecKvSnapshot { k, v, len }))
     }
 
+    /// Device bytes `snapshot` would copy: K and V for the positions held.
+    pub fn snapshot_bytes(&self) -> u64 {
+        let len = self.current_seq_len;
+        let per = |t: &Tensor| {
+            let rows = t.dims()[self.dim].max(1);
+            (t.elem_count() / rows * len * t.dtype().size_in_bytes()) as u64
+        };
+        match (self.k.as_ref(), self.v.as_ref()) {
+            (Some(k), Some(v)) if len > 0 && k.device().is_cuda() => per(k) + per(v),
+            _ => 0,
+        }
+    }
+
     /// Makes a snapshot the whole content of the cache.
     pub fn restore(&mut self, snap: &SpecKvSnapshot) -> Result<()> {
         self.current_seq_len = 0;

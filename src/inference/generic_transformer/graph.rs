@@ -1823,6 +1823,9 @@ impl GenericHeteroTransformer {
             self.kv_snapshots.clear();
             return Ok(());
         }
+        if !self.room_for_snapshot(&tokens) {
+            return Ok(());
+        }
         let layers = match self.capture_layers() {
             Ok(layers) => layers,
             Err(e) => {
@@ -1832,6 +1835,35 @@ impl GenericHeteroTransformer {
         };
         self.store_snapshot(tokens, kv_len, layers, None);
         Ok(())
+    }
+
+    /// Makes room on the cards for a snapshot of what the layers hold now, before it is
+    /// copied: while the copy does not fit in the free memory less what the snapshot budget
+    /// keeps aside, drops the snapshot `tokens` would replace, then the least recently used.
+    /// False, with nothing copied, when it still does not fit once none is left.
+    fn room_for_snapshot(&mut self, tokens: &[u32]) -> bool {
+        let need: u64 = self.layers.iter().map(layer_snapshot_bytes).sum();
+        let reserve = self.snapshot_reserve();
+        loop {
+            let free = self.free_device_memory();
+            if snapshot_fits(need, free, reserve) {
+                return true;
+            }
+            let existing: Vec<(&[u32], u64)> = self
+                .kv_snapshots
+                .iter()
+                .map(|s| (s.tokens.as_slice(), s.tick))
+                .collect();
+            let Some(victim) = snapshot_slot(&existing, tokens, existing.len()) else {
+                tracing::debug!(
+                    "kv snapshot skipped: {need} bytes do not fit in {} free bytes less {reserve} kept aside",
+                    free.unwrap_or(0)
+                );
+                return false;
+            };
+            self.kv_snapshots.swap_remove(victim);
+            crate::inference::place::ladder::release_pools();
+        }
     }
 
     /// Every layer's KV, and every recurrent mixer's state, copied aside.
@@ -1914,6 +1946,9 @@ impl GenericHeteroTransformer {
         if !self.is_recurrent() {
             return Ok(());
         }
+        if !self.room_for_snapshot(prompt) {
+            return Ok(());
+        }
         let layers = match self.capture_layers() {
             Ok(layers) => layers,
             Err(e) => {
@@ -1993,31 +2028,37 @@ impl GenericHeteroTransformer {
         }
     }
 
+    /// Device memory the snapshots leave free: the working window the cache may still grow
+    /// by, the free memory the next prefill sizes its chunk from (the chunk's bytes times the
+    /// share of free memory a chunk may take), for a model that declares its chunk, and what a
+    /// decode was seen to take.
+    fn snapshot_reserve(&self) -> u64 {
+        let (layers, n_kv, hd) = self.kv_layout();
+        let window_bytes = (layers
+            * 2
+            * n_kv
+            * hd
+            * crate::inference::cache::KV_WORKING_WINDOW_TOKENS
+            * crate::tensor::DType::F16.size_in_bytes()) as u64;
+        let shape = self.prefill_shape();
+        let chunk_bytes = if shape.target_chunk > 0 {
+            (shape.bytes_per_token as u64)
+                .saturating_mul(shape.target_chunk as u64)
+                .saturating_add(shape.fixed_bytes as u64)
+                .saturating_mul(shape.share.max(1) as u64)
+        } else {
+            0
+        };
+        window_bytes
+            .saturating_add(chunk_bytes)
+            .saturating_add(self.decode_reserve)
+    }
+
     fn enforce_kv_snapshot_budget(&mut self) {
         let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
-        let budget = {
-            let (layers, n_kv, hd) = self.kv_layout();
-            let window_bytes = (layers
-                * 2
-                * n_kv
-                * hd
-                * crate::inference::cache::KV_WORKING_WINDOW_TOKENS
-                * crate::tensor::DType::F16.size_in_bytes()) as u64;
-            let shape = self.prefill_shape();
-            let chunk_bytes = if shape.target_chunk > 0 {
-                (shape.bytes_per_token as u64)
-                    .saturating_mul(shape.target_chunk as u64)
-                    .saturating_add(shape.fixed_bytes as u64)
-            } else {
-                0
-            };
-            match self.free_device_memory() {
-                Some(free) => (free + held)
-                    .saturating_sub(window_bytes)
-                    .saturating_sub(chunk_bytes)
-                    .saturating_sub(self.decode_reserve),
-                None => return,
-            }
+        let budget = match self.free_device_memory() {
+            Some(free) => (free + held).saturating_sub(self.snapshot_reserve()),
+            None => return,
         };
         let mut held = held;
         while held > budget && !self.kv_snapshots.is_empty() {
@@ -2130,7 +2171,14 @@ impl GenericHeteroTransformer {
         let dt = snap
             .layers
             .iter()
-            .find_map(|l| l.spec.as_ref().map(|s| s.dtype()))?;
+            .find_map(|l| l.spec.as_ref().map(|s| s.dtype()))
+            .or_else(|| {
+                // A quantised layer's rows come out dequantised to F32, which holds them exactly.
+                snap.layers
+                    .iter()
+                    .any(|l| l.quant.is_some())
+                    .then_some(crate::tensor::DType::F32)
+            })?;
         Some(match dt {
             crate::tensor::DType::F16 => 0,
             crate::tensor::DType::F32 => 1,
@@ -2147,11 +2195,7 @@ impl GenericHeteroTransformer {
         let snap = self.kv_snapshots.get(index)?;
         let mut len: Option<usize> = None;
         for l in &snap.layers {
-            let n = match (&l.spec, &l.cpu_f16) {
-                (Some(spec), _) => spec.len(),
-                (None, Some(c)) => c.len(),
-                (None, None) => return None,
-            };
+            let n = l.kv_len()?;
             match len {
                 None => len = Some(n),
                 Some(prev) if prev == n => {}
@@ -2180,9 +2224,8 @@ impl GenericHeteroTransformer {
                 // extent depends on the full sequence, not on this block's tokens, so it
                 // could not share a block hash without corrupting it; it travels in the
                 // manifest's own window blob instead.
-                match (&l.spec, &l.cpu_f16) {
-                    (Some(spec), _) if spec.len() == kv_len => spec.host_rows(from, to).map(Some),
-                    (None, Some(c)) if c.len() == kv_len => Ok(Some(c.host_rows(from, to))),
+                match l.kv_len() {
+                    Some(n) if n == kv_len => l.host_rows(from, to),
                     _ => Ok(None),
                 }
             })
@@ -2205,15 +2248,8 @@ impl GenericHeteroTransformer {
         let drop = kv_len.saturating_sub(covered);
         snap.layers
             .iter()
-            .map(|l| match (&l.spec, &l.cpu_f16) {
-                (Some(spec), _) if spec.len() < kv_len => {
-                    let keep = spec.len().saturating_sub(drop);
-                    spec.host_rows(0, keep).map(Some)
-                }
-                (None, Some(c)) if c.len() < kv_len => {
-                    let keep = c.len().saturating_sub(drop);
-                    Ok(Some(c.host_rows(0, keep)))
-                }
+            .map(|l| match l.kv_len() {
+                Some(n) if n < kv_len => l.host_rows(0, n.saturating_sub(drop)),
                 _ => Ok(None),
             })
             .collect()
@@ -2242,6 +2278,7 @@ impl GenericHeteroTransformer {
             let Some((k, v)) = r else {
                 layers.push(super::LayerKvSnapshot {
                     spec: None,
+                    quant: None,
                     cpu_f16: None,
                     mixer: None,
                     shards: Vec::new(),
@@ -2729,6 +2766,17 @@ mod kv_snapshot_tests {
     }
 
     #[test]
+    fn a_snapshot_larger_than_the_free_room_is_skipped() {
+        use super::snapshot_fits;
+        let (free, reserve) = (10_000u64, 3_000u64);
+        assert!(snapshot_fits(7_000, Some(free), reserve));
+        assert!(!snapshot_fits(7_001, Some(free), reserve));
+        assert!(!snapshot_fits(1, Some(reserve - 1), reserve));
+        assert!(snapshot_fits(0, Some(0), reserve));
+        assert!(snapshot_fits(u64::MAX, None, reserve));
+    }
+
+    #[test]
     fn a_new_conversation_appends_then_evicts_the_least_recent() {
         let a = [1u32, 2, 3];
         let b = [9u32, 8];
@@ -2738,36 +2786,21 @@ mod kv_snapshot_tests {
     }
 }
 
-/// Capture a quantised layer's KV as a snapshot: dequantise the resident cache to F16
-/// tensors `[1, n_kv, len, head_dim]`. Returns `None` for a non-quantised layer, whose
-/// spec cache the caller snapshots directly. Restoring re-appends onto the same quant
-/// grid, so it adds no loss beyond what the cache already carries.
+/// Capture a quantised layer's KV as a snapshot: a device-to-device copy of the cache's
+/// packed codes and scales for the positions it holds, restored bit for bit. Returns `None`
+/// for a non-quantised layer, whose spec cache the caller snapshots directly.
 fn quantised_layer_snapshot(
     l: &GenericTransformerLayer,
 ) -> crate::tensor::Result<Option<super::LayerKvSnapshot>> {
     #[cfg(feature = "cuda")]
     {
         if let Some(q) = l.quant_kv.as_ref() {
-            if q.current_seq_len() > 0 {
-                // F32 holds every dequantised value exactly (an 8- or 4-bit code times an
-                // f16 scale), so the restore requantises to the same codes and scales.
-                let (k, v) = q
-                    .dequantize_kv(crate::tensor::DType::F32)
-                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-                let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
-                    k,
-                    v,
-                    q.current_seq_len(),
-                );
-                return Ok(Some(super::LayerKvSnapshot {
-                    spec: Some(spec),
-                    cpu_f16: None,
-                    mixer: None,
-                    shards: Vec::new(),
-                }));
-            }
+            let quant = q
+                .snapshot_raw()
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
             return Ok(Some(super::LayerKvSnapshot {
                 spec: None,
+                quant,
                 cpu_f16: None,
                 mixer: None,
                 shards: Vec::new(),
@@ -2776,6 +2809,25 @@ fn quantised_layer_snapshot(
     }
     let _ = l;
     Ok(None)
+}
+
+/// Device bytes [`capture_layer`] would copy from `l` and its shares as they hold now: each
+/// KV cache's bytes for its length in the form its snapshot takes, and each recurrent state.
+fn layer_snapshot_bytes(l: &GenericTransformerLayer) -> u64 {
+    #[cfg(feature = "cuda")]
+    let kv = match l.quant_kv.as_ref() {
+        Some(q) => q.raw_bytes(q.current_seq_len()) as u64,
+        None => l.kv_cache.snapshot_bytes(),
+    };
+    #[cfg(not(feature = "cuda"))]
+    let kv = l.kv_cache.snapshot_bytes();
+    kv + l.mixer.state_device_bytes() + l.tp_shards.iter().map(layer_snapshot_bytes).sum::<u64>()
+}
+
+/// Whether a snapshot copy of `need` bytes fits in `free` device bytes once `reserve` is
+/// kept aside. An unknown free figure (no card) never refuses.
+pub(super) fn snapshot_fits(need: u64, free: Option<u64>, reserve: u64) -> bool {
+    free.is_none_or(|free| need <= free.saturating_sub(reserve))
 }
 
 /// A layer's KV snapshot rebuilt from host rows `k` and `v` (token-major, `[n, n_kv, head_dim]`),
@@ -2807,6 +2859,7 @@ pub(super) fn layer_snapshot_from_rows(
         )?;
         return Ok(super::LayerKvSnapshot {
             spec: Some(spec),
+            quant: None,
             cpu_f16: None,
             mixer: None,
             shards: Vec::new(),
@@ -2820,6 +2873,7 @@ pub(super) fn layer_snapshot_from_rows(
         }
         return Ok(super::LayerKvSnapshot {
             spec: None,
+            quant: None,
             cpu_f16: Some(fresh),
             mixer: None,
             shards: Vec::new(),
@@ -2849,6 +2903,7 @@ fn capture_layer(l: &GenericTransformerLayer) -> crate::tensor::Result<super::La
         Some(snap) => snap,
         None => super::LayerKvSnapshot {
             spec: l.kv_cache.snapshot()?,
+            quant: None,
             cpu_f16: l.cpu_f16_kv.clone(),
             mixer: None,
             shards: Vec::new(),
@@ -2886,8 +2941,9 @@ fn restore_layer(
     Ok(())
 }
 
-/// Restore a snapshot layer into a quantised cache by re-appending its dequantised K/V.
-/// Returns `false` for a non-quantised layer, left to the spec path.
+/// Restore a snapshot layer into a quantised cache: its raw codes and scales copied back, or,
+/// for a snapshot rebuilt from host rows, its K/V re-appended. Returns `false` for a
+/// non-quantised layer, left to the spec path.
 fn restore_quantised_layer(
     l: &mut GenericTransformerLayer,
     s: &super::LayerKvSnapshot,
@@ -2895,12 +2951,19 @@ fn restore_quantised_layer(
     #[cfg(feature = "cuda")]
     {
         if let Some(q) = l.quant_kv.as_mut() {
-            q.reset();
-            if let Some(spec) = &s.spec {
-                let (k, v) = spec.kv();
-                q.append(k, v)
-                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-            }
+            let restored = match (&s.quant, &s.spec) {
+                (Some(raw), _) => q.restore_raw(raw),
+                (None, Some(spec)) => {
+                    q.reset();
+                    let (k, v) = spec.kv();
+                    q.append(k, v)
+                }
+                (None, None) => {
+                    q.reset();
+                    Ok(())
+                }
+            };
+            restored.map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
             return Ok(true);
         }
     }

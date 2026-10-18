@@ -963,12 +963,14 @@ impl GenericHeteroTransformer {
             snaps.push(match held {
                 Held::Nothing => super::LayerKvSnapshot {
                     spec: None,
+                    quant: None,
                     cpu_f16: None,
                     mixer: None,
                     shards: Vec::new(),
                 },
                 Held::Mixer(m) => super::LayerKvSnapshot {
                     spec: None,
+                    quant: None,
                     cpu_f16: None,
                     mixer: Some(m.state(&l.cos.device())?),
                     shards: Vec::new(),
@@ -1180,14 +1182,21 @@ fn handover_identity(layout: &Layout) -> [u8; 32] {
 
 /// The rows a layer's snapshot holds, as host f32 with the element type they are held in.
 fn snapshot_rows(l: &GenericTransformerLayer, s: &super::LayerKvSnapshot) -> Result<Rows> {
-    let (dtype, n, (k, v)) = match (&s.spec, &s.cpu_f16) {
-        (Some(spec), _) => (
+    let (dtype, n, (k, v)) = match (&s.spec, &s.quant, &s.cpu_f16) {
+        (Some(spec), _, _) => (
             dtype_code(spec.dtype())?,
             spec.len(),
             spec.host_rows(0, spec.len())?,
         ),
-        (None, Some(c)) => (0, c.len(), c.host_rows(0, c.len())),
-        (None, None) => (0, 0, (Vec::new(), Vec::new())),
+        // A quantised layer's rows come out dequantised to F32, which holds them exactly.
+        (None, Some(q), _) => (
+            dtype_code(DType::F32)?,
+            q.len(),
+            q.host_rows(0, q.len())
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?,
+        ),
+        (None, None, Some(c)) => (0, c.len(), c.host_rows(0, c.len())),
+        (None, None, None) => (0, 0, (Vec::new(), Vec::new())),
     };
     Ok(Rows {
         dtype,
@@ -1221,6 +1230,7 @@ fn rows_snapshot(
     if k.is_empty() {
         return Ok(super::LayerKvSnapshot {
             spec: None,
+            quant: None,
             cpu_f16: None,
             mixer: None,
             shards: Vec::new(),

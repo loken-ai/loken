@@ -47,6 +47,99 @@ const Q8_0_TYPE_SIZE: usize = crate::tensor::quantized::GgmlDType::Q8_0.type_siz
 
 pub(crate) use super::KV_WORKING_WINDOW_TOKENS as INITIAL_CAPACITY_TOKENS;
 
+/// A Q8 cache's packed codes and scales for its first `len` positions, copied aside: the
+/// cache's own bytes, restored bit for bit.
+pub struct Q8KvRaw {
+    k: CudaSlice<u8>,
+    v: CudaSlice<u8>,
+    len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cuda_device: CudaDevice,
+}
+
+impl Q8KvRaw {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Device memory the copied codes and scales occupy.
+    pub fn device_bytes(&self) -> u64 {
+        (self.k.len() + self.v.len()) as u64
+    }
+
+    /// The held positions as `[1, n_kv, len, head_dim]` K and V in `dtype`.
+    pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
+        dequantize_packed(
+            &self.k,
+            &self.v,
+            self.len,
+            self.n_kv_heads,
+            self.head_dim,
+            &self.cuda_device,
+            dtype,
+        )
+    }
+}
+
+/// The first `seq` positions of packed Q8_0 K and V buffers `[seq, n_kv, head_dim]` as
+/// `[1, n_kv, seq, head_dim]` tensors in `dtype`.
+fn dequantize_packed(
+    k_q8: &CudaSlice<u8>,
+    v_q8: &CudaSlice<u8>,
+    seq: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cuda_device: &CudaDevice,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    if seq == 0 {
+        return Err(anyhow!("Q8KvCache::dequantize_kv: cache is empty"));
+    }
+    let elem_count = seq * n_kv_heads * head_dim;
+
+    // Packed storage layout is [seq, n_kv, hd]; the dequantiser writes in the same
+    // element order, then the reshape and permute give [1, n_kv, seq, hd]. F32 is
+    // dequantised directly: it holds every code times its scale exactly.
+    let f32 = dtype == DType::F32;
+    let dq = |blob| {
+        crate::inference::quantized_cuda::dequantize_block32_blob(
+            "q8_0",
+            blob,
+            elem_count,
+            cuda_device,
+            f32,
+        )
+    };
+    let k_dq = dq(k_q8).map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
+    let v_dq = dq(v_q8).map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
+
+    let shape = (1, seq, n_kv_heads, head_dim);
+    let k = tensor_from_cuda_storage(k_dq, shape)?;
+    let v = tensor_from_cuda_storage(v_dq, shape)?;
+
+    // [1, seq, n_kv, hd] -> [1, n_kv, seq, hd]
+    let k = k.permute((0, 2, 1, 3))?.contiguous()?;
+    let v = v.permute((0, 2, 1, 3))?.contiguous()?;
+
+    // Cast to requested dtype if different from the dequant output (F16).
+    let k = if k.dtype() != dtype {
+        k.to_dtype(dtype)?
+    } else {
+        k
+    };
+    let v = if v.dtype() != dtype {
+        v.to_dtype(dtype)?
+    } else {
+        v
+    };
+    Ok((k, v))
+}
+
 /// KV cache where both K and V are persistently stored as Q8_0.
 ///
 /// **Lazy capacity:** the underlying CudaSlice<u8> buffers are sized
@@ -783,48 +876,82 @@ impl Q8KvCache {
     /// history. Single-token decode avoids this round-trip by going
     /// through `attn_scores`/`attn_output` directly.
     pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
-        let seq = self.core.len();
-        if seq == 0 {
-            return Err(anyhow!("Q8KvCache::dequantize_kv: cache is empty"));
+        dequantize_packed(
+            &self.k_q8,
+            &self.v_q8,
+            self.core.len(),
+            self.n_kv_heads,
+            self.head_dim,
+            &self.cuda_device,
+            dtype,
+        )
+    }
+
+    /// Bytes one position takes in each of the K and V buffers.
+    fn token_bytes(&self) -> usize {
+        self.n_kv_heads * (self.head_dim / Q8_0_BLOCK_SIZE) * Q8_0_TYPE_SIZE
+    }
+
+    /// Device bytes a raw snapshot of the first `len` positions holds: their packed codes
+    /// and scales, K and V.
+    pub fn raw_bytes(&self, len: usize) -> usize {
+        2 * len * self.token_bytes()
+    }
+
+    /// The packed codes and scales of the positions held, copied device to device; `None`
+    /// for an empty cache.
+    pub fn snapshot_raw(&self) -> Result<Option<Q8KvRaw>> {
+        let len = self.core.len();
+        if len == 0 {
+            return Ok(None);
         }
-        let elem_count = seq * self.n_kv_heads * self.head_dim;
-
-        // Packed storage layout is [seq, n_kv, hd]; the dequantiser writes in the same
-        // element order, then the reshape and permute give [1, n_kv, seq, hd]. F32 is
-        // dequantised directly: it holds every code times its scale exactly.
-        let f32 = dtype == DType::F32;
-        let dq = |blob| {
-            crate::inference::quantized_cuda::dequantize_block32_blob(
-                "q8_0",
-                blob,
-                elem_count,
-                &self.cuda_device,
-                f32,
-            )
+        let bytes = len * self.token_bytes();
+        let copy = |src: &CudaSlice<u8>| -> Result<CudaSlice<u8>> {
+            let mut dst = self.cuda_device.alloc_zeros::<u8>(bytes)?;
+            self.cuda_device
+                .memcpy_dtod(&src.slice(0..bytes), &mut dst)
+                .map_err(|e| anyhow!("Q8KvCache::snapshot_raw: memcpy_dtod failed: {e}"))?;
+            Ok(dst)
         };
-        let k_dq = dq(&self.k_q8).map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
-        let v_dq = dq(&self.v_q8).map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
+        Ok(Some(Q8KvRaw {
+            k: copy(&self.k_q8)?,
+            v: copy(&self.v_q8)?,
+            len,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            cuda_device: self.cuda_device.clone(),
+        }))
+    }
 
-        let shape = (1, seq, self.n_kv_heads, self.head_dim);
-        let k = tensor_from_cuda_storage(k_dq, shape)?;
-        let v = tensor_from_cuda_storage(v_dq, shape)?;
-
-        // [1, seq, n_kv, hd] -> [1, n_kv, seq, hd]
-        let k = k.permute((0, 2, 1, 3))?.contiguous()?;
-        let v = v.permute((0, 2, 1, 3))?.contiguous()?;
-
-        // Cast to requested dtype if different from the dequant output (F16).
-        let k = if k.dtype() != dtype {
-            k.to_dtype(dtype)?
-        } else {
-            k
-        };
-        let v = if v.dtype() != dtype {
-            v.to_dtype(dtype)?
-        } else {
-            v
-        };
-        Ok((k, v))
+    /// Makes `raw` the whole content of the cache: its codes and scales copied back and the
+    /// length set to its own, growing the buffers when they are shorter.
+    pub fn restore_raw(&mut self, raw: &Q8KvRaw) -> Result<()> {
+        if raw.n_kv_heads != self.n_kv_heads || raw.head_dim != self.head_dim {
+            return Err(anyhow!(
+                "Q8KvCache::restore_raw: snapshot geometry {}x{} does not match {}x{}",
+                raw.n_kv_heads,
+                raw.head_dim,
+                self.n_kv_heads,
+                self.head_dim
+            ));
+        }
+        self.reset();
+        if let Some(need) = self
+            .core
+            .room_for(raw.len)
+            .map_err(|e| anyhow!("Q8KvCache::restore_raw: {e}"))?
+        {
+            self.grow_to(need)?;
+        }
+        let bytes = raw.len * self.token_bytes();
+        for (src, dst) in [(&raw.k, &mut self.k_q8), (&raw.v, &mut self.v_q8)] {
+            let mut dst = dst.slice_mut(0..bytes);
+            self.cuda_device
+                .memcpy_dtod(src, &mut dst)
+                .map_err(|e| anyhow!("Q8KvCache::restore_raw: memcpy_dtod failed: {e}"))?;
+        }
+        self.core.commit(raw.len);
+        Ok(())
     }
 
     /// The current K and V history dequantized to F16, as `[1, n_kv_heads, seq, head_dim]`

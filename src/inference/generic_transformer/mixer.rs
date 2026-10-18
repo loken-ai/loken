@@ -421,6 +421,24 @@ impl Mixer {
         })
     }
 
+    /// Device bytes `snapshot` would copy: the recurrent state held on a card.
+    pub fn state_device_bytes(&self) -> u64 {
+        let bytes = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        match self {
+            Mixer::ShortConv(m) => match &m.state {
+                Some(ConvState::Card(t)) => bytes(t),
+                _ => 0,
+            },
+            Mixer::Ssm(Mamba2 { state, .. }) | Mixer::DeltaNet(GatedDeltaNet { state, .. }) => {
+                match state {
+                    Some(SsmState::Card { conv, h }) => bytes(conv) + bytes(h),
+                    _ => 0,
+                }
+            }
+            Mixer::Attention | Mixer::Absent => 0,
+        }
+    }
+
     /// Makes `state` the mixer's state; the copy stays reusable.
     pub fn restore(&mut self, state: &MixerState) -> Result<()> {
         match (self, state) {

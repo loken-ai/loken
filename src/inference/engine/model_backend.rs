@@ -1517,11 +1517,11 @@ impl ModelBackend for MoondreamBackend {
 
 impl GenericBackend {
     /// The snapshot of an earlier prompt this one extends, restored and advanced over the new
-    /// tokens; `None` when there is none.
+    /// tokens, with whether tokens were prefilled; `None` when there is none.
     fn restore_prefix_and_advance(
         &mut self,
         prompt: &[u32],
-    ) -> crate::tensor::Result<Option<Tensor>> {
+    ) -> crate::tensor::Result<Option<(Tensor, bool)>> {
         // A snapshot of an earlier prompt that this one extends - the previous turn of a
         // conversation - is restored and advanced over the new tokens. With a disk cache the
         // stored states stand in for the in-memory ones when there is none, and a prompt no
@@ -1541,7 +1541,7 @@ impl GenericBackend {
             },
         };
         if covered == prompt.len() {
-            return Ok(logits);
+            return Ok(logits.map(|l| (l, false)));
         }
         // The rest of the prompt is prefilled here: the card's memory lent to the caches is
         // taken back for it, as for any prefill.
@@ -1601,9 +1601,8 @@ impl GenericBackend {
                         remember_shrunk_chunk(used, chunk, prompt.len() - covered, free_now);
                         let secs = started.elapsed().as_secs_f64();
                         cache.tuning().prefilled(prompt.len() - covered, secs);
-                        self.0.snapshot_prefix(prompt, &logits)?;
                         cache.save(&self.0, prompt, grid.into_inner(), Some(secs));
-                        return Ok(Some(logits));
+                        return Ok(Some((logits, true)));
                     }
                     Err(e) => Err(e),
                 }
@@ -1622,8 +1621,7 @@ impl GenericBackend {
                 return Ok(None);
             }
         };
-        self.0.snapshot_prefix(prompt, &logits)?;
-        Ok(Some(logits))
+        Ok(Some((logits, true)))
     }
 }
 
@@ -1911,7 +1909,15 @@ impl ModelBackend for GenericBackend {
     fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
         let restored = self.restore_prefix_and_advance(prompt);
         self.finish_prefill();
-        restored
+        // The prefix snapshot is taken once the expert slots are back, so its room is measured
+        // on the card the decode runs with, not on the memory the prefill borrowed.
+        let Some((logits, prefilled)) = restored? else {
+            return Ok(None);
+        };
+        if prefilled {
+            self.0.snapshot_prefix(prompt, &logits)?;
+        }
+        Ok(Some(logits))
     }
     fn attach_state_cache(
         &mut self,

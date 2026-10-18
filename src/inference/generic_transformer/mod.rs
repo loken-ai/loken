@@ -612,8 +612,30 @@ impl KvSnapshot {
     }
 }
 
+/// A quantised cache's packed bytes copied aside; uninhabited on a build without CUDA.
+#[cfg(feature = "cuda")]
+pub(crate) type QuantSnap = crate::inference::cache::quant_kv::QuantKvSnapshot;
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) enum QuantSnap {}
+
+#[cfg(not(feature = "cuda"))]
+impl QuantSnap {
+    pub fn len(&self) -> usize {
+        match *self {}
+    }
+    pub fn device_bytes(&self) -> u64 {
+        match *self {}
+    }
+    pub fn host_rows(&self, _from: usize, _to: usize) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+        match *self {}
+    }
+}
+
 pub(crate) struct LayerKvSnapshot {
     pub(crate) spec: Option<crate::inference::serve::spec_kv_cache::SpecKvSnapshot>,
+    /// A quantised cache's raw codes and scales, in place of `spec`.
+    pub(crate) quant: Option<QuantSnap>,
     pub(crate) cpu_f16: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     /// A recurrent mixer's state at the snapshot's length.
     pub(crate) mixer: Option<mixer::MixerState>,
@@ -625,8 +647,38 @@ impl LayerKvSnapshot {
     /// Device memory this layer's snapshot and its shares' hold.
     fn device_bytes(&self) -> u64 {
         self.spec.as_ref().map_or(0, |s| s.device_bytes())
+            + self.quant.as_ref().map_or(0, |q| q.device_bytes())
             + self.mixer.as_ref().map_or(0, |m| m.device_bytes())
             + self.shards.iter().map(Self::device_bytes).sum::<u64>()
+    }
+
+    /// Positions the layer's KV snapshot holds, from whichever form it has; `None` for a
+    /// layer that keeps no KV of its own.
+    pub(crate) fn kv_len(&self) -> Option<usize> {
+        match (&self.spec, &self.quant, &self.cpu_f16) {
+            (Some(spec), _, _) => Some(spec.len()),
+            (None, Some(q), _) => Some(q.len()),
+            (None, None, Some(c)) => Some(c.len()),
+            (None, None, None) => None,
+        }
+    }
+
+    /// Tokens `[from, to)` of the layer's KV snapshot as host f32 rows, K then V; `None`
+    /// for a layer that keeps no KV of its own.
+    pub(crate) fn host_rows(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> crate::tensor::Result<Option<(Vec<f32>, Vec<f32>)>> {
+        match (&self.spec, &self.quant, &self.cpu_f16) {
+            (Some(spec), _, _) => spec.host_rows(from, to).map(Some),
+            (None, Some(q), _) => q
+                .host_rows(from, to)
+                .map(Some)
+                .map_err(|e| crate::tensor::Error::msg(e.to_string())),
+            (None, None, Some(c)) => Ok(Some(c.host_rows(from, to))),
+            (None, None, None) => Ok(None),
+        }
     }
 }
 

@@ -36,6 +36,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- KV cache: a quantised cache snapshots its packed codes, and a copy that would not fit is skipped.
 - Speculative decoding: a verify window replays the kept rows instead of storing their states.
 - Prefill: the gated delta rule runs a chunk's rows as blocked matrix products.
 - Prefill: the delta-net convolution spreads a chunk's rows over the card.

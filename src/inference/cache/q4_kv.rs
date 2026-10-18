@@ -82,6 +82,208 @@ fn q4_0_type_size() -> usize {
 /// would need to invalidate_graph_state() before retrying.
 use super::KV_WORKING_WINDOW_TOKENS as INITIAL_CAPACITY_TOKENS;
 
+/// A Q4 cache's flushed K blocks, partial-block residual and V codes for its first `len`
+/// positions, copied aside: the cache's own bytes, restored bit for bit.
+pub struct Q4KvRaw {
+    /// `None` while no K block is flushed.
+    k_blocks: Option<CudaSlice<u8>>,
+    /// `None` when the length ends on a block boundary.
+    k_residual: Option<CudaSlice<f16>>,
+    v_q4: CudaSlice<u8>,
+    len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    device: Device,
+    cuda_device: CudaDevice,
+}
+
+impl Q4KvRaw {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Device memory the copied blocks, residual and codes occupy.
+    pub fn device_bytes(&self) -> u64 {
+        let k = self.k_blocks.as_ref().map_or(0, |k| k.len());
+        let r = self
+            .k_residual
+            .as_ref()
+            .map_or(0, |r| r.len() * std::mem::size_of::<f16>());
+        (k + r + self.v_q4.len()) as u64
+    }
+
+    /// The held positions as `[1, n_kv, len, head_dim]` K and V in `dtype`.
+    pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
+        Q4Parts {
+            k_blocks: self.k_blocks.as_ref(),
+            k_residual: self.k_residual.as_ref(),
+            v_q4: &self.v_q4,
+            seq: self.len,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            device: &self.device,
+            cuda_device: &self.cuda_device,
+        }
+        .read_kv(dtype)
+    }
+}
+
+/// The buffers a Q4 history is read from: a live cache's or a raw snapshot's.
+struct Q4Parts<'a> {
+    /// Read only when a K block is flushed.
+    k_blocks: Option<&'a CudaSlice<u8>>,
+    /// Read only when the length ends inside a block.
+    k_residual: Option<&'a CudaSlice<f16>>,
+    v_q4: &'a CudaSlice<u8>,
+    seq: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    device: &'a Device,
+    cuda_device: &'a CudaDevice,
+}
+
+impl Q4Parts<'_> {
+    /// The first `seq` positions as `[1, n_kv, seq, head_dim]` K and V in `dtype`.
+    fn read_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let seq = self.seq;
+        if seq == 0 {
+            return Err(anyhow!("Q4KvCache::dequantize_kv: cache is empty"));
+        }
+
+        let full_seq_blocks = seq / q4_0_block_size();
+        let partial_slots = seq % q4_0_block_size();
+        let full_seq = full_seq_blocks * q4_0_block_size();
+        // F32 is dequantised directly: it holds every code times its scale exactly.
+        let f32 = dtype == DType::F32;
+        let dq = |blob: &CudaSlice<u8>, n: usize| {
+            crate::inference::quantized_cuda::dequantize_block32_blob(
+                "q4_0",
+                blob,
+                n,
+                self.cuda_device,
+                f32,
+            )
+        };
+
+        // -- K dequant ------------------------------------------------
+        // Blocks live in [seq_block, n_kv, head_dim] order, each block is
+        // 32 seq positions of one (head, channel). Dequantize all flushed
+        // blocks, then permute to [full_seq, n_kv, head_dim].
+        let k_full = if full_seq > 0 {
+            let elem_count = full_seq_blocks * self.n_kv_heads * self.head_dim * q4_0_block_size();
+            // dequantize_q4_0_blob_f16 takes a CudaSlice<u8>; use the prefix
+            // of k_q4_blocks covering just the flushed blocks.
+            let bytes_needed = full_seq_blocks * self.n_kv_heads * self.head_dim * q4_0_type_size();
+            let mut owned = self.cuda_device.alloc_zeros::<u8>(bytes_needed)?;
+            self.cuda_device
+                .memcpy_dtod(
+                    &self
+                        .k_blocks
+                        .ok_or_else(|| anyhow!("Q4KvCache: flushed K blocks missing"))?
+                        .slice(..bytes_needed),
+                    &mut owned,
+                )
+                .map_err(|e| anyhow!("Q4KvCache: K dequant copy: {e}"))?;
+            let dq = dq(&owned, elem_count).map_err(|e| anyhow!("Q4KvCache: K dequant: {e}"))?;
+
+            // Layout after dequant is [seq_block, n_kv, head_dim, 32].
+            // Permute to [seq_block, 32, n_kv, head_dim] -> reshape to
+            // [full_seq, n_kv, head_dim].
+            let t = tensor_from_cuda_storage(
+                dq,
+                (
+                    full_seq_blocks,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    q4_0_block_size(),
+                ),
+            )?;
+            let t = t.permute((0, 3, 1, 2))?.contiguous()?; // [sb, 32, n_kv, hd]
+            t.reshape((full_seq, self.n_kv_heads, self.head_dim))?
+        } else {
+            // Empty - placeholder shape; we'll skip concat when full_seq == 0.
+            Tensor::zeros_on((0, self.n_kv_heads, self.head_dim), DType::F16, self.device)?
+        };
+
+        // Add the residual partial block (if any). Residual is
+        // [n_kv, head_dim, 32] F16; slice first `partial_slots` seq slots
+        // and permute to [partial_slots, n_kv, head_dim].
+        let k = if partial_slots > 0 {
+            let residual_elems = self.n_kv_heads * self.head_dim * q4_0_block_size();
+            let mut owned = self.cuda_device.alloc_zeros::<f16>(residual_elems)?;
+            self.cuda_device
+                .memcpy_dtod(
+                    &self
+                        .k_residual
+                        .ok_or_else(|| anyhow!("Q4KvCache: K residual missing"))?
+                        .slice(..residual_elems),
+                    &mut owned,
+                )
+                .map_err(|e| anyhow!("Q4KvCache: K residual copy: {e}"))?;
+            let residual_storage = CudaStorage::wrap_cuda_slice(owned, self.cuda_device.clone());
+            let res_tensor = tensor_from_cuda_storage(
+                residual_storage,
+                (self.n_kv_heads, self.head_dim, q4_0_block_size()),
+            )?;
+            // [n_kv, head_dim, 32] -> narrow to [n_kv, head_dim, partial_slots]
+            // -> permute to [partial_slots, n_kv, head_dim].
+            let partial = res_tensor
+                .narrow(2, 0, partial_slots)?
+                .permute((2, 0, 1))?
+                .contiguous()?;
+
+            if full_seq > 0 {
+                let partial = partial.to_dtype(k_full.dtype())?;
+                Tensor::cat(&[&k_full, &partial], 0)?
+            } else {
+                partial
+            }
+        } else if full_seq > 0 {
+            k_full
+        } else {
+            return Err(anyhow!("Q4KvCache::dequantize_kv: empty K reconstruction"));
+        };
+
+        // [seq, n_kv, head_dim] -> [1, n_kv, seq, head_dim]
+        let k = k
+            .unsqueeze(0)? // [1, seq, n_kv, head_dim]
+            .permute((0, 2, 1, 3))?
+            .contiguous()?;
+
+        // -- V dequant ------------------------------------------------
+        // V layout is the session-1 [seq, n_kv, head_dim] Q4_0 with blocks
+        // grouped along head_dim. dequantize_q4_0_blob_f16 emits F16 in the
+        // same element order, so reshape + permute reaches the same
+        // [1, n_kv, seq, head_dim] shape.
+        let v_elem_count = seq * self.n_kv_heads * self.head_dim;
+        let v_bytes =
+            seq * self.n_kv_heads * (self.head_dim / q4_0_block_size()) * q4_0_type_size();
+        let mut v_owned = self.cuda_device.alloc_zeros::<u8>(v_bytes)?;
+        self.cuda_device
+            .memcpy_dtod(&self.v_q4.slice(..v_bytes), &mut v_owned)
+            .map_err(|e| anyhow!("Q4KvCache: V dequant copy: {e}"))?;
+        let v_dq = dq(&v_owned, v_elem_count).map_err(|e| anyhow!("Q4KvCache: V dequant: {e}"))?;
+        let v = tensor_from_cuda_storage(v_dq, (1, seq, self.n_kv_heads, self.head_dim))?;
+        let v = v.permute((0, 2, 1, 3))?.contiguous()?;
+
+        let k = if k.dtype() != dtype {
+            k.to_dtype(dtype)?
+        } else {
+            k
+        };
+        let v = if v.dtype() != dtype {
+            v.to_dtype(dtype)?
+        } else {
+            v
+        };
+        Ok((k, v))
+    }
+}
+
 /// KIVI-style Q4_0 KV cache.
 pub struct Q4KvCache {
     /// Packed K blocks `[seq_block, n_kv, head_dim]` - 18 bytes per cell.
@@ -695,130 +897,113 @@ impl Q4KvCache {
     /// Dequantize the full K and V caches into
     /// `[1, n_kv_heads, current_seq_len, head_dim]` F-dtype tensors.
     pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
-        let seq = self.core.len();
-        if seq == 0 {
-            return Err(anyhow!("Q4KvCache::dequantize_kv: cache is empty"));
+        Q4Parts {
+            k_blocks: Some(&self.k_q4_blocks),
+            k_residual: Some(&self.k_residual),
+            v_q4: &self.v_q4,
+            seq: self.core.len(),
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            device: &self.device,
+            cuda_device: &self.cuda_device,
         }
+        .read_kv(dtype)
+    }
 
-        let full_seq_blocks = seq / q4_0_block_size();
-        let partial_slots = seq % q4_0_block_size();
-        let full_seq = full_seq_blocks * q4_0_block_size();
-        // F32 is dequantised directly: it holds every code times its scale exactly.
-        let f32 = dtype == DType::F32;
-        let dq = |blob: &CudaSlice<u8>, n: usize| {
-            crate::inference::quantized_cuda::dequantize_block32_blob(
-                "q4_0",
-                blob,
-                n,
-                &self.cuda_device,
-                f32,
-            )
-        };
-
-        // -- K dequant ------------------------------------------------
-        // Blocks live in [seq_block, n_kv, head_dim] order, each block is
-        // 32 seq positions of one (head, channel). Dequantize all flushed
-        // blocks, then permute to [full_seq, n_kv, head_dim].
-        let k_full = if full_seq > 0 {
-            let elem_count = full_seq_blocks * self.n_kv_heads * self.head_dim * q4_0_block_size();
-            // dequantize_q4_0_blob_f16 takes a CudaSlice<u8>; use the prefix
-            // of k_q4_blocks covering just the flushed blocks.
-            let bytes_needed = full_seq_blocks * self.n_kv_heads * self.head_dim * q4_0_type_size();
-            let mut owned = self.cuda_device.alloc_zeros::<u8>(bytes_needed)?;
-            self.cuda_device
-                .memcpy_dtod(&self.k_q4_blocks.slice(..bytes_needed), &mut owned)
-                .map_err(|e| anyhow!("Q4KvCache: K dequant copy: {e}"))?;
-            let dq = dq(&owned, elem_count).map_err(|e| anyhow!("Q4KvCache: K dequant: {e}"))?;
-
-            // Layout after dequant is [seq_block, n_kv, head_dim, 32].
-            // Permute to [seq_block, 32, n_kv, head_dim] -> reshape to
-            // [full_seq, n_kv, head_dim].
-            let t = tensor_from_cuda_storage(
-                dq,
-                (
-                    full_seq_blocks,
-                    self.n_kv_heads,
-                    self.head_dim,
-                    q4_0_block_size(),
-                ),
-            )?;
-            let t = t.permute((0, 3, 1, 2))?.contiguous()?; // [sb, 32, n_kv, hd]
-            t.reshape((full_seq, self.n_kv_heads, self.head_dim))?
+    /// Bytes of K blocks, residual elements and V bytes a raw snapshot of the first `len`
+    /// positions copies: the flushed K blocks, the residual when a block is partial, the V
+    /// rows.
+    fn raw_extent(&self, len: usize) -> (usize, usize, usize) {
+        let k = (len / q4_0_block_size()) * self.n_kv_heads * self.head_dim * q4_0_type_size();
+        let residual = if !len.is_multiple_of(q4_0_block_size()) {
+            self.n_kv_heads * self.head_dim * q4_0_block_size()
         } else {
-            // Empty - placeholder shape; we'll skip concat when full_seq == 0.
-            Tensor::zeros_on(
-                (0, self.n_kv_heads, self.head_dim),
-                DType::F16,
-                &self.device,
-            )?
+            0
         };
+        let v = len * self.n_kv_heads * (self.head_dim / q4_0_block_size()) * q4_0_type_size();
+        (k, residual, v)
+    }
 
-        // Add the residual partial block (if any). Residual is
-        // [n_kv, head_dim, 32] F16; slice first `partial_slots` seq slots
-        // and permute to [partial_slots, n_kv, head_dim].
-        let k = if partial_slots > 0 {
-            let residual_elems = self.n_kv_heads * self.head_dim * q4_0_block_size();
-            let mut owned = self.cuda_device.alloc_zeros::<f16>(residual_elems)?;
-            self.cuda_device
-                .memcpy_dtod(&self.k_residual.slice(..residual_elems), &mut owned)
-                .map_err(|e| anyhow!("Q4KvCache: K residual copy: {e}"))?;
-            let residual_storage = CudaStorage::wrap_cuda_slice(owned, self.cuda_device.clone());
-            let res_tensor = tensor_from_cuda_storage(
-                residual_storage,
-                (self.n_kv_heads, self.head_dim, q4_0_block_size()),
-            )?;
-            // [n_kv, head_dim, 32] -> narrow to [n_kv, head_dim, partial_slots]
-            // -> permute to [partial_slots, n_kv, head_dim].
-            let partial = res_tensor
-                .narrow(2, 0, partial_slots)?
-                .permute((2, 0, 1))?
-                .contiguous()?;
+    /// Device bytes a raw snapshot of the first `len` positions holds.
+    pub fn raw_bytes(&self, len: usize) -> usize {
+        let (k, residual, v) = self.raw_extent(len);
+        k + residual * std::mem::size_of::<f16>() + v
+    }
 
-            if full_seq > 0 {
-                let partial = partial.to_dtype(k_full.dtype())?;
-                Tensor::cat(&[&k_full, &partial], 0)?
-            } else {
-                partial
+    /// The flushed K blocks, the partial block's residual and the V codes of the positions
+    /// held, copied device to device; `None` for an empty cache.
+    pub fn snapshot_raw(&self) -> Result<Option<Q4KvRaw>> {
+        let len = self.core.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        let (k_bytes, residual_elems, v_bytes) = self.raw_extent(len);
+        let copy = |src: &CudaSlice<u8>, n: usize| -> Result<Option<CudaSlice<u8>>> {
+            if n == 0 {
+                return Ok(None);
             }
-        } else if full_seq > 0 {
-            k_full
-        } else {
-            return Err(anyhow!("Q4KvCache::dequantize_kv: empty K reconstruction"));
+            let mut dst = self.cuda_device.alloc_zeros::<u8>(n)?;
+            self.cuda_device
+                .memcpy_dtod(&src.slice(0..n), &mut dst)
+                .map_err(|e| anyhow!("Q4KvCache::snapshot_raw: memcpy_dtod failed: {e}"))?;
+            Ok(Some(dst))
         };
+        let k_residual = if residual_elems > 0 {
+            let mut dst = self.cuda_device.alloc_zeros::<f16>(residual_elems)?;
+            self.cuda_device
+                .memcpy_dtod(&self.k_residual.slice(0..residual_elems), &mut dst)
+                .map_err(|e| anyhow!("Q4KvCache::snapshot_raw: residual copy failed: {e}"))?;
+            Some(dst)
+        } else {
+            None
+        };
+        Ok(Some(Q4KvRaw {
+            k_blocks: copy(&self.k_q4_blocks, k_bytes)?,
+            k_residual,
+            v_q4: copy(&self.v_q4, v_bytes)?.expect("a non-empty cache holds V rows"),
+            len,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            device: self.device.clone(),
+            cuda_device: self.cuda_device.clone(),
+        }))
+    }
 
-        // [seq, n_kv, head_dim] -> [1, n_kv, seq, head_dim]
-        let k = k
-            .unsqueeze(0)? // [1, seq, n_kv, head_dim]
-            .permute((0, 2, 1, 3))?
-            .contiguous()?;
-
-        // -- V dequant ------------------------------------------------
-        // V layout is the session-1 [seq, n_kv, head_dim] Q4_0 with blocks
-        // grouped along head_dim. dequantize_q4_0_blob_f16 emits F16 in the
-        // same element order, so reshape + permute reaches the same
-        // [1, n_kv, seq, head_dim] shape.
-        let v_elem_count = seq * self.n_kv_heads * self.head_dim;
-        let v_bytes =
-            seq * self.n_kv_heads * (self.head_dim / q4_0_block_size()) * q4_0_type_size();
-        let mut v_owned = self.cuda_device.alloc_zeros::<u8>(v_bytes)?;
+    /// Makes `raw` the whole content of the cache: its blocks, residual and V codes copied
+    /// back and the length set to its own, growing the buffers when they are shorter.
+    pub fn restore_raw(&mut self, raw: &Q4KvRaw) -> Result<()> {
+        if raw.n_kv_heads != self.n_kv_heads || raw.head_dim != self.head_dim {
+            return Err(anyhow!(
+                "Q4KvCache::restore_raw: snapshot geometry {}x{} does not match {}x{}",
+                raw.n_kv_heads,
+                raw.head_dim,
+                self.n_kv_heads,
+                self.head_dim
+            ));
+        }
+        self.reset();
+        if let Some(need) = self
+            .core
+            .room_for(raw.len)
+            .map_err(|e| anyhow!("Q4KvCache::restore_raw: {e}"))?
+        {
+            self.grow_to(need)?;
+        }
+        let fail = |e| anyhow!("Q4KvCache::restore_raw: memcpy_dtod failed: {e}");
+        if let Some(k) = &raw.k_blocks {
+            let mut dst = self.k_q4_blocks.slice_mut(0..k.len());
+            self.cuda_device.memcpy_dtod(k, &mut dst).map_err(fail)?;
+        }
+        if let Some(r) = &raw.k_residual {
+            let mut dst = self.k_residual.slice_mut(0..r.len());
+            self.cuda_device.memcpy_dtod(r, &mut dst).map_err(fail)?;
+        }
+        let mut dst = self.v_q4.slice_mut(0..raw.v_q4.len());
         self.cuda_device
-            .memcpy_dtod(&self.v_q4.slice(..v_bytes), &mut v_owned)
-            .map_err(|e| anyhow!("Q4KvCache: V dequant copy: {e}"))?;
-        let v_dq = dq(&v_owned, v_elem_count).map_err(|e| anyhow!("Q4KvCache: V dequant: {e}"))?;
-        let v = tensor_from_cuda_storage(v_dq, (1, seq, self.n_kv_heads, self.head_dim))?;
-        let v = v.permute((0, 2, 1, 3))?.contiguous()?;
-
-        let k = if k.dtype() != dtype {
-            k.to_dtype(dtype)?
-        } else {
-            k
-        };
-        let v = if v.dtype() != dtype {
-            v.to_dtype(dtype)?
-        } else {
-            v
-        };
-        Ok((k, v))
+            .memcpy_dtod(&raw.v_q4, &mut dst)
+            .map_err(fail)?;
+        self.core.commit(raw.len);
+        Ok(())
     }
 
     /// Fused Q4_0 attention scores. One kernel launch covers the entire
