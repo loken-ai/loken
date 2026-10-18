@@ -90,8 +90,10 @@ cap's key and the value it carried, before the image is decoded.
 | `POST /v1/messages/batches`, `GET /v1/messages/batches/{id}` | Batches in the Messages API's shape. `/cancel` stops one; `/results` serves its JSONL. |
 
 A 401, 429 or 404 under `/v1/messages` carries the Messages API envelope, and the request id
-comes back in the `request-id` header. A part the server cannot take, such as a document
-block or an image by URL, is refused with the reason.
+comes back in the `request-id` header. An image block with a URL source
+(`{"type": "image", "source": {"type": "url", "url": ...}}`) is fetched from a host in
+`image_fetch_hosts` and held to the media caps; a host outside it is answered 400 naming the host.
+A part the server cannot take, such as a document block, is refused with the reason.
 
 ## Server, models and cluster
 

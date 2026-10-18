@@ -87,6 +87,10 @@ fn default_max_audio_seconds() -> f64 {
     crate::api::media_limits::default_max_audio_seconds()
 }
 
+fn default_image_fetch_timeout_secs() -> u64 {
+    crate::api::media_limits::DEFAULT_FETCH_TIMEOUT_SECS
+}
+
 impl Default for InferenceConfigToml {
     /// Every field at its serde default, as a configuration without an `[inference]` table reads.
     fn default() -> Self {
@@ -163,6 +167,12 @@ pub struct InferenceConfigToml {
     /// Seconds of audio one request hands the speech tower; past it the request is refused.
     #[serde(default = "default_max_audio_seconds")]
     pub max_audio_seconds: f64,
+    /// Hosts an image given by URL may be fetched from. Empty fetches nothing.
+    #[serde(default)]
+    pub image_fetch_hosts: Vec<String>,
+    /// Seconds a fetch of an image given by URL may take, connection to last byte.
+    #[serde(default = "default_image_fetch_timeout_secs")]
+    pub image_fetch_timeout_secs: u64,
     /// For a streamed model: how much exactness the output may give up for speed. `exact` (the
     /// default) keeps it identical to the full model; `balanced` accepts differences no larger
     /// than the model's own run-to-run noise; `fast` accepts a small multiple of that. The
@@ -378,6 +388,8 @@ impl Config {
                 max_images: toml_config.max_images,
                 max_image_pixels: toml_config.max_image_pixels,
                 max_audio_seconds: toml_config.max_audio_seconds,
+                fetch_hosts: toml_config.image_fetch_hosts.clone(),
+                fetch_timeout_secs: toml_config.image_fetch_timeout_secs,
             },
             quality: toml_config.quality,
             progress_callback: None, // No progress callback from config file

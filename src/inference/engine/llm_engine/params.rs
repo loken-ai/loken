@@ -205,7 +205,8 @@ pub struct InferenceConfig {
     /// The origin clients reach this server at, for the URLs it hands out; `None` uses
     /// the request\'s `Host`.
     pub public_url: Option<String>,
-    /// Per-request caps on images, pixels and audio seconds.
+    /// Per-request caps on images, pixels and audio seconds, and the hosts an image given
+    /// by URL is fetched from.
     pub media_limits: crate::api::media_limits::MediaLimits,
     /// How much exactness a streamed model may give up for speed.
     pub quality: QualityLevel,

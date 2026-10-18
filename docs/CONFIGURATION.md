@@ -237,8 +237,10 @@ is answered 400 naming the key and the value it carried.
 | Key | Default | What it does |
 |---|---|---|
 | `max_images` | 16, the most one message carries | Images one request hands the vision encoder. |
-| `max_image_pixels` | 134217728, the decoder's 512 MiB budget at RGBA8 | Pixels (width times height) an image may declare in its header, checked before it is decoded. |
+| `max_image_pixels` | 134217728, the decoder's 512 MiB budget at RGBA8 | Pixels (width times height) an image may declare in its header, checked before it is decoded. An image fetched by URL may also be at most four bytes per allowed pixel. |
 | `max_audio_seconds` | 1398, the same budget for a stereo clip at 48 kHz in f32 | Seconds of the audio clip, read from the container's header where it states them and from the decoded frames otherwise. |
+| `image_fetch_hosts` | none | Hosts, or `host:port` pairs, an image given by URL on the Messages API is fetched from; redirects are followed only to them. Empty fetches nothing. |
+| `image_fetch_timeout_secs` | 30 | Seconds a fetch of an image by URL may take, connection to last byte. |
 
 ## `[cpu]`
 

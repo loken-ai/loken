@@ -37,13 +37,20 @@ pub(crate) fn anthropic_api_error(e: ApiError) -> Response {
 pub(crate) async fn anthropic_messages(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
-    AnthropicJson(req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
+    AnthropicJson(mut req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
 ) -> Response {
     use crate::api::anthropic;
     use axum::http::StatusCode;
 
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_api_error(e);
+    }
+    // Images by URL are fetched here, so a relayed request carries them as base64.
+    if let Err(why) = req
+        .inline_url_images(&state.default_inference_config.media_limits)
+        .await
+    {
+        return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
     }
     let model_name = normalize_model_id(&req.model);
     // The conversation goes where the model is. Peers are asked about the prompt this

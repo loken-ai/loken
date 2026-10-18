@@ -140,8 +140,8 @@ fn tool_result_text(content: &Value) -> String {
 
 impl AnthropicMessagesRequest {
     /// Effective max_tokens (Anthropic field, defaulting when absent).
-    /// The first content block this server cannot take, with the reason: an image
-    /// given by URL (nothing is fetched from here) or a document (nothing reads PDFs).
+    /// The first content block this server cannot take, with the reason: a document
+    /// (nothing reads PDFs).
     pub fn unsupported_input(&self) -> Option<String> {
         let messages = serde_json::to_value(&self.messages).ok()?;
         for m in messages.as_array()? {
@@ -149,25 +149,57 @@ impl AnthropicMessagesRequest {
                 continue;
             };
             for b in blocks {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("image")
-                        if b.pointer("/source/type").and_then(Value::as_str) == Some("url") =>
-                    {
-                        return Some(
-                            "image blocks given by URL are not fetched; send the image as base64"
-                                .to_string(),
-                        );
-                    }
-                    Some("document") => {
-                        return Some(
-                            "document blocks are not read; send the document's text".to_string(),
-                        );
-                    }
-                    _ => {}
+                if b.get("type").and_then(Value::as_str) == Some("document") {
+                    return Some(
+                        "document blocks are not read; send the document's text".to_string(),
+                    );
                 }
             }
         }
         None
+    }
+
+    /// Fetches every image block given by URL (`source: {type: "url", url}`) within the
+    /// limits' host allowlist and size caps, and rewrites its source as base64, so the rest
+    /// of the request path sees only base64 images. More URL images than `max_images` are
+    /// refused before any fetch.
+    pub(crate) async fn inline_url_images(
+        &mut self,
+        limits: &crate::api::media_limits::MediaLimits,
+    ) -> Result<(), String> {
+        let mut sources: Vec<&mut Value> = self
+            .messages
+            .iter_mut()
+            .filter_map(|m| match &mut m.content {
+                AnthropicMessageContent::Blocks(blocks) => Some(blocks.iter_mut()),
+                AnthropicMessageContent::Text(_) => None,
+            })
+            .flatten()
+            .filter(|b| block_type(b) == "image")
+            .filter_map(|b| b.get_mut("source"))
+            .filter(|s| s.get("type").and_then(Value::as_str) == Some("url"))
+            .collect();
+        if sources.len() > limits.max_images {
+            return Err(format!(
+                "the request carries {} images by URL and `max_images` allows {}",
+                sources.len(),
+                limits.max_images
+            ));
+        }
+        for source in &mut sources {
+            let url = source
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or("an image source of type `url` needs a `url` string")?
+                .to_string();
+            let (data, media_type) = limits.fetch_image(&url).await?;
+            **source = json!({
+                "type": "base64",
+                "media_type": media_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                "data": data,
+            });
+        }
+        Ok(())
     }
 
     pub fn effective_max_tokens(&self) -> usize {
@@ -593,6 +625,85 @@ impl AnthropicError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn url_image_request(urls: &[String]) -> AnthropicMessagesRequest {
+        let mut blocks: Vec<Value> = urls
+            .iter()
+            .map(|u| json!({"type": "image", "source": {"type": "url", "url": u}}))
+            .collect();
+        blocks.push(json!({"type": "text", "text": "what is this?"}));
+        serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": blocks}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_image_by_url_is_fetched_and_lowered_as_base64() {
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(4, 4)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let body = png.clone();
+        let app = axum::Router::new().route(
+            "/cat.png",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let limits = crate::api::media_limits::MediaLimits {
+            fetch_hosts: vec!["127.0.0.1".to_string()],
+            ..Default::default()
+        };
+        let mut req = url_image_request(&[format!("http://{addr}/cat.png")]);
+        assert!(req.unsupported_input().is_none());
+        req.inline_url_images(&limits).await.unwrap();
+        let (msgs, _) = req.into_internal();
+        let images = msgs[0]
+            .images
+            .as_ref()
+            .expect("the fetched image is carried");
+        assert_eq!(
+            images[0],
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_by_url_from_a_host_outside_the_allowlist_is_refused() {
+        let limits = crate::api::media_limits::MediaLimits {
+            fetch_hosts: vec!["images.example".to_string()],
+            ..Default::default()
+        };
+        let mut req = url_image_request(&["https://elsewhere.example/a.png".to_string()]);
+        let err = req.inline_url_images(&limits).await.unwrap_err();
+        assert!(err.contains("host 'elsewhere.example'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn more_images_by_url_than_the_cap_are_refused_before_any_fetch() {
+        let limits = crate::api::media_limits::MediaLimits {
+            max_images: 1,
+            fetch_hosts: vec!["images.example".to_string()],
+            ..Default::default()
+        };
+        let url = "https://images.example/a.png".to_string();
+        let mut req = url_image_request(&[url.clone(), url]);
+        let err = req.inline_url_images(&limits).await.unwrap_err();
+        assert!(
+            err.contains("2 images by URL") && err.contains("`max_images` allows 1"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn lowers_string_content_and_system() {

@@ -30,7 +30,7 @@ mod anthropic;
 mod api_names_invariants;
 mod client;
 pub mod launch;
-/// Per-request caps on the media a chat request carries.
+/// Per-request caps on the media a chat request carries, and the fetch of images by URL.
 pub mod media_limits;
 pub(crate) mod thinking;
 pub(crate) mod tool_calls;
