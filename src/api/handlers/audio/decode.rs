@@ -858,6 +858,10 @@ pub(crate) async fn audio_generations(
                 .clamp(6, 8192) as usize;
             let temperature = b.get("temperature").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             let topp = b.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.98) as f32;
+            let bpm = match crate::inference::media::midi::requested_bpm(b.get("bpm")) {
+                Ok(bpm) => bpm,
+                Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
+            };
             let prompt_m = prompt.clone();
             let midi_path = checkpoint
                 .as_deref()
@@ -872,6 +876,7 @@ pub(crate) async fn audio_generations(
                     temperature,
                     topp,
                     seed,
+                    bpm,
                 )
                 .map_err(|e| e.to_string())
             })

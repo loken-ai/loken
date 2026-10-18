@@ -31,15 +31,39 @@ const NOTE_OFFSET: u32 = 11_000; // K in [11000,27512) -> instrument*128 + pitch
 const MAX_TIME: u32 = 10_000;
 const MAX_DUR: u32 = 1_000;
 const MAX_NOTE: u32 = 16_512; // 129 instruments x 128 pitches
-const TPQN: u16 = 50; // ticks/beat: with 120 BPM -> 100 ticks/s = the AMT 10 ms resolution
+/// One AMT time unit, the resolution onsets and durations arrive in, in microseconds.
+const AMT_TICK_US: u64 = 10_000;
+/// Microseconds in a minute: a tempo in beats per minute is this over the quarter's length.
+const US_PER_MINUTE: f64 = 60_000_000.0;
+/// The tempo a render carries when the request names none.
+pub const DEFAULT_BPM: f64 = 120.0;
+/// The tempo range a request may name, in beats per minute.
+pub const BPM_RANGE: std::ops::RangeInclusive<f64> = 20.0..=300.0;
 const VELOCITY: u8 = 80;
 
 const SYSTEM_PROMPT: &str =
     "You are a world-class composer. Please compose some music according to the following description: ";
 
-/// Generate a Standard MIDI File (format 1) from a free-form text description. Returns the `.mid`
-/// bytes. `model` is a GGUF filename (resolved under the ollama models dir) or an absolute path;
-/// `device` is "cpu" or "cuda"/"gpu"/"auto".
+/// The tempo a request names in beats per minute, [`DEFAULT_BPM`] when it names none; a tempo
+/// outside [`BPM_RANGE`] or not a number is refused with a message naming it.
+pub fn requested_bpm(value: Option<&serde_json::Value>) -> Result<f64, String> {
+    let Some(v) = value.filter(|v| !v.is_null()) else {
+        return Ok(DEFAULT_BPM);
+    };
+    match v.as_f64() {
+        Some(bpm) if BPM_RANGE.contains(&bpm) => Ok(bpm),
+        _ => Err(format!(
+            "bpm {v} out of range; use a number from {} to {}",
+            BPM_RANGE.start(),
+            BPM_RANGE.end()
+        )),
+    }
+}
+
+/// Generate a Standard MIDI File (format 1) from a free-form text description, its tempo map
+/// set to `bpm`. Returns the `.mid` bytes. `model` is a GGUF filename (resolved under the ollama
+/// models dir) or an absolute path; `device` is "cpu" or "cuda"/"gpu"/"auto".
+#[allow(clippy::too_many_arguments)]
 pub fn render_midi(
     prompt: &str,
     model: &str,
@@ -48,6 +72,7 @@ pub fn render_midi(
     temperature: f32,
     top_p: f32,
     seed: u64,
+    bpm: f64,
 ) -> Result<Vec<u8>, DynErr> {
     if prompt.trim().is_empty() {
         return Err("empty prompt".into());
@@ -185,7 +210,7 @@ pub fn render_midi(
     if notes.is_empty() {
         return Err("no decodable notes (try more max_tokens or a different seed)".into());
     }
-    Ok(write_smf(&notes))
+    Ok(write_smf(&notes, bpm))
 }
 
 /// Last-position logits `[.,vocab]` -> `Vec<f32>`.
@@ -328,8 +353,16 @@ fn chunk(id: &[u8; 4], body: Vec<u8>) -> Vec<u8> {
 }
 
 /// Notes -> a multitrack SMF. Each distinct instrument gets a MIDI channel (drums = ch 9) and its
-/// own track with a program change; note_on at `onset`, note_off at `onset + dur` (1 tick = 10 ms).
-fn write_smf(notes: &[Note]) -> Vec<u8> {
+/// own track with a program change; note_on at `onset`, note_off at `onset + dur`. Track 0 sets
+/// the tempo to `bpm`; the division is the smallest whole number of ticks per quarter that keeps
+/// a tick at or under one AMT unit, and every AMT time is rescaled to it, so the notes sound at
+/// the times the model placed them whatever the tempo. At 120 BPM a tick is exactly one unit.
+fn write_smf(notes: &[Note], bpm: f64) -> Vec<u8> {
+    let us_per_quarter = (US_PER_MINUTE / bpm).round() as u64;
+    let division = us_per_quarter.div_ceil(AMT_TICK_US);
+    let tick = |amt: u32| -> u32 {
+        ((u64::from(amt) * AMT_TICK_US * division + us_per_quarter / 2) / us_per_quarter) as u32
+    };
     // Assign instruments -> channels (drums=9; melodic fill 0..=8,10..=15 in first-seen order,
     // reusing the last channel once they run out).
     const MELODIC: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15];
@@ -356,15 +389,16 @@ fn write_smf(notes: &[Note]) -> Vec<u8> {
         if n.instr != 128 && !ev.iter().any(|e| e.1 == (0xC0 | ch)) {
             ev.push((TRACK_START, 0xC0 | ch, (n.instr % 128) as u8, 0)); // program change
         }
-        ev.push((n.onset, 0x90 | ch, n.pitch, VELOCITY)); // note on
-        ev.push((n.onset + n.dur.max(1), 0x80 | ch, n.pitch, 0)); // note off
+        ev.push((tick(n.onset), 0x90 | ch, n.pitch, VELOCITY)); // note on
+        ev.push((tick(n.onset + n.dur.max(1)), 0x80 | ch, n.pitch, 0)); // note off
     }
 
     let mut tracks: Vec<Vec<u8>> = Vec::new();
-    // Track 0: tempo (500000 µs/quarter = 120 BPM).
+    // Track 0: set_tempo, microseconds per quarter on three bytes.
     let mut t0 = Vec::new();
     vlq(0, &mut t0);
-    t0.extend_from_slice(&[0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // set_tempo 500000
+    t0.extend_from_slice(&[0xFF, 0x51, 0x03]);
+    t0.extend_from_slice(&(us_per_quarter as u32).to_be_bytes()[1..]);
     vlq(0, &mut t0);
     t0.extend_from_slice(&[0xFF, 0x2F, 0x00]); // end of track
     tracks.push(chunk(b"MTrk", t0));
@@ -390,14 +424,74 @@ fn write_smf(notes: &[Note]) -> Vec<u8> {
         tracks.push(chunk(b"MTrk", body));
     }
 
-    // Header: format 1, ntracks, division = TPQN.
+    // Header: format 1, ntracks, division in ticks per quarter.
     let mut hdr = Vec::new();
     hdr.extend_from_slice(&1u16.to_be_bytes());
     hdr.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
-    hdr.extend_from_slice(&TPQN.to_be_bytes());
+    hdr.extend_from_slice(&(division as u16).to_be_bytes());
     let mut out = chunk(b"MThd", hdr);
     for t in tracks {
         out.extend_from_slice(&t);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The set_tempo payload and the header division of a written file.
+    fn tempo_and_division(smf: &[u8]) -> (u32, u16) {
+        let at = smf
+            .windows(3)
+            .position(|w| w == [0xFF, 0x51, 0x03])
+            .expect("set_tempo event");
+        let us = u32::from_be_bytes([0, smf[at + 3], smf[at + 4], smf[at + 5]]);
+        (us, u16::from_be_bytes([smf[12], smf[13]]))
+    }
+
+    fn one_note(onset: u32) -> Vec<Note> {
+        vec![Note {
+            onset,
+            dur: 50,
+            instr: 0,
+            pitch: 60,
+        }]
+    }
+
+    #[test]
+    fn default_tempo_keeps_one_tick_per_amt_unit() {
+        let smf = write_smf(&one_note(100), DEFAULT_BPM);
+        assert_eq!(&smf[..4], b"MThd");
+        assert_eq!(tempo_and_division(&smf), (500_000, 50));
+    }
+
+    #[test]
+    fn named_tempo_is_carried_and_note_times_hold() {
+        let smf = write_smf(&one_note(50), 90.0);
+        let (us, division) = tempo_and_division(&smf);
+        assert_eq!(us, 666_667);
+        assert_eq!(division, 67);
+        // The note on sits half a second in, 50 AMT units, whatever the tick length.
+        let tick_us = f64::from(us) / f64::from(division);
+        let expected = (500_000.0 / tick_us).round() as u8;
+        let on = smf
+            .windows(3)
+            .position(|w| w == [0x90, 60, VELOCITY])
+            .expect("note on");
+        assert_eq!(smf[on - 1], expected);
+    }
+
+    #[test]
+    fn requested_bpm_defaults_and_refuses_out_of_range() {
+        assert_eq!(requested_bpm(None), Ok(DEFAULT_BPM));
+        assert_eq!(
+            requested_bpm(Some(&serde_json::Value::Null)),
+            Ok(DEFAULT_BPM)
+        );
+        assert_eq!(requested_bpm(Some(&serde_json::json!(96))), Ok(96.0));
+        let err = requested_bpm(Some(&serde_json::json!(900))).unwrap_err();
+        assert!(err.contains("900"), "{err}");
+        assert!(requested_bpm(Some(&serde_json::json!("fast"))).is_err());
+    }
 }

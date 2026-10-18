@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- MIDI: render at the tempo the request names in bpm.
 - Audio: answer generated clips as mp3 or flac by response_format.
 - Messages API: read images by URL from allowed hosts.
 - API: cap images, pixels and audio seconds per request.
