@@ -314,6 +314,18 @@ impl GenericHeteroTransformer {
             .collect()
     }
 
+    /// Before a token runs through the expert caches' layers: an error while a card's tier
+    /// worker stands stalled or failed, a stall being lifted once the worker serves again.
+    pub fn tier_check(&self) -> crate::tensor::Result<()> {
+        self.tier_workers.iter().try_for_each(|w| w.check())
+    }
+
+    /// Why a card's tier worker left its mailboxes released, if one did: the step that ran
+    /// through them is not to be trusted.
+    pub fn tier_failure(&self) -> Option<String> {
+        self.tier_workers.iter().find_map(|w| w.failure())
+    }
+
     /// Positions the draft head's cache holds.
     pub fn draft_len(&self) -> usize {
         self.draft.as_ref().map_or(0, |d| d.len)

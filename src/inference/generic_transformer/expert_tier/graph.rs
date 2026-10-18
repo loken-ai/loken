@@ -8,8 +8,8 @@
 //! between two kernels, which is what a recorded graph needs and what an eager decode pays a
 //! round trip for.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::{self, CUresult};
 
@@ -273,6 +273,11 @@ impl Mailbox {
     pub(super) fn abort(&self) {
         unsafe { std::ptr::write_volatile(self.word(ABORT), 1) };
     }
+
+    /// Let the card wait for its answers again.
+    fn clear_abort(&self) {
+        unsafe { std::ptr::write_volatile(self.word(ABORT), 0) };
+    }
 }
 
 impl Drop for Mailbox {
@@ -330,6 +335,161 @@ static WORKER: WorkerStats = WorkerStats {
     missed_many: std::sync::atomic::AtomicU64::new(0),
 };
 
+/// The steps of a request the worker names in its heartbeat, by index.
+const STEPS: [&str; 8] = [
+    "waiting for a request",
+    "reading a request",
+    "counting the routing",
+    "copying experts into the transit room",
+    "computing the missing experts on the host",
+    "waiting for the transit copies to land",
+    "answering",
+    "queueing promotions",
+];
+const IDLE: usize = 0;
+const READING: usize = 1;
+const COUNTING: usize = 2;
+const TO_TRANSIT: usize = 3;
+const ON_HOST: usize = 4;
+const LANDING: usize = 5;
+const ANSWERING: usize = 6;
+const PROMOTING: usize = 7;
+
+/// How many times the longest request the worker is known to take a request may go unanswered,
+/// with the worker making no progress, before the worker counts as stalled.
+const STALL_MARGIN: u64 = 64;
+
+/// How many times the watchdog looks within one stall bound.
+const LOOKS_A_BOUND: u32 = 4;
+
+/// The heartbeat of a card's tier worker and what stands when it stalled or failed: the
+/// worker writes the beat, its watchdog and the decode read it.
+pub(super) struct Health {
+    epoch: std::time::Instant,
+    /// Nanoseconds from `epoch` to the worker's last step.
+    beat: AtomicU64,
+    /// The worker's layer, as its place in the list it serves, and its step, at the last beat.
+    tier: AtomicUsize,
+    step: AtomicUsize,
+    /// Nanoseconds the longest request the worker answered took.
+    longest: AtomicU64,
+    /// Why the card's mailboxes were released, and the beat at that time.
+    failure: Mutex<Option<(String, u64)>>,
+    /// The worker thread returned: what it released stays released.
+    exited: AtomicBool,
+    /// Each recorded layer's place in the worker's list, its mailbox and the request the
+    /// worker last answered there.
+    mails: Vec<(usize, Arc<Mailbox>, Arc<AtomicU32>)>,
+    /// The watchdog's thread, woken once the worker has a measured request.
+    watchdog: OnceLock<std::thread::Thread>,
+}
+
+impl Health {
+    fn new(mails: Vec<(usize, Arc<Mailbox>, Arc<AtomicU32>)>) -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+            beat: AtomicU64::new(0),
+            tier: AtomicUsize::new(0),
+            step: AtomicUsize::new(IDLE),
+            longest: AtomicU64::new(0),
+            failure: Mutex::new(None),
+            exited: AtomicBool::new(false),
+            mails,
+            watchdog: OnceLock::new(),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// The worker is at `step` of the request of its layer `tier`.
+    fn beat(&self, tier: usize, step: usize) {
+        self.tier.store(tier, Ordering::Relaxed);
+        self.step.store(step, Ordering::Relaxed);
+        self.beat.store(self.now(), Ordering::Release);
+    }
+
+    /// A request of `ns` was answered.
+    fn answered(&self, ns: u64) {
+        if self.longest.fetch_max(ns, Ordering::Relaxed) == 0 {
+            if let Some(t) = self.watchdog.get() {
+                t.unpark();
+            }
+        }
+    }
+
+    /// The first layer with a request posted and not answered: its place in the worker's list,
+    /// its mailbox and the request's number.
+    fn pending(&self) -> Option<(usize, &Mailbox, u32)> {
+        self.mails.iter().find_map(|(i, m, done)| {
+            let seq = m.request();
+            (seq != done.load(Ordering::Relaxed)).then_some((*i, &**m, seq))
+        })
+    }
+
+    /// Release every waiting card and keep `why` for the decode, unless a failure stands.
+    fn fail(&self, why: String) {
+        let mut f = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if f.is_none() {
+            *f = Some((why, self.beat.load(Ordering::Acquire)));
+        }
+        for (_, m, _) in &self.mails {
+            m.abort();
+        }
+    }
+
+    /// Why the card's mailboxes stand released, if they do.
+    pub(super) fn failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(why, _)| why.clone())
+    }
+
+    /// Before a token runs through the card's layers: an error while a failure stands. A stall
+    /// is lifted once the worker has moved on since and answered every request posted: the
+    /// card's stream is waited for, so no wait of the failed step reads the cleared word.
+    pub(super) fn check(&self, dev: &Device) -> Result<()> {
+        let mut f = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((why, at)) = f.as_ref() else {
+            return Ok(());
+        };
+        let moved = self.beat.load(Ordering::Acquire) > *at;
+        if self.exited.load(Ordering::Acquire)
+            || !moved
+            || self.pending().is_some()
+            || crate::tensor::cuda_ext::capture_active(dev)
+        {
+            crate::tensor::bail!("expert tier: {why}");
+        }
+        dev.as_cuda_device()?
+            .0
+            .stream()
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("expert tier: {e:?}")))?;
+        for (_, m, _) in &self.mails {
+            m.clear_abort();
+        }
+        tracing::warn!("expert tier: the worker serves again after: {why}");
+        *f = None;
+        Ok(())
+    }
+
+    /// Nanoseconds a request may go unanswered while the worker does not move: [`STALL_MARGIN`]
+    /// times the longest request it answered or the longest any of `tiers` takes at the paces
+    /// measured. None before anything is measured.
+    fn bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> Option<u64> {
+        let paced = tiers
+            .iter()
+            .map(|(_, t)| t.longest_request_ns())
+            .fold(0, u64::max);
+        let base = self.longest.load(Ordering::Relaxed).max(paced);
+        (base > 0).then(|| base.saturating_mul(STALL_MARGIN))
+    }
+}
+
 /// A layer's decoded rows between the post of their request and the wait for the answer.
 pub(crate) struct GraphPending {
     card: Tensor,
@@ -344,12 +504,14 @@ pub(crate) struct GraphPending {
 /// A layer's side of the graph decode: the mailbox, the buffers the kernels write on the card,
 /// the rows they have room for, and the number of the last request the host answered.
 pub(super) struct GraphSide {
-    mail: Mailbox,
+    mail: Arc<Mailbox>,
     counter: Tensor,
     slots: Tensor,
     weights: Tensor,
     rows_max: usize,
-    done: AtomicU32,
+    done: Arc<AtomicU32>,
+    /// The health of the worker that answers this layer, once one is started.
+    health: OnceLock<Arc<Health>>,
     /// Around the copies of a request's late experts into the transit room.
     upload_start: cudarc::driver::CudaEvent,
     upload_end: cudarc::driver::CudaEvent,
@@ -387,6 +549,37 @@ impl LayerTier {
         ))
     }
 
+    /// Nanoseconds the widest request of this layer takes when every pair misses, at the slower
+    /// of the paces measured for a host product and a copy of an expert, the copy at the card's
+    /// measured rate while no copy is timed. Zero before any is known.
+    fn longest_request_ns(&self) -> u64 {
+        let Some(g) = self.graph.get() else {
+            return 0;
+        };
+        let mut us = [&self.host_us, &self.upload_us]
+            .iter()
+            .flat_map(|c| c.iter())
+            .map(|c| f64::from_bits(c.load(Ordering::Relaxed)))
+            .fold(0f64, f64::max);
+        if let Some(rate) = self
+            .stage
+            .as_ref()
+            .map(|s| s.stager.bandwidth)
+            .filter(|&r| r > 0.0)
+        {
+            us = us.max(self.expert_bytes.iter().sum::<usize>() as f64 / rate);
+        }
+        (us * 1e3 * (g.rows_max * g.mail.k) as f64) as u64
+    }
+
+    /// An error while the worker serving this layer's recorded decode stands stalled or failed.
+    pub(super) fn health_check(&self) -> Result<()> {
+        match self.graph.get().and_then(|g| g.health.get()) {
+            Some(h) => h.check(&self.dev),
+            None => Ok(()),
+        }
+    }
+
     /// Let this layer's decoded token, and the rows of a verify up to `rows_max`, run as kernels
     /// alone, served by a [`TierWorker`].
     pub(super) fn enable_graph(&self, hidden: usize, k: usize, rows_max: usize) -> Result<()> {
@@ -406,12 +599,13 @@ impl LayerTier {
         drop(st);
         let pairs = rows_max * k;
         let side = GraphSide {
-            mail: Mailbox::new(dev, k, hidden, rows_max)?,
+            mail: Arc::new(Mailbox::new(dev, k, hidden, rows_max)?),
             counter: Tensor::from_vec(vec![0u32; 2], (2,), &host)?.to_device(dev)?,
             slots: Tensor::from_vec(vec![0u32; pairs], (pairs,), &host)?.to_device(dev)?,
             weights: Tensor::from_vec(vec![0f32; pairs], (1, pairs), &host)?.to_device(dev)?,
             rows_max,
-            done: AtomicU32::new(0),
+            done: Arc::new(AtomicU32::new(0)),
+            health: OnceLock::new(),
             upload_start: super::timed_event(dev)?,
             upload_end: super::timed_event(dev)?,
         };
@@ -487,6 +681,7 @@ impl LayerTier {
     ) -> Result<GraphPending> {
         use crate::inference::moe_cuda;
         let g = self.graph.get().expect("a graph layer is enabled");
+        self.health_check()?;
         let k = moe.n_experts_used;
         let dev = xs.device().clone();
         let cd = dev.as_cuda_device()?;
@@ -692,7 +887,8 @@ impl LayerTier {
     }
 
     /// Answer the layer's request if the card posted one since the last answer. Whether it did.
-    pub(super) fn serve_graph_request(self: &Arc<Self>) -> Result<bool> {
+    /// `beat` tells the worker's health which step it is at.
+    pub(super) fn serve_graph_request(self: &Arc<Self>, beat: &dyn Fn(usize)) -> Result<bool> {
         let Some(g) = self.graph.get() else {
             return Ok(false);
         };
@@ -701,6 +897,11 @@ impl LayerTier {
         }
         let started = std::time::Instant::now();
         let mut laps = Laps::new();
+        beat(READING);
+        #[cfg(test)]
+        while STALL_FOR_TEST.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let req = g.mail.read();
         laps.mark("tier worker: read");
         let pairs = req.ids.len();
@@ -710,6 +911,7 @@ impl LayerTier {
         let mut in_use = vec![false; self.slots()];
         let mut missing: Vec<u32> = Vec::new();
         let mut miss_pairs: Vec<(usize, u32, f32)> = Vec::new();
+        beat(COUNTING);
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             for i in 0..pairs {
@@ -746,6 +948,7 @@ impl LayerTier {
             let to_transit = self.transit_share_of(missing.len(), req.rows);
             let (transit, host_experts) = missing.split_at(to_transit);
             if !transit.is_empty() {
+                beat(TO_TRANSIT);
                 self.copy_to_transit_between(&g.upload_start, &g.upload_end, transit)?;
             }
             let host_pairs: Vec<(usize, u32, f32)> = miss_pairs
@@ -766,6 +969,7 @@ impl LayerTier {
                 })
                 .collect();
             let t = std::time::Instant::now();
+            beat(ON_HOST);
             let product = if host_pairs.is_empty() {
                 vec![0f32; req.rows * req.x.len() / req.rows.max(1)]
             } else {
@@ -785,6 +989,7 @@ impl LayerTier {
                 .missing
                 .fetch_add(missing.len() as u64, Ordering::Relaxed);
             if !transit.is_empty() {
+                beat(LANDING);
                 g.upload_end
                     .synchronize()
                     .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
@@ -796,11 +1001,13 @@ impl LayerTier {
                     .fetch_add(transit.len() as u64, Ordering::Relaxed);
             }
             laps.mark("tier worker: transit landed");
+            beat(ANSWERING);
             g.mail.hand_late(&late);
             g.mail.answer(&product, req.seq);
         }
         g.done.store(req.seq, Ordering::Relaxed);
         laps.mark("tier worker: answer");
+        beat(PROMOTING);
         self.promote_up_to(&missing, &in_use, super::ADAPT_SWAPS_A_REQUEST);
         laps.mark("tier worker: promote");
         // The leader says what a request costs the host, once per window of requests.
@@ -850,52 +1057,105 @@ impl LayerTier {
     }
 }
 
-/// The thread that answers the requests of the graph layers of one card.
+/// Holds the tier worker of a test at the start of its next request until cleared.
+#[cfg(test)]
+pub(super) static STALL_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
+/// The thread that answers the requests of the graph layers of one card, and the watchdog that
+/// releases the card when a request goes unanswered while the worker does not move.
 pub struct TierWorker {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
     tiers: Vec<Arc<LayerTier>>,
+    health: Arc<Health>,
+    dev: Device,
 }
 
 impl TierWorker {
-    pub(super) fn start(dev: &Device, tiers: Vec<Arc<LayerTier>>) -> Result<Self> {
+    /// Serve `tiers`, each named for the logs.
+    pub(super) fn start(dev: &Device, tiers: Vec<(String, Arc<LayerTier>)>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let ctx = dev.as_cuda_device()?.0.context().clone();
-        let mine = tiers.clone();
-        let flag = stop.clone();
+        let mails = tiers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, t))| Some((i, t.graph.get()?)))
+            .map(|(i, g)| (i, g.mail.clone(), g.done.clone()))
+            .collect();
+        let health = Arc::new(Health::new(mails));
+        for (_, t) in &tiers {
+            if let Some(g) = t.graph.get() {
+                let _ = g.health.set(health.clone());
+            }
+        }
+        let mine: Vec<Arc<LayerTier>> = tiers.iter().map(|(_, t)| t.clone()).collect();
+        let served = mine.clone();
+        let (flag, beats) = (stop.clone(), health.clone());
         let thread = std::thread::Builder::new()
             .name("tier-worker".into())
             .spawn(move || {
                 let _ = ctx.bind_to_thread();
-                serve_loop(&mine, &flag);
+                serve_loop(&served, &flag, &beats);
             })
             .map_err(|e| crate::tensor::Error::msg(format!("tier worker: {e}")))?;
+        let (flag, watched) = (stop.clone(), health.clone());
+        let watchdog = std::thread::Builder::new()
+            .name("tier-watchdog".into())
+            .spawn(move || watch(&tiers, &flag, &watched))
+            .map_err(|e| crate::tensor::Error::msg(format!("tier watchdog: {e}")))?;
+        let _ = health.watchdog.set(watchdog.thread().clone());
         Ok(Self {
             stop,
             thread: Some(thread),
-            tiers,
+            watchdog: Some(watchdog),
+            tiers: mine,
+            health,
+            dev: dev.clone(),
         })
+    }
+
+    /// Before a token runs through this card's layers: an error while the worker stands
+    /// stalled or failed, see [`Health::check`].
+    pub fn check(&self) -> Result<()> {
+        self.health.check(&self.dev)
+    }
+
+    /// Why this card's mailboxes stand released, if they do.
+    pub fn failure(&self) -> Option<String> {
+        self.health.failure()
+    }
+
+    /// The stall bound as it stands.
+    #[cfg(test)]
+    pub(super) fn stall_bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> Option<u64> {
+        self.health.bound(tiers)
     }
 }
 
 /// Answer requests until told to stop: spinning while requests keep coming, which the card
-/// waits on, and polling at a gentler pace once they stop. A failure releases every waiting card.
-fn serve_loop(tiers: &[Arc<LayerTier>], stop: &AtomicBool) {
+/// waits on, and polling at a gentler pace once they stop. A failure releases every waiting
+/// card and stands for the decode to read.
+fn serve_loop(tiers: &[Arc<LayerTier>], stop: &AtomicBool, health: &Health) {
     let mut last = std::time::Instant::now();
     // Seconds between requests while they come, smoothed: the spin lasts a few of them.
     let mut gap = 0.0f64;
     while !stop.load(Ordering::Relaxed) {
         let mut served = false;
-        for t in tiers {
-            match t.serve_graph_request() {
-                Ok(s) => served |= s,
+        for (i, t) in tiers.iter().enumerate() {
+            health.beat(i, IDLE);
+            let started = std::time::Instant::now();
+            match t.serve_graph_request(&|step| health.beat(i, step)) {
+                Ok(s) => {
+                    if s {
+                        health.answered(started.elapsed().as_nanos() as u64);
+                    }
+                    served |= s;
+                }
                 Err(e) => {
                     tracing::error!("tier worker: {e}");
-                    for t in tiers {
-                        if let Some(g) = t.graph.get() {
-                            g.mail.abort();
-                        }
-                    }
+                    health.exited.store(true, Ordering::Release);
+                    health.fail(format!("the tier worker failed: {e}"));
                     return;
                 }
             }
@@ -917,13 +1177,57 @@ fn serve_loop(tiers: &[Arc<LayerTier>], stop: &AtomicBool) {
     }
 }
 
+/// Watch the worker of `tiers`: a request left unanswered while the worker has not moved for
+/// longer than [`Health::bound`] releases every card waiting on the worker, and the decode
+/// fails on it. The watchdog sleeps until the worker has a measured request.
+fn watch(tiers: &[(String, Arc<LayerTier>)], stop: &AtomicBool, health: &Health) {
+    while !stop.load(Ordering::Acquire) {
+        let Some(bound) = health.bound(tiers) else {
+            std::thread::park();
+            continue;
+        };
+        std::thread::park_timeout(std::time::Duration::from_nanos(
+            bound / u64::from(LOOKS_A_BOUND),
+        ));
+        if stop.load(Ordering::Acquire) || health.failure().is_some() {
+            continue;
+        }
+        let still = health
+            .now()
+            .saturating_sub(health.beat.load(Ordering::Acquire));
+        if still < bound {
+            continue;
+        }
+        let Some((at, mail, seq)) = health.pending() else {
+            continue;
+        };
+        let name = |i: usize| tiers.get(i).map_or("a layer", |(n, _)| n.as_str());
+        let worker_at = health.tier.load(Ordering::Relaxed);
+        let step = STEPS[health.step.load(Ordering::Relaxed).min(STEPS.len() - 1)];
+        let [request, reply, abort, rows] = mail.words();
+        let why = format!(
+            "the tier worker stalled: {} has request {seq} unanswered while the worker has been {step} for {} for {:.3} s, past the bound of {:.3} s (request {request} reply {reply} abort {abort} rows {rows})",
+            name(at),
+            name(worker_at),
+            still as f64 * 1e-9,
+            bound as f64 * 1e-9,
+        );
+        tracing::error!("expert tier: {why}; the card's mailboxes are released");
+        health.fail(why);
+    }
+}
+
 impl Drop for TierWorker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
         for t in &self.tiers {
             if let Some(g) = t.graph.get() {
                 g.mail.abort();
             }
+        }
+        if let Some(h) = self.watchdog.take() {
+            h.thread().unpark();
+            let _ = h.join();
         }
         if let Some(h) = self.thread.take() {
             let _ = h.join();

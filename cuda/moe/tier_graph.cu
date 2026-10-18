@@ -88,14 +88,26 @@ extern "C" __global__ void loken_tier_plan_kernel(
     if (t == 0) *mail_request = seq;
 }
 
+// The pause between two reads of the reply word grows with the wait: a sixteenth of the time
+// slept so far, between the floor and the ceiling in nanoseconds: the card leaves the wait at
+// most a sixteenth of the time waited, and at most the ceiling, after the answer lands.
+#define LOKEN_TIER_WAIT_SHIFT 4
+#define LOKEN_TIER_WAIT_FLOOR_NS 32u
+#define LOKEN_TIER_WAIT_CEIL_NS 2048u
+
 extern "C" __global__ void loken_tier_wait_kernel(
         const unsigned int * __restrict__ counter,
         volatile unsigned int * reply,
         volatile unsigned int * abort_word) {
     if (threadIdx.x == 0) {
         const unsigned int seq = counter[0];
+        unsigned long long slept = 0ull;
         while (counter[1] != 0u && (int) (*reply - seq) < 0 && *abort_word == 0u) {
-            __nanosleep(100);
+            unsigned long long pause = slept >> LOKEN_TIER_WAIT_SHIFT;
+            if (pause < LOKEN_TIER_WAIT_FLOOR_NS) pause = LOKEN_TIER_WAIT_FLOOR_NS;
+            if (pause > LOKEN_TIER_WAIT_CEIL_NS) pause = LOKEN_TIER_WAIT_CEIL_NS;
+            __nanosleep((unsigned int) pause);
+            slept += pause;
         }
     }
     __syncthreads();

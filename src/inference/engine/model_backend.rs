@@ -457,6 +457,17 @@ pub(crate) trait ModelBackend: Send {
         Vec::new()
     }
 
+    /// Before a recorded step: an error while an expert cache's worker stands stalled or failed.
+    fn tier_check(&self) -> crate::tensor::Result<()> {
+        Ok(())
+    }
+
+    /// After a recorded step: why an expert cache's worker released the card's waits, if it
+    /// did, which makes the step's output untrustworthy.
+    fn tier_failure(&self) -> Option<String> {
+        None
+    }
+
     /// Hand the draft head the hidden state of the recorded step that just replayed.
     fn step_feature(&mut self) {}
 
@@ -1796,6 +1807,14 @@ impl ModelBackend for GenericBackend {
 
     fn tier_mailboxes(&self) -> Vec<String> {
         self.0.tier_mailboxes()
+    }
+
+    fn tier_check(&self) -> crate::tensor::Result<()> {
+        self.0.tier_check()
+    }
+
+    fn tier_failure(&self) -> Option<String> {
+        self.0.tier_failure()
     }
 
     fn step_feature(&mut self) {

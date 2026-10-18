@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Experts: fail a request whose tier worker stalls instead of hanging the card.
 - Experts: lock and unlock host pages without holding the tier worker back.
 
 ## [0.3.0] - 2026-10-18

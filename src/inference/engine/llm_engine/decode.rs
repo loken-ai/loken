@@ -532,7 +532,17 @@ fn wait_telling(
             }
         }
     }
-    Ok(())
+    tier_trusted(model)
+}
+
+/// After a recorded step has run: an error when an expert cache's worker released the card's
+/// waits meanwhile, the step's output then holding no host answer.
+#[cfg(feature = "cuda")]
+fn tier_trusted(model: &BoxedModelBackend) -> crate::tensor::Result<()> {
+    match model.tier_failure() {
+        Some(why) => crate::tensor::bail!("expert tier: {why}"),
+        None => Ok(()),
+    }
 }
 
 /// Seconds a wait on the card lasts before it says what the mailboxes hold.
@@ -981,6 +991,7 @@ impl VerifyGraph {
     /// Runs every part in order and waits for the last card's stream, which holds the logits.
     fn launch(&self, model: &mut BoxedModelBackend, rows: usize) -> crate::tensor::Result<()> {
         let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
+        model.tier_check()?;
         let mut last = None;
         for step in &self.steps {
             match step {
@@ -996,7 +1007,7 @@ impl VerifyGraph {
         if let Some(s) = last {
             s.synchronize().map_err(err)?;
         }
-        Ok(())
+        tier_trusted(model)
     }
 
     /// The nodes of every graph of the verify.
@@ -1047,6 +1058,7 @@ impl DecodeGraph {
     /// logits.
     pub(super) fn launch(&self, model: &mut BoxedModelBackend) -> crate::tensor::Result<()> {
         let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
+        model.tier_check()?;
         use crate::inference::offload::{prof_record, stage_prof_enabled};
         let prof = stage_prof_enabled();
         let started = prof.then(std::time::Instant::now);
@@ -1094,6 +1106,7 @@ impl DecodeGraph {
         if let Some(s) = last {
             s.synchronize().map_err(err)?;
         }
+        tier_trusted(model)?;
         for (_, a, b) in &timed {
             if let Ok(ms) = a.elapsed_ms(b) {
                 prof_record("step: graph device time", (ms as f64 * 1e6) as u64);

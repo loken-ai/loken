@@ -16,6 +16,16 @@ pub(crate) struct GraphPending;
 /// The thread serving a card's recorded decode: none without a card.
 pub struct TierWorker;
 
+impl TierWorker {
+    pub fn check(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        None
+    }
+}
+
 impl LayerTier {
     pub(super) fn decode(
         self: &Arc<Self>,
