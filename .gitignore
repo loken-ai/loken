@@ -27,6 +27,7 @@ test_model_cache/
 # one machine at one moment and should be regenerated rather than committed.
 results/
 !results/.gitkeep
+bench/store/
 *.log
 tmp/
 local/

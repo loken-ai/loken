@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- Bench: keep the store in bench/store, outside the server's configuration.
+
 ## [0.3.1] - 2026-10-19
 
 ### Fixed

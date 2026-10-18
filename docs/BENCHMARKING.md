@@ -23,7 +23,7 @@ Nothing about a campaign is retyped or maintained by hand:
 | model list | loken's own catalogue, `GET /api/tags` - no scan, no list to maintain |
 | matrix axes + vLLM peers | `bench/matrix.toml` - the only curated data, public HF repo ids only |
 | ollama / vLLM binaries | installed by the campaign into a bench-only compartment (see below) |
-| the store | `bench_data_dir` in `config.toml` |
+| the store | `bench/store/` in the loken tree, kept out of git |
 
 ## Run it
 
@@ -51,7 +51,7 @@ other environment.
 Every run is a record of the assay schema, filed once in the store under the hash of its content
 (`runs/<run_id>.json`, written by `assay/scripts/store.py`). A rerun is a new file; nothing is
 overwritten, and a result file in `results/` is only the campaign's scratch copy. The store sits
-outside the repositories, at `bench_data_dir`.
+in `bench/store/`, out of git; the server's configuration does not name it.
 
 ```mermaid
 flowchart LR

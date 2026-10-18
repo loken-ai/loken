@@ -4,10 +4,6 @@
 # Uncomment to override:
 # ollama_models_dir = '/path/to/ollama/models'
 # huggingface_models_dir = '/path/to/huggingface/models'
-#
-# Where the benchmark scripts keep every run (assay/scripts/store.py) and read them back
-# (scripts/report.py). Relative paths are taken from this file's directory.
-# bench_data_dir = '/path/to/bench-data'
 
 [server]
 host = "127.0.0.1"

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Write the benchmark pages from the store, one per hardware configuration.
 
-    report.py [--config config.toml]        # regenerate docs/benchmarks/ and the index block
-    report.py file results/*.json           # file records into the store, then regenerate
-    report.py learn docs/BENCHMARKS.md      # record which model sits in which family section
+    report.py                         # regenerate docs/benchmarks/ and the index block
+    report.py file results/*.json     # file records into the store, then regenerate
+    report.py learn docs/BENCHMARKS.md  # record which model sits in which family section
 
-The store (`bench_data_dir` in config.toml, read by assay/scripts/store.py) holds every run
+The store (bench/store in this tree, filled by assay/scripts/store.py) holds every run
 once. This groups the runs by `hardware_id`, writes one page per group with the report's usual
 table, and writes `compare.md`, the one place where hardware meets: a cell appears there only
 when both machines measured it with the same answer length. Nothing in a page is typed: the
@@ -26,19 +26,15 @@ import hardware as H
 import store as S
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+STORE = ROOT / "bench" / "store"
 DOCS = ROOT / "docs"
 OUT = DOCS / "benchmarks"
 BEGIN, END = "<!-- benchmarks:index -->", "<!-- /benchmarks:index -->"
 
 
-def config(path):
-    cfg = tomllib.loads(path.read_text())
-    base = path.parent
-    store = cfg.get("bench_data_dir")
-    if not store:
-        sys.exit(f"{path} has no bench_data_dir")
-    models = cfg.get("ollama_models_dir")
-    return (base / store).resolve(), models
+def models_dir(path):
+    """The server's model store, where a model's file names its family."""
+    return tomllib.loads(path.read_text()).get("ollama_models_dir")
 
 
 def runs(store):
@@ -202,11 +198,13 @@ def compare(per_hw):
 
 def main(argv):
     cfg = pathlib.Path(argv[argv.index("--config") + 1]) if "--config" in argv else ROOT / "config.toml"
-    store, models_dir = config(cfg)
+    store = STORE
+    models = models_dir(cfg)
+    argv = [a for a in argv if a != "--config" and a != str(cfg)]
     if argv[:1] == ["learn"]:
         return learn(store, argv[1])
     if argv[:1] == ["file"]:
-        paths = [pathlib.Path(a) for a in argv[1:] if not a.startswith("--") and a != str(cfg)]
+        paths = [pathlib.Path(a) for a in argv[1:]]
         S.add(paths, store)
         S.index(store)
     groups, nameless = {}, 0
@@ -233,7 +231,7 @@ def main(argv):
         group = [t for t in group if not t[0].get("archive")]
         merged = B.load_docs(group)
         rows_ = B.cells(merged)
-        fam = families({r[0].strip() for r in rows_}, cache, models_dir)
+        fam = families({r[0].strip() for r in rows_}, cache, models)
         name = slug(machine, taken) + (f"-{backend}" if backend != "unstated" else "")
         taken.add(name)
         (OUT / f"{name}.md").write_text(page(H.label(machine), machine, group,
