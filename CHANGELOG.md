@@ -23,6 +23,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Bench: say in an error cell whether loken or assay lacks the model.
 - Bench: keep the store in bench/store, outside the server's configuration.
 
+### Fixed
+
+- Bench: never stamp an earlier result with a build that measured nothing.
+
 ## [0.3.1] - 2026-10-19
 
 ### Fixed

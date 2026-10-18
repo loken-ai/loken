@@ -274,7 +274,7 @@ provision() {
     [ -x "$obin" ] || die "no ollama binary in the compartment"
     # AMD cards need ollama's ROCm libraries, shipped apart and unpacked over the same tree.
     local odir; odir="$(dirname "$(dirname "$obin")")"
-    if [ "$GPU_VENDOR" = amd ] && ! [ -d "$odir/lib/ollama/rocm" ]; then
+    if [ "$GPU_VENDOR" = amd ] && ! compgen -G "$odir/lib/ollama/rocm*" >/dev/null; then
         local over rurl rarc
         over="$("$obin" --version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
         read -r _ rurl < <(ollama_asset ollama-linux-amd64-rocm.tar.zst "v$over")
@@ -371,14 +371,18 @@ PY
                 asrargs=(--audio "$ASR_AUDIO")
                 [ -s "$ASR_REFERENCE" ] && asrargs+=(--reference "$(cat "$ASR_REFERENCE")")
             fi
-            env ENGINES="$engines" STREAM="$st" BENCH_MODE=gpu OUT="$out" VLLM_SERVE="$vserve" \
+            # Measured into a file of its own: a run that writes nothing leaves no earlier result
+            # to be stamped with this build.
+            rm -f "$out.part"
+            env ENGINES="$engines" STREAM="$st" BENCH_MODE=gpu OUT="$out.part" VLLM_SERVE="$vserve" \
                 ASR_AUDIO="$ASR_AUDIO" \
                 timeout --kill-after=60 "${CELL_CAP:-7200}" \
                 scripts/fair_bench.sh --models "$m" --prompts "$prompts" --num-ctx "$ctx" \
                 --max-tokens "${MAXTOK:-128}" --iterations 3 --modality "$amod" \
                 "${asrargs[@]}" \
                 2>&1 | tail -4
-            [ -s "$out" ] || { echo "no result for $m"; continue; }
+            [ -s "$out.part" ] || { echo "no result for $m"; continue; }
+            mv "$out.part" "$out"
             stamp_result "$out" "$stamp"
             python3 scripts/report.py file "$out" >/dev/null 2>&1 || echo "  (report not modality-aware yet for $amod)"
         done; done
