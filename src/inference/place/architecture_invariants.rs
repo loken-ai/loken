@@ -111,6 +111,8 @@ const FAMILY_WORDS: &[&str] = &[
     "myshell",
     "systran",
     "city96",
+    // Time series forecasters.
+    "chronos",
 ];
 
 /// Files that still decide by a name, with how many literals. The list only shrinks.

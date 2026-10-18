@@ -33,7 +33,7 @@ Major, by priority:
 |---|---|---|---|
 | ROCm and Vulkan backends | Backends | Everything the CUDA build runs also runs through ROCm on AMD cards (every model family and every kernel, the NVIDIA tensor-core ones ported to the AMD matrix units), with the CUDA tests passing on an AMD card; one model of each family also served through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory; all measured against the CUDA path and the reference engine on the same cards | Started |
 | Coding agents beyond verve | Agents | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
-| Forecasting and tabular models | Models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Planned |
+| Forecasting and tabular models | Models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Partial |
 
 Smaller, by priority:
 
@@ -86,6 +86,7 @@ Smaller, by priority:
 | ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song no slower than 1.2x the original code on the same card, and the log shows the time of each step | Planned |
 | Music editing | Music | The music route can repaint, extend, cover, add a track (lego), split tracks (extract) and complete a song, each giving what the original code gives | Planned |
 | ACE-Step adapters | Models | A style LoRA trained for ACE-Step can be applied at load or per request, and its style is audible against the plain render | Planned |
+| Tabular models | Models | Predictions for rows of a table served beside the language models, and better than a simple baseline on a fixed data set | Planned |
 
 ## 0.6.0
 

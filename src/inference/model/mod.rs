@@ -15,6 +15,8 @@ pub mod attention;
 pub mod audio_in;
 pub mod block;
 pub mod boogu;
+/// The patched time series encoder with a quantile head.
+pub mod chronos2;
 pub mod clip;
 pub mod deepseek_v41;
 pub mod embedding;

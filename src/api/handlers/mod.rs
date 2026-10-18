@@ -413,6 +413,8 @@ pub struct APIServer {
     audio_engine: Arc<AudioEngine>,
     #[cfg(feature = "audio")]
     tts_engine: Arc<crate::inference::engine::TtsEngine>,
+    /// The resident time series forecaster.
+    forecast_engine: Arc<crate::inference::engine::forecast_engine::ForecastEngine>,
     /// Priority-aware gate in front of `engine.generate*()` calls. Only one
     /// generate runs at a time (matches the model lock); waiters are
     /// ordered by priority so FIM editor completions skip ahead of queued
@@ -1507,6 +1509,9 @@ impl APIServer {
             audio_engine: Arc::new(AudioEngine::new()),
             #[cfg(feature = "audio")]
             tts_engine: Arc::new(crate::inference::engine::TtsEngine::new()),
+            forecast_engine: Arc::new(
+                crate::inference::engine::forecast_engine::ForecastEngine::new(),
+            ),
             request_gate,
             loading_locks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             loading: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -2728,6 +2733,10 @@ impl APIServer {
                 axum::routing::post(openai::pooling::cohere_embed),
             )
             .route("/score", axum::routing::post(openai::pooling::score))
+            .route(
+                "/v1/forecast",
+                axum::routing::post(openai::forecast::forecast),
+            )
             .route("/v1/score", axum::routing::post(openai::pooling::score))
             .route("/api/create", axum::routing::post(ollama_create_model))
             .route(
@@ -3137,6 +3146,13 @@ pub(crate) fn non_chat_pipeline_component(hf_models_dir: &str, model_name: &str)
     {
         return Some("its files declare a speech model this build runs no engine for.".to_string());
     }
+    if kind == Some(MediaKind::Forecast) {
+        return Some(
+            "its files declare a time series forecaster, not a model that generates text. \
+             Send its series to POST /v1/forecast."
+                .to_string(),
+        );
+    }
     if kind == Some(MediaKind::Component) {
         return Some(
             "its files declare a component of another pipeline - an encoder or an \
@@ -3247,6 +3263,7 @@ fn available_endpoints_list() -> serde_json::Value {
         "POST /v1/chat/completions",
         "POST /v1/completions",
         "POST /v1/embeddings",
+        "POST /v1/forecast",
         "POST /v1/audio/transcriptions",
         "POST /v1/audio/translations",
         "POST /v1/audio/speech",

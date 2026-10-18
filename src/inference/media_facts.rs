@@ -103,6 +103,8 @@ pub enum MediaKind {
     Music,
     /// Symbolic music: MIDI events.
     Midi,
+    /// A time series forecaster: a series in, quantiles of its continuation out.
+    Forecast,
     /// A part another pipeline loads: a text or image encoder, an autoencoder, a tokenizer.
     Component,
 }
@@ -119,6 +121,7 @@ impl MediaKind {
             MediaKind::Sound(_) => "sound",
             MediaKind::Music => "music",
             MediaKind::Midi => "midi",
+            MediaKind::Forecast => "forecast",
             MediaKind::Component => return None,
         })
     }
@@ -206,6 +209,12 @@ fn transformers_model_type(model_type: &str) -> Option<MediaKind> {
         | "umt5" => MediaKind::Component,
         _ => return None,
     })
+}
+
+/// A transformers `architectures` class that names a time series forecaster whose encoder
+/// this server runs.
+fn forecaster_class(class: &str) -> bool {
+    matches!(class, "Chronos2Model")
 }
 
 /// A GGUF `general.architecture`.
@@ -379,6 +388,15 @@ fn from_config(config: &serde_json::Value) -> Option<MediaFacts> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         return Some(facts);
+    }
+    // A forecaster declares the transformers `model_type` of the encoder it was built from,
+    // so its class is read first.
+    if config
+        .pointer("/architectures/0")
+        .and_then(|v| v.as_str())
+        .is_some_and(forecaster_class)
+    {
+        return Some(MediaFacts::of(MediaKind::Forecast));
     }
     if let Some(kind) = text("model_type").and_then(transformers_model_type) {
         return Some(MediaFacts::of(kind));
@@ -852,6 +870,10 @@ mod tests {
             (
                 serde_json::json!({"model_type": "t5"}),
                 MediaKind::Component,
+            ),
+            (
+                serde_json::json!({"model_type": "t5", "architectures": ["Chronos2Model"]}),
+                MediaKind::Forecast,
             ),
             (
                 serde_json::json!({"model": "xtts"}),

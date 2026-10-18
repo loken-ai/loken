@@ -220,6 +220,7 @@ pub(crate) fn media_capabilities(facts: &crate::inference::media_facts::MediaFac
         MediaKind::Sound(SoundKind::LatentDiffusion) => &["sfx"],
         MediaKind::Music => &["music"],
         MediaKind::Midi => &["midi"],
+        MediaKind::Forecast => &["forecast"],
         MediaKind::Component => &[],
     };
     caps.iter().map(|s| s.to_string()).collect()

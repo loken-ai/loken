@@ -22,6 +22,7 @@ pub mod boogu_engine;
 pub(crate) mod decode_step;
 #[cfg(feature = "image")]
 pub mod flux2_engine;
+pub mod forecast_engine;
 #[cfg(feature = "image")]
 pub mod image_engine;
 pub mod llm_engine;

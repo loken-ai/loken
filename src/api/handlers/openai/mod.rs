@@ -3,6 +3,7 @@
 
 use super::*;
 
+pub(crate) mod forecast;
 pub(crate) mod pooling;
 
 /// The string a request field holds, empty when it is absent or is not a string.
