@@ -36,7 +36,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 |---|---|
 | `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`. Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. |
 | `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, and an array of prompts. |
-| `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. |
+| `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. `input_image` (`image_url` as a base64 data URL, or `file_id` of an upload) and `input_audio` (`data`, `format`) parts are ingested as the `image_url` and `input_audio` parts of a chat completion; another part type answers 400 naming it. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. |
 | `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. |
 | `POST /v2/rerank` | The same in Cohere's shape: `documents` as strings or `{text}` objects, `top_n`, `return_documents`; answers `{id, results, meta}`. |

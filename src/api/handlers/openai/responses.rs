@@ -50,9 +50,34 @@ fn error(status: StatusCode, message: String) -> Response {
     (status, Json(openai_error_body(status, message))).into_response()
 }
 
+/// The bytes of an uploaded file, by its Files API id.
+type FileBytes<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
+
+/// The URL an `input_image` part points at: `image_url` as a string or `{url}`, else
+/// the uploaded file `file_id` as a base64 data URL.
+fn input_image_url(p: &Value, file: FileBytes) -> Result<String, String> {
+    use base64::Engine as _;
+    match p.get("image_url") {
+        Some(Value::String(u)) => return Ok(u.clone()),
+        Some(Value::Object(o)) => {
+            if let Some(u) = o.get("url").and_then(Value::as_str) {
+                return Ok(u.to_string());
+            }
+        }
+        _ => {}
+    }
+    let Some(id) = p.get("file_id").and_then(Value::as_str) else {
+        return Err("an `input_image` part needs `image_url` or `file_id`".to_string());
+    };
+    let bytes = file(id).ok_or_else(|| format!("file_id '{id}' is not known"))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:application/octet-stream;base64,{b64}"))
+}
+
 /// A Responses `content` value as chat completion content: a string stays one, an
-/// array of input parts becomes an array of chat parts.
-fn lower_content(content: &Value) -> Result<Value, String> {
+/// array of input parts becomes an array of chat parts. Images and audio become the
+/// `image_url` and `input_audio` parts chat completion ingests.
+fn lower_content(content: &Value, file: FileBytes) -> Result<Value, String> {
     match content {
         Value::String(_) | Value::Null => Ok(content.clone()),
         Value::Array(parts) => {
@@ -65,16 +90,20 @@ fn lower_content(content: &Value) -> Result<Value, String> {
                         "text": p.get("text").and_then(Value::as_str).unwrap_or("")
                     })),
                     "input_image" => {
-                        let url = match p.get("image_url") {
-                            Some(Value::String(u)) => u.clone(),
-                            Some(Value::Object(o)) => o
-                                .get("url")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            _ => String::new(),
-                        };
+                        let url = input_image_url(p, file)?;
                         out.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                    }
+                    "input_audio" => {
+                        // `{"input_audio": {"data", "format"}}`, or the two fields flat.
+                        let a = p.get("input_audio").unwrap_or(p);
+                        let data = a.get("data").and_then(Value::as_str).ok_or(
+                            "an `input_audio` part needs `input_audio.data`, a base64 string",
+                        )?;
+                        let mut audio = json!({"data": data});
+                        if let Some(f) = a.get("format") {
+                            audio["format"] = f.clone();
+                        }
+                        out.push(json!({"type": "input_audio", "input_audio": audio}));
                     }
                     other => return Err(format!("unsupported input part type '{other}'")),
                 }
@@ -85,8 +114,9 @@ fn lower_content(content: &Value) -> Result<Value, String> {
     }
 }
 
-/// The chat messages a Responses request stands for.
-fn lower_input(req: &Value) -> Result<Vec<Value>, String> {
+/// The chat messages a Responses request stands for; `file` reads the uploads a
+/// `file_id` names.
+fn lower_input(req: &Value, file: FileBytes) -> Result<Vec<Value>, String> {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(prev) = req.get("previous_response_id").and_then(Value::as_str) {
         match stored_messages(prev) {
@@ -109,7 +139,8 @@ fn lower_input(req: &Value) -> Result<Vec<Value>, String> {
                 match kind {
                     "message" => {
                         let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                        let content = lower_content(item.get("content").unwrap_or(&Value::Null))?;
+                        let content =
+                            lower_content(item.get("content").unwrap_or(&Value::Null), file)?;
                         messages.push(json!({"role": role, "content": content}));
                     }
                     "function_call" => {
@@ -361,7 +392,8 @@ pub(crate) async fn openai_responses(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::Validation("`model` is required".to_string()))?
         .to_string();
-    let messages = lower_input(&req).map_err(ApiError::Validation)?;
+    let messages = lower_input(&req, &|id| super::files::read_file_bytes(&state, id))
+        .map_err(ApiError::Validation)?;
     if messages.is_empty() {
         return Err(ApiError::Validation("`input` is empty".to_string()));
     }
@@ -576,6 +608,88 @@ pub(crate) async fn openai_delete_response(
 mod tests {
     use super::*;
 
+    fn no_files(_: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The messages chat completion ingests from a Responses request, as JSON.
+    fn ingested_from_responses(req: &Value, file: FileBytes) -> Value {
+        let msgs = lower_input(req, file).unwrap();
+        let chat: ChatCompletionRequest =
+            serde_json::from_value(chat_body(req, "m", &msgs, None, false)).unwrap();
+        serde_json::to_value(&chat.messages).unwrap()
+    }
+
+    /// The messages chat completion ingests from a chat completion request, as JSON.
+    fn ingested_from_chat(messages: Value) -> Value {
+        let chat: ChatCompletionRequest =
+            serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap();
+        serde_json::to_value(&chat.messages).unwrap()
+    }
+
+    #[test]
+    fn an_image_part_is_ingested_as_on_chat_completions() {
+        let url = "data:image/png;base64,iVBORw0KGgo=";
+        let req = json!({"input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": url, "detail": "auto"}
+        ]}]});
+        let chat = json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": url}}
+        ]}]);
+        let got = ingested_from_responses(&req, &no_files);
+        assert_eq!(got, ingested_from_chat(chat));
+        assert_eq!(got[0]["images"][0], "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn an_uploaded_image_is_ingested_by_file_id() {
+        let png = vec![0x89, b'P', b'N', b'G'];
+        let file = |id: &str| (id == "file_1").then(|| png.clone());
+        let req = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "file_id": "file_1"}
+        ]}]});
+        let chat = json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw=="}}
+        ]}]);
+        assert_eq!(
+            ingested_from_responses(&req, &file),
+            ingested_from_chat(chat)
+        );
+        let unknown = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "file_id": "file_2"}
+        ]}]});
+        assert!(lower_input(&unknown, &file).unwrap_err().contains("file_2"));
+    }
+
+    #[test]
+    fn an_audio_part_is_ingested_as_on_chat_completions() {
+        let audio = json!({"data": "UklGRg==", "format": "wav"});
+        let req = json!({"input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "transcribe"},
+            {"type": "input_audio", "input_audio": audio}
+        ]}]});
+        let chat = json!([{"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "input_audio", "input_audio": audio}
+        ]}]);
+        let got = ingested_from_responses(&req, &no_files);
+        assert_eq!(got, ingested_from_chat(chat));
+        assert_eq!(got[0]["audios"][0], "UklGRg==");
+    }
+
+    #[test]
+    fn an_unsupported_part_type_is_refused_by_name() {
+        let req = json!({"input": [{"role": "user", "content": [
+            {"type": "input_video", "video_url": "x"}
+        ]}]});
+        let e = lower_input(&req, &no_files).unwrap_err();
+        assert!(e.contains("'input_video'"), "{e}");
+        let status = ApiError::Validation(e).into_response().status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     /// A whole answer runs as a chat completion chat completion accepts: no
     /// `stream_options` outside a stream, which it refuses.
     #[test]
@@ -587,7 +701,7 @@ mod tests {
             "stop": ["END"],
             "reasoning": {"effort": "minimal"}
         });
-        let msgs = lower_input(&req).unwrap();
+        let msgs = lower_input(&req, &no_files).unwrap();
         let whole = chat_body(&req, "m", &msgs, None, false);
         assert!(whole.get("stream_options").is_none());
         assert_eq!(whole["reasoning_effort"], "minimal");
@@ -609,7 +723,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "c1", "output": "42"}
             ]
         });
-        let m = lower_input(&req).unwrap();
+        let m = lower_input(&req, &no_files).unwrap();
         assert_eq!(m.len(), 4);
         assert_eq!(m[0]["role"], "system");
         assert_eq!(m[1]["content"][0]["type"], "text");

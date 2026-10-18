@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- Responses API: read image and audio input parts as chat completions does.
+
 ### Changed
 
 - Bench: keep the store in bench/store, outside the server's configuration.
