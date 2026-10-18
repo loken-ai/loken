@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Placement: keep every network on the host when the server runs with --cpu.
 - Attention: count each key once when the flash prefill splits a long history.
 - Experts: fail a request whose tier worker stalls instead of hanging the card.
 - Experts: lock and unlock host pages without holding the tier worker back.
