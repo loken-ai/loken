@@ -97,8 +97,9 @@ loken declares and passes `--modality` to assay:
 | tts | `/v1/audio/speech` | real-time factor | produced audio, not silence |
 | asr | `/v1/audio/transcriptions` | word error rate | produced a transcript |
 
-A model loken lists but cannot measure (say an AWQ checkpoint whose tokenizer the loader does not
-read) is an **error cell**, visible in the report - never a silent skip.
+A model loken lists but cannot measure is an **error cell**, visible in the report - never a
+silent skip. The reason says which side lacks it: a model no engine of this build serves (it
+declares no capability), or a capability assay has no clock for (embedding, video, midi).
 
 ## What the driver guards (and why)
 

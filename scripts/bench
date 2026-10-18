@@ -67,7 +67,8 @@ def modality(caps):
     if "tts" in caps: return "tts"
     if "asr" in caps: return "asr"
     if "completion" in caps: return "text"
-    return "other"  # video, embedding, midi... no assay clock: an error cell, not a silent skip
+    if not caps: return "unserved"   # listed from the store, no engine in this build serves it
+    return sorted(caps)[0]           # embedding, video, midi...: no assay clock, an error cell
 for m in json.load(sys.stdin).get("models", []):
     fmt = (m.get("details") or {}).get("format") or ""
     print(m["name"] + "\t" + modality(m.get("capabilities")) + "\t" + fmt)
@@ -96,7 +97,9 @@ plan_cell() { # plan_cell <model> <modality> <format>
             else
                 err="asr needs a golden audio (set ASR_AUDIO=<wav>)"
             fi ;;
-        *)  err="no assay measurement for modality '$mod' (video/embedding/midi/...)" ;;
+        unserved)
+            err="not served by loken: it declares no capability" ;;
+        *)  err="no assay measurement for the '$mod' capability" ;;
     esac
     # "|" separates the fields, not a tab: a tab is IFS whitespace, so an empty middle field (an
     # empty vLLM target) would collapse and shift the error into the wrong column. No field holds a
