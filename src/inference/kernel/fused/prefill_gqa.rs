@@ -60,7 +60,33 @@ pub fn flash_prefill_gqa(
     scale: f32,
     window: usize,
 ) -> Result<Option<Tensor>> {
+    if q.device().is_cuda() && !crate::tensor::gpu_runtime::IS_NVIDIA {
+        return through_wmma(q, k, v, scale, window);
+    }
     Ok(run(q, k, v, scale, window, None)?.map(|(out, _)| out))
+}
+
+/// The same attention through the WMMA flash prefill, which compiles for AMD's matrix cores:
+/// its `[1, n_head, seq_q, hd]` answer laid out as [`flash_prefill_gqa`] returns it.
+fn through_wmma(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    window: usize,
+) -> Result<Option<Tensor>> {
+    let (_, n_head, seq_q, hd) = q.dims4()?;
+    let n_kv = k.dims4()?.1;
+    let window = i32::try_from(window).unwrap_or(i32::MAX);
+    let Some(out) = super::flash_prefill_f16(q, k, v, n_head, n_kv, scale, window)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        out.transpose(1, 2)?
+            .contiguous()?
+            .reshape((1, seq_q, n_head * hd))?
+            .to_dtype(DType::F32)?,
+    ))
 }
 
 /// The attention of `q` `[1, n_head, seq_q, hd]` over `k`, `v` as [`flash_prefill_gqa`] reads
