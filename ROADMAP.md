@@ -80,12 +80,12 @@ Smaller, by priority:
 | MIDI in | Music | A MIDI file given as the prompt continues for the bars asked, in its tempo and key | Planned |
 | Expert parallelism for resident experts | Parallelism | A mixture layer whose experts all fit on the cards split across them where measured links make it pay, faster than the layer on one card | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | A layer split over cards and a cache cut by positions handed over from the prefill instance, the decode instance reading no prompt | Planned |
-| Image and text embeddings | API | A CLIP or SigLIP checkpoint served alone on the embeddings route for text and images, its vectors matching the reference implementation, measured by the bench | Planned |
-| Voice conversion | Audio | An OpenVoice checkpoint turning a recording into a reference speaker's voice through a documented route, measured by the bench | Planned |
-| Embeddings measured by the bench | Bench | Every model with the embedding capability measured by assay, inputs per second and latency, against the peers that serve it | Planned |
-| ACE-Step at the reference speed | Performance | A song of the length asked rendered by each ACE-Step 1.5 variant within 1.2x of the reference implementation's time on the same card, each stage's time logged | Planned |
-| Music editing | Music | Repaint, extend, cover, lego, extract and complete on the audio generations route, each matching the reference implementation's task | Planned |
-| ACE-Step adapters | Models | A LoRA trained for ACE-Step applied at load or per request, its style heard against the base render | Planned |
+| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, with the same vectors as the original code, and the bench measures it | Planned |
+| Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker, through a documented route, and the bench measures it | Planned |
+| Embeddings measured by the bench | Bench | The bench measures every embedding model (inputs per second, latency) and compares it with the other servers that run it | Planned |
+| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song no slower than 1.2x the original code on the same card, and the log shows the time of each step | Planned |
+| Music editing | Music | The music route can repaint, extend, cover, add a track (lego), split tracks (extract) and complete a song, each giving what the original code gives | Planned |
+| ACE-Step adapters | Models | A style LoRA trained for ACE-Step can be applied at load or per request, and its style is audible against the plain render | Planned |
 
 ## 0.6.0
 
@@ -94,7 +94,7 @@ Major, by priority:
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
 | A cluster that survives a node | Cluster | A node lost mid-request re-planned onto the others and the request finished, the loss reported | Planned |
-| A cluster across networks | Cluster | Nodes on different networks, behind NAT and without a shared LAN, joined over an authenticated and encrypted link, the placement pricing the measured wide-area links | Planned |
+| A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an authenticated, encrypted link, and the placement accounts for the slower links | Planned |
 | Tensor parallelism across machines | Cluster | One layer split over cards of several machines where the measured links pay, faster than the layer cut alone | Planned |
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints loaded through the same placement, outputs matching the reference implementation | Planned |
 
@@ -149,14 +149,14 @@ Major, by priority:
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
-| A supermodel from several families | Models | Models of different families and vocabularies served as one model: their next-token distributions combined at each step over an aligned vocabulary, the result scoring above each member on a committed task set | Planned |
+| A supermodel from several families | Models | Several models of different families (for example Llama, Mistral, Qwen, DeepSeek) answer together as one model, choosing each word together, and score better than each of them alone on a fixed task set | Planned |
 
 Smaller, by priority:
 
 | Feature | Category | Acceptance | State |
 |---|---|---|---|
-| Routing between families | Models | One model name answering each request with the member a measured router picks, the choice logged, scoring above each member alone at lower cost than the ensemble | Planned |
-| A supermodel distilled into one | Models | The ensemble's outputs distilled into one member through the adapter training of 0.8.0, served alone near the ensemble's score | Planned |
+| Routing between families | Models | One model name sends each request to the member best suited to it, logs the choice, and scores better than each member alone for less than running them all | Planned |
+| A supermodel distilled into one | Models | One member is trained (with the adapter training of 0.8.0) to answer like the group, and scores close to it on its own | Planned |
 
 ## Waiting for hardware
 
