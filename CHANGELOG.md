@@ -4,6 +4,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
 ### Added
 
 - Experts: a file larger than the host keeps its most routed experts of every layer in host memory.
