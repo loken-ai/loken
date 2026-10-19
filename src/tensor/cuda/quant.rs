@@ -527,10 +527,152 @@ pub fn gpu_mmv_iq2_xxs(
         .map_err(|e| Error(format!("iq2_xxs matvec download: {e}")))
 }
 
-/// A routed expert's whole forward for one row, its three weights already on the device: the gate
-/// and up products with the SwiGLU between them, then the down product. Returns the rows entering
-/// the down projection and the output. Two launches and one crossing each way, where three
-/// separate products pay four - and on a decode the crossing, not the arithmetic, is the cost.
+/// The instances of one expert a warp reads a weight row once for, in the exact expert kernels: a
+/// decode runs one instance per expert, a prompt's expert up to this many rows per read.
+const EXACT_TILE: usize = 8;
+
+/// Routed experts on the card, computed as the host computes them (see `cx_expert_h_iq2_xxs`):
+/// gate and up IQ2_XXS [inter, dim], down Q2_K [dim, inter], all already on the device. Instance
+/// `i` runs expert `instances[i].0` over row `instances[i].1` of `xq`, the q8_K32 rows of the
+/// inputs on the card; instances of one expert stand together. Returns, on the card, the rows
+/// entering the down projections [instances, inter] and the outputs [instances, dim], each the
+/// same bits `offload::cpu_experts` forms on the host.
+#[allow(clippy::type_complexity)]
+pub fn gpu_experts_exact(
+    dev: &CudaDevice,
+    experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
+    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    (dim, inter): (usize, usize),
+    xq: &CudaSlice<u8>,
+    instances: &[(usize, usize)],
+    limit: f32,
+) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
+    use crate::tensor::quant_cpu::format::BlockQ8K;
+    let n = instances.len();
+    if dim % 256 != 0
+        || inter % 256 != 0
+        || n == 0
+        || instances.iter().any(|&(e, _)| e >= experts.len())
+    {
+        return Err(Error(format!(
+            "exact experts: dim {dim}, inter {inter}, {n} instances of {} experts",
+            experts.len()
+        )));
+    }
+    let stream = dev.stream();
+    let mut gate_ptrs = Vec::with_capacity(experts.len());
+    let mut up_ptrs = Vec::with_capacity(experts.len());
+    let mut down_ptrs = Vec::with_capacity(experts.len());
+    let mut guards = Vec::with_capacity(3 * experts.len());
+    for (g, u, d) in experts {
+        let (gp, gg) = g.device_ptr(stream);
+        let (up, gu) = u.device_ptr(stream);
+        let (dp, gd) = d.device_ptr(stream);
+        gate_ptrs.push(gp);
+        up_ptrs.push(up);
+        down_ptrs.push(dp);
+        guards.push(gg);
+        guards.push(gu);
+        guards.push(gd);
+    }
+    // Runs of instances that read one weight, at most a tile long: (expert, first, count).
+    let mut tiles: Vec<i32> = Vec::new();
+    let mut widest = 0usize;
+    let mut start = 0usize;
+    while start < n {
+        let e = instances[start].0;
+        let mut end = start + 1;
+        while end < n && end - start < EXACT_TILE && gate_ptrs[instances[end].0] == gate_ptrs[e] {
+            end += 1;
+        }
+        tiles.extend([e as i32, start as i32, (end - start) as i32]);
+        widest = widest.max(end - start);
+        start = end;
+    }
+    let ntiles = tiles.len() / 3;
+    let rows: Vec<i32> = instances.iter().map(|&(_, r)| r as i32).collect();
+    let up_err = |e| alloc_err("exact experts upload", e);
+    let gate_arr = stream.clone_htod(&gate_ptrs).map_err(up_err)?;
+    let up_arr = stream.clone_htod(&up_ptrs).map_err(up_err)?;
+    let down_arr = stream.clone_htod(&down_ptrs).map_err(up_err)?;
+    let tiles_d = stream.clone_htod(&tiles).map_err(up_err)?;
+    let rows_d = stream.clone_htod(&rows).map_err(up_err)?;
+    let h = with_oom_retry(dev, "exact experts h", || unsafe {
+        stream.alloc::<f32>(n * inter)
+    })?;
+    let hq_bytes = n * (inter / 256) * std::mem::size_of::<BlockQ8K>();
+    let hq = with_oom_retry(dev, "exact experts hq", || unsafe {
+        stream.alloc::<u8>(hq_bytes)
+    })?;
+    let y = with_oom_retry(dev, "exact experts y", || unsafe {
+        stream.alloc::<f32>(n * dim)
+    })?;
+    let (dim_i, inter_i, tt_i) = (dim as i32, inter as i32, widest as i32);
+    let (sbs, sbs2) = (dim / 256, inter / 256);
+    let hfun = dev.quantized_fn("cx_expert_h_iq2_xxs")?;
+    let hcfg = LaunchConfig {
+        grid_dim: (inter as u32, ntiles as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: ((2 * widest * sbs * 8 + 2 * widest * sbs) * F32_BYTES) as u32,
+    };
+    let mut b = stream.launch_builder(&hfun);
+    b.arg(&gate_arr);
+    b.arg(&up_arr);
+    b.arg(tables.0);
+    b.arg(tables.1);
+    b.arg(xq);
+    b.arg(&rows_d);
+    b.arg(&tiles_d);
+    b.arg(&h);
+    b.arg(&dim_i);
+    b.arg(&inter_i);
+    b.arg(&limit);
+    b.arg(&tt_i);
+    unsafe { b.launch(hcfg) }.map_err(|e| Error(format!("cx_expert_h_iq2_xxs launch: {e}")))?;
+    let qfun = dev.quantized_fn("cx_quantize_q8_k")?;
+    let nblocks = (n * sbs2) as i64;
+    let qcfg = LaunchConfig {
+        grid_dim: (nblocks as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&qfun);
+    b.arg(&h);
+    b.arg(&hq);
+    b.arg(&nblocks);
+    unsafe { b.launch(qcfg) }.map_err(|e| Error(format!("cx_quantize_q8_k launch: {e}")))?;
+    let dfun = dev.quantized_fn("cx_expert_down_q2_k")?;
+    let dcfg = LaunchConfig {
+        grid_dim: (dim as u32, ntiles as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: ((2 * widest * sbs2 * 16 + widest * sbs2) * F32_BYTES) as u32,
+    };
+    let mut b = stream.launch_builder(&dfun);
+    b.arg(&down_arr);
+    b.arg(&hq);
+    b.arg(&tiles_d);
+    b.arg(&y);
+    b.arg(&inter_i);
+    b.arg(&dim_i);
+    b.arg(&tt_i);
+    unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("cx_expert_down_q2_k launch: {e}")))?;
+    drop(guards);
+    Ok((h, y))
+}
+
+/// Bytes of an f32, the unit of the exact kernels' shared memory.
+const F32_BYTES: usize = std::mem::size_of::<f32>();
+
+/// `x`, rows of `dim`, on the card as the q8_K32 rows the exact expert kernels read.
+pub fn q8k32_rows_to_card(dev: &CudaDevice, x: &[f32]) -> Result<CudaSlice<u8>> {
+    dev.stream()
+        .clone_htod(&crate::tensor::quant_cpu::format::q8k32_bytes(x))
+        .map_err(|e| alloc_err("expert input upload", e))
+}
+
+/// A routed expert's whole forward for one row, its three weights already on the device: the
+/// rows entering the down projection and the output, the host's bits.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_expert_row(
     dev: &CudaDevice,
@@ -542,52 +684,20 @@ pub fn gpu_expert_row(
     x: &[f32],
     limit: f32,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    if dim % 256 != 0 || inter % 256 != 0 || x.len() != dim {
-        return Err(Error(format!(
-            "expert row: dim {dim}, inter {inter}, {} inputs",
-            x.len()
-        )));
+    if x.len() != dim {
+        return Err(Error(format!("expert row: dim {dim}, {} inputs", x.len())));
     }
+    let xq = q8k32_rows_to_card(dev, x)?;
+    let (h, y) = gpu_experts_exact(
+        dev,
+        &[(gate, up, down)],
+        tables,
+        (dim, inter),
+        &xq,
+        &[(0, 0)],
+        limit,
+    )?;
     let stream = dev.stream();
-    let xs = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("expert row upload", e))?;
-    let h = with_oom_retry(dev, "expert rows", || unsafe { stream.alloc::<f32>(inter) })?;
-    let func = dev.quantized_fn("mmv_expert_h_iq2_xxs_f32")?;
-    let cfg = LaunchConfig {
-        grid_dim: (inter as u32, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let (dim_i, inter_i) = (dim as i32, inter as i32);
-    let mut b = stream.launch_builder(&func);
-    b.arg(gate);
-    b.arg(up);
-    b.arg(tables.0);
-    b.arg(tables.1);
-    b.arg(&xs);
-    b.arg(&h);
-    b.arg(&dim_i);
-    b.arg(&inter_i);
-    b.arg(&limit);
-    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_f32 launch: {e}")))?;
-
-    let y = with_oom_retry(dev, "expert output", || unsafe { stream.alloc::<f32>(dim) })?;
-    let func = dev.quantized_fn("mmv_q2_k_f32")?;
-    let cfg = LaunchConfig {
-        grid_dim: (dim as u32, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut b = stream.launch_builder(&func);
-    b.arg(down);
-    b.arg(&h);
-    b.arg(&y);
-    b.arg(&inter_i);
-    b.arg(&dim_i);
-    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("mmv_q2_k_f32 launch: {e}")))?;
-    // The rows entering the down projection come back beside the output: an observer watching a
-    // calibration reads them, and nine kilobytes is not worth a second path.
     let hs = stream
         .clone_dtoh(&h)
         .map_err(|e| Error(format!("expert rows download: {e}")))?;
@@ -597,91 +707,9 @@ pub fn gpu_expert_row(
     Ok((hs, ys))
 }
 
-/// The same two kernels as `gpu_expert_row`, over several experts that share one input row - the
-/// shape a decode takes, where every active expert of a layer sees the same token. The input goes
-/// over once, all the kernels are queued on the one stream, and the outputs come back after they
-/// have all run: one host round-trip for the block instead of one per expert, which is what the
-/// per-expert path pays. Bit-exact with running them one at a time - the kernels and their inputs
-/// are the same, only the host waits less.
-#[allow(clippy::type_complexity)]
-pub fn gpu_expert_rows(
-    dev: &CudaDevice,
-    experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
-    (dim, inter): (usize, usize),
-    x: &[f32],
-    limit: f32,
-) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
-    if dim % 256 != 0 || inter % 256 != 0 || x.len() != dim {
-        return Err(Error(format!(
-            "expert rows: dim {dim}, inter {inter}, {} inputs",
-            x.len()
-        )));
-    }
-    let stream = dev.stream();
-    let xs = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("expert rows upload", e))?;
-    let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_f32")?;
-    let dfun = dev.quantized_fn("mmv_q2_k_f32")?;
-    let (dim_i, inter_i) = (dim as i32, inter as i32);
-    // Every kernel of every expert is queued before a single byte is read back: the outputs
-    // downloaded below wait once, on the last of them, not once per expert.
-    let mut bufs: Vec<(CudaSlice<f32>, CudaSlice<f32>)> = Vec::with_capacity(experts.len());
-    for (gate, up, down) in experts {
-        let h = with_oom_retry(dev, "expert rows h", || unsafe {
-            stream.alloc::<f32>(inter)
-        })?;
-        let hcfg = LaunchConfig {
-            grid_dim: (inter as u32, 1, 1),
-            block_dim: (32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = stream.launch_builder(&hfun);
-        b.arg(*gate);
-        b.arg(*up);
-        b.arg(tables.0);
-        b.arg(tables.1);
-        b.arg(&xs);
-        b.arg(&h);
-        b.arg(&dim_i);
-        b.arg(&inter_i);
-        b.arg(&limit);
-        unsafe { b.launch(hcfg) }
-            .map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_f32 launch: {e}")))?;
-        let y = with_oom_retry(dev, "expert rows y", || unsafe { stream.alloc::<f32>(dim) })?;
-        let dcfg = LaunchConfig {
-            grid_dim: (dim as u32, 1, 1),
-            block_dim: (32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = stream.launch_builder(&dfun);
-        b.arg(*down);
-        b.arg(&h);
-        b.arg(&y);
-        b.arg(&inter_i);
-        b.arg(&dim_i);
-        unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("mmv_q2_k_f32 launch: {e}")))?;
-        bufs.push((h, y));
-    }
-    // Only the output comes back. The rows entering the down projection (`h`) are read by a
-    // calibration observer, which a decode does not run; downloading them for every expert of
-    // every layer was a device round-trip spent on nothing. The caller gets an empty `h`.
-    let mut out = Vec::with_capacity(bufs.len());
-    for (_h, y) in &bufs {
-        let ys = stream
-            .clone_dtoh(y)
-            .map_err(|e| Error(format!("expert rows download: {e}")))?;
-        out.push((Vec::new(), ys));
-    }
-    Ok(out)
-}
-
-/// The whole block of experts in ONE pair of launches: the h kernel over `(inter, nexperts)`
-/// blocks and the down kernel over `(dim, nexperts)`, each expert's weights reached through a
-/// device array of pointers. The card runs all of a layer's experts at once instead of one at a
-/// time on the host's clock - the difference between a matvec per crossing and a block per layer.
-/// Bit-exact with `gpu_expert_rows`.
+/// Several experts that share one input row - a decode's active experts of a layer - in one pair
+/// of launches. Returns each expert's output; the rows entering the down projections stay on the
+/// card, so `h` comes back empty.
 #[allow(clippy::type_complexity)]
 pub fn gpu_expert_rows_grouped(
     dev: &CudaDevice,
@@ -691,100 +719,30 @@ pub fn gpu_expert_rows_grouped(
     x: &[f32],
     limit: f32,
 ) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
-    use crate::tensor::gpu_runtime::driver::DevicePtr;
-    if dim % 256 != 0 || inter % 256 != 0 || x.len() != dim {
+    if x.len() != dim {
         return Err(Error(format!(
-            "grouped expert rows: dim {dim}, inter {inter}, {} inputs",
+            "grouped expert rows: dim {dim}, {} inputs",
             x.len()
         )));
     }
-    let n = experts.len();
-    if n == 0 {
+    if experts.is_empty() {
         return Ok(Vec::new());
     }
-    let stream = dev.stream();
-    let xs = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("grouped expert upload", e))?;
-    // The experts' device addresses, gathered into three arrays the kernels index by blockIdx.y.
-    // The guards keep the slices mapped until the launches are queued.
-    let mut gate_ptrs = Vec::with_capacity(n);
-    let mut up_ptrs = Vec::with_capacity(n);
-    let mut down_ptrs = Vec::with_capacity(n);
-    let mut guards = Vec::with_capacity(3 * n);
-    for (g, u, d) in experts {
-        let (gp, gg) = g.device_ptr(stream);
-        let (up, gu) = u.device_ptr(stream);
-        let (dp, gd) = d.device_ptr(stream);
-        gate_ptrs.push(gp);
-        up_ptrs.push(up);
-        down_ptrs.push(dp);
-        guards.push(gg);
-        guards.push(gu);
-        guards.push(gd);
-    }
-    let gate_arr = stream
-        .clone_htod(&gate_ptrs)
-        .map_err(|e| alloc_err("grouped gate ptrs", e))?;
-    let up_arr = stream
-        .clone_htod(&up_ptrs)
-        .map_err(|e| alloc_err("grouped up ptrs", e))?;
-    let down_arr = stream
-        .clone_htod(&down_ptrs)
-        .map_err(|e| alloc_err("grouped down ptrs", e))?;
-    let h = with_oom_retry(dev, "grouped h", || unsafe {
-        stream.alloc::<f32>(n * inter)
-    })?;
-    let y = with_oom_retry(dev, "grouped y", || unsafe { stream.alloc::<f32>(n * dim) })?;
-    let (dim_i, inter_i, n_i) = (dim as i32, inter as i32, n as i32);
-    let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_grouped_f32")?;
-    let hcfg = LaunchConfig {
-        grid_dim: (inter as u32, n as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut b = stream.launch_builder(&hfun);
-    b.arg(&gate_arr);
-    b.arg(&up_arr);
-    b.arg(tables.0);
-    b.arg(tables.1);
-    b.arg(&xs);
-    b.arg(&h);
-    b.arg(&dim_i);
-    b.arg(&inter_i);
-    b.arg(&limit);
-    b.arg(&n_i);
-    unsafe { b.launch(hcfg) }
-        .map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_grouped_f32 launch: {e}")))?;
-    let dfun = dev.quantized_fn("mmv_q2_k_grouped_f32")?;
-    let dcfg = LaunchConfig {
-        grid_dim: (dim as u32, n as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut b = stream.launch_builder(&dfun);
-    b.arg(&down_arr);
-    b.arg(&h);
-    b.arg(&y);
-    b.arg(&inter_i);
-    b.arg(&dim_i);
-    b.arg(&n_i);
-    unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("mmv_q2_k_grouped_f32 launch: {e}")))?;
-    drop(guards);
-    let ys_all = stream
+    let xq = q8k32_rows_to_card(dev, x)?;
+    let instances: Vec<(usize, usize)> = (0..experts.len()).map(|i| (i, 0)).collect();
+    let (_h, y) = gpu_experts_exact(dev, experts, tables, (dim, inter), &xq, &instances, limit)?;
+    let ys = dev
+        .stream()
         .clone_dtoh(&y)
         .map_err(|e| Error(format!("grouped expert download: {e}")))?;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push((Vec::new(), ys_all[i * dim..(i + 1) * dim].to_vec()));
-    }
-    Ok(out)
+    Ok(ys.chunks(dim).map(|r| (Vec::new(), r.to_vec())).collect())
 }
 
-/// Grouped experts with one activation row per instance: `x` is [n, dim] and instance `i` reads
-/// row `i`. A speculative verify makes one instance per (expert, token) it routes, so its whole
-/// block of experts runs in one launch. Returns instance `i`'s output row. Bit-exact with
-/// `gpu_expert_row` per instance.
+/// Experts with one input row per instance: `x` is [n, dim] and instance `i`, expert
+/// `experts[i]`, reads row `i`. A speculative verify makes one instance per (expert, token) it
+/// routes, so its whole block of experts runs in one pair of launches. Returns instance `i`'s
+/// output row.
+#[allow(clippy::type_complexity)]
 pub fn gpu_expert_rows_grouped_multi(
     dev: &CudaDevice,
     experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
@@ -793,98 +751,24 @@ pub fn gpu_expert_rows_grouped_multi(
     x: &[f32],
     limit: f32,
 ) -> Result<Vec<Vec<f32>>> {
-    use crate::tensor::gpu_runtime::driver::DevicePtr;
     let n = experts.len();
-    if dim % 256 != 0 || inter % 256 != 0 || x.len() != n * dim {
+    if x.len() != n * dim {
         return Err(Error(format!(
-            "grouped multi expert rows: dim {dim}, inter {inter}, {} inputs for {n}",
+            "grouped multi expert rows: dim {dim}, {} inputs for {n}",
             x.len()
         )));
     }
     if n == 0 {
         return Ok(Vec::new());
     }
-    let stream = dev.stream();
-    let xs = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("grouped multi upload", e))?;
-    let mut gate_ptrs = Vec::with_capacity(n);
-    let mut up_ptrs = Vec::with_capacity(n);
-    let mut down_ptrs = Vec::with_capacity(n);
-    let mut guards = Vec::with_capacity(3 * n);
-    for (g, u, d) in experts {
-        let (gp, gg) = g.device_ptr(stream);
-        let (up, gu) = u.device_ptr(stream);
-        let (dp, gd) = d.device_ptr(stream);
-        gate_ptrs.push(gp);
-        up_ptrs.push(up);
-        down_ptrs.push(dp);
-        guards.push(gg);
-        guards.push(gu);
-        guards.push(gd);
-    }
-    let gate_arr = stream
-        .clone_htod(&gate_ptrs)
-        .map_err(|e| alloc_err("grouped multi gate ptrs", e))?;
-    let up_arr = stream
-        .clone_htod(&up_ptrs)
-        .map_err(|e| alloc_err("grouped multi up ptrs", e))?;
-    let down_arr = stream
-        .clone_htod(&down_ptrs)
-        .map_err(|e| alloc_err("grouped multi down ptrs", e))?;
-    let h = with_oom_retry(dev, "grouped multi h", || unsafe {
-        stream.alloc::<f32>(n * inter)
-    })?;
-    let y = with_oom_retry(dev, "grouped multi y", || unsafe {
-        stream.alloc::<f32>(n * dim)
-    })?;
-    let (dim_i, inter_i, n_i) = (dim as i32, inter as i32, n as i32);
-    let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_grouped_multi_f32")?;
-    let hcfg = LaunchConfig {
-        grid_dim: (inter as u32, n as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut b = stream.launch_builder(&hfun);
-    b.arg(&gate_arr);
-    b.arg(&up_arr);
-    b.arg(tables.0);
-    b.arg(tables.1);
-    b.arg(&xs);
-    b.arg(&h);
-    b.arg(&dim_i);
-    b.arg(&inter_i);
-    b.arg(&limit);
-    b.arg(&n_i);
-    unsafe { b.launch(hcfg) }.map_err(|e| {
-        Error(format!(
-            "mmv_expert_h_iq2_xxs_grouped_multi_f32 launch: {e}"
-        ))
-    })?;
-    let dfun = dev.quantized_fn("mmv_q2_k_grouped_f32")?;
-    let dcfg = LaunchConfig {
-        grid_dim: (dim as u32, n as u32, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut b = stream.launch_builder(&dfun);
-    b.arg(&down_arr);
-    b.arg(&h);
-    b.arg(&y);
-    b.arg(&inter_i);
-    b.arg(&dim_i);
-    b.arg(&n_i);
-    unsafe { b.launch(dcfg) }
-        .map_err(|e| Error(format!("mmv_q2_k_grouped_f32 (multi) launch: {e}")))?;
-    drop(guards);
-    let ys_all = stream
+    let xq = q8k32_rows_to_card(dev, x)?;
+    let instances: Vec<(usize, usize)> = (0..n).map(|i| (i, i)).collect();
+    let (_h, y) = gpu_experts_exact(dev, experts, tables, (dim, inter), &xq, &instances, limit)?;
+    let ys = dev
+        .stream()
         .clone_dtoh(&y)
         .map_err(|e| Error(format!("grouped multi download: {e}")))?;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(ys_all[i * dim..(i + 1) * dim].to_vec());
-    }
-    Ok(out)
+    Ok(ys.chunks(dim).map(<[f32]>::to_vec).collect())
 }
 
 /// Bytes of the card a product of `gpu_quant_linear` may hold at once beside the activations:
@@ -1077,86 +961,6 @@ fn gpu_quant_linear_once(
         gemm_started.elapsed().as_nanos() as u64,
     );
     r
-}
-
-/// The IQ2_XXS tables of a card, uploaded once: the same for every weight.
-fn shared_iq2_tables(dev: &CudaDevice) -> Result<std::sync::Arc<(CudaSlice<u8>, CudaSlice<u8>)>> {
-    static TABLES: std::sync::Mutex<Vec<(usize, std::sync::Arc<(CudaSlice<u8>, CudaSlice<u8>)>)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, t)) = g.iter().find(|(o, _)| *o == dev.ordinal()) {
-        return Ok(t.clone());
-    }
-    let t = std::sync::Arc::new(iq2_xxs_tables(dev)?);
-    g.push((dev.ordinal(), t.clone()));
-    Ok(t)
-}
-
-/// The widest token group the in-place kernels serve; wider groups expand the weight and multiply.
-const IN_PLACE_MAX_ROWS: usize = 8;
-
-/// `input` [rows, inp] through rows `row0 .. row0 + rows` of the quantised weight held on the card
-/// as `blob`, as `[rows, out]`, for the formats a kernel reads in place: no f32 copy of the weight
-/// is made. `None` for a format with no such kernel.
-fn product_in_place(
-    dev: &CudaDevice,
-    dtype: crate::tensor::quantized::GgmlDType,
-    blob: &CudaView<'_, u8>,
-    (out, inp): (usize, usize),
-    input: &CudaSlice<f32>,
-    rows: usize,
-) -> Option<Result<CudaSlice<f32>>> {
-    use crate::tensor::quantized::GgmlDType;
-    let kernel = match dtype {
-        GgmlDType::Iq2Xxs => "mm_iq2_xxs_rows_f32",
-        GgmlDType::Q2K => "mm_q2_k_rows_f32",
-        _ => return None,
-    };
-    // Measured on an expert-sized weight: the kernel beats expanding the weight and a GEMM up to
-    // eight rows (0.105 ms against 0.149), loses at 31 (0.353 against 0.208) and by 3x at 64, because
-    // the expansion's cost does not grow with the rows and the kernel's does.
-    if inp % 256 != 0 || rows > IN_PLACE_MAX_ROWS {
-        return None;
-    }
-    Some((|| {
-        let stream = dev.stream();
-        let y = with_oom_retry(dev, "in place product", || unsafe {
-            stream.alloc::<f32>(rows * out)
-        })?;
-        let tables = if dtype == GgmlDType::Iq2Xxs {
-            Some(shared_iq2_tables(dev)?)
-        } else {
-            None
-        };
-        let func = dev.quantized_fn(kernel)?;
-        let cfg = LaunchConfig {
-            grid_dim: (out.div_ceil(8) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let (k_i, n_i) = (inp as i32, out as i32);
-        // Rows go through in groups the kernel holds in registers; each pass reads the codes once.
-        let mut row0 = 0usize;
-        while row0 < rows {
-            let group = (rows - row0).min(32);
-            let (r0_i, rows_i) = (row0 as i32, group as i32);
-            let mut b = stream.launch_builder(&func);
-            b.arg(blob);
-            if let Some(t) = &tables {
-                b.arg(&t.0);
-                b.arg(&t.1);
-            }
-            b.arg(input);
-            b.arg(&y);
-            b.arg(&k_i);
-            b.arg(&n_i);
-            b.arg(&r0_i);
-            b.arg(&rows_i);
-            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
-            row0 += group;
-        }
-        Ok(y)
-    })())
 }
 
 /// The copy stream of a card, made once: weights go up on it while the compute stream runs.
@@ -1513,14 +1317,33 @@ pub enum ExpertWeight<'a> {
     Card(std::sync::Arc<CudaSlice<u8>>),
 }
 
-/// One expert over a prompt's rows on the card, whole: `x` [n, dim] through the gate and up
-/// weights ([inter, dim] each, quantised, `dtypes` as stored), their SwiGLU on the card, and the
-/// down weight ([dim, inter]) over it. The three weights go over through page-locked staging while
-/// the card works on the one before, nothing returns to the host between the products, and the
-/// intermediate `h` [n, inter] and the output [n, dim] come back together.
+/// The three weights of an expert on the card, staged over the ones that are not there yet.
+fn expert_weights_on_card(
+    dev: &CudaDevice,
+    staging: &mut Staging,
+    weights: &[ExpertWeight; 3],
+) -> Result<[std::sync::Arc<CudaSlice<u8>>; 3]> {
+    let mut on = Vec::with_capacity(3);
+    for w in weights {
+        on.push(match w {
+            ExpertWeight::Card(blob) => blob.clone(),
+            ExpertWeight::Host(bytes) => std::sync::Arc::new(staging.upload(dev, bytes)?),
+        });
+    }
+    let [g, u, d]: [std::sync::Arc<CudaSlice<u8>>; 3] = on
+        .try_into()
+        .map_err(|_| Error("an expert has three weights".into()))?;
+    Ok([g, u, d])
+}
+
+/// One expert over a prompt's rows on the card, whole: `x` [n, dim] through the IQ2_XXS gate and
+/// up weights and the Q2_K down weight (`weights` in that order, staged over through page-locked
+/// memory where they are not on the card), the host's bits. The rows entering the down
+/// projection [n, inter] and the output [n, dim] come back together.
 pub fn gpu_expert_tokens(
     dev: &CudaDevice,
-    weights: [(crate::tensor::quantized::GgmlDType, ExpertWeight); 3],
+    weights: [ExpertWeight; 3],
+    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
     (inter, dim): (usize, usize),
     x: &[f32],
     limit: f32,
@@ -1539,161 +1362,73 @@ pub fn gpu_expert_tokens(
         held: Vec::new(),
         copied: Vec::new(),
     };
-    let xs = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("expert tokens upload", e))?;
-    let product = |staging: &mut Staging,
-                   (dtype, weight): &(crate::tensor::quantized::GgmlDType, ExpertWeight),
-                   input: &CudaSlice<f32>,
-                   (out, inp): (usize, usize)|
-     -> Result<CudaSlice<f32>> {
-        let total = out * inp;
-        let want = total / dtype.block_size() * dtype.type_size();
-        let w = match weight {
-            ExpertWeight::Host(bytes) => {
-                if total % dtype.block_size() != 0 || bytes.len() != want {
-                    return Err(Error(format!(
-                        "{dtype:?} expert weight: {} bytes for [{out}, {inp}]",
-                        bytes.len()
-                    )));
-                }
-                let blob = staging.upload(dev, bytes)?;
-                if let Some(y) =
-                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
-                {
-                    return y;
-                }
-                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
-            }
-            ExpertWeight::Card(blob) => {
-                if let Some(y) =
-                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
-                {
-                    return y;
-                }
-                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
-            }
-        };
-        matmul_nt_f32(dev, input, &w, 1, n, inp, out)
-    };
-    let gate = product(&mut staging, &weights[0], &xs, (inter, dim))?;
-    let up = product(&mut staging, &weights[1], &xs, (inter, dim))?;
-    let h = with_oom_retry(dev, "expert swiglu", || unsafe {
-        stream.alloc::<f32>(n * inter)
-    })?;
-    {
-        let func = dev.quantized_fn("swiglu_f32")?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n * inter).div_ceil(256) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let total = (n * inter) as i64;
-        let mut b = stream.launch_builder(&func);
-        b.arg(&gate);
-        b.arg(&up);
-        b.arg(&h);
-        b.arg(&total);
-        b.arg(&limit);
-        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("swiglu_f32 launch: {e}")))?;
-    }
-    let out = product(&mut staging, &weights[2], &h, (dim, inter))?;
+    let xq = q8k32_rows_to_card(dev, x)?;
+    let [g, u, d] = expert_weights_on_card(dev, &mut staging, &weights)?;
+    let instances: Vec<(usize, usize)> = (0..n).map(|r| (0, r)).collect();
+    let (h, y) = gpu_experts_exact(
+        dev,
+        &[(&g, &u, &d)],
+        tables,
+        (dim, inter),
+        &xq,
+        &instances,
+        limit,
+    )?;
     let t_wait = std::time::Instant::now();
     let h_host = stream
         .clone_dtoh(&h)
         .map_err(|e| Error(format!("expert tokens download: {e}")))?;
     let out_host = stream
-        .clone_dtoh(&out)
+        .clone_dtoh(&y)
         .map_err(|e| Error(format!("expert tokens download: {e}")))?;
     crate::inference::offload::prof_record("staged card wait", t_wait.elapsed().as_nanos() as u64);
     Ok((h_host, out_host))
 }
 
-/// A layer's routed experts' token context on a card: the layer's input rows `xin` [n, dim] and
-/// the accumulated weighted products `y` [n, dim], zeroed. The experts add into `y` in the order
-/// of their position in the layer, which a turnstile enforces, so the sum does not depend on how
-/// the threads that feed the card happened to be scheduled.
+/// A layer's routed experts' token context on a card: the layer's input rows [n, dim] as the
+/// q8_K32 rows the expert kernels read, sent once for every expert of the layer the card runs.
 pub struct LayerBuffers {
-    xin: CudaSlice<f32>,
-    y: CudaSlice<f32>,
+    xq: CudaSlice<u8>,
     n: usize,
     dim: usize,
-    turn: (
-        std::sync::Mutex<(usize, std::collections::HashSet<usize>)>,
-        std::sync::Condvar,
-    ),
-}
-
-impl LayerBuffers {
-    /// Mark position `order` of the layer's experts as past: it added its products, or it will not.
-    /// Idempotent. Every position must be marked once, or a later one waits for ever.
-    pub fn finish(&self, order: usize) {
-        let mut g = self.turn.0.lock().unwrap_or_else(|e| e.into_inner());
-        g.1.insert(order);
-        loop {
-            let next = g.0;
-            if !g.1.remove(&next) {
-                break;
-            }
-            g.0 += 1;
-        }
-        self.turn.1.notify_all();
-    }
-
-    fn wait_turn(&self, order: usize) {
-        let mut g = self.turn.0.lock().unwrap_or_else(|e| e.into_inner());
-        while g.0 != order {
-            g = self.turn.1.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-    }
 }
 
 /// Open a layer's context on the card from its input rows `x` [n, dim].
 pub fn gpu_layer_begin(dev: &CudaDevice, x: &[f32], dim: usize) -> Result<LayerBuffers> {
-    let n = x.len() / dim.max(1);
-    let stream = dev.stream();
-    let xin = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("layer context upload", e))?;
-    let y = with_oom_retry(dev, "layer sum", || stream.alloc_zeros::<f32>(n * dim))?;
+    if dim == 0 || !x.len().is_multiple_of(dim) {
+        return Err(Error(format!(
+            "layer context: {} inputs for rows of {dim}",
+            x.len()
+        )));
+    }
     Ok(LayerBuffers {
-        xin,
-        y,
-        n,
+        xq: q8k32_rows_to_card(dev, x)?,
+        n: x.len() / dim,
         dim,
-        turn: Default::default(),
     })
 }
 
-/// One expert over its rows of the layer on the card, its weighted products added into the layer's
-/// sum: the rows `toks` = (token, weight) are gathered from the layer's input, put through the
-/// expert as `gpu_expert_tokens` does, scaled by their weights and added, in turn after the
-/// experts before it (`order`). Nothing returns to the host.
-pub fn gpu_expert_into_layer(
+/// One expert over its rows of the layer on the card: the rows `toks` are read from the layer's
+/// input where it lies, put through the expert as `gpu_expert_tokens` does, and their outputs
+/// [toks, dim] come back in the order of `toks`, for the host to add in the order it adds every
+/// expert in.
+pub fn gpu_expert_layer_rows(
     dev: &CudaDevice,
-    weights: [(crate::tensor::quantized::GgmlDType, ExpertWeight); 3],
+    weights: [ExpertWeight; 3],
+    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
     (inter, dim): (usize, usize),
     layer: &LayerBuffers,
-    order: usize,
-    toks: &[(u32, f32)],
+    toks: &[u32],
     limit: f32,
-) -> Result<()> {
-    if dim != layer.dim || toks.is_empty() {
-        layer.finish(order);
+) -> Result<Vec<f32>> {
+    if dim != layer.dim || toks.is_empty() || toks.iter().any(|&t| t as usize >= layer.n) {
         return Err(Error(format!(
-            "expert rows: rows of {dim} against a layer of {}",
+            "expert rows: {} rows of {dim} against a layer of {} rows of {}",
+            toks.len(),
+            layer.n,
             layer.dim
         )));
     }
-    /// Marks the expert's position past however the function leaves.
-    struct Past<'a>(&'a LayerBuffers, usize);
-    impl Drop for Past<'_> {
-        fn drop(&mut self) {
-            self.0.finish(self.1);
-        }
-    }
-    let _past = Past(layer, order);
-    let n = toks.len();
     let stream = dev.stream();
     let mut staging = Staging {
         stream,
@@ -1701,124 +1436,26 @@ pub fn gpu_expert_into_layer(
         held: Vec::new(),
         copied: Vec::new(),
     };
-    let tok: Vec<u32> = toks.iter().map(|t| t.0).collect();
-    let w: Vec<f32> = toks.iter().map(|t| t.1).collect();
-    let up = |e| alloc_err("expert rows upload", e);
-    let (tok_d, w_d) = (
-        stream.clone_htod(&tok).map_err(up)?,
-        stream.clone_htod(&w).map_err(up)?,
-    );
-    macro_rules! launch {
-        ($name:expr, $total:expr, $($arg:expr),+) => {{
-            let func = dev.quantized_fn($name)?;
-            let cfg = LaunchConfig {
-                grid_dim: ($total.div_ceil(256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let mut b = stream.launch_builder(&func);
-            $( b.arg($arg); )+
-            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{} launch: {e}", $name)))?;
-        }};
-    }
-    let xs = with_oom_retry(dev, "expert rows", || unsafe {
-        stream.alloc::<f32>(n * dim)
-    })?;
-    {
-        let (total, dim_i) = ((n * dim) as i64, dim as i64);
-        launch!(
-            "gather_rows_f32",
-            n * dim,
-            &layer.xin,
-            &tok_d,
-            &xs,
-            &total,
-            &dim_i
-        );
-    }
-    let product = |staging: &mut Staging,
-                   (dtype, weight): &(crate::tensor::quantized::GgmlDType, ExpertWeight),
-                   input: &CudaSlice<f32>,
-                   (out, inp): (usize, usize)|
-     -> Result<CudaSlice<f32>> {
-        let total = out * inp;
-        let want = total / dtype.block_size() * dtype.type_size();
-        let w = match weight {
-            ExpertWeight::Host(bytes) => {
-                if total % dtype.block_size() != 0 || bytes.len() != want {
-                    return Err(Error(format!(
-                        "{dtype:?} expert weight: {} bytes for [{out}, {inp}]",
-                        bytes.len()
-                    )));
-                }
-                let blob = staging.upload(dev, bytes)?;
-                if let Some(y) =
-                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
-                {
-                    return y;
-                }
-                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
-            }
-            ExpertWeight::Card(blob) => {
-                if let Some(y) =
-                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
-                {
-                    return y;
-                }
-                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
-            }
-        };
-        matmul_nt_f32(dev, input, &w, 1, n, inp, out)
-    };
-    let gate = product(&mut staging, &weights[0], &xs, (inter, dim))?;
-    let up_p = product(&mut staging, &weights[1], &xs, (inter, dim))?;
-    let h = with_oom_retry(dev, "expert swiglu", || unsafe {
-        stream.alloc::<f32>(n * inter)
-    })?;
-    {
-        let total = (n * inter) as i64;
-        launch!("swiglu_f32", n * inter, &gate, &up_p, &h, &total, &limit);
-    }
-    let out = product(&mut staging, &weights[2], &h, (dim, inter))?;
-    // In turn: this expert's add is queued after the ones before it in the layer.
-    let turn_started = std::time::Instant::now();
-    layer.wait_turn(order);
-    crate::inference::offload::prof_record(
-        "expert turn wait",
-        turn_started.elapsed().as_nanos() as u64,
-    );
-    let (total, dim_i) = ((n * dim) as i64, dim as i64);
-    launch!(
-        "scatter_add_f32",
-        n * dim,
-        &out,
-        &tok_d,
-        &w_d,
-        &layer.y,
-        &total,
-        &dim_i
-    );
-    layer.finish(order);
-    // Held to the card's pace: this expert's buffers are freed when its work is behind it, and
-    // threads that queued without limit would hold the card's memory for work not yet reached.
+    let [g, u, d] = expert_weights_on_card(dev, &mut staging, &weights)?;
+    let instances: Vec<(usize, usize)> = toks.iter().map(|&t| (0, t as usize)).collect();
+    let (_h, y) = gpu_experts_exact(
+        dev,
+        &[(&g, &u, &d)],
+        tables,
+        (dim, inter),
+        &layer.xq,
+        &instances,
+        limit,
+    )?;
     let sync_started = std::time::Instant::now();
-    stream
-        .record_event(None)
-        .and_then(|e| e.synchronize())
-        .map_err(|e| Error(format!("expert rows: wait: {e:?}")))?;
+    let out = stream
+        .clone_dtoh(&y)
+        .map_err(|e| Error(format!("expert rows download: {e}")))?;
     crate::inference::offload::prof_record(
         "expert card wait",
         sync_started.elapsed().as_nanos() as u64,
     );
-    Ok(())
-}
-
-/// The accumulated sum, `[n, dim]`, once every expert's work is queued.
-pub fn gpu_layer_sum(dev: &CudaDevice, layer: &LayerBuffers) -> Result<Vec<f32>> {
-    let _ = layer.n;
-    dev.stream()
-        .clone_dtoh(&layer.y)
-        .map_err(|e| Error(format!("layer sum download: {e}")))
+    Ok(out)
 }
 
 /// A quantised weight [rows, inp] as it lies in the file, `dtype` its format.
@@ -3505,22 +3142,27 @@ mod iq2_xxs_gpu_tests {
         }
     }
 
-    /// A whole expert on the card against the same arithmetic taken from the dequantised weights:
-    /// the two products, the clamped SwiGLU between them, and the down product. The clamps are
-    /// the reference's, and getting them wrong moves an output by a hair on most rows and by
-    /// everything on the few the clamp bites.
+    /// Routed experts on the card are the host's bit for bit on every card path: one row, a
+    /// decode's block, a verify's instances, a prompt's rows from staged and from resident weights,
+    /// and a layer's rows. Where an expert runs must not change what it gives, or a greedy decode
+    /// depends on which experts earlier requests left on the card.
     #[test]
-    fn an_expert_row_on_the_card_matches_the_dequantised_arithmetic() {
+    fn card_experts_are_the_hosts_bit_for_bit() {
+        use crate::inference::offload::cpu_experts;
+        use crate::inference::offload::experts::Expert;
+        use crate::inference::offload::projection::Projection;
+        use crate::tensor::quantized::QTensor;
+        use crate::tensor::{Device, Tensor};
         let Ok(dev) = CudaDevice::new(0) else {
-            eprintln!("no CUDA device; the expert row is NOT covered by this run");
+            eprintln!("no CUDA device; the card experts are NOT covered by this run");
             return;
         };
-        let (dim, inter, limit) = (512usize, 256usize, 7.0f32);
-        let draw = |seed: u32, n: usize, scale: f32| -> Vec<f32> {
-            (0..n)
+        let (dim, inter, limit, n) = (1024usize, 512usize, 7.0f32, 11usize);
+        let draw = |seed: u32, len: usize, scale: f32| -> Vec<f32> {
+            (0..len)
                 .map(|i| {
                     (((i as u32)
-                        .wrapping_add(seed)
+                        .wrapping_add(seed.wrapping_mul(0x9E37_79B9))
                         .wrapping_mul(2_654_435_761)
                         .rotate_left(11)
                         >> 8) as f32
@@ -3530,64 +3172,277 @@ mod iq2_xxs_gpu_tests {
                 })
                 .collect()
         };
-        let (gw, uw) = (draw(1, inter * dim, 0.07), draw(2, inter * dim, 0.07));
-        let dw = draw(3, dim * inter, 0.07);
-        let x = draw(4, dim, 1.0);
-
-        let enc = |v: &[f32], d| crate::tensor::quant_cpu::from_float_bytes(d, v).unwrap();
-        let dec = |b: &[u8], d, n| {
-            let mut o = vec![0f32; n];
-            crate::tensor::quant_cpu::to_float_bytes(d, b, &mut o).unwrap();
-            o
+        let quant = |w: Vec<f32>, rows: usize, cols: usize, dtype: GgmlDType| {
+            let t = Tensor::from_vec(w, (rows, cols), &Device::Cpu).unwrap();
+            Projection::Quant(std::sync::Arc::new(QTensor::quantize(&t, dtype).unwrap()))
         };
-        let (gb, ub) = (enc(&gw, GgmlDType::Iq2Xxs), enc(&uw, GgmlDType::Iq2Xxs));
-        let db = enc(&dw, GgmlDType::Q2K);
-        let (gd, ud) = (
-            dec(&gb, GgmlDType::Iq2Xxs, inter * dim),
-            dec(&ub, GgmlDType::Iq2Xxs, inter * dim),
-        );
-        let dd = dec(&db, GgmlDType::Q2K, dim * inter);
-        let h: Vec<f32> = (0..inter)
+        let experts: Vec<std::sync::Arc<Expert>> = (0..3u32)
             .map(|j| {
-                let g: f32 = (0..dim).map(|c| x[c] * gd[j * dim + c]).sum();
-                let u: f32 = (0..dim).map(|c| x[c] * ud[j * dim + c]).sum();
-                let (g, u) = (g.min(limit), u.clamp(-limit, limit));
-                g / (1.0 + (-g).exp()) * u
+                std::sync::Arc::new(Expert {
+                    w1: quant(
+                        draw(10 * j + 1, inter * dim, 0.08),
+                        inter,
+                        dim,
+                        GgmlDType::Iq2Xxs,
+                    ),
+                    w3: quant(
+                        draw(10 * j + 2, inter * dim, 0.08),
+                        inter,
+                        dim,
+                        GgmlDType::Iq2Xxs,
+                    ),
+                    w2: quant(
+                        draw(10 * j + 3, dim * inter, 0.08),
+                        dim,
+                        inter,
+                        GgmlDType::Q2K,
+                    ),
+                })
             })
             .collect();
-        let want: Vec<f32> = (0..dim)
-            .map(|o| (0..inter).map(|c| h[c] * dd[o * inter + c]).sum())
+        // Rows large enough for the clamps to bite, one of zeros, one with a lone extreme.
+        let mut x = draw(99, n * dim, 6.0);
+        x[4 * dim..5 * dim].fill(0.0);
+        x[7 * dim + 300] = 400.0;
+        let row = |t: usize| &x[t * dim..(t + 1) * dim];
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+
+        // The host: each expert over each row, and the rows entering its down projection.
+        let host: Vec<Vec<(Vec<f32>, Vec<f32>)>> = experts
+            .iter()
+            .map(|e| {
+                (0..n)
+                    .map(|t| {
+                        let xe = Tensor::from_vec(row(t).to_vec(), (1, dim), &Device::Cpu).unwrap();
+                        let h = std::cell::RefCell::new(Vec::new());
+                        let seen = |r: &[f32]| *h.borrow_mut() = r.to_vec();
+                        let out = crate::inference::offload::on_host(|| {
+                            e.forward_seen(&xe, limit, Some(&seen))
+                        })
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                        (h.into_inner(), out)
+                    })
+                    .collect()
+            })
             .collect();
+        // The host's own paths agree with each other first.
+        for t in 0..n {
+            let outs = cpu_experts::batched(&experts, row(t), limit).unwrap();
+            for (j, o) in outs.iter().enumerate() {
+                assert_eq!(
+                    bits(o),
+                    bits(&host[j][t].1),
+                    "host block, expert {j} row {t}"
+                );
+            }
+        }
+        let all: Vec<Vec<f32>> = (0..experts.len()).map(|_| x.clone()).collect();
+        let multi = cpu_experts::multirow(&experts, &all, dim, limit).unwrap();
+        for (j, o) in multi.iter().enumerate() {
+            for t in 0..n {
+                assert_eq!(
+                    bits(&o[t * dim..(t + 1) * dim]),
+                    bits(&host[j][t].1),
+                    "host rows, expert {j} row {t}"
+                );
+            }
+        }
 
         let stream = dev.stream();
-        let (gc, uc, dc) = (
-            stream.clone_htod(&gb).unwrap(),
-            stream.clone_htod(&ub).unwrap(),
-            stream.clone_htod(&db).unwrap(),
-        );
+        let bytes = |p: &Projection| match p {
+            Projection::Quant(q) => q.data().unwrap().into_owned(),
+            _ => unreachable!(),
+        };
+        let host_bytes: Vec<[Vec<u8>; 3]> = experts
+            .iter()
+            .map(|e| [bytes(&e.w1), bytes(&e.w3), bytes(&e.w2)])
+            .collect();
+        let on_card: Vec<[std::sync::Arc<CudaSlice<u8>>; 3]> = host_bytes
+            .iter()
+            .map(|b| {
+                b.clone()
+                    .map(|w| std::sync::Arc::new(stream.clone_htod(&w).unwrap()))
+            })
+            .collect();
         let (grid, signs) = iq2_xxs_tables(&dev).unwrap();
-        let (got_h, got) = gpu_expert_row(
-            &dev,
-            &gc,
-            &uc,
-            &dc,
-            (&grid, &signs),
-            (dim, inter),
-            &x,
-            limit,
-        )
-        .unwrap();
-        for (g, v) in got_h.iter().zip(&h) {
-            assert!(
-                (g - v).abs() <= 2e-3 * v.abs().max(1.0),
-                "expert rows: {g} against {v}"
+        let tables = (&grid, &signs);
+        let refs: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> =
+            on_card.iter().map(|w| (&*w[0], &*w[1], &*w[2])).collect();
+
+        for t in 0..n {
+            let (h, out) = gpu_expert_row(
+                &dev,
+                refs[1].0,
+                refs[1].1,
+                refs[1].2,
+                tables,
+                (dim, inter),
+                row(t),
+                limit,
+            )
+            .unwrap();
+            assert_eq!(bits(&h), bits(&host[1][t].0), "card row h, row {t}");
+            assert_eq!(bits(&out), bits(&host[1][t].1), "card row, row {t}");
+            let block =
+                gpu_expert_rows_grouped(&dev, &refs, tables, (dim, inter), row(t), limit).unwrap();
+            for (j, (_, o)) in block.iter().enumerate() {
+                assert_eq!(
+                    bits(o),
+                    bits(&host[j][t].1),
+                    "card block, expert {j} row {t}"
+                );
+            }
+        }
+        // A verify's instances: each expert over some of the rows, the instances of one expert
+        // together, more of them than a tile.
+        let picks: Vec<(usize, usize)> = (0..experts.len())
+            .flat_map(|j| {
+                (0..n)
+                    .filter(move |t| (t + j) % 3 != 0)
+                    .map(move |t| (j, t))
+            })
+            .collect();
+        let inst: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> =
+            picks.iter().map(|&(j, _)| refs[j]).collect();
+        let xs: Vec<f32> = picks
+            .iter()
+            .flat_map(|&(_, t)| row(t).iter().copied())
+            .collect();
+        let got =
+            gpu_expert_rows_grouped_multi(&dev, &inst, tables, (dim, inter), &xs, limit).unwrap();
+        for (k, &(j, t)) in picks.iter().enumerate() {
+            assert_eq!(
+                bits(&got[k]),
+                bits(&host[j][t].1),
+                "card instances, expert {j} row {t}"
             );
         }
-        for (g, v) in got.iter().zip(&want) {
-            assert!(
-                (g - v).abs() <= 2e-3 * v.abs().max(1.0),
-                "expert row: {g} against {v}"
-            );
+        // A prompt's rows, from staged weights and from the card's.
+        for j in 0..experts.len() {
+            for resident in [false, true] {
+                let weights = if resident {
+                    on_card[j].clone().map(ExpertWeight::Card)
+                } else {
+                    [
+                        ExpertWeight::Host(&host_bytes[j][0]),
+                        ExpertWeight::Host(&host_bytes[j][1]),
+                        ExpertWeight::Host(&host_bytes[j][2]),
+                    ]
+                };
+                let (h, out) =
+                    gpu_expert_tokens(&dev, weights, tables, (inter, dim), &x, limit).unwrap();
+                for t in 0..n {
+                    assert_eq!(
+                        bits(&h[t * inter..(t + 1) * inter]),
+                        bits(&host[j][t].0),
+                        "card prompt h, expert {j} row {t}"
+                    );
+                    assert_eq!(
+                        bits(&out[t * dim..(t + 1) * dim]),
+                        bits(&host[j][t].1),
+                        "card prompt, expert {j} row {t} resident {resident}"
+                    );
+                }
+            }
+        }
+        // A layer's rows, read where the layer's input lies.
+        let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
+        for j in 0..experts.len() {
+            let toks: Vec<u32> = (0..n as u32)
+                .filter(|t| (*t as usize + j).is_multiple_of(2))
+                .collect();
+            let weights = [
+                ExpertWeight::Host(&host_bytes[j][0]),
+                ExpertWeight::Host(&host_bytes[j][1]),
+                ExpertWeight::Host(&host_bytes[j][2]),
+            ];
+            let out =
+                gpu_expert_layer_rows(&dev, weights, tables, (inter, dim), &layer, &toks, limit)
+                    .unwrap();
+            for (r, &t) in toks.iter().enumerate() {
+                assert_eq!(
+                    bits(&out[r * dim..(r + 1) * dim]),
+                    bits(&host[j][t as usize].1),
+                    "card layer, expert {j} row {t}"
+                );
+            }
+        }
+    }
+
+    /// Time per expert of a prompt's pass over a layer's rows: weights staged each time, then
+    /// resident on the card; one thread, then four.
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+    fn bench_expert_layer_rows() {
+        let Ok(dev) = CudaDevice::new(0) else { return };
+        let (inter, dim, n) = (2304usize, 5120usize, 128usize);
+        let enc = |dtype: GgmlDType, len: usize, f: f32| {
+            let v: Vec<f32> = (0..len).map(|i| ((i as f32) * f).sin() * 0.05).collect();
+            crate::tensor::quant_cpu::from_float_bytes(dtype, &v).unwrap()
+        };
+        let (gb, ub, db) = (
+            enc(GgmlDType::Iq2Xxs, inter * dim, 0.013),
+            enc(GgmlDType::Iq2Xxs, inter * dim, 0.017),
+            enc(GgmlDType::Q2K, dim * inter, 0.011),
+        );
+        let x: Vec<f32> = (0..n * dim).map(|i| ((i as f32) * 0.3).sin()).collect();
+        let toks: Vec<u32> = (0..31u32).map(|t| t * 3).collect();
+        let stream = dev.stream();
+        let (gc, uc, dc) = (
+            std::sync::Arc::new(stream.clone_htod(&gb).unwrap()),
+            std::sync::Arc::new(stream.clone_htod(&ub).unwrap()),
+            std::sync::Arc::new(stream.clone_htod(&db).unwrap()),
+        );
+        let (grid, signs) = iq2_xxs_tables(&dev).unwrap();
+        for resident in [false, true] {
+            for threads in [1usize, 4] {
+                let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
+                let calls = 120usize;
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let t = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= calls {
+                                break;
+                            }
+                            let w = if resident {
+                                [
+                                    ExpertWeight::Card(gc.clone()),
+                                    ExpertWeight::Card(uc.clone()),
+                                    ExpertWeight::Card(dc.clone()),
+                                ]
+                            } else {
+                                [
+                                    ExpertWeight::Host(&gb),
+                                    ExpertWeight::Host(&ub),
+                                    ExpertWeight::Host(&db),
+                                ]
+                            };
+                            gpu_expert_layer_rows(
+                                &dev,
+                                w,
+                                (&grid, &signs),
+                                (inter, dim),
+                                &layer,
+                                &toks,
+                                7.0,
+                            )
+                            .unwrap();
+                        });
+                    }
+                });
+                dev.stream().synchronize().unwrap();
+                eprintln!(
+                    "resident {resident} threads {threads}: {:.2} ms per expert",
+                    t.elapsed().as_secs_f64() * 1000.0 / calls as f64
+                );
+            }
         }
     }
 
@@ -3642,372 +3497,6 @@ mod iq2_xxs_gpu_tests {
                     "{dtype:?}: {g} vs {v}"
                 );
             }
-        }
-    }
-
-    /// The in-place kernels read the codes where they lie and give what the expanded weight and
-    /// the f32 product give, to rounding, for one row, a few, a full group, and groups past it.
-    #[test]
-    fn gpu_products_in_place_match_the_expanded_weight() {
-        let Ok(dev) = CudaDevice::new(0) else {
-            eprintln!("no CUDA device; the in-place products are NOT covered by this run");
-            return;
-        };
-        let (out, inp) = (100usize, 768usize);
-        let w: Vec<f32> = (0..out * inp)
-            .map(|i| {
-                (((i as u32).wrapping_mul(2_654_435_761).rotate_left(9) >> 8) as f32
-                    / (1 << 24) as f32
-                    - 0.5)
-                    * 0.08
-            })
-            .collect();
-        for dtype in [GgmlDType::Iq2Xxs, GgmlDType::Q2K] {
-            let blocks = crate::tensor::quant_cpu::from_float_bytes(dtype, &w).unwrap();
-            let blob = dev.stream().clone_htod(&blocks).unwrap();
-            for rows in [1usize, 7, 8] {
-                let x: Vec<f32> = (0..rows * inp).map(|i| ((i as f32) * 0.37).sin()).collect();
-                let xd = dev.stream().clone_htod(&x).unwrap();
-                let got = product_in_place(&dev, dtype, &blob.as_view(), (out, inp), &xd, rows)
-                    .expect("a kernel for the format")
-                    .unwrap();
-                let got = dev.stream().clone_dtoh(&got).unwrap();
-                let want = gpu_quant_linear(&dev, dtype, &blocks, (out, inp), &x).unwrap();
-                let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-                let worst = got
-                    .iter()
-                    .zip(&want)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
-                assert!(
-                    worst <= 2e-4 * range.max(1.0),
-                    "{dtype:?} rows {rows}: worst {worst} of range {range}"
-                );
-            }
-        }
-        // Wider groups are left to the expanded weight.
-        let (blocks, x) = (vec![0u8; 8], dev.stream().clone_htod(&[0f32; 4]).unwrap());
-        let blob = dev.stream().clone_htod(&blocks).unwrap();
-        assert!(product_in_place(&dev, GgmlDType::Q6K, &blob.as_view(), (1, 256), &x, 1).is_none());
-    }
-
-    /// Time of one expert-sized product through the in-place kernel against the expanded weight.
-    #[test]
-    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
-    fn bench_products_in_place() {
-        let Ok(dev) = CudaDevice::new(0) else { return };
-        let (out, inp) = (2304usize, 5120usize);
-        let w: Vec<f32> = (0..out * inp)
-            .map(|i| ((i as f32) * 0.013).sin() * 0.05)
-            .collect();
-        for dtype in [GgmlDType::Iq2Xxs, GgmlDType::Q2K] {
-            let blocks = crate::tensor::quant_cpu::from_float_bytes(dtype, &w).unwrap();
-            let blob = dev.stream().clone_htod(&blocks).unwrap();
-            for rows in [8usize, 31, 64] {
-                let x: Vec<f32> = (0..rows * inp).map(|i| ((i as f32) * 0.37).sin()).collect();
-                let xd = dev.stream().clone_htod(&x).unwrap();
-                let time = |f: &mut dyn FnMut()| {
-                    f();
-                    dev.stream().synchronize().unwrap();
-                    let t = std::time::Instant::now();
-                    for _ in 0..50 {
-                        f();
-                    }
-                    dev.stream().synchronize().unwrap();
-                    t.elapsed().as_secs_f64() * 1000.0 / 50.0
-                };
-                let a = time(&mut || {
-                    let _ = product_in_place(&dev, dtype, &blob.as_view(), (out, inp), &xd, rows)
-                        .unwrap()
-                        .unwrap();
-                });
-                let b = time(&mut || {
-                    let wf = dequantise_f32(&dev, dtype, &blob.as_view(), out * inp).unwrap();
-                    let _ = matmul_nt_f32(&dev, &xd, &wf, 1, rows, inp, out).unwrap();
-                });
-                eprintln!("{dtype:?} rows {rows}: in place {a:.3} ms, expanded {b:.3} ms");
-            }
-        }
-    }
-
-    /// Time per expert of a prompt's pass: weights staged each time, then resident on the card;
-    /// one thread, then four.
-    #[test]
-    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
-    fn bench_expert_into_layer() {
-        let Ok(dev) = CudaDevice::new(0) else { return };
-        let (inter, dim, n) = (2304usize, 5120usize, 128usize);
-        let enc = |dtype: GgmlDType, len: usize, f: f32| {
-            let v: Vec<f32> = (0..len).map(|i| ((i as f32) * f).sin() * 0.05).collect();
-            crate::tensor::quant_cpu::from_float_bytes(dtype, &v).unwrap()
-        };
-        let (gb, ub, db) = (
-            enc(GgmlDType::Iq2Xxs, inter * dim, 0.013),
-            enc(GgmlDType::Iq2Xxs, inter * dim, 0.017),
-            enc(GgmlDType::Q2K, dim * inter, 0.011),
-        );
-        let x: Vec<f32> = (0..n * dim).map(|i| ((i as f32) * 0.3).sin()).collect();
-        let toks: Vec<(u32, f32)> = (0..31u32).map(|t| (t * 3, 0.5)).collect();
-        let stream = dev.stream();
-        let (gc, uc, dc) = (
-            std::sync::Arc::new(stream.clone_htod(&gb).unwrap()),
-            std::sync::Arc::new(stream.clone_htod(&ub).unwrap()),
-            std::sync::Arc::new(stream.clone_htod(&db).unwrap()),
-        );
-        for resident in [false, true] {
-            for threads in [1usize, 4] {
-                let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
-                let calls = 120usize;
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                let t = std::time::Instant::now();
-                std::thread::scope(|s| {
-                    for _ in 0..threads {
-                        s.spawn(|| loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= calls {
-                                break;
-                            }
-                            let w = if resident {
-                                [
-                                    (GgmlDType::Iq2Xxs, ExpertWeight::Card(gc.clone())),
-                                    (GgmlDType::Iq2Xxs, ExpertWeight::Card(uc.clone())),
-                                    (GgmlDType::Q2K, ExpertWeight::Card(dc.clone())),
-                                ]
-                            } else {
-                                [
-                                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&gb)),
-                                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&ub)),
-                                    (GgmlDType::Q2K, ExpertWeight::Host(&db)),
-                                ]
-                            };
-                            gpu_expert_into_layer(&dev, w, (inter, dim), &layer, i, &toks, 7.0)
-                                .unwrap();
-                        });
-                    }
-                });
-                dev.stream().synchronize().unwrap();
-                eprintln!(
-                    "resident {resident} threads {threads}: {:.2} ms per expert",
-                    t.elapsed().as_secs_f64() * 1000.0 / calls as f64
-                );
-            }
-        }
-    }
-
-    /// An expert's whole prompt pass on the card - staged weights or weights already resident -
-    /// equals the three products and the SwiGLU on the CPU, to rounding.
-    #[test]
-    fn gpu_expert_tokens_matches_the_cpu() {
-        let Ok(dev) = CudaDevice::new(0) else {
-            eprintln!("no CUDA device; the card expert pass is NOT covered by this run");
-            return;
-        };
-        let (inter, dim, n) = (256usize, 512usize, 9usize);
-        let wave = |len: usize, k: f32, amp: f32| -> Vec<f32> {
-            (0..len).map(|i| ((i as f32) * k).sin() * amp).collect()
-        };
-        let enc = |dtype: GgmlDType, v: &[f32]| {
-            let b = crate::tensor::quant_cpu::from_float_bytes(dtype, v).unwrap();
-            let mut d = vec![0f32; v.len()];
-            crate::tensor::quant_cpu::to_float_bytes(dtype, &b, &mut d).unwrap();
-            (b, d)
-        };
-        let (gb, gd) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, 0.013, 0.08));
-        let (ub, ud) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, 0.017, 0.08));
-        let (db, dd) = enc(GgmlDType::Q2K, &wave(dim * inter, 0.011, 0.08));
-        let x = wave(n * dim, 0.31, 1.0);
-        let limit = 7.0f32;
-        let mut h = vec![0f32; n * inter];
-        let mut want = vec![0f32; n * dim];
-        for t in 0..n {
-            for i in 0..inter {
-                let dot = |w: &[f32]| {
-                    (0..dim)
-                        .map(|c| x[t * dim + c] * w[i * dim + c])
-                        .sum::<f32>()
-                };
-                let (g, u) = (dot(&gd).min(limit), dot(&ud).clamp(-limit, limit));
-                h[t * inter + i] = g / (1.0 + (-g).exp()) * u;
-            }
-            for o in 0..dim {
-                want[t * dim + o] = (0..inter)
-                    .map(|c| h[t * inter + c] * dd[o * inter + c])
-                    .sum();
-            }
-        }
-        let check = |got: &(Vec<f32>, Vec<f32>), what: &str| {
-            let close = |a: &[f32], b: &[f32], tag: &str| {
-                let worst = a
-                    .iter()
-                    .zip(b)
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0f32, f32::max);
-                let range = b.iter().fold(0f32, |m, v| m.max(v.abs()));
-                assert!(
-                    worst <= 1e-3 * range.max(1.0),
-                    "{what} {tag}: worst {worst} of range {range}"
-                );
-            };
-            close(&got.0, &h, "h");
-            close(&got.1, &want, "out");
-        };
-        let host = gpu_expert_tokens(
-            &dev,
-            [
-                (GgmlDType::Iq2Xxs, ExpertWeight::Host(&gb)),
-                (GgmlDType::Iq2Xxs, ExpertWeight::Host(&ub)),
-                (GgmlDType::Q2K, ExpertWeight::Host(&db)),
-            ],
-            (inter, dim),
-            &x,
-            limit,
-        )
-        .unwrap();
-        check(&host, "staged");
-        let stream = dev.stream();
-        let up = |b: &[u8]| std::sync::Arc::new(stream.clone_htod(b).unwrap());
-        let card = gpu_expert_tokens(
-            &dev,
-            [
-                (GgmlDType::Iq2Xxs, ExpertWeight::Card(up(&gb))),
-                (GgmlDType::Iq2Xxs, ExpertWeight::Card(up(&ub))),
-                (GgmlDType::Q2K, ExpertWeight::Card(up(&db))),
-            ],
-            (inter, dim),
-            &x,
-            limit,
-        )
-        .unwrap();
-        check(&card, "resident");
-        assert_eq!(
-            host.1, card.1,
-            "staged and resident weights give the same bits"
-        );
-    }
-
-    /// Experts run over their rows of a layer on the card, their weighted products added into the
-    /// layer's sum, equal the experts and the weighted sum on the CPU, to rounding; threads that
-    /// start the experts in the opposite order give the same bits.
-    #[test]
-    fn gpu_layer_sum_matches_the_cpu() {
-        let Ok(dev) = CudaDevice::new(0) else {
-            eprintln!("no CUDA device; the card layer sum is NOT covered by this run");
-            return;
-        };
-        let (inter, dim, n) = (256usize, 512usize, 13usize);
-        let wave = |len: usize, kk: f32, amp: f32| -> Vec<f32> {
-            (0..len).map(|i| ((i as f32) * kk).sin() * amp).collect()
-        };
-        let enc = |dtype: GgmlDType, v: &[f32]| {
-            let b = crate::tensor::quant_cpu::from_float_bytes(dtype, v).unwrap();
-            let mut d = vec![0f32; v.len()];
-            crate::tensor::quant_cpu::to_float_bytes(dtype, &b, &mut d).unwrap();
-            (b, d)
-        };
-        struct E {
-            gb: Vec<u8>,
-            ub: Vec<u8>,
-            db: Vec<u8>,
-            gd: Vec<f32>,
-            ud: Vec<f32>,
-            dd: Vec<f32>,
-        }
-        let experts: Vec<E> = (0..3)
-            .map(|j| {
-                let f = 0.011 + 0.003 * j as f32;
-                let (gb, gd) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, f, 0.08));
-                let (ub, ud) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, f * 1.3, 0.08));
-                let (db, dd) = enc(GgmlDType::Q2K, &wave(dim * inter, f * 0.9, 0.08));
-                E {
-                    gb,
-                    ub,
-                    db,
-                    gd,
-                    ud,
-                    dd,
-                }
-            })
-            .collect();
-        let x = wave(n * dim, 0.29, 1.0);
-        let limit = 7.0f32;
-        // Every token goes to every expert, with weights that differ, so the sums have three terms
-        // whose order would show in the last bits.
-        let weight = |t: usize, j: usize| 0.25 + 0.1 * ((t + 3 * j) % 5) as f32;
-        let toks =
-            |j: usize| -> Vec<(u32, f32)> { (0..n).map(|t| (t as u32, weight(t, j))).collect() };
-        let cpu_expert = |e: &E, t: usize| -> Vec<f32> {
-            let h: Vec<f32> = (0..inter)
-                .map(|i| {
-                    let dot = |w: &[f32]| {
-                        (0..dim)
-                            .map(|c| x[t * dim + c] * w[i * dim + c])
-                            .sum::<f32>()
-                    };
-                    let (g, u) = (dot(&e.gd).min(limit), dot(&e.ud).clamp(-limit, limit));
-                    g / (1.0 + (-g).exp()) * u
-                })
-                .collect();
-            (0..dim)
-                .map(|o| (0..inter).map(|c| h[c] * e.dd[o * inter + c]).sum())
-                .collect()
-        };
-        let mut want = vec![0f32; n * dim];
-        for t in 0..n {
-            for (j, e) in experts.iter().enumerate() {
-                let out = cpu_expert(e, t);
-                for c in 0..dim {
-                    want[t * dim + c] += weight(t, j) * out[c];
-                }
-            }
-        }
-        let run_one = |layer: &LayerBuffers, j: usize| {
-            let e = &experts[j];
-            gpu_expert_into_layer(
-                &dev,
-                [
-                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&e.gb)),
-                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&e.ub)),
-                    (GgmlDType::Q2K, ExpertWeight::Host(&e.db)),
-                ],
-                (inter, dim),
-                layer,
-                j,
-                &toks(j),
-                limit,
-            )
-            .unwrap();
-        };
-        // In order on one thread.
-        let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
-        for j in 0..3 {
-            run_one(&layer, j);
-        }
-        let a = gpu_layer_sum(&dev, &layer).unwrap();
-        let worst = a
-            .iter()
-            .zip(&want)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max);
-        let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-        assert!(
-            worst <= 1e-3 * range.max(1.0),
-            "worst {worst} of range {range}"
-        );
-        // Started last-first on three threads: the turnstile adds them in order all the same.
-        for _ in 0..3 {
-            let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
-            std::thread::scope(|s| {
-                for j in (0..3).rev() {
-                    let (layer, run_one) = (&layer, &run_one);
-                    s.spawn(move || run_one(layer, j));
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                }
-            });
-            assert_eq!(
-                a,
-                gpu_layer_sum(&dev, &layer).unwrap(),
-                "the order the experts ran in changed the sum"
-            );
         }
     }
 

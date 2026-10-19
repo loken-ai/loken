@@ -4,6 +4,56 @@ use super::projection::Projection;
 use crate::tensor::{Device, Result, Tensor};
 use std::sync::Arc;
 
+/// `e^x` in single precision from additions, multiplications and a division alone, each rounded
+/// once in the order written: a range reduction by ln 2 and a degree-five polynomial, scaled by
+/// two powers of two. The cards compute it with the same steps, so the SwiGLU of an expert is
+/// the same bits wherever the expert runs. Within two units in the last place of `exp`.
+pub fn exp(x: f32) -> f32 {
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = 0.693_359_4;
+    const LN2_LO: f32 = -2.121_944_4e-4;
+    const P: [f32; 6] = [
+        1.987_569_1e-4,
+        1.398_199_9e-3,
+        8.333_452e-3,
+        4.166_579_6e-2,
+        0.166_666_65,
+        0.5,
+    ];
+    if x.is_nan() {
+        return x;
+    }
+    if x > 88.722_84 {
+        return f32::INFINITY;
+    }
+    if x < -103.972_08 {
+        return 0.0;
+    }
+    let k = (x * LOG2E).round_ties_even();
+    let r = (x - k * LN2_HI) - k * LN2_LO;
+    let mut p = P[0];
+    for c in &P[1..] {
+        p = p * r + c;
+    }
+    let y = p * (r * r) + r + 1.0;
+    let k = k as i32;
+    let (k1, k2) = (k / 2, k - k / 2);
+    let two = |e: i32| f32::from_bits(((e + 127) as u32) << 23);
+    y * two(k1) * two(k2)
+}
+
+/// The SwiGLU of one gate and up value, the gate clamped from above and the up value on both
+/// sides when `limit` is positive: `silu(g) * u`, its steps in the order the cards take them.
+#[inline]
+pub fn swiglu(g: f32, u: f32, limit: f32) -> f32 {
+    let (g, u) = if limit > 0.0 {
+        (g.min(limit), u.clamp(-limit, limit))
+    } else {
+        (g, u)
+    };
+    g / (1.0 + exp(-g)) * u
+}
+
 /// One SwiGLU expert. `w1`/`w3` are [inter, dim], `w2` is [dim, inter].
 pub struct Expert {
     pub w1: Projection,
@@ -117,14 +167,7 @@ impl Expert {
         let mut h = vec![0f32; n * inter];
         for t in 0..n {
             for k in 0..inter {
-                let mut g = gate[t][k];
-                let mut u = up[t][k];
-                if swiglu_limit > 0.0 {
-                    u = u.clamp(-swiglu_limit, swiglu_limit);
-                    g = g.min(swiglu_limit);
-                }
-                let silu = g / (1.0 + (-g).exp());
-                h[t * inter + k] = silu * u;
+                h[t * inter + k] = swiglu(gate[t][k], up[t][k], swiglu_limit);
             }
         }
         if let Some(seen) = seen {
@@ -139,39 +182,28 @@ impl Expert {
 /// swiglu_limit)` takes an expert's input rows, row-major, and returns the rows entering its w2 and
 /// its output, or `None` for an expert whose storage it cannot run, which the CPU then runs.
 /// The token context of one layer's routed experts held where the offload computes: the layer's
-/// input rows on each card and a slot for each (token, chosen expert) product. The experts a
-/// card runs gather their rows there and put their weighted products in their slots, so nothing
-/// returns to the host per expert; the sum over a token's slots is read once at the end.
+/// input rows on each card, sent once for all the experts of the layer that card runs. The experts
+/// read their rows there and answer their outputs, which the host adds in the order it adds every
+/// expert in, so a prompt's sum is the same whichever experts ran on a card.
 pub struct DeviceLayer {
-    /// How many devices share a layer's experts: expert `e` is the device `e % groups`'s.
-    pub groups: usize,
     /// Open a layer's context from its input `x` [n, dim]. `None` when the offload has no room.
     #[allow(clippy::type_complexity)]
     pub begin:
         Box<dyn Fn(&[f32], usize) -> Option<Arc<dyn std::any::Any + Send + Sync>> + Send + Sync>,
-    /// Run `expert` on lane `lane` over its `(token, weight)` rows, as the `order`th of its
-    /// device's experts of the layer: the products are added in that order. `None` where the lane
-    /// declines and the host runs the expert.
+    /// Run `expert` on lane `lane` over its rows `toks` of the layer, answering its outputs
+    /// `[toks, dim]` in the order of `toks`. `None` where the lane declines and the host runs it.
     #[allow(clippy::type_complexity)]
     pub run: Box<
         dyn Fn(
                 usize,
                 &Arc<dyn std::any::Any + Send + Sync>,
                 &Expert,
-                usize,
-                &[(u32, f32)],
+                &[u32],
                 f32,
-            ) -> Option<Result<()>>
+            ) -> Option<Result<Vec<f32>>>
             + Send
             + Sync,
     >,
-    /// Mark the `order`th expert of lane `lane`'s device as past without a run, when it could not
-    /// be run at all.
-    #[allow(clippy::type_complexity)]
-    pub skip: Box<dyn Fn(usize, &Arc<dyn std::any::Any + Send + Sync>, usize) + Send + Sync>,
-    /// The sum of every device's products, `[n, dim]`.
-    #[allow(clippy::type_complexity)]
-    pub end: Box<dyn Fn(&Arc<dyn std::any::Any + Send + Sync>) -> Result<Vec<f32>> + Send + Sync>,
 }
 
 pub struct ExpertOffload {
@@ -241,8 +273,9 @@ pub struct ExpertOffload {
 
 impl ExpertOffload {
     /// Run the `active` experts of a layer over the context `ctx` of the device layer, each on the
-    /// lane its number names. An expert a lane ran answers `Some(Ok(..))` with empty vectors - its
-    /// products are in the context - and one a lane declined answers `None` for the host.
+    /// lane its number names. An expert a lane ran answers `Some(Ok(..))` with its output rows (the
+    /// rows entering its down projection are not read back), and one a lane declined answers `None`
+    /// for the host.
     #[allow(clippy::type_complexity)]
     pub fn run_all_dev(
         &self,
@@ -251,7 +284,7 @@ impl ExpertOffload {
         active: &[usize],
         swiglu_limit: f32,
         fetch: &(dyn Fn(usize) -> Result<Arc<Expert>> + Sync),
-        rows_of: &(dyn Fn(usize) -> Vec<(u32, f32)> + Sync),
+        rows_of: &(dyn Fn(usize) -> Vec<u32> + Sync),
     ) -> Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let mut done: Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> =
@@ -259,34 +292,17 @@ impl ExpertOffload {
         let next = AtomicUsize::new(0);
         let slots = std::sync::Mutex::new(&mut done);
         let lanes = self.lanes.max(1);
-        let groups = hooks.groups.max(1);
-        // The place of each expert among its device's: the order its products are added in.
-        let order_of: Vec<usize> = {
-            let mut seen = vec![0usize; groups];
-            active
-                .iter()
-                .map(|&e| {
-                    seen[e % groups] += 1;
-                    seen[e % groups] - 1
-                })
-                .collect()
-        };
         std::thread::scope(|scope| {
             for _ in 0..lanes {
-                let (next, slots, order_of) = (&next, &slots, &order_of);
+                let (next, slots) = (&next, &slots);
                 scope.spawn(move || loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(&e) = active.get(i) else { break };
                     let home = e % lanes;
                     let r = match fetch(e) {
-                        Ok(expert) => {
-                            (hooks.run)(home, ctx, &expert, order_of[i], &rows_of(e), swiglu_limit)
-                                .map(|r| r.map(|()| (Vec::new(), Vec::new())))
-                        }
-                        Err(err) => {
-                            (hooks.skip)(home, ctx, order_of[i]);
-                            Some(Err(err))
-                        }
+                        Ok(expert) => (hooks.run)(home, ctx, &expert, &rows_of(e), swiglu_limit)
+                            .map(|r| r.map(|out| (Vec::new(), out))),
+                        Err(err) => Some(Err(err)),
                     };
                     slots.lock().unwrap()[i] = r;
                 });
@@ -348,5 +364,32 @@ impl ExpertOffload {
             fetch_ns.load(Ordering::Relaxed),
             run_ns.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `exp` is within two units in the last place of the true value over the whole range it does
+    /// not saturate in, and meets the limits as `f32::exp` does.
+    #[test]
+    fn exp_is_within_two_units_in_the_last_place() {
+        let ulps = |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).abs();
+        let mut x = -103.9f32;
+        while x < 88.7 {
+            let want = (x as f64).exp() as f32;
+            assert!(
+                ulps(exp(x), want) <= 2,
+                "exp({x}) = {} against {want}",
+                exp(x)
+            );
+            x += 0.0137;
+        }
+        assert_eq!(exp(0.0), 1.0);
+        assert_eq!(exp(100.0), f32::INFINITY);
+        assert_eq!(exp(f32::INFINITY), f32::INFINITY);
+        assert_eq!(exp(f32::NEG_INFINITY), 0.0);
+        assert!(exp(f32::NAN).is_nan());
     }
 }

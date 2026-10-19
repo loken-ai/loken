@@ -887,239 +887,251 @@ extern "C" __global__ void mmv_iq2_xxs_f32(
     if (threadIdx.x == 0) y[row] = red[0];
 }
 
-// The rows entering an expert's down projection: for each of them the gate and the up product
-// over the same input, through the SwiGLU the reference applies with its clamps. Both weights are
-// IQ2_XXS [inter, dim], read where they lie. A block per row, a thread per sub-block of thirty-two.
-extern "C" __global__ void mmv_expert_h_iq2_xxs_f32(
-        const unsigned char * __restrict__ gate, const unsigned char * __restrict__ up,
-        const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
-        const float * __restrict__ x, float * __restrict__ h,
-        const int dim, const int inter, const float limit) {
-    const int row = blockIdx.x;
-    if (row >= inter) return;
-    const int sbs = dim / 256;
-    const unsigned char * gate0 = gate + (long) row * (long) sbs * 66;
-    const unsigned char * up0 = up + (long) row * (long) sbs * 66;
-    float ag = 0.0f, au = 0.0f;
-    for (int u = threadIdx.x; u < sbs * 8; u += blockDim.x) {
-        const int ib = u / 8, sub = u % 8;
-        const float * xp = x + (long) ib * 256 + sub * 32;
-        for (int w = 0; w < 2; ++w) {
-            const unsigned char * b = (w == 0 ? gate0 : up0) + (long) ib * 66;
-            const float d = req_f16_at(b);
-            const unsigned char * q = b + 2 + 8 * sub;
-            const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
-            const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
-            const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
-            float acc = 0.0f;
-            for (int g = 0; g < 4; ++g) {
-                const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
-                const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float v = db * (float) gp[j];
-                    acc += (((pattern >> j) & 1) ? -v : v) * xp[g * 8 + j];
-                }
-            }
-            if (w == 0) { ag += acc; } else { au += acc; }
-        }
-    }
-    // One warp per output row: each lane holds a partial, reduced by shuffle with no shared
-    // memory and no __syncthreads. The old 128-thread block did about one sub-block of work per
-    // thread and then a seven-step barrier reduction, so the barriers, not the dot, set the pace.
-    for (int off = 16; off > 0; off >>= 1) {
-        ag += __shfl_down_sync(0xffffffffu, ag, off);
-        au += __shfl_down_sync(0xffffffffu, au, off);
-    }
-    if (threadIdx.x == 0) {
-        float g = ag, u = au;
-        if (limit > 0.0f) {
-            g = fminf(g, limit);
-            u = fminf(fmaxf(u, -limit), limit);
-        }
-        h[row] = g / (1.0f + expf(-g)) * u;
-    }
+// Routed experts on a card, computed as the host computes them: the IQ2_XXS gate and up products
+// against the q8_K32 rows of the input, the SwiGLU, the rows entering the down projection as q8_K
+// blocks, and the Q2_K down product against them - the dots of quant_cpu and the SwiGLU of
+// offload::experts, value for value. The integer sums are exact in any order; every float step is
+// taken in the host's order through the rounding intrinsics, which the compiler never contracts.
+// So an expert's product is the same bits on a card as on the host, and where it ran does not
+// change the answer.
+//
+// The launches run a list of instances, an expert over one input row each, in tiles: a run of at
+// most `tt` instances of one expert, `(expert, first instance, count)`, so a weight row is read
+// once for all of them. One warp per (output row, tile).
+
+#define CX_Q8K32_BYTES 272
+#define CX_Q8K_BYTES 292
+#define CX_IQ2XXS_BYTES 66
+#define CX_Q2K_BYTES 84
+
+// e^x from additions, multiplications and a division alone, as offload::experts::exp takes them.
+__device__ static float cx_exp(const float x) {
+    if (x != x) return x;
+    if (x > 88.72284f) return INFINITY;
+    if (x < -103.97208f) return 0.0f;
+    const float k = rintf(__fmul_rn(x, 1.44269504088896341f));
+    const float r = __fsub_rn(__fsub_rn(x, __fmul_rn(k, 0.6933594f)), __fmul_rn(k, -2.1219444e-4f));
+    float p = 1.9875691e-4f;
+    p = __fadd_rn(__fmul_rn(p, r), 1.3981999e-3f);
+    p = __fadd_rn(__fmul_rn(p, r), 8.333452e-3f);
+    p = __fadd_rn(__fmul_rn(p, r), 4.1665796e-2f);
+    p = __fadd_rn(__fmul_rn(p, r), 0.16666665f);
+    p = __fadd_rn(__fmul_rn(p, r), 0.5f);
+    const float y = __fadd_rn(__fadd_rn(__fmul_rn(p, __fmul_rn(r, r)), r), 1.0f);
+    const int ki = (int) k;
+    const int k1 = ki / 2, k2 = ki - ki / 2;
+    return __fmul_rn(__fmul_rn(y, __int_as_float((k1 + 127) << 23)), __int_as_float((k2 + 127) << 23));
 }
 
-// One row of a Q2_K weight [out, inp] against a vector, its codes read where they lie: the decode
-// of dequant_q2_k_f32 accumulated rather than written. A block per row, a thread per sub-block of
-// sixteen.
-extern "C" __global__ void mmv_q2_k_f32(
-        const unsigned char * __restrict__ blocks, const float * __restrict__ x,
-        float * __restrict__ y, const int inp, const int out) {
-    const int row = blockIdx.x;
-    if (row >= out) return;
-    const int sbs = inp / 256;
-    const unsigned char * rowp = blocks + (long) row * (long) sbs * 84;
-    float acc = 0.0f;
-    for (int u = threadIdx.x; u < sbs * 16; u += blockDim.x) {
-        const int ib = u / 16, sub = u % 16, t = sub % 8;
-        const unsigned char * b = rowp + (long) ib * 84;
-        const unsigned char sc = b[sub];
-        const float d = req_f16_at(b + 80), dmin = req_f16_at(b + 82);
-        const int base = 32 * (sub / 8) + 16 * (t % 2), shift = 2 * (t / 2);
-        const float sd = d * (float) (sc & 0x0F), sm = dmin * (float) (sc >> 4);
-        const float * xp = x + (long) ib * 256 + sub * 16;
+// silu(g) * u with the gate clamped from above and the up value on both sides, as
+// offload::experts::swiglu.
+__device__ static float cx_swiglu(float g, float u, const float limit) {
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = u < -limit ? -limit : (u > limit ? limit : u);
+    }
+    return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, cx_exp(-g))), u);
+}
+
+// The 32 signed weights of an IQ2_XXS sub-block, four to an int in the order the activations run.
+__device__ static void cx_iq2xxs_sub(
+        const unsigned char * q, const unsigned char * grid, const unsigned char * signs,
+        int * w, float * scale) {
+    const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
+    const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
+        const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
         #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const int code = (b[16 + base + i] >> shift) & 3;
-            acc += (sd * (float) code - sm) * xp[i];
+        for (int half = 0; half < 2; ++half) {
+            int packed = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int bit = 4 * half + j;
+                const int v = ((pattern >> bit) & 1) ? -(int) gp[bit] : (int) gp[bit];
+                packed |= (v & 0xff) << (8 * j);
+            }
+            w[2 * g + half] = packed;
         }
     }
-    // One warp per output row, reduced by shuffle - no barrier reduction, see the h kernel.
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    }
-    if (threadIdx.x == 0) y[row] = acc;
+    *scale = __fmul_rn(__fadd_rn(0.5f, (float) (hi >> 28)), 0.25f);
 }
 
-// The two kernels above, over a block of experts that share one input row - a decode's active
-// experts of a layer. blockIdx.y indexes the expert; each reads its own weights through a device
-// array of pointers, so all of a layer's experts run in one launch and the card is busy with the
-// whole block at once instead of one expert at a time. Bit-identical to running them singly: the
-// per-expert arithmetic and its order are the same, only the launch is shared.
-extern "C" __global__ void mmv_expert_h_iq2_xxs_grouped_f32(
+// The rows entering the down projections: instance i is expert tiles[3t] over row xrow[i] of `xq`
+// (q8_K32 rows of `dim`), written to row i of `h` [instances, inter]. Shared memory holds each
+// instance's sub-block terms and block shares: (2 * tt * (dim / 32) + 2 * tt * (dim / 256)) floats.
+extern "C" __global__ void cx_expert_h_iq2_xxs(
         const unsigned long long * __restrict__ gate_ptrs,
         const unsigned long long * __restrict__ up_ptrs,
         const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
-        const float * __restrict__ x, float * __restrict__ h,
-        const int dim, const int inter, const float limit, const int nexperts) {
-    const int e = blockIdx.y;
-    if (e >= nexperts) return;
-    const int row = blockIdx.x;
-    if (row >= inter) return;
-    const int sbs = dim / 256;
-    const unsigned char * gate = (const unsigned char *) gate_ptrs[e];
-    const unsigned char * up = (const unsigned char *) up_ptrs[e];
-    const unsigned char * gate0 = gate + (long) row * (long) sbs * 66;
-    const unsigned char * up0 = up + (long) row * (long) sbs * 66;
-    float ag = 0.0f, au = 0.0f;
-    for (int u = threadIdx.x; u < sbs * 8; u += blockDim.x) {
+        const unsigned char * __restrict__ xq, const int * __restrict__ xrow,
+        const int * __restrict__ tiles, float * __restrict__ h,
+        const int dim, const int inter, const float limit, const int tt) {
+    extern __shared__ float cx_shared[];
+    const int row = blockIdx.x, tile = blockIdx.y, lane = threadIdx.x;
+    const int e = tiles[3 * tile], i0 = tiles[3 * tile + 1], c = tiles[3 * tile + 2];
+    const int sbs = dim / 256, nsub = sbs * 8;
+    float * tg = cx_shared;
+    float * tu = tg + tt * nsub;
+    float * sg = tu + tt * nsub;
+    float * su = sg + tt * sbs;
+    const unsigned char * gate0 = (const unsigned char *) gate_ptrs[e] + (long) row * sbs * CX_IQ2XXS_BYTES;
+    const unsigned char * up0 = (const unsigned char *) up_ptrs[e] + (long) row * sbs * CX_IQ2XXS_BYTES;
+    for (int u = lane; u < nsub; u += 32) {
         const int ib = u / 8, sub = u % 8;
-        const float * xp = x + (long) ib * 256 + sub * 32;
-        for (int w = 0; w < 2; ++w) {
-            const unsigned char * b = (w == 0 ? gate0 : up0) + (long) ib * 66;
-            const float d = req_f16_at(b);
-            const unsigned char * q = b + 2 + 8 * sub;
-            const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
-            const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
-            const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
-            float acc = 0.0f;
-            for (int g = 0; g < 4; ++g) {
-                const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
-                const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float v = db * (float) gp[j];
-                    acc += (((pattern >> j) & 1) ? -v : v) * xp[g * 8 + j];
-                }
+        int wg[8], wu[8];
+        float scg, scu;
+        cx_iq2xxs_sub(gate0 + (long) ib * CX_IQ2XXS_BYTES + 2 + 8 * sub, grid, signs, wg, &scg);
+        cx_iq2xxs_sub(up0 + (long) ib * CX_IQ2XXS_BYTES + 2 + 8 * sub, grid, signs, wu, &scu);
+        for (int j = 0; j < c; ++j) {
+            const unsigned char * xb = xq + ((long) xrow[i0 + j] * sbs + ib) * CX_Q8K32_BYTES;
+            const int * a = reinterpret_cast<const int *>(xb + 16 + 32 * sub);
+            int ig = 0, iu = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int av = a[k];
+                ig = __dp4a(wg[k], av, ig);
+                iu = __dp4a(wu[k], av, iu);
             }
-            if (w == 0) { ag += acc; } else { au += acc; }
+            const float yd = req_f16_at(xb + 2 * sub);
+            tg[j * nsub + u] = __fmul_rn(__fmul_rn(scg, (float) ig), yd);
+            tu[j * nsub + u] = __fmul_rn(__fmul_rn(scu, (float) iu), yd);
         }
     }
-    // One warp per (expert, row): lanes reduced by shuffle, no shared memory, no barrier.
-    for (int off = 16; off > 0; off >>= 1) {
-        ag += __shfl_down_sync(0xffffffffu, ag, off);
-        au += __shfl_down_sync(0xffffffffu, au, off);
-    }
-    if (threadIdx.x == 0) {
-        float g = ag, u = au;
-        if (limit > 0.0f) {
-            g = fminf(g, limit);
-            u = fminf(fmaxf(u, -limit), limit);
-        }
-        h[(long) e * inter + row] = g / (1.0f + expf(-g)) * u;
-    }
-}
-
-// Grouped IQ2_XXS gate*up SwiGLU, one activation row per expert-instance: `x` is [nexperts, dim]
-// and instance `e` reads row `e`. A speculative verify makes one instance per (expert, token) it
-// routes, so the block's whole MoE runs in a single launch instead of one per token.
-extern "C" __global__ void mmv_expert_h_iq2_xxs_grouped_multi_f32(
-        const unsigned long long * __restrict__ gate_ptrs,
-        const unsigned long long * __restrict__ up_ptrs,
-        const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
-        const float * __restrict__ x, float * __restrict__ h,
-        const int dim, const int inter, const float limit, const int nexperts) {
-    const int e = blockIdx.y;
-    if (e >= nexperts) return;
-    const int row = blockIdx.x;
-    if (row >= inter) return;
-    const int sbs = dim / 256;
-    const unsigned char * gate = (const unsigned char *) gate_ptrs[e];
-    const unsigned char * up = (const unsigned char *) up_ptrs[e];
-    const unsigned char * gate0 = gate + (long) row * (long) sbs * 66;
-    const unsigned char * up0 = up + (long) row * (long) sbs * 66;
-    const float * xe = x + (long) e * dim;
-    float ag = 0.0f, au = 0.0f;
-    for (int u = threadIdx.x; u < sbs * 8; u += blockDim.x) {
-        const int ib = u / 8, sub = u % 8;
-        const float * xp = xe + (long) ib * 256 + sub * 32;
-        for (int w = 0; w < 2; ++w) {
-            const unsigned char * b = (w == 0 ? gate0 : up0) + (long) ib * 66;
-            const float d = req_f16_at(b);
-            const unsigned char * q = b + 2 + 8 * sub;
-            const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
-            const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
-            const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
-            float acc = 0.0f;
-            for (int g = 0; g < 4; ++g) {
-                const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
-                const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float v = db * (float) gp[j];
-                    acc += (((pattern >> j) & 1) ? -v : v) * xp[g * 8 + j];
-                }
-            }
-            if (w == 0) { ag += acc; } else { au += acc; }
-        }
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        ag += __shfl_down_sync(0xffffffffu, ag, off);
-        au += __shfl_down_sync(0xffffffffu, au, off);
-    }
-    if (threadIdx.x == 0) {
-        float g = ag, u = au;
-        if (limit > 0.0f) {
-            g = fminf(g, limit);
-            u = fminf(fmaxf(u, -limit), limit);
-        }
-        h[(long) e * inter + row] = g / (1.0f + expf(-g)) * u;
-    }
-}
-
-extern "C" __global__ void mmv_q2_k_grouped_f32(
-        const unsigned long long * __restrict__ down_ptrs, const float * __restrict__ h,
-        float * __restrict__ y, const int inp, const int out, const int nexperts) {
-    const int e = blockIdx.y;
-    if (e >= nexperts) return;
-    const int row = blockIdx.x;
-    if (row >= out) return;
-    const int sbs = inp / 256;
-    const unsigned char * blocks = (const unsigned char *) down_ptrs[e];
-    const unsigned char * rowp = blocks + (long) row * (long) sbs * 84;
-    const float * he = h + (long) e * inp;
-    float acc = 0.0f;
-    for (int u = threadIdx.x; u < sbs * 16; u += blockDim.x) {
-        const int ib = u / 16, sub = u % 16, t = sub % 8;
-        const unsigned char * b = rowp + (long) ib * 84;
-        const unsigned char sc = b[sub];
-        const float d = req_f16_at(b + 80), dmin = req_f16_at(b + 82);
-        const int base = 32 * (sub / 8) + 16 * (t % 2), shift = 2 * (t / 2);
-        const float sd = d * (float) (sc & 0x0F), sm = dmin * (float) (sc >> 4);
-        const float * xp = he + (long) ib * 256 + sub * 16;
+    __syncwarp();
+    for (int p = lane; p < c * sbs; p += 32) {
+        const int j = p / sbs, ib = p % sbs;
+        float ag = 0.0f, au = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const int code = (b[16 + base + i] >> shift) & 3;
-            acc += (sd * (float) code - sm) * xp[i];
+        for (int sub = 0; sub < 8; ++sub) {
+            ag = __fadd_rn(ag, tg[j * nsub + ib * 8 + sub]);
+            au = __fadd_rn(au, tu[j * nsub + ib * 8 + sub]);
+        }
+        sg[j * sbs + ib] = __fmul_rn(req_f16_at(gate0 + (long) ib * CX_IQ2XXS_BYTES), ag);
+        su[j * sbs + ib] = __fmul_rn(req_f16_at(up0 + (long) ib * CX_IQ2XXS_BYTES), au);
+    }
+    __syncwarp();
+    if (lane < c) {
+        float g = -0.0f, u = -0.0f;
+        for (int ib = 0; ib < sbs; ++ib) {
+            g = __fadd_rn(g, sg[lane * sbs + ib]);
+            u = __fadd_rn(u, su[lane * sbs + ib]);
+        }
+        h[(long) (i0 + lane) * inter + row] = cx_swiglu(g, u, limit);
+    }
+}
+
+// Rows of `x` [rows, k] as q8_K blocks, the host's activation quantiser value for value: the
+// extreme is the first value of the largest magnitude, the codes are its -127th parts rounded half
+// away from zero and clipped at 127, the scale is the reciprocal, and each sixteen codes are
+// summed. One warp per block, eight consecutive values to a lane.
+extern "C" __global__ void cx_quantize_q8_k(
+        const float * __restrict__ x, unsigned char * __restrict__ out, const long nblocks) {
+    const long blk = blockIdx.x;
+    if (blk >= nblocks) return;
+    const int lane = threadIdx.x;
+    const float * xb = x + blk * 256 + lane * 8;
+    float v[8];
+    float best = 0.0f, bv = 0.0f;
+    int bi = 256;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        v[t] = xb[t];
+        const float a = fabsf(v[t]);
+        if (a > best) { best = a; bv = v[t]; bi = lane * 8 + t; }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ob = __shfl_xor_sync(0xffffffffu, best, off);
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+        if (ob > best || (ob == best && oi < bi)) { best = ob; bv = ov; bi = oi; }
+    }
+    unsigned char * ob = out + blk * CX_Q8K_BYTES;
+    signed char * qs = reinterpret_cast<signed char *>(ob + 4);
+    short * bsums = reinterpret_cast<short *>(ob + 260);
+    int sum = 0;
+    if (bv == 0.0f) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) qs[lane * 8 + t] = 0;
+        if (lane == 0) *reinterpret_cast<float *>(ob) = 0.0f;
+    } else {
+        const float inv = __fdiv_rn(-127.0f, bv);
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            int q = (int) roundf(__fmul_rn(inv, v[t]));
+            q = q > 127 ? 127 : q;
+            qs[lane * 8 + t] = (signed char) q;
+            sum += q;
+        }
+        if (lane == 0) *reinterpret_cast<float *>(ob) = __fdiv_rn(1.0f, inv);
+    }
+    const int pair = __shfl_down_sync(0xffffffffu, sum, 1);
+    if ((lane & 1) == 0) bsums[lane / 2] = (short) (sum + pair);
+}
+
+// The outputs of the down projections: instance i is expert tiles[3t] over row i of `hq` (q8_K
+// rows of `inter`), written to row i of `y` [instances, dim]. Shared memory holds each instance's
+// sub-block sums and block shares: (2 * tt * (inter / 16)) ints and (tt * (inter / 256)) floats.
+extern "C" __global__ void cx_expert_down_q2_k(
+        const unsigned long long * __restrict__ down_ptrs,
+        const unsigned char * __restrict__ hq, const int * __restrict__ tiles,
+        float * __restrict__ y, const int inter, const int dim, const int tt) {
+    extern __shared__ int cx_shared_i[];
+    const int row = blockIdx.x, tile = blockIdx.y, lane = threadIdx.x;
+    const int e = tiles[3 * tile], i0 = tiles[3 * tile + 1], c = tiles[3 * tile + 2];
+    const int sbs = inter / 256, nsub = sbs * 16;
+    int * isc = cx_shared_i;
+    int * ioff = isc + tt * nsub;
+    float * st = reinterpret_cast<float *>(ioff + tt * nsub);
+    const unsigned char * row0 = (const unsigned char *) down_ptrs[e] + (long) row * sbs * CX_Q2K_BYTES;
+    for (int u = lane; u < nsub; u += 32) {
+        const int ib = u / 16, s = u % 16, t = s % 8;
+        const unsigned char * b = row0 + (long) ib * CX_Q2K_BYTES;
+        const int base = 32 * (s / 8) + 16 * (t % 2), shift = 2 * (t / 2);
+        int w[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            int packed = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                packed |= ((b[16 + base + 4 * k + j] >> shift) & 3) << (8 * j);
+            }
+            w[k] = packed;
+        }
+        const int sc = b[s] & 0x0F, mn = b[s] >> 4;
+        for (int j = 0; j < c; ++j) {
+            const unsigned char * hb = hq + ((long) (i0 + j) * sbs + ib) * CX_Q8K_BYTES;
+            const int * a = reinterpret_cast<const int *>(hb + 4 + 16 * s);
+            int dot = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) dot = __dp4a(w[k], a[k], dot);
+            isc[j * nsub + u] = sc * dot;
+            ioff[j * nsub + u] = mn * (int) reinterpret_cast<const short *>(hb + 260)[s];
         }
     }
-    // One warp per (expert, row), reduced by shuffle - see the h kernel.
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    __syncwarp();
+    for (int p = lane; p < c * sbs; p += 32) {
+        const int j = p / sbs, ib = p % sbs;
+        int scaled = 0, offset = 0;
+        #pragma unroll
+        for (int s = 0; s < 16; ++s) {
+            scaled += isc[j * nsub + ib * 16 + s];
+            offset += ioff[j * nsub + ib * 16 + s];
+        }
+        const unsigned char * b = row0 + (long) ib * CX_Q2K_BYTES;
+        const unsigned char * hb = hq + ((long) (i0 + j) * sbs + ib) * CX_Q8K_BYTES;
+        const float yd = *reinterpret_cast<const float *>(hb);
+        st[j * sbs + ib] = __fmul_rn(yd, __fsub_rn(__fmul_rn(req_f16_at(b + 80), (float) scaled),
+                                                  __fmul_rn(req_f16_at(b + 82), (float) offset)));
     }
-    if (threadIdx.x == 0) y[(long) e * out + row] = acc;
+    __syncwarp();
+    if (lane < c) {
+        float acc = -0.0f;
+        for (int ib = 0; ib < sbs; ++ib) acc = __fadd_rn(acc, st[lane * sbs + ib]);
+        y[(long) (i0 + lane) * dim + row] = acc;
+    }
 }
 
 // q2_K to f32 at full precision, one value per thread: sixteen scale/minimum bytes, then the codes of
@@ -1162,111 +1174,6 @@ extern "C" __global__ void dequant_q6_k_f32(
 }
 
 // ---- A token group through a quantised weight, the codes read where they lie ----------------------
-
-#define MMR_MAX 32
-
-// Up to MMR_MAX rows of `x` [total_rows, k], starting at `row0`, through an IQ2_XXS weight [n, k]:
-// y[(row0 + r) * n + o] = sum_c w[o, c] * x[row0 + r, c]. A block of eight warps takes eight weight
-// rows; per superblock of 256 values the block stages the rows' slice of x in shared memory, and
-// each lane decodes eight weight values once and applies them to every row. The codes are read
-// once for the whole group, and no f32 copy of the weight exists.
-extern "C" __global__ void mm_iq2_xxs_rows_f32(
-        const unsigned char * __restrict__ blocks, const unsigned char * __restrict__ grid,
-        const unsigned char * __restrict__ signs, const float * __restrict__ x,
-        float * __restrict__ y, const int k, const int n, const int row0, const int rows) {
-    __shared__ __align__(16) float xs[MMR_MAX * 256];
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int o = blockIdx.x * 8 + warp;
-    const int sbs = k / 256;
-    float acc[MMR_MAX];
-    #pragma unroll
-    for (int r = 0; r < MMR_MAX; ++r) acc[r] = 0.0f;
-    for (int ib = 0; ib < sbs; ++ib) {
-        __syncthreads();
-        for (int e = threadIdx.x; e < rows * 256; e += blockDim.x)
-            xs[e] = x[(long) (row0 + e / 256) * k + (long) ib * 256 + e % 256];
-        __syncthreads();
-        if (o >= n) continue;
-        const unsigned char * b = blocks + ((long) o * sbs + ib) * 66;
-        const float d = req_f16_at(b);
-        const int sub = lane / 4, g = lane % 4;
-        const unsigned char * q = b + 2 + 8 * sub;
-        const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
-        const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
-        const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
-        const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
-        const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
-        float wv[8];
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float v = db * (float) gp[j];
-            wv[j] = ((pattern >> j) & 1) ? -v : v;
-        }
-        #pragma unroll
-        for (int r = 0; r < MMR_MAX; ++r) {
-            if (r >= rows) break;
-            const float4 a = *(const float4 *) (xs + r * 256 + lane * 8);
-            const float4 c = *(const float4 *) (xs + r * 256 + lane * 8 + 4);
-            acc[r] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w
-                    + wv[4] * c.x + wv[5] * c.y + wv[6] * c.z + wv[7] * c.w;
-        }
-    }
-    #pragma unroll
-    for (int r = 0; r < MMR_MAX; ++r) {
-        if (r >= rows) break;
-        float v = acc[r];
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
-        if (lane == 0 && o < n) y[(long) (row0 + r) * n + o] = v;
-    }
-}
-
-// The same for a Q2_K weight [n, k]: superblocks of 256 values in 84 bytes (sixteen scale and
-// minimum bytes, the two-bit codes, then the f16 scale and minimum scale). A lane takes eight values.
-extern "C" __global__ void mm_q2_k_rows_f32(
-        const unsigned char * __restrict__ blocks, const float * __restrict__ x,
-        float * __restrict__ y, const int k, const int n, const int row0, const int rows) {
-    __shared__ __align__(16) float xs[MMR_MAX * 256];
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int o = blockIdx.x * 8 + warp;
-    const int sbs = k / 256;
-    float acc[MMR_MAX];
-    #pragma unroll
-    for (int r = 0; r < MMR_MAX; ++r) acc[r] = 0.0f;
-    for (int ib = 0; ib < sbs; ++ib) {
-        __syncthreads();
-        for (int e = threadIdx.x; e < rows * 256; e += blockDim.x)
-            xs[e] = x[(long) (row0 + e / 256) * k + (long) ib * 256 + e % 256];
-        __syncthreads();
-        if (o >= n) continue;
-        const unsigned char * b = blocks + ((long) o * sbs + ib) * 84;
-        const float d = req_f16_at(b + 80), dmin = req_f16_at(b + 82);
-        const int sub = lane / 2, t = sub % 8;
-        const unsigned char sc = b[sub];
-        const int base = 32 * (sub / 8) + 16 * (t % 2), shift = 2 * (t / 2);
-        const float sd = d * (float) (sc & 0x0F), sm = dmin * (float) (sc >> 4);
-        float wv[8];
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int code = (b[16 + base + (lane % 2) * 8 + j] >> shift) & 3;
-            wv[j] = sd * (float) code - sm;
-        }
-        #pragma unroll
-        for (int r = 0; r < MMR_MAX; ++r) {
-            if (r >= rows) break;
-            const float4 a = *(const float4 *) (xs + r * 256 + lane * 8);
-            const float4 c = *(const float4 *) (xs + r * 256 + lane * 8 + 4);
-            acc[r] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w
-                    + wv[4] * c.x + wv[5] * c.y + wv[6] * c.z + wv[7] * c.w;
-        }
-    }
-    #pragma unroll
-    for (int r = 0; r < MMR_MAX; ++r) {
-        if (r >= rows) break;
-        float v = acc[r];
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
-        if (lane == 0 && o < n) y[(long) (row0 + r) * n + o] = v;
-    }
-}
 
 // ---- Hyper-connection steps over a prompt's residual stream x [n, hc, d] ----------------------------
 
@@ -1421,41 +1328,6 @@ extern "C" __global__ void take_cols_f32(
     const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
     if (i >= total) return;
     dst[i] = src[(i / w) * src_w + off + i % w];
-}
-
-// Rows of `xin` [n, dim] named by `idx`, one value per thread: an expert's input tokens.
-extern "C" __global__ void gather_rows_f32(
-        const float * __restrict__ xin, const unsigned int * __restrict__ idx,
-        float * __restrict__ out, const long total, const long dim) {
-    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
-    if (i >= total) return;
-    out[i] = xin[(long) idx[i / dim] * dim + i % dim];
-}
-
-// An expert's rows `out` [rows, dim], each scaled by its routing weight and added to its token's row
-// of `y` [n, dim]. An expert names a token once, so no two threads of a launch touch one value;
-// launches on a stream run one after another, so the experts add in the order they were queued.
-extern "C" __global__ void scatter_add_f32(
-        const float * __restrict__ out, const unsigned int * __restrict__ tok,
-        const float * __restrict__ w, float * __restrict__ y, const long total, const long dim) {
-    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
-    if (i >= total) return;
-    y[(long) tok[i / dim] * dim + i % dim] += w[i / dim] * out[i];
-}
-
-// SwiGLU over a prompt's rows, one value per thread: the expert's gate and up products clamped as
-// the reference clamps them when `limit` is positive, then silu(gate) * up.
-extern "C" __global__ void swiglu_f32(
-        const float * __restrict__ gate, const float * __restrict__ up, float * __restrict__ h,
-        const long total, const float limit) {
-    const long idx = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
-    if (idx >= total) return;
-    float g = gate[idx], u = up[idx];
-    if (limit > 0.0f) {
-        g = fminf(g, limit);
-        u = fminf(fmaxf(u, -limit), limit);
-    }
-    h[idx] = g / (1.0f + expf(-g)) * u;
 }
 
 // Index scores, one (query, compressed position) pair per thread: the sum over heads of

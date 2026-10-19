@@ -47,7 +47,7 @@ impl DeferredExperts {
                         .iter()
                         .map(|e| {
                             let row = Tensor::from_vec(x.clone(), (1, x.len()), &Device::Cpu)?;
-                            e.forward(&row, swiglu_limit)?
+                            super::on_host(|| e.forward(&row, swiglu_limit))?
                                 .flatten_all()?
                                 .to_vec1::<f32>()
                         })
@@ -94,8 +94,8 @@ impl Drop for DeferredExperts {
 /// of rows) with room for several blocks; a prompt's batch is hundreds.
 pub(crate) const VERIFY_BATCH_MAX_ROWS: usize = 32;
 
-/// A prompt's layer whose experts keep their tokens' rows and products on the cards: the offload's
-/// hooks and the layer's context.
+/// A prompt's layer whose experts read their tokens' rows on the cards: the offload's hooks and the
+/// layer's context.
 pub(crate) struct DevRun<'a> {
     pub hooks: &'a super::experts::DeviceLayer,
     pub ctx: &'a Arc<dyn std::any::Any + Send + Sync>,
@@ -189,8 +189,7 @@ pub(crate) fn run_routed(
                             let expert = active_refs[i].clone();
                             let xe =
                                 Tensor::from_vec(rows_of(e), (assign[e].len(), dim), &Device::Cpu)?;
-                            let out = expert
-                                .forward(&xe, swiglu_limit)?
+                            let out = super::on_host(|| expert.forward(&xe, swiglu_limit))?
                                 .flatten_all()?
                                 .to_vec1::<f32>()?;
                             Ok((Vec::new(), out, Some(expert)))
@@ -290,9 +289,8 @@ pub(crate) fn run_routed(
             })()
             .is_some();
         if let (false, Some(dev)) = (pooled, &dev) {
-            let toks_of = |e: usize| -> Vec<(u32, f32)> {
-                assign[e].iter().map(|&(t, w)| (t as u32, w)).collect()
-            };
+            let toks_of =
+                |e: usize| -> Vec<u32> { assign[e].iter().map(|&(t, _)| t as u32).collect() };
             done = off.run_all_dev(dev.hooks, dev.ctx, active, swiglu_limit, &fetch, &toks_of);
         } else if !pooled {
             let (ran, fetch_ns, run_ns) = off.run_all(active, n, swiglu_limit, &fetch, &rows_of);

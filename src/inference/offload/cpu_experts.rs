@@ -62,12 +62,7 @@ pub(crate) fn batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<
     let mut h = vec![vec![0f32; inter]; ne];
     for e in 0..ne {
         for k in 0..inter {
-            let (mut g, mut u) = (gate_o[e][k], up_o[e][k]);
-            if limit > 0.0 {
-                u = u.clamp(-limit, limit);
-                g = g.min(limit);
-            }
-            h[e][k] = (g / (1.0 + (-g).exp())) * u;
+            h[e][k] = super::experts::swiglu(gate_o[e][k], up_o[e][k], limit);
         }
     }
     let down_r: Vec<&[u8]> = down_c.iter().map(|c| c.as_ref()).collect();
@@ -158,12 +153,7 @@ pub(crate) fn multirow(
     let mut h = vec![vec![0f32; inter]; npairs];
     for p in 0..npairs {
         for k in 0..inter {
-            let (mut g, mut u) = (gate_o[p][k], up_o[p][k]);
-            if limit > 0.0 {
-                u = u.clamp(-limit, limit);
-                g = g.min(limit);
-            }
-            h[p][k] = (g / (1.0 + (-g).exp())) * u;
+            h[p][k] = super::experts::swiglu(gate_o[p][k], up_o[p][k], limit);
         }
     }
     let h_r: Vec<&[f32]> = h.iter().map(|v| v.as_slice()).collect();
@@ -245,5 +235,85 @@ mod bench_tests {
     #[test]
     fn an_unrunnable_dim_yields_none() {
         assert!(bench_miss_ms(100, 2304, GgmlDType::Iq2Xxs, GgmlDType::Q2K, 4).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::offload::projection::Projection;
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{Device, Tensor};
+
+    /// The host's three ways through quantised experts - a decode's block, a verify's rows, an
+    /// expert over a prompt's rows - give the same bits: the card's kernels are held to one product,
+    /// and it is the same whichever of these the host took.
+    #[test]
+    fn the_host_paths_through_an_expert_agree_bit_for_bit() {
+        let (dim, inter, limit, n) = (512usize, 256usize, 7.0f32, 5usize);
+        let draw = |seed: u32, len: usize, scale: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    (((i as u32)
+                        .wrapping_add(seed.wrapping_mul(0x9E37_79B9))
+                        .wrapping_mul(2_654_435_761)
+                        .rotate_left(11)
+                        >> 8) as f32
+                        / (1 << 24) as f32
+                        - 0.5)
+                        * scale
+                })
+                .collect()
+        };
+        let quant = |w: Vec<f32>, rows: usize, cols: usize, dtype: GgmlDType| {
+            let t = Tensor::from_vec(w, (rows, cols), &Device::Cpu).unwrap();
+            Projection::Quant(Arc::new(QTensor::quantize(&t, dtype).unwrap()))
+        };
+        let experts: Vec<Arc<Expert>> = (0..2u32)
+            .map(|j| {
+                Arc::new(Expert {
+                    w1: quant(
+                        draw(10 * j + 1, inter * dim, 0.08),
+                        inter,
+                        dim,
+                        GgmlDType::Iq2Xxs,
+                    ),
+                    w3: quant(
+                        draw(10 * j + 2, inter * dim, 0.08),
+                        inter,
+                        dim,
+                        GgmlDType::Iq2Xxs,
+                    ),
+                    w2: quant(
+                        draw(10 * j + 3, dim * inter, 0.08),
+                        dim,
+                        inter,
+                        GgmlDType::Q2K,
+                    ),
+                })
+            })
+            .collect();
+        let x = draw(77, n * dim, 6.0);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        let rows: Vec<Vec<f32>> = experts.iter().map(|_| x.clone()).collect();
+        let multi = multirow(&experts, &rows, dim, limit).unwrap();
+        for (j, e) in experts.iter().enumerate() {
+            let xe = Tensor::from_vec(x.clone(), (n, dim), &Device::Cpu).unwrap();
+            let whole = crate::inference::offload::on_host(|| e.forward(&xe, limit))
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(bits(&whole), bits(&multi[j]), "rows, expert {j}");
+            for t in 0..n {
+                let one = batched(&experts, &x[t * dim..(t + 1) * dim], limit).unwrap();
+                assert_eq!(
+                    bits(&one[j]),
+                    bits(&whole[t * dim..(t + 1) * dim]),
+                    "block, expert {j} row {t}"
+                );
+            }
+        }
     }
 }

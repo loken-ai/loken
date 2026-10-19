@@ -34,6 +34,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Experts: give the same greedy tokens whichever experts the cards hold.
 - Audio: prompt Voxtral in its own instruction format, not the file's template.
 - Bench: never stamp an earlier result with a build that measured nothing.
 

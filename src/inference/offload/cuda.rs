@@ -1,7 +1,8 @@
 //! The heavy steps of a forward on a card: every projection product, whatever its storage, and
 //! sparse attention, each dequantised or gathered on the device and computed at full precision.
 //! The weights every token reads stay on the card once sent; routed experts are kept as the
-//! room allows and never traded for one another.
+//! room allows and never traded for one another. A routed expert is computed as the host
+//! computes it, bit for bit, so which experts a card holds never changes an answer.
 
 use super::admission::Admission;
 use super::experts::{Expert, ExpertOffload};
@@ -9,10 +10,10 @@ use super::projection::Projection;
 use super::room::Room;
 use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
-    gpu_expert_into_layer, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
+    gpu_expert_layer_rows, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
     gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_layer_begin,
-    gpu_layer_sum, gpu_prefill_attention, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
-    CudaDevice, ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
+    gpu_prefill_attention, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables, CudaDevice,
+    ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
     QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::gpu_runtime::driver::CudaSlice;
@@ -239,20 +240,6 @@ impl Card {
 
     /// `q` on this card, kept for the next call. `None` when it could not go over, which leaves
     /// the caller to upload per call as before.
-    /// A weight already resident in the always-read tier, or `None` - never an upload. A step that
-    /// must not admit (a fused block declining unless the whole set is already here, so it never
-    /// forces a routed expert into the always-read tier nor churns the working set) asks through
-    /// this rather than `kept`.
-    fn kept_resident(&self, q: &Arc<QTensor>) -> Option<Arc<QMatMul>> {
-        let bytes = q.data().ok()?;
-        let key = (bytes.as_ptr() as usize, bytes.len());
-        self.resident
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
-    }
-
     fn kept(&self, q: &Arc<QTensor>) -> Option<Arc<QMatMul>> {
         let bytes = q.data().ok()?;
         let key = (bytes.as_ptr() as usize, bytes.len());
@@ -741,9 +728,44 @@ impl Card {
         out
     }
 
+    /// The IQ2_XXS decode tables on this card, sent the first time an expert needs them.
+    fn iq2_tables(&self) -> Option<&(CudaSlice<u8>, CudaSlice<u8>)> {
+        if self.tables.get().is_none() {
+            let _ = self.tables.set(iq2_xxs_tables(&self.dev).ok()?);
+        }
+        self.tables.get()
+    }
+
+    /// The three weights of `e` for the exact expert kernels: from this card when it keeps the
+    /// expert, else the mapped bytes to stage over. `None` when the expert is not IQ2_XXS gate and
+    /// up with a Q2_K down, the formats those kernels read; the host runs it.
+    fn expert_weights<'a>(
+        &self,
+        e: &'a Expert,
+        staged: &'a [std::borrow::Cow<'a, [u8]>; 3],
+    ) -> Option<[ExpertWeight<'a>; 3]> {
+        let gate = quant_blocks(&e.w1, GgmlDType::Iq2Xxs)?;
+        quant_blocks(&e.w3, GgmlDType::Iq2Xxs)?;
+        quant_blocks(&e.w2, GgmlDType::Q2K)?;
+        let key = (gate.as_ptr() as usize, gate.len());
+        let tier = self.tier();
+        Some(match tier.kept.get(&key) {
+            Some(on) => [
+                ExpertWeight::Card(on.gate.clone()),
+                ExpertWeight::Card(on.up.clone()),
+                ExpertWeight::Card(on.down.clone()),
+            ],
+            None => [
+                ExpertWeight::Host(staged[0].as_ref()),
+                ExpertWeight::Host(staged[1].as_ref()),
+                ExpertWeight::Host(staged[2].as_ref()),
+            ],
+        })
+    }
+
     /// One expert over a prompt's rows, whole on this card: from the weights it keeps when it
-    /// keeps the expert, else staged over from the mapped file. `None` when the weights are not
-    /// quantised in a format the card expands, or it has no room.
+    /// keeps the expert, else staged over from the mapped file. `None` when the weights are not in
+    /// the formats the exact kernels read, or it has no room.
     fn expert_tokens(
         &self,
         e: &Expert,
@@ -751,111 +773,64 @@ impl Card {
         limit: f32,
     ) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
         let (inter, dim) = (e.w1.dims()[0], e.w1.dims()[1]);
-        let dtype_of = |p: &Projection| match p {
-            Projection::Quant(q)
-                if matches!(
-                    q.dtype(),
-                    GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q6K | GgmlDType::Q8_0
-                ) =>
-            {
-                Some(q.dtype())
-            }
-            _ => None,
-        };
-        let (d1, d3, d2) = (dtype_of(&e.w1)?, dtype_of(&e.w3)?, dtype_of(&e.w2)?);
         let rows = xs.len() / dim.max(1);
-        let need = inter * dim * 4 * 2 + (xs.len() + 3 * rows * inter + 2 * rows * dim) * F32;
-        // A resident expert answers from its own weights: nothing crosses for it.
-        let resident = quant_blocks(&e.w1, GgmlDType::Iq2Xxs).and_then(|g| {
-            let key = (g.as_ptr() as usize, g.len());
-            let tier = self.tier();
-            tier.kept
-                .get(&key)
-                .map(|on| (on.gate.clone(), on.up.clone(), on.down.clone()))
-        });
+        let staged = [
+            quant_blocks_any(&e.w1).ok()?,
+            quant_blocks_any(&e.w3).ok()?,
+            quant_blocks_any(&e.w2).ok()?,
+        ];
+        let weights = self.expert_weights(e, &staged)?;
+        let tables = self.iq2_tables()?;
+        let need = e.bytes() + (xs.len() + 2 * rows * inter + rows * dim) * F32;
         self.attempt("an expert's prompt rows", need, || {
-            let b1 = quant_blocks_any(&e.w1)?;
-            let b3 = quant_blocks_any(&e.w3)?;
-            let b2 = quant_blocks_any(&e.w2)?;
-            let w = match &resident {
-                Some((g, u, d)) => [
-                    (d1, ExpertWeight::Card(g.clone())),
-                    (d3, ExpertWeight::Card(u.clone())),
-                    (d2, ExpertWeight::Card(d.clone())),
-                ],
-                None => [
-                    (d1, ExpertWeight::Host(&b1)),
-                    (d3, ExpertWeight::Host(&b3)),
-                    (d2, ExpertWeight::Host(&b2)),
-                ],
-            };
-            gpu_expert_tokens(&self.dev, w, (inter, dim), xs, limit)
+            gpu_expert_tokens(
+                &self.dev,
+                weights,
+                (&tables.0, &tables.1),
+                (inter, dim),
+                xs,
+                limit,
+            )
         })
-    }
-
-    /// The weighted sum over the layer's slots, read back.
-    fn layer_sum(&self, layer: &LayerBuffers) -> Result<Vec<f32>> {
-        gpu_layer_sum(&self.dev, layer)
     }
 
     /// A layer's token context on this card (see `DeviceLayer`): `None` when it has no room.
     fn layer_begin(&self, x: &[f32], dim: usize) -> Option<LayerBuffers> {
-        let need = x.len() * 2 * F32;
+        let need = x.len() * F32;
         self.attempt("a layer's token context", need, || {
             gpu_layer_begin(&self.dev, x, dim)
         })
         .and_then(|r| r.ok())
     }
 
-    /// One expert over its rows of the layer, its products left in the layer's slots: from the
+    /// One expert over its rows `toks` of the layer, its outputs answered in their order: from the
     /// weights this card keeps for it, else staged over from the file.
     fn layer_expert(
         &self,
         layer: &LayerBuffers,
         e: &Expert,
-        order: usize,
-        toks: &[(u32, f32)],
+        toks: &[u32],
         limit: f32,
-    ) -> Option<Result<()>> {
+    ) -> Option<Result<Vec<f32>>> {
         let (inter, dim) = (e.w1.dims()[0], e.w1.dims()[1]);
-        let dtype_of = |p: &Projection| match p {
-            Projection::Quant(q)
-                if matches!(
-                    q.dtype(),
-                    GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q6K | GgmlDType::Q8_0
-                ) =>
-            {
-                Some(q.dtype())
-            }
-            _ => None,
-        };
-        let (d1, d3, d2) = (dtype_of(&e.w1)?, dtype_of(&e.w3)?, dtype_of(&e.w2)?);
-        let rows = toks.len();
-        let need = inter * dim * 4 * 2 + (rows * (dim + 3 * inter + 2 * dim)) * F32;
-        let resident = quant_blocks(&e.w1, GgmlDType::Iq2Xxs).and_then(|g| {
-            let key = (g.as_ptr() as usize, g.len());
-            let tier = self.tier();
-            tier.kept
-                .get(&key)
-                .map(|on| (on.gate.clone(), on.up.clone(), on.down.clone()))
-        });
+        let staged = [
+            quant_blocks_any(&e.w1).ok()?,
+            quant_blocks_any(&e.w3).ok()?,
+            quant_blocks_any(&e.w2).ok()?,
+        ];
+        let weights = self.expert_weights(e, &staged)?;
+        let tables = self.iq2_tables()?;
+        let need = e.bytes() + toks.len() * (2 * inter + dim) * F32;
         self.attempt("an expert's rows of a layer", need, || {
-            let b1 = quant_blocks_any(&e.w1)?;
-            let b3 = quant_blocks_any(&e.w3)?;
-            let b2 = quant_blocks_any(&e.w2)?;
-            let w = match &resident {
-                Some((g, u, d)) => [
-                    (d1, ExpertWeight::Card(g.clone())),
-                    (d3, ExpertWeight::Card(u.clone())),
-                    (d2, ExpertWeight::Card(d.clone())),
-                ],
-                None => [
-                    (d1, ExpertWeight::Host(&b1)),
-                    (d3, ExpertWeight::Host(&b3)),
-                    (d2, ExpertWeight::Host(&b2)),
-                ],
-            };
-            gpu_expert_into_layer(&self.dev, w, (inter, dim), layer, order, toks, limit)
+            gpu_expert_layer_rows(
+                &self.dev,
+                weights,
+                (&tables.0, &tables.1),
+                (inter, dim),
+                layer,
+                toks,
+                limit,
+            )
         })
     }
 
@@ -1153,72 +1128,6 @@ impl Offload for Card {
             m2.forward(&h)?.flatten_all()?.to_vec1::<f32>()
         })
     }
-
-    fn moe_decode(
-        &self,
-        active: &[(&Projection, &Projection, &Projection)],
-        weights: &[f32],
-        shared: Option<(&Projection, &Projection, &Projection)>,
-        x: &[f32],
-        limit: f32,
-        dim: usize,
-    ) -> Option<Result<Vec<f32>>> {
-        let quant = |p: &Projection| match p {
-            Projection::Quant(q) => Some(q.clone()),
-            _ => None,
-        };
-        // Every active expert (and the shared) must ALREADY be resident on THIS card, or the block
-        // declines so the streamed path runs it. Resident-only, never an upload: a routed expert
-        // lives in the evictable expert tier with its CPU overlap, so admitting it into the
-        // always-read tier here would force a per-token crossing and churn the working set - the
-        // regression this fused block existed to avoid.
-        let mut ms: Vec<(Arc<QMatMul>, Arc<QMatMul>, Arc<QMatMul>)> =
-            Vec::with_capacity(active.len());
-        for (w1, w3, w2) in active {
-            ms.push((
-                self.kept_resident(&quant(w1)?)?,
-                self.kept_resident(&quant(w3)?)?,
-                self.kept_resident(&quant(w2)?)?,
-            ));
-        }
-        let sh = match shared {
-            Some((w1, w3, w2)) => Some((
-                self.kept_resident(&quant(w1)?)?,
-                self.kept_resident(&quant(w3)?)?,
-                self.kept_resident(&quant(w2)?)?,
-            )),
-            None => None,
-        };
-        let inter = active.first().map(|(w1, _, _)| w1.dims()[0]).unwrap_or(0);
-        let dev = Device::Cuda(self.dev.clone());
-        let need = (x.len() + (active.len() + 1) * (2 * inter + dim)) * F32;
-        self.attempt("moe decode", need, || {
-            let xd = Tensor::from_vec(x.to_vec(), (1, dim), &dev)?;
-            let hi = Tensor::full(limit, 1, &dev)?;
-            let lo = Tensor::full(-limit, 1, &dev)?;
-            let run = |m1: &QMatMul, m3: &QMatMul, m2: &QMatMul| -> Result<Tensor> {
-                let gate = m1.forward(&xd)?;
-                let up = m3.forward(&xd)?;
-                let h = if limit > 0.0 {
-                    let g = gate.broadcast_minimum(&hi)?;
-                    let u = up.broadcast_maximum(&lo)?.broadcast_minimum(&hi)?;
-                    g.silu()?.mul(&u)?
-                } else {
-                    gate.silu()?.mul(&up)?
-                };
-                m2.forward(&h)
-            };
-            // The shared expert unweighted, then each routed expert scaled by its routing weight.
-            let mut out = match &sh {
-                Some((m1, m3, m2)) => run(m1, m3, m2)?,
-                None => Tensor::zeros_on((1, dim), crate::tensor::DType::F32, &dev)?,
-            };
-            for (i, (m1, m3, m2)) in ms.iter().enumerate() {
-                out = out.add(&run(m1, m3, m2)?.affine(weights[i], 0.0)?)?;
-            }
-            out.flatten_all()?.to_vec1::<f32>()
-        })
-    }
 }
 
 /// The cards of one placement behind the trait: a weight kept on any of them answers from
@@ -1466,24 +1375,10 @@ impl Offload for Cards {
             .iter()
             .find_map(|c| c.expert_dev(w1, w3, w2, x, limit))
     }
-
-    fn moe_decode(
-        &self,
-        active: &[(&Projection, &Projection, &Projection)],
-        weights: &[f32],
-        shared: Option<(&Projection, &Projection, &Projection)>,
-        x: &[f32],
-        limit: f32,
-        dim: usize,
-    ) -> Option<Result<Vec<f32>>> {
-        self.0
-            .iter()
-            .find_map(|c| c.moe_decode(active, weights, shared, x, limit, dim))
-    }
 }
 
-/// Routed experts run on `cards`, a lane per card stream: the gate and up products there, the
-/// activation between them here, the down product there.
+/// Routed experts run on `cards`, a lane per card stream, through the kernels that give the host's
+/// products; an expert in another format, or one a card declines, runs on the host.
 /// Threads that feed each card a prompt's experts: while one expert's weights are read into the
 /// staging buffer and cross the bus, another's products run on the card. An expert goes to the
 /// card its number names whichever thread takes it.
@@ -1503,12 +1398,10 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let batch_timings = timings.clone();
     let multi_cards = cards.clone();
     let multi_timings = timings.clone();
-    let (begin_cards, run_cards, end_cards, skip_cards) =
-        (cards.clone(), cards.clone(), cards.clone(), cards.clone());
+    let (begin_cards, run_cards) = (cards.clone(), cards.clone());
     ExpertOffload {
         host_expert_ns,
         device: Some(super::experts::DeviceLayer {
-            groups: cards.len(),
             begin: Box::new(move |x, dim| {
                 let layers: Vec<Option<LayerBuffers>> =
                     begin_cards.iter().map(|c| c.layer_begin(x, dim)).collect();
@@ -1517,37 +1410,11 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
                     .any(Option::is_some)
                     .then(|| Arc::new(layers) as Arc<dyn std::any::Any + Send + Sync>)
             }),
-            run: Box::new(move |lane, ctx, expert, order, toks, limit| {
+            run: Box::new(move |lane, ctx, expert, toks, limit| {
                 let layers = ctx.downcast_ref::<Vec<Option<LayerBuffers>>>()?;
                 let c = lane % run_cards.len();
                 let layer = layers.get(c)?.as_ref()?;
-                let r = run_cards[c].layer_expert(layer, expert, order, toks, limit);
-                // A card that declined has not taken its turn: the experts after it must not wait.
-                layer.finish(order);
-                r
-            }),
-            skip: Box::new(move |lane, ctx, order| {
-                if let Some(Some(layer)) = ctx
-                    .downcast_ref::<Vec<Option<LayerBuffers>>>()
-                    .and_then(|l| l.get(lane % skip_cards.len()))
-                {
-                    layer.finish(order);
-                }
-            }),
-            end: Box::new(move |ctx| {
-                let layers = ctx
-                    .downcast_ref::<Vec<Option<LayerBuffers>>>()
-                    .ok_or_else(|| Error::msg("a layer context of another kind"))?;
-                let mut sum: Option<Vec<f32>> = None;
-                for (card, layer) in end_cards.iter().zip(layers) {
-                    let Some(layer) = layer else { continue };
-                    let part = card.layer_sum(layer)?;
-                    match &mut sum {
-                        None => sum = Some(part),
-                        Some(s) => s.iter_mut().zip(&part).for_each(|(a, b)| *a += b),
-                    }
-                }
-                sum.ok_or_else(|| Error::msg("no card holds the layer"))
+                run_cards[c].layer_expert(layer, expert, toks, limit)
             }),
         }),
         lanes: cards.len() * LANES_PER_CARD,
@@ -1656,45 +1523,9 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
             }
             // A prompt's rows through the whole expert on the card: staged weights, one sync.
             if tokens > 1 {
-                if let Some(r) = on.expert_tokens(expert, rows, limit) {
-                    return Some(r);
-                }
+                return on.expert_tokens(expert, rows, limit);
             }
-            let (Some(gate), Some(up)) = (
-                on.projection(&expert.w1, rows),
-                on.projection(&expert.w3, rows),
-            ) else {
-                return None;
-            };
-            let run = || -> Result<(Vec<f32>, Vec<f32>)> {
-                let (gate, up) = (gate?, up?);
-                // The SwiGLU with its training clamps, as `Expert::forward` applies them.
-                let h: Vec<f32> = gate
-                    .iter()
-                    .zip(&up)
-                    .map(|(&g, &u)| {
-                        let (g, u) = if limit > 0.0 {
-                            (g.min(limit), u.clamp(-limit, limit))
-                        } else {
-                            (g, u)
-                        };
-                        g / (1.0 + (-g).exp()) * u
-                    })
-                    .collect();
-                let out = match on.projection(&expert.w2, &h) {
-                    Some(r) => r?,
-                    None => {
-                        // The card declined the down product after taking the two before it.
-                        // The rows entering it are here already, so the host finishes the
-                        // expert rather than the step failing.
-                        let inp = expert.w2.dims()[1];
-                        let hx = Tensor::from_vec(h.clone(), (h.len() / inp, inp), &Device::Cpu)?;
-                        expert.w2.apply(&hx)?.flatten_all()?.to_vec1::<f32>()?
-                    }
-                };
-                Ok((h, out))
-            };
-            Some(run())
+            None
         }),
         on_card: Some(Box::new(move |e| for_oncard.iter().any(|c| c.holds(e)))),
     }

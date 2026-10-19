@@ -19,6 +19,23 @@ pub struct BlockQ8K32 {
     pub(crate) qs: [i8; QK_K],
 }
 
+const _: () = assert!(std::mem::size_of::<BlockQ8K32>() == 2 * Q8K32_RUNS + QK_K);
+
+/// `xs`, a whole number of blocks long, quantised and laid out as the blocks lie in memory: the
+/// rows a card dots its IQ2_XXS experts against, the host's own codes and scales.
+pub fn q8k32_bytes(xs: &[f32]) -> Vec<u8> {
+    let mut blocks = vec![BlockQ8K32::zeros(); xs.len() / QK_K];
+    BlockQ8K32::quantize(xs, &mut blocks);
+    // Safety: the block is `repr(C)` plain data, read as the bytes it occupies.
+    unsafe {
+        std::slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            std::mem::size_of_val(&blocks[..]),
+        )
+    }
+    .to_vec()
+}
+
 impl BlockFormat for BlockQ8K32 {
     /// Stands in for the format's own id, which a file never carries: the block is reached by
     /// the weight format that asks for it, not by a type id.

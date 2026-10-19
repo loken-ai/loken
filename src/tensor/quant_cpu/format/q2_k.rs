@@ -89,25 +89,33 @@ impl BlockFormat for BlockQ2K {
         // The minimum is constant over a sub-block, so it multiplies the sum of the sixteen
         // activations - which is exactly one `bsums` entry, sixteen being this format's
         // sub-block size as well.
-        xs.iter()
-            .zip(ys)
-            .map(|(x, y)| {
-                let (mut scaled, mut offset) = (0f32, 0f32);
-                for (s, &packed) in x.scales.iter().enumerate() {
-                    let (base, shift) = placement(s);
-                    let acts = &y.qs[SUB * s..SUB * (s + 1)];
-                    let dot: i32 = x.qs[base..base + SUB]
-                        .iter()
-                        .zip(acts)
-                        .map(|(&q, &a)| ((q >> shift) & 0x03) as i32 * a as i32)
-                        .sum();
-                    scaled += (packed & 0x0F) as f32 * dot as f32;
-                    offset += (packed >> 4) as f32 * y.bsums[s] as f32;
-                }
-                y.d * (x.d.to_f32() * scaled - x.dmin.to_f32() * offset)
-            })
-            .sum()
+        let mut total = -0.0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            let (mut scaled, mut offset) = (0i32, 0i32);
+            for (s, &packed) in x.scales.iter().enumerate() {
+                let (base, shift) = placement(s);
+                let acts = &y.qs[SUB * s..SUB * (s + 1)];
+                let dot: i32 = x.qs[base..base + SUB]
+                    .iter()
+                    .zip(acts)
+                    .map(|(&q, &a)| ((q >> shift) & 0x03) as i32 * a as i32)
+                    .sum();
+                scaled += (packed & 0x0F) as i32 * dot;
+                offset += (packed >> 4) as i32 * y.bsums[s] as i32;
+            }
+            total += combine(x, y.d, scaled, offset);
+        }
+        total
     }
+}
+
+/// One block's share of a dot product from its two integer sums: `scaled`, the codes against the
+/// activations under each sub-block's scale, and `offset`, the activation sums under each
+/// sub-block's minimum. Every kernel ends a block here and adds the shares in block order from
+/// -0, so the product is the same bits whichever kernel formed the sums, a card's included.
+#[inline(always)]
+pub(crate) fn combine(x: &BlockQ2K, y_d: f32, scaled: i32, offset: i32) -> f32 {
+    y_d * (x.d.to_f32() * scaled as f32 - x.dmin.to_f32() * offset as f32)
 }
 
 /// Quantise whole blocks, optionally against an importance matrix.
@@ -180,6 +188,42 @@ fn encode(xs: &[f32], ys: &mut [BlockQ2K], imatrix: Option<&[f32]>, n_per_row: u
             for (i, &v) in x[SUB * s..SUB * (s + 1)].iter().enumerate() {
                 let code = nearest_int((v + offset) / scale).clamp(0, 3) as u8;
                 block.qs[base + i] |= code << shift;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// Every kernel's dot is the scalar dot bit for bit: the integer sums of a block in any order,
+    /// then `combine` and the blocks added in order. A card's kernel ends a block the same way, so
+    /// an expert's product does not depend on where it is formed.
+    #[test]
+    fn the_vector_dots_are_the_scalar_dot_bit_for_bit() {
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        for blocks in [1usize, 3, 9] {
+            let w: Vec<f32> = (0..blocks * QK_K).map(|_| next() * 0.1).collect();
+            let x: Vec<f32> = (0..blocks * QK_K).map(|_| next() * 8.0).collect();
+            let mut wq = vec![BlockQ2K::zeros(); blocks];
+            BlockQ2K::quantize(&w, &mut wq);
+            let mut xq = vec![BlockQ8K::zeros(); blocks];
+            BlockQ8K::quantize(&x, &mut xq);
+            let want = BlockQ2K::dot_scalar(&wq, &xq).to_bits();
+            if crate::cpu::hardware_has_avx2() {
+                let got = crate::tensor::quant_cpu::avx::superblock::vec_dot_q2k_q8k(&wq, &xq);
+                assert_eq!(got.to_bits(), want, "avx2, {blocks} blocks");
+            }
+            if crate::cpu::hardware_has_avx512() {
+                let got = crate::tensor::quant_cpu::avx512::superblock::vec_dot_q2k_q8k(&wq, &xq);
+                assert_eq!(got.to_bits(), want, "avx512, {blocks} blocks");
             }
         }
     }

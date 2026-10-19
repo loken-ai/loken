@@ -288,25 +288,6 @@ pub trait Offload: Send + Sync {
         None
     }
 
-    /// A decode's whole mixture output on one card: the shared expert, each of the `active` routed
-    /// experts over the token's row, and the weighted gather, all on the device so the block crosses
-    /// the bus once. `active[i]` is a routed expert's `(w1, w3, w2)`, `weights[i]` its routing weight;
-    /// `shared` is the always-on expert's `(w1, w3, w2)` or `None`; `x` is the token's row [dim];
-    /// returns the mixture output [dim]. `None` when the card cannot hold every one of the active
-    /// experts, and the host runs the block.
-    #[allow(clippy::type_complexity)]
-    fn moe_decode(
-        &self,
-        _active: &[(&Projection, &Projection, &Projection)],
-        _weights: &[f32],
-        _shared: Option<(&Projection, &Projection, &Projection)>,
-        _x: &[f32],
-        _limit: f32,
-        _dim: usize,
-    ) -> Option<Result<Vec<f32>>> {
-        None
-    }
-
     /// A dense SwiGLU expert (the mixture's shared expert) run whole on one card so its three
     /// products and the SwiGLU stay on the device and the activation crosses the bus once. `x` is
     /// [rows, dim] row-major; `limit` is the SwiGLU clamp (the up branch clamped both sides, the
@@ -351,6 +332,16 @@ thread_local! {
 /// Run `body` with this thread's heavy steps handed to `offload`.
 pub fn with_offload<R>(offload: Arc<dyn Offload>, body: impl FnOnce() -> R) -> R {
     let previous = CURRENT.with(|c| c.replace(Some(offload)));
+    let result = body();
+    CURRENT.with(|c| *c.borrow_mut() = previous);
+    result
+}
+
+/// Run `body` with no offload on this thread: its products are the host's, whatever the thread
+/// was handed. Routed experts the host computes go through here, so a projection inside one is
+/// never taken by a card and computed another way.
+pub fn on_host<R>(body: impl FnOnce() -> R) -> R {
+    let previous = CURRENT.with(|c| c.replace(None));
     let result = body();
     CURRENT.with(|c| *c.borrow_mut() = previous);
     result

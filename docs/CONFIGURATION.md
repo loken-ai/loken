@@ -174,7 +174,7 @@ engine measures the rest.
 
 | Key | Default | What it does |
 |---|---|---|
-| `quality` | `exact` | How much exactness the output may give up for speed. `exact`: identical to the full model. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
+| `quality` | `exact` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold: a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
 
 At load the engine runs a bundled text teacher-forced on the card path and on the host path to
 measure the noise, then once under each candidate way of giving up experts, and applies the

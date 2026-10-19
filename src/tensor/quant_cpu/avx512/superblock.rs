@@ -271,23 +271,15 @@ unsafe fn vec_dot_q2k_q8k_avx512(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
     let two_bits = _mm512_set1_epi8(3);
     let nibble = _mm_set1_epi8(0xF);
     let pair_shift = [shifts(0, 2), shifts(4, 6)];
-    let mut acc = _mm256_setzero_ps();
+    let mut acc = -0.0f32;
 
     for (x, y) in xs.iter().zip(ys) {
-        let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
-        let dmin = -y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.dmin);
-
         let packed = _mm_loadu_si128(x.scales.as_ptr() as *const __m128i);
         let scale_codes = _mm_and_si128(packed, nibble);
         let min_codes = _mm_and_si128(_mm_srli_epi16::<4>(packed), nibble);
         let from_mins = _mm256_madd_epi16(
             _mm256_cvtepi8_epi16(min_codes),
             _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i),
-        );
-        acc = _mm256_fmadd_ps(
-            _mm256_broadcast_ss(&dmin),
-            _mm256_cvtepi32_ps(from_mins),
-            acc,
         );
 
         let mut scales = [0i8; 16];
@@ -307,13 +299,23 @@ unsafe fn vec_dot_q2k_q8k_avx512(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
                 );
             }
         }
-        acc = _mm256_fmadd_ps(
-            _mm256_broadcast_ss(&d),
-            _mm256_cvtepi32_ps(fold(total)),
-            acc,
+        acc += crate::tensor::quant_cpu::format::q2_k::combine(
+            x,
+            y.d,
+            hsum_i32_8(fold(total)),
+            hsum_i32_8(from_mins),
         );
     }
-    lanes_sum(acc)
+    acc
+}
+
+/// The eight lanes of `v` added.
+#[inline(always)]
+unsafe fn hsum_i32_8(v: __m256i) -> i32 {
+    let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0x4E>(s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0xB1>(s));
+    _mm_cvtsi128_si32(s)
 }
 
 /// Three bits per value: two in `qs`, the third in `hmask`, which carries -4 when clear.

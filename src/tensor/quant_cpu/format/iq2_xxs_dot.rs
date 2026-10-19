@@ -135,37 +135,36 @@ fn sub_block_dot(grid: &[u8; 32], signs: &[i8; 32], act: &[i8]) -> i32 {
         .sum()
 }
 
-/// The dot product of IQ2_XXS weight blocks with activation blocks of a scale per run.
+/// The dot product of IQ2_XXS weight blocks with activation blocks of a scale per run. The
+/// integer sum of a sub-block is exact in any order; the float steps are taken in this order,
+/// the blocks added from -0, which is the order a card takes them in too.
 pub(crate) fn dot(xs: &[BlockIq2Xxs], ys: &[BlockQ8K32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     let fused = crate::cpu::dispatch_avx2();
-    xs.iter()
-        .zip(ys)
-        .map(|(x, y)| {
-            let mut acc = 0f32;
-            for ib32 in 0..QK_K / 32 {
-                let q = &x.qs[4 * ib32..4 * ib32 + 4];
-                let act = &y.qs[32 * ib32..32 * ib32 + 32];
-                // The scale rides in the top four bits of the sign half of the sub-block.
-                let hi = q[2] as u32 | ((q[3] as u32) << 16);
-                let scale = (0.5 + (hi >> 28) as f32) * 0.25;
-                #[cfg(target_arch = "x86_64")]
-                let sum = if fused {
-                    // Safety: `act` is the sub-block's 32 activations, and `fused` implies the CPU
-                    // has the feature the kernel enables.
-                    unsafe { sub_block_dot_fused_avx2(q, act.as_ptr()) }
-                } else {
-                    let (grid, signs, _) = sub_block(q);
-                    sub_block_dot(&grid, &signs, act)
-                };
-                #[cfg(not(target_arch = "x86_64"))]
-                let sum = {
-                    let (grid, signs, _) = sub_block(q);
-                    sub_block_dot(&grid, &signs, act)
-                };
-                acc += scale * sum as f32 * y.d[ib32].to_f32();
-            }
-            x.d.to_f32() * acc
-        })
-        .sum()
+    xs.iter().zip(ys).fold(-0.0f32, |total, (x, y)| {
+        let mut acc = 0f32;
+        for ib32 in 0..QK_K / 32 {
+            let q = &x.qs[4 * ib32..4 * ib32 + 4];
+            let act = &y.qs[32 * ib32..32 * ib32 + 32];
+            // The scale rides in the top four bits of the sign half of the sub-block.
+            let hi = q[2] as u32 | ((q[3] as u32) << 16);
+            let scale = (0.5 + (hi >> 28) as f32) * 0.25;
+            #[cfg(target_arch = "x86_64")]
+            let sum = if fused {
+                // Safety: `act` is the sub-block's 32 activations, and `fused` implies the CPU
+                // has the feature the kernel enables.
+                unsafe { sub_block_dot_fused_avx2(q, act.as_ptr()) }
+            } else {
+                let (grid, signs, _) = sub_block(q);
+                sub_block_dot(&grid, &signs, act)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let sum = {
+                let (grid, signs, _) = sub_block(q);
+                sub_block_dot(&grid, &signs, act)
+            };
+            acc += scale * sum as f32 * y.d[ib32].to_f32();
+        }
+        total + x.d.to_f32() * acc
+    })
 }
