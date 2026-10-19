@@ -1094,19 +1094,50 @@ impl LlmEngine {
                                 })
                                 .sum::<f64>(),
                         );
+                    // A context nobody asked for gives way to the split: the cache is halved,
+                    // down to the working window, until each card holds its share of it beside
+                    // its share of the weights. An asked context is kept.
+                    let mut tp_ctx = None;
                     let tp_plan = (awq.is_none() && layer_share.is_none() && split.is_none())
                         .then(|| {
-                            crate::inference::place::tensor_parallel::plan(
-                                &demand,
+                            let rates = crate::inference::place::expert_parallel::card_read_rates();
+                            let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
+                            let holds = |d: &crate::inference::place::ladder::Demand| {
+                                (2..=cuda_devices.len()).any(|ranks| {
+                                    crate::inference::place::llm::tensor_parallel(d, &cuda_devices, ranks, weight)
+                                        .is_some()
+                                })
+                            };
+                            let mut ctx = ctx_for_planning;
+                            let at = |ctx: u64| crate::inference::place::ladder::Demand {
+                                kv_bytes_per_layer: kv_bytes_at(ctx),
+                                ..demand
+                            };
+                            while !window_asked && ctx > lazy_kv_initial_cap && !holds(&at(ctx)) {
+                                ctx = (ctx / 2).max(lazy_kv_initial_cap);
+                            }
+                            let d = at(ctx);
+                            if !holds(&d) {
+                                info!("stays layer by layer: no group of cards holds a split's shares at context {ctx}");
+                                return None;
+                            }
+                            let p = crate::inference::place::tensor_parallel::plan(
+                                &d,
                                 &cuda_devices,
                                 (dims.hidden_size * std::mem::size_of::<f32>()) as u64,
                                 row_flops,
                                 routed,
                                 super::PREFILL_CHUNK_TOKENS,
                                 |ranks| crate::inference::generic_transformer::tp_file_refusal(&content, &arch, ranks),
-                            )
+                            );
+                            if p.is_some() && ctx < ctx_for_planning {
+                                info!("KV context {ctx_for_planning} -> {ctx}: each card holds its share of the split there");
+                                tp_ctx = Some(ctx);
+                            }
+                            p
                         })
                         .flatten();
+                    let effective_ctx = tp_ctx.map_or(effective_ctx, |c| effective_ctx.min(c as usize));
                     if let Some(p) = &tp_plan {
                         info!("⬇️  Loading {arch} with every layer split across GPU {:?}", p.tp_cards);
                     }

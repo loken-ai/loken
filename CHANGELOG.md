@@ -23,6 +23,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Placement: shrink a context nobody asked for until the cards hold a tensor split.
 - Bench: say in an error cell whether loken or assay lacks the model.
 - Bench: keep the store in bench/store, outside the server's configuration.
 
