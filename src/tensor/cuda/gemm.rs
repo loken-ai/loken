@@ -213,6 +213,98 @@ macro_rules! matmul_nt_impl {
     };
 }
 
+/// `A[b, m, k] @ B[b, n, k]^T` over half-width operands of cuBLAS type `ty`, accumulated and
+/// written in F32 into `out`, with cuBLAS held to `compute`.
+#[allow(clippy::too_many_arguments)]
+fn gemm_nt_half_f32(
+    dev: &CudaDevice,
+    a: u64,
+    b: u64,
+    out: u64,
+    ty: crate::tensor::gpu_runtime::cublas::sys::cudaDataType_t,
+    compute: crate::tensor::gpu_runtime::cublas::sys::cublasComputeType_t,
+    [batch, m, k, n]: [usize; 4],
+) -> Result<()> {
+    use crate::tensor::gpu_runtime::cublas::sys;
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    let blas = dev.blas()?;
+    unsafe {
+        crate::tensor::gpu_runtime::cublas::result::gemm_strided_batched_ex(
+            *blas.handle(),
+            sys::cublasOperation_t::CUBLAS_OP_T,
+            sys::cublasOperation_t::CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha as *const f32 as *const std::ffi::c_void,
+            b as *const _,
+            ty,
+            k as i32,
+            (n * k) as i64,
+            a as *const _,
+            ty,
+            k as i32,
+            (m * k) as i64,
+            &beta as *const f32 as *const std::ffi::c_void,
+            out as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            n as i32,
+            (m * n) as i64,
+            batch as i32,
+            compute,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(|e| cublas_err("gemm_nt_half_f32", e))
+}
+
+/// Timed runs of each compute type in [`half_tensor_ops_pay`], after one that is not timed;
+/// the fastest of them is the one compared.
+const HALF_PROBE_RUNS: usize = 3;
+
+/// Whether F16 products of more than one row run faster on this card with cuBLAS free to pick
+/// its kernels than held to F32 arithmetic (`CUBLAS_COMPUTE_32F_PEDANTIC`). Measured once per
+/// card on the first such product `run` issues, and kept; `run` launches it under the compute
+/// type it is given. Inside a graph capture nothing can be timed and the free choice stands.
+fn half_tensor_ops_pay(
+    dev: &CudaDevice,
+    run: impl Fn(crate::tensor::gpu_runtime::cublas::sys::cublasComputeType_t) -> Result<()>,
+) -> Result<bool> {
+    use crate::tensor::gpu_runtime::cublas::sys::cublasComputeType_t as C;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEASURED: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+    let measured = MEASURED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&pays) = measured
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dev.ordinal())
+    {
+        return Ok(pays);
+    }
+    if crate::tensor::cuda_ext::capture_active_on(dev.stream()) {
+        return Ok(true);
+    }
+    let fastest = |compute: C| -> Result<std::time::Duration> {
+        run(compute)?;
+        dev.synchronize()?;
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..HALF_PROBE_RUNS {
+            let t = std::time::Instant::now();
+            run(compute)?;
+            dev.synchronize()?;
+            best = best.min(t.elapsed());
+        }
+        Ok(best)
+    };
+    let pays = fastest(C::CUBLAS_COMPUTE_32F)? <= fastest(C::CUBLAS_COMPUTE_32F_PEDANTIC)?;
+    measured
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dev.ordinal(), pays);
+    Ok(pays)
+}
+
 /// [`matmul_nt_bf16`] summed and written in F32: BF16 operands, F32 accumulation and output.
 pub fn matmul_nt_bf16_f32(
     dev: &CudaDevice,
@@ -229,40 +321,63 @@ pub fn matmul_nt_bf16_f32(
     let mut out = with_oom_retry(dev, "matmul_nt_bf16_f32", || unsafe {
         stream.alloc::<f32>(batch * m * n)
     })?;
-    let (alpha, beta) = (1.0f32, 0.0f32);
-    let blas = dev.blas()?;
     {
         let (a_ptr, _ga) = a.device_ptr(stream);
         let (b_ptr, _gb) = b.device_ptr(stream);
         let (c_ptr, _gc) = out.device_ptr_mut(stream);
-        unsafe {
-            crate::tensor::gpu_runtime::cublas::result::gemm_strided_batched_ex(
-                *blas.handle(),
-                sys::cublasOperation_t::CUBLAS_OP_T,
-                sys::cublasOperation_t::CUBLAS_OP_N,
-                n as i32,
-                m as i32,
-                k as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
-                b_ptr as *const _,
-                sys::cudaDataType_t::CUDA_R_16BF,
-                k as i32,
-                (n * k) as i64,
-                a_ptr as *const _,
-                sys::cudaDataType_t::CUDA_R_16BF,
-                k as i32,
-                (m * k) as i64,
-                &beta as *const f32 as *const std::ffi::c_void,
-                c_ptr as *mut _,
-                sys::cudaDataType_t::CUDA_R_32F,
-                n as i32,
-                (m * n) as i64,
-                batch as i32,
-                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        gemm_nt_half_f32(
+            dev,
+            a_ptr as u64,
+            b_ptr as u64,
+            c_ptr as u64,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            [batch, m, k, n],
+        )?;
+    }
+    Ok(out)
+}
+
+/// [`matmul_nt_f16`] summed and written in F32: F16 operands, F32 accumulation and output.
+///
+/// A product of more than one row runs under the compute type [`half_tensor_ops_pay`] measured
+/// faster on this card; a single row keeps cuBLAS's own choice.
+pub fn matmul_nt_f16_f32(
+    dev: &CudaDevice,
+    a: &CudaSlice<half::f16>,
+    b: &CudaSlice<half::f16>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<CudaSlice<f32>> {
+    use crate::tensor::gpu_runtime::cublas::sys;
+    use crate::tensor::gpu_runtime::driver::{DevicePtr, DevicePtrMut};
+    let stream = dev.stream();
+    let mut out = with_oom_retry(dev, "matmul_nt_f16_f32", || unsafe {
+        stream.alloc::<f32>(batch * m * n)
+    })?;
+    {
+        let (a_ptr, _ga) = a.device_ptr(stream);
+        let (b_ptr, _gb) = b.device_ptr(stream);
+        let (c_ptr, _gc) = out.device_ptr_mut(stream);
+        let run = |compute| {
+            gemm_nt_half_f32(
+                dev,
+                a_ptr as u64,
+                b_ptr as u64,
+                c_ptr as u64,
+                sys::cudaDataType_t::CUDA_R_16F,
+                compute,
+                [batch, m, k, n],
             )
-        }
-        .map_err(|e| cublas_err("gemm_nt_bf16_f32", e))?;
+        };
+        let compute = if batch * m == 1 || half_tensor_ops_pay(dev, &run)? {
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+        } else {
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_PEDANTIC
+        };
+        run(compute)?;
     }
     Ok(out)
 }

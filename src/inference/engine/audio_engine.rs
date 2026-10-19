@@ -385,11 +385,14 @@ fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
     let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
     LittleEndian::read_f32_into(mel_bytes, &mut mel_filters);
 
-    // Native substrate, F32 end-to-end, placed through the ladder in `place`: the weights as
-    // the card holds them, and one encoder pass over the full audio window beside them.
+    // Placed through the ladder in `place`: the weights as the card holds them (projections in
+    // half precision, the rest F32, the position table on the host), and one encoder pass over
+    // the full audio window beside them.
     let (weights_size, _) =
-        crate::inference::place::runtime_demand::safetensors_f32_split(&[&weights_path], |_| true)
-            .map_err(|e| anyhow!("size whisper weights: {e}"))?;
+        crate::inference::place::runtime_demand::safetensors_card_split(&[&weights_path], |name| {
+            !name.ends_with("embed_positions.weight")
+        })
+        .map_err(|e| anyhow!("size whisper weights: {e}"))?;
     let encoder_ffn =
         unsafe { crate::tensor::safetensors_io::SafeTensorsLoader::multi(&[&weights_path]) }
             .ok()
@@ -410,7 +413,7 @@ fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
             Ok::<_, crate::tensor::Error>((device.clone(), model))
         })
         .map_err(|e| anyhow!("load whisper weights: {e}"))?;
-    info!("Whisper device: {device:?}, dtype: F32 (native)");
+    info!("Whisper device: {device:?}");
 
     let control = ControlTokens::resolve(&tokenizer)?;
 
@@ -504,7 +507,9 @@ fn transcribe_blocking(
         });
     }
     // 1. Build mel spectrogram on CPU.
+    let t_mel = std::time::Instant::now();
     let mel = audio::pcm_to_mel(&s.config, samples, &s.mel_filters);
+    let mel_ms = t_mel.elapsed().as_secs_f64() * 1e3;
     let mel_len = mel.len();
     let n_mels = s.config.num_mel_bins;
     let n_frames = mel_len / n_mels;
@@ -540,6 +545,14 @@ fn transcribe_blocking(
         let mel_segment = mel_tensor.narrow(2, seek, segment_size)?;
         let chunk_offset_s = (seek as f32) * 0.01; // 1 frame = 10 ms in whisper's mel
         let dec = decode_segment(s, &mel_segment, &effective, chunk_offset_s)?;
+        tracing::debug!(
+            "whisper chunk at {chunk_offset_s:.1} s: mel {mel_ms:.1} ms, encoder {:.1} ms, \
+             prompt {:.1} ms, {} steps {:.1} ms",
+            dec.timing.encoder_ms,
+            dec.timing.prompt_ms,
+            dec.timing.steps,
+            dec.timing.steps_ms,
+        );
         if detected_lang.is_none() {
             detected_lang = Some(dec.lang_code.clone());
             if effective.language.is_none() {
@@ -622,6 +635,17 @@ struct ChunkDecode {
     logprob_sum: f64,
     logprob_count: usize,
     chunk_no_speech_prob: f32,
+    timing: ChunkTiming,
+}
+
+/// Wall time of one chunk's stages, in milliseconds: the encoder, the language and prompt
+/// passes up to the first sampled token, and the decode steps after it.
+#[derive(Default)]
+struct ChunkTiming {
+    encoder_ms: f64,
+    prompt_ms: f64,
+    steps: usize,
+    steps_ms: f64,
 }
 
 fn decode_segment(
@@ -644,7 +668,15 @@ fn decode_segment(
     }
     .to_device(&s.device)?;
 
+    let mut timing = ChunkTiming::default();
+    let t_enc = std::time::Instant::now();
     let audio_features = s.model.encoder.forward(&mel_in, true)?;
+    s.device.synchronize()?;
+    timing.encoder_ms = t_enc.elapsed().as_secs_f64() * 1e3;
+    let t_prompt = std::time::Instant::now();
+    // New audio: the cross attentions project these features on their first call and keep
+    // them for the language pass and the whole decode.
+    s.model.decoder.reset_kv_cache();
 
     // Build the prompt tokens: [<sot>, <lang?>, <transcribe|translate>, <no_timestamps>]
     let (lang_token, lang_code) = if s.vocab.english_only() {
@@ -773,11 +805,11 @@ fn decode_segment(
     // tokenizer doesn't expose `<|nospeech|>`.
     let mut no_speech_prob: f32 = 0.0;
 
-    // First iteration: feed the entire prompt prefix and let the decoder
-    // initialize self-attn + cross-attn KV caches. Subsequent iterations:
-    // feed just the most recently sampled token - the cached K/V handle
-    // the prefix, slashing per-step decoder cost from O(N) to O(1).
-    s.model.decoder.reset_kv_cache();
+    // First iteration: feed the entire prompt prefix into the self-attention
+    // caches; the cross attentions keep what the first pass over these
+    // features projected. Subsequent iterations feed just the most recently
+    // sampled token - the cached K/V handle the prefix.
+    s.model.decoder.restart_sequence();
     for i in 0..sample_len {
         let step_tokens: &[u32] = if i == 0 {
             tokens.as_slice()
@@ -785,9 +817,10 @@ fn decode_segment(
             // Just the last token; the rest is already in the KV cache.
             &tokens[tokens.len() - 1..]
         };
-        let toks_t = Tensor::from_vec_u32(step_tokens.to_vec(), vec![1, step_tokens.len()])?
-            .to_device(&s.device)?;
-        let ys = s.model.decoder.forward(&toks_t, &audio_features, i == 0)?;
+        let t_step = std::time::Instant::now();
+        // The ids stay on the host, where the decoder looks them up.
+        let toks_t = Tensor::from_vec_u32(step_tokens.to_vec(), vec![1, step_tokens.len()])?;
+        let ys = s.model.decoder.forward(&toks_t, &audio_features, false)?;
         let (_, seq_len, _) = ys.shape().dims3()?;
         // On iter 0 with metrics collection + a `<|nospeech|>` token,
         // also project position 0 (right after SOT) for no_speech_prob.
@@ -827,6 +860,12 @@ fn decode_segment(
         // text/json formats skip it.
         if collect {
             logprobs.push(host_log_softmax_at(&logits, next_token as usize));
+        }
+        if i == 0 {
+            timing.prompt_ms = t_prompt.elapsed().as_secs_f64() * 1e3;
+        } else {
+            timing.steps += 1;
+            timing.steps_ms += t_step.elapsed().as_secs_f64() * 1e3;
         }
         tokens.push(next_token);
         if next_token == s.control.eot || tokens.len() >= s.config.max_target_positions {
@@ -905,6 +944,7 @@ fn decode_segment(
         logprob_sum,
         logprob_count,
         chunk_no_speech_prob: no_speech_prob,
+        timing,
     })
 }
 
@@ -1121,12 +1161,10 @@ fn detect_language_from_features(
         Some(m) => m,
         None => anyhow::bail!("language detect requires a multilingual model"),
     };
-    let tokens_t = Tensor::from_vec_u32(vec![s.control.sot], vec![1, 1])?.to_device(&s.device)?;
-    // flush=true: this is a scratch decoder run that doesn't share KV
-    // cache state with the main decode loop. The main loop will call
-    // forward(flush=true) again before sampling, so any cross-attn
-    // cache we touch here is overwritten.
-    let ys = s.model.decoder.forward(&tokens_t, audio_features, true)?;
+    let tokens_t = Tensor::from_vec_u32(vec![s.control.sot], vec![1, 1])?;
+    // A scratch sequence: the main loop restarts the tokens before sampling and keeps the
+    // cross attentions this pass projected from the same features.
+    let ys = s.model.decoder.forward(&tokens_t, audio_features, false)?;
     let logits = s.model.decoder.final_linear(&ys)?.to_vec_f32();
     let mut codes_and_ids: Vec<(String, u32)> =
         lang_map.iter().map(|(c, id)| (c.clone(), *id)).collect();

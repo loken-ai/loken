@@ -1026,6 +1026,34 @@ pub fn llm_work_reserve(width: usize, chunk: usize) -> u64 {
     CUBLAS_WORKSPACE_BYTES.saturating_add(act)
 }
 
+/// [`safetensors_f32_split`] for a loader that holds its projection matrices in half precision
+/// on a card: each tensor is charged what [`crate::inference::model::half::card_bytes`] says it
+/// takes there.
+pub fn safetensors_card_split(
+    paths: &[impl AsRef<std::path::Path>],
+    is_block: impl Fn(&str) -> bool,
+) -> Result<(u64, u64), String> {
+    let (mut blocks, mut rest) = (0u64, 0u64);
+    for p in paths {
+        let p = p.as_ref();
+        let file = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        // SAFETY: the mapping is read-only and dropped before this function returns.
+        let map =
+            unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{}: {e}", p.display()))?;
+        let (_, meta) = safetensors::SafeTensors::read_metadata(&map)
+            .map_err(|e| format!("{}: {e}", p.display()))?;
+        for (name, info) in meta.tensors() {
+            let bytes = crate::inference::model::half::card_bytes(&name, &info.shape);
+            if is_block(&name) {
+                blocks += bytes;
+            } else {
+                rest += bytes;
+            }
+        }
+    }
+    Ok((blocks, rest))
+}
+
 /// Bytes the tensors of safetensors checkpoints take once expanded to f32, split into the
 /// tensors `is_block` accepts and the rest. Read from the headers only.
 pub fn safetensors_f32_split(

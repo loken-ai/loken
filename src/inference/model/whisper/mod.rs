@@ -152,6 +152,8 @@ pub mod audio {
         n_len: usize,
         n_mel: usize,
         n_threads: usize,
+        /// Frames from this one on start past the waveform: they hold only the padding.
+        first_silent: usize,
     }
 
     /// The mel bands of every `n_threads`-th frame, starting at `ith`.
@@ -172,11 +174,12 @@ pub mod audio {
             n_len,
             n_mel,
             n_threads,
+            first_silent,
         } = framing;
         let bins = 1 + fft_size / 2;
         let mut frame = vec![0.0f32; fft_size];
         let mut mel = vec![0.0f32; n_len * n_mel];
-        let last = std::cmp::min(samples.len() / fft_step + 1, n_len);
+        let last = std::cmp::min(samples.len() / fft_step + 1, first_silent);
 
         for i in (ith..last).step_by(n_threads) {
             let offset = i * fft_step;
@@ -240,6 +243,7 @@ pub mod audio {
         let pad = 100 * super::CHUNK_LENGTH / 2;
         let frames = samples.len() / fft_step;
         let n_len = frames.div_ceil(pad) * pad + pad;
+        let first_silent = samples.len().div_ceil(fft_step).min(n_len);
         let mut samples = samples.to_vec();
         samples.resize(n_len * fft_step, 0.0);
 
@@ -257,6 +261,7 @@ pub mod audio {
             n_len,
             n_mel,
             n_threads,
+            first_silent,
         };
         let per_thread = thread::scope(|s| {
             // Every worker is started before any is waited on; joining as they are made would
@@ -285,6 +290,12 @@ pub mod audio {
             for (m, p) in mel.iter_mut().zip(part) {
                 *m += p;
             }
+        }
+        // A frame of padding alone has no power in any band, so each of its bands is the
+        // floor's logarithm, which is what the transform of its zeros would give.
+        let silent = f32::max(0.0, 1e-10).log10();
+        for band in mel.chunks_mut(n_len) {
+            band[first_silent..].fill(silent);
         }
 
         // Anything eight decades below the loudest bin of the utterance is floored, and the

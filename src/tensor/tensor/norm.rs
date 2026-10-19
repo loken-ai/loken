@@ -416,6 +416,218 @@ impl Tensor {
         )?))
     }
 
+    /// `self @ rhs^T` for two F16 tensors on one card, `[.., m, k]` by `[.., n, k]`: summed and
+    /// written in F32. `None` where the operands are not that.
+    #[cfg(feature = "gpu")]
+    pub fn matmul_t_f16_f32(&self, rhs: &Self) -> Result<Option<Self>> {
+        let (ldims, rdims) = (self.dims(), rhs.dims());
+        if self.dtype() != DType::F16
+            || rhs.dtype() != DType::F16
+            || ldims.len() != 2
+            || rdims.len() != 2
+        {
+            return Ok(None);
+        }
+        let (m, k) = (ldims[0], ldims[1]);
+        let (n, k2) = (rdims[0], rdims[1]);
+        if k != k2 {
+            return Ok(None);
+        }
+        let (lhs, rhs) = (self.contiguous()?, rhs.contiguous()?);
+        let (
+            Storage::Cuda { data, dev },
+            Storage::Cuda {
+                data: rd,
+                dev: rdev,
+            },
+        ) = (lhs.storage().as_ref(), rhs.storage().as_ref())
+        else {
+            return Ok(None);
+        };
+        if dev.ordinal() != rdev.ordinal() {
+            return Ok(None);
+        }
+        let out = crate::tensor::cuda::matmul_nt_f16_f32(
+            dev,
+            data.as_f16_slice()?,
+            rd.as_f16_slice()?,
+            1,
+            m,
+            k,
+            n,
+        )?;
+        Ok(Some(Self::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(out),
+            dev.clone(),
+            vec![m, n],
+        )?))
+    }
+
+    /// One F32 row `[1, k]` through an F16 weight `[n, k]` plus an optional F32 bias `[n]`,
+    /// written `[1, n]` F32 in one kernel; `None` off a card or off that shape.
+    #[cfg(feature = "gpu")]
+    pub fn gemv_f16w(&self, w: &Self, bias: Option<&Self>) -> Result<Option<Self>> {
+        let (Ok((1, k)), Ok((n, k2))) = (self.dims2(), w.dims2()) else {
+            return Ok(None);
+        };
+        // A block is given 48 KiB of shared memory without opting in to more; x sits there.
+        if self.dtype() != DType::F32
+            || w.dtype() != DType::F16
+            || k != k2
+            || !k.is_multiple_of(4)
+            || k * std::mem::size_of::<f32>() > 48 * 1024
+            || bias.is_some_and(|b| b.dtype() != DType::F32 || b.elem_count() != n)
+        {
+            return Ok(None);
+        }
+        let (x, w) = (self.contiguous()?, w.contiguous()?);
+        let b = bias.map(|b| b.contiguous()).transpose()?;
+        let (
+            Storage::Cuda { data, dev },
+            Storage::Cuda {
+                data: wd,
+                dev: wdev,
+            },
+        ) = (x.storage().as_ref(), w.storage().as_ref())
+        else {
+            return Ok(None);
+        };
+        let bd = match &b {
+            Some(b) => match b.storage().as_ref() {
+                Storage::Cuda { data, dev: bdev } if bdev.ordinal() == dev.ordinal() => {
+                    Some(data.as_f32_slice()?)
+                }
+                _ => return Ok(None),
+            },
+            None => None,
+        };
+        if dev.ordinal() != wdev.ordinal() {
+            return Ok(None);
+        }
+        let out = crate::tensor::cuda::gemv_f16w_f32(
+            dev,
+            data.as_f32_slice()?,
+            wd.as_f16_slice()?,
+            bd,
+            k,
+            n,
+        )?;
+        Ok(Some(Self::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(out),
+            dev.clone(),
+            vec![1, n],
+        )?))
+    }
+
+    /// Without a GPU runtime there is no card to multiply on.
+    #[cfg(not(feature = "gpu"))]
+    pub fn gemv_f16w(&self, _w: &Self, _bias: Option<&Self>) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
+    /// Without a GPU runtime there is no card to multiply on.
+    #[cfg(not(feature = "gpu"))]
+    pub fn matmul_t_f16_f32(&self, _rhs: &Self) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
+    /// Attention of these query rows over a key/value cache, in one kernel; `None` off a
+    /// CUDA card or off the shapes the kernel takes.
+    ///
+    /// `self` is `[1, rows, heads * head_dim]` F32, the layout a projection writes, and so is
+    /// the result. `k` and `v` are `[1, kv_heads, cap, head_dim]` buffers, both F32 or both
+    /// F16, of which the first `kv_len` positions are read. With `causal`, query row `r` sees
+    /// the positions up to `kv_len - rows + r`.
+    #[cfg(feature = "gpu")]
+    pub fn attend_rows(
+        &self,
+        k: &Self,
+        v: &Self,
+        kv_len: usize,
+        heads: usize,
+        causal: bool,
+        scale: f32,
+    ) -> Result<Option<Self>> {
+        let (Ok((1, rows, width)), Ok((1, kv_heads, cap, head_dim))) =
+            (self.dims3(), k.shape().dims4())
+        else {
+            return Ok(None);
+        };
+        // A block is given 48 KiB of shared memory without opting in to more.
+        let shared = crate::tensor::cuda::attend_rows_shared_bytes(kv_len);
+        if self.dtype() != DType::F32
+            || v.dims() != k.dims()
+            || heads == 0
+            || kv_heads == 0
+            || !heads.is_multiple_of(kv_heads)
+            || width != heads * head_dim
+            || !crate::tensor::cuda::attend_rows_takes(head_dim)
+            || kv_len == 0
+            || kv_len > cap
+            || (causal && rows > kv_len)
+            || shared > 48 * 1024
+        {
+            return Ok(None);
+        }
+        let (q, k, v) = (self.contiguous()?, k.contiguous()?, v.contiguous()?);
+        let (
+            Storage::Cuda { data, dev },
+            Storage::Cuda {
+                data: kd,
+                dev: kdev,
+            },
+            Storage::Cuda {
+                data: vd,
+                dev: vdev,
+            },
+        ) = (
+            q.storage().as_ref(),
+            k.storage().as_ref(),
+            v.storage().as_ref(),
+        )
+        else {
+            return Ok(None);
+        };
+        if dev.ordinal() != kdev.ordinal() || dev.ordinal() != vdev.ordinal() {
+            return Ok(None);
+        }
+        let out = crate::tensor::cuda::attend_rows(
+            dev,
+            data.as_f32_slice()?,
+            kd,
+            vd,
+            crate::tensor::cuda::AttendRows {
+                rows,
+                heads,
+                groups: heads / kv_heads,
+                head_dim,
+                cap,
+                kv_len,
+                causal,
+                scale,
+            },
+        )?;
+        Ok(Some(Self::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(out),
+            dev.clone(),
+            vec![1, rows, width],
+        )?))
+    }
+
+    /// Without a GPU runtime there is no kernel to take the call.
+    #[cfg(not(feature = "gpu"))]
+    pub fn attend_rows(
+        &self,
+        _k: &Self,
+        _v: &Self,
+        _kv_len: usize,
+        _heads: usize,
+        _causal: bool,
+        _scale: f32,
+    ) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
     pub fn matmul_t(&self, rhs: &Self) -> Result<Self> {
         if self.is_dry() || rhs.is_dry() {
             let (ldims, rdims) = (self.dims(), rhs.dims());

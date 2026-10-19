@@ -849,6 +849,138 @@ extern "C" __global__ void native_group_norm_f32(
         y[base + i] = (x[base + i] - mean) * inv * w[ch] + bias[ch];
     }
 }
+// Attention of a few query rows over a key/value cache, in one launch per call.
+// q and out are [rows, heads * hd] F32, the layout a projection writes. k and v are
+// [kv_heads, cap, hd] in KV (F32 or F16); only the first kv_len positions are read.
+// One block of NATIVE_ATTEND_THREADS per (head, query row). With `causal`, row r sees the
+// positions up to kv_len - rows + r. hd is a multiple of eight whose eighth divides the
+// block: a thread owns eight consecutive dimensions of one key, so `lanes` threads cover a
+// key and a tile of `tile` keys is read as one contiguous span. Dynamic shared memory:
+// kv_len scores, then tile * hd partial sums.
+#define NATIVE_ATTEND_THREADS 256
+#define NATIVE_ATTEND_ROWS(NAME, KV, LOAD8)                                                  \
+extern "C" __global__ void NAME(                                                              \
+    const float* q, const KV* k, const KV* v, float* out,                                     \
+    int rows, int heads, int groups, int hd, int cap, int kv_len, int causal, float scale) {  \
+    extern __shared__ float smem[];                                                           \
+    float* score = smem;                                                                      \
+    float* part = smem + kv_len;                                                              \
+    const int h = blockIdx.x, r = blockIdx.y, tid = threadIdx.x;                              \
+    const int lanes = hd / 8, tile = NATIVE_ATTEND_THREADS / lanes;                           \
+    const int j = tid / lanes, c = tid % lanes;                                               \
+    const float* qr = q + ((long long)r * heads + h) * hd;                                    \
+    const long long kvh = (long long)(h / groups) * cap * hd;                                 \
+    const int seen = causal ? kv_len - rows + r + 1 : kv_len;                                 \
+    float qv[8];                                                                              \
+    for (int i = 0; i < 8; i++) qv[i] = qr[c * 8 + i] * scale;                                \
+    for (int t0 = 0; t0 < seen; t0 += tile) {                                                 \
+        const int t = t0 + j;                                                                 \
+        float s = 0.0f;                                                                       \
+        if (t < seen) {                                                                       \
+            float kv8[8];                                                                     \
+            LOAD8(kv8, k + kvh + (long long)t * hd + c * 8);                                  \
+            for (int i = 0; i < 8; i++) s += qv[i] * kv8[i];                                  \
+        }                                                                                     \
+        part[tid] = s;                                                                        \
+        __syncthreads();                                                                      \
+        if (c == 0 && t < seen) {                                                             \
+            float d = 0.0f;                                                                   \
+            for (int l = 0; l < lanes; l++) d += part[j * lanes + l];                         \
+            score[t] = d;                                                                     \
+        }                                                                                     \
+        __syncthreads();                                                                      \
+    }                                                                                         \
+    float best = __int_as_float(0xff800000);                                                  \
+    for (int t = tid; t < seen; t += NATIVE_ATTEND_THREADS) best = fmaxf(best, score[t]);     \
+    part[tid] = best;                                                                         \
+    __syncthreads();                                                                          \
+    for (int w = NATIVE_ATTEND_THREADS / 2; w > 0; w >>= 1) {                                 \
+        if (tid < w) part[tid] = fmaxf(part[tid], part[tid + w]);                             \
+        __syncthreads();                                                                      \
+    }                                                                                         \
+    best = part[0];                                                                           \
+    __syncthreads();                                                                          \
+    float sum = 0.0f;                                                                         \
+    for (int t = tid; t < seen; t += NATIVE_ATTEND_THREADS) {                                 \
+        float e = __expf(score[t] - best);                                                    \
+        score[t] = e;                                                                         \
+        sum += e;                                                                             \
+    }                                                                                         \
+    part[tid] = sum;                                                                          \
+    __syncthreads();                                                                          \
+    for (int w = NATIVE_ATTEND_THREADS / 2; w > 0; w >>= 1) {                                 \
+        if (tid < w) part[tid] += part[tid + w];                                              \
+        __syncthreads();                                                                      \
+    }                                                                                         \
+    const float total = part[0];                                                              \
+    __syncthreads();                                                                          \
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};                          \
+    for (int t = j; t < seen; t += tile) {                                                    \
+        float kv8[8];                                                                         \
+        LOAD8(kv8, v + kvh + (long long)t * hd + c * 8);                                      \
+        const float p = score[t];                                                             \
+        for (int i = 0; i < 8; i++) acc[i] += p * kv8[i];                                     \
+    }                                                                                         \
+    for (int i = 0; i < 8; i++) part[j * hd + c * 8 + i] = acc[i];                            \
+    __syncthreads();                                                                          \
+    for (int d = tid; d < hd; d += NATIVE_ATTEND_THREADS) {                                   \
+        float o = 0.0f;                                                                       \
+        for (int jj = 0; jj < tile; jj++) o += part[jj * hd + d];                             \
+        out[((long long)r * heads + h) * hd + d] = o / total;                                 \
+    }                                                                                         \
+}
+#define NATIVE_LOAD8_F32(dst, src)                                                           \
+    {                                                                                         \
+        const float4 a4 = *(const float4*)(src);                                              \
+        const float4 b4 = *(const float4*)((src) + 4);                                        \
+        dst[0] = a4.x; dst[1] = a4.y; dst[2] = a4.z; dst[3] = a4.w;                           \
+        dst[4] = b4.x; dst[5] = b4.y; dst[6] = b4.z; dst[7] = b4.w;                           \
+    }
+#define NATIVE_LOAD8_F16(dst, src)                                                           \
+    {                                                                                         \
+        const uint4 u4 = *(const uint4*)(src);                                                \
+        const __half2* h2 = (const __half2*)&u4;                                              \
+        for (int e = 0; e < 4; e++) {                                                         \
+            const float2 f2 = __half22float2(h2[e]);                                          \
+            dst[2 * e] = f2.x; dst[2 * e + 1] = f2.y;                                         \
+        }                                                                                     \
+    }
+NATIVE_ATTEND_ROWS(native_attend_rows_f32, float, NATIVE_LOAD8_F32)
+NATIVE_ATTEND_ROWS(native_attend_rows_f16, __half, NATIVE_LOAD8_F16)
+// One row through a projection held in F16: y[n] = x . w[n] (+ bias[n]), x and y F32,
+// w [n_out, k] row-major. NATIVE_GEMV_ROWS outputs per block, 32 threads on each, every
+// thread reading four weights at a time strided across the row; the 32 partial sums of an
+// output are added in shared memory. k is a multiple of four. Dynamic shared memory: k
+// floats of x.
+#define NATIVE_GEMV_ROWS 8
+extern "C" __global__ void native_gemv_f16w_f32(
+    const float* x, const __half* w, const float* bias, float* y,
+    int k, int n_out, int has_bias) {
+    extern __shared__ float xs[];
+    __shared__ float part[NATIVE_GEMV_ROWS * 32];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    const int lane = threadIdx.x % 32, slot = threadIdx.x / 32;
+    const int row = blockIdx.x * NATIVE_GEMV_ROWS + slot;
+    float s = 0.0f;
+    if (row < n_out) {
+        const __half* wr = w + (long long)row * k;
+        for (int i = lane * 4; i < k; i += 128) {
+            const uint2 u = *(const uint2*)(wr + i);
+            const __half2* h2 = (const __half2*)&u;
+            const float2 a = __half22float2(h2[0]);
+            const float2 b = __half22float2(h2[1]);
+            s += xs[i] * a.x + xs[i + 1] * a.y + xs[i + 2] * b.x + xs[i + 3] * b.y;
+        }
+    }
+    part[threadIdx.x] = s;
+    __syncthreads();
+    for (int width = 16; width > 0; width >>= 1) {
+        if (lane < width) part[threadIdx.x] += part[threadIdx.x + width];
+        __syncthreads();
+    }
+    if (lane == 0 && row < n_out) y[row] = part[threadIdx.x] + (has_bias ? bias[row] : 0.0f);
+}
 "#;
 
 // --- GPU op launchers - same kernels + launch configs as the live

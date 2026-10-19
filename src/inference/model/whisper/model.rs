@@ -6,68 +6,124 @@
 //! projects the last hidden state back through the embedding table to score the next token. The
 //! audio front-end, the config and the tokenizer constants live alongside, in the module above.
 //!
-//! Everything here is F32. The causal mask and both positional tables stay on HOST and only the
-//! rows a step actually needs are uploaded - a decode step wants one `[1, n_state]` row, not a
-//! narrow across 1.4 MB of device memory. The self-attention caches grow device-side instead.
+//! On a card the projections a decode step runs, the head included, are held in half precision
+//! and the stream between them runs F32; the projections over the whole audio window are held
+//! in half precision when the card multiplies them faster that way ([`half_matmul_pays`]), and
+//! in F32 otherwise. The convolutions, norms and biases stay F32. Both embedding tables
+//! stay on HOST: a decode step looks up its token and position there and uploads the one row
+//! it built. The decoder's self attention writes into buffers reserved for its whole context.
 
-use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
+use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention, Reserved};
 use crate::inference::model::block::CrossAttentionBlock;
+use crate::inference::model::half::half_matmul_pays;
 use crate::inference::model::whisper::Config;
 use crate::tensor::layer::{
-    conv1d, embedding, layer_norm, linear, linear_no_bias, same_length_1d, Conv1d, Conv1dConfig,
-    Embedding, LayerNorm,
+    conv1d, embedding, layer_norm, same_length_1d, Conv1d, Conv1dConfig, Embedding, LayerNorm,
+    Linear,
 };
 use crate::tensor::ops::Activation;
 use crate::tensor::VarBuilder;
-use crate::tensor::{Device, Result, Tensor};
+use crate::tensor::{DType, Device, Result, Tensor};
+
+/// The `[to, from]` projection under `vb`, with its bias when `bias` is set: read on the host
+/// and held at its resident half precision on a card when `half` is set, and in F32 otherwise.
+fn projection(from: usize, to: usize, bias: bool, half: bool, vb: &VarBuilder) -> Result<Linear> {
+    if !(half && vb.device().is_cuda()) {
+        let w = vb.get((to, from), "weight")?;
+        let b = bias.then(|| vb.get(to, "bias")).transpose()?;
+        return Linear::new(w, b);
+    }
+    let host = vb.to(DType::F32, &Device::Cpu);
+    let w = host.get((to, from), "weight")?;
+    let b = bias.then(|| host.get(to, "bias")).transpose()?;
+    crate::inference::model::half::linear(&w, b.as_ref(), vb.device())
+}
 
 /// One attention of this model, read off the four names its checkpoint uses.
 ///
 /// The key projection carries no bias and the other three do - the model was trained that way,
 /// and a bias of zeros would answer the same but cost a row of weights per layer to say so.
 ///
-/// `kv` is what the attention keeps: the encoder's own attention and the decoder's self
-/// attention grow their cache a step at a time, while the decoder's cross attention projects
-/// the encoder's output once and holds it for the whole generation.
-fn attention(n_state: usize, n_head: usize, kv: Kv, vb: VarBuilder) -> Result<MultiHeadAttention> {
+/// `kv` is what the attention keeps: the encoder's own attention keeps nothing, the decoder's
+/// self attention writes each step into its reserved buffers, and the decoder's cross attention
+/// projects the encoder's output once and holds it for the whole generation.
+///
+/// `half` says, for the query and output projections and then for the key and value ones,
+/// whether they are held in half precision.
+fn attention(
+    n_state: usize,
+    n_head: usize,
+    kv: Kv,
+    [half_q, half_kv]: [bool; 2],
+    vb: VarBuilder,
+) -> Result<MultiHeadAttention> {
     MultiHeadAttention::new(
-        linear(n_state, n_state, &vb.pp("q_proj"))?,
-        linear_no_bias(n_state, n_state, &vb.pp("k_proj"))?,
-        linear(n_state, n_state, &vb.pp("v_proj"))?,
-        linear(n_state, n_state, &vb.pp("out_proj"))?,
+        projection(n_state, n_state, true, half_q, &vb.pp("q_proj"))?,
+        projection(n_state, n_state, false, half_kv, &vb.pp("k_proj"))?,
+        projection(n_state, n_state, true, half_kv, &vb.pp("v_proj"))?,
+        projection(n_state, n_state, true, half_q, &vb.pp("out_proj"))?,
         n_state,
         n_head,
         n_head,
         kv,
     )
+    .map(MultiHeadAttention::with_half_cache)
 }
 
 /// One block of either stack, read off the names whisper's checkpoint uses.
 ///
-/// `ca` says whether there is an encoder to attend to: the audio tower has none, and its
-/// checkpoint carries no cross-attention weights to read. Both feed-forward projections carry a
-/// bias here, and the activation between them is the error-function GELU.
-fn block(n_state: usize, n_head: usize, ca: bool, vb: VarBuilder) -> Result<CrossAttentionBlock> {
-    let self_attn = attention(n_state, n_head, Kv::Growing(None), vb.pp("self_attn"))?;
-    let cross_attn = match ca {
-        true => Some(attention(
-            n_state,
-            n_head,
-            Kv::Fixed(None),
-            vb.pp("encoder_attn"),
-        )?),
-        false => None,
+/// `context` is how many positions the decoder's self attention reserves; the audio tower has
+/// none, attends to all of its positions at once and carries no cross-attention weights. Both
+/// feed-forward projections carry a bias here, and the activation between them is the
+/// error-function GELU.
+///
+/// `window_half` says whether the projections that read the whole audio window - all of the
+/// tower's, and the keys and values the decoder projects from it - are held in half precision.
+/// The decoder's other projections read one step at a time and always are.
+fn block(
+    n_state: usize,
+    n_head: usize,
+    context: Option<usize>,
+    window_half: bool,
+    vb: VarBuilder,
+) -> Result<CrossAttentionBlock> {
+    let (self_kv, cross_attn, step_half) = match context {
+        Some(span) => (
+            Kv::Reserved(Reserved::new(span)),
+            Some(attention(
+                n_state,
+                n_head,
+                Kv::Fixed(None),
+                [true, window_half],
+                vb.pp("encoder_attn"),
+            )?),
+            true,
+        ),
+        None => (Kv::None, None, window_half),
     };
-    CrossAttentionBlock::new(
+    let self_attn = attention(
+        n_state,
+        n_head,
+        self_kv,
+        [step_half, step_half],
+        vb.pp("self_attn"),
+    )?;
+    CrossAttentionBlock::with_projections(
         self_attn,
         cross_attn,
         n_state,
         n_state * 4,
         1e-5,
-        true,
         Activation::Gelu,
         &vb,
+        |from, to, vb| projection(from, to, true, step_half, vb),
     )
+}
+
+/// Whether the projections over the whole audio window are held in half precision on the
+/// device `vb` loads to.
+fn window_half(vb: &VarBuilder, cfg: &Config) -> Result<bool> {
+    half_matmul_pays(vb.device(), cfg.max_source_positions, cfg.d_model)
 }
 
 /// `[length, channels]` sin/cos table, built host-side.
@@ -102,6 +158,7 @@ impl AudioEncoder {
     /// `audio_tower.*` tensors use the same names) without the text decoder.
     pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let (width, heads) = (cfg.d_model, cfg.encoder_attention_heads);
+        let window_half = window_half(&vb, cfg)?;
         // The mel front-end: a three-tap convolution that keeps the length, then the same
         // one striding by two, which is where the sequence halves.
         let taps = same_length_1d(3, 1);
@@ -112,7 +169,15 @@ impl AudioEncoder {
             // Nothing was stored for the audio positions, so the table is computed.
             positional_embedding: sinusoids(cfg.max_source_positions, width)?,
             blocks: (0..cfg.encoder_layers)
-                .map(|i| block(width, heads, false, vb.pp(format!("layers.{i}"))))
+                .map(|i| {
+                    block(
+                        width,
+                        heads,
+                        None,
+                        window_half,
+                        vb.pp(format!("layers.{i}")),
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?,
             ln_post: layer_norm(width, 1e-5, &vb.pp("layer_norm"))?,
         })
@@ -150,16 +215,15 @@ impl AudioEncoder {
 /// a head that is the embedding table read the other way round.
 #[derive(Debug, Clone)]
 pub struct TextDecoder {
+    /// `[vocab, n_state]` on HOST: a step looks up its own tokens there.
     token_embedding: Embedding,
-    /// `[n_ctx, n_state]`, kept on HOST; per-step slices upload tiny rows.
+    /// `[n_ctx, n_state]` on HOST, read beside the token rows.
     positional_embedding: Tensor,
-    /// Weight-tied lm-head, pre-transposed to `[n_state, vocab]` on the
-    /// compute device at load (transposing 160 MB per token would hurt).
-    lm_head_t: Tensor,
+    /// The weight-tied head: the token table as a projection onto the vocabulary, on the
+    /// compute device.
+    head: Linear,
     blocks: Vec<CrossAttentionBlock>,
     ln: LayerNorm,
-    /// `[n_ctx, n_ctx]` causal mask on HOST (sliced + uploaded per step).
-    mask: Tensor,
     /// How many tokens have flowed into the self-attn KV cache so far.
     /// Reset to 0 on flush, incremented each forward - picks the right
     /// slice of `positional_embedding` so incremental decode steps line
@@ -171,58 +235,56 @@ impl TextDecoder {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let (width, heads) = (cfg.d_model, cfg.decoder_attention_heads);
         let span = cfg.max_target_positions;
-        let token_embedding = embedding(cfg.vocab_size, width, &vb.pp("embed_tokens"))?;
-        // Text positions were learned rather than computed, so the table is read; it stays on
-        // host because a step only ever wants a row or two of it.
-        let positional_embedding = vb
-            .to(vb.dtype(), &Device::Cpu)
-            .get((span, width), "embed_positions.weight")?;
-        let lm_head_t = token_embedding.table().transpose(0, 1)?;
+        let host = vb.to(DType::F32, &Device::Cpu);
+        let token_embedding = embedding(cfg.vocab_size, width, &host.pp("embed_tokens"))?;
+        // Text positions were learned rather than computed, so the table is read.
+        let positional_embedding = host.get((span, width), "embed_positions.weight")?;
+        let head = if vb.device().is_cuda() {
+            crate::inference::model::half::linear(token_embedding.table(), None, vb.device())?
+        } else {
+            Linear::new(token_embedding.table().to_device(vb.device())?, None)?
+        };
+        let window_half = window_half(&vb, cfg)?;
         let blocks = (0..cfg.decoder_layers)
-            .map(|i| block(width, heads, true, vb.pp(format!("layers.{i}"))))
+            .map(|i| {
+                let vb = vb.pp(format!("layers.{i}"));
+                block(width, heads, Some(span), window_half, vb)
+            })
             .collect::<Result<Vec<_>>>()?;
         let ln = layer_norm(width, 1e-5, &vb.pp("layer_norm"))?;
-        // Added to the self-attention scores, so it says what a query is allowed to have seen:
-        // row `i` leaves the columns up to its own position alone and sends the rest to minus
-        // infinity, where the softmax gives them no weight at all.
-        let mut future = vec![0f32; span * span];
-        for (i, row) in future.chunks_mut(span).enumerate() {
-            row[i + 1..].fill(f32::NEG_INFINITY);
-        }
         Ok(Self {
             token_embedding,
             positional_embedding,
-            lm_head_t,
+            head,
             blocks,
             ln,
-            mask: Tensor::from_vec_f32(future, vec![span, span])?,
             cache_offset: 0,
         })
     }
 
     /// Token ids `[1, n]` (u32) + audio features -> hidden `[1, n, n_state]`.
+    ///
+    /// The ids are read on the host, where both tables are; the embedded rows are what goes to
+    /// the device. Each block's self attention sees the positions up to its own.
     pub fn forward(&mut self, x: &Tensor, xa: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
         let last = *x.dims().last().unwrap_or(&0);
         if flush_kv_cache {
-            self.cache_offset = 0;
+            self.reset_kv_cache();
         }
-        let token_embedding = self.token_embedding.forward(x)?;
+        let token_embedding = self.token_embedding.forward(&x.to_device(&Device::Cpu)?)?;
         // With incremental decode (self-attn KV cache + caller supplying
         // only the new token), `x` is the tail of the prefix that hasn't
         // been seen yet. The positional embedding must therefore start at
         // `cache_offset`, not 0, so position ids line up with the cached
-        // K/V layout. For the legacy full-prefix call (cache_offset == 0,
-        // x = whole prompt) this trivially reduces to narrow(0, 0, last).
+        // K/V layout.
         let positional_embedding = self
             .positional_embedding
-            .narrow(0, self.cache_offset, last)?
-            .to_device(&token_embedding.device())?;
-        let mut x = token_embedding.broadcast_add(&positional_embedding)?;
+            .narrow(0, self.cache_offset, last)?;
+        let mut x = token_embedding
+            .broadcast_add(&positional_embedding)?
+            .to_device(&xa.device())?;
         for block in self.blocks.iter_mut() {
-            if flush_kv_cache {
-                block.clear();
-            }
-            x = block.forward(&x, Some(xa), Mask::Table(&self.mask))?;
+            x = block.forward(&x, Some(xa), Mask::Causal)?;
         }
         self.cache_offset += last;
         self.ln.forward(&x)
@@ -230,21 +292,23 @@ impl TextDecoder {
 
     /// Hidden `[1, n, n_state]` -> logits `[1, n, vocab]` (weight-tied head).
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, n, d) = x.shape().dims3()?;
-        let logits = x.reshape((b * n, d))?.matmul(&self.lm_head_t)?;
-        let vocab = *logits.dims().last().unwrap_or(&0);
-        logits.reshape((b, n, vocab))
+        self.head.forward(x)
     }
 
+    /// Forget both caches: the next forward starts a new sequence over new audio.
     pub fn reset_kv_cache(&mut self) {
-        // Defensive: pair the cache reset with the position-id reset
-        // so callers that reset_kv_cache() and then call forward() with
-        // flush=false don't see stale positional offsets. The hot
-        // transcribe path always passes flush=true on iter 0 so this
-        // is rarely the deciding write - but explicit is safer.
         self.cache_offset = 0;
         for block in self.blocks.iter_mut() {
             block.clear();
+        }
+    }
+
+    /// Forget the tokens but keep what was projected from the audio: the next forward starts a
+    /// new sequence over the same encoder output.
+    pub fn restart_sequence(&mut self) {
+        self.cache_offset = 0;
+        for block in self.blocks.iter_mut() {
+            block.clear_self();
         }
     }
 }
@@ -335,21 +399,11 @@ mod tests {
         map
     }
 
-    fn causal_table(n: usize) -> Tensor {
-        let mut v = vec![0f32; n * n];
-        for r in 0..n {
-            for c in (r + 1)..n {
-                v[r * n + c] = f32::NEG_INFINITY;
-            }
-        }
-        Tensor::from_vec(v, (n, n), &Device::Cpu).unwrap()
-    }
-
     /// A decoder block fed one token at a time answers what it answers fed the whole prefix.
     ///
     /// This is the wiring rather than the arithmetic: that the self attention is the one that
     /// accumulates, that the cross attention is the one that is projected once and kept, and
-    /// that the mask table is cut to the rows being asked for rather than read from the top.
+    /// that the causal positions count from where the cache ends rather than from zero.
     /// Each of those is a choice made where the block is built, and each of them fails by
     /// returning a plausible tensor of the right shape.
     #[test]
@@ -365,13 +419,12 @@ mod tests {
             .map(|i| (((i * 19 + 7) % 53) as f32) * 0.015 - 0.4)
             .collect();
         let xa = Tensor::from_vec(audio, (1, src, n_state), &Device::Cpu).unwrap();
-        let mask = causal_table(n);
 
-        let mut whole = block(n_state, n_head, true, vb.clone()).unwrap();
+        let mut whole = block(n_state, n_head, Some(n), true, vb.clone()).unwrap();
         whole.clear();
-        let at_once = whole.forward(&xs, Some(&xa), Mask::Table(&mask)).unwrap();
+        let at_once = whole.forward(&xs, Some(&xa), Mask::Causal).unwrap();
 
-        let mut stepped = block(n_state, n_head, true, vb).unwrap();
+        let mut stepped = block(n_state, n_head, Some(n), true, vb).unwrap();
         let mut rows = Vec::new();
         for t in 0..n {
             let step = xs.narrow(1, t, 1).unwrap();
@@ -379,11 +432,7 @@ mod tests {
             if t == 0 {
                 stepped.clear();
             }
-            rows.push(
-                stepped
-                    .forward(&step, Some(&xa), Mask::Table(&mask))
-                    .unwrap(),
-            );
+            rows.push(stepped.forward(&step, Some(&xa), Mask::Causal).unwrap());
         }
         let step_by_step = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1).unwrap();
 

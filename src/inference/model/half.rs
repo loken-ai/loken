@@ -38,6 +38,49 @@ pub fn linear(weight: &Tensor, bias: Option<&Tensor>, dev: &Device) -> Result<Li
     Linear::from_published(w, b)
 }
 
+/// Timed runs of each precision in [`half_matmul_pays`], after one that is not timed; the
+/// fastest of them is the one compared.
+const MATMUL_PROBE_RUNS: usize = 3;
+
+/// Whether `dev` multiplies `rows` rows by a `[width, width]` projection held in half precision
+/// at least as fast as by the same projection held in F32. Measured on the card once per card
+/// and shape, and kept; `false` off a card.
+pub fn half_matmul_pays(dev: &Device, rows: usize, width: usize) -> Result<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEASURED: OnceLock<Mutex<HashMap<(usize, usize, usize), bool>>> = OnceLock::new();
+    let crate::tensor::DeviceLocation::Cuda { gpu_id } = dev.location() else {
+        return Ok(false);
+    };
+    let key = (gpu_id, rows, width);
+    let measured = MEASURED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&pays) = measured.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(pays);
+    }
+    let weight = Tensor::zeros((width, width), DType::F32)?;
+    let full = Linear::new(weight.to_device(dev)?, None)?;
+    let half = linear(&weight, None, dev)?;
+    let x = Tensor::zeros_on((1, rows, width), DType::F32, dev)?;
+    let fastest = |l: &Linear| -> Result<std::time::Duration> {
+        l.forward(&x)?;
+        dev.synchronize()?;
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..MATMUL_PROBE_RUNS {
+            let t = std::time::Instant::now();
+            l.forward(&x)?;
+            dev.synchronize()?;
+            best = best.min(t.elapsed());
+        }
+        Ok(best)
+    };
+    let pays = fastest(&half)? <= fastest(&full)?;
+    measured
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, pays);
+    Ok(pays)
+}
+
 /// Bytes the tensor `name` of shape `dims` takes once loaded for a card. A projection matrix
 /// (`*.weight` with two axes) and a weight-normed kernel direction (`*.weight_v`) are held in
 /// half precision; a weight-norm magnitude (`*.weight_g`) is folded into its kernel and takes

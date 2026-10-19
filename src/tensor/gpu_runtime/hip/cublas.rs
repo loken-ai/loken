@@ -167,6 +167,7 @@ pub mod sys {
     pub enum cublasComputeType_t {
         CUBLAS_COMPUTE_16F = 64,
         CUBLAS_COMPUTE_32F = 68,
+        CUBLAS_COMPUTE_32F_PEDANTIC = 69,
         CUBLAS_COMPUTE_32F_FAST_16F = 74,
         CUBLAS_COMPUTE_32F_FAST_16BF = 75,
         CUBLAS_COMPUTE_32F_FAST_TF32 = 77,
@@ -181,6 +182,7 @@ pub mod sys {
                 // A reduced-precision f32 product is a permission, not a demand: the full f32
                 // product every AMD card runs answers it.
                 Self::CUBLAS_COMPUTE_32F
+                | Self::CUBLAS_COMPUTE_32F_PEDANTIC
                 | Self::CUBLAS_COMPUTE_32F_FAST_16F
                 | Self::CUBLAS_COMPUTE_32F_FAST_16BF
                 | Self::CUBLAS_COMPUTE_32F_FAST_TF32 => 2,

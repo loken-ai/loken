@@ -346,6 +346,134 @@ pub fn layer_norm_f32(
     Ok(out)
 }
 
+/// Outputs per block of [`gemv_f16w_f32`], `NATIVE_GEMV_ROWS` in the kernel; 32 threads each.
+const GEMV_ROWS: usize = 8;
+
+/// One F32 row `x` (`k` wide) through an F16 weight `w` (`[n_out, k]`), plus `bias`: `n_out`
+/// F32 outputs, in one launch. `k` is a multiple of four.
+pub fn gemv_f16w_f32(
+    dev: &CudaDevice,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<half::f16>,
+    bias: Option<&CudaSlice<f32>>,
+    k: usize,
+    n_out: usize,
+) -> Result<CudaSlice<f32>> {
+    let func = dev.elementwise_fn("native_gemv_f16w_f32")?;
+    let stream = dev.stream();
+    let out = with_oom_retry(dev, "gemv_f16w_f32", || unsafe {
+        stream.alloc::<f32>(n_out)
+    })?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out.div_ceil(GEMV_ROWS) as u32, 1, 1),
+        block_dim: ((GEMV_ROWS * 32) as u32, 1, 1),
+        shared_mem_bytes: (k * std::mem::size_of::<f32>()) as u32,
+    };
+    let (k_i, n_i, has_bias) = (k as i32, n_out as i32, bias.is_some() as i32);
+    let mut bd = stream.launch_builder(&func);
+    bd.arg(x);
+    bd.arg(w);
+    // The kernel reads no bias when there is none; x stands in for the pointer.
+    match bias {
+        Some(b) => bd.arg(b),
+        None => bd.arg(x),
+    };
+    bd.arg(&out);
+    bd.arg(&k_i);
+    bd.arg(&n_i);
+    bd.arg(&has_bias);
+    unsafe { bd.launch(cfg) }.map_err(|e| Error(format!("gemv_f16w_f32 launch: {e}")))?;
+    Ok(out)
+}
+
+/// The shape of one [`attend_rows`] call.
+#[derive(Clone, Copy, Debug)]
+pub struct AttendRows {
+    /// Query rows, each `heads * head_dim` wide.
+    pub rows: usize,
+    pub heads: usize,
+    /// Query heads that read one key head.
+    pub groups: usize,
+    pub head_dim: usize,
+    /// Positions the cache buffers hold per key head.
+    pub cap: usize,
+    /// Positions written so far; only these are read.
+    pub kv_len: usize,
+    pub causal: bool,
+    pub scale: f32,
+}
+
+/// Threads per block of [`attend_rows`], `NATIVE_ATTEND_THREADS` in the kernel.
+pub const ATTEND_ROWS_THREADS: usize = 256;
+
+/// Whether [`attend_rows`] takes heads of `head_dim`: eight dimensions per thread, and the
+/// threads of one key dividing the block.
+pub fn attend_rows_takes(head_dim: usize) -> bool {
+    let lanes = head_dim / 8;
+    head_dim.is_multiple_of(8) && lanes.is_power_of_two() && lanes <= ATTEND_ROWS_THREADS
+}
+
+/// Shared memory one [`attend_rows`] block uses over `kv_len` positions: a score per position
+/// and a partial sum per dimension of every key of a tile, which is eight per thread.
+pub fn attend_rows_shared_bytes(kv_len: usize) -> usize {
+    (kv_len + 8 * ATTEND_ROWS_THREADS) * std::mem::size_of::<f32>()
+}
+
+/// Attention of `q` (`[rows, heads * head_dim]`, F32) over the first `kv_len` positions of
+/// `k` and `v` (`[kv_heads, cap, head_dim]`, F32 or F16), written as `[rows, heads *
+/// head_dim]` F32. One launch: scores, softmax and the weighted sum of values.
+pub fn attend_rows(
+    dev: &CudaDevice,
+    q: &CudaSlice<f32>,
+    k: &CudaStorage,
+    v: &CudaStorage,
+    a: AttendRows,
+) -> Result<CudaSlice<f32>> {
+    let stream = dev.stream();
+    let out = with_oom_retry(dev, "attend_rows", || unsafe {
+        stream.alloc::<f32>(a.rows * a.heads * a.head_dim)
+    })?;
+    let cfg = LaunchConfig {
+        grid_dim: (a.heads as u32, a.rows as u32, 1),
+        block_dim: (ATTEND_ROWS_THREADS as u32, 1, 1),
+        shared_mem_bytes: attend_rows_shared_bytes(a.kv_len) as u32,
+    };
+    let ints = [
+        a.rows as i32,
+        a.heads as i32,
+        a.groups as i32,
+        a.head_dim as i32,
+        a.cap as i32,
+        a.kv_len as i32,
+        a.causal as i32,
+    ];
+    macro_rules! launch {
+        ($name:literal, $k:expr, $v:expr) => {{
+            let func = dev.elementwise_fn($name)?;
+            let mut bd = stream.launch_builder(&func);
+            bd.arg(q);
+            bd.arg($k);
+            bd.arg($v);
+            bd.arg(&out);
+            for i in &ints {
+                bd.arg(i);
+            }
+            bd.arg(&a.scale);
+            unsafe { bd.launch(cfg) }.map_err(|e| Error(format!("attend_rows launch: {e}")))?;
+        }};
+    }
+    match (k, v) {
+        (CudaStorage::F32(k), CudaStorage::F32(v)) => launch!("native_attend_rows_f32", k, v),
+        (CudaStorage::F16(k), CudaStorage::F16(v)) => launch!("native_attend_rows_f16", k, v),
+        _ => {
+            return Err(Error(
+                "attend_rows: keys and values must both be F32 or F16".into(),
+            ))
+        }
+    }
+    Ok(out)
+}
+
 /// Copy one cat operand (`src` = [outer, src_row] elements) into `dst` whose
 /// rows are `dst_stride` apart, starting at element offset `dst_off`.
 pub fn cat_copy_f32(

@@ -210,33 +210,60 @@ impl Linear {
         // largest buffer in the block - on a video-sized sequence, the largest allocation
         // there is. The result is handed back in the dtype the caller passed in, so a stream
         // running F32 stays F32 across a half-precision weight.
+        // One F32 row through a published F16 weight on a card: product and bias in one
+        // kernel.
+        if let Held::Published(w) = &self.held {
+            if rows == 1
+                && w.dtype() == DType::F16
+                && x.dtype() == DType::F32
+                && self.fused.is_none()
+            {
+                if let Some(y) = x.reshape(vec![1, k])?.gemv_f16w(w, self.bias.as_ref())? {
+                    let mut odims = dims;
+                    *odims.last_mut().unwrap() = self.out_dim;
+                    return y.reshape(odims);
+                }
+            }
+        }
+
         let wdt = self.held.tensor().dtype();
         let follow = wdt != x.dtype() && matches!(wdt, DType::BF16 | DType::F16);
         let xm = if follow { x.to_dtype(wdt)? } else { x.clone() };
 
-        let y = match &self.held {
-            Held::Transposed(wt) => {
-                let wt = if follow || wt.dtype() == xm.dtype() {
-                    wt.clone()
-                } else {
-                    wt.to_dtype(xm.dtype())?
-                };
-                xm.reshape(vec![1, rows, k])?.matmul(&wt.reshape(vec![
-                    1,
-                    self.in_dim,
-                    self.out_dim,
-                ])?)?
+        // A published F16 weight under an F32 stream on a card: cuBLAS writes the F32 sum
+        // directly, so the product is neither rounded to F16 nor cast back.
+        let widened = match &self.held {
+            Held::Published(w) if follow && wdt == DType::F16 && x.dtype() == DType::F32 => {
+                xm.reshape(vec![rows, k])?.matmul_t_f16_f32(w)?
             }
-            // The N-T flag, not a materialised transpose: the weight is read in the
-            // orientation the checkpoint published it in and never copied.
-            Held::Published(w) => {
-                let w = if follow || w.dtype() == xm.dtype() {
-                    w.clone()
-                } else {
-                    w.to_dtype(xm.dtype())?
-                };
-                xm.matmul_t(&w)?
-            }
+            _ => None,
+        };
+        let y = match (widened, &self.held) {
+            (Some(y), _) => y,
+            (None, held) => match held {
+                Held::Transposed(wt) => {
+                    let wt = if follow || wt.dtype() == xm.dtype() {
+                        wt.clone()
+                    } else {
+                        wt.to_dtype(xm.dtype())?
+                    };
+                    xm.reshape(vec![1, rows, k])?.matmul(&wt.reshape(vec![
+                        1,
+                        self.in_dim,
+                        self.out_dim,
+                    ])?)?
+                }
+                // The N-T flag, not a materialised transpose: the weight is read in the
+                // orientation the checkpoint published it in and never copied.
+                Held::Published(w) => {
+                    let w = if follow || w.dtype() == xm.dtype() {
+                        w.clone()
+                    } else {
+                        w.to_dtype(xm.dtype())?
+                    };
+                    xm.matmul_t(&w)?
+                }
+            },
         };
         let mut odims = dims;
         *odims.last_mut().unwrap() = self.out_dim;

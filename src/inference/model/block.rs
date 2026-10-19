@@ -47,6 +47,24 @@ impl CrossAttentionBlock {
             true => linear(from, to, vb),
             false => linear_no_bias(from, to, vb),
         };
+        Self::with_projections(
+            self_attn, cross_attn, hidden, ffn, eps, activation, vb, project,
+        )
+    }
+
+    /// [`Self::new`] with the feed-forward projections built by `project(from, to, vb)`, for a
+    /// family that holds them other than as read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_projections(
+        self_attn: MultiHeadAttention,
+        cross_attn: Option<MultiHeadAttention>,
+        hidden: usize,
+        ffn: usize,
+        eps: f32,
+        activation: Activation,
+        vb: &VarBuilder,
+        project: impl Fn(usize, usize, &VarBuilder) -> Result<Linear>,
+    ) -> Result<Self> {
         let cross = match cross_attn {
             Some(attn) => Some((
                 attn,
@@ -88,6 +106,12 @@ impl CrossAttentionBlock {
         let widened = self.ffn_norm.forward(&xs)?.apply(&self.fc1)?;
         let narrowed = self.activation.apply(&widened)?.apply(&self.fc2)?;
         xs.add(&narrowed)
+    }
+
+    /// Forget the self attention's cache and keep the cross attention's: the next call starts
+    /// a new sequence over the same encoder output.
+    pub fn clear_self(&mut self) {
+        self.self_attn.clear();
     }
 
     /// Forget both caches - the next call starts a new sequence.
