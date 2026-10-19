@@ -345,7 +345,7 @@ impl DeviceManager {
             // Check up to 8 devices
             if let Ok(_device) = Device::new_cuda(i) {
                 // Get device properties via NVML if available
-                let (name, memory) = if crate::tensor::gpu_runtime::IS_NVIDIA {
+                let (name, memory) = if crate::tensor::gpu_runtime::is_nvidia_ordinal(i) {
                     (
                         self.get_cuda_device_name(i)
                             .unwrap_or_else(|_| format!("CUDA Device {}", i)),

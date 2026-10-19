@@ -3,40 +3,42 @@
 use crate::tensor::{DType, Result, Tensor};
 use core::ffi::c_void;
 
-extern "C" {
-    fn loken_flash_prefill_gqa_f16kv(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        o: *mut c_void,
-        n_head: i32,
-        n_kv: i32,
-        seq_q: i32,
-        seq_kv: i32,
-        head_dim: i32,
-        kv_tok_stride: i64,
-        kv_head_stride: i64,
-        scale: f32,
-        window: i32,
-        stream: i64,
-    ) -> i32;
-    fn loken_flash_prefill_gqa_parts_f16kv(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        o: *mut c_void,
-        ml: *mut f32,
-        n_head: i32,
-        n_kv: i32,
-        seq_q: i32,
-        seq_kv: i32,
-        head_dim: i32,
-        kv_tok_stride: i64,
-        kv_head_stride: i64,
-        scale: f32,
-        pos_off: i32,
-        stream: i64,
-    ) -> i32;
+crate::tensor::gpu_runtime::aot_kernels! {
+    extern "C" {
+        fn loken_flash_prefill_gqa_f16kv(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            o: *mut c_void,
+            n_head: i32,
+            n_kv: i32,
+            seq_q: i32,
+            seq_kv: i32,
+            head_dim: i32,
+            kv_tok_stride: i64,
+            kv_head_stride: i64,
+            scale: f32,
+            window: i32,
+            stream: i64,
+        ) -> i32;
+        fn loken_flash_prefill_gqa_parts_f16kv(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            o: *mut c_void,
+            ml: *mut f32,
+            n_head: i32,
+            n_kv: i32,
+            seq_q: i32,
+            seq_kv: i32,
+            head_dim: i32,
+            kv_tok_stride: i64,
+            kv_head_stride: i64,
+            scale: f32,
+            pos_off: i32,
+            stream: i64,
+        ) -> i32;
+    }
 }
 
 /// Head sizes `flash_prefill_gqa` has a kernel for.
@@ -60,7 +62,7 @@ pub fn flash_prefill_gqa(
     scale: f32,
     window: usize,
 ) -> Result<Option<Tensor>> {
-    if q.device().is_cuda() && !crate::tensor::gpu_runtime::IS_NVIDIA {
+    if q.device().is_cuda() && !q.device().is_nvidia() {
         return through_wmma(q, k, v, scale, window);
     }
     Ok(run(q, k, v, scale, window, None)?.map(|(out, _)| out))
@@ -134,7 +136,7 @@ fn run(
     // The kernel is written in NVIDIA's own matrix instructions; another runtime keeps the
     // caller's path.
     if !q.device().is_cuda()
-        || !crate::tensor::gpu_runtime::IS_NVIDIA
+        || !q.device().is_nvidia()
         || k.dtype() != DType::F16
         || v.dtype() != DType::F16
     {

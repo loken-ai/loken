@@ -117,7 +117,10 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
         let _ = crate::tensor::gpu_runtime::driver::result::init();
         if let Ok(n) = crate::tensor::gpu_runtime::driver::result::device::get_count() {
             let mut out = Vec::new();
-            for ordinal in 0..n {
+            // NVML lists NVIDIA cards only; the runtime numbers them first.
+            for ordinal in
+                (0..n).filter(|&o| crate::tensor::gpu_runtime::is_nvidia_ordinal(o as usize))
+            {
                 let mut id = [0 as std::os::raw::c_char; 64];
                 let ok = unsafe { cuDeviceGetPCIBusId(id.as_mut_ptr(), id.len() as i32, ordinal) }
                     == cudaError_enum::CUDA_SUCCESS;
@@ -152,7 +155,7 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
 /// NVIDIA runtime, the runtime's own count otherwise.
 pub fn card_count() -> usize {
     #[cfg(feature = "gpu")]
-    if !crate::tensor::gpu_runtime::IS_NVIDIA {
+    if !crate::tensor::gpu_runtime::only_nvidia_cards() {
         use crate::tensor::gpu_runtime::driver::result as cu;
         if crate::tensor::cuda::runtime::require().is_err() || cu::init().is_err() {
             return 0;
@@ -404,9 +407,17 @@ pub fn group_sum(_cards: &[usize]) -> Option<(f64, f64)> {
 }
 
 pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
+    // The cards NVML does not see, read through their runtime.
     #[cfg(feature = "gpu")]
-    if !crate::tensor::gpu_runtime::IS_NVIDIA {
-        return probe_runtime_gpus();
+    let others = if crate::tensor::gpu_runtime::only_nvidia_cards() {
+        Vec::new()
+    } else {
+        probe_runtime_gpus()
+    };
+    #[cfg(not(feature = "gpu"))]
+    let others: Vec<CudaGpuInfo> = Vec::new();
+    if !cfg!(feature = "cuda") {
+        return others;
     }
     let mut gpu_info: Vec<CudaGpuInfo> = Vec::new();
     match nvml_wrapper::Nvml::init() {
@@ -509,19 +520,19 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
             // Rank by compute throughput (CUDA cores x SM clock), fastest first,
             // with the GPU index as a stable tiebreaker. SM clock alone misranks
             // a high-boost but low-core card as fastest.
-            gpu_info.sort_by(|a, b| b.perf_score.cmp(&a.perf_score).then(a.index.cmp(&b.index)));
         }
         Err(e) => {
             warn!("⚠️  NVML init failed: {}", e);
         }
     }
+    gpu_info.extend(others);
+    gpu_info.sort_by(|a, b| b.perf_score.cmp(&a.perf_score).then(a.index.cmp(&b.index)));
     gpu_info
 }
 
-/// Every card the runtime lists, read through the runtime itself, for a runtime NVML does not
-/// see: name and memory from the driver, the throughput proxy from compute units times clock,
-/// the host link from the PCI device's own link in sysfs. Sorted fastest first like
-/// `probe_cuda_gpus`.
+/// Every card the runtime lists that NVML does not see, read through the runtime itself: name
+/// and memory from the driver, the throughput proxy from compute units times clock, the host
+/// link from the PCI device's own link in sysfs. Sorted fastest first like `probe_cuda_gpus`.
 #[cfg(feature = "gpu")]
 fn probe_runtime_gpus() -> Vec<CudaGpuInfo> {
     use crate::tensor::gpu_runtime::driver::result as cu;
@@ -531,7 +542,8 @@ fn probe_runtime_gpus() -> Vec<CudaGpuInfo> {
     }
     let count = cu::device::get_count().unwrap_or(0).max(0) as usize;
     let mut gpu_info = Vec::new();
-    for i in 0..count {
+    // The NVIDIA cards are NVML's to read.
+    for i in (0..count).filter(|&i| !crate::tensor::gpu_runtime::is_nvidia_ordinal(i)) {
         let Ok(d) = cu::device::get(i as i32) else {
             continue;
         };
@@ -778,8 +790,10 @@ mod visible_tests {
             eprintln!("skipping: no NVML");
             return;
         };
-        let visible =
-            crate::tensor::gpu_runtime::driver::result::device::get_count().unwrap_or(0) as usize;
+        let visible = (0..crate::tensor::gpu_runtime::driver::result::device::get_count()
+            .unwrap_or(0) as usize)
+            .filter(|&o| crate::tensor::gpu_runtime::is_nvidia_ordinal(o))
+            .count();
         let cards = visible_cards(&nvml);
         assert_eq!(cards.len(), visible, "every visible card and only those");
         for (ordinal, index) in cards {

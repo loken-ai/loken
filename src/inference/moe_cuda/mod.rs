@@ -10,11 +10,13 @@ use crate::tensor::cuda_ext::{tensor_from_cuda_storage, CudaStorage, DevicePtr};
 use crate::tensor::{DType, Result, StorageView, Tensor};
 use core::ffi::c_void;
 
-extern "C" {
-    /// The rows of one chunk of the chunked delta-rule launch: fewer rows run row by row.
-    fn loken_gated_delta_net_chunk_rows() -> i32;
-    /// The scratch, in floats, the chunked delta-rule launch needs for these shapes.
-    fn loken_gated_delta_net_chunked_scratch(h: i32, n_tokens: i32, s_v: i32) -> i64;
+crate::tensor::gpu_runtime::aot_kernels! {
+    extern "C" {
+        /// The rows of one chunk of the chunked delta-rule launch: fewer rows run row by row.
+        fn loken_gated_delta_net_chunk_rows() -> i32;
+        /// The scratch, in floats, the chunked delta-rule launch needs for these shapes.
+        fn loken_gated_delta_net_chunked_scratch(h: i32, n_tokens: i32, s_v: i32) -> i64;
+    }
 }
 
 cuda_launchers! {

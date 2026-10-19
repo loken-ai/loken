@@ -481,7 +481,7 @@ impl CudaDevice {
     /// sm_80, so those families ship no code for a Turing card and their callers have to
     /// decline the same way they decline an unsupported dtype - a launch would fail.
     pub fn has_ampere_tensor_cores(&self) -> bool {
-        crate::tensor::gpu_runtime::IS_NVIDIA && self.mmq_device_info().is_ok_and(|i| i.cc >= 800)
+        self.is_nvidia() && self.mmq_device_info().is_ok_and(|i| i.cc >= 800)
     }
 
     pub fn mmq_device_info(&self) -> Result<MmqDeviceInfo> {
@@ -503,11 +503,12 @@ impl CudaDevice {
         );
         // An NVIDIA card's compute capability, or an AMD card's generation above the offset the
         // kernels test, so no NVIDIA-only path opens for it.
-        #[cfg(feature = "cuda")]
+        #[cfg(not(feature = "rocm"))]
         let cc = major * 100 + minor * 10;
-        #[cfg(not(feature = "cuda"))]
-        let cc = {
-            let _ = (major, minor);
+        #[cfg(feature = "rocm")]
+        let cc = if self.is_nvidia() {
+            major * 100 + minor * 10
+        } else {
             result::device::gcn_arch_name(cu_device)
                 .ok()
                 .and_then(|name| amd_generation(&name))
@@ -697,6 +698,11 @@ impl CudaDevice {
         self.ordinal
     }
 
+    /// Whether NVIDIA's runtime drives this card.
+    pub fn is_nvidia(&self) -> bool {
+        crate::tensor::gpu_runtime::is_nvidia_ordinal(self.ordinal)
+    }
+
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.ctx
     }
@@ -831,12 +837,12 @@ pub(crate) fn dev_const_i32(dev: &CudaDevice, vals: &[i32]) -> Result<Arc<CudaSl
 
 /// Where the kernels' `cc` encoding puts an AMD card: its generation is added to this, so every
 /// value at or above it is not an NVIDIA compute capability.
-#[cfg(any(not(feature = "cuda"), test))]
+#[cfg(any(feature = "rocm", test))]
 pub const AMD_CC_OFFSET: i32 = 0x100_0000;
 
 /// An AMD card's generation from its architecture name: the hexadecimal digits after `gfx`, before
 /// any feature suffix (`gfx1201:sramecc-` is `0x1201`, `gfx90a` is `0x90a`).
-#[cfg(any(not(feature = "cuda"), test))]
+#[cfg(any(feature = "rocm", test))]
 pub fn amd_generation(arch: &str) -> Option<i32> {
     let digits = arch.strip_prefix("gfx")?.split(':').next()?;
     if digits.is_empty() || digits.len() > 4 {

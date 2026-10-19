@@ -54,6 +54,11 @@ impl std::fmt::Debug for DriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut t = f.debug_tuple("DriverError");
         t.field(&self.0);
+        #[cfg(feature = "cuda")]
+        if let Some(s) = crate::tensor::gpu_runtime::dual::cuda_error_string(self.0) {
+            t.field(&s);
+            return t.finish();
+        }
         match self.error_string() {
             Ok(s) => t.field(&s),
             Err(_) => t.field(&"<no description>"),

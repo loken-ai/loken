@@ -436,14 +436,16 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
         return;
     }
 
-    extern "C" {
-        fn loken_moe_expert_offsets(
-            expert_ids: *const i32,
-            size_m: i32,
-            expert_offsets: *mut i32,
-            num_experts: i32,
-            stream: *mut std::ffi::c_void,
-        );
+    crate::tensor::gpu_runtime::aot_kernels! {
+        extern "C" {
+            fn loken_moe_expert_offsets(
+                expert_ids: *const i32,
+                size_m: i32,
+                expert_offsets: *mut i32,
+                num_experts: i32,
+                stream: *mut std::ffi::c_void,
+            );
+        }
     }
 
     // (expert count, the sorted expert id of each token)

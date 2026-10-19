@@ -14,13 +14,15 @@
 macro_rules! cuda_launchers {
     ($(
         $(#[$attr:meta])*
-        $name:ident($($arg:ident: $ty:ty),* $(,)?);
+        $vis:vis $name:ident($($arg:ident: $ty:ty),* $(,)?);
     )+) => {
-        extern "C" {
-            $(
-                $(#[$attr])*
-                fn $name($($arg: $ty,)* stream: i64);
-            )+
+        crate::tensor::gpu_runtime::aot_kernels! {
+            extern "C" {
+                $(
+                    $(#[$attr])*
+                    $vis fn $name($($arg: $ty,)* stream: i64);
+                )+
+            }
         }
     };
 }

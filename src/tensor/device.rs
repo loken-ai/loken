@@ -41,6 +41,17 @@ impl Device {
         }
     }
 
+    /// Whether this is a card NVIDIA's runtime drives: kernels written in NVIDIA's own
+    /// instructions run only there.
+    pub fn is_nvidia(&self) -> bool {
+        match self {
+            Self::Cpu => false,
+            #[cfg(feature = "gpu")]
+            Self::Cuda(d) => d.is_nvidia(),
+            Self::Dry(_) => false,
+        }
+    }
+
     /// Whether the code should take the ARRANGEMENT a card gets.
     ///
     /// A branch on a device asks one of two questions, and until this existed they

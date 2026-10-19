@@ -208,7 +208,7 @@ pub fn flash_dit_bf16(
     }
     // The kernel is written in NVIDIA's warp-matrix instructions: another runtime has no build
     // of it.
-    if !crate::tensor::gpu_runtime::IS_NVIDIA {
+    if !q.device().is_nvidia() {
         return Ok(None);
     }
     // This kernel ships SASS only for the architectures whose shared memory fits its

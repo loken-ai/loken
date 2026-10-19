@@ -79,6 +79,8 @@ pub(crate) mod tiny_model;
 mod tp_forward;
 #[cfg(all(test, feature = "gpu"))]
 mod tp_tests;
+#[cfg(all(test, feature = "cuda", feature = "rocm"))]
+mod vendor_split_parity;
 #[cfg(all(test, feature = "gpu"))]
 mod verify_decode_parity;
 mod verify_window;

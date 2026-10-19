@@ -64,31 +64,6 @@ cuda_launchers! {
         nsplit: i32, head_dim: i32, scale: f32, k_batch_stride: i64, k_head_stride: i64,
         k_pos_stride: i64, v_batch_stride: i64, v_head_stride: i64, v_pos_stride: i64);
     loken_copy_f32(src: *const f32, dst: *mut f32, n: i32);
-    #[link_name = "flash_dit_bf16_hd64"]
-    flash_dit_bf16_hd64_raw(
-        q: *const c_void, k: *const c_void, v: *const c_void,
-        o: *mut c_void, batch: i32, n_head: i32, seq_q: i32, seq_kv: i32,
-        scale: f32, frame_tokens: i32, grid_w: i32);
-    #[link_name = "flash_dit_bf16_hd128"]
-    flash_dit_bf16_hd128_raw(
-        q: *const c_void, k: *const c_void, v: *const c_void,
-        o: *mut c_void, batch: i32, n_head: i32, seq_q: i32, seq_kv: i32,
-        scale: f32, frame_tokens: i32, grid_w: i32);
-    #[link_name = "flash_prefill_f16"]
-    flash_prefill_f16_raw(
-        q: *const c_void, k: *const c_void, v: *const c_void,
-        o: *mut c_void, batch: i32, n_head: i32, n_kv: i32, seq_q: i32, seq_kv: i32,
-        head_dim: i32, scale: f32, window: i32);
-    #[link_name = "flash_prefill_split_f16"]
-    flash_prefill_split_f16_raw(
-        q: *const c_void, k: *const c_void, v: *const c_void,
-        partials: *mut f32, o: *mut c_void, batch: i32, n_head: i32, n_kv: i32,
-        seq_q: i32, seq_kv: i32, head_dim: i32, nsplit: i32, scale: f32, window: i32);
-    #[link_name = "flash_prefill_parts_f16"]
-    flash_prefill_parts_f16_raw(
-        q: *const c_void, k: *const c_void, v: *const c_void,
-        partials: *mut f32, n_head: i32, n_kv: i32, seq_q: i32, seq_kv: i32,
-        head_dim: i32, nsplit: i32, scale: f32, pos_off: i32);
     loken_flash_decode_devkvlen_f16(
         q: *const c_void, k: *const c_void, v: *const c_void,
         pos_dev: *const i32, out: *mut c_void, sinks: *const f32, batch: i32,
@@ -116,6 +91,40 @@ cuda_launchers! {
         batch: i32, n_head: i32, n_kv: i32, nsplit: i32, head_dim: i32, scale: f32,
         block_size: i32, max_blocks: i32, feat: i32);
 }
+
+/// The launchers whose safe wrappers keep the launcher's own name: declared apart and imported
+/// under a `_raw` name.
+mod raw {
+    use core::ffi::c_void;
+    cuda_launchers! {
+        pub(super) flash_dit_bf16_hd64(
+            q: *const c_void, k: *const c_void, v: *const c_void,
+            o: *mut c_void, batch: i32, n_head: i32, seq_q: i32, seq_kv: i32,
+            scale: f32, frame_tokens: i32, grid_w: i32);
+        pub(super) flash_dit_bf16_hd128(
+            q: *const c_void, k: *const c_void, v: *const c_void,
+            o: *mut c_void, batch: i32, n_head: i32, seq_q: i32, seq_kv: i32,
+            scale: f32, frame_tokens: i32, grid_w: i32);
+        pub(super) flash_prefill_f16(
+            q: *const c_void, k: *const c_void, v: *const c_void,
+            o: *mut c_void, batch: i32, n_head: i32, n_kv: i32, seq_q: i32, seq_kv: i32,
+            head_dim: i32, scale: f32, window: i32);
+        pub(super) flash_prefill_split_f16(
+            q: *const c_void, k: *const c_void, v: *const c_void,
+            partials: *mut f32, o: *mut c_void, batch: i32, n_head: i32, n_kv: i32,
+            seq_q: i32, seq_kv: i32, head_dim: i32, nsplit: i32, scale: f32, window: i32);
+        pub(super) flash_prefill_parts_f16(
+            q: *const c_void, k: *const c_void, v: *const c_void,
+            partials: *mut f32, n_head: i32, n_kv: i32, seq_q: i32, seq_kv: i32,
+            head_dim: i32, nsplit: i32, scale: f32, pos_off: i32);
+    }
+}
+use raw::{
+    flash_dit_bf16_hd128 as flash_dit_bf16_hd128_raw,
+    flash_dit_bf16_hd64 as flash_dit_bf16_hd64_raw, flash_prefill_f16 as flash_prefill_f16_raw,
+    flash_prefill_parts_f16 as flash_prefill_parts_f16_raw,
+    flash_prefill_split_f16 as flash_prefill_split_f16_raw,
+};
 
 mod attention;
 pub use attention::*;

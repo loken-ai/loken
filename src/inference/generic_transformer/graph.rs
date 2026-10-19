@@ -478,7 +478,15 @@ impl GenericHeteroTransformer {
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
         #[cfg(feature = "gpu")]
-        if !crate::tensor::gpu_runtime::IS_NVIDIA {
+        if self
+            .layers
+            .iter()
+            .any(|l| l.cos.device().is_cuda() && !l.cos.device().is_nvidia())
+            || self
+                .cuda_devices
+                .values()
+                .any(|d| d.is_cuda() && !d.is_nvidia())
+        {
             return Err("this GPU runtime replays no captured decode step yet");
         }
         // A sink layer's step is not captured: its replay, which reads the length on the

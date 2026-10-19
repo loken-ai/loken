@@ -26,6 +26,21 @@ HIP runtime, hipBLAS, hipRTC and RCCL are opened when the server starts, so the 
 a machine without them and lists no AMD card. Not yet on AMD: the replayed decode step and the
 kernels written in NVIDIA's own matrix instructions, whose callers take their other paths.
 
+## NVIDIA and AMD cards in one binary
+
+```sh
+cargo build --release --features cuda,rocm
+```
+
+The build wants both toolkits. It lists the NVIDIA cards through CUDA, then the AMD cards through
+HIP, as one set of card numbers: the placement plan, the ladder and the probes see every card,
+and a model can be split across a GeForce and a Radeon. Tensors move between cards of different
+vendors through host memory, as between cards without peer access. Each runtime's libraries are
+opened when the server starts, the HIP runtime included, so the binary starts on a machine with
+one vendor's stack and lists only that vendor's cards. A tensor-parallel group and a replayed
+decode step stay on cards of one vendor; a layer on an AMD card takes the kernels the ROCm build
+runs.
+
 ## Without CUDA
 
 ```sh

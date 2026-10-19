@@ -66,25 +66,27 @@ macro_rules! mmq_quantizers {
         );
 
         #[cfg(feature = "gpu")]
-        extern "C" {
-            $(
-                $(#[$note])*
-                fn $name(
-                    x: *const std::ffi::c_void,
-                    ids: *const i32,
-                    vy: *mut std::ffi::c_void,
-                    type_x: i32,
-                    ne00: i64,
-                    s01: i64,
-                    s02: i64,
-                    s03: i64,
-                    ne0: i64,
-                    ne1: i64,
-                    ne2: i64,
-                    ne3: i64,
-                    stream: *mut std::ffi::c_void,
-                );
-            )+
+        crate::tensor::gpu_runtime::aot_kernels! {
+            extern "C" {
+                $(
+                    $(#[$note])*
+                    fn $name(
+                        x: *const std::ffi::c_void,
+                        ids: *const i32,
+                        vy: *mut std::ffi::c_void,
+                        type_x: i32,
+                        ne00: i64,
+                        s01: i64,
+                        s02: i64,
+                        s03: i64,
+                        ne0: i64,
+                        ne1: i64,
+                        ne2: i64,
+                        ne3: i64,
+                        stream: *mut std::ffi::c_void,
+                    );
+                )+
+            }
         }
     };
 }
@@ -154,54 +156,58 @@ macro_rules! mmq_formats {
         ) -> i32;
 
         #[cfg(feature = "gpu")]
-        extern "C" {
-            $(
-                fn $moe(
-                    x: *const std::ffi::c_void,
-                    x_second: *const std::ffi::c_void,
-                    dst_second: i64,
-                    y: *const std::ffi::c_void,
-                    dst: *mut std::ffi::c_void,
-                    expert_bounds: *const i32,
-                    ids_dst: *const i32,
-                    stride_expert_x: i64,
-                    ncols_x: i64,
-                    nrows_x: i64,
-                    ncols_y: i64,
-                    stride_row_x: i64,
-                    stride_col_dst: i64,
-                    n_experts: i32,
-                    ncols_max: i64,
-                    ncols_hint: i64,
-                    mmq_x: i32,
-                    cc: i32,
-                    smpbo: i64,
-                    warp_size: i32,
-                    stream: *mut std::ffi::c_void,
-                ) -> i32;
-            )+
+        crate::tensor::gpu_runtime::aot_kernels! {
+            extern "C" {
+                $(
+                    fn $moe(
+                        x: *const std::ffi::c_void,
+                        x_second: *const std::ffi::c_void,
+                        dst_second: i64,
+                        y: *const std::ffi::c_void,
+                        dst: *mut std::ffi::c_void,
+                        expert_bounds: *const i32,
+                        ids_dst: *const i32,
+                        stride_expert_x: i64,
+                        ncols_x: i64,
+                        nrows_x: i64,
+                        ncols_y: i64,
+                        stride_row_x: i64,
+                        stride_col_dst: i64,
+                        n_experts: i32,
+                        ncols_max: i64,
+                        ncols_hint: i64,
+                        mmq_x: i32,
+                        cc: i32,
+                        smpbo: i64,
+                        warp_size: i32,
+                        stream: *mut std::ffi::c_void,
+                    ) -> i32;
+                )+
+            }
         }
 
         #[cfg(feature = "gpu")]
-        extern "C" {
-            $(
-                fn $matmul(
-                    tmp_fixup: *mut std::ffi::c_void,
-                    x: *const std::ffi::c_void,
-                    y: *const std::ffi::c_void,
-                    dst: *mut std::ffi::c_void,
-                    ncols_x: i64,
-                    nrows_x: i64,
-                    ncols_y: i64,
-                    stride_row_x: i64,
-                    stride_col_dst: i64,
-                    cc: i32,
-                    nsm: i32,
-                    smpbo: i64,
-                    warp_size: i32,
-                    stream: *mut std::ffi::c_void,
-                );
-            )+
+        crate::tensor::gpu_runtime::aot_kernels! {
+            extern "C" {
+                $(
+                    fn $matmul(
+                        tmp_fixup: *mut std::ffi::c_void,
+                        x: *const std::ffi::c_void,
+                        y: *const std::ffi::c_void,
+                        dst: *mut std::ffi::c_void,
+                        ncols_x: i64,
+                        nrows_x: i64,
+                        ncols_y: i64,
+                        stride_row_x: i64,
+                        stride_col_dst: i64,
+                        cc: i32,
+                        nsm: i32,
+                        smpbo: i64,
+                        warp_size: i32,
+                        stream: *mut std::ffi::c_void,
+                    );
+                )+
+            }
         }
 
         /// Whether a tile kernel exists for this weight format.
@@ -269,30 +275,32 @@ mmq_formats! {
 macro_rules! expert_only_formats {
     ($($dtype:ident => $launcher:ident;)+) => {
         #[cfg(feature = "gpu")]
-        extern "C" {
-            $(fn $launcher(
-                x: *const std::ffi::c_void,
-                x_second: *const std::ffi::c_void,
-                dst_second: i64,
-                y: *const std::ffi::c_void,
-                dst: *mut std::ffi::c_void,
-                expert_bounds: *const i32,
-                ids_dst: *const i32,
-                stride_expert_x: i64,
-                ncols_x: i64,
-                nrows_x: i64,
-                ncols_y: i64,
-                stride_row_x: i64,
-                stride_col_dst: i64,
-                n_experts: i32,
-                ncols_max: i64,
-                ncols_hint: i64,
-                mmq_x: i32,
-                cc: i32,
-                smpbo: i64,
-                warp_size: i32,
-                stream: *mut std::ffi::c_void,
-            ) -> i32;)+
+        crate::tensor::gpu_runtime::aot_kernels! {
+            extern "C" {
+                $(fn $launcher(
+                    x: *const std::ffi::c_void,
+                    x_second: *const std::ffi::c_void,
+                    dst_second: i64,
+                    y: *const std::ffi::c_void,
+                    dst: *mut std::ffi::c_void,
+                    expert_bounds: *const i32,
+                    ids_dst: *const i32,
+                    stride_expert_x: i64,
+                    ncols_x: i64,
+                    nrows_x: i64,
+                    ncols_y: i64,
+                    stride_row_x: i64,
+                    stride_col_dst: i64,
+                    n_experts: i32,
+                    ncols_max: i64,
+                    ncols_hint: i64,
+                    mmq_x: i32,
+                    cc: i32,
+                    smpbo: i64,
+                    warp_size: i32,
+                    stream: *mut std::ffi::c_void,
+                ) -> i32;)+
+            }
         }
 
         /// The expert-batched launcher of a format only mixtures store.

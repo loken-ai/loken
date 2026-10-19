@@ -372,7 +372,7 @@ pub enum CUstreamCaptureStatus_enum {
 pub use self::CUstreamCaptureStatus_enum as CUstreamCaptureStatus;
 
 impl CUstreamCaptureStatus_enum {
-    fn from_hip(v: c_int) -> Self {
+    pub(crate) fn from_hip(v: c_int) -> Self {
         match v {
             0 => Self::CU_STREAM_CAPTURE_STATUS_NONE,
             1 => Self::CU_STREAM_CAPTURE_STATUS_ACTIVE,
@@ -403,7 +403,7 @@ pub enum CUgraphNodeType_enum {
 pub use self::CUgraphNodeType_enum as CUgraphNodeType;
 
 impl CUgraphNodeType_enum {
-    fn from_hip(v: c_int) -> Self {
+    pub(crate) fn from_hip(v: c_int) -> Self {
         use CUgraphNodeType_enum::*;
         [
             CU_GRAPH_NODE_TYPE_KERNEL,

@@ -26,15 +26,17 @@ use half::f16;
 
 // The IMMA (tensor-core) GEMV kernel, compiled by NVCC into libloken_imma.a
 // (see build.rs). NVRTC can't JIT `mma.sync`, so this stays an FFI launcher.
-extern "C" {
-    fn q4k_mmvq_imma(
-        vx: *const core::ffi::c_void,
-        vy: *const core::ffi::c_void,
-        dst: *mut core::ffi::c_void,
-        ncols_x: i32,
-        nrows_x: i32,
-        stream: i64,
-    );
+crate::tensor::gpu_runtime::aot_kernels! {
+    extern "C" {
+        fn q4k_mmvq_imma(
+            vx: *const core::ffi::c_void,
+            vy: *const core::ffi::c_void,
+            dst: *mut core::ffi::c_void,
+            ncols_x: i32,
+            nrows_x: i32,
+            stream: i64,
+        );
+    }
 }
 
 /// Local equivalent of the reference internal `builder_arg!` macro: push each scalar
@@ -105,6 +107,13 @@ pub(crate) fn nvrtc_arch_of_ordinal(ordinal: usize) -> Option<&'static str> {
     use crate::tensor::gpu_runtime::driver::result as cu;
     use crate::tensor::gpu_runtime::driver::sys::CUdevice_attribute as A;
     let d = cu::device::get(ordinal as i32).ok()?;
+    // An AMD card's code is compiled for its own architecture name.
+    #[cfg(feature = "rocm")]
+    if !crate::tensor::gpu_runtime::is_nvidia_ordinal(ordinal) {
+        let a: &'static str = Box::leak(cu::device::gcn_arch_name(d).ok()?.into_boxed_str());
+        g.insert(ordinal, a);
+        return Some(a);
+    }
     let maj =
         unsafe { cu::device::get_attribute(d, A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) }
             .ok()?;
@@ -129,7 +138,7 @@ pub(crate) fn nvrtc_arch() -> Option<&'static str> {
         cu::init().ok()?;
         let n = cu::device::get_count().ok()?;
         let mut min: Option<(i32, i32)> = None;
-        for i in 0..n {
+        for i in (0..n).filter(|&i| crate::tensor::gpu_runtime::is_nvidia_ordinal(i as usize)) {
             let d = cu::device::get(i).ok()?;
             let maj = unsafe {
                 cu::device::get_attribute(d, A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)

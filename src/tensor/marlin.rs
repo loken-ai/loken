@@ -262,24 +262,26 @@ mod device {
     use crate::tensor::gpu_runtime::driver::{CudaSlice, CudaView, DevicePtr};
     use std::sync::Arc;
 
-    extern "C" {
-        /// cuda/marlin/marlin_launcher.cu - returns 0 on success.
-        fn loken_marlin_awq_f16_gemm(
-            a: *const std::ffi::c_void,
-            b: *const std::ffi::c_void,
-            scales: *const std::ffi::c_void,
-            zp: *const std::ffi::c_void,
-            c: *mut std::ffi::c_void,
-            c_tmp: *mut f32,
-            locks: *mut i32,
-            prob_m: i32,
-            prob_n: i32,
-            prob_k: i32,
-            num_groups: i32,
-            sms: i32,
-            max_shared_mem: i32,
-            stream: *mut std::ffi::c_void,
-        ) -> i32;
+    crate::tensor::gpu_runtime::aot_kernels! {
+        extern "C" {
+            /// cuda/marlin/marlin_launcher.cu - returns 0 on success.
+            fn loken_marlin_awq_f16_gemm(
+                a: *const std::ffi::c_void,
+                b: *const std::ffi::c_void,
+                scales: *const std::ffi::c_void,
+                zp: *const std::ffi::c_void,
+                c: *mut std::ffi::c_void,
+                c_tmp: *mut f32,
+                locks: *mut i32,
+                prob_m: i32,
+                prob_n: i32,
+                prob_k: i32,
+                num_groups: i32,
+                sms: i32,
+                max_shared_mem: i32,
+                stream: *mut std::ffi::c_void,
+            ) -> i32;
+        }
     }
 
     /// Kernel scratch shared by every Marlin layer on one stream: the fp32 partial-tile

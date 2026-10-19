@@ -51,20 +51,22 @@ pub use correct::*;
 mod cast;
 pub use cast::*;
 
-extern "C" {
-    fn loken_moe_gemm_gguf_gate_up_silu_mul(
-        inputs: *const f32,
-        gate_weights: *const core::ffi::c_void,
-        up_weights: *const core::ffi::c_void,
-        sorted_token_ids: *const i32,
-        expert_ids: *const i32,
-        outputs: *mut f32,
-        num_experts: i32,
-        topk: i32,
-        size_m: i32,
-        size_n: i32,
-        size_k: i32,
-        quant_type: i32,
-        stream: i64,
-    );
+crate::tensor::gpu_runtime::aot_kernels! {
+    extern "C" {
+        fn loken_moe_gemm_gguf_gate_up_silu_mul(
+            inputs: *const f32,
+            gate_weights: *const core::ffi::c_void,
+            up_weights: *const core::ffi::c_void,
+            sorted_token_ids: *const i32,
+            expert_ids: *const i32,
+            outputs: *mut f32,
+            num_experts: i32,
+            topk: i32,
+            size_m: i32,
+            size_n: i32,
+            size_k: i32,
+            quant_type: i32,
+            stream: i64,
+        );
+    }
 }

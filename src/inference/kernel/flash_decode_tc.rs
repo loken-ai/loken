@@ -26,24 +26,26 @@ use anyhow::Result;
 use core::ffi::c_void;
 use half::f16;
 
-extern "C" {
-    fn flashdecode_tc_hd128(
-        k_blocks: *const c_void,
-        v_blocks: *const c_void,
-        q: *const c_void,
-        partials: *mut f32,
-        seq_kv_dev: *const i32,
-        out: *mut c_void,
-        n_kv: i32,
-        n_q_per_kv: i32,
-        qlen: i32,
-        grid_splits: i32,
-        chunk: i32,
-        lo: i32,
-        hi: i32,
-        scale: f32,
-        stream: i64,
-    );
+crate::tensor::gpu_runtime::aot_kernels! {
+    extern "C" {
+        fn flashdecode_tc_hd128(
+            k_blocks: *const c_void,
+            v_blocks: *const c_void,
+            q: *const c_void,
+            partials: *mut f32,
+            seq_kv_dev: *const i32,
+            out: *mut c_void,
+            n_kv: i32,
+            n_q_per_kv: i32,
+            qlen: i32,
+            grid_splits: i32,
+            chunk: i32,
+            lo: i32,
+            hi: i32,
+            scale: f32,
+            stream: i64,
+        );
+    }
 }
 
 const MAX_NSPLIT: usize = 256;

@@ -1,8 +1,9 @@
-//! Checks of the HIP runtime surface on the first device the runtime lists. Each test passes
-//! without running when no device is listed. Only the runtime module is used, so the binary
+//! Checks of the HIP runtime surface on the first AMD card listed: the first device of a ROCm
+//! build, the first card after the NVIDIA ones in a build with both runtimes. Each test passes
+//! without running when no AMD card is listed. Only the runtime module is used, so the binary
 //! links without the static kernel libraries.
 
-#![cfg(all(feature = "rocm", not(feature = "cuda")))]
+#![cfg(feature = "rocm")]
 
 use std::sync::Arc;
 
@@ -13,16 +14,13 @@ use loken::tensor::gpu_runtime::driver::{
 };
 use loken::tensor::gpu_runtime::nvrtc;
 
-/// The first device and its default stream, or `None` when the runtime lists none.
+/// The first AMD card and its default stream, or `None` when none is listed.
 fn device() -> Option<(Arc<CudaContext>, Arc<CudaStream>)> {
-    match CudaContext::device_count() {
-        Ok(n) if n > 0 => {
-            let ctx = CudaContext::new(0).expect("open device 0");
-            let stream = ctx.default_stream();
-            Some((ctx, stream))
-        }
-        _ => None,
-    }
+    let n = CudaContext::device_count().ok()?.max(0) as usize;
+    let ordinal = (0..n).find(|&i| !loken::tensor::gpu_runtime::is_nvidia_ordinal(i))?;
+    let ctx = CudaContext::new(ordinal).expect("open the AMD card");
+    let stream = ctx.default_stream();
+    Some((ctx, stream))
 }
 
 const ADD_ONE: &str = r#"

@@ -82,8 +82,9 @@ fn main() {
         compile_marlin_kernels();
         compile_flashdecode_tc_kernels();
     }
-    // The same kernels for AMD cards, through HIP, when ROCm is the runtime.
-    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    // The same kernels for AMD cards, through HIP: alone when ROCm is the only runtime, beside
+    // the CUDA ones under a prefix of their own when both are.
+    #[cfg(feature = "rocm")]
     compile_hip_kernels();
 }
 
@@ -159,7 +160,7 @@ const KERNELS_MMQ: [&str; 18] = [
 /// The AMD targets a portable ROCm build carries code for, oldest first: CDNA (MFMA), RDNA2,
 /// RDNA3, RDNA3.5 and RDNA4 (WMMA from RDNA3 on). The runtime loads the object for the card it
 /// finds; a card none of them covers has no GPU code in this build.
-#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+#[cfg(feature = "rocm")]
 const ROCM_ARCHS: [&str; 11] = [
     "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151",
     "gfx1200", "gfx1201",
@@ -169,8 +170,13 @@ const ROCM_ARCHS: [&str; 11] = [
 /// `LOKEN_ROCM_ARCHS` (comma separated) or, without it, every target of [`ROCM_ARCHS`]. The
 /// sources are the CUDA build's, read through `cuda/hip`, which gives the CUDA names their HIP
 /// meaning; the kernels in NVIDIA's own instructions are left out and `cuda/hip/nvidia_only.cpp`
-/// stands for their launchers. HIP has no static runtime: the binary links `libamdhip64`.
-#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+/// stands for their launchers. HIP has no static runtime: a ROCm build links `libamdhip64`.
+///
+/// Beside the CUDA kernels, every symbol the objects define takes the prefix `loken_hip_`, so the
+/// two libraries do not clash, and every call they make into `libamdhip64` goes through a
+/// trampoline that the library opened at start resolves (see [`hip_runtime_trampolines`]): the
+/// binary then starts on a machine without ROCm.
+#[cfg(feature = "rocm")]
 fn compile_hip_kernels() {
     use std::path::PathBuf;
     use std::process::Command;
@@ -260,7 +266,12 @@ fn compile_hip_kernels() {
             })
         })
         .collect();
-    let objs: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    #[allow(unused_mut)]
+    let mut objs: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    #[cfg(feature = "cuda")]
+    {
+        objs = prefix_hip_symbols(&objs, &rocm.join("lib").join("libamdhip64.so"), &out_dir);
+    }
 
     let lib = out_dir.join("libloken_hip_kernels.a");
     let _ = std::fs::remove_file(&lib);
@@ -273,11 +284,148 @@ fn compile_hip_kernels() {
     assert!(ar.success(), "ar failed for libloken_hip_kernels.a");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=loken_hip_kernels");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        rocm.join("lib").display()
+    if cfg!(not(feature = "cuda")) {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            rocm.join("lib").display()
+        );
+        println!("cargo:rustc-link-lib=dylib=amdhip64");
+    }
+}
+
+/// The names `nm` lists for `obj` with `flags`, one per symbol.
+#[cfg(all(feature = "rocm", feature = "cuda"))]
+fn symbol_names(obj: &std::path::Path, flags: &[&str]) -> Vec<String> {
+    let out = std::process::Command::new("nm")
+        .args(flags)
+        .arg("-P")
+        .arg(obj)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run nm on {obj:?}: {e}"));
+    assert!(out.status.success(), "nm failed on {obj:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+/// Renames the HIP objects' symbols for a binary that also carries the CUDA kernels: each
+/// defined global `s` becomes `loken_hip_s`, and each call into `libamdhip64` becomes a call to
+/// `loken_hiprt_s`, a trampoline added to the returned objects.
+#[cfg(all(feature = "rocm", feature = "cuda"))]
+fn prefix_hip_symbols(
+    objs: &[std::path::PathBuf],
+    hip_runtime: &std::path::Path,
+    out_dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    use std::collections::BTreeSet;
+    let runtime: BTreeSet<String> = symbol_names(hip_runtime, &["-D", "--defined-only"])
+        .into_iter()
+        .map(|s| s.split('@').next().unwrap_or_default().to_string())
+        .collect();
+    let mut defined = BTreeSet::new();
+    let mut undefined = BTreeSet::new();
+    for obj in objs {
+        defined.extend(symbol_names(obj, &["--defined-only", "-g"]));
+        undefined.extend(symbol_names(obj, &["-u"]));
+    }
+    let calls: Vec<String> = undefined
+        .into_iter()
+        .filter(|s| !defined.contains(s) && runtime.contains(s))
+        .collect();
+    let mut map = String::new();
+    for s in &defined {
+        map.push_str(&format!("{s} loken_hip_{s}\n"));
+    }
+    for s in &calls {
+        map.push_str(&format!("{s} loken_hiprt_{s}\n"));
+    }
+    let map_file = out_dir.join("hip_symbols.map");
+    std::fs::write(&map_file, map).expect("symbol map");
+    let mut renamed: Vec<std::path::PathBuf> = objs
+        .iter()
+        .map(|obj| {
+            let out = obj.with_extension("prefixed.o");
+            let status = std::process::Command::new("objcopy")
+                .arg(format!("--redefine-syms={}", map_file.display()))
+                .arg(obj)
+                .arg(&out)
+                .status()
+                .expect("failed to run objcopy");
+            assert!(status.success(), "objcopy failed on {obj:?}");
+            out
+        })
+        .collect();
+    renamed.push(hip_runtime_trampolines(&calls, out_dir));
+    renamed
+}
+
+/// The highest major version tried when `libamdhip64` has no unversioned name on the search
+/// path, as the run-time HIP module tries it.
+#[cfg(all(feature = "rocm", feature = "cuda"))]
+const HIP_MAX_SONAME_MAJOR: u32 = 16;
+
+/// An object holding one trampoline `loken_hiprt_s` per HIP runtime entry point `s` the kernels
+/// call, and a constructor that runs before the kernels' own and resolves them in `libamdhip64`
+/// when it opens. An unresolved trampoline returns zero: the kernels' registration then does
+/// nothing, and no AMD card is listed to launch them on.
+#[cfg(all(feature = "rocm", feature = "cuda"))]
+fn hip_runtime_trampolines(calls: &[String], out_dir: &std::path::Path) -> std::path::PathBuf {
+    use std::fmt::Write;
+    let mut c = String::new();
+    let _ = writeln!(c, "#include <dlfcn.h>");
+    let _ = writeln!(c, "#include <stdio.h>");
+    let _ = writeln!(c, "void* loken_hiprt_table[{}];", calls.len().max(1));
+    let _ = writeln!(c, "static const char* const loken_hiprt_names[] = {{");
+    for s in calls {
+        let _ = writeln!(c, "    \"{s}\",");
+    }
+    let _ = writeln!(c, "    0,\n}};");
+    let _ = writeln!(
+        c,
+        r#"__attribute__((constructor(101))) static void loken_hiprt_resolve(void) {{
+    void* h = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+    char name[32];
+    for (int v = {HIP_MAX_SONAME_MAJOR}; !h && v >= 0; --v) {{
+        snprintf(name, sizeof name, "libamdhip64.so.%d", v);
+        h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+    }}
+    if (!h) return;
+    for (int i = 0; loken_hiprt_names[i]; ++i)
+        loken_hiprt_table[i] = dlsym(h, loken_hiprt_names[i]);
+}}"#
     );
-    println!("cargo:rustc-link-lib=dylib=amdhip64");
+    let _ = writeln!(c, "__asm__(\".text\\n\"");
+    for (i, s) in calls.iter().enumerate() {
+        let t = format!("loken_hiprt_{s}");
+        let off = i * 8;
+        for line in [
+            format!(".globl {t}"),
+            format!(".type {t}, @function"),
+            format!("{t}:"),
+            format!("    movq loken_hiprt_table+{off}(%rip), %rax"),
+            "    testq %rax, %rax".to_string(),
+            "    je 1f".to_string(),
+            "    jmp *%rax".to_string(),
+            "1:  xorl %eax, %eax".to_string(),
+            "    ret".to_string(),
+        ] {
+            let _ = writeln!(c, "    \"{line}\\n\"");
+        }
+    }
+    let _ = writeln!(c, ");");
+    let src = out_dir.join("hip_runtime_trampolines.c");
+    std::fs::write(&src, c).expect("trampoline source");
+    let obj = out_dir.join("hip_runtime_trampolines.o");
+    let status = std::process::Command::new("cc")
+        .args(["-c", "-O2", "-fPIC"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .expect("failed to run cc");
+    assert!(status.success(), "cc failed on the HIP runtime trampolines");
+    obj
 }
 
 /// With `LOKEN_STATIC_CXX` set, links the C++ runtime into the binary so it needs no
