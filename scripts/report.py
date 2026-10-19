@@ -6,9 +6,8 @@
     report.py learn docs/BENCHMARKS.md  # record which model sits in which family section
 
 The store (bench/store in this tree, filled by assay/scripts/store.py) holds every run
-once. This groups the runs by `hardware_id`, writes one page per group with the report's usual
-table, and writes `compare.md`, the one place where hardware meets: a cell appears there only
-when both machines measured it with the same answer length. Nothing in a page is typed: the
+once. This groups the runs by `hardware_id` and writes one page per group with the report's
+usual table. Nothing in a page is typed: the
 hardware block comes from the records, the dates from their timestamps, the builds from what
 the servers said.
 
@@ -172,30 +171,6 @@ def decode_of(by, kind):
     return max(picks, key=lambda v: v["decode"]) if picks else None
 
 
-def compare(per_hw):
-    """Rows keyed by cell with one column per hardware, where at least two measured it."""
-    names = list(per_hw)
-    keys = sorted({k for m in per_hw.values() for k in m})
-    lines = []
-    for k in keys:
-        have = [n for n in names if k in per_hw[n]]
-        if len(have) < 2:
-            continue
-        cols, lok = [], []
-        for n in names:
-            by = per_hw[n].get(k)
-            lo = decode_of(by, "loken") if by else None
-            ol = decode_of(by, "ollama") if by else None
-            cols.append(" / ".join(f"{v['decode']:.1f}" if v else "-" for v in (lo, ol)) if by else "")
-            lok.append(lo)
-        base = next((x for x in lok if x), None)
-        # Answers of different length are not the same work: that column says so.
-        cols = [c if (lok[i] is None or abs(lok[i]["ntok"] - base["ntok"]) <= 0.02 * base["ntok"])
-                else "n/c" for i, c in enumerate(cols)]
-        lines.append([k[0], str(k[1]), k[2], k[3], k[4]] + cols)
-    return names, lines
-
-
 def main(argv):
     cfg = pathlib.Path(argv[argv.index("--config") + 1]) if "--config" in argv else ROOT / "config.toml"
     store = STORE
@@ -218,7 +193,7 @@ def main(argv):
             nameless += 1
     cache = read_arch_cache(store)
     OUT.mkdir(parents=True, exist_ok=True)
-    taken, written, index_rows, per_hw = set(), [], [], {}
+    taken, written, index_rows = set(), [], []
     for (hid, backend), group in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         machine = next(d["machine"] for d, _, _ in reversed(group) if d.get("machine"))
         # A replayable record is one engine on one prompt, kept to be played again on another
@@ -240,27 +215,10 @@ def main(argv):
         first, last = span(group)
         index_rows.append([f"[{H.label(machine)}](benchmarks/{name}.md)", backend, hid,
                            f"{first} to {last}", str(len(group)), str(len(rows_))])
-        per_hw[name] = merged
     write_arch_cache(store, cache)
-
-    names, lines = compare(per_hw)
-    body = ["# Benchmarks across hardware", "",
-            "A cell is listed when at least two hardware configurations measured it. A column "
-            "holds the decode tok/s of loken, then of ollama; `n/c` marks a machine whose answer "
-            "length differs from the first column's by more than 2%, which is not the same work.",
-            ""]
-    if lines:
-        head = ["Model", "Ctx", "Prompt", "Mode", "Device"] + names
-        body.append(_table(head, lines))
-    else:
-        body.append(f"Only {len(names)} hardware configuration has measurements so far; the "
-                    "table appears with the second.")
-    (OUT / "compare.md").write_text("\n".join(body) + "\n")
-    written.append("compare.md")
 
     idx = [BEGIN, "", "| Hardware | Backend | Id | Runs from | Runs | Rows |", "|---|---|---|---|---|---|"]
     idx += ["| " + " | ".join(r) + " |" for r in index_rows]
-    idx += ["", "Across machines: [benchmarks/compare.md](benchmarks/compare.md)."]
     if nameless:
         idx += ["", f"{nameless} run(s) in the store carry no machine and appear on no page."]
     idx += ["", END]

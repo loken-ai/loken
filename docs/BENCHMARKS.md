@@ -2,8 +2,7 @@
 
 One page per hardware configuration, written from the store by `scripts/report.py`; nothing
 below the index is typed. A page names the runs, dates and loken builds behind its rows, and
-a figure is only ever compared with another on the same page or in the cross-hardware table,
-which lists a cell once two configurations measured it with the same answer length. The
+a figure is only ever compared with another on the same page. The
 procedure that produces the runs is [BENCHMARKING.md](BENCHMARKING.md).
 
 ## Hardware
@@ -13,8 +12,6 @@ procedure that produces the runs is [BENCHMARKING.md](BENCHMARKING.md).
 | Hardware | Backend | Id | Runs from | Runs | Rows |
 |---|---|---|---|---|---|
 | [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/rtx5060ti-rtx5070ti-i910900k.md) | unstated | 91853bdab0a9d057 | 2026-09-03 to 2026-10-05 | 711 | 1366 |
-
-Across machines: [benchmarks/compare.md](benchmarks/compare.md).
 
 <!-- /benchmarks:index -->
 

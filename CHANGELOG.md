@@ -28,6 +28,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 - Bench: never stamp an earlier result with a build that measured nothing.
 
+### Removed
+
+- Bench: drop the cross-hardware table; each hardware keeps its own page.
+
 ## [0.3.1] - 2026-10-19
 
 ### Fixed

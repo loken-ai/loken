@@ -60,7 +60,6 @@ flowchart LR
     O["old report or replay record"] -->|"convert-archive, ingest-benchrec, operator attestation"| S
     S --> R["scripts/report.py"]
     R --> P["docs/benchmarks/ one page per hardware"]
-    R --> X["compare.md"]
     R --> I["BENCHMARKS.md index"]
 ```
 
@@ -72,8 +71,7 @@ card through two backends is two pages.
 A record names its machine: `hardware_id` identifies the cards, processor and memory, so a card
 swap is a new hardware and the same machine keeps its `host_id`. `scripts/report.py` groups the
 store by `hardware_id` and writes one page per group, `docs/benchmarks/<hardware>.md`, with the
-hardware block, the dates and the loken builds read from its records. `benchmarks/compare.md`
-lists a cell once two hardware configurations measured it with the same answer length.
+hardware block, the dates and the loken builds read from its records.
 
 ```
 scripts/report.py                      # regenerate the pages from the store
