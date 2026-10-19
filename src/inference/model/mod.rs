@@ -26,6 +26,8 @@ pub mod flow_match;
 pub mod flux;
 #[cfg(feature = "image")]
 pub mod flux2;
+/// Half-precision residency for model weights.
+pub mod half;
 pub mod kyutai;
 pub mod mixformer;
 /// The vision-tower metadata a llama.cpp `mmproj` GGUF carries.

@@ -54,7 +54,7 @@ Smaller, by priority:
 | Multimodal parts on the Responses API | API | The Responses API reads images and audio as chat completions does. | Done |
 | Generated audio as mp3 and flac | Audio | Generated audio comes back as wav, mp3 or flac, as asked. | Done |
 | MIDI at the tempo asked | Music | A MIDI render has the tempo the request asks for. | Done |
-| Audio models in half precision | Audio | Stable Audio, EzAudio and ACE-Step keep their weights in F16, and Stable Audio fits in 2.5 GB. | Planned |
+| Audio models in half precision | Audio | Stable Audio, EzAudio and ACE-Step keep their weights in F16, and Stable Audio fits in 2.5 GB. | Done |
 
 ## 0.5.0
 

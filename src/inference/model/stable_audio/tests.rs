@@ -75,6 +75,27 @@ impl Divergence {
     }
 }
 
+/// The pipeline the resident keeps on its card - DiT, decoder, number conditioners - is
+/// planned at half width and fits 2.5 GB. Reads the checkpoint's header only.
+#[test]
+fn resident_pipeline_is_planned_within_two_and_a_half_gigabytes() {
+    const BUDGET: u64 = 2_500_000_000;
+    let ckpt = ckpt();
+    if !std::path::Path::new(&ckpt).is_file() {
+        return;
+    }
+    let half = component_bytes(&ckpt, &RESIDENT_PREFIXES).unwrap();
+    let loader = unsafe { SafeTensorsLoader::multi(&[&ckpt]) }.unwrap();
+    let file: u64 = loader
+        .byte_sizes()
+        .iter()
+        .filter(|(n, _)| RESIDENT_PREFIXES.iter().any(|p| n.starts_with(p)))
+        .map(|(_, b)| *b as u64)
+        .sum();
+    eprintln!("stable-audio resident demand {half} bytes, {file} in the checkpoint");
+    assert!(half <= BUDGET, "{half} bytes over the budget");
+}
+
 /// t5-base conditioner parity vs the torch mirror (oracle_t5.py): tokenizer
 /// ids must match exactly, encoder output within f32 noise.
 #[test]
@@ -526,7 +547,7 @@ fn head_weight_fold_matches_torch() {
         "pretransform.model.decoder",
     )
     .unwrap();
-    let ours_w = dec.head.weight.to_vec_f32();
+    let ours_w = dec.head.w.wt.to_vec_f32();
     let ref_w = read("head_w_ref.f32");
     assert_eq!(ours_w.len(), ref_w.len());
     let mut mx = 0f64;
@@ -534,7 +555,7 @@ fn head_weight_fold_matches_torch() {
         mx = mx.max((*a as f64 - *b as f64).abs() / (b.abs() as f64).max(1e-6));
     }
     eprintln!("head WEIGHT fold max_rel = {mx:.3e}");
-    let ours_b = dec.head.bias.as_ref().unwrap().to_vec_f32();
+    let ours_b = dec.head.w.bt.to_vec_f32();
     let ref_b = read("head_b_ref.f32");
     let mut mb = 0f64;
     for (a, b) in ours_b.iter().zip(&ref_b) {
@@ -649,4 +670,105 @@ fn oobleck_decoder_matches_torch() {
         "decoder diverges beyond mixed abs/rel tolerance: {worst_mixed:.3e}"
     );
     assert!(snr_db > 70.0, "decoder SNR too low: {snr_db:.1} dB");
+}
+
+/// The half-precision DiT and decoder against their F32 originals on one input: the DiT
+/// rebuilt with the checkpoint's F32 projections on the host, the decoder loaded on the
+/// host, where its kernels stay F32. F16 rounds each operand to one part in 2^11, about
+/// 66 dB; 40 dB, an error of one percent of the signal, bounds what a stage may lose.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "hardware probe: needs the stable-audio weights and a CUDA card"]
+fn half_stages_match_their_f32_originals() {
+    const MIN_SNR_DB: f64 = 40.0;
+    let ckpt = ckpt();
+    if !std::path::Path::new(&ckpt).is_file() {
+        return;
+    }
+    let Ok(card) = Device::new_cuda(0) else {
+        return;
+    };
+    let loader = unsafe { SafeTensorsLoader::multi(&[&ckpt]) }.unwrap();
+    let f32_lin = |name: &str, bias: bool| -> Linear {
+        let w = loader.load(&format!("{name}.weight")).unwrap();
+        let b = bias.then(|| loader.load(&format!("{name}.bias")).unwrap());
+        Linear::new(w.to_dtype(DType::F32).unwrap(), b).unwrap()
+    };
+    let mut st = 0x2545F4914F6CDD1Du64;
+    let mut xs = || {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        ((st >> 40) as f32 / 8388608.0) - 1.0
+    };
+    let (t, s) = (130usize, 130usize);
+    let x: Vec<f32> = (0..t * 64).map(|_| xs()).collect();
+
+    let half = load_dit(&ckpt, &card).unwrap();
+    let cond = half.cond_dim();
+    let cross: Vec<f32> = (0..s * cond).map(|_| xs() * 0.2).collect();
+    let glob: Vec<f32> = (0..2 * cond).map(|_| xs() * 0.2).collect();
+    let on = |v: &[f32], d: (usize, usize), dev: &Device| {
+        Tensor::from_vec_f32(v.to_vec(), d)
+            .unwrap()
+            .to_device(dev)
+            .unwrap()
+    };
+    let run = |dit: &SaoDit, dev: &Device| {
+        dit.forward(
+            &on(&x, (t, 64), dev),
+            0.5,
+            &on(&cross, (s, cond), dev),
+            &on(&glob, (1, 2 * cond), dev),
+        )
+        .unwrap()
+        .to_vec_f32()
+    };
+    let ours = run(&half, &card);
+    drop(half);
+
+    let mut full = load_dit(&ckpt, &Device::Cpu).unwrap();
+    let (pfx, tr) = ("model.model", "model.model.transformer");
+    full.to_timestep_a = f32_lin(&format!("{pfx}.to_timestep_embed.0"), true);
+    full.to_timestep_b = f32_lin(&format!("{pfx}.to_timestep_embed.2"), true);
+    full.to_cond_a = f32_lin(&format!("{pfx}.to_cond_embed.0"), false);
+    full.to_cond_b = f32_lin(&format!("{pfx}.to_cond_embed.2"), false);
+    full.to_global_a = f32_lin(&format!("{pfx}.to_global_embed.0"), false);
+    full.to_global_b = f32_lin(&format!("{pfx}.to_global_embed.2"), false);
+    full.project_in = f32_lin(&format!("{tr}.project_in"), false);
+    full.project_out = f32_lin(&format!("{tr}.project_out"), false);
+    for (i, blk) in full.blocks.iter_mut().enumerate() {
+        let b = format!("{tr}.layers.{i}");
+        blk.to_qkv = f32_lin(&format!("{b}.self_attn.to_qkv"), false);
+        blk.self_out = f32_lin(&format!("{b}.self_attn.to_out"), false);
+        blk.cross_q = f32_lin(&format!("{b}.cross_attn.to_q"), false);
+        blk.cross_kv = f32_lin(&format!("{b}.cross_attn.to_kv"), false);
+        blk.cross_out = f32_lin(&format!("{b}.cross_attn.to_out"), false);
+        blk.ff_proj = f32_lin(&format!("{b}.ff.ff.0.proj"), true);
+        blk.ff_out = f32_lin(&format!("{b}.ff.ff.2"), true);
+    }
+    let reference = run(&full, &Device::Cpu);
+    drop(full);
+    let d = Divergence::of(&ours, &reference, 1e-3);
+    eprintln!(
+        "dit forward: snr {:.1} dB, max_abs {:.3e}",
+        d.snr_db, d.max_abs
+    );
+    assert!(d.snr_db > MIN_SNR_DB, "dit forward snr {:.1} dB", d.snr_db);
+
+    let lat: Vec<f32> = (0..64 * t).map(|_| xs()).collect();
+    let dec_half = load_decoder_on(&ckpt, DECODER_PREFIX, &card).unwrap();
+    let ours = dec_half
+        .decode(&on(&lat, (64, t), &card))
+        .unwrap()
+        .to_vec_f32();
+    drop(dec_half);
+    let dec_full = load_decoder(&ckpt, DECODER_PREFIX).unwrap();
+    let reference = dec_full
+        .decode(&on(&lat, (64, t), &Device::Cpu))
+        .unwrap()
+        .to_vec_f32();
+    let d = Divergence::of(&ours, &reference, 1e-3);
+    eprintln!("decoder: snr {:.1} dB, max_abs {:.3e}", d.snr_db, d.max_abs);
+    assert!(d.snr_db > MIN_SNR_DB, "decoder snr {:.1} dB", d.snr_db);
 }

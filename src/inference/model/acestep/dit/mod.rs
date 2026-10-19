@@ -157,15 +157,14 @@ pub fn adaln_gate(y: &[f32], gate: &[f32], c: usize, t: usize) -> Vec<f32> {
 }
 
 // -- DiT weight structs + GGUF loader -----------------------------------------
-// Weights held as dequantized f32 Tensors (Q8_0/BF16 -> F32 at load), in the
-// substrate's row-major layout: Linear weight `[out, in]` (apply as `x.matmul(w.t())`).
+// The small weights held dequantized (Q8_0/BF16 at load), in the substrate's row-major layout: Linear weight `[out, in]` (apply as `x.matmul(w.t())`).
 use crate::inference::model::acestep::fsq::in_heads;
 use crate::tensor::layer::qlinear::{QLinear, Weight};
 use crate::tensor::lora::LoraDelta;
 use crate::tensor::{Device, Tensor};
 
-/// A weight + optional bias, kept dequantized to F32, for the small conv-shaped tensors:
-/// proj_in/proj_out, cond_emb, time_embed.
+/// A weight + optional bias, kept dequantized, for the small conv-shaped tensors:
+/// proj_in/proj_out and cond_emb in F32, the time_embed towers in half precision.
 ///
 /// NOT a projection, despite the name it is applied under. `proj_in.weight` is `[hidden,
 /// in_ch, patch]` - a three-axis kernel that the patchify path reshapes itself - so this
@@ -302,6 +301,20 @@ fn dit_lin(
         None
     };
     Ok(DitLinear { w, b })
+}
+
+/// [`dit_lin`] with the weight held in half precision, for a tower read back to the host
+/// at the width it is stored in.
+fn dit_half_lin(
+    device: &Device,
+    content: &crate::tensor::quantized::gguf_file::Content,
+    file: &mut std::fs::File,
+    prefix: &str,
+) -> crate::tensor::Result<DitLinear> {
+    let w = dit_load_t(&Device::Cpu, content, file, &format!("{prefix}.weight"))?;
+    let w = crate::inference::model::half::to_resident(&w)?.to_device(device)?;
+    let b = dit_load_t(device, content, file, &format!("{prefix}.bias"))?;
+    Ok(DitLinear { w, b: Some(b) })
 }
 
 impl DitModel {
@@ -518,20 +531,14 @@ impl DitModel {
                 proj_in: dit_lin(&device, &c, &mut f, "decoder.proj_in.1", true)?,
                 cond_emb: dit_lin(&device, &c, &mut f, "decoder.condition_embedder", true)?,
                 time_embed: DitTimeEmbed {
-                    linear_1: dit_lin(&device, &c, &mut f, "decoder.time_embed.linear_1", true)?,
-                    linear_2: dit_lin(&device, &c, &mut f, "decoder.time_embed.linear_2", true)?,
-                    time_proj: dit_lin(&device, &c, &mut f, "decoder.time_embed.time_proj", true)?,
+                    linear_1: dit_half_lin(&device, &c, &mut f, "decoder.time_embed.linear_1")?,
+                    linear_2: dit_half_lin(&device, &c, &mut f, "decoder.time_embed.linear_2")?,
+                    time_proj: dit_half_lin(&device, &c, &mut f, "decoder.time_embed.time_proj")?,
                 },
                 time_embed_r: DitTimeEmbed {
-                    linear_1: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_1", true)?,
-                    linear_2: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_2", true)?,
-                    time_proj: dit_lin(
-                        &device,
-                        &c,
-                        &mut f,
-                        "decoder.time_embed_r.time_proj",
-                        true,
-                    )?,
+                    linear_1: dit_half_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_1")?,
+                    linear_2: dit_half_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_2")?,
+                    time_proj: dit_half_lin(&device, &c, &mut f, "decoder.time_embed_r.time_proj")?,
                 },
                 layers,
                 norm_out: dit_load_t(&device, &c, &mut f, "decoder.norm_out.weight")?,

@@ -14,14 +14,10 @@ use crate::tensor::{Result, Tensor, D};
 /// measured cannot decide a placement, and the tensor directory is right there: it is read
 /// before placement in every one of these loaders and accounts for every weight.
 ///
-/// These loaders dequantise every weight they read and hand the card an f32 tensor, so
-/// what goes resident is the component's element count times four - not the quantised
-/// bytes, and not the file. Gating on the file was wrong in both directions at once, and
-/// only worked because the two errors happened to cancel: the shared ACE-Step GGUF holds
-/// the denoiser as well, so it over-states a small encoder by the rest of the file, while
-/// under-stating that encoder's own expansion by four. A checkpoint whose split between
-/// components differs breaks the coincidence, and the failure is an out-of-memory during
-/// the load, on a card the planner had already approved.
+/// These loaders dequantise every weight they read and hand the card its matrices in half
+/// precision and its vectors in F32 (`half::card_bytes`), so what goes resident is neither
+/// the quantised bytes nor the file. The shared ACE-Step GGUF holds the denoiser as well,
+/// so its size over-states a small encoder by the rest of the file.
 ///
 /// `prefixes` selects the component's tensors. When none of them match - a renamed prefix,
 /// a repacked checkpoint - the whole directory is charged rather than nothing: a demand of
@@ -31,21 +27,19 @@ pub(crate) fn gguf_resident_bytes(
     c: &crate::tensor::quantized::gguf_file::Content,
     prefixes: &[&str],
 ) -> u64 {
-    /// Bytes per element once the loader has expanded the weight for the device.
-    const RESIDENT_BYTES: u64 = 4;
+    let bytes = |(n, i): (&String, &crate::tensor::quantized::gguf_file::TensorInfo)| {
+        crate::inference::model::half::card_bytes(n, i.shape.dims())
+    };
     let matched: u64 = c
         .tensor_infos
         .iter()
         .filter(|(n, _)| prefixes.iter().any(|p| n.starts_with(p)))
-        .map(|(_, i)| i.elem_count() as u64 * RESIDENT_BYTES)
+        .map(bytes)
         .sum();
     if matched > 0 {
         return matched;
     }
-    c.tensor_infos
-        .values()
-        .map(|i| i.elem_count() as u64 * RESIDENT_BYTES)
-        .sum()
+    c.tensor_infos.iter().map(bytes).sum()
 }
 
 /// Repeat KV heads for grouped-query attention - the substrate states it once.

@@ -8,10 +8,11 @@
 use crate::inference::model::acestep::fsq::{
     detok_load_t, load_component, load_stack, rope_tables, DetokLayer, StackGeometry,
 };
+use crate::inference::model::qwen3::encoder::load_matrix;
 use crate::tensor::{Device, Tensor};
 
 pub struct TextEncoder {
-    pub embed_tokens: Tensor, // [V, H]
+    pub embed_tokens: Tensor, // [V, H], half precision
     pub layers: Vec<DetokLayer>,
     pub norm: Tensor, // [H]
     pub hidden: usize,
@@ -33,7 +34,7 @@ impl TextEncoder {
             let g = StackGeometry::read(&c, "")?;
             Ok(TextEncoder {
                 layers: load_stack(&c, &mut f, "", g.layers, device)?,
-                embed_tokens: detok_load_t(&c, &mut f, "embed_tokens.weight", device)?,
+                embed_tokens: load_matrix(&c, &mut f, "embed_tokens.weight", device)?,
                 norm: detok_load_t(&c, &mut f, "norm.weight", device)?,
                 hidden: g.hidden,
                 n_head: g.n_head,
@@ -58,7 +59,7 @@ impl TextEncoder {
         s: usize,
     ) -> crate::tensor::Result<Tensor> {
         let d = self.head_dim;
-        let proj = x.matmul_t(lin.weight()?)?;
+        let proj = lin.forward(x)?;
         let q = proj
             .reshape((s, n_heads, d))?
             .transpose(0, 1)?
@@ -77,12 +78,12 @@ impl TextEncoder {
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qk_roped(&l.q, &l.q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.qk_roped(&l.k, &l.k_norm, x, nkv, s)?; // [1,nkv,s,d]
-        let v = x
-            .matmul_t(l.v.weight()?)?
-            .reshape((s, nkv, d))?
-            .transpose(0, 1)?
-            .unsqueeze(0)?
-            .contiguous()?; // [1,nkv,s,d]
+        let v =
+            l.v.forward(x)?
+                .reshape((s, nkv, d))?
+                .transpose(0, 1)?
+                .unsqueeze(0)?
+                .contiguous()?; // [1,nkv,s,d]
         let nrep = nh / nkv;
         let (k, v) = (repeat_kv(k, nrep)?, repeat_kv(v, nrep)?); // [1,nh,s,d]
         let scale = 1.0f32 / (d as f32).sqrt();
@@ -96,10 +97,10 @@ impl TextEncoder {
         let norm = x.rms_norm(&l.input_ln, eps)?;
         let x = x.add(&self.self_attn(l, &norm, s)?)?;
         let norm2 = x.rms_norm(&l.post_ln, eps)?;
-        let gate = norm2.matmul_t(l.gate.weight()?)?;
-        let up = norm2.matmul_t(l.up.weight()?)?;
+        let gate = l.gate.forward(&norm2)?;
+        let up = l.up.forward(&norm2)?;
         let ff = gate.silu()?.mul(&up)?;
-        x.add(&ff.matmul_t(l.down.weight()?)?)
+        x.add(&l.down.forward(&ff)?)
     }
 
     /// Vocab embed lookup only (no encoder layers) -> `[S,H]` row-major - the
@@ -128,7 +129,7 @@ impl TextEncoder {
             .map(|&id| self.embed_tokens.narrow(0, id as usize, 1))
             .collect::<crate::tensor::Result<_>>()?;
         let refs: Vec<&Tensor> = rows.iter().collect();
-        let mut hid = Tensor::cat(&refs, 0)?; // [s,h] on device
+        let mut hid = Tensor::cat(&refs, 0)?.to_dtype(crate::tensor::DType::F32)?; // [s,h] on device
         for l in &self.layers {
             hid = self.enc_layer(l, &hid, s)?;
         }
@@ -189,6 +190,13 @@ mod tests {
 impl TextEncoder {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(&self.device, self.layers.len())
+        let layers: Vec<_> = self.layers.iter().collect();
+        let mut runs =
+            crate::inference::model::qwen3::encoder::stack_placement(&self.device, &layers);
+        if let Some(first) = runs.first_mut() {
+            first.bytes +=
+                crate::inference::model::qwen3::encoder::tensor_bytes(&self.embed_tokens);
+        }
+        runs
     }
 }

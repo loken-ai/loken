@@ -105,6 +105,8 @@ pub struct EzAudioDiT {
     /// One device per block, in forward order: the in-blocks, the middle, the
     /// out-blocks. The stem and the head stay on `device`.
     block_devices: Vec<Device>,
+    /// The bytes each block holds on its device, in the same order.
+    block_bytes: Vec<u64>,
     device: Device,
 }
 
@@ -121,8 +123,9 @@ impl EzAudioDiT {
     }
 
     /// Load the DiT from a torch `.pt` (full-Rust [`crate::tensor::pth`] reader), placed
-    /// through the ladder in `place` for a render of `frames` latent frames. All weights
-    /// are coerced to F32 on the device the plan gives them.
+    /// through the ladder in `place` for a render of `frames` latent frames. The projection
+    /// matrices are held in half precision on the device the plan gives them, every other
+    /// tensor in F32.
     pub fn from_pt(path: &str, frames: usize) -> Result<Self> {
         let m = crate::tensor::pth::read_pt(path)?;
         eprintln!("[ezaudio-dit] loading {} tensors from {path}", m.len());
@@ -132,7 +135,7 @@ impl EzAudioDiT {
                 .ok_or_else(|| Error(format!("ezaudio-dit: missing tensor `{name}`")))
         };
         // The demand, from the tensor directory: the tower's blocks, and the stem and head
-        // beside them, each expanded to F32.
+        // beside them, each at the width it is held in.
         let pe = dims("model.patch_embed.proj.weight")?; // [H, in_chans, patch]
         let (hidden, patch) = (pe[0], pe[2]);
         let heads = hidden / dims("model.in_blocks.0.attn.norm_q.weight")?[0].max(1);
@@ -142,10 +145,9 @@ impl EzAudioDiT {
                 || n.starts_with("model.mid_block.")
                 || n.starts_with("model.out_blocks.")
         };
-        const F32_BYTES: u64 = 4;
         let (mut block_bytes, mut head_bytes) = (0u64, 0u64);
         for (name, t) in &m {
-            let b = t.dims().iter().product::<usize>() as u64 * F32_BYTES;
+            let b = crate::inference::model::half::card_bytes(name, t.dims());
             if is_block(name) {
                 block_bytes += b;
             } else {
@@ -187,21 +189,32 @@ impl EzAudioDiT {
         // the fetch helpers below read it.
         let cur_dev = std::cell::RefCell::new(dev.clone());
 
-        // -- tensor / layer fetch helpers (host .pt -> F32 device tensors) --
+        // -- tensor / layer fetch helpers: host .pt -> F32 device tensors, and projections
+        // with their matrix in half precision --
         let get = |name: &str| -> Result<Tensor> {
             m.get(name)
                 .ok_or_else(|| Error(format!("ezaudio-dit: missing tensor `{name}`")))?
                 .to_dtype(DType::F32)?
                 .to_device(&cur_dev.borrow())
         };
+        let host = |name: &str| -> Result<&Tensor> {
+            m.get(name)
+                .ok_or_else(|| Error(format!("ezaudio-dit: missing tensor `{name}`")))
+        };
         let lin = |name: &str| -> Result<Linear> {
-            Linear::new(
-                get(&format!("{name}.weight"))?,
-                Some(get(&format!("{name}.bias"))?),
+            crate::inference::model::half::linear(
+                host(&format!("{name}.weight"))?,
+                Some(host(&format!("{name}.bias"))?),
+                &cur_dev.borrow(),
             )
         };
-        let lin_nb =
-            |name: &str| -> Result<Linear> { Linear::new(get(&format!("{name}.weight"))?, None) };
+        let lin_nb = |name: &str| -> Result<Linear> {
+            crate::inference::model::half::linear(
+                host(&format!("{name}.weight"))?,
+                None,
+                &cur_dev.borrow(),
+            )
+        };
         let ln = |name: &str| -> Result<LayerNorm> {
             Ok(LayerNorm::new(
                 get(&format!("{name}.weight"))?,
@@ -219,9 +232,9 @@ impl EzAudioDiT {
         let qn = get("model.in_blocks.0.attn.norm_q.weight")?; // [head_dim]
         let head_dim = qn.dims()[0];
         let n_heads = hidden / head_dim;
-        let out_chans = get("model.final_block.linear.weight")?.dims()[0]; // [out_chans.patch, H]
-                                                                           // SOLA rank: lora_a is [rank.6, H] -> rank = rows / 6.
-        let lora_a_rows = get("model.in_blocks.0.adaln.lora_a.weight")?.dims()[0];
+        let out_chans = host("model.final_block.linear.weight")?.dims()[0]; // [out_chans.patch, H]
+                                                                            // SOLA rank: lora_a is [rank.6, H] -> rank = rows / 6.
+        let lora_a_rows = host("model.in_blocks.0.adaln.lora_a.weight")?.dims()[0];
         let lora_rank = lora_a_rows / 6;
         // ada_lora_alpha == ada_lora_rank in the EzAudio config ⟹ scale 1.0; kept explicit.
         let lora_scale = 1.0f32;
@@ -282,6 +295,21 @@ impl EzAudioDiT {
 
         let n_blocks = n_in + 1 + n_out;
         let block_devices = crate::inference::place::ladder::layer_devices(plan, n_blocks);
+        // What each block holds on its device, in forward order.
+        let prefixes: Vec<String> = (0..n_in)
+            .map(|i| format!("model.in_blocks.{i}."))
+            .chain(std::iter::once("model.mid_block.".to_string()))
+            .chain((0..n_out).map(|i| format!("model.out_blocks.{i}.")))
+            .collect();
+        let block_bytes: Vec<u64> = prefixes
+            .iter()
+            .map(|p| {
+                m.iter()
+                    .filter(|(n, _)| n.starts_with(p.as_str()))
+                    .map(|(n, t)| crate::inference::model::half::card_bytes(n, t.dims()))
+                    .sum()
+            })
+            .collect();
         eprintln!(
             "[ezaudio-dit] {n_blocks} blocks placed across {} device(s)",
             {
@@ -343,6 +371,7 @@ impl EzAudioDiT {
             mid_block,
             out_blocks,
             block_devices,
+            block_bytes,
             final_norm: ln("model.final_block.norm")?,
             final_linear: lin("model.final_block.linear")?,
             final_conv,
@@ -715,9 +744,11 @@ mod tests {
 impl EzAudioDiT {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::runs(
-            self.block_devices.iter().map(|d| d.location()),
-            0,
+        crate::inference::serve::progress::placement::sized_runs(
+            self.block_devices
+                .iter()
+                .map(|d| d.location())
+                .zip(self.block_bytes.iter().copied()),
         )
     }
 }

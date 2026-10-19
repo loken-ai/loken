@@ -9,8 +9,6 @@
 use crate::inference::model::acestep::vae::{
     fuse_weight_norm, BlockW, ConvW, OobleckDecoder, ResUnitW, SnakeW,
 };
-#[cfg(feature = "gpu")]
-use crate::tensor::DType;
 use crate::tensor::{Device as ND, Result, Tensor as NT};
 use std::collections::HashMap;
 
@@ -26,7 +24,7 @@ fn get<'a>(m: &'a HashMap<String, NT>, name: &str) -> Result<&'a NT> {
 
 /// Build a `ConvW` from a weight-norm pair (`weight_v`/`weight_g`) + bias, mirroring
 /// `vae_load_conv`'s kernel layout (conv `[c_out,c_in,k]`; convT raw `[c_in,c_out,k]`),
-/// incl. the CUDA F16 conv / rearranged-F16 convT fast-path.
+/// held in half precision on a card.
 fn conv_from_pt(
     m: &HashMap<String, NT>,
     prefix: &str,
@@ -50,44 +48,7 @@ fn conv_from_pt(
         Some(t) => t.to_vec_f32(),
         None => vec![0.0; c_out],
     };
-    let wt = if is_convt {
-        #[cfg(feature = "gpu")]
-        if matches!(dev, ND::Cuda(_)) {
-            // [c_in,c_out,k] -> [k*c_out, c_in] so the convT contraction is a plain GEMM, F16.
-            let mut wr = vec![0f32; k * c_out * c_in];
-            for ci in 0..c_in {
-                for oc in 0..c_out {
-                    for kk in 0..k {
-                        wr[(kk * c_out + oc) * c_in + ci] = w[(ci * c_out + oc) * k + kk];
-                    }
-                }
-            }
-            NT::from_vec_f32(wr, (k * c_out, c_in, 1))?
-                .to_device(dev)?
-                .to_dtype(DType::F16)?
-        } else {
-            NT::from_vec_f32(w, (c_in, c_out, k))?.to_device(dev)?
-        }
-        #[cfg(not(feature = "gpu"))]
-        NT::from_vec_f32(w, (c_in, c_out, k))?.to_device(dev)?
-    } else {
-        let t = NT::from_vec_f32(w, (c_out, c_in, k))?.to_device(dev)?;
-        #[cfg(feature = "gpu")]
-        let t = if matches!(dev, ND::Cuda(_)) {
-            t.to_dtype(DType::F16)?
-        } else {
-            t
-        };
-        t
-    };
-    let bt = NT::from_vec_f32(b, (1, c_out, 1))?.to_device(dev)?;
-    Ok(ConvW {
-        wt,
-        bt,
-        c_in,
-        c_out,
-        k,
-    })
+    ConvW::from_fused(w, (c_out, c_in, k), b, is_convt, true, dev)
 }
 
 /// Build a `SnakeW` from `alpha`/`beta` (pre-exp'd: `alpha=exp(α)`, `inv_beta=1/exp(β)`),
@@ -107,24 +68,22 @@ fn snake_from_pt(m: &HashMap<String, NT>, prefix: &str, dev: &ND) -> Result<Snak
 
 /// What the decoder puts on the card, from the checkpoint already in memory.
 ///
-/// The weight-norm pair is fused into one f32 kernel weight, so the resident set is the
-/// fused half of what the file carries; the file also holds the encoder, which this loader
-/// does not read. Neither is visible in the file size, which is why this counts tensors.
+/// The weight-norm pair is fused into one kernel held in half precision on a card, so the
+/// resident set is the half-width direction of each pair; the file also holds the encoder,
+/// which this loader does not read. Neither is visible in the file size, which is why this
+/// counts tensors.
 fn decoder_resident_bytes(m: &HashMap<String, NT>, prefix: &str) -> u64 {
-    /// Bytes per element of a fused kernel weight.
-    const RESIDENT_BYTES: u64 = 4;
+    let bytes = |(k, t): (&String, &NT)| crate::inference::model::half::card_bytes(k, t.dims());
     let matched: u64 = m
         .iter()
-        .filter(|(k, _)| k.starts_with(prefix) && !k.ends_with(".weight_g"))
-        .map(|(_, t)| t.elem_count() as u64 * RESIDENT_BYTES)
+        .filter(|(k, _)| k.starts_with(prefix))
+        .map(bytes)
         .sum();
     if matched > 0 {
         return matched;
     }
     // Never plan against zero: a renamed prefix must charge the whole checkpoint.
-    m.values()
-        .map(|t| t.elem_count() as u64 * RESIDENT_BYTES)
-        .sum()
+    m.iter().map(bytes).sum()
 }
 
 /// The decoder's `(channels out, cumulative upsample)` per block, from its transposed

@@ -224,7 +224,7 @@ impl Pooler {
         s: usize,
     ) -> crate::tensor::Result<Tensor> {
         let d = self.head_dim;
-        let proj = x.matmul_t(lin.weight()?)?;
+        let proj = lin.forward(x)?;
         let q = in_heads(proj, n_heads, s, d)?;
         let q = q.rms_norm(qknorm, self.rms_eps())?;
         let (cosv, sinv) = rope_tables(s, d, self.rope_theta);
@@ -240,7 +240,7 @@ impl Pooler {
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qk_roped(&l.q, &l.q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.qk_roped(&l.k, &l.k_norm, x, nkv, s)?; // [1,nkv,s,d]
-        let v = in_heads(x.matmul_t(l.v.weight()?)?, nkv, s, d)?; // [1,nkv,s,d]
+        let v = in_heads(l.v.forward(x)?, nkv, s, d)?; // [1,nkv,s,d]
         let nrep = nh / nkv;
         let (k, v) = (repeat_kv(k, nrep)?, repeat_kv(v, nrep)?); // [1,nh,s,d]
         let scale = 1.0f32 / (d as f32).sqrt();
@@ -255,10 +255,10 @@ impl Pooler {
         let norm = x.rms_norm(&l.input_ln, eps)?;
         let x = x.add(&self.self_attn(l, &norm, s)?)?; // plain residual
         let norm2 = x.rms_norm(&l.post_ln, eps)?;
-        let gate = norm2.matmul_t(l.gate.weight()?)?;
-        let up = norm2.matmul_t(l.up.weight()?)?;
+        let gate = l.gate.forward(&norm2)?;
+        let up = l.up.forward(&norm2)?;
         let ff = gate.silu()?.mul(&up)?; // SwiGLU
-        x.add(&ff.matmul_t(l.down.weight()?)?)
+        x.add(&l.down.forward(&ff)?)
     }
 
     /// Every layer in turn over `x [S,H]`, already on this stack's device.
@@ -539,19 +539,15 @@ mod tests {
 impl DetokModel {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(
-            &self.stack.device,
-            self.stack.layers.len(),
-        )
+        let layers: Vec<_> = self.stack.layers.iter().collect();
+        crate::inference::model::qwen3::encoder::stack_placement(&self.stack.device, &layers)
     }
 }
 
 impl TokEncoder {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(
-            &self.stack.device,
-            self.stack.layers.len(),
-        )
+        let layers: Vec<_> = self.stack.layers.iter().collect();
+        crate::inference::model::qwen3::encoder::stack_placement(&self.stack.device, &layers)
     }
 }

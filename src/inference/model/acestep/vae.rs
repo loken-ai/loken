@@ -244,27 +244,25 @@ pub fn vae_best_device_with_reserve(model_size: u64, reserve: u64) -> ND {
 
 /// What the decoder puts on the card, from the checkpoint's own tensor directory.
 ///
-/// Every weight is dequantised and fused into f32 on the way to the device, so the
-/// quantised bytes on disk are not what goes resident - and the file also holds the
-/// encoder, which this loader does not read.
+/// Every kernel is dequantised, fused and held in half precision on a card, the per-channel
+/// vectors in F32, so the bytes on disk are not what goes resident - and the file also holds
+/// the encoder, which this loader does not read.
 fn decoder_resident_bytes(c: &crate::tensor::quantized::gguf_file::Content) -> u64 {
-    /// Bytes per element once the loader has expanded and fused the weight.
-    const RESIDENT_BYTES: u64 = 4;
+    let bytes = |(n, i): (&String, &crate::tensor::quantized::gguf_file::TensorInfo)| {
+        crate::inference::model::half::card_bytes(n, i.shape.dims())
+    };
     let matched: u64 = c
         .tensor_infos
         .iter()
         .filter(|(n, _)| n.starts_with("decoder."))
-        .map(|(_, i)| i.elem_count() as u64 * RESIDENT_BYTES)
+        .map(bytes)
         .sum();
     if matched > 0 {
         return matched;
     }
     // A repacked checkpoint that names its tensors differently must not read as "needs
     // nothing": charge the whole directory rather than plan against zero.
-    c.tensor_infos
-        .values()
-        .map(|i| i.elem_count() as u64 * RESIDENT_BYTES)
-        .sum()
+    c.tensor_infos.iter().map(bytes).sum()
 }
 
 /// The decoder's `(channels out, cumulative upsample)` per block, from its transposed
@@ -347,7 +345,12 @@ impl ConvW {
     /// conv1d: `x [1,c_in,T]` -> `[1,c_out,T']` + bias. When the fused weight is
     /// F16 on CUDA, route the contraction through the tensor-core im2col GEMM
     /// (F16 in / F32 accumulate); otherwise the generic F32/CPU `conv1d`.
-    fn conv(&self, x: &NT, padding: usize, dilation: usize) -> crate::tensor::Result<NT> {
+    pub(crate) fn conv(
+        &self,
+        x: &NT,
+        padding: usize,
+        dilation: usize,
+    ) -> crate::tensor::Result<NT> {
         #[cfg(feature = "gpu")]
         if self.wt.dtype() == DType::F16 {
             if let (
@@ -383,7 +386,12 @@ impl ConvW {
     }
     /// Strided downsample conv (encoder): `x [1,c_in,T]` -> `[1,c_out,T/stride]` + bias,
     /// K=2.stride, dilation 1. Generic F32 `conv1d` (the encoder keeps weights F32).
-    fn conv_down(&self, x: &NT, padding: usize, stride: usize) -> crate::tensor::Result<NT> {
+    pub(crate) fn conv_down(
+        &self,
+        x: &NT,
+        padding: usize,
+        stride: usize,
+    ) -> crate::tensor::Result<NT> {
         x.conv1d(&self.wt, padding, stride, 1, 1)?
             .broadcast_add(&self.bt)
     }
@@ -391,7 +399,12 @@ impl ConvW {
     /// When the weight is the F16 rearranged form (CUDA), route the heavy `c_in`
     /// contraction through the tensor-core GEMM + col2im (F16 in / F32 accumulate)
     /// instead of the serial F32 gather kernel; otherwise the generic F32/CPU op.
-    fn conv_t(&self, x: &NT, padding: usize, stride: usize) -> crate::tensor::Result<NT> {
+    pub(crate) fn conv_t(
+        &self,
+        x: &NT,
+        padding: usize,
+        stride: usize,
+    ) -> crate::tensor::Result<NT> {
         #[cfg(feature = "gpu")]
         if self.wt.dtype() == DType::F16 {
             if let (
@@ -508,15 +521,25 @@ fn vae_load_conv(
         Ok((b, _)) => b,
         Err(_) => vec![0.0; c_out],
     };
-    // native conv kernel: conv [c_out,c_in,k]; convT [c_in,c_out,k] (= raw weight_v dims).
-    // conv1d weights on CUDA are stored F16 to feed the tensor-core im2col GEMM
-    // (F32-accumulate) - halves the weight VRAM + bandwidth; convT weights stay
-    // F32 (the convT runs the direct gather kernel, not a cuBLAS GEMM).
-    let wt = if is_convt {
-        #[cfg(feature = "gpu")]
-        if matches!(dev, ND::Cuda(_)) {
-            // Rearrange [c_in,c_out,k] -> [k*c_out, c_in] so the convT contraction
-            // is a plain GEMM (W_r . x), stored F16 for tensor cores. wr[kk*c_out+oc, ci] = w[ci,oc,kk].
+    ConvW::from_fused(w, (c_out, c_in, k), b, is_convt, true, dev)
+}
+
+impl ConvW {
+    /// A conv (`w` laid out `[c_out, c_in, k]`) or convT (`[c_in, c_out, k]`) from its fused
+    /// weight and bias. With `half` on a CUDA device the kernel is held F16 for the
+    /// tensor-core GEMMs, which accumulate in F32 - a convT rearranged to `[k * c_out, c_in]`
+    /// so its contraction is a plain GEMM. Otherwise, and on the host, it stays F32.
+    pub fn from_fused(
+        w: Vec<f32>,
+        (c_out, c_in, k): (usize, usize, usize),
+        b: Vec<f32>,
+        is_convt: bool,
+        half: bool,
+        dev: &ND,
+    ) -> crate::tensor::Result<Self> {
+        let half = half && !dev.is_cpu();
+        let wt = if is_convt && half {
+            // wr[kk*c_out+oc, ci] = w[ci,oc,kk].
             let mut wr = vec![0f32; k * c_out * c_in];
             for ci in 0..c_in {
                 for oc in 0..c_out {
@@ -525,30 +548,27 @@ fn vae_load_conv(
                     }
                 }
             }
-            vae_nt(wr, (k * c_out, c_in, 1), dev)?.to_dtype(DType::F16)?
-        } else {
+            NT::from_vec_f32(wr, (k * c_out, c_in, 1))?
+                .to_dtype(DType::F16)?
+                .to_device(dev)?
+        } else if is_convt {
             vae_nt(w, (c_in, c_out, k), dev)?
-        }
-        #[cfg(not(feature = "gpu"))]
-        vae_nt(w, (c_in, c_out, k), dev)?
-    } else {
-        let t = vae_nt(w, (c_out, c_in, k), dev)?;
-        #[cfg(feature = "gpu")]
-        let t = if matches!(dev, ND::Cuda(_)) {
-            t.to_dtype(DType::F16)?
+        } else if half {
+            NT::from_vec_f32(w, (c_out, c_in, k))?
+                .to_dtype(DType::F16)?
+                .to_device(dev)?
         } else {
-            t
+            vae_nt(w, (c_out, c_in, k), dev)?
         };
-        t
-    };
-    let bt = vae_nt(b, (1, c_out, 1), dev)?;
-    Ok(ConvW {
-        wt,
-        bt,
-        c_in,
-        c_out,
-        k,
-    })
+        let bt = vae_nt(b, (1, c_out, 1), dev)?;
+        Ok(ConvW {
+            wt,
+            bt,
+            c_in,
+            c_out,
+            k,
+        })
+    }
 }
 
 /// Load a Snake param pair -> pre-exp'd (`alpha=exp(α)`, `inv_beta=1/exp(β)`),
@@ -572,7 +592,7 @@ fn vae_load_snake(
 }
 
 /// The smallest decode chunk, in latent frames, worth retrying at.
-const MIN_DECODE_CHUNK: usize = 16;
+pub(crate) const MIN_DECODE_CHUNK: usize = 16;
 
 impl OobleckDecoder {
     /// Load the AutoencoderOobleck DECODER from an ACE-Step VAE GGUF
@@ -740,46 +760,73 @@ impl OobleckDecoder {
             .map(|b| b.stride)
             .product::<usize>()
             .max(1);
-        if t <= chunk + 2 * overlap {
-            return self.decode(latent, c, t);
-        }
-        let c_out = self.conv2.c_out;
-        let total = t * up;
-        let mut audio = vec![0f32; c_out * total];
-        let mut s = 0usize;
-        while s < t {
-            // Say how far the decode has got. It already walks the latent in chunks, so the
-            // count was there - it just never left the function, and a decode that takes
-            // minutes then shows a bare phase name, which reads as a hang.
-            if let Some(f) = on_chunk {
-                f(s, t)?;
-            }
-            let e = (s + chunk).min(t);
-            let a = s.saturating_sub(overlap);
-            let b = (e + overlap).min(t);
-            let w = b - a;
-            // sub-latent [c, w] channel-major
-            let mut sub = vec![0f32; c * w];
-            for ch in 0..c {
-                for f in 0..w {
-                    sub[ch * w + f] = latent[ch * t + (a + f)];
-                }
-            }
-            let (chunk_audio, cc, ct) = self.decode(&sub, c, w)?;
-            debug_assert_eq!(cc, c_out);
-            debug_assert_eq!(ct, w * up);
-            // keep the [s,e) window: it starts at sample (s-a)*up inside this chunk.
-            let left = (s - a) * up;
-            let keep = (e - s) * up;
-            for ch in 0..c_out {
-                let dst = ch * total + s * up;
-                let src = ch * ct + left;
-                audio[dst..dst + keep].copy_from_slice(&chunk_audio[src..src + keep]);
-            }
-            s = e;
-        }
-        Ok((audio, c_out, total))
+        decode_in_chunks(
+            latent,
+            c,
+            t,
+            up,
+            (chunk, overlap),
+            on_chunk,
+            &|sub, c, w| self.decode(sub, c, w),
+        )
     }
+}
+
+/// An Oobleck decode of `latent` `[c, t]` (channel-major) in time chunks of `chunk` frames
+/// (`window` is `(chunk, overlap)`), each decoded with `overlap` frames of context on either side that are cropped away. A
+/// decoder upsampling by `up` is translation-equivariant away from the signal edges, so with
+/// an overlap past its receptive field the stitched audio is the full decode, while each
+/// convolution's buffers follow the chunk. `decode` maps a `[c, w]` sub-latent to
+/// `(audio, channels, w * up)`; a latent no longer than one window is decoded whole.
+pub(crate) fn decode_in_chunks(
+    latent: &[f32],
+    c: usize,
+    t: usize,
+    up: usize,
+    (chunk, overlap): (usize, usize),
+    on_chunk: Option<&dyn Fn(usize, usize) -> crate::tensor::Result<()>>,
+    decode: &dyn Fn(&[f32], usize, usize) -> crate::tensor::Result<(Vec<f32>, usize, usize)>,
+) -> crate::tensor::Result<(Vec<f32>, usize, usize)> {
+    if t <= chunk + 2 * overlap {
+        return decode(latent, c, t);
+    }
+    let total = t * up;
+    let mut audio: Vec<f32> = Vec::new();
+    let mut s = 0usize;
+    while s < t {
+        // Say how far the decode has got, so a decode that takes minutes does not read as a
+        // hang.
+        if let Some(f) = on_chunk {
+            f(s, t)?;
+        }
+        let e = (s + chunk).min(t);
+        let a = s.saturating_sub(overlap);
+        let b = (e + overlap).min(t);
+        let w = b - a;
+        // sub-latent [c, w] channel-major
+        let mut sub = vec![0f32; c * w];
+        for ch in 0..c {
+            for f in 0..w {
+                sub[ch * w + f] = latent[ch * t + (a + f)];
+            }
+        }
+        let (chunk_audio, c_out, ct) = decode(&sub, c, w)?;
+        debug_assert_eq!(ct, w * up);
+        if audio.is_empty() {
+            audio = vec![0f32; c_out * total];
+        }
+        // keep the [s,e) window: it starts at sample (s-a)*up inside this chunk.
+        let left = (s - a) * up;
+        let keep = (e - s) * up;
+        for ch in 0..c_out {
+            let dst = ch * total + s * up;
+            let src = ch * ct + left;
+            audio[dst..dst + keep].copy_from_slice(&chunk_audio[src..src + keep]);
+        }
+        s = e;
+    }
+    let c_out = audio.len() / total;
+    Ok((audio, c_out, total))
 }
 
 /// One Oobleck ENCODER block: 3x ResUnit (at in_ch) -> snake -> strided downsample conv

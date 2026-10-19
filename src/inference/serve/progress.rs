@@ -274,18 +274,24 @@ pub mod placement {
         devices: impl IntoIterator<Item = DeviceLocation>,
         bytes_per_layer: u64,
     ) -> Vec<Placed> {
+        sized_runs(devices.into_iter().map(|d| (d, bytes_per_layer)))
+    }
+
+    /// The runs of a model whose layers sit on the devices of `layers`, in layer order,
+    /// each with the bytes paired with it.
+    pub fn sized_runs(layers: impl IntoIterator<Item = (DeviceLocation, u64)>) -> Vec<Placed> {
         let mut out: Vec<Placed> = Vec::new();
-        for (i, device) in devices.into_iter().enumerate() {
+        for (i, (device, bytes)) in layers.into_iter().enumerate() {
             match out.last_mut() {
                 Some(last) if last.device == device && last.layer_end == i => {
                     last.layer_end = i + 1;
-                    last.bytes += bytes_per_layer;
+                    last.bytes += bytes;
                 }
                 _ => out.push(Placed {
                     device,
                     layer_start: i,
                     layer_end: i + 1,
-                    bytes: bytes_per_layer,
+                    bytes,
                 }),
             }
         }

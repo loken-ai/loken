@@ -115,7 +115,7 @@ impl CondModel {
         s: usize,
     ) -> crate::tensor::Result<Tensor> {
         let d = self.head_dim;
-        let proj = x.matmul_t(lin.weight()?)?;
+        let proj = lin.forward(x)?;
         let q = proj
             .reshape((s, n_heads, d))?
             .transpose(0, 1)?
@@ -141,12 +141,12 @@ impl CondModel {
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qk_roped(&l.q, &l.q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.qk_roped(&l.k, &l.k_norm, x, nkv, s)?; // [1,nkv,s,d]
-        let v = x
-            .matmul_t(l.v.weight()?)?
-            .reshape((s, nkv, d))?
-            .transpose(0, 1)?
-            .unsqueeze(0)?
-            .contiguous()?; // [1,nkv,s,d]
+        let v =
+            l.v.forward(x)?
+                .reshape((s, nkv, d))?
+                .transpose(0, 1)?
+                .unsqueeze(0)?
+                .contiguous()?; // [1,nkv,s,d]
         let nrep = nh / nkv;
         let (k, v) = (repeat_kv(k, nrep)?, repeat_kv(v, nrep)?); // [1,nh,s,d]
         let scale = 1.0f32 / (d as f32).sqrt();
@@ -181,10 +181,10 @@ impl CondModel {
         let norm = x.rms_norm(&l.input_ln, eps)?;
         let x = x.add(&self.self_attn(l, &norm, s, win)?)?;
         let norm2 = x.rms_norm(&l.post_ln, eps)?;
-        let gate = norm2.matmul_t(l.gate.weight()?)?;
-        let up = norm2.matmul_t(l.up.weight()?)?;
+        let gate = l.gate.forward(&norm2)?;
+        let up = l.up.forward(&norm2)?;
         let ff = gate.silu()?.mul(&up)?;
-        x.add(&ff.matmul_t(l.down.weight()?)?)
+        x.add(&l.down.forward(&ff)?)
     }
 
     /// Run an embed-linear + N-layer encoder stack (alternating SWA-128/full on
@@ -368,9 +368,11 @@ mod tests {
 impl CondModel {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(
-            &self.device,
-            self.lyric_layers.len() + self.timbre_layers.len(),
-        )
+        let layers: Vec<_> = self
+            .lyric_layers
+            .iter()
+            .chain(&self.timbre_layers)
+            .collect();
+        crate::inference::model::qwen3::encoder::stack_placement(&self.device, &layers)
     }
 }

@@ -35,6 +35,37 @@ pub struct Layer {
     pub down: Linear,
 }
 
+/// The bytes `t` holds.
+pub(crate) fn tensor_bytes(t: &Tensor) -> u64 {
+    (t.elem_count() * t.dtype().size_in_bytes()) as u64
+}
+
+impl Layer {
+    /// The bytes this block's norms and projection matrices hold on its device.
+    pub fn bytes(&self) -> u64 {
+        let norms = [&self.input_ln, &self.post_ln, &self.q_norm, &self.k_norm];
+        let lins = [
+            &self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down,
+        ];
+        norms.iter().map(|t| tensor_bytes(t)).sum::<u64>()
+            + lins
+                .iter()
+                .map(|l| l.weight().map_or(0, tensor_bytes))
+                .sum::<u64>()
+    }
+}
+
+/// The runs of a stack of `layers` sitting whole on `device`, each with its bytes.
+pub(crate) fn stack_placement(
+    device: &Device,
+    layers: &[&Layer],
+) -> Vec<crate::inference::serve::progress::placement::Placed> {
+    let loc = device.location();
+    crate::inference::serve::progress::placement::sized_runs(
+        layers.iter().map(|l| (loc, l.bytes())),
+    )
+}
+
 /// RoPE cos/sin tables in NEOX layout: `cos[p,j] = cos(p.θ^(-2j/D))`.
 pub(crate) fn rope_tables(s: usize, d: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
     let half = d / 2;
@@ -69,7 +100,19 @@ pub(crate) fn load_t(
     Tensor::from_vec_f32(v, dims)?.to_device(device)
 }
 
-/// Load a linear from `<prefix>.weight` and, when asked for, `<prefix>.bias`.
+/// Load one GGUF matrix on `device` at its resident half-precision dtype.
+pub(crate) fn load_matrix(
+    c: &crate::tensor::quantized::gguf_file::Content,
+    f: &mut std::fs::File,
+    name: &str,
+    device: &Device,
+) -> crate::tensor::Result<Tensor> {
+    crate::inference::model::half::to_resident(&load_t(c, f, name, &Device::Cpu)?)?
+        .to_device(device)
+}
+
+/// Load a linear from `<prefix>.weight` and, when asked for, `<prefix>.bias`: the matrix in
+/// half precision, the bias in F32.
 pub(crate) fn lin(
     c: &crate::tensor::quantized::gguf_file::Content,
     f: &mut std::fs::File,
@@ -77,13 +120,13 @@ pub(crate) fn lin(
     bias: bool,
     device: &Device,
 ) -> crate::tensor::Result<Linear> {
-    let w = load_t(c, f, &format!("{prefix}.weight"), device)?;
+    let w = load_t(c, f, &format!("{prefix}.weight"), &Device::Cpu)?;
     let b = if bias {
-        Some(load_t(c, f, &format!("{prefix}.bias"), device)?)
+        Some(load_t(c, f, &format!("{prefix}.bias"), &Device::Cpu)?)
     } else {
         None
     };
-    Linear::new(w, b)
+    crate::inference::model::half::linear(&w, b.as_ref(), device)
 }
 
 #[cfg(test)]

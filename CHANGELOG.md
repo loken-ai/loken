@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Audio: keep Stable Audio, EzAudio and ACE-Step weights in half precision.
 - ROCm: read a prompt through the WMMA flash prefill on AMD cards.
 - Bench: measure AMD cards against ollama's ROCm build.
 - ROCm: serve language models on AMD cards through HIP.

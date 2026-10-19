@@ -9,6 +9,7 @@
 //! and the SnakeBeta activations pre-exponentiate their log-scale alpha/beta,
 //! so the forward is plain convs + a fused-able `x + sin^2(a x)/b` pointwise.
 
+use crate::inference::model::acestep::vae::ConvW;
 use crate::tensor::safetensors_io::SafeTensorsLoader;
 use crate::tensor::{DType, Device, Error, Result, Tensor};
 
@@ -72,10 +73,10 @@ impl SnakeBeta {
     }
 }
 
-/// A weight-norm-folded 1-D convolution (regular or transposed).
+/// A weight-norm-folded 1-D convolution (regular or transposed), its kernel held in half
+/// precision on a card except for a strided downsample.
 struct Conv {
-    weight: Tensor,
-    bias: Option<Tensor>,
+    w: ConvW,
     stride: usize,
     padding: usize,
     dilation: usize,
@@ -84,20 +85,18 @@ struct Conv {
 
 impl Conv {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Tensor conv ops want [B, C, T].
+        // The kernels take [B, C, T].
         let (c, t) = x.shape().dims2()?;
-        let xb = x.reshape((1, c, t))?;
+        let xb = x.contiguous()?.reshape((1, c, t))?;
         let y = if self.transposed {
-            xb.conv_transpose1d(&self.weight, self.padding, 0, self.stride, 1, 1)?
+            self.w.conv_t(&xb, self.padding, self.stride)?
+        } else if self.stride == 1 {
+            self.w.conv(&xb, self.padding, self.dilation)?
         } else {
-            xb.conv1d(&self.weight, self.padding, self.stride, self.dilation, 1)?
+            self.w.conv_down(&xb, self.padding, self.stride)?
         };
         let (_, oc, ot) = y.shape().dims3()?;
-        let mut y = y.reshape((oc, ot))?;
-        if let Some(b) = &self.bias {
-            y = y.broadcast_add(&b.reshape((oc, 1))?)?;
-        }
-        Ok(y)
+        y.reshape((oc, ot))
     }
 }
 
@@ -150,15 +149,50 @@ impl OobleckDecoder {
         self.blocks.iter().map(|b| b.upsample.stride).product()
     }
 
-    /// Decode a latent `[latent_dim, T]` into audio `[channels, T * stride]` (f32, ~[-1, 1]).
+    /// Decode a latent `[latent_dim, T]` into audio `[channels, T * stride]` (f32, ~[-1, 1])
+    /// on the host. The latent is decoded in time chunks with overlapping context, and the
+    /// chunk is halved each time the card runs out of memory.
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
-        let (c, _) = latent.shape().dims2()?;
+        use crate::inference::place::audio_demand as ad;
+        let (c, t) = latent.shape().dims2()?;
         if c != self.latent_dim {
             return Err(Error::msg(format!(
                 "oobleck decoder expects [{}, T] latents, got {c} channels",
                 self.latent_dim
             )));
         }
+        let host = latent.to_vec_f32();
+        let dev = self.head.w.wt.device();
+        let whole = |sub: &[f32], c: usize, w: usize| -> Result<(Vec<f32>, usize, usize)> {
+            let x = Tensor::from_vec_f32(sub.to_vec(), (c, w))?.to_device(&dev)?;
+            let y = self.decode_whole(&x)?;
+            let (oc, n) = y.shape().dims2()?;
+            Ok((y.to_vec_f32(), oc, n))
+        };
+        let (audio, oc, n) = crate::inference::place::ladder::halve_until_fits(
+            "Stable Audio decode chunk",
+            ad::DECODE_CHUNK_FRAMES,
+            crate::inference::model::acestep::vae::MIN_DECODE_CHUNK,
+            |chunk| {
+                let overlap = ad::DECODE_OVERLAP_FRAMES
+                    .min(chunk.saturating_sub(1))
+                    .max(1);
+                crate::inference::model::acestep::vae::decode_in_chunks(
+                    &host,
+                    c,
+                    t,
+                    self.stride(),
+                    (chunk, overlap),
+                    None,
+                    &whole,
+                )
+            },
+        )?;
+        Tensor::from_vec_f32(audio, (oc, n))
+    }
+
+    /// Decode a latent `[latent_dim, T]` in one pass on the decoder's device.
+    fn decode_whole(&self, latent: &Tensor) -> Result<Tensor> {
         let mut h = self.head.forward(latent)?;
         for b in &self.blocks {
             h = b.forward(&h)?;
@@ -221,16 +255,22 @@ fn load_wn_conv(
             w[i * rest + j] = s * scale;
         }
     }
-    let weight = Tensor::from_vec_f32(w, dims)?.to_device(dev)?;
+    // A regular conv is `[O, I, K]`, a transposed one `[I, O, K]`.
+    let (c_out, c_in, k) = if transposed {
+        (dims[1], dims[0], dims[2])
+    } else {
+        (dims[0], dims[1], dims[2])
+    };
     let bias_name = format!("{prefix}.bias");
     let bias = if loader.contains(&bias_name) {
-        Some(get_f32(loader, &bias_name)?.to_device(dev)?)
+        get_f32(loader, &bias_name)?.to_vec_f32()
     } else {
-        None
+        vec![0.0; c_out]
     };
+    // The strided downsample runs the generic convolution, which reads an F32 kernel.
+    let half = transposed || stride == 1;
     Ok(Conv {
-        weight,
-        bias,
+        w: ConvW::from_fused(w, (c_out, c_in, k), bias, transposed, half, dev)?,
         stride,
         padding,
         dilation,
@@ -246,11 +286,24 @@ fn load_resampling_conv(
     prefix: &str,
     transposed: bool,
 ) -> Result<Conv> {
-    let mut conv = load_wn_conv(loader, dev, prefix, 1, 0, 1, transposed)?;
-    let (_, _, kernel) = conv.weight.shape().dims3()?;
-    conv.stride = kernel / 2;
-    conv.padding = conv.stride.div_ceil(2);
-    Ok(conv)
+    let kernel = [
+        format!("{prefix}.weight_v"),
+        format!("{prefix}.parametrizations.weight.original1"),
+    ]
+    .iter()
+    .find_map(|n| loader.shape_of(n))
+    .and_then(|d| d.get(2).copied())
+    .ok_or_else(|| Error(format!("{prefix}: no conv kernel")))?;
+    let stride = kernel / 2;
+    load_wn_conv(
+        loader,
+        dev,
+        prefix,
+        stride,
+        stride.div_ceil(2),
+        1,
+        transposed,
+    )
 }
 
 fn load_snake(loader: &SafeTensorsLoader, dev: &Device, prefix: &str) -> Result<SnakeBeta> {
@@ -301,7 +354,7 @@ pub fn load_decoder_on(path: &str, prefix: &str, dev: &Device) -> Result<Oobleck
     let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
     let stages = oobleck_blocks(&loader, prefix);
     let head = load_wn_conv(&loader, dev, &format!("{prefix}.layers.0"), 1, 3, 1, false)?;
-    let latent_dim = head.weight.shape().dims3()?.1;
+    let latent_dim = head.w.c_in;
     let mut blocks = Vec::with_capacity(stages);
     for li in 1..=stages {
         let bp = format!("{prefix}.layers.{li}");
@@ -472,6 +525,8 @@ pub struct SaoDit {
     /// All the same device is the ONE-SEGMENT PLAN and stays bit-identical: the moves below
     /// are no-ops, because a tensor already on a device is returned unchanged.
     block_devices: Vec<Device>,
+    /// The bytes one block holds on its device; every block has the same tensors.
+    block_bytes: u64,
     /// Rotary inverse frequencies, one per rotated pair, host-side.
     inv_freq: Vec<f32>,
     postprocess: Linear,
@@ -673,15 +728,21 @@ pub fn load_dit_planned(path: &str, block_devices: &[Device], primary: &Device) 
     let get_on = |name: String, d: &Device| -> Result<Tensor> {
         loader.load(&name)?.to_dtype(DType::F32)?.to_device(d)
     };
-    let lin_on = |name: String, d: &Device| -> Result<Linear> {
-        Linear::new(get_on(format!("{name}.weight"), d)?, None)
-    };
-    let lin_b_on = |name: String, d: &Device| -> Result<Linear> {
-        Linear::new(
-            get_on(format!("{name}.weight"), d)?,
-            Some(get_on(format!("{name}.bias"), d)?),
+    // A projection holds its matrix in half precision and its bias in F32.
+    let half_lin = |name: String, bias: bool, d: &Device| -> Result<Linear> {
+        let b = if bias {
+            Some(loader.load(&format!("{name}.bias"))?)
+        } else {
+            None
+        };
+        crate::inference::model::half::linear(
+            &loader.load(&format!("{name}.weight"))?,
+            b.as_ref(),
+            d,
         )
     };
+    let lin_on = |name: String, d: &Device| half_lin(name, false, d);
+    let lin_b_on = |name: String, d: &Device| half_lin(name, true, d);
     let norm_on = |name: String, d: &Device| -> Result<LayerNorm> {
         Ok(LayerNorm::new(
             get_on(format!("{name}.gamma"), d)?,
@@ -692,15 +753,9 @@ pub fn load_dit_planned(path: &str, block_devices: &[Device], primary: &Device) 
     let get = |name: String| -> Result<Tensor> {
         loader.load(&name)?.to_dtype(DType::F32)?.to_device(device)
     };
-    let lin =
-        |name: String| -> Result<Linear> { Linear::new(get(format!("{name}.weight"))?, None) };
-    let lin_b = |name: String| -> Result<Linear> {
-        Linear::new(
-            get(format!("{name}.weight"))?,
-            Some(get(format!("{name}.bias"))?),
-        )
-    };
-    // 1x1 convs are plain linears over the channel dim.
+    let lin = |name: String| half_lin(name, false, device);
+    let lin_b = |name: String| half_lin(name, true, device);
+    // 1x1 convs are plain linears over the channel dim, kept F32 beside the latent they add to.
     let conv1 = |name: String| -> Result<Linear> {
         let w = get(format!("{name}.weight"))?;
         let (o, i, _) = w.shape().dims3()?;
@@ -753,6 +808,7 @@ pub fn load_dit_planned(path: &str, block_devices: &[Device], primary: &Device) 
         project_out: lin(format!("{tr}.project_out"))?,
         blocks,
         block_devices: block_devices.to_vec(),
+        block_bytes: component_bytes(path, &[&format!("{tr}.layers.0.")])?,
         inv_freq,
         postprocess: conv1(format!("{pfx}.postprocess_conv"))?,
         device: device.clone(),
@@ -777,9 +833,10 @@ impl SaoNumberConditioner {
             loader.load(&name)?.to_dtype(DType::F32)?.to_device(device)
         };
         let weights = get(format!("{p}.0.weights"))?.to_vec_f32();
-        let proj = Linear::new(
-            get(format!("{p}.1.weight"))?,
-            Some(get(format!("{p}.1.bias"))?),
+        let proj = crate::inference::model::half::linear(
+            &loader.load(&format!("{p}.1.weight"))?,
+            Some(&loader.load(&format!("{p}.1.bias"))?),
+            device,
         )?;
         Ok(Self {
             weights,
@@ -981,26 +1038,41 @@ pub fn unload_resident() -> usize {
     usize::from(dropped)
 }
 
-/// On-disk bytes of everything the resident keeps loaded (DiT + decoder
-/// checkpoint + t5-base) - the figure the pressure protocol should demand
-/// before a stable-audio request places its pipeline.
+/// Bytes of everything the resident keeps loaded - the DiT, the decoder and the number
+/// conditioners as they sit on a card, and the t5-base file - the figure the pressure
+/// protocol should demand before a stable-audio request places its pipeline.
 pub fn resident_bytes() -> u64 {
     let Some(dir) = model_dir() else { return 0 };
     let sz = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    sz(dir.join("model.safetensors")) + sz(dir.join("t5-base/model.safetensors"))
+    let pipeline = dir
+        .join("model.safetensors")
+        .to_str()
+        .and_then(|ckpt| component_bytes(ckpt, &RESIDENT_PREFIXES).ok())
+        .unwrap_or(0);
+    pipeline + sz(dir.join("t5-base/model.safetensors"))
 }
 
 /// Where the decoder's tensors sit in the checkpoint.
 const DECODER_PREFIX: &str = "pretransform.model.decoder";
 
-/// Bytes of the tensors under `prefix` in the checkpoint at `path`, read from its header.
-fn component_bytes(path: &str, prefix: &str) -> Result<u64> {
+/// The checkpoint's parts the resident pipeline loads onto its device: the DiT, the decoder
+/// and the number conditioners.
+const RESIDENT_PREFIXES: [&str; 3] = ["model.model.", DECODER_PREFIX, "conditioner."];
+
+/// Bytes the tensors under `prefixes` in the checkpoint at `path` take on a card, read from
+/// its header.
+fn component_bytes(path: &str, prefixes: &[&str]) -> Result<u64> {
     let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
     Ok(loader
-        .byte_sizes()
-        .iter()
-        .filter(|(n, _)| n.starts_with(prefix))
-        .map(|(_, b)| *b as u64)
+        .names()
+        .into_iter()
+        .filter(|n| prefixes.iter().any(|p| n.starts_with(p)))
+        .filter_map(|n| {
+            Some(crate::inference::model::half::card_bytes(
+                n,
+                &loader.shape_of(n)?,
+            ))
+        })
         .sum())
 }
 
@@ -1038,9 +1110,7 @@ fn resident() -> Result<std::sync::Arc<SaoResident>> {
         .to_str()
         .ok_or_else(|| Error::msg("bad t5 path".to_string()))?
         .to_string();
-    let sz = std::fs::metadata(&ckpt_path)
-        .map(|m| m.len())
-        .map_err(|e| Error::msg(format!("stable-audio checkpoint {ckpt}: {e}")))?;
+    let sz = component_bytes(ckpt, &RESIDENT_PREFIXES)?;
     let t5 = crate::inference::model::t5::flan::T5Encoder::from_dir(&t5_dir)?;
     // The DiT, the decoder and the conditioners share one device, placed whole by the
     // ladder in `place` with the decode's reserve beside them.
@@ -1251,7 +1321,7 @@ pub fn render_with_init(
                 .ok_or_else(|| Error::msg("bad checkpoint path".to_string()))?;
             crate::inference::place::ladder::load_whole(
                 "Stable Audio decoder",
-                component_bytes(ckpt, DECODER_PREFIX)?,
+                component_bytes(ckpt, &[DECODER_PREFIX])?,
                 decode_reserve(),
                 |dev| load_decoder_on(ckpt, DECODER_PREFIX, dev)?.decode(&latent.to_device(dev)?),
             )?
@@ -1553,22 +1623,60 @@ mod op_determinism {
 #[cfg(test)]
 mod tests;
 
+/// The bytes a convolution's kernel and bias hold.
+fn conv_bytes(c: &Conv) -> u64 {
+    [&c.w.wt, &c.w.bt]
+        .iter()
+        .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+        .sum()
+}
+
 impl OobleckDecoder {
-    /// Where this model's layers sit, by device.
+    /// Where this model's layers sit, by device, each block with the kernels it holds; the
+    /// head and tail convolutions count with the first block.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(
-            &self.head.weight.device(),
-            self.blocks.len(),
+        let loc = self.head.w.wt.device().location();
+        let mut bytes: Vec<u64> = self
+            .blocks
+            .iter()
+            .map(|b| {
+                conv_bytes(&b.upsample)
+                    + b.res
+                        .iter()
+                        .map(|r| conv_bytes(&r.conv1) + conv_bytes(&r.conv2))
+                        .sum::<u64>()
+            })
+            .collect();
+        if let Some(first) = bytes.first_mut() {
+            *first += conv_bytes(&self.head) + conv_bytes(&self.tail);
+        }
+        crate::inference::serve::progress::placement::sized_runs(
+            bytes.into_iter().map(|b| (loc, b)),
         )
     }
 }
 
 impl OobleckEncoder {
-    /// Where this model's layers sit, by device.
+    /// Where this model's layers sit, by device, each block with the kernels it holds; the
+    /// head and tail convolutions count with the first block.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(
-            &self.head.weight.device(),
-            self.blocks.len(),
+        let loc = self.head.w.wt.device().location();
+        let mut bytes: Vec<u64> = self
+            .blocks
+            .iter()
+            .map(|b| {
+                conv_bytes(&b.downsample)
+                    + b.res
+                        .iter()
+                        .map(|r| conv_bytes(&r.conv1) + conv_bytes(&r.conv2))
+                        .sum::<u64>()
+            })
+            .collect();
+        if let Some(first) = bytes.first_mut() {
+            *first += conv_bytes(&self.head) + conv_bytes(&self.tail);
+        }
+        crate::inference::serve::progress::placement::sized_runs(
+            bytes.into_iter().map(|b| (loc, b)),
         )
     }
 }
@@ -1578,7 +1686,7 @@ impl SaoDit {
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
         crate::inference::serve::progress::placement::runs(
             self.block_devices.iter().map(|d| d.location()),
-            0,
+            self.block_bytes,
         )
     }
 }
