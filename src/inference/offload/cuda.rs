@@ -953,9 +953,12 @@ impl Offload for Card {
         dims: (usize, usize, usize, usize),
         scale: f32,
     ) -> Option<Result<Vec<f32>>> {
-        // The launcher takes the queries in chunks sized by what the card has free, so what a
-        // call needs beside the keys and its answer is its own to size.
-        let need = (q.len() + kv.len() + idxs.len()) * F32 + q.len() * F32;
+        // The queries, keys, slots and answer, and one chunk's gathered keys, logits and outputs.
+        let (s, h, d, topk) = dims;
+        let chunk = crate::tensor::cuda::ATTENTION_QUERY_CHUNK.min(s);
+        let need = (q.len() + kv.len() + idxs.len()) * F32
+            + q.len() * F32
+            + chunk * (topk * d + h * topk + 2 * h * d) * F32;
         self.attempt("sparse attention", need, || {
             gpu_sparse_attn(&self.dev, q, kv, sink, idxs, dims, scale)
         })

@@ -1627,6 +1627,11 @@ fn linear_tiled(
     Ok(out)
 }
 
+/// Queries a prompt's attention takes on a card at once. Fixed rather than sized from the memory
+/// free at the call: a product's bits follow how many rows it takes, so a chunk that followed the
+/// free memory would make a prompt's answer follow what else the card holds.
+pub const ATTENTION_QUERY_CHUNK: usize = 256;
+
 /// A prompt's attention on the card from the shared query latent on, in chunks of queries: the
 /// queries from the latent, rotated, over the gathered keys with the sink, rotated back, and
 /// through the grouped output projection; `[n, dim]` comes back. Nothing but the latent and the
@@ -1695,17 +1700,8 @@ pub fn gpu_prefill_attention_with(
         stream.clone_htod(a.sin).map_err(up)?,
         stream.clone_htod(&neg_sin).map_err(up)?,
     );
-    // Queries go through in chunks whose gathered keys, logits and outputs, and the queries and
-    // outputs themselves, take at most a third of what the card has free now.
-    // PLACEMENT-EXEMPT: sizes a kernel's chunks inside the card its caller placed it on.
-    let (free, _) = dev
-        .ctx
-        .mem_get_info()
-        .map_err(|e| Error(format!("prefill attention memory: {e}")))?;
-    let per_query = (topk * hd + h * topk + 4 * h * hd + groups * r + dim) * 4;
-    let chunk = (free / 3 / per_query.max(1))
-        .clamp(1, n.max(1))
-        .min(max_chunk.max(1));
+    // Queries go through in chunks of a fixed count (see `ATTENTION_QUERY_CHUNK`).
+    let chunk = ATTENTION_QUERY_CHUNK.min(max_chunk).clamp(1, n.max(1));
     let launch1 = |name: &str, total: usize| -> Result<(CudaFunction, LaunchConfig)> {
         Ok((
             dev.quantized_fn(name)?,
@@ -2105,16 +2101,8 @@ pub fn gpu_sparse_attn(
         stream.clone_htod(sink).map_err(up)?,
         stream.clone_htod(idxs).map_err(up)?,
     );
-    // Queries go through in chunks whose gathered keys, logits and outputs take at most half of
-    // what the card has free now.
-    // PLACEMENT-EXEMPT: sizes a kernel's chunks inside the card its caller placed it on;
-    // nothing is placed by it.
-    let (free, _) = dev
-        .ctx
-        .mem_get_info()
-        .map_err(|e| Error(format!("sparse attention memory: {e}")))?;
-    let per_query = (topk * d + h * topk + 2 * h * d) * std::mem::size_of::<f32>();
-    let chunk = (free / 2 / per_query.max(1)).clamp(1, s.max(1));
+    // Queries go through in chunks of a fixed count (see `ATTENTION_QUERY_CHUNK`).
+    let chunk = ATTENTION_QUERY_CHUNK.clamp(1, s.max(1));
     let (func_gather, func_softmax) = (
         dev.quantized_fn("gather_slots_f32")?,
         dev.quantized_fn("sink_softmax_f32")?,
