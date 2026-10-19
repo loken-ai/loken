@@ -26,6 +26,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- MoE: read each host expert once for all the prompt rows that route to it.
 - Bench: sweep the whole matrix with FULL=1, one fair-run per prompt, in place of campaign.sh.
 - Whisper: transcribe with half-precision weights and a reserved decoder cache.
 - Placement: shrink a context nobody asked for until the cards hold a tensor split.

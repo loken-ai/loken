@@ -2151,6 +2151,115 @@ where
     Ok(())
 }
 
+/// Several experts, each over its own rows, in one thread-pool region: expert `e`'s weight
+/// `rhs_bytes[e]` (`[n, k]` blocks of `dtype`) against its `lhs[e].len() / k` activation rows,
+/// into `outs[e]` (`[rows, n]`, row-major). The region shards (expert x output-column chunk), and
+/// each loaded weight column is dotted with every row of its expert before the next one is
+/// loaded, so an expert's weights are read once however many rows route to it. Each row is
+/// quantised and each output is the same `dot` as `matmul_bytes_multi` gives that row alone,
+/// so the outputs are bit-for-bit those of one GEMV per (expert, row).
+pub fn matmul_bytes_grouped(
+    dtype: GgmlDType,
+    k: usize,
+    n: usize,
+    rhs_bytes: &[&[u8]],
+    lhs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+) -> Result<()> {
+    if lhs.len() != rhs_bytes.len() || outs.len() != rhs_bytes.len() {
+        return Err(Error(format!(
+            "matmul_bytes_grouped: ne mismatch rhs {} lhs {} outs {}",
+            rhs_bytes.len(),
+            lhs.len(),
+            outs.len()
+        )));
+    }
+    if rhs_bytes.is_empty() {
+        return Ok(());
+    }
+    with_blocks!(dtype, T => {
+        matmul_bytes_grouped_impl::<T>(k, n, rhs_bytes, lhs, outs)
+    })
+}
+
+fn matmul_bytes_grouped_impl<T: BlockFormat>(
+    k: usize,
+    n: usize,
+    rhs_bytes: &[&[u8]],
+    lhs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+) -> Result<()>
+where
+    T::ActivationBlock: 'static,
+{
+    let ne = rhs_bytes.len();
+    if k == 0 || !k.is_multiple_of(T::BLOCK_LEN) {
+        return Err(Error(format!(
+            "matmul_bytes_grouped: k {k} not a multiple of block size {}",
+            T::BLOCK_LEN
+        )));
+    }
+    let k_in_blocks = k / T::BLOCK_LEN;
+    let mut rhs: Vec<&[T]> = Vec::with_capacity(ne);
+    let mut rows_of = Vec::with_capacity(ne);
+    for e in 0..ne {
+        if !lhs[e].len().is_multiple_of(k) {
+            return Err(Error(format!(
+                "matmul_bytes_grouped: lhs[{e}] len {} not whole rows of {k}",
+                lhs[e].len()
+            )));
+        }
+        let rows = lhs[e].len() / k;
+        if outs[e].len() != rows * n {
+            return Err(Error(format!(
+                "matmul_bytes_grouped: outs[{e}] len {} != {rows}x{n}",
+                outs[e].len()
+            )));
+        }
+        let blocks: &[T] = cast_blocks(rhs_bytes[e])?;
+        if blocks.len() != n * k_in_blocks {
+            return Err(Error(format!(
+                "matmul_bytes_grouped: rhs[{e}] has {} blocks, want {}",
+                blocks.len(),
+                n * k_in_blocks
+            )));
+        }
+        rhs.push(blocks);
+        rows_of.push(rows);
+    }
+    // Each row quantised once, as `matmul_bytes_multi` quantises a row of its own.
+    let mut lhsq: Vec<Vec<T::ActivationBlock>> = Vec::with_capacity(ne);
+    for e in 0..ne {
+        let mut b = vec![T::ActivationBlock::zeros(); rows_of[e] * k_in_blocks];
+        for (r, q) in b.chunks_exact_mut(k_in_blocks).enumerate() {
+            T::ActivationBlock::quantize(&lhs[e][r * k..(r + 1) * k], q);
+        }
+        lhsq.push(b);
+    }
+    let pool = gemv_pool::pool();
+    let (chunk_cols, chunks_per_expert) = gemv_grid(1, n, pool.threads);
+    let out_ptrs: Vec<SendMutPtr<f32>> = outs
+        .iter_mut()
+        .map(|o| SendMutPtr(o.as_mut_ptr()))
+        .collect();
+    pool.run(ne * chunks_per_expert, &|chunk| {
+        let e = chunk / chunks_per_expert;
+        let col0 = (chunk % chunks_per_expert) * chunk_cols;
+        let col1 = (col0 + chunk_cols).min(n);
+        let (re, xq, rows, op) = (rhs[e], lhsq[e].as_slice(), rows_of[e], &out_ptrs[e]);
+        for col in col0..col1 {
+            let rhs_col = &re[col * k_in_blocks..(col + 1) * k_in_blocks];
+            for r in 0..rows {
+                let v = T::dot(rhs_col, &xq[r * k_in_blocks..(r + 1) * k_in_blocks]);
+                // SAFETY: each (expert e, row r, column col) is written exactly once: column
+                // chunks of one expert are disjoint, and experts write their own outputs.
+                unsafe { *op.0.add(r * n + col) = v };
+            }
+        }
+    });
+    Ok(())
+}
+
 /// f16-carrier variant (gpt-oss attention path: parallel `matmul_f16`).
 pub fn matmul_f16_bytes(
     dtype: GgmlDType,

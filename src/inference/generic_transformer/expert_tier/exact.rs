@@ -347,29 +347,92 @@ fn host_rows<G: ExactDot, D: ExactDot>(
         }
     }
     let n = pairs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // The pairs by expert, in their order within one: each unit of work is one expert and a run
+    // of its weight rows, and each row meets every pair of the expert before the next is read,
+    // so an expert's blocks are read once for all the pairs that route to it.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&p| pairs[p].1);
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (j, &p) in order.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if pairs[order[g.0]].1 == pairs[p].1 => g.1 = j + 1,
+            _ => groups.push((j, j + 1)),
+        }
+    }
+    let units = |len: usize| -> Vec<(usize, usize)> {
+        groups
+            .iter()
+            .enumerate()
+            .flat_map(|(g, _)| (0..len.div_ceil(ROWS_A_UNIT)).map(move |c| (g, c * ROWS_A_UNIT)))
+            .collect()
+    };
+    let pool = crate::tensor::quant_cpu::gemv_pool::pool();
     let mut h = vec![0f32; n * inter];
-    crate::tensor::quant_cpu::pool_for_each_mut(&mut h, 16, &|i, out| {
-        let (p, r) = (i / inter, i % inter);
-        let (row, e, _) = pairs[p];
-        let at = (e as usize * inter + r) * nb;
-        let a = &xq[row * nb..(row + 1) * nb];
-        let g = G::dot_exact(&gate[at..at + nb], a);
-        let u = G::dot_exact(&up[at..at + nb], a);
-        *out = crate::inference::offload::experts::swiglu(g, u, 0.0);
-    });
+    {
+        let at_h = Shared(h.as_mut_ptr());
+        let work = units(inter);
+        pool.run(work.len(), &|u| {
+            let at_h = &at_h;
+            let (g, r0) = work[u];
+            let (lo, hi) = groups[g];
+            let e = pairs[order[lo]].1 as usize;
+            for r in r0..(r0 + ROWS_A_UNIT).min(inter) {
+                let at = (e * inter + r) * nb;
+                let (gw, uw) = (&gate[at..at + nb], &up[at..at + nb]);
+                for &p in &order[lo..hi] {
+                    let row = pairs[p].0;
+                    let a = &xq[row * nb..(row + 1) * nb];
+                    let v = crate::inference::offload::experts::swiglu(
+                        G::dot_exact(gw, a),
+                        G::dot_exact(uw, a),
+                        0.0,
+                    );
+                    // SAFETY: each (pair, row) is written by the one unit that holds the row of
+                    // the pair's expert.
+                    unsafe { *at_h.0.add(p * inter + r) = v };
+                }
+            }
+        });
+    }
     let mut hq = vec![BlockQ8K::zeros(); n * nbi];
     for (p, q) in hq.chunks_exact_mut(nbi).enumerate() {
         BlockQ8K::quantize(&h[p * inter..(p + 1) * inter], q);
     }
     let mut y = vec![0f32; n * dim];
-    crate::tensor::quant_cpu::pool_for_each_mut(&mut y, 16, &|i, out| {
-        let (p, c) = (i / dim, i % dim);
-        let (_, e, w) = pairs[p];
-        let at = (e as usize * dim + c) * nbi;
-        *out = w * D::dot_exact(&down[at..at + nbi], &hq[p * nbi..(p + 1) * nbi]);
-    });
+    {
+        let at_y = Shared(y.as_mut_ptr());
+        let work = units(dim);
+        pool.run(work.len(), &|u| {
+            let at_y = &at_y;
+            let (g, c0) = work[u];
+            let (lo, hi) = groups[g];
+            let e = pairs[order[lo]].1 as usize;
+            for c in c0..(c0 + ROWS_A_UNIT).min(dim) {
+                let at = (e * dim + c) * nbi;
+                let dw = &down[at..at + nbi];
+                for &p in &order[lo..hi] {
+                    let v = pairs[p].2 * D::dot_exact(dw, &hq[p * nbi..(p + 1) * nbi]);
+                    // SAFETY: each (pair, column) is written by the one unit that holds the
+                    // column of the pair's expert.
+                    unsafe { *at_y.0.add(p * dim + c) = v };
+                }
+            }
+        });
+    }
     y
 }
+
+/// Weight rows of one expert a unit of [`host_rows`] takes.
+const ROWS_A_UNIT: usize = 16;
+
+/// A pointer the units of [`host_rows`] write their disjoint outputs through.
+struct Shared(*mut f32);
+// SAFETY: the units write disjoint elements, and the pool joins them before the buffer is read.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
 /// The rows of a token's pairs summed as `tx_sum` sums them: in the router's order from -0.
 #[cfg(test)]
@@ -705,4 +768,75 @@ pub(super) struct Mail {
     pub(super) late_pairs: u64,
     pub(super) late_places: u64,
     pub(super) product: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stack of `experts` matrices `[rows, cols]` drawn from `seed`, quantised on the host.
+    fn stack(
+        experts: usize,
+        rows: usize,
+        cols: usize,
+        seed: u32,
+        dtype: GgmlDType,
+    ) -> Arc<QTensor> {
+        let values: Vec<f32> = (0..experts * rows * cols)
+            .map(|i| {
+                (((i as u32)
+                    .wrapping_add(seed.wrapping_mul(0x9E37_79B9))
+                    .wrapping_mul(2_654_435_761)
+                    .rotate_left(9)
+                    >> 8) as f32
+                    / (1 << 24) as f32
+                    - 0.5)
+                    * 0.2
+            })
+            .collect();
+        let w = Tensor::from_vec(values, (experts, rows, cols), &Device::Cpu).unwrap();
+        Arc::new(QTensor::quantize_onto(&w, dtype, &Device::Cpu).unwrap())
+    }
+
+    /// The host's pairs of a synthetic prompt, each expert read once for all the rows that route
+    /// to it, are the bits each pair gets computed alone as a decoded token's would be, and the
+    /// rows they sum to in the router's order are the same.
+    #[test]
+    fn a_prompt_batched_by_expert_matches_its_pairs_one_by_one() {
+        let (experts, used, dim, inter, rows) = (6usize, 3usize, 512usize, 256usize, 11usize);
+        for (gate_dt, down_dt) in [
+            (GgmlDType::Q2K, GgmlDType::Q4K),
+            (GgmlDType::Q4K, GgmlDType::Q6K),
+        ] {
+            let host = [
+                stack(experts, inter, dim, 1, gate_dt),
+                stack(experts, inter, dim, 2, gate_dt),
+                stack(experts, dim, inter, 3, down_dt),
+            ];
+            let exact = Exact::of(&host).expect("formats with exact kernels");
+            let x: Vec<f32> = (0..rows * dim)
+                .map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 4.0)
+                .collect();
+            // Row r routes to experts r, r + 1 and r + 3 (mod experts): each expert serves several
+            // rows, adjacent and not.
+            let pairs: Vec<(usize, u32, f32)> = (0..rows)
+                .flat_map(|r| {
+                    [0usize, 1, 3]
+                        .map(|d| (r, ((r + d) % experts) as u32, 0.2 + 0.03 * (r + d) as f32))
+                })
+                .collect();
+            assert_eq!(pairs.len(), rows * used);
+            let together = host_pairs(&exact, &host, &x, &pairs).unwrap();
+            let mut alone = Vec::with_capacity(together.len());
+            for p in &pairs {
+                alone.extend(host_pairs(&exact, &host, &x, std::slice::from_ref(p)).unwrap());
+            }
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&together), bits(&alone), "{gate_dt:?} / {down_dt:?}");
+            assert_eq!(
+                bits(&sum_in_order(&together, used, dim)),
+                bits(&sum_in_order(&alone, used, dim))
+            );
+        }
+    }
 }

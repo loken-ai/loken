@@ -75,12 +75,14 @@ pub(crate) fn batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<
     Some(out)
 }
 
-/// A block of tokens through its routed experts in one thread-pool region, each expert over the
-/// rows the block routed to it. `row_batches[i]` is expert `i`'s inputs, row-major (`nrows_i * dim`
-/// floats); the result is expert `i`'s outputs in the same order. A verify runs this once for the
-/// whole block, so the pool is published to three times a layer for the block instead of three
-/// times a layer per token - the per-layer dispatch is what a decode pays over and over, and the
-/// batch pays it once. `None` if a weight is not in the format the kernels read.
+/// A block of tokens through its routed experts in one thread-pool region per projection, each
+/// expert over the rows the block routed to it. `row_batches[i]` is expert `i`'s inputs, row-major
+/// (`nrows_i * dim` floats); the result is expert `i`'s outputs in the same order. Each loaded
+/// weight column meets every row of its expert before the next column is loaded, so an expert's
+/// weights are read once for all the rows that route to it, not once per row. The pool is
+/// published to three times a layer for the whole block. Bit-for-bit the per-row products: each
+/// output is the same dot over the same quantised row. `None` if a weight is not in the format the
+/// kernels read.
 #[allow(clippy::type_complexity)]
 pub(crate) fn multirow(
     experts: &[Arc<Expert>],
@@ -89,7 +91,7 @@ pub(crate) fn multirow(
     limit: f32,
 ) -> Option<Vec<Vec<f32>>> {
     use crate::inference::offload::projection::Projection;
-    use crate::tensor::quant_cpu::matmul_bytes_multi;
+    use crate::tensor::quant_cpu::matmul_bytes_grouped;
     use crate::tensor::quantized::GgmlDType;
     let ne = experts.len();
     if ne == 0 {
@@ -121,56 +123,42 @@ pub(crate) fn multirow(
         up_c.push(qbytes(&e.w3, up_dt)?);
         down_c.push(qbytes(&e.w2, down_dt)?);
     }
-    // Every (expert, row) is a pair the pool runs as one GEMV: the same weight bytes for each of
-    // an expert's rows, that row's activation as the input.
-    let (mut gate_r, mut up_r, mut down_r) = (Vec::new(), Vec::new(), Vec::new());
-    let mut lhs: Vec<&[f32]> = Vec::new();
-    let mut nrows_of = vec![0usize; ne];
-    for i in 0..ne {
-        let nrows = row_batches[i].len() / dim;
-        nrows_of[i] = nrows;
-        for r in 0..nrows {
-            gate_r.push(gate_c[i].as_ref());
-            up_r.push(up_c[i].as_ref());
-            down_r.push(down_c[i].as_ref());
-            lhs.push(&row_batches[i][r * dim..(r + 1) * dim]);
-        }
+    if row_batches.len() != ne || row_batches.iter().any(|b| b.len() % dim.max(1) != 0) {
+        return None;
     }
-    let npairs = lhs.len();
-    if npairs == 0 {
+    let nrows_of: Vec<usize> = row_batches.iter().map(|b| b.len() / dim.max(1)).collect();
+    if nrows_of.iter().all(|&r| r == 0) {
         return Some(vec![Vec::new(); ne]);
     }
-    let mut gate_o = vec![vec![0f32; inter]; npairs];
-    let mut up_o = vec![vec![0f32; inter]; npairs];
+    let lhs: Vec<&[f32]> = row_batches.iter().map(|b| b.as_slice()).collect();
+    let gate_r: Vec<&[u8]> = gate_c.iter().map(|c| c.as_ref()).collect();
+    let up_r: Vec<&[u8]> = up_c.iter().map(|c| c.as_ref()).collect();
+    let down_r: Vec<&[u8]> = down_c.iter().map(|c| c.as_ref()).collect();
+    let mut gate_o: Vec<Vec<f32>> = nrows_of.iter().map(|&r| vec![0f32; r * inter]).collect();
+    let mut up_o: Vec<Vec<f32>> = nrows_of.iter().map(|&r| vec![0f32; r * inter]).collect();
     {
         let mut o: Vec<&mut [f32]> = gate_o.iter_mut().map(|v| v.as_mut_slice()).collect();
-        matmul_bytes_multi(gate_dt, dim, inter, &gate_r, &lhs, &mut o).ok()?;
+        matmul_bytes_grouped(gate_dt, dim, inter, &gate_r, &lhs, &mut o).ok()?;
     }
     {
         let mut o: Vec<&mut [f32]> = up_o.iter_mut().map(|v| v.as_mut_slice()).collect();
-        matmul_bytes_multi(up_dt, dim, inter, &up_r, &lhs, &mut o).ok()?;
+        matmul_bytes_grouped(up_dt, dim, inter, &up_r, &lhs, &mut o).ok()?;
     }
-    let mut h = vec![vec![0f32; inter]; npairs];
-    for p in 0..npairs {
-        for k in 0..inter {
-            h[p][k] = super::experts::swiglu(gate_o[p][k], up_o[p][k], limit);
-        }
-    }
-    let h_r: Vec<&[f32]> = h.iter().map(|v| v.as_slice()).collect();
-    let mut out_pairs = vec![vec![0f32; dim]; npairs];
-    {
-        let mut o: Vec<&mut [f32]> = out_pairs.iter_mut().map(|v| v.as_mut_slice()).collect();
-        matmul_bytes_multi(down_dt, inter, dim, &down_r, &h_r, &mut o).ok()?;
-    }
-    let mut out: Vec<Vec<f32>> = (0..ne)
-        .map(|i| Vec::with_capacity(nrows_of[i] * dim))
+    let h: Vec<Vec<f32>> = gate_o
+        .iter()
+        .zip(&up_o)
+        .map(|(g, u)| {
+            g.iter()
+                .zip(u)
+                .map(|(&g, &u)| super::experts::swiglu(g, u, limit))
+                .collect()
+        })
         .collect();
-    let mut p = 0usize;
-    for i in 0..ne {
-        for _ in 0..nrows_of[i] {
-            out[i].extend_from_slice(&out_pairs[p]);
-            p += 1;
-        }
+    let h_r: Vec<&[f32]> = h.iter().map(|v| v.as_slice()).collect();
+    let mut out: Vec<Vec<f32>> = nrows_of.iter().map(|&r| vec![0f32; r * dim]).collect();
+    {
+        let mut o: Vec<&mut [f32]> = out.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_grouped(down_dt, inter, dim, &down_r, &h_r, &mut o).ok()?;
     }
     Some(out)
 }
@@ -315,5 +303,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A synthetic MoE's prompt, its experts read once for all the tokens that route to them,
+    /// gives each token the bits it gets when its experts run for it alone: every pair's product,
+    /// and every token's weighted sum taken in the router's order.
+    #[test]
+    fn a_prompt_batched_by_expert_matches_its_tokens_one_by_one() {
+        let (dim, inter, limit) = (512usize, 256usize, 7.0f32);
+        let (n_experts, k, tokens) = (5usize, 2usize, 13usize);
+        let draw = |seed: u32, len: usize, scale: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    (((i as u32)
+                        .wrapping_add(seed.wrapping_mul(0x9E37_79B9))
+                        .wrapping_mul(2_654_435_761)
+                        .rotate_left(13)
+                        >> 8) as f32
+                        / (1 << 24) as f32
+                        - 0.5)
+                        * scale
+                })
+                .collect()
+        };
+        let quant = |w: Vec<f32>, rows: usize, cols: usize, dtype: GgmlDType| {
+            let t = Tensor::from_vec(w, (rows, cols), &Device::Cpu).unwrap();
+            Projection::Quant(Arc::new(QTensor::quantize(&t, dtype).unwrap()))
+        };
+        let experts: Vec<Arc<Expert>> = (0..n_experts as u32)
+            .map(|j| {
+                Arc::new(Expert {
+                    w1: quant(
+                        draw(7 * j + 1, inter * dim, 0.08),
+                        inter,
+                        dim,
+                        GgmlDType::Q2K,
+                    ),
+                    w3: quant(
+                        draw(7 * j + 2, inter * dim, 0.08),
+                        inter,
+                        dim,
+                        GgmlDType::Q2K,
+                    ),
+                    w2: quant(
+                        draw(7 * j + 3, dim * inter, 0.08),
+                        dim,
+                        inter,
+                        GgmlDType::Q4K,
+                    ),
+                })
+            })
+            .collect();
+        let x = draw(91, tokens * dim, 5.0);
+        // Token t routes to experts (t, t + 1 + t / 3) mod n, with weights of its own: every expert
+        // serves several tokens, some of them adjacent.
+        let routing: Vec<Vec<(usize, f32)>> = (0..tokens)
+            .map(|t| {
+                let a = t % n_experts;
+                let b = (t + 1 + t / 3) % n_experts;
+                let b = if b == a { (a + 1) % n_experts } else { b };
+                vec![(a, 0.6 + t as f32 * 0.01), (b, 0.4 - t as f32 * 0.01)]
+            })
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+
+        // One by one: each token's experts as a decode runs them.
+        let mut one_by_one = vec![0f32; tokens * dim];
+        let mut pair_rows: Vec<Vec<Vec<f32>>> = Vec::with_capacity(tokens);
+        for (t, route) in routing.iter().enumerate() {
+            let mine: Vec<Arc<Expert>> = route.iter().map(|&(e, _)| experts[e].clone()).collect();
+            let outs = batched(&mine, &x[t * dim..(t + 1) * dim], limit).unwrap();
+            for (out, &(_, w)) in outs.iter().zip(route) {
+                for (a, b) in one_by_one[t * dim..(t + 1) * dim].iter_mut().zip(out) {
+                    *a += w * b;
+                }
+            }
+            pair_rows.push(outs);
+        }
+
+        // Batched: every expert once over all the rows that route to it.
+        let mut assign: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_experts];
+        for (t, route) in routing.iter().enumerate() {
+            for (slot, &(e, _)) in route.iter().enumerate() {
+                assign[e].push((t, slot));
+            }
+        }
+        let batches: Vec<Vec<f32>> = assign
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .flat_map(|&(t, _)| x[t * dim..(t + 1) * dim].iter().copied())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            assign.iter().all(|a| a.len() >= 2),
+            "every expert serves several tokens"
+        );
+        let grouped = multirow(&experts, &batches, dim, limit).unwrap();
+        let mut at = vec![vec![(0usize, 0usize); k]; tokens];
+        for (e, rows) in assign.iter().enumerate() {
+            for (r, &(t, slot)) in rows.iter().enumerate() {
+                assert_eq!(
+                    bits(&grouped[e][r * dim..(r + 1) * dim]),
+                    bits(&pair_rows[t][slot]),
+                    "expert {e} token {t}"
+                );
+                at[t][slot] = (e, r);
+            }
+        }
+        let mut together = vec![0f32; tokens * dim];
+        for (t, route) in routing.iter().enumerate() {
+            for (slot, &(_, w)) in route.iter().enumerate() {
+                let (e, r) = at[t][slot];
+                for (a, b) in together[t * dim..(t + 1) * dim]
+                    .iter_mut()
+                    .zip(&grouped[e][r * dim..(r + 1) * dim])
+                {
+                    *a += w * b;
+                }
+            }
+        }
+        assert_eq!(bits(&together), bits(&one_by_one));
     }
 }
