@@ -55,6 +55,27 @@
 #define GCN
 #endif
 
+// CUDA's rounding intrinsics: each operation rounded on its own, never contracted into a fused
+// multiply-add with its neighbours, and a square root correctly rounded. HIP defines them as the
+// plain operators, which the compiler contracts, and the square root as the native one.
+__device__ static __forceinline__ float loken_fadd_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+__device__ static __forceinline__ float loken_fsub_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a - b;
+}
+__device__ static __forceinline__ float loken_fmul_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a * b;
+}
+__device__ static __forceinline__ float loken_fsqrt_rn(float a) { return __builtin_sqrtf(a); }
+#define __fadd_rn loken_fadd_rn
+#define __fsub_rn loken_fsub_rn
+#define __fmul_rn loken_fmul_rn
+#define __fsqrt_rn loken_fsqrt_rn
+
 // Runtime API.
 #define cudaStream_t hipStream_t
 #define cudaError_t hipError_t
