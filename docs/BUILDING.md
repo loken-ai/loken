@@ -65,8 +65,9 @@ AVX2 twin, except the bf16 and fp8 row dots, which sum in another order and agre
 of the sum.
 
 The attention dot and axpy, the f16 and q8 KV helpers, the activations, the softmax exp, RMSNorm
-and RoPE use 512-bit registers too, with the AVX2 results. The IQ formats, the fp4 chunk dot, the
-argmax and the decode GEMVs of the repacked layouts stay on their AVX2 form.
+and RoPE use 512-bit registers too, with the AVX2 results. So do the expert products of IQ2_S,
+IQ3_XXS and IQ4_NL, to the AVX2 bits. The other IQ formats, the fp4 chunk dot, the argmax and the
+decode GEMVs of the repacked layouts stay on their AVX2 form.
 
 To let the compiler use the build host's whole instruction set outside the kernels, build with
 `RUSTFLAGS="-C target-cpu=native"`; that binary does not run on other hosts.

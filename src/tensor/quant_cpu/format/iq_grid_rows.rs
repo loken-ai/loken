@@ -523,6 +523,84 @@ pub(super) mod tests {
         }
     }
 
+    /// Blocks a row of the scalar comparisons: one, and odd and even counts.
+    const SCALAR_BLOCKS: [usize; 6] = [1, 2, 3, 5, 7, 13];
+
+    /// `kernel` against the format's scalar definition, within the tolerance the vectorised
+    /// kernels are held to, for 1 to `2 MANY + 1` activations over each count of `sizes` blocks.
+    pub(in super::super) fn agrees_with_scalar<B: BlockFormat>(
+        name: &str,
+        sizes: &[usize],
+        activations: Activations<B>,
+        kernel: Many<B>,
+    ) {
+        let mut rng = Bytes(0x5CA1A);
+        for &blocks in sizes {
+            for rows in 1..=2 * super::super::iq_read::MANY + 1 {
+                let xs = weights::<B>(blocks, &mut rng);
+                let acts: Vec<Vec<B::ActivationBlock>> =
+                    (0..rows).map(|_| activations(blocks, &mut rng)).collect();
+                let ys: Vec<&[B::ActivationBlock]> = acts.iter().map(|a| a.as_slice()).collect();
+                let mut got = vec![0f32; rows];
+                kernel(&xs, &ys, &mut got);
+                for t in 0..rows {
+                    crate::tensor::quant_cpu::avx::parity::close(
+                        name,
+                        &format!("{blocks} blocks, {rows} rows, row {t}"),
+                        got[t],
+                        B::dot_scalar(&xs, ys[t]),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_kernels_agree_with_the_scalar_definition() {
+        if !crate::cpu::dispatch_avx2() {
+            return;
+        }
+        agrees_with_scalar::<BlockIq3Xxs>(
+            "iq3_xxs avx2",
+            &SCALAR_BLOCKS,
+            activations,
+            |x, y, o| unsafe { iq3_xxs::dot_many_avx2(x, y, o) },
+        );
+        agrees_with_scalar::<BlockIq2S>(
+            "iq2_s avx2",
+            &SCALAR_BLOCKS,
+            activations,
+            |x, y, o| unsafe { iq2_s::dot_many_avx2(x, y, o) },
+        );
+        agrees_with_scalar::<BlockIq3Xxs>(
+            "iq3_xxs dispatch",
+            &SCALAR_BLOCKS,
+            activations,
+            BlockIq3Xxs::dot_many,
+        );
+        agrees_with_scalar::<BlockIq2S>(
+            "iq2_s dispatch",
+            &SCALAR_BLOCKS,
+            activations,
+            BlockIq2S::dot_many,
+        );
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        agrees_with_scalar::<BlockIq3Xxs>(
+            "iq3_xxs avx512",
+            &SCALAR_BLOCKS,
+            activations,
+            |x, y, o| unsafe { iq3_xxs::dot_many_avx512(x, y, o) },
+        );
+        agrees_with_scalar::<BlockIq2S>(
+            "iq2_s avx512",
+            &SCALAR_BLOCKS,
+            activations,
+            |x, y, o| unsafe { iq2_s::dot_many_avx512(x, y, o) },
+        );
+    }
+
     /// Blocks a row of the tested matrices.
     const TESTED_BLOCKS: usize = 10;
 
@@ -687,11 +765,17 @@ pub(super) mod tests {
                     slow = slow.max(rate(before.1, pooled));
                     fast = fast.max(rate(after.1, pooled));
                 }
+                // Row products per second: each matrix row against each activation.
+                let row_bytes = (shape.blocks * std::mem::size_of::<B>()) as f64;
+                let products = |gbs: f64| gbs * 1e9 / row_bytes * rows as f64 / 1e6;
                 eprintln!(
-                    "{name:8} {rows} rows {:6}: {} {slow:6.2} -> {} {fast:6.2} GB/s of weights",
+                    "{name:8} {rows} rows {:6}: {} {slow:6.2} -> {} {fast:6.2} GB/s of weights, \
+                     {:7.2} -> {:7.2} M products/s",
                     if pooled { "pool" } else { "1 thr" },
                     before.0,
                     after.0,
+                    products(slow),
+                    products(fast),
                 );
             }
         }

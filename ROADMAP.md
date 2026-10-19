@@ -42,7 +42,7 @@ Smaller, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| AVX-512 host kernels for the IQ formats | CPU | IQ2_S, IQ3_XXS and IQ4_NL experts run faster with AVX-512 than with AVX2 on the same machine. | Planned |
+| AVX-512 host kernels for the IQ formats | CPU | IQ2_S, IQ3_XXS and IQ4_NL experts run faster with AVX-512 than with AVX2 on the same machine. | Done |
 | The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU, faster than on its CPU. | Partial |
 | A routing profile kept per model | Performance | After a restart, a model's expert cache is already warm, with no setting needed. | Done |
 | Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |

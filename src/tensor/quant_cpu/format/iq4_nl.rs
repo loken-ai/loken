@@ -255,7 +255,7 @@ mod tests {
 
         use super::super::*;
         use crate::tensor::quant_cpu::format::iq_grid_rows::tests::{
-            measure, same_bits, Bytes, Shape,
+            agrees_with_scalar, measure, same_bits, Bytes, Shape,
         };
 
         fn activations(count: usize, rng: &mut Bytes) -> Vec<BlockQ8_0> {
@@ -307,6 +307,37 @@ mod tests {
                     (one_avx2, |x, y, o| unsafe { dot_many_avx2(x, y, o) }),
                 );
             }
+        }
+
+        /// Blocks a row of the scalar comparisons: odd counts on both sides of a reduction group.
+        const SCALAR_BLOCKS: [usize; 7] = [1, 3, 5, 9, 15, 17, 31];
+
+        #[test]
+        fn rows_kernels_agree_with_the_scalar_definition() {
+            if !crate::cpu::dispatch_avx2() {
+                return;
+            }
+            agrees_with_scalar::<BlockIq4Nl>(
+                "iq4_nl avx2",
+                &SCALAR_BLOCKS,
+                activations,
+                |x, y, o| unsafe { dot_many_avx2(x, y, o) },
+            );
+            agrees_with_scalar::<BlockIq4Nl>(
+                "iq4_nl dispatch",
+                &SCALAR_BLOCKS,
+                activations,
+                BlockIq4Nl::dot_many,
+            );
+            if !crate::cpu::hardware_has_avx512() {
+                return;
+            }
+            agrees_with_scalar::<BlockIq4Nl>(
+                "iq4_nl avx512",
+                &SCALAR_BLOCKS,
+                activations,
+                |x, y, o| unsafe { dot_many_avx512(x, y, o) },
+            );
         }
 
         #[test]
