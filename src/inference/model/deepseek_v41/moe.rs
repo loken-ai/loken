@@ -236,10 +236,22 @@ impl Moe {
     }
 
     /// Start reading this layer's experts into memory: a prompt's batch routes to nearly all of
-    /// them, so the whole layer is asked for while the layers before it compute.
-    pub fn prefetch_layer(&self) {
+    /// them, so the whole layer is asked for while the layers before it compute. The mapped spans
+    /// `first`, the weights the layer reads before its experts, are asked for ahead of them; the
+    /// shared expert's follow.
+    pub fn prefetch_layer(&self, first: &[(usize, usize)]) {
         let on_card = self.on_card_probe();
-        self.experts.populate_all(self.n_activated * 2, &on_card);
+        let spans: Vec<(usize, usize)> = first
+            .iter()
+            .copied()
+            .chain(
+                [&self.shared.w1, &self.shared.w3, &self.shared.w2]
+                    .into_iter()
+                    .filter_map(|p| p.storage_span()),
+            )
+            .collect();
+        self.experts
+            .populate_all(self.n_activated * 2, &on_card, &spans);
     }
 
     /// The experts this block is expected to route one token `x` [1, dim] to, from an input that
@@ -362,8 +374,13 @@ impl Moe {
             .iter()
             .map(|&e| self.experts.fetch(e))
             .collect::<Result<_>>()?;
+        // A card that holds an expert runs it from its own copy, and one a layer's read-ahead
+        // stages is read there: only the others are read in through the mapping.
+        let on_card = self.on_card_probe();
         for r in &active_refs {
-            r.will_need();
+            if !on_card(r) && !r.prestaged() {
+                r.will_need();
+            }
         }
 
         crate::inference::offload::prof_record(

@@ -798,6 +798,14 @@ pub fn gpu_quant_linear_tiled(
     x: &[f32],
     tile_bytes: usize,
 ) -> Result<Vec<f32>> {
+    // From the page-locked copy a layer's read-ahead made, where it made one: the mapping's
+    // pages are then not in memory. Every upload below completes before its download returns,
+    // and the slab is refilled only two layers on.
+    let staged = staged_weight(blocks.as_ptr() as usize, blocks.len()).map(|at| {
+        // Safety: the slab holds `blocks.len()` bytes of this weight at `at` until its refill.
+        unsafe { std::slice::from_raw_parts(at as *const u8, blocks.len()) }
+    });
+    let blocks = staged.unwrap_or(blocks);
     let bs = dtype.block_size();
     if inp == 0 || inp % bs != 0 || !x.len().is_multiple_of(inp) {
         return gpu_quant_linear_once(dev, dtype, blocks, (out, inp), x);
@@ -1040,6 +1048,62 @@ static SLAB_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// on `readers` threads this call does not wait for, in the order given and as many as the host's
 /// free memory allows a quarter of. Answers whether the slab took them; `false` leaves the reads
 /// to whoever asks for the weights.
+/// The file of `f` opened again for direct I/O, kept per file: `None` where it cannot be.
+#[cfg(target_os = "linux")]
+fn direct_file(f: &std::fs::File) -> Option<std::sync::Arc<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    type Opened = std::collections::HashMap<i32, Option<std::sync::Arc<std::fs::File>>>;
+    static OPENED: std::sync::Mutex<Option<Opened>> = std::sync::Mutex::new(None);
+    let fd = f.as_raw_fd();
+    let mut g = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(Default::default)
+        .entry(fd)
+        .or_insert_with(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(format!("/proc/self/fd/{fd}"))
+                .ok()
+                .map(std::sync::Arc::new)
+        })
+        .clone()
+}
+
+/// Read at least `need` bytes of `f` from `off` into `buf` with direct I/O; `off`, `buf`'s
+/// address and length are on pages. False when direct I/O is refused or the file ends first.
+fn read_direct(f: &std::fs::File, buf: &mut [u8], off: u64, need: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::FileExt;
+        let Some(d) = direct_file(f) else {
+            return false;
+        };
+        let mut done = 0usize;
+        while done < need {
+            match d.read_at(&mut buf[done..], off + done as u64) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => done += n,
+            }
+        }
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (f, buf, off, need);
+        false
+    }
+}
+
+/// Whether a slab has taken the weight at `addr`, `len` bytes, read or not: its bytes are, or
+/// are about to be, in page-locked memory, and a read of the mapping would read them again.
+pub fn is_prestaged(addr: usize, len: usize) -> bool {
+    slabs().iter().any(|slab| {
+        let g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.entries.get(&addr).is_some_and(|&(_, l, _)| l == len)
+    })
+}
+
 pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
     #[cfg(unix)]
     {
@@ -1058,15 +1122,22 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
             })
             .map_or(0, |kb| kb * 1024);
         let budget = avail / 4;
+        // Each weight is read with direct I/O, around the page-cache, when its file allows it:
+        // the read then starts and ends on a page, which the slab leaves room for, and the
+        // weight's bytes sit `delta` past the read's start.
+        let page = crate::tensor::mapped::page_size().unwrap_or(1);
         let mut taken = 0usize;
         let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
         for &(addr, len) in &spans {
-            let at = taken.div_ceil(64) * 64;
-            if at + len > budget {
+            let delta = crate::tensor::mapped::file_span(addr, len)
+                .map_or(0, |(_, off)| off as usize % page);
+            let start = taken.div_ceil(page) * page;
+            let span = (delta + len).div_ceil(page) * page;
+            if start + span > budget {
                 break;
             }
-            chosen.push((addr, len, at));
-            taken = at + len;
+            chosen.push((addr, len, start + delta));
+            taken = start + span;
         }
         if chosen.is_empty() {
             return false;
@@ -1083,6 +1154,9 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
                 g = slab.cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
             if g.cap < taken {
+                // Grown with headroom up to the budget: the layers' fills differ by a few
+                // experts, and a page-locked allocation costs far more than the copies it serves.
+                let want = (taken + taken / 2).min(budget).max(taken);
                 if g.ptr != 0 {
                     let _ = unsafe {
                         crate::tensor::gpu_runtime::driver::result::free_host(
@@ -1092,10 +1166,10 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
                     g.ptr = 0;
                     g.cap = 0;
                 }
-                match unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(taken, 0) } {
+                match unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(want, 0) } {
                     Ok(p) => {
                         g.ptr = p as usize;
-                        g.cap = taken;
+                        g.cap = want;
                     }
                     Err(_) => return false,
                 }
@@ -1125,6 +1199,17 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
                         g.ptr
                     };
                     let read = crate::tensor::mapped::file_span(addr, len).and_then(|(f, off)| {
+                        let page = crate::tensor::mapped::page_size().unwrap_or(1);
+                        let delta = off as usize % page;
+                        let span = (delta + len).div_ceil(page) * page;
+                        // Safety: the chooser reserved `span` bytes of the slab from
+                        // `at - delta`, a page boundary, for this weight alone.
+                        let whole = unsafe {
+                            std::slice::from_raw_parts_mut((base + at - delta) as *mut u8, span)
+                        };
+                        if read_direct(&f, whole, off - delta as u64, delta + len) {
+                            return Some(());
+                        }
                         let buf =
                             unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, len) };
                         f.read_exact_at(buf, off).ok()

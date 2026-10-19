@@ -127,6 +127,22 @@ impl Expert {
         }
     }
 
+    /// Whether a layer's read-ahead has taken all three projections into page-locked staging,
+    /// where a card's upload reads them.
+    pub fn prestaged(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            [&self.w1, &self.w3, &self.w2].iter().all(|p| {
+                p.storage_span()
+                    .is_some_and(|(a, l)| crate::tensor::cuda::is_prestaged(a, l))
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
+    }
+
     /// Start reading the three projections in: one request over the unit when the expert is
     /// stored as one, a request per projection otherwise.
     pub fn will_need(&self) {

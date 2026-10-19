@@ -558,7 +558,7 @@ impl DeepseekV41Model {
         let reads_whole_layers = self.routes_whole_layers(tokens.len());
         if reads_whole_layers {
             if let Some(b) = self.blocks.iter().flatten().next() {
-                b.moe.prefetch_layer();
+                b.prefetch_layer();
             }
         }
         let mut prefill = self.prefill_begin_at(tokens, base)?;
@@ -578,7 +578,7 @@ impl DeepseekV41Model {
             };
             if reads_whole_layers {
                 if let Some(next) = self.blocks.get(i + 1).and_then(Option::as_ref) {
-                    next.moe.prefetch_layer();
+                    next.prefetch_layer();
                 }
             }
             // Each layer's own time, for a recorder that keeps them apart rather than summed.

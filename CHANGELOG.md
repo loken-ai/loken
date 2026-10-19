@@ -30,6 +30,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Offload: stream a prompt's weights with direct reads and drop pages off the compute thread.
 - CUDA: serve a one-row mat-vec whose row fits one pass of a block at 4 to 16 rows a block.
 - CUDA: fuse a dense decode's gate, up and silu in one launch for 32-value and mixed pairs.
 - CUDA: write a decode token's Q8 keys and values in one launch at any head count.

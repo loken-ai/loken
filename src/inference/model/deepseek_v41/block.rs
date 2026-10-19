@@ -26,6 +26,23 @@ pub enum LayerAttn {
 }
 
 impl LayerAttn {
+    /// The mapped storage (address, length) of the quantised projections a prompt's attention
+    /// reads, in the order it reads them.
+    pub fn storage_spans(&self) -> Vec<(usize, usize)> {
+        let ps: Vec<&crate::inference::offload::projection::Projection> = match self {
+            LayerAttn::Ratio0(a) => vec![&a.wq_a, &a.wkv, &a.wq_b, &a.wo_a, &a.wo_b],
+            LayerAttn::Band(a) => {
+                let mut v = vec![&a.wq_a, &a.wkv];
+                if let Some(i) = &a.indexer {
+                    v.push(&i.wq_b);
+                }
+                v.extend([&a.wq_b, &a.wo_a, &a.wo_b]);
+                v
+            }
+        };
+        ps.into_iter().filter_map(|p| p.storage_span()).collect()
+    }
+
     /// The bytes of the attention projections as stored.
     pub fn bytes(&self) -> usize {
         match self {
@@ -129,6 +146,11 @@ pub struct Block {
 }
 
 impl Block {
+    /// Start reading this layer's weights for a prompt: its attention's, then its experts'.
+    pub fn prefetch_layer(&self) {
+        self.moe.prefetch_layer(&self.attn.storage_spans());
+    }
+
     fn mixes(&self, x: &Tensor, w: &HcWeights) -> Result<HcMixes> {
         hc_mixes(
             x,

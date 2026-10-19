@@ -153,6 +153,36 @@ pub trait ExpertLoader: Send + Sync {
     }
 }
 
+/// A page drop waiting for the dropper thread.
+type PageDrop = Box<dyn FnOnce() + Send>;
+
+static DROPPER: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<PageDrop>>> =
+    std::sync::OnceLock::new();
+
+/// Run `job`, which only drops pages from memory, on the dropper thread, in the order asked: a
+/// drop changes what stays in the page cache, never a byte any read returns, so the compute
+/// thread does not wait on the advice calls. Run here when the thread cannot be had.
+fn drop_later(job: PageDrop) {
+    let tx = DROPPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PageDrop>();
+        let spawned = std::thread::Builder::new()
+            .name("expert page drops".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            });
+        if spawned.is_err() {
+            tracing::warn!("no thread for the expert page drops; they run inline");
+        }
+        Mutex::new(tx)
+    });
+    let sent = tx.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    if let Err(std::sync::mpsc::SendError(job)) = sent {
+        job();
+    }
+}
+
 /// Tier accounting, for observability and to let the gate assert eviction actually happened.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct StoreStats {
@@ -177,7 +207,7 @@ struct CacheInner {
 /// The routed experts of one layer behind their loader, keeping `capacity` of them in the page
 /// cache (0: none), the least recently routed to giving way.
 pub struct ExpertStore {
-    loader: Box<dyn ExpertLoader>,
+    loader: Arc<dyn ExpertLoader>,
     capacity: AtomicUsize,
     inner: Mutex<CacheInner>,
 }
@@ -185,7 +215,7 @@ pub struct ExpertStore {
 impl ExpertStore {
     pub fn new(loader: Box<dyn ExpertLoader>, capacity: usize) -> Self {
         Self {
-            loader,
+            loader: Arc::from(loader),
             capacity: AtomicUsize::new(capacity),
             inner: Mutex::new(CacheInner {
                 kept: HashMap::new(),
@@ -303,7 +333,8 @@ impl ExpertStore {
 
     fn evict(&self, g: &mut CacheInner, id: usize) {
         if let Some(e) = g.kept.remove(&id) {
-            self.loader.release(&e);
+            let loader = self.loader.clone();
+            drop_later(Box::new(move || loader.release(&e)));
             g.stats.evictions += 1;
         }
     }
@@ -372,8 +403,15 @@ impl ExpertStore {
 
     /// Start reading every expert that is neither kept nor on a card into the page cache, across
     /// `readers` threads that this call does not wait for: the read-ahead of a layer a prompt's
-    /// batch is about to use nearly whole. Counts no request and admits nothing.
-    pub fn populate_all(&self, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
+    /// batch is about to use nearly whole. The mapped spans `first` (address, length), weights
+    /// the layer reads before its experts, are read ahead of them where a card's staging takes
+    /// the reads. Counts no request and admits nothing.
+    pub fn populate_all(
+        &self,
+        readers: usize,
+        on_card: &dyn Fn(&Expert) -> bool,
+        first: &[(usize, usize)],
+    ) {
         let mut todo: Vec<Arc<Expert>> = Vec::new();
         for id in 0..self.loader.count() {
             if self.is_kept(id) {
@@ -388,10 +426,14 @@ impl ExpertStore {
         // Into page-locked memory a card's uploads read from directly, where there is a card.
         #[cfg(feature = "gpu")]
         {
-            let spans: Vec<(usize, usize)> = todo
+            let spans: Vec<(usize, usize)> = first
                 .iter()
-                .flat_map(|e| [&e.w1, &e.w3, &e.w2])
-                .filter_map(|p| p.storage_span())
+                .copied()
+                .chain(
+                    todo.iter()
+                        .flat_map(|e| [&e.w1, &e.w3, &e.w2])
+                        .filter_map(|p| p.storage_span()),
+                )
                 .collect();
             if crate::tensor::cuda::prestage_weights(spans, readers.max(1)) {
                 return;
@@ -423,7 +465,13 @@ impl ExpertStore {
     pub fn release(&self, id: usize, expert: &Expert) {
         let kept = self.inner.lock().unwrap().kept.contains_key(&id);
         if !kept && self.capacity.load(Ordering::Relaxed) > 0 {
-            self.loader.release(expert);
+            let loader = self.loader.clone();
+            let e = Expert {
+                w1: expert.w1.clone(),
+                w2: expert.w2.clone(),
+                w3: expert.w3.clone(),
+            };
+            drop_later(Box::new(move || loader.release(&e)));
         }
     }
 
@@ -436,11 +484,16 @@ impl ExpertStore {
             return Ok(());
         }
         let kept: Vec<usize> = self.inner.lock().unwrap().kept.keys().copied().collect();
-        for id in 0..self.loader.count() {
-            if !kept.contains(&id) {
-                self.loader.release(&self.loader.build(id)?);
+        let loader = self.loader.clone();
+        drop_later(Box::new(move || {
+            for id in 0..loader.count() {
+                if !kept.contains(&id) {
+                    if let Ok(e) = loader.build(id) {
+                        loader.release(&e);
+                    }
+                }
             }
-        }
+        }));
         Ok(())
     }
 
@@ -501,10 +554,15 @@ impl ExpertSet {
     }
 
     /// Start reading the experts of a streamed set that are neither kept nor on a card, without
-    /// waiting; a no-op when resident.
-    pub fn populate_all(&self, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
+    /// waiting, the spans `first` ahead of them; a no-op when resident.
+    pub fn populate_all(
+        &self,
+        readers: usize,
+        on_card: &dyn Fn(&Expert) -> bool,
+        first: &[(usize, usize)],
+    ) {
         if let ExpertSet::Streamed(s) = self {
-            s.populate_all(readers, on_card);
+            s.populate_all(readers, on_card, first);
         }
     }
 
