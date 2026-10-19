@@ -1186,6 +1186,7 @@ mod tests {
                 inp: groups * r,
             },
             groups,
+            kept: Default::default(),
         };
         let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         for (chunk, tile) in [
@@ -1204,6 +1205,134 @@ mod tests {
                 "chunk {chunk} tile {tile}: worst {worst} of range {range}"
             );
         }
+        // The weights read from copies the card keeps give the same bits as the weights sent.
+        let stream = dev.stream();
+        let row_bytes = wo_a.len() / (groups * r);
+        let on_card = |b: &[u8]| stream.clone_htod(b).unwrap();
+        let (qb, ob) = (on_card(&wq_b), on_card(&wo_b));
+        let oa: Vec<_> = (0..groups)
+            .map(|g| on_card(&wo_a[g * r * row_bytes..(g + 1) * r * row_bytes]))
+            .collect();
+        let sent = gpu_prefill_attention_with(&dev, &args, usize::MAX, 96 << 20).unwrap();
+        let kept = PrefillAttention {
+            kept: crate::tensor::cuda::KeptAttention {
+                wq_b: Some(&qb),
+                wo_a: oa.iter().collect(),
+                wo_b: Some(&ob),
+            },
+            ..args
+        };
+        let read = gpu_prefill_attention_with(&dev, &kept, usize::MAX, 96 << 20).unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        assert!(
+            bits(&sent) == bits(&read),
+            "the kept weights changed the attention"
+        );
+    }
+
+    /// A prompt's attention on a card gives the same bits however full the card is: the queries
+    /// go through in chunks of a fixed count, so what else the card holds never changes them.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_prompts_attention_on_the_card_does_not_follow_the_free_memory() {
+        use crate::tensor::cuda::{
+            gpu_prefill_attention, gpu_sparse_attn, reclaim_pool, CudaDevice, PrefillAttention,
+            QuantWeight, ATTENTION_QUERY_CHUNK,
+        };
+        use crate::tensor::quantized::GgmlDType;
+        // The second card when there is one: fewer tests hold memory there.
+        let Ok(dev) = CudaDevice::new(1).or_else(|_| CudaDevice::new(0)) else {
+            eprintln!("no CUDA device; the card attention's chunking is NOT covered by this run");
+            return;
+        };
+        let (n, q_lora, h, hd, rd, groups, r, keys, topk) = (
+            320usize, 256usize, 16usize, 512usize, 64usize, 2usize, 128usize, 2048usize, 2048usize,
+        );
+        let (p, dim) = (h * hd / groups, 256usize);
+        let wave = |len: usize, k: f32, amp: f32| -> Vec<f32> {
+            (0..len).map(|i| ((i as f32) * k).sin() * amp).collect()
+        };
+        let enc =
+            |v: &[f32]| crate::tensor::quant_cpu::from_float_bytes(GgmlDType::Q6K, v).unwrap();
+        let (wq_b, wo_a, wo_b) = (
+            enc(&wave(h * hd * q_lora, 0.013, 0.1)),
+            enc(&wave(groups * r * p, 0.017, 0.1)),
+            enc(&wave(dim * groups * r, 0.019, 0.1)),
+        );
+        let qr = wave(n * q_lora, 0.29, 1.0);
+        let q = wave(n * h * hd, 0.37, 1.0);
+        let kv = wave(keys * hd, 0.11, 1.0);
+        let sink: Vec<f32> = wave(h, 0.7, 1.0);
+        let half = rd / 2;
+        let cos: Vec<f32> = (0..n * half).map(|i| ((i as f32) * 0.05).cos()).collect();
+        let sin: Vec<f32> = (0..n * half).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let idxs: Vec<i32> = (0..n * topk)
+            .map(|i| match i % 11 {
+                10 => -1,
+                _ => ((i * 7 + i / topk * 13) % keys) as i32,
+            })
+            .collect();
+        let weight = |bytes, rows, inp| QuantWeight {
+            dtype: GgmlDType::Q6K,
+            bytes,
+            rows,
+            inp,
+        };
+        let args = PrefillAttention {
+            qr: &qr,
+            wq_b: weight(&wq_b, h * hd, q_lora),
+            cos: &cos,
+            sin: &sin,
+            heads: h,
+            hd,
+            rd,
+            kv: &kv,
+            sink: &sink,
+            idxs: &idxs,
+            topk,
+            scale: 0.05,
+            wo_a: weight(&wo_a, groups * r, p),
+            wo_b: weight(&wo_b, dim, groups * r),
+            groups,
+            kept: Default::default(),
+        };
+        let run = || {
+            (
+                gpu_prefill_attention(&dev, &args).unwrap(),
+                gpu_sparse_attn(&dev, &q, &kv, &sink, &idxs, (n, h, hd, topk), 0.05).unwrap(),
+            )
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        // Room for the whole prompt in one chunk of a third of the free memory, then room for
+        // two fixed chunks and no more: a chunk sized from the free memory would split the prompt
+        // differently the second time.
+        let per_query = (topk * hd + h * topk + 4 * h * hd + groups * r + dim) * 4;
+        let leave = 2 * ATTENTION_QUERY_CHUNK * per_query;
+        let free = || {
+            crate::tensor::cuda_ext::mem_get_info(&Device::Cuda(dev.clone()))
+                .unwrap()
+                .0
+        };
+        if free() < 4 * n * per_query {
+            eprintln!("the card has too little free; the attention's chunking is NOT covered");
+            return;
+        }
+        let roomy = run();
+        let Ok(hold) = (unsafe { dev.stream().alloc::<u8>(free().saturating_sub(leave)) }) else {
+            eprintln!("the card's memory could not be held; the chunking is NOT covered");
+            return;
+        };
+        let tight = run();
+        drop(hold);
+        reclaim_pool(&dev);
+        assert!(
+            bits(&roomy.0) == bits(&tight.0),
+            "the prompt's attention changed with the free memory"
+        );
+        assert!(
+            bits(&roomy.1) == bits(&tight.1),
+            "the sparse attention changed with the free memory"
+        );
     }
 
     /// A prompt's attention on a card gives the same bits however full the card is: the queries

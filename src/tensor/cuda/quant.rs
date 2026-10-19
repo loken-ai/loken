@@ -1551,6 +1551,16 @@ pub struct QuantWeight<'a> {
     pub inp: usize,
 }
 
+/// Copies of a prompt attention's weights the card already keeps, read where they lie instead of
+/// sent for the call: the same bytes through the same kernels. `wo_a` holds one blob per group
+/// of the output projection's first half, or none.
+#[derive(Default)]
+pub struct KeptAttention<'a> {
+    pub wq_b: Option<&'a CudaSlice<u8>>,
+    pub wo_a: Vec<&'a CudaSlice<u8>>,
+    pub wo_b: Option<&'a CudaSlice<u8>>,
+}
+
 /// What a prompt's attention needs on the card from the shared query latent on.
 pub struct PrefillAttention<'a> {
     /// The query latent [n, q_lora] and the projection of it to the heads, [heads * hd, q_lora].
@@ -1574,6 +1584,8 @@ pub struct PrefillAttention<'a> {
     pub wo_a: QuantWeight<'a>,
     pub wo_b: QuantWeight<'a>,
     pub groups: usize,
+    /// The weights above the card keeps, each read from there in place of an upload.
+    pub kept: KeptAttention<'a>,
 }
 
 /// `x` [n, inp] through rows `row0 .. row0 + rows` of the weight held on the card as `blob`, as
@@ -1684,11 +1696,27 @@ pub fn gpu_prefill_attention_with(
         copied: Vec::new(),
     };
     let up = |e| alloc_err("prefill attention upload", e);
-    let blobs = [
-        staging.upload(dev, a.wq_b.bytes)?,
-        staging.upload(dev, a.wo_a.bytes)?,
-        staging.upload(dev, a.wo_b.bytes)?,
-    ];
+    // Each weight from the copy the card keeps, else sent for this call.
+    let (sent_wq_b, sent_wo_b);
+    let wq_b: &CudaSlice<u8> = match a.kept.wq_b {
+        Some(b) => b,
+        None => {
+            sent_wq_b = staging.upload(dev, a.wq_b.bytes)?;
+            &sent_wq_b
+        }
+    };
+    let wo_b: &CudaSlice<u8> = match a.kept.wo_b {
+        Some(b) => b,
+        None => {
+            sent_wo_b = staging.upload(dev, a.wo_b.bytes)?;
+            &sent_wo_b
+        }
+    };
+    let kept_groups = a.kept.wo_a.len() == groups;
+    let sent_wo_a = match kept_groups {
+        true => None,
+        false => Some(staging.upload(dev, a.wo_a.bytes)?),
+    };
     let (kvd, sd, idd) = (
         stream.clone_htod(a.kv).map_err(up)?,
         stream.clone_htod(a.sink).map_err(up)?,
@@ -1727,7 +1755,7 @@ pub fn gpu_prefill_attention_with(
             dev,
             tile_bytes,
             a.wq_b.dtype,
-            &blobs[0],
+            wq_b,
             (0, h * hd, q_lora),
             &qr,
             count,
@@ -1815,12 +1843,16 @@ pub fn gpu_prefill_attention_with(
             b.arg(&off);
             unsafe { b.launch(cfg(count * p)) }
                 .map_err(|e| Error(format!("take_cols_f32 launch: {e}")))?;
+            let (blob, row0) = match &sent_wo_a {
+                Some(whole) => (whole, gi * r),
+                None => (a.kept.wo_a[gi], 0),
+            };
             let y = linear_tiled(
                 dev,
                 tile_bytes,
                 a.wo_a.dtype,
-                &blobs[1],
-                (gi * r, r, p),
+                blob,
+                (row0, r, p),
                 &slice,
                 count,
             )?;
@@ -1844,7 +1876,7 @@ pub fn gpu_prefill_attention_with(
             dev,
             tile_bytes,
             a.wo_b.dtype,
-            &blobs[2],
+            wo_b,
             (0, dim, groups * r),
             &wide,
             count,
@@ -2351,14 +2383,34 @@ pub fn gpu_matmul_host(
             out.len()
         )));
     }
+    let b = dev
+        .stream()
+        .clone_htod(b)
+        .map_err(|e| Error(format!("matmul upload: {e}")))?;
+    gpu_matmul_kept(dev, a, &b, out, (m, k, n))
+}
+
+/// `gpu_matmul_host` over a `b` [k, n] already on the card: the same product, bit for bit.
+pub fn gpu_matmul_kept(
+    dev: &CudaDevice,
+    a: &[f32],
+    b: &CudaSlice<f32>,
+    out: &mut [f32],
+    (m, k, n): (usize, usize, usize),
+) -> Result<()> {
+    if a.len() != m * k || b.len() < k * n || out.len() != m * n {
+        return Err(Error(format!(
+            "matmul: {} by {} into {} for {m}x{k}x{n}",
+            a.len(),
+            b.len(),
+            out.len()
+        )));
+    }
     let stream = dev.stream();
     let a = stream
         .clone_htod(a)
         .map_err(|e| Error(format!("matmul upload: {e}")))?;
-    let b = stream
-        .clone_htod(b)
-        .map_err(|e| Error(format!("matmul upload: {e}")))?;
-    let c = matmul_f32_inner(dev, &a, &b, 1, m, k, n, false)?;
+    let c = matmul_f32_inner(dev, &a, b, 1, m, k, n, false)?;
     stream
         .memcpy_dtoh(&c, out)
         .map_err(|e| Error(format!("matmul download: {e}")))

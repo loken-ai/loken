@@ -12,8 +12,8 @@ use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
     gpu_expert_layer_rows, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
     gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_layer_begin,
-    gpu_prefill_attention, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables, CudaDevice,
-    ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
+    gpu_matmul_kept, gpu_prefill_attention, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
+    CudaDevice, ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
     QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::gpu_runtime::driver::CudaSlice;
@@ -119,6 +119,8 @@ pub struct Card {
     resident: Mutex<Resident>,
     /// The dense always-read weights - a router's gate - by their storage.
     dense: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<QMatMul>>>,
+    /// The same weights transposed as a prompt's product reads them, by their storage.
+    dense_t: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<CudaSlice<f32>>>>,
     experts: Mutex<ExpertTier>,
     /// The clock ticks one expert block spans a token - the model's layer count. An expert used
     /// within this many ticks is this token's working set and is never evicted, so a decode
@@ -150,6 +152,7 @@ impl Card {
             room,
             resident: Mutex::new(HashMap::new()),
             dense: Mutex::new(HashMap::new()),
+            dense_t: Mutex::new(HashMap::new()),
             experts: Mutex::new(ExpertTier::default()),
             protect: protect.max(1),
             tables: OnceLock::new(),
@@ -236,6 +239,57 @@ impl Card {
             .unwrap_or_else(|e| e.into_inner())
             .insert(key, m.clone());
         Some(m)
+    }
+
+    /// `w` [out, inp] on this card transposed to [inp, out], as a prompt's product of it reads
+    /// it, kept for the next call, keyed by its storage. `None` when the card has no room for it,
+    /// which leaves the call to send it.
+    fn kept_dense_t(&self, w: &Tensor) -> Option<Arc<CudaSlice<f32>>> {
+        let key = w.id();
+        if let Some(t) = self
+            .dense_t
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Some(t.clone());
+        }
+        let (out, inp) = w.dims2().ok()?;
+        let bytes = out * inp * F32;
+        if !self.take_room(bytes, true) {
+            return None;
+        }
+        let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+            let wv = w.flatten_all()?.to_vec1::<f32>()?;
+            let wt: Vec<f32> = (0..inp * out)
+                .map(|i| wv[(i % out) * inp + i / out])
+                .collect();
+            self.dev
+                .stream()
+                .clone_htod(&wt)
+                .map_err(|e| Error::msg(format!("dense weight upload: {e}")))
+        }));
+        let Ok(Ok(t)) = sent else {
+            self.give_room(bytes);
+            self.say_once("a dense always-read weight could not go over for a prompt");
+            return None;
+        };
+        let t = Arc::new(t);
+        self.dense_t
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, t.clone());
+        Some(t)
+    }
+
+    /// `q` when this card already keeps it; nothing is sent.
+    fn kept_already(&self, q: &Arc<QTensor>) -> Option<Arc<QMatMul>> {
+        let bytes = q.data().ok()?;
+        self.resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(bytes.as_ptr() as usize, bytes.len()))
+            .cloned()
     }
 
     /// `q` on this card, kept for the next call. `None` when it could not go over, which leaves
@@ -930,6 +984,16 @@ impl Offload for Card {
                 if dims.len() != 2 {
                     return None;
                 }
+                // A prompt's rows read the weight transposed, kept from the first prompt on: the
+                // product the call would send it for, without sending it.
+                if let Some(wt) = self.kept_dense_t(w) {
+                    let need = (xs.len() + rows * out) * F32;
+                    return self.attempt("a kept dense weight", need, || {
+                        let mut y = vec![0f32; rows * out];
+                        gpu_matmul_kept(dev, xs, &wt, &mut y, (rows, inp, out))?;
+                        Ok(y)
+                    });
+                }
                 self.attempt("a dense weight", need * 2, || {
                     let wv = w.flatten_all()?.to_vec1::<f32>()?;
                     let mut y = vec![0f32; rows * out];
@@ -1232,6 +1296,14 @@ impl<'a> HeldWeight<'a> {
     }
 }
 
+/// The blocks of a weight kept on a card, as they lie there.
+fn kept_blob(m: &Arc<QMatMul>) -> Option<&CudaSlice<u8>> {
+    match m.as_ref() {
+        QMatMul::QTensor(q) => crate::tensor::cuda_ext::qtensor_blob(q).ok(),
+        _ => None,
+    }
+}
+
 fn quant_weight(p: &Projection) -> Option<HeldWeight<'_>> {
     match p {
         Projection::Quant(q)
@@ -1261,6 +1333,28 @@ impl Card {
             quant_weight(a.wo_a)?,
             quant_weight(a.wo_b)?,
         );
+        // The weights a decode has kept on this card - the query projection, each group of the
+        // output projection's first half, its second half - are read from there; the others are
+        // sent for the call, and none is taken on for a prompt.
+        let keep = |p: &Projection| -> Option<Arc<QMatMul>> {
+            match p {
+                Projection::Quant(q) => self.kept_already(q),
+                _ => None,
+            }
+        };
+        let r = o1.rows / a.groups.max(1);
+        let (kept_qb, kept_ob) = (keep(a.wq_b), keep(a.wo_b));
+        let kept_oa: Option<Vec<Arc<QMatMul>>> = (0..a.groups)
+            .map(|g| a.wo_a.rows(g * r, r).ok().and_then(|p| keep(&p)))
+            .collect();
+        let kept = crate::tensor::cuda::KeptAttention {
+            wq_b: kept_qb.as_ref().and_then(kept_blob),
+            wo_a: kept_oa
+                .as_ref()
+                .and_then(|v| v.iter().map(kept_blob).collect::<Option<Vec<_>>>())
+                .unwrap_or_default(),
+            wo_b: kept_ob.as_ref().and_then(kept_blob),
+        };
         let need = b.bytes.len()
             + o1.bytes.len()
             + o2.bytes.len()
@@ -1286,6 +1380,7 @@ impl Card {
                     wo_a: o1.as_weight(),
                     wo_b: o2.as_weight(),
                     groups: a.groups,
+                    kept,
                 },
             )
         })

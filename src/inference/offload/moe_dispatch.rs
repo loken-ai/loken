@@ -228,54 +228,83 @@ pub(crate) fn run_routed(
             done = rb(active, &fetch, xv[0], swiglu_limit);
         }
     } else {
-        // A small batch is a speculative verify, not a prompt's prefill. Its resident experts run
-        // in one grouped launch per card over their rows, so the per-layer launch a decode pays for
-        // every token is paid once for the whole block; the non-resident ones run in one pool region
-        // over their rows, the same amortising. A prefill's wide batch stays on the lanes, where the
-        // cards earn their crossing.
+        // A small batch - a speculative verify or a short prompt. Its resident experts run in one
+        // grouped launch per card over their rows, so the per-layer launch a decode pays for every
+        // token is paid once for the whole block; the non-resident ones run meanwhile in one pool
+        // region over their rows, the same amortising. A prefill's wide batch stays on the lanes,
+        // where the cards earn their crossing.
         const VERIFY_BATCH_MAX: usize = VERIFY_BATCH_MAX_ROWS;
         let pooled = n <= VERIFY_BATCH_MAX
             && !observed
             && off.run_multi.is_some()
             && (|| -> Option<()> {
-                // One instance per (expert, routed row), the rows kept in the expert's assignment
-                // order so a card's answers scatter back where the host's would.
+                // The experts the cards hold run there in one grouped launch over their rows while
+                // the cores run the others at the same instant; one a card declines runs on the
+                // cores once the launch is back. One instance per (expert, routed row), the rows in
+                // the expert's assignment order, so the answers scatter back where the host's would.
+                let held: Vec<bool> = (0..active.len())
+                    .map(|i| {
+                        off.on_card
+                            .as_ref()
+                            .is_none_or(|is_on| is_on(&active_refs[i]))
+                    })
+                    .collect();
                 let mut eidx: Vec<usize> = Vec::new();
                 let mut xrows: Vec<&[f32]> = Vec::new();
                 let mut inst_of: Vec<Vec<usize>> = vec![Vec::new(); active.len()];
                 for (i, &e) in active.iter().enumerate() {
+                    if !held[i] {
+                        continue;
+                    }
                     for &(t, _w) in &assign[e] {
                         inst_of[i].push(eidx.len());
                         eidx.push(e);
                         xrows.push(xv[t]);
                     }
                 }
+                let host_rows = |idx: &[usize]| -> Option<Vec<Vec<f32>>> {
+                    let refs: Vec<Arc<Expert>> =
+                        idx.iter().map(|&i| active_refs[i].clone()).collect();
+                    let rows: Vec<Vec<f32>> = idx.iter().map(|&i| rows_of(active[i])).collect();
+                    crate::inference::offload::cpu_experts::multirow(
+                        &refs,
+                        &rows,
+                        dim,
+                        swiglu_limit,
+                    )
+                };
+                let missed: Vec<usize> = (0..active.len()).filter(|&i| !held[i]).collect();
                 let rm = off.run_multi.as_ref().unwrap();
-                let gpu = rm(&eidx, &xrows, &fetch, swiglu_limit);
-                // An expert is resident when its first instance came back from a card; then all of
-                // its instances did. The rest go to the host in one region.
-                let miss_i: Vec<usize> = (0..active.len())
-                    .filter(|&i| {
-                        inst_of[i]
-                            .first()
-                            .map(|&k| gpu[k].is_none())
-                            .unwrap_or(false)
-                    })
+                let (gpu, cpu) = std::thread::scope(|s| {
+                    let cards = s.spawn(|| {
+                        let t = std::time::Instant::now();
+                        let r = rm(&eidx, &xrows, &fetch, swiglu_limit);
+                        crate::inference::offload::prof_record(
+                            "moe cards block",
+                            t.elapsed().as_nanos() as u64,
+                        );
+                        r
+                    });
+                    let t = std::time::Instant::now();
+                    let cpu = host_rows(&missed);
+                    crate::inference::offload::prof_record(
+                        "moe host misses",
+                        t.elapsed().as_nanos() as u64,
+                    );
+                    (cards.join(), cpu)
+                });
+                let (gpu, cpu) = (gpu.ok()?, cpu?);
+                // A held expert whose first instance did not come back was declined by its card.
+                let declined: Vec<usize> = (0..active.len())
+                    .filter(|&i| held[i] && inst_of[i].first().is_some_and(|&k| gpu[k].is_none()))
                     .collect();
-                let miss_refs: Vec<Arc<Expert>> =
-                    miss_i.iter().map(|&i| active_refs[i].clone()).collect();
-                let miss_rows: Vec<Vec<f32>> = miss_i.iter().map(|&i| rows_of(active[i])).collect();
-                let cpu = crate::inference::offload::cpu_experts::multirow(
-                    &miss_refs,
-                    &miss_rows,
-                    dim,
-                    swiglu_limit,
-                )?;
-                let mut miss_at = 0usize;
+                let late = host_rows(&declined)?;
+                let on_host = missed.iter().chain(&declined);
+                for (&i, out) in on_host.zip(cpu.into_iter().chain(late)) {
+                    done[i] = Some(Ok((Vec::new(), out)));
+                }
                 for i in 0..active.len() {
-                    if miss_at < miss_i.len() && miss_i[miss_at] == i {
-                        done[i] = Some(Ok((Vec::new(), cpu[miss_at].clone())));
-                        miss_at += 1;
+                    if done[i].is_some() {
                         continue;
                     }
                     let mut out = Vec::with_capacity(inst_of[i].len() * dim);
