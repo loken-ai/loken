@@ -1347,8 +1347,14 @@ impl LlmEngine {
             // answer: the extra ones are control tokens a decode drops, so no text stop sees
             // them.
             let ends = |t: u32| t == eos_token_id || eos_extra.contains(&t);
+            // The stage profile's view of a token: the whole iteration, and its parts below.
+            use crate::inference::offload::prof_record;
+            let mut last_top: Option<Instant> = None;
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
                 let step_start = Instant::now();
+                if let Some(t) = last_top.replace(step_start) {
+                    prof_record("token: iteration", t.elapsed().as_nanos() as u64);
+                }
                 loop_iters += 1;
                 if let Some(t) = cycle_end.take() {
                     loop_after_ns += t.elapsed().as_nanos() as u64;
@@ -1369,7 +1375,8 @@ impl LlmEngine {
                 }
                 // Stream the current token (tokenizer decode + blocking_send)
                 // - EXCLUDED from compute_ns.
-                if !stream_token(
+                let t_stream = Instant::now();
+                let streamed = stream_token(
                     next_token,
                     &mut token_count,
                     &mut generated_token_ids,
@@ -1379,7 +1386,9 @@ impl LlmEngine {
                     &tx,
                     &stream_tokenizer,
                     &stop_sequences,
-                ) {
+                );
+                prof_record("token: stream", t_stream.elapsed().as_nanos() as u64);
+                if !streamed {
                     break;
                 }
                 // Restart compute window for this iter's forward+sample.
@@ -1784,6 +1793,11 @@ impl LlmEngine {
                         // here: warmup at this token, capture at the next. When the state
                         // cannot be prepared even without a graph, the rest of the request
                         // runs eagerly.
+                        let t_prepare = Instant::now();
+                        prof_record(
+                            "token: before prepare",
+                            step_start.elapsed().as_nanos() as u64,
+                        );
                         if let Err(e) = state.model.update_graph_state(pos) {
                             cuda_graph = None;
                             graph_logits = None;
@@ -1809,6 +1823,7 @@ impl LlmEngine {
                             verify_graphs.clear();
                             break 'graph_blk None;
                         }
+                        prof_record("token: prepare", t_prepare.elapsed().as_nanos() as u64);
 
                         // Streaming greedy/temperature sampling from a graph
                         // logits tensor (parity with the eager branch below).
@@ -1875,6 +1890,7 @@ impl LlmEngine {
                                     }
                                 };
                                 plain_sample_ns += t_sample.elapsed().as_nanos() as u64;
+                                prof_record("token: sample", t_sample.elapsed().as_nanos() as u64);
                                 out
                             }};
                         }
@@ -1896,9 +1912,14 @@ impl LlmEngine {
                             match graph.launch(&mut state.model) {
                                 Ok(()) => {
                                     plain_launch_ns += t_launch.elapsed().as_nanos() as u64;
+                                    prof_record(
+                                        "token: launch",
+                                        t_launch.elapsed().as_nanos() as u64,
+                                    );
                                     let t_wait = std::time::Instant::now();
                                     let _ = crate::tensor::cuda_ext::synchronize_yielding(stream);
                                     plain_wait_ns += t_wait.elapsed().as_nanos() as u64;
+                                    prof_record("token: wait", t_wait.elapsed().as_nanos() as u64);
                                     plain_steps += 1;
                                     if graph_validations < graph_validations_needed {
                                         let rep_logits: Option<Vec<f32>> = logits_ref

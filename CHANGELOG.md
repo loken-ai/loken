@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- API: time each streamed token's parts in /api/stage_perf.
 - ROCm: run the grouped-query prefill attention on AMD matrix cores.
 - ROCm: run the DiT flash attention on AMD matrix cores.
 - ROCm: run the MoE prefill over quantised experts on AMD matrix cores.
