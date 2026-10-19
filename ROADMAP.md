@@ -48,7 +48,7 @@ Smaller, by priority:
 | A routing profile kept per model | Performance | After a restart, a model's expert cache is already warm, with no setting needed. | Done |
 | Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
 | Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
-| Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcribe a 20-clip set as well as the reference implementation. | Planned |
+| Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcribe a 20-clip set as well as the reference implementation. | Started |
 | Ultravox on its own | Audio | An Ultravox checkpoint answers audio with no extra GGUF beside it. | Done |
 | Media input limits | API | A request with too many images, pixels or audio seconds gets a 400 that names the limit. | Done |
 | Images by URL on the Messages API | API | The Messages API reads an image from a URL on an allowed host. | Done |

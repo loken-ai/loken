@@ -144,8 +144,16 @@ impl Expert {
     }
 
     /// Start reading the three projections in: one request over the unit when the expert is
-    /// stored as one, a request per projection otherwise.
+    /// stored as one, a request per projection otherwise. An expert already in memory asks for
+    /// nothing: asking costs a look-up per page.
     pub fn will_need(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            let (resident, pages) = self.resident_pages();
+            if resident == pages {
+                return;
+            }
+        }
         #[cfg(unix)]
         if let Some((start, len)) = self.storage_unit() {
             crate::tensor::mapped::advise_span(start, len, libc::MADV_WILLNEED, false);

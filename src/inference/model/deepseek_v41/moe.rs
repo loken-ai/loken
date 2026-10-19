@@ -365,22 +365,24 @@ impl Moe {
             }
         }
         // Every routed expert's bytes are asked for at once, so the reads of one overlap the
-        // compute of another instead of each faulting in alone. In turn rather than from
-        // several threads: issuing the same requests across a thread pool was measured on a
-        // cold prefill and changed nothing, so the loop stays the simpler of the two. Built
-        // once and kept: the residency read, the block and the host all take these same handles,
-        // where fetching afresh at each re-sliced the mmap three times over for one expert.
+        // compute of another instead of each faulting in alone. Built once and kept: the
+        // residency read, the block and the host all take these same handles, where fetching
+        // afresh at each re-sliced the mmap three times over for one expert.
         let active_refs: Vec<Arc<Expert>> = active
             .iter()
             .map(|&e| self.experts.fetch(e))
             .collect::<Result<_>>()?;
         // A card that holds an expert runs it from its own copy, and one a layer's read-ahead
-        // stages is read there: only the others are read in through the mapping.
+        // stages is read there: only the others are read in through the mapping, asked for
+        // from several threads so that their reads reach the disk together.
         let on_card = self.on_card_probe();
-        for r in &active_refs {
-            if !on_card(r) && !r.prestaged() {
-                r.will_need();
-            }
+        {
+            use rayon::prelude::*;
+            active_refs.par_iter().for_each(|r| {
+                if !on_card(r) && !r.prestaged() {
+                    r.will_need();
+                }
+            });
         }
 
         crate::inference::offload::prof_record(
