@@ -311,10 +311,11 @@ print(r["tag_name"].lstrip("v"), url)' "$1"
 # The measurement protocol (kill peers, thermal floor, per-engine invoke, merge) lives in
 # fair-run.sh and is reused unchanged; this only names the cells from the catalogue + manifest and
 # stamps/reports each. It provisions the bench engine compartment first (ollama + vLLM, never
-# ~/vllm), so text cells run loken vs ollama vs vLLM from the start. First-launch scope: GPU, ctx
-# 4096, short prompts, streaming - a fast pass; FULL=1 for the whole matrix. Vision/tts/asr need
-# golden input assets and are skipped with a note until wired; HF-direct (org/name) needs the
-# loken+vllm engine selection and is likewise skipped for now.
+# ~/vllm), so text cells run loken vs ollama vs vLLM from the start. Without FULL=1 it is a fast
+# pass: GPU, ctx 4096, the short prompt, streaming. FULL=1 sweeps the whole matrix the way the
+# campaigns of August and September did: for each device, context, prompt and streaming mode in
+# that order, every model once, one fair-run per cell and per prompt, the CPU sweeps streamed
+# only. A generated-media cell has no such axes and is measured once, in the first sweep.
 run() {
     [ -x "$LOKEN_BIN" ] || die "no loken binary at $LOKEN_BIN; build it first"
     "$LOKEN/../assert-binary-current.sh" >/dev/null 2>&1 || die "binary is stale; rebuild before measuring"
@@ -322,50 +323,80 @@ run() {
     local models; models="$(loken_models)"
     [ -n "$models" ] || die "loken returned no catalogue at $LOKEN_URL/api/tags (is it serving?)"
 
-    local ctxs prompts streams
+    local ctxs prompts streams devices
     if [ "${FULL:-0}" = 1 ]; then
         # The full matrix axes come from the manifest - the only curated data a campaign reads.
-        IFS='|' read -r ctxs prompts streams < <(python3 - "$MATRIX" <<'PY'
+        IFS='|' read -r ctxs prompts streams devices < <(python3 - "$MATRIX" <<'PY'
 import sys, tomllib
 a = tomllib.load(open(sys.argv[1], "rb"))["axes"]
 print(" ".join(str(c) for c in a["context"]) + "|"
       + " ".join(a["prompts"]) + "|"
-      + " ".join("1" if s else "0" for s in a["stream"]))
+      + " ".join("1" if s else "0" for s in a["stream"]) + "|"
+      + " ".join(a["device"]))
 PY
 )
     else
-        ctxs="4096"; prompts="short"; streams="1"
+        ctxs="4096"; prompts="short"; streams="1"; devices="gpu"
     fi
     local stamp; stamp=$(stat -c %Y "$LOKEN_BIN")
 
     cd "$LOKEN" || die "cannot cd $LOKEN"
-    local m mod fmt engines amod vserve err ctx st out tag mctxs mstreams asrargs
-    while IFS=$'\t' read -r m mod fmt; do
-        [ -n "$m" ] || continue
-        if [ -n "${BENCH_ONLY:-}" ] && ! [[ " $BENCH_ONLY " == *" $m "* ]]; then continue; fi
-        IFS='|' read -r engines amod vserve err < <(plan_cell "$m" "$mod" "$fmt")
-        tag=$(echo "$m" | tr ':/' '__')
-        # A model loken lists but the campaign cannot measure is an ERROR cell, visible in the
-        # report - never a silent skip.
-        if [ -n "$err" ]; then
-            out="results/${tag}_error.json"
-            write_error_cell "$m" "$err" "$out" "$stamp"
-            echo "ERROR cell: $m ($mod) - $err"
-            continue
+    # The thermal floor, read once for the whole campaign while nothing works on the cards and
+    # exported to every cell: read per cell, on cards still warm from the cell before, the gate
+    # would open on a reading that means nothing.
+    if [ "$GPU_VENDOR" = nvidia ] && have nvidia-smi && [ -z "${GPU_IDLE_C:-}" ]; then
+        local busy held
+        busy=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | sort -rn | head -1)
+        held=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -rn | head -1)
+        if [ "${busy:-0}" -gt 5 ] || [ "${held:-0}" -gt 600 ]; then
+            die "cards are still working (${busy}% busy, ${held} MiB held): stop what holds them first"
         fi
-        # Text and vision sweep the ctx/stream axes; a generated-media cell (image/music/tts/asr)
-        # has neither, so it is measured once.
-        case "$mod" in
-            text|vision) mctxs="$ctxs"; mstreams="$streams" ;;
-            *)           mctxs="4096"; mstreams="1" ;;
-        esac
-        for ctx in $mctxs; do for st in $mstreams; do
-            out="results/${tag}_${ctx}_$([ "$st" = 1 ] && echo stream || echo non-stream).json"
+        GPU_IDLE_C=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits | sort -rn | head -1)
+        export GPU_IDLE_C
+        echo "thermal floor for this campaign: ${GPU_IDLE_C}C (idle, nothing resident)"
+    fi
+
+    local m mod fmt engines amod vserve err ctx st pr dev out tag mode psuf suffix asrargs rc
+    local first=1 missing=0
+    for dev in $devices; do for ctx in $ctxs; do for pr in $prompts; do for st in $streams; do
+        # The CPU sweeps are streamed only.
+        [ "$dev" = cpu ] && [ "$st" != 1 ] && continue
+        echo "########## ${dev^^} ctx=$ctx prompts=$pr stream=$st"
+        while IFS=$'\t' read -r m mod fmt; do
+            [ -n "$m" ] || continue
+            if [ -n "${BENCH_ONLY:-}" ] && ! [[ " $BENCH_ONLY " == *" $m "* ]]; then continue; fi
+            IFS='|' read -r engines amod vserve err < <(plan_cell "$m" "$mod" "$fmt")
+            tag=$(echo "$m" | tr ':/' '__')
+            # A model loken lists but the campaign cannot measure is an ERROR cell, visible in
+            # the report - never a silent skip. Written once, in the first sweep.
+            if [ -n "$err" ]; then
+                if [ "$first" = 1 ]; then
+                    out="results/${tag}_error.json"
+                    write_error_cell "$m" "$err" "$out" "$stamp"
+                    echo "ERROR cell: $m ($mod) - $err"
+                fi
+                continue
+            fi
+            # Text and vision sweep every axis; a generated-media cell has none and is
+            # measured in the first sweep only.
+            case "$mod" in
+                text|vision) ;;
+                *) [ "$first" = 1 ] || continue ;;
+            esac
+            # vLLM serves on GPUs only.
+            if [ "$dev" = cpu ]; then
+                engines=$(echo " $engines " | sed 's/ vllm / /; s/^ //; s/ $//'); vserve=""
+                [ -n "$engines" ] || continue
+            fi
+            mode=stream; [ "$st" = 1 ] || mode=non-stream
+            psuf=""; [ "$pr" != short ] && psuf="_$pr"
+            suffix=""; [ "$dev" = cpu ] && suffix="_cpu"
+            out="results/${tag}_${ctx}_${mode}${psuf}${suffix}.json"
             # Resume: keep a cell only if measured by this binary AND the current engine versions.
             if [ -s "$out" ] && cell_current "$out" "$stamp"; then
-                echo "kept $m ctx=$ctx stream=$st (already measured, versions current)"; continue
+                echo "kept $m ctx=$ctx $pr stream=$st $dev (already measured, versions current)"; continue
             fi
-            echo "===== $m ctx=$ctx stream=$st modality=$amod engines=[$engines]"
+            echo "===== $m ctx=$ctx prompt=$pr stream=$st device=$dev modality=$amod engines=[$engines]"
             asrargs=()
             if [ "$amod" = asr ]; then
                 asrargs=(--audio "$ASR_AUDIO")
@@ -374,19 +405,31 @@ PY
             # Measured into a file of its own: a run that writes nothing leaves no earlier result
             # to be stamped with this build.
             rm -f "$out.part"
-            env ENGINES="$engines" STREAM="$st" BENCH_MODE=gpu OUT="$out.part" VLLM_SERVE="$vserve" \
-                ASR_AUDIO="$ASR_AUDIO" \
+            env ENGINES="$engines" STREAM="$st" BENCH_MODE="$dev" OUT="$out.part" VLLM_SERVE="$vserve" \
+                GPU_PIN="$([ "$dev" = gpu ] && echo "${PIN:-}")" ASR_AUDIO="$ASR_AUDIO" \
                 timeout --kill-after=60 "${CELL_CAP:-7200}" \
-                scripts/fair_bench.sh --models "$m" --prompts "$prompts" --num-ctx "$ctx" \
+                scripts/fair_bench.sh --models "$m" --prompts "$pr" --num-ctx "$ctx" \
                 --max-tokens "${MAXTOK:-128}" --iterations 3 --modality "$amod" \
                 "${asrargs[@]}" \
                 2>&1 | tail -4
-            [ -s "$out.part" ] || { echo "no result for $m"; continue; }
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+                echo "cell interrupted after ${CELL_CAP:-7200}s: $m ctx=$ctx $pr stream=$st $dev"
+            fi
+            [ -s "$out.part" ] || { echo "no result for $m"; missing=$((missing + 1)); continue; }
             mv "$out.part" "$out"
             stamp_result "$out" "$stamp"
             python3 scripts/report.py file "$out" >/dev/null 2>&1 || echo "  (report not modality-aware yet for $amod)"
-        done; done
-    done <<< "$models"
+            # The plot and the score follow every cell, so a regression shows while the
+            # campaign still runs.
+            python3 scripts/plot-bench.py >/dev/null 2>&1 || true
+            python3 scripts/scoreboard.py results --brief 2>/dev/null || true
+        done <<< "$models"
+        first=0
+    done; done; done; done
+    if [ "$missing" -gt 0 ]; then
+        echo "campaign incomplete: $missing cell(s) without a result"
+    fi
     echo "campaign done"
 }
 

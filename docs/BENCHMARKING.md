@@ -127,10 +127,12 @@ declares no capability), or a capability assay has no clock for (embedding, vide
   `../assay/scripts/fair-run.sh`: peers' processes are killed, cards return to an idle floor, and
   each engine is measured alone. The driver does not reimplement it.
 
-## Status
+## The whole matrix
 
-Being built as an approved redesign (see the plan). Done: all five modalities native in assay;
-`bench` plan core (store from config, catalogue from loken, matrix from the manifest). Landing next:
-the `run` path (engine provisioning + the fair-run/assay sweep with resume), `bench_row.py` made
-modality-aware, and the removal of the old `campaign.sh` / `full_matrix.sh` / `fair_bench.sh` /
-`image_parity.sh` once their responsibilities have moved here.
+`FULL=1 scripts/bench run` sweeps every axis of `bench/matrix.toml`: for each device, context,
+prompt and streaming mode in that order, every model once. Each cell is one `fair-run` on one
+prompt, so the servers start afresh for every prompt, and its file is
+`results/<model>_<ctx>_<stream|non-stream>[_<prompt>][_cpu].json` (no prompt suffix for the short
+one). The CPU sweeps are streamed only and have no vLLM. A generated-media cell has no such axes
+and is measured once, in the first sweep. The thermal floor is read once, before the first cell,
+while nothing works on the cards.

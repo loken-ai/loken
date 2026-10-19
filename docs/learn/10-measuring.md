@@ -33,7 +33,7 @@ The discipline that came out of nine months of this:
 |---|---|
 | [`../BENCHMARKS.md`](../BENCHMARKS.md#method) | The protocol: the cell, the prompts, which cards each engine may use, what a cell that publishes no rate means, the `Tokens` column beside the rate. |
 | [`../BENCHMARKS.md`](../BENCHMARKS.md#the-two-rate-columns) | Why prefill is prompt tokens over the client's time to first token, why decode is the client's span, and why both are medians. |
-| `scripts/campaign.sh`, `scripts/bench_row.py`, `scripts/scoreboard.py` | The harness: refuses a stale binary, stamps the build into every row, writes the rows into the page. |
+| `scripts/bench`, `scripts/bench_row.py`, `scripts/scoreboard.py` | The harness: refuses a stale binary, stamps the build into every row, writes the rows into the page. |
 | `scripts/figures.py` | Regenerates the table in `STATUS.md` and the figures from one parse of `BENCHMARKS.md`, because the two pages once disagreed. |
 | `scripts/determinism.py` | The same prompt repeated, and a diff of the answers. |
 | `src/inference/place/layer_perf.rs`, `src/energy.rs` | The per-layer timers of lesson 5, and the joules: host RAPL and card NVML summed over the request window. |
