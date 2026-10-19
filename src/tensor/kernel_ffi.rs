@@ -319,6 +319,11 @@ impl CudaDevice {
         self.native().has_ampere_tensor_cores()
     }
 
+    /// See [`tensor::cuda::CudaDevice::has_integer_matrix_cores`].
+    pub fn has_integer_matrix_cores(&self) -> bool {
+        self.native().has_integer_matrix_cores()
+    }
+
     pub fn native(&self) -> &Arc<tensor::cuda::CudaDevice> {
         &self.0
     }

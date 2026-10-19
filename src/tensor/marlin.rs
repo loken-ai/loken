@@ -524,19 +524,7 @@ pub use device::{MarlinAwqLayer, MarlinScratch};
 /// for it, and their AWQ layers keep the dp4a path.
 #[cfg(feature = "gpu")]
 pub fn runs_on(dev: &crate::tensor::cuda::CudaDevice) -> bool {
-    if dev.is_nvidia() {
-        return true;
-    }
-    #[cfg(feature = "rocm")]
-    {
-        use crate::tensor::cuda::AMD_CC_OFFSET;
-        dev.mmq_device_info().is_ok_and(|i| {
-            let generation = i.cc - AMD_CC_OFFSET;
-            (0x908..0x1000).contains(&generation) || (0x1100..0x1300).contains(&generation)
-        })
-    }
-    #[cfg(not(feature = "rocm"))]
-    false
+    dev.is_nvidia() || dev.has_amd_matrix_cores()
 }
 
 #[cfg(test)]

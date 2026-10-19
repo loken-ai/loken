@@ -152,16 +152,25 @@ fn crowded_runs(n_tokens: usize, topk: usize, run: usize) -> (Vec<u32>, Vec<u32>
     (slots, experts, n_experts)
 }
 
-/// The largest offset a Q4_K sub-block can carry, read off its dequantised values.
+/// The largest code of a k-quant format: fifteen for Q4_K's four bits, thirty-one for Q5_K's
+/// five.
+fn top_code(dtype: GgmlDType) -> f64 {
+    match dtype {
+        GgmlDType::Q5K => 31.0,
+        _ => 15.0,
+    }
+}
+
+/// The largest offset a k-quant sub-block can carry, read off its dequantised values.
 ///
-/// A sub-block dequantises to `A.q - B` with `q` a four-bit code, so `A <= hi - lo` whenever two
-/// codes differ and `B = A.q_min - lo`, giving `|B| <= 15.(hi - lo) + max(|hi|, |lo|)`. The
+/// A sub-block dequantises to `A.q - B` with `q` a code up to `top`, so `A <= hi - lo` whenever
+/// two codes differ and `B = A.q_min - lo`, giving `|B| <= top.(hi - lo) + max(|hi|, |lo|)`. The
 /// kernel forms `A.Σq.x` and `B.Σx` as separate f32 terms, so this is what the rounding bound
 /// needs and the only thing it is used for - a loose answer costs a part in ten million.
-fn offset_ceiling(sub: &[f32]) -> f64 {
+fn offset_ceiling(sub: &[f32], top: f64) -> f64 {
     let hi = sub.iter().fold(f32::MIN, |a, b| a.max(*b)) as f64;
     let lo = sub.iter().fold(f32::MAX, |a, b| a.min(*b)) as f64;
-    15.0 * (hi - lo) + hi.abs().max(lo.abs())
+    top * (hi - lo) + hi.abs().max(lo.abs())
 }
 
 /// One dequantised weight row, and what it takes to judge a dot product against it.
@@ -173,10 +182,18 @@ struct WeightRow {
 
 impl WeightRow {
     fn split(dequantised: &[f32], rows: usize, k: usize) -> Vec<Self> {
+        Self::split_coded(dequantised, rows, k, top_code(GgmlDType::Q4K))
+    }
+
+    /// [`Self::split`] for a format whose largest code is `top`.
+    fn split_coded(dequantised: &[f32], rows: usize, k: usize, top: f64) -> Vec<Self> {
         (0..rows)
             .map(|r| {
                 let values = dequantised[r * k..(r + 1) * k].to_vec();
-                let offsets = values.chunks(BLOCK).map(offset_ceiling).collect();
+                let offsets = values
+                    .chunks(BLOCK)
+                    .map(|sub| offset_ceiling(sub, top))
+                    .collect();
                 Self { values, offsets }
             })
             .collect()
@@ -214,14 +231,18 @@ fn block_sums(x: &[f32], rows: usize, k: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// A CUDA device, or the reason this run judges nothing.
+/// A GPU device, or the reason this run judges nothing.
 ///
-/// The IMMA kernels are built on `m16n8k32`, which arrived with Ampere; below that the family
-/// ships no code and a launch would only report the card, so the skip says so out loud.
-fn ampere_card() -> Option<Device> {
+/// The IMMA kernels are integer matrix products; a card without integer matrix instructions
+/// ships no code for them and a launch would only report the card, so the skip says so out
+/// loud.
+fn imma_card() -> Option<Device> {
     let dev = crate::tensor::cuda::CudaDevice::new(0).ok()?;
-    if !dev.has_ampere_tensor_cores() {
-        eprintln!("no m16n8k32 on this card; the IMMA MoE kernels are NOT covered by this run");
+    if !dev.has_integer_matrix_cores() {
+        eprintln!(
+            "no integer matrix instructions on this card; the IMMA kernels are NOT covered by \
+             this run"
+        );
         return None;
     }
     Some(Device::Cuda(dev))
@@ -229,9 +250,19 @@ fn ampere_card() -> Option<Device> {
 
 /// Quantise a dense stack to Q4_K on the card, and hand back what the host reads it as.
 fn q4k_pair(dev: &Device, dense: &[f32], dims: (usize, usize, usize)) -> (QTensor, Vec<f32>) {
+    quantized_pair(dev, dense, dims, GgmlDType::Q4K)
+}
+
+/// [`q4k_pair`] for any shape and k-quant format.
+fn quantized_pair<S: Into<crate::tensor::Shape>>(
+    dev: &Device,
+    dense: &[f32],
+    dims: S,
+    dtype: GgmlDType,
+) -> (QTensor, Vec<f32>) {
     let t = Tensor::from_vec(dense.to_vec(), dims, &Device::Cpu).expect("stack tensor");
-    let q = QTensor::quantize(&t, GgmlDType::Q4K)
-        .expect("quantise to Q4_K")
+    let q = QTensor::quantize(&t, dtype)
+        .expect("quantise the stack")
         .to_device(dev)
         .expect("upload the expert stack");
     let deq = q
@@ -450,7 +481,7 @@ const DOWN_SHAPES: [(usize, usize, usize); 6] = [
 
 #[test]
 fn the_imma_down_projection_agrees_with_a_host_reduction_of_the_dequantised_weights() {
-    let Some(dev) = ampere_card() else { return };
+    let Some(dev) = imma_card() else { return };
     let mut failures: Vec<String> = Vec::new();
     // Held for the whole run: the repack cache is keyed by device pointer, so a stack freed
     // here can hand its address to the next one and be answered from the first one's entry.
@@ -486,7 +517,7 @@ fn the_imma_down_projection_agrees_with_a_host_reduction_of_the_dequantised_weig
 /// for - four - so that a drop there is not mistaken for anything else.
 #[test]
 fn the_imma_down_projection_serves_every_expert_in_a_crowded_tile() {
-    let Some(dev) = ampere_card() else { return };
+    let Some(dev) = imma_card() else { return };
     let mut failures: Vec<String> = Vec::new();
     let mut keep: Vec<QTensor> = Vec::new();
 
@@ -533,7 +564,7 @@ fn the_imma_down_projection_serves_every_expert_in_a_crowded_tile() {
 /// way, because bit-identical and merely-close are worth telling apart even when both pass.
 #[test]
 fn the_imma_down_projection_repeats_within_its_reduction_order() {
-    let Some(dev) = ampere_card() else { return };
+    let Some(dev) = imma_card() else { return };
     let case = DownCase::build(&dev, 16, 8, 128, 512, long_runs(16, 8), 0xDE_7E01);
     let (_, bound) = case.reference();
     let runs: Vec<Vec<f32>> = (0..REPEATS).map(|_| case.launch()).collect();
@@ -698,7 +729,7 @@ const SILU_SHAPES: [(usize, usize, usize); 7] = [
 
 #[test]
 fn the_fused_silu_gate_up_agrees_with_a_host_dot_of_the_dequantised_weights() {
-    let Some(dev) = ampere_card() else { return };
+    let Some(dev) = imma_card() else { return };
     let mut failures: Vec<String> = Vec::new();
     let mut keep: Vec<QTensor> = Vec::new();
 
@@ -731,7 +762,7 @@ fn the_fused_silu_gate_up_agrees_with_a_host_dot_of_the_dequantised_weights() {
 
 #[test]
 fn the_fused_silu_gate_up_writes_the_same_bits_every_run() {
-    let Some(dev) = ampere_card() else { return };
+    let Some(dev) = imma_card() else { return };
     let case = SiluCase::build(&dev, 16, 8, 128, 512, long_runs(16, 8), 0x51_7E01);
     let runs: Vec<Vec<f32>> = (0..REPEATS).map(|_| case.launch()).collect();
     let (differing, worst_rel, gaps) = run_gaps(&runs);
@@ -743,5 +774,320 @@ fn the_fused_silu_gate_up_writes_the_same_bits_every_run() {
          once, with no accumulation to reorder, so any movement at all is a race.",
         case.label(),
         gaps.len()
+    );
+}
+
+// ------------------------------------------------------------
+// The fused gate‖up projection with GELU
+// ------------------------------------------------------------
+
+/// The most `tanhf` misses by, relative - two ulp of f32.
+const TANH_ULP: f64 = 2.0 * 2.0 * HALF_ULP_F32;
+
+/// `gelu_pytorch_tanh` in f64, and its argument to `tanh`.
+fn gelu_tanh(g: f64) -> (f64, f64) {
+    let arg = 0.797_884_560_802_865_4 * (g + 0.044_715 * g * g * g);
+    (0.5 * g * (1.0 + arg.tanh()), arg)
+}
+
+/// What the f32 epilogue `act(g) . u` can drift by: the derivative of either activation stays
+/// under `1.2`, the product and the exponential cost a rounding each, and for GELU the `tanh`
+/// carries its own error and that of its f32 argument.
+fn epilogue_bound(gelu: bool, g: f64, g_slack: f64, u: f64, u_slack: f64) -> (f64, f64) {
+    if gelu {
+        let (act, arg) = gelu_tanh(g);
+        let tanh = 0.5 * g.abs() * u.abs() * (TANH_ULP + 6.0 * HALF_ULP_F32 * arg.abs());
+        let bound = 1.2 * g_slack * u.abs()
+            + act.abs() * u_slack
+            + (act * u).abs() * 2.0 * HALF_ULP_F32
+            + tanh;
+        (act * u, bound)
+    } else {
+        let act = g / (1.0 + (-g).exp());
+        let bound = 1.2 * g_slack * u.abs()
+            + act.abs() * u_slack
+            + (act * u).abs() * (EXPF_ULP + HALF_ULP_F32);
+        (act * u, bound)
+    }
+}
+
+/// One MoE gate‖up case over a fused stack `[experts, 2N, K]`, the gate rows first.
+struct GeluCase {
+    stack: QTensor,
+    input: Tensor,
+    slots_dev: Tensor,
+    experts_dev: Tensor,
+    slots: Vec<u32>,
+    experts: Vec<u32>,
+    x: Vec<f32>,
+    rows: Vec<WeightRow>,
+    sums: Vec<Vec<f32>>,
+    n_tokens: usize,
+    topk: usize,
+    width: usize,
+    k: usize,
+}
+
+impl GeluCase {
+    fn build(
+        dev: &Device,
+        n_tokens: usize,
+        topk: usize,
+        width: usize,
+        k: usize,
+        routing: (Vec<u32>, Vec<u32>, usize),
+        seed: u64,
+    ) -> Self {
+        let (slots, experts, n_experts) = routing;
+        let dense = expert_stack(n_experts, 2 * width, k, seed);
+        let (stack, deq) = q4k_pair(dev, &dense, (n_experts, 2 * width, k));
+        let x = exact_q8_1_rows(n_tokens, k, seed ^ 0x6E1D);
+        Self {
+            input: Tensor::from_vec(x.clone(), (n_tokens, k), dev).expect("upload activation"),
+            slots_dev: Tensor::from_vec(slots.clone(), slots.len(), dev).expect("upload slots"),
+            experts_dev: Tensor::from_vec(experts.clone(), experts.len(), dev)
+                .expect("upload experts"),
+            rows: WeightRow::split(&deq, n_experts * 2 * width, k),
+            sums: block_sums(&x, n_tokens, k),
+            stack,
+            slots,
+            experts,
+            x,
+            n_tokens,
+            topk,
+            width,
+            k,
+        }
+    }
+
+    /// The reference, one row per routed pair, indexed by slot.
+    fn reference(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut want = vec![0.0f64; self.slots.len() * self.width];
+        let mut bound = vec![0.0f64; self.slots.len() * self.width];
+        for pair in 0..self.slots.len() {
+            let slot = self.slots[pair] as usize;
+            let expert = self.experts[pair] as usize;
+            let token = slot / self.topk;
+            let xrow = &self.x[token * self.k..(token + 1) * self.k];
+            let sums = &self.sums[token];
+            for col in 0..self.width {
+                let base = expert * 2 * self.width;
+                let (g, g_slack) = self.rows[base + col].dot_and_slack(xrow, sums);
+                let (u, u_slack) = self.rows[base + self.width + col].dot_and_slack(xrow, sums);
+                let out = slot * self.width + col;
+                (want[out], bound[out]) = epilogue_bound(true, g, g_slack, u, u_slack);
+            }
+        }
+        (want, bound)
+    }
+
+    fn launch(&self) -> Vec<f32> {
+        super::moe_q4k_imma_m8_gate_up_gelu_mul_concat(
+            &self.input,
+            &self.stack,
+            &self.slots_dev,
+            &self.experts_dev,
+            self.topk,
+        )
+        .expect("the IMMA gate‖up refused the case")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1::<f32>()
+        .expect("read back")
+    }
+
+    fn label(&self) -> String {
+        format!(
+            "size_m={} (tokens={} topk={}) N={} K={}",
+            self.slots.len(),
+            self.n_tokens,
+            self.topk,
+            self.width,
+            self.k
+        )
+    }
+}
+
+#[test]
+fn the_imma_gelu_gate_up_agrees_with_a_host_dot_of_the_dequantised_weights() {
+    let Some(dev) = imma_card() else { return };
+    let mut failures: Vec<String> = Vec::new();
+    let mut keep: Vec<QTensor> = Vec::new();
+
+    for (i, &(tokens, topk, width)) in SILU_SHAPES.iter().enumerate() {
+        let case = GeluCase::build(
+            &dev,
+            tokens,
+            topk,
+            width,
+            512,
+            long_runs(tokens, topk),
+            0x6E_0000 + i as u64,
+        );
+        let (want, bound) = case.reference();
+        let got = case.launch();
+        let (count, _, where_) = breaches(&got, &want, &bound, width);
+        if count > 0 {
+            failures.push(format!("{}: {where_}", case.label()));
+        }
+        keep.push(case.stack);
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the IMMA GELU gate‖up does not compute what the host says it should:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+// ------------------------------------------------------------
+// The dense projections: one weight, and the gate‖up pair
+// ------------------------------------------------------------
+
+/// What a dense case runs: the single-weight projection, or the gate‖up pair closed by SiLU or
+/// GELU.
+#[derive(Clone, Copy, Debug)]
+enum DenseEpilogue {
+    Plain,
+    Silu,
+    Gelu,
+}
+
+/// One dense case: `[tokens, K]` against `[N, K]` weights of one k-quant format.
+struct DenseCase {
+    gate: QTensor,
+    up: QTensor,
+    input: Tensor,
+    x: Vec<f32>,
+    gate_rows: Vec<WeightRow>,
+    up_rows: Vec<WeightRow>,
+    sums: Vec<Vec<f32>>,
+    dtype: GgmlDType,
+    tokens: usize,
+    width: usize,
+    k: usize,
+}
+
+impl DenseCase {
+    fn build(
+        dev: &Device,
+        dtype: GgmlDType,
+        tokens: usize,
+        width: usize,
+        k: usize,
+        seed: u64,
+    ) -> Self {
+        let g_dense = expert_stack(1, width, k, seed);
+        let u_dense = expert_stack(1, width, k, seed ^ 0x22EE);
+        let (gate, g_deq) = quantized_pair(dev, &g_dense, (width, k), dtype);
+        let (up, u_deq) = quantized_pair(dev, &u_dense, (width, k), dtype);
+        let x = exact_q8_1_rows(tokens, k, seed ^ 0x5AD3);
+        let top = top_code(dtype);
+        Self {
+            input: Tensor::from_vec(x.clone(), (tokens, k), dev).expect("upload activation"),
+            gate_rows: WeightRow::split_coded(&g_deq, width, k, top),
+            up_rows: WeightRow::split_coded(&u_deq, width, k, top),
+            sums: block_sums(&x, tokens, k),
+            gate,
+            up,
+            x,
+            dtype,
+            tokens,
+            width,
+            k,
+        }
+    }
+
+    fn reference(&self, epilogue: DenseEpilogue) -> (Vec<f64>, Vec<f64>) {
+        let mut want = vec![0.0f64; self.tokens * self.width];
+        let mut bound = vec![0.0f64; self.tokens * self.width];
+        for t in 0..self.tokens {
+            let xrow = &self.x[t * self.k..(t + 1) * self.k];
+            let sums = &self.sums[t];
+            for col in 0..self.width {
+                let (g, g_slack) = self.gate_rows[col].dot_and_slack(xrow, sums);
+                let out = t * self.width + col;
+                (want[out], bound[out]) = match epilogue {
+                    DenseEpilogue::Plain => (g, g_slack),
+                    act => {
+                        let (u, u_slack) = self.up_rows[col].dot_and_slack(xrow, sums);
+                        let gelu = matches!(act, DenseEpilogue::Gelu);
+                        epilogue_bound(gelu, g, g_slack, u, u_slack)
+                    }
+                };
+            }
+        }
+        (want, bound)
+    }
+
+    fn launch(&self, epilogue: DenseEpilogue) -> Vec<f32> {
+        let out = match epilogue {
+            DenseEpilogue::Plain => super::dense_q4k_imma_m8_matmul(&self.input, &self.gate)
+                .expect("the IMMA projection failed")
+                .expect("the IMMA projection declined a card it runs on"),
+            DenseEpilogue::Silu => {
+                super::dense_q4k_imma_m8_silu_mul(&self.input, &self.gate, &self.up)
+                    .expect("the IMMA SiLU gate‖up failed")
+            }
+            DenseEpilogue::Gelu => {
+                super::dense_q4k_imma_m8_gelu_mul(&self.input, &self.gate, &self.up)
+                    .expect("the IMMA GELU gate‖up failed")
+            }
+        };
+        out.flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("read back")
+    }
+
+    fn label(&self, epilogue: DenseEpilogue) -> String {
+        format!(
+            "{:?} {epilogue:?} tokens={} N={} K={}",
+            self.dtype, self.tokens, self.width, self.k
+        )
+    }
+}
+
+/// Token counts either side of the kernels' token tiles, and widths on and off their sixteen-row
+/// tile.
+const DENSE_SHAPES: [(usize, usize); 6] = [
+    (1, 128),
+    (15, 100),
+    (16, 128),
+    (33, 100),
+    (64, 128),
+    (130, 100),
+];
+
+#[test]
+fn the_imma_dense_projections_agree_with_a_host_dot_of_the_dequantised_weights() {
+    let Some(dev) = imma_card() else { return };
+    let mut failures: Vec<String> = Vec::new();
+    let mut keep: Vec<QTensor> = Vec::new();
+
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q5K] {
+        for (i, &(tokens, width)) in DENSE_SHAPES.iter().enumerate() {
+            let case = DenseCase::build(&dev, dtype, tokens, width, 512, 0xDE_0000 + i as u64);
+            for epilogue in [
+                DenseEpilogue::Plain,
+                DenseEpilogue::Silu,
+                DenseEpilogue::Gelu,
+            ] {
+                let (want, bound) = case.reference(epilogue);
+                let got = case.launch(epilogue);
+                let (count, _, where_) = breaches(&got, &want, &bound, width);
+                if count > 0 {
+                    failures.push(format!("{}: {where_}", case.label(epilogue)));
+                }
+            }
+            keep.push(case.gate);
+            keep.push(case.up);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the IMMA dense projections do not compute what the host says they should:\n  {}",
+        failures.join("\n  ")
     );
 }

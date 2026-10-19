@@ -23,8 +23,10 @@ cargo build --release --no-default-features --features rocm,cpu
 The build wants ROCm's `hipcc` on the `PATH` or under `ROCM_PATH`. The kernels are compiled for
 the AMD targets from CDNA (gfx908) to RDNA4 (gfx1201); `LOKEN_ROCM_ARCHS` narrows the list. The
 HIP runtime, hipBLAS, hipRTC and RCCL are opened when the server starts, so the binary starts on
-a machine without them and lists no AMD card. Not yet on AMD: the replayed decode step and the
-kernels written in NVIDIA's own matrix instructions, whose callers take their other paths.
+a machine without them and lists no AMD card. The W4A16 GEMM and the integer matrix products
+run on AMD's matrix instructions, on CDNA and from RDNA3 on. Not yet on AMD: the replayed decode
+step and the kernels written in NVIDIA's own bf16 matrix instructions, whose callers take their
+other paths.
 
 ## NVIDIA and AMD cards in one binary
 

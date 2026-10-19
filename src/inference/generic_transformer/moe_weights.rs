@@ -1594,13 +1594,12 @@ impl MoeWeights {
         // dispatch overhead vs dp4a's per-(token,expert) granularity).
         // For tiny prefills (size_m<64) dp4a's denser dispatch wins.
         let size_m_est = num_tokens * self.n_experts_used;
-        // The IMMA kernels are built on the `m16n8k32` integer MMA, which arrived with
-        // Ampere: below that this family ships no code at all, so the card decides here
-        // alongside the shape.
+        // The IMMA kernels are integer matrix products: a card without integer matrix
+        // instructions has no code for them, so the card decides here alongside the shape.
         let has_imma = xs
             .device()
             .as_cuda_device()
-            .is_ok_and(|d| d.has_ampere_tensor_cores());
+            .is_ok_and(|d| d.has_integer_matrix_cores());
         let use_imma_m8_auto = is_prefill
             && weight_is_q4k
             && k_is_aligned
@@ -1662,7 +1661,8 @@ impl MoeWeights {
                 .unwrap_or(false);
         let down_no = false;
         // Same size_m guard as gate||up: tiny prefills lose to dp4a.
-        let down_use_imma_m8 = is_prefill && down_q4k_aligned && size_m_est >= 64 && !down_no;
+        let down_use_imma_m8 =
+            is_prefill && down_q4k_aligned && size_m_est >= 64 && !down_no && has_imma;
         let out = routing.down_reduce(
             &down_inputs,
             down_stack,

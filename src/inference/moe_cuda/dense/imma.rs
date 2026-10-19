@@ -4,14 +4,15 @@
 
 use super::*;
 
-/// Every kernel this file launches is built on the `m16n8k32` integer MMA, which arrived with
-/// Ampere. A Turing card has no code for any of them, so the answer here is "not this path"  -
+/// Every kernel this file launches is an integer matrix product: the `m16n8k32` integer MMA on
+/// an NVIDIA card from Ampere on, AMD's integer matrix instructions on an AMD card with them. A
+/// card with neither has no code for any of them, so the answer here is "not this path"  -
 /// exactly as for an unsupported dtype, and never a launch that would fail.
 fn card_has_the_instruction(input: &Tensor) -> bool {
     input
         .device()
         .as_cuda_device()
-        .is_ok_and(|d| d.has_ampere_tensor_cores())
+        .is_ok_and(|d| d.has_integer_matrix_cores())
 }
 
 /// The card a tensor lives on, and the raw handle of its compute stream - what every

@@ -433,12 +433,13 @@ impl GenericTransformerLayer {
                 } else {
                     None
                 };
-                // Same Ampere floor as the MoE path: no code below sm_80, so the dense
-                // projection stays on the generic quantised matmul there.
+                // Same floor as the MoE path: a card without integer matrix instructions has
+                // no code for the kernel, so the dense projection stays on the generic
+                // quantised matmul there.
                 let candidate_qt = candidate_qt.filter(|_| {
                     x.device()
                         .as_cuda_device()
-                        .is_ok_and(|d| d.has_ampere_tensor_cores())
+                        .is_ok_and(|d| d.has_integer_matrix_cores())
                 });
                 if let Some((gqt, uqt)) = candidate_qt {
                     // Flatten x to [size_m, K] F32 for the IMMA kernel.

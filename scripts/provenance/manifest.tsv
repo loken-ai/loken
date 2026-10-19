@@ -66,6 +66,7 @@ cuda/moe/gdn_prep.cu	0.0%	0	-
 cuda/moe/qk_prep.cu	0.0%	0	-
 cuda/moe/shared_expert.cu	0.0%	0	-
 cuda/moe/hyper_residual.cu	0.0%	0	-
+cuda/moe/imma_amd.cu	0.0%	0	-
 cuda/moe/indexer.cu	0.0%	0	-
 cuda/moe/tier_graph.cu	0.0%	0	-
 cuda/moe/tp_local.cu	0.0%	0	-

@@ -484,6 +484,28 @@ impl CudaDevice {
         self.is_nvidia() && self.mmq_device_info().is_ok_and(|i| i.cc >= 800)
     }
 
+    /// Whether this card is an AMD card with matrix instructions: MFMA from gfx908 in the gfx9
+    /// family, WMMA in gfx11 and gfx12. Always false for an NVIDIA card.
+    pub fn has_amd_matrix_cores(&self) -> bool {
+        #[cfg(feature = "rocm")]
+        {
+            !self.is_nvidia()
+                && self.mmq_device_info().is_ok_and(|i| {
+                    let generation = i.cc - AMD_CC_OFFSET;
+                    (0x908..0x1000).contains(&generation) || (0x1100..0x1300).contains(&generation)
+                })
+        }
+        #[cfg(not(feature = "rocm"))]
+        false
+    }
+
+    /// Whether this card runs the integer matrix-product kernels (the IMMA family): an NVIDIA
+    /// card from sm_80, which has the `m16n8k32` integer MMA they are written in, or an AMD
+    /// card with matrix instructions, which has integer ones of its own.
+    pub fn has_integer_matrix_cores(&self) -> bool {
+        self.has_ampere_tensor_cores() || self.has_amd_matrix_cores()
+    }
+
     pub fn mmq_device_info(&self) -> Result<MmqDeviceInfo> {
         if let Some(i) = self.mmq_info.get() {
             return Ok(*i);
