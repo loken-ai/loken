@@ -226,6 +226,7 @@ mod tests {
     /// to the bit, in every format the host decodes once for them.
     #[test]
     fn a_dot_over_several_activations_is_each_dot() {
+        many_is_each::<BlockQ4K>("q4_k");
         many_is_each::<BlockIq2S>("iq2_s");
         many_is_each::<BlockIq3Xxs>("iq3_xxs");
         many_is_each::<BlockIq3S>("iq3_s");

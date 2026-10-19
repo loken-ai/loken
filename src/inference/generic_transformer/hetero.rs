@@ -1766,8 +1766,9 @@ impl GenericHeteroTransformer {
     /// verify K drafts in a single batched forward.
     ///
     /// A draft verify (a few rows continuing a cache) runs its rows together, so the experts two
-    /// rows share are read once; a row's logits can differ from the decode step's in the last
-    /// bits, as a batched product's do.
+    /// rows share are read once; on a card a row's logits can differ from the decode step's in
+    /// the last bits, as a batched product's do. On the host each row's logits are the decode
+    /// step's.
     pub fn forward_all(&mut self, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         let verify = index_pos > 0 && seq_len <= crate::inference::engine::decode_step::VERIFY_ROWS;
@@ -1779,6 +1780,14 @@ impl GenericHeteroTransformer {
         // recorded against those buffers goes on reading them.
         #[cfg(feature = "gpu")]
         let _in_place = recording.then(|| crate::inference::moe_cuda::in_place_state(true));
+        // On the host every verified row runs the decode step it stands for, so greedy output
+        // does not depend on how many tokens were drafted.
+        let on_host = self.output_proj_dev.is_none()
+            && self
+                .layer_devs
+                .iter()
+                .all(|d| matches!(d, LayerDevice::Cpu));
+        let _order = (verify && on_host).then(crate::tensor::quantized::DecodeOrder::enter);
         let out = self.forward_inner(input_ids, index_pos, /*all_positions=*/ true);
         if recording {
             self.spec_close(out.is_ok());

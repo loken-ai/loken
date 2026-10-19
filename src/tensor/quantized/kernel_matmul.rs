@@ -795,6 +795,32 @@ impl QKernelMatMul {
             return crate::tensor::Tensor::dry(&self.device, odtype, odims);
         }
 
+        // Rows that must each reproduce a one-row call: the decode engine over all of them
+        // where it serves the one-row call, else one call per row.
+        if rows > 1
+            && DecodeOrder::active()
+            && matches!(self.device, crate::tensor::Device::Cpu)
+            && crate::tensor::quant_cpu::supports(self.dtype)
+            && self.k.is_multiple_of(self.dtype.block_size())
+        {
+            if x.dtype() == crate::tensor::DType::F32
+                && crate::cpu::dispatch_avx2()
+                && self.dtype != GgmlDType::Q4_0
+            {
+                if let Ok(lhs) = x.cpu_f32_data() {
+                    let mut dst = crate::tensor::quant_cpu::zeroed_vec_f32(rows * self.n);
+                    if self.forward_rows_cpu(lhs, &mut dst)? {
+                        return crate::tensor::Tensor::from_vec_f32(dst, odims);
+                    }
+                }
+            }
+            let flat = x.reshape((rows, self.k))?;
+            let ys = (0..rows)
+                .map(|r| self.forward_base(&flat.narrow(0, r, 1)?))
+                .collect::<Result<Vec<_>>>()?;
+            return crate::tensor::Tensor::cat(&ys.iter().collect::<Vec<_>>(), 0)?.reshape(odims);
+        }
+
         // CPU fast path: the lifted k_quants dot engine - the
         // activation is Q8-quantized once per row and the output columns run
         // rayon-parallel, bit-exact with the fork's CPU matmul. This replaces

@@ -45,6 +45,50 @@ impl QKernelMatMul {
         Ok(true)
     }
 
+    /// [`Self::forward_slice_cpu`] over the `x.len() / k` rows of `x`: row `r` of `out` is
+    /// bit-identical to a one-row call over row `r`, and the weight streams once for all the
+    /// rows. Returns `false` without writing where the one-row call would decline.
+    pub fn forward_rows_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
+        if !matches!(self.device, crate::tensor::Device::Cpu)
+            || !crate::tensor::quant_cpu::supports(self.dtype)
+            || !self.k.is_multiple_of(self.dtype.block_size())
+        {
+            return Ok(false);
+        }
+        let rows = x.len() / self.k;
+        if x.len() != rows * self.k || out.len() != rows * self.n {
+            return Err(Error(format!(
+                "forward_rows_cpu: x len {} and out len {} are not rows of k {} and n {}",
+                x.len(),
+                out.len(),
+                self.k,
+                self.n
+            )));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            if let Some(x8) = self.q4k_x8() {
+                crate::tensor::quant_cpu::matmul_q4k_plain_rows(
+                    (rows, self.k, self.n),
+                    x,
+                    x8,
+                    out,
+                )?;
+                return Ok(true);
+            }
+        }
+        // The per-column engine quantises each row and runs the same dot per (row, column)
+        // whatever the row count.
+        crate::tensor::quant_cpu::matmul_bytes(
+            self.dtype,
+            (rows, self.k, self.n),
+            x,
+            self.host.data(),
+            out,
+        )?;
+        Ok(true)
+    }
+
     /// Run several weights against ONE activation, quantising it once.
     ///
     /// At decode the same normed vector feeds `q`, `k` and `v`, and the same FFN

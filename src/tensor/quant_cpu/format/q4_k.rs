@@ -49,6 +49,16 @@ impl BlockFormat for BlockQ4K {
         Self::dot_scalar(xs, ys)
     }
 
+    fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() && !crate::cpu::dispatch_avx512() {
+            return avx::vec_dot_q4k_q8k_many(xs, ys, out);
+        }
+        for (o, y) in out.iter_mut().zip(ys) {
+            *o = Self::dot(xs, y);
+        }
+    }
+
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         const SUB: usize = 32;
         // `y = d.sc[s].q - dmin.m[s]`, so over a sub-block the minimum multiplies the SUM of

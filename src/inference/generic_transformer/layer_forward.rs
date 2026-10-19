@@ -903,30 +903,9 @@ impl GenericTransformerLayer {
             .as_ref()
             .map(|m| m.router_prenormed)
             .unwrap_or(false);
-        if self.flags.use_rope_i
-            || self.attn_v.is_none() && self.attn_qkv.is_none()
-            || self.flags.is_phi2_simple_ffn
-            || self.rope_dim != 0 && self.rope_dim != hd
+        if !self.host_decode_arch_ok(moe_prenormed)
             || x.len() != arena.hidden
             || arena.ffn != self.flags.intermediate_size
-            // gemma needs post-norm weights + gelu; if it's gemma-shaped but
-            // missing those, bail (don't half-apply the sandwich norm).
-            || (is_gemma && (self.post_attn_norm.is_none() || self.post_ffn_norm.is_none() || !self.flags.use_gelu))
-            // OLMo2 (post-norm-only): the Identity pre-norm is a passthrough, NOT a
-            // real RMS - this zero-alloc executor caches attn_norm.weight() and would
-            // mis-apply the [1] ones tensor as a norm. Route it to the regular forward
-            // (where WeightedNorm::Identity::forward returns x unchanged, correctly).
-            || matches!(self.attn_norm, WeightedNorm::Identity(_))
-            // Capped attention scores (Gemma2): the executor's attention does not cap.
-            || self.attn_softcap.is_some()
-            // Gated attention output: the executor projects the attention output ungated.
-            || self.attn_gate.is_some()
-            // MoE layers: this executor computes a DENSE FFN (ffn_gate/up/down); an
-            // MoE layer has no real dense FFN (only expert stacks + a placeholder),
-            // so it MUST bail to the regular forward that routes through the experts.
-            // Only the SIMPLE router-prenormed MoE is handled here (FFN via
-            // moe.forward). gemma4-MoE (not prenormed) still bails.
-            || (self.moe.is_some() && !moe_prenormed)
         {
             return Ok(false);
         }
@@ -945,76 +924,7 @@ impl GenericTransformerLayer {
                 nh, nkv, hd,
             ));
         }
-        // Materialise the per-layer constant norm weights/biases once (f32),
-        // then reuse every token - removes ~5 `to_vec1` allocs/layer/token of
-        // pure repeated conversion of weights that never change.
-        if self.cpu_norm_cache.is_none() {
-            let q_bias = self
-                .attn_q_bias
-                .as_ref()
-                .map(|b| b.to_vec1::<f32>())
-                .transpose()?;
-            let k_bias = self
-                .attn_k_bias
-                .as_ref()
-                .map(|b| b.to_vec1::<f32>())
-                .transpose()?;
-            let v_bias = self
-                .attn_v_bias
-                .as_ref()
-                .map(|b| b.to_vec1::<f32>())
-                .transpose()?;
-            let q_norm_w = match &self.attn_q_norm {
-                Some(qn) => Some((qn.weight().to_vec1::<f32>()?, qn.eps() as f32)),
-                None => None,
-            };
-            let k_norm_w = match &self.attn_k_norm {
-                Some(kn) => Some((kn.weight().to_vec1::<f32>()?, kn.eps() as f32)),
-                None => None,
-            };
-            let post_attn_norm_w = match &self.post_attn_norm {
-                Some(n) => Some((n.weight().to_vec1::<f32>()?, n.eps() as f32)),
-                None => None,
-            };
-            let post_ffn_norm_w = match &self.post_ffn_norm {
-                Some(n) => Some((n.weight().to_vec1::<f32>()?, n.eps() as f32)),
-                None => None,
-            };
-            let ple_post_norm_w = match &self.ple_post_norm {
-                Some(n) => Some((n.weight().to_vec1::<f32>()?, n.eps() as f32)),
-                None => None,
-            };
-            let ple_output_scale = self
-                .ple_output_scale
-                .as_ref()
-                .map(|t| {
-                    t.to_dtype(crate::tensor::DType::F32)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()
-                })
-                .transpose()?;
-            self.cpu_norm_cache =
-                Some(crate::inference::kernel::cpu_decode_exec::DecodeNormCache {
-                    attn_norm_w: self.attn_norm.weight().to_vec1::<f32>()?,
-                    attn_eps: self.attn_norm.eps() as f32,
-                    ffn_norm_w: self.ffn_norm.as_ref().unwrap().weight().to_vec1::<f32>()?,
-                    ffn_eps: self.ffn_norm_eps,
-                    q_bias,
-                    k_bias,
-                    v_bias,
-                    q_norm_w,
-                    k_norm_w,
-                    post_attn_norm_w,
-                    post_ffn_norm_w,
-                    ple_post_norm_w,
-                    ple_output_scale,
-                    o_bias: self
-                        .attn_output_bias
-                        .as_ref()
-                        .map(|b| b.to_dtype(crate::tensor::DType::F32)?.to_vec1::<f32>())
-                        .transpose()?,
-                });
-        }
+        self.ensure_cpu_norm_cache()?;
         // Owned take: `nc` no longer borrows `self`, so the attention block's
         // `&mut self.cpu_q8_kv` doesn't conflict. Restored after the FFN norm.
         let nc = self.cpu_norm_cache.take().unwrap();
@@ -1479,6 +1389,16 @@ impl GenericTransformerLayer {
         if matches!(x.device(), crate::tensor::Device::Cpu) && mask.is_none() && shared_kv.is_none()
         {
             if let Some(y) = self.try_decode_layer_cpu(x, index_pos, ple_layer_input)? {
+                return Ok(y);
+            }
+        }
+        // A draft verify on the host: every row runs the decode step it stands for.
+        if matches!(x.device(), crate::tensor::Device::Cpu)
+            && shared_kv.is_none()
+            && ple_layer_input.is_none()
+            && crate::tensor::quantized::DecodeOrder::active()
+        {
+            if let Some(y) = self.try_decode_rows_cpu(x, index_pos)? {
                 return Ok(y);
             }
         }
@@ -2190,5 +2110,112 @@ impl GenericTransformerLayer {
         }
 
         Ok(x)
+    }
+}
+
+impl GenericTransformerLayer {
+    /// Whether the layer's architecture is one the zero-alloc host decode executes: standard
+    /// dense GQA with neox rope, no partial rope, no capped scores, no gated output, and only
+    /// the router-prenormed mixture. `moe_prenormed` is that mixture's flag.
+    pub(super) fn host_decode_arch_ok(&self, moe_prenormed: bool) -> bool {
+        let (hd, is_gemma) = (self.head_dim, self.attn_v_norm_ones.is_some());
+        !(self.flags.use_rope_i
+            || self.attn_v.is_none() && self.attn_qkv.is_none()
+            || self.flags.is_phi2_simple_ffn
+            || self.rope_dim != 0 && self.rope_dim != hd
+            // gemma needs post-norm weights + gelu; if it's gemma-shaped but
+            // missing those, bail (don't half-apply the sandwich norm).
+            || (is_gemma && (self.post_attn_norm.is_none() || self.post_ffn_norm.is_none() || !self.flags.use_gelu))
+            // OLMo2 (post-norm-only): the Identity pre-norm is a passthrough, NOT a
+            // real RMS - this zero-alloc executor caches attn_norm.weight() and would
+            // mis-apply the [1] ones tensor as a norm. Route it to the regular forward
+            // (where WeightedNorm::Identity::forward returns x unchanged, correctly).
+            || matches!(self.attn_norm, WeightedNorm::Identity(_))
+            // Capped attention scores (Gemma2): the executor's attention does not cap.
+            || self.attn_softcap.is_some()
+            // Gated attention output: the executor projects the attention output ungated.
+            || self.attn_gate.is_some()
+            // MoE layers: this executor computes a DENSE FFN (ffn_gate/up/down); an
+            // MoE layer has no real dense FFN (only expert stacks + a placeholder),
+            // so it MUST bail to the regular forward that routes through the experts.
+            // Only the SIMPLE router-prenormed MoE is handled here (FFN via
+            // moe.forward). gemma4-MoE (not prenormed) still bails.
+            || (self.moe.is_some() && !moe_prenormed))
+    }
+
+    /// Materialise the per-layer constant norm weights and biases once, as f32, for the host
+    /// decode executors.
+    pub(super) fn ensure_cpu_norm_cache(&mut self) -> Result<()> {
+        // Materialise the per-layer constant norm weights/biases once (f32),
+        // then reuse every token - removes ~5 `to_vec1` allocs/layer/token of
+        // pure repeated conversion of weights that never change.
+        if self.cpu_norm_cache.is_none() {
+            let q_bias = self
+                .attn_q_bias
+                .as_ref()
+                .map(|b| b.to_vec1::<f32>())
+                .transpose()?;
+            let k_bias = self
+                .attn_k_bias
+                .as_ref()
+                .map(|b| b.to_vec1::<f32>())
+                .transpose()?;
+            let v_bias = self
+                .attn_v_bias
+                .as_ref()
+                .map(|b| b.to_vec1::<f32>())
+                .transpose()?;
+            let q_norm_w = match &self.attn_q_norm {
+                Some(qn) => Some((qn.weight().to_vec1::<f32>()?, qn.eps() as f32)),
+                None => None,
+            };
+            let k_norm_w = match &self.attn_k_norm {
+                Some(kn) => Some((kn.weight().to_vec1::<f32>()?, kn.eps() as f32)),
+                None => None,
+            };
+            let post_attn_norm_w = match &self.post_attn_norm {
+                Some(n) => Some((n.weight().to_vec1::<f32>()?, n.eps() as f32)),
+                None => None,
+            };
+            let post_ffn_norm_w = match &self.post_ffn_norm {
+                Some(n) => Some((n.weight().to_vec1::<f32>()?, n.eps() as f32)),
+                None => None,
+            };
+            let ple_post_norm_w = match &self.ple_post_norm {
+                Some(n) => Some((n.weight().to_vec1::<f32>()?, n.eps() as f32)),
+                None => None,
+            };
+            let ple_output_scale = self
+                .ple_output_scale
+                .as_ref()
+                .map(|t| {
+                    t.to_dtype(crate::tensor::DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                })
+                .transpose()?;
+            self.cpu_norm_cache =
+                Some(crate::inference::kernel::cpu_decode_exec::DecodeNormCache {
+                    attn_norm_w: self.attn_norm.weight().to_vec1::<f32>()?,
+                    attn_eps: self.attn_norm.eps() as f32,
+                    ffn_norm_w: self.ffn_norm.as_ref().unwrap().weight().to_vec1::<f32>()?,
+                    ffn_eps: self.ffn_norm_eps,
+                    q_bias,
+                    k_bias,
+                    v_bias,
+                    q_norm_w,
+                    k_norm_w,
+                    post_attn_norm_w,
+                    post_ffn_norm_w,
+                    ple_post_norm_w,
+                    ple_output_scale,
+                    o_bias: self
+                        .attn_output_bias
+                        .as_ref()
+                        .map(|b| b.to_dtype(crate::tensor::DType::F32)?.to_vec1::<f32>())
+                        .transpose()?,
+                });
+        }
+        Ok(())
     }
 }

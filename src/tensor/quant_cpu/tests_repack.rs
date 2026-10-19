@@ -833,21 +833,26 @@ where
         let r_tile = m.div_ceil(tiles);
         let chunk_cols = (n / (pool.threads * 8)).clamp(8, 256).min(n.max(1));
         let n_col_chunks = n.div_ceil(chunk_cols);
+        let row_refs: Vec<&[T::ActivationBlock]> = (0..m)
+            .map(|row| &lhs_b_slice[row * k_in_blocks..(row + 1) * k_in_blocks])
+            .collect();
+        let row_refs = &row_refs;
         pool.run(n_col_chunks, &|cc| {
             let dst_ptr = &dst_ptr;
             let col0 = cc * chunk_cols;
             let col1 = (col0 + chunk_cols).min(n);
+            let mut vals = [0f32; R_MAX];
             let mut r0 = 0;
             while r0 < m {
                 let r1 = (r0 + r_tile).min(m);
                 for col in col0..col1 {
                     let rhs_col = &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks];
-                    for row in r0..r1 {
-                        let lhs_row = &lhs_b_slice[row * k_in_blocks..(row + 1) * k_in_blocks];
-                        let v = T::dot(rhs_col, lhs_row);
+                    // `dot_many` is each row's `dot`, to the bit.
+                    T::dot_many(rhs_col, &row_refs[r0..r1], &mut vals[..r1 - r0]);
+                    for (t, v) in vals[..r1 - r0].iter().enumerate() {
                         // SAFETY: each (row, col) is written exactly once - column
                         // chunks are disjoint across threads, rows disjoint within.
-                        unsafe { *dst_ptr.0.add(row * n + col) = v };
+                        unsafe { *dst_ptr.0.add((r0 + t) * n + col) = *v };
                     }
                 }
                 r0 = r1;
@@ -899,6 +904,67 @@ pub fn matmul_q4k_plain(
         return r;
     }
     matmul_q4k_repacked_tiled((m, k, n), lhs, rhs_x8, dst)
+}
+
+/// [`matmul_q4k_plain`]'s one-row arithmetic over `m` rows: each row is quantised and run
+/// through the interleaved decode GEMV exactly as a one-row call runs it, so row `r` of `dst`
+/// is bit-identical to `matmul_q4k_plain((1, k, n))` over row `r`. A column group is loaded
+/// once and serves every row while it is resident.
+#[cfg(target_arch = "x86_64")]
+pub fn matmul_q4k_plain_rows(
+    (m, k, n): (usize, usize, usize),
+    lhs: &[f32],
+    rhs_x8: &[repack_q4k::BlockQ4Kx8],
+    dst: &mut [f32],
+) -> Result<()> {
+    let nb = k / QK_K;
+    let groups = n / 8;
+    if lhs.len() != m * k || dst.len() != m * n || rhs_x8.len() != groups * nb {
+        return Err(Error(format!(
+            "matmul_q4k_plain_rows: shapes disagree (m {m}, k {k}, n {n})"
+        )));
+    }
+    let mut aq = vec![BlockQ8K::zeros(); m * nb];
+    for r in 0..m {
+        BlockQ8K::quantize(&lhs[r * k..(r + 1) * k], &mut aq[r * nb..(r + 1) * nb]);
+    }
+    let pool = gemv_pool::pool();
+    let chunk = groups.div_ceil(pool.threads.max(1)).max(1);
+    let dst_ptr = SendMutPtr(dst.as_mut_ptr());
+    let aq_ref: &[BlockQ8K] = &aq;
+    pool.run(groups.div_ceil(chunk), &|c| {
+        let dst_ptr = &dst_ptr;
+        for g in c * chunk..((c + 1) * chunk).min(groups) {
+            let bgrp = &rhs_x8[g * nb..(g + 1) * nb];
+            let mut r0 = 0;
+            while r0 < m {
+                let r1 = (r0 + repack_q4k::PLAIN_ROWS_MAX).min(m);
+                let mut acts: [&[BlockQ8K]; repack_q4k::PLAIN_ROWS_MAX] =
+                    [&[]; repack_q4k::PLAIN_ROWS_MAX];
+                for (t, a) in acts.iter_mut().enumerate().take(r1 - r0) {
+                    *a = &aq_ref[(r0 + t) * nb..(r0 + t + 1) * nb];
+                }
+                let mut outs = [[0f32; 8]; repack_q4k::PLAIN_ROWS_MAX];
+                unsafe {
+                    repack_q4k::gemv_group_avx2_plain_rows(
+                        bgrp,
+                        &acts[..r1 - r0],
+                        nb,
+                        &mut outs[..r1 - r0],
+                    )
+                };
+                for (t, o) in outs.iter().enumerate().take(r1 - r0) {
+                    // SAFETY: each (row, group) writes its own 8 columns of dst.
+                    let out = unsafe {
+                        std::slice::from_raw_parts_mut(dst_ptr.0.add((r0 + t) * n + g * 8), 8)
+                    };
+                    out.copy_from_slice(o);
+                }
+                r0 = r1;
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Quantise one activation row to Q8_K, for callers that then drive SEVERAL

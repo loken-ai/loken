@@ -1150,6 +1150,185 @@ pub unsafe fn gemv_group_avx2_plain(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize,
     _mm256_storeu_ps(out.as_mut_ptr(), _mm256_sub_ps(acc_row, acc_min_rows));
 }
 
+/// The sixteen-bit partial of one sub-block of [`gemv_group_avx2_plain_rows`]: the eight
+/// weight operands from `base` against the activation lanes of `la` then `lb`, summed in the
+/// one-row kernel's order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+#[inline]
+unsafe fn plain_rows_half(w: &[__m256i; 16], base: usize, la: __m256i, lb: __m256i) -> __m256i {
+    let mut acc = _mm256_setzero_si256();
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base], _mm256_shuffle_epi32::<0>(la)),
+    );
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 1], _mm256_shuffle_epi32::<85>(la)),
+    );
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 2], _mm256_shuffle_epi32::<170>(la)),
+    );
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 3], _mm256_shuffle_epi32::<255>(la)),
+    );
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 4], _mm256_shuffle_epi32::<0>(lb)),
+    );
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 5], _mm256_shuffle_epi32::<85>(lb)),
+    );
+    acc = _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 6], _mm256_shuffle_epi32::<170>(lb)),
+    );
+    _mm256_add_epi16(
+        acc,
+        _mm256_maddubs_epi16(w[base + 7], _mm256_shuffle_epi32::<255>(lb)),
+    )
+}
+
+/// Most activation rows [`gemv_group_avx2_plain_rows`] takes in one call.
+pub const PLAIN_ROWS_MAX: usize = 16;
+
+/// [`gemv_group_avx2_plain`] over several activation rows: the weight group's scales and
+/// nibbles are unpacked once per block and spent on every row, and each row runs the one-row
+/// kernel's own operations in its order, so `outs[r]` is bit-identical to a one-row call over
+/// `acts[r]`. At most [`PLAIN_ROWS_MAX`] rows.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub unsafe fn gemv_group_avx2_plain_rows(
+    b: &[BlockQ4Kx8],
+    acts: &[&[BlockQ8K]],
+    nb: usize,
+    outs: &mut [[f32; 8]],
+) {
+    let rows = acts.len();
+    assert!(rows <= PLAIN_ROWS_MAX && outs.len() == rows);
+    let m4b = _mm256_set1_epi8(0x0F);
+    let deltamask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
+    let scalemask = _mm_set_epi8(7, 7, 3, 3, 6, 6, 2, 2, 5, 5, 1, 1, 4, 4, 0, 0);
+    let finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+
+    let mut acc_row = [_mm256_setzero_ps(); PLAIN_ROWS_MAX];
+    let mut acc_min_rows = [_mm256_setzero_ps(); PLAIN_ROWS_MAX];
+    let mut iacc_b = [_mm256_setzero_si256(); PLAIN_ROWS_MAX];
+    let mut iacc_min_b = [_mm256_setzero_si256(); PLAIN_ROWS_MAX];
+    let mut q8s = [_mm256_setzero_si256(); PLAIN_ROWS_MAX];
+
+    for bi in 0..nb {
+        let blk = &b[bi];
+        let col_scale_f32 = _mm256_cvtph_ps(_mm_shuffle_epi8(
+            _mm_loadu_si128(blk.d.as_ptr() as *const __m128i),
+            deltamask,
+        ));
+        let col_dmin_f32 = _mm256_cvtph_ps(_mm_loadu_si128(blk.dmin.as_ptr() as *const __m128i));
+
+        let mut ms_all = [[0u8; 16]; 8];
+        for j in 0..8 {
+            let q = &blk.scales[j * 12..j * 12 + 12];
+            for i in 0..4 {
+                ms_all[i][j] = q[i] & 63;
+                ms_all[i][8 + j] = q[i + 4] & 63;
+            }
+            for i in 4..8 {
+                ms_all[i][j] = (q[i + 4] & 0x0F) | ((q[i - 4] >> 6) << 4);
+                ms_all[i][8 + j] = (q[i + 4] >> 4) | ((q[i] >> 6) << 4);
+            }
+        }
+
+        for r in 0..rows {
+            let act = &acts[r][bi];
+            iacc_b[r] = _mm256_setzero_si256();
+            iacc_min_b[r] = _mm256_setzero_si256();
+            let q8sums = _mm256_loadu_si256(act.bsums.as_ptr() as *const __m256i);
+            let s = _mm256_castsi128_si256(_mm_hadd_epi16(
+                _mm256_castsi256_si128(q8sums),
+                _mm256_extracti128_si256::<1>(q8sums),
+            ));
+            q8s[r] = _mm256_permute2f128_si256::<0>(s, s);
+        }
+
+        for sb in 0..(QK_K / 64) {
+            let qs = blk.qs.as_ptr();
+            let o = sb * 256;
+            // The sixteen weight operands of the sub-block pair, in the one-row kernel's
+            // order: low nibbles feed the first sub-block, high nibbles the second.
+            let mut w = [_mm256_setzero_si256(); 16];
+            for p in 0..4 {
+                let raw0123 = _mm256_loadu_si256(qs.add(o + 64 * p) as *const __m256i);
+                let raw4567 = _mm256_loadu_si256(qs.add(o + 64 * p + 32) as *const __m256i);
+                for (half, (v0123, v4567)) in [
+                    (
+                        _mm256_and_si256(raw0123, m4b),
+                        _mm256_and_si256(raw4567, m4b),
+                    ),
+                    (
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(raw0123), m4b),
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(raw4567), m4b),
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    w[half * 8 + 2 * p] =
+                        _mm256_blend_epi32::<170>(v0123, _mm256_shuffle_epi32::<177>(v4567));
+                    w[half * 8 + 2 * p + 1] =
+                        _mm256_blend_epi32::<170>(_mm256_shuffle_epi32::<177>(v0123), v4567);
+                }
+            }
+            let mins_and_scales_0 = _mm_loadu_si128(ms_all[2 * sb].as_ptr() as *const __m128i);
+            let scales_0 = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(mins_and_scales_0, scalemask));
+            let mins_and_scales_1 = _mm_loadu_si128(ms_all[2 * sb + 1].as_ptr() as *const __m128i);
+            let scales_1 = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(mins_and_scales_1, scalemask));
+            let mins_01 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(
+                _mm_shuffle_epi32::<78>(mins_and_scales_0),
+                _mm_shuffle_epi32::<78>(mins_and_scales_1),
+            ));
+
+            for r in 0..rows {
+                let lhs = acts[r][bi].qs.as_ptr();
+                let mut l = [_mm256_setzero_si256(); 4];
+                for (i, li) in l.iter_mut().enumerate() {
+                    let h = _mm256_castsi128_si256(_mm_loadu_si128(
+                        lhs.add(16 * i + sb * 64) as *const __m128i
+                    ));
+                    *li = _mm256_permute2f128_si256::<0>(h, h);
+                }
+                let iacc_0 = _mm256_madd_epi16(plain_rows_half(&w, 0, l[0], l[1]), scales_0);
+                let iacc_1 = _mm256_madd_epi16(plain_rows_half(&w, 8, l[2], l[3]), scales_1);
+                let iacc_sb = _mm256_add_epi32(iacc_0, iacc_1);
+                let q8s_sb = _mm256_shuffle_epi32::<0>(q8s[r]);
+                let iacc_min_sb = _mm256_madd_epi16(q8s_sb, mins_01);
+                q8s[r] = _mm256_bsrli_epi128::<4>(q8s[r]);
+                iacc_b[r] = _mm256_add_epi32(iacc_b[r], iacc_sb);
+                iacc_min_b[r] = _mm256_add_epi32(iacc_min_b[r], iacc_min_sb);
+            }
+        }
+        for r in 0..rows {
+            let row_scale_f32 = _mm256_set1_ps(acts[r][bi].d);
+            acc_row[r] = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(iacc_b[r]),
+                _mm256_mul_ps(col_scale_f32, row_scale_f32),
+                acc_row[r],
+            );
+            acc_min_rows[r] = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(iacc_min_b[r]),
+                _mm256_mul_ps(col_dmin_f32, row_scale_f32),
+                acc_min_rows[r],
+            );
+        }
+    }
+    for r in 0..rows {
+        let a = _mm256_permutevar8x32_ps(acc_row[r], finalpermutemask);
+        _mm256_storeu_ps(outs[r].as_mut_ptr(), _mm256_sub_ps(a, acc_min_rows[r]));
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemv_group_avx2_v2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: &mut [f32]) {

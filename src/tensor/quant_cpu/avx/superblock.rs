@@ -392,6 +392,72 @@ unsafe fn hsum_i32_4(v: __m128i) -> i32 {
     }
 }
 
+/// Activations [`vec_dot_q4k_q8k_many`] carries through one pass over the weights.
+const Q4K_MANY_ROWS: usize = 4;
+
+/// [`vec_dot_q4k_q8k`] for several activations over the same weights: each block's scales and
+/// nibbles are unpacked once and spent on up to four activations, each of which runs the
+/// one-activation kernel's own operations in its order, so `out[t]` is bit-identical to
+/// `vec_dot_q4k_q8k(xs, ys[t])`.
+pub(crate) fn vec_dot_q4k_q8k_many(xs: &[BlockQ4K], ys: &[&[BlockQ8K]], out: &mut [f32]) {
+    super::require_avx2();
+    for (y, o) in ys.chunks(Q4K_MANY_ROWS).zip(out.chunks_mut(Q4K_MANY_ROWS)) {
+        // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+        unsafe { vec_dot_q4k_q8k_many_avx2(xs, y, o) }
+    }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q4k_q8k_many_avx2(xs: &[BlockQ4K], ys: &[&[BlockQ8K]], out: &mut [f32]) {
+    unsafe {
+        let rows = ys.len().min(Q4K_MANY_ROWS);
+        let nibble = _mm256_set1_epi8(0xF);
+        let mut acc = [_mm256_setzero_ps(); Q4K_MANY_ROWS];
+        let mut acc_min = [_mm_setzero_ps(); Q4K_MANY_ROWS];
+
+        for (b, x) in xs.iter().enumerate() {
+            let both = scales_and_mins(&x.scales);
+            let sc = _mm256_extracti128_si256(both, 0);
+            let scales = join_halves(sc, sc);
+            // The sixteen weight operands of the block with their scale selectors, in the
+            // one-activation kernel's order: per 64 values, low nibbles then high.
+            let mut codes = [_mm256_setzero_si256(); 8];
+            let mut picks = [_mm256_setzero_si256(); 8];
+            for j in 0..QK_K / 64 {
+                let packed = _mm256_loadu_si256(x.qs.as_ptr().add(32 * j) as *const __m256i);
+                codes[2 * j] = _mm256_and_si256(packed, nibble);
+                codes[2 * j + 1] = _mm256_and_si256(_mm256_srli_epi16(packed, 4), nibble);
+                picks[2 * j] = _mm256_shuffle_epi8(scales, scale_over_16_pairs(2 * j));
+                picks[2 * j + 1] = _mm256_shuffle_epi8(scales, scale_over_16_pairs(2 * j + 1));
+            }
+            for t in 0..rows {
+                let y = &ys[t][b];
+                let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
+                let dmin = -y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.dmin);
+                let from_mins = offset_term(both, &y.bsums);
+                acc_min[t] =
+                    _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(from_mins), acc_min[t]);
+                let acts = y.qs.as_ptr();
+                let mut total = _mm256_setzero_si256();
+                for i in 0..8 {
+                    let a = _mm256_loadu_si256(acts.add(32 * i) as *const __m256i);
+                    total = _mm256_add_epi32(
+                        total,
+                        _mm256_madd_epi16(picks[i], _mm256_maddubs_epi16(codes[i], a)),
+                    );
+                }
+                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(total), acc[t]);
+            }
+        }
+
+        for t in 0..rows {
+            let pairs = _mm_add_ps(acc_min[t], _mm_movehl_ps(acc_min[t], acc_min[t]));
+            let min_total = _mm_add_ss(pairs, _mm_movehdup_ps(pairs));
+            out[t] = lanes_sum(acc[t]) + _mm_cvtss_f32(min_total);
+        }
+    }
+}
+
 /// q4_K plus a fifth bit per value, held in a `qh` bitplane consumed one bit at
 /// a time as the loop walks the super-block.
 pub(crate) fn vec_dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {

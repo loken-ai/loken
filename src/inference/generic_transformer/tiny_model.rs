@@ -221,3 +221,101 @@ pub(crate) fn load(path: &std::path::Path, layers: usize) -> super::GenericHeter
     )
     .unwrap()
 }
+
+/// Width, feed-forward width, heads, key-value heads and vocabulary of the quantised model:
+/// whole K-quant blocks along every reduction, grouped-query attention.
+pub(crate) const QUANT_EMBD: usize = 256;
+const QUANT_FFN: usize = 512;
+const QUANT_HEADS: usize = 4;
+const QUANT_KV_HEADS: usize = 2;
+pub(crate) const QUANT_VOCAB: usize = 64;
+
+/// A qwen3 model of `layers` blocks with the weights of a K-quant file: Q4_K projections,
+/// Q6_K value, down and head, f32 norms and embedding. Written as [`write`] writes the dense
+/// model.
+pub(crate) fn write_quant(tag: &str, layers: usize) -> std::path::PathBuf {
+    let mut seed = 23u32;
+    let mut values = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 16) as f32 / 65536.0 - 0.5) * 0.4
+            })
+            .collect()
+    };
+    let mut entry = |name: String, dims: Vec<usize>, dtype: GgmlDType| {
+        let xs = values(dims.iter().product());
+        let data = if dtype == GgmlDType::F32 {
+            xs.iter().flat_map(|v| v.to_le_bytes()).collect()
+        } else {
+            crate::tensor::quant_cpu::from_float_bytes(dtype, &xs).unwrap()
+        };
+        GgufEntry {
+            name,
+            dims,
+            dtype,
+            data,
+        }
+    };
+    let ones = |name: String, n: usize| GgufEntry {
+        name,
+        dims: vec![n],
+        dtype: GgmlDType::F32,
+        data: [1.0f32.to_le_bytes(); 1].repeat(n).concat(),
+    };
+    let head_dim = QUANT_EMBD / QUANT_HEADS;
+    let kv = QUANT_KV_HEADS * head_dim;
+    let mut entries = vec![
+        entry(
+            "token_embd.weight".into(),
+            vec![QUANT_VOCAB, QUANT_EMBD],
+            GgmlDType::F32,
+        ),
+        entry(
+            "output.weight".into(),
+            vec![QUANT_VOCAB, QUANT_EMBD],
+            GgmlDType::Q6K,
+        ),
+        ones("output_norm.weight".into(), QUANT_EMBD),
+    ];
+    for il in 0..layers {
+        entries.push(ones(format!("blk.{il}.attn_norm.weight"), QUANT_EMBD));
+        entries.push(ones(format!("blk.{il}.ffn_norm.weight"), QUANT_EMBD));
+        entries.push(ones(format!("blk.{il}.attn_q_norm.weight"), head_dim));
+        entries.push(ones(format!("blk.{il}.attn_k_norm.weight"), head_dim));
+        for (n, d, t) in [
+            ("attn_q", [QUANT_EMBD, QUANT_EMBD], GgmlDType::Q4K),
+            ("attn_k", [kv, QUANT_EMBD], GgmlDType::Q4K),
+            ("attn_v", [kv, QUANT_EMBD], GgmlDType::Q6K),
+            ("attn_output", [QUANT_EMBD, QUANT_EMBD], GgmlDType::Q4K),
+            ("ffn_gate", [QUANT_FFN, QUANT_EMBD], GgmlDType::Q4K),
+            ("ffn_up", [QUANT_FFN, QUANT_EMBD], GgmlDType::Q4K),
+            ("ffn_down", [QUANT_EMBD, QUANT_FFN], GgmlDType::Q6K),
+        ] {
+            entries.push(entry(format!("blk.{il}.{n}.weight"), d.to_vec(), t));
+        }
+    }
+    let u = |k: &str, v: u32| (format!("qwen3.{k}"), Value::U32(v));
+    let metadata = vec![
+        ("general.architecture".into(), Value::String("qwen3".into())),
+        u("block_count", layers as u32),
+        u("embedding_length", QUANT_EMBD as u32),
+        u("feed_forward_length", QUANT_FFN as u32),
+        u("attention.head_count", QUANT_HEADS as u32),
+        u("attention.head_count_kv", QUANT_KV_HEADS as u32),
+        u("attention.key_length", head_dim as u32),
+        u("attention.value_length", head_dim as u32),
+        u("context_length", 64),
+        (
+            "qwen3.attention.layer_norm_rms_epsilon".into(),
+            Value::F32(1e-6),
+        ),
+        ("qwen3.rope.freq_base".into(), Value::F32(1_000_000.0)),
+    ];
+    let dir = std::env::temp_dir().join(format!("loken-tiny-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.gguf");
+    write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
+    path
+}

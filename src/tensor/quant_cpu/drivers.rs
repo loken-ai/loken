@@ -1733,36 +1733,19 @@ pub fn ffn_swiglu_coop(
     use std::sync::atomic::{AtomicUsize, Ordering};
     // Separate gate/up ([N,K] each) or a FUSED [2N,K] stack in `up` (rows 0..N =
     // gate, N..2N = up - the layout `forward_slice_cpu(&norm, &mut gateup)` fills).
-    let (udt, uk, un, ubytes) = up;
-    let (gdt, gk, gn, gbytes) = gate.unwrap_or(up);
-    let (ddt, dk, dn, dbytes) = down;
+    let (_, _, _, ubytes) = up;
+    let (gdt, _, _, gbytes) = gate.unwrap_or(up);
+    let (ddt, _, _, dbytes) = down;
     let hidden = x.len();
-    let inter = if gate.is_some() { gn } else { un / 2 };
-    if gdt != udt
-        || gk != hidden
-        || uk != hidden
-        || (gate.is_some() && (gn != inter || un != inter))
-        || (gate.is_none() && un != 2 * inter)
-        || inter == 0
-        || dk != inter
-        || dn != hidden
-        || norm_buf.len() != hidden
-        || gu_buf.len() != 2 * inter
-        || act_buf.len() != inter
-        || !supports(gdt)
-        || !supports(ddt)
-    {
+    let Some(inter) = coop_inter(gate, up, down, hidden) else {
+        return Ok(false);
+    };
+    if norm_buf.len() != hidden || gu_buf.len() != 2 * inter || act_buf.len() != inter {
         return Ok(false);
     }
     with_blocks!(gdt, TG => {
         with_blocks!(ddt, TD => {
-            if gk % TG::BLOCK_LEN != 0
-                || TG::BLOCK_LEN != <<TG as BlockFormat>::ActivationBlock as BlockFormat>::BLOCK_LEN
-                || dk % TD::BLOCK_LEN != 0
-                || TD::BLOCK_LEN != <<TD as BlockFormat>::ActivationBlock as BlockFormat>::BLOCK_LEN
-                || TG::COPIES_VERBATIM
-                || TD::COPIES_VERBATIM
-            {
+            if !coop_blocks_ok::<TG, TD>(hidden, inter) {
                 return Ok(false);
             }
             let grhs: &[TG] = cast_blocks(gbytes)?;
@@ -1790,7 +1773,7 @@ pub fn ffn_swiglu_coop(
             let qd_items = nth.min(kb_d);
             let col_chunk_gu = ((2 * inter) / (nth * 8)).clamp(8, 256).min((2 * inter).max(1));
             let gu_items = (2 * inter).div_ceil(col_chunk_gu);
-            let act_chunk = inter.div_ceil(nth).max(1);
+            let act_chunk = coop_act_chunk(inter, nth);
             let act_items = inter.div_ceil(act_chunk);
             let col_chunk_d = (hidden / (nth * 8)).clamp(8, 256).min(hidden.max(1));
             let d_items = hidden.div_ceil(col_chunk_d);
@@ -1912,6 +1895,187 @@ pub fn ffn_swiglu_coop(
             });
             qscratch_return(aq_g);
             let _ = aq_d;
+            Ok(true)
+        })
+    })
+}
+
+/// The intermediate width of a gate/up/down triple [`ffn_swiglu_coop`] serves over a residual
+/// of `hidden`, or `None` where its shapes or formats fall outside it.
+fn coop_inter(
+    gate: Option<(GgmlDType, usize, usize, &[u8])>,
+    up: (GgmlDType, usize, usize, &[u8]),
+    down: (GgmlDType, usize, usize, &[u8]),
+    hidden: usize,
+) -> Option<usize> {
+    let (udt, uk, un, _) = up;
+    let (gdt, gk, gn, _) = gate.unwrap_or(up);
+    let (ddt, dk, dn, _) = down;
+    let inter = if gate.is_some() { gn } else { un / 2 };
+    let fits = gdt == udt
+        && gk == hidden
+        && uk == hidden
+        && !(gate.is_some() && (gn != inter || un != inter))
+        && !(gate.is_none() && un != 2 * inter)
+        && inter != 0
+        && dk == inter
+        && dn == hidden
+        && supports(gdt)
+        && supports(ddt);
+    fits.then_some(inter)
+}
+
+/// Whether the block formats `TG` (gate/up) and `TD` (down) suit [`ffn_swiglu_coop`]: whole
+/// blocks along both reductions, activation blocks of the weight's length, no verbatim carrier.
+fn coop_blocks_ok<TG: BlockFormat, TD: BlockFormat>(hidden: usize, inter: usize) -> bool {
+    hidden.is_multiple_of(TG::BLOCK_LEN)
+        && TG::BLOCK_LEN == <<TG as BlockFormat>::ActivationBlock as BlockFormat>::BLOCK_LEN
+        && inter.is_multiple_of(TD::BLOCK_LEN)
+        && TD::BLOCK_LEN == <<TD as BlockFormat>::ActivationBlock as BlockFormat>::BLOCK_LEN
+        && !TG::COPIES_VERBATIM
+        && !TD::COPIES_VERBATIM
+}
+
+/// Elements of one activation-mul item of [`ffn_swiglu_coop`] over `threads` workers. The
+/// activation kernels finish a slice that is not whole vectors with a scalar tail, so the
+/// item boundaries are part of the arithmetic.
+fn coop_act_chunk(inter: usize, threads: usize) -> usize {
+    inter.div_ceil(threads).max(1)
+}
+
+/// Activation rows one `dot_many` call of [`ffn_swiglu_coop_rows`] takes.
+const COOP_ROWS_MAX: usize = 16;
+
+/// [`ffn_swiglu_coop`] over the `x.len() / hidden` rows of `x`: each row's residual comes out
+/// bit-identical to a one-row call over that row, with every weight column loaded once for all
+/// the rows. `inter_len` is the activation length the one-row call is given. Returns
+/// `Ok(false)` without writing where the one-row call would decline.
+pub fn ffn_swiglu_coop_rows(
+    x: &mut [f32],
+    hidden: usize,
+    inter_len: usize,
+    gate: Option<(GgmlDType, usize, usize, &[u8])>,
+    up: (GgmlDType, usize, usize, &[u8]),
+    down: (GgmlDType, usize, usize, &[u8]),
+    residual_scale: Option<f32>,
+    norm_fn: &(dyn Fn(&[f32], &mut [f32]) + Sync),
+    act_mul_fn: &(dyn Fn(&[f32], &[f32], &mut [f32]) + Sync),
+) -> Result<bool> {
+    let Some(inter) = coop_inter(gate, up, down, hidden) else {
+        return Ok(false);
+    };
+    if inter != inter_len || hidden == 0 || !x.len().is_multiple_of(hidden) {
+        return Ok(false);
+    }
+    let rows = x.len() / hidden;
+    let (_, _, _, ubytes) = up;
+    let (gdt, _, _, gbytes) = gate.unwrap_or(up);
+    let (ddt, _, _, dbytes) = down;
+    with_blocks!(gdt, TG => {
+        with_blocks!(ddt, TD => {
+            if !coop_blocks_ok::<TG, TD>(hidden, inter) {
+                return Ok(false);
+            }
+            let grhs: &[TG] = cast_blocks(gbytes)?;
+            let urhs: &[TG] = cast_blocks(ubytes)?;
+            let drhs: &[TD] = cast_blocks(dbytes)?;
+            let kb_g = hidden / TG::BLOCK_LEN;
+            let kb_d = inter / TD::BLOCK_LEN;
+            let fused = gate.is_none();
+            let gu_rows_ok = if fused {
+                urhs.len() == 2 * inter * kb_g
+            } else {
+                grhs.len() == inter * kb_g && urhs.len() == inter * kb_g
+            };
+            if !gu_rows_ok || drhs.len() != hidden * kb_d {
+                return Ok(false);
+            }
+            let pool = gemv_pool::pool();
+            let nth = pool.threads.max(1);
+            // Norm and quantise each row; the activation blocks are independent, so a whole
+            // row quantises as the one-row call's block chunks do.
+            let mut normed = vec![0f32; hidden];
+            let mut aqg =
+                vec![<<TG as BlockFormat>::ActivationBlock as BlockFormat>::zeros(); rows * kb_g];
+            for r in 0..rows {
+                norm_fn(&x[r * hidden..(r + 1) * hidden], &mut normed);
+                <<TG as BlockFormat>::ActivationBlock as BlockFormat>::quantize(
+                    &normed,
+                    &mut aqg[r * kb_g..(r + 1) * kb_g],
+                );
+            }
+            // Gate and up: one dot per (row, column), each column serving every row.
+            let mut gu = vec![0f32; rows * 2 * inter];
+            let col_chunk = ((2 * inter) / (nth * 8)).clamp(8, 256);
+            let gu_ptr = SendMutPtr(gu.as_mut_ptr());
+            let g_refs: Vec<&[<TG as BlockFormat>::ActivationBlock]> =
+                aqg.chunks(kb_g).collect();
+            let g_refs = &g_refs;
+            pool.run((2 * inter).div_ceil(col_chunk), &|cc| {
+                let gu_ptr = &gu_ptr;
+                for c in cc * col_chunk..((cc + 1) * col_chunk).min(2 * inter) {
+                    let (w, col) = if fused {
+                        (urhs, c)
+                    } else if c < inter {
+                        (grhs, c)
+                    } else {
+                        (urhs, c - inter)
+                    };
+                    let rhs_col = &w[col * kb_g..(col + 1) * kb_g];
+                    let mut vals = [0f32; COOP_ROWS_MAX];
+                    for (i, refs) in g_refs.chunks(COOP_ROWS_MAX).enumerate() {
+                        let r0 = i * COOP_ROWS_MAX;
+                        TG::dot_many(rhs_col, refs, &mut vals[..refs.len()]);
+                        for (t, v) in vals[..refs.len()].iter().enumerate() {
+                            // SAFETY: each (row, column) is written by exactly one item.
+                            unsafe { *gu_ptr.0.add((r0 + t) * 2 * inter + c) = *v };
+                        }
+                    }
+                }
+            });
+            // Activation in the one-row call's items, then quantise each row for the down.
+            let act_chunk = coop_act_chunk(inter, nth);
+            let mut act = vec![0f32; inter];
+            let mut aqd =
+                vec![<<TD as BlockFormat>::ActivationBlock as BlockFormat>::zeros(); rows * kb_d];
+            for r in 0..rows {
+                let g = &gu[r * 2 * inter..r * 2 * inter + inter];
+                let u = &gu[r * 2 * inter + inter..(r + 1) * 2 * inter];
+                let mut a0 = 0;
+                while a0 < inter {
+                    let a1 = (a0 + act_chunk).min(inter);
+                    act_mul_fn(&g[a0..a1], &u[a0..a1], &mut act[a0..a1]);
+                    a0 = a1;
+                }
+                <<TD as BlockFormat>::ActivationBlock as BlockFormat>::quantize(
+                    &act,
+                    &mut aqd[r * kb_d..(r + 1) * kb_d],
+                );
+            }
+            // Down and the residual, multiply-then-add as the one-row call does.
+            let col_chunk_d = (hidden / (nth * 8)).clamp(8, 256);
+            let xptr = SendMutPtr(x.as_mut_ptr());
+            let d_refs: Vec<&[<TD as BlockFormat>::ActivationBlock]> =
+                aqd.chunks(kb_d).collect();
+            let d_refs = &d_refs;
+            pool.run(hidden.div_ceil(col_chunk_d), &|cc| {
+                let xptr = &xptr;
+                for c in cc * col_chunk_d..((cc + 1) * col_chunk_d).min(hidden) {
+                    let rhs_col = &drhs[c * kb_d..(c + 1) * kb_d];
+                    let mut vals = [0f32; COOP_ROWS_MAX];
+                    for (i, refs) in d_refs.chunks(COOP_ROWS_MAX).enumerate() {
+                        let r0 = i * COOP_ROWS_MAX;
+                        TD::dot_many(rhs_col, refs, &mut vals[..refs.len()]);
+                        for (t, v) in vals[..refs.len()].iter_mut().enumerate() {
+                            if let Some(s) = residual_scale {
+                                *v *= s;
+                            }
+                            // SAFETY: each (row, column) is written by exactly one item.
+                            unsafe { *xptr.0.add((r0 + t) * hidden + c) += *v };
+                        }
+                    }
+                }
+            });
             Ok(true)
         })
     })

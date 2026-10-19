@@ -37,8 +37,8 @@ pub(crate) use block32::{
     vec_dot_q8_0_q8_0, vec_dot_q8_1_q8_1,
 };
 pub(crate) use superblock::{
-    vec_dot_q2k_q8k, vec_dot_q3k_q8k, vec_dot_q4k_q8k, vec_dot_q4k_q8k_exact, vec_dot_q5k_q8k,
-    vec_dot_q6k_q8k, vec_dot_q6k_q8k_exact, vec_dot_q8k_q8k,
+    vec_dot_q2k_q8k, vec_dot_q3k_q8k, vec_dot_q4k_q8k, vec_dot_q4k_q8k_exact, vec_dot_q4k_q8k_many,
+    vec_dot_q5k_q8k, vec_dot_q6k_q8k, vec_dot_q6k_q8k_exact, vec_dot_q8k_q8k,
 };
 
 #[cfg(target_arch = "x86")]

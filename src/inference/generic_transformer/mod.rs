@@ -64,6 +64,7 @@ mod layer_attn;
 mod layer_cpu_attn;
 mod layer_ffn;
 mod layer_forward;
+mod layer_rows_cpu;
 mod loader;
 pub mod mixer;
 mod moe_weights;
@@ -83,6 +84,8 @@ mod tp_tests;
 mod vendor_split_parity;
 #[cfg(all(test, feature = "gpu"))]
 mod verify_decode_parity;
+#[cfg(test)]
+mod verify_rows_cpu_tests;
 mod verify_window;
 mod wide;
 pub use config::*;

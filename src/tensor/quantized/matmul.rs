@@ -186,6 +186,15 @@ impl QMatMul {
         }
     }
 
+    /// [`Self::forward_slice_cpu`] over several rows at once, each row bit-identical to a
+    /// one-row call. `Ok(false)` where the one-row call declines.
+    pub fn forward_rows_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
+        match self {
+            Self::QTensor(qt) => qt.native_qmm()?.forward_rows_cpu(x, out),
+            _ => Ok(false),
+        }
+    }
+
     /// Several projections against ONE activation, quantised once.
     /// `Ok(false)` and nothing written when any weight is not block-quantized,
     /// so the caller falls back to the per-weight calls.

@@ -573,6 +573,18 @@ impl QMatMul {
         }
     }
 
+    /// [`Self::forward_slice_cpu`] over several rows at once, each row bit-identical to a
+    /// one-row call. `Ok(false)` where the one-row call declines.
+    pub fn forward_rows_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
+        if self.lora_fused.is_some() {
+            return Ok(false);
+        }
+        match &self.inner {
+            QMatMulKind::Gguf(inner) => inner.forward_rows_cpu(x, out),
+            _ => Ok(false),
+        }
+    }
+
     /// Several projections against ONE activation, quantised once.
     ///
     /// Delegates to the GGUF slice path's shared entry point when every weight

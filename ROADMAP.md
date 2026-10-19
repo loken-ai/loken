@@ -174,6 +174,6 @@ Smaller, by priority:
 Features that cannot be measured on the machines at hand; each moves into a version once a machine
 to measure it on is available.
 
-| Feature | Done when | Needs |
+| Feature | Category | Done when | State |
 |---|---|---|---|
 | A backend for Apple silicon | Backends | One model of each family runs through Metal on an Apple Silicon Mac. | Waiting |
