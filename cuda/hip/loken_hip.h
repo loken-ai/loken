@@ -79,6 +79,10 @@
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaMallocAsync hipMallocAsync
 #define cudaFreeAsync hipFreeAsync
+#define cudaMalloc hipMalloc
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 
 // Types.
 typedef __hip_bfloat16 __nv_bfloat16;

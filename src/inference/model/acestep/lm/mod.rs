@@ -1108,7 +1108,6 @@ impl Qwen3Lm {
         // cuBLAS alloc invalidates it). Guarded so recaptures don't leak a workspace.
         static CUBLAS_WS_PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         if CUBLAS_WS_PINNED.get().is_none() {
-            use crate::tensor::gpu_runtime::cublas::sys::cublasSetWorkspace_v2;
             use crate::tensor::gpu_runtime::driver::result::malloc_sync;
             // Sized from the bucket the graph is captured at: the workspace backs the
             // score GEMMs of one step, so a wider bucket means wider score matrices and
@@ -1116,12 +1115,10 @@ impl Qwen3Lm {
             let bytes =
                 crate::inference::place::audio_demand::lm_cublas_workspace_bytes(GRAPH_BUCKET)
                     as usize;
-            let raw = *cd.blas().map_err(|e| err(e.0))?.handle();
             let ws = unsafe { malloc_sync(bytes) }
                 .map_err(|e| err(format!("cublas ws malloc: {e:?}")))?;
-            unsafe { cublasSetWorkspace_v2(raw, ws as *mut std::ffi::c_void, bytes) }
-                .result()
-                .map_err(|e| err(format!("cublas set ws: {e:?}")))?;
+            cd.pin_blas_workspace(ws, bytes)
+                .map_err(|e| err(format!("cublas set ws: {e}")))?;
             let _ = CUBLAS_WS_PINNED.set(());
         }
         // WARMUP eager pass: loads every kernel module (lazy load in capture is illegal)

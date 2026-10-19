@@ -148,9 +148,10 @@ mod cuda {
             .unwrap_or(false)
     }
 
-    /// Stream-level form of [`capture_active`].
+    /// Stream-level form of [`capture_active`]: for a card's stream, whether the calling
+    /// thread records a graph on that card.
     pub fn capture_active_on(stream: &Arc<CudaStream>) -> bool {
-        stream
+        tensor::cuda::routed_stream(stream)
             .capture_status()
             .ok()
             .map(|st| !matches!(st, CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE))
@@ -203,14 +204,10 @@ mod cuda {
     /// capture (in-capture cuBLAS allocs invalidate the capture). Leaks the
     /// workspace by design (lives for the process).
     pub fn pin_cublas_workspace(device: &Device, bytes: usize) -> Result<()> {
-        use crate::tensor::gpu_runtime::cublas::sys::cublasSetWorkspace_v2;
         use crate::tensor::gpu_runtime::driver::result::malloc_sync;
         let cd = device.as_cuda_device()?;
-        let raw = *cd.native().blas()?.handle();
         let ws = unsafe { malloc_sync(bytes) }.map_err(msg("pin_cublas_workspace/malloc"))?;
-        unsafe { cublasSetWorkspace_v2(raw, ws as *mut std::ffi::c_void, bytes) }
-            .result()
-            .map_err(msg("pin_cublas_workspace/set"))?;
+        cd.native().pin_blas_workspace(ws, bytes)?;
         Ok(())
     }
 

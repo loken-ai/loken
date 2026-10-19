@@ -206,6 +206,15 @@ pub enum Storage {
     Dry(DryStorage),
 }
 
+#[cfg(feature = "gpu")]
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if let Self::Cuda { data, dev } = self {
+            dev.before_free(data.alloc_stream());
+        }
+    }
+}
+
 impl Storage {
     pub fn dtype(&self) -> DType {
         match self {

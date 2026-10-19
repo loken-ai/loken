@@ -83,9 +83,17 @@ static y_q8_1_reservation get_y_q8_1_scratch(size_t needed, cudaStream_t stream)
     }
     if (needed > slot->bytes) {
         // The old buffer stays allocated: a recorded graph holds its address and replays into
-        // it after a wider call moved on. Doubling bounds how many are left behind.
+        // it after a wider call moved on. Doubling bounds how many are left behind. A stream
+        // that is being captured gets a plain allocation: a stream-ordered one would be a node
+        // of the graph, its memory the graph's, while the slot keeps it for every later call.
         const size_t bytes = needed > 2 * slot->bytes ? needed : 2 * slot->bytes;
-        cudaMallocAsync(&slot->ptr, bytes, stream);
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &capturing);
+        if (capturing == cudaStreamCaptureStatusNone) {
+            cudaMallocAsync(&slot->ptr, bytes, stream);
+        } else {
+            cudaMalloc(&slot->ptr, bytes);
+        }
         slot->bytes = bytes;
     }
     return {std::move(held), slot->ptr};

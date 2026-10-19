@@ -34,10 +34,10 @@ fn workspace_ensure(
     use crate::tensor::gpu_runtime::driver::sys::CUstream;
     let map = WORKSPACE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (dev.ordinal(), dev.stream().cu_stream() as CUstream as usize);
+    let stream = dev.card_stream();
+    let key = (dev.ordinal(), stream.cu_stream() as CUstream as usize);
     if g.get(&key).map(|b| b.len()) < Some(min_bytes) {
-        let fresh = dev
-            .stream()
+        let fresh = stream
             .alloc_zeros::<u8>(min_bytes)
             .map_err(|er| Error::msg(format!("fast_mmvq workspace: {er}")))?;
         g.insert(key, Arc::new(fresh));

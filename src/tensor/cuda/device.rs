@@ -261,6 +261,32 @@ pub struct CudaDevice {
     /// One per device and re-recorded in place: a boundary crossing happens once per
     /// token, and creating a driver object that often is a cost on the hot path.
     pub(super) xfer_event: OnceLock<CudaEvent>,
+    /// The graph recording of this card (see `begin_capture`).
+    pub(super) recording: Recording,
+    /// The cuBLAS workspace pinned for every handle of the card: device address and bytes.
+    pub(super) blas_workspace: std::sync::Mutex<Option<(u64, usize)>>,
+}
+
+/// The workspace cuBLAS recommends a caller give a handle: 32 MiB from compute capability 9.0
+/// on, 4 MiB below.
+fn recommended_blas_workspace(cc: i32) -> usize {
+    if cc >= 900 {
+        32 << 20
+    } else {
+        4 << 20
+    }
+}
+
+/// Sets `ws` of `bytes` as the workspace of `blas`.
+fn set_blas_workspace(
+    blas: &crate::tensor::gpu_runtime::cublas::CudaBlas,
+    ws: u64,
+    bytes: usize,
+) -> Result<()> {
+    use crate::tensor::gpu_runtime::cublas::sys::cublasSetWorkspace_v2;
+    unsafe { cublasSetWorkspace_v2(*blas.handle(), ws as *mut std::ffi::c_void, bytes) }
+        .result()
+        .map_err(|e| cublas_err("set workspace", e))
 }
 
 /// Compute capability / SM count / opt-in smem / warp size - what the MMQ
@@ -343,6 +369,8 @@ impl CudaDevice {
             alt_stream: OnceLock::new(),
             pool_chunk: std::sync::atomic::AtomicU64::new(0),
             xfer_event: OnceLock::new(),
+            recording: Recording::default(),
+            blas_workspace: std::sync::Mutex::new(None),
         });
         // Taken HERE because it can only be taken against a pool with nothing spare,
         // and this is the moment that is true: the device has just been opened and
@@ -552,14 +580,80 @@ impl CudaDevice {
         Ok(info)
     }
 
-    /// cuBLAS handle (created once per device; thread-safe per NVIDIA docs).
+    /// The cuBLAS handle of [`Self::stream`], created once: the card's, thread-safe per NVIDIA
+    /// docs, or the recording one for the thread that records a graph on the card. Both use the
+    /// workspace [`Self::pin_blas_workspace`] pinned, if any.
     pub fn blas(&self) -> Result<&crate::tensor::gpu_runtime::cublas::CudaBlas> {
-        if self.blas.get().is_none() {
-            let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(self.stream.clone())
+        let (cell, stream) = match self.recording.mine() {
+            Some(r) => (&r.blas, &r.stream),
+            None => (&self.blas, &self.stream),
+        };
+        if cell.get().is_none() {
+            let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(stream.clone())
                 .map_err(|e| cublas_err("init", e))?;
-            let _ = self.blas.set(b);
+            let pinned = *self
+                .blas_workspace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((ws, bytes)) = pinned {
+                set_blas_workspace(&b, ws, bytes)?;
+            }
+            let _ = cell.set(b);
         }
-        Ok(self.blas.get().unwrap())
+        Ok(cell.get().unwrap())
+    }
+
+    /// Makes the cuBLAS handle of the recorder `r` before its capture begins, with the card's
+    /// pinned workspace, or a workspace of its own of the size cuBLAS recommends when none is
+    /// pinned: a handle made or a workspace taken inside a capture is recorded into the graph.
+    pub(super) fn ready_recorder(&self, r: &Recorder) -> Result<()> {
+        if r.blas.get().is_some() {
+            return Ok(());
+        }
+        let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(r.stream.clone())
+            .map_err(|e| cublas_err("init", e))?;
+        let pinned = *self
+            .blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match pinned {
+            Some((ws, bytes)) => set_blas_workspace(&b, ws, bytes)?,
+            None => {
+                use crate::tensor::gpu_runtime::driver::DevicePtr;
+                let bytes = recommended_blas_workspace(self.mmq_device_info()?.cc);
+                let ws = self
+                    .stream
+                    .alloc_zeros::<u8>(bytes)
+                    .map_err(|e| Error(format!("recording cuBLAS workspace: {e}")))?;
+                set_blas_workspace(&b, ws.device_ptr(&self.stream).0, bytes)?;
+                let _ = r.workspace.set(ws);
+            }
+        }
+        let _ = r.blas.set(b);
+        Ok(())
+    }
+
+    /// Gives every cuBLAS handle of the card the workspace of `bytes` at `ws`: cuBLAS then
+    /// allocates no workspace of its own, which a graph capture forbids. Both handles share it,
+    /// as everything they queue runs in the order of the card's stream.
+    pub fn pin_blas_workspace(&self, ws: u64, bytes: usize) -> Result<()> {
+        let mut pinned = self
+            .blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *pinned = Some((ws, bytes));
+        if let Some(b) = self.blas.get() {
+            set_blas_workspace(b, ws, bytes)?;
+        }
+        let made = self
+            .recording
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for b in made.iter().filter_map(|r| r.blas.get()) {
+            set_blas_workspace(b, ws, bytes)?;
+        }
+        Ok(())
     }
 
     /// `name` of `module`, from the cache or the driver: a launch of a kernel the step has
@@ -730,13 +824,25 @@ impl CudaDevice {
     }
 
     /// The stream all native allocations/copies/launches go through. Existing
-    /// kernel launchers take exactly this type.
+    /// kernel launchers take exactly this type. The card's stream, except for the thread that
+    /// records a graph on the card, which is given the recording stream until its capture ends.
+    #[inline]
     pub fn stream(&self) -> &Arc<CudaStream> {
+        match self.recording.mine() {
+            Some(r) => &r.stream,
+            None => &self.stream,
+        }
+    }
+
+    /// The card's stream itself, for every thread: what the graphs recorded on the card replay
+    /// on. A buffer cached for the stream's work is allocated on it and keyed by it, so a
+    /// recording uses the buffers the work it records will replay among.
+    pub fn card_stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
 
     pub fn synchronize(&self) -> Result<()> {
-        self.stream
+        self.stream()
             .synchronize()
             .map_err(|e| Error(format!("cuda sync: {e}")))
     }
@@ -778,9 +884,9 @@ impl CudaDevice {
                     .ok_or_else(|| Error("cuda event create: lost the race".into()))?
             }
         };
-        ev.record(&src.stream)
+        ev.record(src.stream())
             .map_err(|e| Error(format!("cuda event record: {e}")))?;
-        self.stream
+        self.stream()
             .wait(ev)
             .map_err(|e| Error(format!("cuda event wait: {e}")))
     }
@@ -885,6 +991,22 @@ pub enum CudaStorage {
     F16(CudaSlice<half::f16>),
     BF16(CudaSlice<half::bf16>),
     F32(CudaSlice<f32>),
+}
+
+impl CudaStorage {
+    /// The stream the buffer was allocated on, which its free is queued on.
+    pub fn alloc_stream(&self) -> &Arc<CudaStream> {
+        match self {
+            Self::U8(s) => s.stream(),
+            Self::U32(s) => s.stream(),
+            Self::I16(s) => s.stream(),
+            Self::I32(s) => s.stream(),
+            Self::I64(s) => s.stream(),
+            Self::F16(s) => s.stream(),
+            Self::BF16(s) => s.stream(),
+            Self::F32(s) => s.stream(),
+        }
+    }
 }
 
 #[cfg(test)]

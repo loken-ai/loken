@@ -34,6 +34,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- CUDA: record graphs on a stream of their own, out of other threads' work on the card.
 - Experts: give the same greedy tokens whichever experts the cards hold.
 - Audio: prompt Voxtral in its own instruction format, not the file's template.
 - Bench: never stamp an earlier result with a build that measured nothing.
