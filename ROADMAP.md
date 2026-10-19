@@ -65,6 +65,7 @@ Major, by priority:
 | Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Planned |
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Planned |
 | Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Planned |
+| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on two 16 GB cards and the host | Planned |
 
 Smaller, by priority:
 
@@ -83,6 +84,10 @@ Smaller, by priority:
 | MIDI in | Music | A MIDI file given as the prompt continues in its tempo and key. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
+| Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
+| Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
+| DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
+| Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
 | Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Planned |
 | Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker. | Planned |
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
