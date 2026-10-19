@@ -519,6 +519,26 @@ mod device {
 #[cfg(feature = "gpu")]
 pub use device::{MarlinAwqLayer, MarlinScratch};
 
+/// Whether `dev` runs the kernel: every NVIDIA card, and an AMD card with matrix instructions -
+/// MFMA from gfx908 in the gfx9 family, WMMA in gfx11 and gfx12. Other AMD cards have no code
+/// for it, and their AWQ layers keep the dp4a path.
+#[cfg(feature = "gpu")]
+pub fn runs_on(dev: &crate::tensor::cuda::CudaDevice) -> bool {
+    if dev.is_nvidia() {
+        return true;
+    }
+    #[cfg(feature = "rocm")]
+    {
+        use crate::tensor::cuda::AMD_CC_OFFSET;
+        dev.mmq_device_info().is_ok_and(|i| {
+            let generation = i.cc - AMD_CC_OFFSET;
+            (0x908..0x1000).contains(&generation) || (0x1100..0x1300).contains(&generation)
+        })
+    }
+    #[cfg(not(feature = "rocm"))]
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

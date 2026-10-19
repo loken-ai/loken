@@ -15,6 +15,7 @@ cuda/hip/mma.h	0.0%	0	-
 cuda/marlin/dequant.h	0.0%	0	-
 cuda/marlin/kernel.h	0.0%	0	-
 cuda/marlin/marlin.cuh	0.0%	0	-
+cuda/marlin/marlin_amd.cu	0.0%	0	candle/candle-kernels/src/quantized.cu
 cuda/marlin/marlin_awq_f16_m16.cu	0.0%	0	-
 cuda/marlin/marlin_awq_f16_m32.cu	0.0%	0	-
 cuda/marlin/marlin_awq_f16_m8.cu	0.0%	0	-

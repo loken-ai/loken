@@ -225,6 +225,7 @@ fn compile_hip_kernels() {
         "cuda/flashdecode_tc/flashdecode_tc.cu",
         "cuda/flash_prefill_f16.cu",
         "cuda/flash_prefill_gqa.cu",
+        "cuda/marlin/marlin_amd.cu",
         "cuda/hip/nvidia_only.cpp",
     ]);
     println!("cargo:rerun-if-changed=cuda/hip");

@@ -486,10 +486,13 @@ impl QMatMul {
                     use crate::tensor::marlin;
                     let policy = awq_marlin_policy();
                     let mut marlin_built = false;
-                    // Marlin is written in NVIDIA's tensor-core instructions: another runtime has
-                    // no build of it, and the dp4a path serves the layer.
+                    // A card without matrix instructions has no build of the kernel, and the
+                    // dp4a path serves the layer.
                     if policy != AwqMarlinPolicy::Off
-                        && w.qweight.device().is_nvidia()
+                        && w.qweight
+                            .device()
+                            .as_cuda_device()
+                            .is_ok_and(|d| marlin::runs_on(d.native()))
                         && w.k.is_multiple_of(marlin::MARLIN_TILE)
                         && w.n.is_multiple_of(marlin::MIN_THREAD_N)
                         && w.group_size == marlin::MARLIN_GROUP_SIZE
