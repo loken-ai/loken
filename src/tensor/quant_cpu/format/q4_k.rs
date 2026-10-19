@@ -104,6 +104,45 @@ impl BlockFormat for BlockQ4K {
     }
 }
 
+impl ExactDot for BlockQ4K {
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            return avx::vec_dot_q4k_q8k_exact(xs, ys);
+        }
+        let mut total = -0.0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            let (scaled, offset) = block_sums(x, y);
+            total += combine(x, y.d, scaled, offset);
+        }
+        total
+    }
+}
+/// A block's two integer sums against a q8_K block: the codes against the activations under
+/// each sub-block's scale, and the activation sums under each sub-block's minimum.
+fn block_sums(x: &BlockQ4K, y: &BlockQ8K) -> (i32, i32) {
+    const SUB: usize = 32;
+    let (scales, mins) = kquant_scales_and_mins(&x.scales);
+    let (mut scaled, mut offset) = (0i32, 0i32);
+    for s in 0..QK_K / SUB {
+        let group = &x.qs[(s / 2) * SUB..(s / 2) * SUB + SUB];
+        let shift = if s % 2 == 0 { 0 } else { 4 };
+        let acts = &y.qs[s * SUB..(s + 1) * SUB];
+        let dot: i32 = group
+            .iter()
+            .zip(acts)
+            .map(|(&packed, &a)| ((packed >> shift) & 0x0F) as i32 * a as i32)
+            .sum();
+        scaled += scales[s] as i32 * dot;
+        offset += mins[s] as i32 * (y.bsums[2 * s] as i32 + y.bsums[2 * s + 1] as i32);
+    }
+    (scaled, offset)
+}
+/// One block's share of the exact dot from its two integer sums (see [`block_sums`]).
+#[inline(always)]
+pub(crate) fn combine(x: &BlockQ4K, y_d: f32, scaled: i32, offset: i32) -> f32 {
+    y_d * (x.d.to_f32() * scaled as f32 - x.dmin.to_f32() * offset as f32)
+}
 /// Quantise whole blocks, optionally against an importance matrix.
 ///
 /// Two stages. Each thirty-two-value sub-block is fitted on its own to a `(scale, minimum)`

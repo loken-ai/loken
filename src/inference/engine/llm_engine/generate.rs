@@ -613,6 +613,7 @@ impl LlmEngine {
             if head_capable && !head_on {
                 state.model.draft_head_capture(false);
             }
+            state.model.settle_hot_experts();
             let cache_at_start = state.model.expert_cache_counters();
             let mut head_tokens: Vec<u32> = vec![next_token];
             // What the head's cycles came to: verifies, of them recorded, and steps it had no

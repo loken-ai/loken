@@ -62,6 +62,7 @@ impl TierState {
 }
 
 mod direct;
+mod exact;
 mod graph;
 mod hot;
 pub(crate) use graph::mapped;
@@ -188,6 +189,9 @@ pub struct LayerTier {
     uploaded: AtomicU64,
     /// The layer's side of a decode recorded in a graph, once enabled.
     graph: std::sync::OnceLock<graph::GraphSide>,
+    /// The layer's formats and widths when the card, the transit room and the host compute its
+    /// experts in the same steps; `None` for the formats without an exact kernel.
+    exact: Option<exact::Exact>,
 }
 
 /// What one decoded token moves between the card and the host, in page-locked memory and in
@@ -888,6 +892,12 @@ impl super::GenericHeteroTransformer {
             h.rerank();
         }
     }
+    /// Wait for the locks of the hot experts a re-rank is moving, before a request runs.
+    pub fn settle_hot_experts(&self) {
+        if let Some(h) = &self.hot_locks {
+            h.settle();
+        }
+    }
 }
 
 impl super::GenericHeteroTransformer {
@@ -1234,6 +1244,7 @@ impl LayerTier {
         ];
         let expert_bytes = [0, 1, 2]
             .map(|i| host[i].native_qtensor().data().len() / host[i].shape().dims()[0].max(1));
+        let exact = exact::Exact::of(&host);
         let mut slot_of = vec![-1i32; moe.n_experts];
         let mut owner = vec![-1i32; slots];
         for s in 0..slots {
@@ -1279,6 +1290,7 @@ impl LayerTier {
             transit_eighths: [AtomicU64::new(0), AtomicU64::new(0)],
             uploaded: AtomicU64::new(0),
             graph: std::sync::OnceLock::new(),
+            exact,
         })
     }
 
@@ -1787,6 +1799,29 @@ impl LayerTier {
         let (transit_ids, host_ids) = miss_ids.split_at(to_transit);
         let (transit_w, host_w) = miss_weights.split_at(to_transit);
         laps.mark("tier token: partition");
+        if let Some(exact) = self.exact {
+            let slots: Vec<Option<u32>> =
+                (0..k).map(|i| is_hit[i].then_some(slot_ids[i])).collect();
+            let out = self.exact_eager(
+                &exact,
+                scratch,
+                xs,
+                h_x,
+                &w_card,
+                exact::Partition {
+                    ids: &ids_h,
+                    weights: &w_h,
+                    slots: &slots,
+                    transit: transit_ids,
+                },
+                &mut laps,
+            )?;
+            drop(guard);
+            self.keep_in_transit(transit_ids, false, &mut in_use, &stream)?;
+            self.promote(host_ids, &in_use);
+            laps.mark("tier token: finish");
+            return Ok(out);
+        }
 
         // The card's share is launched first, and runs while the host does its own. A routed pair
         // whose expert is missing reads a slot that is in use and weighs zero.
@@ -2054,6 +2089,37 @@ impl LayerTier {
         let to_transit = self.transit_share(missing.len(), rows);
         let transit_experts: Vec<u32> = missing[..to_transit].to_vec();
         laps.mark("tier rows: partition");
+        if let Some(exact) = self.exact {
+            let slots: Vec<Option<u32>> = (0..pairs)
+                .map(|p| is_hit[p].then_some(slot_ids[p]))
+                .collect();
+            let x_host: Vec<f32> = xs
+                .to_device(&host)?
+                .to_dtype(crate::tensor::DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let w_card = weights.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
+            let out = self.exact_eager(
+                &exact,
+                scratch,
+                xs,
+                &x_host,
+                &w_card,
+                exact::Partition {
+                    ids: &ids_h,
+                    weights: &w_h,
+                    slots: &slots,
+                    transit: &transit_experts,
+                },
+                &mut laps,
+            )?;
+            drop(guard);
+            let host_experts: Vec<u32> = missing[to_transit..].to_vec();
+            self.keep_in_transit(&transit_experts, false, &mut in_use, &stream)?;
+            self.promote_up_to(&host_experts, &in_use, rows.max(ADAPT_SWAPS_A_REQUEST));
+            laps.mark("tier rows: finish");
+            return Ok(out);
+        }
 
         // The card's share is launched first, and runs while the host does its own.
         let card_out = if hits > 0 {
@@ -4765,6 +4831,134 @@ mod tests {
                     worst <= 3e-2 * peak,
                     "{formats:?} rows {rows}: max diff {worst} of {peak}"
                 );
+            }
+        }
+    }
+
+    /// A routed pair's row is the same bits whether its expert sits in a slot of the cache, in the
+    /// transit room or on the host, in each format the exact kernels serve, through an eager
+    /// decode and a recorded one, for a token and for the rows of a verify: the output of a
+    /// layer does not change with what the cache holds or how the misses are split.
+    #[test]
+    fn the_card_the_transit_room_and_the_host_give_the_same_bits() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let host = Device::Cpu;
+        let (experts, used, hidden, ffn) = (16usize, 4usize, 512usize, 256usize);
+        for formats in [
+            [GgmlDType::Q4K, GgmlDType::Q6K],
+            [GgmlDType::Q4K, GgmlDType::Q4K],
+            [GgmlDType::Q6K, GgmlDType::Q6K],
+            [GgmlDType::Q2K, GgmlDType::Q2K],
+            [GgmlDType::Q2K, GgmlDType::Q4K],
+        ] {
+            let moe = layer_of(&card, experts, used, hidden, ffn, formats);
+            let stacks = [
+                moe.gate_exps_sep.clone().unwrap(),
+                moe.up_exps_sep.clone().unwrap(),
+                moe.down_exps.clone(),
+            ];
+            let exact = exact::Exact::of(&stacks).expect("a format with exact kernels");
+            let widest = [0, 1, 2].map(|i| stacks[i].native_qtensor().data().len());
+            let stager = CardStager::new(&card, widest, experts).unwrap();
+            for rows in [1usize, 3] {
+                let ids: Vec<u32> = (0..rows)
+                    .flat_map(|r| [1u32, 6, 9, 14].map(|e| (e + r as u32) % experts as u32))
+                    .collect();
+                let w: Vec<f32> = (0..rows * used).map(|i| 0.1 + 0.05 * i as f32).collect();
+                let x = values(rows * hidden, 31 + rows as u64, 1.0);
+                let pairs: Vec<(usize, u32, f32)> =
+                    (0..rows * used).map(|p| (p / used, ids[p], w[p])).collect();
+                let want = exact::sum_in_order(
+                    &exact::host_pairs(&exact, &stacks, &x, &pairs).unwrap(),
+                    used,
+                    hidden,
+                );
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                // All missing, half, none; the misses split from mostly the host's to mostly the
+                // transit room's.
+                for slots in [1usize, 8, experts] {
+                    for eighths in [1u64, 4, 7] {
+                        for recorded in [false, true] {
+                            let mut tiered = layer_of(&card, experts, used, hidden, ffn, formats);
+                            // The stacks page-locked: a copy from pageable memory waits for a
+                            // card that waits on the worker.
+                            let built = LayerTier::new(&tiered, &card, slots)
+                                .unwrap()
+                                .with_stage(&stager, 0, true)
+                                .unwrap();
+                            // Paces in milliseconds, for the watchdog's bound to stand well past
+                            // a first copy.
+                            for class in 0..2 {
+                                built.host_us[class]
+                                    .store((1e3 * eighths as f64).to_bits(), Ordering::Relaxed);
+                                built.upload_us[class].store(
+                                    (1e3 * (8 - eighths) as f64).to_bits(),
+                                    Ordering::Relaxed,
+                                );
+                                built.paced[class].store(TRANSIT_PACE_SAMPLES, Ordering::Relaxed);
+                            }
+                            tiered.tier = Some(Arc::new(built));
+                            let tier = tiered.tier.clone().unwrap();
+                            let worker = if recorded {
+                                tier.enable_graph(hidden, used, 4).unwrap();
+                                let w =
+                                    TierWorker::start(&card, vec![("layer".into(), tier.clone())])
+                                        .unwrap();
+                                GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+                                Some(w)
+                            } else {
+                                None
+                            };
+                            let xs = Tensor::from_vec(x.clone(), (rows, hidden), &card).unwrap();
+                            let ids_t = Tensor::from_vec(ids.clone(), (rows, used), &host)
+                                .unwrap()
+                                .to_device(&card)
+                                .unwrap();
+                            let w_t = Tensor::from_vec(w.clone(), (rows, used), &host)
+                                .unwrap()
+                                .to_device(&card)
+                                .unwrap();
+                            let got = match (recorded, rows) {
+                                (_, 1) => tier.decode(&tiered, &xs, &ids_t, &w_t),
+                                (true, _) => tier.decode_rows_graph(&tiered, &xs, &ids_t, &w_t),
+                                (false, _) => tier.decode_rows(&tiered, &xs, &ids_t, &w_t),
+                            }
+                            .unwrap();
+                            // The card waits on the worker, whose copies from pageable memory
+                            // queue behind a read of the card's from the same: the stream is
+                            // waited for first.
+                            card.as_cuda_device()
+                                .unwrap()
+                                .0
+                                .stream()
+                                .synchronize()
+                                .unwrap();
+                            let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                            GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+                            let failure = worker.as_ref().and_then(|w| w.failure());
+                            assert!(failure.is_none(), "{failure:?}");
+                            // The tier is dropped here, once the copies into its slots let go of
+                            // it: freeing its page-locked memory waits for the card, which must
+                            // not be waiting on the next tier's worker then.
+                            tier.settle();
+                            drop(worker);
+                            while Arc::strong_count(&tier) > 2 {
+                                std::thread::yield_now();
+                            }
+                            drop(tiered);
+                            drop(tier);
+                            assert!(
+                                bits(&got) == bits(&want),
+                                "{formats:?}, {rows} rows, {slots} slots, {eighths}/8 to transit, \
+                                 recorded {recorded}: the layer's output moved with the cache"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

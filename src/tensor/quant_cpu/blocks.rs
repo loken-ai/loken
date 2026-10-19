@@ -77,6 +77,15 @@ pub trait BlockFormat: Sized + Clone + Send + Sync {
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32;
 }
 
+/// A weight format whose dot against q8_K rows every kernel takes in the same steps: the integer
+/// sums of a 256-value block are exact in any order, one fixed float step folds them into the
+/// block's share, and the shares are added in block order from -0. The card's kernels for the
+/// routed experts of a cached layer take these steps too, so an expert's product is the same
+/// bits on a card and on the host.
+pub trait ExactDot: BlockFormat<ActivationBlock = BlockQ8K> {
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32;
+}
+
 /// The eight `(scale, min)` pairs a q4_K or q5_K block packs into twelve bytes.
 ///
 /// Sixteen six-bit values, ninety-six bits, twelve bytes - and the packing is not uniform.

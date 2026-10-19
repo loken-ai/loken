@@ -118,6 +118,48 @@ impl BlockFormat for BlockQ6K {
     }
 }
 
+impl ExactDot for BlockQ6K {
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            return avx::vec_dot_q6k_q8k_exact(xs, ys);
+        }
+        let mut total = -0.0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            total += combine(x, y.d, block_sum(x, y));
+        }
+        total
+    }
+}
+/// A block's integer sum against a q8_K block: the signed codes against the activations under
+/// each sub-block's scale.
+fn block_sum(x: &BlockQ6K, y: &BlockQ8K) -> i32 {
+    let mut scaled = 0i32;
+    for half in 0..2 {
+        let ql = &x.ql[64 * half..];
+        let qh = &x.qh[32 * half..];
+        let acts = &y.qs[128 * half..];
+        for g in 0..4 {
+            let (span, nibble) = (32 * (g % 2), if g < 2 { 0 } else { 4 });
+            for sub in 0..2 {
+                let mut dot = 0i32;
+                for l in 16 * sub..16 * (sub + 1) {
+                    let low = (ql[span + l] >> nibble) & 0x0F;
+                    let high = (qh[l] >> (2 * g)) & 0x03;
+                    let q = (low | (high << 4)) as i32 - Q6_K_BIAS;
+                    dot += q * acts[32 * g + l] as i32;
+                }
+                scaled += x.scales[8 * half + 2 * g + sub] as i32 * dot;
+            }
+        }
+    }
+    scaled
+}
+/// One block's share of the exact dot from its integer sum (see [`block_sum`]).
+#[inline(always)]
+pub(crate) fn combine(x: &BlockQ6K, y_d: f32, scaled: i32) -> f32 {
+    y_d * (x.d.to_f32() * scaled as f32)
+}
 /// Quantise whole blocks, optionally against an importance matrix.
 ///
 /// The plain and imatrix encoders differ in one thing only - whether each group of sixteen is

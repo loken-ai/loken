@@ -135,14 +135,22 @@ pub(super) struct Request {
 }
 
 impl Mailbox {
-    fn new(dev: &Device, k: usize, hidden: usize, rows_max: usize) -> Result<Self> {
+    /// Room for `rows_max` rows of `k` pairs, and `products` rows of the host's product: one a
+    /// row, or one a pair when the host answers each pair apart.
+    fn new(
+        dev: &Device,
+        k: usize,
+        hidden: usize,
+        rows_max: usize,
+        products: usize,
+    ) -> Result<Self> {
         let pairs = rows_max * k;
         let ids = BODY;
         let weights = ids + line(4 * pairs);
         let slots = weights + line(4 * pairs);
         let x = slots + line(4 * pairs);
         let product = x + line(4 * hidden * rows_max);
-        let late_pairs = product + line(4 * hidden * rows_max);
+        let late_pairs = product + line(4 * hidden * products);
         let late_experts = late_pairs + line(4 * pairs);
         let late_weights = late_experts + line(4 * pairs);
         let (host, device) = mapped(dev, late_weights + line(4 * pairs))?;
@@ -232,6 +240,23 @@ impl Mailbox {
         )
     }
 
+    /// Leave each pair's row of the host's product at the pair's place, for the card, and raise
+    /// the reply word to `seq`.
+    pub(super) fn answer_pairs(&self, pairs: &[usize], rows: &[f32], seq: u32) {
+        let hidden = self.hidden;
+        debug_assert!(pairs.iter().all(|&p| p < self.rows_max * self.k));
+        for (j, &p) in pairs.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    rows[j * hidden..].as_ptr(),
+                    (self.host.add(self.product) as *mut f32).add(p * hidden),
+                    hidden,
+                );
+            }
+        }
+        std::sync::atomic::fence(Ordering::Release);
+        unsafe { std::ptr::write_volatile(self.word(REPLY), seq) };
+    }
     pub(super) fn answer(&self, product: &[f32], seq: u32) {
         debug_assert!(product.len() <= self.hidden * self.rows_max);
         unsafe {
@@ -492,9 +517,12 @@ impl Health {
 
 /// A layer's decoded rows between the post of their request and the wait for the answer.
 pub(crate) struct GraphPending {
-    card: Tensor,
+    /// The card's pairs' rows; `None` when the exact launches keep them in their rooms.
+    card: Option<Tensor>,
     /// The rows' input, which the late experts read.
     x: Tensor,
+    /// The router's weights, which the exact launches of the late pairs read.
+    weights: Tensor,
     rows: usize,
     k: usize,
     hidden: usize,
@@ -515,6 +543,8 @@ pub(super) struct GraphSide {
     /// Around the copies of a request's late experts into the transit room.
     upload_start: crate::tensor::gpu_runtime::driver::CudaEvent,
     upload_end: crate::tensor::gpu_runtime::driver::CudaEvent,
+    /// The buffers of the exact launches, for a layer that has them.
+    exact: Option<super::exact::GraphRooms>,
 }
 
 impl LayerTier {
@@ -602,8 +632,16 @@ impl LayerTier {
         st.table = Some(table.clone());
         drop(st);
         let pairs = rows_max * k;
+        let exact = match &self.exact {
+            Some(e) => {
+                super::exact::preload(dev, e)?;
+                Some(super::exact::GraphRooms::new(dev, e, rows_max, k)?)
+            }
+            None => None,
+        };
+        let products = if exact.is_some() { pairs } else { rows_max };
         let side = GraphSide {
-            mail: Arc::new(Mailbox::new(dev, k, hidden, rows_max)?),
+            mail: Arc::new(Mailbox::new(dev, k, hidden, rows_max, products)?),
             counter: Tensor::from_vec(vec![0u32; 2], (2,), &host)?.to_device(dev)?,
             slots: Tensor::from_vec(vec![0u32; pairs], (pairs,), &host)?.to_device(dev)?,
             weights: Tensor::from_vec(vec![0f32; pairs], (1, pairs), &host)?.to_device(dev)?,
@@ -612,6 +650,7 @@ impl LayerTier {
             health: OnceLock::new(),
             upload_start: super::timed_event(dev)?,
             upload_end: super::timed_event(dev)?,
+            exact,
         };
         let _ = self.graph.set(side);
         Ok(())
@@ -717,6 +756,10 @@ impl LayerTier {
                 address_of::<u32>(&g.counter)? as *mut u32,
                 address_of::<u32>(&g.slots)? as *mut u32,
                 address_of::<f32>(&g.weights)? as *mut f32,
+                match &g.exact {
+                    Some(rooms) => address_of::<u32>(&rooms.card_slots)? as *mut u32,
+                    None => std::ptr::null_mut(),
+                },
                 g.mail.dptr(g.mail.ids) as *mut u32,
                 g.mail.dptr(g.mail.weights) as *mut f32,
                 g.mail.dptr(g.mail.slots) as *mut u32,
@@ -731,6 +774,18 @@ impl LayerTier {
             );
         }
         let pairs = rows * k;
+        if let (Some(exact), Some(rooms)) = (&self.exact, &g.exact) {
+            self.exact_graph_begin(exact, rooms, &x, &w, rows, k)?;
+            return Ok(GraphPending {
+                card: None,
+                x,
+                weights: w,
+                rows,
+                k,
+                hidden,
+                dev,
+            });
+        }
         let slots = g.slots.narrow(0, 0, pairs)?;
         let weights = g.weights.narrow(1, 0, pairs)?;
         // One token's pairs are read as the router listed them; the rows of a verify are
@@ -758,8 +813,9 @@ impl LayerTier {
             .map(|table| moe_cuda::MoreExperts::Table { table, slots });
         let card = routing.down_pairs_over(&h, &self.card[2], down, &weights)?;
         Ok(GraphPending {
-            card,
+            card: Some(card),
             x,
+            weights: w,
             rows,
             k,
             hidden,
@@ -774,6 +830,7 @@ impl LayerTier {
         let GraphPending {
             card,
             x,
+            weights,
             rows,
             k,
             hidden,
@@ -790,6 +847,24 @@ impl LayerTier {
                 stream,
             );
         }
+        let card = match (card, &self.exact, &g.exact) {
+            (None, Some(exact), Some(rooms)) => {
+                use crate::tensor::gpu_runtime::driver::DevicePtr;
+                let mail = super::exact::Mail {
+                    counter: address_of::<u32>(&g.counter)?,
+                    live: g.mail.dptr(LIVE),
+                    late_pairs: g.mail.dptr(g.mail.late_pairs),
+                    late_places: g.mail.dptr(g.mail.late_experts),
+                    product: g.mail.dptr(g.mail.product),
+                };
+                let at = out.device_ptr(out.stream()).0;
+                self.exact_graph_end(exact, rooms, mail, &weights, rows, k, at)?;
+                return crate::tensor::cuda_ext::tensor_from_f32_slice(out, (rows, hidden), &dev);
+            }
+            (Some(card), _, _) => card,
+            (None, _, _) => unreachable!("a pending block without the card's rows is exact"),
+        };
+        drop(weights);
         // The late pairs, from the transit room the host filled while the card waited: the
         // launches run the count the host wrote, nothing when it wrote none.
         let late = match self.transit_stacks() {
@@ -915,6 +990,8 @@ impl LayerTier {
         let mut in_use = vec![false; self.slots()];
         let mut missing: Vec<u32> = Vec::new();
         let mut miss_pairs: Vec<(usize, u32, f32)> = Vec::new();
+        // Each missing pair's place among the request's pairs.
+        let mut miss_at: Vec<usize> = Vec::new();
         beat(COUNTING);
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -927,6 +1004,7 @@ impl LayerTier {
                         missing.push(req.ids[i]);
                     }
                     miss_pairs.push((i / k, req.ids[i], req.weights[i]));
+                    miss_at.push(i);
                 } else {
                     in_use[req.slots[i] as usize] = true;
                 }
@@ -955,11 +1033,12 @@ impl LayerTier {
                 beat(TO_TRANSIT);
                 self.copy_to_transit_between(&g.upload_start, &g.upload_end, transit)?;
             }
-            let host_pairs: Vec<(usize, u32, f32)> = miss_pairs
+            let (host_at, host_pairs): (Vec<usize>, Vec<(usize, u32, f32)>) = miss_at
                 .iter()
-                .copied()
-                .filter(|p| host_experts.contains(&p.1))
-                .collect();
+                .zip(&miss_pairs)
+                .filter(|(_, p)| host_experts.contains(&p.1))
+                .map(|(&at, &p)| (at, p))
+                .unzip();
             let late: Vec<(u32, u32, f32)> = miss_pairs
                 .iter()
                 .filter_map(|&(row, e, w)| {
@@ -974,10 +1053,13 @@ impl LayerTier {
                 .collect();
             let t = std::time::Instant::now();
             beat(ON_HOST);
-            let product = if host_pairs.is_empty() {
-                vec![0f32; req.rows * req.x.len() / req.rows.max(1)]
-            } else {
-                self.host_product(&req.x, req.rows, &host_pairs)?
+            let product = match (&self.exact, host_pairs.is_empty()) {
+                (Some(_), true) => Vec::new(),
+                (None, true) => vec![0f32; req.rows * req.x.len() / req.rows.max(1)],
+                (Some(exact), false) => {
+                    super::exact::host_pairs(exact, &self.host, &req.x, &host_pairs)?
+                }
+                (None, false) => self.host_product(&req.x, req.rows, &host_pairs)?,
             };
             if !host_experts.is_empty() {
                 blend(
@@ -1007,7 +1089,11 @@ impl LayerTier {
             laps.mark("tier worker: transit landed");
             beat(ANSWERING);
             g.mail.hand_late(&late);
-            g.mail.answer(&product, req.seq);
+            if self.exact.is_some() {
+                g.mail.answer_pairs(&host_at, &product, req.seq);
+            } else {
+                g.mail.answer(&product, req.seq);
+            }
         }
         g.done.store(req.seq, Ordering::Relaxed);
         laps.mark("tier worker: answer");

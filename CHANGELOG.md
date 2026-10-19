@@ -34,6 +34,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Experts: give the same greedy tokens whichever experts a cached layer holds.
+- Experts: finish moving locked experts before a decode waits on the tier worker.
 - CUDA: record graphs on a stream of their own, out of other threads' work on the card.
 - Experts: give the same greedy tokens whichever experts the cards hold.
 - Audio: prompt Voxtral in its own instruction format, not the file's template.

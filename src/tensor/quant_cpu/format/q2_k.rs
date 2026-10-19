@@ -109,6 +109,12 @@ impl BlockFormat for BlockQ2K {
     }
 }
 
+/// The dot is already taken in these steps by every kernel.
+impl ExactDot for BlockQ2K {
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32 {
+        Self::dot(xs, ys)
+    }
+}
 /// One block's share of a dot product from its two integer sums: `scaled`, the codes against the
 /// activations under each sub-block's scale, and `offset`, the activation sums under each
 /// sub-block's minimum. Every kernel ends a block here and adds the shares in block order from

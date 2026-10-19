@@ -232,6 +232,8 @@ pub struct HotLocks {
     state: Mutex<Locked>,
     /// A re-rank is applying its locks: the next one is skipped.
     busy: AtomicBool,
+    /// The thread applying them, until a request start joins it.
+    applying: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl HotLocks {
@@ -255,6 +257,7 @@ impl HotLocks {
                 off: false,
             }),
             busy: AtomicBool::new(false),
+            applying: Mutex::new(None),
         })
     }
 
@@ -351,9 +354,28 @@ impl HotLocks {
                 me.apply(hot, traffic);
                 me.busy.store(false, Ordering::Release);
             });
-        if let Err(e) = spawned {
-            tracing::warn!("hot experts not moved: {e}");
-            self.busy.store(false, Ordering::Release);
+        match spawned {
+            Ok(handle) => {
+                *self.applying.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            }
+            Err(e) => {
+                tracing::warn!("hot experts not moved: {e}");
+                self.busy.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Wait for the locks being applied, before a request runs. A release or a registration
+    /// holds the driver until the cards are idle, and a card waiting on the tier worker is not:
+    /// the worker's own calls to the driver queue behind it, and the card waits for good.
+    pub(crate) fn settle(&self) {
+        let handle = self
+            .applying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
         }
     }
 

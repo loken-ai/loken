@@ -27,6 +27,7 @@ extern "C" __global__ void loken_tier_plan_kernel(
         unsigned int * __restrict__ counter,        // [0] the layer's request counter, [1] whether a reply is due
         unsigned int * __restrict__ slot_out,       // [rows * k] the slot each pair reads
         float * __restrict__ weight_out,            // [rows * k] its weight, zero for a missing expert
+        unsigned int * __restrict__ exact_out,      // [rows * k] the slot, all ones for a missing expert; may be null
         unsigned int * mail_ids,
         float * mail_weights,
         unsigned int * mail_slots,                  // [rows * k] the slot, or all ones for a missing expert
@@ -73,6 +74,7 @@ extern "C" __global__ void loken_tier_plan_kernel(
         const int s = slot_of[t];
         slot_out[t] = s >= 0 ? (unsigned int) s : filler;
         weight_out[t] = s >= 0 ? weights[t] : 0.0f;
+        if (exact_out != nullptr) exact_out[t] = s >= 0 ? (unsigned int) s : 0xFFFFFFFFu;
         mail_ids[t] = ids[t];
         mail_weights[t] = weights[t];
         mail_slots[t] = s >= 0 ? (unsigned int) s : 0xFFFFFFFFu;
@@ -140,12 +142,12 @@ extern "C" __global__ void loken_tier_merge_kernel(
 
 extern "C" void loken_tier_plan(
         const unsigned int * ids, const float * weights, const float * x, const int * table,
-        unsigned int * counter, unsigned int * slot_out, float * weight_out,
+        unsigned int * counter, unsigned int * slot_out, float * weight_out, unsigned int * exact_out,
         unsigned int * mail_ids, float * mail_weights, unsigned int * mail_slots, float * mail_x,
         unsigned int * mail_rows, unsigned int * mail_request, unsigned int * mail_live,
         int rows, int k, int hidden, cudaStream_t stream) {
     loken_tier_plan_kernel<<<1, TIER_PLAN_PAIRS, 0, stream>>>(
-        ids, weights, x, table, counter, slot_out, weight_out, mail_ids, mail_weights,
+        ids, weights, x, table, counter, slot_out, weight_out, exact_out, mail_ids, mail_weights,
         mail_slots, mail_x, mail_rows, mail_request, mail_live, rows, k, hidden);
 }
 

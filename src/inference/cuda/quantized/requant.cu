@@ -1022,16 +1022,12 @@ extern "C" __global__ void cx_expert_h_iq2_xxs(
     }
 }
 
-// Rows of `x` [rows, k] as q8_K blocks, the host's activation quantiser value for value: the
-// extreme is the first value of the largest magnitude, the codes are its -127th parts rounded half
-// away from zero and clipped at 127, the scale is the reciprocal, and each sixteen codes are
-// summed. One warp per block, eight consecutive values to a lane.
-extern "C" __global__ void cx_quantize_q8_k(
-        const float * __restrict__ x, unsigned char * __restrict__ out, const long nblocks) {
-    const long blk = blockIdx.x;
-    if (blk >= nblocks) return;
-    const int lane = threadIdx.x;
-    const float * xb = x + blk * 256 + lane * 8;
+// One 256-value block at `xb` as a q8_K block at `ob`, the host's activation quantiser value for
+// value: the extreme is the first value of the largest magnitude, the codes are its -127th parts
+// rounded half away from zero and clipped at 127, the scale is the reciprocal, and each sixteen
+// codes are summed. A warp per block, eight consecutive values to a lane.
+__device__ static void cx_q8k_block(const float * __restrict__ x, unsigned char * __restrict__ ob, const int lane) {
+    const float * xb = x + lane * 8;
     float v[8];
     float best = 0.0f, bv = 0.0f;
     int bi = 256;
@@ -1048,7 +1044,6 @@ extern "C" __global__ void cx_quantize_q8_k(
         const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
         if (ob > best || (ob == best && oi < bi)) { best = ob; bv = ov; bi = oi; }
     }
-    unsigned char * ob = out + blk * CX_Q8K_BYTES;
     signed char * qs = reinterpret_cast<signed char *>(ob + 4);
     short * bsums = reinterpret_cast<short *>(ob + 260);
     int sum = 0;
@@ -1069,6 +1064,14 @@ extern "C" __global__ void cx_quantize_q8_k(
     }
     const int pair = __shfl_down_sync(0xffffffffu, sum, 1);
     if ((lane & 1) == 0) bsums[lane / 2] = (short) (sum + pair);
+}
+
+// Rows of `x` [rows, k] as q8_K blocks (see cx_q8k_block). One warp per block.
+extern "C" __global__ void cx_quantize_q8_k(
+        const float * __restrict__ x, unsigned char * __restrict__ out, const long nblocks) {
+    const long blk = blockIdx.x;
+    if (blk >= nblocks) return;
+    cx_q8k_block(x + blk * 256, out + blk * CX_Q8K_BYTES, threadIdx.x);
 }
 
 // The outputs of the down projections: instance i is expert tiles[3t] over row i of `hq` (q8_K
@@ -1132,6 +1135,247 @@ extern "C" __global__ void cx_expert_down_q2_k(
         for (int ib = 0; ib < sbs; ++ib) acc = __fadd_rn(acc, st[lane * sbs + ib]);
         y[(long) (i0 + lane) * dim + row] = acc;
     }
+}
+
+// The routed experts of a cached layer (generic_transformer::expert_tier), computed as the host
+// computes them for the formats of quant_cpu::ExactDot: the gate and up products against the q8_K
+// row of the input, the SwiGLU of offload::experts, the row entering the down projection as q8_K
+// blocks, and the down product against it times the pair's weight. A 256-value block's integer
+// sums are exact in any order; the step folding them and the sum over blocks are the host's,
+// through the rounding intrinsics, which the compiler never contracts. So a pair's row is the
+// same bits whether its expert sits in a slot of the cache, in the transit room or on the host.
+//
+// A launch runs instances, one routed pair each: slots[i] is where the pair's expert sits, all
+// ones for an instance the launch skips; the pair is pairs[i], or i when the list is null, and
+// its input row is pair / k. A slot below `base_slots` is in the stacks at `base`, a slot past
+// them in the stacks whose addresses the card reads at `extra` (gate, up, down).
+#define TX_SKIP 0xFFFFFFFFu
+#define TX_Q2K 0
+#define TX_Q4K 1
+#define TX_Q6K 2
+
+template <int F> struct TxFmt;
+template <> struct TxFmt<TX_Q2K> { static constexpr int BYTES = 84; };
+template <> struct TxFmt<TX_Q4K> { static constexpr int BYTES = 144; };
+template <> struct TxFmt<TX_Q6K> { static constexpr int BYTES = 210; };
+
+// Four bytes from `p`, whatever its alignment, the first in the low byte.
+__device__ static __forceinline__ unsigned int tx_u32(const unsigned char * p) {
+    return (unsigned int) p[0] | ((unsigned int) p[1] << 8) | ((unsigned int) p[2] << 16) |
+           ((unsigned int) p[3] << 24);
+}
+
+// A lane's part of a weight block against a q8_K block `a`, the lane's eight values being
+// 8 * lane..8 * lane + 8: the codes against the activations under their sub-block's scale, and
+// the activation sums under each sub-block's minimum (one lane a sub-block adds those).
+template <int F> __device__ static void tx_lane_sums(
+        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset);
+
+template <> __device__ void tx_lane_sums<TX_Q4K>(
+        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
+    const int s = lane >> 2, l0 = (lane & 3) * 8, shift = 4 * (s & 1);
+    const unsigned char * q = w + 16 + 32 * (s >> 1) + l0;
+    const int w0 = (int) ((tx_u32(q) >> shift) & 0x0F0F0F0Fu);
+    const int w1 = (int) ((tx_u32(q + 4) >> shift) & 0x0F0F0F0Fu);
+    const int * ap = reinterpret_cast<const int *>(a + 4 + 8 * lane);
+    const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
+    const unsigned char * sc = w + 4;
+    int scale, mn;
+    if (s < 4) {
+        scale = sc[s] & 63;
+        mn = sc[s + 4] & 63;
+    } else {
+        scale = (sc[s + 4] & 0x0F) | ((sc[s - 4] >> 6) << 4);
+        mn = (sc[s + 4] >> 4) | ((sc[s] >> 6) << 4);
+    }
+    *scaled = scale * dot;
+    const short * bsums = reinterpret_cast<const short *>(a + 260);
+    *offset = (lane & 3) == 0 ? mn * ((int) bsums[2 * s] + (int) bsums[2 * s + 1]) : 0;
+}
+
+template <> __device__ void tx_lane_sums<TX_Q6K>(
+        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
+    const int v0 = 8 * lane, half = v0 >> 7, g = (v0 & 127) >> 5, l0 = v0 & 31;
+    const unsigned char * ql = w + 64 * half + 32 * (g & 1) + l0;
+    const unsigned char * qh = w + 128 + 32 * half + l0;
+    const int nib = 4 * (g >> 1), hs = 2 * g;
+    int packed[2];
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        int p = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int t = 4 * k + j;
+            const int q = (int) (((ql[t] >> nib) & 0x0F) | (((qh[t] >> hs) & 0x03) << 4)) - 32;
+            p |= (q & 0xff) << (8 * j);
+        }
+        packed[k] = p;
+    }
+    const int * ap = reinterpret_cast<const int *>(a + 4 + v0);
+    const int dot = __dp4a(packed[1], ap[1], __dp4a(packed[0], ap[0], 0));
+    *scaled = (int) reinterpret_cast<const signed char *>(w + 192)[v0 >> 4] * dot;
+    *offset = 0;
+}
+
+template <> __device__ void tx_lane_sums<TX_Q2K>(
+        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
+    const int s = lane >> 1, l0 = (lane & 1) * 8, t = s & 7;
+    const int base = 32 * (s >> 3) + 16 * (t & 1), shift = 2 * (t >> 1);
+    const unsigned char * q = w + 16 + base + l0;
+    const int w0 = (int) ((tx_u32(q) >> shift) & 0x03030303u);
+    const int w1 = (int) ((tx_u32(q + 4) >> shift) & 0x03030303u);
+    const int * ap = reinterpret_cast<const int *>(a + 4 + 8 * lane);
+    const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
+    *scaled = (w[s] & 0x0F) * dot;
+    const short * bsums = reinterpret_cast<const short *>(a + 260);
+    *offset = (lane & 1) == 0 ? (w[s] >> 4) * (int) bsums[s] : 0;
+}
+
+// A block's share from its two integer sums, as quant_cpu's `combine` of each format.
+template <int F> __device__ static float tx_combine(const unsigned char * w, float yd, int scaled, int offset);
+template <> __device__ float tx_combine<TX_Q4K>(const unsigned char * w, float yd, int scaled, int offset) {
+    return __fmul_rn(yd, __fsub_rn(__fmul_rn(req_f16_at(w), (float) scaled),
+                                   __fmul_rn(req_f16_at(w + 2), (float) offset)));
+}
+template <> __device__ float tx_combine<TX_Q6K>(const unsigned char * w, float yd, int scaled, int) {
+    return __fmul_rn(yd, __fmul_rn(req_f16_at(w + 208), (float) scaled));
+}
+template <> __device__ float tx_combine<TX_Q2K>(const unsigned char * w, float yd, int scaled, int offset) {
+    return __fmul_rn(yd, __fsub_rn(__fmul_rn(req_f16_at(w + 80), (float) scaled),
+                                   __fmul_rn(req_f16_at(w + 82), (float) offset)));
+}
+
+// A weight row of `nsb` blocks against a q8_K row: the dot of ExactDot, the same on every lane.
+template <int F> __device__ static float tx_row(const unsigned char * w, const unsigned char * a, const int nsb, const int lane) {
+    float acc = -0.0f;
+    for (int b = 0; b < nsb; ++b) {
+        const unsigned char * wb = w + (long) b * TxFmt<F>::BYTES;
+        const unsigned char * ab = a + (long) b * CX_Q8K_BYTES;
+        int scaled, offset;
+        tx_lane_sums<F>(wb, ab, lane, &scaled, &offset);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            scaled += __shfl_xor_sync(0xffffffffu, scaled, off);
+            offset += __shfl_xor_sync(0xffffffffu, offset, off);
+        }
+        acc = __fadd_rn(acc, tx_combine<F>(wb, *reinterpret_cast<const float *>(ab), scaled, offset));
+    }
+    return acc;
+}
+
+// Where instance i's expert sits in stack `stack`, or null for an instance the launch skips.
+__device__ static __forceinline__ const unsigned char * tx_expert(
+        const unsigned long long base, const unsigned long long * extra, const int stack,
+        const int base_slots, const long long bytes, const unsigned int slot) {
+    if (slot == TX_SKIP) return nullptr;
+    if ((int) slot < base_slots) return (const unsigned char *) (base + (unsigned long long) slot * bytes);
+    return (const unsigned char *) (extra[stack] + (unsigned long long) ((int) slot - base_slots) * bytes);
+}
+
+// The rows entering the down projections: h[pair, row] = swiglu(gate . x, up . x). A warp per
+// (output row, instance).
+template <int F> __device__ static void tx_h(
+        const unsigned long long gate, const unsigned long long up, const unsigned long long * extra,
+        const int base_slots, const long long bytes, const unsigned int * slots,
+        const unsigned int * pairs, const int k, const unsigned char * xq, float * h,
+        const int dim, const int inter) {
+    const int row = blockIdx.x, i = blockIdx.y, lane = threadIdx.x;
+    const unsigned int slot = slots[i];
+    const unsigned char * g = tx_expert(gate, extra, 0, base_slots, bytes, slot);
+    if (g == nullptr) return;
+    const unsigned char * u = tx_expert(up, extra, 1, base_slots, bytes, slot);
+    const int pair = pairs != nullptr ? (int) pairs[i] : i;
+    const int nsb = dim / 256;
+    const long roff = (long) row * nsb * TxFmt<F>::BYTES;
+    const unsigned char * a = xq + (long) (pair / k) * nsb * CX_Q8K_BYTES;
+    const float gv = tx_row<F>(g + roff, a, nsb, lane);
+    const float uv = tx_row<F>(u + roff, a, nsb, lane);
+    if (lane == 0) h[(long) pair * inter + row] = cx_swiglu(gv, uv, 0.0f);
+}
+
+// The rows of `h` of the launch's instances as q8_K blocks. A warp per (block, instance).
+extern "C" __global__ void tx_quantize_h(
+        const float * __restrict__ h, const unsigned int * __restrict__ slots,
+        const unsigned int * __restrict__ pairs, unsigned char * __restrict__ hq, const int inter) {
+    const int blk = blockIdx.x, i = blockIdx.y;
+    if (slots[i] == TX_SKIP) return;
+    const int pair = pairs != nullptr ? (int) pairs[i] : i;
+    const int nb = inter / 256;
+    cx_q8k_block(h + (long) pair * inter + (long) blk * 256, hq + ((long) pair * nb + blk) * CX_Q8K_BYTES, threadIdx.x);
+}
+
+// The pairs' rows: out[pair, row] = weight[pair] * (down . hq[pair]). A warp per (output row,
+// instance).
+template <int F> __device__ static void tx_down(
+        const unsigned long long down, const unsigned long long * extra, const int base_slots,
+        const long long bytes, const unsigned int * slots, const unsigned int * pairs,
+        const float * weights, const unsigned char * hq, float * out, const int inter, const int dim) {
+    const int row = blockIdx.x, i = blockIdx.y, lane = threadIdx.x;
+    const unsigned char * d = tx_expert(down, extra, 2, base_slots, bytes, slots[i]);
+    if (d == nullptr) return;
+    const int pair = pairs != nullptr ? (int) pairs[i] : i;
+    const int nsb = inter / 256;
+    const float v = tx_row<F>(d + (long) row * nsb * TxFmt<F>::BYTES, hq + (long) pair * nsb * CX_Q8K_BYTES, nsb, lane);
+    if (lane == 0) out[(long) pair * dim + row] = __fmul_rn(weights[pair], v);
+}
+
+#define TX_ENTRIES(name, F)                                                                          \
+extern "C" __global__ void tx_h_##name(                                                              \
+        const unsigned long long gate, const unsigned long long up, const unsigned long long * extra,\
+        const int base_slots, const long long bytes, const unsigned int * slots,                     \
+        const unsigned int * pairs, const int k, const unsigned char * xq, float * h,                \
+        const int dim, const int inter) {                                                            \
+    tx_h<F>(gate, up, extra, base_slots, bytes, slots, pairs, k, xq, h, dim, inter);                 \
+}                                                                                                    \
+extern "C" __global__ void tx_down_##name(                                                           \
+        const unsigned long long down, const unsigned long long * extra, const int base_slots,      \
+        const long long bytes, const unsigned int * slots, const unsigned int * pairs,               \
+        const float * weights, const unsigned char * hq, float * out, const int inter,               \
+        const int dim) {                                                                             \
+    tx_down<F>(down, extra, base_slots, bytes, slots, pairs, weights, hq, out, inter, dim);          \
+}
+TX_ENTRIES(q2_k, TX_Q2K)
+TX_ENTRIES(q4_k, TX_Q4K)
+TX_ENTRIES(q6_k, TX_Q6K)
+
+// After a recorded decode's answer: which pairs the transit room runs (late_slots, the expert's
+// place there, all ones for the others) and where each pair's row is read from (src: -1 for the
+// card's rows, the pair for the host's). The late pairs are read from the mailbox only when the
+// request was waited for. One block.
+extern "C" __global__ void tx_sources(
+        const unsigned int * __restrict__ card_slots, const unsigned int * __restrict__ counter,
+        const volatile unsigned int * live, const volatile unsigned int * late_pairs,
+        const volatile unsigned int * late_places, unsigned int * __restrict__ late_slots,
+        int * __restrict__ src, const int pairs) {
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        late_slots[p] = TX_SKIP;
+        src[p] = card_slots[p] != TX_SKIP ? -1 : p;
+    }
+    __syncthreads();
+    const unsigned int n = counter[1] != 0u ? *live : 0u;
+    for (unsigned int j = threadIdx.x; j < n; j += blockDim.x) {
+        const unsigned int p = late_pairs[j];
+        late_slots[p] = late_places[j];
+        src[p] = -1;
+    }
+}
+
+// out[row] = the sum of the row's k pairs in their order from -0, each pair's row read from
+// `card` [pairs, hidden], or from row src[pair] of `host` when src[pair] is not negative.
+extern "C" __global__ void tx_sum(
+        const float * __restrict__ card, const volatile float * host, const int * __restrict__ src,
+        float * __restrict__ out, const int rows, const int k, const int hidden) {
+    const long idx = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long) rows * hidden) return;
+    const int r = (int) (idx / hidden), c = (int) (idx % hidden);
+    float acc = -0.0f;
+    for (int j = 0; j < k; ++j) {
+        const int p = r * k + j;
+        const int s = src[p];
+        const float v = s < 0 ? card[(long) p * hidden + c] : host[(long) s * hidden + c];
+        acc = __fadd_rn(acc, v);
+    }
+    out[idx] = acc;
 }
 
 // q2_K to f32 at full precision, one value per thread: sixteen scale/minimum bytes, then the codes of

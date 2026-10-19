@@ -1199,6 +1199,9 @@ impl LlmEngine {
                     s.model.draft_head_capture(false);
                 }
             }
+            if let Some(s) = model_state.blocking_lock().as_ref() {
+                s.model.settle_hot_experts();
+            }
             let cache_at_start = model_state
                 .blocking_lock()
                 .as_ref()

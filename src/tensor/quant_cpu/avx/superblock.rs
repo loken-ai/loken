@@ -302,56 +302,93 @@ pub(crate) fn vec_dot_q4k_q8k(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
 unsafe fn vec_dot_q4k_q8k_avx2(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
-        let nibble = _mm256_set1_epi8(0xF);
         let mut acc = _mm256_setzero_ps();
         let mut acc_min = _mm_setzero_ps();
-
         for (x, y) in xs.iter().zip(ys) {
             let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
             let dmin = -y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.dmin);
-            let mut codes = x.qs.as_ptr();
-            let mut acts = y.qs.as_ptr();
-
-            let both = scales_and_mins(&x.scales);
-            let from_mins = offset_term(both, &y.bsums);
+            let (total, from_mins) = q4k_block_sums(x, y);
             acc_min = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(from_mins), acc_min);
-
-            let sc = _mm256_extracti128_si256(both, 0);
-            let scales = join_halves(sc, sc);
-
-            let mut total = _mm256_setzero_si256();
-            for j in 0..QK_K / 64 {
-                let packed_codes = _mm256_loadu_si256(codes as *const __m256i);
-                codes = codes.add(32);
-
-                let low = _mm256_and_si256(packed_codes, nibble);
-                let a_low = _mm256_loadu_si256(acts as *const __m256i);
-                acts = acts.add(32);
-                total = _mm256_add_epi32(
-                    total,
-                    _mm256_madd_epi16(
-                        _mm256_shuffle_epi8(scales, scale_over_16_pairs(2 * j)),
-                        _mm256_maddubs_epi16(low, a_low),
-                    ),
-                );
-
-                let high = _mm256_and_si256(_mm256_srli_epi16(packed_codes, 4), nibble);
-                let a_high = _mm256_loadu_si256(acts as *const __m256i);
-                acts = acts.add(32);
-                total = _mm256_add_epi32(
-                    total,
-                    _mm256_madd_epi16(
-                        _mm256_shuffle_epi8(scales, scale_over_16_pairs(2 * j + 1)),
-                        _mm256_maddubs_epi16(high, a_high),
-                    ),
-                );
-            }
             acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(total), acc);
         }
-
         let pairs = _mm_add_ps(acc_min, _mm_movehl_ps(acc_min, acc_min));
         let min_total = _mm_add_ss(pairs, _mm_movehdup_ps(pairs));
         lanes_sum(acc) + _mm_cvtss_f32(min_total)
+    }
+}
+
+/// The dot in the steps of [`crate::tensor::quant_cpu::ExactDot`].
+pub(crate) fn vec_dot_q4k_q8k_exact(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q4k_q8k_exact_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q4k_q8k_exact_avx2(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+    unsafe {
+        let mut acc = -0.0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            let (total, from_mins) = q4k_block_sums(x, y);
+            acc += crate::tensor::quant_cpu::format::q4_k::combine(
+                x,
+                y.d,
+                hsum_i32_8(total),
+                hsum_i32_4(from_mins),
+            );
+        }
+        acc
+    }
+}
+
+/// A q4_K block against a q8_K block in integers: the codes against the activations under each
+/// sub-block's scale, in eight lanes, and the activation sums under each minimum, in four.
+#[inline(always)]
+unsafe fn q4k_block_sums(x: &BlockQ4K, y: &BlockQ8K) -> (__m256i, __m128i) {
+    unsafe {
+        let nibble = _mm256_set1_epi8(0xF);
+        let mut codes = x.qs.as_ptr();
+        let mut acts = y.qs.as_ptr();
+        let both = scales_and_mins(&x.scales);
+        let from_mins = offset_term(both, &y.bsums);
+        let sc = _mm256_extracti128_si256(both, 0);
+        let scales = join_halves(sc, sc);
+        let mut total = _mm256_setzero_si256();
+        for j in 0..QK_K / 64 {
+            let packed_codes = _mm256_loadu_si256(codes as *const __m256i);
+            codes = codes.add(32);
+            let low = _mm256_and_si256(packed_codes, nibble);
+            let a_low = _mm256_loadu_si256(acts as *const __m256i);
+            acts = acts.add(32);
+            total = _mm256_add_epi32(
+                total,
+                _mm256_madd_epi16(
+                    _mm256_shuffle_epi8(scales, scale_over_16_pairs(2 * j)),
+                    _mm256_maddubs_epi16(low, a_low),
+                ),
+            );
+            let high = _mm256_and_si256(_mm256_srli_epi16(packed_codes, 4), nibble);
+            let a_high = _mm256_loadu_si256(acts as *const __m256i);
+            acts = acts.add(32);
+            total = _mm256_add_epi32(
+                total,
+                _mm256_madd_epi16(
+                    _mm256_shuffle_epi8(scales, scale_over_16_pairs(2 * j + 1)),
+                    _mm256_maddubs_epi16(high, a_high),
+                ),
+            );
+        }
+        (total, from_mins)
+    }
+}
+
+/// The four lanes of `v` added.
+#[inline(always)]
+unsafe fn hsum_i32_4(v: __m128i) -> i32 {
+    unsafe {
+        let s = _mm_add_epi32(v, _mm_shuffle_epi32::<0x4E>(v));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0xB1>(s));
+        _mm_cvtsi128_si32(s)
     }
 }
 
@@ -458,81 +495,108 @@ pub(crate) fn vec_dot_q6k_q8k(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
 unsafe fn vec_dot_q6k_q8k_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
-        let nibble = _mm256_set1_epi8(0xF);
-        let two_bits = _mm256_set1_epi8(3);
         let mut acc = _mm256_setzero_ps();
-
         for (x, y) in xs.iter().zip(ys) {
             let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
-            let mut low_ptr = x.ql.as_ptr();
-            let mut high_ptr = x.qh.as_ptr();
-            let mut acts = y.qs.as_ptr();
-
-            let scales = _mm_loadu_si128(x.scales.as_ptr() as *const __m128i);
-            let zero_point = _mm256_slli_epi32(
-                _mm256_madd_epi16(
-                    _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i),
-                    _mm256_cvtepi8_epi16(scales),
-                ),
-                5,
-            );
-
-            let mut total = _mm256_setzero_si256();
-            for j in 0..QK_K / 128 {
-                let low_a = _mm256_loadu_si256(low_ptr as *const __m256i);
-                low_ptr = low_ptr.add(32);
-                let low_b = _mm256_loadu_si256(low_ptr as *const __m256i);
-                low_ptr = low_ptr.add(32);
-                let high_bits = _mm256_loadu_si256(high_ptr as *const __m256i);
-                high_ptr = high_ptr.add(32);
-
-                // Quarter q takes bits 2q..2q+2 of the high plane and puts them
-                // at position four, above the nibble they complete.
-                let codes = [
-                    _mm256_or_si256(
-                        _mm256_and_si256(low_a, nibble),
-                        _mm256_slli_epi16(_mm256_and_si256(high_bits, two_bits), 4),
-                    ),
-                    _mm256_or_si256(
-                        _mm256_and_si256(low_b, nibble),
-                        _mm256_slli_epi16(
-                            _mm256_and_si256(_mm256_srli_epi16(high_bits, 2), two_bits),
-                            4,
-                        ),
-                    ),
-                    _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16(low_a, 4), nibble),
-                        _mm256_slli_epi16(
-                            _mm256_and_si256(_mm256_srli_epi16(high_bits, 4), two_bits),
-                            4,
-                        ),
-                    ),
-                    _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16(low_b, 4), nibble),
-                        _mm256_slli_epi16(
-                            _mm256_and_si256(_mm256_srli_epi16(high_bits, 6), two_bits),
-                            4,
-                        ),
-                    ),
-                ];
-
-                for (q, code) in codes.into_iter().enumerate() {
-                    let scale = _mm_shuffle_epi8(scales, scale_pair_over_8_bytes(4 * j + q));
-                    let a = _mm256_loadu_si256(acts as *const __m256i);
-                    acts = acts.add(32);
-                    total = _mm256_add_epi32(
-                        total,
-                        _mm256_madd_epi16(
-                            _mm256_cvtepi8_epi16(scale),
-                            _mm256_maddubs_epi16(code, a),
-                        ),
-                    );
-                }
-            }
-            let total = _mm256_sub_epi32(total, zero_point);
+            let total = q6k_block_sums(x, y);
             acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(total), acc);
         }
         lanes_sum(acc)
+    }
+}
+
+/// The dot in the steps of [`crate::tensor::quant_cpu::ExactDot`].
+pub(crate) fn vec_dot_q6k_q8k_exact(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q6k_q8k_exact_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q6k_q8k_exact_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
+    unsafe {
+        let mut acc = -0.0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            acc += crate::tensor::quant_cpu::format::q6_k::combine(
+                x,
+                y.d,
+                hsum_i32_8(q6k_block_sums(x, y)),
+            );
+        }
+        acc
+    }
+}
+
+/// A q6_K block against a q8_K block in integers, eight lanes: the signed codes against the
+/// activations under each sub-block's scale.
+#[inline(always)]
+unsafe fn q6k_block_sums(x: &BlockQ6K, y: &BlockQ8K) -> __m256i {
+    unsafe {
+        let nibble = _mm256_set1_epi8(0xF);
+        let two_bits = _mm256_set1_epi8(3);
+        let mut low_ptr = x.ql.as_ptr();
+        let mut high_ptr = x.qh.as_ptr();
+        let mut acts = y.qs.as_ptr();
+
+        let scales = _mm_loadu_si128(x.scales.as_ptr() as *const __m128i);
+        let zero_point = _mm256_slli_epi32(
+            _mm256_madd_epi16(
+                _mm256_loadu_si256(y.bsums.as_ptr() as *const __m256i),
+                _mm256_cvtepi8_epi16(scales),
+            ),
+            5,
+        );
+
+        let mut total = _mm256_setzero_si256();
+        for j in 0..QK_K / 128 {
+            let low_a = _mm256_loadu_si256(low_ptr as *const __m256i);
+            low_ptr = low_ptr.add(32);
+            let low_b = _mm256_loadu_si256(low_ptr as *const __m256i);
+            low_ptr = low_ptr.add(32);
+            let high_bits = _mm256_loadu_si256(high_ptr as *const __m256i);
+            high_ptr = high_ptr.add(32);
+
+            // Quarter q takes bits 2q..2q+2 of the high plane and puts them
+            // at position four, above the nibble they complete.
+            let codes = [
+                _mm256_or_si256(
+                    _mm256_and_si256(low_a, nibble),
+                    _mm256_slli_epi16(_mm256_and_si256(high_bits, two_bits), 4),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(low_b, nibble),
+                    _mm256_slli_epi16(
+                        _mm256_and_si256(_mm256_srli_epi16(high_bits, 2), two_bits),
+                        4,
+                    ),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(low_a, 4), nibble),
+                    _mm256_slli_epi16(
+                        _mm256_and_si256(_mm256_srli_epi16(high_bits, 4), two_bits),
+                        4,
+                    ),
+                ),
+                _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16(low_b, 4), nibble),
+                    _mm256_slli_epi16(
+                        _mm256_and_si256(_mm256_srli_epi16(high_bits, 6), two_bits),
+                        4,
+                    ),
+                ),
+            ];
+
+            for (q, code) in codes.into_iter().enumerate() {
+                let scale = _mm_shuffle_epi8(scales, scale_pair_over_8_bytes(4 * j + q));
+                let a = _mm256_loadu_si256(acts as *const __m256i);
+                acts = acts.add(32);
+                total = _mm256_add_epi32(
+                    total,
+                    _mm256_madd_epi16(_mm256_cvtepi8_epi16(scale), _mm256_maddubs_epi16(code, a)),
+                );
+            }
+        }
+        _mm256_sub_epi32(total, zero_point)
     }
 }
 

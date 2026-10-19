@@ -236,7 +236,7 @@ cuda_launchers! {
 cuda_launchers! {
     loken_tier_plan(
         ids: *const u32, weights: *const f32, x: *const f32, table: *const i32,
-        counter: *mut u32, slot_out: *mut u32, weight_out: *mut f32, mail_ids: *mut u32,
+        counter: *mut u32, slot_out: *mut u32, weight_out: *mut f32, exact_out: *mut u32, mail_ids: *mut u32,
         mail_weights: *mut f32, mail_slots: *mut u32, mail_x: *mut f32, mail_rows: *mut u32,
         mail_request: *mut u32, mail_live: *mut u32, rows: i32, k: i32, hidden: i32);
     loken_tier_wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32);
@@ -257,6 +257,7 @@ pub(crate) mod tier_graph {
         counter: *mut u32,
         slot_out: *mut u32,
         weight_out: *mut f32,
+        exact_out: *mut u32,
         mail_ids: *mut u32,
         mail_weights: *mut f32,
         mail_slots: *mut u32,
@@ -277,6 +278,7 @@ pub(crate) mod tier_graph {
             counter,
             slot_out,
             weight_out,
+            exact_out,
             mail_ids,
             mail_weights,
             mail_slots,
