@@ -549,13 +549,13 @@ impl ConvW {
                 }
             }
             NT::from_vec_f32(wr, (k * c_out, c_in, 1))?
-                .to_dtype(DType::F16)?
+                .to_dtype(crate::tensor::DType::F16)?
                 .to_device(dev)?
         } else if is_convt {
             vae_nt(w, (c_in, c_out, k), dev)?
         } else if half {
             NT::from_vec_f32(w, (c_out, c_in, k))?
-                .to_dtype(DType::F16)?
+                .to_dtype(crate::tensor::DType::F16)?
                 .to_device(dev)?
         } else {
             vae_nt(w, (c_out, c_in, k), dev)?
