@@ -4,6 +4,7 @@ mod capture_hold;
 pub mod result;
 mod safe;
 pub mod sys;
+mod unpinnable;
 
 pub use result::DriverError;
 pub use safe::*;

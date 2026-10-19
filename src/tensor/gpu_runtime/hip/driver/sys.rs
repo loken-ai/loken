@@ -953,8 +953,37 @@ pub unsafe fn cuMemHostGetDevicePointer_v2(
     r
 }
 
+/// Runs `copy(offset, len)` over `bytes` from `src`: at once, or in pieces the runtime stages
+/// without trying to page-lock them when `src` lies in memory that cannot be page-locked.
+fn in_pieces(
+    src: *const c_void,
+    bytes: usize,
+    mut copy: impl FnMut(usize, usize) -> CUresult,
+) -> CUresult {
+    let piece = super::unpinnable::PIECE;
+    if bytes <= piece || !super::unpinnable::contains(src as usize, bytes) {
+        return copy(0, bytes);
+    }
+    let mut at = 0;
+    while at < bytes {
+        let len = piece.min(bytes - at);
+        let r = copy(at, len);
+        if r != CUresult::CUDA_SUCCESS {
+            return r;
+        }
+        at += len;
+    }
+    CUresult::CUDA_SUCCESS
+}
+
 pub unsafe fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult {
-    unsafe { hip!(hipMemcpyHtoD(ptr(dst), src, bytes)) }
+    in_pieces(src, bytes, |at, len| unsafe {
+        hip!(hipMemcpyHtoD(
+            ptr(dst + at as CUdeviceptr),
+            (src as *const u8).add(at) as *const c_void,
+            len
+        ))
+    })
 }
 
 pub unsafe fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult {
@@ -967,7 +996,14 @@ pub unsafe fn cuMemcpyHtoDAsync_v2(
     bytes: usize,
     stream: CUstream,
 ) -> CUresult {
-    unsafe { hip!(hipMemcpyHtoDAsync(ptr(dst), src, bytes, stream)) }
+    in_pieces(src, bytes, |at, len| unsafe {
+        hip!(hipMemcpyHtoDAsync(
+            ptr(dst + at as CUdeviceptr),
+            (src as *const u8).add(at) as *const c_void,
+            len,
+            stream
+        ))
+    })
 }
 
 pub unsafe fn cuMemcpyDtoHAsync_v2(
