@@ -674,27 +674,20 @@ pub(super) struct Q8Staging {
     pub row_bytes: usize,
 }
 
-/// Check `k` against the Q8_0 block layout and derive the launch for staging one row of it.
+/// Check `k` against the Q8_0 block layout and derive the launch for writing one row of it
+/// straight into a cache slot.
 ///
-/// `k` must divide into whole Q8_0 blocks AND already be a multiple of
-/// [`MATRIX_ROW_PADDING`]: otherwise the kernel writes padding zeros past the row's logical
-/// end, which is the next token's slot. Callers needing an arbitrary `k` stage into a
-/// scratch buffer and copy from there instead; each names itself by wrapping the error.
-/// `grid_z` is 1 for a single destination, 2 for the paired K/V form whose z axis picks the
-/// side.
+/// `k` must divide into whole Q8_0 blocks. The row is written unpadded, `k / 32` blocks,
+/// which is the stride a token takes in the cache: a padded row would write zeros into the
+/// next token's slot. `grid_z` is 1 for a single destination, 2 for the paired K/V form
+/// whose z axis picks the side.
 pub(super) fn q8_0_row_staging(k: usize, grid_z: u32, dev: &CudaDevice) -> Result<Q8Staging> {
     if !k.is_multiple_of(Q8_0_BLOCK_SIZE) {
         return Err(anyhow!(
             "k {k} not a multiple of block size {Q8_0_BLOCK_SIZE}"
         ));
     }
-    let kx_padded = pad(k, MATRIX_ROW_PADDING);
-    if kx_padded != k {
-        return Err(anyhow!(
-            "k {k} must be a multiple of {MATRIX_ROW_PADDING} to skip the padding \
-             write; callers needing an arbitrary k must use the staging-then-copy path"
-        ));
-    }
+    let kx_padded = k;
     let (block_x, grid_x) = adaptive_block_grid_x(
         CUDA_QUANTIZE_BLOCK_SIZE as u32,
         ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
@@ -745,7 +738,7 @@ pub(super) fn adaptive_block_grid_x(
 
 /// Quantize a single K row and V row to Q8_0, writing into `dst_k`/`dst_v` at
 /// `dst_byte_offset`, in one fused launch (gridDim.z=2). Returns the number of
-/// bytes written per row. `k` must be a multiple of `MATRIX_ROW_PADDING`.
+/// bytes written per row. `k` must be a multiple of the Q8_0 block.
 ///
 ///.
 /// the kernel from loken's NVRTC-compiled module instead of the tensor-op

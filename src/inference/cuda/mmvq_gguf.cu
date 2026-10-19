@@ -99,23 +99,33 @@ enum class GateAct { Silu, Gelu };
 ///
 /// `small_k` packs four rows per block instead of one or two; the caller guarantees that
 /// `nrows_x` divides by that, so the inner loop needs no bound check.
+///
+/// `group_warps` (0: all of them) splits the block's warps into groups that each own their own
+/// rows. A group of fewer warps than the block serves a row whose blocks its lanes cover in one
+/// pass; the lanes a four-warp row would leave idle then work on the next rows. Each lane reads
+/// the same weight block and sums in the same order as in a four-warp row, and the warps it
+/// drops would only have added zeros, so every output is bit-identical to the four-warp kernel.
 template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
-          mmvq_dot_t dot_block, int ncols_dst, int nmat, bool small_k, typename combine_t>
+          mmvq_dot_t dot_block, int ncols_dst, int nmat, bool small_k, typename combine_t,
+          int group_warps = 0>
 static __device__ void mmvq_core_impl(
     const void *const __restrict__ vx[nmat],
     const block_q8_1 *__restrict__ y,
     dst_t *__restrict__ dst,
     const int ncols_x, const int nrows_x,
     const int stride_col_y, const int stride_col_dst,
-    combine_t combine) {
+    combine_t combine, const float *__restrict__ bias = nullptr) {
 
-  constexpr int nwarps = mmvq_nwarps_for(ncols_dst);
+  constexpr int nwarps = group_warps > 0 ? group_warps : mmvq_nwarps_for(ncols_dst);
+  constexpr int ngroups = mmvq_nwarps_for(ncols_dst) / nwarps;
   constexpr int rows_per_cuda_block = small_k
     ? mmvq_rows_per_cuda_block_for_smallk(ncols_dst)
     : mmvq_rows_per_cuda_block_for(ncols_dst);
+  const int group = threadIdx.y / nwarps;
+  const int warp = threadIdx.y % nwarps;
 
-  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
-  const int row0 = rows_per_cuda_block * blockIdx.x;
+  const int tid = WARP_SIZE * warp + threadIdx.x;
+  const int row0 = rows_per_cuda_block * (ngroups * blockIdx.x + group);
   const int blocks_per_row = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
 
@@ -142,22 +152,24 @@ static __device__ void mmvq_core_impl(
   }
 
   // Warps 1.. hand their partials to warp 0 and stop.
-  __shared__ float partial[nmat][nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_dst]
+  __shared__ float partial[ngroups][nmat][nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_dst]
                           [rows_per_cuda_block][WARP_SIZE];
-  if (threadIdx.y > 0) {
+  if (warp > 0) {
 #pragma unroll
     for (int m = 0; m < nmat; ++m) {
 #pragma unroll
       for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
-          partial[m][threadIdx.y - 1][j][i][threadIdx.x] = acc[m][j][i];
+          partial[group][m][warp - 1][j][i][threadIdx.x] = acc[m][j][i];
         }
       }
     }
   }
-  __syncthreads();
-  if (threadIdx.y > 0) {
+  if (nwarps > 1) {
+    __syncthreads();
+  }
+  if (warp > 0) {
     return;
   }
 
@@ -169,7 +181,7 @@ static __device__ void mmvq_core_impl(
       for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
         for (int w = 0; w < nwarps - 1; ++w) {
-          acc[m][j][i] += partial[m][w][j][i][threadIdx.x];
+          acc[m][j][i] += partial[group][m][w][j][i][threadIdx.x];
         }
         acc[m][j][i] = warp_sum(acc[m][j][i]);
       }
@@ -184,24 +196,31 @@ static __device__ void mmvq_core_impl(
       for (int m = 0; m < nmat; ++m) {
         mats[m] = acc[m][j][threadIdx.x];
       }
-      dst[j * stride_col_dst + row0 + threadIdx.x] = (dst_t)combine(mats);
+      float value = combine(mats);
+      if (bias != nullptr) {
+        value += bias[row0 + threadIdx.x];
+      }
+      dst[j * stride_col_dst + row0 + threadIdx.x] = (dst_t)value;
     }
   }
 }
 
 /// The plain mat-vec: one matrix, and the sum IS the result.
 template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
-          mmvq_dot_t dot_block, int ncols_dst, bool small_k = false>
+          mmvq_dot_t dot_block, int ncols_dst, bool small_k = false,
+          int group_warps = 0>
 static __device__ void mmvq_core_plain(
     const void *__restrict__ vx,
     const block_q8_1 *__restrict__ y,
     dst_t *__restrict__ dst,
     const int ncols_x, const int nrows_x,
-    const int stride_col_y, const int stride_col_dst) {
+    const int stride_col_y, const int stride_col_dst,
+    const float *__restrict__ bias = nullptr) {
   const void *const mats[1] = {vx};
-  mmvq_core_impl<dst_t, qk, qi, block_q_t, vdr, dot_block, ncols_dst, 1, small_k>(
-      mats, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst,
-      [] (const float * a) { return a[0]; });
+  auto first = [] (const float * a) { return a[0]; };
+  mmvq_core_impl<dst_t, qk, qi, block_q_t, vdr, dot_block, ncols_dst, 1, small_k,
+                 decltype(first), group_warps>(
+      mats, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, first, bias);
 }
 
 /// Gate and up in one pass, the gate through its activation.
@@ -299,29 +318,68 @@ static __device__ void mmvq_core_fused_impl(
 
 MMVQ_FORMATS(MMVQ_PLAIN_BATCH_SET)
 
+/// The one-row small-K kernels, by how many warps serve a row: `smallk` four, `smallk_w2`
+/// two and `smallk_w1` one. A block always holds four warps, so the fewer a row takes, the
+/// more rows a block serves: 4, 8 or 16.
 #define MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,        \
-                                  vec_dot, dst_tag, dst_c_type)                 \
+                                  vec_dot, dst_tag, dst_c_type, suffix, gw)     \
   extern "C" __global__ void                                                    \
-      mmvq_gguf_##tag##_##dst_tag##_plain_smallk_cuda1(                         \
+      mmvq_gguf_##tag##_##dst_tag##_plain_smallk##suffix##_cuda1(               \
           const void *__restrict__ vx, const void *__restrict__ vy,             \
           dst_c_type *__restrict__ dst, const int ncols_x, const int nrows_x,   \
           const int stride_col_y, const int stride_col_dst) {                   \
     mmvq_core_plain<dst_c_type, qk_val, qi_val, block_q_t, vdr_val, vec_dot,    \
-                    1, /*small_k=*/true>(                                       \
+                    1, /*small_k=*/true, gw>(                                   \
         vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y,        \
         stride_col_dst);                                                        \
   }
 
+#define MMVQ_PLAIN_SMALLK_WIDTHS(tag, block_q_t, qk_val, qi_val, vdr_val,       \
+                                 vec_dot, dst_tag, dst_c_type)                  \
+  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+                            dst_tag, dst_c_type, , 4)                           \
+  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+                            dst_tag, dst_c_type, _w2, 2)                        \
+  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+                            dst_tag, dst_c_type, _w1, 1)
+
 #define MMVQ_PLAIN_SMALLK_BATCH_SET(tag, block_q_t, qk_val, qi_val, vdr_val,    \
                                       vec_dot)                                  \
-  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+  MMVQ_PLAIN_SMALLK_WIDTHS(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,    \
                             bf16, __nv_bfloat16)                                \
-  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+  MMVQ_PLAIN_SMALLK_WIDTHS(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,    \
                             f16, half)                                          \
-  MMVQ_PLAIN_SMALLK_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
+  MMVQ_PLAIN_SMALLK_WIDTHS(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,    \
                             f32, float)
 
 MMVQ_FORMATS(MMVQ_PLAIN_SMALLK_BATCH_SET)
+
+/// The one-row F32 kernels with a bias: each output row gets `bias[row]` added to its sum, the
+/// addition a separate bias kernel would make. `gw` 0 is the one-row kernel, 4, 2 and 1 the
+/// small-K widths.
+#define MMVQ_PLAIN_BIAS_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,  \
+                              suffix, small_k, gw)                              \
+  extern "C" __global__ void mmvq_gguf_##tag##_f32_plain##suffix##_bias_cuda1(   \
+      const void *__restrict__ vx, const void *__restrict__ vy,                 \
+      float *__restrict__ dst, const int ncols_x, const int nrows_x,            \
+      const int stride_col_y, const int stride_col_dst,                         \
+      const float *__restrict__ bias) {                                         \
+    mmvq_core_plain<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot, 1,      \
+                    small_k, gw>(vx, (const block_q8_1 *)vy, dst, ncols_x,      \
+                                 nrows_x, stride_col_y, stride_col_dst, bias);  \
+  }
+
+#define MMVQ_PLAIN_BIAS_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)   \
+  MMVQ_PLAIN_BIAS_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, ,     \
+                        false, 0)                                               \
+  MMVQ_PLAIN_BIAS_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,       \
+                        _smallk, true, 4)                                       \
+  MMVQ_PLAIN_BIAS_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,       \
+                        _smallk_w2, true, 2)                                    \
+  MMVQ_PLAIN_BIAS_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,       \
+                        _smallk_w1, true, 1)
+
+MMVQ_FORMATS(MMVQ_PLAIN_BIAS_SET)
 
 // ---------------------------------------------------------------------------
 // Fused MMVQ entries (Q4_K, F32 output, ncols_dst=1).
@@ -343,16 +401,20 @@ mmvq_gguf_q4_k_f32_fused_silu_cuda1(
 }
 
 // ---------------------------------------------------------------------------
-// A gate and up pair in two formats, one row a block: each matrix is accumulated
-// in its own block geometry over the one q8_1 activation, the four warps' partials
-// join, and the row's value is the up projection times the gate's silu.
+// A gate and up pair in two formats: each matrix is accumulated in its own block
+// geometry over the one q8_1 activation, the warps' partials join, and the row's
+// value is the up projection times the gate's silu.
+//
+// `group_warps` warps serve a row and a block of four warps serves 4 / group_warps
+// rows. The launcher picks the fewest warps whose lanes cover both matrices' blocks
+// in one pass, so each lane reads the same blocks and the sum runs in the same order
+// as in a four-warp row: the warps a narrower row drops would only add zeros.
 // ---------------------------------------------------------------------------
-template <int qk, int qi, int vdr, mmvq_dot_t dot_block>
+template <int qk, int qi, int vdr, mmvq_dot_t dot_block, int nwarps>
 static __device__ float mmvq_row_partial(const void *__restrict__ vx,
                                          const block_q8_1 *__restrict__ y,
                                          const int ncols_x, const int row,
                                          const int tid) {
-  constexpr int nwarps = mmvq_nwarps_for(1);
   const int blocks_per_row = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
   float acc = 0.0f;
@@ -365,33 +427,38 @@ static __device__ float mmvq_row_partial(const void *__restrict__ vx,
 }
 
 template <int qk_u, int qi_u, int vdr_u, mmvq_dot_t dot_u,
-          int qk_g, int qi_g, int vdr_g, mmvq_dot_t dot_g>
+          int qk_g, int qi_g, int vdr_g, mmvq_dot_t dot_g, int group_warps>
 static __device__ void mmvq_core_pair_silu(const void *__restrict__ vx,
                                            const void *__restrict__ vgate,
                                            const block_q8_1 *__restrict__ y,
                                            float *__restrict__ dst,
                                            const int ncols_x, const int nrows_x) {
-  constexpr int nwarps = mmvq_nwarps_for(1);
-  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
-  const int row = blockIdx.x;
-  if (row >= nrows_x) {
-    return;
+  constexpr int nwarps = group_warps;
+  constexpr int ngroups = mmvq_nwarps_for(1) / nwarps;
+  const int group = threadIdx.y / nwarps;
+  const int warp = threadIdx.y % nwarps;
+  const int tid = WARP_SIZE * warp + threadIdx.x;
+  const int row = ngroups * blockIdx.x + group;
+  const bool live = row < nrows_x;
+  float up = 0.0f;
+  float gate = 0.0f;
+  if (live) {
+    up = mmvq_row_partial<qk_u, qi_u, vdr_u, dot_u, nwarps>(vx, y, ncols_x, row, tid);
+    gate = mmvq_row_partial<qk_g, qi_g, vdr_g, dot_g, nwarps>(vgate, y, ncols_x, row, tid);
   }
-  float up = mmvq_row_partial<qk_u, qi_u, vdr_u, dot_u>(vx, y, ncols_x, row, tid);
-  float gate = mmvq_row_partial<qk_g, qi_g, vdr_g, dot_g>(vgate, y, ncols_x, row, tid);
-  __shared__ float partial[2][nwarps][WARP_SIZE];
-  partial[0][threadIdx.y][threadIdx.x] = up;
-  partial[1][threadIdx.y][threadIdx.x] = gate;
+  __shared__ float partial[ngroups][2][nwarps][WARP_SIZE];
+  partial[group][0][warp][threadIdx.x] = up;
+  partial[group][1][warp][threadIdx.x] = gate;
   __syncthreads();
-  if (threadIdx.y > 0) {
+  if (warp > 0 || !live) {
     return;
   }
   up = 0.0f;
   gate = 0.0f;
 #pragma unroll
   for (int w = 0; w < nwarps; ++w) {
-    up += partial[0][w][threadIdx.x];
-    gate += partial[1][w][threadIdx.x];
+    up += partial[group][0][w][threadIdx.x];
+    gate += partial[group][1][w][threadIdx.x];
   }
   up = warp_sum(up);
   gate = warp_sum(gate);
@@ -400,22 +467,36 @@ static __device__ void mmvq_core_pair_silu(const void *__restrict__ vx,
   }
 }
 
-/// The formats a dense pair is held in: the k-quants and the q8_0 a float weight becomes.
+#define MMVQ_PAIR_ENTRY_W(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u,  \
+                          vdr_u, dot_u, suffix, gw)                             \
+  extern "C" __global__ void                                                    \
+      mmvq_gguf_pair_##tag_g##_##tag_u##_silu##suffix##_cuda1(                  \
+          const void *__restrict__ vx, const void *__restrict__ vgate,          \
+          const void *__restrict__ vy, float *__restrict__ dst,                 \
+          const int ncols_x, const int nrows_x, const int stride_col_y,         \
+          const int stride_col_dst) {                                           \
+    mmvq_core_pair_silu<qk_u, qi_u, vdr_u, dot_u, qk_g, qi_g, vdr_g, dot_g,     \
+                        gw>(vx, vgate, (const block_q8_1 *)vy, dst, ncols_x,    \
+                            nrows_x);                                           \
+  }
+/// A pair's entry points by how many warps serve a row: four, two (`_w2`) or one (`_w1`).
+#define MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u,    \
+                        vdr_u, dot_u)                                           \
+  MMVQ_PAIR_ENTRY_W(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u, vdr_u,  \
+                    dot_u, , 4)                                                 \
+  MMVQ_PAIR_ENTRY_W(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u, vdr_u,  \
+                    dot_u, _w2, 2)                                              \
+  MMVQ_PAIR_ENTRY_W(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u, vdr_u,  \
+                    dot_u, _w1, 1)
+
+/// The formats a dense pair is held in across each other: the k-quants and the q8_0 a float
+/// weight becomes.
 #define MMVQ_PAIR_FORMATS(X)                                                   \
   X(q4_k, QK_K, QI4_K, VDR_Q4_K_Q8_1_MMVQ, mmvq_dot_q4_K)                       \
   X(q5_k, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ, mmvq_dot_q5_K)                       \
   X(q6_k, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ, mmvq_dot_q6_K)                       \
   X(q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, mmvq_dot_q8_0)
 
-#define MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u,    \
-                        vdr_u, dot_u)                                           \
-  extern "C" __global__ void mmvq_gguf_pair_##tag_g##_##tag_u##_silu_cuda1(      \
-      const void *__restrict__ vx, const void *__restrict__ vgate,               \
-      const void *__restrict__ vy, float *__restrict__ dst, const int ncols_x,   \
-      const int nrows_x, const int stride_col_y, const int stride_col_dst) {     \
-    mmvq_core_pair_silu<qk_u, qi_u, vdr_u, dot_u, qk_g, qi_g, vdr_g, dot_g>(     \
-        vx, vgate, (const block_q8_1 *)vy, dst, ncols_x, nrows_x);               \
-  }
 #define MMVQ_PAIR_ROW(tag_g, qk_g, qi_g, vdr_g, dot_g)                          \
   MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, q4_k, QK_K, QI4_K,           \
                   VDR_Q4_K_Q8_1_MMVQ, mmvq_dot_q4_K)                             \
@@ -427,7 +508,17 @@ static __device__ void mmvq_core_pair_silu(const void *__restrict__ vx,
                   VDR_Q8_0_Q8_1_MMVQ, mmvq_dot_q8_0)
 MMVQ_PAIR_FORMATS(MMVQ_PAIR_ROW)
 #undef MMVQ_PAIR_ROW
+
+/// The 32-value formats pair with themselves only.
+#define MMVQ_PAIR_SELF(tag, qk, qi, vdr, dot)                                   \
+  MMVQ_PAIR_ENTRY(tag, qk, qi, vdr, dot, tag, qk, qi, vdr, dot)
+MMVQ_PAIR_SELF(q4_0, QK4_0, QI4_0, VDR_Q4_0_Q8_1_MMVQ, mmvq_dot_q4_0)
+MMVQ_PAIR_SELF(q4_1, QK4_1, QI4_1, VDR_Q4_1_Q8_1_MMVQ, mmvq_dot_q4_1)
+MMVQ_PAIR_SELF(q5_0, QK5_0, QI5_0, VDR_Q5_0_Q8_1_MMVQ, mmvq_dot_q5_0)
+MMVQ_PAIR_SELF(q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ, mmvq_dot_q5_1)
+#undef MMVQ_PAIR_SELF
 #undef MMVQ_PAIR_ENTRY
+#undef MMVQ_PAIR_ENTRY_W
 
 
 

@@ -517,10 +517,8 @@ impl QKernelMatMul {
         odims: Vec<usize>,
     ) -> Result<crate::tensor::Tensor> {
         let k = self.k;
-        // smallk (4-rows/block decode kernel) - same ggml dispatch as the
-        // F16 path: decode-only (rows==1), n%4==0, K-quant with a
-        // smallk entry, small K ((k/256) < 4*vdr). Tiny-model GEMVs (small K)
-        // otherwise run the 1-row/block kernel at only ~27% BW peak.
+        // A one-row call with a small K takes the small-K kernels, which serve several rows a
+        // block (`smallk_single`).
         let y = if rows > 1 && DecodeOrder::active() {
             crate::tensor::cuda::mmvq_decode_order::<f32>(
                 qdev,
@@ -662,6 +660,58 @@ impl QKernelMatMul {
         crate::tensor::Tensor::from_cuda_storage(storage, device, odims).map(Some)
     }
 
+    /// [`Self::forward_quantized`] over one F32 row with `bias` (`[n]` F32 on the same card)
+    /// added to each output in the kernel's store: the same bits as the product followed by a
+    /// bias add, one launch fewer. `None` where another path serves the row.
+    #[cfg(feature = "gpu")]
+    pub fn forward_quantized_bias(
+        &self,
+        a: &QuantizedActivation,
+        bias: &crate::tensor::Tensor,
+    ) -> Result<Option<crate::tensor::Tensor>> {
+        let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
+        else {
+            return Ok(None);
+        };
+        if a.k != self.k
+            || a.rows != 1
+            || a.dtype != crate::tensor::DType::F32
+            || a.ordinal != qdev.ordinal()
+            || !self.takes_matvec(qdev, 1)
+            || self.lora_fused.is_some()
+            || bias.dtype() != crate::tensor::DType::F32
+            || bias.elem_count() != self.n
+            || !bias.is_contiguous()
+        {
+            return Ok(None);
+        }
+        let (b_slice, bdev) = bias.cuda_f32_slice()?;
+        if bdev.ordinal() != qdev.ordinal() {
+            return Ok(None);
+        }
+        let offset = bias.layout().start_offset();
+        let b_view = b_slice.slice(offset..offset + self.n);
+        let tag = self.kernel_tag()?;
+        let y = crate::tensor::cuda::mmvq_f32_bias(
+            qdev,
+            tag,
+            blob,
+            &a.q81,
+            self.k,
+            self.n,
+            self.smallk_single(self.k),
+            &b_view,
+        )?;
+        let mut odims = a.lead.clone();
+        odims.push(self.n);
+        crate::tensor::Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(y),
+            qdev.clone(),
+            odims,
+        )
+        .map(Some)
+    }
+
     /// Whether `forward` serves `rows` F32 activation rows with the mat-vec kernels.
     #[cfg(feature = "gpu")]
     fn takes_matvec(&self, qdev: &crate::tensor::cuda::CudaDevice, rows: usize) -> bool {
@@ -672,17 +722,13 @@ impl QKernelMatMul {
             && self.kernel_tag().is_ok()
     }
 
-    /// Whether a one-row call over this weight takes the four-rows-per-block `smallk`
-    /// mat-vec (ggml's dispatch): K-quants with an entry, `n % 4 == 0`, and a K small
-    /// enough, `(k/256) < 4*vdr`, that the one-row kernel would leave threads idle.
+    /// Whether a one-row call over this weight takes a small-K mat-vec: a K whose row the
+    /// one-row kernel's lanes cover in one pass, and a row count the kernel's rows per block
+    /// divide ([`crate::tensor::cuda::mmvq_smallk_warps`]).
     #[cfg(feature = "gpu")]
     fn smallk_single(&self, k: usize) -> bool {
-        let vdr: Option<i32> = match self.dtype {
-            GgmlDType::Q4K | GgmlDType::Q5K => Some(2),
-            GgmlDType::Q6K => Some(1),
-            _ => None,
-        };
-        self.n.is_multiple_of(4) && vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr)
+        self.kernel_tag()
+            .is_ok_and(|tag| crate::tensor::cuda::mmvq_smallk_warps(tag, k, self.n).is_some())
     }
 
     pub fn forward(&self, x: &crate::tensor::Tensor) -> Result<crate::tensor::Tensor> {
@@ -1083,9 +1129,7 @@ impl QKernelMatMul {
                         }
                         let q81 =
                             crate::tensor::cuda::quantize_q8_1_rows_f16(qdev, x_slice, k, rows)?;
-                        // ggml small_k dispatch (fork fast_mmvq.rs): decode-only
-                        // (b_size==1), K-quants with a smallk entry, nrows%4==0,
-                        // and (k/256) < 4*vdr.
+                        // The small-K kernels for a one-row call (`smallk_single`).
                         let smallk = rows == 1 && self.smallk_single(k);
                         let y = if decode_order {
                             crate::tensor::cuda::mmvq_decode_order::<half::f16>(
@@ -1401,14 +1445,7 @@ impl QKernelMatMul {
                 let xv = x_slice.slice(offset..offset + n_in);
                 let q81 = crate::tensor::cuda::quantize_q8_1_rows_f16_view(qdev, &xv, k, rows)?;
                 // same small_k dispatch as `forward`
-                let smallk_vdr: Option<i32> = match self.dtype {
-                    GgmlDType::Q4K | GgmlDType::Q5K => Some(2),
-                    GgmlDType::Q6K => Some(1),
-                    _ => None,
-                };
-                let smallk = rows == 1
-                    && self.n.is_multiple_of(4)
-                    && smallk_vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr);
+                let smallk = rows == 1 && self.smallk_single(k);
                 let y =
                     crate::tensor::cuda::mmvq_f16(qdev, tag, blob, &q81, k, self.n, rows, smallk)?;
                 Ok(Some(crate::tensor::Tensor::from_cuda_storage(

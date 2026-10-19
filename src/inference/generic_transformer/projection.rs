@@ -735,6 +735,10 @@ impl QMatMul {
             GgmlDType::Q5K,
             GgmlDType::Q6K,
             GgmlDType::Q8_0,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
         ];
         if !fused_formats.contains(&gq.dtype())
             || !fused_formats.contains(&uq.dtype())
@@ -849,6 +853,34 @@ impl QMatMul {
             Some(k) => k.forward_quantized(a),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::forward_quantized`] with `bias` added in the mat-vec's store, the same bits as
+    /// the product followed by a bias add; `None` where the row takes another path.
+    #[cfg(feature = "gpu")]
+    pub fn forward_quantized_bias(
+        &self,
+        a: &crate::tensor::quantized::QuantizedActivation,
+        bias: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        match self.bare_kernel() {
+            Some(k) => k.forward_quantized_bias(a, bias),
+            None => Ok(None),
+        }
+    }
+
+    /// `forward(xs) + bias`: one launch for a decode row the mat-vec serves, the product and
+    /// a broadcast add otherwise.
+    pub fn forward_bias(&self, xs: &Tensor, bias: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "gpu")]
+        if xs.device().is_cuda() {
+            if let Some(a) = self.quantize_for_matvec(&xs.contiguous()?)? {
+                if let Some(y) = self.forward_quantized_bias(&a, bias)? {
+                    return Ok(y);
+                }
+            }
+        }
+        self.forward(xs)?.broadcast_add(bias)
     }
 }
 

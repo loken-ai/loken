@@ -135,7 +135,7 @@ pub fn mvq_via_pre_quantized_q8_1(
 /// token instead of being baked at capture time.
 ///
 /// Same row-width / k-alignment constraint as `quantize_q8_0_f32_into_offset`
-/// (k must be a multiple of MATRIX_ROW_PADDING). Single-row decode only.
+/// (k must be a multiple of the Q8_0 block). Single-row decode only.
 pub fn quantize_q8_0_f32_dev_slot(
     src: &CudaView<f32>,
     dst: &mut CudaSlice<u8>,
@@ -224,12 +224,8 @@ pub fn quantize_q8_0_kv_paired_f32_dev_slot(
 /// launches (quantize-into-staging, memcpy-staging-to-buffer) into one.
 ///
 /// `k` is elements per row (assumed n_kv_heads x head_dim for the
-/// single-row decode case). `k` MUST be a multiple of MATRIX_ROW_PADDING
-/// (512) - otherwise the kernel writes padding zeros into the slot
-/// after the current write, corrupting the next token's KV. This holds
-/// for common decode shapes (e.g. n_kv_headsxhead_dim of 32x64, 2x512,
-/// 8x128); the caller should fall back to the staging-then-memcpy path
-/// when it doesn't.
+/// single-row decode case), a multiple of the Q8_0 block; the row is written unpadded,
+/// so it ends where the next token's slot begins.
 ///
 /// Returns the number of bytes written: `(k / 32) x 34`.
 pub fn quantize_q8_0_f32_into_offset(

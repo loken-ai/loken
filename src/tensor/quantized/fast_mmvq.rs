@@ -85,18 +85,36 @@ fn try_fused(
     act: Act,
 ) -> Result<Option<(CudaStorage, Shape)>> {
     use super::GgmlDType;
-    // The silu pair is served in any two of the dense formats; gelu and the bf16 output for a
-    // q4_k pair alone.
+    // The silu pair is served in any two of the k-quants and q8_0, and in a 32-value format
+    // paired with itself; gelu and the bf16 output for a q4_k pair alone.
     let pair_tag = |d: GgmlDType| match d {
         GgmlDType::Q4K => Some("q4_k"),
         GgmlDType::Q5K => Some("q5_k"),
         GgmlDType::Q6K => Some("q6_k"),
         GgmlDType::Q8_0 => Some("q8_0"),
+        GgmlDType::Q4_0 => Some("q4_0"),
+        GgmlDType::Q4_1 => Some("q4_1"),
+        GgmlDType::Q5_0 => Some("q5_0"),
+        GgmlDType::Q5_1 => Some("q5_1"),
         _ => None,
     };
-    let silu_kname = match (pair_tag(gate_storage.dtype()), pair_tag(up_storage.dtype())) {
-        (Some(g), Some(u)) => format!("mmvq_gguf_pair_{g}_{u}_silu_cuda1"),
+    let (Some(gate_tag), Some(up_tag)) =
+        (pair_tag(gate_storage.dtype()), pair_tag(up_storage.dtype()))
+    else {
+        return Ok(None);
+    };
+    let k_in = self_shape.dims().last().copied().unwrap_or(0);
+    // The warps a row of the pair takes: enough for the wider of its two matrices.
+    let row_warps = match (
+        crate::tensor::cuda::mmvq_row_warps(gate_tag, k_in),
+        crate::tensor::cuda::mmvq_row_warps(up_tag, k_in),
+    ) {
+        (Some(g), Some(u)) => g.max(u),
         _ => return Ok(None),
+    };
+    let silu_kname = match row_warps {
+        4 => format!("mmvq_gguf_pair_{gate_tag}_{up_tag}_silu_cuda1"),
+        w => format!("mmvq_gguf_pair_{gate_tag}_{up_tag}_silu_w{w}_cuda1"),
     };
     let q4_pair = up_storage.dtype() == GgmlDType::Q4K && gate_storage.dtype() == GgmlDType::Q4K;
     let rdt = rhs.dtype()?;
@@ -182,9 +200,14 @@ fn try_fused(
         _ => unreachable!(),
     }
 
-    // 2) fused (gate + up + activation) MMVQ
+    // 2) fused (gate + up + activation) MMVQ: the pair kernels serve 4 / row_warps rows a
+    // block, the single-format fused ones a row.
+    let rows_per_block = match fused_kname == silu_kname {
+        true => 4 / row_warps,
+        false => 1,
+    };
     let f_cfg = LaunchConfig {
-        grid_dim: (nrows as u32, 1, 1),
+        grid_dim: (nrows.div_ceil(rows_per_block) as u32, 1, 1),
         block_dim: (32, 4, 1),
         shared_mem_bytes: 0,
     };

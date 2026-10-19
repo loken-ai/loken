@@ -2331,9 +2331,8 @@ pub fn dequantize_q8_0_f32(
 }
 
 /// F16-output batched MMVQ (the fork's `plain_launcher_f16` family).
-/// `smallk` selects the decode-only 4-rows/block `plain_smallk_cuda1`
-/// kernel - caller must ensure `b_size == 1 && n % 4 == 0` and apply the
-/// ggml dispatch threshold `(k/256) < 4*vdr` (`quantized/fast_mmvq.rs`).
+/// `smallk` selects the decode-only small-K kernels - the caller ensures `b_size == 1` and
+/// that [`mmvq_smallk_warps`] applies.
 pub fn mmvq_f16(
     dev: &CudaDevice,
     tag: &str,
@@ -2390,6 +2389,44 @@ pub(super) fn mmvq_t<
         n,
         b_size,
         smallk,
+        None,
+    )?;
+    Ok(dst)
+}
+
+/// One-row F32 mat-vec with `bias` (`n` F32 values) added to each output row in the kernel's
+/// store: the same bits as the mat-vec followed by a bias add.
+#[allow(clippy::too_many_arguments)]
+pub fn mmvq_f32_bias(
+    dev: &CudaDevice,
+    tag: &str,
+    weight_blob: &CudaSlice<u8>,
+    q8_1: &CudaSlice<u8>,
+    k: usize,
+    n: usize,
+    smallk: bool,
+    bias: &CudaView<'_, f32>,
+) -> Result<CudaSlice<f32>> {
+    if bias.len() < n {
+        return Err(Error(format!(
+            "mmvq bias: {} values for {n} rows",
+            bias.len()
+        )));
+    }
+    let stream = dev.stream();
+    let mut dst = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<f32>(n) })?;
+    launch_mmvq(
+        dev,
+        tag,
+        "f32",
+        weight_blob,
+        &q8_1.slice(..),
+        &mut dst.slice_mut(..),
+        k,
+        n,
+        1,
+        smallk,
+        Some(bias),
     )?;
     Ok(dst)
 }
@@ -2436,10 +2473,55 @@ pub fn mmvq_decode_order<
             n,
             b,
             b == 1 && smallk_single,
+            None,
         )?;
         first += b;
     }
     Ok(dst)
+}
+
+/// A mat-vec format's block geometry as `mmvq_gguf.cu` walks it: values per block, 32-bit
+/// ints per block, and ints one lane takes per dot product.
+fn mmvq_geometry(tag: &str) -> Option<(usize, usize, usize)> {
+    Some(match tag {
+        "q4_0" | "q4_1" | "q5_0" | "q5_1" => (32, 4, 2),
+        "q8_0" => (32, 8, 2),
+        "q2_k" | "q3_k" => (256, 16, 1),
+        "q4_k" | "q5_k" => (256, 32, 2),
+        "q6_k" => (256, 32, 1),
+        _ => return None,
+    })
+}
+
+/// The fewest warps, of 1, 2 or 4, whose lanes cover a row of `k` values of format `tag` in
+/// one pass: `(k / qk) * (qi / vdr)` lanes. Four when the row needs four warps or more.
+pub fn mmvq_row_warps(tag: &str, k: usize) -> Option<usize> {
+    let (qk, qi, vdr) = mmvq_geometry(tag)?;
+    let lanes = (k / qk) * (qi / vdr);
+    Some(
+        [1usize, 2]
+            .into_iter()
+            .find(|&w| w * 32 >= lanes)
+            .unwrap_or(4),
+    )
+}
+
+/// The warps a one-row small-K mat-vec gives each output row, or `None` when a row takes
+/// the four warps more than one pass.
+///
+/// When the four warps' 128 lanes cover a row in one pass, the small-K kernels apply: a block
+/// of four warps serves 4 rows a group of [`mmvq_row_warps`], `n` dividing by the rows of a
+/// block. The four-warp small-K kernel takes a row count that the narrower ones do not divide.
+pub fn mmvq_smallk_warps(tag: &str, k: usize, n: usize) -> Option<usize> {
+    let (qk, qi, vdr) = mmvq_geometry(tag)?;
+    if (k / qk) * (qi / vdr) > 128 {
+        return None;
+    }
+    let warps = mmvq_row_warps(tag, k)?;
+    match n.is_multiple_of(4 * (4 / warps)) {
+        true => Some(warps),
+        false => n.is_multiple_of(4).then_some(4),
+    }
 }
 
 /// One mat-vec launch of `b_size` activation rows into `dst`.
@@ -2455,17 +2537,33 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     n: usize,
     b_size: usize,
     smallk: bool,
+    bias: Option<&CudaView<'_, f32>>,
 ) -> Result<()> {
     use crate::tensor::quantized::MATRIX_ROW_PADDING;
-    if smallk && (b_size != 1 || !n.is_multiple_of(4)) {
+    if bias.is_some() && (b_size != 1 || dst_tag != "f32") {
         return Err(Error(format!(
-            "mmvq smallk requires b_size==1 && n%4==0 (got b_size={b_size}, n={n})"
+            "mmvq bias takes one F32 row (got b_size={b_size}, dst {dst_tag})"
         )));
     }
-    let kernel = if smallk {
-        format!("mmvq_gguf_{tag}_{dst_tag}_plain_smallk_cuda1")
-    } else {
-        format!("mmvq_gguf_{tag}_{dst_tag}_plain_cuda{b_size}")
+    let smallk_warps = match smallk {
+        true => match mmvq_smallk_warps(tag, k, n) {
+            Some(warps) if b_size == 1 => warps,
+            _ => {
+                return Err(Error(format!(
+                    "mmvq smallk requires b_size==1, a small k and n%4==0 (got b_size={b_size}, \
+                     k={k}, n={n})"
+                )))
+            }
+        },
+        false => 4,
+    };
+    let with_bias = if bias.is_some() { "_bias" } else { "" };
+    let kernel = match (smallk, smallk_warps) {
+        (true, 4) => format!("mmvq_gguf_{tag}_{dst_tag}_plain_smallk{with_bias}_cuda1"),
+        (true, warps) => {
+            format!("mmvq_gguf_{tag}_{dst_tag}_plain_smallk_w{warps}{with_bias}_cuda1")
+        }
+        (false, _) => format!("mmvq_gguf_{tag}_{dst_tag}_plain{with_bias}_cuda{b_size}"),
     };
     let func = dev.mmvq_fn(&kernel)?;
     let stream = dev.stream();
@@ -2474,9 +2572,9 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     let stride_col_dst = n as i32;
     // Launch geometry mirrors the fork's C launchers exactly:
     // plain: rows_per_block = b<=1 ? 1 : 2, nwarps = b<=4 ? 4 : 2;
-    // smallk (MMVQ_LAUNCHER_SMALLK_PLAIN): rows_per_block = 4, nwarps = 4.
+    // smallk: four rows to each group of `smallk_warps` warps, nwarps = 4.
     let rows_per_block: usize = if smallk {
-        4
+        4 * (4 / smallk_warps)
     } else if b_size <= 1 {
         1
     } else {
@@ -2506,6 +2604,9 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     b.arg(&n_i);
     b.arg(&stride_col_y);
     b.arg(&stride_col_dst);
+    if let Some(bias) = bias {
+        b.arg(bias);
+    }
     unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
     Ok(())
 }
@@ -2553,6 +2654,298 @@ pub fn cast_f16_to_f32(
     b.arg(&n_i);
     unsafe { b.launch(cfg) }.map_err(|e| Error(format!("cast launch: {e}")))?;
     Ok(out)
+}
+
+/// The small-K mat-vecs and the gate and up pair against the four-warp one-row kernel.
+///
+/// A narrower row reads the same blocks per lane and sums in the same order, so the outputs
+/// are the same bits: a decode that moves to them emits the same tokens.
+#[cfg(test)]
+mod small_k_bits {
+    use super::*;
+    use crate::tensor::quant_cpu;
+    use crate::tensor::quantized::GgmlDType;
+
+    fn values(len: usize, seed: u32, scale: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed);
+                ((h >> 8) as f32 / (1 << 24) as f32 - 0.5) * scale
+            })
+            .collect()
+    }
+
+    /// Formats and widths that give a row one, two and four warps, and a row of exactly the
+    /// four warps' lanes.
+    const CASES: [(GgmlDType, &str, usize); 7] = [
+        (GgmlDType::Q4_0, "q4_0", 256),
+        (GgmlDType::Q5_0, "q5_0", 896),
+        (GgmlDType::Q8_0, "q8_0", 896),
+        (GgmlDType::Q4K, "q4_k", 256),
+        (GgmlDType::Q4K, "q4_k", 1024),
+        (GgmlDType::Q6K, "q6_k", 512),
+        (GgmlDType::Q4K, "q4_k", 2048),
+    ];
+
+    #[test]
+    fn every_small_k_width_writes_the_one_row_kernel_bits() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the small-K mat-vec is NOT covered by this run");
+            return;
+        };
+        let stream = dev.stream().clone();
+        // 48 rows: whole blocks of 16, 8 and 4 rows, and a tail for the pair's guard.
+        let n = 48;
+        let mut widths = Vec::new();
+        for (dtype, tag, k) in CASES {
+            let w = quant_cpu::from_float_bytes(dtype, &values(n * k, 3, 0.6)).unwrap();
+            let blob = stream.clone_htod(&w).unwrap();
+            let x = stream.clone_htod(&values(k, 11, 2.0)).unwrap();
+            let q81 = quantize_q8_1(&dev, &x, k).unwrap();
+            let one = stream.clone_dtoh(&mmvq_f32(&dev, tag, &blob, &q81, k, n, 1, false).unwrap());
+            let warps = mmvq_smallk_warps(tag, k, n)
+                .unwrap_or_else(|| panic!("{tag} k={k}: no small-K kernel for a one-pass row"));
+            let small =
+                stream.clone_dtoh(&mmvq_f32(&dev, tag, &blob, &q81, k, n, 1, true).unwrap());
+            let (one, small) = (one.unwrap(), small.unwrap());
+            assert!(
+                one.iter().any(|v| *v != 0.0),
+                "{tag} k={k}: the one-row kernel wrote zeros"
+            );
+            for (row, (a, b)) in one.iter().zip(&small).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{tag} k={k} row {row}: {warps}-warp small-K {b} against one-row {a}"
+                );
+            }
+            // The bias kernels: the sum, then the row's bias, as a separate add would.
+            let bias = values(n, 17, 1.0);
+            let bias_dev = stream.clone_htod(&bias).unwrap();
+            for smallk in [false, true] {
+                let y = mmvq_f32_bias(&dev, tag, &blob, &q81, k, n, smallk, &bias_dev.slice(..))
+                    .unwrap();
+                let y = stream.clone_dtoh(&y).unwrap();
+                for (row, (a, got)) in one.iter().zip(&y).enumerate() {
+                    let want = a + bias[row];
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "{tag} k={k} row {row} small-K {smallk}: biased {got} against {want}"
+                    );
+                }
+            }
+            widths.push(warps);
+        }
+        for warps in [1, 2, 4] {
+            assert!(widths.contains(&warps), "no case gives a row {warps} warps");
+        }
+    }
+
+    #[test]
+    fn the_pair_writes_silu_of_the_gate_times_the_up_rows() {
+        use crate::tensor::kernel_ffi::{CudaDevice as FfiDevice, CudaStorage, Layout};
+        use crate::tensor::quantized::QCudaStorage;
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the gate and up pair is NOT covered by this run");
+            return;
+        };
+        let stream = dev.stream().clone();
+        let silu = dev.fused_fn("fused_silu_mul_f32").unwrap();
+        // An odd row count: the narrower pairs' last block holds a row past the end.
+        let n = 45;
+        for (dtype, tag, k) in CASES {
+            let gate_w = quant_cpu::from_float_bytes(dtype, &values(n * k, 5, 0.3)).unwrap();
+            let up_w = quant_cpu::from_float_bytes(dtype, &values(n * k, 9, 0.6)).unwrap();
+            let ffi = FfiDevice(dev.clone());
+            let gate_s = QCudaStorage::upload(&ffi, &gate_w, dtype).unwrap();
+            let up_s = QCudaStorage::upload(&ffi, &up_w, dtype).unwrap();
+            let xs = values(k, 13, 2.0);
+            let x = stream.clone_htod(&xs).unwrap();
+            let q81 = quantize_q8_1(&dev, &x, k).unwrap();
+            let gate =
+                mmvq_f32(&dev, tag, gate_s.weight_cuda_slice(), &q81, k, n, 1, false).unwrap();
+            let up = mmvq_f32(&dev, tag, up_s.weight_cuda_slice(), &q81, k, n, 1, false).unwrap();
+            let want = stream.alloc_zeros::<f32>(n).unwrap();
+            let n_i = n as i32;
+            let mut b = stream.launch_builder(&silu);
+            b.arg(&gate).arg(&up).arg(&want).arg(&n_i);
+            let cfg = LaunchConfig {
+                grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(cfg) }.unwrap();
+            let want = stream.clone_dtoh(&want).unwrap();
+
+            let rhs = CudaStorage::wrap_cuda_slice(x, ffi.clone());
+            let layout = Layout::contiguous_with_offset(crate::tensor::Shape::from(vec![1, k]), 0);
+            let shape = crate::tensor::Shape::from(vec![n, k]);
+            let (out, _) = crate::tensor::quantized::fast_mmvq::try_fused_silu(
+                &up_s, &gate_s, &shape, &rhs, &layout,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{tag} k={k}: the pair declined a same-format pair"));
+            let got = stream
+                .clone_dtoh(out.as_cuda_slice::<f32>().unwrap())
+                .unwrap();
+            for (row, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{tag} k={k} row {row}: pair {b} against the projections apart {a}"
+                );
+            }
+        }
+    }
+}
+
+/// What the one-row mat-vec kernels reach on a decode's shapes, in weight bytes a second.
+///
+/// Each shape runs the four-warp one-row kernel and every small-K width whose lanes cover the
+/// row, on zeroed weights: the bytes moved are the format's, the values do not matter.
+#[cfg(test)]
+mod mat_vec_throughput {
+    #[test]
+    #[ignore = "measurement: needs a CUDA device"]
+    fn what_each_one_row_kernel_reaches() {
+        use crate::tensor::cuda::CudaDevice;
+        use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
+        use crate::tensor::quantized::{GgmlDType, MATRIX_ROW_PADDING};
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device");
+            return;
+        };
+        let stream = dev.stream().clone();
+        let ctx = stream.context();
+        let shapes = [
+            ("q5_0", GgmlDType::Q5_0, 896, 9728),
+            ("q5_0", GgmlDType::Q5_0, 896, 896),
+            ("q8_0", GgmlDType::Q8_0, 896, 151936),
+            ("q8_0", GgmlDType::Q8_0, 1024, 151936),
+            ("q4_k", GgmlDType::Q4K, 1024, 3072),
+            ("q6_k", GgmlDType::Q6K, 1024, 3072),
+            ("q4_k", GgmlDType::Q4K, 2048, 8192),
+            ("q6_k", GgmlDType::Q6K, 4864, 896),
+            ("q4_k", GgmlDType::Q4K, 4864, 896),
+        ];
+        for (tag, dtype, k, n) in shapes {
+            let bytes = n * (k / dtype.block_size()) * dtype.type_size();
+            let weights = stream.alloc_zeros::<u8>(bytes).unwrap();
+            let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+            let q8_1 = stream.alloc_zeros::<u8>(k_padded / 32 * 36).unwrap();
+            let mut dst = stream.alloc_zeros::<f32>(n).unwrap();
+            let lanes_warps = super::mmvq_row_warps(tag, k).unwrap();
+            let mut variants = vec![(format!("mmvq_gguf_{tag}_f32_plain_cuda1"), 1)];
+            for warps in [4usize, 2, 1] {
+                if warps >= lanes_warps && n.is_multiple_of(4 * (4 / warps)) {
+                    let name = match warps {
+                        4 => format!("mmvq_gguf_{tag}_f32_plain_smallk_cuda1"),
+                        w => format!("mmvq_gguf_{tag}_f32_plain_smallk_w{w}_cuda1"),
+                    };
+                    variants.push((name, 4 * (4 / warps)));
+                }
+            }
+            for (name, rows_per_block) in variants {
+                let func = dev.mmvq_fn(&name).unwrap();
+                let cfg = LaunchConfig {
+                    grid_dim: ((n / rows_per_block) as u32, 1, 1),
+                    block_dim: (32, 4, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (k_i, n_i, sy, sd) = (k as i32, n as i32, (k_padded / 32) as i32, n as i32);
+                let launch = |dst: &mut crate::tensor::gpu_runtime::driver::CudaSlice<f32>| {
+                    let mut b = stream.launch_builder(&func);
+                    b.arg(&weights)
+                        .arg(&q8_1)
+                        .arg(dst)
+                        .arg(&k_i)
+                        .arg(&n_i)
+                        .arg(&sy)
+                        .arg(&sd);
+                    unsafe { b.launch(cfg) }.unwrap();
+                };
+                for _ in 0..20 {
+                    launch(&mut dst);
+                }
+                const RUNS: usize = 200;
+                // Timing events: the default flags leave timing on.
+                let flags =
+                    crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                let (a, b) = (
+                    ctx.new_event(Some(flags)).unwrap(),
+                    ctx.new_event(Some(flags)).unwrap(),
+                );
+                a.record(&stream).unwrap();
+                for _ in 0..RUNS {
+                    launch(&mut dst);
+                }
+                b.record(&stream).unwrap();
+                b.synchronize().unwrap();
+                let us = a.elapsed_ms(&b).unwrap() as f64 * 1e3 / RUNS as f64;
+                eprintln!(
+                    "{tag} k={k} n={n}: {name}: {us:.1} us, {:.1} GB/s",
+                    bytes as f64 / us / 1e3
+                );
+            }
+        }
+        // The gate and up pair: two matrices of the shape, one launch.
+        let pairs = [
+            ("q5_0", GgmlDType::Q5_0, 896, 4864),
+            ("q4_k", GgmlDType::Q4K, 1024, 3072),
+            ("q4_k", GgmlDType::Q4K, 2048, 8192),
+        ];
+        for (tag, dtype, k, n) in pairs {
+            let bytes = 2 * n * (k / dtype.block_size()) * dtype.type_size();
+            let gate = stream.alloc_zeros::<u8>(bytes / 2).unwrap();
+            let up = stream.alloc_zeros::<u8>(bytes / 2).unwrap();
+            let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+            let q8_1 = stream.alloc_zeros::<u8>(k_padded / 32 * 36).unwrap();
+            let mut dst = stream.alloc_zeros::<f32>(n).unwrap();
+            let lanes_warps = super::mmvq_row_warps(tag, k).unwrap();
+            for (suffix, warps) in [("", 4usize), ("_w2", 2), ("_w1", 1)] {
+                if warps < lanes_warps {
+                    continue;
+                }
+                let name = format!("mmvq_gguf_pair_{tag}_{tag}_silu{suffix}_cuda1");
+                let func = dev.mmvq_fn(&name).unwrap();
+                let rows_per_block = 4 / warps;
+                let cfg = LaunchConfig {
+                    grid_dim: (n.div_ceil(rows_per_block) as u32, 1, 1),
+                    block_dim: (32, 4, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (k_i, n_i, sy, sd) = (k as i32, n as i32, (k_padded / 32) as i32, n as i32);
+                let launch = |dst: &mut crate::tensor::gpu_runtime::driver::CudaSlice<f32>| {
+                    let mut b = stream.launch_builder(&func);
+                    b.arg(&up).arg(&gate).arg(&q8_1).arg(dst);
+                    b.arg(&k_i).arg(&n_i).arg(&sy).arg(&sd);
+                    unsafe { b.launch(cfg) }.unwrap();
+                };
+                for _ in 0..20 {
+                    launch(&mut dst);
+                }
+                const RUNS: usize = 200;
+                let flags =
+                    crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                let (a, b) = (
+                    ctx.new_event(Some(flags)).unwrap(),
+                    ctx.new_event(Some(flags)).unwrap(),
+                );
+                a.record(&stream).unwrap();
+                for _ in 0..RUNS {
+                    launch(&mut dst);
+                }
+                b.record(&stream).unwrap();
+                b.synchronize().unwrap();
+                let us = a.elapsed_ms(&b).unwrap() as f64 * 1e3 / RUNS as f64;
+                eprintln!(
+                    "pair {tag} k={k} n={n}: {name}: {us:.1} us, {:.1} GB/s",
+                    bytes as f64 / us / 1e3
+                );
+            }
+        }
+    }
 }
 
 /// What resolving a kernel by name costs, per launch.

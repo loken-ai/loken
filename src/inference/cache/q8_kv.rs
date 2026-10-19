@@ -14,7 +14,7 @@ use super::kv_core::{DevPos, KvCore};
 use crate::inference::quantized_cuda::{
     attn_output_q8_0_f32_dev_pos, attn_output_q8_0_f32_gqa, attn_score_q8_0_f32_dev_pos,
     attn_score_q8_0_q8_1_gqa, attn_softmax_output_q8_0_f32_dev_pos, quantize_q8_0_f32_dev_slot,
-    quantize_q8_0_f32_into_offset, MATRIX_ROW_PADDING,
+    quantize_q8_0_f32_into_offset,
 };
 use crate::tensor::cuda_ext::{
     capture_active_on, tensor_from_cuda_storage, CudaSlice, DevicePtr, RawCudaDevice as CudaDevice,
@@ -453,15 +453,13 @@ impl Q8KvCache {
             self.grow_to(need)?;
         }
 
-        // Fast-fast path: single-token decode with row-aligned width AND
-        // not under graph capture -> both K and V quantize launches collapse
-        // into ONE `quantize_q8_0_kv_paired_into_offset` kernel (gridDim.z=2).
-        // Saves 1 launch per layer = 24/token on phi2. Falls back to the
-        // two-call helper for n_new>1, non-aligned widths, or capture mode
-        // (those cases either need staging or dev_slot semantics).
+        // A single-token decode quantises K and V in ONE kernel (gridDim.z=2) straight into
+        // their slots: at a host offset outside capture, at the slot `cur_pos_dev` names at
+        // replay under it. The row is whole blocks (head_dim is), so it is written unpadded.
+        // Several tokens go through the staged quantize and copy.
         let row_width = self.n_kv_heads * self.head_dim;
         let in_capture = capture_active_on(&self.cuda_device.cuda_stream());
-        let paired_ok = n_new == 1 && row_width.is_multiple_of(MATRIX_ROW_PADDING);
+        let paired_ok = n_new == 1;
         if paired_ok && !in_capture {
             self.append_kv_paired_single(k_new, v_new, row_width)?;
         } else if paired_ok && self.core.is_primed() {
@@ -625,10 +623,8 @@ impl Q8KvCache {
         let dst_byte_offset = self.core.len() * token_bytes;
         let copy_bytes = n_new * token_bytes;
 
-        // Fast path: single-token decode where the row width (n_kv x
-        // head_dim) is a multiple of MATRIX_ROW_PADDING. Quantize
-        // directly into the persistent buffer - saves the staging
-        // quantize + memcpy_dtod pair (2 launches -> 1).
+        // Fast path: single-token decode, the row (n_kv x head_dim, whole blocks) quantised
+        // directly into the persistent buffer - saves the staging quantize + copy pair.
         //
         // Two variants depending on capture mode:
         //   - In capture mode: use `quantize_q8_0_f32_dev_slot` which
@@ -642,7 +638,7 @@ impl Q8KvCache {
         //     with the host-int dst_byte_offset (~1 launch saved per
         //     K/V vs the staged path).
         let row_width = self.n_kv_heads * self.head_dim;
-        let direct_write_ok = n_new == 1 && row_width.is_multiple_of(MATRIX_ROW_PADDING);
+        let direct_write_ok = n_new == 1;
         if direct_write_ok {
             let src_view = src_cuda
                 .as_cuda_slice::<f32>()

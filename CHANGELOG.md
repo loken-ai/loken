@@ -29,6 +29,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- CUDA: serve a one-row mat-vec whose row fits one pass of a block at 4 to 16 rows a block.
+- CUDA: fuse a dense decode's gate, up and silu in one launch for 32-value and mixed pairs.
+- CUDA: write a decode token's Q8 keys and values in one launch at any head count.
+- CUDA: add the QKV bias in the mat-vec that projects a decode row.
 - MoE: read each host expert once for all the prompt rows that route to it.
 - Bench: sweep the whole matrix with FULL=1, one fair-run per prompt, in place of campaign.sh.
 - Whisper: transcribe with half-precision weights and a reserved decoder cache.

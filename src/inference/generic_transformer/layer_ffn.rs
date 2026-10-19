@@ -463,37 +463,16 @@ impl GenericTransformerLayer {
                         out
                     }
                 } else {
-                    // Try the fused (up + gate + silu)
-                    // single-kernel MMVQ path when:
-                    //   - seq == 1 (decode, not prefill)
-                    //   - on CUDA
-                    //   - activation is SiLU (use_gelu = false)
-                    //   - both weights are Q4_K QTensors
-                    //   - input is F32
-                    // Returns Ok(None) on any mismatch, falling through to
-                    // the unfused 3-launch chain.
-                    //
-                    // Measured: the substrate kernel
-                    // commit 651de9e1 shipped a BF16-output variant of
-                    // the fused (gate+up+silu) Q4_K kernel. Engine path
-                    // widened to BF16 and tested on deepcoder long  -
-                    // regressed 78.3->76.6 tok/s (-2.2 %). The BF16
-                    // input -> Q8_1 quantize step is measurably slower
-                    // than F32 -> Q8_1, and the downstream cast that was
-                    // supposed to eat the launch save turned out to be
-                    // absent (the reference broadcast_add handles mixed
-                    // dtypes without explicit cast). Net negative.
-                    // Engine gate kept F32-only; BF16 kernel infrastructure
-                    // remains in tree for future BF16
-                    // attempts that might compose differently.
+                    // The fused (up + gate + silu) single-kernel mat-vec for a decode row on
+                    // CUDA with an F32 input; it returns None for a pair it has no kernel for,
+                    // and the unfused 3-launch chain runs.
                     let fused_si = if on_cuda && !use_gelu && x.dim(1).unwrap_or(0) == 1 {
-                        use crate::tensor::quantized::GgmlDType;
                         let gq = self.ffn_gate.as_ref().unwrap().qtensor();
                         let uq = self.ffn_up.qtensor();
+                        // The launch declines a pair of formats it has no kernel for.
                         match (gq, uq) {
                             (Some(gqt), Some(uqt))
-                                if gqt.dtype() == GgmlDType::Q4K
-                                    && uqt.dtype() == GgmlDType::Q4K
+                                if gqt.shape().dims() == uqt.shape().dims()
                                     && x.dtype() == crate::tensor::DType::F32 =>
                             {
                                 use crate::tensor::quantized::QStorage;

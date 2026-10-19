@@ -160,6 +160,40 @@ impl GenericTransformerLayer {
         }
     }
 
+    /// [`Self::try_qkv_shared_q8_1`] with each projection's bias added: in the mat-vec's store
+    /// where it takes the row, by a broadcast add after the shared or the plain product where
+    /// it does not. The same bits as the product followed by the add either way.
+    #[cfg(feature = "gpu")]
+    fn try_qkv_shared_q8_1_bias(
+        &self,
+        x: &Tensor,
+        (bq, bk, bv): (&Tensor, &Tensor, &Tensor),
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        let (Some(wq), Some(wk), Some(wv)) = (
+            self.attn_q.as_ref(),
+            self.attn_k.as_ref(),
+            self.attn_v.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if !x.device().is_cuda() {
+            return Ok(None);
+        }
+        let Some(a) = wq.quantize_for_matvec(&x.contiguous()?)? else {
+            return Ok(None);
+        };
+        let project = |w: &super::projection::QMatMul, b: &Tensor| -> Result<Tensor> {
+            if let Some(y) = w.forward_quantized_bias(&a, b)? {
+                return Ok(y);
+            }
+            match w.forward_quantized(&a)? {
+                Some(y) => y.broadcast_add(b),
+                None => w.forward(x)?.broadcast_add(b),
+            }
+        };
+        Ok(Some((project(wq, bq)?, project(wk, bk)?, project(wv, bv)?)))
+    }
+
     /// Separate Q/K/V projections over one quantisation of `x`: the three `forward`s
     /// would each quantise the same activation. Every output is bit-identical to the
     /// projection's own `forward`. `None` when a weight would not take the mat-vec kernels
@@ -818,17 +852,18 @@ impl GenericTransformerLayer {
 
             // Fused QKV -> F32 flat buffer, unless the caller projected it ahead (the
             // phi2 shared-Q8_1 path, or a verify row).
-            let mut qkv = match &projected {
-                Some(Projected::Qkv(pre)) => pre.clone(),
-                _ => self.attn_qkv.as_ref().unwrap().forward(x)?,
+            // qwen2-family bias: folded into qkv before reshape/cast so the kernel sees Q/K/V
+            // with it, by the projection's own store when it projects here.
+            let bias = self
+                .attn_qkv_bias
+                .as_ref()
+                .filter(|_| self.flags.has_qkv_bias);
+            let qkv = match (&projected, bias) {
+                (Some(Projected::Qkv(pre)), Some(b)) => pre.broadcast_add(b)?,
+                (Some(Projected::Qkv(pre)), None) => pre.clone(),
+                (_, Some(b)) => self.attn_qkv.as_ref().unwrap().forward_bias(x, b)?,
+                (_, None) => self.attn_qkv.as_ref().unwrap().forward(x)?,
             };
-            // qwen2-family bias add: applied to qkv before reshape/cast so
-            // the kernel sees Q/K/V with biases already folded in.
-            if self.flags.has_qkv_bias {
-                if let Some(bqkv) = self.attn_qkv_bias.as_ref() {
-                    qkv = qkv.broadcast_add(bqkv)?;
-                }
-            }
             let total = self.n_head * self.head_dim + 2 * self.n_kv_head * self.head_dim;
             let qkv_flat = qkv.reshape((qkv.elem_count() / total, total))?;
             let qkv_flat = if qkv_flat.dtype() == crate::tensor::DType::F32 {
@@ -1285,12 +1320,30 @@ impl GenericTransformerLayer {
                 Some(Projected::Split(q, k, v)) => Some((q.clone(), k.clone(), v.clone())),
                 _ => None,
             };
+            // A decode row projected here takes its biases in the projections' stores.
             #[cfg(feature = "gpu")]
-            let shared_qkv = ahead.or_else(|| self.try_qkv_shared_q8_1(x).ok().flatten());
+            let biases = match (&self.attn_q_bias, &self.attn_k_bias, &self.attn_v_bias) {
+                (Some(bq), Some(bk), Some(bv)) if self.flags.has_qkv_bias => Some((bq, bk, bv)),
+                _ => None,
+            };
+            #[cfg(feature = "gpu")]
+            let biased = match (&ahead, biases) {
+                (None, Some(b)) => self.try_qkv_shared_q8_1_bias(x, b).ok().flatten(),
+                _ => None,
+            };
+            #[cfg(not(feature = "gpu"))]
+            let biased: Option<(Tensor, Tensor, Tensor)> = None;
+            #[cfg(feature = "gpu")]
+            let shared_qkv = match biased.is_some() {
+                true => None,
+                false => ahead.or_else(|| self.try_qkv_shared_q8_1(x).ok().flatten()),
+            };
             #[cfg(not(feature = "gpu"))]
             let shared_qkv: Option<(Tensor, Tensor, Tensor)> = ahead;
 
-            if let Some((mut q, mut k, mut v)) = shared_qkv {
+            if let Some(qkv) = biased {
+                qkv
+            } else if let Some((mut q, mut k, mut v)) = shared_qkv {
                 // Biases on top of the shared-path outputs (phi2/qwen2 family).
                 if self.flags.has_qkv_bias {
                     if let (Some(bq), Some(bk), Some(bv)) =
