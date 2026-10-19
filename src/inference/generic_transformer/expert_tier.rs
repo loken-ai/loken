@@ -1003,6 +1003,14 @@ impl super::GenericHeteroTransformer {
     /// hottest, within what the decode that follows was seen to need. How many experts were
     /// copied.
     pub fn return_expert_cache(&mut self) -> Result<usize> {
+        // A model with no expert tier lent nothing: the pools and the residency stay as they are.
+        if !self
+            .layers
+            .iter()
+            .any(|l| l.moe.as_ref().is_some_and(|m| m.tier.is_some()))
+        {
+            return Ok(0);
+        }
         for stager in self.card_stagers() {
             stager.note_decode();
         }

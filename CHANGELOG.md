@@ -34,6 +34,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- API: read a checkpoint's declared context once, not on each request past it.
+- Prefill: stop probing and trimming the cards on each request to a dense model.
 - Experts: give the same greedy tokens whichever experts a cached layer holds.
 - Experts: finish moving locked experts before a decode waits on the tier worker.
 - CUDA: record graphs on a stream of their own, out of other threads' work on the card.

@@ -236,10 +236,16 @@ pub(crate) async fn ollama_chat(
         }
     }
 
+    // A model loaded in a language engine was classified as one when it loaded: its files
+    // are not read again to classify each request.
+    let text_loaded = state.serves_text(&model_name).await;
     // Reject non-decoder pipeline components (CLIP, T5, whisper, parler)
     // before they reach the text engine, where the panic-on-missing-
     // weights path would tear down the worker thread.
-    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
+    if let Some(hint) = (!text_loaded)
+        .then(|| non_chat_pipeline_component(&state.huggingface_models_dir, &model_name))
+        .flatten()
+    {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is not a chat model: {hint}",
         )));
@@ -249,7 +255,9 @@ pub(crate) async fn ollama_chat(
     // Returns audio embedded in the response (audios[0] WAV base64) so
     // the chat tab can render an inline playback control. No streaming
     // - TTS engines synth the full utterance up front.
-    if crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name) {
+    if !text_loaded
+        && crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name)
+    {
         let last_user_msg = request
             .messages
             .iter()
@@ -293,7 +301,9 @@ pub(crate) async fn ollama_chat(
 
     // Check if this is an image generation model (e.g., Flux, Z-Image)
     #[cfg(feature = "image")]
-    if crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name) {
+    if !text_loaded
+        && crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name)
+    {
         // Extract prompt and images from last user message. Reject
         // explicitly when no user turn exists - the diffusion engine
         // would otherwise generate from an empty prompt and produce
@@ -944,9 +954,15 @@ pub(crate) async fn ollama_generate(
         }
     }
 
+    // A model loaded in a language engine was classified as one when it loaded: its files
+    // are not read again to classify each request.
+    let text_loaded = state.serves_text(&model_name).await;
     // Same guard as ollama_chat - reject component-only repos before
     // they panic the text engine.
-    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
+    if let Some(hint) = (!text_loaded)
+        .then(|| non_chat_pipeline_component(&state.huggingface_models_dir, &model_name))
+        .flatten()
+    {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is not a generation model: {hint}",
         )));
@@ -955,14 +971,18 @@ pub(crate) async fn ollama_generate(
     // TTS routing - same shape as image-gen, returns audio in the
     // response payload. /api/generate's `prompt` field maps directly
     // to the TTS input text.
-    if crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name) {
+    if !text_loaded
+        && crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name)
+    {
         #[cfg(feature = "audio")]
         return handle_generate_tts(&state, &model_name, &request.prompt).await;
     }
 
     // Check if this is an image generation model (e.g., Flux, Z-Image)
     #[cfg(feature = "image")]
-    if crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name) {
+    if !text_loaded
+        && crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name)
+    {
         return handle_image_generation(&state, &model_name, &request).await;
     }
 

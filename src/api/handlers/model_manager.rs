@@ -6,6 +6,59 @@ use super::*;
 /// Default keep-alive duration in minutes (same as Ollama)
 pub(crate) const DEFAULT_KEEP_ALIVE_MINUTES: i64 = 5;
 
+/// A file's length and modification time: a header read under one stamp answers for the
+/// file while the stamp holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    pub(crate) fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// The context length each checkpoint declares, keyed by its path and remembered while the
+/// file's stamp holds.
+#[derive(Default)]
+pub(crate) struct DeclaredContexts {
+    read: std::sync::Mutex<std::collections::HashMap<PathBuf, (FileStamp, Option<usize>)>>,
+}
+
+impl DeclaredContexts {
+    /// The value remembered for `path` under `stamp`, else the one `read` returns, which is
+    /// then remembered.
+    pub(crate) fn get_or_read(
+        &self,
+        path: &std::path::Path,
+        stamp: FileStamp,
+        read: impl FnOnce() -> Option<usize>,
+    ) -> Option<usize> {
+        if let Some((at, value)) = self
+            .read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+        {
+            if *at == stamp {
+                return *value;
+            }
+        }
+        let value = read();
+        self.read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf(), (stamp, value));
+        value
+    }
+}
+
 /// Declare the engines that can still be holding weights once a request ends.
 ///
 /// One list, expanded into the enum AND into `ALL`, so an engine cannot exist without
@@ -479,14 +532,19 @@ impl APIServer {
     /// matches, or if it's not currently loaded (caller gets the usual
     /// "not loaded" error from `get_engine` afterward).
     /// The context length a model's GGUF header declares, read without loading it.
+    /// Read once per file: a request asking past the loaded window would otherwise parse
+    /// the whole header, vocabulary included, on every call.
     pub(crate) fn declared_context(&self, model_id: &str) -> Option<usize> {
         let path = self.manifest_layer_path(model_id, "model")?;
-        let (meta, _, _, _) = super::ollama::gguf_facts(&path);
-        let meta = meta?;
-        let arch = meta.get("general.architecture")?.as_str()?.to_string();
-        meta.get(&format!("{arch}.context_length"))?
-            .as_u64()
-            .map(|v| v as usize)
+        let stamp = FileStamp::of(&path)?;
+        self.declared_contexts.get_or_read(&path, stamp, || {
+            let (meta, _, _, _) = super::ollama::gguf_facts(&path);
+            let meta = meta?;
+            let arch = meta.get("general.architecture")?.as_str()?.to_string();
+            meta.get(&format!("{arch}.context_length"))?
+                .as_u64()
+                .map(|v| v as usize)
+        })
     }
 
     /// A request's `num_ctx` above the context the engine was configured with reloads it
@@ -1087,6 +1145,43 @@ impl APIServer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_declared_context_is_read_once_per_file_stamp() {
+        use super::{DeclaredContexts, FileStamp};
+        let memo = DeclaredContexts::default();
+        let path = std::path::Path::new("model.gguf");
+        let first = FileStamp {
+            len: 10,
+            modified: None,
+        };
+        let reads = std::cell::Cell::new(0);
+        let read = |v| {
+            reads.set(reads.get() + 1);
+            v
+        };
+        assert_eq!(
+            memo.get_or_read(path, first, || read(Some(32768))),
+            Some(32768)
+        );
+        assert_eq!(memo.get_or_read(path, first, || read(Some(1))), Some(32768));
+        assert_eq!(reads.get(), 1);
+        // A file rewritten under the same path is read again.
+        let rewritten = FileStamp {
+            len: 11,
+            modified: None,
+        };
+        assert_eq!(
+            memo.get_or_read(path, rewritten, || read(Some(8192))),
+            Some(8192)
+        );
+        assert_eq!(reads.get(), 2);
+        // A header with no context is remembered as such.
+        let other = std::path::Path::new("other.gguf");
+        assert_eq!(memo.get_or_read(other, first, || read(None)), None);
+        assert_eq!(memo.get_or_read(other, first, || read(Some(1))), None);
+        assert_eq!(reads.get(), 3);
+    }
+
     #[test]
     fn a_request_goes_to_the_least_taken_copy_and_a_conversation_stays_put() {
         use super::pick_copy;

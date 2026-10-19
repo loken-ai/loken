@@ -104,9 +104,9 @@ pub(super) fn pull_prompt_from_peer(
     if !carries_state && (model.kv_layout().is_none() || !model.capabilities().trim_kv) {
         return;
     }
-    let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(
-        crate::inference::engine::model_backend::PrefillShape::from_widest_ffn(model.widest_ffn()),
-    );
+    // The chunk the model's own prefill runs at, from the same sizing.
+    let chunk =
+        crate::inference::engine::model_backend::adaptive_prefill_chunk(model.prefill_shape());
     let held = if carries_state {
         model.state_snapshot_len(prompt_tokens).unwrap_or(0)
     } else {

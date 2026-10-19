@@ -432,6 +432,8 @@ pub struct APIServer {
     /// where the model is neither absent nor present. A sync mutex, so the RAII guard that
     /// clears it runs in `Drop`.
     loading: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The context length each checkpoint's header declares, read once per file.
+    declared_contexts: Arc<model_manager::DeclaredContexts>,
     /// ONE media job at a time (image / video / audio generation, including its
     /// model load). Media engines each want most of a card; running two at once
     /// cannot fit by construction, and doing it anyway produced the OOM storm that
@@ -1515,6 +1517,7 @@ impl APIServer {
             request_gate,
             loading_locks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             loading: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            declared_contexts: Arc::default(),
             media_gate: Arc::new(tokio::sync::Mutex::new(())),
             media_jobs: Arc::new(std::sync::Mutex::new(MediaJobs::default())),
             // Defaults to off; `configure_auth` applies the config at startup.
@@ -3136,6 +3139,13 @@ fn files_carry_audio(_path: &std::path::Path) -> bool {
 ///
 /// Speech and transcription checkpoints are not refused here: the chat routes send them to
 /// their own handlers.
+impl APIServer {
+    /// Whether `model_name` is loaded in a language engine, which only a text model reaches.
+    pub(crate) async fn serves_text(&self, model_name: &str) -> bool {
+        self.get_engine(model_name).await.is_ok()
+    }
+}
+
 pub(crate) fn non_chat_pipeline_component(hf_models_dir: &str, model_name: &str) -> Option<String> {
     use crate::inference::media_facts::{MediaKind, SpeechModel, TranscriptionModel};
     let kind = media_facts(hf_models_dir, model_name).map(|f| f.kind);

@@ -44,8 +44,16 @@ pub(crate) type BoxedModelBackend = Box<dyn ModelBackend>;
 /// VRAM, so it cannot change between two requests that load nothing - but it was recomputed
 /// per request, and each recomputation probed both cards with a stability loop AND trimmed
 /// the memory pools. Measured at four device probes per `/api/generate`, on every model.
-static CHUNK_MEMO: std::sync::Mutex<Option<(u64, PrefillShape, usize)>> =
+static CHUNK_MEMO: std::sync::Mutex<Option<(u64, PrefillShape, PrefillSizing)>> =
     std::sync::Mutex::new(None);
+
+/// A prefill's starting chunk and the free memory of the tightest card it was sized from, when
+/// a card was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefillSizing {
+    pub chunk: usize,
+    pub tightest_free: Option<u64>,
+}
 
 /// What a model's prefill asks of a card per token, and the chunk it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,25 +117,34 @@ fn remember_shrunk_chunk(used: usize, chunk: usize, rows: usize, free_now: usize
 }
 
 pub(crate) fn adaptive_prefill_chunk(shape: PrefillShape) -> usize {
+    prefill_sizing(shape).chunk
+}
+
+/// [`adaptive_prefill_chunk`] with the free memory it was sized from, memoised against the
+/// residency epoch.
+pub(crate) fn prefill_sizing(shape: PrefillShape) -> PrefillSizing {
     let epoch = crate::inference::place::vram_manager::residency_epoch();
     if let Ok(memo) = CHUNK_MEMO.lock() {
-        if let Some((e, sh, chunk)) = *memo {
+        if let Some((e, sh, sizing)) = *memo {
             if e == epoch && sh == shape {
-                return chunk;
+                return sizing;
             }
         }
     }
-    let chunk = adaptive_prefill_chunk_uncached(shape);
+    let sizing = prefill_sizing_uncached(shape);
     if let Ok(mut memo) = CHUNK_MEMO.lock() {
-        *memo = Some((epoch, shape, chunk));
+        *memo = Some((epoch, shape, sizing));
     }
-    chunk
+    sizing
 }
 
-fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
+fn prefill_sizing_uncached(shape: PrefillShape) -> PrefillSizing {
     let per_token = shape.bytes_per_token;
     if per_token == 0 {
-        return PREFILL_CHUNK_TOKENS;
+        return PrefillSizing {
+            chunk: PREFILL_CHUNK_TOKENS,
+            tightest_free: None,
+        };
     }
     // What the pools still hold from the last request is free for this one: it is handed back
     // before the cards are measured, so a request is sized from what the cards have and not
@@ -141,7 +158,10 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
     if free == 0 {
         // No CUDA, or nothing to probe: the host path is bounded by RAM, which this is not
         // measuring, so keep the conservative default rather than inventing a number.
-        return PREFILL_CHUNK_TOKENS;
+        return PrefillSizing {
+            chunk: PREFILL_CHUNK_TOKENS,
+            tightest_free: None,
+        };
     }
     let raw = (free / shape.share.max(1)).saturating_sub(shape.fixed_bytes) / per_token;
     let top = shape.target_chunk.max(2048);
@@ -151,7 +171,7 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
         per_token,
         shape.fixed_bytes as f64 / 1e6
     );
-    if raw >= top {
+    let chunk = if raw >= top {
         top
     } else if raw >= 2048 {
         2048
@@ -163,6 +183,10 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
         // Below the default the ladder in `forward_prefill_chunked` takes over, but starting
         // it lower saves the passes that would only have failed.
         raw.max(PREFILL_CHUNK_TOKENS_MIN)
+    };
+    PrefillSizing {
+        chunk,
+        tightest_free: Some(free as u64),
     }
 }
 
@@ -316,7 +340,8 @@ pub(crate) trait ModelBackend: Send {
         index_pos: usize,
     ) -> crate::tensor::Result<Tensor> {
         let (_, seq_len) = x.dims2()?;
-        let chunk_start = adaptive_prefill_chunk(self.prefill_shape());
+        let sizing = prefill_sizing(self.prefill_shape());
+        let chunk_start = sizing.chunk;
         // A prompt that fits one chunk runs as one forward; a longer one starts from the last
         // chunk that fit this model, clamped into [MIN, default]. Each out-of-memory failure
         // halves the chunk down to the floor and replays the prefill from `index_pos`, which
@@ -327,15 +352,17 @@ pub(crate) trait ModelBackend: Send {
             let sh = self.prefill_shape();
             (sh.bytes_per_token, sh.fixed_bytes)
         };
-        let free_now =
-            crate::inference::place::vram_manager::free_on_cards(self.prefill_shape().cards)
-                as usize;
-        let first = if seq_len <= chunk_start {
-            seq_len
-        } else {
-            start_chunk(chunk_start, per_token, free_now)
+        // The cards are measured only for a prompt longer than one chunk: one that fits starts
+        // at its own length whatever they hold.
+        let cards = self.prefill_shape().cards;
+        let free_at_start = || crate::inference::place::vram_manager::free_on_cards(cards) as usize;
+        let free_now = (seq_len > chunk_start).then(free_at_start);
+        let first = match free_now {
+            None => seq_len,
+            Some(free) => start_chunk(chunk_start, per_token, free),
         };
         let mut replay = false;
+        let mut replay_measures = false;
         let (logits, chunk_tokens) = crate::inference::place::recover::shrink_on_oom(
             "prefill",
             first,
@@ -358,9 +385,13 @@ pub(crate) trait ModelBackend: Send {
                 // A card with room for the pass three times over is not drained behind each stage
                 // of a layer.
                 let pass = ((chunk * per_token.max(1) + fixed) as u64).saturating_mul(3);
-                let room = crate::inference::place::vram_manager::tightest_free_on_cards(
-                    self.prefill_shape().cards,
-                );
+                // The reading the chunk was sized from stands while the residency does; a
+                // replay after a failure measures again.
+                let room = match sizing.tightest_free.filter(|_| !replay_measures) {
+                    Some(free) => free,
+                    None => crate::inference::place::vram_manager::tightest_free_on_cards(cards),
+                };
+                replay_measures = true;
                 crate::inference::generic_transformer::set_prefill_settle(room < pass);
                 let r = self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk);
                 crate::inference::generic_transformer::set_prefill_settle(false);
@@ -368,7 +399,16 @@ pub(crate) trait ModelBackend: Send {
             },
         )?;
         // Remember a chunk that had to shrink, so later requests start at it.
-        remember_shrunk_chunk(chunk_tokens, chunk_start, seq_len, free_now);
+        // A prompt that fit one chunk measured nothing at its start: its cards are read once it
+        // had to shrink.
+        if chunk_tokens < chunk_start && chunk_tokens < seq_len {
+            remember_shrunk_chunk(
+                chunk_tokens,
+                chunk_start,
+                seq_len,
+                free_now.unwrap_or_else(free_at_start),
+            );
+        }
         Ok(logits)
     }
 

@@ -1046,9 +1046,9 @@ pub(crate) fn kv_reuse_start(
     // reassociated arithmetic flips greedy argmax wherever the top two candidates are
     // close. Rounding down makes the warm tail exactly cold's tail chunks - a fixed
     // remainder was measured insufficient, since any shape difference reassociates.
-    let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(
-        crate::inference::engine::model_backend::PrefillShape::from_widest_ffn(model.widest_ffn()),
-    );
+    // The chunk the model's own prefill runs at, from the same sizing.
+    let chunk =
+        crate::inference::engine::model_backend::adaptive_prefill_chunk(model.prefill_shape());
     // A snapshot of another conversation that shares more of this prompt than the
     // resident KV does becomes the resident: the resident sequence itself was copied
     // aside when its request ended, so nothing is lost by the swap.
