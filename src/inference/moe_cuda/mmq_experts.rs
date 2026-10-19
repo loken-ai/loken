@@ -193,7 +193,8 @@ impl MmqRouting {
         Ok(plan)
     }
 
-    /// Force the tile width (a measurement knob; 0 restores the launcher's choice).
+    /// Ask for a tile width (a measurement knob; 0 restores the launcher's choice): the launcher
+    /// takes the narrowest width the card builds at or above it.
     pub fn with_tile_width(mut self, mmq_x: i32) -> Self {
         self.mmq_x = mmq_x;
         self

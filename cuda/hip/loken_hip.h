@@ -70,7 +70,7 @@
 #define cudaFuncSetAttribute(f, a, v) hipFuncSetAttribute(reinterpret_cast<const void*>(f), a, v)
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncAttributes hipFuncAttributes
-#define cudaFuncGetAttributes(attr, f) hipFuncGetAttributes(attr, reinterpret_cast<const void*>(f))
+#define cudaFuncGetAttributes(attr, f) loken_hip_func_attributes(attr, reinterpret_cast<const void*>(f))
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
@@ -83,6 +83,16 @@
 #define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamCaptureStatus hipStreamCaptureStatus
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+
+// A kernel's attributes, with no PTX version: a HIP kernel is built for an AMD target, so a test
+// for the PTX a CUDA kernel was built from does not take an NVIDIA-only path.
+#if !defined(__HIPCC_RTC__)
+static inline hipError_t loken_hip_func_attributes(hipFuncAttributes* attr, const void* f) {
+    const hipError_t e = hipFuncGetAttributes(attr, f);
+    attr->ptxVersion = 0;
+    return e;
+}
+#endif
 
 // Types.
 typedef __hip_bfloat16 __nv_bfloat16;

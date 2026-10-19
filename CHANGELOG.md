@@ -6,6 +6,9 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- ROCm: run the grouped-query prefill attention on AMD matrix cores.
+- ROCm: run the DiT flash attention on AMD matrix cores.
+- ROCm: run the MoE prefill over quantised experts on AMD matrix cores.
 - ROCm: run the IMMA Q4_K and Q5_K matrix products on AMD matrix cores.
 - ROCm: run the AWQ W4A16 GEMM on AMD matrix cores.
 - ROCm: replay the recorded decode step on AMD cards.
@@ -35,6 +38,9 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- ROCm: keep AMD builds of a kernel off the paths chosen by PTX version.
+- Indexer: fit the WMMA attention of prompt rows in 64 KB of shared memory.
+- Experts: take the narrowest tile the card builds at or above a requested width.
 - API: read a checkpoint's declared context once, not on each request past it.
 - Prefill: stop probing and trimming the cards on each request to a dense model.
 - Experts: give the same greedy tokens whichever experts a cached layer holds.

@@ -1190,10 +1190,10 @@ inline __device__ void dequantize_block_nibble_K(const void * __restrict__ vx, d
 // rest of the formats rather than inside whichever kernel happens to want them.
 
 /// The scale the whole block shares: lane zero reads the two bytes it occupies and hands it to
-/// the rest of the warp.
+/// the rest of its 32 lanes, which on a 64-lane wave is the half that holds the block.
 static __device__ __forceinline__ float block_scale_broadcast(const uint8_t * b) {
     const half d = (threadIdx.x == 0) ? *(const half *) b : (half) 0.0f;
-    return __half2float(__shfl_sync(0xFFFFFFFF, d, 0));
+    return __half2float(__shfl_sync(0xFFFFFFFF, d, 0, 32));
 }
 
 /// Q8_0: a signed byte and one scale for the block.

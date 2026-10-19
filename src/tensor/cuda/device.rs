@@ -534,6 +534,14 @@ impl CudaDevice {
         self.has_ampere_tensor_cores() || self.has_amd_matrix_cores()
     }
 
+    /// Whether this card runs the 16-bit float matrix kernels with bf16 operands (the MoE
+    /// prefill over quantised experts, the DiT and GQA prefill flash attention): an NVIDIA card
+    /// from sm_80, which has the bf16 fragments they are written in, or an AMD card with matrix
+    /// instructions, which has bf16 ones of its own.
+    pub fn has_bf16_matrix_cores(&self) -> bool {
+        self.has_ampere_tensor_cores() || self.has_amd_matrix_cores()
+    }
+
     pub fn mmq_device_info(&self) -> Result<MmqDeviceInfo> {
         if let Some(i) = self.mmq_info.get() {
             return Ok(*i);

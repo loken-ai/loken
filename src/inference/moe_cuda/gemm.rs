@@ -214,10 +214,11 @@ pub fn moe_gemm_gguf(
     // MXFP4 experts have no WMMA prefill kernel; route prefill through the
     // (row-per-warp) mmvq path too. Correct numerics, slightly slower prefill  -
     // acceptable since decode is the bottleneck and prefill is infrequent.
-    // The WMMA prefill kernel needs bf16 fragments, which are Ampere and above; below that
-    // the family ships no code at all, so a Turing card takes the mmvq path for prefill too.
+    // The WMMA prefill kernel needs bf16 fragments: an NVIDIA card from Ampere or an AMD card
+    // with matrix instructions. Elsewhere the family ships no code, so such a card takes the
+    // mmvq path for prefill too.
     let is_prefill =
-        is_prefill && weights.dtype() != GgmlDType::MxFp4 && dev.has_ampere_tensor_cores();
+        is_prefill && weights.dtype() != GgmlDType::MxFp4 && dev.has_bf16_matrix_cores();
     let weight_ptr = weights.device_ptr()?;
     let scale = opt_f32_addr(topk_weights.as_ref(), "topk_weights")?;
     let (slots, experts) = plan_addrs(sorted_token_ids, experts_ids)?;

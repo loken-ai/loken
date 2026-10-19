@@ -206,9 +206,9 @@ pub fn flash_dit_bf16(
     if k.dims4()? != v.dims4()? {
         return Ok(None);
     }
-    // The kernel is written in NVIDIA's warp-matrix instructions: another runtime has no build
-    // of it.
-    if !q.device().is_nvidia() {
+    // The kernel has an NVIDIA build and an AMD build for cards with matrix instructions; any
+    // other card has no build of it.
+    if !q.device().is_nvidia() && !q.device().as_cuda_device()?.has_bf16_matrix_cores() {
         return Ok(None);
     }
     // This kernel ships SASS only for the architectures whose shared memory fits its

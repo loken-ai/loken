@@ -495,7 +495,7 @@ mod tests {
         // the only one, and there is nothing to compare it with.
         if !card
             .as_cuda_device()
-            .is_ok_and(|d| d.has_ampere_tensor_cores())
+            .is_ok_and(|d| d.has_bf16_matrix_cores())
         {
             return;
         }

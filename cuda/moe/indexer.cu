@@ -782,9 +782,14 @@ extern "C" void loken_selected_attn_group(
 #define SELROWS_W_TLD (SELROWS_W_HD + 4)       // floats a row of the values' weighted sum
 #define SELROWS_W_GMAX 16
 
-// Bytes of shared memory a block needs.
+// Bytes of shared memory a block needs, within the 64 KB a block has on every card: the partial
+// scores and the weighted sums share the keys' tile, which is dead once the scores are taken.
 #define SELROWS_W_SMEM (2 * 16 * SELROWS_W_LD * 2 + 2 * SELROWS_W_CELLS * SELROWS_W_LD * 2 \
-                      + 16 * SELROWS_W_TLD * 4 + 2 * 16 * SELROWS_W_PHLD * 2 + 3 * 16 * 4)
+                      + 2 * 16 * SELROWS_W_PHLD * 2 + 3 * 16 * 4)
+static_assert(16 * SELROWS_W_TLD * 4 <= SELROWS_W_CELLS * SELROWS_W_LD * 2
+                  && 4 * 16 * SELROWS_W_PLD * 4 <= SELROWS_W_CELLS * SELROWS_W_LD * 2,
+              "the scores and the sums fit the keys' tile");
+static_assert(SELROWS_W_SMEM <= 64 * 1024, "a block's shared memory fits every card");
 
 extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_wmma_kernel(
         const float * __restrict__ q, const __half * __restrict__ kbuf,
@@ -798,8 +803,8 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_wmma_
     __half * ql = qh + 16 * SELROWS_W_LD;                             // [16][LD] query, low half
     __half * ks = ql + 16 * SELROWS_W_LD;                             // [CELLS][LD]
     __half * vs = ks + SELROWS_W_CELLS * SELROWS_W_LD;                  // [CELLS][LD]
-    float * work = (float *) (vs + SELROWS_W_CELLS * SELROWS_W_LD);     // partial scores, then the sums
-    __half * ph = (__half *) (work + 16 * SELROWS_W_TLD);             // [16][PHLD] probabilities
+    float * work = (float *) ks;                                     // partial scores, then the sums
+    __half * ph = vs + SELROWS_W_CELLS * SELROWS_W_LD;                 // [16][PHLD] probabilities
     __half * pl = ph + 16 * SELROWS_W_PHLD;
     float * stats = (float *) (pl + 16 * SELROWS_W_PHLD);             // m[16], l[16], alpha[16]
     const int row = blockIdx.x, kvh = blockIdx.y, t = threadIdx.x;
@@ -860,6 +865,8 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_wmma_
                 wmma::load_matrix_sync(fa, ql + d0, SELROWS_W_LD);
                 wmma::mma_sync(fc, fa, fb, fc);
             }
+            // every warp is done reading the keys the scores overwrite
+            __syncthreads();
             wmma::store_matrix_sync(work + kg * 16 * SELROWS_W_PLD + nt * 16, fc, SELROWS_W_PLD,
                                     wmma::mem_row_major);
         }

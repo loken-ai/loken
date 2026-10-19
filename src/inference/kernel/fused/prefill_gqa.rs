@@ -62,33 +62,7 @@ pub fn flash_prefill_gqa(
     scale: f32,
     window: usize,
 ) -> Result<Option<Tensor>> {
-    if q.device().is_cuda() && !q.device().is_nvidia() {
-        return through_wmma(q, k, v, scale, window);
-    }
     Ok(run(q, k, v, scale, window, None)?.map(|(out, _)| out))
-}
-
-/// The same attention through the WMMA flash prefill, which compiles for AMD's matrix cores:
-/// its `[1, n_head, seq_q, hd]` answer laid out as [`flash_prefill_gqa`] returns it.
-fn through_wmma(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    scale: f32,
-    window: usize,
-) -> Result<Option<Tensor>> {
-    let (_, n_head, seq_q, hd) = q.dims4()?;
-    let n_kv = k.dims4()?.1;
-    let window = i32::try_from(window).unwrap_or(i32::MAX);
-    let Some(out) = super::flash_prefill_f16(q, k, v, n_head, n_kv, scale, window)? else {
-        return Ok(None);
-    };
-    Ok(Some(
-        out.transpose(1, 2)?
-            .contiguous()?
-            .reshape((1, seq_q, n_head * hd))?
-            .to_dtype(DType::F32)?,
-    ))
 }
 
 /// The attention of `q` `[1, n_head, seq_q, hd]` over `k`, `v` as [`flash_prefill_gqa`] reads
@@ -133,10 +107,10 @@ fn run(
 ) -> Result<Option<(Tensor, Option<Tensor>)>> {
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
-    // The kernel is written in NVIDIA's own matrix instructions; another runtime keeps the
-    // caller's path.
+    // The kernel has an NVIDIA build and an AMD build for cards with matrix instructions; any
+    // other card keeps the caller's path.
     if !q.device().is_cuda()
-        || !q.device().is_nvidia()
+        || !(q.device().is_nvidia() || q.device().as_cuda_device()?.has_bf16_matrix_cores())
         || k.dtype() != DType::F16
         || v.dtype() != DType::F16
     {

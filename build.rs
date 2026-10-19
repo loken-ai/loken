@@ -169,10 +169,10 @@ const ROCM_ARCHS: [&str; 11] = [
 /// The kernel families every AMD card serves, compiled with hipcc for the targets of
 /// `LOKEN_ROCM_ARCHS` (comma separated) or, without it, every target of [`ROCM_ARCHS`]. The
 /// sources are the CUDA build's, read through `cuda/hip`, which gives the CUDA names their HIP
-/// meaning; the kernels in NVIDIA's own instructions are left out, `cuda/marlin/marlin_amd.cu`
-/// and `cuda/moe/imma_amd.cu` give the matrix-instruction ones AMD versions, and
-/// `cuda/hip/nvidia_only.cpp` stands for the launchers of the rest. HIP has no static runtime:
-/// a ROCm build links `libamdhip64`.
+/// meaning; the kernels in NVIDIA's own instructions are left out, and the `_amd` sources
+/// (`cuda/marlin/marlin_amd.cu`, `cuda/moe/imma_amd.cu`, `cuda/moe/moe_wmma_amd.cu`,
+/// `cuda/flash_prefill_gqa_amd.cu`, `cuda/flash_dit_amd.cu`) give them AMD versions with the
+/// same entry points. HIP has no static runtime: a ROCm build links `libamdhip64`.
 ///
 /// Beside the CUDA kernels, every symbol the objects define takes the prefix `loken_hip_`, so the
 /// two libraries do not clash, and every call they make into `libamdhip64` goes through a
@@ -226,10 +226,11 @@ fn compile_hip_kernels() {
     sources.extend([
         "cuda/flashdecode_tc/flashdecode_tc.cu",
         "cuda/flash_prefill_f16.cu",
-        "cuda/flash_prefill_gqa.cu",
+        "cuda/flash_prefill_gqa_amd.cu",
+        "cuda/flash_dit_amd.cu",
         "cuda/marlin/marlin_amd.cu",
         "cuda/moe/imma_amd.cu",
-        "cuda/hip/nvidia_only.cpp",
+        "cuda/moe/moe_wmma_amd.cu",
     ]);
     println!("cargo:rerun-if-changed=cuda/hip");
     let mut flags: Vec<String> = vec!["-x".into(), "hip".into()];

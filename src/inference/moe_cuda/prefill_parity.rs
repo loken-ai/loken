@@ -16,8 +16,9 @@
 //! also ride whatever the ambient TF32 setting is, so the same inputs stop giving the same
 //! answer when something else on the device has changed that flag.
 //!
-//! The tensor-core path needs Ampere; below that both calls take the same kernel and the
-//! comparison says nothing, which is why the capability is checked and reported.
+//! The tensor-core path needs bf16 matrix instructions (NVIDIA from Ampere, AMD with matrix
+//! cores); without them both calls take the same kernel and the comparison says nothing, which
+//! is why the capability is checked and reported.
 
 use crate::tensor::quantized::{GgmlDType, QTensor};
 use crate::tensor::{DType, Device, Tensor};
@@ -26,10 +27,10 @@ use std::sync::Arc;
 /// A card the comparison means something on, or the reason this run judges nothing.
 ///
 /// Both halves of the skip matter and they are different failures. With no card there is
-/// nothing to run at all; with a pre-Ampere card the two calls resolve to the SAME kernel, so
+/// nothing to run at all; with a card lacking bf16 matrix instructions the two calls resolve to the SAME kernel, so
 /// the run is green without having compared anything - which is the more dangerous of the two
 /// and the reason neither is silent. `what` names the coverage the caller is losing.
-fn ampere_card(what: &str) -> Option<Device> {
+fn matrix_card(what: &str) -> Option<Device> {
     let Some(dev) = crate::tensor::cuda::CudaDevice::new(0)
         .ok()
         .map(Device::Cuda)
@@ -37,7 +38,7 @@ fn ampere_card(what: &str) -> Option<Device> {
         eprintln!("no CUDA device; {what} NOT covered by this run");
         return None;
     };
-    if !dev.as_cuda_device().unwrap().has_ampere_tensor_cores() {
+    if !dev.as_cuda_device().unwrap().has_bf16_matrix_cores() {
         eprintln!(
             "no bf16 fragments on this card; both calls take the decode path, \
              so this run judges nothing"
@@ -218,7 +219,7 @@ impl Case {
 
 #[test]
 fn the_prefill_expert_gemm_agrees_with_the_decode_one_on_the_same_weights() {
-    let Some(dev) = ampere_card("the expert GEMMs are") else {
+    let Some(dev) = matrix_card("the expert GEMMs are") else {
         return;
     };
 
@@ -278,7 +279,7 @@ fn read_only_experts(dtype: GgmlDType, experts: usize, rows: usize, k: usize) ->
 /// is held to blocks cut from real files.
 #[test]
 fn the_expert_gemms_read_the_low_bit_formats_as_the_host_decodes_them() {
-    let Some(dev) = ampere_card("the low-bit expert formats are") else {
+    let Some(dev) = matrix_card("the low-bit expert formats are") else {
         return;
     };
     let (n_tokens, topk, experts, rows, k) = (5usize, 2usize, 4usize, 64usize, 512usize);
@@ -366,7 +367,7 @@ fn the_expert_gemms_read_the_low_bit_formats_as_the_host_decodes_them() {
 /// would only ever catch the interleaving.
 #[test]
 fn the_expert_gemm_holds_up_when_several_threads_share_the_stream() {
-    let Some(dev) = ampere_card("the shared staging buffer is") else {
+    let Some(dev) = matrix_card("the shared staging buffer is") else {
         return;
     };
 
@@ -429,10 +430,12 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
         eprintln!("no CUDA device; the expert offsets are NOT covered by this run");
         return;
     };
-    // The builder lives in the Ampere set of kernels: below sm_80 it ships no code and a
-    // launch only reports the card.
-    if !dev.has_ampere_tensor_cores() {
-        eprintln!("no Ampere code on this card; the expert offsets are NOT covered by this run");
+    // The builder lives with the bf16 matrix kernels: a card without them has no code for it
+    // and a launch only reports the card.
+    if !dev.has_bf16_matrix_cores() {
+        eprintln!(
+            "no bf16 matrix code on this card; the expert offsets are NOT covered by this run"
+        );
         return;
     }
 

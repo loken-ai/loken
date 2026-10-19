@@ -242,10 +242,10 @@ static void mmq_moe_launch_tile(const char *x, const char *x_second, int64_t dst
 /// `ncols_max` is the run length the grid is sized for: a longer run is still covered whole,
 /// its blocks taking several column tiles each. `ncols_hint` is the run length the width is
 /// chosen for: the widest tile that still fits shared memory, cut back to the narrowest one
-/// covering the run in as few tiles. `mmq_x` forces a width when it is non-zero. A non-null
-/// `x_second` is a second stack of the same shape multiplied against the same columns in the
-/// same launch, its results `dst_second` floats after the first's. Returns the width launched,
-/// or 0 when none fits and nothing ran.
+/// covering the run in as few tiles. A non-zero `mmq_x` asks for a width: the narrowest one the
+/// card builds and fits at or above it. A non-null `x_second` is a second stack of the same
+/// shape multiplied against the same columns in the same launch, its results `dst_second`
+/// floats after the first's. Returns the width launched, or 0 when none fits and nothing ran.
 template <ggml_type type>
 static int mmq_moe_launch(const char *x, const char *x_second, int64_t dst_second,
                           const int *y, float *dst, const int *expert_bounds,
@@ -269,7 +269,7 @@ static int mmq_moe_launch(const char *x, const char *x_second, int64_t dst_secon
             continue;
         }
         if (mmq_x != 0) {
-            if (w == mmq_x) {
+            if (w >= mmq_x && best == 0) {
                 best = w;
             }
             continue;
