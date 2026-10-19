@@ -273,17 +273,23 @@ enum QuantizeSrc<'a> {
     F16(crate::tensor::gpu_runtime::driver::CudaView<'a, half::f16>),
 }
 
+/// The lent pools made so far, by card ordinal.
+#[cfg(feature = "gpu")]
+fn lent_pools() -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, usize>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOLS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    POOLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// The memory pool of card `ordinal` that holds the blobs lent to a prefill (made on first use).
 #[cfg(feature = "gpu")]
 fn lent_pool(ordinal: usize) -> Result<crate::tensor::gpu_runtime::driver::sys::CUmemoryPool> {
     use crate::tensor::gpu_runtime::driver::sys;
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static POOLS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-    let mut pools = POOLS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut pools = lent_pools();
     if let Some(&p) = pools.get(&ordinal) {
         return Ok(p as sys::CUmemoryPool);
     }
@@ -302,13 +308,22 @@ fn lent_pool(ordinal: usize) -> Result<crate::tensor::gpu_runtime::driver::sys::
     Ok(pool)
 }
 
-/// `bytes` zeroed bytes from the memory pool of the card that holds only what is lent.
+/// `bytes` zeroed bytes from the memory pool of the card that holds only what is lent. A card
+/// without a stream-ordered allocator takes them from the card's own allocations, which free
+/// their memory to the card on release.
 #[cfg(feature = "gpu")]
 fn lent_blob(
     device: &CudaDevice,
     bytes: usize,
 ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<u8>> {
     use crate::tensor::gpu_runtime::driver::sys;
+    if !device.0.context().has_async_alloc() {
+        return device
+            .0
+            .stream()
+            .alloc_zeros::<u8>(bytes)
+            .map_err(|e| Error::msg(format!("lent blob: {e:?}")));
+    }
     let pool = lent_pool(device.0.ordinal())?;
     device
         .0
@@ -336,9 +351,13 @@ fn lent_blob(
 /// Give the card `ordinal` the memory the lent pool still holds after its blobs were freed.
 #[cfg(feature = "gpu")]
 pub(crate) fn trim_lent_pool(ordinal: usize) {
-    if let Ok(pool) = lent_pool(ordinal) {
+    let pool = lent_pools().get(&ordinal).copied();
+    if let Some(pool) = pool {
         unsafe {
-            let _ = crate::tensor::gpu_runtime::driver::sys::cuMemPoolTrimTo(pool, 0);
+            let _ = crate::tensor::gpu_runtime::driver::sys::cuMemPoolTrimTo(
+                pool as crate::tensor::gpu_runtime::driver::sys::CUmemoryPool,
+                0,
+            );
         }
     }
 }

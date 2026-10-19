@@ -38,6 +38,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- ROCm: take lent expert blobs outside the stream-ordered pool on AMD cards.
 - ROCm: keep AMD builds of a kernel off the paths chosen by PTX version.
 - Indexer: fit the WMMA attention of prompt rows in 64 KB of shared memory.
 - Experts: take the narrowest tile the card builds at or above a requested width.
