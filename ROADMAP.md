@@ -1,170 +1,173 @@
 # Roadmap
 
 What the next releases bring, feature by feature. [`CHANGELOG.md`](CHANGELOG.md) lists what is
-done; [`docs/STATUS.md`](docs/STATUS.md) says what is measured. A feature is done when its
-acceptance is met and measured; until then it stays here with its state.
+done; [`docs/STATUS.md`](docs/STATUS.md) says what is measured. A feature is done when
+what its "Done when" column says is true and measured; until then it stays here with its state.
 
 A state is one word: Done, Partial (what is left is a feature of a later version), Started,
 Planned, or Waiting (for the hardware to measure it on).
 
 ## 0.3.0
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| One model across several machines, cut by layer | Cluster | A model no single machine serves well, cut across machines from each one's measured layer cost, faster than the best machine alone | Done |
-| Tensor parallelism in the generic path | Parallelism | A layer's dense projections split across cards inside the one placement path, any number of cards, mixtures included | Done |
-| Expert parallelism | Parallelism | A mixture layer's experts split across cards where measured links make it pay | Partial |
-| Pipeline parallelism across machines | Cluster | A chain of any length, the prompt-lookup verify crossing every cut | Done |
-| Data parallelism | Parallelism | Copies of a model served side by side, requests spread over them | Done |
-| Context parallelism | Parallelism | A long context's attention split across cards | Done |
-| Prefill and decode on different instances | Serving | A prompt read on one instance and decoded on another, its state handed over | Partial |
-| CUDA on the published cudarc crate | Backends | No patched fork, graphs still recorded and replayed | Done |
-| A Linux binary | Packaging | One archive that starts on a machine without CUDA libraries and serves on the CPU, and a second that adds them for the cards | Done |
-| CPU kernels chosen at run time | CPU | One binary serving AVX2 and AVX-512 machines, the level capped by configuration | Done |
-| Qwen3.8 at full speed | Performance | The IQ1_M and UD-Q4_K_XL Qwen3.8 files at or above the reference engine on one and on two cards of a machine where the reference runs, both measured the same day | Partial |
-| A coding agent on large models | Agents | verve completing a multi-step task on the IQ1_M and UD-Q4_K_XL Qwen3.8 files and on DeepSeek V4.1, tool calls and reasoning kept apart | Done |
-| A faster test suite | Tests | The checks a change must pass in a fraction of today's time | Done |
+| One model across several machines, cut by layer | Cluster | A model too big for one machine runs across several, faster than on the best machine alone. | Done |
+| Tensor parallelism in the generic path | Parallelism | A model runs split across any number of cards, MoE models included. | Done |
+| Expert parallelism | Parallelism | A MoE model's experts are spread across cards when that is faster. | Partial |
+| Pipeline parallelism across machines | Cluster | A chain of any number of machines serves one model, with speculative decoding still working. | Done |
+| Data parallelism | Parallelism | Several copies of a model share the incoming requests. | Done |
+| Context parallelism | Parallelism | A long context's attention is split across cards. | Done |
+| Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Partial |
+| CUDA on the published cudarc crate | Backends | loken builds on the published cudarc crate, with no patched fork, and graphs still work. | Done |
+| A Linux binary | Packaging | One Linux archive runs on the CPU anywhere; a second one adds the CUDA libraries. | Done |
+| CPU kernels chosen at run time | CPU | One binary picks AVX2 or AVX-512 on the machine it runs on. | Done |
+| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on one and two cards. | Partial |
+| A coding agent on large models | Agents | verve finishes a multi-step task on Qwen3.8 and DeepSeek V4.1. | Done |
+| A faster test suite | Tests | The tests a change must pass run in a fraction of the old time. | Done |
 
 ## 0.4.0
 
 Major, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| ROCm and Vulkan backends | Backends | One loken binary drives every card the machine has, NVIDIA through CUDA and AMD through ROCm at the same time (one model split over a GeForce and a Radeon), and runs everything the CUDA path runs on AMD cards (every model family and every kernel, the NVIDIA tensor-core ones ported to the AMD matrix units), with the CUDA tests passing on an AMD card; one model of each family also served through Vulkan on an NVIDIA card, an AMD card and an Intel GPU that shares the host's memory; all measured against the CUDA path and the reference engine on the same cards | Started |
-| Coding agents beyond verve | Agents | opencode, Claude Code and Cline completing the verve task on a Qwen3.8 file and on DeepSeek V4.1, each through its own protocol | Planned |
-| Forecasting and tabular models | Models | Time series forecasts and tabular predictions served beside the language models, measured against naive baselines | Partial |
+| One binary for NVIDIA and AMD cards | Backends | One binary uses NVIDIA and AMD cards at the same time, and one model can run across both. | Started |
+| Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Started |
+| A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card. | Planned |
+| Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
+| Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Planned |
+| Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
 
 Smaller, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| AVX-512 host kernels for the IQ formats | CPU | The IQ2_S, IQ3_XXS and IQ4_NL expert products faster on an AVX-512 host than its AVX2 path, measured on the same host | Planned |
-| The OpenCL path brought back | Backends | A language and an image model served on an Intel GPU that shares the host's memory through the OpenCL path, that memory counted once by the placement, measured against the host | Partial |
-| A routing profile kept per model | Performance | The profile of each model written and read back without configuration, so a restart starts with a warm expert cache | Done |
-| Qwen3.8 IQ1_M on one card at the reference | Performance | The reference engine's own bench (128-token replies, 3k and 13k prompts) at or above it on one card it runs on, measured the same day: decode and first token | Planned |
-| Context parallelism inside the recorded step | Parallelism | The decode of a context cut over the cards replayed as a graph, within a tenth of an uncut cache's speed | Planned |
-| Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcripts of a 20-clip set at or below the reference's word error rate, with their real-time factor, committed | Planned |
-| Ultravox on its own | Audio | One pull or checkpoint directory serves an audio turn with no GGUF supplied beside it | Done |
-| Media input limits | API | Per-request caps on images, pixels and audio seconds, stated in the docs, a request past one answered 400 with the reason | Done |
-| Images by URL on the Messages API | API | An image block with a URL source fetched within the host allowlist and answered | Done |
-| Multimodal parts on the Responses API | API | Image and audio input items answered as on chat completions, covered by a test | Done |
-| Generated audio as mp3 and flac | Audio | The audio generations route answers the format asked, mp3 and flac besides wav, as the speech route does | Done |
-| MIDI at the tempo asked | Music | A MIDI render carries the tempo the request names instead of a fixed one | Done |
-| Audio models in half precision | Audio | The Stable Audio, EzAudio and ACE-Step weights held in F16 rather than widened to F32, Stable Audio resident in 2.5 GB at most | Planned |
+| AVX-512 host kernels for the IQ formats | CPU | IQ2_S, IQ3_XXS and IQ4_NL experts run faster with AVX-512 than with AVX2 on the same machine. | Planned |
+| The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU, faster than on its CPU. | Partial |
+| A routing profile kept per model | Performance | After a restart, a model's expert cache is already warm, with no setting needed. | Done |
+| Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
+| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
+| Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcribe a 20-clip set as well as the reference implementation. | Planned |
+| Ultravox on its own | Audio | An Ultravox checkpoint answers audio with no extra GGUF beside it. | Done |
+| Media input limits | API | A request with too many images, pixels or audio seconds gets a 400 that names the limit. | Done |
+| Images by URL on the Messages API | API | The Messages API reads an image from a URL on an allowed host. | Done |
+| Multimodal parts on the Responses API | API | The Responses API reads images and audio as chat completions does. | Done |
+| Generated audio as mp3 and flac | Audio | Generated audio comes back as wav, mp3 or flac, as asked. | Done |
+| MIDI at the tempo asked | Music | A MIDI render has the tempo the request asks for. | Done |
+| Audio models in half precision | Audio | Stable Audio, EzAudio and ACE-Step keep their weights in F16, and Stable Audio fits in 2.5 GB. | Planned |
 
 ## 0.5.0
 
 Major, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Throughput serving | Serving | Continuous batching with chunked prefill and multi-step scheduling: a concurrent load of many requests served at the reference server's throughput on the same card | Planned |
-| Video input | Multimodal input | A video turn read by a model's vision tower, frames sampled by the model's own rule, answers matching the reference implementation | Planned |
-| Speculation for every model | Speculation | A draft model or head found or built for any served model, its windows verified as a tree, faster than plain decode on each family | Planned |
+| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Planned |
+| Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Planned |
+| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Planned |
 
 Smaller, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Sleep mode | Serving | A model unloaded to host memory on idle and back on the next request, the reload time logged | Planned |
-| Per-request metrics | Operations | Queue, prefill, decode and cache figures per request on the metrics endpoint | Planned |
-| Beam search | Decoding | n beams with length penalty, the result equal to the reference implementation's | Planned |
-| Prompt embeddings | API | A request that hands embeddings instead of tokens, answered as for the tokens they stand for | Planned |
-| Streamed speech | Audio | The first audio chunk of a speech request before a tenth of its render time, opus, flac and aac besides wav and mp3 | Planned |
-| Audio from a chat turn | Audio | A chat completion asking for text and audio modalities returns the audio in its message | Planned |
-| Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other | Planned |
-| Streamed music | Music | A streamed music request's first audio bytes arrive before the render ends, within a fifth of its time | Planned |
-| Several takes at once | Music | n renders with different seeds in less than n times one render's time, each listed in the answer | Planned |
-| Audio-conditioned sound | Audio | A reference clip conditions Stable Audio and EzAudio, a repaint keeping the clip outside its span (SNR above 30 dB) | Planned |
-| MIDI in | Music | A MIDI file given as the prompt continues for the bars asked, in its tempo and key | Planned |
-| Expert parallelism for resident experts | Parallelism | A mixture layer whose experts all fit on the cards split across them where measured links make it pay, faster than the layer on one card | Planned |
-| Prefill hand-over for split layers and cut caches | Serving | A layer split over cards and a cache cut by positions handed over from the prefill instance, the decode instance reading no prompt | Planned |
-| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, with the same vectors as the original code, and the bench measures it | Planned |
-| Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker, through a documented route, and the bench measures it | Planned |
-| Embeddings measured by the bench | Bench | The bench measures every embedding model (inputs per second, latency) and compares it with the other servers that run it | Planned |
-| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song no slower than 1.2x the original code on the same card, and the log shows the time of each step | Planned |
-| Music editing | Music | The music route can repaint, extend, cover, add a track (lego), split tracks (extract) and complete a song, each giving what the original code gives | Planned |
-| ACE-Step adapters | Models | A style LoRA trained for ACE-Step can be applied at load or per request, and its style is audible against the plain render | Planned |
-| Tabular models | Models | Predictions for rows of a table served beside the language models, and better than a simple baseline on a fixed data set | Planned |
+| Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
+| Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Planned |
+| Beam search | Decoding | Beam search gives the same result as the reference implementation. | Planned |
+| Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Planned |
+| Streamed speech | Audio | Speech starts playing before a tenth of its render time, in opus, flac, aac, wav or mp3. | Planned |
+| Audio from a chat turn | Audio | A chat completion can answer with text and audio. | Planned |
+| Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |
+| Streamed music | Music | Streamed music starts within a fifth of its render time. | Planned |
+| Several takes at once | Music | n music takes with different seeds take less than n times one take. | Planned |
+| Audio-conditioned sound | Audio | A reference clip guides Stable Audio and EzAudio, and a repaint leaves the rest of the clip intact. | Planned |
+| MIDI in | Music | A MIDI file given as the prompt continues in its tempo and key. | Planned |
+| Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
+| Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
+| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Planned |
+| Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker. | Planned |
+| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
+| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
+| Music editing | Music | The music route can repaint, extend, cover, add a track, split tracks and complete a song. | Planned |
+| ACE-Step adapters | Models | A style LoRA for ACE-Step changes the sound of a render. | Planned |
+| Tabular models | Models | loken predicts rows of a table and beats a simple baseline on a fixed data set. | Planned |
 
 ## 0.6.0
 
 Major, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| A cluster that survives a node | Cluster | A node lost mid-request re-planned onto the others and the request finished, the loss reported | Planned |
-| A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an authenticated, encrypted link, and the placement accounts for the slower links | Planned |
-| Tensor parallelism across machines | Cluster | One layer split over cards of several machines where the measured links pay, faster than the layer cut alone | Planned |
-| More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints loaded through the same placement, outputs matching the reference implementation | Planned |
+| A cluster that survives a node | Cluster | When a machine drops out mid-request, the others finish the request. | Planned |
+| A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an encrypted link. | Planned |
+| Tensor parallelism across machines | Cluster | A layer split across the cards of several machines runs faster than the layer cut alone. | Planned |
+| More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
 
 Smaller, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Adapters per request | Models | Several text adapters served over one base model, each request naming its own | Planned |
-| Pooling and classification | API | The classify, score and pooling routes over the loaded models | Planned |
-| Encoder-decoder models | Models | A sequence-to-sequence family served for text and speech, matching the reference implementation | Planned |
-| Vision and video speed | Performance | A one-megapixel image's first token within 1.2x of the reference engines, a video clip's time within 1.2x with its decoder on the card | Planned |
-| Image and sound quality measured | Quality | Image families scored by PSNR or LPIPS against their reference, music and sound families by a committed metric set | Planned |
-| Longer sound | Audio | A sound or Stable Audio request past today's caps renders its whole length without an audible seam | Planned |
-| Another music family | Music | One more open music family rendering through the audio generations route on the placement ladder | Planned |
-| Audio speed published | Performance | The real-time factor of each music and sound family on a named card in the benchmarks | Planned |
+| Adapters per request | Models | Several text adapters share one base model, and each request picks its own. | Planned |
+| Pooling and classification | API | The classify, score and pooling routes work on the loaded models. | Planned |
+| Encoder-decoder models | Models | An encoder-decoder family serves text and speech as the reference implementation does. | Planned |
+| Vision and video speed | Performance | An image or a video clip is read at most 1.2x slower than the reference engines. | Planned |
+| Image and sound quality measured | Quality | Every image, music and sound family has a quality score against its reference. | Planned |
+| Longer sound | Audio | A long sound renders in one piece, with no audible seam. | Planned |
+| Another music family | Music | One more open music family renders through the music route. | Planned |
+| Audio speed published | Performance | The benchmarks show each music and sound family's speed on a named card. | Planned |
 
 ## 0.7.0
 
 Major, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| A native Windows server | Packaging | The server built, installed and run as a service on Windows with CUDA, at the Linux build's speed on the same card | Planned |
-| Quantisation from the command line | Quantisation | A checkpoint quantised to a chosen format with an importance matrix, its quality scored against the original | Planned |
+| A native Windows server | Packaging | The server runs as a Windows service with CUDA, as fast as on Linux. | Planned |
+| Quantisation from the command line | Quantisation | One command quantises a checkpoint, and its quality is scored against the original. | Planned |
 
 Smaller, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Web search and fetch tools | Tools | Built-in tools a request may enable, their calls and results logged as tool turns | Planned |
-| A build with vision input alone | Packaging | A build that reads images in chat without the generation pipelines | Planned |
+| Web search and fetch tools | Tools | A request can turn on web search and fetch, and each call is logged. | Planned |
+| A build with vision input alone | Packaging | A smaller build reads images in chat without the generation pipelines. | Planned |
 
 ## 0.8.0
 
 Major, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Fine-tuning of adapters | Models | A text adapter trained on the local cards from a dataset, served at once, its loss and quality measured | Planned |
-| loken as a tool server | Tools | loken's models and media pipelines offered to agents as MCP tools, each call within the server's limits | Planned |
+| Fine-tuning of adapters | Models | A text adapter trains on the local cards and is served right away, its quality measured. | Planned |
+| loken as a tool server | Tools | Agents can call loken's models and media pipelines as MCP tools. | Planned |
 
 Smaller, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Energy-aware placement | Operations | A placement that trades speed for watts when asked, both measured | Planned |
-| Quotas per key | Operations | Token and request budgets per API key, enforced and reported | Planned |
+| Energy-aware placement | Operations | On request, the placement saves watts at some cost in speed, both measured. | Planned |
+| Quotas per key | Operations | Each API key has a token and request budget that loken enforces. | Planned |
 
 ## 0.9.0
 
 Major, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| Routing between families | Models | One model name sends each request to the member best suited to it, logs the choice, and scores better than each member alone for less than running them all | Planned |
-| A supermodel from several families | Models | Several models of different families (for example Llama, Mistral, Qwen, DeepSeek) answer together as one model, choosing each word together, and score better than each of them alone on a fixed task set | Planned |
-| A mixture of experts built from several families | Models | Models of different families joined into one mixture of experts: one shared tokenizer, a small projection in and out of each member, a router that picks the members for each request, the new parts trained with the training of 0.8.0, and the result scoring better than each member alone | Planned |
+| Routing between families | Models | One model name sends each request to the best member, beats each member alone, and costs less than running them all. | Planned |
+| A supermodel from several families | Models | Models of different families choose each word together and beat each of them alone. | Planned |
+| A mixture of experts built from several families | Models | Models of different families join one trained mixture of experts that beats each of them alone. | Planned |
 
 Smaller, by priority:
 
-| Feature | Category | Acceptance | State |
+| Feature | Category | Done when | State |
 |---|---|---|---|
-| A supermodel distilled into one | Models | One member is trained (with the adapter training of 0.8.0) to answer like the group, and scores close to it on its own | Planned |
+| A supermodel distilled into one | Models | One model trained to answer like the group scores close to the group on its own. | Planned |
 
 ## Waiting for hardware
 
 Features that cannot be measured on the machines at hand; each moves into a version once a machine
 to measure it on is available.
 
-| Feature | Acceptance | Needs |
+| Feature | Done when | Needs |
 |---|---|---|---|
-| A backend for Apple silicon | Backends | One model of each family served through Metal on an M-series Mac by the same placement path, measured against the reference engine on that Mac | Waiting |
+| A backend for Apple silicon | Backends | One model of each family runs through Metal on an Apple Silicon Mac. | Waiting |
