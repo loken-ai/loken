@@ -28,6 +28,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Audio: prompt Voxtral in its own instruction format, not the file's template.
 - Bench: never stamp an earlier result with a build that measured nothing.
 
 ### Removed

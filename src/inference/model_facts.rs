@@ -311,10 +311,16 @@ pub struct AudioFacts {
     /// window is full and each yields the same number of embeddings. Otherwise only the last
     /// window is short and yields what its frames give.
     pub pads_to_window: bool,
+    /// The model is prompted in the bracket instruction format its vocabulary's markers spell
+    /// (`[INST]...[/INST]`, a system turn in `[SYSTEM_PROMPT]`), whatever chat template the
+    /// file carries.
+    pub instruction_format: bool,
 }
 
 const AUDIO: &[(&str, AudioFacts)] = &[
     // Padded to whole 30 s windows; the audio sits between a begin marker and the question.
+    // The family's turns carry no default system prompt; the published GGUF's template is
+    // another model's and writes one.
     (
         "voxtral",
         AudioFacts {
@@ -322,6 +328,7 @@ const AUDIO: &[(&str, AudioFacts)] = &[
             placeholder: "[AUDIO]",
             begin: "[BEGIN_AUDIO]",
             pads_to_window: true,
+            instruction_format: true,
         },
     ),
     // Not padded: the last window carries its own length. The placeholder is not a
@@ -333,6 +340,7 @@ const AUDIO: &[(&str, AudioFacts)] = &[
             placeholder: "<|audio|>",
             begin: "",
             pads_to_window: false,
+            instruction_format: false,
         },
     ),
 ];
@@ -396,8 +404,8 @@ mod tests {
 
     #[test]
     fn a_speech_projector_has_one_row() {
-        assert!(audio_facts("voxtral").is_some_and(|f| f.pads_to_window));
-        assert!(audio_facts("ultravox").is_some_and(|f| !f.pads_to_window));
+        assert!(audio_facts("voxtral").is_some_and(|f| f.pads_to_window && f.instruction_format));
+        assert!(audio_facts("ultravox").is_some_and(|f| !f.pads_to_window && !f.instruction_format));
         assert!(audio_facts("pixtral").is_none());
     }
 

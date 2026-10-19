@@ -1158,6 +1158,8 @@ pub struct AudioInput {
     pub placeholder: String,
     /// Written before the placeholder, empty for none.
     pub begin: String,
+    /// Every turn is written in the bracket instruction format, not by the file's template.
+    pub instruction_format: bool,
 }
 
 /// Moondream legacy path (original PyTorch state-dict naming GGUF).
@@ -1692,6 +1694,7 @@ impl ModelBackend for GenericBackend {
             sample_rate: tower.sample_rate(),
             placeholder: tower.facts().placeholder.to_string(),
             begin: tower.facts().begin.to_string(),
+            instruction_format: tower.facts().instruction_format,
         })
     }
 

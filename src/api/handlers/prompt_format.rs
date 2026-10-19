@@ -98,17 +98,20 @@ pub(crate) fn template_from_vocabulary(markers: &str) -> Option<String> {
     if let Some(format) = FORMATS.iter().find(|f| holds(f)) {
         return Some(format.concat());
     }
-    // The instruction format: every bracket marker the vocabulary holds, which is what
-    // `format_mistral_tools` reads the system, call and result spelling from.
-    if markers.contains("[INST]") {
-        let brackets: String = FORMAT_MARKERS
+    instruction_markers(markers)
+}
+
+/// The fingerprint of the bracket instruction format: every bracket marker the vocabulary
+/// holds, which is what `format_mistral_tools` reads the system, call and result spelling
+/// from. `None` when the vocabulary holds no `[INST]`.
+pub(crate) fn instruction_markers(markers: &str) -> Option<String> {
+    markers.contains("[INST]").then(|| {
+        FORMAT_MARKERS
             .iter()
             .filter(|m| m.starts_with('[') && m.ends_with(']') && markers.contains(*m))
             .copied()
-            .collect();
-        return Some(brackets);
-    }
-    None
+            .collect()
+    })
 }
 
 /// Format chat messages into a prompt string using Mistral/Llama chat template.

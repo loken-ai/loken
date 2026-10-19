@@ -242,6 +242,16 @@ fn with_audio_sentinel(messages: &[Message], sentinel: &str) -> Vec<Message> {
     msgs
 }
 
+/// The template a prompt is rendered with: the format's own, or, for a model prompted in
+/// the bracket instruction format, that format's fingerprint from the vocabulary's markers,
+/// which routes the render to its writer.
+pub(crate) fn prompt_template(format: &ChatFormat, instruction_format: bool) -> Option<String> {
+    instruction_format
+        .then(|| instruction_markers(&format.vocabulary))
+        .flatten()
+        .or_else(|| format.effective_template())
+}
+
 /// Whether any user turn carries audio.
 pub(crate) fn carries_audio(messages: &[Message]) -> bool {
     messages
@@ -392,20 +402,23 @@ impl APIServer {
         spec: &PromptSpec<'_>,
     ) -> PreparedPrompt {
         let format = self.chat_format_for(model_name).await;
-        let template = format.effective_template();
         let vision = match engine {
             Some(e) if carries_images(spec.messages) => e.is_qwen35_vision().await,
             _ => false,
         };
+        let tower = match engine {
+            Some(e) => e.audio_input().await,
+            None => None,
+        };
+        let template = prompt_template(
+            &format,
+            tower.as_ref().is_some_and(|a| a.instruction_format),
+        );
         // What opens a clip and marks where its embeddings go, as the loaded model's tower
         // declares it.
-        let audio = match engine {
-            Some(e) if carries_audio(spec.messages) => e
-                .audio_input()
-                .await
-                .map(|a| format!("{}{}", a.begin, a.placeholder)),
-            _ => None,
-        };
+        let audio = tower
+            .filter(|_| carries_audio(spec.messages))
+            .map(|a| format!("{}{}", a.begin, a.placeholder));
         build_prompt(
             spec,
             template.as_deref(),
@@ -513,6 +526,41 @@ mod tests {
         let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", false, None);
         assert!(!p.prompt.contains("<a><b>"));
         assert_eq!(last_user_audio(&msgs), Some("AAAA"));
+    }
+
+    /// A model prompted in the bracket instruction format is rendered by that format's
+    /// writer, not by a file template that writes a default system turn; any other model
+    /// keeps its file's template.
+    #[test]
+    fn an_instruction_format_model_ignores_the_files_template() {
+        let format = ChatFormat {
+            template: Some(
+                "{% set default_system_message = 'You are an agent.' %}{{ bos_token }}\
+                 [SYSTEM_PROMPT]{{ default_system_message }}[/SYSTEM_PROMPT]\
+                 {% for m in messages %}[INST]{{ m.content }}[/INST]{% endfor %}"
+                    .to_string(),
+            ),
+            vocabulary: "[INST][SYSTEM_PROMPT][TOOL_CALLS]".to_string(),
+        };
+        let mut clip = user("Transcribe this audio", None);
+        clip.audios = Some(vec!["AAAA".to_string()]);
+        let msgs = [clip];
+        let render = |instruction_format: bool| {
+            let template = prompt_template(&format, instruction_format);
+            build_prompt(
+                &spec(&msgs, None, None),
+                template.as_deref(),
+                &format.vocabulary,
+                false,
+                Some("[BEGIN_AUDIO][AUDIO]"),
+            )
+            .prompt
+        };
+        assert_eq!(
+            render(true),
+            "[INST][BEGIN_AUDIO][AUDIO]Transcribe this audio[/INST]"
+        );
+        assert!(render(false).contains("You are an agent."));
     }
 
     /// `none` switches tools off in both dialects, and a structured output wins over a
