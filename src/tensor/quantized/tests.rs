@@ -171,6 +171,7 @@ use super::*;
 /// The tiled matmul at the shapes a prompt of a real model gives it: an output a few thousand
 /// wide, in many tiles, and a row count that fills no tile. Each row agrees with the mat-vec of
 /// that row alone.
+#[cfg(feature = "gpu")]
 #[test]
 fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_at_model_shapes() {
     if !crate::cpu::hardware_has_avx2() {
