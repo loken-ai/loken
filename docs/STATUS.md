@@ -137,8 +137,39 @@ Voxtral and Ultravox towers are read from an `mmproj` GGUF or a checkpoint direc
 dimension taken from the file, and spliced into a chat turn. The mel features and the towers are
 held against the reference implementation at rounding level on toy towers
 (`tests/vectors/audio_in/`). An Ultravox checkpoint serves alone: its text model is the safetensors
-checkpoint its config names, found in the hub cache or pulled with it. No real-checkpoint transcript
-or timing is committed.
+checkpoint its config names, found in the hub cache or pulled with it. A Voxtral model is prompted
+in the bracket instruction format whatever template its file carries: the published GGUF holds
+another model's template, whose default system prompt made the model answer the clip instead of
+transcribing it.
+
+Real checkpoints against the reference implementation (transformers 4.57.1, F32), 2026-10-19:
+the 20 clips of `bench/asr/librispeech-20/` (183 s), each sent as one chat turn of an audio part
+and a text part, greedy, at most 256 tokens. Both sides run on the CPU of an i9-10900K shared
+with other jobs, so the real-time factor (wall time over clip time) is indicative. Words are
+lowercased with punctuation removed on both sides. "On task" leaves out the clips where either
+side answers or comments instead of transcribing (errors at least the clip's word count).
+
+| Model | Prompt | Side | WER | Errors per clip | WER on task | Clips on task | RTF |
+|---|---|---|---:|---:|---:|---:|---:|
+| Voxtral Mini 3B | Transcribe this audio | reference | 20.4% | 5.05 | 7.4% | 18 | 3.96 |
+| Voxtral Mini 3B | Transcribe this audio | loken | 33.8% | 8.35 | 1.6% | 18 | 5.82 |
+| Ultravox 0.5 1B | Repeat exactly what the speaker says. | reference | 22.9% | 5.65 | 2.6% | 16 | 1.64 |
+| Ultravox 0.5 1B | Repeat exactly what the speaker says. | loken | 41.1% | 10.15 | 3.6% | 16 | 1.33 |
+| Ultravox 0.5 1B | Transcribe this audio | reference | 356% | 88.0 | - | 1 | 6.74 |
+| Ultravox 0.5 1B | Transcribe this audio | loken | 370% | 91.4 | - | 1 | 2.77 |
+
+On the clips both sides transcribe, loken is within a quarter of a word per clip of the reference
+or better. The whole-set gap is one clip per model where both sides answer instead of
+transcribing and loken's answer is longer: 2830-3979-0000 for Voxtral (159 errors against 13),
+1995-1826-0000 for Ultravox (141 against 27). loken runs the published Q4_K_M Voxtral file and holds
+the Ultravox text model in Q4_K, the reference both in F32, so an off-task answer takes another
+course. Ultravox answers "Transcribe this audio" with commentary on nearly every clip on both sides,
+which leaves that prompt nothing to compare but the length of the commentary. Between a Voxtral
+request's arrival and its prefill, where the clip is decoded and the speech tower runs on its 30 s
+window, loken spends 29 to 74 s (median 36 s): most of its time per clip.
+
+`scripts/asr_chat.py` reproduces loken's side against a running lokend
+(`--model`, `--prompt`, `--port`).
 
 ## The qwen4exp family
 

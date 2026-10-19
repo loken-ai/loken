@@ -45,8 +45,9 @@ perf.data*
 *.webp
 *.bmp
 *.wav
-# The golden recording the ASR bench cells transcribe.
+# The golden recording the ASR bench cells transcribe, and the clip set of the audio-input check.
 !bench/asr/*.wav
+!bench/asr/librispeech-20/*.wav
 *.mp3
 *.flac
 *.ogg
