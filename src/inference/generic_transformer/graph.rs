@@ -477,18 +477,6 @@ impl GenericHeteroTransformer {
     /// than logged here so the caller decides where it surfaces; `graph_capture_auto_on`
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
-        #[cfg(feature = "gpu")]
-        if self
-            .layers
-            .iter()
-            .any(|l| l.cos.device().is_cuda() && !l.cos.device().is_nvidia())
-            || self
-                .cuda_devices
-                .values()
-                .any(|d| d.is_cuda() && !d.is_nvidia())
-        {
-            return Err("this GPU runtime replays no captured decode step yet");
-        }
         // A sink layer's step is not captured: its replay, which reads the length on the
         // device, costs more than the eager step, whose attention is GPU-bound.
         if self.captured_layers().any(|l| l.attn_sinks.is_some()) {

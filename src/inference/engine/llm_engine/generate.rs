@@ -1236,6 +1236,9 @@ impl LlmEngine {
                                             if agrees {
                                                 graph_validations += 1;
                                                 graph_kept = false;
+                                                if graph_validations == GRAPH_VALIDATIONS {
+                                                    info!("graph replays matched the eager step {GRAPH_VALIDATIONS} times by pos={pos}");
+                                                }
                                             } else {
                                                 warn!("CUDA graph replay!=eager at pos={pos} (argmax {:?} vs {}); the step is recorded again, the request decodes eagerly after repeated disagreements",
                                                     rep_argmax, eag_argmax);

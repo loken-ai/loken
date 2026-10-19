@@ -453,6 +453,10 @@ impl<T> Drop for CudaSlice<T> {
             return;
         }
         let ctx = &self.stream.ctx;
+        // A buffer released while its card captures stays allocated for the captured graph.
+        if super::capture_hold::hold(ctx.cu_device, self.cu_device_ptr) {
+            return;
+        }
         ctx.record_err(ctx.bind_to_thread());
         ctx.record_err(unsafe { result::free_sync(self.cu_device_ptr) });
     }

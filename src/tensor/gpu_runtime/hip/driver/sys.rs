@@ -56,6 +56,7 @@ crate::tensor::gpu_runtime::hip::dynamic_api! {
         fn hipStreamBeginCapture(s: CUstream, mode: c_int) -> c_int;
         fn hipStreamEndCapture(s: CUstream, g: *mut CUgraph) -> c_int;
         fn hipStreamIsCapturing(s: CUstream, status: *mut c_int) -> c_int;
+        fn hipStreamGetDevice(s: CUstream, d: *mut c_int) -> c_int;
         fn hipEventCreateWithFlags(e: *mut CUevent, flags: c_uint) -> c_int;
         fn hipEventRecord(e: CUevent, s: CUstream) -> c_int;
         fn hipEventRecordWithFlags(e: CUevent, s: CUstream, flags: c_uint) -> c_int;
@@ -1035,11 +1036,24 @@ pub unsafe fn cuStreamIsCapturing(
 }
 
 pub unsafe fn cuStreamBeginCapture_v2(stream: CUstream, mode: CUstreamCaptureMode) -> CUresult {
-    unsafe { hip!(hipStreamBeginCapture(stream, mode as c_int)) }
+    let r = unsafe { hip!(hipStreamBeginCapture(stream, mode as c_int)) };
+    if r == CUresult::CUDA_SUCCESS {
+        super::capture_hold::begin(stream);
+    }
+    r
 }
 
 pub unsafe fn cuStreamEndCapture(stream: CUstream, graph: *mut CUgraph) -> CUresult {
-    unsafe { hip!(hipStreamEndCapture(stream, graph)) }
+    let mut g: CUgraph = std::ptr::null_mut();
+    let r = unsafe { hip!(hipStreamEndCapture(stream, &mut g)) };
+    let g = if r == CUresult::CUDA_SUCCESS {
+        g
+    } else {
+        std::ptr::null_mut()
+    };
+    super::capture_hold::end(stream, g);
+    unsafe { *graph = g };
+    r
 }
 
 pub unsafe fn cuEventRecordWithFlags(event: CUevent, stream: CUstream, flags: c_uint) -> CUresult {
@@ -1124,6 +1138,9 @@ pub unsafe fn cuGraphExecUpdate_v2(
             }
         };
     }
+    if r == CUresult::CUDA_SUCCESS && outcome == 0 {
+        super::capture_hold::updated(exec, graph);
+    }
     r
 }
 
@@ -1132,15 +1149,23 @@ pub unsafe fn cuGraphInstantiateWithFlags(
     graph: CUgraph,
     flags: u64,
 ) -> CUresult {
-    unsafe { hip!(hipGraphInstantiateWithFlags(exec, graph, flags)) }
+    let r = unsafe { hip!(hipGraphInstantiateWithFlags(exec, graph, flags)) };
+    if r == CUresult::CUDA_SUCCESS {
+        super::capture_hold::instantiated(graph, unsafe { *exec });
+    }
+    r
 }
 
 pub unsafe fn cuGraphExecDestroy(exec: CUgraphExec) -> CUresult {
-    unsafe { hip!(hipGraphExecDestroy(exec)) }
+    let r = unsafe { hip!(hipGraphExecDestroy(exec)) };
+    super::capture_hold::exec_destroyed(exec);
+    r
 }
 
 pub unsafe fn cuGraphDestroy(graph: CUgraph) -> CUresult {
-    unsafe { hip!(hipGraphDestroy(graph)) }
+    let r = unsafe { hip!(hipGraphDestroy(graph)) };
+    super::capture_hold::graph_destroyed(graph);
+    r
 }
 
 pub unsafe fn cuGraphLaunch(exec: CUgraphExec, stream: CUstream) -> CUresult {
