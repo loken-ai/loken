@@ -12,25 +12,26 @@ use super::CUDA_QUANTIZE_BLOCK_SIZE;
 
 use super::pad_to as pad;
 
-/// Grow-only Q8_1 scratch for the quantized activation, one per STREAM.
+/// Grow-only Q8_1 scratch for the quantized activation, one per stream.
 ///
-/// Per device was wrong: a device carries as many streams as it has users - a language model
-/// and an image engine on one card, two requests in flight - and each quantises its own
-/// activation into this buffer before reading it back in the next kernel. The host mutex
-/// orders the entry, and the entry is all it orders: a launch returns before it runs.
-///
-/// The tiled matmul's workspace has the same hazard and is fixed by an event, because it is
-/// megabytes and cannot be duplicated per stream. This one is kilobytes - `k` padded, over
-/// blocks of 32, at 36 bytes each - so giving each stream its own removes the sharing rather
-/// than sequencing it. That also keeps this path capturable: a decode runs inside a CUDA
-/// graph, and waiting there on an event recorded outside the capture invalidates it.
-static WORKSPACE: OnceLock<Mutex<std::collections::HashMap<(usize, usize), Arc<CudaSlice<u8>>>>> =
-    OnceLock::new();
+/// Every user of a card shares the card's stream: a language model and an image engine on one
+/// card, two requests in flight, two models in two threads. Each quantises its own activation
+/// into this buffer and reads it back in the next kernel, so the map's lock is held from the
+/// quantisation's launch to the launch of the kernel that reads it (see [`Workspace`]): the
+/// stream then runs the two before the next user's quantisation, with no event, which keeps
+/// the path capturable. A graph recorded on the card replays the two in one launch.
+static WORKSPACE: OnceLock<Mutex<Workspaces>> = OnceLock::new();
 
-fn workspace_ensure(
-    dev: &tensor::cuda::CudaDevice,
-    min_bytes: usize,
-) -> Result<Arc<CudaSlice<u8>>> {
+type Workspaces = std::collections::HashMap<(usize, usize), Arc<CudaSlice<u8>>>;
+
+/// The scratch of one stream, with the lock that keeps the other users of the stream from
+/// queueing their own quantisation into it until the reader of this one is queued.
+struct Workspace {
+    _order: std::sync::MutexGuard<'static, Workspaces>,
+    slice: Arc<CudaSlice<u8>>,
+}
+
+fn workspace_ensure(dev: &tensor::cuda::CudaDevice, min_bytes: usize) -> Result<Workspace> {
     use crate::tensor::gpu_runtime::driver::sys::CUstream;
     let map = WORKSPACE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
@@ -42,7 +43,8 @@ fn workspace_ensure(
             .map_err(|er| Error::msg(format!("fast_mmvq workspace: {er}")))?;
         g.insert(key, Arc::new(fresh));
     }
-    Ok(g[&key].clone())
+    let slice = g[&key].clone();
+    Ok(Workspace { _order: g, slice })
 }
 
 /// Pre-size the per-device scratch (model load).
@@ -177,7 +179,9 @@ fn try_fused(
 
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let scratch_bytes = (k_padded / Q8_1_BLOCK_SIZE) * Q8_1_TYPE_SIZE;
-    let scratch = workspace_ensure(&dev, scratch_bytes)?;
+    // Held until the fused kernel that reads the scratch is queued.
+    let workspace = workspace_ensure(&dev, scratch_bytes)?;
+    let scratch = &workspace.slice;
 
     // 1) quantize activation -> Q8_1 scratch
     let q_cfg = LaunchConfig {

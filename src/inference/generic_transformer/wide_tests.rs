@@ -1471,3 +1471,42 @@ fn a_forward_run_again_gathers_the_same_ngram_rows() {
         "a position the history never stood at is still refused"
     );
 }
+
+/// Two copies of the toy decoding at once on one card, from two threads, give the logits each
+/// gives alone: the copies share the card's stream and the scratch kept for it.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn two_models_decoding_at_once_on_a_card_give_the_logits_each_gives_alone() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let decode = || -> Vec<Vec<f32>> {
+        let mut m = toy_on(Some(0));
+        let card = m.layers[0].cos.device();
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let input = Tensor::from_vec(vec![*t], (1, 1), &card).unwrap();
+                let got = m.forward(&input, i).unwrap();
+                got.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            })
+            .collect()
+    };
+    let alone = decode();
+    for round in 0..4 {
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(decode);
+            let b = s.spawn(decode);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        for (name, got) in [("first", a), ("second", b)] {
+            let differing = (0..tokens.len()).find(|&i| got[i] != alone[i]);
+            assert_eq!(
+                differing, None,
+                "round {round}: the {name} copy departs from the lone decode"
+            );
+        }
+    }
+}
