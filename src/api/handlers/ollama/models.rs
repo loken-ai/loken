@@ -728,6 +728,23 @@ pub(crate) async fn ollama_pull_model(
         metadata.size / (1024 * 1024)
     );
 
+    // A media checkpoint is loaded by its own route on first request, not as a language model.
+    let media = crate::api::handlers::media_catalogue::media_checkpoint(
+        &state.huggingface_models_dir,
+        &model_name,
+    )
+    .and_then(|dir| crate::inference::media_facts::read(&dir));
+    if media.is_some() {
+        info!("   PULL complete: a media checkpoint, loaded on first request");
+        return Ok(Json(OllamaPullResponse {
+            status: "success".to_string(),
+            digest: Some(metadata.id),
+            total: Some(metadata.size),
+            completed: Some(metadata.size),
+        })
+        .into_response());
+    }
+
     // 2. Load model into memory (like Ollama does)
     info!("   Step 2: Loading model into memory...");
 
