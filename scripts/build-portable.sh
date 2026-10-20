@@ -22,10 +22,14 @@
 # compiler and the CUDA toolkit. The CUDA toolkit is read from CUDA_PATH, else from nvcc.
 #
 # Settings (environment):
-#   BASE_IMAGE       image the container build starts from (default ubuntu:22.04)
+#   BASE_IMAGE       image the container build starts from (default ubuntu:22.04, or the ROCm
+#                    development image of the host's ROCm version when FEATURES holds rocm)
 #   CPU_BASELINE     value of -C target-cpu for the CPU kernels (default x86-64-v3: AVX2, FMA, BMI2)
 #   MAX_GLIBC        highest glibc symbol version the binaries may need (default 2.34)
-#   FEATURES         cargo features, comma separated (default: the crate's defaults)
+#   FEATURES         cargo features, comma separated (default: the crate's defaults plus rocm
+#                    when hipcc is found, so one binary serves NVIDIA and AMD cards)
+#   ROCM_PATH        ROCm root, read from hipcc when unset
+#   LOKEN_ROCM_ARCHS AMD targets to build for (default: every target build.rs lists)
 #   CUDA_PATH        CUDA toolkit root
 #   NCCL_LIB         path of libnccl.so.2 to bundle (default: the one ldconfig lists, if any)
 #   CARGO_TARGET_DIR build directory (default: target in the repository)
@@ -43,10 +47,26 @@ case "${1:-}" in
     *) echo "usage: $0 [--host]" >&2; exit 2 ;;
 esac
 
-BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
 CPU_BASELINE="${CPU_BASELINE:-x86-64-v3}"
 MAX_GLIBC="${MAX_GLIBC:-2.34}"
+crate_defaults="$(sed -n 's/^default = \[\(.*\)\]/\1/p' Cargo.toml | head -1 | tr -d ' "')"
+if [ -z "${ROCM_PATH:-}" ] && command -v hipcc >/dev/null; then
+    ROCM_PATH="$(dirname "$(dirname "$(readlink -f "$(command -v hipcc)")")")"
+fi
+if [ -z "${FEATURES:-}" ] && [ -n "${ROCM_PATH:-}" ]; then
+    FEATURES="$crate_defaults,rocm"
+fi
 FEATURES="${FEATURES:-}"
+with_rocm=
+case ",$FEATURES," in *,rocm,*) with_rocm=1 ;; esac
+rocm_version=
+if [ -n "$with_rocm" ]; then
+    [ -x "${ROCM_PATH:-}/bin/hipcc" ] || { echo "FEATURES holds rocm but no hipcc under ROCM_PATH" >&2; exit 1; }
+    rocm_version="$(cut -d- -f1 "$ROCM_PATH/.info/version" 2>/dev/null || true)"
+    [ -n "$rocm_version" ] || { echo "no ROCm version under $ROCM_PATH/.info/version" >&2; exit 1; }
+    BASE_IMAGE="${BASE_IMAGE:-rocm/dev-ubuntu-22.04:$rocm_version}"
+fi
+BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
 DIST="${DIST:-dist}"
 ROOT="$PWD"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
@@ -77,7 +97,7 @@ cargo_build() {
 }
 
 if [ "$MODE" = host ]; then
-    CUDA_PATH="$CUDA_PATH" cargo_build
+    CUDA_PATH="$CUDA_PATH" ${with_rocm:+ROCM_PATH="$ROCM_PATH"} cargo_build
     RUSTC_VERSION="$(rustc --version)"
 else
     command -v docker >/dev/null || { echo "docker not found (or use --host)" >&2; exit 1; }
@@ -87,7 +107,7 @@ else
 FROM $BASE_IMAGE
 ENV DEBIAN_FRONTEND=noninteractive RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:\$PATH
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends build-essential pkg-config git curl ca-certificates cmake perl \\
+ && apt-get install -y --no-install-recommends build-essential pkg-config git curl ca-certificates cmake perl ${with_rocm:+rocwmma-dev} \\
  && rm -rf /var/lib/apt/lists/*
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $rust_version
 EOF
@@ -97,6 +117,7 @@ EOF
         -u "$(id -u):$(id -g)" -e HOME=/tmp \
         -e RUSTFLAGS="-C target-cpu=$CPU_BASELINE" -e LOKEN_STATIC_CXX=1 \
         -e CARGO_TARGET_DIR="$PROFILE_DIR" -e CUDA_PATH="$CUDA_PATH" \
+        ${with_rocm:+-e ROCM_PATH=/opt/rocm} ${LOKEN_ROCM_ARCHS:+-e LOKEN_ROCM_ARCHS="$LOKEN_ROCM_ARCHS"} \
         -e PATH="$CUDA_PATH/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         -v "$ROOT:$ROOT:ro" -v "$git_common:$git_common:ro" \
         -v "$PROFILE_DIR:$PROFILE_DIR" -v "$CUDA_PATH:$CUDA_PATH:ro" \
@@ -138,7 +159,12 @@ cp LICENSE-MIT LICENSE-APACHE NOTICE.md "$STAGE/$NAME/"
 archs="$(grep -o 'code=sm_[0-9][0-9]*a\?' build.rs | sed 's/code=//' | sort -u | tr '\n' ' ')"
 cuda_version="$(sed -n 's/.*"cuda" *: *{[^}]*"version" *: *"\([^"]*\)".*/\1/p' "$CUDA_PATH/version.json" 2>/dev/null | head -1)"
 [ -n "$cuda_version" ] || cuda_version="$("$CUDA_PATH/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
-features="${FEATURES:-$(sed -n 's/^default = \[\(.*\)\]/\1/p' Cargo.toml | head -1 | tr -d ' "')}"
+features="${FEATURES:-$crate_defaults}"
+rocm_line="none (built without rocm)"
+if [ -n "$with_rocm" ]; then
+    rocm_archs="${LOKEN_ROCM_ARCHS:-$(sed -n '/^const ROCM_ARCHS/,/^];/p' build.rs | grep -o '"gfx[0-9a-z]*"' | tr -d '"' | tr '\n' ' ')}"
+    rocm_line="$rocm_version, targets $rocm_archs; the target needs the ROCm runtime (libamdhip64, hipRTC, hipBLAS) for AMD cards"
+fi
 cat > "$STAGE/$NAME/BUILD-INFO" <<EOF
 version:        $VERSION
 commit:         $COMMIT
@@ -146,11 +172,12 @@ rust:           $RUSTC_VERSION
 cuda toolkit:   $cuda_version (kernels compiled with it; the target needs the CUDA 13 libraries for GPU use)
 cuda archs:     $archs (SASS per architecture, plus compute_80 PTX for newer cards)
 cuda tested:    sm_120 only; the other architectures are built for, untested on
+rocm:           $rocm_line
 cpu baseline:   $CPU_BASELINE
 features:       $features
 glibc needed:   $(objdump -T "$BIN_DIR/lokend" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
 build mode:     $MODE ($BASE_IMAGE)
-runtime libs:   none required. CUDA driver, NVRTC, cuBLAS, NCCL and the OpenCL loader are
+runtime libs:   none required. CUDA driver, NVRTC, cuBLAS, NCCL, the ROCm runtime and the OpenCL loader are
                 opened when present; without them the server runs on the CPU. The archive
                 named -cuda-libs carries NVRTC, cuBLAS and cuBLASLt in lib/.
 EOF

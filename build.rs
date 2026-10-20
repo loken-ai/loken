@@ -915,7 +915,12 @@ fn compile_kernel(nvcc: &std::path::Path, src: &str, flags: &[String], obj: &std
         .args(["-MM", src])
         .output()
         .unwrap_or_else(|e| panic!("failed to run nvcc -MM for {src}: {e}"));
-    assert!(deps.status.success(), "nvcc -MM failed for {src}");
+    assert!(
+        deps.status.success(),
+        "{} -MM failed for {src}: {}",
+        nvcc.display(),
+        String::from_utf8_lossy(&deps.stderr)
+    );
     let rule = String::from_utf8_lossy(&deps.stdout).replace("\\\n", " ");
     // A HIP compiler writes one rule per target with bundle markers between them: what
     // names a file is a dependency, everything else is syntax.

@@ -33,7 +33,7 @@ Major, by priority:
 |---|---|---|---|
 | One binary for NVIDIA and AMD cards | Backends | One binary uses NVIDIA and AMD cards at the same time, and one model can run across both. | Started |
 | Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Started |
-| A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card. | Planned |
+| A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card, at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, in decode and in prompt reading. | Started |
 | Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
 | Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Planned |
 | Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
