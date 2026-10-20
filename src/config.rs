@@ -608,9 +608,13 @@ pub fn hf_models_dir() -> PathBuf {
 mod store_tests {
     #[test]
     fn the_first_installed_stores_are_what_every_loader_reads() {
-        // Another test in this process may have built a server first; whichever stores
-        // were installed first are the ones every later reader sees.
-        super::install_stores("/stores/ollama", "/stores/hf");
+        // The stores installed are the test configuration's, the ones every test that opens a
+        // real checkpoint reads, so this test changes nothing for them.
+        let cfg = super::Config::load_test();
+        super::install_stores(
+            &cfg.get_ollama_models_dir().to_string_lossy(),
+            &cfg.get_hf_models_dir().to_string_lossy(),
+        );
         let (ollama, hf) = (super::ollama_models_dir(), super::hf_models_dir());
         assert!(!ollama.as_os_str().is_empty() && !hf.as_os_str().is_empty());
         super::install_stores("/other/ollama", "/other/hf");
