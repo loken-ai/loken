@@ -142,6 +142,16 @@ __global__ void attn_post_qkv_decode_qf32_kernel(
      || (kind == 1 && head >= n_kv)
      || (kind == 2 && head >= n_kv)) return;
 
+    // Row `z` of a packed launch is the token at `rope_pos + z`: its own QKV row and outputs.
+    if constexpr (!Split) {
+        const int row = blockIdx.z;
+        qkv += (size_t)row * (n_q + 2 * n_kv) * hd;
+        q_out += (size_t)row * n_q * hd;
+        k_out += (size_t)row * n_kv * hd;
+        v_out += (size_t)row * n_kv * hd;
+        rope_pos += row;
+    }
+
     extern __shared__ float smem[];
     float* warp_tmp = smem;
     float* shared_v = smem + ((blockDim.x + WARP_SIZE - 1) / WARP_SIZE);
@@ -605,6 +615,64 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm(
         else                 { LAUNCH_QF32_NN(float, 1); }
     }
 #undef LAUNCH_QF32_NN
+}
+
+// attn_post_qkv_decode_qf32 (q_norm_w set) or its no-norm variant (q_norm_w null) over `rows`
+// packed QKV rows, row `r` at `rope_pos + r`: each row's Q, K and V are what a one-row launch
+// at its position writes.
+extern "C" void loken_attn_post_qkv_decode_qf32_rows(
+    const float* qkv,
+    const float* q_norm_w,
+    const float* k_norm_w,
+    const void*  rope_cos,
+    const void*  rope_sin,
+    const float* rope_freqs,
+    float*       q_out,
+    void*        k_out,
+    float*       v_out,
+    int n_q, int n_kv, int hd,
+    int rope_pos,
+    int rows,
+    float rms_eps,
+    float q_scale,
+    int dtype,
+    int rope_style,
+    cudaStream_t stream
+) {
+    dim3 grid(3, max(n_q, n_kv), rows);
+    dim3 block(hd, 1, 1);
+    int n_warps = (hd + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (n_warps + hd) * sizeof(float);
+    const bool with_norm = q_norm_w != nullptr;
+    const float* qn = with_norm ? q_norm_w : (const float*)q_out;
+    const float* kn = with_norm ? k_norm_w : (const float*)q_out;
+
+#define LAUNCH_QF32_ROWS(T, STYLE, NORM) \
+    loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE, NORM> \
+        <<<grid, block, smem_bytes, stream>>>( \
+            qkv, nullptr, nullptr, qn, kn, \
+            (const T*)rope_cos, (const T*)rope_sin, rope_freqs, \
+            q_out, (T*)k_out, v_out, \
+            n_q, n_kv, hd, rope_pos, NORM ? rms_eps : 0.0f, q_scale);
+#define LAUNCH_QF32_ROWS_STYLE(T, NORM) \
+    if (rope_style == 0) { LAUNCH_QF32_ROWS(T, 0, NORM); } \
+    else                 { LAUNCH_QF32_ROWS(T, 1, NORM); }
+#define LAUNCH_QF32_ROWS_NORM(T) \
+    if (with_norm) { LAUNCH_QF32_ROWS_STYLE(T, 1); } \
+    else           { LAUNCH_QF32_ROWS_STYLE(T, 0); }
+
+    if (dtype == 0) {
+        LAUNCH_QF32_ROWS_NORM(__half);
+    } else if (dtype == 1) {
+#ifndef NO_BF16_KERNEL
+        LAUNCH_QF32_ROWS_NORM(__nv_bfloat16);
+#endif
+    } else {
+        LAUNCH_QF32_ROWS_NORM(float);
+    }
+#undef LAUNCH_QF32_ROWS_NORM
+#undef LAUNCH_QF32_ROWS_STYLE
+#undef LAUNCH_QF32_ROWS
 }
 
 // Partial-RoPE variant of attn_post_qkv_decode_qf32_no_norm. When

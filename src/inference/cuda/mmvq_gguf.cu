@@ -100,6 +100,10 @@ enum class GateAct { Silu, Gelu };
 /// `small_k` packs four rows per block instead of one or two; the caller guarantees that
 /// `nrows_x` divides by that, so the inner loop needs no bound check.
 ///
+/// `block_warps_fixed` (0: `mmvq_nwarps_for`) sets the block's warps whatever the batch: four
+/// give every column the lanes, the sums and the order of a one-column launch, so each output
+/// column is bit-identical to that column alone.
+///
 /// `group_warps` (0: all of them) splits the block's warps into groups that each own their own
 /// rows. A group of fewer warps than the block serves a row whose blocks its lanes cover in one
 /// pass; the lanes a four-warp row would leave idle then work on the next rows. Each lane reads
@@ -107,7 +111,7 @@ enum class GateAct { Silu, Gelu };
 /// drops would only have added zeros, so every output is bit-identical to the four-warp kernel.
 template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
           mmvq_dot_t dot_block, int ncols_dst, int nmat, bool small_k, typename combine_t,
-          int group_warps = 0>
+          int group_warps = 0, int block_warps_fixed = 0>
 static __device__ void mmvq_core_impl(
     const void *const __restrict__ vx[nmat],
     const block_q8_1 *__restrict__ y,
@@ -116,8 +120,10 @@ static __device__ void mmvq_core_impl(
     const int stride_col_y, const int stride_col_dst,
     combine_t combine, const float *__restrict__ bias = nullptr) {
 
-  constexpr int nwarps = group_warps > 0 ? group_warps : mmvq_nwarps_for(ncols_dst);
-  constexpr int ngroups = mmvq_nwarps_for(ncols_dst) / nwarps;
+  constexpr int block_warps =
+      block_warps_fixed > 0 ? block_warps_fixed : mmvq_nwarps_for(ncols_dst);
+  constexpr int nwarps = group_warps > 0 ? group_warps : block_warps;
+  constexpr int ngroups = block_warps / nwarps;
   constexpr int rows_per_cuda_block = small_k
     ? mmvq_rows_per_cuda_block_for_smallk(ncols_dst)
     : mmvq_rows_per_cuda_block_for(ncols_dst);
@@ -208,7 +214,7 @@ static __device__ void mmvq_core_impl(
 /// The plain mat-vec: one matrix, and the sum IS the result.
 template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
           mmvq_dot_t dot_block, int ncols_dst, bool small_k = false,
-          int group_warps = 0>
+          int group_warps = 0, int block_warps_fixed = 0>
 static __device__ void mmvq_core_plain(
     const void *__restrict__ vx,
     const block_q8_1 *__restrict__ y,
@@ -219,7 +225,7 @@ static __device__ void mmvq_core_plain(
   const void *const mats[1] = {vx};
   auto first = [] (const float * a) { return a[0]; };
   mmvq_core_impl<dst_t, qk, qi, block_q_t, vdr, dot_block, ncols_dst, 1, small_k,
-                 decltype(first), group_warps>(
+                 decltype(first), group_warps, block_warps_fixed>(
       mats, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, first, bias);
 }
 
@@ -317,6 +323,86 @@ static __device__ void mmvq_core_fused_impl(
                      float)
 
 MMVQ_FORMATS(MMVQ_PLAIN_BATCH_SET)
+
+/// The batches past four in the warps of a single column (`block_warps_fixed` 4): each output
+/// column is the one a one-column launch over it writes, so the rows of a draft verify read the
+/// weight once and still sum as their decode steps.
+#define MMVQ_PLAIN_DECODE_ORDER_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,  \
+                                      vec_dot, dst_tag, dst_c_type, ncols)     \
+  extern "C" __global__ void                                                   \
+      mmvq_gguf_##tag##_##dst_tag##_plain_do_cuda##ncols(                      \
+          const void *__restrict__ vx, const void *__restrict__ vy,            \
+          dst_c_type *__restrict__ dst, const int ncols_x, const int nrows_x,  \
+          const int stride_col_y, const int stride_col_dst) {                  \
+    mmvq_core_plain<dst_c_type, qk_val, qi_val, block_q_t, vdr_val, vec_dot,   \
+                    ncols, false, 0, 4>(vx, (const block_q8_1 *)vy, dst,       \
+                                        ncols_x, nrows_x, stride_col_y,        \
+                                        stride_col_dst);                       \
+  }
+#define MMVQ_PLAIN_DECODE_ORDER_BATCHES(tag, block_q_t, qk_val, qi_val,        \
+                                        vdr_val, vec_dot, dst_tag, dst_c_type) \
+  MMVQ_PLAIN_DECODE_ORDER_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,       \
+                                vec_dot, dst_tag, dst_c_type, 5)               \
+  MMVQ_PLAIN_DECODE_ORDER_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,       \
+                                vec_dot, dst_tag, dst_c_type, 6)               \
+  MMVQ_PLAIN_DECODE_ORDER_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,       \
+                                vec_dot, dst_tag, dst_c_type, 7)               \
+  MMVQ_PLAIN_DECODE_ORDER_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,       \
+                                vec_dot, dst_tag, dst_c_type, 8)                \
+  MMVQ_PLAIN_DECODE_ORDER_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val,       \
+                                vec_dot, dst_tag, dst_c_type, 9)
+#define MMVQ_PLAIN_DECODE_ORDER_SET(tag, block_q_t, qk_val, qi_val, vdr_val,    \
+                                    vec_dot)                                   \
+  MMVQ_PLAIN_DECODE_ORDER_BATCHES(tag, block_q_t, qk_val, qi_val, vdr_val,     \
+                                  vec_dot, bf16, __nv_bfloat16)                \
+  MMVQ_PLAIN_DECODE_ORDER_BATCHES(tag, block_q_t, qk_val, qi_val, vdr_val,     \
+                                  vec_dot, f16, half)                          \
+  MMVQ_PLAIN_DECODE_ORDER_BATCHES(tag, block_q_t, qk_val, qi_val, vdr_val,     \
+                                  vec_dot, f32, float)
+
+MMVQ_FORMATS(MMVQ_PLAIN_DECODE_ORDER_SET)
+
+/// The decode-order batches over a row whose blocks the lanes of `G` warps cover in one pass
+/// (`mmvq_row_warps`): each group of `G` warps owns two rows, so the lanes four warps would
+/// leave idle serve the next rows, and every column is still the one-column launch's. The
+/// caller guarantees that `nrows_x` divides by the block's rows, `2 * 4 / G`.
+#define MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val,     \
+                                            vdr_val, vec_dot, ncols, G)        \
+  extern "C" __global__ void                                                   \
+      mmvq_gguf_##tag##_f32_plain_do_w##G##_cuda##ncols(                       \
+          const void *__restrict__ vx, const void *__restrict__ vy,            \
+          float *__restrict__ dst, const int ncols_x, const int nrows_x,       \
+          const int stride_col_y, const int stride_col_dst) {                  \
+    mmvq_core_plain<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot, ncols, \
+                    false, G, 4>(vx, (const block_q8_1 *)vy, dst, ncols_x,     \
+                                 nrows_x, stride_col_y, stride_col_dst);       \
+  }
+#define MMVQ_PLAIN_DECODE_ORDER_GROUP_BATCHES(tag, block_q_t, qk_val, qi_val,   \
+                                              vdr_val, vec_dot, G)             \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 2, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 3, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 4, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 5, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 6, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 7, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 8, G)                           \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, \
+                                      vec_dot, 9, G)
+#define MMVQ_PLAIN_DECODE_ORDER_GROUP_SET(tag, block_q_t, qk_val, qi_val,       \
+                                          vdr_val, vec_dot)                    \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_BATCHES(tag, block_q_t, qk_val, qi_val,        \
+                                        vdr_val, vec_dot, 1)                   \
+  MMVQ_PLAIN_DECODE_ORDER_GROUP_BATCHES(tag, block_q_t, qk_val, qi_val,        \
+                                        vdr_val, vec_dot, 2)
+
+MMVQ_FORMATS(MMVQ_PLAIN_DECODE_ORDER_GROUP_SET)
 
 /// The one-row small-K kernels, by how many warps serve a row: `smallk` four, `smallk_w2`
 /// two and `smallk_w1` one. A block always holds four warps, so the fewer a row takes, the

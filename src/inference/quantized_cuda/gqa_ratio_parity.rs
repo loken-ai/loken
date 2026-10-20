@@ -152,7 +152,7 @@ fn every_admitted_head_shape_decodes_like_the_reference() {
 
             if FLASH_HEAD_DIMS.contains(&hd) && nqpk <= FLASH_MAX_RATIO {
                 let flash = attn_flash_splitk_q8_gqa_decode_dev_pos(
-                    &k_blob, &v_blob, &qv, &pos_dev, hd, N_KV, nqpk, SEQ, scale, &dev,
+                    &k_blob, &v_blob, &qv, &pos_dev, hd, N_KV, nqpk, SEQ, 1, scale, &dev,
                 )
                 .unwrap();
                 diffs.push(("flash", max_diff(&host(&flash), &want)));
@@ -235,6 +235,7 @@ fn flash_decode_matches_the_reference_at_long_lengths() {
                     N_KV,
                     nqpk,
                     seq,
+                    1,
                     scale,
                     &dev,
                 )

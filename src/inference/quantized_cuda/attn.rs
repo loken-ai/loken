@@ -352,6 +352,11 @@ pub fn gqa_nsplit(seq_kv: usize, n_kv_heads: usize) -> usize {
 /// The kernels take their split count from the length they read on the device
 /// (`gqa_nsplit`), so an eager step and a graph replay at the same length split alike.
 /// `seq_kv_hint` is the longest length the launch may serve: it sizes the grid.
+///
+/// `rows` queries, `[rows, n_q_heads, head_dim]`, attend in one launch pair: row `r` is the
+/// token at the device position plus `r`, reads `r` more keys, and gets exactly the output a
+/// one-row launch at its position gives.
+#[allow(clippy::too_many_arguments)]
 pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     k_blob: &CudaSlice<u8>,
     v_blob: &CudaSlice<u8>,
@@ -361,6 +366,7 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     n_kv_heads: usize,
     n_q_per_kv: usize,
     seq_kv_hint: usize,
+    rows: usize,
     scale: f32,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
@@ -379,9 +385,9 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
         );
     }
     let n_q_heads = n_kv_heads * n_q_per_kv;
-    if q_f32.len() != n_q_heads * head_dim {
+    if rows == 0 || q_f32.len() != rows * n_q_heads * head_dim {
         anyhow::bail!(
-            "attn_flash_splitk_q8_gqa_decode_dev_pos: Q has {} elems, expected {}",
+            "attn_flash_splitk_q8_gqa_decode_dev_pos: Q has {} elems, expected {rows} x {}",
             q_f32.len(),
             n_q_heads * head_dim
         );
@@ -421,12 +427,12 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     // index by the device length's split count (<= GqaSplits::MAX), using only the
     // live prefix.
     debug_assert!(nsplit <= GqaSplits::MAX);
-    let partials = unsafe { dev.alloc::<f32>(n_q_heads * GqaSplits::MAX * (head_dim + 2))? };
+    let partials = unsafe { dev.alloc::<f32>(rows * n_q_heads * GqaSplits::MAX * (head_dim + 2))? };
 
-    // Partial grid is (splits of the longest length served, n_kv_heads): each warp serves
-    // n_q_per_kv query heads, and the blocks past the device length's count leave.
+    // Partial grid is (splits of the longest length served, n_kv_heads, rows): each warp
+    // serves n_q_per_kv query heads, and the blocks past the device length's count leave.
     let cfg1 = LaunchConfig {
-        grid_dim: (nsplit as u32, n_kv_heads as u32, 1),
+        grid_dim: (nsplit as u32, n_kv_heads as u32, rows as u32),
         block_dim: (WARP_SIZE as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -453,9 +459,9 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     // match FLASH_SPLITK_COMBINE_WARPS). The per-head grid of the old combine
     // couldn't keep up with the chunk-8 nsplit (nsys: 5.8 µs vs
     // 2.5 µs); HD_BLOCKSx the blocks restores the balance.
-    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let dst = unsafe { dev.alloc::<f32>(rows * n_q_heads * head_dim)? };
     let cfg2 = LaunchConfig {
-        grid_dim: (n_q_heads as u32, (head_dim / 32) as u32, 1),
+        grid_dim: (n_q_heads as u32, (head_dim / 32) as u32, rows as u32),
         block_dim: (WARP_SIZE as u32, 8, 1),
         shared_mem_bytes: 0,
     };

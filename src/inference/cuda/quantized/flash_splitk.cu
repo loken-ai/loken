@@ -201,7 +201,7 @@ static __device__ __forceinline__ void flash_splitk_q8_gqa_partial_inner(
     const void  * __restrict__ V_blocks,
     const float * __restrict__ Q,
     float       * __restrict__ partials,
-    const int32_t * __restrict__ seq_kv_dev,
+    int seq_kv,
     int n_kv,
     int n_q_per_kv,
     int nsplit,
@@ -210,7 +210,6 @@ static __device__ __forceinline__ void flash_splitk_q8_gqa_partial_inner(
     int split,
     int lane
 ) {
-    const int seq_kv = seq_kv_dev[0] + 1;
     constexpr int HD_BLOCKS = HD / 32;
     const int chunk = (seq_kv + nsplit - 1) / nsplit;
     const int t0 = split * chunk;
@@ -476,7 +475,7 @@ extern "C" __global__ void NAME(                                              \
     float scale                                                               \
 ) {                                                                           \
     flash_splitk_q8_gqa_partial_inner<HD, MAXNQ>(                             \
-        K_blocks, V_blocks, Q, partials, seq_kv_dev,                          \
+        K_blocks, V_blocks, Q, partials, seq_kv_dev[0] + 1,                   \
         n_kv, n_q_per_kv, nsplit, scale, blockIdx.y, blockIdx.x, threadIdx.x  \
     );                                                                        \
 }
@@ -575,7 +574,9 @@ static __device__ __forceinline__ int flash_splitk_nsplit(
 }
 
 // GQA partial whose split count follows the device length. Grid: (splits for the longest
-// length the launch may serve, n_kv_heads); blocks past the length's own count leave.
+// length the launch may serve, n_kv_heads, rows); blocks past the length's own count leave.
+// Row `z` is the query of the token at the device position plus `z`: it reads `z` more keys,
+// its own query and partials, and computes exactly what a one-row launch at its position does.
 #define FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(NAME, HD, MAXNQ)                \
 extern "C" __global__ void NAME(                                              \
     const void  * __restrict__ K_blocks,                                      \
@@ -588,10 +589,14 @@ extern "C" __global__ void NAME(                                              \
     int base, int chunk, int lo, int hi,                                      \
     float scale                                                               \
 ) {                                                                           \
-    const int nsplit = flash_splitk_nsplit(seq_kv_dev[0] + 1, base, chunk, lo, hi); \
+    const int row = blockIdx.z;                                               \
+    const int seq_kv = seq_kv_dev[0] + 1 + row;                               \
+    const int n_q = n_kv * n_q_per_kv;                                        \
+    const int nsplit = flash_splitk_nsplit(seq_kv, base, chunk, lo, hi);      \
     if ((int)blockIdx.x >= nsplit) return;                                    \
     flash_splitk_q8_gqa_partial_inner<HD, MAXNQ>(                             \
-        K_blocks, V_blocks, Q, partials, seq_kv_dev,                          \
+        K_blocks, V_blocks, Q + (size_t)row * n_q * HD,                       \
+        partials + (size_t)row * n_q * hi * (HD + 2), seq_kv,                 \
         n_kv, n_q_per_kv, nsplit, scale, blockIdx.y, blockIdx.x, threadIdx.x  \
     );                                                                        \
 }
@@ -677,6 +682,7 @@ extern "C" __global__ void NAME(                                              \
         blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);                    \
 }
 // Wide combine of the device-length partials: the same split count, from the same length.
+// Row `z` merges the partials of the token at the device position plus `z`.
 #define FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(NAME, HD)                 \
 extern "C" __global__ void NAME(                                              \
     const float * __restrict__ partials,                                      \
@@ -684,8 +690,12 @@ extern "C" __global__ void NAME(                                              \
     const int32_t * __restrict__ seq_kv_dev,                                  \
     int base, int chunk, int lo, int hi                                       \
 ) {                                                                           \
-    const int nsplit = flash_splitk_nsplit(seq_kv_dev[0] + 1, base, chunk, lo, hi); \
-    flash_splitk_gqa_combine_wide_inner<HD>(partials, out, nsplit,            \
+    const int row = blockIdx.z;                                               \
+    const int n_q = gridDim.x;                                                \
+    const int nsplit = flash_splitk_nsplit(seq_kv_dev[0] + 1 + row, base, chunk, lo, hi); \
+    flash_splitk_gqa_combine_wide_inner<HD>(                                  \
+        partials + (size_t)row * n_q * hi * (HD + 2),                         \
+        out + (size_t)row * n_q * HD, nsplit,                                 \
         blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);                    \
 }
 FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(flash_splitk_gqa_combine_wide_devlen_hd64,  64)

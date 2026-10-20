@@ -39,7 +39,7 @@ fn flash_q8_gqa_ncu_harness() {
         let q_view = q_slice.slice(..);
         for _ in 0..20 {
             let out = attn_flash_splitk_q8_gqa_decode_dev_pos(
-                &k_blob, &v_blob, &q_view, &pos_dev, hd, n_kv, nqpk, seq_kv, scale, &dev,
+                &k_blob, &v_blob, &q_view, &pos_dev, hd, n_kv, nqpk, seq_kv, 1, scale, &dev,
             )
             .unwrap();
             std::hint::black_box(&out);
@@ -49,7 +49,7 @@ fn flash_q8_gqa_ncu_harness() {
         let t0 = std::time::Instant::now();
         for _ in 0..ITERS {
             let out = attn_flash_splitk_q8_gqa_decode_dev_pos(
-                &k_blob, &v_blob, &q_view, &pos_dev, hd, n_kv, nqpk, seq_kv, scale, &dev,
+                &k_blob, &v_blob, &q_view, &pos_dev, hd, n_kv, nqpk, seq_kv, 1, scale, &dev,
             )
             .unwrap();
             std::hint::black_box(&out);

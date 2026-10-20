@@ -2606,6 +2606,7 @@ pub(super) fn mmvq_t<
         b_size,
         smallk,
         None,
+        None,
     )?;
     Ok(dst)
 }
@@ -2643,18 +2644,35 @@ pub fn mmvq_f32_bias(
         1,
         smallk,
         Some(bias),
+        None,
     )?;
     Ok(dst)
 }
 
-/// The largest batch the mat-vec kernels run with the warp count of a single column
+/// The largest batch the plain mat-vec kernels run with the warp count of a single column
 /// (`mmvq_nwarps_for` in `mmvq_gguf.cu`). Up to it, every column's blocks meet in the order
 /// a one-row launch sums them, so each output row is bit-identical to that row alone.
 pub const MMVQ_DECODE_ORDER_BATCH: usize = 4;
 
+/// The largest batch one decode-order launch takes: past [`MMVQ_DECODE_ORDER_BATCH`] the
+/// `_plain_do` kernels keep the single column's warps. It covers a draft verify.
+pub const MMVQ_DECODE_ORDER_WIDE: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
+
+/// The warps of a group in a decode-order launch over `n` rows of `k` values of `tag` with
+/// F32 output: the fewest whose lanes cover a row in one pass (`mmvq_row_warps`), when the
+/// block's rows divide `n`; four otherwise.
+fn decode_order_group(tag: &str, dst_tag: &str, k: usize, n: usize) -> usize {
+    match mmvq_row_warps(tag, k) {
+        Some(w) if w < 4 && dst_tag == "f32" && n.is_multiple_of(2 * 4 / w) => w,
+        _ => 4,
+    }
+}
+
 /// Batched MMVQ whose every output row equals a one-row launch over that row: the rows go
-/// in launches of at most [`MMVQ_DECODE_ORDER_BATCH`], and a lone row takes the kernel a
-/// one-row call would (`smallk_single`). `q8_1` holds `rows` quantised activation rows.
+/// in launches of at most [`MMVQ_DECODE_ORDER_WIDE`], each reading the weight once, and a lone
+/// row takes the kernel a one-row call would (`smallk_single`). Over a short row the warps of
+/// a block split into groups that each own rows, as the one-row small-K kernels do. `q8_1`
+/// holds `rows` quantised activation rows.
 #[allow(clippy::too_many_arguments)]
 pub fn mmvq_decode_order<
     T: crate::tensor::gpu_runtime::driver::DeviceRepr
@@ -2675,9 +2693,10 @@ pub fn mmvq_decode_order<
     let mut dst = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<T>(n * rows) })?;
     // block_q8_1 = 32 i8 + 2 f16 per 32 activations.
     let q8_row_bytes = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING / 32 * 36;
+    let group = decode_order_group(tag, dst_tag, k, n);
     let mut first = 0;
     while first < rows {
-        let b = MMVQ_DECODE_ORDER_BATCH.min(rows - first);
+        let b = MMVQ_DECODE_ORDER_WIDE.min(rows - first);
         launch_mmvq(
             dev,
             tag,
@@ -2690,6 +2709,7 @@ pub fn mmvq_decode_order<
             b,
             b == 1 && smallk_single,
             None,
+            Some(group),
         )?;
         first += b;
     }
@@ -2754,6 +2774,7 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     b_size: usize,
     smallk: bool,
     bias: Option<&CudaView<'_, f32>>,
+    decode_order: Option<usize>,
 ) -> Result<()> {
     use crate::tensor::quantized::MATRIX_ROW_PADDING;
     if bias.is_some() && (b_size != 1 || dst_tag != "f32") {
@@ -2779,7 +2800,15 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
         (true, warps) => {
             format!("mmvq_gguf_{tag}_{dst_tag}_plain_smallk_w{warps}{with_bias}_cuda1")
         }
-        (false, _) => format!("mmvq_gguf_{tag}_{dst_tag}_plain{with_bias}_cuda{b_size}"),
+        (false, _) => match decode_order {
+            Some(group) if group < 4 && b_size > 1 => {
+                format!("mmvq_gguf_{tag}_{dst_tag}_plain_do_w{group}_cuda{b_size}")
+            }
+            Some(_) if b_size > MMVQ_DECODE_ORDER_BATCH => {
+                format!("mmvq_gguf_{tag}_{dst_tag}_plain_do_cuda{b_size}")
+            }
+            _ => format!("mmvq_gguf_{tag}_{dst_tag}_plain{with_bias}_cuda{b_size}"),
+        },
     };
     let func = dev.mmvq_fn(&kernel)?;
     let stream = dev.stream();
@@ -2789,19 +2818,29 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     // Launch geometry mirrors the fork's C launchers exactly:
     // plain: rows_per_block = b<=1 ? 1 : 2, nwarps = b<=4 ? 4 : 2;
     // smallk: four rows to each group of `smallk_warps` warps, nwarps = 4.
+    // A decode-order batch in groups of fewer warps holds two rows to each group.
+    let groups = match decode_order {
+        Some(group) if group < 4 && b_size > 1 => 4 / group,
+        _ => 1,
+    };
     let rows_per_block: usize = if smallk {
         4 * (4 / smallk_warps)
     } else if b_size <= 1 {
         1
     } else {
-        2
+        2 * groups
     };
-    let nwarps: u32 = if smallk || b_size <= MMVQ_DECODE_ORDER_BATCH {
+    if groups > 1 && !n.is_multiple_of(rows_per_block) {
+        return Err(Error(format!(
+            "mmvq decode order: {n} rows not a multiple of the block's {rows_per_block}"
+        )));
+    }
+    let nwarps: u32 = if smallk || decode_order.is_some() || b_size <= MMVQ_DECODE_ORDER_BATCH {
         4
     } else {
         2
     };
-    let grid_x = if smallk {
+    let grid_x = if smallk || groups > 1 {
         n / rows_per_block
     } else {
         n.div_ceil(rows_per_block)

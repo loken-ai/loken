@@ -1439,6 +1439,7 @@ impl Q8KvCache {
                 self.n_kv_heads,
                 n_q_per_kv,
                 longest,
+                1,
                 scale,
                 &self.cuda_device,
             )
@@ -1449,6 +1450,94 @@ impl Q8KvCache {
 
         let out_tensor = tensor_from_cuda_storage(out_storage, (1, n_q_heads, 1, self.head_dim))?;
         Ok(out_tensor)
+    }
+
+    /// The rows of a draft verify appended at once: `k_rows` and `v_rows` hold `rows` tokens'
+    /// K and V packed as `[rows * n_kv, head_dim]` (any float carrier), quantised in one launch
+    /// into the slots after the cache's end. Each token's blocks are the ones a one-token
+    /// append writes. Outside graph capture only.
+    pub fn append_rows(&mut self, k_rows: &Tensor, v_rows: &Tensor, rows: usize) -> Result<()> {
+        let row_width = self.n_kv_heads * self.head_dim;
+        if rows == 0
+            || k_rows.elem_count() != rows * row_width
+            || v_rows.elem_count() != rows * row_width
+            || capture_active_on(&self.cuda_device.cuda_stream())
+        {
+            return Err(anyhow!(
+                "Q8KvCache::append_rows: {rows} rows of {row_width} outside capture expected"
+            ));
+        }
+        if let Some(need) = self
+            .core
+            .room_for(rows)
+            .map_err(|e| anyhow!("Q8KvCache::append_rows: {e}"))?
+        {
+            self.grow_to(need)?;
+        }
+        self.append_kv_paired_single(k_rows, v_rows, rows * row_width)?;
+        self.core.commit(rows);
+        Ok(())
+    }
+
+    /// Split-K flash decode of the last `rows` tokens' queries, `q` `[rows * n_q, head_dim]`
+    /// F32: row `r` attends over the keys up to and including token `len - rows + r`, as the
+    /// decode step of that token does, and the output, `[rows * n_q, head_dim]` F32, is that
+    /// step's. Primes the device position at the first row's slot. Outside graph capture only.
+    pub fn attn_flash_splitk_decode_rows(
+        &mut self,
+        q: &Tensor,
+        rows: usize,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let len = self.core.len();
+        let n_q_heads = q.elem_count() / (rows.max(1) * self.head_dim);
+        if rows == 0
+            || rows > len
+            || q.dtype() != DType::F32
+            || q.elem_count() != rows * n_q_heads * self.head_dim
+            || self.n_kv_heads == 0
+            || !n_q_heads.is_multiple_of(self.n_kv_heads)
+            || n_q_heads == self.n_kv_heads
+            || capture_active_on(&self.cuda_device.cuda_stream())
+        {
+            return Err(anyhow!(
+                "Q8KvCache::attn_flash_splitk_decode_rows: {rows} GQA rows of {:?} over {len} keys",
+                q.dims()
+            ));
+        }
+        self.update_graph_state(len - rows)?;
+        let q_flat = q.contiguous()?;
+        let (q_guard, q_layout) = q_flat.storage_and_layout();
+        let q_cuda = match &*q_guard {
+            StorageView::Cuda(c) => c,
+            _ => {
+                return Err(anyhow!(
+                    "Q8KvCache::attn_flash_splitk_decode_rows: Q not on CUDA"
+                ))
+            }
+        };
+        let start = q_layout.start_offset();
+        let q_view = q_cuda
+            .as_cuda_slice::<f32>()?
+            .slice(start..start + q.elem_count());
+        let out = crate::inference::quantized_cuda::attn_flash_splitk_q8_gqa_decode_dev_pos(
+            &self.k_q8,
+            &self.v_q8,
+            &q_view,
+            self.pos.slice(),
+            self.head_dim,
+            self.n_kv_heads,
+            n_q_heads / self.n_kv_heads,
+            len,
+            rows,
+            scale,
+            &self.cuda_device,
+        )
+        .map_err(|e| anyhow!("Q8KvCache: attn_flash_splitk_q8_gqa_decode_dev_pos rows: {e}"))?;
+        Ok(tensor_from_cuda_storage(
+            out,
+            (rows * n_q_heads, self.head_dim),
+        )?)
     }
 
     /// Query-head-packed TENSOR-CORE flash-decode. Same contract as

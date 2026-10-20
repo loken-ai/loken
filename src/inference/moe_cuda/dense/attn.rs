@@ -90,6 +90,19 @@ fn outputs<Qv: CudaDType, K: CudaDType>(
     hd: usize,
     launch: impl FnOnce(*mut c_void, *mut c_void, *mut c_void),
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    outputs_rows::<Qv, K>(dev, 1, n_q, n_kv, hd, launch)
+}
+
+/// [`outputs`] for `rows` packed rows: Q is `[rows * n_q, hd]`, K and V `[rows * n_kv, hd]`.
+fn outputs_rows<Qv: CudaDType, K: CudaDType>(
+    dev: &CudaDevice,
+    rows: usize,
+    n_q: usize,
+    n_kv: usize,
+    hd: usize,
+    launch: impl FnOnce(*mut c_void, *mut c_void, *mut c_void),
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (n_q, n_kv) = (rows * n_q, rows * n_kv);
     let q = unsafe { dev.alloc::<Qv>(n_q * hd) }?;
     let k = unsafe { dev.alloc::<K>(n_kv * hd) }?;
     let v = unsafe { dev.alloc::<Qv>(n_kv * hd) }?;
@@ -467,6 +480,95 @@ pub fn attn_post_qkv_decode_qf32_no_norm(
             );
         },
     )
+}
+
+/// [`attn_post_qkv_decode_qf32`] (with `norms`, weights and epsilon) or
+/// [`attn_post_qkv_decode_qf32_no_norm`] (without) over `rows` packed QKV rows, `[rows, total]`
+/// F32, row `r` at `rope_pos + r`: one launch, and each row's Q, K and V are the ones a one-row
+/// call at its position returns. Q and V come back `[rows * n_q, hd]` and `[rows * n_kv, hd]`
+/// F32, K `[rows * n_kv, hd]` in `out_dtype`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_post_qkv_decode_qf32_rows(
+    qkv: &Tensor,
+    norms: Option<(&Tensor, &Tensor, f32)>,
+    rope_cos: &Tensor,
+    rope_sin: &Tensor,
+    rope_freqs: Option<&Tensor>,
+    n_q: usize,
+    n_kv: usize,
+    hd: usize,
+    rope_pos: usize,
+    rows: usize,
+    q_scale: f32,
+    out_dtype: DType,
+    rope_style: i32,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if qkv.dtype() != DType::F32 || qkv.elem_count() != rows * (n_q + 2 * n_kv) * hd {
+        crate::tensor::bail!("attn_post_qkv_decode_qf32_rows: qkv must be {rows} F32 rows");
+    }
+    if rope_cos.dtype() != out_dtype || rope_sin.dtype() != out_dtype {
+        crate::tensor::bail!("attn_post_qkv_decode_qf32_rows: rope dtype mismatch");
+    }
+    if norms.is_some_and(|(q, k, _)| q.dtype() != DType::F32 || k.dtype() != DType::F32) {
+        crate::tensor::bail!("attn_post_qkv_decode_qf32_rows: norm weights must be F32");
+    }
+
+    let dev = qkv.device().as_cuda_device()?;
+    let dtype_int = carrier_code(out_dtype)?;
+    let stream_i64 = dev.cuda_stream().cu_stream() as i64;
+
+    let qkv_c = qkv.contiguous()?;
+    let rc_c = rope_cos.contiguous()?;
+    let rs_c = rope_sin.contiguous()?;
+    let norms_c = norms
+        .map(|(q, k, eps)| Ok::<_, crate::tensor::Error>((q.contiguous()?, k.contiguous()?, eps)))
+        .transpose()?;
+
+    let (qkv_storage, _) = qkv_c.storage_and_layout();
+    let (rc_storage, _) = rc_c.storage_and_layout();
+    let (rs_storage, _) = rs_c.storage_and_layout();
+    let (qn_ptr, kn_ptr, rms_eps) = match &norms_c {
+        Some((q, k, eps)) => (
+            address_of::<f32>(&q.storage_and_layout().0, "q_norm_w")? as *const f32,
+            address_of::<f32>(&k.storage_and_layout().0, "k_norm_w")? as *const f32,
+            *eps,
+        ),
+        None => (std::ptr::null(), std::ptr::null(), 0.0),
+    };
+
+    let qkv_ptr = address_of::<f32>(&qkv_storage, "qkv")? as *const f32;
+    let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+    let freqs_ptr = freqs_address(rope_freqs, hd / 2)?;
+
+    let launch = |q_ptr: *mut c_void, k_ptr: *mut c_void, v_ptr: *mut c_void| unsafe {
+        loken_attn_post_qkv_decode_qf32_rows(
+            qkv_ptr,
+            qn_ptr,
+            kn_ptr,
+            rc_ptr,
+            rs_ptr,
+            freqs_ptr,
+            q_ptr as *mut f32,
+            k_ptr,
+            v_ptr as *mut f32,
+            n_q as i32,
+            n_kv as i32,
+            hd as i32,
+            rope_pos as i32,
+            rows as i32,
+            rms_eps,
+            q_scale,
+            dtype_int,
+            rope_style,
+            stream_i64,
+        );
+    };
+    match out_dtype {
+        DType::F16 => outputs_rows::<f32, f16>(&dev, rows, n_q, n_kv, hd, launch),
+        DType::BF16 => outputs_rows::<f32, bf16>(&dev, rows, n_q, n_kv, hd, launch),
+        DType::F32 => outputs_rows::<f32, f32>(&dev, rows, n_q, n_kv, hd, launch),
+        d => crate::tensor::bail!("post-QKV decode: unsupported output dtype {d:?}"),
+    }
 }
 
 /// [`attn_post_qkv_decode`] for the architectures that carry no Q/K norm: Q, K and V all come

@@ -75,6 +75,12 @@ cuda_launchers! {
         rope_sin: *const c_void, rope_freqs: *const f32, q_out: *mut f32, k_out: *mut c_void,
         v_out: *mut f32, n_q: i32, n_kv: i32, hd: i32, rope_pos: i32, q_scale: f32, dtype: i32,
         rope_style: i32);
+    loken_attn_post_qkv_decode_qf32_rows(
+        qkv: *const f32, q_norm_w: *const f32, k_norm_w: *const f32,
+        rope_cos: *const c_void, rope_sin: *const c_void, rope_freqs: *const f32,
+        q_out: *mut f32, k_out: *mut c_void, v_out: *mut f32, n_q: i32, n_kv: i32,
+        hd: i32, rope_pos: i32, rows: i32, rms_eps: f32, q_scale: f32, dtype: i32,
+        rope_style: i32);
     loken_attn_post_qkv_decode_qf32_no_norm_partial_rope(
         qkv: *const f32, rope_cos: *const c_void,
         rope_sin: *const c_void, rope_freqs: *const f32, q_out: *mut f32, k_out: *mut c_void,

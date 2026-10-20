@@ -763,8 +763,8 @@ impl MoeWeights {
     ///       `out[token] += topk_p * y`
     /// [`Self::forward`] over the rows of `moe_in`. While a verify holds `DecodeOrder` the rows
     /// take the decode kernels, so a verified row routes and sums exactly as the step it
-    /// stands for: together through a tier on a card (the kernels work a routed pair at a time,
-    /// and a token's pairs are summed in rank order), one at a time elsewhere. The whole batch
+    /// stands for: together on a card (the kernels work a routed pair at a time, and a token's
+    /// pairs are summed in rank order), one at a time elsewhere. The whole batch
     /// at once otherwise.
     pub(super) fn forward_rows(
         &self,
@@ -777,8 +777,9 @@ impl MoeWeights {
         // A layer whose experts pass through a cache takes the rows together: it routes every
         // row alone, and its card runs each row's pairs as it would the decoded token's.
         let decode_order = crate::tensor::quantized::DecodeOrder::active();
-        // A tier, cached or resident, runs every row's pairs in the decode kernels on the card.
-        let on_card = moe_in.device().runs_as_card() && !self.up_relu2 && self.tier.is_some();
+        // On a card every row's pairs run in the decode kernels, the experts read once for the
+        // rows that share them, whether the layer's experts live there or pass through a tier.
+        let on_card = moe_in.device().runs_as_card() && !self.up_relu2;
         // A cached layer's rows go through the cache as decoded tokens, prompt or verify.
         let cached =
             moe_in.device().runs_as_card() && self.tier.as_ref().is_some_and(|t| !t.is_resident());
@@ -927,13 +928,21 @@ impl MoeWeights {
             };
             match self.gate_inp_bias.as_ref() {
                 None if self.sigmoid_routing.is_some() => exact_logits()?,
-                // The rows of a verify score one at a time, as a decoded token does: a library
-                // matrix product picks its arithmetic by shape.
-                // The rows of a verify each as the one-row call: the row-wise gate kernel over
-                // the rows at once, or the quantised gate's mat-vecs, which take the rows one by
-                // one under the decode order.
+                // The rows of a verify each as the decoded token it stands for: the quantised
+                // gate's mat-vecs take the rows one by one under the decode order, and a dense
+                // gate scores each row alone, as a library matrix product picks its arithmetic
+                // by shape.
                 None if num_tokens > 1 && crate::tensor::quantized::DecodeOrder::active() => {
-                    exact_logits()?
+                    match &self.gate_inp {
+                        crate::tensor::quantized::QMatMul::QTensor(_) => exact_logits()?,
+                        gate => {
+                            let rows = (0..num_tokens)
+                                .map(|r| gate.forward(&xs.narrow(0, r, 1)?))
+                                .collect::<Result<Vec<_>>>()?;
+                            Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
+                                .to_dtype(crate::tensor::DType::F32)?
+                        }
+                    }
                 }
                 // The cards of a split layer each route the same rows: each row's logits are
                 // summed as a one-row call sums them, which no card's kernel choice changes, so
