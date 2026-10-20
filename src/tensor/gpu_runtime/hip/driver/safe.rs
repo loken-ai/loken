@@ -122,11 +122,11 @@ impl CudaContext {
         unsafe { hip!(hipDeviceSynchronize()) }.result()
     }
 
-    /// Makes host waits on this device block the thread instead of spinning.
+    /// Leaves the host waits on this device as they are. HIP holds the wait mode per device for
+    /// the whole process, so one model would set it for every user of the card, and under
+    /// blocking waits two threads releasing memory on one card at once can wait forever.
     pub fn set_blocking_synchronize(&self) -> Result<(), DriverError> {
-        self.bind_to_thread()?;
-        let schedule_blocking_sync = 4;
-        unsafe { hip!(hipSetDeviceFlags(schedule_blocking_sync)) }.result()
+        Ok(())
     }
 
     /// Whether more than one stream is in use. Buffers are not tracked across streams, so this
