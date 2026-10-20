@@ -46,6 +46,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- CUDA: bind the card before a page-locked staging buffer is made on a new thread.
 - Attention: give a long prompt the same greedy tokens however full the cards are.
 - CPU: give each row of a draft verify the arithmetic of its decode step.
 - ROCm: stage copies from read-only mappings so the driver never tries to pin them.

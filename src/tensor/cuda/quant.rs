@@ -1310,6 +1310,11 @@ impl<'a> Staging<'a> {
                 Some(i) => pool.swap_remove(i),
                 None => {
                     let cap = bytes.len().next_power_of_two().max(1 << 20);
+                    // Page-locked memory belongs to the context current on this thread.
+                    self.stream
+                        .context()
+                        .bind_to_thread()
+                        .map_err(|e| Error(format!("pinned staging buffer: {e}")))?;
                     let ptr =
                         unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(cap, 0) }
                             .map_err(|e| Error(format!("pinned staging buffer: {e}")))?;
