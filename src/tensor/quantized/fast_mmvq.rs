@@ -59,6 +59,18 @@ pub fn max_scratch_bytes_for_k(max_k: usize) -> usize {
     pad(max_k, MATRIX_ROW_PADDING) / Q8_1_BLOCK_SIZE * Q8_1_TYPE_SIZE
 }
 
+/// Drops the scratch of card `ordinal`, released. False when the map is busy.
+pub fn release_workspaces_of(ordinal: usize) -> bool {
+    match WORKSPACE.get().map(|m| m.try_lock()) {
+        Some(Ok(mut g)) => {
+            g.retain(|(o, _), _| *o != ordinal);
+            true
+        }
+        Some(Err(_)) => false,
+        None => true,
+    }
+}
+
 /// Drop the per-device scratch (model unload). try_lock + skip: the
 /// emergency-reclaim path may run while a forward holds this map
 /// (same self-deadlock class as `release_mmq_workspaces`); an in-use

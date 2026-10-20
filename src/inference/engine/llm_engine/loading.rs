@@ -224,9 +224,13 @@ impl LlmEngine {
                 let size = std::fs::metadata(&target).ok()?.len();
                 self.plan_drafter(&target, size)
             });
-        self.load_model_only().await?;
-        self.load_planned_drafter(planned).await;
-        Ok(())
+        let loaded = self.load_model_only().await.map_err(|e| e.to_string());
+        if loaded.is_ok() {
+            self.load_planned_drafter(planned).await;
+        }
+        // The cards the placement opened and the model did not take.
+        release_idle_cards();
+        Ok(loaded?)
     }
 
     /// Loads the configured model alone.

@@ -769,6 +769,7 @@ impl APIServer {
         if freed > 0 {
             crate::inference::engine::llm_engine::release_cuda_pools();
         }
+        crate::inference::engine::llm_engine::release_idle_cards();
         freed
     }
 

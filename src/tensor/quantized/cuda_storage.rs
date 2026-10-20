@@ -285,6 +285,18 @@ fn lent_pools() -> std::sync::MutexGuard<'static, std::collections::HashMap<usiz
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Destroys the lent pool of card `ordinal`, released; the next lend makes a new one.
+#[cfg(feature = "gpu")]
+pub fn release_lent_pool(ordinal: usize) {
+    if let Some(p) = lent_pools().remove(&ordinal) {
+        let _ = unsafe {
+            crate::tensor::gpu_runtime::driver::sys::cuMemPoolDestroy(
+                p as crate::tensor::gpu_runtime::driver::sys::CUmemoryPool,
+            )
+        };
+    }
+}
+
 /// The memory pool of card `ordinal` that holds the blobs lent to a prefill (made on first use).
 #[cfg(feature = "gpu")]
 fn lent_pool(ordinal: usize) -> Result<crate::tensor::gpu_runtime::driver::sys::CUmemoryPool> {

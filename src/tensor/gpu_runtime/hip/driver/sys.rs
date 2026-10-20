@@ -22,6 +22,7 @@ crate::tensor::gpu_runtime::hip::dynamic_api! {
         fn hipDeviceCanAccessPeer(can: *mut c_int, d: c_int, peer: c_int) -> c_int;
         fn hipDevicePrimaryCtxRetain(ctx: *mut CUcontext, d: c_int) -> c_int;
         fn hipDevicePrimaryCtxRelease(d: c_int) -> c_int;
+        fn hipDevicePrimaryCtxReset(d: c_int) -> c_int;
         fn hipDevicePrimaryCtxGetState(d: c_int, flags: *mut c_uint, active: *mut c_int) -> c_int;
         fn hipCtxPushCurrent(ctx: CUcontext) -> c_int;
         fn hipCtxPopCurrent(ctx: *mut CUcontext) -> c_int;
@@ -99,6 +100,7 @@ crate::tensor::gpu_runtime::hip::dynamic_api! {
         fn hipMemPoolGetAttribute(p: CUmemoryPool, a: c_int, v: *mut c_void) -> c_int;
         fn hipMemPoolSetAttribute(p: CUmemoryPool, a: c_int, v: *mut c_void) -> c_int;
         fn hipMemPoolTrimTo(p: CUmemoryPool, keep: usize) -> c_int;
+        fn hipMemPoolDestroy(p: CUmemoryPool) -> c_int;
         fn hipMemPoolCreate(p: *mut CUmemoryPool, props: *const HipMemPoolProps) -> c_int;
         fn hipMallocFromPoolAsync(
             d: *mut *mut c_void,
@@ -904,6 +906,10 @@ pub unsafe fn cuDevicePrimaryCtxRelease_v2(dev: CUdevice) -> CUresult {
     unsafe { hip!(hipDevicePrimaryCtxRelease(dev)) }
 }
 
+pub unsafe fn cuDevicePrimaryCtxReset_v2(dev: CUdevice) -> CUresult {
+    unsafe { hip!(hipDevicePrimaryCtxReset(dev)) }
+}
+
 pub unsafe fn cuDevicePrimaryCtxGetState(
     dev: CUdevice,
     flags: *mut c_uint,
@@ -1234,6 +1240,10 @@ pub unsafe fn cuMemPoolSetAttribute(
 
 pub unsafe fn cuMemPoolTrimTo(pool: CUmemoryPool, keep: usize) -> CUresult {
     unsafe { hip!(hipMemPoolTrimTo(pool, keep)) }
+}
+
+pub unsafe fn cuMemPoolDestroy(pool: CUmemoryPool) -> CUresult {
+    unsafe { hip!(hipMemPoolDestroy(pool)) }
 }
 
 pub unsafe fn cuMemPoolCreate(pool: *mut CUmemoryPool, props: *const CUmemPoolProps) -> CUresult {

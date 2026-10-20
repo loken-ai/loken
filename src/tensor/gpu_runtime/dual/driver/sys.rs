@@ -226,6 +226,11 @@ pub unsafe fn cuDevicePrimaryCtxRelease_v2(dev: CUdevice) -> CUresult {
         hip => unsafe { hs::cuDevicePrimaryCtxRelease_v2(d) })
 }
 
+pub unsafe fn cuDevicePrimaryCtxReset_v2(dev: CUdevice) -> CUresult {
+    on_device!(dev, |d| cuda => unsafe { cu::cuDevicePrimaryCtxReset_v2(d) },
+        hip => unsafe { hs::cuDevicePrimaryCtxReset_v2(d) })
+}
+
 pub unsafe fn cuDevicePrimaryCtxGetState(
     dev: CUdevice,
     flags: *mut c_uint,
@@ -571,6 +576,11 @@ pub unsafe fn cuMemPoolSetAttribute(
 ) -> CUresult {
     on_pool!(pool, cuda => unsafe { cu::cuMemPoolSetAttribute(cuh(pool), same(attr), value) },
         hip => unsafe { hs::cuMemPoolSetAttribute(pool, attr, value) })
+}
+
+pub unsafe fn cuMemPoolDestroy(pool: CUmemoryPool) -> CUresult {
+    on_pool!(pool, cuda => unsafe { cu::cuMemPoolDestroy(cuh(pool)) },
+        hip => unsafe { hs::cuMemPoolDestroy(pool) })
 }
 
 pub unsafe fn cuMemPoolTrimTo(pool: CUmemoryPool, keep: usize) -> CUresult {

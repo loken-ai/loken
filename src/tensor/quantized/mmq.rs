@@ -22,6 +22,19 @@ pub(super) static MMQ_WORKSPACES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<usize, MmqWorkspace>>,
 > = std::sync::OnceLock::new();
 
+/// Drops the MMQ scratch of card `ordinal`, released. False when the map is busy.
+#[cfg(feature = "gpu")]
+pub fn release_mmq_workspaces_of(ordinal: usize) -> bool {
+    match MMQ_WORKSPACES.get().map(|m| m.try_lock()) {
+        Some(Ok(mut g)) => {
+            g.remove(&ordinal);
+            true
+        }
+        Some(Err(_)) => false,
+        None => true,
+    }
+}
+
 /// Drop the per-device MMQ scratch workspaces (model unload - returns the
 /// reserved VRAM; re-created lazily on the next batched matmul).
 #[cfg(feature = "gpu")]

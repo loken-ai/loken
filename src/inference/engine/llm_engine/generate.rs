@@ -75,6 +75,7 @@ impl LlmEngine {
         unsafe {
             libc::malloc_trim(0);
         }
+        release_idle_cards();
         Ok(())
     }
 

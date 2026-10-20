@@ -216,11 +216,7 @@ impl CudaDevice {
 
 /// The card whose shared stream `stream` is.
 fn card_of(stream: &Arc<CudaStream>) -> Option<Arc<CudaDevice>> {
-    let map = super::DEVICES.get()?;
-    let map = map.lock().unwrap_or_else(|e| e.into_inner());
-    map.values()
-        .find(|d| Arc::ptr_eq(&d.stream, stream))
-        .cloned()
+    super::shared_card_of(stream)
 }
 
 /// The stream work meant for `stream` goes to from the calling thread: the card's recording

@@ -962,18 +962,21 @@ struct PlannedDrafter {
     room: crate::inference::place::vram_manager::DemandLease,
 }
 
-/// Warm one card, once per process: a tiny matmul allocates the cuBLAS handle and
-/// workspace, which latches the primary context - the deliberate cost that makes every
-/// later budget probe of this card read the same world.
+/// Warm one card, once per opening of its context: a tiny matmul allocates the cuBLAS handle
+/// and workspace, which latches the primary context until the card is released - the
+/// deliberate cost that makes every later budget probe of this card read the same world.
 #[cfg(feature = "gpu")]
 pub(crate) fn warm_card(ordinal: usize) {
     use std::sync::{Mutex, OnceLock};
-    static WARMED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
-    if !WARMED
+    static WARMED: OnceLock<Mutex<std::collections::HashMap<usize, u64>>> = OnceLock::new();
+    let opening = crate::tensor::cuda::card_releases(ordinal);
+    if WARMED
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(ordinal)
+        .insert(ordinal, opening)
+        == Some(opening)
+        && crate::tensor::cuda::card_context_active(ordinal)
     {
         return;
     }
@@ -989,6 +992,13 @@ pub(crate) fn warm_card(ordinal: usize) {
 
 #[cfg(not(feature = "gpu"))]
 pub fn release_cuda_pools() {}
+
+/// Releases every card no model holds any more: its context, its caches and the power state
+/// the context keeps it in. A model loaded later opens its cards afresh.
+pub fn release_idle_cards() {
+    #[cfg(feature = "gpu")]
+    let _ = crate::tensor::cuda::release_idle_cards();
+}
 
 #[cfg(feature = "gpu")]
 /// MINIMAL pool trim, safe to call at ANY time - including while other models are actively
@@ -1040,16 +1050,9 @@ pub fn release_cuda_pools() {
     // exposes a `release_workspaces()` for exactly this teardown step.
     crate::tensor::quantized::fast_mmvq::release_workspaces();
     crate::tensor::quantized::release_mmq_workspaces();
-    // Z-Image static caches (timestep_freqs + coordinate grids) hold
-    // Tensors keeping VRAM alive. Without this clear, repeated load ->
-    // gen -> unload cycles leak ~1-5 MB per shape variant. Real users
-    // hit this when swapping between image models.
-    #[cfg(feature = "image")]
-    // Drop the global substrate CudaDevice cache. Each cache entry holds
-    // Arc<CudaContext>; the primary context cannot be released (and its
-    // pool reservation can't be returned to the OS) while ANY Arc clone
-    // is alive. Tensors and workspaces above already dropped their
-    // clones - clearing the cache typically removes the last one.
+    // Forget the devices nobody holds. The registry holds them weakly, so a card in use keeps
+    // its one shared device and stream; a card nobody uses is released by
+    // `release_idle_cards`.
     crate::tensor::cuda_ext::clear_device_cache();
     use crate::tensor::gpu_runtime::driver::sys::{
         cuCtxPopCurrent_v2, cuCtxPushCurrent_v2, cuCtxSynchronize, cuDeviceGetDefaultMemPool,
@@ -1070,8 +1073,10 @@ pub fn release_cuda_pools() {
             // "used 3 MB, reserved 15456 MB, trim CUDA_SUCCESS, nothing
             // released" (a campaign: every gemma4:31b retry then
             // OOM'd against the phantom-full GPU1 -> all-CPU at 1.2 tok/s).
+            // A card with no context has nothing queued, and retaining one would open it.
             let mut ctx: CUcontext = std::ptr::null_mut();
-            if cuDevicePrimaryCtxRetain(&mut ctx, ordinal) == cudaError_enum::CUDA_SUCCESS
+            if crate::tensor::cuda::card_context_active(ordinal as usize)
+                && cuDevicePrimaryCtxRetain(&mut ctx, ordinal) == cudaError_enum::CUDA_SUCCESS
                 && !ctx.is_null()
             {
                 let _ = cuCtxPushCurrent_v2(ctx);

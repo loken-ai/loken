@@ -971,17 +971,19 @@ fn gpu_quant_linear_once(
     r
 }
 
+/// The copy stream of each card, by ordinal.
+static COPY: std::sync::Mutex<
+    Vec<(
+        usize,
+        std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
 /// The copy stream of a card, made once: weights go up on it while the compute stream runs.
 fn copy_stream(
     dev: &CudaDevice,
 ) -> Result<std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>> {
-    static COPY: std::sync::Mutex<
-        Vec<(
-            usize,
-            std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
-        )>,
-    > = std::sync::Mutex::new(Vec::new());
-    let mut g = COPY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = copy_streams().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = g.iter().find(|(o, _)| *o == dev.ordinal()) {
         return Ok(s.clone());
     }
@@ -993,14 +995,90 @@ fn copy_stream(
     Ok(s)
 }
 
+fn copy_streams() -> &'static std::sync::Mutex<
+    Vec<(
+        usize,
+        std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+    )>,
+> {
+    &COPY
+}
+
+/// Drops the copy stream of card `ordinal`, released. False when the list is busy.
+pub(super) fn release_copy_stream(ordinal: usize) -> bool {
+    match copy_streams().try_lock() {
+        Ok(mut g) => {
+            g.retain(|(o, _)| *o != ordinal);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Frees the page-locked buffers of card `ordinal`, whose primary context is `ctx` and current
+/// on the calling thread: the staging pool's, and each slab allocated under that context. False
+/// when a slab is still being read into.
+pub(super) fn release_host_buffers(ordinal: usize, ctx: usize) -> bool {
+    let Ok(mut pool) = PINNED.try_lock() else {
+        return false;
+    };
+    pool.retain(|p| {
+        if p.ordinal != ordinal {
+            return true;
+        }
+        let _ = unsafe { crate::tensor::gpu_runtime::driver::result::free_host(p.ptr) };
+        false
+    });
+    drop(pool);
+    let mut clean = true;
+    for slab in slabs() {
+        let Ok(mut g) = slab.inner.try_lock() else {
+            clean = false;
+            continue;
+        };
+        if g.ptr == 0 || (g.ctx != 0 && g.ctx != ctx) {
+            continue;
+        }
+        if g.active > 0 {
+            clean = false;
+            continue;
+        }
+        let _ = unsafe {
+            crate::tensor::gpu_runtime::driver::result::free_host(g.ptr as *mut std::ffi::c_void)
+        };
+        g.generation += 1;
+        g.entries.clear();
+        g.ptr = 0;
+        g.cap = 0;
+        g.ctx = 0;
+    }
+    clean
+}
+
+/// The context current on the calling thread, as an address; zero when none is or the runtime
+/// cannot say.
+fn current_context() -> usize {
+    #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+    {
+        crate::tensor::gpu_runtime::driver::result::ctx::get_current()
+            .ok()
+            .flatten()
+            .map_or(0, |c| c as usize)
+    }
+    #[cfg(not(all(feature = "cuda", not(feature = "rocm"))))]
+    0
+}
+
 /// A page-locked host buffer the weights of an expert are staged through: copied into here from
 /// the mapped file, then sent to the card by a copy that runs beside the card's other work.
 struct Pinned {
     ptr: *mut std::ffi::c_void,
     cap: usize,
+    /// The card whose context the buffer was allocated under, and dies with.
+    ordinal: usize,
 }
 
-// Safety: the buffer is owned by one holder at a time and freed only with the process.
+// Safety: the buffer is owned by one holder at a time and freed only with its card's release.
 unsafe impl Send for Pinned {}
 
 static PINNED: std::sync::Mutex<Vec<Pinned>> = std::sync::Mutex::new(Vec::new());
@@ -1012,6 +1090,8 @@ static PINNED: std::sync::Mutex<Vec<Pinned>> = std::sync::Mutex::new(Vec::new())
 struct SlabInner {
     ptr: usize,
     cap: usize,
+    /// The context the buffer was allocated under, as an address; zero when unknown.
+    ctx: usize,
     /// Bumped when the slab is refilled: readers of an earlier fill stop, and its entries vanish.
     generation: u64,
     /// Source address of a weight to its place in the slab and whether it has arrived.
@@ -1032,6 +1112,7 @@ fn slabs() -> &'static [Slab; 2] {
             inner: std::sync::Mutex::new(SlabInner {
                 ptr: 0,
                 cap: 0,
+                ctx: 0,
                 generation: 0,
                 entries: Default::default(),
                 active: 0,
@@ -1170,6 +1251,7 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
                     Ok(p) => {
                         g.ptr = p as usize;
                         g.cap = want;
+                        g.ctx = current_context();
                     }
                     Err(_) => return false,
                 }
@@ -1318,7 +1400,11 @@ impl<'a> Staging<'a> {
                     let ptr =
                         unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(cap, 0) }
                             .map_err(|e| Error(format!("pinned staging buffer: {e}")))?;
-                    Pinned { ptr, cap }
+                    Pinned {
+                        ptr,
+                        cap,
+                        ordinal: self.stream.context().ordinal(),
+                    }
                 }
             }
         };

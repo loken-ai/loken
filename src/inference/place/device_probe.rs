@@ -720,15 +720,12 @@ pub fn probe_cuda_devices_for(
 mod primary_ctx_tests {
     use super::primary_ctx_active;
 
-    /// The proven mechanics behind an idle card that never cools (#64): a driver
-    /// context releases cleanly with its last handle, but ONE cuBLAS init latches the
-    /// primary context inside the CUDA runtime for the life of the process - no Rust
-    /// drop, cache clear or pool release can undo it. This is why a card warmed with a
-    /// matmul keeps ~150 MB and ~10 W forever. If a future driver changes either
-    /// behaviour, this test says so.
+    /// A card holds a context only while something uses it: a bare create+drop releases it, and
+    /// so does a card that ran cuBLAS, whose runtime keeps the primary context until the card is
+    /// released. A released card opens again and computes the same answer.
     #[test]
     #[ignore = "hardware probe: needs a second CUDA card and owns its context state"]
-    fn a_context_releases_cleanly_until_cublas_latches_it() {
+    fn a_card_holds_no_context_once_its_last_user_is_gone() {
         let ord = 1usize;
         if crate::tensor::gpu_runtime::driver::result::init().is_err() {
             return;
@@ -738,6 +735,10 @@ mod primary_ctx_tests {
         if count <= ord {
             return;
         }
+        let release = || {
+            crate::tensor::cuda::release_idle_cards();
+        };
+        release();
         assert!(
             !primary_ctx_active(ord),
             "context active before anything ran"
@@ -745,31 +746,37 @@ mod primary_ctx_tests {
         {
             let _d = crate::tensor::Device::new_cuda(ord).unwrap();
         }
+        release();
         assert!(
             !primary_ctx_active(ord),
             "a bare create+drop must release the context"
         );
-        {
+        let product = || -> Vec<f32> {
             let d = crate::tensor::Device::new_cuda(ord).unwrap();
-            let _a =
-                crate::tensor::Tensor::zeros_on((16usize, 16usize), crate::tensor::DType::F32, &d)
-                    .unwrap();
-        }
+            let a: Vec<f32> = (0..256).map(|i| (i % 7) as f32 - 3.0).collect();
+            let a = crate::tensor::Tensor::from_vec(a, (16usize, 16usize), &d).unwrap();
+            let p = a.matmul(&a).unwrap();
+            assert!(primary_ctx_active(ord), "a card in use holds its context");
+            p.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let first = product();
+        release();
         assert!(
             !primary_ctx_active(ord),
-            "an allocation must not outlive its device"
+            "a card that ran cuBLAS must release its context once its last user is gone"
         );
-        {
-            let d = crate::tensor::Device::new_cuda(ord).unwrap();
-            if let crate::tensor::Device::Cuda(cd) = &d {
-                let _ = cd.blas().unwrap();
-            }
-        }
+        let held = crate::tensor::Device::new_cuda(ord).unwrap();
+        release();
         assert!(
             primary_ctx_active(ord),
-            "cuBLAS no longer latches the primary context - the warm-up policy in \
-             llm_engine (WARM_CTX) can be revisited"
+            "a card someone holds must keep its context"
         );
+        drop(held);
+        for _ in 0..3 {
+            assert_eq!(product(), first, "a released card computes the same answer");
+            release();
+            assert!(!primary_ctx_active(ord), "released again");
+        }
     }
 }
 

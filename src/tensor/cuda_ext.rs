@@ -253,10 +253,8 @@ mod cuda {
         tensor::cuda::set_gemm_reduced_precision_f16(false);
     }
 
-    /// Drop the per-ordinal device registry. Each entry holds an
-    /// `Arc<CudaContext>`; the primary context (and its pool reservation)
-    /// cannot be released back to the OS while any clone is alive, so model
-    /// unload clears the cache after dropping tensors/workspaces.
+    /// Forgets the devices nobody holds any more; a card's context goes with
+    /// `tensor::cuda::release_idle_cards`.
     pub fn clear_device_cache() {
         tensor::cuda::clear_device_cache();
     }

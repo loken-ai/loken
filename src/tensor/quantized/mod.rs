@@ -92,6 +92,8 @@ pub fn pad_to(x: usize, q: usize) -> usize {
 }
 
 #[cfg(feature = "gpu")]
+pub use cuda_storage::release_lent_pool;
+#[cfg(feature = "gpu")]
 pub(crate) use cuda_storage::trim_lent_pool;
 #[cfg(feature = "gpu")]
 pub use cuda_storage::QCudaStorage;
@@ -105,6 +107,8 @@ pub use kernel_matmul::QuantizedActivation;
 pub use matmul::QMatMul;
 #[cfg(feature = "gpu")]
 pub use mmq::release_mmq_workspaces;
+#[cfg(feature = "gpu")]
+pub use mmq::release_mmq_workspaces_of;
 #[cfg(feature = "gpu")]
 pub(crate) use mmq::{mmq_moe_launcher, mmq_moe_qk, mmq_moe_quantize_launcher, mmq_moe_supports};
 pub use qtensor::QTensor;

@@ -305,26 +305,165 @@ impl std::fmt::Debug for CudaDevice {
     }
 }
 
-/// Per-ordinal device registry - `CudaDevice` carries per-device kernel-module
-/// caches, so everything should share one instance per GPU.
-pub(super) static DEVICES: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<usize, Arc<CudaDevice>>>,
-> = OnceLock::new();
+/// The cards this process has opened, behind one lock that orders opening a card against
+/// releasing it.
+#[derive(Default)]
+struct Cards {
+    /// The device every caller of [`CudaDevice::get`] shares, by ordinal, while anyone holds it:
+    /// one stream per card, since two instances of a card run on two unordered streams.
+    shared: std::collections::HashMap<usize, std::sync::Weak<CudaDevice>>,
+    /// Every device opened, by ordinal, with its context: a card is released only once all of
+    /// them are gone.
+    opened: Vec<(
+        usize,
+        std::sync::Weak<CudaDevice>,
+        std::sync::Weak<CudaContext>,
+    )>,
+    /// How many times each card has been released.
+    releases: std::collections::HashMap<usize, u64>,
+}
+
+fn cards() -> std::sync::MutexGuard<'static, Cards> {
+    static CARDS: OnceLock<std::sync::Mutex<Cards>> = OnceLock::new();
+    CARDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The shared device whose stream `stream` is.
+pub(super) fn shared_card_of(stream: &Arc<CudaStream>) -> Option<Arc<CudaDevice>> {
+    cards()
+        .shared
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .find(|d| Arc::ptr_eq(&d.stream, stream))
+}
+
+/// How many times card `ordinal` has been released: a figure kept about the card's context is
+/// stale once this moves.
+pub fn card_releases(ordinal: usize) -> u64 {
+    cards().releases.get(&ordinal).copied().unwrap_or(0)
+}
+
+/// Whether card `ordinal` has a primary context in this process.
+pub fn card_context_active(ordinal: usize) -> bool {
+    use crate::tensor::gpu_runtime::driver::{result, sys};
+    let Ok(dev) = result::device::get(ordinal as i32) else {
+        return false;
+    };
+    let (mut flags, mut active) = (0u32, 0i32);
+    let ok = unsafe { sys::cuDevicePrimaryCtxGetState(dev, &mut flags, &mut active) };
+    ok == sys::cudaError_enum::CUDA_SUCCESS && active != 0
+}
+
+/// Releases every card nothing in the process uses any more, and answers the cards released.
+///
+/// A card with no device left first loses the per-card caches that hold its memory: constant
+/// tables, matmul workspaces, its copy stream. Once no context of it is alive either, its
+/// page-locked staging buffers and lent pool are freed and its primary context is reset, which
+/// also drops the hold cuBLAS's runtime keeps on it. A card any of these is still busy on is
+/// left as it is for the next call. The next user of a released card opens it afresh.
+pub fn release_idle_cards() -> Vec<usize> {
+    use crate::tensor::gpu_runtime::driver::result;
+    if super::runtime::require().is_err() || result::init().is_err() {
+        return Vec::new();
+    }
+    let count = result::device::get_count().unwrap_or(0).max(0) as usize;
+    let mut g = cards();
+    g.shared.retain(|_, d| d.strong_count() > 0);
+    g.opened
+        .retain(|(_, d, c)| d.strong_count() > 0 || c.strong_count() > 0);
+    let mut released = Vec::new();
+    for ordinal in 0..count {
+        if g.opened
+            .iter()
+            .any(|(o, d, _)| *o == ordinal && d.strong_count() > 0)
+            || !card_context_active(ordinal)
+        {
+            continue;
+        }
+        if !purge_card_caches(ordinal) {
+            tracing::debug!("cuda card {ordinal}: a cache is busy, release deferred");
+            continue;
+        }
+        g.opened
+            .retain(|(_, d, c)| d.strong_count() > 0 || c.strong_count() > 0);
+        if g.opened.iter().any(|(o, _, _)| *o == ordinal) {
+            tracing::debug!("cuda card {ordinal}: a context is still held, release deferred");
+            continue;
+        }
+        if reset_card(ordinal) {
+            *g.releases.entry(ordinal).or_insert(0) += 1;
+            released.push(ordinal);
+        }
+    }
+    if !released.is_empty() {
+        tracing::info!("cuda: released the context of card(s) {released:?}");
+    }
+    released
+}
+
+/// Drops what the process-wide caches hold on card `ordinal`, which has no device left. False
+/// when one of them is busy.
+fn purge_card_caches(ordinal: usize) -> bool {
+    if let Some(m) = DEV_CONST_I32.get() {
+        match m.try_lock() {
+            Ok(mut g) => g.retain(|(o, _), _| *o != ordinal),
+            Err(_) => return false,
+        }
+    }
+    crate::tensor::quantized::fast_mmvq::release_workspaces_of(ordinal)
+        && crate::tensor::quantized::release_mmq_workspaces_of(ordinal)
+        && super::quant::release_copy_stream(ordinal)
+}
+
+/// Frees what is left of card `ordinal` under its primary context, which nothing in the process
+/// holds but the CUDA runtime, then resets that context. False when the card stays as it was.
+fn reset_card(ordinal: usize) -> bool {
+    use crate::tensor::gpu_runtime::driver::{result, sys};
+    let Ok(dev) = result::device::get(ordinal as i32) else {
+        return false;
+    };
+    let mut ctx: sys::CUcontext = std::ptr::null_mut();
+    unsafe {
+        if sys::cuDevicePrimaryCtxRetain(&mut ctx, dev) != sys::cudaError_enum::CUDA_SUCCESS
+            || ctx.is_null()
+        {
+            return false;
+        }
+        let _ = sys::cuCtxPushCurrent_v2(ctx);
+        let _ = sys::cuCtxSynchronize();
+    }
+    let freed = super::quant::release_host_buffers(ordinal, ctx as usize);
+    crate::tensor::quantized::release_lent_pool(ordinal);
+    unsafe {
+        let mut popped: sys::CUcontext = std::ptr::null_mut();
+        let _ = sys::cuCtxPopCurrent_v2(&mut popped);
+        let _ = sys::cuDevicePrimaryCtxRelease_v2(dev);
+    }
+    freed && unsafe { sys::cuDevicePrimaryCtxReset_v2(dev) } == sys::cudaError_enum::CUDA_SUCCESS
+}
 
 impl CudaDevice {
-    /// The shared device handle for `ordinal` (created on first use).
+    /// The shared device handle for `ordinal`: the live one while anyone holds it, else a new
+    /// one.
     pub fn get(ordinal: usize) -> Result<Arc<Self>> {
-        let map = DEVICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(d) = g.get(&ordinal) {
-            return Ok(d.clone());
+        let mut g = cards();
+        if let Some(d) = g.shared.get(&ordinal).and_then(std::sync::Weak::upgrade) {
+            return Ok(d);
         }
-        let d = Self::new(ordinal)?;
-        g.insert(ordinal, d.clone());
+        let d = Self::open(&mut g, ordinal)?;
+        g.shared.insert(ordinal, Arc::downgrade(&d));
         Ok(d)
     }
 
+    /// A device of its own on `ordinal`, with its own stream.
     pub fn new(ordinal: usize) -> Result<Arc<Self>> {
+        Self::open(&mut cards(), ordinal)
+    }
+
+    fn open(cards: &mut Cards, ordinal: usize) -> Result<Arc<Self>> {
         super::runtime::require()?;
         tracing::debug!("cuda ctx: creating a context on ordinal {ordinal}");
         let ctx =
@@ -377,6 +516,9 @@ impl CudaDevice {
         // nothing has allocated on it yet. One allocation of one byte, two attribute
         // reads, and every later caller gets the answer from the cache.
         let _ = dev.pool_chunk();
+        cards
+            .opened
+            .push((ordinal, Arc::downgrade(&dev), Arc::downgrade(&dev.ctx)));
         Ok(dev)
     }
 
@@ -900,16 +1042,13 @@ impl CudaDevice {
     }
 }
 
-/// Drop the per-ordinal device registry (model unload: each entry pins an
-/// `Arc<CudaContext>`; clearing lets the last user release it).
+/// Forgets the devices nobody holds any more. A card's caches go with its release (see
+/// [`release_idle_cards`]).
 pub fn clear_device_cache() {
-    if let Some(m) = DEVICES.get() {
-        m.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-    // The device-constant cache pins slices (-> streams -> contexts) too.
-    if let Some(m) = DEV_CONST_I32.get() {
-        m.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
+    let mut g = cards();
+    g.shared.retain(|_, d| d.strong_count() > 0);
+    g.opened
+        .retain(|(_, d, c)| d.strong_count() > 0 || c.strong_count() > 0);
 }
 
 /// Per-device cache of small immutable i32 meta arrays (permute dims/strides,
