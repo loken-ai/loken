@@ -361,8 +361,20 @@ pub(crate) async fn convert_model(
         let run = || -> std::result::Result<(), String> {
             let src = SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?;
             let cfg = convert::released_config(&src, &dir).map_err(|e| e.to_string())?;
-            let records = calibration::read(&record).map_err(|e| e.to_string())?;
             let layers = layers.unwrap_or(0..cfg.n_layers);
+            let started = std::time::Instant::now();
+            // Only the layers written: a record is named `blk.{layer}.` and the projection.
+            let wanted = |name: &str| {
+                name.strip_prefix("blk.")
+                    .and_then(|rest| rest.split('.').next())
+                    .and_then(|l| l.parse::<usize>().ok())
+                    .is_some_and(|l| layers.contains(&l))
+            };
+            let records = calibration::read_where(&record, &wanted).map_err(|e| e.to_string())?;
+            tracing::info!(
+                "convert: calibration record read in {:.2}s",
+                started.elapsed().as_secs_f64()
+            );
             let tokenizer = convert::TokenizerFiles::read(&dir).map_err(|e| e.to_string())?;
             let digest = convert::convert(
                 &src,

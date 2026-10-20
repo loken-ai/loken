@@ -2255,3 +2255,20 @@ extern "C" __global__ void sink_softmax_f32(
     for (long k = 0; k < topk; k++) l[k] /= denom;
 }
 
+// Block-scaled fp4 weight to f32 in column order: `packed` is [rows, cols/2] e2m1 (element 2j in
+// the low nibble, 2j+1 in the high), `scale` [rows, cols/block] the power-of-two scales already
+// decoded. Value (r, c) lands at out[c * rows + r]. Every product is exact in f32, so the values
+// are the host decoder's bit for bit. One thread per value, consecutive threads down a column.
+extern "C" __global__ void fp4_to_columns(
+        const unsigned char * __restrict__ packed, const float * __restrict__ scale,
+        float * __restrict__ out, const int rows, const int cols, const int block) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) rows * cols) return;
+    const int c = (int) (i / rows), r = (int) (i % rows);
+    const unsigned char byte = packed[(size_t) r * (cols / 2) + c / 2];
+    const int nib = (c & 1) ? (byte >> 4) : (byte & 0x0F);
+    const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float mag = grid[nib & 7];
+    const float v = (nib & 8) ? -mag : mag;
+    out[i] = v * scale[(size_t) r * (cols / block) + c / block];
+}

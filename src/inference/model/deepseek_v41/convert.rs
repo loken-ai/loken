@@ -18,6 +18,7 @@ use super::source::{gguf_names, WeightSource};
 use super::DeepseekV41Config;
 use crate::inference::load::calibrated::{quantize_projection_on, Kernels, Recipe, Records};
 use crate::inference::load::calibration::Calibration;
+use crate::inference::load::compensate::stage::{self, time, Stage};
 use crate::inference::load::compensate::{Calibration as Moment, Factor};
 use crate::tensor::gguf_write::{GgufStreamWriter, PlannedEntry};
 use crate::tensor::quantized::gguf_file::Value;
@@ -488,14 +489,20 @@ pub(super) fn bytes_per(dtype: GgmlDType, elems: usize) -> u64 {
     (elems / dtype.block_size() * dtype.type_size()) as u64
 }
 
-/// Workers that quantise experts at once, spread over the accelerators when there are any. Each
-/// expert's CPU work already spreads over the cores, so a handful of experts at a time is what keeps
-/// the cores and the cards fed without starving each other.
-const WORKERS: usize = 4;
+/// Workers that quantise experts at once, spread over the accelerators when there are any. A
+/// worker's host work for one expert overlaps the card work the others have queued, so the cards
+/// always have an expert to run.
+const WORKERS: usize = 8;
+
+/// Tensors produced ahead of the file writer at most.
+const WRITER_AHEAD: usize = 32;
+
+/// Tensors the host encodes ahead of their turn in the file at most.
+const DENSE_AHEAD: usize = 8;
 
 /// Streams opened on each accelerator: a worker holds one, so this many experts are on a card at once.
 #[cfg(feature = "gpu")]
-const STREAMS_PER_CARD: usize = 4;
+const STREAMS_PER_CARD: usize = 8;
 
 /// The accelerators present, each opened `STREAMS_PER_CARD` times: every handle has its own stream
 /// and its own cuBLAS handle, so the workers holding them do not wait on each other.
@@ -552,6 +559,371 @@ fn quantize_on_device(
         factor,
         Some(&kernels),
     )
+}
+
+/// `values` in `dtype` without a record: f32 as its bytes, a block format's blocks encoded across the
+/// rayon pool, each block alone as the format's plain encoder takes it.
+fn encode_plain(dtype: GgmlDType, values: &[f32]) -> Result<Vec<u8>> {
+    use rayon::prelude::*;
+    if dtype == GgmlDType::F32 {
+        let mut bytes = vec![0u8; values.len() * 4];
+        bytes
+            .par_chunks_mut(4 << 16)
+            .zip(values.par_chunks(1 << 16))
+            .for_each(|(out, v)| {
+                for (o, x) in out.chunks_exact_mut(4).zip(v) {
+                    o.copy_from_slice(&x.to_le_bytes());
+                }
+            });
+        return Ok(bytes);
+    }
+    // Whole blocks a task, a few hundred of them, so the pool's overhead stays small.
+    let chunk = dtype.block_size() * 256;
+    let parts = values
+        .par_chunks(chunk)
+        .map(|c| crate::tensor::quant_cpu::from_float_bytes(dtype, c))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parts.concat())
+}
+
+/// What quantising a layer's expert stacks reads: the checkpoint, the calibration, and the cards.
+struct Stacks<'a> {
+    src: &'a SafeTensorsSource,
+    cfg: &'a DeepseekV41Config,
+    records: &'a Records,
+    recipe: Recipe,
+    #[cfg(feature = "gpu")]
+    devices: &'a [Arc<crate::tensor::cuda::CudaDevice>],
+    #[cfg(not(feature = "gpu"))]
+    devices: &'a (),
+    /// The factors of records experts fall back on, by record address and column count.
+    shared: Mutex<std::collections::HashMap<(usize, usize), SharedFactor>>,
+}
+
+type Record = (Vec<f32>, Vec<f32>, usize);
+
+/// The card buffers a worker keeps from one expert to the next.
+#[cfg(feature = "gpu")]
+type WorkerScratch = crate::tensor::cuda::Scratch;
+#[cfg(not(feature = "gpu"))]
+type WorkerScratch = ();
+
+/// A factor computed once and handed to every caller that asks for it, or the error it gave.
+type SharedFactor = Arc<std::sync::OnceLock<std::result::Result<Arc<Factor>, String>>>;
+
+impl Stacks<'_> {
+    /// A record's factor over `cols` columns, computed by the caller.
+    fn new_factor(&self, record: &Record, cols: usize) -> Result<Arc<Factor>> {
+        let (_, sample, kept) = record;
+        let moment = Moment {
+            rows: sample,
+            n: *kept,
+            damping: self.recipe.damping,
+        };
+        time(Stage::Factor, || Factor::new(&moment, cols)).map(Arc::new)
+    }
+
+    /// The factor of a record experts fall back on, computed by the first caller to need it and
+    /// kept, keyed by the record's address and the column count, until `release`.
+    fn shared_factor(&self, record: &Record, cols: usize) -> Result<Arc<Factor>> {
+        let slot = self
+            .shared
+            .lock()
+            .unwrap()
+            .entry((record as *const _ as usize, cols))
+            .or_default()
+            .clone();
+        slot.get_or_init(|| self.new_factor(record, cols).map_err(|e| e.to_string()))
+            .clone()
+            .map_err(Error::msg)
+    }
+
+    /// The factor of the record a layer's gate and up projections fall back on, computed now:
+    /// run ahead of the layer, so its experts do not wait for it.
+    fn prepare(&self, layer: usize, cols: usize) {
+        if let Some(r) = self
+            .records
+            .get(&moe_input(layer))
+            .filter(|r| r.2 >= self.recipe.min_rows)
+        {
+            let started = std::time::Instant::now();
+            if self.shared_factor(r, cols).is_ok() {
+                tracing::info!(
+                    "convert: layer {layer}'s shared factor of {} rows ready in {:.2}s",
+                    r.2,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+
+    /// The shared factors of a layer's records dropped.
+    fn release(&self, layer: usize) {
+        let keys: Vec<usize> = [moe_input(layer), down_pooled(layer)]
+            .iter()
+            .filter_map(|n| self.records.get(n))
+            .map(|r| r as *const _ as usize)
+            .collect();
+        self.shared
+            .lock()
+            .unwrap()
+            .retain(|(at, _), _| !keys.contains(at));
+    }
+
+    /// The record projection `w` of expert `e` is quantised with, whether its rows enter the
+    /// correction, and whether the record is that expert's own. Gate and up see the rows routed to
+    /// the expert, or the whole block's input when it saw too few; down sees its own rows, or takes
+    /// the layer's pooled weights without their rows, which describe other experts.
+    fn record_for(&self, layer: usize, w: &str, e: usize) -> (Option<&Record>, bool, bool) {
+        let (own, shared, compensate) = if w == "w2" {
+            (down_seen(layer, e), down_pooled(layer), false)
+        } else {
+            (gate_up_seen(layer, e), moe_input(layer), true)
+        };
+        match self
+            .records
+            .get(&own)
+            .filter(|r| r.2 >= self.recipe.min_rows)
+        {
+            Some(r) => (Some(r), true, true),
+            None => (self.records.get(&shared), compensate, false),
+        }
+    }
+
+    /// Every expert's projections `ws` of `layer`, each `rows` by `cols` in `dtype`. The first
+    /// projection's expert blocks are handed to `first` in expert order as they are done; the
+    /// others come back as one list of expert blocks per projection. The projections of one call
+    /// share their records, so each expert's factor is computed, and put on a card, once for all
+    /// of them.
+    fn quantize(
+        &self,
+        layer: usize,
+        ws: &[&'static str],
+        (rows, cols): (usize, usize),
+        dtype: GgmlDType,
+        first: &(dyn Fn(Result<Vec<u8>>) -> Result<()> + Sync),
+    ) -> Result<Vec<Vec<Result<Vec<u8>>>>> {
+        let n_experts = self.cfg.n_routed_experts;
+        let recipe = self.recipe;
+        let name = |w: &str, e: usize| format!("layers.{layer}.ffn.experts.{e}.{w}.weight");
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Mutex<Vec<Vec<Option<Result<Vec<u8>>>>>> = Mutex::new(
+            ws.iter()
+                .map(|_| (0..n_experts).map(|_| None).collect())
+                .collect(),
+        );
+        let claim = || {
+            let e = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (e < n_experts).then_some(e)
+        };
+        let factor_of = |record: &Record, own: bool| -> Result<Arc<Factor>> {
+            if own {
+                self.new_factor(record, cols)
+            } else {
+                self.shared_factor(record, cols)
+            }
+        };
+        // The same shared factors on each card, uploaded by the first worker there to need one.
+        type Shared<T> = Arc<std::sync::OnceLock<std::result::Result<Arc<T>, String>>>;
+        #[cfg(feature = "gpu")]
+        let on_cards: Mutex<
+            std::collections::HashMap<(usize, usize), Shared<crate::tensor::cuda::CardFactor>>,
+        > = Mutex::default();
+        let one = |device: usize, e: usize, scratch: &mut WorkerScratch| -> Result<Vec<Vec<u8>>> {
+            let (record, compensate, own) = self.record_for(layer, ws[0], e);
+            let factor = match record {
+                Some(r) if compensate && r.2 >= recipe.min_rows => Some(factor_of(r, own)?),
+                _ => None,
+            };
+            #[cfg(feature = "gpu")]
+            if let (Some(dev), Some(r), Some(f)) = (self.devices.get(device), record, &factor) {
+                if matches!(
+                    dtype,
+                    GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Q2K | GgmlDType::Q3K
+                ) {
+                    use crate::inference::load::compensate::block_inverse;
+                    use crate::tensor::cuda::{
+                        card_factor, card_factor_in, quantize_columns_on_card, quantize_fp4_on_card,
+                    };
+                    let shape = (r.2, cols);
+                    let build = || {
+                        card_factor(dev, &r.1, f.solved(), shape, f.lambda(), &block_inverse)
+                            .map(Arc::new)
+                    };
+                    // An expert's own factor lives in the worker's buffers; a shared one is kept
+                    // for every worker on the card.
+                    let mut mine = None;
+                    let card = if own {
+                        mine = Some(card_factor_in(
+                            dev,
+                            &r.1,
+                            f.solved(),
+                            shape,
+                            f.lambda(),
+                            &block_inverse,
+                            scratch,
+                        )?);
+                        None
+                    } else {
+                        let slot = on_cards
+                            .lock()
+                            .unwrap()
+                            .entry((r as *const _ as usize, device))
+                            .or_default()
+                            .clone();
+                        Some(
+                            slot.get_or_init(|| build().map_err(|e| e.to_string()))
+                                .clone()
+                                .map_err(Error::msg)?,
+                        )
+                    };
+                    let Some(held) = card.as_deref().or(mine.as_ref()) else {
+                        return Err(Error::msg("convert: no factor on the card"));
+                    };
+                    let got = ws
+                        .iter()
+                        .map(|w| {
+                            let name = name(w, e);
+                            // Stored as fp4, the weight crosses packed and is decoded on the card.
+                            if let Some((packed, scales, block)) = self.src.fp4(&name)? {
+                                return quantize_fp4_on_card(
+                                    dev,
+                                    dtype,
+                                    packed.as_slice(),
+                                    &scales,
+                                    block,
+                                    (rows, cols),
+                                    &r.0,
+                                    held,
+                                    scratch,
+                                );
+                            }
+                            let v = self.src.values_in_columns(&name)?;
+                            quantize_columns_on_card(
+                                dev,
+                                dtype,
+                                &v,
+                                (rows, cols),
+                                &r.0,
+                                held,
+                                scratch,
+                            )
+                        })
+                        .collect();
+                    if let Some(f) = mine {
+                        scratch.keep(f);
+                    }
+                    return got;
+                }
+            }
+            ws.iter()
+                .map(|w| {
+                    let v = self.src.values(&name(w, e))?;
+                    #[cfg(feature = "gpu")]
+                    if let Some(dev) = self.devices.get(device) {
+                        return quantize_on_device(
+                            dev,
+                            dtype,
+                            &v,
+                            (rows, cols),
+                            record,
+                            compensate,
+                            recipe,
+                            factor.as_deref(),
+                        );
+                    }
+                    let _ = (device, &scratch);
+                    quantize_projection_on(
+                        dtype,
+                        &v,
+                        (rows, cols),
+                        record,
+                        compensate,
+                        recipe,
+                        factor.as_deref(),
+                        None,
+                    )
+                })
+                .collect()
+        };
+        let done = std::sync::Condvar::new();
+        let store = |e: usize, r: Result<Vec<Vec<u8>>>| {
+            let mut held = results.lock().unwrap();
+            match r {
+                Ok(parts) => {
+                    for (slot, part) in held.iter_mut().zip(parts) {
+                        slot[e] = Some(Ok(part));
+                    }
+                }
+                Err(err) => {
+                    for slot in held.iter_mut() {
+                        slot[e] = Some(Err(Error::msg(err.to_string())));
+                    }
+                }
+            }
+            done.notify_all();
+        };
+        #[cfg(feature = "gpu")]
+        let cards = self.devices.len().max(1);
+        #[cfg(not(feature = "gpu"))]
+        let cards = 1;
+        // Each worker asks for the pages of the expert a round of workers ahead of its own.
+        let workers = WORKERS.max(cards);
+        let streamed = std::thread::scope(|scope| -> Result<()> {
+            for worker in 0..workers {
+                let (claim, store, one) = (&claim, &store, &one);
+                scope.spawn(move || {
+                    // The scratch is a unit type in a build without a card.
+                    #[allow(clippy::let_unit_value)]
+                    let mut scratch = WorkerScratch::default();
+                    while let Some(e) = claim() {
+                        if e + workers < n_experts {
+                            for w in ws {
+                                self.src.will_need(&name(w, e + workers));
+                            }
+                        }
+                        store(e, one(worker % cards, e, &mut scratch));
+                    }
+                });
+            }
+            let mut sent = Ok(());
+            for e in 0..n_experts {
+                let part = {
+                    let mut held = results.lock().unwrap();
+                    loop {
+                        if let Some(part) = held[0][e].take() {
+                            break part;
+                        }
+                        held = done.wait(held).unwrap();
+                    }
+                };
+                if sent.is_ok() {
+                    sent = first(part);
+                }
+            }
+            sent
+        });
+        streamed?;
+        Ok(results
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .map(|stack| {
+                stack
+                    .into_iter()
+                    .enumerate()
+                    .map(|(e, r)| {
+                        r.unwrap_or_else(|| {
+                            Err(Error::msg(format!(
+                                "layer {layer}: expert {e} was never quantised"
+                            )))
+                        })
+                    })
+                    .collect()
+            })
+            .collect())
+    }
 }
 
 /// Write the file. `records` is a calibration read back with `calibration::read`. `layers` limits the
@@ -702,196 +1074,154 @@ pub fn convert(
             byte_len: e.byte_len,
         })
         .collect();
-    let mut writer = GgufStreamWriter::create(out, &md, &entries)?;
+    let writer = GgufStreamWriter::create(out, &md, &entries)?;
     let total = plan.len();
     // Opened once for the whole file: a context costs seconds and holds memory on the card.
     #[cfg(feature = "gpu")]
     let devices = accelerators();
-    for (i, (entry, source)) in plan.iter().enumerate() {
-        match source {
-            Source::Dense(name) => {
-                let values = src.dense_f32(name)?.flatten_all()?.to_vec1::<f32>()?;
-                let bytes = if entry.dtype == GgmlDType::F32 {
-                    values.iter().flat_map(|v| v.to_le_bytes()).collect()
-                } else {
-                    crate::tensor::quant_cpu::from_float_bytes(entry.dtype, &values)?
+    #[cfg(not(feature = "gpu"))]
+    let devices = ();
+    let stacks = Stacks {
+        src,
+        cfg,
+        records,
+        recipe,
+        devices: &devices,
+        shared: Mutex::default(),
+    };
+    let stacks = &stacks;
+    // The file is written, and hashed, on its own thread, in plan order, while the tensors after
+    // the one being written are produced. Up to `WRITER_AHEAD` tensors wait for it, enough for a
+    // layer's small tensors to queue behind its last stack while the next layer's stacks start.
+    let (to_writer, pieces) = std::sync::mpsc::sync_channel::<Piece>(WRITER_AHEAD);
+    let stopped = || Error::msg("convert: the file writer stopped");
+    std::thread::scope(|scope| -> Result<String> {
+        let writing = scope.spawn(move || -> Result<GgufStreamWriter> {
+            let mut writer = writer;
+            for piece in pieces {
+                time(Stage::Write, || match piece {
+                    Piece::Bytes(b) => writer.append(&b),
+                    Piece::Mapped(b) => writer.append(b.as_slice()),
+                    Piece::Stream(parts) => writer.append_parts(parts),
+                    Piece::Parts(parts) => writer.append_parts(parts),
+                })?;
+            }
+            Ok(writer)
+        });
+        // The tensors encoded on the host alone are encoded ahead, in plan order, on their own
+        // thread, while the cards work through the expert stacks before them.
+        let (encoded, ahead) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(DENSE_AHEAD);
+        let order = &plan;
+        scope.spawn(move || {
+            for (entry, source) in order.iter() {
+                let Source::Dense(name) = source else {
+                    continue;
                 };
-                writer.append(&bytes)?;
+                let bytes = src
+                    .values(name)
+                    .and_then(|v| time(Stage::HostEncode, || encode_plain(entry.dtype, &v)));
+                if encoded.send(bytes).is_err() {
+                    return;
+                }
             }
-            Source::Verbatim(name) => {
-                let (_, _, bytes) = src.raw(name)?;
-                writer.append(bytes.as_slice())?;
-            }
-            Source::Experts(layer, w) => {
-                let (layer, w) = (*layer, *w);
-                let (rows, cols, dtype) = (entry.dims[1], entry.dims[2], entry.dtype);
-                // Gate and up see the rows routed to the expert, or the whole block's input when it
-                // saw too few; down sees its own rows, or takes the layer's pooled weights without
-                // their rows, which describe other experts.
-                let record_for = |e: usize| {
-                    if w == "w2" {
-                        match records
-                            .get(&down_seen(layer, e))
-                            .filter(|r| r.2 >= recipe.min_rows)
-                        {
-                            Some(r) => (Some(r), true),
-                            None => (records.get(&down_pooled(layer)), false),
-                        }
-                    } else {
-                        match records
-                            .get(&gate_up_seen(layer, e))
-                            .filter(|r| r.2 >= recipe.min_rows)
-                        {
-                            Some(r) => (Some(r), true),
-                            None => (records.get(&moe_input(layer)), true),
-                        }
+        });
+        let run = || -> Result<()> {
+            // A layer's up projections, quantised beside its gate projections, whose records they
+            // share, and held until their turn in the file.
+            let mut held_up: Option<(usize, Vec<Result<Vec<u8>>>)> = None;
+            for (i, (entry, source)) in plan.iter().enumerate() {
+                let started = std::time::Instant::now();
+                match source {
+                    Source::Dense(_) => {
+                        let bytes = ahead
+                            .recv()
+                            .map_err(|_| Error::msg("convert: the host encoder stopped"))??;
+                        to_writer.send(Piece::Bytes(bytes)).map_err(|_| stopped())?;
                     }
-                };
-                let weights = |e: usize| -> Result<Vec<f32>> {
-                    src.dense_f32(&format!("layers.{layer}.ffn.experts.{e}.{w}.weight"))?
-                        .flatten_all()?
-                        .to_vec1::<f32>()
-                };
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                let results: Mutex<Vec<Option<Result<Vec<u8>>>>> =
-                    Mutex::new((0..cfg.n_routed_experts).map(|_| None).collect());
-                let claim = || {
-                    let e = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    (e < cfg.n_routed_experts).then_some(e)
-                };
-                let store = |e: usize, r: Result<Vec<u8>>| results.lock().unwrap()[e] = Some(r);
-                // Experts that fall back on one record share its factor: computed by the first to
-                // need it, keyed by the record's address, dropped with the stack.
-                type Shared = Arc<std::sync::OnceLock<std::result::Result<Factor, String>>>;
-                let factors: Mutex<std::collections::HashMap<usize, Shared>> = Mutex::default();
-                let factor_of = |record: &(Vec<f32>, Vec<f32>, usize)| -> Result<Shared> {
-                    let slot = factors
-                        .lock()
-                        .unwrap()
-                        .entry(record as *const _ as usize)
-                        .or_default()
-                        .clone();
-                    let (_, sample, kept) = record;
-                    let moment = Moment {
-                        rows: sample,
-                        n: *kept,
-                        damping: recipe.damping,
-                    };
-                    let done =
-                        slot.get_or_init(|| Factor::new(&moment, cols).map_err(|e| e.to_string()));
-                    done.as_ref().map_err(|e| Error::msg(e.clone()))?;
-                    Ok(slot)
-                };
-                // The same factors on each card, uploaded by the first worker there to need one.
-                #[cfg(feature = "gpu")]
-                let on_cards: Mutex<
-                    std::collections::HashMap<(usize, usize), Arc<crate::tensor::cuda::CardFactor>>,
-                > = Mutex::default();
-                let one = |device: usize, e: usize| -> Result<Vec<u8>> {
-                    let (record, compensate) = record_for(e);
-                    let v = weights(e)?;
-                    let shared = match record {
-                        Some(r) if compensate && r.2 >= recipe.min_rows => Some(factor_of(r)?),
-                        _ => None,
-                    };
-                    let factor = shared
-                        .as_ref()
-                        .and_then(|s| s.get())
-                        .and_then(|f| f.as_ref().ok());
-                    #[cfg(feature = "gpu")]
-                    if let (Some(dev), Some(r), Some(f)) = (devices.get(device), record, factor) {
-                        if matches!(
-                            dtype,
-                            GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Q2K | GgmlDType::Q3K
-                        ) {
-                            use crate::inference::load::compensate::block_inverse;
-                            use crate::tensor::cuda::{card_factor, quantize_compensated_on_card};
-                            let card = {
-                                let mut held = on_cards.lock().unwrap();
-                                let key = (r as *const _ as usize, device);
-                                match held.get(&key) {
-                                    Some(c) => c.clone(),
-                                    None => {
-                                        let c = Arc::new(card_factor(
-                                            dev,
-                                            &r.1,
-                                            f.solved(),
-                                            (r.2, cols),
-                                            f.lambda(),
-                                        )?);
-                                        held.insert(key, c.clone());
-                                        c
+                    Source::Verbatim(name) => {
+                        let (_, _, bytes) = src.raw(name)?;
+                        to_writer
+                            .send(Piece::Mapped(bytes))
+                            .map_err(|_| stopped())?;
+                    }
+                    Source::Experts(layer, w) => {
+                        let (layer, w) = (*layer, *w);
+                        let (rows, cols, dtype) = (entry.dims[1], entry.dims[2], entry.dtype);
+                        let up_follows = plan.get(i + 1).is_some_and(|(next, source)| {
+                            matches!(source, Source::Experts(l, "w3") if *l == layer)
+                                && next.dims == entry.dims
+                                && next.dtype == dtype
+                        });
+                        match held_up.take() {
+                            Some((l, parts)) if w == "w3" && l == layer => {
+                                to_writer.send(Piece::Parts(parts)).map_err(|_| stopped())?;
+                            }
+                            other => {
+                                held_up = other;
+                                let pair: &[&'static str] = if w == "w1" && up_follows {
+                                    &["w1", "w3"]
+                                } else {
+                                    std::slice::from_ref(&w)
+                                };
+                                // A layer's shared factor is computed while the layer before
+                                // it runs; the first layer's beside its own experts.
+                                if w == "w1" {
+                                    if layer == layers.start {
+                                        scope.spawn(move || stacks.prepare(layer, cols));
+                                    }
+                                    if layer + 1 < layers.end.min(cfg.n_layers) {
+                                        scope.spawn(move || stacks.prepare(layer + 1, cols));
                                     }
                                 }
-                            };
-                            return quantize_compensated_on_card(
-                                dev,
-                                dtype,
-                                &v,
-                                (rows, cols),
-                                &r.0,
-                                &card,
-                                &block_inverse,
-                            );
+                                // The first projection's experts go to the writer as they come.
+                                let (parts, stream) = std::sync::mpsc::channel();
+                                to_writer
+                                    .send(Piece::Stream(stream))
+                                    .map_err(|_| stopped())?;
+                                let first =
+                                    |part: Result<Vec<u8>>| parts.send(part).map_err(|_| stopped());
+                                let mut rest =
+                                    stacks.quantize(layer, pair, (rows, cols), dtype, &first)?;
+                                if pair.len() == 2 {
+                                    held_up = rest.pop().map(|up| (layer, up));
+                                }
+                                if w == "w2" {
+                                    stacks.release(layer);
+                                }
+                            }
                         }
                     }
-                    #[cfg(feature = "gpu")]
-                    if let Some(dev) = devices.get(device) {
-                        return quantize_on_device(
-                            dev,
-                            dtype,
-                            &v,
-                            (rows, cols),
-                            record,
-                            compensate,
-                            recipe,
-                            factor,
-                        );
-                    }
-                    let _ = device;
-                    quantize_projection_on(
-                        dtype,
-                        &v,
-                        (rows, cols),
-                        record,
-                        compensate,
-                        recipe,
-                        factor,
-                        None,
-                    )
-                };
-                #[cfg(feature = "gpu")]
-                let cards = devices.len().max(1);
-                #[cfg(not(feature = "gpu"))]
-                let cards = 1;
-                std::thread::scope(|scope| {
-                    for worker in 0..WORKERS.max(cards) {
-                        let (claim, store, one) = (&claim, &store, &one);
-                        scope.spawn(move || {
-                            while let Some(e) = claim() {
-                                store(e, one(worker % cards, e));
-                            }
-                        });
-                    }
-                });
-                let parts = results
-                    .into_inner()
-                    .unwrap()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(e, r)| {
-                        r.unwrap_or_else(|| {
-                            Err(Error::msg(format!(
-                                "layer {layer}: expert {e} was never quantised"
-                            )))
-                        })
-                    });
-                writer.append_parts(parts)?;
+                }
+                tracing::info!(
+                    "convert {}: {:.2}s; {}",
+                    entry.name,
+                    started.elapsed().as_secs_f64(),
+                    stage::take()
+                );
+                progress(i + 1, total, &entry.name);
             }
-        }
-        progress(i + 1, total, &entry.name);
-    }
-    writer.finish_with_digest()
+            Ok(())
+        };
+        let outcome = run();
+        drop(ahead);
+        drop(to_writer);
+        let writer = writing
+            .join()
+            .map_err(|_| Error::msg("convert: the file writer panicked"))?;
+        // The writer's own failure is the cause when both failed.
+        let writer = writer?;
+        outcome?;
+        writer.finish_with_digest()
+    })
+}
+
+/// What the file writer is handed, in plan order: one tensor's bytes, whole or in pieces.
+enum Piece {
+    Bytes(Vec<u8>),
+    Mapped(crate::tensor::mapped::MappedBytes),
+    /// Pieces still being produced, ending when their sender is dropped.
+    Stream(std::sync::mpsc::Receiver<Result<Vec<u8>>>),
+    Parts(Vec<Result<Vec<u8>>>),
 }
 
 #[cfg(test)]

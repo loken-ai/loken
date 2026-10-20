@@ -33,6 +33,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Convert: keep the cards busy through a conversion, about seven times faster.
 - GPU: verify the draft rows of an MHA model in one launch per kernel.
 - Offload: read a streamed expert not in memory in full read-ahead windows.
 - Offload: read a short prompt on the cards with their kept weights and overlap card and host experts.

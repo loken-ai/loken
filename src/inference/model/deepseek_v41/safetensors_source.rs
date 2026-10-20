@@ -13,7 +13,9 @@ use crate::inference::offload::experts::Expert;
 use crate::inference::offload::projection::Projection;
 use crate::inference::offload::store::ExpertLoader;
 use crate::tensor::blockscaled::bf16::Bf16Weight;
-use crate::tensor::blockscaled::dequant::{dequant_fp4_blocked, dequant_fp8_blocked, e8m0_to_f32};
+use crate::tensor::blockscaled::dequant::{
+    dequant_fp4_blocked, dequant_fp4_blocked_columns, dequant_fp8_blocked, e8m0_to_f32,
+};
 use crate::tensor::blockscaled::fp4::Fp4Weight;
 use crate::tensor::blockscaled::fp8::Fp8Weight;
 use crate::tensor::mapped::MappedBytes;
@@ -149,6 +151,58 @@ impl SafeTensorsSource {
         })
     }
 
+    /// A tensor's values as f32, row-major, decoded as `dense_f32` decodes them.
+    pub fn values(&self, name: &str) -> Result<Vec<f32>> {
+        self.inner.dense_values(name, false).map(|(v, _)| v)
+    }
+
+    /// A matrix's values as f32 in column order, value `(i, j)` at `j * rows + i`: fp4 decoded
+    /// straight into that order.
+    pub fn values_in_columns(&self, name: &str) -> Result<Vec<f32>> {
+        self.inner.dense_values(name, true).map(|(v, _)| v)
+    }
+
+    /// A block-scaled fp4 matrix as stored: its packed bytes, its scales decoded, and the values
+    /// each scale covers. `None` for a tensor stored otherwise.
+    pub fn fp4(&self, name: &str) -> Result<Option<(MappedBytes, Vec<f32>, usize)>> {
+        use crate::inference::load::compensate::stage::{time, Stage};
+        let (e, b) = self.inner.bytes(name)?;
+        if e.dtype != Dtype::I8 || e.shape.len() != 2 {
+            return Ok(None);
+        }
+        let Some(scale_name) = Inner::scale_name(name) else {
+            return Ok(None);
+        };
+        let (se, _) = self.inner.bytes(&scale_name)?;
+        let (out, inp) = (e.shape[0], e.shape[1] * 2);
+        let per_row = se.shape.get(1).copied().unwrap_or(0);
+        if se.shape.first().copied() != Some(out) || per_row == 0 || inp % per_row != 0 {
+            return Err(Error::msg(format!(
+                "{name}: scales {:?} do not tile [{out}, {inp}] by rows",
+                se.shape
+            )));
+        }
+        time(Stage::Read, || {
+            let mut sum = 0u8;
+            for page in b.as_slice().iter().step_by(4096) {
+                sum = sum.wrapping_add(*page);
+            }
+            std::hint::black_box(sum);
+        });
+        let scales = time(Stage::Dequant, || self.inner.scales_f32(&scale_name))?;
+        Ok(Some((b, scales, inp / per_row)))
+    }
+
+    /// Ask the kernel to read a tensor's pages, and its scales', ahead of their use.
+    pub fn will_need(&self, name: &str) {
+        if let Ok((_, b)) = self.inner.bytes(name) {
+            b.will_need();
+        }
+        if let Some(Ok((_, b))) = Inner::scale_name(name).map(|s| self.inner.bytes(&s)) {
+            b.will_need();
+        }
+    }
+
     pub fn names(&self) -> Vec<&str> {
         self.inner.index.keys().map(|s| s.as_str()).collect()
     }
@@ -209,72 +263,114 @@ impl Inner {
     }
 
     fn dense_f32(&self, name: &str) -> Result<Tensor> {
+        let (values, shape) = self.dense_values(name, false)?;
+        Tensor::from_vec(values, shape, &Device::Cpu)
+    }
+
+    /// A tensor's values as f32 with its logical shape: row-major, or for a matrix in column order
+    /// when `columns` is set, value `(i, j)` at `j * rows + i`.
+    fn dense_values(&self, name: &str, columns: bool) -> Result<(Vec<f32>, Vec<usize>)> {
+        use crate::inference::load::compensate::stage::{time, Stage};
         let (e, b) = self.bytes(name)?;
         let bytes = b.as_slice();
+        // One byte a page, so the stages that follow see the file's time apart from their own.
+        time(Stage::Read, || {
+            let mut sum = 0u8;
+            for page in bytes.iter().step_by(4096) {
+                sum = sum.wrapping_add(*page);
+            }
+            std::hint::black_box(sum);
+        });
         let shape = self.logical_shape(e);
         let n: usize = shape.iter().product();
-        let values: Vec<f32> = match e.dtype {
-            Dtype::F32 => bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            Dtype::BF16 => bytes
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect(),
-            Dtype::F16 => bytes
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect(),
-            Dtype::F8_E4M3 => {
-                let scale_name = Inner::scale_name(name).ok_or_else(|| {
-                    Error::msg(format!("{name}: fp8 tensor without a .weight name"))
-                })?;
-                let (se, _) = self.bytes(&scale_name)?;
-                let [out, inp] = shape[..] else {
-                    return Err(Error::msg(format!("{name}: fp8 tensor is not 2-D")));
-                };
-                let (br, bc) = self.fp8_block;
-                if br != bc || se.shape != vec![out.div_ceil(br), inp.div_ceil(bc)] {
-                    return Err(Error::msg(format!(
-                        "{name}: scales {:?} do not tile [{out}, {inp}] by {br}x{bc}",
-                        se.shape
-                    )));
+        let values: Vec<f32> = time(Stage::Dequant, || -> Result<Vec<f32>> {
+            Ok(match e.dtype {
+                Dtype::F32 => bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                Dtype::BF16 => bytes
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect(),
+                Dtype::F16 => bytes
+                    .chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect(),
+                Dtype::F8_E4M3 => {
+                    let scale_name = Inner::scale_name(name).ok_or_else(|| {
+                        Error::msg(format!("{name}: fp8 tensor without a .weight name"))
+                    })?;
+                    let (se, _) = self.bytes(&scale_name)?;
+                    let [out, inp] = shape[..] else {
+                        return Err(Error::msg(format!("{name}: fp8 tensor is not 2-D")));
+                    };
+                    let (br, bc) = self.fp8_block;
+                    if br != bc || se.shape != vec![out.div_ceil(br), inp.div_ceil(bc)] {
+                        return Err(Error::msg(format!(
+                            "{name}: scales {:?} do not tile [{out}, {inp}] by {br}x{bc}",
+                            se.shape
+                        )));
+                    }
+                    dequant_fp8_blocked(bytes, &self.scales_f32(&scale_name)?, out, inp, br)
                 }
-                dequant_fp8_blocked(bytes, &self.scales_f32(&scale_name)?, out, inp, br)
-            }
-            Dtype::I8 => {
-                let scale_name = Inner::scale_name(name).ok_or_else(|| {
-                    Error::msg(format!("{name}: fp4 tensor without a .weight name"))
-                })?;
-                let (se, _) = self.bytes(&scale_name)?;
-                let [out, inp] = shape[..] else {
-                    return Err(Error::msg(format!("{name}: fp4 tensor is not 2-D")));
-                };
-                let per_row = se.shape.get(1).copied().unwrap_or(0);
-                if se.shape.first().copied() != Some(out) || per_row == 0 || inp % per_row != 0 {
-                    return Err(Error::msg(format!(
-                        "{name}: scales {:?} do not tile [{out}, {inp}] by rows",
-                        se.shape
-                    )));
+                Dtype::I8 => {
+                    let scale_name = Inner::scale_name(name).ok_or_else(|| {
+                        Error::msg(format!("{name}: fp4 tensor without a .weight name"))
+                    })?;
+                    let (se, _) = self.bytes(&scale_name)?;
+                    let [out, inp] = shape[..] else {
+                        return Err(Error::msg(format!("{name}: fp4 tensor is not 2-D")));
+                    };
+                    let per_row = se.shape.get(1).copied().unwrap_or(0);
+                    if se.shape.first().copied() != Some(out) || per_row == 0 || inp % per_row != 0
+                    {
+                        return Err(Error::msg(format!(
+                            "{name}: scales {:?} do not tile [{out}, {inp}] by rows",
+                            se.shape
+                        )));
+                    }
+                    let decode = if columns {
+                        dequant_fp4_blocked_columns
+                    } else {
+                        dequant_fp4_blocked
+                    };
+                    decode(
+                        bytes,
+                        &self.scales_f32(&scale_name)?,
+                        out,
+                        inp,
+                        inp / per_row,
+                    )
                 }
-                dequant_fp4_blocked(
-                    bytes,
-                    &self.scales_f32(&scale_name)?,
-                    out,
-                    inp,
-                    inp / per_row,
-                )
-            }
-            other => return Err(Error::msg(format!("{name}: unsupported dtype {other:?}"))),
-        };
+                other => return Err(Error::msg(format!("{name}: unsupported dtype {other:?}"))),
+            })
+        })?;
         if values.len() != n {
             return Err(Error::msg(format!(
                 "{name}: {} values for shape {shape:?}",
                 values.len()
             )));
         }
-        Tensor::from_vec(values, shape, &Device::Cpu)
+        if !columns || e.dtype == Dtype::I8 {
+            return Ok((values, shape));
+        }
+        let [rows, cols] = shape[..] else {
+            return Err(Error::msg(format!("{name}: a column order needs a matrix")));
+        };
+        let transposed = time(Stage::Dequant, || {
+            use rayon::prelude::*;
+            let mut t = vec![0f32; n];
+            t.par_chunks_mut(rows.max(1))
+                .enumerate()
+                .for_each(|(j, column)| {
+                    for (i, v) in column.iter_mut().enumerate() {
+                        *v = values[i * cols + j];
+                    }
+                });
+            t
+        });
+        Ok((transposed, shape))
     }
 
     fn projection(&self, name: &str) -> Result<Option<Projection>> {

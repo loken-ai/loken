@@ -184,11 +184,19 @@ impl Calibration {
 
 /// One projection's record, read back from a file: the weights per column, and the sampled rows.
 pub fn read(path: &Path) -> Result<HashMap<String, (Vec<f32>, Vec<f32>, usize)>> {
+    read_where(path, &|_| true)
+}
+
+/// `read`, keeping only the records whose name `keep` accepts; the others are never read.
+pub fn read_where(
+    path: &Path,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<HashMap<String, (Vec<f32>, Vec<f32>, usize)>> {
     let g = crate::tensor::quantized::gguf_file::open_mapped(path)?;
     let mut out: HashMap<String, (Vec<f32>, Vec<f32>, usize)> = HashMap::new();
     for name in g.content.tensor_infos.keys() {
         let (base, what) = match name.rsplit_once('.') {
-            Some((b, w)) if w == "importance" || w == "rows" => (b.to_string(), w),
+            Some((b, w)) if (w == "importance" || w == "rows") && keep(b) => (b.to_string(), w),
             _ => continue,
         };
         let info = &g.content.tensor_infos[name];

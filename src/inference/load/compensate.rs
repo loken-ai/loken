@@ -17,6 +17,69 @@
 use crate::tensor::quant_cpu::BlockFormat;
 use crate::tensor::{Error, Result};
 
+/// Time a conversion spends in each of its stages, summed over the threads that ran them.
+pub mod stage {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// One stage of a conversion.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Stage {
+        /// The checkpoint's pages brought into memory.
+        Read,
+        /// fp4, fp8 and bf16 decoded to f32.
+        Dequant,
+        /// A record's rows solved against their moment, on the host.
+        Factor,
+        /// Weights and factors uploaded to a card.
+        Upload,
+        /// Waiting on a card for a projection's blocks: its decode, encode and correction.
+        Encode,
+        /// The correction's products on a card.
+        Compensate,
+        /// A block's corner of the inverse moment inverted.
+        Inverse,
+        /// A tensor encoded on the host.
+        HostEncode,
+        /// Bytes written to the file.
+        Write,
+    }
+
+    const COUNT: usize = 9;
+    const NAMES: [&str; COUNT] = [
+        "read",
+        "dequant",
+        "factor",
+        "upload",
+        "encode",
+        "compensate",
+        "inverse",
+        "host encode",
+        "write",
+    ];
+    static NANOS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
+
+    /// Run `f`, its time counted to `s`.
+    pub fn time<R>(s: Stage, f: impl FnOnce() -> R) -> R {
+        let start = Instant::now();
+        let r = f();
+        NANOS[s as usize].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
+    }
+
+    /// The seconds each stage took since the last call, by name, and the counters reset.
+    pub fn take() -> String {
+        NAMES
+            .iter()
+            .zip(&NANOS)
+            .map(|(name, n)| (name, n.swap(0, Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{name} {:.2}s", n as f64 / 1e9))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// The rows a projection saw, and how strongly to hold the fit back where they say little.
 pub struct Calibration<'a> {
     /// `n` rows of `cols` values, row-major: the inputs of this projection over a calibration text.
@@ -439,8 +502,15 @@ mod tests {
                 damping: 1.0,
             };
             let factor = Factor::new(&cal, cols).unwrap();
-            let on_card =
-                card_factor(&dev, &x, factor.solved(), (n, cols), factor.lambda()).unwrap();
+            let on_card = card_factor(
+                &dev,
+                &x,
+                factor.solved(),
+                (n, cols),
+                factor.lambda(),
+                &block_inverse,
+            )
+            .unwrap();
             for dtype in [
                 GgmlDType::Iq2Xxs,
                 GgmlDType::Iq3Xxs,
@@ -484,7 +554,6 @@ mod tests {
                     (rows, cols),
                     &importance,
                     &on_card,
-                    &block_inverse,
                 )
                 .unwrap();
                 let (e_cpu, e_card) = (output_error(&decode(&cpu)), output_error(&decode(&card)));
