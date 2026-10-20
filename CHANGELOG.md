@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Forecast: serve the Timestral checkpoints, with 21 quantiles and covariates.
 - Release: ship one Linux archive that serves NVIDIA and AMD cards.
 - Models: keep the routing profile of a DeepSeek V4.1 model across restarts.
 - Convert: encode q4_K, q5_K and q6_K on the card.

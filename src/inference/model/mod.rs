@@ -55,6 +55,8 @@ pub mod sdxl;
 #[cfg(feature = "audio")]
 pub mod stable_audio;
 pub mod t5;
+/// The patched time series transformer with attention across series and covariates.
+pub mod timestral;
 #[cfg(feature = "audio")]
 pub mod ultravox;
 pub mod umt5;

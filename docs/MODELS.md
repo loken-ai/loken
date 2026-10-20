@@ -206,6 +206,23 @@ of one render per family and depends on the placement, see [`STATUS.md`](STATUS.
 The OpenAI voice names (`alloy`, `echo`, `fable`, `onyx` and the rest) are accepted and mapped;
 `GET /v1/audio/voices` lists what the resident model offers.
 
+## Time series
+
+A forecaster answers `POST /v1/forecast` (see [`API.md`](API.md)) and is named by its
+repository. Its configuration says which network it is.
+
+| Family | Repositories | Reads | Horizon |
+|---|---|---|---|
+| Chronos-2 | `autogluon/chronos-2-small` and the other sizes | one series | what one pass answers |
+| Timestral | `mistralai/Timestral-5M`, `-28M`, `-123M`, `-209M` | one series, past and known covariates, numeric or categorical | up to the context length, 1,024 steps per block |
+
+A Timestral forecast reads the last 32,768 points and answers 21 quantile levels, 0.01 to 0.99.
+A horizon longer than one block is decoded block by block, each block's median read back as
+context. The forecast is averaged with the reflected forecast of the negated series, and
+clipped at zero when the context never goes below it. A categorical covariate is encoded by
+the mean of the series over each category. The four checkpoints match the reference library
+within 5e-4 of the largest quantile on the fixed set under `tests/vectors/timestral`.
+
 ## What a request may not ask for
 
 A family that is not compiled reports its models as unknown. A media request for a family the

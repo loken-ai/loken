@@ -1,13 +1,81 @@
 //! The resident time series forecaster: loaded on first request through the placement ladder,
 //! kept until another checkpoint is asked for.
 
-use crate::inference::model::chronos2::{self, Forecast, Forecaster};
+use crate::inference::model::chronos2::{self, Forecast};
+use crate::inference::model::timestral;
 use crate::tensor::Device;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub use crate::inference::model::timestral::Request;
+
 /// Bytes per element of the weights and activations once loaded.
 const F32_BYTES: u64 = 4;
+
+/// A loaded forecaster, of whichever network its configuration describes.
+pub enum Forecaster {
+    /// An encoder over one series, without covariates.
+    Encoder(chronos2::Forecaster),
+    /// A patched transformer across the series of a group, with covariates.
+    Patched(timestral::Forecaster),
+}
+
+impl std::fmt::Debug for Forecaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Forecaster::Encoder(_) => "Forecaster::Encoder",
+            Forecaster::Patched(_) => "Forecaster::Patched",
+        })
+    }
+}
+
+impl Forecaster {
+    /// The quantile levels the head answers.
+    pub fn levels(&self) -> &[f32] {
+        match self {
+            Forecaster::Encoder(m) => m.levels(),
+            Forecaster::Patched(m) => m.levels(),
+        }
+    }
+
+    /// Forecast what `req` asks.
+    pub fn forecast(&self, req: &Request) -> anyhow::Result<Forecast> {
+        match self {
+            Forecaster::Encoder(m) => {
+                if req.has_covariates() {
+                    anyhow::bail!("this forecaster reads one series without covariates");
+                }
+                Ok(m.forecast(&req.series, req.horizon)?)
+            }
+            Forecaster::Patched(m) => Ok(m.forecast(req)?),
+        }
+    }
+}
+
+/// What a forecaster checkpoint's configuration bounds a request by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_horizon: usize,
+    pub covariates: bool,
+    pub known_covariates: bool,
+}
+
+/// The limits of the checkpoint in `dir`.
+pub fn limits(dir: &Path) -> anyhow::Result<Limits> {
+    if let Ok(cfg) = timestral::read_config(dir) {
+        return Ok(Limits {
+            max_horizon: cfg.max_horizon(),
+            covariates: cfg.covariate_enabled,
+            known_covariates: cfg.supports_known_covariates(),
+        });
+    }
+    let cfg = chronos2::read_config(dir)?;
+    Ok(Limits {
+        max_horizon: cfg.max_horizon(),
+        covariates: false,
+        known_covariates: false,
+    })
+}
 
 /// One forecaster at a time, keyed by its checkpoint directory.
 #[derive(Default)]
@@ -38,9 +106,9 @@ impl ForecastEngine {
         Ok(model)
     }
 
-    /// Forecast `horizon` steps after `series` with the checkpoint in `dir`.
-    pub fn forecast(&self, dir: &Path, series: &[f32], horizon: usize) -> anyhow::Result<Forecast> {
-        Ok(self.forecaster(dir)?.forecast(series, horizon)?)
+    /// Forecast what `req` asks with the checkpoint in `dir`.
+    pub fn forecast(&self, dir: &Path, req: &Request) -> anyhow::Result<Forecast> {
+        self.forecaster(dir)?.forecast(req)
     }
 
     /// Drop the resident forecaster. Whether one was resident.
@@ -56,21 +124,33 @@ impl ForecastEngine {
 /// What the checkpoint in `dir` holds resident, and what one forecast at its longest context
 /// keeps free beside it.
 pub fn demand(dir: &Path) -> anyhow::Result<(u64, u64)> {
-    let cfg = chronos2::read_config(dir)?;
     let files = chronos2::weight_files(dir)?;
     let (weights, _) =
         crate::inference::place::runtime_demand::safetensors_f32_split(&files, |_| true)
             .map_err(|e| anyhow::anyhow!("size forecaster weights: {e}"))?;
+    // Rows one attention spans, its width, heads and feed-forward width, and how many rows
+    // a forecast runs at once.
+    let (tokens, dim, heads, ffn, batch) = match timestral::read_config(dir) {
+        Ok(cfg) => {
+            // The context's patches and a horizon block, for the series and its mirror.
+            let tokens = cfg.max_tokens() / 2;
+            (tokens, cfg.d_model, cfg.num_heads, cfg.mlp_hidden_dim, 2)
+        }
+        Err(_) => {
+            let cfg = chronos2::read_config(dir)?;
+            (cfg.max_rows(), cfg.d_model, cfg.num_heads, cfg.d_ff, 1)
+        }
+    };
     let reserve = crate::inference::place::runtime_demand::transformer_work_reserve(
         weights,
-        cfg.max_rows(),
-        cfg.d_model,
-        cfg.num_heads,
-        cfg.d_ff,
+        tokens * batch,
+        dim,
+        heads,
+        ffn,
     );
     // The scores of one attention over every row, per head.
-    let rows = cfg.max_rows() as u64;
-    let scores = rows * rows * cfg.num_heads as u64 * F32_BYTES;
+    let rows = tokens as u64;
+    let scores = rows * rows * heads as u64 * F32_BYTES * batch as u64;
     Ok((weights, reserve.saturating_add(scores)))
 }
 
@@ -81,13 +161,20 @@ pub fn load_on(
     need: u64,
     cards: &[(usize, u64)],
 ) -> anyhow::Result<(Forecaster, Device)> {
+    let patched = timestral::read_config(dir).is_ok();
     crate::inference::place::ladder::load_whole_on(
         "Forecaster",
         need,
         need,
         cards,
         None,
-        |device| chronos2::load_dir(dir, device),
+        |device| {
+            Ok(if patched {
+                Forecaster::Patched(timestral::load_dir(dir, device)?)
+            } else {
+                Forecaster::Encoder(chronos2::load_dir(dir, device)?)
+            })
+        },
     )
 }
 
@@ -177,7 +264,9 @@ mod tests {
         // No card offered: the ladder builds it on the host.
         let (model, device) = load_on(&dir, need, &[]).unwrap();
         assert!(device.is_cpu());
-        let f = model.forecast(history, horizon).unwrap();
+        let f = model
+            .forecast(&Request::univariate(history.to_vec(), horizon))
+            .unwrap();
         assert_eq!(f.values.len(), f.levels.len());
         assert!(f.values.iter().all(|v| v.len() == horizon));
         // Quantiles are ordered at every step.

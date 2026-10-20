@@ -34,6 +34,62 @@ fn series_of(body: &serde_json::Value) -> Option<Vec<f32>> {
         .collect()
 }
 
+/// The rows of a covariate field: an array of rows, or an object of named rows. Absent is
+/// no row. `cell` reads one point; `None` from it rejects the field.
+fn rows_of<T>(
+    body: &serde_json::Value,
+    field: &str,
+    cell: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Result<Vec<Vec<T>>, String> {
+    let rows: Vec<&serde_json::Value> = match body.get(field) {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(rows)) => rows.iter().collect(),
+        Some(serde_json::Value::Object(rows)) => rows.values().collect(),
+        Some(_) => {
+            return Err(format!(
+                "`{field}` must be an array of rows or an object of rows"
+            ))
+        }
+    };
+    rows.into_iter()
+        .map(|row| {
+            row.as_array()
+                .and_then(|r| r.iter().map(&cell).collect::<Option<Vec<T>>>())
+                .ok_or_else(|| format!("`{field}` holds a row that is not an array of its points"))
+        })
+        .collect()
+}
+
+/// A numeric point: a number, `null` for a missing one.
+fn number(v: &serde_json::Value) -> Option<f32> {
+    match v {
+        serde_json::Value::Null => Some(f32::NAN),
+        v => v.as_f64().map(|x| x as f32),
+    }
+}
+
+/// Category rows as codes: each distinct value of a row its own code, `null` missing.
+fn categories(rows: Vec<Vec<serde_json::Value>>) -> Vec<Vec<f64>> {
+    rows.into_iter()
+        .map(|row| {
+            let mut seen: Vec<String> = Vec::new();
+            row.iter()
+                .map(|v| {
+                    if v.is_null() {
+                        return f64::NAN;
+                    }
+                    let key = v.to_string();
+                    let code = seen.iter().position(|k| *k == key).unwrap_or_else(|| {
+                        seen.push(key);
+                        seen.len() - 1
+                    });
+                    code as f64
+                })
+                .collect()
+        })
+        .collect()
+}
+
 pub(crate) async fn forecast(
     State(state): State<APIServer>,
     Json(body): Json<serde_json::Value>,
@@ -95,10 +151,11 @@ pub(crate) async fn forecast(
         );
     }
 
-    let max_horizon = match crate::inference::model::chronos2::read_config(&dir) {
-        Ok(cfg) => cfg.max_horizon(),
+    let limits = match crate::inference::engine::forecast_engine::limits(&dir) {
+        Ok(l) => l,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
+    let max_horizon = limits.max_horizon;
     if horizon as usize > max_horizon {
         return err(
             StatusCode::BAD_REQUEST,
@@ -111,11 +168,59 @@ pub(crate) async fn forecast(
             "`series` holds no observed value".into(),
         );
     }
+    let scalar = |v: &serde_json::Value| (!v.is_array() && !v.is_object()).then(|| v.clone());
+    let fields = (
+        rows_of(&body, "past_covariates", number),
+        rows_of(&body, "known_covariates", number),
+        rows_of(&body, "categorical_past_covariates", scalar),
+        rows_of(&body, "categorical_known_covariates", scalar),
+    );
+    let (past, known, cat_past, cat_known) = match fields {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, categories(c), categories(d)),
+        (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (.., Err(e)) => {
+            return err(StatusCode::BAD_REQUEST, e)
+        }
+    };
+    let req = crate::inference::engine::forecast_engine::Request {
+        series,
+        horizon: horizon as usize,
+        past,
+        known,
+        categorical_past: cat_past,
+        categorical_known: cat_known,
+    };
+    if req.has_covariates() && !limits.covariates {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("Model '{id}' reads one series without covariates"),
+        );
+    }
+    if req.has_known() && !limits.known_covariates {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("Model '{id}' cannot read covariates known over the horizon"),
+        );
+    }
+    let t = req.series.len();
+    let short = |rows: &[Vec<f32>], want: usize| rows.iter().any(|r| r.len() != want);
+    let short_codes = |rows: &[Vec<f64>], want: usize| rows.iter().any(|r| r.len() != want);
+    if short(&req.past, t) || short_codes(&req.categorical_past, t) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("a past covariate must be as long as `series`, {t} points"),
+        );
+    }
+    let span = t + req.horizon;
+    if short(&req.known, span) || short_codes(&req.categorical_known, span) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("a known covariate must cover `series` and the horizon, {span} points"),
+        );
+    }
 
     let engine = state.forecast_engine.clone();
     let t0 = std::time::Instant::now();
-    let run =
-        tokio::task::spawn_blocking(move || engine.forecast(&dir, &series, horizon as usize)).await;
+    let run = tokio::task::spawn_blocking(move || engine.forecast(&dir, &req)).await;
     let f = match run {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => {
@@ -170,6 +275,24 @@ mod tests {
         assert!((mid[0] - 2.0).abs() < 1e-5, "{mid:?}");
         assert_eq!(at_level(&levels, &values, 0.95), None);
         assert_eq!(at_level(&levels, &values, 0.05), None);
+    }
+
+    #[test]
+    fn covariates_read_as_rows_named_or_not() {
+        let body = serde_json::json!({
+            "past_covariates": [[1, null, 2]],
+            "known_covariates": {"price": [1, 2], "promo": [0, 1]},
+            "categorical_past_covariates": [["a", "b", "a", null]],
+        });
+        let past = rows_of(&body, "past_covariates", number).unwrap();
+        assert!(past[0][1].is_nan() && past[0][2] == 2.0);
+        assert_eq!(rows_of(&body, "known_covariates", number).unwrap().len(), 2);
+        let scalar = |v: &serde_json::Value| Some(v.clone());
+        let codes = categories(rows_of(&body, "categorical_past_covariates", scalar).unwrap());
+        assert_eq!(&codes[0][..3], &[0.0, 1.0, 0.0]);
+        assert!(codes[0][3].is_nan());
+        assert!(rows_of(&body, "absent", number).unwrap().is_empty());
+        assert!(rows_of(&serde_json::json!({"x": [["a"]]}), "x", number).is_err());
     }
 
     #[test]

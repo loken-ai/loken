@@ -398,6 +398,14 @@ fn from_config(config: &serde_json::Value) -> Option<MediaFacts> {
     {
         return Some(MediaFacts::of(MediaKind::Forecast));
     }
+    // A patched forecaster that names no class: its layer schedule, its quantile levels and
+    // its patch length.
+    if ["block_schedule", "quantile_knots", "patch_size"]
+        .iter()
+        .all(|k| config.get(*k).is_some())
+    {
+        return Some(MediaFacts::of(MediaKind::Forecast));
+    }
     if let Some(kind) = text("model_type").and_then(transformers_model_type) {
         return Some(MediaFacts::of(kind));
     }
@@ -873,6 +881,10 @@ mod tests {
             ),
             (
                 serde_json::json!({"model_type": "t5", "architectures": ["Chronos2Model"]}),
+                MediaKind::Forecast,
+            ),
+            (
+                serde_json::json!({"patch_size": 32, "block_schedule": ["time"], "quantile_knots": [0.5]}),
                 MediaKind::Forecast,
             ),
             (
