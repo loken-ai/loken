@@ -6,6 +6,11 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Convert: encode q4_K, q5_K and q6_K on the card.
+- Convert: write iq3_s and iq2_s, weighted by importance, on the card.
+- Convert: write iq4_nl and iq4_xs, weighted by importance, on the card.
+- Convert: weight q4_0, q4_1, q5_0 and q5_1 by importance.
+- Requantize: write q2_0.
 - Models: serve a mixture from several files of its checkpoint, expert by expert.
 - Offload: run IQ3_XXS and Q3_K routed experts on the cards.
 - Convert: write IQ3_XXS weighted by each expert's importance.

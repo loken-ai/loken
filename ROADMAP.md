@@ -37,7 +37,7 @@ Major, by priority:
 | Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
 | Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Planned |
 | Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
-| Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Started |
+| Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
 | Mistral Timestral forecasts | Models | The four Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Planned |
 
 Smaller, by priority:

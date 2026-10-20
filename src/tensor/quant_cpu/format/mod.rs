@@ -6,6 +6,8 @@
 
 use super::*;
 
+#[cfg(test)]
+mod ggml_parity;
 pub mod iq2_s;
 pub mod iq2_xxs;
 mod iq2_xxs_dot;
@@ -14,9 +16,11 @@ pub mod iq3_xxs;
 pub mod iq4_nl;
 mod iq4_nl_rows;
 pub mod iq4_xs;
+mod iq_codebook;
 mod iq_grid_rows;
 mod iq_grids;
 mod iq_read;
+mod legacy_guided;
 pub mod mxfp4;
 pub mod q2_0;
 pub mod q2_k;

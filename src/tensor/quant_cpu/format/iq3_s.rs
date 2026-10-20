@@ -1,6 +1,5 @@
 //! iq3_s - 256 values in 110 bytes: nine-bit codes into a 512-entry grid of four magnitudes (the
-//! ninth bit in a side array), an explicit sign bit per value, and a four-bit scale per sixty-four.
-//! Read-only.
+//! ninth bit in a side array), an explicit sign bit per value, and a four-bit scale per thirty-two.
 
 use super::iq_grids::IQ3S_GRID;
 use super::*;
@@ -68,8 +67,12 @@ impl BlockFormat for BlockIq3S {
         }
     }
 
-    fn quantize(_: &[f32], _: &mut [Self]) {
-        panic!("iq3_s is read, not written");
+    fn quantize(xs: &[f32], ys: &mut [Self]) {
+        encode(xs, ys, None, 0);
+    }
+
+    fn quantize_guided(xs: &[f32], ys: &mut [Self], imatrix_weights: &[f32], n_per_row: usize) {
+        encode(xs, ys, Some(imatrix_weights), n_per_row);
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
@@ -222,5 +225,175 @@ unsafe fn dot_many_avx2(
                 _mm256_madd_epi16(super::iq_read::run_pairs(mags, negate, acts), scale)
             },
         )
+    }
+}
+
+/// Levels a grid coordinate takes: the value is `2 * level + 1` steps of the run's scale.
+const LEVELS: u8 = 8;
+
+pub(super) fn codebook() -> &'static super::iq_codebook::Codebook<4> {
+    static BOOK: std::sync::OnceLock<super::iq_codebook::Codebook<4>> = std::sync::OnceLock::new();
+    BOOK.get_or_init(|| {
+        let bytes: Vec<[u8; 4]> = IQ3S_GRID.iter().map(|g| g.to_le_bytes()).collect();
+        let levels = bytes.iter().map(|b| b.map(|v| (v - 1) / 2)).collect();
+        super::iq_codebook::Codebook::new(bytes, levels, 3, LEVELS, 3)
+    })
+}
+
+/// The encoder's codebook as one table, for a card that runs the same search.
+pub fn iq3_s_codebook() -> Vec<i32> {
+    codebook().table()
+}
+
+/// Quantise whole blocks, optionally against an importance matrix: one weight per column of a row
+/// `n_per_row` long.
+///
+/// The search is ggml's `quantize_row_iq3_s_impl` (MIT). Each run of thirty-two values tries
+/// nineteen scales around its largest magnitude; at each, every value rounds to a level, a group
+/// of four whose levels the grid does not hold takes the nearest point it does, and the scale is
+/// refitted by least squares. The best fit wins; when a group of it left the grid, every group is
+/// placed again at the scale chosen. A value weighs its importance times its distance from the
+/// block's spread, or its square without an importance.
+fn encode(xs: &[f32], ys: &mut [BlockIq3S], imatrix: Option<&[f32]>, n_per_row: usize) {
+    use rayon::prelude::*;
+    let book = codebook();
+    ys.par_iter_mut()
+        .zip(xs.par_chunks_exact(QK_K))
+        .enumerate()
+        .for_each(|(idx, (block, x))| {
+            let row = imatrix.map(|m| {
+                let base = (idx % (n_per_row / QK_K)) * QK_K;
+                &m[base..base + QK_K]
+            });
+            encode_block(book, x, row, block);
+        });
+}
+
+/// `(sum w x q, sum w q q)` for levels `l`, `q = 2 l + 1`.
+fn fit(w: &[f32], x: &[f32], l: &[u8]) -> (f32, f32) {
+    let (mut qx, mut q2) = (0f32, 0f32);
+    for i in 0..w.len() {
+        let q = (2 * l[i] as i32 + 1) as f32;
+        qx += w[i] * x[i] * q;
+        q2 += w[i] * q * q;
+    }
+    (qx, q2)
+}
+
+fn encode_block(
+    book: &super::iq_codebook::Codebook<4>,
+    x: &[f32],
+    row: Option<&[f32]>,
+    block: &mut BlockIq3S,
+) {
+    /// Scales tried either side of the largest magnitude's own, a fifth of a level apart.
+    const STEPS: i32 = 9;
+    const STEP: f32 = 0.2;
+    /// The largest level's value, in steps of the scale.
+    const TOP: f32 = (2 * LEVELS - 1) as f32;
+    /// Run scales are four bits; the block scale is the largest over this many steps.
+    const SCALE_STEPS: f32 = 31.0;
+    /// The block scale is stored larger than the step the runs were quantised against.
+    const SCALE_LIFT: f32 = 1.033;
+    const RUN: usize = 32;
+    const RUNS: usize = QK_K / RUN;
+
+    *block = BlockIq3S::zeros();
+    let sigma2 = 2.0 * x.iter().map(|v| v * v).sum::<f32>() / QK_K as f32;
+    let mut scales = [0f32; RUNS];
+    for run in 0..RUNS {
+        let xb = &x[RUN * run..RUN * run + RUN];
+        let weight: [f32; RUN] = std::array::from_fn(|i| match row {
+            Some(r) => r[RUN * run + i] * (sigma2 + xb[i] * xb[i]).sqrt(),
+            None => xb[i] * xb[i],
+        });
+        let root = weight.map(f32::sqrt);
+        let xval = xb.iter().map(|v| v.abs()).collect::<Vec<_>>();
+        let mut signs = [0u8; RUN / 8];
+        for (k, s) in signs.iter_mut().enumerate() {
+            for i in 0..8 {
+                if xb[8 * k + i] < 0.0 {
+                    *s |= 1 << i;
+                }
+            }
+        }
+        let max = xval.iter().copied().fold(xval[0], f32::max);
+        if max == 0.0 {
+            continue;
+        }
+
+        let mut best = 0f32;
+        let mut scale = max / TOP;
+        let mut l = [0u8; RUN];
+        let mut on_grid = [false; RUN / 4];
+        for step in -STEPS..=STEPS {
+            let inverse = (TOP + step as f32 * STEP) / max;
+            let this = 1.0 / inverse;
+            let mut trial = [0u8; RUN];
+            let mut held = [true; RUN / 4];
+            for k in 0..RUN / 4 {
+                let at = 4 * k..4 * k + 4;
+                let (n, h) = book.place(
+                    &xval[at.clone()],
+                    &root[at.clone()],
+                    (inverse, this),
+                    LEVELS - 1,
+                );
+                held[k] = h;
+                trial[at].copy_from_slice(&book.levels[n]);
+            }
+            let (qx, q2) = fit(&weight, &xval, &trial);
+            if q2 > 0.0 && qx * qx > best * q2 {
+                scale = qx / q2;
+                best = scale * qx;
+                l = trial;
+                on_grid = held;
+            }
+        }
+
+        // Some group left the grid at the scale chosen: place every group again at it, and refit.
+        if on_grid.contains(&false) && scale > 0.0 {
+            let inverse = 1.0 / scale;
+            for k in 0..RUN / 4 {
+                let at = 4 * k..4 * k + 4;
+                let (n, _) = book.place(
+                    &xval[at.clone()],
+                    &root[at.clone()],
+                    (inverse, scale),
+                    LEVELS - 1,
+                );
+                l[at].copy_from_slice(&book.levels[n]);
+            }
+            let (qx, q2) = fit(&weight, &xval, &l);
+            if q2 > 0.0 {
+                scale = qx / q2;
+            }
+        }
+        if scale < 0.0 {
+            scale = -scale;
+            for s in signs.iter_mut() {
+                *s = !*s;
+            }
+        }
+
+        for k in 0..RUN / 4 {
+            let n = book.index[book.pattern(&l[4 * k..4 * k + 4])] as usize;
+            block.qs[8 * run + k] = n as u8;
+            block.qh[run] |= ((n >> 8) as u8) << k;
+        }
+        block.signs[4 * run..4 * run + 4].copy_from_slice(&signs);
+        scales[run] = scale;
+    }
+
+    let max_scale = scales.iter().copied().fold(0f32, f32::max);
+    if max_scale == 0.0 {
+        return;
+    }
+    let d = max_scale / SCALE_STEPS;
+    block.d = f16::from_f32(d * SCALE_LIFT);
+    let inverse = 1.0 / d;
+    for (pair, out) in block.scales.iter_mut().enumerate() {
+        let level = |s: f32| nearest_int(0.5 * (inverse * s - 1.0)).clamp(0, 15) as u8;
+        *out = level(scales[2 * pair]) | level(scales[2 * pair + 1]) << 4;
     }
 }

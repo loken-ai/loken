@@ -188,7 +188,10 @@ fn encode(xs: &[f32], ys: &mut [BlockQ6K], imatrix: Option<&[f32]>, n_per_row: u
                 magnitude_weights(xg, &mut fallback);
             }
             let w = row.map_or(&fallback[..], |r| &r[16 * g..16 * (g + 1)]);
-            *scale = fit_signed_scale(32, xg, lg, w);
+            *scale = match row {
+                Some(_) => super::legacy_guided::fit_signed_wide(32, xg, lg, w),
+                None => fit_signed_scale(32, xg, lg, w),
+            };
         }
 
         // The group scales are themselves quantised, to eight bits against the largest of them.

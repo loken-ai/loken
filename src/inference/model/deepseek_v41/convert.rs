@@ -532,8 +532,8 @@ fn quantize_on_device(
     factor: Option<&Factor>,
 ) -> Result<Vec<u8>> {
     use crate::tensor::cuda::{
-        gpu_matmul_host, gpu_quantize_iq2_xxs, gpu_quantize_iq3_xxs, gpu_quantize_q2_k_guided,
-        gpu_quantize_q3_k_guided,
+        gpu_matmul_host, gpu_quantize_exact, gpu_quantize_iq2_xxs, gpu_quantize_iq3_xxs,
+        gpu_quantize_q2_k_guided, gpu_quantize_q3_k_guided,
     };
     let product = |a: &[f32], b: &[f32], out: &mut [f32], dims: (usize, usize, usize)| {
         gpu_matmul_host(dev, a, b, out, dims)
@@ -544,6 +544,16 @@ fn quantize_on_device(
         (GgmlDType::Iq3Xxs, _) => Some(gpu_quantize_iq3_xxs(dev, v, imp, width)),
         (GgmlDType::Q2K, Some(imp)) => Some(gpu_quantize_q2_k_guided(dev, v, imp, width)),
         (GgmlDType::Q3K, Some(imp)) => Some(gpu_quantize_q3_k_guided(dev, v, imp, width)),
+        (
+            GgmlDType::Iq2S
+            | GgmlDType::Iq3S
+            | GgmlDType::Iq4Xs
+            | GgmlDType::Iq4Nl
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K,
+            _,
+        ) if width.is_multiple_of(256) => Some(gpu_quantize_exact(dev, dtype, v, imp, width)),
         _ => None,
     };
     let kernels = Kernels {
@@ -738,10 +748,7 @@ impl Stacks<'_> {
             };
             #[cfg(feature = "gpu")]
             if let (Some(dev), Some(r), Some(f)) = (self.devices.get(device), record, &factor) {
-                if matches!(
-                    dtype,
-                    GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Q2K | GgmlDType::Q3K
-                ) {
+                if crate::tensor::cuda::carries_correction(dtype) {
                     use crate::inference::load::compensate::block_inverse;
                     use crate::tensor::cuda::{
                         card_factor, card_factor_in, quantize_columns_on_card, quantize_fp4_on_card,

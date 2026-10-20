@@ -17,6 +17,9 @@
 use crate::tensor::quant_cpu::BlockFormat;
 use crate::tensor::{Error, Result};
 
+/// The columns a card's correction takes at a time, whatever the format's block.
+pub const CARD_SPAN: usize = 256;
+
 /// Time a conversion spends in each of its stages, summed over the threads that ran them.
 pub mod stage {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -364,12 +367,20 @@ pub fn quantize_factored_with<T: BlockFormat>(
     quantise: &BlockQuantiser<T>,
     product: &MatMul,
 ) -> Result<()> {
-    let width = T::BLOCK_LEN;
-    if !cols.is_multiple_of(width) || w.len() != rows * cols {
+    // Columns are taken a card block at a time - several blocks of a short format - so the host
+    // and the card carry the error across the same spans.
+    let width = if cols.is_multiple_of(CARD_SPAN) {
+        CARD_SPAN.max(T::BLOCK_LEN)
+    } else {
+        T::BLOCK_LEN
+    };
+    if !cols.is_multiple_of(width) || !width.is_multiple_of(T::BLOCK_LEN) || w.len() != rows * cols
+    {
         return Err(Error(format!(
             "compensate: {rows} by {cols} does not tile into blocks of {width}"
         )));
     }
+    let per_span = width / T::BLOCK_LEN;
     if factor.cols != cols || factor.n != cal.n || cal.rows.len() != cal.n * cols {
         return Err(Error(format!(
             "compensate: a factor of {} rows of {} does not fit {} rows of {cols}",
@@ -378,13 +389,13 @@ pub fn quantize_factored_with<T: BlockFormat>(
     }
     let (n, x, y, lambda) = (cal.n, cal.rows, &factor.y, factor.lambda);
 
-    let per_row = cols / width;
+    let per_row = cols / T::BLOCK_LEN;
     // The correction every earlier block owes the columns still to come, in the space the rows
     // span: `carried` times the solved rows gives it for any block. Applying it lazily, a block at
     // a time, is exact - the correction is linear - and costs a block's width instead of the tail.
     let mut carried = vec![0f32; rows * n];
     let mut block = vec![0f32; rows * width];
-    let mut quantised = vec![T::zeros(); rows];
+    let mut quantised = vec![T::zeros(); rows * per_span];
     let mut got = vec![0f32; rows * width];
     let mut y_block = vec![0f32; n * width];
     let mut x_block = vec![0f32; n * width];
@@ -408,8 +419,9 @@ pub fn quantize_factored_with<T: BlockFormat>(
             &mut quantised,
         )?;
         T::dequantize(&quantised, &mut got);
-        for (r, q) in quantised.iter().enumerate() {
-            out[r * per_row + a / width] = q.clone();
+        for (r, row) in quantised.chunks(per_span).enumerate() {
+            let at = r * per_row + a / T::BLOCK_LEN;
+            out[at..at + per_span].clone_from_slice(row);
         }
         if b == cols {
             break;
@@ -452,12 +464,15 @@ mod tests {
     use crate::tensor::quant_cpu::BlockIq2Xxs;
 
     /// Held on a card from end to end, the correction leaves the output error the CPU leaves, for
-    /// both formats it carries, on rows fewer and more numerous than a block is wide.
+    /// every format it carries, on rows fewer and more numerous than a block is wide.
     #[cfg(feature = "gpu")]
     #[test]
     fn the_card_carries_the_error_as_the_cpu_does() {
         use crate::tensor::cuda::{card_factor, quantize_compensated_on_card, CudaDevice};
-        use crate::tensor::quant_cpu::{to_float_bytes, BlockIq3Xxs, BlockQ2K, BlockQ3K};
+        use crate::tensor::quant_cpu::{
+            to_float_bytes, BlockIq2S, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockIq4Xs, BlockQ2K,
+            BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K,
+        };
         use crate::tensor::quantized::GgmlDType;
         let Ok(dev) = CudaDevice::new(0) else {
             eprintln!("no CUDA device; the card correction is NOT covered by this run");
@@ -516,6 +531,13 @@ mod tests {
                 GgmlDType::Iq3Xxs,
                 GgmlDType::Q2K,
                 GgmlDType::Q3K,
+                GgmlDType::Iq2S,
+                GgmlDType::Iq3S,
+                GgmlDType::Iq4Xs,
+                GgmlDType::Iq4Nl,
+                GgmlDType::Q4K,
+                GgmlDType::Q5K,
+                GgmlDType::Q6K,
             ] {
                 let decode = |bytes: &[u8]| {
                     let mut got = vec![0f32; rows * cols];
@@ -528,7 +550,7 @@ mod tests {
                     cal: &Calibration,
                     importance: &[f32],
                 ) -> Vec<u8> {
-                    let mut blocks = vec![T::zeros(); rows * cols / 256];
+                    let mut blocks = vec![T::zeros(); rows * cols / T::BLOCK_LEN];
                     quantize_compensated(w, rows, cols, cal, Some(importance), &mut blocks)
                         .unwrap();
                     // Safety: plain block data.
@@ -545,7 +567,14 @@ mod tests {
                     GgmlDType::Iq2Xxs => on_host::<BlockIq2Xxs>(&w, shape, &cal, &importance),
                     GgmlDType::Iq3Xxs => on_host::<BlockIq3Xxs>(&w, shape, &cal, &importance),
                     GgmlDType::Q2K => on_host::<BlockQ2K>(&w, shape, &cal, &importance),
-                    _ => on_host::<BlockQ3K>(&w, shape, &cal, &importance),
+                    GgmlDType::Q3K => on_host::<BlockQ3K>(&w, shape, &cal, &importance),
+                    GgmlDType::Iq2S => on_host::<BlockIq2S>(&w, shape, &cal, &importance),
+                    GgmlDType::Iq3S => on_host::<BlockIq3S>(&w, shape, &cal, &importance),
+                    GgmlDType::Iq4Xs => on_host::<BlockIq4Xs>(&w, shape, &cal, &importance),
+                    GgmlDType::Iq4Nl => on_host::<BlockIq4Nl>(&w, shape, &cal, &importance),
+                    GgmlDType::Q4K => on_host::<BlockQ4K>(&w, shape, &cal, &importance),
+                    GgmlDType::Q5K => on_host::<BlockQ5K>(&w, shape, &cal, &importance),
+                    _ => on_host::<BlockQ6K>(&w, shape, &cal, &importance),
                 };
                 let card = quantize_compensated_on_card(
                     &dev,
@@ -558,8 +587,8 @@ mod tests {
                 .unwrap();
                 let (e_cpu, e_card) = (output_error(&decode(&cpu)), output_error(&decode(&card)));
                 eprintln!("{dtype:?}, {n} rows: card {e_card} against cpu {e_cpu}");
-                // The three-bit encoders on the card write the host's blocks.
-                let slack = if matches!(dtype, GgmlDType::Iq3Xxs | GgmlDType::Q3K) {
+                // The encoders on the card that write the host's blocks.
+                let slack = if !matches!(dtype, GgmlDType::Iq2Xxs | GgmlDType::Q2K) {
                     1.001
                 } else {
                     1.02

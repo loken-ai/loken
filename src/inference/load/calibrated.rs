@@ -11,7 +11,8 @@ use super::compensate::{
     cpu_product, quantize_factored_with, quantize_rows, Calibration, Factor, MatMul,
 };
 use crate::tensor::quant_cpu::{
-    BlockFormat, BlockIq2Xxs, BlockIq3Xxs, BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K,
+    BlockFormat, BlockIq2S, BlockIq2Xxs, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockIq4Xs, BlockQ2K,
+    BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K,
 };
 use crate::tensor::quantized::GgmlDType;
 use crate::tensor::{Error, Result};
@@ -30,18 +31,54 @@ pub struct Recipe {
 /// Records by projection name, as `calibration::read` returns them: importance, rows, rows kept.
 pub type Records = HashMap<String, (Vec<f32>, Vec<f32>, usize)>;
 
-/// The formats that take an importance: every one this dispatches to.
+/// The formats that take an importance: every one this dispatches to. The others - q8_0, q2_0,
+/// mxfp4 and the float formats - are fitted the same way with or without one.
 pub fn guided(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
-        GgmlDType::Q2K
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q2K
             | GgmlDType::Q3K
             | GgmlDType::Q4K
             | GgmlDType::Q5K
             | GgmlDType::Q6K
             | GgmlDType::Iq2Xxs
+            | GgmlDType::Iq2S
             | GgmlDType::Iq3Xxs
+            | GgmlDType::Iq3S
+            | GgmlDType::Iq4Nl
+            | GgmlDType::Iq4Xs
     )
+}
+
+/// `one::<T>` for the block type of `dtype`, `None` for a format that takes no importance.
+fn dispatch(
+    dtype: GgmlDType,
+    w: &[f32],
+    record: Option<&(Vec<f32>, Vec<f32>, usize)>,
+    at: &Placement,
+) -> Option<Result<Vec<u8>>> {
+    Some(match dtype {
+        GgmlDType::Q4_0 => one::<BlockQ4_0>(w, record, at),
+        GgmlDType::Q4_1 => one::<BlockQ4_1>(w, record, at),
+        GgmlDType::Q5_0 => one::<BlockQ5_0>(w, record, at),
+        GgmlDType::Q5_1 => one::<BlockQ5_1>(w, record, at),
+        GgmlDType::Q2K => one::<BlockQ2K>(w, record, at),
+        GgmlDType::Q3K => one::<BlockQ3K>(w, record, at),
+        GgmlDType::Q4K => one::<BlockQ4K>(w, record, at),
+        GgmlDType::Q5K => one::<BlockQ5K>(w, record, at),
+        GgmlDType::Q6K => one::<BlockQ6K>(w, record, at),
+        GgmlDType::Iq2Xxs => one::<BlockIq2Xxs>(w, record, at),
+        GgmlDType::Iq2S => one::<BlockIq2S>(w, record, at),
+        GgmlDType::Iq3Xxs => one::<BlockIq3Xxs>(w, record, at),
+        GgmlDType::Iq3S => one::<BlockIq3S>(w, record, at),
+        GgmlDType::Iq4Nl => one::<BlockIq4Nl>(w, record, at),
+        GgmlDType::Iq4Xs => one::<BlockIq4Xs>(w, record, at),
+        _ => return None,
+    })
 }
 
 fn bytes_of<T>(blocks: &[T]) -> Vec<u8> {
@@ -116,18 +153,11 @@ pub fn quantize_projection_on(
         factor,
         kernels,
     };
-    match dtype {
-        GgmlDType::Q2K => one::<BlockQ2K>(w, record, &at),
-        GgmlDType::Q3K => one::<BlockQ3K>(w, record, &at),
-        GgmlDType::Q4K => one::<BlockQ4K>(w, record, &at),
-        GgmlDType::Q5K => one::<BlockQ5K>(w, record, &at),
-        GgmlDType::Q6K => one::<BlockQ6K>(w, record, &at),
-        GgmlDType::Iq2Xxs => one::<BlockIq2Xxs>(w, record, &at),
-        GgmlDType::Iq3Xxs => one::<BlockIq3Xxs>(w, record, &at),
-        other => Err(Error(format!(
-            "{other:?} takes no importance; quantise it plainly"
-        ))),
-    }
+    dispatch(dtype, w, record, &at).unwrap_or_else(|| {
+        Err(Error(format!(
+            "{dtype:?} takes no importance; quantise it plainly"
+        )))
+    })
 }
 
 struct Placement<'a> {
@@ -249,20 +279,11 @@ pub fn quantize_tensor(
         } else {
             records.get(base)
         };
-        let bytes = match dtype {
-            GgmlDType::Q2K => one::<BlockQ2K>(slice, record, &at)?,
-            GgmlDType::Q3K => one::<BlockQ3K>(slice, record, &at)?,
-            GgmlDType::Q4K => one::<BlockQ4K>(slice, record, &at)?,
-            GgmlDType::Q5K => one::<BlockQ5K>(slice, record, &at)?,
-            GgmlDType::Q6K => one::<BlockQ6K>(slice, record, &at)?,
-            GgmlDType::Iq2Xxs => one::<BlockIq2Xxs>(slice, record, &at)?,
-            GgmlDType::Iq3Xxs => one::<BlockIq3Xxs>(slice, record, &at)?,
-            other => {
-                return Err(Error(format!(
-                    "{name}: {other:?} takes no importance; quantise it plainly"
-                )))
-            }
-        };
+        let bytes = dispatch(dtype, slice, record, &at).unwrap_or_else(|| {
+            Err(Error(format!(
+                "{name}: {dtype:?} takes no importance; quantise it plainly"
+            )))
+        })?;
         out.extend_from_slice(&bytes);
     }
     Ok(out)

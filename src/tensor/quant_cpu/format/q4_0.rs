@@ -47,6 +47,17 @@ impl BlockFormat for BlockQ4_0 {
         }
     }
 
+    /// ggml's importance-weighted fit: see `legacy_guided`.
+    fn quantize_guided(xs: &[f32], ys: &mut [Self], imatrix_weights: &[f32], n_per_row: usize) {
+        let fitted = super::legacy_guided::signed_blocks(xs, imatrix_weights, n_per_row, Q4_0_BIAS);
+        for (block, (d, c)) in ys.iter_mut().zip(fitted) {
+            block.d = d;
+            for j in 0..QK4_0 / 2 {
+                block.qs[j] = c[j] | c[j + QK4_0 / 2] << 4;
+            }
+        }
+    }
+
     fn quantize(xs: &[f32], ys: &mut [Self]) {
         const HALF: usize = QK4_0 / 2;
         for (block, x) in blocks_with_input(xs, ys) {

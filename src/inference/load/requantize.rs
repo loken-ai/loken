@@ -36,9 +36,14 @@ pub fn parse_dtype(name: &str) -> Option<GgmlDType> {
         "q5_0" => GgmlDType::Q5_0,
         "q5_1" => GgmlDType::Q5_1,
         "q8_0" => GgmlDType::Q8_0,
+        "q2_0" => GgmlDType::Q2_0,
         "q2_k" => GgmlDType::Q2K,
         "iq2_xxs" => GgmlDType::Iq2Xxs,
+        "iq2_s" => GgmlDType::Iq2S,
         "iq3_xxs" => GgmlDType::Iq3Xxs,
+        "iq3_s" => GgmlDType::Iq3S,
+        "iq4_nl" => GgmlDType::Iq4Nl,
+        "iq4_xs" => GgmlDType::Iq4Xs,
         "q3_k" => GgmlDType::Q3K,
         "q4_k" => GgmlDType::Q4K,
         "q5_k" => GgmlDType::Q5K,
@@ -88,12 +93,23 @@ fn target_dtype(
 pub fn no_progress(_done: usize, _total: usize) {}
 
 /// Which target types have a device quantise kernel. The GPU path is taken only when every
-/// requantised tensor lands on one of these; the set grows as kernels are added (q8_0 today).
+/// requantised tensor lands on one of these.
 #[cfg(feature = "gpu")]
 fn gpu_target_supported(t: GgmlDType) -> bool {
     matches!(
         t,
-        GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q3K | GgmlDType::Q2K
+        GgmlDType::Q8_0
+            | GgmlDType::Q4K
+            | GgmlDType::Q3K
+            | GgmlDType::Q2K
+            | GgmlDType::Iq2Xxs
+            | GgmlDType::Iq3Xxs
+            | GgmlDType::Iq2S
+            | GgmlDType::Iq3S
+            | GgmlDType::Iq4Xs
+            | GgmlDType::Iq4Nl
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
     )
 }
 
@@ -197,6 +213,24 @@ pub fn requantize_gguf(
                         GgmlDType::Q4K => crate::tensor::cuda::gpu_quantize_q4_k(&cdev, f),
                         GgmlDType::Q3K => crate::tensor::cuda::gpu_quantize_q3_k(&cdev, f),
                         GgmlDType::Q2K => crate::tensor::cuda::gpu_quantize_q2_k(&cdev, f),
+                        // Without an importance the row length only has to tile the kernels'
+                        // spans of 256; an iq4_nl tensor that does not is encoded on the host.
+                        GgmlDType::Iq2Xxs => {
+                            crate::tensor::cuda::gpu_quantize_iq2_xxs(&cdev, f, None, 256)
+                        }
+                        GgmlDType::Iq3Xxs => {
+                            crate::tensor::cuda::gpu_quantize_iq3_xxs(&cdev, f, None, 256)
+                        }
+                        GgmlDType::Iq2S
+                        | GgmlDType::Iq3S
+                        | GgmlDType::Iq4Xs
+                        | GgmlDType::Iq4Nl
+                        | GgmlDType::Q5K
+                        | GgmlDType::Q6K
+                            if f.len().is_multiple_of(256) =>
+                        {
+                            crate::tensor::cuda::gpu_quantize_exact(&cdev, t, f, None, 256)
+                        }
                         // Not reached while all_on_gpu gates entry, but keeps the closure total.
                         other => crate::tensor::quant_cpu::from_float_bytes(other, f),
                     }

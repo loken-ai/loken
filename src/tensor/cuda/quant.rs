@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::tensor::gpu_runtime::driver::CudaView;
+use crate::tensor::quantized::GgmlDType;
 
 /// F32 activations -> q8_1 blocks (row padded to MATRIX_ROW_PADDING=512),
 /// the input format every mmvq GEMV kernel consumes.
@@ -2668,6 +2669,143 @@ pub fn gpu_quantize_iq3_xxs(
         .map_err(|e| Error(format!("iq3_xxs download: {e}")))
 }
 
+/// How a card encodes one of the formats added after the first ones: its kernel, the bytes it
+/// writes for 256 values, the threads it runs per 256 values, and the codebook table it reads.
+pub(crate) struct CardEncoder {
+    pub kernel: &'static str,
+    pub span_bytes: usize,
+    pub threads: u32,
+    pub table: Option<fn() -> Vec<i32>>,
+}
+
+/// The card encoder of `dtype` among iq2_s, iq3_s, iq4_nl, iq4_xs, q4_K, q5_K and q6_K: their
+/// kernels all take the values, their strides, the importance, the table when there is one, the
+/// blocks, the decoded values, then the block count, the spans a row and whether the importance
+/// is there.
+pub(crate) fn card_encoder(dtype: GgmlDType) -> Option<CardEncoder> {
+    use crate::tensor::quant_cpu as q;
+    Some(match dtype {
+        GgmlDType::Iq3S => CardEncoder {
+            kernel: "requant_iq3_s",
+            span_bytes: std::mem::size_of::<q::BlockIq3S>(),
+            threads: 256,
+            table: Some(q::iq3_s_codebook),
+        },
+        GgmlDType::Iq2S => CardEncoder {
+            kernel: "requant_iq2_s",
+            span_bytes: std::mem::size_of::<q::BlockIq2S>(),
+            threads: 512,
+            table: Some(q::iq2_s_codebook),
+        },
+        GgmlDType::Iq4Xs => CardEncoder {
+            kernel: "requant_iq4_xs",
+            span_bytes: std::mem::size_of::<q::BlockIq4Xs>(),
+            threads: 256,
+            table: None,
+        },
+        GgmlDType::Iq4Nl => CardEncoder {
+            kernel: "requant_iq4_nl",
+            span_bytes: 8 * std::mem::size_of::<q::BlockIq4Nl>(),
+            threads: 256,
+            table: None,
+        },
+        GgmlDType::Q4K => CardEncoder {
+            kernel: "requant_q4_k_exact",
+            span_bytes: std::mem::size_of::<q::BlockQ4K>(),
+            threads: 32,
+            table: None,
+        },
+        GgmlDType::Q5K => CardEncoder {
+            kernel: "requant_q5_k_exact",
+            span_bytes: std::mem::size_of::<q::BlockQ5K>(),
+            threads: 32,
+            table: None,
+        },
+        GgmlDType::Q6K => CardEncoder {
+            kernel: "requant_q6_k_exact",
+            span_bytes: std::mem::size_of::<q::BlockQ6K>(),
+            threads: 32,
+            table: None,
+        },
+        _ => return None,
+    })
+}
+
+/// `dtype` (one `card_encoder` names) quantised on the device, optionally weighted:
+/// `importance` holds one weight per column of a row `n_per_row` values wide, the layout the CPU
+/// encoder takes, and the blocks are the ones it writes.
+pub fn gpu_quantize_exact(
+    dev: &CudaDevice,
+    dtype: GgmlDType,
+    f32s: &[f32],
+    importance: Option<&[f32]>,
+    n_per_row: usize,
+) -> Result<Vec<u8>> {
+    let Some(enc) = card_encoder(dtype) else {
+        return Err(Error(format!("{dtype:?} has no card encoder")));
+    };
+    if !f32s.len().is_multiple_of(256)
+        || !n_per_row.is_multiple_of(256)
+        || importance.is_some_and(|w| w.len() != n_per_row)
+    {
+        return Err(Error(format!(
+            "{dtype:?} quantize: {} values, {n_per_row} per row",
+            f32s.len()
+        )));
+    }
+    let spans = f32s.len() / 256;
+    let stream = dev.stream();
+    let x = stream
+        .clone_htod(f32s)
+        .map_err(|e| Error(format!("{} upload: {e}", enc.kernel)))?;
+    let imp_host: Vec<f32> = importance.map_or_else(|| vec![0.0; 256], |w| w.to_vec());
+    let imp = stream
+        .clone_htod(&imp_host)
+        .map_err(|e| Error(format!("{} importance upload: {e}", enc.kernel)))?;
+    let table = match enc.table {
+        Some(t) => Some(
+            stream
+                .clone_htod(&t())
+                .map_err(|e| Error(format!("{} codebook upload: {e}", enc.kernel)))?,
+        ),
+        None => None,
+    };
+    let out = with_oom_retry(dev, enc.kernel, || unsafe {
+        stream.alloc::<u8>(spans * enc.span_bytes)
+    })?;
+    let func = dev.quantized_fn(enc.kernel)?;
+    let cfg = LaunchConfig {
+        grid_dim: (spans as u32, 1, 1),
+        block_dim: (enc.threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (n_i, per_row, has) = (
+        spans as i32,
+        (n_per_row / 256) as i32,
+        importance.is_some() as i32,
+    );
+    let (block_step, value_step, no) = (256i64, 1i64, 0i32);
+    let unused = with_oom_retry(dev, enc.kernel, || unsafe { stream.alloc::<f32>(1) })?;
+    let mut b = stream.launch_builder(&func);
+    b.arg(&x);
+    b.arg(&block_step);
+    b.arg(&value_step);
+    b.arg(&imp);
+    if let Some(t) = &table {
+        b.arg(t);
+    }
+    b.arg(&out);
+    b.arg(&unused);
+    b.arg(&no);
+    b.arg(&n_i);
+    b.arg(&per_row);
+    b.arg(&has);
+    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{} launch: {e}", enc.kernel)))?;
+    stream
+        .clone_dtoh(&out)
+        .map_err(|e| Error(format!("{} download: {e}", enc.kernel)))
+}
+
 /// `a` (`m` by `k`) times `b` (`k` by `n`), row-major host buffers, into `out` (`m` by `n`), through
 /// cuBLAS on `dev` at full precision.
 pub fn gpu_matmul_host(
@@ -4062,6 +4200,122 @@ mod three_bit_encoders {
                 off, 0,
                 "iq3_xxs guided {guided}: the card wrote other blocks"
             );
+        }
+    }
+
+    /// The card encoders of iq2_s, iq3_s, iq4_xs, iq4_nl, q4_K, q5_K and q6_K write the host
+    /// encoders' blocks, with an importance and without.
+    #[test]
+    fn card_exact_encoders_write_the_host_blocks() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card exact encoders are NOT covered by this run");
+            return;
+        };
+        let (r, cols) = (48usize, 1024usize);
+        let xs = rows(r, cols);
+        let imp = importance(cols);
+        let ones = vec![1f32; cols];
+        for dtype in [
+            GgmlDType::Iq2S,
+            GgmlDType::Iq3S,
+            GgmlDType::Iq4Xs,
+            GgmlDType::Iq4Nl,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            for guided in [true, false] {
+                let host = if guided {
+                    crate::inference::load::calibrated::quantize_projection(
+                        dtype,
+                        &xs,
+                        r,
+                        cols,
+                        Some(&(imp.clone(), Vec::new(), 0)),
+                        false,
+                        crate::inference::load::calibrated::Recipe {
+                            min_rows: usize::MAX,
+                            damping: 1.0,
+                        },
+                    )
+                    .unwrap()
+                } else {
+                    crate::tensor::quant_cpu::from_float_bytes(dtype, &xs).unwrap()
+                };
+                let card =
+                    gpu_quantize_exact(&dev, dtype, &xs, guided.then_some(&imp[..]), cols).unwrap();
+                let w = if guided { &imp } else { &ones };
+                let (e_card, e_host) = (
+                    weighted(dtype, &card, &xs, w),
+                    weighted(dtype, &host, &xs, w),
+                );
+                let block = dtype.type_size();
+                let off = differing(&card, &host, block);
+                eprintln!(
+                    "{dtype:?} guided {guided}: {off} of {} blocks differ, card {e_card} host {e_host}",
+                    host.len() / block
+                );
+                assert_eq!(
+                    off, 0,
+                    "{dtype:?} guided {guided}: the card wrote other blocks"
+                );
+            }
+        }
+    }
+
+    /// Seconds each encoder takes on a 2304 by 5120 matrix, weighted, on the card and on the host.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn time_the_encoders_on_an_expert_matrix() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            return;
+        };
+        let (r, cols) = (2304usize, 5120usize);
+        let xs = rows(r, cols);
+        let imp = importance(cols);
+        for dtype in [
+            GgmlDType::Iq2Xxs,
+            GgmlDType::Iq3Xxs,
+            GgmlDType::Iq2S,
+            GgmlDType::Iq3S,
+            GgmlDType::Iq4Xs,
+            GgmlDType::Iq4Nl,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            let card = |dev: &CudaDevice| -> Vec<u8> {
+                match dtype {
+                    GgmlDType::Iq2Xxs => gpu_quantize_iq2_xxs(dev, &xs, Some(&imp), cols),
+                    GgmlDType::Iq3Xxs => gpu_quantize_iq3_xxs(dev, &xs, Some(&imp), cols),
+                    GgmlDType::Q2K => gpu_quantize_q2_k_guided(dev, &xs, &imp, cols),
+                    GgmlDType::Q3K => gpu_quantize_q3_k_guided(dev, &xs, &imp, cols),
+                    _ => gpu_quantize_exact(dev, dtype, &xs, Some(&imp), cols),
+                }
+                .unwrap()
+            };
+            card(&dev);
+            let start = std::time::Instant::now();
+            card(&dev);
+            let on_card = start.elapsed().as_secs_f64();
+            let start = std::time::Instant::now();
+            crate::inference::load::calibrated::quantize_projection(
+                dtype,
+                &xs,
+                r,
+                cols,
+                Some(&(imp.clone(), Vec::new(), 0)),
+                false,
+                crate::inference::load::calibrated::Recipe {
+                    min_rows: usize::MAX,
+                    damping: 1.0,
+                },
+            )
+            .unwrap();
+            let on_host = start.elapsed().as_secs_f64();
+            eprintln!("{dtype:?}: card {on_card:.3} s, host {on_host:.3} s");
         }
     }
 

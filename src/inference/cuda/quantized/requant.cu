@@ -1210,6 +1210,843 @@ extern "C" __global__ void requant_iq3_xxs(
     }
 }
 
+// The grid formats iq3_s and iq2_s: groups of D magnitudes, each group one point of a grid, a sign
+// bit per value and a four-bit scale per run under the block's f16 scale. The host encoders'
+// searches, step for step: each run tries nineteen scales around its largest magnitude, a group
+// the grid does not hold taking the nearest point among the ones `book` lists for it, the scale
+// refitted by least squares; the best fit wins and groups are placed again at it. `book` is the
+// format's codebook table (`iq3_s_codebook`, `iq2_s_codebook`): the point of each pattern or -1,
+// the offsets of the near lists, each point's levels, its magnitudes, then the lists. `imp` holds
+// one weight per column of a row, `blocks_per_row` blocks of it. With `has_got` the values the
+// blocks decode to are written to `got`, in the layout `x` has. The same blocks as the host.
+#define RQ_GRID_STEPS 19
+
+// The point a group of D values takes: the one its rounded levels name, or the nearest the grid
+// holds at `scale`. `top` is the highest level; `bits` the bits a level takes in a pattern.
+template <int D>
+__device__ static int rq_grid_place(const int * __restrict__ book, const int npat, const int npts,
+        const int bits, const int top, const float * x, const float * w, const float inverse,
+        const float scale, bool * held) {
+    RQ_EXACT
+    int p = 0;
+    for (int i = 0; i < D; i++) {
+        const int l = req_clampi(req_nint(RQ_MUL(0.5f, RQ_SUB(RQ_MUL(inverse, x[i]), 1.0f))), 0, top);
+        p |= l << (bits * i);
+    }
+    const int n = book[p];
+    if (n >= 0) { *held = true; return n; }
+    *held = false;
+    const int * offsets = book + npat;
+    const int * levels = offsets + npat + 1;
+    const int * near = levels + 2 * D * npts;
+    int at = -1;
+    float best = 3.402823466e38f;
+    for (int c = offsets[p]; c < offsets[p + 1]; c++) {
+        const int m = near[c];
+        const int * l = levels + D * m;
+        float err = 0.0f;
+        for (int i = 0; i < D; i++) {
+            const float d = RQ_SUB(RQ_MUL(scale, (float) (2 * l[i] + 1)), x[i]);
+            err = RQ_ADD(err, RQ_MUL(RQ_MUL(w[i], d), d));
+        }
+        if (err < best) { best = err; at = m; }
+    }
+    return at;
+}
+
+// `sum w x q` over n values of levels `l`, q = 2 l + 1; `sum w q q` into `q2_out`.
+__device__ static float rq_grid_fit(const int n, const float * w, const float * x, const unsigned char * l, float * q2_out) {
+    RQ_EXACT
+    float qx = 0.0f, q2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float q = (float) (2 * (int) l[i] + 1);
+        qx = RQ_ADD(qx, RQ_MUL(RQ_MUL(w[i], x[i]), q));
+        q2 = RQ_ADD(q2, RQ_MUL(RQ_MUL(w[i], q), q));
+    }
+    *q2_out = q2;
+    return qx;
+}
+
+// One block of a grid format. RUN values a run, D a group; LEVELS levels, BITS bits a level in a
+// pattern; NPAT patterns, NPTS points; STEP apart the scales tried; a run below EMPTY is zeros;
+// the second placement takes every group (ALL) or the off-grid ones; a value without importance
+// weighs its square plus FLOOR times the block's spread. `out_run` writes a run's codes, signs
+// and scale into the block; `decode` gives value t of the block from it.
+template <int RUN, int D, int LEVELS, int BITS, int NPAT, int NPTS, bool ALL>
+__device__ static void rq_grid_block(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, const int * __restrict__ book,
+        const int sb, const int blocks_per_row, const int has_imp,
+        const float STEP, const float EMPTY, const float FLOOR,
+        float * sh_x, float * sh_v, float * sh_w, float * sh_r, float * sh_sigma2,
+        unsigned char * sh_sign, float * sh_max, unsigned char * sh_trial, unsigned int * sh_held,
+        float * sh_qx, float * sh_q2, float * sh_scale, int * sh_point) {
+    RQ_EXACT
+    const int RUNS = REQ_QK_K / RUN, GROUPS = RUN / D;
+    const float TOP = (float) (2 * LEVELS - 1);
+    const int t = threadIdx.x;
+    if (t < REQ_QK_K) sh_x[t] = x[(size_t) sb * block_step + (size_t) t * value_step];
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < REQ_QK_K; i++) s = RQ_ADD(s, RQ_MUL(sh_x[i], sh_x[i]));
+        *sh_sigma2 = RQ_MUL(2.0f, s) / (float) REQ_QK_K;
+    }
+    __syncthreads();
+    if (t < REQ_QK_K) {
+        const float v = sh_x[t];
+        const float w = has_imp
+            ? RQ_MUL(imp[(size_t) (sb % blocks_per_row) * REQ_QK_K + t], sqrtf(RQ_ADD(*sh_sigma2, RQ_MUL(v, v))))
+            : RQ_ADD(RQ_MUL(FLOOR, *sh_sigma2), RQ_MUL(v, v));
+        sh_w[t] = w;
+        sh_r[t] = sqrtf(w);
+        sh_v[t] = fabsf(v);
+    }
+    if (t < REQ_QK_K / 8) {
+        unsigned int s = 0;
+        for (int i = 0; i < 8; i++) if (sh_x[8 * t + i] < 0.0f) s |= 1u << i;
+        sh_sign[t] = (unsigned char) s;
+    }
+    __syncthreads();
+    if (t < RUNS) {
+        float m = sh_v[RUN * t];
+        for (int i = 0; i < RUN; i++) m = fmaxf(m, sh_v[RUN * t + i]);
+        sh_max[t] = m;
+    }
+    __syncthreads();
+
+    // Thread (run, step): run t / 32, step t % 32.
+    {
+        const int run = t / 32, lane = t % 32;
+        if (run < RUNS && lane < RQ_GRID_STEPS) {
+            const float max = sh_max[run];
+            const bool live = EMPTY > 0.0f ? max >= EMPTY : max != 0.0f;
+            if (live) {
+                const float * xv = sh_v + RUN * run;
+                const float * rv = sh_r + RUN * run;
+                const float inverse = RQ_ADD(TOP, RQ_MUL((float) (lane - 9), STEP)) / max;
+                const float this_scale = 1.0f / inverse;
+                unsigned char * trial = sh_trial + (run * RQ_GRID_STEPS + lane) * RUN;
+                const int * levels = book + 2 * NPAT + 1;
+                unsigned int held_mask = 0;
+                for (int k = 0; k < GROUPS; k++) {
+                    bool held;
+                    const int n = rq_grid_place<D>(book, NPAT, NPTS, BITS, LEVELS - 1, xv + D * k,
+                                                   rv + D * k, inverse, this_scale, &held);
+                    if (held) held_mask |= 1u << k;
+                    for (int i = 0; i < D; i++) trial[D * k + i] = (unsigned char) levels[D * n + i];
+                }
+                float q2;
+                const float qx = rq_grid_fit(RUN, sh_w + RUN * run, xv, trial, &q2);
+                sh_qx[run * RQ_GRID_STEPS + lane] = qx;
+                sh_q2[run * RQ_GRID_STEPS + lane] = q2;
+                sh_held[run * RQ_GRID_STEPS + lane] = held_mask;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (t < RUNS) {
+        const int run = t;
+        const float max = sh_max[run];
+        const bool live = EMPTY > 0.0f ? max >= EMPTY : max != 0.0f;
+        const float * xv = sh_v + RUN * run;
+        const float * rv = sh_r + RUN * run;
+        const int * levels = book + 2 * NPAT + 1;
+        float scale = 0.0f;
+        unsigned char l[RUN];
+        for (int i = 0; i < RUN; i++) l[i] = 0;
+        if (live) {
+            float best = 0.0f;
+            scale = max / TOP;
+            unsigned int on_grid = ALL ? 0u : (1u << GROUPS) - 1;
+            for (int s = 0; s < RQ_GRID_STEPS; s++) {
+                const float qx = sh_qx[run * RQ_GRID_STEPS + s], q2 = sh_q2[run * RQ_GRID_STEPS + s];
+                if (q2 > 0.0f && RQ_MUL(qx, qx) > RQ_MUL(best, q2)) {
+                    scale = qx / q2;
+                    best = RQ_MUL(scale, qx);
+                    for (int i = 0; i < RUN; i++) l[i] = sh_trial[(run * RQ_GRID_STEPS + s) * RUN + i];
+                    on_grid = sh_held[run * RQ_GRID_STEPS + s];
+                }
+            }
+            if (on_grid != (1u << GROUPS) - 1 && scale > 0.0f) {
+                const float inverse = 1.0f / scale;
+                for (int k = 0; k < GROUPS; k++) {
+                    if (!ALL && ((on_grid >> k) & 1)) continue;
+                    bool held;
+                    const int n = rq_grid_place<D>(book, NPAT, NPTS, BITS, LEVELS - 1, xv + D * k,
+                                                   rv + D * k, inverse, scale, &held);
+                    for (int i = 0; i < D; i++) l[D * k + i] = (unsigned char) levels[D * n + i];
+                }
+                float q2;
+                const float qx = rq_grid_fit(RUN, sh_w + RUN * run, xv, l, &q2);
+                if (q2 > 0.0f) scale = qx / q2;
+            }
+            if (scale < 0.0f) {
+                scale = -scale;
+                for (int k = 0; k < RUN / 8; k++) sh_sign[RUN / 8 * run + k] = (unsigned char) ~sh_sign[RUN / 8 * run + k];
+            }
+            for (int k = 0; k < GROUPS; k++) {
+                int p = 0;
+                for (int i = 0; i < D; i++) p |= (int) l[D * k + i] << (BITS * i);
+                sh_point[GROUPS * run + k] = book[p];
+            }
+        } else {
+            for (int k = 0; k < GROUPS; k++) sh_point[GROUPS * run + k] = 0;
+            for (int k = 0; k < RUN / 8; k++) sh_sign[RUN / 8 * run + k] = 0;
+        }
+        sh_scale[run] = scale;
+    }
+    __syncthreads();
+}
+
+// The block scale over the runs' scales: `d` is their largest over 31 steps, stored times `lift`;
+// each run's four-bit level written to `sh_level`. Zero everything when every run is.
+__device__ static void rq_grid_scales(const int runs, const float lift, const float * sh_scale,
+        int * sh_level, float * sh_d, half * hd_out) {
+    RQ_EXACT
+    float max_scale = 0.0f;
+    for (int i = 0; i < runs; i++) max_scale = fmaxf(max_scale, sh_scale[i]);
+    if (max_scale == 0.0f) {
+        *hd_out = __float2half(0.0f);
+        *sh_d = 0.0f;
+        for (int i = 0; i < runs; i++) sh_level[i] = 0;
+        return;
+    }
+    const float d = max_scale / 31.0f;
+    const half hd = __float2half(RQ_MUL(d, lift));
+    *hd_out = hd;
+    *sh_d = __half2float(hd);
+    const float inverse = 1.0f / d;
+    for (int i = 0; i < runs; i++)
+        sh_level[i] = req_clampi(req_nint(RQ_MUL(0.5f, RQ_SUB(RQ_MUL(inverse, sh_scale[i]), 1.0f))), 0, 15);
+}
+
+#define RQ_IQ3S_NPAT 4096
+#define RQ_IQ3S_NPTS 512
+#define RQ_IQ3S_BYTES 110
+
+extern "C" __global__ void requant_iq3_s(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, const int * __restrict__ book, void * __restrict__ vy,
+        float * __restrict__ got, const int has_got,
+        const int nblocks, const int blocks_per_row, const int has_imp) {
+    RQ_EXACT
+    const int sb = blockIdx.x;
+    if (sb >= nblocks) return;
+    const int t = threadIdx.x;
+    __shared__ float sh_x[REQ_QK_K], sh_v[REQ_QK_K], sh_w[REQ_QK_K], sh_r[REQ_QK_K];
+    __shared__ float sh_sigma2, sh_d;
+    __shared__ unsigned char sh_sign[32];
+    __shared__ float sh_max[8];
+    __shared__ unsigned char sh_trial[8 * RQ_GRID_STEPS * 32];
+    __shared__ unsigned int sh_held[8 * RQ_GRID_STEPS];
+    __shared__ float sh_qx[8 * RQ_GRID_STEPS], sh_q2[8 * RQ_GRID_STEPS];
+    __shared__ float sh_scale[8];
+    __shared__ int sh_point[64];
+    __shared__ int sh_level[8];
+    rq_grid_block<32, 4, 8, 3, RQ_IQ3S_NPAT, RQ_IQ3S_NPTS, true>(
+        x, block_step, value_step, imp, book, sb, blocks_per_row, has_imp, 0.2f, 0.0f, 0.0f,
+        sh_x, sh_v, sh_w, sh_r, &sh_sigma2, sh_sign, sh_max, sh_trial, sh_held, sh_qx, sh_q2,
+        sh_scale, sh_point);
+    unsigned char * y = (unsigned char *) vy + (size_t) sb * RQ_IQ3S_BYTES;
+    if (t == 0) {
+        half hd;
+        rq_grid_scales(8, 1.033f, sh_scale, sh_level, &sh_d, &hd);
+        *(half *) y = hd;
+    }
+    __syncthreads();
+    // d, qs[64], qh[8], signs[32], scales[4]
+    if (t < 64) y[2 + t] = (unsigned char) (sh_point[t] & 255);
+    if (t < 8) {
+        unsigned int h = 0;
+        for (int k = 0; k < 8; k++) h |= (unsigned int) (sh_point[8 * t + k] >> 8) << k;
+        y[66 + t] = (unsigned char) h;
+    }
+    if (t < 32) y[74 + t] = sh_sign[t];
+    if (t < 4) y[106 + t] = (unsigned char) (sh_level[2 * t] | (sh_level[2 * t + 1] << 4));
+    if (has_got && t < REQ_QK_K) {
+        RQ_EXACT
+        const int run = t / 32, k = (t % 32) / 4, j = t % 4;
+        const float db = RQ_MUL(sh_d, (float) (1 + 2 * sh_level[run]));
+        const int n = sh_point[8 * run + k];
+        const float mag = RQ_MUL(db, (float) book[2 * RQ_IQ3S_NPAT + 1 + 4 * RQ_IQ3S_NPTS + 4 * n + j]);
+        got[(size_t) sb * block_step + (size_t) t * value_step] = ((sh_sign[t / 8] >> (t % 8)) & 1) ? -mag : mag;
+    }
+}
+
+#define RQ_IQ2S_NPAT 65536
+#define RQ_IQ2S_NPTS 1024
+#define RQ_IQ2S_BYTES 82
+
+extern "C" __global__ void requant_iq2_s(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, const int * __restrict__ book, void * __restrict__ vy,
+        float * __restrict__ got, const int has_got,
+        const int nblocks, const int blocks_per_row, const int has_imp) {
+    RQ_EXACT
+    const int sb = blockIdx.x;
+    if (sb >= nblocks) return;
+    const int t = threadIdx.x;
+    __shared__ float sh_x[REQ_QK_K], sh_v[REQ_QK_K], sh_w[REQ_QK_K], sh_r[REQ_QK_K];
+    __shared__ float sh_sigma2, sh_d;
+    __shared__ unsigned char sh_sign[32];
+    __shared__ float sh_max[16];
+    __shared__ unsigned char sh_trial[16 * RQ_GRID_STEPS * 16];
+    __shared__ unsigned int sh_held[16 * RQ_GRID_STEPS];
+    __shared__ float sh_qx[16 * RQ_GRID_STEPS], sh_q2[16 * RQ_GRID_STEPS];
+    __shared__ float sh_scale[16];
+    __shared__ int sh_point[32];
+    __shared__ int sh_level[16];
+    rq_grid_block<16, 8, 3, 2, RQ_IQ2S_NPAT, RQ_IQ2S_NPTS, false>(
+        x, block_step, value_step, imp, book, sb, blocks_per_row, has_imp, 0.1f, 1e-8f, 0.25f,
+        sh_x, sh_v, sh_w, sh_r, &sh_sigma2, sh_sign, sh_max, sh_trial, sh_held, sh_qx, sh_q2,
+        sh_scale, sh_point);
+    unsigned char * y = (unsigned char *) vy + (size_t) sb * RQ_IQ2S_BYTES;
+    if (t == 0) {
+        half hd;
+        rq_grid_scales(16, 0.9875f, sh_scale, sh_level, &sh_d, &hd);
+        *(half *) y = hd;
+    }
+    __syncthreads();
+    // d, qs[32] codes, qs[32] signs, qh[8], scales[8]
+    if (t < 32) {
+        y[2 + t] = (unsigned char) (sh_point[t] & 255);
+        y[34 + t] = sh_sign[t];
+    }
+    if (t < 8) {
+        unsigned int h = 0;
+        for (int k = 0; k < 4; k++) h |= (unsigned int) (sh_point[4 * t + k] >> 8) << (2 * k);
+        y[66 + t] = (unsigned char) h;
+        y[74 + t] = (unsigned char) (sh_level[2 * t] | (sh_level[2 * t + 1] << 4));
+    }
+    if (has_got && t < REQ_QK_K) {
+        RQ_EXACT
+        const int run = t / 16, g = t / 8, j = t % 8;
+        const float db = RQ_MUL(RQ_MUL(sh_d, RQ_ADD(0.5f, (float) sh_level[run])), 0.25f);
+        const int n = sh_point[g];
+        const float mag = RQ_MUL(db, (float) book[2 * RQ_IQ2S_NPAT + 1 + 8 * RQ_IQ2S_NPTS + 8 * n + j]);
+        got[(size_t) sb * block_step + (size_t) t * value_step] = ((sh_sign[g] >> j) & 1) ? -mag : mag;
+    }
+}
+
+// iq4_nl and iq4_xs: four-bit codes into a sixteen-level table, a scale per run of thirty-two. The
+// host encoders' search, step for step: a run's largest magnitude starts on the widest level,
+// fifteen scales around it are tried with every value at its nearest level and the scale refitted
+// by least squares, and the best fit wins. iq4_nl stores each run's scale as its block's f16;
+// iq4_xs stores six-bit steps of one f16 scale a block of 256. One CUDA block of 256 threads per
+// 256 values: thread (run, try). `imp` holds one weight per column of a row, `blocks_per_row`
+// spans of 256 of it. With `has_got` the values the blocks decode to are written to `got`.
+__constant__ signed char rq_iq4_levels[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+__device__ static int rq_iq4_index(const float v) {
+    if (v <= (float) rq_iq4_levels[0]) return 0;
+    if (v >= (float) rq_iq4_levels[15]) return 15;
+    int low = 0, high = 15;
+    while (high - low > 1) {
+        const int mid = (low + high) / 2;
+        if (v < (float) rq_iq4_levels[mid]) high = mid; else low = mid;
+    }
+    return RQ_SUB(v, (float) rq_iq4_levels[high - 1]) < RQ_SUB((float) rq_iq4_levels[high], v) ? high - 1 : high;
+}
+
+template <bool XS>
+__device__ static void rq_iq4(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    RQ_EXACT
+    const int sb = blockIdx.x;
+    if (sb >= nblocks) return;
+    const int t = threadIdx.x, run = t / 32, lane = t % 32;
+    __shared__ float sh_x[REQ_QK_K], sh_w[REQ_QK_K];
+    __shared__ float sh_sigma2[8], sh_max[8], sh_scale[8], sh_step[8];
+    __shared__ float sh_qx[8][16], sh_q2[8][16];
+    __shared__ float sh_d;
+    __shared__ int sh_l[8];
+    sh_x[t] = x[(size_t) sb * block_step + (size_t) t * value_step];
+    __syncthreads();
+    // The spread: over the whole block for iq4_xs, over each run of thirty-two for iq4_nl.
+    if (XS ? t == 0 : lane == 0) {
+        const int from = XS ? 0 : 32 * run, len = XS ? REQ_QK_K : 32;
+        float s = 0.0f;
+        for (int i = 0; i < len; i++) s = RQ_ADD(s, RQ_MUL(sh_x[from + i], sh_x[from + i]));
+        s = RQ_MUL(s, 2.0f / (float) len);
+        if (XS) for (int i = 0; i < 8; i++) sh_sigma2[i] = s; else sh_sigma2[run] = s;
+    }
+    __syncthreads();
+    {
+        const float v = sh_x[t];
+        sh_w[t] = has_imp
+            ? RQ_MUL(imp[(size_t) (sb % blocks_per_row) * REQ_QK_K + t], sqrtf(RQ_ADD(sh_sigma2[run], RQ_MUL(v, v))))
+            : RQ_MUL(v, v);
+    }
+    if (lane == 0) {
+        float amax = 0.0f, max = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            const float v = sh_x[32 * run + i];
+            if (fabsf(v) > amax) { amax = fabsf(v); max = v; }
+        }
+        sh_max[run] = amax < 1e-15f ? 0.0f : max;
+    }
+    __syncthreads();
+    const float max = sh_max[run];
+    const float * xb = sh_x + 32 * run;
+    const float * wb = sh_w + 32 * run;
+    // Lanes 0..14 try the scales -7..7 steps from the widest level; lane 15 the widest itself.
+    if (max != 0.0f && lane < 16) {
+        const float inverse = lane < 15
+            ? (float) (lane - 7 + rq_iq4_levels[0]) / max
+            : 1.0f / ((-max) / (float) rq_iq4_levels[0]);
+        float qx = 0.0f, q2 = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            const float q = (float) rq_iq4_levels[rq_iq4_index(RQ_MUL(inverse, xb[j]))];
+            qx = RQ_ADD(qx, RQ_MUL(RQ_MUL(wb[j], q), xb[j]));
+            q2 = RQ_ADD(q2, RQ_MUL(RQ_MUL(wb[j], q), q));
+        }
+        sh_qx[run][lane] = qx;
+        sh_q2[run][lane] = q2;
+    }
+    __syncthreads();
+    if (lane == 0) {
+        float d = 0.0f;
+        if (max != 0.0f) {
+            const float qx0 = sh_qx[run][15], q20 = sh_q2[run][15];
+            d = q20 > 0.0f ? qx0 / q20 : 0.0f;
+            float best = RQ_MUL(d, qx0);
+            for (int s = 0; s < 15; s++) {
+                const float qx = sh_qx[run][s], q2 = sh_q2[run][s];
+                if (q2 > 0.0f && RQ_MUL(qx, qx) > RQ_MUL(best, q2)) {
+                    d = qx / q2;
+                    best = RQ_MUL(d, qx);
+                }
+            }
+        }
+        sh_scale[run] = d;
+    }
+    __syncthreads();
+    unsigned char * y;
+    if (XS) {
+        // d, scales_h, scales_l[4], qs[128]
+        y = (unsigned char *) vy + (size_t) sb * 136;
+        if (t == 0) {
+            float widest = 0.0f, max_scale = 0.0f;
+            for (int i = 0; i < 8; i++) {
+                if (fabsf(sh_scale[i]) > widest) { widest = fabsf(sh_scale[i]); max_scale = sh_scale[i]; }
+            }
+            const half hd = __float2half(max_scale == 0.0f ? 0.0f : (-max_scale) / 32.0f);
+            *(half *) y = hd;
+            const float d = __half2float(hd);
+            sh_d = d;
+            const float inverse = d != 0.0f ? 1.0f / d : 0.0f;
+            unsigned int high = 0;
+            for (int i = 0; i < 8; i++) {
+                const int l = req_clampi(req_nint(RQ_MUL(inverse, sh_scale[i])), -32, 31);
+                sh_l[i] = l;
+                const float dl = RQ_MUL(d, (float) l);
+                sh_step[i] = dl != 0.0f ? 1.0f / dl : 0.0f;
+                high |= (unsigned int) ((l + 32) >> 4) << (2 * i);
+            }
+            *(unsigned short *) (y + 2) = (unsigned short) high;
+            for (int i = 0; i < 4; i++)
+                y[4 + i] = (unsigned char) (((sh_l[2 * i] + 32) & 15) | (((sh_l[2 * i + 1] + 32) & 15) << 4));
+        }
+        __syncthreads();
+        if (lane < 16) {
+            const float step = sh_step[run];
+            y[8 + 16 * run + lane] = (unsigned char) (rq_iq4_index(RQ_MUL(step, xb[lane]))
+                                                      | (rq_iq4_index(RQ_MUL(step, xb[lane + 16])) << 4));
+        }
+        if (has_got) {
+            const float dl = RQ_MUL(sh_d, (float) sh_l[run]);
+            got[(size_t) sb * block_step + (size_t) t * value_step] =
+                RQ_MUL(dl, (float) rq_iq4_levels[rq_iq4_index(RQ_MUL(sh_step[run], xb[lane]))]);
+        }
+    } else {
+        // Eight blocks of d, qs[16].
+        y = (unsigned char *) vy + ((size_t) sb * 8 + run) * 18;
+        __shared__ float sh_dn[8];
+        if (lane == 0) {
+            const half hd = __float2half(sh_scale[run]);
+            *(half *) y = hd;
+            const float d = __half2float(hd);
+            sh_dn[run] = d;
+            sh_step[run] = d != 0.0f ? 1.0f / d : 0.0f;
+        }
+        __syncthreads();
+        const float step = sh_step[run];
+        if (lane < 16) {
+            y[2 + lane] = (unsigned char) (rq_iq4_index(RQ_MUL(step, xb[lane]))
+                                           | (rq_iq4_index(RQ_MUL(step, xb[lane + 16])) << 4));
+        }
+        if (has_got) {
+            got[(size_t) sb * block_step + (size_t) t * value_step] =
+                RQ_MUL(sh_dn[run], (float) rq_iq4_levels[rq_iq4_index(RQ_MUL(step, xb[lane]))]);
+        }
+    }
+}
+
+extern "C" __global__ void requant_iq4_xs(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    rq_iq4<true>(x, block_step, value_step, imp, vy, got, has_got, nblocks, blocks_per_row, has_imp);
+}
+
+extern "C" __global__ void requant_iq4_nl(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    rq_iq4<false>(x, block_step, value_step, imp, vy, got, has_got, nblocks, blocks_per_row, has_imp);
+}
+
+// q6_K, q5_K and q4_K as the host encoders write them, with an importance and without. `imp` holds
+// one weight per column of a row, `blocks_per_row` blocks of it, read when `has_imp` says it is
+// there. With `has_got` the values the blocks decode to are written to `got`, in the layout `x`
+// has. One CUDA block of 32 threads per block; the same blocks as the host.
+
+// `rq_fit_signed` and then the scales a wider sweep reaches, a tenth of a level apart from half a
+// level to nine tenths either side of the extreme's own, kept where they fit better.
+__device__ static float rq_fit_signed_wide(int nmax, int n, const float * x, unsigned char * ls, const float * w) {
+    RQ_EXACT
+    float scale = rq_fit_signed(nmax, n, x, ls, w);
+    float extreme = 0.0f;
+    for (int i = 0; i < n; i++) if (fabsf(x[i]) > fabsf(extreme)) extreme = x[i];
+    if (extreme == 0.0f) return scale;
+    float wxl = 0.0f, wl2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float l = (float) ((int) ls[i] - nmax);
+        wxl = RQ_ADD(wxl, RQ_MUL(RQ_MUL(w[i], x[i]), l));
+        wl2 = RQ_ADD(wl2, RQ_MUL(RQ_MUL(w[i], l), l));
+    }
+    float best = wl2 > 0.0f ? RQ_MUL(wxl, wxl) / wl2 : 0.0f;
+    const int wide[10] = {-9, -8, -7, -6, -5, 5, 6, 7, 8, 9};
+    for (int k = 0; k < 10; k++) {
+        const float inv = -RQ_ADD((float) nmax, RQ_MUL(0.1f, (float) wide[k])) / extreme;
+        float cwl2, cwxl = rq_score(nmax, n, x, w, inv, &cwl2);
+        if (cwl2 > 0.0f && RQ_MUL(cwxl, cwxl) > RQ_MUL(best, cwl2)) {
+            for (int i = 0; i < n; i++) ls[i] = (unsigned char) (req_clampi(req_nint(RQ_MUL(inv, x[i])), -nmax, nmax - 1) + nmax);
+            scale = cwxl / cwl2;
+            best = RQ_MUL(scale, cwxl);
+        }
+    }
+    return scale;
+}
+
+// `rms(x) + |x|` over n values: the weight of a value when no importance says.
+__device__ static void rq_magnitude_weights(int n, const float * x, float * w) {
+    RQ_EXACT
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s = RQ_ADD(s, RQ_MUL(x[i], x[i]));
+    const float rms = sqrtf(s / (float) n);
+    for (int i = 0; i < n; i++) w[i] = RQ_ADD(rms, fabsf(x[i]));
+}
+
+extern "C" __global__ void requant_q6_k_exact(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    RQ_EXACT
+    const int sb = blockIdx.x;
+    if (sb >= nblocks) return;
+    const int t = threadIdx.x;
+    __shared__ float sh_x[REQ_QK_K];
+    __shared__ float sh_scale[16];
+    __shared__ float sh_dg[16];
+    __shared__ unsigned char sh_l[REQ_QK_K];
+    for (int i = t; i < REQ_QK_K; i += 32) sh_x[i] = x[(size_t) sb * block_step + (size_t) i * value_step];
+    __syncthreads();
+    if (t < 16) {
+        const float * xg = sh_x + 16 * t;
+        float w[16];
+        if (has_imp) {
+            for (int i = 0; i < 16; i++) w[i] = imp[(size_t) (sb % blocks_per_row) * REQ_QK_K + 16 * t + i];
+            sh_scale[t] = rq_fit_signed_wide(32, 16, xg, sh_l + 16 * t, w);
+        } else {
+            rq_magnitude_weights(16, xg, w);
+            sh_scale[t] = rq_fit_signed(32, 16, xg, sh_l + 16 * t, w);
+        }
+    }
+    __syncthreads();
+    // ql[128], qh[64], scales[16], d
+    unsigned char * y = (unsigned char *) vy + (size_t) sb * 210;
+    __shared__ float sh_d;
+    __shared__ bool sh_zero;
+    if (t == 0) {
+        float max = 0.0f;
+        for (int i = 0; i < 16; i++) if (fabsf(sh_scale[i]) > fabsf(max)) max = sh_scale[i];
+        sh_zero = max == 0.0f;
+        if (sh_zero) {
+            sh_d = 0.0f;
+            for (int i = 0; i < 16; i++) sh_dg[i] = 0.0f;
+        } else {
+            const float iscale = -128.0f / max;
+            const half hd = __float2half(1.0f / iscale);
+            *(half *) (y + 208) = hd;
+            sh_d = __half2float(hd);
+            for (int i = 0; i < 16; i++) {
+                int s = req_nint(RQ_MUL(iscale, sh_scale[i]));
+                s = s > 127 ? 127 : s;
+                y[192 + i] = (unsigned char) (signed char) s;
+                sh_dg[i] = RQ_MUL(sh_d, (float) (signed char) s);
+            }
+        }
+    }
+    __syncthreads();
+    if (sh_zero) {
+        for (int i = t; i < 210; i += 32) y[i] = 0;
+        if (has_got) for (int i = t; i < REQ_QK_K; i += 32) got[(size_t) sb * block_step + (size_t) i * value_step] = 0.0f;
+        return;
+    }
+    for (int i = t; i < REQ_QK_K; i += 32) {
+        const float dg = sh_dg[i / 16];
+        if (dg != 0.0f) sh_l[i] = (unsigned char) (req_clampi(req_nint(sh_x[i] / dg), -32, 31) + 32);
+    }
+    __syncthreads();
+    for (int half_ = 0; half_ < 2; half_++) {
+        const unsigned char * h = sh_l + 128 * half_;
+        const int i = t;
+        const int a = h[i], b = h[i + 32], c = h[i + 64], e = h[i + 96];
+        y[64 * half_ + i] = (unsigned char) ((a & 15) | ((c & 15) << 4));
+        y[64 * half_ + i + 32] = (unsigned char) ((b & 15) | ((e & 15) << 4));
+        y[128 + 32 * half_ + i] = (unsigned char) ((a >> 4) | ((b >> 4) << 2) | ((c >> 4) << 4) | ((e >> 4) << 6));
+    }
+    if (has_got) {
+        for (int i = t; i < REQ_QK_K; i += 32) {
+            const signed char s = (signed char) y[192 + i / 16];
+            got[(size_t) sb * block_step + (size_t) i * value_step] =
+                RQ_MUL(RQ_MUL(sh_d, (float) s), (float) ((int) sh_l[i] - 32));
+        }
+    }
+}
+
+// The host's `fit_scales_and_offsets` for one group of n values: levels 0..nmax under
+// `scale * l + offset`, offset at most zero, the grid of scales walked from nmax - 0.9 to nmax + 0.9
+// in steps of 0.05. Returns the scale; the negated offset into `below`.
+__device__ static float rq_fit_scale_offset(int nmax, int n, const float * x, const float * w, float * below) {
+    RQ_EXACT
+    const float top_level = (float) nmax;
+    float offset = x[0], top = x[0], w_total = w[0], wx_total = RQ_MUL(w[0], x[0]);
+    for (int i = 1; i < n; i++) {
+        if (x[i] < offset) offset = x[i];
+        if (x[i] > top) top = x[i];
+        w_total = RQ_ADD(w_total, w[i]);
+        wx_total = RQ_ADD(wx_total, RQ_MUL(w[i], x[i]));
+    }
+    if (offset > 0.0f) offset = 0.0f;
+    const bool flat = top <= offset;
+    float per_unit = top_level / RQ_SUB(top, offset);
+    float scale = 1.0f / per_unit;
+    float best_error = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float l = (float) req_clampi(req_nint(RQ_MUL(per_unit, RQ_SUB(x[i], offset))), 0, nmax);
+        const float diff = RQ_SUB(RQ_ADD(RQ_MUL(scale, l), offset), x[i]);
+        best_error = RQ_ADD(best_error, RQ_MUL(RQ_MUL(w[i], diff), diff));
+    }
+    float levels[32];
+    for (int step = 0; step <= 36; step++) {
+        per_unit = RQ_ADD(RQ_ADD(-0.9f, RQ_MUL(0.05f, (float) step)), top_level) / RQ_SUB(top, offset);
+        float wl = 0.0f, wl2 = 0.0f, wxl = 0.0f;
+        for (int i = 0; i < n; i++) {
+            const float l = (float) req_clampi(req_nint(RQ_MUL(per_unit, RQ_SUB(x[i], offset))), 0, nmax);
+            levels[i] = l;
+            wl = RQ_ADD(wl, RQ_MUL(w[i], l));
+            wl2 = RQ_ADD(wl2, RQ_MUL(w[i], RQ_MUL(l, l)));
+            wxl = RQ_ADD(wxl, RQ_MUL(RQ_MUL(w[i], l), x[i]));
+        }
+        const float denom = RQ_SUB(RQ_MUL(w_total, wl2), RQ_MUL(wl, wl));
+        const bool fits = denom > 0.0f;
+        float cs = RQ_SUB(RQ_MUL(w_total, wxl), RQ_MUL(wx_total, wl)) / denom;
+        float co = RQ_SUB(RQ_MUL(wl2, wx_total), RQ_MUL(wl, wxl)) / denom;
+        if (co > 0.0f) { co = 0.0f; cs = wxl / wl2; }
+        float error = 0.0f;
+        for (int i = 0; i < n; i++) {
+            const float diff = RQ_SUB(RQ_ADD(RQ_MUL(cs, levels[i]), co), x[i]);
+            error = RQ_ADD(error, RQ_MUL(RQ_MUL(w[i], diff), diff));
+        }
+        if (fits && !flat && error < best_error) { best_error = error; scale = cs; offset = co; }
+    }
+    *below = -offset;
+    return flat ? 0.0f : scale;
+}
+
+// The host's `fit_unsigned_scale`: non-negative `x` to codes 0..nmax with no offset, against
+// weights `w`; the codes into `l`, the scale returned.
+__device__ static float rq_fit_unsigned(int nmax, int n, const float * x, unsigned char * l, const float * w) {
+    RQ_EXACT
+    float max = 0.0f;
+    for (int i = 0; i < n; i++) max = fmaxf(max, x[i]);
+    if (max == 0.0f) {
+        for (int i = 0; i < n; i++) l[i] = 0;
+        return 0.0f;
+    }
+#define RQ_CODE(inv, v) min((int) (unsigned char) req_nint(RQ_MUL((inv), (v))), nmax)
+    float inv = (float) nmax / max;
+    float best;
+    {
+        const float scale = 1.0f / inv;
+        float e = -0.0f;
+        for (int i = 0; i < n; i++) {
+            const float diff = RQ_SUB(x[i], RQ_MUL(scale, (float) RQ_CODE(inv, x[i])));
+            e = RQ_ADD(e, RQ_MUL(RQ_MUL(w[i], diff), diff));
+        }
+        best = e;
+    }
+    for (int s = -4; s <= 4; s++) {
+        if (s == 0) continue;
+        const float candidate = RQ_ADD(RQ_MUL(0.1f, (float) s), (float) nmax) / max;
+        const float scale = 1.0f / candidate;
+        float e = -0.0f;
+        for (int i = 0; i < n; i++) {
+            const float diff = RQ_SUB(x[i], RQ_MUL(scale, (float) RQ_CODE(candidate, x[i])));
+            e = RQ_ADD(e, RQ_MUL(RQ_MUL(w[i], diff), diff));
+        }
+        if (e < best) { best = e; inv = candidate; }
+    }
+    float wxl = 0.0f, wl2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const int c = RQ_CODE(inv, x[i]);
+        l[i] = (unsigned char) c;
+        wxl = RQ_ADD(wxl, RQ_MUL(RQ_MUL(w[i], x[i]), (float) c));
+        wl2 = RQ_ADD(wl2, RQ_MUL(RQ_MUL(w[i], (float) c), (float) c));
+    }
+#undef RQ_CODE
+    for (int pass = 0; pass < 5; pass++) {
+        int moved = 0;
+        for (int i = 0; i < n; i++) {
+            const float v = x[i], ww = w[i], c = (float) l[i];
+            float nwxl = RQ_SUB(wxl, RQ_MUL(RQ_MUL(ww, v), c));
+            float nwl2 = RQ_SUB(wl2, RQ_MUL(RQ_MUL(ww, c), c));
+            if (nwxl <= 0.0f || nwl2 <= 0.0f) continue;
+            const int to = min((int) (unsigned char) req_nint(RQ_MUL(v, nwl2) / nwxl), nmax);
+            if (to == (int) l[i]) continue;
+            nwxl = RQ_ADD(nwxl, RQ_MUL(RQ_MUL(ww, v), (float) to));
+            nwl2 = RQ_ADD(nwl2, RQ_MUL(RQ_MUL(ww, (float) to), (float) to));
+            if (RQ_MUL(RQ_MUL(nwxl, nwxl), wl2) > RQ_MUL(RQ_MUL(wxl, wxl), nwl2)) {
+                l[i] = (unsigned char) to;
+                wxl = nwxl; wl2 = nwl2;
+                moved++;
+            }
+        }
+        if (moved == 0) break;
+    }
+    return wxl / wl2;
+}
+
+template <bool Q5>
+__device__ static void rq_qk_exact(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    RQ_EXACT
+    const int sb = blockIdx.x;
+    if (sb >= nblocks) return;
+    const int t = threadIdx.x;
+    const int NMAX = Q5 ? 31 : 15;
+    const int BYTES = Q5 ? 176 : 144;
+    __shared__ float sh_x[REQ_QK_K], sh_w[REQ_QK_K];
+    __shared__ float sh_sigma2;
+    __shared__ float sh_scale[8], sh_min[8], sh_carried[8], sh_dg[8], sh_mg[8];
+    for (int i = t; i < REQ_QK_K; i += 32) sh_x[i] = x[(size_t) sb * block_step + (size_t) i * value_step];
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < REQ_QK_K; i++) s = RQ_ADD(s, RQ_MUL(sh_x[i], sh_x[i]));
+        sh_sigma2 = RQ_MUL(2.0f, s) / (float) REQ_QK_K;
+    }
+    __syncthreads();
+    if (t < 8) {
+        const float * xg = sh_x + 32 * t;
+        float * wg = sh_w + 32 * t;
+        if (has_imp) {
+            for (int i = 0; i < 32; i++)
+                wg[i] = RQ_MUL(imp[(size_t) (sb % blocks_per_row) * REQ_QK_K + 32 * t + i],
+                               sqrtf(RQ_ADD(sh_sigma2, RQ_MUL(xg[i], xg[i]))));
+        } else {
+            rq_magnitude_weights(32, xg, wg);
+        }
+        float c = -0.0f;
+        for (int i = 0; i < 32; i++) c = RQ_ADD(c, wg[i]);
+        sh_carried[t] = c;
+        float below;
+        sh_scale[t] = rq_fit_scale_offset(NMAX, 32, xg, wg, &below);
+        sh_min[t] = below;
+    }
+    __syncthreads();
+    unsigned char * y = (unsigned char *) vy + (size_t) sb * BYTES;
+    if (t == 0) {
+        unsigned char ls[8], lm[8];
+        float d, dmin;
+        if (has_imp) {
+            d = rq_fit_unsigned(63, 8, sh_scale, ls, sh_carried);
+            dmin = rq_fit_unsigned(63, 8, sh_min, lm, sh_carried);
+        } else {
+            float max_scale = 0.0f, max_min = 0.0f;
+            for (int g = 0; g < 8; g++) { max_scale = fmaxf(sh_scale[g], max_scale); max_min = fmaxf(sh_min[g], max_min); }
+            const float is = max_scale > 0.0f ? 63.0f / max_scale : 0.0f;
+            const float im = max_min > 0.0f ? 63.0f / max_min : 0.0f;
+            for (int g = 0; g < 8; g++) {
+                ls[g] = (unsigned char) min(req_nint(RQ_MUL(is, sh_scale[g])), 63);
+                lm[g] = (unsigned char) min(req_nint(RQ_MUL(im, sh_min[g])), 63);
+            }
+            d = max_scale / 63.0f;
+            dmin = max_min / 63.0f;
+        }
+        const half hd = __float2half(d), hm = __float2half(dmin);
+        *(half *) y = hd;
+        *(half *) (y + 2) = hm;
+        unsigned char p[12];
+        for (int i = 0; i < 4; i++) { p[i] = ls[i] & 63; p[i + 4] = lm[i] & 63; }
+        for (int i = 4; i < 8; i++) {
+            p[i + 4] = (unsigned char) ((ls[i] & 15) | ((lm[i] & 15) << 4));
+            p[i - 4] |= (unsigned char) ((ls[i] >> 4) << 6);
+            p[i] |= (unsigned char) ((lm[i] >> 4) << 6);
+        }
+        for (int i = 0; i < 12; i++) y[4 + i] = p[i];
+        const float du = __half2float(hd), mu = __half2float(hm);
+        for (int g = 0; g < 8; g++) {
+            sh_dg[g] = RQ_MUL(du, (float) (ls[g] & 63));
+            sh_mg[g] = RQ_MUL(mu, (float) (lm[g] & 63));
+        }
+    }
+    __syncthreads();
+    // Thread t takes value t of each group: its byte of each pair of groups, and for q5_K its qh.
+    unsigned char code[8];
+    for (int g = 0; g < 8; g++) {
+        const float dg = sh_dg[g];
+        code[g] = dg == 0.0f ? 0
+            : (unsigned char) req_clampi(req_nint(RQ_ADD(sh_x[32 * g + t], sh_mg[g]) / dg), 0, NMAX);
+    }
+    const int qs = Q5 ? 48 : 16;
+    for (int p = 0; p < 4; p++)
+        y[qs + 32 * p + t] = (unsigned char) ((code[2 * p] & 15) | ((code[2 * p + 1] & 15) << 4));
+    if (Q5) {
+        unsigned char h = 0;
+        for (int g = 0; g < 8; g++) h |= (unsigned char) ((code[g] >> 4) << g);
+        y[16 + t] = h;
+    }
+    if (has_got) {
+        for (int g = 0; g < 8; g++)
+            got[(size_t) sb * block_step + (size_t) (32 * g + t) * value_step] =
+                RQ_SUB(RQ_MUL(sh_dg[g], (float) code[g]), sh_mg[g]);
+    }
+}
+
+extern "C" __global__ void requant_q4_k_exact(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    rq_qk_exact<false>(x, block_step, value_step, imp, vy, got, has_got, nblocks, blocks_per_row, has_imp);
+}
+
+extern "C" __global__ void requant_q5_k_exact(
+        const float * __restrict__ x, const long block_step, const long value_step,
+        const float * __restrict__ imp, void * __restrict__ vy, float * __restrict__ got,
+        const int has_got, const int nblocks, const int blocks_per_row, const int has_imp) {
+    rq_qk_exact<true>(x, block_step, value_step, imp, vy, got, has_got, nblocks, blocks_per_row, has_imp);
+}
+
 // Block-scaled fp4 to f32: `rows` by `inp` values, each row `inp / 2` bytes of e2m1 nibbles (element
 // 2j in the low nibble, 2j + 1 in the high) and `inp / block` ue8m0 scales along the input.
 extern "C" __global__ void dequant_fp4_e8m0(

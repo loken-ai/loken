@@ -50,6 +50,22 @@ impl BlockFormat for BlockQ5_1 {
         }
     }
 
+    /// ggml's importance-weighted fit: see `legacy_guided`.
+    fn quantize_guided(xs: &[f32], ys: &mut [Self], imatrix_weights: &[f32], n_per_row: usize) {
+        const HALF: usize = QK5_1 / 2;
+        let fitted = super::legacy_guided::affine_blocks(xs, imatrix_weights, n_per_row, 31);
+        for (block, (d, m, c)) in ys.iter_mut().zip(fitted) {
+            (block.d, block.m) = (d, m);
+            let mut qh = 0u32;
+            for j in 0..HALF {
+                let (a, b) = (c[j] as u32, c[j + HALF] as u32);
+                block.qs[j] = (a & 0x0F) as u8 | ((b & 0x0F) as u8) << 4;
+                qh |= (a >> 4) << j | (b >> 4) << (j + HALF);
+            }
+            block.qh = qh.to_le_bytes();
+        }
+    }
+
     fn quantize(xs: &[f32], ys: &mut [Self]) {
         const HALF: usize = QK5_1 / 2;
         for (block, x) in blocks_with_input(xs, ys) {

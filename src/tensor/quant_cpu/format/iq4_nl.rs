@@ -20,20 +20,6 @@ pub struct BlockIq4Nl {
 }
 const _: () = assert!(std::mem::size_of::<BlockIq4Nl>() == 2 + QK4_NL / 2);
 
-/// The code whose level is nearest `v` after division by the scale.
-fn nearest(v: f32) -> u8 {
-    let mut best = 0u8;
-    let mut err = f32::INFINITY;
-    for (code, &level) in LEVELS.iter().enumerate() {
-        let e = (v - level as f32).abs();
-        if e < err {
-            err = e;
-            best = code as u8;
-        }
-    }
-    best
-}
-
 impl BlockFormat for BlockIq4Nl {
     const DTYPE: GgmlDType = GgmlDType::Iq4Nl;
     const BLOCK_LEN: usize = QK4_NL;
@@ -58,27 +44,12 @@ impl BlockFormat for BlockIq4Nl {
         }
     }
 
-    /// The scale puts the block's largest magnitude on the widest level of its sign, then
-    /// every value takes the nearest level.
     fn quantize(xs: &[f32], ys: &mut [Self]) {
-        const HALF: usize = QK4_NL / 2;
-        for (block, x) in blocks_with_input(xs, ys) {
-            let amax = x
-                .iter()
-                .copied()
-                .fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
-            let d = if amax == 0.0 {
-                0.0
-            } else {
-                amax / if amax < 0.0 { -127.0 } else { 113.0 }
-            };
-            block.d = f16::from_f32(d);
-            let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
-            let (low, high) = x.split_at(HALF);
-            for ((&lo, &hi), packed) in low.iter().zip(high).zip(block.qs.iter_mut()) {
-                *packed = nearest(lo * inv) | (nearest(hi * inv) << 4);
-            }
-        }
+        encode(xs, ys, None, 0);
+    }
+
+    fn quantize_guided(xs: &[f32], ys: &mut [Self], imatrix_weights: &[f32], n_per_row: usize) {
+        encode(xs, ys, Some(imatrix_weights), n_per_row);
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
@@ -207,7 +178,8 @@ mod tests {
         BlockIq4Nl::quantize(&x, &mut b);
         let mut y = vec![0f32; 32];
         BlockIq4Nl::dequantize(&b, &mut y);
-        let d = b[0].d.to_f32();
+        // The scale is signed: it puts the largest magnitude on the widest level of either sign.
+        let d = b[0].d.to_f32().abs();
         for (a, r) in x.iter().zip(&y) {
             assert!((a - r).abs() <= d * 12.0, "{a} vs {r}");
         }
@@ -428,4 +400,111 @@ pub(super) unsafe fn reference_dot_avx2(
                 * crate::tensor::quant_cpu::avx::f16c_to_f32(y.d)
         })
         .sum()
+}
+
+/// The code whose level is nearest `v`, in units of the scale; a value halfway between two levels
+/// takes the upper one.
+pub(super) fn level_index(v: f32) -> u8 {
+    if v <= LEVELS[0] as f32 {
+        return 0;
+    }
+    if v >= LEVELS[15] as f32 {
+        return 15;
+    }
+    let (mut low, mut high) = (0usize, 15usize);
+    while high - low > 1 {
+        let mid = (low + high) / 2;
+        if v < LEVELS[mid] as f32 {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    if v - (LEVELS[high - 1] as f32) < LEVELS[high] as f32 - v {
+        (high - 1) as u8
+    } else {
+        high as u8
+    }
+}
+
+/// The weights a run of thirty-two values is fitted under: the importance times the value's
+/// distance from the spread `sigma2` of its block, or the value's square without an importance.
+pub(super) fn run_weights(x: &[f32], importance: Option<&[f32]>, sigma2: f32) -> [f32; 32] {
+    std::array::from_fn(|j| match importance {
+        Some(r) => r[j] * (sigma2 + x[j] * x[j]).sqrt(),
+        None => x[j] * x[j],
+    })
+}
+
+/// The spread a block's runs are weighed against: twice the mean square of its values.
+pub(super) fn spread(x: &[f32]) -> f32 {
+    let mut s = 0f32;
+    for v in x {
+        s += v * v;
+    }
+    s * (2.0 / x.len() as f32)
+}
+
+/// The scale of one run of thirty-two values, signed: ggml's `quantize_row_iq4_nl_impl` (MIT).
+/// The run's largest magnitude starts on the table's widest level; fifteen scales around it are
+/// tried, each value at its nearest level and the scale refitted by least squares, and the best
+/// fit wins. Zero for a run that is all zeros.
+pub(super) fn run_scale(x: &[f32], w: &[f32; 32]) -> f32 {
+    /// Scales tried either side of the widest level, one level apart.
+    const TRIES: i32 = 7;
+    /// A run below this magnitude is stored as zeros.
+    const EMPTY: f32 = 1e-15;
+    let (mut amax, mut max) = (0f32, 0f32);
+    for &v in x {
+        if v.abs() > amax {
+            (amax, max) = (v.abs(), v);
+        }
+    }
+    if amax < EMPTY {
+        return 0.0;
+    }
+    let sums = |inverse: f32| {
+        let (mut qx, mut q2) = (0f32, 0f32);
+        for (&v, &wj) in x.iter().zip(w) {
+            let q = LEVELS[level_index(inverse * v) as usize] as f32;
+            qx += wj * q * v;
+            q2 += wj * q * q;
+        }
+        (qx, q2)
+    };
+    let d = -max / LEVELS[0] as f32;
+    let (qx, q2) = sums(1.0 / d);
+    let mut d = if q2 > 0.0 { qx / q2 } else { 0.0 };
+    let mut best = d * qx;
+    for t in -TRIES..=TRIES {
+        let (qx, q2) = sums((t + LEVELS[0] as i32) as f32 / max);
+        if q2 > 0.0 && qx * qx > best * q2 {
+            d = qx / q2;
+            best = d * qx;
+        }
+    }
+    d
+}
+
+/// Quantise whole blocks, optionally against an importance matrix: one weight per column of a row
+/// `n_per_row` long. Each block is one run fitted by [`run_scale`], its values levelled against
+/// the scale as stored.
+fn encode(xs: &[f32], ys: &mut [BlockIq4Nl], imatrix: Option<&[f32]>, n_per_row: usize) {
+    use rayon::prelude::*;
+    ys.par_iter_mut()
+        .zip(xs.par_chunks_exact(QK4_NL))
+        .enumerate()
+        .for_each(|(idx, (block, x))| {
+            let row = imatrix.map(|m| {
+                let base = (idx % (n_per_row / QK4_NL)) * QK4_NL;
+                &m[base..base + QK4_NL]
+            });
+            let w = run_weights(x, row, spread(x));
+            block.d = f16::from_f32(run_scale(x, &w));
+            let d = block.d.to_f32();
+            let inverse = if d != 0.0 { 1.0 / d } else { 0.0 };
+            for j in 0..QK4_NL / 2 {
+                block.qs[j] = level_index(inverse * x[j]) | level_index(inverse * x[j + 16]) << 4;
+            }
+        });
 }

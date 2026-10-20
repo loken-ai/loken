@@ -1,8 +1,7 @@
 //! iq4_xs - 256 values in 136 bytes, four-bit codes into the non-linear table of iq4_nl.
 //!
 //! The block carries one f16 scale and a six-bit scale per thirty-two values, split between a
-//! low nibble array and a shared 16-bit word of high pairs. Read-only: loken reads these files
-//! and does not produce them.
+//! low nibble array and a shared 16-bit word of high pairs.
 
 use super::iq4_nl::LEVELS;
 use super::*;
@@ -47,8 +46,12 @@ impl BlockFormat for BlockIq4Xs {
         }
     }
 
-    fn quantize(_: &[f32], _: &mut [Self]) {
-        panic!("iq4_xs is read, not written");
+    fn quantize(xs: &[f32], ys: &mut [Self]) {
+        encode(xs, ys, None, 0);
+    }
+
+    fn quantize_guided(xs: &[f32], ys: &mut [Self], imatrix_weights: &[f32], n_per_row: usize) {
+        encode(xs, ys, Some(imatrix_weights), n_per_row);
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
@@ -159,4 +162,58 @@ unsafe fn dot_many_avx2(
             out.copy_from_slice(&totals[..out.len()]);
         }
     }
+}
+
+/// Quantise whole blocks, optionally against an importance matrix: one weight per column of a row
+/// `n_per_row` long.
+///
+/// ggml's `quantize_iq4_xs` (MIT): each run of thirty-two is fitted alone, as an iq4_nl block is;
+/// the eight scales are then stored as six-bit steps of the block scale, which puts the largest
+/// of them on the step -32, and each run's values are levelled against its scale as stored.
+fn encode(xs: &[f32], ys: &mut [BlockIq4Xs], imatrix: Option<&[f32]>, n_per_row: usize) {
+    use super::iq4_nl::{level_index, run_scale, run_weights, spread};
+    use rayon::prelude::*;
+    const RUNS: usize = QK_K / 32;
+    ys.par_iter_mut()
+        .zip(xs.par_chunks_exact(QK_K))
+        .enumerate()
+        .for_each(|(idx, (block, x))| {
+            let row = imatrix.map(|m| {
+                let base = (idx % (n_per_row / QK_K)) * QK_K;
+                &m[base..base + QK_K]
+            });
+            let sigma2 = spread(x);
+            let mut scales = [0f32; RUNS];
+            let (mut widest, mut max_scale) = (0f32, 0f32);
+            for (ib, scale) in scales.iter_mut().enumerate() {
+                let xb = &x[32 * ib..32 * ib + 32];
+                let w = run_weights(xb, row.map(|r| &r[32 * ib..32 * ib + 32]), sigma2);
+                *scale = run_scale(xb, &w);
+                if scale.abs() > widest {
+                    (widest, max_scale) = (scale.abs(), *scale);
+                }
+            }
+            *block = BlockIq4Xs::zeros();
+            // An all-zero block stores +0, whichever sign the division would give it.
+            block.d = f16::from_f32(if max_scale == 0.0 {
+                0.0
+            } else {
+                -max_scale / 32.0
+            });
+            let d = block.d.to_f32();
+            let inverse = if d != 0.0 { 1.0 / d } else { 0.0 };
+            for (ib, &scale) in scales.iter().enumerate() {
+                let l = nearest_int(inverse * scale).clamp(-32, 31);
+                let dl = d * l as f32;
+                let step = if dl != 0.0 { 1.0 / dl } else { 0.0 };
+                let xb = &x[32 * ib..32 * ib + 32];
+                for j in 0..16 {
+                    block.qs[16 * ib + j] =
+                        level_index(step * xb[j]) | level_index(step * xb[j + 16]) << 4;
+                }
+                let l = (l + 32) as u8;
+                block.scales_l[ib / 2] |= (l & 0x0F) << (4 * (ib % 2));
+                block.scales_h |= ((l >> 4) as u16) << (2 * ib);
+            }
+        });
 }

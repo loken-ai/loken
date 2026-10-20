@@ -66,6 +66,19 @@ The IQ3_XXS encoder in `src/tensor/quant_cpu/format/iq3_xxs.rs` follows the sear
 `ggml/src/ggml-quants.c` (MIT): the scale candidates, the weighting by importance and the
 nearest-point fallback for patterns off the grid. The code is written for loken.
 
+The encoders below follow the same file's searches in the same way, written for loken:
+
+| Path | Follows |
+|------|---------|
+| `src/tensor/quant_cpu/format/iq3_s.rs` | `quantize_row_iq3_s_impl` |
+| `src/tensor/quant_cpu/format/iq2_s.rs` | `quantize_row_iq2_s_impl` |
+| `src/tensor/quant_cpu/format/iq_codebook.rs` | the neighbour lists of `iq2xs_init_impl` and `iq3xs_init_impl` |
+| `src/tensor/quant_cpu/format/iq4_nl.rs`, `iq4_xs.rs` | `quantize_row_iq4_nl_impl`, `quantize_iq4_xs` |
+| `src/tensor/quant_cpu/format/legacy_guided.rs` | the importance weighting of `quantize_row_q4_0_impl` and its kin |
+
+The card kernels for these formats in `src/inference/cuda/quantized/requant.cu` run the same
+searches as the host encoders above.
+
 Model *weights* are not distributed with this repository. Downloading and using any model is
 subject to that model's own license and terms of use. The references each model
 implementation was written against - architecture attribution, not borrowed code - are listed

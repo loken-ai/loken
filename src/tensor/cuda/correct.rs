@@ -52,7 +52,8 @@ pub struct Scratch {
     y: Option<CudaSlice<f32>>,
     inverses: Option<CudaSlice<f32>>,
     grid: Option<CudaSlice<f32>>,
-    book: Option<CudaSlice<i32>>,
+    /// The codebook tables uploaded, by the format that reads them.
+    books: Vec<(GgmlDType, CudaSlice<i32>)>,
     pinned: Option<Pinned>,
 }
 
@@ -384,8 +385,17 @@ unsafe fn gemm(
     )
 }
 
-/// Quantise `w` (`rows` by `cols`, row-major) to `dtype` - iq2_xxs, iq3_xxs, q2_K or q3_K, each
-/// weighted by `importance` - carrying each block's error onto the columns after it through
+/// Whether a card carries the error correction for `dtype`: the formats a kernel encodes with an
+/// importance and also writes what its blocks decode to.
+pub fn carries_correction(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Q2K | GgmlDType::Q3K
+    ) || super::quant::card_encoder(dtype).is_some()
+}
+
+/// Quantise `w` (`rows` by `cols`, row-major) to `dtype`, a format `carries_correction` names,
+/// weighted by `importance`, carrying each block's error onto the columns after it through
 /// `factor`. Returns the blocks as the file stores them, row by row.
 pub fn quantize_compensated_on_card(
     dev: &CudaDevice,
@@ -552,16 +562,18 @@ fn quantize_on_card(
     scratch: &mut Scratch,
 ) -> Result<Vec<u8>> {
     use crate::tensor::quant_cpu::{BlockIq2Xxs, BlockIq3Xxs, BlockQ2K, BlockQ3K};
-    let (kernel, block_bytes, threads) = match dtype {
-        GgmlDType::Iq2Xxs => ("requant_iq2_xxs", std::mem::size_of::<BlockIq2Xxs>(), 32u32),
-        GgmlDType::Iq3Xxs => (
+    let added = super::quant::card_encoder(dtype);
+    let (kernel, block_bytes, threads) = match (dtype, &added) {
+        (_, Some(enc)) => (enc.kernel, enc.span_bytes, enc.threads),
+        (GgmlDType::Iq2Xxs, _) => ("requant_iq2_xxs", std::mem::size_of::<BlockIq2Xxs>(), 32u32),
+        (GgmlDType::Iq3Xxs, _) => (
             "requant_iq3_xxs",
             std::mem::size_of::<BlockIq3Xxs>(),
             super::quant::IQ3_XXS_THREADS,
         ),
-        GgmlDType::Q2K => ("requant_q2_k_guided", std::mem::size_of::<BlockQ2K>(), 32),
-        GgmlDType::Q3K => ("requant_q3_k_guided", std::mem::size_of::<BlockQ3K>(), 32),
-        other => {
+        (GgmlDType::Q2K, _) => ("requant_q2_k_guided", std::mem::size_of::<BlockQ2K>(), 32),
+        (GgmlDType::Q3K, _) => ("requant_q3_k_guided", std::mem::size_of::<BlockQ3K>(), 32),
+        (other, _) => {
             return Err(Error(format!(
                 "{other:?} has no kernel that carries a correction"
             )))
@@ -593,12 +605,18 @@ fn quantize_on_card(
                 .map_err(|e| alloc_err("iq2_xxs grid upload", e))?,
         );
     }
-    if dtype == GgmlDType::Iq3Xxs && scratch.book.is_none() {
-        scratch.book = Some(
-            stream
-                .clone_htod(&crate::tensor::quant_cpu::iq3_xxs_codebook())
-                .map_err(|e| alloc_err("iq3_xxs codebook upload", e))?,
-        );
+    let table: Option<fn() -> Vec<i32>> = match &added {
+        Some(enc) => enc.table,
+        None if dtype == GgmlDType::Iq3Xxs => Some(crate::tensor::quant_cpu::iq3_xxs_codebook),
+        None => None,
+    };
+    if let Some(table) = table {
+        if !scratch.books.iter().any(|(d, _)| *d == dtype) {
+            let uploaded = stream
+                .clone_htod(&table())
+                .map_err(|e| alloc_err("codebook upload", e))?;
+            scratch.books.push((dtype, uploaded));
+        }
     }
     let mut imp = take(&mut scratch.imp, dev, cols)?;
     let mut carried = take(&mut scratch.carried, dev, rows * n)?;
@@ -621,9 +639,14 @@ fn quantize_on_card(
             .memset_zeros(&mut carried.slice_mut(0..rows * n))
             .map_err(|e| alloc_err("card correction", e))?;
         let grid = scratch.grid.as_ref().filter(|_| dtype == GgmlDType::Iq2Xxs);
-        let book = scratch.book.as_ref().filter(|_| dtype == GgmlDType::Iq3Xxs);
-        // The grid formats' kernels end on a flag that says the importance is there.
-        let flags_importance = grid.is_some() || book.is_some();
+        let book = scratch
+            .books
+            .iter()
+            .find(|(d, _)| *d == dtype)
+            .map(|(_, b)| b);
+        // The grid formats' kernels and the ones added after them end on a flag that says the
+        // importance is there.
+        let flags_importance = grid.is_some() || book.is_some() || added.is_some();
         let func = dev.quantized_fn(kernel)?;
         let blas = dev.blas()?;
         let handle = *blas.handle();
