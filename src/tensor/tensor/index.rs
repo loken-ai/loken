@@ -790,6 +790,13 @@ impl Tensor {
         dilation: usize,
         groups: usize,
     ) -> Result<Self> {
+        // A half-precision convolution on a card runs the F32 one on device casts, with F32
+        // accumulation: the host convolution it would otherwise fall back to reads F32 alone.
+        #[cfg(feature = "gpu")]
+        if self.is_cuda_f16() && kernel.dtype() == self.dtype() {
+            let k = kernel.to_dtype(DType::F32)?;
+            return self.f16_unary_via_f32(|x| x.conv2d(&k, padding, stride, dilation, groups));
+        }
         #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
             if groups == 1 && self.dtype() == DType::F32 && kernel.dtype() == DType::F32 {

@@ -46,6 +46,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- SDXL: render with a bf16 UNet on a card.
 - GPU: keep two models decoding on one card from mixing their activations.
 - Tokenizer: lead a bare prompt with the BOS a model's chat template opens with.
 - GPU: release a card's context once no loaded model uses it, so the card cools.
