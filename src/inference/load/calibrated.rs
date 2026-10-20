@@ -11,7 +11,7 @@ use super::compensate::{
     cpu_product, quantize_factored_with, quantize_rows, Calibration, Factor, MatMul,
 };
 use crate::tensor::quant_cpu::{
-    BlockFormat, BlockIq2Xxs, BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K,
+    BlockFormat, BlockIq2Xxs, BlockIq3Xxs, BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K,
 };
 use crate::tensor::quantized::GgmlDType;
 use crate::tensor::{Error, Result};
@@ -40,6 +40,7 @@ pub fn guided(dtype: GgmlDType) -> bool {
             | GgmlDType::Q5K
             | GgmlDType::Q6K
             | GgmlDType::Iq2Xxs
+            | GgmlDType::Iq3Xxs
     )
 }
 
@@ -122,6 +123,7 @@ pub fn quantize_projection_on(
         GgmlDType::Q5K => one::<BlockQ5K>(w, record, &at),
         GgmlDType::Q6K => one::<BlockQ6K>(w, record, &at),
         GgmlDType::Iq2Xxs => one::<BlockIq2Xxs>(w, record, &at),
+        GgmlDType::Iq3Xxs => one::<BlockIq3Xxs>(w, record, &at),
         other => Err(Error(format!(
             "{other:?} takes no importance; quantise it plainly"
         ))),
@@ -254,6 +256,7 @@ pub fn quantize_tensor(
             GgmlDType::Q5K => one::<BlockQ5K>(slice, record, &at)?,
             GgmlDType::Q6K => one::<BlockQ6K>(slice, record, &at)?,
             GgmlDType::Iq2Xxs => one::<BlockIq2Xxs>(slice, record, &at)?,
+            GgmlDType::Iq3Xxs => one::<BlockIq3Xxs>(slice, record, &at)?,
             other => {
                 return Err(Error(format!(
                     "{name}: {other:?} takes no importance; quantise it plainly"
@@ -294,6 +297,15 @@ mod tests {
     /// them is trusted. A stack whose slices were laid out in the wrong order fails here.
     #[test]
     fn a_stack_reads_back_as_its_own_slices() {
+        reads_back(GgmlDType::Iq2Xxs);
+    }
+
+    #[test]
+    fn an_iq3_xxs_stack_reads_back_as_its_own_slices() {
+        reads_back(GgmlDType::Iq3Xxs);
+    }
+
+    fn reads_back(dtype: GgmlDType) {
         let (stack, rows, cols, n) = (2usize, 6usize, 512usize, 24usize);
         let w = stream(11, stack * rows * cols, 0.02);
         let mut records = Records::new();
@@ -317,12 +329,12 @@ mod tests {
             "blk.3.ffn_gate_exps.weight",
             &[stack, rows, cols],
             &w,
-            GgmlDType::Iq2Xxs,
+            dtype,
             &records,
             recipe,
         )
         .unwrap();
-        let plain = crate::tensor::quant_cpu::from_float_bytes(GgmlDType::Iq2Xxs, &w).unwrap();
+        let plain = crate::tensor::quant_cpu::from_float_bytes(dtype, &w).unwrap();
 
         let per = bytes.len() / stack;
         let output_error = |got: &[f32], orig: &[f32], x: &[f32]| -> f64 {
@@ -343,9 +355,9 @@ mod tests {
         for s in 0..stack {
             let orig = &w[s * rows * cols..(s + 1) * rows * cols];
             let mut ours = vec![0f32; rows * cols];
-            to_float_bytes(GgmlDType::Iq2Xxs, &bytes[s * per..(s + 1) * per], &mut ours).unwrap();
+            to_float_bytes(dtype, &bytes[s * per..(s + 1) * per], &mut ours).unwrap();
             let mut base = vec![0f32; rows * cols];
-            to_float_bytes(GgmlDType::Iq2Xxs, &plain[s * per..(s + 1) * per], &mut base).unwrap();
+            to_float_bytes(dtype, &plain[s * per..(s + 1) * per], &mut base).unwrap();
             let (e_ours, e_plain) = (
                 output_error(&ours, orig, &xs[s]),
                 output_error(&base, orig, &xs[s]),

@@ -59,6 +59,13 @@ threshold that remain ports carry their attribution inline.
 | `cuda/mmq_gguf/mmq_gguf.cuh` | 58% | - | [ggerganov/ggml](https://github.com/ggerganov/ggml) `ggml/src/ggml-cuda/mmq.cuh` | MIT |
 | `src/tensor/quant_cpu/format/iq2_xxs.rs` | 53% | 64 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `ggml/src/ggml-common.h` | MIT |
 
+## Algorithms followed
+
+The IQ3_XXS encoder in `src/tensor/quant_cpu/format/iq3_xxs.rs` follows the search of
+`quantize_row_iq3_xxs_impl` in [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+`ggml/src/ggml-quants.c` (MIT): the scale candidates, the weighting by importance and the
+nearest-point fallback for patterns off the grid. The code is written for loken.
+
 Model *weights* are not distributed with this repository. Downloading and using any model is
 subject to that model's own license and terms of use. The references each model
 implementation was written against - architecture attribution, not borrowed code - are listed

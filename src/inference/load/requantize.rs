@@ -38,6 +38,7 @@ pub fn parse_dtype(name: &str) -> Option<GgmlDType> {
         "q8_0" => GgmlDType::Q8_0,
         "q2_k" => GgmlDType::Q2K,
         "iq2_xxs" => GgmlDType::Iq2Xxs,
+        "iq3_xxs" => GgmlDType::Iq3Xxs,
         "q3_k" => GgmlDType::Q3K,
         "q4_k" => GgmlDType::Q4K,
         "q5_k" => GgmlDType::Q5K,
