@@ -653,7 +653,7 @@ impl GenericTransformerLayer {
 
     /// The attention block over `x`'s rows, each row through the decode step at its own
     /// position: the projections run batched (row-exact under `DecodeOrder`), then the rows
-    /// rotate, append and attend in one launch each where the Q8 split-K decode serves them,
+    /// rotate, append and attend in one launch each where the Q8 decode attention serves them,
     /// or one by one as a one-token forward would.
     fn forward_attn_rows_as_decode(
         &mut self,
@@ -674,6 +674,10 @@ impl GenericTransformerLayer {
         #[cfg(feature = "gpu")]
         if let Some(qkv) = packed.as_ref() {
             if let Some(y) = self.attend_rows_packed(x, index_pos, qkv)? {
+                let y = self.gate_attention(x, y)?;
+                return self.attn_output_projection(&y, false);
+            }
+            if let Some(y) = self.attend_rows_unfused_packed(x, index_pos, qkv)? {
                 let y = self.gate_attention(x, y)?;
                 return self.attn_output_projection(&y, false);
             }
@@ -700,7 +704,7 @@ impl GenericTransformerLayer {
                 }
             };
             #[cfg(feature = "gpu")]
-            if let Some(y) = self.attend_rows_split(index_pos, &q, &k, &v)? {
+            if let Some(y) = self.attend_rows_split(index_pos, &q, &k, &v, false)? {
                 let y = self.gate_attention(x, y)?;
                 return self.attn_output_projection(&y, false);
             }
@@ -720,7 +724,7 @@ impl GenericTransformerLayer {
 
     /// The attention of `x`'s rows, `[1, rows, hidden]` at `index_pos..`, from their packed
     /// projections `qkv` `[1, rows, total]`, each row exactly as its decode step attends: one
-    /// fused norm and rotation launch, one append and one split-K attention pair serve every
+    /// fused norm and rotation launch, one append and one Q8 decode attention pair serve every
     /// row. `None`, with nothing done, where a decode step would take another kernel than these
     /// (a quantised cache other than Q8, a window, sinks, a V norm, partial rotation, the
     /// tensor-core decode, an unrotated or captured step); the caller then runs row by row.
@@ -734,7 +738,7 @@ impl GenericTransformerLayer {
         let rows = x.dim(1)?;
         let route = self.fused_decode_route(&x.narrow(1, 0, 1)?, true)?;
         let served = route.is_some()
-            && self.rows_take_q8_splitk(&x.device(), index_pos, rows)
+            && self.rows_take_q8_decode(&x.device(), index_pos, rows)
             && !(self.rope_dim > 0 && self.rope_dim < self.head_dim);
         if !served {
             return Ok(None);
@@ -802,18 +806,35 @@ impl GenericTransformerLayer {
         self.attend_rows_q8(&q, &k, &v, rows, 1.0).map(Some)
     }
 
-    /// Whether the decode step of each of `rows` tokens at `index_pos..` on `device` appends to
-    /// the Q8 cache and attends through its split-K kernel pair, the one
-    /// [`Self::attend_rows_q8`] runs: an eager step over a layer of its own, GQA heads the
-    /// kernel takes, no window, sinks or V norm, and short of the tensor-core decode.
+    /// Whether a decode step's Q8 attention takes the split-K kernel pair (GQA heads the kernel
+    /// takes) rather than the score and softmax-output pair, as `q8_decode_attention` picks.
     #[cfg(feature = "gpu")]
-    fn rows_take_q8_splitk(&self, device: &Device, index_pos: usize, rows: usize) -> bool {
+    fn decode_takes_splitk(&self) -> bool {
+        self.n_head > self.n_kv_head && (self.head_dim == 64 || self.head_dim == 128)
+    }
+
+    /// Whether the decode step of each of `rows` tokens at `index_pos..` on `device` appends to
+    /// the Q8 cache and attends through the kernel pair [`Self::attend_rows_q8`] runs for it:
+    /// an eager step over a layer of its own, heads a pair takes, no window, sinks or V norm,
+    /// and short of the tensor-core decode.
+    #[cfg(feature = "gpu")]
+    fn rows_take_q8_decode(&self, device: &Device, index_pos: usize, rows: usize) -> bool {
         let n_q_per_kv = self.n_head / self.n_kv_head.max(1);
         let tc_card = self.head_dim == 128
             && device
                 .as_cuda_device()
                 .map(|d| d.has_ampere_tensor_cores())
                 .unwrap_or(false);
+        let heads_ok = match self.decode_takes_splitk() {
+            true => {
+                (1..=16).contains(&n_q_per_kv)
+                    && !(tc_card
+                        && index_pos + rows >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV)
+            }
+            false => {
+                crate::inference::cache::kv_core::kv_shape_supported(self.head_dim, n_q_per_kv)
+            }
+        };
         self.has_q8_cache()
             && !self.graph_step()
             && !crate::tensor::cuda_ext::capture_active(device)
@@ -822,12 +843,9 @@ impl GenericTransformerLayer {
             && self.attn_v_norm_ones.is_none()
             && self.attn_sinks.is_none()
             && self.sliding_window.is_none()
-            && self.n_head > self.n_kv_head
-            && self.n_head.is_multiple_of(self.n_kv_head.max(1))
-            && (1..=16).contains(&n_q_per_kv)
-            && (self.head_dim == 64 || self.head_dim == 128)
-            && !(tc_card
-                && index_pos + rows >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV)
+            && self.n_kv_head > 0
+            && self.n_head.is_multiple_of(self.n_kv_head)
+            && heads_ok
             && index_pos > 0
             && self.q8_kv().is_some_and(|c| {
                 c.current_seq_len() == index_pos && index_pos + rows <= c.max_seq_padded()
@@ -847,23 +865,65 @@ impl GenericTransformerLayer {
         scale: f32,
     ) -> Result<Tensor> {
         let attn_out_dim = self.n_head * self.head_dim;
+        let splitk = self.decode_takes_splitk();
         let cache = self
             .q8_kv_mut()
             .ok_or_else(|| crate::tensor::Error::msg("verify rows: no Q8 cache"))?;
         cache
             .append_rows(k, v, rows)
             .map_err(|e| crate::tensor::Error::msg(format!("verify rows: {e}")))?;
-        let y = cache
-            .attn_flash_splitk_decode_rows(&q.to_dtype(DType::F32)?, rows, scale)
-            .map_err(|e| crate::tensor::Error::msg(format!("verify rows: {e}")))?;
+        let q = q.to_dtype(DType::F32)?;
+        let y = match splitk {
+            true => cache.attn_flash_splitk_decode_rows(&q, rows, scale),
+            false => cache.attn_chain_decode_rows(&q, rows, scale),
+        }
+        .map_err(|e| crate::tensor::Error::msg(format!("verify rows: {e}")))?;
         y.reshape((1, rows, attn_out_dim))
     }
 
-    /// The attention of a verify's rows at `index_pos..` from their separate projections `q`,
-    /// `k`, `v` (`[1, rows, heads * hd]`, before their biases), each row exactly as its decode
-    /// step attends through the unfused chain: biases, rotation, one append and one split-K
-    /// pair for every row. `None`, with nothing done, where a decode step would take another
-    /// path (see [`Self::rows_take_q8_splitk`]; rotation rows of its own, a V shared with K).
+    /// The attention of `x`'s rows at `index_pos..` from their packed projections `qkv`
+    /// `[1, rows, total]` where the decode step takes the unfused chain over them: the packed
+    /// bias where the layer has one, then the split rows through [`Self::attend_rows_split`].
+    /// `None`, with nothing done, where the decode step takes the fused launch or that chain
+    /// does not serve the rows.
+    #[cfg(feature = "gpu")]
+    fn attend_rows_unfused_packed(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        qkv: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let rows = qkv.dim(1)?;
+        if self
+            .fused_decode_route(&x.narrow(1, 0, 1)?, true)?
+            .is_some()
+            || !self.rows_take_q8_decode(&qkv.device(), index_pos, rows)
+        {
+            return Ok(None);
+        }
+        let qkv = match self
+            .attn_qkv_bias
+            .as_ref()
+            .filter(|_| self.flags.has_qkv_bias)
+        {
+            Some(b) => qkv.broadcast_add(b)?,
+            None => qkv.clone(),
+        };
+        let q_dim = self.n_head * self.head_dim;
+        let kv_dim = self.n_kv_head * self.head_dim;
+        let q = qkv.narrow(crate::tensor::D::Minus1, 0, q_dim)?;
+        let k = qkv.narrow(crate::tensor::D::Minus1, q_dim, kv_dim)?;
+        let v = qkv.narrow(crate::tensor::D::Minus1, q_dim + kv_dim, kv_dim)?;
+        self.attend_rows_split(index_pos, &q, &k, &v, true)
+    }
+
+    /// The attention of a verify's rows at `index_pos..` from their projections `q`, `k`, `v`
+    /// (`[1, rows, heads * hd]`, before their biases), each row exactly as its decode step
+    /// attends through the unfused chain: biases, rotation, one append and one Q8 decode
+    /// attention pair for every row. `packed` says they are slices of one packed projection,
+    /// its packed bias already added where the layer has one. `None`, with nothing done, where
+    /// a decode step would take another path (see [`Self::rows_take_q8_decode`]; rotation rows
+    /// of its own, a V shared with K).
     #[cfg(feature = "gpu")]
     fn attend_rows_split(
         &mut self,
@@ -871,17 +931,19 @@ impl GenericTransformerLayer {
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
+        packed: bool,
     ) -> Result<Option<Tensor>> {
         let (b, rows, _) = q.dims3()?;
         let norms_ok = !self.flags.has_qk_norm
             || (self.attn_q_norm.is_some() && self.attn_k_norm.is_some())
             || self.qk_norm_is_full();
+        let component_bias = self.flags.has_qkv_bias && !(packed && self.attn_qkv_bias.is_some());
         let served = b == 1
-            && self.rows_take_q8_splitk(&q.device(), index_pos, rows)
+            && self.rows_take_q8_decode(&q.device(), index_pos, rows)
             && norms_ok
             && self.rope_rows.is_none()
-            && self.attn_v.is_some()
-            && (!self.flags.has_qkv_bias
+            && (packed || self.attn_v.is_some())
+            && (!component_bias
                 || (self.attn_q_bias.is_some()
                     && self.attn_k_bias.is_some()
                     && self.attn_v_bias.is_some()));
@@ -889,7 +951,7 @@ impl GenericTransformerLayer {
             return Ok(None);
         }
         let (mut q, mut k, mut v) = (q.clone(), k.clone(), v.clone());
-        if self.flags.has_qkv_bias {
+        if component_bias {
             q = q.broadcast_add(self.attn_q_bias.as_ref().unwrap())?;
             k = k.broadcast_add(self.attn_k_bias.as_ref().unwrap())?;
             v = v.broadcast_add(self.attn_v_bias.as_ref().unwrap())?;

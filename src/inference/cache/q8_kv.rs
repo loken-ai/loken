@@ -1140,6 +1140,7 @@ impl Q8KvCache {
             self.n_kv_heads,
             n_q_per_kv,
             window,
+            1,
             &self.cuda_device,
         )
         .map_err(|e| anyhow!("Q8KvCache: q8 dev-pos score kernel: {e}"))?;
@@ -1271,6 +1272,7 @@ impl Q8KvCache {
             n_q_per_kv,
             scale,
             window,
+            1,
             &self.cuda_device,
         )
         .map_err(|e| anyhow!("Q8KvCache: q8 fused softmax+output dev-pos kernel: {e}"))?;
@@ -1540,6 +1542,80 @@ impl Q8KvCache {
         )?)
     }
 
+    /// The score and softmax-output pair of the last `rows` tokens' queries, `q`
+    /// `[rows * n_q, head_dim]` F32: row `r` attends over the keys up to and including token
+    /// `len - rows + r`, scores scaled by `scale`, exactly as the decode step of that token
+    /// does through the same pair, and the output, `[rows * n_q, head_dim]` F32, is that step's.
+    /// Primes the device position at the first row's slot. Outside graph capture only.
+    pub fn attn_chain_decode_rows(
+        &mut self,
+        q: &Tensor,
+        rows: usize,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let len = self.core.len();
+        let n_q_heads = q.elem_count() / (rows.max(1) * self.head_dim);
+        if rows == 0
+            || rows > len
+            || q.dtype() != DType::F32
+            || q.elem_count() != rows * n_q_heads * self.head_dim
+            || self.n_kv_heads == 0
+            || !n_q_heads.is_multiple_of(self.n_kv_heads)
+            || capture_active_on(&self.cuda_device.cuda_stream())
+        {
+            return Err(anyhow!(
+                "Q8KvCache::attn_chain_decode_rows: {rows} rows of {:?} over {len} keys",
+                q.dims()
+            ));
+        }
+        self.update_graph_state(len - rows)?;
+        let n_q_per_kv = n_q_heads / self.n_kv_heads;
+        // One stride covers every row: the last row's keys and the slot past them.
+        let stride = self.max_seq_padded();
+        let q_flat = q.contiguous()?;
+        let (q_guard, q_layout) = q_flat.storage_and_layout();
+        let q_cuda = match &*q_guard {
+            StorageView::Cuda(c) => c,
+            _ => return Err(anyhow!("Q8KvCache::attn_chain_decode_rows: Q not on CUDA")),
+        };
+        let start = q_layout.start_offset();
+        let q_view = q_cuda
+            .as_cuda_slice::<f32>()?
+            .slice(start..start + q.elem_count());
+        let scores = attn_score_q8_0_f32_dev_pos(
+            &self.k_q8,
+            &q_view,
+            self.pos.slice(),
+            self.head_dim,
+            stride,
+            self.n_kv_heads,
+            n_q_per_kv,
+            0,
+            rows,
+            &self.cuda_device,
+        )
+        .map_err(|e| anyhow!("Q8KvCache: q8 dev-pos score kernel rows: {e}"))?;
+        let s_view = scores.as_cuda_slice::<f32>()?.slice(..);
+        let out = attn_softmax_output_q8_0_f32_dev_pos(
+            &self.v_q8,
+            &s_view,
+            self.pos.slice(),
+            self.head_dim,
+            stride,
+            self.n_kv_heads,
+            n_q_per_kv,
+            scale,
+            0,
+            rows,
+            &self.cuda_device,
+        )
+        .map_err(|e| anyhow!("Q8KvCache: q8 fused softmax+output dev-pos kernel rows: {e}"))?;
+        Ok(tensor_from_cuda_storage(
+            out,
+            (rows * n_q_heads, self.head_dim),
+        )?)
+    }
+
     /// Query-head-packed TENSOR-CORE flash-decode. Same contract as
     /// `attn_flash_splitk_decode_graph` (Q `[1,n_q,1,hd]`, returns `[1,n_q,1,hd]`
     /// F32 logically - here F16 then cast) but runs the m16n8k16 HMMA kernel that
@@ -1737,6 +1813,7 @@ mod dev_pos_tests {
                         n_kv_heads,
                         n_q_per_kv,
                         /*window=*/ 0,
+                        1,
                         &cuda_dev,
                     )
                     .unwrap();

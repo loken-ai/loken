@@ -32,6 +32,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- GPU: verify the draft rows of an MHA model in one launch per kernel.
 - Offload: read a streamed expert not in memory in full read-ahead windows.
 - Offload: read a short prompt on the cards with their kept weights and overlap card and host experts.
 - Offload: stream a prompt's weights with direct reads and drop pages off the compute thread.

@@ -420,16 +420,19 @@ extern "C" __global__ void NAME(                                              \
 //
 // Launch contract:
 //   blockDim = (32, n_warps_per_block, 1)
-//   gridDim  = (ceil(max_seq_padded / n_warps_per_block), n_kv_heads, 1)
+//   gridDim  = (ceil(max_seq_padded / n_warps_per_block), n_kv_heads, rows)
 //   Each warp computes one (token, h_kv) and emits scores for all
 //   `n_q_per_kv` query heads in that kv-group.
+//   Row `z` is the query of the token at the device position plus `z`: it
+//   reads `z` more keys, its own query and score rows, and computes exactly
+//   what a one-row launch at its position does.
 // ------------------------------------------------------------
 template<int HD, int MAX_NQ_PER_KV>
 static __device__ __forceinline__ void attn_score_q8_inner_dev_pos(
     const void  * __restrict__ K_blocks,
     const float * __restrict__ Q,
     float       * __restrict__ scores,
-    const int32_t * __restrict__ seq_kv_dev,
+    int seq_kv,
     int max_seq_padded,
     int n_kv,
     int n_q_per_kv,
@@ -438,11 +441,6 @@ static __device__ __forceinline__ void attn_score_q8_inner_dev_pos(
     int lane,
     int window
 ) {
-    // Host stores `current_seq_len BEFORE the append` in seq_kv_dev so the
-    // append kernels can derive the destination block index. Attention sees
-    // the cache AFTER the append, so add 1.
-    const int seq_kv = seq_kv_dev[0] + 1;
-
     if (token >= max_seq_padded) return;
 
     // Sliding-window attention (gemma4 SWA layers, window>0): tokens older
@@ -527,8 +525,12 @@ extern "C" __global__ void NAME(                                              \
     const int token = blockIdx.x * blockDim.y + threadIdx.y;                  \
     const int h_kv  = blockIdx.y;                                             \
     const int lane  = threadIdx.x;                                            \
+    const int row   = blockIdx.z;                                             \
+    const size_t n_q = (size_t)n_kv * NQ;                                     \
     attn_score_q8_inner_dev_pos<HD, NQ>(                                      \
-        K_blocks, Q, scores, seq_kv_dev,                                      \
+        K_blocks, Q + row * n_q * HD,                                         \
+        scores + row * n_q * (size_t)max_seq_padded,                          \
+        seq_kv_dev[0] + 1 + row,                                              \
         max_seq_padded, n_kv, NQ,                                             \
         token, h_kv, lane, window                                            \
     );                                                                        \
@@ -1089,6 +1091,10 @@ extern "C" __global__ void __launch_bounds__(ATTN_OUTPUT_WARPS * 32) NAME(      
 //
 // Output: [n_q_heads, head_dim] f32.
 //
+// Grid: (head_dim / 32, n_kv_heads, rows). Row `z` merges the scores of the
+// token at the device position plus `z` into its own output, as a one-row
+// launch at its position does.
+//
 // Block shape: 16 warps x 32 threads = 512 threads/block. Matches the
 // dev_pos non-fused output kernel - fits phi2's hd=64 register budget
 // where the 32-warp non-dev_pos kernel hits LAUNCH_OUT_OF_RESOURCES.
@@ -1100,7 +1106,7 @@ static __device__ __forceinline__ void attn_softmax_output_q8_inner_dev_pos(
     const void * __restrict__ V_blob,
     const float * __restrict__ scores,
     float * __restrict__ out,
-    const int32_t * __restrict__ seq_kv_dev,
+    int seq_kv,
     int max_seq_padded,
     int n_kv_stride_blocks,
     int kv_head_stride_blocks,
@@ -1112,7 +1118,6 @@ static __device__ __forceinline__ void attn_softmax_output_q8_inner_dev_pos(
     int warp_id,
     int window
 ) {
-    const int seq_kv = seq_kv_dev[0] + 1;
     // Sliding-window (gemma4 SWA): only the last `window` keys contribute. The
     // score kernel already -INF'd the rest, so starting the reductions at
     // win_start is bit-identical AND skips their score/V loads (the perf win).
@@ -1222,8 +1227,11 @@ extern "C" __global__ void NAME(                                             \
     const int lane      = threadIdx.x;                                       \
     const int warp_id   = threadIdx.y;                                       \
     if (block_idx >= (HD / 32)) return;                                      \
+    const int row       = blockIdx.z;                                        \
+    const size_t n_q    = (size_t)gridDim.y * NQ;                            \
     attn_softmax_output_q8_inner_dev_pos<HD, NQ>(                            \
-        V_blob, scores, out, seq_kv_dev,                                     \
+        V_blob, scores + row * n_q * (size_t)max_seq_padded,                 \
+        out + row * n_q * HD, seq_kv_dev[0] + 1 + row,                       \
         max_seq_padded,                                                      \
         n_kv_stride_blocks, kv_head_stride_blocks,                           \
         scale, NQ,                                                           \

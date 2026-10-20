@@ -313,6 +313,11 @@ pub fn attn_score_q8_0_q8_1_gqa(
 ///
 /// Returns scores `[n_q_heads, max_seq_padded]` F32. Callers MUST keep
 /// `max_seq_padded` constant across all calls in one captured graph.
+///
+/// `rows` queries, `[rows, n_q_heads, head_dim]`, score in one launch: row `r` is the token at
+/// the device position plus `r`, reads `r` more keys, and gets exactly the scores a one-row
+/// launch at its position writes, in its own `[n_q_heads, max_seq_padded]` slab.
+#[allow(clippy::too_many_arguments)]
 pub fn attn_score_q8_0_f32_dev_pos(
     k_blob: &CudaSlice<u8>,
     q_f32: &CudaView<f32>,
@@ -322,13 +327,14 @@ pub fn attn_score_q8_0_f32_dev_pos(
     n_kv_heads: usize,
     n_q_per_kv: usize,
     window: usize,
+    rows: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     let n_q_heads = gqa_query_heads(head_dim, n_kv_heads, n_q_per_kv)
         .map_err(|e| anyhow!("attn_score_q8_0_f32_dev_pos: {e}"))?;
-    if q_f32.len() != n_q_heads * head_dim {
+    if rows == 0 || q_f32.len() != rows * n_q_heads * head_dim {
         anyhow::bail!(
-            "attn_score_q8_0_f32_dev_pos: Q has {} elems, expected {}",
+            "attn_score_q8_0_f32_dev_pos: Q has {} elems, expected {rows} x {}",
             q_f32.len(),
             n_q_heads * head_dim
         );
@@ -343,13 +349,13 @@ pub fn attn_score_q8_0_f32_dev_pos(
         (
             (max_seq_padded as u32).div_ceil(WARPS_PER_BLOCK),
             n_kv_heads as u32,
-            1,
+            rows as u32,
         ),
         WARPS_PER_BLOCK,
         0,
     );
 
-    let dst = unsafe { dev.alloc::<f32>(n_q_heads * max_seq_padded)? };
+    let dst = unsafe { dev.alloc::<f32>(rows * n_q_heads * max_seq_padded)? };
     let mut builder = func.builder();
     builder.arg(k_blob);
     builder.arg(q_f32);
@@ -504,6 +510,11 @@ pub fn attn_output_q8_0_f32_dev_pos(
 /// the last `window` keys (gemma4 SWA; the score kernel -INF'd the rest).
 ///
 /// Returns `[n_q_heads, head_dim]` F32.
+///
+/// `rows` score slabs (see [`attn_score_q8_0_f32_dev_pos`]) merge in one launch: row `r`'s
+/// output, `[n_q_heads, head_dim]` at row `r` of `[rows, n_q_heads, head_dim]`, is exactly a
+/// one-row launch's at its position.
+#[allow(clippy::too_many_arguments)]
 pub fn attn_softmax_output_q8_0_f32_dev_pos(
     v_blob: &CudaSlice<u8>,
     scores_f32: &CudaView<f32>,
@@ -514,15 +525,15 @@ pub fn attn_softmax_output_q8_0_f32_dev_pos(
     n_q_per_kv: usize,
     scale: f32,
     window: usize,
+    rows: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
     let n_q_heads = gqa_query_heads(head_dim, n_kv_heads, n_q_per_kv)
         .map_err(|e| anyhow!("attn_softmax_output_q8_0_f32_dev_pos: {e}"))?;
-    if scores_f32.len() != n_q_heads * max_seq_padded {
+    if rows == 0 || scores_f32.len() != rows * n_q_heads * max_seq_padded {
         anyhow::bail!(
-            "attn_softmax_output_q8_0_f32_dev_pos: scores has {} elements, expected {} ({} x {})",
+            "attn_softmax_output_q8_0_f32_dev_pos: scores has {} elements, expected {rows} x {} x {}",
             scores_f32.len(),
-            n_q_heads * max_seq_padded,
             n_q_heads,
             max_seq_padded
         );
@@ -535,9 +546,13 @@ pub fn attn_softmax_output_q8_0_f32_dev_pos(
 
     // Must match ATTN_SOFTMAX_OUTPUT_DEV_POS_WARPS in quantized.cu.
     const WARPS_PER_BLOCK: u32 = 16;
-    let cfg = warp_block_launch((hd_blocks as u32, n_kv_heads as u32, 1), WARPS_PER_BLOCK, 0);
+    let cfg = warp_block_launch(
+        (hd_blocks as u32, n_kv_heads as u32, rows as u32),
+        WARPS_PER_BLOCK,
+        0,
+    );
 
-    let dst = unsafe { dev.alloc::<f32>(n_q_heads * head_dim)? };
+    let dst = unsafe { dev.alloc::<f32>(rows * n_q_heads * head_dim)? };
     let mut builder = func.builder();
     builder.arg(v_blob);
     builder.arg(scores_f32);

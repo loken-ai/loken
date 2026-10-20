@@ -926,37 +926,54 @@ impl MoeWeights {
                 };
                 logits.to_dtype(crate::tensor::DType::F32)
             };
-            match self.gate_inp_bias.as_ref() {
-                None if self.sigmoid_routing.is_some() => exact_logits()?,
-                // The rows of a verify each as the decoded token it stands for: the quantised
-                // gate's mat-vecs take the rows one by one under the decode order, and a dense
-                // gate scores each row alone, as a library matrix product picks its arithmetic
-                // by shape.
-                None if num_tokens > 1 && crate::tensor::quantized::DecodeOrder::active() => {
-                    match &self.gate_inp {
-                        crate::tensor::quantized::QMatMul::QTensor(_) => exact_logits()?,
-                        gate => {
-                            let rows = (0..num_tokens)
-                                .map(|r| gate.forward(&xs.narrow(0, r, 1)?))
-                                .collect::<Result<Vec<_>>>()?;
-                            Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
-                                .to_dtype(crate::tensor::DType::F32)?
+            // An F32 dense gate on a card scores a decoded token and each row of a verify with
+            // the row-wise GEMV, all the rows in one launch: a row's logits do not depend on
+            // the rows beside it.
+            let row_gemv = match &self.gate_inp {
+                crate::tensor::quantized::QMatMul::Tensor(w)
+                    if self.gate_inp_bias.is_none()
+                        && xs.device().is_cuda()
+                        && (num_tokens == 1 || crate::tensor::quantized::DecodeOrder::active()) =>
+                {
+                    crate::inference::moe_cuda::gate_gemv_f32(&xs, w)?
+                }
+                _ => None,
+            };
+            if let Some(logits) = row_gemv {
+                logits
+            } else {
+                match self.gate_inp_bias.as_ref() {
+                    None if self.sigmoid_routing.is_some() => exact_logits()?,
+                    // The rows of a verify each as the decoded token it stands for: the quantised
+                    // gate's mat-vecs take the rows one by one under the decode order, and another
+                    // dense gate scores each row alone, as a library matrix product picks its
+                    // arithmetic by shape.
+                    None if num_tokens > 1 && crate::tensor::quantized::DecodeOrder::active() => {
+                        match &self.gate_inp {
+                            crate::tensor::quantized::QMatMul::QTensor(_) => exact_logits()?,
+                            gate => {
+                                let rows = (0..num_tokens)
+                                    .map(|r| gate.forward(&xs.narrow(0, r, 1)?))
+                                    .collect::<Result<Vec<_>>>()?;
+                                Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
+                                    .to_dtype(crate::tensor::DType::F32)?
+                            }
                         }
                     }
-                }
-                // The cards of a split layer each route the same rows: each row's logits are
-                // summed as a one-row call sums them, which no card's kernel choice changes, so
-                // every card picks the same experts.
-                None if self.local.is_some() => {
-                    let _order = crate::tensor::quantized::DecodeOrder::enter();
-                    exact_logits()?
-                }
-                None => self
-                    .gate_inp
-                    .forward(&xs)?
-                    .to_dtype(crate::tensor::DType::F32)?,
-                Some(bias) => {
-                    exact_logits()?.broadcast_add(&bias.to_dtype(crate::tensor::DType::F32)?)?
+                    // The cards of a split layer each route the same rows: each row's logits are
+                    // summed as a one-row call sums them, which no card's kernel choice changes, so
+                    // every card picks the same experts.
+                    None if self.local.is_some() => {
+                        let _order = crate::tensor::quantized::DecodeOrder::enter();
+                        exact_logits()?
+                    }
+                    None => self
+                        .gate_inp
+                        .forward(&xs)?
+                        .to_dtype(crate::tensor::DType::F32)?,
+                    Some(bias) => {
+                        exact_logits()?.broadcast_add(&bias.to_dtype(crate::tensor::DType::F32)?)?
+                    }
                 }
             }
         } else {

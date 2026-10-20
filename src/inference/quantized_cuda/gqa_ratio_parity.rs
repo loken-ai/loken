@@ -121,12 +121,12 @@ fn every_admitted_head_shape_decodes_like_the_reference() {
             let mut diffs = Vec::new();
 
             let dev_scores = attn_score_q8_0_f32_dev_pos(
-                &k_blob, &qv, &pos_dev, hd, MAX_SEQ, N_KV, nqpk, 0, &dev,
+                &k_blob, &qv, &pos_dev, hd, MAX_SEQ, N_KV, nqpk, 0, 1, &dev,
             )
             .unwrap();
             let sv = dev_scores.as_cuda_slice::<f32>().unwrap().slice(..);
             let chain = attn_softmax_output_q8_0_f32_dev_pos(
-                &v_blob, &sv, &pos_dev, hd, MAX_SEQ, N_KV, nqpk, scale, 0, &dev,
+                &v_blob, &sv, &pos_dev, hd, MAX_SEQ, N_KV, nqpk, scale, 0, 1, &dev,
             )
             .unwrap();
             diffs.push(("graph chain", max_diff(&host(&chain), &want)));
