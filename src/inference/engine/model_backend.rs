@@ -2711,6 +2711,12 @@ impl ModelBackend for DeepseekV41Backend {
         self.widest_ffn
     }
 
+    fn expert_profile(
+        &self,
+    ) -> Option<crate::inference::generic_transformer::expert_profile::ExpertProfile> {
+        self.model.routing_profile()
+    }
+
     /// A finished turn, prompt and reply: the state it left stands after the tokens it fed.
     fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
         if let (Some(cache), None) = (&self.state_cache, &self.pipeline) {

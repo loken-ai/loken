@@ -708,9 +708,12 @@ mod tests {
 
 /// The real-model run, by hand: `cargo test --release --lib -- --ignored --nocapture
 /// score_the_listed_models`. It reads no process environment: the models come from the list in
-/// `models.txt` under `loken/quality/` in the user cache directory (one model file per line),
-/// the texts from the repository this crate was built in, and every result goes beside that
-/// list.
+/// `models.txt` under `loken/quality/` in the user cache directory, the texts from the
+/// repository this crate was built in, and every result goes beside that list. A line is a
+/// model file, or a model id, the store it is served from and optionally an excerpt length in
+/// tokens: the id loads as the server loads it, and with a length each text is scored as
+/// `EXCERPTS_PER_TEXT` excerpts of that many tokens, each a fresh sequence. A text with a
+/// reference dump is scored on the reference's tokens.
 #[cfg(test)]
 mod real_models {
     use super::*;
@@ -719,6 +722,9 @@ mod real_models {
     /// Token budgets of the two held-out texts.
     const CODE_TOKENS: usize = 1500;
     const DOCS_TOKENS: usize = 2200;
+
+    /// Excerpts cut from each text when a line names an excerpt length.
+    const EXCERPTS_PER_TEXT: usize = 2;
 
     /// Characters read per token wanted, a margin: the text is cut to its token budget after
     /// tokenising.
@@ -796,17 +802,31 @@ mod real_models {
         };
         let texts = held_out_texts();
         let widest = texts.iter().map(|t| t.1).max().unwrap_or(0);
-        for path in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let stem = Path::new(path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+        for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (model_id, models_dir, stem) = match fields.as_slice() {
+                [path] => (
+                    "quality".to_string(),
+                    PathBuf::from(path),
+                    Path::new(path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+                [id, store, ..] => (
+                    id.to_string(),
+                    PathBuf::from(store),
+                    id.replace(['/', ':'], "_"),
+                ),
+                [] => continue,
+            };
+            let excerpt: Option<usize> = fields.get(2).and_then(|t| t.parse().ok());
             let out: PathBuf = root.join(&stem);
             std::fs::create_dir_all(&out).unwrap();
             let engine = LlmEngine::with_config(InferenceConfig {
-                model_id: "quality".to_string(),
-                models_dir: Some(PathBuf::from(path)),
-                context_length: widest + 64,
+                model_id,
+                models_dir: Some(models_dir),
+                context_length: excerpt.unwrap_or(widest) + 64,
                 ..InferenceConfig::default()
             });
             engine
@@ -815,16 +835,32 @@ mod real_models {
                 .expect("the model loads as the server loads it");
             let mut guard = engine.model_state.lock().await;
             let state = guard.as_mut().expect("a loaded model");
+            let mut runs: Vec<(String, Vec<u32>)> = Vec::new();
             for (name, budget, text) in &texts {
                 let mut tokens: Vec<u32> = super::encode_prompt(&state.tokenizer, text.as_str())
                     .unwrap()
                     .get_ids()
                     .to_vec();
                 tokens.truncate(*budget);
+                match excerpt {
+                    Some(len) => runs.extend(
+                        tokens
+                            .chunks_exact(len)
+                            .take(EXCERPTS_PER_TEXT)
+                            .enumerate()
+                            .map(|(i, c)| (format!("{name}-{i}"), c.to_vec())),
+                    ),
+                    None => runs.push((name.to_string(), tokens)),
+                }
+            }
+            for (name, tokens) in &runs {
                 let reference =
                     std::fs::File::open(out.join("reference").join(format!("{name}.lkq")))
                         .ok()
                         .and_then(|f| Dump::read(f).ok());
+                // Against a reference, the tokens it was made from: two tokenizers of one
+                // checkpoint may differ in the tokens they add around a text.
+                let tokens = reference.as_ref().map_or(tokens, |r| &r.tokens);
                 let first = crate::inference::engine::model_backend::adaptive_prefill_chunk(
                     state.model.prefill_shape(),
                 );

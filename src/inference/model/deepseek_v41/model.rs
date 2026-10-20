@@ -98,12 +98,14 @@ pub struct DeepseekV41Model {
     /// The bytes the host tier may keep routed experts in, as last sized.
     host_tier_bytes: std::sync::atomic::AtomicU64,
     /// How the routed experts pick between the files they are stored in, and the heat ranking
-    /// the plan and the cards' warming follow: set once at load when the experts come from
-    /// several files.
+    /// the plan and the cards' warming follow: set once at load.
     variant_policy: std::sync::OnceLock<(
         crate::inference::place::expert_variants::VariantChoice,
         Vec<Vec<usize>>,
     )>,
+    /// The routing counts a stored profile carried at load, `[layers * experts]`; empty without
+    /// one. The profile this model writes adds the routes counted since the load to them.
+    routing_seed: std::sync::Mutex<Vec<u32>>,
     // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
     // with YaRN from original_seq_len.
     rope_theta: f32,
@@ -409,6 +411,7 @@ impl DeepseekV41Model {
             quality: std::sync::Mutex::new(None),
             host_tier_bytes: std::sync::atomic::AtomicU64::new(0),
             variant_policy: std::sync::OnceLock::new(),
+            routing_seed: std::sync::Mutex::new(Vec::new()),
             // Starts one layer ahead (the nearest stream that stands in for the layer's own) and
             // may go as deep as the stack; a window is as many tokens as the stack has layers.
             readahead: crate::inference::offload::tuner::Tuner::new(
@@ -1004,6 +1007,61 @@ impl DeepseekV41Model {
     ) {
         let ranks = ranks.unwrap_or_else(|| self.hot_experts.clone());
         let _ = self.variant_policy.set((choice, ranks));
+    }
+
+    /// Routed experts per layer, the most any held layer has.
+    fn routed_per_layer(&self) -> usize {
+        self.blocks
+            .iter()
+            .flatten()
+            .map(|b| b.moe.experts.count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Carry the counts of `profile`, a run's routing as stored, into the profile this model
+    /// writes. A profile of another shape is refused, naming both shapes.
+    pub fn seed_routing_profile(
+        &self,
+        profile: &crate::inference::generic_transformer::expert_profile::ExpertProfile,
+    ) -> Result<()> {
+        let (layers, experts) = (self.blocks.len(), self.routed_per_layer());
+        if profile.layers != layers || profile.experts != experts {
+            crate::tensor::bail!(
+                "the profile counts {} layers of {} experts, the model has {layers} layers of \
+                 {experts} experts",
+                profile.layers,
+                profile.experts,
+            );
+        }
+        *self.routing_seed.lock().unwrap() = profile.counts.clone();
+        Ok(())
+    }
+
+    /// The routing counts of every layer: the stored profile's, plus the decoded tokens each
+    /// expert was routed to since the load. `None` when the model holds no layer.
+    pub fn routing_profile(
+        &self,
+    ) -> Option<crate::inference::generic_transformer::expert_profile::ExpertProfile> {
+        use crate::inference::generic_transformer::expert_profile::{add_counts, ExpertProfile};
+        let experts = self.routed_per_layer();
+        if experts == 0 {
+            return None;
+        }
+        let mut counts = self.routing_seed.lock().unwrap().clone();
+        counts.resize(self.blocks.len() * experts, 0);
+        for (l, b) in self.blocks.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let routes = b.moe.decode_routes.lock().unwrap();
+            let mut extra = routes.clone();
+            extra.resize(experts, 0);
+            add_counts(&mut counts[l * experts..(l + 1) * experts], &extra);
+        }
+        Some(ExpertProfile {
+            layers: self.blocks.len(),
+            experts,
+            counts,
+        })
     }
 
     /// The most stored variants any layer's routed experts can be read from.
@@ -4991,6 +5049,50 @@ mod oracle_gate {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(a, b, "one-slot expert cache changed the logits");
+    }
+
+    /// The routing profile a model writes is the stored one plus every decoded token's routes
+    /// since the load, a prompt's left out, and a stored profile of another shape is refused.
+    #[test]
+    fn the_routing_profile_adds_this_runs_routes_to_the_stored_ones() {
+        use crate::inference::generic_transformer::expert_profile::ExpertProfile;
+        let (m, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 1);
+        let fresh = m.routing_profile().expect("a model counts its routes");
+        assert_eq!(fresh.layers, m.n_layers());
+        assert!(fresh.counts.iter().all(|&c| c == 0));
+        m.forward_prefill(&tokens).unwrap();
+        let prompt = m.routing_profile().unwrap();
+        assert!(
+            prompt.counts.iter().all(|&c| c == 0),
+            "a prompt is not counted"
+        );
+        let mut state = m.new_decode_state();
+        for &t in tokens.iter().take(3) {
+            m.forward_decode(t, &mut state).unwrap();
+        }
+        let run = m.routing_profile().unwrap();
+        let per_token = m.n_activated() as u32;
+        for l in 0..run.layers {
+            let sum: u32 = run.layer(l).iter().sum();
+            assert!(sum == 0 || sum == 3 * per_token, "layer {l} counted {sum}");
+        }
+        assert!(run.counts.iter().any(|&c| c > 0));
+        let seed = ExpertProfile {
+            layers: run.layers,
+            experts: run.experts,
+            counts: (0..run.counts.len() as u32).collect(),
+        };
+        m.seed_routing_profile(&seed).unwrap();
+        let both = m.routing_profile().unwrap();
+        for (i, &c) in both.counts.iter().enumerate() {
+            assert_eq!(c, seed.counts[i] + run.counts[i]);
+        }
+        let other = ExpertProfile {
+            layers: run.layers + 1,
+            experts: run.experts,
+            counts: vec![0; (run.layers + 1) * run.experts],
+        };
+        assert!(m.seed_routing_profile(&other).is_err());
     }
 
     /// A backend serving as a pipeline head over a loopback tail draws the same tokens, step for

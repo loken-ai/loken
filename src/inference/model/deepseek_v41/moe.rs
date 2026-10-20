@@ -63,6 +63,9 @@ pub struct Moe {
     pub last_routing: std::sync::Mutex<Vec<Vec<(usize, f32)>>>,
     /// The experts the last `predict_and_advise` named, compared with the routing that follows.
     pub predicted: std::sync::Mutex<Vec<usize>>,
+    /// How many decoded tokens routed to each expert since the load, by expert id; empty until
+    /// the first decode. A prompt's batch is not counted: the profile ranks the decode's heat.
+    pub decode_routes: std::sync::Mutex<Vec<u32>>,
     /// Slots of a token that were not in memory and that the lossy options removed or replaced,
     /// since last read: the disk reads they saved.
     pub saved: std::sync::atomic::AtomicU64,
@@ -347,6 +350,12 @@ impl Moe {
             })
             .collect();
         if n == 1 {
+            let mut counts = self.decode_routes.lock().unwrap();
+            counts.resize(self.n_routed, 0);
+            for &(e, _, _) in &uses {
+                crate::inference::generic_transformer::expert_profile::count_route(&mut counts, e);
+            }
+            drop(counts);
             let guess = std::mem::take(&mut *self.predicted.lock().unwrap());
             if !guess.is_empty() {
                 crate::inference::offload::store::note_prediction(
@@ -729,6 +738,7 @@ mod tests {
             norm_topk: true,
             last_routing: std::sync::Mutex::new(Vec::new()),
             predicted: std::sync::Mutex::new(Vec::new()),
+            decode_routes: Default::default(),
             saved: Default::default(),
             truncation: Default::default(),
             resident_override: Default::default(),

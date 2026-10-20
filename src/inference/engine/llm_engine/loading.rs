@@ -871,25 +871,30 @@ impl LlmEngine {
                         )
                     }
                     .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
-                    if !variants.is_empty() {
-                        // The routing heat: the model's own profile first, then the file's prior.
-                        let ranks = expert_profile.as_deref().and_then(|path| {
-                            use crate::inference::generic_transformer::expert_profile::ExpertProfile;
-                            let profile =
-                                ExpertProfile::read_if_present(std::path::Path::new(path)).ok()??;
-                            crate::inference::place::expert_variants::ranks_from_counts(
-                                &profile.counts,
-                                profile.layers,
-                                profile.experts,
-                                &cfg.hot_experts,
-                            )
-                            .filter(|_| {
-                                profile.layers == cfg.n_layers
-                                    && profile.experts == cfg.n_routed_experts
-                            })
-                        });
-                        model.set_variant_policy(expert_variants, ranks);
-                    }
+                    // The routing heat: the model's own profile first, then the file's prior. The
+                    // profile's counts carry into the one this run writes.
+                    let ranks = expert_profile.as_deref().and_then(|path| {
+                        use crate::inference::generic_transformer::expert_profile::ExpertProfile;
+                        let profile = match ExpertProfile::read_if_present(std::path::Path::new(path)) {
+                            Ok(p) => p?,
+                            Err(e) => {
+                                warn!("expert profile not read: {e}");
+                                return None;
+                            }
+                        };
+                        if let Err(e) = model.seed_routing_profile(&profile) {
+                            warn!("expert profile {path} not used: {e}");
+                            return None;
+                        }
+                        info!("routing heat read from the expert profile {path}");
+                        crate::inference::place::expert_variants::ranks_from_counts(
+                            &profile.counts,
+                            profile.layers,
+                            profile.experts,
+                            &cfg.hot_experts,
+                        )
+                    });
+                    model.set_variant_policy(expert_variants, ranks);
                     if quality != QualityLevel::Exact {
                         let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
                         let name = model_file
