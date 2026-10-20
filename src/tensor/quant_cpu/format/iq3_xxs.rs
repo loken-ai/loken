@@ -392,6 +392,12 @@ fn codebook() -> &'static Codebook {
     })
 }
 
+/// The grid's 256 points as four magnitude bytes each, point after point: what a card's dot of
+/// this format reads.
+pub fn iq3_xxs_grid_bytes() -> Vec<u8> {
+    IQ3XXS_GRID.iter().flat_map(|g| g.to_le_bytes()).collect()
+}
+
 /// The encoder's codebook as one table, for a card that runs the same search: the point each
 /// pattern of four levels names or -1, an offset per pattern into the lists of near points and one
 /// past the last, each point's four levels, each point's four stored magnitudes, then the lists.

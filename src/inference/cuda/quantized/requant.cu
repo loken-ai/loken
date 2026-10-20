@@ -1574,6 +1574,183 @@ extern "C" __global__ void cx_expert_down_q2_k(
     }
 }
 
+// Routed experts with IQ3_XXS gate and up and a Q3_K down, computed as the host's 256-bit grid and
+// superblock kernels compute them. Those keep eight float accumulators, lane l summing the
+// products of the values whose place in each run of thirty-two is 4l to 4l + 3: per run (IQ3_XXS)
+// or per block (Q3_K) the lane's integer sum, converted and fused into the lane's accumulator
+// under the run's or block's float scale, from +0 in run order, then one horizontal sum. Here a
+// thread is one such lane of one instance, eight threads an instance: the integer sums are the
+// host's exactly, each fused step is one __fmaf_rn, and the horizontal sum is taken in the host's
+// order. So the products are the host's bits, as the IQ2_XXS kernels above give theirs. A warp
+// holds four output rows, eight threads each, so a decode's single instance keeps every thread busy.
+
+#define CX_IQ3XXS_BYTES 98
+#define CX_Q3K_BYTES 110
+
+#define CX_ROWS_PER_WARP 4
+// The most instances of one expert a launch's tile holds (EXACT_TILE): each thread keeps an
+// accumulator for each, so a weight lane is decoded once for all of them.
+#define CX_TILE 8
+
+// The eight lanes of a group of eight threads added in the order of the host's horizontal sum:
+// lane i with lane i + 4, then the first with the third and the second with the fourth, then the
+// two. Lane 0 of the group holds the sum; every thread of the warp must take part.
+__device__ static float cx_lanes_sum8(float v) {
+    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 4, 8));
+    v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 2, 8));
+    return __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, 1, 8));
+}
+
+// Lane `l` of run `r` of the IQ3_XXS block at `b`: its four signed weights packed as bytes, and the
+// run's odd integer scale.
+__device__ static int cx_iq3xxs_lane(
+        const unsigned char * b, const int r, const int l, const unsigned char * grid,
+        const unsigned char * signs, int * odd) {
+    const unsigned char * qs = b + 2;
+    const unsigned char * t = qs + 64 + 4 * r;
+    const unsigned int word = (unsigned int) t[0] | ((unsigned int) t[1] << 8) | ((unsigned int) t[2] << 16) | ((unsigned int) t[3] << 24);
+    const unsigned char * mag = grid + 4 * (int) qs[8 * r + l];
+    const unsigned char pattern = signs[(word >> (7 * (l >> 1))) & 127];
+    const int shift = 4 * (l & 1);
+    int packed = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int v = ((pattern >> (shift + k)) & 1) ? -(int) mag[k] : (int) mag[k];
+        packed |= (v & 0xff) << (8 * k);
+    }
+    *odd = 2 * (int) (word >> 28) + 1;
+    return packed;
+}
+
+// The rows entering the down projections: instance i is expert tiles[3t] over row xrow[i] of `xq`
+// (q8_K32 rows of `dim`), written to row i of `h` [instances, inter]. A warp per (four output
+// rows, tile). No shared memory.
+extern "C" __global__ void cx_expert_h_iq3_xxs(
+        const unsigned long long * __restrict__ gate_ptrs,
+        const unsigned long long * __restrict__ up_ptrs,
+        const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
+        const unsigned char * __restrict__ xq, const int * __restrict__ xrow,
+        const int * __restrict__ tiles, float * __restrict__ h,
+        const int dim, const int inter, const float limit, const int tt) {
+    const int tile = blockIdx.y, lane = threadIdx.x;
+    const int e = tiles[3 * tile], i0 = tiles[3 * tile + 1], c = tiles[3 * tile + 2];
+    const int sbs = dim / 256, l = lane & 7;
+    const int want = blockIdx.x * CX_ROWS_PER_WARP + (lane >> 3);
+    const bool live = want < inter;
+    const int row = live ? want : 0;
+    const unsigned char * gate0 = (const unsigned char *) gate_ptrs[e] + (long) row * sbs * CX_IQ3XXS_BYTES;
+    const unsigned char * up0 = (const unsigned char *) up_ptrs[e] + (long) row * sbs * CX_IQ3XXS_BYTES;
+    long xr[CX_TILE];
+    float tg[CX_TILE], tu[CX_TILE];
+    #pragma unroll
+    for (int j = 0; j < CX_TILE; ++j) {
+        xr[j] = j < c ? xrow[i0 + j] : 0;
+        tg[j] = 0.0f;
+        tu[j] = 0.0f;
+    }
+    for (int ib = 0; ib < sbs; ++ib) {
+        const unsigned char * gb = gate0 + (long) ib * CX_IQ3XXS_BYTES;
+        const unsigned char * ub = up0 + (long) ib * CX_IQ3XXS_BYTES;
+        const float unit_g = __fmul_rn(req_f16_at(gb), 0.25f);
+        const float unit_u = __fmul_rn(req_f16_at(ub), 0.25f);
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int og, ou;
+            const int wg = cx_iq3xxs_lane(gb, r, l, grid, signs, &og);
+            const int wu = cx_iq3xxs_lane(ub, r, l, grid, signs, &ou);
+            #pragma unroll
+            for (int j = 0; j < CX_TILE; ++j) {
+                if (j < c) {
+                    const unsigned char * xb = xq + (xr[j] * sbs + ib) * CX_Q8K32_BYTES;
+                    const float yd = req_f16_at(xb + 2 * r);
+                    const int a = *reinterpret_cast<const int *>(xb + 16 + 32 * r + 4 * l);
+                    tg[j] = __fmaf_rn((float) (og * __dp4a(wg, a, 0)), __fmul_rn(unit_g, yd), tg[j]);
+                    tu[j] = __fmaf_rn((float) (ou * __dp4a(wu, a, 0)), __fmul_rn(unit_u, yd), tu[j]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < CX_TILE; ++j) {
+        if (j < c) {
+            const float g = cx_lanes_sum8(tg[j]);
+            const float u = cx_lanes_sum8(tu[j]);
+            if (live && l == 0) h[(long) (i0 + j) * inter + row] = cx_swiglu(g, u, limit);
+        }
+    }
+}
+
+// Sixteen-value sub-block `s` of a Q3_K block's packed scales, signed.
+__device__ static int cx_q3k_scale(const unsigned char * sc, const int s) {
+    const int group = s >> 2, j = s & 3;
+    const int byte = sc[j + 4 * (group & 1)];
+    const int low = group < 2 ? (byte & 0x0F) : (byte >> 4);
+    const int high = (sc[8 + j] >> (2 * group)) & 0x03;
+    return (low | (high << 4)) - 32;
+}
+
+// The outputs of the down projections: instance i is expert tiles[3t] over row i of `hq` (q8_K
+// rows of `inter`), written to row i of `y` [instances, dim]. A warp per (four output rows,
+// tile). No shared memory.
+extern "C" __global__ void cx_expert_down_q3_k(
+        const unsigned long long * __restrict__ down_ptrs,
+        const unsigned char * __restrict__ hq, const int * __restrict__ tiles,
+        float * __restrict__ y, const int inter, const int dim, const int tt) {
+    const int tile = blockIdx.y, lane = threadIdx.x;
+    const int e = tiles[3 * tile], i0 = tiles[3 * tile + 1], c = tiles[3 * tile + 2];
+    const int sbs = inter / 256, l = lane & 7;
+    const int want = blockIdx.x * CX_ROWS_PER_WARP + (lane >> 3);
+    const bool live = want < dim;
+    const int row = live ? want : 0;
+    const unsigned char * row0 = (const unsigned char *) down_ptrs[e] + (long) row * sbs * CX_Q3K_BYTES;
+    float acc[CX_TILE];
+    #pragma unroll
+    for (int j = 0; j < CX_TILE; ++j) acc[j] = 0.0f;
+    for (int ib = 0; ib < sbs; ++ib) {
+        const unsigned char * b = row0 + (long) ib * CX_Q3K_BYTES;
+        const float xd = req_f16_at(b + 108);
+        int total[CX_TILE];
+        #pragma unroll
+        for (int j = 0; j < CX_TILE; ++j) total[j] = 0;
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const int chunk = m >> 2, ln = m & 3;
+            const int sc = cx_q3k_scale(b + 96, 2 * m + (l >> 2));
+            int packed = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int at = 4 * l + k;
+                const int low = (b[32 + 32 * chunk + at] >> (2 * ln)) & 0x03;
+                const int third = ((b[at] >> (4 * chunk + ln)) & 1) ? 0 : 4;
+                packed |= ((low - third) & 0xff) << (8 * k);
+            }
+            #pragma unroll
+            for (int j = 0; j < CX_TILE; ++j) {
+                if (j < c) {
+                    const unsigned char * hb = hq + ((long) (i0 + j) * sbs + ib) * CX_Q8K_BYTES;
+                    const int a = *reinterpret_cast<const int *>(hb + 4 + 32 * m + 4 * l);
+                    total[j] += sc * __dp4a(packed, a, 0);
+                }
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < CX_TILE; ++j) {
+            if (j < c) {
+                const unsigned char * hb = hq + ((long) (i0 + j) * sbs + ib) * CX_Q8K_BYTES;
+                const float d = __fmul_rn(*reinterpret_cast<const float *>(hb), xd);
+                acc[j] = __fmaf_rn(d, (float) total[j], acc[j]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < CX_TILE; ++j) {
+        if (j < c) {
+            const float v = cx_lanes_sum8(acc[j]);
+            if (live && l == 0) y[(long) (i0 + j) * dim + row] = v;
+        }
+    }
+}
+
 // The routed experts of a cached layer (generic_transformer::expert_tier), computed as the host
 // computes them for the formats of quant_cpu::ExactDot: the gate and up products against the q8_K
 // row of the input, the SwiGLU of offload::experts, the row entering the down projection as q8_K
@@ -2077,3 +2254,4 @@ extern "C" __global__ void sink_softmax_f32(
     }
     for (long k = 0; k < topk; k++) l[k] /= denom;
 }
+

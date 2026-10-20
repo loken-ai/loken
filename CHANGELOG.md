@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Offload: run IQ3_XXS and Q3_K routed experts on the cards.
 - Convert: write IQ3_XXS weighted by each expert's importance.
 - Convert: encode IQ3_XXS and Q3_K on the card, error compensation included.
 - API: time each streamed token's parts in /api/stage_perf.

@@ -528,11 +528,87 @@ pub fn gpu_mmv_iq2_xxs(
 }
 
 /// The instances of one expert a warp reads a weight row once for, in the exact expert kernels: a
-/// decode runs one instance per expert, a prompt's expert up to this many rows per read.
+/// decode runs one instance per expert, a prompt's expert up to this many rows per read. The
+/// IQ3_XXS and Q3_K kernels hold an accumulator per instance of a tile (`CX_TILE`, the same).
 const EXACT_TILE: usize = 8;
 
-/// Routed experts on the card, computed as the host computes them (see `cx_expert_h_iq2_xxs`):
-/// gate and up IQ2_XXS [inter, dim], down Q2_K [dim, inter], all already on the device. Instance
+/// The output rows one warp of the IQ3_XXS and Q3_K expert kernels holds (`CX_ROWS_PER_WARP`).
+const EXACT_ROWS_PER_WARP: usize = 4;
+
+/// The routed-expert formats the exact expert kernels read: gate and up, then down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertFormat {
+    /// IQ2_XXS gate and up, Q2_K down.
+    Iq2XxsQ2K,
+    /// IQ3_XXS gate and up, Q3_K down.
+    Iq3XxsQ3K,
+}
+
+impl ExpertFormat {
+    /// Every format, each at its `index`.
+    pub const ALL: [ExpertFormat; 2] = [ExpertFormat::Iq2XxsQ2K, ExpertFormat::Iq3XxsQ3K];
+
+    /// The format of an expert stored as `gate`, `up` and `down`, when the kernels read it.
+    pub fn of(
+        gate: crate::tensor::quantized::GgmlDType,
+        up: crate::tensor::quantized::GgmlDType,
+        down: crate::tensor::quantized::GgmlDType,
+    ) -> Option<Self> {
+        use crate::tensor::quantized::GgmlDType as T;
+        match (gate, up, down) {
+            (T::Iq2Xxs, T::Iq2Xxs, T::Q2K) => Some(Self::Iq2XxsQ2K),
+            (T::Iq3Xxs, T::Iq3Xxs, T::Q3K) => Some(Self::Iq3XxsQ3K),
+            _ => None,
+        }
+    }
+
+    /// Its place in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The kernels: the rows entering the down projection, then the down projection.
+    fn kernels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Iq2XxsQ2K => ("cx_expert_h_iq2_xxs", "cx_expert_down_q2_k"),
+            Self::Iq3XxsQ3K => ("cx_expert_h_iq3_xxs", "cx_expert_down_q3_k"),
+        }
+    }
+}
+
+/// The decode tables of a format's gate and up weights on a card, kept beside its weights: the
+/// grid of magnitudes and the sign patterns its seven-bit selectors name.
+pub struct ExpertTables {
+    pub format: ExpertFormat,
+    grid: CudaSlice<u8>,
+    signs: CudaSlice<u8>,
+}
+
+/// The decode tables of `format` on `dev`.
+pub fn expert_tables(dev: &CudaDevice, format: ExpertFormat) -> Result<ExpertTables> {
+    let (grid, signs) = match format {
+        ExpertFormat::Iq2XxsQ2K => iq2_xxs_tables(dev)?,
+        ExpertFormat::Iq3XxsQ3K => {
+            let stream = dev.stream();
+            let grid = stream
+                .clone_htod(&crate::tensor::quant_cpu::iq3_xxs_grid_bytes())
+                .map_err(|e| alloc_err("iq3_xxs grid upload", e))?;
+            let signs = stream
+                .clone_htod(&crate::tensor::quant_cpu::format::KSIGNS_IQ2XS)
+                .map_err(|e| alloc_err("iq3_xxs signs upload", e))?;
+            (grid, signs)
+        }
+    };
+    Ok(ExpertTables {
+        format,
+        grid,
+        signs,
+    })
+}
+
+/// Routed experts on the card, computed as the host computes them (see `cx_expert_h_iq2_xxs` and
+/// `cx_expert_h_iq3_xxs`): gate and up [inter, dim], down [dim, inter], in the format `tables`
+/// names, all already on the device. Instance
 /// `i` runs expert `instances[i].0` over row `instances[i].1` of `xq`, the q8_K32 rows of the
 /// inputs on the card; instances of one expert stand together. Returns, on the card, the rows
 /// entering the down projections [instances, inter] and the outputs [instances, dim], each the
@@ -541,7 +617,7 @@ const EXACT_TILE: usize = 8;
 pub fn gpu_experts_exact(
     dev: &CudaDevice,
     experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    tables: &ExpertTables,
     (dim, inter): (usize, usize),
     xq: &CudaSlice<u8>,
     instances: &[(usize, usize)],
@@ -610,17 +686,32 @@ pub fn gpu_experts_exact(
     })?;
     let (dim_i, inter_i, tt_i) = (dim as i32, inter as i32, widest as i32);
     let (sbs, sbs2) = (dim / 256, inter / 256);
-    let hfun = dev.quantized_fn("cx_expert_h_iq2_xxs")?;
+    let (hname, dname) = tables.format.kernels();
+    // The IQ2_XXS kernels stage their sub-block terms in shared memory; the IQ3_XXS ones keep
+    // them in registers.
+    let (hshared, dshared) = match tables.format {
+        ExpertFormat::Iq2XxsQ2K => (
+            (2 * widest * sbs * 8 + 2 * widest * sbs) * F32_BYTES,
+            (2 * widest * sbs2 * 16 + widest * sbs2) * F32_BYTES,
+        ),
+        ExpertFormat::Iq3XxsQ3K => (0, 0),
+    };
+    // The IQ3_XXS kernels hold several output rows in a warp.
+    let rows_per_warp = match tables.format {
+        ExpertFormat::Iq2XxsQ2K => 1,
+        ExpertFormat::Iq3XxsQ3K => EXACT_ROWS_PER_WARP,
+    };
+    let hfun = dev.quantized_fn(hname)?;
     let hcfg = LaunchConfig {
-        grid_dim: (inter as u32, ntiles as u32, 1),
+        grid_dim: (inter.div_ceil(rows_per_warp) as u32, ntiles as u32, 1),
         block_dim: (32, 1, 1),
-        shared_mem_bytes: ((2 * widest * sbs * 8 + 2 * widest * sbs) * F32_BYTES) as u32,
+        shared_mem_bytes: hshared as u32,
     };
     let mut b = stream.launch_builder(&hfun);
     b.arg(&gate_arr);
     b.arg(&up_arr);
-    b.arg(tables.0);
-    b.arg(tables.1);
+    b.arg(&tables.grid);
+    b.arg(&tables.signs);
     b.arg(xq);
     b.arg(&rows_d);
     b.arg(&tiles_d);
@@ -629,7 +720,7 @@ pub fn gpu_experts_exact(
     b.arg(&inter_i);
     b.arg(&limit);
     b.arg(&tt_i);
-    unsafe { b.launch(hcfg) }.map_err(|e| Error(format!("cx_expert_h_iq2_xxs launch: {e}")))?;
+    unsafe { b.launch(hcfg) }.map_err(|e| Error(format!("{hname} launch: {e}")))?;
     let qfun = dev.quantized_fn("cx_quantize_q8_k")?;
     let nblocks = (n * sbs2) as i64;
     let qcfg = LaunchConfig {
@@ -642,11 +733,11 @@ pub fn gpu_experts_exact(
     b.arg(&hq);
     b.arg(&nblocks);
     unsafe { b.launch(qcfg) }.map_err(|e| Error(format!("cx_quantize_q8_k launch: {e}")))?;
-    let dfun = dev.quantized_fn("cx_expert_down_q2_k")?;
+    let dfun = dev.quantized_fn(dname)?;
     let dcfg = LaunchConfig {
-        grid_dim: (dim as u32, ntiles as u32, 1),
+        grid_dim: (dim.div_ceil(rows_per_warp) as u32, ntiles as u32, 1),
         block_dim: (32, 1, 1),
-        shared_mem_bytes: ((2 * widest * sbs2 * 16 + widest * sbs2) * F32_BYTES) as u32,
+        shared_mem_bytes: dshared as u32,
     };
     let mut b = stream.launch_builder(&dfun);
     b.arg(&down_arr);
@@ -656,7 +747,7 @@ pub fn gpu_experts_exact(
     b.arg(&inter_i);
     b.arg(&dim_i);
     b.arg(&tt_i);
-    unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("cx_expert_down_q2_k launch: {e}")))?;
+    unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("{dname} launch: {e}")))?;
     drop(guards);
     Ok((h, y))
 }
@@ -679,7 +770,7 @@ pub fn gpu_expert_row(
     gate: &CudaSlice<u8>,
     up: &CudaSlice<u8>,
     down: &CudaSlice<u8>,
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    tables: &ExpertTables,
     (dim, inter): (usize, usize),
     x: &[f32],
     limit: f32,
@@ -714,7 +805,7 @@ pub fn gpu_expert_row(
 pub fn gpu_expert_rows_grouped(
     dev: &CudaDevice,
     experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    tables: &ExpertTables,
     (dim, inter): (usize, usize),
     x: &[f32],
     limit: f32,
@@ -746,7 +837,7 @@ pub fn gpu_expert_rows_grouped(
 pub fn gpu_expert_rows_grouped_multi(
     dev: &CudaDevice,
     experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    tables: &ExpertTables,
     (dim, inter): (usize, usize),
     x: &[f32],
     limit: f32,
@@ -1512,14 +1603,14 @@ fn expert_weights_on_card(
     Ok([g, u, d])
 }
 
-/// One expert over a prompt's rows on the card, whole: `x` [n, dim] through the IQ2_XXS gate and
-/// up weights and the Q2_K down weight (`weights` in that order, staged over through page-locked
-/// memory where they are not on the card), the host's bits. The rows entering the down
-/// projection [n, inter] and the output [n, dim] come back together.
+/// One expert over a prompt's rows on the card, whole: `x` [n, dim] through the gate and up
+/// weights and the down weight in the format `tables` names (`weights` in that order, staged over
+/// through page-locked memory where they are not on the card), the host's bits. The rows entering
+/// the down projection [n, inter] and the output [n, dim] come back together.
 pub fn gpu_expert_tokens(
     dev: &CudaDevice,
     weights: [ExpertWeight; 3],
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    tables: &ExpertTables,
     (inter, dim): (usize, usize),
     x: &[f32],
     limit: f32,
@@ -1591,7 +1682,7 @@ pub fn gpu_layer_begin(dev: &CudaDevice, x: &[f32], dim: usize) -> Result<LayerB
 pub fn gpu_expert_layer_rows(
     dev: &CudaDevice,
     weights: [ExpertWeight; 3],
-    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    tables: &ExpertTables,
     (inter, dim): (usize, usize),
     layer: &LayerBuffers,
     toks: &[u32],
@@ -4053,6 +4144,16 @@ mod iq2_xxs_gpu_tests {
     /// depends on which experts earlier requests left on the card.
     #[test]
     fn card_experts_are_the_hosts_bit_for_bit() {
+        for (format, gate, down) in [
+            (ExpertFormat::Iq2XxsQ2K, GgmlDType::Iq2Xxs, GgmlDType::Q2K),
+            (ExpertFormat::Iq3XxsQ3K, GgmlDType::Iq3Xxs, GgmlDType::Q3K),
+        ] {
+            card_experts_match_the_host(format, gate, down);
+        }
+    }
+
+    /// The bit-for-bit check of experts with `gate` gate and up and a `down` down.
+    fn card_experts_match_the_host(format: ExpertFormat, gate: GgmlDType, down: GgmlDType) {
         use crate::inference::offload::cpu_experts;
         use crate::inference::offload::experts::Expert;
         use crate::inference::offload::projection::Projection;
@@ -4084,24 +4185,9 @@ mod iq2_xxs_gpu_tests {
         let experts: Vec<std::sync::Arc<Expert>> = (0..3u32)
             .map(|j| {
                 std::sync::Arc::new(Expert {
-                    w1: quant(
-                        draw(10 * j + 1, inter * dim, 0.08),
-                        inter,
-                        dim,
-                        GgmlDType::Iq2Xxs,
-                    ),
-                    w3: quant(
-                        draw(10 * j + 2, inter * dim, 0.08),
-                        inter,
-                        dim,
-                        GgmlDType::Iq2Xxs,
-                    ),
-                    w2: quant(
-                        draw(10 * j + 3, dim * inter, 0.08),
-                        dim,
-                        inter,
-                        GgmlDType::Q2K,
-                    ),
+                    w1: quant(draw(10 * j + 1, inter * dim, 0.08), inter, dim, gate),
+                    w3: quant(draw(10 * j + 2, inter * dim, 0.08), inter, dim, gate),
+                    w2: quant(draw(10 * j + 3, dim * inter, 0.08), dim, inter, down),
                 })
             })
             .collect();
@@ -4141,7 +4227,7 @@ mod iq2_xxs_gpu_tests {
                 assert_eq!(
                     bits(o),
                     bits(&host[j][t].1),
-                    "host block, expert {j} row {t}"
+                    "{format:?} host block, expert {j} row {t}"
                 );
             }
         }
@@ -4152,7 +4238,7 @@ mod iq2_xxs_gpu_tests {
                 assert_eq!(
                     bits(&o[t * dim..(t + 1) * dim]),
                     bits(&host[j][t].1),
-                    "host rows, expert {j} row {t}"
+                    "{format:?} host rows, expert {j} row {t}"
                 );
             }
         }
@@ -4173,8 +4259,7 @@ mod iq2_xxs_gpu_tests {
                     .map(|w| std::sync::Arc::new(stream.clone_htod(&w).unwrap()))
             })
             .collect();
-        let (grid, signs) = iq2_xxs_tables(&dev).unwrap();
-        let tables = (&grid, &signs);
+        let tables = &expert_tables(&dev, format).unwrap();
         let refs: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> =
             on_card.iter().map(|w| (&*w[0], &*w[1], &*w[2])).collect();
 
@@ -4190,15 +4275,23 @@ mod iq2_xxs_gpu_tests {
                 limit,
             )
             .unwrap();
-            assert_eq!(bits(&h), bits(&host[1][t].0), "card row h, row {t}");
-            assert_eq!(bits(&out), bits(&host[1][t].1), "card row, row {t}");
+            assert_eq!(
+                bits(&h),
+                bits(&host[1][t].0),
+                "{format:?} card row h, row {t}"
+            );
+            assert_eq!(
+                bits(&out),
+                bits(&host[1][t].1),
+                "{format:?} card row, row {t}"
+            );
             let block =
                 gpu_expert_rows_grouped(&dev, &refs, tables, (dim, inter), row(t), limit).unwrap();
             for (j, (_, o)) in block.iter().enumerate() {
                 assert_eq!(
                     bits(o),
                     bits(&host[j][t].1),
-                    "card block, expert {j} row {t}"
+                    "{format:?} card block, expert {j} row {t}"
                 );
             }
         }
@@ -4223,7 +4316,7 @@ mod iq2_xxs_gpu_tests {
             assert_eq!(
                 bits(&got[k]),
                 bits(&host[j][t].1),
-                "card instances, expert {j} row {t}"
+                "{format:?} card instances, expert {j} row {t}"
             );
         }
         // A prompt's rows, from staged weights and from the card's.
@@ -4244,12 +4337,12 @@ mod iq2_xxs_gpu_tests {
                     assert_eq!(
                         bits(&h[t * inter..(t + 1) * inter]),
                         bits(&host[j][t].0),
-                        "card prompt h, expert {j} row {t}"
+                        "{format:?} card prompt h, expert {j} row {t}"
                     );
                     assert_eq!(
                         bits(&out[t * dim..(t + 1) * dim]),
                         bits(&host[j][t].1),
-                        "card prompt, expert {j} row {t} resident {resident}"
+                        "{format:?} card prompt, expert {j} row {t} resident {resident}"
                     );
                 }
             }
@@ -4272,7 +4365,7 @@ mod iq2_xxs_gpu_tests {
                 assert_eq!(
                     bits(&out[r * dim..(r + 1) * dim]),
                     bits(&host[j][t as usize].1),
-                    "card layer, expert {j} row {t}"
+                    "{format:?} card layer, expert {j} row {t}"
                 );
             }
         }
@@ -4302,7 +4395,7 @@ mod iq2_xxs_gpu_tests {
             std::sync::Arc::new(stream.clone_htod(&ub).unwrap()),
             std::sync::Arc::new(stream.clone_htod(&db).unwrap()),
         );
-        let (grid, signs) = iq2_xxs_tables(&dev).unwrap();
+        let tables = expert_tables(&dev, ExpertFormat::Iq2XxsQ2K).unwrap();
         for resident in [false, true] {
             for threads in [1usize, 4] {
                 let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
@@ -4332,7 +4425,7 @@ mod iq2_xxs_gpu_tests {
                             gpu_expert_layer_rows(
                                 &dev,
                                 w,
-                                (&grid, &signs),
+                                &tables,
                                 (inter, dim),
                                 &layer,
                                 &toks,

@@ -10,11 +10,11 @@ use super::projection::Projection;
 use super::room::Room;
 use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
-    gpu_expert_layer_rows, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
-    gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_layer_begin,
-    gpu_matmul_kept, gpu_prefill_attention, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
-    CudaDevice, ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
-    QUANT_LINEAR_TILE_BYTES,
+    expert_tables, gpu_expert_layer_rows, gpu_expert_row, gpu_expert_rows_grouped,
+    gpu_expert_rows_grouped_multi, gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear,
+    gpu_index_scores, gpu_layer_begin, gpu_matmul_kept, gpu_prefill_attention, gpu_quant_linear,
+    gpu_sparse_attn, CudaDevice, ExpertFormat, ExpertTables, ExpertWeight, HcStreamDev,
+    LayerBuffers, PrefillAttention, QuantWeight, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::gpu_runtime::driver::CudaSlice;
 use crate::tensor::ops::rms_norm;
@@ -91,7 +91,7 @@ struct ExpertTier {
     clock: u64,
 }
 
-/// A projection's blocks, when it is quantised in the format asked for.
+/// A projection's blocks, when it is quantised.
 fn quant_blocks_any(p: &Projection) -> Result<std::borrow::Cow<'_, [u8]>> {
     match p {
         Projection::Quant(q) => q.data(),
@@ -99,11 +99,19 @@ fn quant_blocks_any(p: &Projection) -> Result<std::borrow::Cow<'_, [u8]>> {
     }
 }
 
-fn quant_blocks(p: &Projection, want: GgmlDType) -> Option<std::borrow::Cow<'_, [u8]>> {
-    match p {
-        Projection::Quant(q) if q.dtype() == want => q.data().ok(),
+/// The format of `e` when the exact expert kernels read it.
+fn expert_format(e: &Expert) -> Option<ExpertFormat> {
+    let dtype = |p: &Projection| match p {
+        Projection::Quant(q) => Some(q.dtype()),
         _ => None,
-    }
+    };
+    ExpertFormat::of(dtype(&e.w1)?, dtype(&e.w3)?, dtype(&e.w2)?)
+}
+
+/// The gate's blocks of `e`, which key the expert on a card, when the kernels read its format.
+fn expert_gate(e: &Expert) -> Option<(ExpertFormat, std::borrow::Cow<'_, [u8]>)> {
+    let format = expert_format(e)?;
+    Some((format, quant_blocks_any(&e.w1).ok()?))
 }
 
 /// One card stream and what it keeps.
@@ -127,8 +135,8 @@ pub struct Card {
     /// adapts the card toward its own hot experts across tokens without trading out, at every
     /// layer, the ones the same token still needs.
     protect: u64,
-    /// The IQ2_XXS decode tables, built on first use and kept beside the weights.
-    tables: OnceLock<(CudaSlice<u8>, CudaSlice<u8>)>,
+    /// Each expert format's decode tables, built on first use and kept beside the weights.
+    tables: [OnceLock<ExpertTables>; ExpertFormat::ALL.len()],
     /// Set when a step failed for want of memory. From then on a step is tried only when the
     /// card has the room for it, read from the driver, until one succeeds: a transient of a
     /// prefill can fill the card for a moment, and a card written off at that moment would
@@ -155,7 +163,7 @@ impl Card {
             dense_t: Mutex::new(HashMap::new()),
             experts: Mutex::new(ExpertTier::default()),
             protect: protect.max(1),
-            tables: OnceLock::new(),
+            tables: Default::default(),
             declined: AtomicBool::new(false),
             said: AtomicBool::new(false),
             admission: Admission::new(protect as usize),
@@ -400,7 +408,7 @@ impl Card {
     /// lock to look, changes nothing, and is what lets the host start its own experts the moment
     /// the cards start theirs rather than after the block returns.
     pub fn holds(&self, e: &Expert) -> bool {
-        let Some(gate) = quant_blocks(&e.w1, GgmlDType::Iq2Xxs) else {
+        let Some((_, gate)) = expert_gate(e) else {
             return false;
         };
         let key = (gate.as_ptr() as usize, gate.len());
@@ -412,9 +420,9 @@ impl Card {
     /// by several tokens at once, which is what a decode learns over several tokens. `None`
     /// when the expert is not in the formats the kernels read, or the card is not taking it.
     pub fn admit(&self, e: &Expert, proven: bool) -> Option<ExpertKeys> {
-        let gate = quant_blocks(&e.w1, GgmlDType::Iq2Xxs)?;
-        let up = quant_blocks(&e.w3, GgmlDType::Iq2Xxs)?;
-        let down = quant_blocks(&e.w2, GgmlDType::Q2K)?;
+        let (_, gate) = expert_gate(e)?;
+        let up = quant_blocks_any(&e.w3).ok()?;
+        let down = quant_blocks_any(&e.w2).ok()?;
         let key = (gate.as_ptr() as usize, gate.len());
         let total = gate.len() + up.len() + down.len();
         let n = {
@@ -588,6 +596,7 @@ impl Card {
     ) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
         let hold_started = std::time::Instant::now();
         let dims = (e.w1.dims()[1], e.w1.dims()[0]);
+        let format = expert_format(e)?;
         let key = self.admit(e, false)?;
         let mut tier = self.tier();
         tier.clock += 1;
@@ -599,10 +608,7 @@ impl Card {
         drop(tier);
         timings[0].fetch_add(hold_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let kernels_started = std::time::Instant::now();
-        if self.tables.get().is_none() {
-            let _ = self.tables.set(iq2_xxs_tables(&self.dev).ok()?);
-        }
-        let tables = self.tables.get()?;
+        let tables = self.tables_for(format)?;
         let need = (xs.len() + 2 * dims.1 + dims.0) * F32;
         let r = self.attempt("an expert row", need, || {
             gpu_expert_row(
@@ -610,7 +616,7 @@ impl Card {
                 gate_d.as_ref(),
                 up_d.as_ref(),
                 down_d.as_ref(),
-                (&tables.0, &tables.1),
+                tables,
                 dims,
                 xs,
                 limit,
@@ -643,15 +649,10 @@ impl Card {
             return out;
         };
         let dims = (first.w1.dims()[1], first.w1.dims()[0]);
-        if self.tables.get().is_none() {
-            match iq2_xxs_tables(&self.dev) {
-                Ok(t) => {
-                    let _ = self.tables.set(t);
-                }
-                Err(_) => return out,
-            }
-        }
-        let Some(tables) = self.tables.get() else {
+        let Some(format) = expert_format(first) else {
+            return out;
+        };
+        let Some(tables) = self.tables_for(format) else {
             return out;
         };
         // The resident subset, admitted (second-sighting or with room) as `expert_row` does, each
@@ -661,6 +662,9 @@ impl Card {
         let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> =
             Vec::new();
         for (i, e) in es.iter().enumerate() {
+            if expert_format(e) != Some(format) {
+                continue;
+            }
             let Some(key) = self.admit(e, false) else {
                 continue;
             };
@@ -685,7 +689,7 @@ impl Card {
         let need = (xs.len() + held.len() * (2 * dims.1 + dims.0)) * F32;
         let kernels_started = std::time::Instant::now();
         let ran = self.attempt("expert rows", need, || {
-            gpu_expert_rows_grouped(&self.dev, &batch, (&tables.0, &tables.1), dims, xs, limit)
+            gpu_expert_rows_grouped(&self.dev, &batch, tables, dims, xs, limit)
         });
         timings[1].fetch_add(
             kernels_started.elapsed().as_nanos() as u64,
@@ -717,15 +721,10 @@ impl Card {
             return out;
         };
         let dims = (first.w1.dims()[1], first.w1.dims()[0]);
-        if self.tables.get().is_none() {
-            match iq2_xxs_tables(&self.dev) {
-                Ok(t) => {
-                    let _ = self.tables.set(t);
-                }
-                Err(_) => return out,
-            }
-        }
-        let Some(tables) = self.tables.get() else {
+        let Some(format) = expert_format(first) else {
+            return out;
+        };
+        let Some(tables) = self.tables_for(format) else {
             return out;
         };
         let hold_started = std::time::Instant::now();
@@ -734,9 +733,12 @@ impl Card {
             Vec::new();
         let mut x_multi: Vec<f32> = Vec::new();
         for (i, e) in insts.iter().enumerate() {
-            let Some(gate) = quant_blocks(&e.w1, GgmlDType::Iq2Xxs) else {
+            let Some((f, gate)) = expert_gate(e) else {
                 continue;
             };
+            if f != format {
+                continue;
+            }
             let key = (gate.as_ptr() as usize, gate.len());
             let mut tier = self.tier();
             tier.clock += 1;
@@ -760,14 +762,7 @@ impl Card {
         let need = (x_multi.len() + held.len() * (2 * dims.1 + dims.0)) * F32;
         let kernels_started = std::time::Instant::now();
         let ran = self.attempt("expert rows multi", need, || {
-            gpu_expert_rows_grouped_multi(
-                &self.dev,
-                &batch,
-                (&tables.0, &tables.1),
-                dims,
-                &x_multi,
-                limit,
-            )
+            gpu_expert_rows_grouped_multi(&self.dev, &batch, tables, dims, &x_multi, limit)
         });
         timings[1].fetch_add(
             kernels_started.elapsed().as_nanos() as u64,
@@ -782,39 +777,41 @@ impl Card {
         out
     }
 
-    /// The IQ2_XXS decode tables on this card, sent the first time an expert needs them.
-    fn iq2_tables(&self) -> Option<&(CudaSlice<u8>, CudaSlice<u8>)> {
-        if self.tables.get().is_none() {
-            let _ = self.tables.set(iq2_xxs_tables(&self.dev).ok()?);
+    /// The decode tables of `format` on this card, sent the first time an expert needs them.
+    fn tables_for(&self, format: ExpertFormat) -> Option<&ExpertTables> {
+        let slot = &self.tables[format.index()];
+        if slot.get().is_none() {
+            let _ = slot.set(expert_tables(&self.dev, format).ok()?);
         }
-        self.tables.get()
+        slot.get()
     }
 
-    /// The three weights of `e` for the exact expert kernels: from this card when it keeps the
-    /// expert, else the mapped bytes to stage over. `None` when the expert is not IQ2_XXS gate and
-    /// up with a Q2_K down, the formats those kernels read; the host runs it.
+    /// The three weights of `e` for the exact expert kernels, with their format: from this card
+    /// when it keeps the expert, else the mapped bytes to stage over. `None` when the expert is
+    /// not in a format those kernels read; the host runs it.
     fn expert_weights<'a>(
         &self,
         e: &'a Expert,
         staged: &'a [std::borrow::Cow<'a, [u8]>; 3],
-    ) -> Option<[ExpertWeight<'a>; 3]> {
-        let gate = quant_blocks(&e.w1, GgmlDType::Iq2Xxs)?;
-        quant_blocks(&e.w3, GgmlDType::Iq2Xxs)?;
-        quant_blocks(&e.w2, GgmlDType::Q2K)?;
+    ) -> Option<(ExpertFormat, [ExpertWeight<'a>; 3])> {
+        let (format, gate) = expert_gate(e)?;
         let key = (gate.as_ptr() as usize, gate.len());
         let tier = self.tier();
-        Some(match tier.kept.get(&key) {
-            Some(on) => [
-                ExpertWeight::Card(on.gate.clone()),
-                ExpertWeight::Card(on.up.clone()),
-                ExpertWeight::Card(on.down.clone()),
-            ],
-            None => [
-                ExpertWeight::Host(staged[0].as_ref()),
-                ExpertWeight::Host(staged[1].as_ref()),
-                ExpertWeight::Host(staged[2].as_ref()),
-            ],
-        })
+        Some((
+            format,
+            match tier.kept.get(&key) {
+                Some(on) => [
+                    ExpertWeight::Card(on.gate.clone()),
+                    ExpertWeight::Card(on.up.clone()),
+                    ExpertWeight::Card(on.down.clone()),
+                ],
+                None => [
+                    ExpertWeight::Host(staged[0].as_ref()),
+                    ExpertWeight::Host(staged[1].as_ref()),
+                    ExpertWeight::Host(staged[2].as_ref()),
+                ],
+            },
+        ))
     }
 
     /// One expert over a prompt's rows, whole on this card: from the weights it keeps when it
@@ -833,18 +830,11 @@ impl Card {
             quant_blocks_any(&e.w3).ok()?,
             quant_blocks_any(&e.w2).ok()?,
         ];
-        let weights = self.expert_weights(e, &staged)?;
-        let tables = self.iq2_tables()?;
+        let (format, weights) = self.expert_weights(e, &staged)?;
+        let tables = self.tables_for(format)?;
         let need = e.bytes() + (xs.len() + 2 * rows * inter + rows * dim) * F32;
         self.attempt("an expert's prompt rows", need, || {
-            gpu_expert_tokens(
-                &self.dev,
-                weights,
-                (&tables.0, &tables.1),
-                (inter, dim),
-                xs,
-                limit,
-            )
+            gpu_expert_tokens(&self.dev, weights, tables, (inter, dim), xs, limit)
         })
     }
 
@@ -872,19 +862,11 @@ impl Card {
             quant_blocks_any(&e.w3).ok()?,
             quant_blocks_any(&e.w2).ok()?,
         ];
-        let weights = self.expert_weights(e, &staged)?;
-        let tables = self.iq2_tables()?;
+        let (format, weights) = self.expert_weights(e, &staged)?;
+        let tables = self.tables_for(format)?;
         let need = e.bytes() + toks.len() * (2 * inter + dim) * F32;
         self.attempt("an expert's rows of a layer", need, || {
-            gpu_expert_layer_rows(
-                &self.dev,
-                weights,
-                (&tables.0, &tables.1),
-                (inter, dim),
-                layer,
-                toks,
-                limit,
-            )
+            gpu_expert_layer_rows(&self.dev, weights, tables, (inter, dim), layer, toks, limit)
         })
     }
 
