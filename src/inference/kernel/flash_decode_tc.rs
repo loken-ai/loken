@@ -86,6 +86,9 @@ pub fn flash_decode_tc_q8_gqa(
     scale: f32,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    if !dev.has_f16_matrix_cores() {
+        anyhow::bail!("flash_decode_tc_q8_gqa: the card has no f16 matrix instructions");
+    }
     if head_dim != 128 {
         anyhow::bail!("flash_decode_tc_q8_gqa: head_dim {head_dim} unsupported (only 128)");
     }
@@ -147,3 +150,87 @@ pub fn flash_decode_tc_q8_gqa(
 /// The shortest KV this path is worth taking. Below it, split-K's wider grid fills the device
 /// better than the tensor cores' deeper one; the crossover was measured at 512.
 pub const TC_MIN_KV: usize = 512;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::Device;
+
+    fn pseudo(i: usize, seed: usize) -> f32 {
+        let h = (i.wrapping_mul(2_654_435_761) ^ seed.wrapping_mul(40_503)) % 2001;
+        h as f32 / 1000.0 - 1.0
+    }
+
+    /// The kernel's answer against a host reference on a card with f16 matrix instructions; a
+    /// card without them declines, so its caller takes split-K.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn flashdecode_tc_matches_a_host_reference() {
+        let dev = Device::new_cuda(0)
+            .expect("a card for the card test")
+            .as_cuda_device()
+            .unwrap();
+        let (hd, n_kv, n_q_per_kv, qlen, seq_kv) = (128usize, 2usize, 4usize, 2usize, 600usize);
+        let hdb = hd / 32;
+        let mrows = n_q_per_kv * qlen;
+        let rows = n_kv * mrows;
+        // block_q8_0 [t, n_kv, hd / 32]: an f16 scale and 32 signed bytes.
+        let quantised = |seed: usize| -> (Vec<u8>, Vec<f32>) {
+            let (mut bytes, mut values) = (Vec::new(), vec![0f32; seq_kv * n_kv * hd]);
+            for blk in 0..seq_kv * n_kv * hdb {
+                let d = f16::from_f32(0.01 + 0.005 * pseudo(blk, seed).abs());
+                bytes.extend_from_slice(&d.to_bits().to_le_bytes());
+                for e in 0..32 {
+                    let qv = (pseudo(blk * 32 + e, seed + 1) * 127.0) as i8;
+                    bytes.push(qv as u8);
+                    values[blk * 32 + e] = qv as f32 * d.to_f32();
+                }
+            }
+            (bytes, values)
+        };
+        let (kb, k) = quantised(2);
+        let (vb, v) = quantised(4);
+        let q: Vec<f16> = (0..rows * hd)
+            .map(|i| f16::from_f32(pseudo(i, 6)))
+            .collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let k_dev = dev.memcpy_stod(&kb).unwrap();
+        let v_dev = dev.memcpy_stod(&vb).unwrap();
+        let q_dev = dev.memcpy_stod(&q).unwrap();
+        let pos_dev = dev.memcpy_stod(&[seq_kv as i32 - 1]).unwrap();
+        let got = flash_decode_tc_q8_gqa(
+            &k_dev, &v_dev, &q_dev, &pos_dev, hd, n_kv, n_q_per_kv, qlen, seq_kv, scale, &dev,
+        );
+        if !dev.has_f16_matrix_cores() {
+            assert!(
+                got.is_err(),
+                "a card without f16 fragments declines the kernel"
+            );
+            return;
+        }
+        let got = dev
+            .memcpy_dtov(got.unwrap().as_cuda_slice::<f16>().unwrap())
+            .unwrap();
+        let mut worst = 0f32;
+        for g in 0..rows {
+            let h = g / mrows;
+            let at = |x: &[f32], t: usize, d: usize| x[(t * n_kv + h) * hd + d];
+            let s: Vec<f64> = (0..seq_kv)
+                .map(|t| {
+                    (0..hd)
+                        .map(|d| q[g * hd + d].to_f32() as f64 * at(&k, t, d) as f64)
+                        .sum::<f64>()
+                        * scale as f64
+                })
+                .collect();
+            let m = s.iter().cloned().fold(f64::MIN, f64::max);
+            let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+            let total: f64 = e.iter().sum();
+            for d in 0..hd {
+                let want = (0..seq_kv).map(|t| e[t] * at(&v, t, d) as f64).sum::<f64>() / total;
+                worst = worst.max((got[g * hd + d].to_f32() - want as f32).abs());
+            }
+        }
+        assert!(worst < 2e-2, "differs by {worst}");
+    }
+}

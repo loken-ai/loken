@@ -660,13 +660,20 @@ impl CudaDevice {
         #[cfg(feature = "rocm")]
         {
             !self.is_nvidia()
-                && self.mmq_device_info().is_ok_and(|i| {
-                    let generation = i.cc - AMD_CC_OFFSET;
-                    (0x908..0x1000).contains(&generation) || (0x1100..0x1300).contains(&generation)
-                })
+                && self
+                    .mmq_device_info()
+                    .is_ok_and(|i| amd_has_matrix_units(i.cc - AMD_CC_OFFSET))
         }
         #[cfg(not(feature = "rocm"))]
         false
+    }
+
+    /// Whether this card runs the kernels written with 16-bit float warp fragments (`wmma`): the
+    /// f16 flash attention of prefill and decode, the indexer's attention over a chunk's rows.
+    /// See [`cc_has_f16_fragments`]; a card without them takes those kernels' fallbacks.
+    pub fn has_f16_matrix_cores(&self) -> bool {
+        self.mmq_device_info()
+            .is_ok_and(|i| cc_has_f16_fragments(i.cc))
     }
 
     /// Whether this card runs the integer matrix-product kernels (the IMMA family): an NVIDIA
@@ -1115,6 +1122,25 @@ pub(crate) fn dev_const_i32(dev: &CudaDevice, vals: &[i32]) -> Result<Arc<CudaSl
 #[cfg(any(feature = "rocm", test))]
 pub const AMD_CC_OFFSET: i32 = 0x100_0000;
 
+/// Whether an AMD card of `generation` (`0x1201` for gfx1201) has matrix instructions: MFMA from
+/// gfx908 in the gfx9 family, WMMA in gfx11 and gfx12. RDNA2 (gfx103x) and older have none, and a
+/// HIP build compiles the fragment kernels to stubs for them.
+#[cfg(any(feature = "rocm", test))]
+pub fn amd_has_matrix_units(generation: i32) -> bool {
+    (0x908..0x1000).contains(&generation) || (0x1100..0x1300).contains(&generation)
+}
+
+/// Whether a card of `cc`, in the kernels' encoding, runs the 16-bit float warp fragments: an
+/// NVIDIA card from sm_70, or an AMD card (`AMD_CC_OFFSET` + generation) with matrix
+/// instructions.
+pub fn cc_has_f16_fragments(cc: i32) -> bool {
+    #[cfg(any(feature = "rocm", test))]
+    if cc >= AMD_CC_OFFSET {
+        return amd_has_matrix_units(cc - AMD_CC_OFFSET);
+    }
+    cc >= 700
+}
+
 /// An AMD card's generation from its architecture name: the hexadecimal digits after `gfx`, before
 /// any feature suffix (`gfx1201:sramecc-` is `0x1201`, `gfx90a` is `0x90a`).
 #[cfg(any(feature = "rocm", test))]
@@ -1170,5 +1196,22 @@ mod tests {
         assert_eq!(amd_generation("gfx"), None);
         // Above the offset: never read as an NVIDIA compute capability.
         assert!(AMD_CC_OFFSET + 0x1201 > 0x0100000);
+    }
+
+    #[test]
+    fn a_card_without_matrix_units_takes_the_fragment_kernels_fallbacks() {
+        let amd = |arch: &str| AMD_CC_OFFSET + amd_generation(arch).unwrap();
+        // RDNA2 has no matrix instructions: its fragment kernels are stubs.
+        assert!(!cc_has_f16_fragments(amd("gfx1030")));
+        assert!(!cc_has_f16_fragments(amd("gfx1031")));
+        for arch in [
+            "gfx908", "gfx90a", "gfx942", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151",
+            "gfx1200", "gfx1201",
+        ] {
+            assert!(cc_has_f16_fragments(amd(arch)), "{arch}");
+        }
+        assert!(cc_has_f16_fragments(750));
+        assert!(cc_has_f16_fragments(1200));
+        assert!(!cc_has_f16_fragments(610));
     }
 }

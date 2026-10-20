@@ -28,7 +28,9 @@
 #include <mma.h>
 #include <stdint.h>
 
+#if !defined(LOKEN_NO_WMMA)
 using namespace nvcuda;
+#endif
 
 #define FDTC_QK8 32
 typedef struct { half d; int8_t qs[FDTC_QK8]; } fdtc_block_q8_0;
@@ -46,6 +48,10 @@ static __device__ __forceinline__ void flashdecode_tc_partial_inner(
     int n_kv, int n_q_per_kv, int qlen, int nsplit, float scale,
     int h_kv, int split, int lane)
 {
+#if defined(LOKEN_NO_WMMA)
+    // A target without matrix instructions: the host never launches this kernel there.
+    __trap();
+#else
     constexpr int HDB    = HD / 32;       // q8_0 blocks per head row (4)
     constexpr int KSTEPS = HD / 16;       // QK^T contraction chunks (8)
     constexpr int HCHUNK = HD / 16;       // P.V output head-dim chunks (8)
@@ -191,6 +197,7 @@ static __device__ __forceinline__ void flashdecode_tc_partial_inner(
         for (int d = lane; d < HD; d += 32) p[d] = Oacc[r * HD + d];
         if (lane == 0) { p[HD] = m_row[r]; p[HD + 1] = l_row[r]; }
     }
+#endif
 }
 
 // Split count of a sequence of `seq_kv` keys: `ceil(seq_kv / chunk)` within [lo, hi] and at

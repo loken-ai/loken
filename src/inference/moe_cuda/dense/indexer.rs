@@ -599,8 +599,21 @@ pub fn selected_attention_rows(
         crate::tensor::bail!("selected attention over rows: {n_head} heads of {hd} over {n_kv}");
     }
     let dev = q.device().as_cuda_device()?;
-    let stream = stream_of_card(q)?;
     let rows = q.dim(0)?;
+    // The kernel is written with f16 warp fragments: a card without them reads each group's kept
+    // tokens through the grouped kernel, which takes the same selection.
+    if !dev.has_f16_matrix_cores() {
+        let kept = GroupKept::Selected { sel, count };
+        return match selected_attention_steps_grouped(
+            q, kbuf, vbuf, kept, rows, n_head, n_kv, cap, hd, scale,
+        )? {
+            Some(y) => y.reshape((rows, n_head * hd)),
+            None => crate::tensor::bail!(
+                "selected attention over rows: {n_head} heads of {hd} over {n_kv}"
+            ),
+        };
+    }
+    let stream = stream_of_card(q)?;
     let ncap = sel.dim(1)?;
     let out = unsafe { dev.alloc::<f32>(rows * n_head * hd) }?;
     unsafe {

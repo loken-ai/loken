@@ -796,6 +796,10 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_wmma_
         const __half * __restrict__ vbuf, const uint32_t * __restrict__ sel,
         const uint32_t * __restrict__ count, float * __restrict__ out, int n_head, int n_kv,
         int cap, int ncap, float scale) {
+#if defined(LOKEN_NO_WMMA)
+    // A target without matrix instructions: the host never launches this kernel there.
+    __trap();
+#else
     using namespace nvcuda;
     extern __shared__ __align__(128) unsigned char raw[];
     const int g = n_head / n_kv;
@@ -928,6 +932,7 @@ extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_wmma_
             orow[h * SELROWS_W_HD + t] = l > 0.f ? acc[h] / l : 0.f;
         }
     }
+#endif
 }
 
 // Attention of the rows of a prompt chunk, each over its own kept tokens. A block takes one row and

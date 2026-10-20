@@ -314,7 +314,8 @@ pub fn flash_prefill_parts_f16(
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
-    if !q.device().is_cuda() {
+    // The kernel is written with f16 warp fragments: a card without them takes the caller's path.
+    if !q.device().is_cuda() || !q.device().as_cuda_device()?.has_f16_matrix_cores() {
         return Ok(None);
     }
     let (b, n_head, seq_q, hd) = q.dims4()?;
@@ -409,7 +410,8 @@ pub fn flash_prefill_f16(
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
-    if !q.device().is_cuda() {
+    // The kernel is written with f16 warp fragments: a card without them takes the caller's path.
+    if !q.device().is_cuda() || !q.device().as_cuda_device()?.has_f16_matrix_cores() {
         return Ok(None);
     }
     let out_dtype = q.dtype();

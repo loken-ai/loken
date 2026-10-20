@@ -26,7 +26,9 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#if !defined(LOKEN_NO_WMMA)
 using namespace nvcuda;
+#endif
 
 template <int HD>
 static __device__ __forceinline__ void flash_prefill_f16_inner(
@@ -35,6 +37,10 @@ static __device__ __forceinline__ void flash_prefill_f16_inner(
     int n_head, int n_kv, int seq_q, int seq_kv, float scale, int window,
     int qblk, int head, int bi, int lane)
 {
+#if defined(LOKEN_NO_WMMA)
+    // A target without matrix instructions: the host never launches this kernel there.
+    __trap();
+#else
     constexpr int KSTEPS = HD / 16;   // QKᵀ contraction chunks
     constexpr int HCHUNK = HD / 16;   // P.V output head-dim chunks
     const int groups  = n_head / n_kv;
@@ -161,6 +167,7 @@ static __device__ __forceinline__ void flash_prefill_f16_inner(
         for (int d = lane; d < HD; d += 32)
             Oh[(size_t)r * HD + d] = __float2half(Oacc[r * HD + d] * inv);
     }
+#endif
 }
 
 #define FLASH_PREFILL_KERNEL(NAME, HD)                                          \
@@ -193,6 +200,10 @@ static __device__ __forceinline__ void flash_prefill_split_inner(
     int n_head, int n_kv, int seq_q, int seq_kv, int nsplit, float scale, int window,
     int pos_off, int qblk, int head, int split, int bi, int lane)
 {
+#if defined(LOKEN_NO_WMMA)
+    // A target without matrix instructions: the host never launches this kernel there.
+    __trap();
+#else
     constexpr int KSTEPS = HD / 16;
     constexpr int HCHUNK = HD / 16;
     const int groups  = n_head / n_kv;
@@ -321,6 +332,7 @@ static __device__ __forceinline__ void flash_prefill_split_inner(
         for (int d = lane; d < HD; d += 32) p[d] = Oacc[r * HD + d];
         if (lane == 0) { p[HD] = m_row[r]; p[HD + 1] = l_row[r]; }
     }
+#endif
 }
 
 #define FLASH_PREFILL_SPLIT_KERNEL(NAME, HD)                                    \
