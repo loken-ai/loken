@@ -345,7 +345,9 @@ pub(crate) async fn convert_model(
         Some(span) => {
             let parsed = span
                 .split_once(':')
-                .and_then(|(a, b)| Some(a.parse::<usize>().ok()?..b.parse::<usize>().ok()?));
+                .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+                .filter(|(first, last)| first <= last)
+                .map(|(first, last)| first..last + 1);
             Some(parsed.ok_or_else(|| ApiError::Validation("layers takes first:last".into()))?)
         }
     };

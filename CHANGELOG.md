@@ -47,6 +47,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Convert: read a layer span as first to last, both included.
 - SDXL: render with a bf16 UNet on a card.
 - GPU: keep two models decoding on one card from mixing their activations.
 - Tokenizer: lead a bare prompt with the BOS a model's chat template opens with.
