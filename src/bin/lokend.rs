@@ -289,6 +289,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ollama_models_dir = config.get_ollama_models_dir().to_string_lossy().to_string();
             let huggingface_models_dir = config.get_hf_models_dir().to_string_lossy().to_string();
 
+            // Loaders without a server handle read the stores this daemon serves.
+            loken::config::install_stores(&ollama_models_dir, &huggingface_models_dir);
+
             // Adapters are named, not pathed: fix the one directory they resolve inside
             // before any request can arrive.
             let lora_dir = config.get_lora_dir();

@@ -578,8 +578,9 @@ mod tests {
 /// looked for weights in a store the daemon was never given.
 static STORES: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
 
-/// Record the Ollama and Hugging Face stores of this process. The first call wins; a
-/// server built twice in one process, as tests do, keeps the first.
+/// Record the Ollama and Hugging Face stores of this process; the daemon calls it once at
+/// start. The first call wins. A server built in a test installs nothing, so a test that
+/// opens a real checkpoint reads the test configuration's store.
 pub fn install_stores(ollama: &str, huggingface: &str) {
     let _ = STORES.set((PathBuf::from(ollama), PathBuf::from(huggingface)));
 }
