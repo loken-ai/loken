@@ -477,9 +477,8 @@ pub(super) fn tokenize_around_audio(
     let (before, after) = prompt
         .split_once(placeholder)
         .ok_or_else(|| format!("the prompt holds no audio placeholder {placeholder:?}"))?;
-    let head = tokenizer
-        .encode(before, true)
-        .map_err(|e| format!("Tokenization error: {e}"))?;
+    let head =
+        super::encode_prompt(tokenizer, before).map_err(|e| format!("Tokenization error: {e}"))?;
     let tail = tokenizer
         .encode(after, false)
         .map_err(|e| format!("Tokenization error: {e}"))?;

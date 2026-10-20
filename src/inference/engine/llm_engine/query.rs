@@ -46,9 +46,7 @@ impl LlmEngine {
             };
             let yes_id = tok_id("yes", "Ġyes")?;
             let no_id = tok_id("no", "Ġno")?;
-            let encoding = state
-                .tokenizer
-                .encode(prompt.as_str(), true)
+            let encoding = super::encode_prompt(&state.tokenizer, prompt.as_str())
                 .map_err(|e| anyhow!("reranker encode: {e}"))?;
             let ids: Vec<u32> = encoding.get_ids().to_vec();
             let seq = ids.len();

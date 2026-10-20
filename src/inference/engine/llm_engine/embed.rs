@@ -28,9 +28,7 @@ impl LlmEngine {
             let state = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("Embedding model not loaded"))?;
-            let encoding = state
-                .tokenizer
-                .encode(input.as_str(), true)
+            let encoding = super::encode_prompt(&state.tokenizer, input.as_str())
                 .map_err(|e| anyhow!("embedding encode: {e}"))?;
             let ids: Vec<u32> = encoding.get_ids().to_vec();
             if ids.is_empty() {

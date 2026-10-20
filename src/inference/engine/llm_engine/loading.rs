@@ -645,7 +645,7 @@ impl LlmEngine {
 
             // --- 3. Build tokenizer ---
             debug!("🔍 Looking for tokenizer.json...");
-            let tokenizer: Tokenizer = {
+            let mut tokenizer: Tokenizer = {
                 let tokenizer_path = model_file.parent()
                     .map(|p| p.join("tokenizer.json"))
                     .filter(|p| p.exists());
@@ -667,6 +667,7 @@ impl LlmEngine {
                 }
             };
 
+            super::gguf::lead_with_template_bos(&mut tokenizer, &content);
             debug!("✓ Tokenizer loaded");
 
             // --- 4. The cards the placement offers this model ---

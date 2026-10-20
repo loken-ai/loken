@@ -46,6 +46,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Tokenizer: lead a bare prompt with the BOS a model's chat template opens with.
 - GPU: list the cards at start without opening a context, so an idle server leaves them cold.
 - CUDA: bind the card before a page-locked staging buffer is made on a new thread.
 - Attention: give a long prompt the same greedy tokens however full the cards are.

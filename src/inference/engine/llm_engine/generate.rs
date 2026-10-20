@@ -235,7 +235,7 @@ impl LlmEngine {
 
             // Tokenize prompt. Its TEXT is user content - log the size, never the text.
             debug!("Tokenizing prompt: {} chars", prompt.len());
-            let encoding = state.tokenizer.encode(prompt.as_str(), true)
+            let encoding = super::encode_prompt(&state.tokenizer, prompt.as_str())
                 .map_err(|e| anyhow!("Tokenization error: {}", e))?;
             // Robustness: clamp an over-long prompt to the KV window (else prefill
             // overflows the KV cache and the attention mask breaks -> crash).
@@ -2150,9 +2150,7 @@ impl LlmEngine {
             let mut constraint = llguidance::Constraint::new(parser);
             info!("🎯 Grammar-constrained decode: spec={}", grammar_str);
 
-            let encoding = state
-                .tokenizer
-                .encode(prompt.as_str(), true)
+            let encoding = super::encode_prompt(&state.tokenizer, prompt.as_str())
                 .map_err(|e| anyhow!("Tokenization error: {}", e))?;
             let prompt_tokens: Vec<u32> = clamp_prompt_to_window(
                 with_prefix_tokens(&params, encoding.get_ids()),
@@ -2374,7 +2372,7 @@ impl LlmEngine {
             let mut constraint = llguidance::Constraint::new(parser);
             info!("🎯 Grammar-constrained streaming: spec={}", grammar_str);
 
-            let encoding = match state.tokenizer.encode(prompt.as_str(), true) {
+            let encoding = match super::encode_prompt(&state.tokenizer, prompt.as_str()) {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = tx.blocking_send(Err(format!("Tokenization: {e}")));

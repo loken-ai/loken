@@ -293,6 +293,27 @@ impl InferenceEngine for LlmEngine {
 /// from the previous step's partial decode, landing `from` INSIDE a char in the new
 /// cumulative string - a raw `s[from..]` slice then panics. Used by every incremental
 /// stream-decode site.
+/// The tokens of a prompt, special tokens added as the tokenizer adds them. A prompt that
+/// already opens with the special token the tokenizer leads with, as one rendered by a chat
+/// template that writes its BOS, keeps a single one.
+pub(crate) fn encode_prompt(
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
+) -> tokenizers::Result<tokenizers::Encoding> {
+    let encoding = tokenizer.encode(prompt, true)?;
+    let ids = encoding.get_ids();
+    let doubled = ids.len() >= 2
+        && ids[0] == ids[1]
+        && tokenizer
+            .get_added_tokens_decoder()
+            .get(&ids[0])
+            .is_some_and(|t| t.special);
+    if doubled {
+        return tokenizer.encode(prompt, false);
+    }
+    Ok(encoding)
+}
+
 fn char_safe_suffix(s: &str, from: usize) -> String {
     let mut i = from.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -839,9 +860,7 @@ impl LlmEngine {
     pub async fn count_tokens(&self, text: &str) -> Option<usize> {
         let guard = self.model_state.lock().await;
         let state = guard.as_ref()?;
-        state
-            .tokenizer
-            .encode(text, true)
+        encode_prompt(&state.tokenizer, text)
             .ok()
             .map(|e| e.get_ids().len())
     }

@@ -20,9 +20,7 @@ impl LlmEngine {
         tokio::task::spawn_blocking(move || -> AnyResult<Vec<u8>> {
             let guard = model_state.blocking_lock();
             let state = guard.as_ref().ok_or_else(|| anyhow!("no model loaded"))?;
-            let tokens = state
-                .tokenizer
-                .encode(prompt.as_str(), true)
+            let tokens = super::encode_prompt(&state.tokenizer, prompt.as_str())
                 .map_err(|e| anyhow!("tokenize: {e}"))?
                 .get_ids()
                 .to_vec();

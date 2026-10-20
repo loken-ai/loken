@@ -88,7 +88,7 @@ impl LlmEngine {
             params.stop_sequences = defaults.stop.clone();
         }
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(4096);
-        let tokens: Vec<u32> = match tokenizer.encode(prompt, true) {
+        let tokens: Vec<u32> = match super::encode_prompt(&tokenizer, prompt) {
             Ok(e) => with_prefix_tokens(&params, e.get_ids()),
             Err(e) => {
                 let _ = tx.try_send(Err(format!("Tokenization: {e}")));
@@ -365,7 +365,7 @@ impl LlmEngine {
 
                 // Tokenize. The prompt text is user content; log its size only.
                 debug!("Tokenizing prompt: {} chars", prompt.len());
-                let encoding = match state.tokenizer.encode(prompt.as_str(), true) {
+                let encoding = match super::encode_prompt(&state.tokenizer, prompt.as_str()) {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = tx.blocking_send(Err(format!("Tokenization: {e}")));
@@ -3141,7 +3141,7 @@ impl LlmEngine {
     pub async fn cached_prompt_tokens(&self, model_name: &str, prompt: &str) -> Option<usize> {
         let guard = self.model_state.lock().await;
         let state = guard.as_ref()?;
-        let encoding = state.tokenizer.encode(prompt, true).ok()?;
+        let encoding = super::encode_prompt(&state.tokenizer, prompt).ok()?;
         let tokens: Vec<u32> = encoding.get_ids().to_vec();
         let sessions = self.sessions.lock().await;
         let Some(s) = sessions.get(GLOBAL_PROMPT_CACHE_KEY) else {

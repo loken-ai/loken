@@ -816,9 +816,7 @@ mod real_models {
             let mut guard = engine.model_state.lock().await;
             let state = guard.as_mut().expect("a loaded model");
             for (name, budget, text) in &texts {
-                let mut tokens: Vec<u32> = state
-                    .tokenizer
-                    .encode(text.as_str(), true)
+                let mut tokens: Vec<u32> = super::encode_prompt(&state.tokenizer, text.as_str())
                     .unwrap()
                     .get_ids()
                     .to_vec();
