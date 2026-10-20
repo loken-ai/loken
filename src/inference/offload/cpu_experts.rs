@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// own threads the decode collapses onto two or three cores; this keeps the pool to one publisher
 /// so all of them run. Bit-for-bit the per-expert products (the kernel is the same dot). `None` if
 /// a weight is not in the format the kernels read, and the caller runs the experts the old way.
-pub(crate) fn batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<Vec<Vec<f32>>> {
+fn batched_one_format(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<Vec<Vec<f32>>> {
     use crate::inference::offload::projection::Projection;
     use crate::tensor::quant_cpu::matmul_bytes_multi;
     use crate::tensor::quantized::GgmlDType;
@@ -84,7 +84,7 @@ pub(crate) fn batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<
 /// output is the same dot over the same quantised row. `None` if a weight is not in the format the
 /// kernels read.
 #[allow(clippy::type_complexity)]
-pub(crate) fn multirow(
+fn multirow_one_format(
     experts: &[Arc<Expert>],
     row_batches: &[Vec<f32>],
     dim: usize,
@@ -161,6 +161,74 @@ pub(crate) fn multirow(
         matmul_bytes_grouped(down_dt, inter, dim, &down_r, &h_r, &mut o).ok()?;
     }
     Some(out)
+}
+
+/// The formats of an expert's gate, up and down, `None` for one that is not quantised.
+fn formats(e: &Expert) -> Option<[crate::tensor::quantized::GgmlDType; 3]> {
+    use crate::inference::offload::projection::Projection;
+    let dt = |p: &Projection| match p {
+        Projection::Quant(q) => Some(q.dtype()),
+        _ => None,
+    };
+    Some([dt(&e.w1)?, dt(&e.w3)?, dt(&e.w2)?])
+}
+
+/// `experts` split into runs of one format each, in the order first seen: the indices of each.
+fn by_format(experts: &[Arc<Expert>]) -> Option<Vec<Vec<usize>>> {
+    let mut groups: Vec<([crate::tensor::quantized::GgmlDType; 3], Vec<usize>)> = Vec::new();
+    for (i, e) in experts.iter().enumerate() {
+        let f = formats(e)?;
+        match groups.iter_mut().find(|(g, _)| *g == f) {
+            Some((_, ids)) => ids.push(i),
+            None => groups.push((f, vec![i])),
+        }
+    }
+    Some(groups.into_iter().map(|(_, ids)| ids).collect())
+}
+
+/// Run `one` over each format's experts and put the outputs back in the experts' order: experts
+/// read from files of different formats run as one batch per format.
+fn per_format(
+    experts: &[Arc<Expert>],
+    one: &dyn Fn(&[Arc<Expert>], &[usize]) -> Option<Vec<Vec<f32>>>,
+) -> Option<Vec<Vec<f32>>> {
+    let groups = by_format(experts)?;
+    if groups.len() <= 1 {
+        let all: Vec<usize> = (0..experts.len()).collect();
+        return one(experts, &all);
+    }
+    let mut out = vec![Vec::new(); experts.len()];
+    for ids in groups {
+        let part: Vec<Arc<Expert>> = ids.iter().map(|&i| experts[i].clone()).collect();
+        for (i, o) in ids.iter().zip(one(&part, &ids)?) {
+            out[*i] = o;
+        }
+    }
+    Some(out)
+}
+
+/// The decode's host experts, as `batched_one_format` computes them, one batch per format.
+pub(crate) fn batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<Vec<Vec<f32>>> {
+    per_format(experts, &|part, _| batched_one_format(part, x, limit))
+}
+
+/// A prompt's host experts, as `multirow_one_format` computes them, one batch per format.
+pub(crate) fn multirow(
+    experts: &[Arc<Expert>],
+    row_batches: &[Vec<f32>],
+    dim: usize,
+    limit: f32,
+) -> Option<Vec<Vec<f32>>> {
+    if by_format(experts)?.len() <= 1 {
+        return multirow_one_format(experts, row_batches, dim, limit);
+    }
+    per_format(experts, &|part, ids| {
+        let rows: Vec<Vec<f32>> = ids
+            .iter()
+            .map(|&i| row_batches.get(i).cloned())
+            .collect::<Option<_>>()?;
+        multirow_one_format(part, &rows, dim, limit)
+    })
 }
 
 /// How long this node's cores take to compute one routed expert it does not hold resident: gate and

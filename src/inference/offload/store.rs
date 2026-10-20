@@ -151,6 +151,21 @@ pub trait ExpertLoader: Send + Sync {
     fn backing_file(&self) -> Option<Arc<std::fs::File>> {
         None
     }
+    /// How many stored variants each expert can be read from: one unless the experts come from
+    /// several files of one checkpoint.
+    fn variants(&self) -> usize {
+        1
+    }
+    /// The bytes expert `id` occupies in variant `v`, `None` when there is no such variant.
+    fn variant_bytes(&self, id: usize, v: usize) -> Option<usize> {
+        (v == 0)
+            .then(|| self.build(id).ok().map(|e| e.bytes()))
+            .flatten()
+    }
+    /// Read expert `id` from variant `v` from now on; false when there is no such variant.
+    fn choose_variant(&self, _id: usize, v: usize) -> bool {
+        v == 0
+    }
 }
 
 /// A page drop waiting for the dropper thread.
@@ -290,6 +305,27 @@ impl ExpertStore {
     /// The file the experts are mapped from, when there is one.
     pub fn backing_file(&self) -> Option<Arc<std::fs::File>> {
         self.loader.backing_file()
+    }
+
+    /// How many stored variants each expert can be read from.
+    pub fn variants(&self) -> usize {
+        self.loader.variants()
+    }
+
+    /// The bytes expert `id` occupies in variant `v`.
+    pub fn variant_bytes(&self, id: usize, v: usize) -> Option<usize> {
+        self.loader.variant_bytes(id, v)
+    }
+
+    /// Read expert `id` from variant `v` from now on. A kept copy of the expert is let go, so the
+    /// next request reads the variant chosen.
+    pub fn choose_variant(&self, id: usize, v: usize) -> bool {
+        if !self.loader.choose_variant(id, v) {
+            return false;
+        }
+        let mut g = self.inner.lock().unwrap();
+        self.evict(&mut g, id);
+        true
     }
 
     /// Build expert `id`'s views without touching the tier: for probes.
@@ -566,6 +602,30 @@ impl ExpertSet {
         }
     }
 
+    /// How many stored variants each expert can be read from: one for a resident set.
+    pub fn variants(&self) -> usize {
+        match self {
+            ExpertSet::Resident(_) => 1,
+            ExpertSet::Streamed(s) => s.variants(),
+        }
+    }
+
+    /// The bytes expert `id` occupies in variant `v`.
+    pub fn variant_bytes(&self, id: usize, v: usize) -> Option<usize> {
+        match self {
+            ExpertSet::Resident(e) => e.get(id).filter(|_| v == 0).map(|e| e.bytes()),
+            ExpertSet::Streamed(s) => s.variant_bytes(id, v),
+        }
+    }
+
+    /// Read expert `id` from variant `v` from now on; false when the set has no such variant.
+    pub fn choose_variant(&self, id: usize, v: usize) -> bool {
+        match self {
+            ExpertSet::Resident(_) => v == 0,
+            ExpertSet::Streamed(s) => s.choose_variant(id, v),
+        }
+    }
+
     /// Reclaim the pages of every expert a streamed set does not keep; a no-op when resident.
     pub fn sweep(&self) -> Result<()> {
         match self {
@@ -817,6 +877,141 @@ impl ExpertLoader for UnitExpertLoader {
             }
         }
         expert.dont_need();
+    }
+}
+
+/// One mapped file the experts lie in: the file, the address its mapping starts at, and the
+/// mapping's length.
+pub type MappedAnchor = (Arc<std::fs::File>, usize, usize);
+
+/// Drop `expert`'s pages from memory: each projection by its file range when one of `anchors`
+/// maps it, through its own mapping advice otherwise.
+fn release_by_file(anchors: &[MappedAnchor], expert: &Expert) {
+    for p in [&expert.w1, &expert.w3, &expert.w2] {
+        let anchor = p.storage_span().and_then(|(addr, len)| {
+            anchors
+                .iter()
+                .find(|(_, base, size)| addr >= *base && addr + len <= base + size)
+                .map(|(file, base, _)| (file, addr - base, len))
+        });
+        match anchor {
+            Some((file, offset, len)) => {
+                // This mapping's entries first: the file's pages are not dropped while a process
+                // maps them.
+                p.unmap_pages();
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    // Safety: a valid descriptor and a range inside the file; advice only.
+                    unsafe {
+                        libc::posix_fadvise(
+                            file.as_raw_fd(),
+                            offset as libc::off_t,
+                            len as libc::off_t,
+                            libc::POSIX_FADV_DONTNEED,
+                        );
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (file, offset, len);
+            }
+            None => p.dont_need(),
+        }
+    }
+}
+
+/// An `ExpertLoader` over the same routed experts stored in several files of one checkpoint,
+/// each quantised to its own format: per expert, its gate, up and down views in every variant,
+/// and the variant it is read from. Every file stays mapped; only the variant an expert is read
+/// from is ever brought into memory. Variant 0 is the one read until another is chosen.
+pub struct VariantExpertLoader {
+    /// Per variant, per expert: gate `[inter, dim]`, up `[inter, dim]`, down `[dim, inter]`.
+    variants: Vec<Vec<[Arc<QTensor>; 3]>>,
+    /// The files the variants map.
+    anchors: Vec<MappedAnchor>,
+    /// Per expert, the variant it is read from.
+    chosen: Vec<std::sync::atomic::AtomicU8>,
+}
+
+impl VariantExpertLoader {
+    /// The loader over `variants`, which must each hold the same number of experts.
+    pub fn new(variants: Vec<Vec<[Arc<QTensor>; 3]>>, anchors: Vec<MappedAnchor>) -> Result<Self> {
+        let n = variants.first().map_or(0, Vec::len);
+        if variants.is_empty()
+            || variants.len() > u8::MAX as usize
+            || variants.iter().any(|v| v.len() != n)
+        {
+            return Err(crate::tensor::Error::msg(format!(
+                "expert variants: {} variants of unequal expert counts",
+                variants.len()
+            )));
+        }
+        Ok(Self {
+            variants,
+            anchors,
+            chosen: (0..n)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
+        })
+    }
+
+    fn expert(&self, v: usize, id: usize) -> Result<Expert> {
+        let [gate, up, down] = self
+            .variants
+            .get(v)
+            .and_then(|x| x.get(id))
+            .ok_or_else(|| {
+                crate::tensor::Error::msg(format!(
+                    "expert {id} variant {v} of {} experts in {} variants",
+                    self.chosen.len(),
+                    self.variants.len()
+                ))
+            })?;
+        Ok(Expert {
+            w1: Projection::Quant(gate.clone()),
+            w2: Projection::Quant(down.clone()),
+            w3: Projection::Quant(up.clone()),
+        })
+    }
+}
+
+impl ExpertLoader for VariantExpertLoader {
+    fn build(&self, id: usize) -> Result<Expert> {
+        let v = self
+            .chosen
+            .get(id)
+            .map_or(0, |c| c.load(Ordering::Relaxed) as usize);
+        self.expert(v, id)
+    }
+
+    fn count(&self) -> usize {
+        self.chosen.len()
+    }
+
+    fn backing_file(&self) -> Option<Arc<std::fs::File>> {
+        self.anchors.first().map(|(f, _, _)| f.clone())
+    }
+
+    fn release(&self, expert: &Expert) {
+        release_by_file(&self.anchors, expert);
+    }
+
+    fn variants(&self) -> usize {
+        self.variants.len()
+    }
+
+    fn variant_bytes(&self, id: usize, v: usize) -> Option<usize> {
+        self.expert(v, id).ok().map(|e| e.bytes())
+    }
+
+    fn choose_variant(&self, id: usize, v: usize) -> bool {
+        match self.chosen.get(id) {
+            Some(c) if v < self.variants.len() => {
+                c.store(v as u8, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 }
 

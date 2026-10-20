@@ -179,6 +179,12 @@ pub struct InferenceConfigToml {
     /// engine measures the noise and the cost of each way of giving up experts at load.
     #[serde(default)]
     pub quality: crate::inference::engine::llm_engine::QualityLevel,
+    /// For a model whose manifest names further files of its checkpoint: which file each routed
+    /// expert is read from. `plan` (the default) reads the experts kept on the cards from the
+    /// most precise file and those the host computes from the smallest;
+    /// `smallest` and `largest` read every expert from that one file.
+    #[serde(default)]
+    pub expert_variants: crate::inference::place::expert_variants::VariantChoice,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
@@ -392,6 +398,7 @@ impl Config {
                 fetch_timeout_secs: toml_config.image_fetch_timeout_secs,
             },
             quality: toml_config.quality,
+            expert_variants: toml_config.expert_variants,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
             disable_arc_layers: false,

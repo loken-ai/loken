@@ -95,6 +95,15 @@ pub struct DeepseekV41Model {
     /// The quality budget to calibrate at backend start, with the model's identity and the
     /// calibration text's tokens; taken once.
     quality: std::sync::Mutex<Option<(QualityLevel, String, Vec<u32>)>>,
+    /// The bytes the host tier may keep routed experts in, as last sized.
+    host_tier_bytes: std::sync::atomic::AtomicU64,
+    /// How the routed experts pick between the files they are stored in, and the heat ranking
+    /// the plan and the cards' warming follow: set once at load when the experts come from
+    /// several files.
+    variant_policy: std::sync::OnceLock<(
+        crate::inference::place::expert_variants::VariantChoice,
+        Vec<Vec<usize>>,
+    )>,
     // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
     // with YaRN from original_seq_len.
     rope_theta: f32,
@@ -398,6 +407,8 @@ impl DeepseekV41Model {
             rms_eps: cfg.rms_eps as f32,
             expert_deferral: 0.0,
             quality: std::sync::Mutex::new(None),
+            host_tier_bytes: std::sync::atomic::AtomicU64::new(0),
+            variant_policy: std::sync::OnceLock::new(),
             // Starts one layer ahead (the nearest stream that stands in for the layer's own) and
             // may go as deep as the stack; a window is as many tokens as the stack has layers.
             readahead: crate::inference::offload::tuner::Tuner::new(
@@ -977,8 +988,121 @@ impl DeepseekV41Model {
             sys.available_memory() / 1_000_000,
             reserve / 1_000_000
         );
+        self.host_tier_bytes
+            .store(budget, std::sync::atomic::Ordering::Relaxed);
         self.set_expert_cache(slots);
         Ok(slots)
+    }
+
+    /// Pick between the files the routed experts are stored in by `choice`, the experts ranked
+    /// per layer by `ranks` (hottest first), the file's routing prior when `None`. Applied when
+    /// the placement knows the room it keeps experts in; a second call is ignored.
+    pub fn set_variant_policy(
+        &self,
+        choice: crate::inference::place::expert_variants::VariantChoice,
+        ranks: Option<Vec<Vec<usize>>>,
+    ) {
+        let ranks = ranks.unwrap_or_else(|| self.hot_experts.clone());
+        let _ = self.variant_policy.set((choice, ranks));
+    }
+
+    /// The most stored variants any layer's routed experts can be read from.
+    pub fn expert_variants(&self) -> usize {
+        self.blocks
+            .iter()
+            .flatten()
+            .map(|b| b.moe.experts.variants())
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Choose each routed expert's variant: the experts the cards' `card_bytes` keep, in heat
+    /// order, read from the precise variant while the cards have room for it; the next ones the
+    /// host tier keeps and those read from disk from the small one. The host tier of each layer
+    /// is resized to the experts the plan gives it. `None` when the experts have one variant or
+    /// no policy is set.
+    pub fn place_variants(
+        &self,
+        card_bytes: u64,
+    ) -> Option<crate::inference::place::expert_variants::VariantPlan> {
+        use crate::inference::place::expert_variants::{plan, Tier};
+        let (choice, ranks) = self.variant_policy.get()?;
+        let variants = self.expert_variants();
+        if variants < 2 {
+            return None;
+        }
+        let held: Vec<(usize, &Block)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().map(|b| (i, b)))
+            .collect();
+        let experts = held
+            .iter()
+            .map(|(_, b)| b.moe.experts.count())
+            .max()
+            .unwrap_or(0);
+        // Bytes of every expert in every variant, `u64::MAX` where a layer has no such one.
+        let sizes: Vec<Vec<Vec<u64>>> = held
+            .iter()
+            .map(|(_, b)| {
+                (0..experts)
+                    .map(|e| {
+                        (0..variants)
+                            .map(|v| {
+                                b.moe
+                                    .experts
+                                    .variant_bytes(e, v)
+                                    .map_or(u64::MAX, |n| n as u64)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let held_ranks: Vec<Vec<usize>> = held
+            .iter()
+            .map(|(i, _)| ranks.get(*i).cloned().unwrap_or_default())
+            .collect();
+        let host = self
+            .host_tier_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let p = plan(
+            held.len(),
+            experts,
+            variants,
+            &|l, e, v| sizes[l][e][v],
+            &held_ranks,
+            &[
+                // A card computes an expert at the same speed whatever its format.
+                Tier {
+                    bytes: card_bytes,
+                    precise: true,
+                },
+                // The host's cores read every byte of an expert at each use.
+                Tier {
+                    bytes: host,
+                    precise: false,
+                },
+            ],
+            *choice,
+        );
+        for (l, (_, b)) in held.iter().enumerate() {
+            for (e, &v) in p.chosen[l].iter().enumerate() {
+                b.moe.experts.choose_variant(e, v);
+            }
+            b.moe.set_expert_cache(p.kept[1][l]);
+        }
+        tracing::info!(
+            "expert variants ({choice:?}): {:?} experts read from each of {variants} files; \
+             {} kept on the cards ({} MB), {} in the host tier ({} MB)",
+            p.per_variant(variants),
+            p.kept[0].iter().sum::<usize>(),
+            card_bytes / 1_000_000,
+            p.kept[1].iter().sum::<usize>(),
+            host / 1_000_000,
+        );
+        Some(p)
     }
 
     /// Per layer, the streamed expert store's counters (hits, misses, evictions); empty entries
@@ -2164,7 +2288,13 @@ impl crate::inference::offload::streamed::StreamedModel for DeepseekV41Model {
         self.n_layers()
     }
     fn routing_prior(&self) -> &[Vec<usize>] {
-        self.hot_experts()
+        match self.variant_policy.get() {
+            Some((_, ranks)) => ranks,
+            None => self.hot_experts(),
+        }
+    }
+    fn place_variants(&self, card_bytes: u64) {
+        let _ = DeepseekV41Model::place_variants(self, card_bytes);
     }
     fn expert(
         &self,

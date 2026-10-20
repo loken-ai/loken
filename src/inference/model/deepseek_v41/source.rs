@@ -10,10 +10,14 @@
 use super::engram::EngramTable;
 use super::load::load_f32;
 use crate::inference::offload::projection::Projection;
-use crate::inference::offload::store::{ExpertLoader, QuantExpertLoader, UnitExpertLoader};
+use crate::inference::offload::store::{
+    ExpertLoader, MappedAnchor, QuantExpertLoader, UnitExpertLoader, VariantExpertLoader,
+};
 use crate::tensor::mapped::MappedBytes;
+use crate::tensor::quant_view::expert_view;
 use crate::tensor::quantized::gguf_source::GgufSource;
 use crate::tensor::quantized::GgmlDType;
+use crate::tensor::quantized::QTensor;
 use crate::tensor::{Error, Result, Tensor};
 use std::sync::Arc;
 
@@ -257,6 +261,126 @@ fn unit_loader<G: GgufSource>(
         .mapped_range(&first)?
         .and_then(|(map, _, _)| Some((g.mapped_file(&first)?, map.as_ptr() as usize)));
     Ok(Box::new(UnitExpertLoader::new(views, anchor)))
+}
+
+/// The routed experts of `layer` as views in the mapping, gate, up and down each, whatever the
+/// file stores them as (one stack per projection, or one tensor per expert and projection), with
+/// the mappings they lie in. `None` when their format has no view path.
+pub fn expert_views<G: GgufSource>(
+    g: &G,
+    layer: usize,
+    n: usize,
+) -> Result<Option<(Vec<[Arc<QTensor>; 3]>, Vec<MappedAnchor>)>> {
+    let present = |w: &str| -> Result<String> {
+        let canonical = format!("layers.{layer}.ffn.experts.0.{w}.weight");
+        gguf_names(&canonical)
+            .into_iter()
+            .find(|n| g.info(n).is_some())
+            .ok_or_else(|| Error::msg(format!("gguf: no expert tensor for {canonical}")))
+    };
+    let mut anchors: Vec<MappedAnchor> = Vec::new();
+    let mut note = |name: &str| -> Result<()> {
+        if let (Some((map, _, _)), Some(file)) = (g.mapped_range(name)?, g.mapped_file(name)) {
+            let base = map.as_ptr() as usize;
+            if !anchors.iter().any(|(_, b, _)| *b == base) {
+                anchors.push((file, base, map.len()));
+            }
+        }
+        Ok(())
+    };
+    let gate = present("w1")?;
+    if is_stack(g, &gate) {
+        let mut stacks = Vec::with_capacity(3);
+        for (_, w) in EXPERT_STACKS {
+            let name = present(w)?;
+            note(&name)?;
+            match g.mmap_view(&name)? {
+                Some(v) => stacks.push(Arc::new(v)),
+                None => return Ok(None),
+            }
+        }
+        let views = (0..n)
+            .map(|e| {
+                Ok([
+                    Arc::new(expert_view(&stacks[0], e)?),
+                    Arc::new(expert_view(&stacks[1], e)?),
+                    Arc::new(expert_view(&stacks[2], e)?),
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some((views, anchors)));
+    }
+    let mut views = Vec::with_capacity(n);
+    for e in 0..n {
+        let mut unit = Vec::with_capacity(3);
+        for (stack, _) in EXPERT_STACKS {
+            let name = expert_unit_name(layer, stack, e);
+            if g.info(&name).is_none() {
+                return Err(Error::msg(format!("gguf: no expert tensor {name}")));
+            }
+            note(&name)?;
+            match g.mmap_view(&name)? {
+                Some(v) => unit.push(Arc::new(v)),
+                None => return Ok(None),
+            }
+        }
+        views
+            .push(<[Arc<QTensor>; 3]>::try_from(unit).map_err(|_| {
+                Error::msg(format!("gguf: expert {e} of layer {layer} incomplete"))
+            })?);
+    }
+    Ok(Some((views, anchors)))
+}
+
+/// A model served from several files of one checkpoint: every tensor is read from the first
+/// file, the primary, except the routed experts, which every file offers in its own format and
+/// the placement picks between, expert by expert.
+pub struct VariantSource<'a, G: GgufSource> {
+    pub primary: &'a G,
+    pub variants: &'a [G],
+}
+
+impl<G: GgufSource> WeightSource for VariantSource<'_, G> {
+    fn shape(&self, name: &str) -> Option<Vec<usize>> {
+        WeightSource::shape(self.primary, name)
+    }
+
+    fn dense_f32(&self, name: &str) -> Result<Tensor> {
+        WeightSource::dense_f32(self.primary, name)
+    }
+
+    fn projection(&self, name: &str) -> Result<Option<Projection>> {
+        WeightSource::projection(self.primary, name)
+    }
+
+    fn experts(&self, layer: usize, n: usize) -> Result<Box<dyn ExpertLoader>> {
+        let Some((first, mut anchors)) = expert_views(self.primary, layer, n)? else {
+            return Err(Error::msg(format!(
+                "expert variants: the experts of layer {layer} have no format read in place"
+            )));
+        };
+        let mut all = vec![first];
+        for (i, v) in self.variants.iter().enumerate() {
+            let Some((views, a)) = expert_views(v, layer, n)? else {
+                return Err(Error::msg(format!(
+                    "expert variants: the experts of layer {layer} in variant {} have no format \
+                     read in place",
+                    i + 1
+                )));
+            };
+            all.push(views);
+            anchors.extend(a);
+        }
+        Ok(Box::new(VariantExpertLoader::new(all, anchors)?))
+    }
+
+    fn experts_under(&self, prefix: &str, n: usize) -> Result<Box<dyn ExpertLoader>> {
+        WeightSource::experts_under(self.primary, prefix, n)
+    }
+
+    fn engram_table(&self, name: &str) -> Result<EngramTable> {
+        WeightSource::engram_table(self.primary, name)
+    }
 }
 
 impl<G: GgufSource> WeightSource for G {

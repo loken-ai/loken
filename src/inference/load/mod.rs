@@ -18,6 +18,7 @@ pub mod onnx;
 pub mod onnx_exec;
 pub mod requantize;
 pub mod shapes;
+pub mod variant_files;
 // Low-rank adapters: reading them off disk is a loading concern, and applying them is
 // the projection's, so the type lives with the layers and the reader lives here.
 pub mod lora;

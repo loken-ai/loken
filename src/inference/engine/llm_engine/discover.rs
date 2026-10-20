@@ -172,9 +172,26 @@ impl LlmEngine {
     /// same `library/{name}/{tag}` and namespaced `{ns}/{name}/{tag}` layouts as
     /// `find_model_file`, without the full directory scan.
     pub(super) fn find_manifest_layer(&self, model_id: &str, media_type: &str) -> Option<PathBuf> {
-        let models_dir = self.config.models_dir.as_ref()?;
+        self.find_manifest_layers(model_id, media_type)
+            .into_iter()
+            .next()
+    }
+
+    /// The further files of a model's checkpoint its manifest names, each holding the same
+    /// routed experts in another format: the manifest's `application/vnd.loken.image.model.variant`
+    /// layers, in their order.
+    pub(super) fn find_variant_blobs_for_model(&self, model_id: &str) -> Vec<PathBuf> {
+        self.find_manifest_layers(model_id, "application/vnd.loken.image.model.variant")
+    }
+
+    /// Every blob of `media_type` in the first manifest of `model_id` that names one, in the
+    /// manifest's order.
+    fn find_manifest_layers(&self, model_id: &str, media_type: &str) -> Vec<PathBuf> {
+        let Some(models_dir) = self.config.models_dir.as_ref() else {
+            return Vec::new();
+        };
         if !models_dir.is_dir() {
-            return None;
+            return Vec::new();
         }
         // Build the canonical Ollama manifest path. This covers the
         // standard `library/{name}/{tag}` and namespaced `{ns}/{name}/{tag}`
@@ -228,6 +245,7 @@ impl LlmEngine {
                 Some(l) => l,
                 None => continue,
             };
+            let mut found = Vec::new();
             for layer in layers {
                 let mtype = layer
                     .get("mediaType")
@@ -245,11 +263,14 @@ impl LlmEngine {
                     None => continue,
                 };
                 if let Some(blob) = Self::find_blob_for_digest(&root, digest) {
-                    return Some(blob);
+                    found.push(blob);
                 }
             }
+            if !found.is_empty() {
+                return found;
+            }
         }
-        None
+        Vec::new()
     }
 
     fn find_sibling_projector(&self, model_id: &str) -> Option<PathBuf> {

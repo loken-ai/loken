@@ -55,6 +55,7 @@ pub fn run_tail_local(
         layers: model.n_layers(),
         prior: model.hot_experts(),
         fetch: &|l, id| model.expert_store(l)?.fetch(id).ok(),
+        choose: &|_| {},
     })
     .ok_or_else(|| "pipeline tail: no card for the placement".to_string())?;
     model.offload_experts(Some(streamed.lanes.clone()));

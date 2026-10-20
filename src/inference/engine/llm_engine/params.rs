@@ -210,6 +210,9 @@ pub struct InferenceConfig {
     pub media_limits: crate::api::media_limits::MediaLimits,
     /// How much exactness a streamed model may give up for speed.
     pub quality: QualityLevel,
+    /// Which of a model's files each routed expert is read from, when its manifest names more
+    /// than one.
+    pub expert_variants: crate::inference::place::expert_variants::VariantChoice,
     /// Progress callback
     pub progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     /// Models directory (for finding model files)
@@ -284,6 +287,7 @@ impl Default for InferenceConfig {
             public_url: None,
             media_limits: crate::api::media_limits::MediaLimits::default(),
             quality: QualityLevel::Exact,
+            expert_variants: Default::default(),
             progress_callback: None,
             models_dir: None,
             disable_arc_layers: false,

@@ -23,6 +23,10 @@ pub struct Demand<'a> {
     pub prior: &'a [Vec<usize>],
     /// Expert `id` of layer `layer`, for warming the cards.
     pub fetch: &'a dyn Fn(usize, usize) -> Option<Arc<Expert>>,
+    /// Told the bytes the cards keep routed experts in once the weights every token reads are
+    /// set aside, before any expert is sent: where the experts come from several files, the
+    /// model picks each one's file from it.
+    pub choose: &'a dyn Fn(u64),
 }
 
 /// A model whose routed experts the engine streams onto the cards. The engine reads these figures
@@ -44,6 +48,9 @@ pub trait StreamedModel {
     fn routing_prior(&self) -> &[Vec<usize>];
     /// Expert `id` of `layer`, for warming and fetching; `None` when the model has no such expert.
     fn expert(&self, layer: usize, id: usize) -> Option<Arc<Expert>>;
+    /// Pick, for routed experts stored in several files, each one's file, the cards keeping
+    /// `card_bytes` of experts; nothing to do for experts stored once.
+    fn place_variants(&self, _card_bytes: u64) {}
 }
 
 /// The cards behind a model's forward: `offload` for its steps, `lanes` for its routed experts.
@@ -69,14 +76,25 @@ impl Streamed {
     /// the model runs on the host alone.
     pub fn open_for<M: StreamedModel>(model: &M, transient_tokens: usize) -> Option<Self> {
         let fetch = |layer: usize, id: usize| model.expert(layer, id);
-        Self::open(&Demand {
+        let chosen = std::cell::Cell::new(false);
+        let choose = |card_bytes: u64| {
+            chosen.set(true);
+            model.place_variants(card_bytes);
+        };
+        let placed = Self::open(&Demand {
             always_read: model.resident_bytes(),
             transient: model.peak_transient_bytes(transient_tokens),
             concurrency: model.active_experts(),
             layers: model.layer_count(),
             prior: model.routing_prior(),
             fetch: &fetch,
-        })
+            choose: &choose,
+        });
+        // No card took any experts: the host tier alone keeps them.
+        if !chosen.get() {
+            model.place_variants(0);
+        }
+        placed
     }
 
     #[cfg(feature = "gpu")]
@@ -118,6 +136,14 @@ impl Streamed {
                 left / 1_000_000
             );
         }
+        let expert_room: usize = rooms
+            .iter()
+            .map(|(_, r)| {
+                let r = r.lock().unwrap();
+                r.ceiling().saturating_sub(r.taken() + r.reserved())
+            })
+            .sum();
+        (demand.choose)(expert_room as u64);
         // Each card handle is its own stream: the steps' handles, one per card, and the lanes',
         // one per expert a token routes to, spread over the cards.
         let protect = demand.layers as u64;

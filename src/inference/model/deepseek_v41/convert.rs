@@ -184,6 +184,7 @@ pub fn calibrate(
             layers: model.n_layers(),
             prior: &no_prior,
             fetch: &|_, _| None,
+            choose: &|_| {},
         },
     );
     model.offload_experts(streamed.as_ref().map(|s| s.lanes.clone()));

@@ -170,10 +170,11 @@ the state size. A restore always leaves at least one token to prefill, to produc
 ### Streamed mixtures (DeepSeek V4.1)
 
 `quality` applies to a model whose routed experts stream from disk, and it is the only knob: the
-engine measures the rest.
+engine measures the rest. `expert_variants` applies only to a model served from several files.
 
 | Key | Default | What it does |
 |---|---|---|
+| `expert_variants` | `plan` | For a model whose manifest names further files of its checkpoint ([`MODELS.md`](MODELS.md)): which file each routed expert is read from. `plan`: the experts the cards keep, hottest first, from the most precise file while the cards have room for them; those the host tier keeps or reads from disk, from the smallest. `smallest` and `largest`: every expert from that file, which answers as that file alone does. |
 | `quality` | `exact` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold: a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
 
 At load the engine runs a bundled text teacher-forced on the card path and on the host path to

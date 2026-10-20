@@ -15,6 +15,7 @@ pub mod dry_plan;
 mod environment_invariants;
 pub mod expert_cache;
 pub mod expert_parallel;
+pub mod expert_variants;
 pub mod fit_report;
 #[cfg(all(test, feature = "image"))]
 mod geometry_invariants;

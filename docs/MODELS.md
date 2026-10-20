@@ -52,6 +52,32 @@ A set is placed layer by layer, never tensor-parallel. A family's vision tower r
 first part only; a set whose `v.*` tensors sit in another part is served as text, and the log
 says why.
 
+A mixture model may be served from several GGUF files of one checkpoint, each quantising the
+routed experts to its own format. Its Ollama manifest names the first file as its model layer, as
+any model does, and each further file as a layer of media type
+`application/vnd.loken.image.model.variant`; the tag is listed by `/api/tags` like any other.
+Every tensor is read from the first file except the routed experts, which the placement reads
+expert by expert from one file or another. The placement fills the cards, then the host tier,
+in routing-heat order: the experts the cards keep come from the file that stores them in the
+most bytes, while the cards have room for them, since a card computes an expert at the same speed
+whatever its format; those the host tier keeps or reads from disk come from the file that stores
+them in the fewest, since the host's cores read every byte of an expert at each use. The
+heat is the model's routing profile in `profiles/` of the store, else the routing prior the file
+records. `expert_variants` in [`CONFIGURATION.md`](CONFIGURATION.md) forces one file for every
+expert. A further file is refused at load, with what differs, unless it carries the same
+`general.architecture` and `tokenizer.*` metadata, the same routed experts (layer, projection
+and expert) at the same shapes, whether stacked or one tensor each, and every other tensor of
+the first file at the same shape, format and bytes; a table read row by row (the engram tables)
+is compared on evenly spread spans. Tensors only the further file carries are ignored. The
+DeepSeek V4.1 route reads this layout.
+
+```json
+{"layers": [
+  {"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:<iq2 file>", "size": 374255419392},
+  {"mediaType": "application/vnd.loken.image.model.variant", "digest": "sha256:<iq3 file>", "size": 437973673600}
+]}
+```
+
 A checkpoint may ship a draft head that the served file leaves out: the multi-token-prediction
 layer of the wide-residual family. It is read from a companion file, `<stem>.mtp.gguf` beside
 the model, the stem being that of a split's parts. `loken draft-head <repo> <out.gguf>` writes it

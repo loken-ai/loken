@@ -434,6 +434,185 @@ mod tests {
         );
     }
 
+    /// A block whose routed experts come from two files of one checkpoint - Q8_0 experts stored
+    /// one tensor each in the first, a Q4_K stack in the second - computes, with every expert
+    /// read from one file, exactly what that file computes alone.
+    #[test]
+    fn a_block_read_from_one_variant_computes_what_that_file_does() {
+        use super::super::source::VariantSource;
+        let (dim, nh, hd, rd, qlora, olora, og) = (256usize, 4, 128, 32, 64, 64, 4);
+        let (er, inter, hc, mix) = (8usize, 256usize, 4usize, 24usize);
+        let u = |k: &str, v: u32| (format!("deepseek_v41.{k}"), Value::U32(v));
+        let f = |k: &str, v: f32| (format!("deepseek_v41.{k}"), Value::F32(v));
+        let md = vec![
+            (
+                "general.architecture".to_string(),
+                Value::String("deepseek_v41".into()),
+            ),
+            u("block_count", 1),
+            u("embedding_length", dim as u32),
+            u("attention.head_count", nh as u32),
+            u("attention.key_length", hd as u32),
+            u("expert_count", er as u32),
+            u("expert_used_count", 2),
+            u("expert_shared_count", 1),
+            u("expert_feed_forward_length", inter as u32),
+            f("expert_weights_scale", 1.5),
+            f("expert_swiglu_limit", 10.0),
+            u("hyper_connection_mult", hc as u32),
+            u("hyper_connection_sinkhorn_iters", 20),
+        ];
+        let base = || {
+            vec![
+                f32e("blk.0.attn_q_a.weight", vec![qlora, dim]),
+                f32e("blk.0.attn_q_a_norm.weight", vec![qlora]),
+                f32e("blk.0.attn_q_b.weight", vec![nh * hd, qlora]),
+                f32e("blk.0.attn_kv.weight", vec![hd, dim]),
+                f32e("blk.0.attn_kv_norm.weight", vec![hd]),
+                f32e("blk.0.attn_sink", vec![nh]),
+                f32e("blk.0.attn_o_a.weight", vec![og * olora, nh * hd / og]),
+                f32e("blk.0.attn_o_b.weight", vec![dim, og * olora]),
+                f32e("blk.0.attn_norm.weight", vec![dim]),
+                f32e("blk.0.ffn_norm.weight", vec![dim]),
+                f32e("blk.0.ffn_gate_inp.weight", vec![er, dim]),
+                f32e("blk.0.ffn_gate_inp.bias", vec![er]),
+                f32e("blk.0.ffn_gate_shexp.weight", vec![inter, dim]),
+                f32e("blk.0.ffn_up_shexp.weight", vec![inter, dim]),
+                f32e("blk.0.ffn_down_shexp.weight", vec![dim, inter]),
+                f32e("blk.0.hc_attn_fn.weight", vec![mix, hc * dim]),
+                f32e("blk.0.hc_attn_scale", vec![3]),
+                f32e("blk.0.hc_attn_base", vec![mix]),
+                f32e("blk.0.hc_ffn_fn.weight", vec![mix, hc * dim]),
+                f32e("blk.0.hc_ffn_scale", vec![3]),
+                f32e("blk.0.hc_ffn_base", vec![mix]),
+                f32e("token_embd.weight", vec![1, dim]),
+            ]
+        };
+        // One expert's projection, the same values in both files.
+        let values = |stack: usize, e: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 7 + e * 131 + stack * 17) as f32 * 0.37).sin() * 0.05)
+                .collect()
+        };
+        let quant = |dtype: GgmlDType, v: &[f32]| {
+            crate::tensor::quant_cpu::from_float_bytes(dtype, v).unwrap()
+        };
+        let stacks = [
+            ("ffn_gate_exps", [inter, dim]),
+            ("ffn_up_exps", [inter, dim]),
+            ("ffn_down_exps", [dim, inter]),
+        ];
+        let mut units = base();
+        let mut stacked = base();
+        for (s, (name, [r, c])) in stacks.iter().enumerate() {
+            let mut all = Vec::new();
+            for e in 0..er {
+                let v = values(s, e, r * c);
+                units.push(GgufEntry {
+                    name: format!("blk.0.{name}.{e}"),
+                    dims: vec![*r, *c],
+                    dtype: GgmlDType::Q8_0,
+                    data: quant(GgmlDType::Q8_0, &v),
+                });
+                all.extend(v);
+            }
+            stacked.push(GgufEntry {
+                name: format!("blk.0.{name}.weight"),
+                dims: vec![er, *r, *c],
+                dtype: GgmlDType::Q4K,
+                data: quant(GgmlDType::Q4K, &all),
+            });
+        }
+        let open = |tag: &str, entries: &[GgufEntry]| {
+            let path = std::env::temp_dir().join(format!(
+                "loken-dsv41-variant-{tag}-{}.gguf",
+                std::process::id()
+            ));
+            write_gguf_with_metadata(&path, &md, entries).unwrap();
+            let g = open_mapped(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            g
+        };
+        let (ga, gb) = (open("a", &units), open("b", &stacked));
+        crate::inference::load::variant_files::check_variant(&ga, &gb, &|_| false).unwrap();
+
+        let mut cfg = DeepseekV41Config::from_gguf(&ga.content).unwrap();
+        cfg.rope_head_dim = rd;
+        cfg.q_lora_rank = qlora;
+        cfg.o_lora_rank = olora;
+        cfg.o_groups = og;
+        cfg.window_size = 32;
+        cfg.rms_eps = 1e-20;
+
+        let s = 16usize;
+        let run = |block: &Block| -> Vec<f32> {
+            let x = Tensor::from_vec(
+                (0..s * hc * dim)
+                    .map(|i| (i as f32 * 0.01).sin() * 0.1)
+                    .collect(),
+                (1, s, hc, dim),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let pre_mix: Vec<Vec<f32>> = (0..s).map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect();
+            let cos = Tensor::from_vec(vec![1f32; s * rd / 2], (s, rd / 2), &Device::Cpu).unwrap();
+            let sin = Tensor::from_vec(vec![0f32; s * rd / 2], (s, rd / 2), &Device::Cpu).unwrap();
+            let mut shared = SharedAttn::default();
+            let (out, _) = block
+                .forward_prefill(&x, &pre_mix, &cos, &sin, &mut shared)
+                .unwrap();
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        // Each expert alone, over a few rows.
+        let rows = Tensor::from_vec(
+            (0..4 * dim).map(|i| (i as f32 * 0.03).cos()).collect(),
+            (4, dim),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let experts = |block: &Block| -> Vec<Vec<f32>> {
+            (0..er)
+                .map(|e| {
+                    let x = block.moe.experts.get(e).unwrap();
+                    let y = x.forward(&rows, 10.0).unwrap();
+                    y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                })
+                .collect()
+        };
+        let (block_a, block_b) = (
+            load_ratio0_block(&ga, 0, &cfg).unwrap(),
+            load_ratio0_block(&gb, 0, &cfg).unwrap(),
+        );
+        let (alone_a, alone_b) = (run(&block_a), run(&block_b));
+        let (experts_a, experts_b) = (experts(&block_a), experts(&block_b));
+        assert_ne!(
+            experts_a, experts_b,
+            "the two formats compute the same experts"
+        );
+
+        let pair = VariantSource {
+            primary: &ga,
+            variants: std::slice::from_ref(&gb),
+        };
+        let block = load_ratio0_block(&pair, 0, &cfg).unwrap();
+        assert_eq!(block.moe.experts.variants(), 2);
+        assert_eq!(
+            experts(&block),
+            experts_a,
+            "every expert from the first file"
+        );
+        assert_eq!(run(&block), alone_a);
+        for e in 0..er {
+            assert!(block.moe.experts.choose_variant(e, 1));
+        }
+        assert_eq!(
+            experts(&block),
+            experts_b,
+            "every expert from the second file"
+        );
+        assert_eq!(run(&block), alone_b);
+    }
+
     /// A self-sourcing band block (ratio 2, kv + index source) loads its compressor and indexer by
     /// the name contract and runs to a finite hc-copy stream.
     #[test]

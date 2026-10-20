@@ -314,6 +314,10 @@ impl LlmEngine {
                                                // the spawn_blocking closure so the CLIP loader can pick it up
                                                // after the LM has loaded as GenericHetero.
         let projector_blob = self.find_projector_blob_for_model(&model_id_clone);
+        // Further files of the checkpoint the manifest names, each holding the routed experts
+        // in another format.
+        let variant_blobs = self.find_variant_blobs_for_model(&model_id_clone);
+        let expert_variants = self.config.expert_variants;
         let generation_defaults = self.generation_defaults_for(&model_id_clone, &model_file);
         // A speech tower that names its text model: the weights and the tokenizer are the text
         // model's; the tower is read from the checkpoint the request named (`projector_blob`).
@@ -833,8 +837,59 @@ impl LlmEngine {
                             cfg.hot_experts = prior;
                         }
                     }
-                    let model = DeepseekV41Model::load(&source, &cfg)
-                        .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
+                    // The further files of the checkpoint, each checked to be of it before any
+                    // expert is read from it.
+                    let variants = variant_blobs
+                        .iter()
+                        .map(|p| {
+                            let t = std::time::Instant::now();
+                            let v = crate::tensor::quantized::gguf_source::SplitGguf::open(p)
+                                .map_err(|e| anyhow!("{}: {e}", p.display()))?;
+                            crate::inference::load::variant_files::check_variant(
+                                &source,
+                                &v,
+                                &|name| name.contains("engram_embd"),
+                            )
+                            .map_err(|e| anyhow!("{} cannot serve {model_id_clone}: {e}", p.display()))?;
+                            info!(
+                                "expert variant {} checked against the model's file in {:.1}s",
+                                p.display(),
+                                t.elapsed().as_secs_f32()
+                            );
+                            Ok(v)
+                        })
+                        .collect::<AnyResult<Vec<_>>>()?;
+                    let model = if variants.is_empty() {
+                        DeepseekV41Model::load(&source, &cfg)
+                    } else {
+                        DeepseekV41Model::load(
+                            &crate::inference::model::deepseek_v41::source::VariantSource {
+                                primary: &source,
+                                variants: &variants,
+                            },
+                            &cfg,
+                        )
+                    }
+                    .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
+                    if !variants.is_empty() {
+                        // The routing heat: the model's own profile first, then the file's prior.
+                        let ranks = expert_profile.as_deref().and_then(|path| {
+                            use crate::inference::generic_transformer::expert_profile::ExpertProfile;
+                            let profile =
+                                ExpertProfile::read_if_present(std::path::Path::new(path)).ok()??;
+                            crate::inference::place::expert_variants::ranks_from_counts(
+                                &profile.counts,
+                                profile.layers,
+                                profile.experts,
+                                &cfg.hot_experts,
+                            )
+                            .filter(|_| {
+                                profile.layers == cfg.n_layers
+                                    && profile.experts == cfg.n_routed_experts
+                            })
+                        });
+                        model.set_variant_policy(expert_variants, ranks);
+                    }
                     if quality != QualityLevel::Exact {
                         let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
                         let name = model_file
