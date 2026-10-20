@@ -331,8 +331,6 @@ impl DeviceManager {
     /// Detect NVIDIA CUDA devices
     #[cfg(feature = "gpu")]
     fn detect_cuda_devices(&mut self) -> Result<()> {
-        use crate::tensor::Device;
-
         // `--cpu`: skip CUDA enumeration entirely so only the CPU device is
         // registered and the placement plan keeps every layer on the CPU.
         if crate::gpu::force_cpu() {
@@ -340,10 +338,10 @@ impl DeviceManager {
             return Ok(());
         }
 
-        // Try to enumerate CUDA devices
-        for i in 0..8 {
-            // Check up to 8 devices
-            if let Ok(_device) = Device::new_cuda(i) {
+        // Counted without opening a context: a card listed here stays cold until a model
+        // is placed on it.
+        for i in 0..crate::inference::place::device_probe::card_count() {
+            {
                 // Get device properties via NVML if available
                 let (name, memory) = if crate::tensor::gpu_runtime::is_nvidia_ordinal(i) {
                     (
@@ -363,8 +361,6 @@ impl DeviceManager {
                     device.memory_gb()
                 );
                 self.devices.push(device);
-            } else {
-                break; // No more CUDA devices
             }
         }
 
