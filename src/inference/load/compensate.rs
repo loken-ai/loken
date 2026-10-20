@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn the_card_carries_the_error_as_the_cpu_does() {
         use crate::tensor::cuda::{card_factor, quantize_compensated_on_card, CudaDevice};
-        use crate::tensor::quant_cpu::{to_float_bytes, BlockQ2K};
+        use crate::tensor::quant_cpu::{to_float_bytes, BlockIq3Xxs, BlockQ2K, BlockQ3K};
         use crate::tensor::quantized::GgmlDType;
         let Ok(dev) = CudaDevice::new(0) else {
             eprintln!("no CUDA device; the card correction is NOT covered by this run");
@@ -441,16 +441,27 @@ mod tests {
             let factor = Factor::new(&cal, cols).unwrap();
             let on_card =
                 card_factor(&dev, &x, factor.solved(), (n, cols), factor.lambda()).unwrap();
-            for dtype in [GgmlDType::Iq2Xxs, GgmlDType::Q2K] {
+            for dtype in [
+                GgmlDType::Iq2Xxs,
+                GgmlDType::Iq3Xxs,
+                GgmlDType::Q2K,
+                GgmlDType::Q3K,
+            ] {
                 let decode = |bytes: &[u8]| {
                     let mut got = vec![0f32; rows * cols];
                     to_float_bytes(dtype, bytes, &mut got).unwrap();
                     got
                 };
-                let cpu: Vec<u8> = if dtype == GgmlDType::Q2K {
-                    let mut blocks = vec![BlockQ2K::zeros(); rows * cols / 256];
-                    quantize_compensated(&w, rows, cols, &cal, Some(&importance), &mut blocks)
+                fn on_host<T: BlockFormat>(
+                    w: &[f32],
+                    (rows, cols): (usize, usize),
+                    cal: &Calibration,
+                    importance: &[f32],
+                ) -> Vec<u8> {
+                    let mut blocks = vec![T::zeros(); rows * cols / 256];
+                    quantize_compensated(w, rows, cols, cal, Some(importance), &mut blocks)
                         .unwrap();
+                    // Safety: plain block data.
                     unsafe {
                         std::slice::from_raw_parts(
                             blocks.as_ptr() as *const u8,
@@ -458,17 +469,13 @@ mod tests {
                         )
                     }
                     .to_vec()
-                } else {
-                    let mut blocks = vec![BlockIq2Xxs::zeros(); rows * cols / 256];
-                    quantize_compensated(&w, rows, cols, &cal, Some(&importance), &mut blocks)
-                        .unwrap();
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            blocks.as_ptr() as *const u8,
-                            std::mem::size_of_val(&blocks[..]),
-                        )
-                    }
-                    .to_vec()
+                }
+                let shape = (rows, cols);
+                let cpu = match dtype {
+                    GgmlDType::Iq2Xxs => on_host::<BlockIq2Xxs>(&w, shape, &cal, &importance),
+                    GgmlDType::Iq3Xxs => on_host::<BlockIq3Xxs>(&w, shape, &cal, &importance),
+                    GgmlDType::Q2K => on_host::<BlockQ2K>(&w, shape, &cal, &importance),
+                    _ => on_host::<BlockQ3K>(&w, shape, &cal, &importance),
                 };
                 let card = quantize_compensated_on_card(
                     &dev,
@@ -481,8 +488,15 @@ mod tests {
                 )
                 .unwrap();
                 let (e_cpu, e_card) = (output_error(&decode(&cpu)), output_error(&decode(&card)));
+                eprintln!("{dtype:?}, {n} rows: card {e_card} against cpu {e_cpu}");
+                // The three-bit encoders on the card write the host's blocks.
+                let slack = if matches!(dtype, GgmlDType::Iq3Xxs | GgmlDType::Q3K) {
+                    1.001
+                } else {
+                    1.02
+                };
                 assert!(
-                    e_card <= e_cpu * 1.02 + 1e-6,
+                    e_card <= e_cpu * slack + 1e-6,
                     "{dtype:?}, {n} rows: card {e_card} against cpu {e_cpu}"
                 );
             }

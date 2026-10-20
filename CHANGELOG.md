@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Added
 
 - Convert: write IQ3_XXS weighted by each expert's importance.
+- Convert: encode IQ3_XXS and Q3_K on the card, error compensation included.
 - API: time each streamed token's parts in /api/stage_perf.
 - ROCm: run the grouped-query prefill attention on AMD matrix cores.
 - ROCm: run the DiT flash attention on AMD matrix cores.

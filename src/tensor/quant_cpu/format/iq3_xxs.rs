@@ -392,6 +392,29 @@ fn codebook() -> &'static Codebook {
     })
 }
 
+/// The encoder's codebook as one table, for a card that runs the same search: the point each
+/// pattern of four levels names or -1, an offset per pattern into the lists of near points and one
+/// past the last, each point's four levels, each point's four stored magnitudes, then the lists.
+pub fn iq3_xxs_codebook() -> Vec<i32> {
+    let book = codebook();
+    let mut out: Vec<i32> = book.index.iter().map(|&i| i as i32).collect();
+    let mut at = 0i32;
+    for near in &book.near {
+        out.push(at);
+        at += near.len() as i32;
+    }
+    out.push(at);
+    out.extend(book.levels.iter().flatten().map(|&l| l as i32));
+    out.extend(
+        IQ3XXS_GRID
+            .iter()
+            .flat_map(|g| g.to_le_bytes())
+            .map(|b| b as i32),
+    );
+    out.extend(book.near.iter().flatten().map(|&n| n as i32));
+    out
+}
+
 /// Quantise whole blocks, optionally against an importance matrix: one weight per column of a row
 /// `n_per_row` long.
 ///

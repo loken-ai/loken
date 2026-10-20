@@ -113,9 +113,9 @@ unsafe fn gemm(
     )
 }
 
-/// Quantise `w` (`rows` by `cols`, row-major) to `dtype` - iq2_xxs, or q2_K weighted by
-/// `importance` - carrying each block's error onto the columns after it through `factor`. `invert`
-/// takes a block's `X_B^T Y_B`, `BLOCK` by `BLOCK` row-major, and returns the inverse of that
+/// Quantise `w` (`rows` by `cols`, row-major) to `dtype` - iq2_xxs, iq3_xxs, q2_K or q3_K, each
+/// weighted by `importance` - carrying each block's error onto the columns after it through
+/// `factor`. `invert` takes a block's `X_B^T Y_B`, `BLOCK` by `BLOCK` row-major, and returns the inverse of that
 /// block's corner of the moment, or `None` when it is not positive, which leaves the block's error
 /// where it is. Returns the blocks as the file stores them, row by row.
 pub fn quantize_compensated_on_card(
@@ -127,9 +127,16 @@ pub fn quantize_compensated_on_card(
     factor: &CardFactor,
     invert: &dyn Fn(&[f32], f32) -> Option<Vec<f32>>,
 ) -> Result<Vec<u8>> {
-    let (kernel, block_bytes) = match dtype {
-        GgmlDType::Iq2Xxs => ("requant_iq2_xxs", 66usize),
-        GgmlDType::Q2K => ("requant_q2_k_guided", 84usize),
+    use crate::tensor::quant_cpu::{BlockIq2Xxs, BlockIq3Xxs, BlockQ2K, BlockQ3K};
+    let (kernel, block_bytes, threads) = match dtype {
+        GgmlDType::Iq2Xxs => ("requant_iq2_xxs", std::mem::size_of::<BlockIq2Xxs>(), 32u32),
+        GgmlDType::Iq3Xxs => (
+            "requant_iq3_xxs",
+            std::mem::size_of::<BlockIq3Xxs>(),
+            super::quant::IQ3_XXS_THREADS,
+        ),
+        GgmlDType::Q2K => ("requant_q2_k_guided", std::mem::size_of::<BlockQ2K>(), 32),
+        GgmlDType::Q3K => ("requant_q3_k_guided", std::mem::size_of::<BlockQ3K>(), 32),
         other => {
             return Err(Error(format!(
                 "{other:?} has no kernel that carries a correction"
@@ -179,6 +186,17 @@ pub fn quantize_compensated_on_card(
     } else {
         None
     };
+    let book = if dtype == GgmlDType::Iq3Xxs {
+        Some(
+            stream
+                .clone_htod(&crate::tensor::quant_cpu::iq3_xxs_codebook())
+                .map_err(|e| alloc_err("iq3_xxs codebook upload", e))?,
+        )
+    } else {
+        None
+    };
+    // The grid formats' kernels end on a flag that says the importance is there.
+    let flags_importance = grid.is_some() || book.is_some();
     let func = dev.quantized_fn(kernel)?;
     let blas = dev.blas()?;
     let handle = *blas.handle();
@@ -227,7 +245,7 @@ pub fn quantize_compensated_on_card(
             .map_err(|e| alloc_err("importance upload", e))?;
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
-            block_dim: (32, 1, 1),
+            block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
         let (block_step, value_step, nblocks, one, yes) =
@@ -240,12 +258,15 @@ pub fn quantize_compensated_on_card(
         if let Some(g) = &grid {
             launch.arg(g);
         }
+        if let Some(b) = &book {
+            launch.arg(b);
+        }
         launch.arg(&bytes);
         launch.arg(&got);
         launch.arg(&yes);
         launch.arg(&nblocks);
         launch.arg(&one);
-        if grid.is_some() {
+        if flags_importance {
             launch.arg(&yes);
         }
         unsafe { launch.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;

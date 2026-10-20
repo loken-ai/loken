@@ -523,14 +523,19 @@ fn quantize_on_device(
     recipe: Recipe,
     factor: Option<&Factor>,
 ) -> Result<Vec<u8>> {
-    use crate::tensor::cuda::{gpu_matmul_host, gpu_quantize_iq2_xxs, gpu_quantize_q2_k_guided};
+    use crate::tensor::cuda::{
+        gpu_matmul_host, gpu_quantize_iq2_xxs, gpu_quantize_iq3_xxs, gpu_quantize_q2_k_guided,
+        gpu_quantize_q3_k_guided,
+    };
     let product = |a: &[f32], b: &[f32], out: &mut [f32], dims: (usize, usize, usize)| {
         gpu_matmul_host(dev, a, b, out, dims)
     };
     let encode = |dtype: GgmlDType, v: &[f32], width: usize, imp: Option<&[f32]>| match (dtype, imp)
     {
         (GgmlDType::Iq2Xxs, _) => Some(gpu_quantize_iq2_xxs(dev, v, imp, width)),
+        (GgmlDType::Iq3Xxs, _) => Some(gpu_quantize_iq3_xxs(dev, v, imp, width)),
         (GgmlDType::Q2K, Some(imp)) => Some(gpu_quantize_q2_k_guided(dev, v, imp, width)),
+        (GgmlDType::Q3K, Some(imp)) => Some(gpu_quantize_q3_k_guided(dev, v, imp, width)),
         _ => None,
     };
     let kernels = Kernels {
@@ -795,7 +800,10 @@ pub fn convert(
                         .and_then(|f| f.as_ref().ok());
                     #[cfg(feature = "gpu")]
                     if let (Some(dev), Some(r), Some(f)) = (devices.get(device), record, factor) {
-                        if matches!(dtype, GgmlDType::Iq2Xxs | GgmlDType::Q2K) {
+                        if matches!(
+                            dtype,
+                            GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Q2K | GgmlDType::Q3K
+                        ) {
                             use crate::inference::load::compensate::block_inverse;
                             use crate::tensor::cuda::{card_factor, quantize_compensated_on_card};
                             let card = {

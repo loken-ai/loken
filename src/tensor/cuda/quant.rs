@@ -2457,6 +2457,126 @@ pub fn gpu_quantize_iq2_xxs(
         .map_err(|e| Error(format!("iq2_xxs download: {e}")))
 }
 
+/// q3_K quantise on the device weighted by `importance`, one weight per column of a row
+/// `n_per_row` values wide: the blocks the CPU encoder's guided path writes.
+pub fn gpu_quantize_q3_k_guided(
+    dev: &CudaDevice,
+    f32s: &[f32],
+    importance: &[f32],
+    n_per_row: usize,
+) -> Result<Vec<u8>> {
+    if !f32s.len().is_multiple_of(256)
+        || !n_per_row.is_multiple_of(256)
+        || importance.len() != n_per_row
+    {
+        return Err(Error(format!(
+            "q3_K guided quantize: {} values, {} weights, {n_per_row} per row",
+            f32s.len(),
+            importance.len()
+        )));
+    }
+    let nblocks = f32s.len() / 256;
+    let stream = dev.stream();
+    let x = stream
+        .clone_htod(f32s)
+        .map_err(|e| Error(format!("q3_K upload: {e}")))?;
+    let imp = stream
+        .clone_htod(importance)
+        .map_err(|e| Error(format!("q3_K importance upload: {e}")))?;
+    let out = with_oom_retry(dev, "requant_q3_k_guided", || unsafe {
+        stream.alloc::<u8>(nblocks * std::mem::size_of::<crate::tensor::quant_cpu::BlockQ3K>())
+    })?;
+    let func = dev.quantized_fn("requant_q3_k_guided")?;
+    let cfg = LaunchConfig {
+        grid_dim: (nblocks as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (n_i, per_row) = (nblocks as i32, (n_per_row / 256) as i32);
+    let (block_step, value_step, no) = (256i64, 1i64, 0i32);
+    let unused = with_oom_retry(dev, "requant_q3_k_guided", || unsafe {
+        stream.alloc::<f32>(1)
+    })?;
+    let mut b = stream.launch_builder(&func);
+    b.arg(&x);
+    b.arg(&block_step);
+    b.arg(&value_step);
+    b.arg(&imp);
+    b.arg(&out);
+    b.arg(&unused);
+    b.arg(&no);
+    b.arg(&n_i);
+    b.arg(&per_row);
+    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("requant_q3_k_guided launch: {e}")))?;
+    stream
+        .clone_dtoh(&out)
+        .map_err(|e| Error(format!("q3_K download: {e}")))
+}
+
+/// Threads `requant_iq3_xxs` runs per block: one per sub-block and scale tried.
+pub(crate) const IQ3_XXS_THREADS: u32 = 256;
+
+/// IQ3_XXS quantise on the device, optionally weighted: `importance` holds one weight per column of
+/// a row `n_per_row` values wide, the layout the CPU encoder takes, and the blocks are the ones it
+/// writes. The encoder's codebook is uploaded with the values.
+pub fn gpu_quantize_iq3_xxs(
+    dev: &CudaDevice,
+    f32s: &[f32],
+    importance: Option<&[f32]>,
+    n_per_row: usize,
+) -> Result<Vec<u8>> {
+    if !f32s.len().is_multiple_of(256)
+        || !n_per_row.is_multiple_of(256)
+        || importance.is_some_and(|w| w.len() != n_per_row)
+    {
+        return Err(Error(format!(
+            "iq3_xxs quantize: {} values, {n_per_row} per row",
+            f32s.len()
+        )));
+    }
+    let nblocks = f32s.len() / 256;
+    let stream = dev.stream();
+    let x = stream
+        .clone_htod(f32s)
+        .map_err(|e| Error(format!("iq3_xxs upload: {e}")))?;
+    let has_imp = importance.is_some() as i32;
+    let imp_host: Vec<f32> = importance.map_or_else(|| vec![0.0; 256], |w| w.to_vec());
+    let imp = stream
+        .clone_htod(&imp_host)
+        .map_err(|e| Error(format!("iq3_xxs importance upload: {e}")))?;
+    let book = stream
+        .clone_htod(&crate::tensor::quant_cpu::iq3_xxs_codebook())
+        .map_err(|e| Error(format!("iq3_xxs codebook upload: {e}")))?;
+    let out = with_oom_retry(dev, "requant_iq3_xxs", || unsafe {
+        stream.alloc::<u8>(nblocks * std::mem::size_of::<crate::tensor::quant_cpu::BlockIq3Xxs>())
+    })?;
+    let func = dev.quantized_fn("requant_iq3_xxs")?;
+    let cfg = LaunchConfig {
+        grid_dim: (nblocks as u32, 1, 1),
+        block_dim: (IQ3_XXS_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (n_i, per_row, has) = (nblocks as i32, (n_per_row / 256) as i32, has_imp);
+    let (block_step, value_step, no) = (256i64, 1i64, 0i32);
+    let unused = with_oom_retry(dev, "requant_iq3_xxs", || unsafe { stream.alloc::<f32>(1) })?;
+    let mut b = stream.launch_builder(&func);
+    b.arg(&x);
+    b.arg(&block_step);
+    b.arg(&value_step);
+    b.arg(&imp);
+    b.arg(&book);
+    b.arg(&out);
+    b.arg(&unused);
+    b.arg(&no);
+    b.arg(&n_i);
+    b.arg(&per_row);
+    b.arg(&has);
+    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("requant_iq3_xxs launch: {e}")))?;
+    stream
+        .clone_dtoh(&out)
+        .map_err(|e| Error(format!("iq3_xxs download: {e}")))
+}
+
 /// `a` (`m` by `k`) times `b` (`k` by `n`), row-major host buffers, into `out` (`m` by `n`), through
 /// cuBLAS on `dev` at full precision.
 pub fn gpu_matmul_host(
@@ -3745,6 +3865,143 @@ mod requant_q2k_parity {
             e_gpu <= e_cpu * 1.01 + 1e-6,
             "guided q2_K: gpu {e_gpu} against cpu {e_cpu}"
         );
+    }
+}
+
+#[cfg(test)]
+mod three_bit_encoders {
+    use super::*;
+    use crate::tensor::quant_cpu::{BlockFormat, BlockIq3Xxs, BlockQ3K};
+    use crate::tensor::quantized::GgmlDType;
+
+    /// Rows with a spread, a heavy tail, sign runs, an empty block and a constant one.
+    fn rows(rows: usize, cols: usize) -> Vec<f32> {
+        let mut v = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            v ^= v << 13;
+            v ^= v >> 7;
+            v ^= v << 17;
+            (v >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                match r % 6 {
+                    0 if c < 256 => 0.0,
+                    1 if c < 256 => 0.013,
+                    2 => next() * 0.02 + if c % 97 == 0 { 0.4 } else { 0.0 },
+                    3 => next().abs() * 0.05,
+                    4 => next().powi(3) * 0.1,
+                    _ => next() * 0.03,
+                }
+            })
+            .collect()
+    }
+
+    fn importance(cols: usize) -> Vec<f32> {
+        (0..cols)
+            .map(|c| 0.05 + ((c * 37) % 97) as f32 / 40.0)
+            .collect()
+    }
+
+    fn bytes<T>(blocks: &[T]) -> Vec<u8> {
+        // Safety: plain block data.
+        unsafe {
+            std::slice::from_raw_parts(blocks.as_ptr() as *const u8, std::mem::size_of_val(blocks))
+        }
+        .to_vec()
+    }
+
+    /// The weighted error a quantisation leaves, relative to the weight's weighted size.
+    fn weighted(dtype: GgmlDType, b: &[u8], xs: &[f32], imp: &[f32]) -> f64 {
+        let mut got = vec![0f32; xs.len()];
+        crate::tensor::quant_cpu::to_float_bytes(dtype, b, &mut got).unwrap();
+        let (mut num, mut den) = (0f64, 0f64);
+        for (i, (g, t)) in got.iter().zip(xs).enumerate() {
+            let w = imp[i % imp.len()] as f64;
+            num += w * (*g as f64 - *t as f64).powi(2);
+            den += w * (*t as f64).powi(2);
+        }
+        (num / den).sqrt()
+    }
+
+    /// Blocks of `block` bytes that differ between `a` and `b`.
+    fn differing(a: &[u8], b: &[u8], block: usize) -> usize {
+        a.chunks(block)
+            .zip(b.chunks(block))
+            .filter(|(x, y)| x != y)
+            .count()
+    }
+
+    /// The card's IQ3_XXS encoder writes the host encoder's blocks, with an importance and without.
+    #[test]
+    fn card_iq3_xxs_writes_the_host_blocks() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card iq3_xxs encoder is NOT covered by this run");
+            return;
+        };
+        let (r, cols) = (48usize, 1024usize);
+        let xs = rows(r, cols);
+        let imp = importance(cols);
+        for guided in [true, false] {
+            let mut blocks = vec![BlockIq3Xxs::zeros(); xs.len() / 256];
+            if guided {
+                BlockIq3Xxs::quantize_guided(&xs, &mut blocks, &imp, cols);
+            } else {
+                BlockIq3Xxs::quantize(&xs, &mut blocks);
+            }
+            let host = bytes(&blocks);
+            let card = gpu_quantize_iq3_xxs(&dev, &xs, guided.then_some(&imp[..]), cols).unwrap();
+            let ones = vec![1f32; cols];
+            let w = if guided { &imp } else { &ones };
+            let (e_card, e_host) = (
+                weighted(GgmlDType::Iq3Xxs, &card, &xs, w),
+                weighted(GgmlDType::Iq3Xxs, &host, &xs, w),
+            );
+            let off = differing(&card, &host, std::mem::size_of::<BlockIq3Xxs>());
+            eprintln!(
+                "iq3_xxs guided {guided}: {off} of {} blocks differ, card {e_card} host {e_host}",
+                blocks.len()
+            );
+            assert!(
+                e_card <= e_host * 1.001,
+                "card {e_card} against host {e_host}"
+            );
+            assert_eq!(
+                off, 0,
+                "iq3_xxs guided {guided}: the card wrote other blocks"
+            );
+        }
+    }
+
+    /// The card's guided q3_K encoder writes the host encoder's blocks.
+    #[test]
+    fn card_q3_k_guided_writes_the_host_blocks() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card q3_K encoder is NOT covered by this run");
+            return;
+        };
+        let (r, cols) = (48usize, 1024usize);
+        let xs = rows(r, cols);
+        let imp = importance(cols);
+        let mut blocks = vec![BlockQ3K::zeros(); xs.len() / 256];
+        BlockQ3K::quantize_guided(&xs, &mut blocks, &imp, cols);
+        let host = bytes(&blocks);
+        let card = gpu_quantize_q3_k_guided(&dev, &xs, &imp, cols).unwrap();
+        let (e_card, e_host) = (
+            weighted(GgmlDType::Q3K, &card, &xs, &imp),
+            weighted(GgmlDType::Q3K, &host, &xs, &imp),
+        );
+        let off = differing(&card, &host, std::mem::size_of::<BlockQ3K>());
+        eprintln!(
+            "q3_K guided: {off} of {} blocks differ, card {e_card} host {e_host}",
+            blocks.len()
+        );
+        assert!(
+            e_card <= e_host * 1.001,
+            "card {e_card} against host {e_host}"
+        );
+        assert_eq!(off, 0, "q3_K guided: the card wrote other blocks");
     }
 }
 
