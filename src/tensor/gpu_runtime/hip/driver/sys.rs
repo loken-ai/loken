@@ -26,9 +26,7 @@ crate::tensor::gpu_runtime::hip::dynamic_api! {
         fn hipDevicePrimaryCtxGetState(d: c_int, flags: *mut c_uint, active: *mut c_int) -> c_int;
         fn hipCtxPushCurrent(ctx: CUcontext) -> c_int;
         fn hipCtxPopCurrent(ctx: *mut CUcontext) -> c_int;
-        fn hipCtxSynchronize() -> c_int;
         fn hipSetDevice(d: c_int) -> c_int;
-        fn hipSetDeviceFlags(flags: c_uint) -> c_int;
         fn hipGetDevice(d: *mut c_int) -> c_int;
         fn hipDeviceSynchronize() -> c_int;
         fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
@@ -926,8 +924,10 @@ pub unsafe fn cuCtxPopCurrent_v2(ctx: *mut CUcontext) -> CUresult {
     unsafe { hip!(hipCtxPopCurrent(ctx)) }
 }
 
+/// Waits for the card of the current context: pushing a context makes its card current, and HIP
+/// answers `hipCtxSynchronize` with an error and no wait.
 pub unsafe fn cuCtxSynchronize() -> CUresult {
-    unsafe { hip!(hipCtxSynchronize()) }
+    unsafe { hip!(hipDeviceSynchronize()) }
 }
 
 pub unsafe fn cuMemHostAlloc(p: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult {

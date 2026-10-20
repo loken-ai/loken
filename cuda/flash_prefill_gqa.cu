@@ -320,6 +320,8 @@ int launch(const float* Q, const half* K, const half* V, float* O, int n_head, i
     const int G = n_head / n_kv;
     dim3 grid((seq_q * G + BM - 1) / BM, n_kv, 1);
     const float log2e = 1.4426950408889634f;
+    // The check below reads this launch's error, not one an earlier call left on the thread.
+    (void) cudaGetLastError();
     kern<<<grid, NW * 32, smem, stream>>>(Q, K, V, O, n_head, n_kv, seq_q, seq_kv, tok_stride,
                                           head_stride, scale * log2e, window, pos_off, ML);
     return cudaGetLastError() == cudaSuccess ? 0 : 4;

@@ -335,6 +335,8 @@ extern "C" int loken_marlin_awq_f16_gemm(const void* A, const void* B, const voi
     const _Float16* sc = static_cast<const _Float16*>(scales);
     const uint32_t* z = static_cast<const uint32_t*>(zp);
     _Float16* c = static_cast<_Float16*>(C);
+    // The check below reads this launch's error, not one an earlier call left on the thread.
+    (void) hipGetLastError();
     if (mt == 1) {
         w4a16_gemm<1><<<grid, block_threads(1), 0, s>>>(a, b, sc, z, c, c_tmp, locks, prob_m,
                                                          prob_n, prob_k, slices);

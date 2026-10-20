@@ -182,6 +182,8 @@ extern "C" int loken_marlin_awq_f16_gemm(const void* A, const void* B, const voi
         if (!shape) return -3;
         if (!grant_shared_memory(shape->fn, max_shared_mem)) return -5;
 
+        // The check below reads this launch's error, not one an earlier call left on the thread.
+        (void) cudaGetLastError();
         shape->fn<<<sms, shape->threads, max_shared_mem, cu_stream>>>(
             A_ptr, B_ptr, C_ptr, C_tmp_ptr, s_ptr, zp_ptr, prob_m_split, prob_n, prob_k, lda,
             locks, max_shared_mem);
