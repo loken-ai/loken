@@ -114,6 +114,37 @@ fn expert_gate(e: &Expert) -> Option<(ExpertFormat, std::borrow::Cow<'_, [u8]>)>
     Some((format, quant_blocks_any(&e.w1).ok()?))
 }
 
+/// The positions of `es` grouped by the format the exact kernels read them in, in the order the
+/// formats first appear; an expert in no such format is in no group.
+fn format_groups(es: &[&Expert]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(ExpertFormat, Vec<usize>)> = Vec::new();
+    for (i, e) in es.iter().enumerate() {
+        let Some(f) = expert_format(e) else { continue };
+        match groups.iter_mut().find(|(g, _)| *g == f) {
+            Some((_, ids)) => ids.push(i),
+            None => groups.push((f, vec![i])),
+        }
+    }
+    groups.into_iter().map(|(_, ids)| ids).collect()
+}
+
+/// `one` run over each format's experts of `es`, one grouped launch per format, the answers put
+/// back in the order of `es`; an expert in no format the kernels read gets `None`.
+fn per_format<T>(es: &[&Expert], one: impl Fn(&[&Expert]) -> Vec<Option<T>>) -> Vec<Option<T>> {
+    let groups = format_groups(es);
+    if groups.len() <= 1 {
+        return one(es);
+    }
+    let mut out: Vec<Option<T>> = (0..es.len()).map(|_| None).collect();
+    for ids in groups {
+        let part: Vec<&Expert> = ids.iter().map(|&i| es[i]).collect();
+        for (&i, r) in ids.iter().zip(one(&part)) {
+            out[i] = r;
+        }
+    }
+    out
+}
+
 /// One card stream and what it keeps.
 pub struct Card {
     dev: Arc<CudaDevice>,
@@ -643,6 +674,19 @@ impl Card {
         limit: f32,
         timings: &[AtomicU64; 3],
     ) -> Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> {
+        per_format(es, |part| {
+            self.expert_rows_one_format(part, xs, limit, timings)
+        })
+    }
+
+    /// `expert_rows` over experts of one format: those of another format get `None`.
+    fn expert_rows_one_format(
+        &self,
+        es: &[&Expert],
+        xs: &[f32],
+        limit: f32,
+        timings: &[AtomicU64; 3],
+    ) -> Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> {
         let mut out: Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> =
             (0..es.len()).map(|_| None).collect();
         let Some(&first) = es.first() else {
@@ -710,6 +754,30 @@ impl Card {
     /// resident here gets `None` and the caller runs it on the host. Nothing is uploaded: a verify
     /// uses only what a decode already warmed, so it never churns the set.
     fn expert_rows_multi(
+        &self,
+        insts: &[&Expert],
+        xrows: &[&[f32]],
+        limit: f32,
+        timings: &[AtomicU64; 3],
+    ) -> Vec<Option<Result<Vec<f32>>>> {
+        let groups = format_groups(insts);
+        if groups.len() <= 1 {
+            return self.expert_rows_multi_one_format(insts, xrows, limit, timings);
+        }
+        let mut out: Vec<Option<Result<Vec<f32>>>> = (0..insts.len()).map(|_| None).collect();
+        for ids in groups {
+            let part: Vec<&Expert> = ids.iter().map(|&i| insts[i]).collect();
+            let rows: Vec<&[f32]> = ids.iter().map(|&i| xrows[i]).collect();
+            let ran = self.expert_rows_multi_one_format(&part, &rows, limit, timings);
+            for (&i, r) in ids.iter().zip(ran) {
+                out[i] = r;
+            }
+        }
+        out
+    }
+
+    /// `expert_rows_multi` over instances of one format: those of another format get `None`.
+    fn expert_rows_multi_one_format(
         &self,
         insts: &[&Expert],
         xrows: &[&[f32]],

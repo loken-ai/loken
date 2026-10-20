@@ -57,6 +57,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Offload: run card experts of two formats as two batches in one block.
 - ROCm: build the matrix kernels for every AMD target, with a fallback on RDNA2.
 - ROCm: answer the first prompt a model reads after it loads on an AMD card.
 - ROCm: keep two models decoding on one AMD card from hanging.
