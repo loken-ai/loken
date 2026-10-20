@@ -232,6 +232,9 @@ pub struct InferenceConfig {
     /// nodes run the rest of; `None` loads the whole stack. Set by the cluster when it places a
     /// segment here, never read from the configuration.
     pub layer_share: Option<(usize, usize)>,
+    /// The Vulkan devices placement may give layers to, by index or by a part of their name;
+    /// empty offers those no other runtime of the build drives.
+    pub vulkan_devices: Vec<String>,
 }
 
 /// KV-cache storage mode for per-layer caches.
@@ -295,6 +298,7 @@ impl Default for InferenceConfig {
             force_cuda_only_layers: false,
             kv_quant: KvQuant::Off,
             layer_share: None,
+            vulkan_devices: Vec::new(),
         }
     }
 }

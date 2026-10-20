@@ -55,11 +55,13 @@ pub fn host_spill_budget_bytes() -> u64 {
 // Heterogeneous Device Planning (CUDA + wgpu + CPU)
 // ============================================================================
 
-/// Device kind for layer assignment (CUDA, OpenCL, or CPU)
+/// Device kind for layer assignment (CUDA, OpenCL, Vulkan or CPU)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     Cuda(usize),   // CUDA device index
     OpenCL(usize), // OpenCL device index
+    /// A Vulkan device, by its place among the GPUs the Vulkan loader lists.
+    Vulkan(usize),
     Cpu,
 }
 
@@ -68,6 +70,7 @@ impl std::fmt::Display for DeviceKind {
         match self {
             Self::Cuda(idx) => write!(f, "CUDA({})", idx),
             Self::OpenCL(idx) => write!(f, "opencl({})", idx),
+            Self::Vulkan(idx) => write!(f, "vulkan({})", idx),
             Self::Cpu => write!(f, "CPU"),
         }
     }
@@ -558,7 +561,7 @@ impl HeteroPlan {
         // simply receives fewer/no layers from the budget fill below.
         devices.sort_by_key(|(k, _, _)| match k {
             DeviceKind::Cuda(_) => 0,
-            DeviceKind::OpenCL(_) => 1,
+            DeviceKind::OpenCL(_) | DeviceKind::Vulkan(_) => 1,
             DeviceKind::Cpu => 2,
         });
 

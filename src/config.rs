@@ -112,6 +112,10 @@ pub struct InferenceConfigToml {
     pub replicas: usize,
     #[serde(default)]
     pub kv_disk_dir: Option<String>,
+    /// The Vulkan devices placement may give layers to, by index or by a part of their name.
+    /// Empty offers the ones no other runtime of the build drives.
+    #[serde(default)]
+    pub vulkan_devices: Vec<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
     /// The instance that reads this one's long prompts: it hands back their KV cache and this
@@ -406,6 +410,7 @@ impl Config {
             force_cuda_only_layers: false, // Not exposed in config.toml, use programmatically for testing
             kv_quant: crate::inference::engine::llm_engine::KvQuant::Off,
             layer_share: None,
+            vulkan_devices: toml_config.vulkan_devices.clone(),
         }
     }
 

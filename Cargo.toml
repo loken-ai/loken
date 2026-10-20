@@ -124,6 +124,9 @@ once_cell = "1.20"
 # GPU compute shaders for Intel Arc / AMD support (via OpenCL)
 # Opens the OpenCL loader at run time: a machine without one has no OpenCL device.
 opencl3 = { version = "0.12", optional = true }
+# Vulkan: the loader is opened at run time, the kernels are WGSL compiled to SPIR-V by naga.
+ash = { version = "0.38", optional = true }
+naga = { version = "30", optional = true, features = ["wgsl-in", "spv-out"] }
 # adjacent_loop_items: chat templates decide where a run of tool messages ends by
 # comparing loop.previtem and loop.nextitem. Without it those are undefined and the
 # render fails on the turn that carries a tool result, which is every agent turn.
@@ -161,6 +164,9 @@ metrics = []
 # Enable SYCL support (Intel Arc/Xe)
 # Enable OpenCL backend for Intel Arc / AMD GPU inference via OpenCL kernels
 opencl = ["dep:opencl3"]
+# Vulkan for the cards no other runtime drives, or the ones the configuration names: the dense
+# decoder layers a placement gives a Vulkan device run there.
+vulkan = ["dep:ash", "dep:naga"]
 # Pure CPU build - no GPU runtime deps. Useful for cloud CPU
 # instances and constrained environments. Build with:
 #   cargo build --release --no-default-features --features cpu

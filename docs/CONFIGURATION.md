@@ -75,6 +75,7 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | Key | Default | What it does |
 |---|---|---|
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
+| `vulkan_devices` | none | The Vulkan devices placement may give layers to, by index or by a part of their name. Empty offers those no other runtime of the build drives. Needs the `vulkan` feature. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
 
 ### Prompts read by another instance
@@ -287,5 +288,6 @@ model; the keys are:
 | `cuda`, `opencl` | on | The device backends. |
 | `rocm` | off | AMD cards through HIP: alone with `--no-default-features --features rocm,cpu`, or beside `cuda` with `--features cuda,rocm`, where one binary drives both vendors' cards. |
 | `image`, `audio`, `video`, `midi`, or `media` for all | on | The generative-media families and their routes. |
+| `vulkan` | off | Dense decoder layers on Vulkan GPUs, the ones no other runtime drives or those `vulkan_devices` names. |
 | `metrics` | off | `GET /metrics` in OpenMetrics, behind the same authentication as every other route. |
 | `cpu` | off | Language models on the host only. |

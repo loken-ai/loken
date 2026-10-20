@@ -29,6 +29,9 @@ impl GenericHeteroTransformer {
     /// what its own layers need, so a model whose layers read state kept outside them stays
     /// whole.
     pub fn segment_unsupported_reason(&self) -> Option<&'static str> {
+        if !self.vulkan.is_empty() {
+            return Some("its layers run through Vulkan");
+        }
         if self.ple_dim > 0 {
             return Some("its layers take per-layer inputs built from the tokens");
         }

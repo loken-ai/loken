@@ -4249,6 +4249,7 @@ impl GenericHeteroTransformer {
             layers,
             first_layer: share_start,
             layer_devs,
+            vulkan: Default::default(),
             output_norm,
             output_proj,
             output_bias,
@@ -4298,6 +4299,36 @@ impl GenericHeteroTransformer {
             ngram: ngram_model,
             draft,
         };
+        // The layers the plan gives a Vulkan device go there from the file's blocks.
+        if plan
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, DeviceKind::Vulkan(_)))
+        {
+            let read = |name: &str| -> crate::tensor::Result<
+                Option<(crate::tensor::quantized::GgmlDType, usize, usize, Vec<u8>)>,
+            > {
+                let Some(t) = source.read_opt(name, &Device::Cpu)? else {
+                    return Ok(None);
+                };
+                let (rows, cols) = t.shape().dims2()?;
+                let bytes = t.data()?.into_owned();
+                Ok(Some((t.dtype(), rows, cols, bytes)))
+            };
+            model.vulkan = super::vulkan_layers::VulkanLayers::build(
+                plan,
+                &model.config,
+                &model.layers,
+                share_start,
+                &read,
+                &cos_cpu,
+                &sin_cpu,
+                match (&model.output_norm, model.output_hyper.is_none()) {
+                    (super::config::WeightedNorm::Rms(n), true) => Some(n.weight()),
+                    _ => None,
+                },
+            )?;
+        }
 
         // A SiLU MoE layer on the host runs its experts through a repacked layout derived
         // from the stacks rather than stored with them. It is built on first use, which is
@@ -4452,6 +4483,15 @@ impl GenericHeteroTransformer {
         } else {
             "model.embed_tokens.weight"
         };
+        if plan
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, DeviceKind::Vulkan(_)))
+        {
+            return Err(crate::tensor::Error::msg(
+                "the Vulkan layers read GGUF files only".to_string(),
+            ));
+        }
         // Each layer on the device its plan segment names.
         let layer_card: Vec<Option<usize>> = plan
             .segments
@@ -4604,6 +4644,7 @@ impl GenericHeteroTransformer {
             layers,
             first_layer: 0,
             layer_devs,
+            vulkan: Default::default(),
             output_norm,
             output_proj,
             // The AWQ safetensors path does not read a logit bias today; the

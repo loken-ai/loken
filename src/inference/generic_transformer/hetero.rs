@@ -580,6 +580,9 @@ impl GenericHeteroTransformer {
     /// serving layer (to decide whether to route a model through ContinuousServer).
     pub fn cb_unsupported_reason(&self) -> Option<&'static str> {
         let c = &self.config;
+        if !self.vulkan.is_empty() {
+            return Some("layers run through Vulkan");
+        }
         if self.is_recurrent() {
             return Some("recurrent mixer");
         }
@@ -2044,6 +2047,7 @@ impl GenericHeteroTransformer {
         upto: usize,
     ) -> Result<(Tensor, bool)> {
         let mut on_cuda = !hidden.device().is_cpu();
+        self.vulkan.clear_logits();
 
         // -- Layer-by-layer with segment-based transfers -------------------
         let mut seg_start = from;
@@ -2054,9 +2058,21 @@ impl GenericHeteroTransformer {
                 None
             };
         while seg_start < upto {
+            // A Vulkan segment takes the rows on the host and gives them back there.
+            if let Some(end) = self.vulkan.end_of(seg_start) {
+                let end = end.min(upto);
+                hidden = self.vulkan.run(hidden, index_pos, seg_start, end)?;
+                current_cuda_idx = None;
+                on_cuda = false;
+                seg_start = end;
+                continue;
+            }
             let seg_dev = &self.layer_devs[seg_start];
             let mut seg_end = seg_start + 1;
-            while seg_end < upto && &self.layer_devs[seg_end] == seg_dev {
+            while seg_end < upto
+                && &self.layer_devs[seg_end] == seg_dev
+                && self.vulkan.end_of(seg_end).is_none()
+            {
                 seg_end += 1;
             }
 
@@ -2453,6 +2469,9 @@ impl GenericHeteroTransformer {
                 let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
                 normed_f16.matmul_t(proj)?
             }
+        } else if let Some(logits) = self.vulkan.take_logits().filter(|_| !all_positions) {
+            // The output head ran on the Vulkan device of the last layer.
+            logits
         } else {
             // Fallback: transfer to CPU, norm + matmul on CPU
             if on_cuda {

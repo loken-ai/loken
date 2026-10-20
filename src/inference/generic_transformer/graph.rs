@@ -1803,11 +1803,13 @@ impl GenericHeteroTransformer {
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
         // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
         // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
-        // A cache cut over cards has no snapshot form either: its prefix is read again.
+        // A cache cut over cards has no snapshot form either: its prefix is read again. Nor
+        // has the cache of a layer on a Vulkan device.
         self.layers
             .iter()
             .all(|l| l.cpu_q8_kv.is_none() && l.context.is_none())
             && !self.is_recurrent()
+            && self.vulkan.is_empty()
     }
 
     /// Whether some layer's cache is cut over several cards.

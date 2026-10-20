@@ -405,7 +405,7 @@ pub fn cards_for(owner: &str, reserve: u64) -> Vec<(usize, u64)> {
 
 /// The host-side accelerators, with the bytes each offers once `reserve` is kept free on
 /// it. Empty in a build without them.
-pub fn accelerators(reserve: u64) -> Vec<(usize, u64)> {
+pub fn accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
     #[cfg(feature = "opencl")]
     {
         crate::inference::kernel::opencl::enumerate_opencl_devices()
@@ -413,7 +413,7 @@ pub fn accelerators(reserve: u64) -> Vec<(usize, u64)> {
             .enumerate()
             .map(|(i, id)| {
                 let mem = crate::inference::kernel::opencl::get_opencl_device_memory(id);
-                (i, mem.saturating_sub(reserve))
+                (DeviceKind::OpenCL(i), mem.saturating_sub(reserve))
             })
             .filter(|(_, free)| *free > 0)
             .collect()
@@ -421,6 +421,28 @@ pub fn accelerators(reserve: u64) -> Vec<(usize, u64)> {
     #[cfg(not(feature = "opencl"))]
     {
         let _ = reserve;
+        Vec::new()
+    }
+}
+
+/// The Vulkan devices placement may use, with the bytes each offers once `reserve` is kept
+/// free on it: those `chosen` names, or with `chosen` empty, those no other runtime of the
+/// build drives. Empty in a build without Vulkan.
+pub fn vulkan_devices(chosen: &[String], reserve: u64) -> Vec<(DeviceKind, u64)> {
+    #[cfg(feature = "vulkan")]
+    {
+        crate::inference::kernel::vulkan::offered(chosen)
+            .into_iter()
+            .map(|d| {
+                let free = crate::inference::kernel::vulkan::free_bytes(d.index);
+                (DeviceKind::Vulkan(d.index), free.saturating_sub(reserve))
+            })
+            .filter(|(_, free)| *free > 0)
+            .collect()
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = (chosen, reserve);
         Vec::new()
     }
 }
@@ -490,7 +512,9 @@ pub fn open(kind: DeviceKind) -> anyhow::Result<Device> {
         DeviceKind::Cuda(idx) => crate::tensor::cuda_ext::new_device_with_stream(idx)
             .map(|d| d.native_device())
             .map_err(|e| anyhow::anyhow!("CUDA:{idx}: {e}")),
-        DeviceKind::OpenCL(_) => Err(anyhow::anyhow!("{kind} has no tensor device")),
+        DeviceKind::OpenCL(_) | DeviceKind::Vulkan(_) => {
+            Err(anyhow::anyhow!("{kind} has no tensor device"))
+        }
     }
 }
 
@@ -523,7 +547,7 @@ fn cards_used(plan: &HeteroPlan) -> usize {
 fn later_rungs(
     demand: &Demand,
     cards: &[(usize, u64)],
-    accelerators: &[(usize, u64)],
+    accelerators: &[(DeviceKind, u64)],
 ) -> Vec<(String, HeteroPlan)> {
     let mut rungs = Vec::new();
     if cards.len() > 1 {
@@ -568,12 +592,28 @@ fn later_rungs(
         .collect()
 }
 
-/// `plan` with the blocks it leaves on the host offered to `accelerators` first.
-fn beside_host(plan: HeteroPlan, demand: &Demand, accelerators: &[(usize, u64)]) -> HeteroPlan {
+/// `plan` with the blocks it leaves on the host offered to `accelerators` first, each block
+/// costing its weights and its cache there.
+fn beside_host(
+    plan: HeteroPlan,
+    demand: &Demand,
+    accelerators: &[(DeviceKind, u64)],
+) -> HeteroPlan {
     if accelerators.is_empty() || demand.layers == 0 {
         return plan;
     }
     let per_block = demand.block_bytes / demand.layers as u64;
+    // The planner fills accelerators by their place in this list; each place is mapped back
+    // to the device it stands for.
+    let listed: Vec<(usize, u64)> = accelerators
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, free))| (i, free))
+        .collect();
+    let kind_of = |k: DeviceKind| match k {
+        DeviceKind::OpenCL(i) => accelerators.get(i).map_or(k, |a| a.0),
+        other => other,
+    };
     let mut segments = Vec::with_capacity(plan.segments.len());
     for seg in plan.segments {
         if !matches!(seg.kind, DeviceKind::Cpu) {
@@ -581,14 +621,16 @@ fn beside_host(plan: HeteroPlan, demand: &Demand, accelerators: &[(usize, u64)])
             continue;
         }
         let blocks = seg.num_layers();
-        let host = HeteroPlan::calculate(
+        let host = HeteroPlan::calculate_with_kv(
             blocks,
             per_block.saturating_mul(blocks as u64),
             &[],
-            accelerators,
+            &listed,
             1.0,
+            demand.kv_bytes_per_layer,
         );
         segments.extend(host.segments.into_iter().map(|s| HeteroSegment {
+            kind: kind_of(s.kind),
             layer_start: s.layer_start + seg.layer_start,
             layer_end: s.layer_end + seg.layer_start,
             ..s
@@ -629,7 +671,7 @@ pub fn load_planned<T, E: std::fmt::Display>(
     first_plan: HeteroPlan,
     demand: &Demand,
     cards: &[(usize, u64)],
-    accelerators: &[(usize, u64)],
+    accelerators: &[(DeviceKind, u64)],
     cancelled: impl Fn() -> bool,
     mut build: impl FnMut(&HeteroPlan) -> Result<T, E>,
 ) -> Result<T, E> {
@@ -1289,13 +1331,50 @@ mod tests {
     #[test]
     fn host_blocks_go_to_an_accelerator_first() {
         let d = demand(10, 10);
-        let plan = beside_host(HeteroPlan::forced_gpu(10, 4, 0), &d, &[(0, 100 * GB)]);
+        let plan = beside_host(
+            HeteroPlan::forced_gpu(10, 4, 0),
+            &d,
+            &[(DeviceKind::OpenCL(0), 100 * GB)],
+        );
         assert_eq!(
             kinds(&plan),
             vec!["CUDA(0)".to_string(), "opencl(0)".to_string()]
         );
         assert_eq!(plan.segments[1].layer_start, 4);
         assert_eq!(plan.segments[1].layer_end, 10);
+    }
+
+    #[test]
+    fn host_blocks_go_to_the_vulkan_device_that_holds_them() {
+        let d = Demand {
+            kv_bytes_per_layer: GB / 2,
+            ..demand(10, 10)
+        };
+        // Each block costs 1.5 GB there: the first device holds 2 of the 6, the second the rest.
+        let plan = beside_host(
+            HeteroPlan::forced_gpu(10, 4, 0),
+            &d,
+            &[
+                (DeviceKind::Vulkan(2), 3 * GB),
+                (DeviceKind::Vulkan(0), 100 * GB),
+            ],
+        );
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                "CUDA(0)".to_string(),
+                "vulkan(2)".to_string(),
+                "vulkan(0)".to_string()
+            ]
+        );
+        assert_eq!(
+            (plan.segments[1].layer_start, plan.segments[1].layer_end),
+            (4, 6)
+        );
+        assert_eq!(
+            (plan.segments[2].layer_start, plan.segments[2].layer_end),
+            (6, 10)
+        );
     }
 
     #[test]

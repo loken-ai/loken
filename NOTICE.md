@@ -12,6 +12,8 @@ any crate dependency is the one shipped in its own source tree (resolved in `Car
 | Component | Upstream | License |
 |-----------|----------|---------|
 | `cudarc` | [chelsea0x3b/cudarc](https://github.com/chelsea0x3b/cudarc) | MIT OR Apache-2.0 |
+| `ash` | [ash-rs/ash](https://github.com/ash-rs/ash) | MIT OR Apache-2.0 |
+| `naga` | [gfx-rs/wgpu](https://github.com/gfx-rs/wgpu) | MIT OR Apache-2.0 |
 
 ## Redistributed binaries
 

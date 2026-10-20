@@ -300,6 +300,7 @@ impl LlmEngine {
         // `--cpu` serve flag forces the same all-CPU placement as the
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
+        let vulkan_devices = self.config.vulkan_devices.clone();
         let kv_quant = self.config.kv_quant;
         let expert_profile = self.config.expert_profile.clone();
         let layer_share = self.config.layer_share;
@@ -1255,12 +1256,22 @@ impl LlmEngine {
                             // capture.
                             let mut handles: std::collections::HashMap<usize, Device> =
                                 std::collections::HashMap::new();
+                            // The Vulkan devices take the layers a rung leaves on the host
+                            // before the host does.
+                            let vulkan = if crate::gpu::force_cpu() {
+                                Vec::new()
+                            } else {
+                                crate::inference::place::ladder::vulkan_devices(
+                                    &vulkan_devices,
+                                    runtime_reserve_bytes,
+                                )
+                            };
                             let model = crate::inference::place::ladder::load_planned(
                                 &arch,
                                 first_plan.clone(),
                                 &demand,
                                 &cuda_devices,
-                                &[],
+                                &vulkan,
                                 || false,
                                 |plan| {
                                     for idx in crate::inference::place::ladder::cards_of(plan) {
@@ -1279,7 +1290,12 @@ impl LlmEngine {
                                             .filter_map(|idx| handles.get(&idx).map(|d| (idx, d.clone())))
                                             .collect();
                                     // The host keeps an unquantised cache sized by the model.
-                                    let host_only = on_plan.is_empty();
+                                    use crate::inference::place::layer_executor::DeviceKind;
+                                    let on_vulkan = plan
+                                        .segments
+                                        .iter()
+                                        .any(|s| matches!(s.kind, DeviceKind::Vulkan(_)));
+                                    let host_only = on_plan.is_empty() && !on_vulkan;
                                     let (kv, ctx) = if host_only {
                                         (KvQuant::Off, None)
                                     } else {

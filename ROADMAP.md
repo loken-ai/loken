@@ -38,7 +38,7 @@ Major, by priority:
 | Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Planned |
 | Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
 | Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
-| Mistral Timestral forecasts | Models | The four Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Planned |
+| Mistral Timestral forecasts | Models | The four Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Done |
 
 Smaller, by priority:
 
@@ -74,30 +74,20 @@ Smaller, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
+| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Planned |
+| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
 | Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Planned |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Planned |
 | Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Planned |
-| Streamed speech | Audio | Speech starts playing before a tenth of its render time, in opus, flac, aac, wav or mp3. | Planned |
-| Audio from a chat turn | Audio | A chat completion can answer with text and audio. | Planned |
 | Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |
-| Streamed music | Music | Streamed music starts within a fifth of its render time. | Planned |
-| Several takes at once | Music | n music takes with different seeds take less than n times one take. | Planned |
-| Audio-conditioned sound | Audio | A reference clip guides Stable Audio and EzAudio, and a repaint leaves the rest of the clip intact. | Planned |
-| MIDI in | Music | A MIDI file given as the prompt continues in its tempo and key. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
-| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Planned |
-| Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker. | Planned |
-| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
-| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
-| Music editing | Music | The music route can repaint, extend, cover, add a track, split tracks and complete a song. | Planned |
-| ACE-Step adapters | Models | A style LoRA for ACE-Step changes the sound of a render. | Planned |
-| Tabular models | Models | loken predicts rows of a table and beats a simple baseline on a fixed data set. | Planned |
 
 ## 0.6.0
 
@@ -106,6 +96,7 @@ Major, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | A cluster that survives a node | Cluster | When a machine drops out mid-request, the others finish the request. | Planned |
+| Routing across loken nodes | Cluster | One model name sends each request to the loken node that serves it best by load, speed and energy, and to another node when one fails. | Planned |
 | A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an encrypted link. | Planned |
 | Tensor parallelism across machines | Cluster | A layer split across the cards of several machines runs faster than the layer cut alone. | Planned |
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
@@ -114,6 +105,7 @@ Smaller, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| Decision route | Models | A decision route takes a block of state and typed questions (choice, score, yes or no) and returns one calibrated probability per option in one pass, and several questions on one state cost one reading. Strands Decider 2B matches its reference on a fixed set, on the host and on a card. | Planned |
 | Adapters per request | Models | Several text adapters share one base model, and each request picks its own. | Planned |
 | Pooling and classification | API | The classify, score and pooling routes work on the loaded models. | Planned |
 | Encoder-decoder models | Models | An encoder-decoder family serves text and speech as the reference implementation does. | Planned |
@@ -130,12 +122,22 @@ Major, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | A native Windows server | Packaging | The server runs as a Windows service with CUDA, as fast as on Linux. | Planned |
+| Typed answers on the language route | API | A request with a schema always gets an answer that fits it, or an explicit error, never a malformed one. | Planned |
 | Quantisation from the command line | Quantisation | One command quantises a checkpoint, and its quality is scored against the original. | Planned |
 
 Smaller, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| Open decision models | Models | Clef 27B, Clef-flash 9B, Clef-omni 30B, Perplexity's Decider, Liquid's d1-3B and d1-omni-600M each match their reference on a fixed set on the decision route, and read the images, audio or video they were trained on. Closed ones (Jev, Microsoft, OpenAI, Liquid d1-ultra) are not served. | Planned |
+| System One extraction models | Models | Once its weights are published, Clairic returns numbers with an 80 % range, typed values and extracts with their positions in one pass, matching the reference on a fixed set. | Planned |
+| Streamed speech | Audio | Speech starts playing before a tenth of its render time, in opus, flac, aac, wav or mp3. | Planned |
+| Audio from a chat turn | Audio | A chat completion can answer with text and audio. | Planned |
+| Streamed music | Music | Streamed music starts within a fifth of its render time. | Planned |
+| Several takes at once | Music | n music takes with different seeds take less than n times one take. | Planned |
+| Audio-conditioned sound | Audio | A reference clip guides Stable Audio and EzAudio, and a repaint leaves the rest of the clip intact. | Planned |
+| MIDI in | Music | A MIDI file given as the prompt continues in its tempo and key. | Planned |
+| Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker. | Planned |
 | Web search and fetch tools | Tools | A request can turn on web search and fetch, and each call is logged. | Planned |
 | A build with vision input alone | Packaging | A smaller build reads images in chat without the generation pipelines. | Planned |
 
@@ -152,6 +154,9 @@ Smaller, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| Music editing | Music | The music route can repaint, extend, cover, add a track, split tracks and complete a song. | Planned |
+| ACE-Step adapters | Models | A style LoRA for ACE-Step changes the sound of a render. | Planned |
+| Tabular models | Models | loken predicts rows of a table and beats a simple baseline on a fixed data set. | Planned |
 | Energy-aware placement | Operations | On request, the placement saves watts at some cost in speed, both measured. | Planned |
 | Quotas per key | Operations | Each API key has a token and request budget that loken enforces. | Planned |
 

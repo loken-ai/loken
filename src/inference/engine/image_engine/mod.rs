@@ -56,6 +56,7 @@ fn spread_over_plan(plan: &HeteroPlan, resident_bytes: u64) -> Vec<ImageLayerDis
             let (device_type, device_id) = match seg.kind {
                 DeviceKind::Cuda(i) => ("CUDA".to_string(), i),
                 DeviceKind::OpenCL(i) => ("Arc".to_string(), i),
+                DeviceKind::Vulkan(i) => ("Vulkan".to_string(), i),
                 DeviceKind::Cpu => ("CPU".to_string(), 0),
             };
             ImageLayerDist {

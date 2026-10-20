@@ -42,3 +42,5 @@ pub mod fused;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 pub mod opencl_probe;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;

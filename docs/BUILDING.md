@@ -42,6 +42,18 @@ one vendor's stack and lists only that vendor's cards. A tensor-parallel group a
 decode step stay on cards of one vendor; a layer on an AMD card takes the kernels the ROCm build
 runs.
 
+## Vulkan cards
+
+```sh
+cargo build --release --features vulkan
+```
+
+The build needs nothing beyond the crates: the Vulkan loader is opened when the server starts, and
+the kernels are compiled for the device when it opens. Placement offers the Vulkan GPUs that no
+other runtime of the build drives, after the CUDA or HIP cards and before the host; the
+`vulkan_devices` setting names others. The layers of a dense decoder in Q4_K, Q6_K, Q8_0 or F16
+run there, with the output head when the last layer does; a model of another shape stays off them.
+
 ## Without CUDA
 
 ```sh

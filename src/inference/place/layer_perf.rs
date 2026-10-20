@@ -164,6 +164,9 @@ impl LayerPerformanceTracker {
                 crate::inference::place::layer_executor::DeviceKind::OpenCL(idx) => {
                     format!("Arc #{}", idx)
                 }
+                crate::inference::place::layer_executor::DeviceKind::Vulkan(idx) => {
+                    format!("Vulkan #{}", idx)
+                }
                 crate::inference::place::layer_executor::DeviceKind::Cpu => "CPU".to_string(),
             };
 

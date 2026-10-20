@@ -87,6 +87,9 @@ mod verify_decode_parity;
 #[cfg(test)]
 mod verify_rows_cpu_tests;
 mod verify_window;
+mod vulkan_layers;
+#[cfg(all(test, feature = "vulkan"))]
+mod vulkan_parity;
 mod wide;
 pub use config::*;
 pub use dense::DenseCheckpoint;
@@ -471,7 +474,10 @@ pub struct GenericHeteroTransformer {
     /// checkpoint as it was read.
     adapters: Vec<String>,
     layer_devs: Vec<LayerDevice>, // parallel to `layers`
-    output_norm: WeightedNorm,    // CPU or CUDA - RmsNorm or LayerNorm-with-bias
+    /// The layers the plan gives a Vulkan device, which run there instead of on their host
+    /// build.
+    vulkan: vulkan_layers::VulkanLayers,
+    output_norm: WeightedNorm, // CPU or CUDA - RmsNorm or LayerNorm-with-bias
     output_proj: crate::tensor::quantized::QMatMul, // CPU fallback
     /// Per-vocabulary bias added to the logits (`output.bias`). Present on the
     /// phi2/GPT-NeoX family, absent on most others. It shifts each vocabulary

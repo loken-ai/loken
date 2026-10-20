@@ -368,7 +368,7 @@ impl HeteroZImage {
                     let vb = vb_cpu.as_ref().unwrap_or(&vb_primary);
                     (vb, Device::Cpu, cpu_dtype)
                 }
-                DeviceKind::OpenCL(_) => {
+                DeviceKind::OpenCL(_) | DeviceKind::Vulkan(_) => {
                     // OpenCL fall-back path (no pipelines): use CPU.
                     let vb = vb_cpu.as_ref().unwrap_or(&vb_primary);
                     (vb, Device::Cpu, cpu_dtype)
