@@ -2731,6 +2731,10 @@ impl ModelBackend for GenericVisionBackend {
 }
 
 impl ModelBackend for DeepseekV41Backend {
+    fn prefix_covered(&self) -> usize {
+        self.restored
+    }
+
     /// The prompt in one pass: the prefill runs each layer once over all of it and bounds its own
     /// memory, and the state cache sees the whole prompt to restore and store against.
     fn forward_prefill_chunked(

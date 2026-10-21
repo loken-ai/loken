@@ -941,6 +941,9 @@ impl LlmEngine {
                             Ok(None) => {
                                 match state.model.forward_prefill_chunked(&x, session_start) {
                                     Ok(l) => {
+                                        // A prefill that began from a cached state read only the rest.
+                                        reused_prompt_tokens =
+                                            reused_prompt_tokens.max(state.model.prefix_covered());
                                         if let Err(e) =
                                             state.model.snapshot_prefix(&prompt_tokens, &l)
                                         {

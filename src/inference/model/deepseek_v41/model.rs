@@ -4889,6 +4889,10 @@ mod oracle_gate {
         assert_eq!(argmax(&warm_48), argmax(&cold_48));
         wait_for_len(&store2, 48);
         assert_eq!(second.last_restored(), 24);
+        assert_eq!(
+            crate::inference::engine::model_backend::ModelBackend::prefix_covered(&second),
+            24
+        );
 
         // The prompt seen whole comes back with the logits it was stored with, to the bit.
         let (mut third, _) = cached_backend(&dir);
