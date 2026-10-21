@@ -305,6 +305,7 @@ impl LlmEngine {
             // resident KV (mirrored under GLOBAL_PROMPT_CACHE_KEY, in-memory only).
             // Same proven trim_kv logic as generate_stream -> greedy-identical. Vision
             // requests fall back to a full reset.
+            state.exact_prefill = None;
             let cache_session_start: usize = {
                 let is_vision_req = (state.model.is_vision_model() && state.image_embeds.is_some())
                     || state.qwen35_image.is_some()
@@ -481,7 +482,6 @@ impl LlmEngine {
                 };
                 (vpl, lg, None)
             };
-            let prompt_eval_duration = prefill_start.elapsed().as_nanos() as u64;
             // Decode position must account for the vision prefix written into
             // KV alongside the text tokens (moondream: +image_patches), or the
             // qwen35 mRoPE next-position (image compresses positions).
@@ -491,6 +491,8 @@ impl LlmEngine {
                 Device::Cpu => logits,
                 _ => logits.to_device(&Device::Cpu)?,
             };
+            // The prefill ends when its logits are on the host: the card's queue is drained by then.
+            let prompt_eval_duration = prefill_start.elapsed().as_nanos() as u64;
             // Diagnostic: fingerprint prefill logits + KV cache state.
             // Goal: localize the cyclic-3 non-determinism to prefill vs. decode.
             // If iter 1's prefill-logits fingerprint matches iter 2's, prefill

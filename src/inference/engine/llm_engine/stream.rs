@@ -333,6 +333,9 @@ impl LlmEngine {
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
             let reused_prompt_tokens: usize;
+            // Whether the whole prompt came back from the cache: its tokens are still the
+            // prompt the client sent, so they stay in the count it is shown.
+            let repeated_prompt: bool;
             // What the decode takes of a card beyond the request's start: the snapshots
             // leave that much room at the next request.
             let decode_free_start: Option<u64>;
@@ -488,7 +491,21 @@ impl LlmEngine {
                 // model means we can only match against ONE other session's
                 // tokens (whichever the engine currently holds), but the
                 // sessions table tells us which.
-                let session_start: usize = if audio_split.is_some() {
+                let sessionless_text = audio_split.is_none()
+                    && !is_vision
+                    && qwen35_sentinel.is_none()
+                    && session_id.is_none();
+                let mut exact_logits = if sessionless_text {
+                    exact_repeat(state, &sessions, &prompt_tokens)
+                } else {
+                    state.exact_prefill = None;
+                    None
+                };
+                repeated_prompt = exact_logits.is_some();
+                let session_start: usize = if exact_logits.is_some() {
+                    // The prompt is the one the resident KV holds: nothing is left to prefill.
+                    prompt_tokens.len()
+                } else if audio_split.is_some() {
                     // The rows of a clip are in no token stream a prefix could match.
                     state.model.reset_kv_from(0);
                     0
@@ -743,7 +760,13 @@ impl LlmEngine {
                 } else {
                     session_start
                 };
-                let prefill_slice = &prompt_tokens[text_start..];
+                // A repeated prompt has nothing to prefill; the last token stands in for the
+                // input the forward pass would have taken.
+                let prefill_slice = &prompt_tokens[if exact_logits.is_some() {
+                    text_start - 1
+                } else {
+                    text_start
+                }..];
                 // A model that came with a draft head reads the hidden state of every forward from
                 // the prefill on: the head drafts from the state before the token it is given. A
                 // prompt that starts after a cached prefix would leave the head without it.
@@ -889,29 +912,38 @@ impl LlmEngine {
                     // trim_kv prefix path above cannot serve (rolling state can be
                     // advanced, never rewound). A hit skips the prefill entirely;
                     // trim-capable variants take the default miss and prefill.
-                    match state.model.try_restore_prefix(&prompt_tokens) {
-                        Ok(Some(l)) => l,
-                        Ok(None) => match state.model.forward_prefill_chunked(&x, session_start) {
-                            Ok(l) => {
-                                if let Err(e) = state.model.snapshot_prefix(&prompt_tokens, &l) {
-                                    // A snapshot failure costs only the next reuse.
-                                    debug!("prefix snapshot skipped: {e}");
+                    if let Some(l) = exact_logits.take() {
+                        l
+                    } else {
+                        match state.model.try_restore_prefix(&prompt_tokens) {
+                            Ok(Some(l)) => l,
+                            Ok(None) => {
+                                match state.model.forward_prefill_chunked(&x, session_start) {
+                                    Ok(l) => {
+                                        if let Err(e) =
+                                            state.model.snapshot_prefix(&prompt_tokens, &l)
+                                        {
+                                            // A snapshot failure costs only the next reuse.
+                                            debug!("prefix snapshot skipped: {e}");
+                                        }
+                                        l
+                                    }
+                                    Err(e) => {
+                                        let err_msg =
+                                            format!("STREAMING PREFILL: Forward failed: {}", e);
+                                        error!("{}", err_msg);
+                                        let _ = tx.blocking_send(Err(err_msg));
+                                        return;
+                                    }
                                 }
-                                l
                             }
                             Err(e) => {
-                                let err_msg = format!("STREAMING PREFILL: Forward failed: {}", e);
+                                let err_msg =
+                                    format!("STREAMING PREFILL: prefix restore failed: {}", e);
                                 error!("{}", err_msg);
                                 let _ = tx.blocking_send(Err(err_msg));
                                 return;
                             }
-                        },
-                        Err(e) => {
-                            let err_msg =
-                                format!("STREAMING PREFILL: prefix restore failed: {}", e);
-                            error!("{}", err_msg);
-                            let _ = tx.blocking_send(Err(err_msg));
-                            return;
                         }
                     }
                 };
@@ -951,6 +983,10 @@ impl LlmEngine {
                         }
                     },
                 };
+                // The prompt and the logits its prefill ended on stay for an identical prompt.
+                state.exact_prefill =
+                    (audio_split.is_none() && !is_vision && qwen35_next_pos.is_none())
+                        .then(|| (prompt_tokens.clone(), logits.clone()));
                 let squeezed = match logits.squeeze(0) {
                     Ok(s) => s,
                     Err(e) => {
@@ -3020,7 +3056,11 @@ impl LlmEngine {
                     eval_duration_ns: compute_ns,
                     prompt_eval_count: prompt_eval_positions(
                         prompt_tokens.len(),
-                        reused_prompt_tokens,
+                        if repeated_prompt {
+                            0
+                        } else {
+                            reused_prompt_tokens
+                        },
                         audio_positions,
                     ),
                     prompt_eval_duration_ns,

@@ -430,6 +430,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
         moondream_decode_count: 0,
         #[cfg(feature = "gpu")]
         kept_graphs: Default::default(),
+        exact_prefill: None,
         eos_token_ids_extra: Vec::new(),
         file_size,
         model: backend,
@@ -853,6 +854,9 @@ pub(crate) struct LoadedModelState {
     /// The decode's recorded graphs, kept between requests while nothing they read has moved.
     #[cfg(feature = "gpu")]
     pub(super) kept_graphs: super::decode::KeptGraphs<super::decode::DecodeGraphs>,
+    /// The prompt of the last text prefill and the logits it ended on, valid while the resident
+    /// KV still holds that prompt's rows. Any request that touches the KV another way clears it.
+    pub(super) exact_prefill: Option<(Vec<u32>, Tensor)>,
     /// Additional EOS-equivalent token IDs (e.g. Gemma4's
     /// `tokenizer.ggml.eos_token_ids` = [1, 106, 50] where 106 and 50
     /// are turn-end markers used in the chat template). Single
@@ -982,6 +986,49 @@ pub(crate) fn honest_reuse_start(
             0
         }
     }
+}
+
+/// The logits of a prompt the resident KV holds whole, when the same prompt comes back.
+///
+/// The rows of the prompt are the ones its own prefill wrote and the logits are the ones that
+/// prefill ended on, so the request resumes exactly where a cold run would, with no forward
+/// pass. The KV is cut back to the prompt, dropping the rows the answer added. `None` when the
+/// prompt differs, the resident sequence is another one, or the model cannot cut its KV back;
+/// the record is dropped then, since the request is about to rewrite the KV.
+pub(crate) fn exact_repeat(
+    state: &mut LoadedModelState,
+    sessions: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionState>>>,
+    prompt_tokens: &[u32],
+) -> Option<Tensor> {
+    let n = prompt_tokens.len();
+    let hit = n > 1
+        && state.model.capabilities().trim_kv
+        && state
+            .exact_prefill
+            .as_ref()
+            .is_some_and(|(tokens, _)| tokens == prompt_tokens)
+        && state.model.kv_len().is_some_and(|held| held >= n)
+        && sessions
+            .blocking_lock()
+            .get(GLOBAL_PROMPT_CACHE_KEY)
+            .is_some_and(|s| {
+                s.model_name == state.name
+                    && s.image_hash.is_none()
+                    && s.kv_len >= n
+                    && s.tokens.starts_with(prompt_tokens)
+            });
+    if hit {
+        state.model.trim_kv(n);
+        if state.model.kv_len() == Some(n) {
+            if let Some(s) = sessions.blocking_lock().get_mut(GLOBAL_PROMPT_CACHE_KEY) {
+                s.tokens.truncate(n);
+                s.kv_len = n;
+            }
+            return state.exact_prefill.as_ref().map(|(_, l)| l.clone());
+        }
+    }
+    state.exact_prefill = None;
+    None
 }
 
 /// What to do about an offset and the cache that is supposed to honour it.
