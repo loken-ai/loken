@@ -273,3 +273,11 @@ async fn best_of_keeps_the_most_probable_completions() {
     assert!(v["choices"][0]["logprobs"].is_null());
     assert_eq!(v["usage"]["completion_tokens"], 8);
 }
+
+#[test]
+fn the_time_to_first_token_runs_from_the_request_to_the_first_token() {
+    let started = std::time::Instant::now();
+    let first = started + std::time::Duration::from_millis(1500);
+    assert_eq!(time_to_first_token_ms(started, Some(first)), 1500);
+    assert_eq!(time_to_first_token_ms(started, None), 0);
+}

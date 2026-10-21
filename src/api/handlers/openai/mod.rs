@@ -451,6 +451,9 @@ pub(crate) async fn chat_completion(
         // Streaming response using SSE (OpenAI-compatible format)
         let engine_for_stats = engine.clone();
         let wants_logprobs = request.logprobs == Some(true);
+        // Taken before the engine reads the prompt: the first message of a stream only comes
+        // once the prefill is done, and a time to first token counted from after it is zero.
+        let stream_started = std::time::Instant::now();
         match engine.generate_stream(&prompt, params.clone()).await {
             Ok(mut rx) => {
                 let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -461,7 +464,6 @@ pub(crate) async fn chat_completion(
                 // re-sampling `now()` per chunk made it drift seconds
                 // over a long generation).
                 let created_at = chrono::Utc::now().timestamp();
-                let stream_started = std::time::Instant::now();
                 let stream = async_stream::stream! {
                     let _admitted = admission;
                     // First chunk: role indicator
@@ -1238,13 +1240,13 @@ pub(crate) async fn text_completions(
         // cap (was hardcoded "stop" regardless).
         let max_tokens_cap = params.max_tokens;
         let engine_for_stats = engine.clone();
+        let stream_started = std::time::Instant::now();
         let rx = engine
             .generate_stream(&prompt, params.clone())
             .await
             .map_err(|e| ApiError::Internal(format!("generate_stream: {e}")))?;
         let cid = completion_id.clone();
         let mn = model_name.clone();
-        let stream_started = std::time::Instant::now();
         let mut echo_pending = echo_text.clone();
         let mut text_offset = echo_text.len();
         let stream = async_stream::stream! {
