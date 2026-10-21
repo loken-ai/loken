@@ -69,6 +69,9 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serve: read only the tokens a turn adds on a model with a recurrent state.
+- Prefill: give back the kept conversation states before a chunk runs out of memory.
+- Serve: keep each conversation's state while others take turns, until a set lease ends.
 - Chat: count a streamed answer's time to first token from the request.
 - State cache: keep prompt states in memory when no directory is set.
 - KV cache: keep both buffers whole when a growth runs out of memory.

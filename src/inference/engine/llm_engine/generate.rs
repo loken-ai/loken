@@ -395,7 +395,15 @@ impl LlmEngine {
 
 
             // Batched prefill (all prompt tokens in one forward pass)
-            let prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
+            let mut prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
+            // Where the prompt stops being the same in the conversation's next turn: a model
+            // that cannot rewind its state keeps the state there.
+            let boundary = if audio_split.is_none() && state.qwen35_image.is_none() {
+                params.stable_prefix.and_then(|bytes| stable_prefix_tokens(&state.tokenizer, &encoding, bytes, prompt_tokens.len()))
+            } else {
+                None
+            };
+            state.model.set_prefix_boundary(boundary);
             // A model that came with a draft head reads the hidden state of every forward from
             // the prefill on: the head drafts from the state before the token it is given.
             let head_capable = config.recorded_drafts && state.model.draft_head_capture(true);
@@ -482,6 +490,11 @@ impl LlmEngine {
                 };
                 (vpl, lg, None)
             };
+            // A conversation state restored from an earlier turn is prompt not read again.
+            let cached_tokens = cache_session_start.max(state.model.prefix_covered());
+            if cached_tokens > cache_session_start {
+                prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cached_tokens, audio_positions);
+            }
             // Decode position must account for the vision prefix written into
             // KV alongside the text tokens (moondream: +image_patches), or the
             // qwen35 mRoPE next-position (image compresses positions).
@@ -2107,7 +2120,7 @@ impl LlmEngine {
                 prompt_eval_duration,
                 eval_count,
                 eval_duration,
-                cached_prompt_tokens: cache_session_start as u64,
+                cached_prompt_tokens: cached_tokens as u64,
                 finish_reason,
                 logprobs: logprob_acc,
             })

@@ -1859,7 +1859,7 @@ impl GenericHeteroTransformer {
             let existing: Vec<(&[u32], u64)> = self
                 .kv_snapshots
                 .iter()
-                .map(|s| (s.tokens.as_slice(), s.tick))
+                .map(|s| (s.tokens.as_slice(), s.rank()))
                 .collect();
             let Some(victim) = snapshot_slot(&existing, tokens, existing.len()) else {
                 tracing::debug!(
@@ -1887,6 +1887,7 @@ impl GenericHeteroTransformer {
         layers: Vec<super::LayerKvSnapshot>,
         logits: Option<crate::tensor::Tensor>,
     ) {
+        self.expire_snapshots();
         self.kv_snapshot_tick += 1;
         let draft = match self.capture_draft(kv_len) {
             Ok(d) => d,
@@ -1895,21 +1896,27 @@ impl GenericHeteroTransformer {
                 None
             }
         };
-        let snap = super::KvSnapshot {
+        let mut snap = super::KvSnapshot {
             draft,
             tokens,
             kv_len,
             layers,
             tick: self.kv_snapshot_tick,
             logits,
+            used: std::time::Instant::now(),
+            hits: 0,
         };
         let existing: Vec<(&[u32], u64)> = self
             .kv_snapshots
             .iter()
-            .map(|s| (s.tokens.as_slice(), s.tick))
+            .map(|s| (s.tokens.as_slice(), s.rank()))
             .collect();
         match snapshot_slot(&existing, &snap.tokens, SNAPSHOT_COUNT_UNBOUNDED) {
-            Some(i) => self.kv_snapshots[i] = snap,
+            Some(i) => {
+                // The conversation goes on in the snapshot that replaces its earlier turn.
+                snap.hits = self.kv_snapshots[i].hits;
+                self.kv_snapshots[i] = snap;
+            }
             None => self.kv_snapshots.push(snap),
         }
         self.enforce_kv_snapshot_budget();
@@ -1937,6 +1944,20 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
+    /// Makes a checkpoint the recurrent states again, wherever they live: on a card or on the
+    /// host, in new buffers when the old ones differ.
+    pub fn recurrent_rewind(
+        &mut self,
+        checkpoint: &[Option<super::mixer::MixerState>],
+    ) -> Result<()> {
+        for (l, saved) in self.layers.iter_mut().zip(checkpoint) {
+            if let Some(state) = saved {
+                l.state_restore(state)?;
+            }
+        }
+        Ok(())
+    }
+
     /// True when a layer carries a recurrent state beside its KV cache.
     pub fn is_recurrent(&self) -> bool {
         self.layers.iter().any(|l| l.mixer.is_recurrent())
@@ -1950,11 +1971,27 @@ impl GenericHeteroTransformer {
         prompt: &[u32],
         logits: &crate::tensor::Tensor,
     ) -> crate::tensor::Result<()> {
+        self.keep_prefix_state(prompt, Some(logits)).map(|_| ())
+    }
+
+    /// A recurrent model's state after `prefix`, kept without logits for a later prompt that
+    /// begins with `prefix` and goes on: the next turn of the conversation. True when it was
+    /// kept; false for a model with no recurrent layer or when no card has the room.
+    pub fn snapshot_boundary(&mut self, prefix: &[u32]) -> crate::tensor::Result<bool> {
+        self.keep_prefix_state(prefix, None)
+    }
+
+    fn keep_prefix_state(
+        &mut self,
+        prompt: &[u32],
+        logits: Option<&crate::tensor::Tensor>,
+    ) -> crate::tensor::Result<bool> {
         if !self.is_recurrent() {
-            return Ok(());
+            return Ok(false);
         }
+        self.expire_snapshots();
         if !self.room_for_snapshot(prompt) {
-            return Ok(());
+            return Ok(false);
         }
         let layers = match self.capture_layers() {
             Ok(layers) => layers,
@@ -1963,9 +2000,54 @@ impl GenericHeteroTransformer {
                 return Err(e);
             }
         };
-        let logits = logits.affine(1.0, 0.0)?;
-        self.store_snapshot(prompt.to_vec(), prompt.len(), layers, Some(logits));
-        Ok(())
+        let logits = logits.map(|l| l.affine(1.0, 0.0)).transpose()?;
+        self.store_snapshot(prompt.to_vec(), prompt.len(), layers, logits);
+        Ok(true)
+    }
+
+    /// Sets the time a snapshot is kept after its last use, from the configuration.
+    pub fn set_kv_lease(&mut self, lease: Option<std::time::Duration>) {
+        self.kv_lease = lease;
+    }
+
+    /// Drops the snapshots whose lease ran out, handing their memory back.
+    pub fn expire_snapshots(&mut self) {
+        let Some(lease) = self.kv_lease else { return };
+        let before = self.kv_snapshots.len();
+        self.kv_snapshots.retain(|s| s.used.elapsed() < lease);
+        if self.kv_snapshots.len() < before {
+            tracing::debug!(
+                "kv snapshots: {} past their lease dropped",
+                before - self.kv_snapshots.len()
+            );
+            crate::inference::place::ladder::release_pools();
+        }
+    }
+
+    /// Names the position up to which the prompt about to be read is shared with the next
+    /// turn of its conversation: the state there is kept while the prompt is read.
+    pub fn set_prefix_boundary(&mut self, boundary: Option<usize>) {
+        self.prefix_boundary = boundary;
+        self.prefix_covered = 0;
+    }
+
+    pub fn prefix_boundary(&self) -> Option<usize> {
+        self.prefix_boundary
+    }
+
+    /// Tokens the last prefix restore covered, 0 after a prompt read whole.
+    pub fn prefix_covered(&self) -> usize {
+        self.prefix_covered
+    }
+
+    /// Records the tokens a prompt's read began after, for the reply to report.
+    pub fn set_prefix_covered(&mut self, covered: usize) {
+        self.prefix_covered = covered;
+    }
+
+    /// Device memory the kept conversation states hold.
+    pub fn kv_snapshot_bytes(&self) -> u64 {
+        self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum()
     }
 
     /// Restores the longest prefix snapshot whose tokens begin `prompt` and returns how
@@ -1975,14 +2057,32 @@ impl GenericHeteroTransformer {
         &mut self,
         prompt: &[u32],
     ) -> crate::tensor::Result<Option<(usize, crate::tensor::Tensor)>> {
+        Ok(self
+            .restore_prefix(prompt, true)?
+            .and_then(|(covered, logits)| logits.map(|l| (covered, l))))
+    }
+
+    /// [`Self::try_restore_prefix`] that also takes a state kept without logits (a
+    /// conversation's boundary) when it is shorter than `prompt`; the logits come back only
+    /// for a state that has them.
+    pub fn restore_prefix(
+        &mut self,
+        prompt: &[u32],
+        logits_only: bool,
+    ) -> crate::tensor::Result<Option<(usize, Option<crate::tensor::Tensor>)>> {
+        self.prefix_covered = 0;
         if !self.is_recurrent() {
             return Ok(None);
         }
+        self.expire_snapshots();
         let Some(index) = self
             .kv_snapshots
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.logits.is_some() && prompt.starts_with(&s.tokens))
+            .filter(|(_, s)| {
+                prompt.starts_with(&s.tokens)
+                    && (s.logits.is_some() || (!logits_only && s.tokens.len() < prompt.len()))
+            })
             .max_by_key(|(_, s)| s.tokens.len())
             .map(|(i, _)| i)
         else {
@@ -2003,10 +2103,13 @@ impl GenericHeteroTransformer {
             .logits
             .as_ref()
             .map(|l| l.affine(1.0, 0.0))
-            .transpose()?
-            .expect("filtered on logits above");
+            .transpose()?;
         self.kv_snapshot_tick += 1;
-        self.kv_snapshots[index].tick = self.kv_snapshot_tick;
+        let used = &mut self.kv_snapshots[index];
+        used.tick = self.kv_snapshot_tick;
+        used.used = std::time::Instant::now();
+        used.hits = used.hits.saturating_add(1);
+        self.prefix_covered = covered;
         Ok(Some((covered, logits)))
     }
 
@@ -2016,14 +2119,14 @@ impl GenericHeteroTransformer {
     /// the next prefill chunk works in, for a model that declares its chunk.
     /// Drop the least recently used snapshots until `bytes` of the cards are free of them, or
     /// none is left; what they held goes back to the cards.
-    pub(super) fn drop_kv_snapshots_for(&mut self, bytes: u64) {
+    pub(crate) fn drop_kv_snapshots_for(&mut self, bytes: u64) {
         let mut freed = 0u64;
         while freed < bytes && !self.kv_snapshots.is_empty() {
             let i = self
                 .kv_snapshots
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, s)| s.tick)
+                .min_by_key(|(_, s)| s.rank())
                 .map(|(i, _)| i)
                 .unwrap();
             freed += self.kv_snapshots[i].device_bytes();
@@ -2035,10 +2138,9 @@ impl GenericHeteroTransformer {
         }
     }
 
-    /// Device memory the snapshots leave free: the working window the cache may still grow
-    /// by, the free memory the next prefill sizes its chunk from (the chunk's bytes times the
-    /// share of free memory a chunk may take), for a model that declares its chunk, and what a
-    /// decode was seen to take.
+    /// Device memory the snapshots leave free: the working window the cache may still grow by
+    /// and what a decode was seen to take. The next prefill's chunk is not kept aside: it takes
+    /// its room from the snapshots when it starts, oldest first.
     fn snapshot_reserve(&self) -> u64 {
         let (layers, n_kv, hd) = self.kv_layout();
         let window_bytes = (layers
@@ -2047,18 +2149,7 @@ impl GenericHeteroTransformer {
             * hd
             * crate::inference::cache::KV_WORKING_WINDOW_TOKENS
             * crate::tensor::DType::F16.size_in_bytes()) as u64;
-        let shape = self.prefill_shape();
-        let chunk_bytes = if shape.target_chunk > 0 {
-            (shape.bytes_per_token as u64)
-                .saturating_mul(shape.target_chunk as u64)
-                .saturating_add(shape.fixed_bytes as u64)
-                .saturating_mul(shape.share.max(1) as u64)
-        } else {
-            0
-        };
-        window_bytes
-            .saturating_add(chunk_bytes)
-            .saturating_add(self.decode_reserve)
+        window_bytes.saturating_add(self.decode_reserve)
     }
 
     fn enforce_kv_snapshot_budget(&mut self) {
@@ -2073,7 +2164,7 @@ impl GenericHeteroTransformer {
                 .kv_snapshots
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, s)| s.tick)
+                .min_by_key(|(_, s)| s.rank())
                 .map(|(i, _)| i)
                 .unwrap();
             held -= self.kv_snapshots[i].device_bytes();
@@ -2130,7 +2221,10 @@ impl GenericHeteroTransformer {
         let out = (snap.tokens.clone(), snap.kv_len);
         self.rebuild_host_stores();
         self.kv_snapshot_tick += 1;
-        self.kv_snapshots[index].tick = self.kv_snapshot_tick;
+        let used = &mut self.kv_snapshots[index];
+        used.tick = self.kv_snapshot_tick;
+        used.used = std::time::Instant::now();
+        used.hits = used.hits.saturating_add(1);
         self.invalidate_graph_state();
         Ok(out)
     }

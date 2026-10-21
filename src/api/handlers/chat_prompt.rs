@@ -195,6 +195,8 @@ pub(crate) struct PreparedPrompt {
     pub grammar: Option<String>,
     /// Whether the template already opened the thinking block.
     pub thinking_opened: bool,
+    /// Bytes of `prompt` the next turn of the conversation renders the same.
+    pub stable_prefix: Option<usize>,
 }
 
 /// The token a Qwen3-VL prompt carries where the vision encoder's output is spliced; the
@@ -337,27 +339,32 @@ pub(crate) fn build_prompt(
         spec.thinking
     };
     let thinking_off = thinking == Some("disabled");
-    let mut prompt = match spec.tools.filter(|_| tools_active) {
-        Some(tools) if template_takes_tools(template) => {
-            format_chat_prompt_with_tools(messages, template, tools)
-        }
-        Some(tools) if template_is_harmony(template) => format_harmony(messages, Some(tools)),
-        Some(tools) if template_is_mistral_tools(template) => {
-            format_mistral_tools(messages, template.unwrap_or_default(), Some(tools))
-        }
-        Some(tools) => {
-            let directive = crate::api::tool_calls::tool_choice_directive(spec.tool_choice);
-            let flat = crate::api::tool_calls::flatten_messages(
-                messages,
-                tool_format,
-                tools,
-                directive.as_deref(),
-            );
-            format_chat_prompt_thinking(&flat, template, thinking_off)
-        }
-        None => format_chat_prompt_thinking(messages, template, thinking_off),
+    let render = |messages: &[Message]| -> String {
+        let mut prompt = match spec.tools.filter(|_| tools_active) {
+            Some(tools) if template_takes_tools(template) => {
+                format_chat_prompt_with_tools(messages, template, tools)
+            }
+            Some(tools) if template_is_harmony(template) => format_harmony(messages, Some(tools)),
+            Some(tools) if template_is_mistral_tools(template) => {
+                format_mistral_tools(messages, template.unwrap_or_default(), Some(tools))
+            }
+            Some(tools) => {
+                let directive = crate::api::tool_calls::tool_choice_directive(spec.tool_choice);
+                let flat = crate::api::tool_calls::flatten_messages(
+                    messages,
+                    tool_format,
+                    tools,
+                    directive.as_deref(),
+                );
+                format_chat_prompt_thinking(&flat, template, thinking_off)
+            }
+            None => format_chat_prompt_thinking(messages, template, thinking_off),
+        };
+        apply_thinking_preference(&mut prompt, thinking, template);
+        prompt
     };
-    apply_thinking_preference(&mut prompt, thinking, template);
+    let prompt = render(messages);
+    let stable_prefix = stable_prefix_len(messages, &prompt, &render);
     let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
     let forced = spec
         .tools
@@ -375,7 +382,35 @@ pub(crate) fn build_prompt(
         tool_format,
         grammar: spec.output_grammar.clone().or(forced),
         thinking_opened,
+        stable_prefix,
     }
+}
+
+/// Bytes of `prompt` that the next turn of its conversation renders the same: the prompt up to
+/// where the template opens the assistant's turn differently for an answer than for a turn to
+/// be written. Found by rendering the conversation again with an answer after it and keeping
+/// what the two have in common. `None` when the conversation already ends on an answer, or the
+/// two have nothing to share.
+fn stable_prefix_len(
+    messages: &[Message],
+    prompt: &str,
+    render: &dyn Fn(&[Message]) -> String,
+) -> Option<usize> {
+    if messages.last().is_none_or(|m| m.role == "assistant") {
+        return None;
+    }
+    let mut answered = messages.to_vec();
+    answered.push(Message::new("assistant".to_string(), "ok".to_string()));
+    let next = render(&answered);
+    let mut shared = prompt
+        .bytes()
+        .zip(next.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while shared > 0 && !prompt.is_char_boundary(shared) {
+        shared -= 1;
+    }
+    (shared > 0).then_some(shared)
 }
 
 impl APIServer {
@@ -742,5 +777,51 @@ mod tests {
             None,
         );
         assert!(p.prompt.contains("[INST]hi[/INST]"), "{}", p.prompt);
+    }
+
+    /// The part of a prompt the conversation's next turn renders the same ends where the template
+    /// opens the assistant's turn differently for an answer than for a turn to be written.
+    #[test]
+    fn the_shared_part_ends_where_the_assistants_turn_opens() {
+        let render = |messages: &[Message]| -> String {
+            let mut out = String::new();
+            for m in messages {
+                if m.role == "assistant" {
+                    out += &format!(
+                        "<|im_start|>assistant\n<think>\n\n</think>\n\n{}<|im_end|>\n",
+                        m.content
+                    );
+                } else {
+                    out += &format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content);
+                }
+            }
+            out + "<|im_start|>assistant\n<think>\n"
+        };
+        let first = [user("question", None)];
+        let prompt = render(&first);
+        let shared = stable_prefix_len(&first, &prompt, &render).unwrap();
+        assert_eq!(
+            &prompt[..shared],
+            "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+
+        // The next turn's prompt begins with the shared part, whatever the answer was.
+        let mut next = first.to_vec();
+        next.push(Message::new(
+            "assistant".to_string(),
+            "a long answer".to_string(),
+        ));
+        next.push(user("more", None));
+        assert!(render(&next).starts_with(&prompt[..shared]));
+        let again = stable_prefix_len(&next, &render(&next), &render).unwrap();
+        assert!(render(&next)[..again].starts_with(&prompt[..shared]));
+    }
+
+    /// A conversation that already ends on an answer has no turn to share.
+    #[test]
+    fn a_conversation_ending_on_an_answer_shares_nothing() {
+        let render = |_: &[Message]| String::from("x");
+        let ended = [Message::new("assistant".to_string(), "done".to_string())];
+        assert_eq!(stable_prefix_len(&ended, "x", &render), None);
     }
 }

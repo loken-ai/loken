@@ -1370,6 +1370,35 @@ pub(crate) fn shift_reuse_plan(
 
 /// The largest reusable prefix that sits on a cold-run chunk boundary, always leaving at
 /// least the final token to re-prefill so the call produces logits.
+/// Tokens of an encoded prompt to keep a conversation's state at, for the next turn: the ones that
+/// lie wholly within its first `bytes` bytes, cut back to the last token the tokenizer never
+/// merges with its neighbours (an added token such as a turn marker), since the text after
+/// the cut is read again and may tokenise its first characters otherwise. `None` when the tokens
+/// are not the encoding's own (the prompt was clamped or given a prefix), or when the cut leaves
+/// nothing.
+pub(crate) fn stable_prefix_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    encoding: &tokenizers::Encoding,
+    bytes: usize,
+    prompt_len: usize,
+) -> Option<usize> {
+    if prompt_len != encoding.len() {
+        return None;
+    }
+    let inside = encoding
+        .get_offsets()
+        .iter()
+        .take_while(|(_, end)| *end <= bytes)
+        .count();
+    let added = tokenizer.get_added_tokens_decoder();
+    let ids = encoding.get_ids();
+    let cut = (1..=inside)
+        .rev()
+        .find(|&k| added.contains_key(&ids[k - 1]))
+        .unwrap_or(inside.saturating_sub(1));
+    (cut > 0).then_some(cut)
+}
+
 pub(crate) fn chunk_aligned_keep(common: usize, prompt_len: usize, chunk: usize) -> usize {
     let capped = common.min(prompt_len.saturating_sub(1));
     capped - capped % chunk.max(1)

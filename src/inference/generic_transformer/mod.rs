@@ -51,6 +51,8 @@ mod dense;
 mod draft_head;
 pub use draft_head::set_probe_dir;
 mod context_parallel;
+#[cfg(test)]
+mod conversation_tests;
 pub mod expert_profile;
 #[cfg(feature = "gpu")]
 pub mod expert_tier;
@@ -569,6 +571,13 @@ pub struct GenericHeteroTransformer {
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,
     kv_snapshot_tick: u64,
+    /// How long a snapshot is kept after it was last used; `None` keeps it until memory is needed.
+    kv_lease: Option<std::time::Duration>,
+    /// The token count up to which the prompt being read is the same in the next turn of its
+    /// conversation: the state there is kept for that turn.
+    prefix_boundary: Option<usize>,
+    /// Tokens the last prefix restore covered.
+    prefix_covered: usize,
     /// The most a request's decode took of a card beyond its start, in bytes.
     decode_reserve: u64,
     /// The disk cache of this model's decode state, when the operator opened a store and the
@@ -614,9 +623,21 @@ pub struct KvSnapshot {
     pub(crate) logits: Option<Tensor>,
     /// The draft head's state at `kv_len`, when the head had read the same prefix.
     pub(crate) draft: Option<state_cache::DraftHeld>,
+    /// When the snapshot was taken or last restored: the lease runs from here.
+    pub(crate) used: std::time::Instant,
+    /// Times a later prompt restored this conversation's snapshot, the lineage of the ones it
+    /// replaced included: a conversation that came back is kept over one that never did.
+    pub(crate) hits: u32,
 }
 
 impl KvSnapshot {
+    /// What decides which snapshot goes first when memory is needed: the least recently used,
+    /// after every one that never came back.
+    pub(crate) fn rank(&self) -> u64 {
+        const CAME_BACK: u64 = 1 << 40;
+        self.tick + if self.hits > 0 { CAME_BACK } else { 0 }
+    }
+
     /// Device memory this snapshot holds across its layers (host copies are not counted).
     pub fn device_bytes(&self) -> u64 {
         self.layers.iter().map(LayerKvSnapshot::device_bytes).sum()

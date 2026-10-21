@@ -27,6 +27,10 @@ model_id = "qwen3:0.6b"
 # requests run in parallel. A model that does not fit one card is served once.
 # replicas = 1
 
+# Seconds a conversation's kept state stays after its last turn, so the next turn reads only the
+# tokens it adds. Past it the state is dropped. 0 keeps a state until the memory is needed.
+# kv_lease_secs = 1800
+
 # The disk tier keeps conversation snapshots across a restart, within a disk budget.
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit

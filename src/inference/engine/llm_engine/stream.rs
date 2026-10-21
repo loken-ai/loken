@@ -332,7 +332,7 @@ impl LlmEngine {
             // Log-probabilities gathered between two chunks, and the prompt tokens the
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
-            let reused_prompt_tokens: usize;
+            let mut reused_prompt_tokens: usize;
             // Whether the whole prompt came back from the cache: its tokens are still the
             // prompt the client sent, so they stay in the count it is shown.
             let repeated_prompt: bool;
@@ -433,6 +433,22 @@ impl LlmEngine {
 
                 // Token ids decode back to the prompt, so only the count is logged.
                 debug!("Prompt tokens: {}", prompt_tokens.len());
+
+                // Where the prompt stops being the same in the conversation's next turn: a model
+                // that cannot rewind its state keeps the state there.
+                let boundary = if audio_split.is_none() && qwen35_sentinel.is_none() {
+                    params.stable_prefix.and_then(|bytes| {
+                        stable_prefix_tokens(
+                            &state.tokenizer,
+                            &encoding,
+                            bytes,
+                            prompt_tokens.len(),
+                        )
+                    })
+                } else {
+                    None
+                };
+                state.model.set_prefix_boundary(boundary);
 
                 // Resolve generation parameters
                 // Per-request num_ctx is clamped to the model's loaded context window.
@@ -916,7 +932,12 @@ impl LlmEngine {
                         l
                     } else {
                         match state.model.try_restore_prefix(&prompt_tokens) {
-                            Ok(Some(l)) => l,
+                            Ok(Some(l)) => {
+                                // A state restored from an earlier turn is prompt not read again.
+                                reused_prompt_tokens =
+                                    reused_prompt_tokens.max(state.model.prefix_covered());
+                                l
+                            }
                             Ok(None) => {
                                 match state.model.forward_prefill_chunked(&x, session_start) {
                                     Ok(l) => {
@@ -3036,6 +3057,13 @@ impl LlmEngine {
                 Some(end) => end.duration_since(stream_start).as_nanos() as u64,
                 None => 0u64,
             };
+            info!(
+                "prompt: {} tokens, {} already read, {} read now in {} ms",
+                prompt_tokens.len(),
+                reused_prompt_tokens,
+                prompt_tokens.len().saturating_sub(reused_prompt_tokens),
+                prompt_eval_duration_ns / 1_000_000
+            );
             if let Ok(mut slot) = stream_stats_slot.lock() {
                 if !logprob_buf.is_empty() {
                     if let Ok(mut q) = logprob_queue.lock() {

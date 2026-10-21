@@ -11,14 +11,14 @@ const HIDDEN: usize = 32;
 const HEADS: usize = 4;
 const KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 32;
-const VOCAB: usize = 96;
+pub(super) const VOCAB: usize = 96;
 const WINDOW: usize = 16;
 /// Tokens per block of the store under test.
 const BLOCK: usize = 64;
 /// Tokens per forward of the prefill under test.
 const CHUNK: usize = 128;
 
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
+pub(super) fn scratch_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("loken-hybrid-cache-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
@@ -41,7 +41,7 @@ fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
 
 /// A hybrid file written to `path`: blocks 0 and 2 short convolutions, block 1 global attention,
 /// block 3 attention over a window.
-fn write_hybrid(path: &std::path::Path) {
+pub(super) fn write_hybrid(path: &std::path::Path) {
     let meta = vec![
         (
             "general.architecture".to_string(),
@@ -156,7 +156,7 @@ fn write_hybrid(path: &std::path::Path) {
     crate::tensor::gguf_write::write_gguf_with_metadata(path, &meta, &entries).unwrap();
 }
 
-fn load(path: &std::path::Path) -> GenericHeteroTransformer {
+pub(super) fn load(path: &std::path::Path) -> GenericHeteroTransformer {
     let file = std::fs::File::open(path).unwrap();
     let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
     let content =
@@ -175,11 +175,11 @@ fn attach(model: &mut GenericHeteroTransformer, store: &Arc<StateStore>, salt: &
     assert!(model.attach_state_cache(store.clone(), identity));
 }
 
-fn prompt(n: usize) -> Vec<u32> {
+pub(super) fn prompt(n: usize) -> Vec<u32> {
     (0..n).map(|i| ((i * 7 + i / 5) % VOCAB) as u32).collect()
 }
 
-fn bits(t: &Tensor) -> Vec<u32> {
+pub(super) fn bits(t: &Tensor) -> Vec<u32> {
     t.flatten_all()
         .unwrap()
         .to_dtype(DType::F32)
@@ -191,7 +191,7 @@ fn bits(t: &Tensor) -> Vec<u32> {
         .collect()
 }
 
-fn floats(t: &Tensor) -> Vec<f32> {
+pub(super) fn floats(t: &Tensor) -> Vec<f32> {
     t.flatten_all()
         .unwrap()
         .to_dtype(DType::F32)
@@ -200,7 +200,7 @@ fn floats(t: &Tensor) -> Vec<f32> {
         .unwrap()
 }
 
-fn argmax(v: &[f32]) -> usize {
+pub(super) fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
@@ -248,23 +248,33 @@ fn decode(
     out
 }
 
-struct Fixture {
+/// The prefill chunk size and the kept states are process-wide, so two tests that read prompts
+/// at once would see each other's chunks. A fixture holds this lock for the life of its test.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(super) struct Fixture {
     dir: std::path::PathBuf,
     file: std::path::PathBuf,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
-    fn new(tag: &str) -> Self {
+    pub(super) fn new(tag: &str) -> Self {
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch_dir(tag);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hybrid.gguf");
         write_hybrid(&file);
-        Self { dir, file }
+        Self {
+            dir,
+            file,
+            _serial: serial,
+        }
     }
     fn store_dir(&self) -> std::path::PathBuf {
         self.dir.join("states")
     }
-    fn model(&self) -> GenericHeteroTransformer {
+    pub(super) fn model(&self) -> GenericHeteroTransformer {
         load(&self.file)
     }
 }

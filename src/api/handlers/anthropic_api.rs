@@ -138,6 +138,7 @@ pub(crate) async fn anthropic_messages(
         tool_format,
         grammar,
         thinking_opened,
+        stable_prefix,
     } = state
         .prepare_prompt(
             &model_name,
@@ -155,6 +156,7 @@ pub(crate) async fn anthropic_messages(
 
     let params = GenerationParams {
         grammar,
+        stable_prefix,
         ..sampling.into_params()
     };
 

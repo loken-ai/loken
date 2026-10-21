@@ -192,6 +192,9 @@ pub struct InferenceConfig {
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
+    /// Seconds a conversation's kept state stays after its last turn; 0 keeps it until the
+    /// memory is needed.
+    pub kv_lease_secs: u64,
     /// Directory of the on-disk cache of DeepSeek V4.1 decode states (prompt-derived KV
     /// tensors, no text). `None` keeps the cache off.
     pub state_cache_dir: Option<String>,
@@ -283,6 +286,7 @@ impl Default for InferenceConfig {
             expert_profile: None,
             expert_profile_save: None,
             kv_disk_budget_gb: 0.0,
+            kv_lease_secs: 1800,
             state_cache_dir: None,
             state_cache_budget_gb: 0.0,
             files_dir: None,
@@ -416,6 +420,10 @@ pub struct GenerationParams {
     /// new suffix gets prefilled. Set via Ollama option `session_id` or the
     /// OpenAI `user` field.
     pub session_id: Option<String>,
+    /// Bytes of the prompt that the next turn of its conversation renders the same: the
+    /// prompt up to where the assistant's turn opens. A model that cannot rewind its state
+    /// keeps the state at that point.
+    pub stable_prefix: Option<usize>,
     /// Grammar-constrained decoding. Accepted shapes:
     ///   - `"json_object"`              -> bare JSON object output
     ///   - `"json_schema:<schema>"`     -> `<schema>` is a JSON-encoded JSON Schema

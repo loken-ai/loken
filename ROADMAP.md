@@ -85,6 +85,8 @@ Smaller, by priority:
 | Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
+| Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds; the Responses API's previous response names the conversation. | Started |
+| Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Planned |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
@@ -97,7 +99,7 @@ Major, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | A cluster that survives a node | Cluster | When a machine drops out mid-request, the others finish the request. | Planned |
-| Routing across loken nodes | Cluster | One model name sends each request to the loken node that serves it best by load, speed and energy, and to another node when one fails. | Planned |
+| Routing across loken nodes | Cluster | One model name sends each request to the loken node that serves it best by load, speed and energy, to the node that already holds its conversation's KV, and to another node when one fails. | Planned |
 | A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an encrypted link. | Planned |
 | Tensor parallelism across machines | Cluster | A layer split across the cards of several machines runs faster than the layer cut alone. | Planned |
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
@@ -159,7 +161,7 @@ Smaller, by priority:
 | ACE-Step adapters | Models | A style LoRA for ACE-Step changes the sound of a render. | Planned |
 | Tabular models | Models | loken predicts rows of a table and beats a simple baseline on a fixed data set. | Planned |
 | Energy-aware placement | Operations | On request, the placement saves watts at some cost in speed, both measured. | Planned |
-| Quotas per key | Operations | Each API key has a token and request budget that loken enforces. | Planned |
+| Quotas per key | Operations | Each API key has a token and request budget that loken enforces, names the models, tools and media it may use, and every request leaves a record of the key, model and tools. | Planned |
 
 ## 0.9.0
 

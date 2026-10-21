@@ -91,6 +91,10 @@ fn default_image_fetch_timeout_secs() -> u64 {
     crate::api::media_limits::DEFAULT_FETCH_TIMEOUT_SECS
 }
 
+fn default_kv_lease_secs() -> u64 {
+    1800
+}
+
 impl Default for InferenceConfigToml {
     /// Every field at its serde default, as a configuration without an `[inference]` table reads.
     fn default() -> Self {
@@ -118,6 +122,11 @@ pub struct InferenceConfigToml {
     pub vulkan_devices: Vec<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
+    /// Seconds a conversation's kept state stays after its last turn; past it the state is
+    /// dropped and the next turn reads its prompt again. 0 keeps a state until the memory is
+    /// needed.
+    #[serde(default = "default_kv_lease_secs")]
+    pub kv_lease_secs: u64,
     /// The instance that reads this one's long prompts: it hands back their KV cache and this
     /// one decodes. Both serve the same model. None reads every prompt here.
     #[serde(default)]
@@ -389,6 +398,7 @@ impl Config {
             expert_profile: toml_config.expert_profile.clone(),
             expert_profile_save: toml_config.expert_profile_save.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
+            kv_lease_secs: toml_config.kv_lease_secs,
             state_cache_dir: toml_config.state_cache_dir.clone(),
             state_cache_budget_gb: toml_config.state_cache_budget_gb,
             files_dir: toml_config.files_dir.clone(),

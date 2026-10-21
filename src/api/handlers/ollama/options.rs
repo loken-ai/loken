@@ -366,6 +366,7 @@ pub(crate) async fn ollama_chat(
         tool_format,
         grammar,
         thinking_opened,
+        stable_prefix,
     } = state
         .prepare_prompt(
             &model_name,
@@ -380,6 +381,7 @@ pub(crate) async fn ollama_chat(
         )
         .await;
     params.grammar = grammar;
+    params.stable_prefix = stable_prefix;
     // Length only: the prompt itself is user content and is never written to a log.
     debug!("Chat prompt: {} chars", prompt.len());
 

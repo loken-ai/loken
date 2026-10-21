@@ -968,6 +968,20 @@ impl super::GenericHeteroTransformer {
             crate::inference::place::ladder::release_pools();
             crate::inference::place::vram_manager::residency_changed();
         }
+        // The room of whole stacks is taken from what the card has free, and a chunk's
+        // activations come out of what is left. A card that cannot give both keeps the room
+        // unmade: the prompt then reads chunk by chunk, each bringing the experts it routes
+        // to, where a room that left no memory for a chunk would fail whatever the chunk's size.
+        let free_now = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
+        let smallest_chunk = ((crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS
+            * shape.bytes_per_token
+            + shape.fixed_bytes) as u64)
+            .saturating_mul(shape.share.max(1) as u64);
+        let made = self
+            .card_stagers()
+            .iter()
+            .all(|s| s.full.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        let wide = wide && (made || free_now >= room.saturating_add(smallest_chunk));
         if wide {
             for tier in self
                 .layers

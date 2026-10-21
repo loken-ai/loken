@@ -696,6 +696,7 @@ impl GenericHeteroTransformer {
                 .iter()
                 .any(|l| l.moe.as_ref().is_some_and(|m| m.tier.is_some())),
         );
+
         // A model on cards is sized from the cards it uses, and a model with layers on the host
         // from every card, as before.
         if self

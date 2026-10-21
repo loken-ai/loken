@@ -401,6 +401,7 @@ pub(crate) async fn chat_completion(
         tool_format,
         grammar,
         thinking_opened,
+        stable_prefix,
     } = state
         .prepare_prompt(&model_name, Some(&engine), &chat_prompt_spec(&request))
         .await;
@@ -408,6 +409,7 @@ pub(crate) async fn chat_completion(
 
     let params = GenerationParams {
         grammar,
+        stable_prefix,
         ..sampling.into_params()
     };
 
@@ -713,8 +715,12 @@ pub(crate) async fn chat_completion(
                     let total_ms = stream_started.elapsed().as_millis();
                     let ttft_ms = time_to_first_token_ms(stream_started, first_token_at);
                     let rate = decode_rate_suffix(first_token_at, token_count as u64);
+                    let cached = stats.as_ref().map_or(0, |s| s.cached_prompt_tokens);
+                    let prefill_ms = stats
+                        .as_ref()
+                        .map_or(0, |s| s.prompt_eval_duration_ns / 1_000_000);
                     tracing::info!(
-                        "Chat completion stream: prompt_tokens={in_tokens} completion_tokens={out_tokens} finish={finish_reason} ttft={ttft_ms}ms total={total_ms}ms{rate}"
+                        "Chat completion stream: prompt_tokens={in_tokens} cached={cached} completion_tokens={out_tokens} finish={finish_reason} prefill={prefill_ms}ms ttft={ttft_ms}ms total={total_ms}ms{rate}"
                     );
                     // Terminal marker
                     yield Ok(Event::default().data("[DONE]"));

@@ -240,6 +240,7 @@ impl LlmEngine {
         // their room serves the layers.
         let draft_resident = self.config.recorded_drafts;
         let context_parallel = self.config.context_parallel;
+        let kv_lease_secs = self.config.kv_lease_secs;
         crate::inference::generic_transformer::set_probe_dir(self.config.probe_dump_dir.clone());
         let load_start = std::time::Instant::now();
         crate::inference::place::device_probe::debug_vram_by_card("load-entry");
@@ -1382,6 +1383,9 @@ impl LlmEngine {
             // A model with a recurrent state keeps the states of its prompts on disk when the
             // operator opened a store, under the file and the numerics they were computed with.
             let mut model = model;
+            model.set_kv_lease(
+                (kv_lease_secs > 0).then(|| std::time::Duration::from_secs(kv_lease_secs)),
+            );
             if let Some(store) = state_cache.clone() {
                 let mut files = crate::inference::cache::state_disk::FilesDigest::new();
                 let head = &mmap[..mmap.len().min(crate::inference::cache::state_disk::DIGEST_HEAD_BYTES)];

@@ -163,7 +163,7 @@ fn prefill_sizing_uncached(shape: PrefillShape) -> PrefillSizing {
             tightest_free: None,
         };
     }
-    let raw = (free / shape.share.max(1)).saturating_sub(shape.fixed_bytes) / per_token;
+    let raw = affordable_rows(free, &shape);
     let top = shape.target_chunk.max(2048);
     tracing::info!(
         "prefill chunk: {:.2} GB free, {} B per token + {:.0} MB fixed, ladder top {top}: rows {raw}",
@@ -171,7 +171,28 @@ fn prefill_sizing_uncached(shape: PrefillShape) -> PrefillSizing {
         per_token,
         shape.fixed_bytes as f64 / 1e6
     );
-    let chunk = if raw >= top {
+    PrefillSizing {
+        chunk: chunk_for_rows(raw, top),
+        tightest_free: Some(free as u64),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most rows a chunk may have before the card runs out of memory, for a test.
+    pub(crate) static FORCED_CHUNK_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Rows of a chunk that `free` card bytes afford a model of `shape`: a share of the free memory,
+/// less what a chunk keeps live whatever its length, over what each row keeps live.
+pub(crate) fn affordable_rows(free: usize, shape: &PrefillShape) -> usize {
+    (free / shape.share.max(1)).saturating_sub(shape.fixed_bytes) / shape.bytes_per_token.max(1)
+}
+
+/// The chunk a prefill starts at when `raw` rows are affordable and the model wants `top`: the
+/// largest rung of the ladder that fits.
+pub(crate) fn chunk_for_rows(raw: usize, top: usize) -> usize {
+    if raw >= top {
         top
     } else if raw >= 2048 {
         2048
@@ -183,10 +204,6 @@ fn prefill_sizing_uncached(shape: PrefillShape) -> PrefillSizing {
         // Below the default the ladder in `forward_prefill_chunked` takes over, but starting
         // it lower saves the passes that would only have failed.
         raw.max(PREFILL_CHUNK_TOKENS_MIN)
-    };
-    PrefillSizing {
-        chunk,
-        tightest_free: Some(free as u64),
     }
 }
 
@@ -326,6 +343,12 @@ pub(crate) trait ModelBackend: Send {
         logits
     }
 
+    /// Gives back card memory that only serves later requests, until `need` bytes are free or
+    /// none is left; true when anything was given back.
+    fn reclaim_prefill_room(&mut self, _need: u64) -> bool {
+        false
+    }
+
     /// Called before a prefill of `tokens` rows from position `from` is planned: a backend that
     /// lends card memory to something else while it is idle takes it back here.
     fn prepare_prefill(&mut self, _from: usize, _tokens: usize) {}
@@ -379,6 +402,8 @@ pub(crate) trait ModelBackend: Send {
                 // A failed pass leaves partial KV behind; the session prefix [0, index_pos)
                 // stays.
                 if replay {
+                    // A failed pass is answered first by the memory only later requests use.
+                    self.reclaim_prefill_room((chunk * per_token.max(1) + fixed) as u64);
                     self.reset_kv_from(index_pos);
                 }
                 replay = true;
@@ -748,6 +773,18 @@ pub(crate) trait ModelBackend: Send {
     fn try_restore_prefix(&mut self, _prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
         Ok(None)
     }
+
+    /// Names the token position up to which the next prompt is the same in the next turn of its
+    /// conversation, so a model that cannot rewind its state keeps the state there.
+    fn set_prefix_boundary(&mut self, _boundary: Option<usize>) {}
+
+    /// Tokens of the prompt the last `try_restore_prefix` found already read.
+    fn prefix_covered(&self) -> usize {
+        0
+    }
+
+    /// Sets how long a kept conversation state stays after its last use.
+    fn set_kv_lease(&mut self, _lease: Option<std::time::Duration>) {}
 
     // --- CUDA-graph decode path -----------------------------------------
 
@@ -1582,8 +1619,14 @@ impl GenericBackend {
         // stored states stand in for the in-memory ones when there is none, and a prompt no
         // state covers is prefilled here too, so the states it passes are kept.
         let cache = self.0.state_cache();
-        let (covered, logits) = match self.0.try_restore_prefix(prompt)? {
-            Some((covered, logits)) => (covered, Some(logits)),
+        // The position the conversation's next turn shares with this prompt, when it falls
+        // inside the part still to read.
+        let boundary = self
+            .0
+            .prefix_boundary()
+            .filter(|&b| b > 0 && b < prompt.len());
+        let (covered, logits) = match self.0.restore_prefix(prompt, false)? {
+            Some((covered, logits)) => (covered, logits),
             None => match &cache {
                 Some(cache) if prompt.len() > 1 => {
                     let covered = cache.restore(&mut self.0, prompt);
@@ -1591,6 +1634,12 @@ impl GenericBackend {
                         self.0.trim_kv(0);
                     }
                     (covered, None)
+                }
+                // Nothing kept to start from: a prompt with a boundary is read here, from a
+                // fresh state, so the state at the boundary is kept on the way.
+                _ if boundary.is_some() && self.0.is_recurrent() => {
+                    self.0.trim_kv(0);
+                    (0, None)
                 }
                 _ => return Ok(None),
             },
@@ -1663,25 +1712,153 @@ impl GenericBackend {
                 }
             }
             None => {
-                let rest =
-                    Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
-                self.forward_prefill_with_chunk(&rest, covered, prompt.len() - covered, chunk)
+                // The state at the boundary is kept between the two spans: the prompt of the
+                // conversation's next turn begins with it. The end of this prompt is kept
+                // only when there is no boundary.
+                let mut at = covered;
+                let mut kept = false;
+                let mut walk = Ok(None);
+                if let Some(b) = boundary.filter(|&b| b > covered) {
+                    walk = self.prefill_span(prompt, at, b, chunk).map(Some);
+                    if walk.is_ok() {
+                        at = b;
+                        kept = match self.0.snapshot_boundary(&prompt[..b]) {
+                            Ok(kept) => kept,
+                            Err(e) => {
+                                tracing::warn!("conversation state not kept: {e}");
+                                false
+                            }
+                        };
+                    }
+                }
+                if walk.is_ok() {
+                    walk = self.prefill_span(prompt, at, prompt.len(), chunk).map(Some);
+                }
+                self.0.set_prefix_covered(covered);
+                match walk {
+                    Ok(logits) => Ok((logits, kept)),
+                    Err(e) => Err(e),
+                }
             }
         };
-        let logits = match logits {
-            Ok(logits) => logits,
+        let (logits, kept) = match logits {
+            Ok((Some(logits), kept)) => (logits, kept),
+            Ok((None, _)) => return Ok(None),
             Err(e) => {
                 tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
                 self.0.trim_kv(0);
+                self.0.set_prefix_covered(0);
                 return Ok(None);
             }
         };
-        Ok(Some((logits, true)))
+        Ok(Some((logits, !kept)))
+    }
+
+    /// Reads `prompt[from..to]` at position `from` in chunks, smaller after a card runs out of
+    /// memory. A recurrent state cannot be cut back, so it is copied before the span and put
+    /// back before a replay.
+    fn prefill_span(
+        &mut self,
+        prompt: &[u32],
+        from: usize,
+        to: usize,
+        chunk: usize,
+    ) -> crate::tensor::Result<Tensor> {
+        let rows = to - from;
+        let span = Tensor::new(&prompt[from..to], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
+        let checkpoint = if from > 0 {
+            Some(self.0.recurrent_checkpoint()?)
+        } else {
+            None
+        };
+        let shape = self.prefill_shape();
+        let (per_token, fixed) = (shape.bytes_per_token, shape.fixed_bytes);
+        let free_now = crate::inference::place::vram_manager::free_on_cards(shape.cards) as usize;
+        let first = start_chunk(chunk, per_token, free_now).min(rows.max(1));
+        let mut replay = false;
+        let (logits, used) = crate::inference::place::recover::shrink_on_oom(
+            "prefill",
+            first,
+            |c| (c > PREFILL_CHUNK_TOKENS_MIN).then(|| (c / 2).max(PREFILL_CHUNK_TOKENS_MIN)),
+            |c| {
+                let want = (c * per_token.max(1) + fixed) as u64;
+                crate::inference::place::vram_manager::ensure_gpu_headroom_blocking("llm", want)
+            },
+            |c| {
+                if replay {
+                    // A failed pass is answered first by the memory only later requests use.
+                    self.reclaim_for_chunk((c * per_token.max(1) + fixed) as u64);
+                    self.0.trim_kv(from);
+                    if let Some(saved) = &checkpoint {
+                        self.0.recurrent_rewind(saved)?;
+                    }
+                }
+                replay = true;
+                self.forward_prefill_with_chunk(&span, from, rows, c)
+            },
+        )?;
+        remember_shrunk_chunk(used, chunk, rows, free_now);
+        Ok(logits)
+    }
+
+    /// Before a prefill is sized: when the cards have less free than one chunk of the size the
+    /// model wants needs, the conversation states kept for later turns are given back, oldest
+    /// first, until it fits or none is left. A kept state is a convenience; a prefill that runs
+    /// out of memory costs a reload.
+    fn make_room_for_prefill(&mut self, tokens: usize) {
+        let held = self.0.kv_snapshot_bytes();
+        if held == 0 {
+            return;
+        }
+        let shape = self.prefill_shape();
+        let rows = tokens.min(shape.target_chunk.max(2048));
+        let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
+            .saturating_mul(shape.share.max(1) as u64);
+        let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
+        tracing::debug!(
+            "prefill of {tokens} rows: {} MB of kept states, {} MB free, {} MB wanted",
+            held >> 20,
+            free >> 20,
+            need >> 20
+        );
+        if free >= need {
+            return;
+        }
+        self.0.drop_kv_snapshots_for(need - free);
+        crate::inference::place::vram_manager::residency_changed();
+        tracing::info!(
+            "prefill: {} MB free of the {} MB a chunk needs; kept states went from {} MB to {} MB",
+            free >> 20,
+            need >> 20,
+            held >> 20,
+            self.0.kv_snapshot_bytes() >> 20
+        );
+    }
+
+    /// Gives back card memory that only serves later requests - the kept conversation states -
+    /// until `need` bytes are free or none is left; true when anything was given back.
+    fn reclaim_for_chunk(&mut self, need: u64) -> bool {
+        let free = crate::inference::place::vram_manager::tightest_free_on_cards(
+            self.prefill_shape().cards,
+        );
+        let before = self.0.kv_snapshot_bytes();
+        if before == 0 {
+            return false;
+        }
+        self.0
+            .drop_kv_snapshots_for(need.saturating_sub(free).max(1));
+        crate::inference::place::vram_manager::residency_changed();
+        self.0.kv_snapshot_bytes() < before
     }
 }
 
 impl ModelBackend for GenericBackend {
+    fn reclaim_prefill_room(&mut self, need: u64) -> bool {
+        self.reclaim_for_chunk(need)
+    }
+
     fn prepare_prefill(&mut self, from: usize, tokens: usize) {
+        self.make_room_for_prefill(tokens);
         self.0.reserve_context(from + tokens);
         let t = std::time::Instant::now();
         let lent = self.0.lend_expert_cache(tokens);
@@ -1712,6 +1889,15 @@ impl ModelBackend for GenericBackend {
         seq_len: usize,
         chunk_tokens: usize,
     ) -> crate::tensor::Result<Tensor> {
+        #[cfg(test)]
+        if chunk_tokens > FORCED_CHUNK_ROWS.with(|c| c.get()) {
+            // A card with room for fewer rows than asked: the failure lands after part of the
+            // chunk was read, as a real one does.
+            self.forward(&x.narrow(1, 0, 1)?, index_pos)?;
+            return Err(crate::tensor::Error::msg(
+                "alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".to_string(),
+            ));
+        }
         if self.0.layer_major_pays(seq_len, chunk_tokens) {
             return self
                 .0
@@ -1724,6 +1910,15 @@ impl ModelBackend for GenericBackend {
             let n = chunk_tokens.min(seq_len - off);
             let chunk = x.narrow(1, off, n)?;
             last = Some(self.forward(&chunk, index_pos + off)?);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    "prefill chunk of {n} rows at {}: {} MB free on the tightest card",
+                    index_pos + off,
+                    crate::inference::place::vram_manager::tightest_free_on_cards(
+                        self.prefill_shape().cards
+                    ) >> 20
+                );
+            }
             off += n;
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))
@@ -1973,6 +2168,15 @@ impl ModelBackend for GenericBackend {
     }
     fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
         self.0.snapshot_prefix(prompt, logits)
+    }
+    fn set_prefix_boundary(&mut self, boundary: Option<usize>) {
+        self.0.set_prefix_boundary(boundary);
+    }
+    fn prefix_covered(&self) -> usize {
+        self.0.prefix_covered()
+    }
+    fn set_kv_lease(&mut self, lease: Option<std::time::Duration>) {
+        self.0.set_kv_lease(lease);
     }
     fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
         let restored = self.restore_prefix_and_advance(prompt);
@@ -2882,6 +3086,44 @@ mod prefill_chunk_memo_tests {
             before, after,
             "the memo key never changes, so it never invalidates"
         );
+    }
+
+    /// The chunk follows the free memory and the model's footprint: more free memory or a lighter
+    /// row gives a larger chunk, never past the model's own top, never below the floor.
+    #[test]
+    fn the_chunk_is_derived_from_the_free_memory_and_the_footprint() {
+        let shape = super::PrefillShape {
+            bytes_per_token: 1000,
+            fixed_bytes: 10_000,
+            target_chunk: 0,
+            share: 2,
+            cards: 0,
+        };
+        // Half the free memory, less the fixed part, over a row.
+        assert_eq!(super::affordable_rows(2_020_000, &shape), 1000);
+        assert_eq!(super::affordable_rows(9_999, &shape), 0);
+        let rows = |free: usize| super::affordable_rows(free, &shape);
+        let chunk = |free: usize| super::chunk_for_rows(rows(free), 2048);
+        assert_eq!(chunk(100_000_000), 2048, "plenty of room takes the top");
+        assert_eq!(
+            chunk(2_020_000),
+            super::PREFILL_CHUNK_TOKENS,
+            "1000 rows is the default"
+        );
+        assert_eq!(
+            chunk(30_000),
+            super::PREFILL_CHUNK_TOKENS_MIN,
+            "almost none is the floor"
+        );
+        let heavier = super::PrefillShape {
+            bytes_per_token: 4000,
+            ..shape
+        };
+        let at = |free: usize, s: &super::PrefillShape| {
+            super::chunk_for_rows(super::affordable_rows(free, s), 2048)
+        };
+        assert!(at(6_000_000, &shape) > at(6_000_000, &heavier));
+        assert!(at(3_000_000, &shape) <= at(6_000_000, &shape));
     }
 
     /// Two calls with no residency change in between agree. Without the memo they would too,

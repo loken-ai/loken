@@ -323,6 +323,7 @@ impl SamplingRequest {
             })
         });
         GenerationParams {
+            stable_prefix: None,
             prefix_tokens: None,
             // A negative cap is Ollama's "until EOS".
             max_tokens: self.max_tokens.and_then(|v| usize::try_from(v).ok()),
