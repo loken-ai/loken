@@ -26,17 +26,18 @@ fn clamp_prompt_to_window_keeps_bos_and_recent_tail() {
 }
 
 #[test]
-fn clamp_prompt_to_window_reserve_never_exceeds_half_the_window() {
-    // A huge want_gen can't starve the prompt below half the window.
-    let long: Vec<u32> = (0..10_000).collect();
-    let out = clamp_prompt_to_window(long, 4096, 100_000);
+fn clamp_prompt_to_window_reserve_never_exceeds_an_eighth_of_the_window() {
+    // A huge want_gen can't starve the prompt below seven eighths of the window.
+    let long: Vec<u32> = (0..40_000).collect();
+    let out = clamp_prompt_to_window(long, 32_768, 100_000);
     assert!(
-        out.len() >= 4096 / 2,
-        "prompt keeps at least half the window, got {}",
+        out.len() >= 32_768 - 32_768 / 8,
+        "prompt keeps seven eighths of the window, got {}",
         out.len()
     );
+    let fits: Vec<u32> = (0..28_000).collect();
+    assert_eq!(clamp_prompt_to_window(fits.clone(), 32_768, 32_000), fits);
 }
-
 #[test]
 fn vision_extra_kv_reserves_embeds_plus_splice_controls() {
     let img = Tensor::zeros_on(

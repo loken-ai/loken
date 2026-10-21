@@ -97,7 +97,7 @@ pub(super) fn clamp_qwen35_prompt_to_window(
     if kv_window == 0 || tokens.len() <= 1 {
         return tokens;
     }
-    let reserve = want_gen.max(1).min(kv_window / 2).max(16);
+    let reserve = want_gen.max(1).min(kv_window / 8).max(16);
     let budget = kv_window.saturating_sub(reserve).max(1);
     if tokens.len() <= budget {
         return tokens;
@@ -137,8 +137,10 @@ pub(super) fn clamp_prompt_to_window(
     if kv_window == 0 || tokens.len() <= 1 {
         return tokens;
     }
-    // Reserve for generation, but never sacrifice more than half the window to it.
-    let reserve = want_gen.max(1).min(kv_window / 2).max(16);
+    // Reserve for generation, but never sacrifice more than an eighth of the window to it: a
+    // client that allows a huge reply (an agent asks for 32000) does not need that room, and the
+    // reply is cut at the window anyway.
+    let reserve = want_gen.max(1).min(kv_window / 8).max(16);
     let budget = kv_window.saturating_sub(reserve).max(1);
     if tokens.len() <= budget {
         return tokens;
