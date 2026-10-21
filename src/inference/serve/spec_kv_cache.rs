@@ -493,18 +493,27 @@ impl SpecKvCache {
         let dim = self.dim;
         while total > self.max_seq_len {
             let grow = self.max_seq_len.max(step);
-            self.max_seq_len += grow;
-
-            let k_old = self.k.take().unwrap();
-            let v_old = self.v.take().unwrap();
-            let mut shape = k_old.dims().to_vec();
-            shape[dim] = grow;
-            let k_ext = Tensor::zeros_on(&shape[..], k_old.dtype(), &k_old.device())?;
-            let v_ext = Tensor::zeros_on(&shape[..], v_old.dtype(), &v_old.device())?;
-            self.k = Some(Tensor::cat(&[&k_old, &k_ext], dim)?);
-            self.v = Some(Tensor::cat(&[&v_old, &v_ext], dim)?);
-            self.moves += 1;
+            self.grow_by(grow, dim)?;
         }
+        Ok(())
+    }
+
+    /// Extend both buffers by `grow` positions. The buffers and the capacity change together
+    /// or not at all: an allocation that fails leaves the cache as it was.
+    fn grow_by(&mut self, grow: usize, dim: usize) -> Result<()> {
+        let (Some(k_old), Some(v_old)) = (self.k.as_ref(), self.v.as_ref()) else {
+            return Err(crate::tensor::Error::msg("KvCache: no buffers to grow"));
+        };
+        let mut shape = k_old.dims().to_vec();
+        shape[dim] = grow;
+        let k_ext = Tensor::zeros_on(&shape[..], k_old.dtype(), &k_old.device())?;
+        let v_ext = Tensor::zeros_on(&shape[..], v_old.dtype(), &v_old.device())?;
+        let k_new = Tensor::cat(&[k_old, &k_ext], dim)?;
+        let v_new = Tensor::cat(&[v_old, &v_ext], dim)?;
+        self.k = Some(k_new);
+        self.v = Some(v_new);
+        self.max_seq_len += grow;
+        self.moves += 1;
         Ok(())
     }
 
@@ -580,16 +589,7 @@ impl SpecKvCache {
         // Grow if needed
         while self.current_seq_len + n_new > self.max_seq_len {
             let grow = self.max_seq_len.max(n_new);
-            self.max_seq_len += grow;
-            let k_old = self.k.take().unwrap();
-            let v_old = self.v.take().unwrap();
-            let mut shape = k_old.dims().to_vec();
-            shape[dim] = grow;
-            let k_ext = Tensor::zeros_on(&shape[..], k_old.dtype(), &k_old.device())?;
-            let v_ext = Tensor::zeros_on(&shape[..], v_old.dtype(), &v_old.device())?;
-            self.k = Some(Tensor::cat(&[&k_old, &k_ext], dim)?);
-            self.v = Some(Tensor::cat(&[&v_old, &v_ext], dim)?);
-            self.moves += 1;
+            self.grow_by(grow, dim)?;
         }
 
         let k_buf = self.k.as_mut().unwrap();
@@ -813,6 +813,21 @@ mod tests {
             .unwrap();
         assert_eq!(c.current_seq_len(), 6);
         assert!(c.max_seq_len_padded() >= 6, "buffer must grow to fit");
+    }
+
+    #[test]
+    fn a_growth_that_cannot_happen_leaves_the_cache_as_it_was() {
+        // No buffers yet: nothing to extend, and neither the capacity nor the buffers move.
+        let mut c = SpecKvCache::new(4);
+        assert!(c.grow_by(4, 2).is_err());
+        assert_eq!(c.max_seq_len_padded(), 4);
+        assert!(c.k_buffer().is_none() && c.v_buffer().is_none());
+        // With buffers, a growth moves both and the capacity together.
+        c.append(&make_4d(&Device::Cpu, 3), &make_4d(&Device::Cpu, 3))
+            .unwrap();
+        c.grow_by(4, 2).unwrap();
+        assert_eq!(c.max_seq_len_padded(), 8);
+        assert_eq!(c.k_buffer().unwrap().dims(), c.v_buffer().unwrap().dims());
     }
 
     #[test]
