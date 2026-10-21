@@ -6,6 +6,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Vulkan: run mat-vec on int8 activations with the integer dot product.
+- Vulkan: read prompts through tiled mat-mat and attention kernels.
 - Vulkan: run the layers of a dense decoder on Vulkan devices.
 - Forecast: serve the Timestral checkpoints, with 21 quantiles and covariates.
 - Release: ship one Linux archive that serves NVIDIA and AMD cards.

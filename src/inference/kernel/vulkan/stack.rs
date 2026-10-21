@@ -13,16 +13,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Rows of the residual stream one step carries.
-pub const MAX_TOKENS: usize = 8;
+pub const MAX_TOKENS: usize = 128;
+/// Rows a mat-vec dispatch carries; more rows go through the mat-mat kernels.
+pub const MV_TOKENS: usize = 8;
+/// Rows and tokens of a mat-mat workgroup's tile.
+const MM_ROWS: u32 = 64;
+const MM_TOKENS: u32 = 32;
 /// Rows of a mat-vec grid's x dimension; the rest go to y.
 const GRID_X: u32 = 32768;
 
-/// Rows one mat-vec workgroup runs.
-const ROWS_PER_GROUP: u32 = 2;
+/// Workgroups the attention of a decode step aims for, by cutting the keys into slices.
+const ATTENTION_GROUPS: usize = 64;
+/// Most slices the keys of a head are cut into.
+const MAX_SPLITS: usize = 8;
+use super::shaders::lanes_per_row;
 
-/// The workgroup grid of a mat-vec over `rows` rows.
-fn matvec_groups(rows: u32) -> [u32; 3] {
-    let groups = rows.div_ceil(ROWS_PER_GROUP);
+/// The workgroup grid of the mat-vec `kernel` over `rows` rows on workgroups of `workgroup`
+/// lanes.
+fn matvec_groups(kernel: &str, rows: u32, workgroup: u32) -> [u32; 3] {
+    let groups = rows.div_ceil(workgroup / lanes_per_row(kernel));
     [groups.min(GRID_X), groups.div_ceil(GRID_X), 1]
 }
 
@@ -82,6 +91,8 @@ pub fn runs_format(dtype: GgmlDType) -> bool {
 struct Matrix {
     buf: Buffer,
     kernel: &'static str,
+    /// The mat-mat kernel of the format, when it has one.
+    mat_mat: Option<&'static str>,
     rows: usize,
     cols: usize,
 }
@@ -102,16 +113,26 @@ impl Matrix {
         if !t.cols.is_multiple_of(32) {
             anyhow::bail!("vulkan: {} columns is not a multiple of 32", t.cols);
         }
-        let (kernel, bytes): (&'static str, Cow<[u8]>) = match t.dtype {
-            GgmlDType::Q4K => ("mv_q4k", Cow::Borrowed(&t.bytes)),
-            GgmlDType::F16 => ("mv_f16", Cow::Borrowed(&t.bytes)),
-            GgmlDType::Q6K => ("mv_q6k", Cow::Owned(repack(&t.bytes, 210, 208, 212))),
-            GgmlDType::Q8_0 => ("mv_q8_0", Cow::Owned(repack_q8_0(&t.bytes))),
-            other => anyhow::bail!("vulkan: no mat-vec for {}", other.gguf_name()),
-        };
+        let (kernel, mat_mat, bytes): (&'static str, Option<&'static str>, Cow<[u8]>) =
+            match t.dtype {
+                GgmlDType::Q4K => ("mv_q4k", Some("mm_q4k"), Cow::Borrowed(&t.bytes)),
+                GgmlDType::F16 => ("mv_f16", Some("mm_f16"), Cow::Borrowed(&t.bytes)),
+                GgmlDType::Q6K => (
+                    "mv_q6k",
+                    Some("mm_q6k"),
+                    Cow::Owned(repack(&t.bytes, 210, 208, 224)),
+                ),
+                GgmlDType::Q8_0 => (
+                    "mv_q8_0",
+                    Some("mm_q8_0"),
+                    Cow::Owned(repack_q8_0(&t.bytes)),
+                ),
+                other => anyhow::bail!("vulkan: no mat-vec for {}", other.gguf_name()),
+            };
         Ok(Self {
             buf: ctx.upload(&bytes)?,
             kernel,
+            mat_mat,
             rows: t.rows,
             cols: t.cols,
         })
@@ -195,6 +216,8 @@ pub struct VulkanStack {
     table_len: usize,
     x: Buffer,
     xn: Buffer,
+    xq: Buffer,
+    xm: Buffer,
     q_raw: Buffer,
     k_raw: Buffer,
     v_raw: Buffer,
@@ -202,7 +225,7 @@ pub struct VulkanStack {
     attn: Buffer,
     gate: Buffer,
     up: Buffer,
-    scores: Buffer,
+    part: Buffer,
     io: Buffer,
     step: Buffer,
     dummy: Buffer,
@@ -233,8 +256,8 @@ impl VulkanStack {
     ) -> anyhow::Result<Self> {
         let ctx = super::context(device)?;
         let s = &spec;
-        if s.head_dim > 512
-            || !s.head_dim.is_multiple_of(2)
+        if s.head_dim > 128
+            || !s.head_dim.is_multiple_of(8)
             || s.n_kv == 0
             || !s.n_head.is_multiple_of(s.n_kv)
         {
@@ -280,6 +303,7 @@ impl VulkanStack {
         let t = MAX_TOKENS;
         let qd = s.n_head * s.head_dim;
         let kvd = s.n_kv * s.head_dim;
+        let kmax = s.hidden.max(qd).max(s.ffn);
         Ok(Self {
             layers: built,
             head: None,
@@ -288,7 +312,9 @@ impl VulkanStack {
             table_half,
             table_len: cos.len() / table_half.max(1),
             x: card(t * s.hidden)?,
-            xn: card(t * s.hidden)?,
+            xn: card(t * kmax)?,
+            xq: card(t * kmax / 4)?,
+            xm: card(t * kmax / 8)?,
             q_raw: card(t * qd)?,
             k_raw: card(t * kvd)?,
             v_raw: card(t * kvd)?,
@@ -296,7 +322,7 @@ impl VulkanStack {
             attn: card(t * qd)?,
             gate: card(t * s.ffn)?,
             up: card(t * s.ffn)?,
-            scores: card(t * s.n_head * s.ctx)?,
+            part: card(MV_TOKENS * s.n_head * MAX_SPLITS * (s.head_dim + 2))?,
             io: ctx.buffer((t * s.hidden * 4) as u64, true)?,
             step: ctx.buffer(16, true)?,
             dummy: ctx.buffer(16, false)?,
@@ -413,71 +439,80 @@ impl VulkanStack {
                 self.programs.insert(key, program);
             }
             self.ctx.run(self.programs[&key].cmd)?;
-            let mut chunk = vec![0u8; n * h * 4];
-            self.io.read(0, &mut chunk);
-            out.extend(
-                chunk
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            );
+            self.io.read_f32s(n * h, &mut out);
             if with_head {
                 let head = self.head.as_ref().expect("checked");
-                let mut bytes = vec![0u8; head.proj.rows * 4];
-                head.out.read(0, &mut bytes);
-                logits = Some(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect(),
-                );
+                let mut values = Vec::new();
+                head.out.read_f32s(head.proj.rows, &mut values);
+                logits = Some(values);
             }
             start += n;
         }
         Ok((out, logits))
     }
 
+    /// Pushes `y = w x` for the `tokens` rows of activations the last [`Self::quant`] left in
+    /// `xq` and `xm` (and in `xn`, as f32, for the F16 kernel).
     fn matvec(
         &self,
+        ops: &mut Vec<Op>,
         w: &Matrix,
-        x: &Buffer,
         y: &Buffer,
         bias: Option<&Buffer>,
         accumulate: bool,
         tokens: usize,
         barrier: bool,
-    ) -> Op {
+    ) {
         let rows = w.rows as u32;
         let flags = u32::from(accumulate) | (u32::from(bias.is_some()) << 1);
+        let bufs = [
+            &w.buf,
+            &self.xq,
+            y,
+            bias.unwrap_or(&self.dummy),
+            &self.xm,
+            &self.xn,
+        ];
         let mut args = [0u32; 16];
-        args[..8].copy_from_slice(&[
-            rows,
-            w.cols as u32,
-            tokens as u32,
-            0,
-            0,
-            flags,
-            w.cols as u32,
-            rows,
-        ]);
-        self.op(
-            w.kernel,
-            &[&w.buf, x, y, bias.unwrap_or(&self.dummy)],
-            args,
-            matvec_groups(rows),
-            barrier,
-        )
+        args[..8].copy_from_slice(&[rows, w.cols as u32, tokens as u32, 0, 0, flags, 0, rows]);
+        match w.mat_mat.filter(|_| tokens > MV_TOKENS) {
+            Some(kernel) => ops.push(self.op(
+                kernel,
+                &bufs,
+                args,
+                [
+                    rows.div_ceil(MM_ROWS),
+                    (tokens as u32).div_ceil(MM_TOKENS),
+                    1,
+                ],
+                barrier,
+            )),
+            None => {
+                for first in (0..tokens).step_by(MV_TOKENS) {
+                    args[2] = (tokens - first).min(MV_TOKENS) as u32;
+                    args[3] = first as u32;
+                    ops.push(self.op(
+                        w.kernel,
+                        &bufs,
+                        args,
+                        matvec_groups(w.kernel, rows, self.ctx.workgroup),
+                        barrier && first == 0,
+                    ));
+                }
+            }
+        }
     }
 
-    /// The products `ws` of `x`: the first waits for `x`, the others run beside it.
+    /// The products of the quantised activations: the first waits for them, the others run
+    /// beside it.
     fn products(
         &self,
         ops: &mut Vec<Op>,
-        x: &Buffer,
         tokens: usize,
         ws: &[(&Matrix, &Buffer, Option<&Buffer>, bool)],
     ) {
         for (i, (w, y, bias, accumulate)) in ws.iter().enumerate() {
-            ops.push(self.matvec(w, x, y, *bias, *accumulate, tokens, i == 0));
+            self.matvec(ops, w, y, *bias, *accumulate, tokens, i == 0);
         }
     }
 
@@ -502,17 +537,40 @@ impl VulkanStack {
         }
     }
 
-    fn norm(&self, x: &Buffer, w: &Buffer, y: &Buffer, rows: usize, x_off: usize) -> Op {
+    /// Quantises `rows` rows of `n` values of `a`, from float `src_off`, into `xq` and `xm`:
+    /// as they are (mode 0), RMS normed with weight `b` (1), or as `silu(a) * b` (2). `f32_copy`
+    /// also leaves the values in `xn`.
+    fn quant(
+        &self,
+        mode: u32,
+        a: &Buffer,
+        b: &Buffer,
+        rows: usize,
+        n: usize,
+        src_off: usize,
+        f32_copy: bool,
+    ) -> Op {
         let mut args = [0u32; 16];
         args[..6].copy_from_slice(&[
             rows as u32,
-            self.spec.hidden as u32,
-            x_off as u32,
-            0,
+            n as u32,
+            src_off as u32,
             self.spec.eps.to_bits(),
-            0,
+            u32::from(f32_copy),
+            mode,
         ]);
-        self.op("rms_norm", &[x, w, y], args, [rows as u32, 1, 1], true)
+        self.op(
+            "quant",
+            &[a, b, &self.dummy, &self.xq, &self.xm, &self.xn],
+            args,
+            [rows as u32, 1, 1],
+            true,
+        )
+    }
+
+    /// Whether any of `ws` reads the f32 copy of the activations.
+    fn wants_f32(ws: &[&Matrix]) -> bool {
+        ws.iter().any(|w| w.kernel == "mv_f16")
     }
 
     /// The dispatches of a step of `tokens` rows through layers `[from, to)`.
@@ -521,10 +579,17 @@ impl VulkanStack {
         let t = tokens as u32;
         let mut ops = Vec::new();
         for l in &self.layers[from..to] {
-            ops.push(self.norm(&self.x, &l.attn_norm, &self.xn, tokens, 0));
+            ops.push(self.quant(
+                1,
+                &self.x,
+                &l.attn_norm,
+                tokens,
+                s.hidden,
+                0,
+                Self::wants_f32(&[&l.q, &l.k, &l.v]),
+            ));
             self.products(
                 &mut ops,
-                &self.xn,
                 tokens,
                 &[
                     (&l.q, &self.q_raw, l.q_bias.as_ref(), false),
@@ -586,56 +651,97 @@ impl VulkanStack {
                 s.attn_scale.to_bits(),
                 s.ctx as u32,
             ]);
-            ops.push(self.op(
-                "attention",
-                &[
-                    &self.q,
-                    &l.k_cache,
-                    &l.v_cache,
-                    &self.attn,
-                    &self.scores,
-                    &self.step,
-                ],
-                a,
-                [s.n_head as u32, t, 1],
-                true,
+            if tokens > MV_TOKENS {
+                a[5] = t;
+                ops.push(self.op(
+                    "attn_tiled",
+                    &[
+                        &self.q,
+                        &l.k_cache,
+                        &l.v_cache,
+                        &self.attn,
+                        &self.dummy,
+                        &self.step,
+                    ],
+                    a,
+                    [s.n_head as u32, t.div_ceil(16), 1],
+                    true,
+                ));
+            } else {
+                // Enough workgroups to fill the card: the keys are cut into slices.
+                let splits = (ATTENTION_GROUPS / (s.n_head * tokens)).clamp(1, MAX_SPLITS) as u32;
+                a[5] = splits;
+                ops.push(self.op(
+                    "attention",
+                    &[
+                        &self.q,
+                        &l.k_cache,
+                        &l.v_cache,
+                        &self.part,
+                        &self.dummy,
+                        &self.step,
+                    ],
+                    a,
+                    [s.n_head as u32, t, splits],
+                    true,
+                ));
+                ops.push(self.op(
+                    "attention_join",
+                    &[&self.part, &self.dummy, &self.dummy, &self.attn],
+                    a,
+                    [s.n_head as u32, t, 1],
+                    true,
+                ));
+            }
+            ops.push(self.quant(
+                0,
+                &self.attn,
+                &self.dummy,
+                tokens,
+                s.n_head * s.head_dim,
+                0,
+                Self::wants_f32(&[&l.o]),
             ));
-            self.products(&mut ops, &self.attn, tokens, &[(&l.o, &self.x, None, true)]);
-            ops.push(self.norm(&self.x, &l.ffn_norm, &self.xn, tokens, 0));
+            self.products(&mut ops, tokens, &[(&l.o, &self.x, None, true)]);
+            ops.push(self.quant(
+                1,
+                &self.x,
+                &l.ffn_norm,
+                tokens,
+                s.hidden,
+                0,
+                Self::wants_f32(&[&l.gate, &l.up]),
+            ));
             self.products(
                 &mut ops,
-                &self.xn,
                 tokens,
                 &[
                     (&l.gate, &self.gate, None, false),
                     (&l.up, &self.up, None, false),
                 ],
             );
-            let n = (tokens * s.ffn) as u32;
-            let mut a = [0u32; 16];
-            a[0] = n;
-            ops.push(self.op(
-                "silu_mul",
-                &[&self.gate, &self.up],
-                a,
-                [n.div_ceil(256), 1, 1],
-                true,
-            ));
-            self.products(
-                &mut ops,
+            ops.push(self.quant(
+                2,
                 &self.gate,
+                &self.up,
                 tokens,
-                &[(&l.down, &self.x, None, true)],
-            );
+                s.ffn,
+                0,
+                Self::wants_f32(&[&l.down]),
+            ));
+            self.products(&mut ops, tokens, &[(&l.down, &self.x, None, true)]);
         }
         if let Some(hd) = self.head.as_ref().filter(|_| head) {
-            ops.push(self.norm(&self.x, &hd.norm, &self.xn, 1, (tokens - 1) * s.hidden));
-            self.products(
-                &mut ops,
-                &self.xn,
+            ops.push(self.quant(
                 1,
-                &[(&hd.proj, &hd.logits, None, false)],
-            );
+                &self.x,
+                &hd.norm,
+                1,
+                s.hidden,
+                (tokens - 1) * s.hidden,
+                Self::wants_f32(&[&hd.proj]),
+            ));
+            self.products(&mut ops, 1, &[(&hd.proj, &hd.logits, None, false)]);
         }
         ops
     }
@@ -882,10 +988,11 @@ impl VulkanStack {
             dev.destroy_descriptor_pool(descriptors, None);
         }
         let mut by: Vec<(&'static str, f64)> = Vec::new();
+        let mut streamed: Vec<(&'static str, f64)> = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             let us = (stamps[i + 1] - stamps[i]) as f64 * self.ctx.timestamp_period as f64 / 1e3;
-            let name = if op.kernel.starts_with("mv_")
-                && op.groups[0] as usize * op.groups[1] as usize > 25_000
+            let name = if (op.kernel.starts_with("mv_") || op.kernel.starts_with("mm_"))
+                && op.args[0] > 50_000
             {
                 "head"
             } else {
@@ -895,8 +1002,39 @@ impl VulkanStack {
                 Some(e) => e.1 += us,
                 None => by.push((name, us)),
             }
+            if op.kernel.starts_with("mv_") || op.kernel.starts_with("mm_") {
+                let bytes = self.weight_bytes(op);
+                match streamed.iter_mut().find(|(k, _)| *k == name) {
+                    Some(e) => e.1 += bytes,
+                    None => streamed.push((name, bytes)),
+                }
+            }
+        }
+        for (name, bytes) in streamed {
+            let us = by.iter().find(|(k, _)| *k == name).map_or(1.0, |e| e.1);
+            eprintln!(
+                "{name}: {:.1} MB, {:.1} GB/s",
+                bytes / 1e6,
+                bytes / us / 1e3
+            );
         }
         Ok(by)
+    }
+}
+
+#[cfg(test)]
+impl VulkanStack {
+    /// Bytes of weights a mat-vec op reads.
+    fn weight_bytes(&self, op: &Op) -> f64 {
+        let rows = op.args[0] as f64;
+        let k = op.args[1] as f64;
+        let per = match op.kernel {
+            "mv_q4k" | "mm_q4k" => 144.0 / 256.0,
+            "mv_q6k" | "mm_q6k" => 224.0 / 256.0,
+            "mv_q8_0" | "mm_q8_0" => 36.0 / 32.0,
+            _ => 2.0,
+        };
+        rows * k * per
     }
 }
 
@@ -913,8 +1051,8 @@ impl Drop for VulkanStack {
     }
 }
 
-/// `W x` for `tokens` rows of `x` through the mat-vec kernel of `w`'s format, on device
-/// `device`: the kernel alone, for the checks against the host.
+/// `W x` for `tokens` rows of `x` through the quantiser and the mat-vec kernel of `w`'s format,
+/// on device `device`: the kernels alone, for the checks against the host.
 #[cfg(test)]
 pub(super) fn matvec_probe(
     device: usize,
@@ -928,99 +1066,119 @@ pub(super) fn matvec_probe(
     let yb = ctx.buffer((tokens * m.rows * 4) as u64, false)?;
     let out = ctx.buffer((tokens * m.rows * 4) as u64, true)?;
     let dummy = ctx.buffer(16, false)?;
+    let xq = ctx.buffer((tokens * m.cols) as u64, false)?;
+    let xm = ctx.buffer((tokens * m.cols / 2) as u64, false)?;
+    let xn = ctx.buffer((tokens * m.cols * 4) as u64, false)?;
     let dev = ctx.device();
     let sizes = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(super::BINDINGS)];
+        .descriptor_count(2 * super::BINDINGS)];
     let pool = unsafe {
         dev.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
+                .max_sets(2)
                 .pool_sizes(&sizes),
             None,
         )?
     };
-    let layouts = [ctx.set_layout()];
-    let set = unsafe {
+    let layouts = [ctx.set_layout(), ctx.set_layout()];
+    let sets = unsafe {
         dev.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts),
-        )?[0]
+        )?
     };
-    let mut bufs = [dummy.buf; super::BINDINGS as usize];
-    bufs[..3].copy_from_slice(&[m.buf.buf, xb.buf, yb.buf]);
-    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
-        .iter()
-        .map(|&b| {
-            [vk::DescriptorBufferInfo::default()
-                .buffer(b)
-                .range(vk::WHOLE_SIZE)]
-        })
-        .collect();
-    let writes: Vec<vk::WriteDescriptorSet> = infos
-        .iter()
-        .enumerate()
-        .map(|(i, info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(i as u32)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(info)
-        })
-        .collect();
-    unsafe { dev.update_descriptor_sets(&writes, &[]) };
+    let bind = |set: vk::DescriptorSet, used: [&Buffer; 6]| {
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = used
+            .iter()
+            .map(|b| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(b.buf)
+                    .range(vk::WHOLE_SIZE)]
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info)
+            })
+            .collect();
+        unsafe { dev.update_descriptor_sets(&writes, &[]) };
+    };
+    bind(sets[0], [&xb, &dummy, &dummy, &xq, &xm, &xn]);
+    bind(sets[1], [&m.buf, &xq, &yb, &dummy, &xm, &xn]);
     let rows = m.rows as u32;
-    let args: [u32; 16] = [
-        rows,
-        m.cols as u32,
-        tokens as u32,
-        0,
-        0,
-        0,
-        m.cols as u32,
-        rows,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
-    let words: Vec<u8> = args.iter().flat_map(|a| a.to_le_bytes()).collect();
-    let pipeline = ctx.pipeline(m.kernel)?;
+    let words = |a: [u32; 8]| -> Vec<u8> {
+        let mut all = [0u32; 16];
+        all[..8].copy_from_slice(&a);
+        all.iter().flat_map(|v| v.to_le_bytes()).collect()
+    };
+    let quant = words([tokens as u32, m.cols as u32, 0, 0, 1, 0, 0, 0]);
+    let mv = words([rows, m.cols as u32, tokens as u32, 0, 0, 0, 0, rows]);
+    let quant_pipe = ctx.pipeline("quant")?;
+    let (pipeline, groups) = match m.mat_mat.filter(|_| tokens > MV_TOKENS) {
+        Some(k) => (
+            ctx.pipeline(k)?,
+            [
+                rows.div_ceil(MM_ROWS),
+                (tokens as u32).div_ceil(MM_TOKENS),
+                1,
+            ],
+        ),
+        None => (
+            ctx.pipeline(m.kernel)?,
+            matvec_groups(m.kernel, rows, ctx.workgroup),
+        ),
+    };
     ctx.submit_once(|cmd| unsafe {
-        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-        dev.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            ctx.pipeline_layout(),
-            0,
-            &[set],
-            &[],
-        );
-        dev.cmd_push_constants(
-            cmd,
-            ctx.pipeline_layout(),
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            &words,
-        );
-        let [gx, gy, gz] = matvec_groups(rows);
-        dev.cmd_dispatch(cmd, gx, gy, gz);
-        let mb = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        dev.cmd_pipeline_barrier(
-            cmd,
+        let run = |pipe: vk::Pipeline, set: vk::DescriptorSet, imm: &[u8], g: [u32; 3]| {
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            dev.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                ctx.pipeline_layout(),
+                0,
+                &[set],
+                &[],
+            );
+            dev.cmd_push_constants(
+                cmd,
+                ctx.pipeline_layout(),
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                imm,
+            );
+            dev.cmd_dispatch(cmd, g[0], g[1], g[2]);
+        };
+        let barrier = |dst: vk::AccessFlags, to: vk::PipelineStageFlags| {
+            let mb = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(dst)];
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                to,
+                vk::DependencyFlags::empty(),
+                &mb,
+                &[],
+                &[],
+            );
+        };
+        run(quant_pipe, sets[0], &quant, [tokens as u32, 1, 1]);
+        barrier(
+            vk::AccessFlags::SHADER_READ,
             vk::PipelineStageFlags::COMPUTE_SHADER,
+        );
+        run(pipeline, sets[1], &mv, groups);
+        barrier(
+            vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &mb,
-            &[],
-            &[],
         );
         let region = [vk::BufferCopy::default().size(yb.size)];
         dev.cmd_copy_buffer(cmd, yb.buf, out.buf, &region);

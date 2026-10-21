@@ -18,8 +18,8 @@ fn values(n: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-fn check(dtype: GgmlDType) {
-    let (rows, cols, tokens) = (70, 512, 3);
+fn check(dtype: GgmlDType, tokens: usize) {
+    let (rows, cols) = (70, 512);
     let w = Tensor::from_vec(values(rows * cols, 7), (rows, cols), &Device::Cpu).unwrap();
     let q = QTensor::quantize(&w, dtype).unwrap();
     let dense = q
@@ -32,12 +32,25 @@ fn check(dtype: GgmlDType) {
         .to_vec1::<f32>()
         .unwrap();
     let x = values(tokens * cols, 11);
+    // The kernels read int8 blocks of 32 for every format but F16, as the quantiser makes them.
+    let seen = if dtype == GgmlDType::F16 {
+        x.clone()
+    } else {
+        x.chunks(if cols % 128 == 0 { 128 } else { 32 })
+            .flat_map(|b| {
+                let mx = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let (d, inv) = (mx / 127.0, if mx > 0.0 { 127.0 / mx } else { 0.0 });
+                b.iter()
+                    .map(move |v| (v * inv).round_ties_even().clamp(-127.0, 127.0) * d)
+            })
+            .collect()
+    };
     let want: Vec<f32> = (0..tokens)
         .flat_map(|t| {
-            let (x, dense) = (&x, &dense);
+            let (seen, dense) = (&seen, &dense);
             (0..rows).map(move |r| {
                 (0..cols)
-                    .map(|c| dense[r * cols + c] as f64 * x[t * cols + c] as f64)
+                    .map(|c| dense[r * cols + c] as f64 * seen[t * cols + c] as f64)
                     .sum::<f64>() as f32
             })
         })
@@ -71,20 +84,35 @@ fn check(dtype: GgmlDType) {
 
 #[test]
 fn matvec_q4k() {
-    check(GgmlDType::Q4K);
+    check(GgmlDType::Q4K, 3);
 }
 
 #[test]
 fn matvec_q6k() {
-    check(GgmlDType::Q6K);
+    check(GgmlDType::Q6K, 3);
 }
 
 #[test]
 fn matvec_q8_0() {
-    check(GgmlDType::Q8_0);
+    check(GgmlDType::Q8_0, 3);
 }
 
 #[test]
 fn matvec_f16() {
-    check(GgmlDType::F16);
+    check(GgmlDType::F16, 3);
+}
+
+#[test]
+fn matmat_q4k() {
+    check(GgmlDType::Q4K, 40);
+}
+
+#[test]
+fn matmat_q6k() {
+    check(GgmlDType::Q6K, 40);
+}
+
+#[test]
+fn matmat_q8_0() {
+    check(GgmlDType::Q8_0, 40);
 }

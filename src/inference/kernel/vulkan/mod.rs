@@ -34,6 +34,15 @@ pub struct DeviceInfo {
     pub total: u64,
 }
 
+/// Lanes of a mat-vec workgroup: a multiple of the largest subgroup, with sixteen lanes a row.
+const MV_WORKGROUP: u32 = 128;
+
+/// Lanes of the subgroups the kernels run on when the device lets a pipeline choose.
+const SUBGROUP_LANES: u32 = 32;
+
+/// The device extension of the packed integer dot product the mat-vec kernels use.
+const DOT_EXTENSION: &std::ffi::CStr = c"VK_KHR_shader_integer_dot_product";
+
 const VENDOR_NVIDIA: u32 = 0x10de;
 const VENDOR_AMD: u32 = 0x1002;
 
@@ -183,6 +192,10 @@ pub struct Context {
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipelines: Mutex<HashMap<&'static str, vk::Pipeline>>,
+    /// Whether pipelines ask for subgroups of [`SUBGROUP_LANES`].
+    size_control: bool,
+    /// Lanes of the workgroups the mat-vec kernels run.
+    pub(crate) workgroup: u32,
     /// Nanoseconds a timestamp tick lasts.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) timestamp_period: f32,
@@ -231,9 +244,43 @@ impl Context {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities)];
-        let create = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+        let has_dot = unsafe { inst.instance.enumerate_device_extension_properties(pd) }
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(DOT_EXTENSION));
+        if !has_dot {
+            anyhow::bail!("vulkan: {} lacks the integer dot product", info.name);
+        }
+        // Kernels asking for 32-lane subgroups, where the device can run them.
+        let mut size_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut size_props);
+        unsafe {
+            inst.instance
+                .get_physical_device_properties2(pd, &mut props2)
+        };
+        let size_control = unsafe { inst.instance.enumerate_device_extension_properties(pd) }
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::subgroup_size_control::NAME))
+            && size_props.min_subgroup_size <= SUBGROUP_LANES
+            && size_props.max_subgroup_size >= SUBGROUP_LANES;
+        let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+            .shader_integer_dot_product(true);
+        let mut control =
+            vk::PhysicalDeviceSubgroupSizeControlFeatures::default().subgroup_size_control(true);
+        let mut extensions = vec![DOT_EXTENSION.as_ptr()];
+        let mut create = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .push_next(&mut dot);
+        if size_control {
+            extensions.push(ash::ext::subgroup_size_control::NAME.as_ptr());
+            create = create.push_next(&mut control);
+        }
+        let create = create.enabled_extension_names(&extensions);
         let device = unsafe { inst.instance.create_device(pd, &create, None)? };
+
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let workgroup = MV_WORKGROUP;
         let mem_props = unsafe { inst.instance.get_physical_device_memory_properties(pd) };
         let timestamp_period = unsafe { inst.instance.get_physical_device_properties(pd) }
             .limits
@@ -276,6 +323,8 @@ impl Context {
             set_layout,
             pipeline_layout,
             pipelines: Mutex::new(HashMap::new()),
+            size_control,
+            workgroup,
             timestamp_period,
         })
     }
@@ -286,15 +335,20 @@ impl Context {
         if let Some(p) = pipes.get(name) {
             return Ok(*p);
         }
-        let words = shaders::spirv(name)?;
+        let words = shaders::spirv(name, self.workgroup)?;
         let module = unsafe {
             self.device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?
         };
-        let stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(SUBGROUP_LANES);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(c"main");
+        if self.size_control {
+            stage = stage.push_next(&mut subgroup);
+        }
         let info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(self.pipeline_layout)];
@@ -339,7 +393,14 @@ impl Context {
         } else {
             vk::MemoryPropertyFlags::DEVICE_LOCAL
         };
-        let Some(kind) = self.memory_type(req.memory_type_bits, flags) else {
+        // Host memory the CPU caches reads fast; uncached host memory reads at a crawl.
+        let cached = flags | vk::MemoryPropertyFlags::HOST_CACHED;
+        let picked = if host {
+            self.memory_type(req.memory_type_bits, cached)
+        } else {
+            None
+        };
+        let Some(kind) = picked.or_else(|| self.memory_type(req.memory_type_bits, flags)) else {
             unsafe { self.device.destroy_buffer(buf, None) };
             anyhow::bail!("vulkan: no memory type for {flags:?}");
         };
@@ -516,7 +577,34 @@ impl Buffer {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(offset), bytes.len()) };
     }
 
+    /// Appends `n` `f32`s read from the start of a host-mapped buffer to `out`.
+    #[cfg(target_endian = "little")]
+    pub(crate) fn read_f32s(&self, n: usize, out: &mut Vec<f32>) {
+        let p = self.mapped.expect("a host-mapped buffer");
+        assert!(n * 4 <= self.size as usize);
+        out.reserve(n);
+        let at = out.len();
+        // SAFETY: `n` floats are reserved past `at`, and the mapped bytes are little-endian f32.
+        unsafe {
+            std::ptr::copy_nonoverlapping(p as *const f32, out.as_mut_ptr().add(at), n);
+            out.set_len(at + n);
+        }
+    }
+
+    /// Appends `n` `f32`s read from the start of a host-mapped buffer to `out`.
+    #[cfg(not(target_endian = "little"))]
+    pub(crate) fn read_f32s(&self, n: usize, out: &mut Vec<f32>) {
+        let mut bytes = vec![0u8; n * 4];
+        self.read(0, &mut bytes);
+        out.extend(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
+    }
+
     /// Reads `out.len()` bytes at byte `offset` of a host-mapped buffer.
+    #[cfg(any(test, not(target_endian = "little")))]
     pub(crate) fn read(&self, offset: usize, out: &mut [u8]) {
         let p = self.mapped.expect("a host-mapped buffer");
         assert!(offset + out.len() <= self.size as usize);

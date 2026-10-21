@@ -1,8 +1,22 @@
 //! The kernels, in WGSL, compiled to SPIR-V with naga.
 //!
 //! Every kernel shares one layout: storage bindings 0..8 of set 0 and 64 bytes of immediates,
-//! read as sixteen `u32` (a float travels as its bits). Weights are read as whole words: the
-//! stack repacks the block formats whose blocks are not a multiple of four bytes.
+//! read as sixteen `u32` (a float travels as its bits). Weights are read as whole words, or as
+//! four-word vectors where the block size allows.
+//!
+//! Activations that feed a mat-vec travel as int8 blocks of 32 (`xq`, four values a word) with
+//! one `vec4<f32>` per block in `xm`: the scale `d`, and the sums of the first and of the last
+//! sixteen int8 values. The mat-vec kernels take the integer dot product of the weight
+//! bytes with those values.
+
+/// Lanes that run one row of the mat-vec of `kernel`: more where a row has plenty of items
+/// and the format's loads are narrow enough to want the extra requests in flight.
+pub(super) fn lanes_per_row(kernel: &str) -> u32 {
+    match kernel {
+        "mv_q4k" | "mv_f16" => 32,
+        _ => 16,
+    }
+}
 
 /// The immediates: sixteen words whose meaning each kernel states.
 const HEAD: &str = r#"
@@ -10,75 +24,339 @@ struct P { a: array<vec4<u32>, 4> }
 var<immediate> p: P;
 fn arg(i: u32) -> u32 { return p.a[i >> 2u][i & 3u]; }
 fn argf(i: u32) -> f32 { return bitcast<f32>(arg(i)); }
-"#;
-
-/// Root-mean-square norm of `rows` rows of `n`: `y = x / rms(x) * w`.
-/// Args: rows, n, x_off, y_off, eps, w_off. One workgroup per row.
-const RMS_NORM: &str = r#"
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> w: array<f32>;
-@group(0) @binding(2) var<storage, read_write> y: array<f32>;
-var<workgroup> red: array<f32, 256>;
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-    let n = arg(1u);
-    let row = wid.x;
-    let xb = arg(2u) + row * n;
-    var s = 0.0;
-    for (var i = li; i < n; i = i + 256u) { let v = x[xb + i]; s = s + v * v; }
-    red[li] = s;
-    workgroupBarrier();
-    for (var k = 128u; k > 0u; k = k >> 1u) {
-        if (li < k) { red[li] = red[li] + red[li + k]; }
-        workgroupBarrier();
-    }
-    let r = inverseSqrt(red[0] / f32(n) + argf(4u));
-    let yb = arg(3u) + row * n;
-    let wb = arg(5u);
-    for (var i = li; i < n; i = i + 256u) { y[yb + i] = x[xb + i] * r * w[wb + i]; }
+fn dot4(a: vec4<u32>, b: vec4<u32>) -> i32 {
+    return dot4I8Packed(a.x, b.x) + dot4I8Packed(a.y, b.y) + dot4I8Packed(a.z, b.z) + dot4I8Packed(a.w, b.w);
 }
 "#;
 
-/// The mat-vec frame: `y[t, r] (+)= sum_k W[r, k] x[t, k] (+ bias[r])` for up to eight tokens.
-/// Args: m, k, tokens, x_off, y_off, flags (1 accumulate, 2 bias), x_stride, y_stride.
-/// A workgroup of 64 runs rows `2 g` and `2 g + 1` of group `g = wid.x + wid.y * 32768`, a
-/// subgroup to a row at a time; the lanes of a subgroup split the row and add up with the
-/// subgroup sum. `ITEMS` and `ITEM` are the format's: how many items a row has and what one
-/// item adds to `acc`.
-const MATVEC: &str = r#"
-@group(0) @binding(0) var<storage, read> w: array<u32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read_write> y: array<f32>;
-@group(0) @binding(3) var<storage, read> bias: array<f32>;
-@compute @workgroup_size(64)
+/// Quantises rows of `n` values to int8 blocks (see the module comment), the scale shared by
+/// 128 values when `n` is a multiple of 128 and by 32 otherwise, after an optional
+/// transform of the source. Args: rows, n, src_off, eps, flags (1: also write the transformed
+/// values as f32 to `xn`), mode (0 copy, 1 RMS norm with weight `b`, 2 `silu(a) * b`).
+/// One workgroup per row; eight values a lane, four lanes a block.
+const QUANT: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> b: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> xq: array<u32>;
+@group(0) @binding(4) var<storage, read_write> xm: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> xn: array<vec4<f32>>;
+var<workgroup> red: array<f32, 64>;
+fn packq(q: vec4<i32>) -> u32 {
+    let u = bitcast<vec4<u32>>(q) & vec4<u32>(255u);
+    return u.x | (u.y << 8u) | (u.z << 16u) | (u.w << 24u);
+}
+fn val(i: u32, base: u32, mode: u32, scale: f32) -> vec4<f32> {
+    let v = a[base + i];
+    if (mode == 1u) { return v * scale * b[i]; }
+    if (mode == 2u) { return v / (vec4<f32>(1.0) + exp(-v)) * b[base + i]; }
+    return v;
+}
+@compute @workgroup_size(256)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) li: u32,
     @builtin(subgroup_invocation_id) lane: u32,
-    @builtin(subgroup_size) lanes: u32,
     @builtin(subgroup_id) sg: u32,
     @builtin(num_subgroups) sgs: u32,
+) {
+    let n = arg(1u);
+    let n4 = n / 4u;
+    let row = wid.x;
+    let base = (arg(2u) + row * n) / 4u;
+    let mode = arg(5u);
+    var scale = 1.0;
+    if (mode == 1u) {
+        var s = 0.0;
+        for (var i = li; i < n4; i = i + 256u) { let v = a[base + i]; s = s + dot(v, v); }
+        s = subgroupAdd(s);
+        if (lane == 0u) { red[sg] = s; }
+        workgroupBarrier();
+        var tot = 0.0;
+        for (var i = 0u; i < sgs; i = i + 1u) { tot = tot + red[i]; }
+        scale = inverseSqrt(tot / f32(n) + argf(3u));
+    }
+    let wide = (n % 128u) == 0u;
+    let units = ((n / 8u) + 255u) / 256u * 256u;
+    for (var u = li; u < units; u = u + 256u) {
+        let valid = u * 8u < n;
+        var v0 = vec4<f32>(0.0);
+        var v1 = vec4<f32>(0.0);
+        if (valid) { v0 = val(2u * u, base, mode, scale); v1 = val(2u * u + 1u, base, mode, scale); }
+        let a0 = abs(v0);
+        let a1 = abs(v1);
+        var mx = max(max(max(a0.x, a0.y), max(a0.z, a0.w)), max(max(a1.x, a1.y), max(a1.z, a1.w)));
+        mx = max(mx, subgroupShuffleXor(mx, 1u));
+        mx = max(mx, subgroupShuffleXor(mx, 2u));
+        if (wide) {
+            mx = max(mx, subgroupShuffleXor(mx, 4u));
+            mx = max(mx, subgroupShuffleXor(mx, 8u));
+        }
+        let d = mx / 127.0;
+        let inv = select(0.0, 127.0 / mx, mx > 0.0);
+        let q0 = vec4<i32>(round(v0 * inv));
+        let q1 = vec4<i32>(round(v1 * inv));
+        let sm = q0.x + q0.y + q0.z + q0.w + q1.x + q1.y + q1.z + q1.w;
+        let s16 = sm + subgroupShuffleXor(sm, 1u);
+        let shi = subgroupShuffleXor(s16, 2u);
+        if (valid) {
+            xq[row * n4 + 2u * u] = packq(q0);
+            xq[row * n4 + 2u * u + 1u] = packq(q1);
+            if ((u & 3u) == 0u) {
+                xm[row * (n / 32u) + (u >> 2u)] = vec4<f32>(d, f32(s16), f32(shi), 0.0);
+            }
+            if ((arg(4u) & 1u) != 0u) {
+                xn[row * n4 + 2u * u] = v0;
+                xn[row * n4 + 2u * u + 1u] = v1;
+            }
+        }
+    }
+}
+"#;
+
+/// The mat-vec frame: `y[t, r] (+)= sum_k W[r, k] x[t, k] (+ bias[r])` for up to `MAXT` tokens.
+/// Args: m, k, tokens, first token, y_off, flags (1 accumulate, 2 bias), -, y_stride. A workgroup is one
+/// workgroup of `WG` lanes; sixteen lanes run a row, so it runs `WG / 16` rows. `ITEMS` and
+/// `ITEM` are the format's: how many items a row has and what one item adds to `acc[t]`.
+const MATVEC: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<WTYPE>;
+@group(0) @binding(1) var<storage, read> xq: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read> xm: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> xf: array<vec4<f32>>;
+const M4: vec4<u32> = vec4<u32>(0x0F0F0F0Fu);
+fn kbyte(i: u32, a: u32, b: u32, c: u32) -> u32 {
+    let wd = select(select(a, b, (i >> 2u) == 1u), c, (i >> 2u) == 2u);
+    return (wd >> ((i & 3u) * 8u)) & 255u;
+}
+fn q4k_sm(s: u32, a: u32, b: u32, c: u32) -> vec2<u32> {
+    let lo = vec2<u32>(kbyte(s, a, b, c) & 63u, kbyte(s + 4u, a, b, c) & 63u);
+    let h4 = kbyte(s + 4u, a, b, c);
+    let hi = vec2<u32>((h4 & 15u) | ((kbyte(s & 3u, a, b, c) >> 6u) << 4u), (h4 >> 4u) | ((kbyte(s, a, b, c) >> 6u) << 4u));
+    return select(hi, lo, s < 4u);
+}
+fn sgn6(u: vec4<u32>) -> vec4<u32> {
+    return ((u | vec4<u32>(0x80808080u)) - vec4<u32>(0x20202020u)) ^ vec4<u32>(0x80808080u);
+}
+@compute @workgroup_size(WG)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
 ) {
     let m = arg(0u);
     let k = arg(1u);
     let nt = arg(2u);
-    let xo = arg(3u);
-    let xs = arg(6u);
-    let items = ITEMS;
-    for (var slot = sg; slot < 2u; slot = slot + sgs) {
-        let raw = (wid.x + wid.y * 32768u) * 2u + slot;
-        let row = min(raw, m - 1u);
-        var acc: array<f32, 8>;
-        for (var t = 0u; t < 8u; t = t + 1u) { acc[t] = 0.0; }
-        for (var it = lane; it < items; it = it + lanes) {
-            ITEM
+    let tb = arg(3u);
+    let raw = (wid.x + wid.y * 32768u) * (WG / LPRu) + lane / LPRu;
+    let row = min(raw, m - 1u);
+    var acc: array<f32, MAXT>;
+    for (var it = lane & (LPRu - 1u); it < ITEMS; it = it + LPRu) {
+        ITEM
+    }
+    for (var t = 0u; t < nt; t = t + 1u) {
+        var v = acc[t];
+        SHUFFLES
+        if (raw < m && (lane & (LPRu - 1u)) == 0u) {
+            let flags = arg(5u);
+            if ((flags & 2u) != 0u) { v = v + bias[row]; }
+            let at = arg(4u) + (tb + t) * arg(7u) + row;
+            if ((flags & 1u) != 0u) { v = v + y[at]; }
+            y[at] = v;
         }
+    }
+}
+"#;
+
+/// Q4_K, as stored: 9 vectors a block of 256 (d and dmin, 12 bytes of 6-bit scales and mins,
+/// 128 bytes of nibbles). An item is sixteen bytes of nibbles of one group of 64 values: the
+/// low nibbles are half a sub-block, the high ones half of the next.
+const Q4K_ITEM: (&str, &str, &str) = (
+    "vec4<u32>",
+    "(k / 256u) * 8u",
+    r#"
+        let b = it >> 3u;
+        let j = (it >> 1u) & 3u;
+        let h = it & 1u;
+        let sb = (row * (k / 256u) + b) * 9u;
+        let head = w[sb];
+        let wv = w[sb + 1u + 2u * j + h];
+        let dm = unpack2x16float(head.x);
+        let sm0 = q4k_sm(2u * j, head.y, head.z, head.w);
+        let sm1 = q4k_sm(2u * j + 1u, head.y, head.z, head.w);
+        let dl0 = dm.x * f32(sm0.x);
+        let ml0 = dm.y * f32(sm0.y);
+        let dl1 = dm.x * f32(sm1.x);
+        let ml1 = dm.y * f32(sm1.y);
+        let lo = wv & M4;
+        let hi = (wv >> vec4<u32>(4u)) & M4;
+        let blk = b * 8u + 2u * j;
         for (var t = 0u; t < nt; t = t + 1u) {
-            let v0 = subgroupAdd(acc[t]);
-            if (raw < m && lane == 0u) {
-                var v = v0;
+            let xi = (tb + t) * (k / 16u) + blk * 2u + h;
+            let xa = xq[xi];
+            let xb = xq[xi + 2u];
+            let ma = xm[(tb + t) * (k / 32u) + blk];
+            let mb = xm[(tb + t) * (k / 32u) + blk + 1u];
+            let sa = dot4(lo, xa);
+            let sc = dot4(hi, xb);
+            acc[t] = acc[t] + ma.x * (dl0 * f32(sa) - ml0 * select(ma.y, ma.z, h == 1u))
+                + mb.x * (dl1 * f32(sc) - ml1 * select(mb.y, mb.z, h == 1u));
+        }
+"#,
+);
+
+/// Q6_K, repacked to 14 vectors a block of 256: ql (128 bytes), qh (64), the int8 scales (16),
+/// d (a word, padded). An item is sixteen lanes of each of the four quarters of one half block:
+/// 64 values on four scales.
+const Q6K_ITEM: (&str, &str, &str) = (
+    "vec4<u32>",
+    "(k / 256u) * 4u",
+    r#"
+        let b = it >> 2u;
+        let n = (it >> 1u) & 1u;
+        let hh = it & 1u;
+        let sb = (row * (k / 256u) + b) * 14u;
+        let wa = w[sb + n * 4u + hh];
+        let wb = w[sb + n * 4u + 2u + hh];
+        let wh = w[sb + 8u + n * 2u + hh];
+        let scw = w[sb + 12u];
+        let d = unpack2x16float(w[sb + 13u].x).x;
+        let sa = select(scw.xy, scw.zw, n == 1u);
+        let s0 = d * f32(extractBits(bitcast<i32>(sa.x), hh * 8u, 8u));
+        let s1 = d * f32(extractBits(bitcast<i32>(sa.x), (2u + hh) * 8u, 8u));
+        let s2 = d * f32(extractBits(bitcast<i32>(sa.y), hh * 8u, 8u));
+        let s3 = d * f32(extractBits(bitcast<i32>(sa.y), (2u + hh) * 8u, 8u));
+        let m3 = vec4<u32>(0x03030303u);
+        let u1 = sgn6((wa & M4) | ((wh & m3) << vec4<u32>(4u)));
+        let u2 = sgn6((wb & M4) | (((wh >> vec4<u32>(2u)) & m3) << vec4<u32>(4u)));
+        let u3 = sgn6(((wa >> vec4<u32>(4u)) & M4) | (((wh >> vec4<u32>(4u)) & m3) << vec4<u32>(4u)));
+        let u4 = sgn6(((wb >> vec4<u32>(4u)) & M4) | (((wh >> vec4<u32>(6u)) & m3) << vec4<u32>(4u)));
+        let blk = b * 8u + n * 4u;
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let xi = (tb + t) * (k / 16u) + blk * 2u + hh;
+            let mi = (tb + t) * (k / 32u) + blk;
+            acc[t] = acc[t]
+                + s0 * xm[mi].x * f32(dot4(u1, xq[xi]))
+                + s1 * xm[mi + 1u].x * f32(dot4(u2, xq[xi + 2u]))
+                + s2 * xm[mi + 2u].x * f32(dot4(u3, xq[xi + 4u]))
+                + s3 * xm[mi + 3u].x * f32(dot4(u4, xq[xi + 6u]));
+        }
+"#,
+);
+
+/// Q8_0, repacked to 9 words a block of 32: d, then the 32 int8. An item is sixteen of them.
+const Q8_0_ITEM: (&str, &str, &str) = (
+    "u32",
+    "(k / 32u) * 2u",
+    r#"
+        let blk = it >> 1u;
+        let h = it & 1u;
+        let sb = (row * (k / 32u) + blk) * 9u;
+        let d = unpack2x16float(w[sb]).x;
+        let wv = vec4<u32>(w[sb + 1u + h * 4u], w[sb + 2u + h * 4u], w[sb + 3u + h * 4u], w[sb + 4u + h * 4u]);
+        for (var t = 0u; t < nt; t = t + 1u) {
+            acc[t] = acc[t] + d * xm[(tb + t) * (k / 32u) + blk].x * f32(dot4(wv, xq[(tb + t) * (k / 16u) + blk * 2u + h]));
+        }
+"#,
+);
+
+/// F16, as stored: eight values a vector, read against the f32 activations. An item is a vector.
+const F16_ITEM: (&str, &str, &str) = (
+    "vec4<u32>",
+    "k / 8u",
+    r#"
+        let wv = w[row * (k / 8u) + it];
+        let w0 = unpack2x16float(wv.x);
+        let w1 = unpack2x16float(wv.y);
+        let w2 = unpack2x16float(wv.z);
+        let w3 = unpack2x16float(wv.w);
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let xi = (tb + t) * (k / 4u) + it * 2u;
+            let x0 = xf[xi];
+            let x1 = xf[xi + 1u];
+            acc[t] = acc[t] + dot(w0, x0.xy) + dot(w1, x0.zw) + dot(w2, x1.xy) + dot(w3, x1.zw);
+        }
+"#,
+);
+
+/// The mat-mat frame for up to 32 tokens per tile row: `y[t, r] (+)= sum_k W[r, k] x[t, k]
+/// (+ bias[r])` on a tile of 64 rows and 32 tokens a workgroup of 128 lanes, each lane 4 rows by
+/// 4 tokens. A step stages `BK` columns of the weights as int8 words with their scales and the
+/// same columns of the activations, then takes the integer dot products. `DOTS` is the format's
+/// way of weighing a block's products; the K-quants keep their integer scales and minimums in
+/// `si`, their super-block scales in `sd`, and apply the activations' scale once a step.
+/// Args as the mat-vec's.
+const MATMAT: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<WTYPE>;
+@group(0) @binding(1) var<storage, read> xq: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read> xm: array<vec4<f32>>;
+const BK: u32 = BKV;
+const NB: u32 = BKV / 32u;
+const SV: u32 = BKV / 16u + 1u;
+const M4: vec4<u32> = vec4<u32>(0x0F0F0F0Fu);
+var<workgroup> sw: array<vec4<u32>, SWN>;
+var<workgroup> si: array<vec2<i32>, 512>;
+var<workgroup> sd: array<vec2<f32>, 64>;
+var<workgroup> ss: array<vec4<f32>, SSN>;
+var<workgroup> sx: array<vec4<u32>, SXN>;
+var<workgroup> sm: array<vec4<f32>, SMN>;
+var<workgroup> sxs: array<i32, SMN>;
+fn kbyte(i: u32, a: u32, b: u32, c: u32) -> u32 {
+    let wd = select(select(a, b, (i >> 2u) == 1u), c, (i >> 2u) == 2u);
+    return (wd >> ((i & 3u) * 8u)) & 255u;
+}
+fn q4k_sm(s: u32, a: u32, b: u32, c: u32) -> vec2<u32> {
+    let lo = vec2<u32>(kbyte(s, a, b, c) & 63u, kbyte(s + 4u, a, b, c) & 63u);
+    let h4 = kbyte(s + 4u, a, b, c);
+    let hi = vec2<u32>((h4 & 15u) | ((kbyte(s & 3u, a, b, c) >> 6u) << 4u), (h4 >> 4u) | ((kbyte(s, a, b, c) >> 6u) << 4u));
+    return select(hi, lo, s < 4u);
+}
+fn sgn6(u: vec4<u32>) -> vec4<u32> {
+    return ((u | vec4<u32>(0x80808080u)) - vec4<u32>(0x20202020u)) ^ vec4<u32>(0x80808080u);
+}
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let m = arg(0u);
+    let k = arg(1u);
+    let nt = arg(2u);
+    let row0 = wid.x * 64u;
+    let tok0 = wid.y * 32u;
+    let ty = li >> 3u;
+    let tx = li & 7u;
+    var acc: array<f32, 16>;
+    for (var kk = 0u; kk < k; kk = kk + BK) {
+        {
+            LOADW
+        }
+        for (var e = li; e < 32u * (BK / 16u); e = e + 128u) {
+            let tk = e / (BK / 16u);
+            let pv = e % (BK / 16u);
+            var v = vec4<u32>(0u);
+            if (tok0 + tk < nt) { v = xq[(tok0 + tk) * (k / 16u) + kk / 16u + pv]; }
+            sx[tk * SV + pv] = v;
+        }
+        for (var e = li; e < 32u * NB; e = e + 128u) {
+            let tk = e / NB;
+            let bb = e % NB;
+            var v = vec4<f32>(0.0);
+            if (tok0 + tk < nt) { v = xm[(tok0 + tk) * (k / 32u) + kk / 32u + bb]; }
+            sm[e] = v;
+            sxs[e] = i32(v.y + v.z);
+        }
+        workgroupBarrier();
+        DOTS
+        workgroupBarrier();
+    }
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        let row = row0 + ty * 4u + r;
+        for (var t = 0u; t < 4u; t = t + 1u) {
+            let tk = tok0 + t * 8u + tx;
+            if (row < m && tk < nt) {
+                var v = acc[r * 4u + t];
                 let flags = arg(5u);
                 if ((flags & 2u) != 0u) { v = v + bias[row]; }
-                let at = arg(4u) + t * arg(7u) + row;
+                let at = arg(4u) + tk * arg(7u) + row;
                 if ((flags & 1u) != 0u) { v = v + y[at]; }
                 y[at] = v;
             }
@@ -87,122 +365,393 @@ fn main(
 }
 "#;
 
-/// Q4_K, as stored: 36 words a block of 256 (d and dmin, 12 bytes of 6-bit scales and mins,
-/// 128 bytes of nibbles). An item is one word of nibbles: four values of sub-block `2 jp` in
-/// its low nibbles, four of sub-block `2 jp + 1` in its high ones. Neighbouring lanes read
-/// neighbouring words.
-const Q4K_ITEM: (&str, &str) = (
-    "(k / 256u) * 32u",
+/// The products of a step of formats with a float scale to each block of 32 (Q8_0).
+const DOTS_BLOCKS: &str = r#"
+        for (var blk = 0u; blk < NB; blk = blk + 1u) {
+            var isum: array<i32, 16>;
+            for (var hf = 0u; hf < 2u; hf = hf + 1u) {
+                var wr: array<vec4<u32>, 4>;
+                var xt: array<vec4<u32>, 4>;
+                for (var r = 0u; r < 4u; r = r + 1u) { wr[r] = sw[(ty * 4u + r) * SV + blk * 2u + hf]; }
+                for (var t = 0u; t < 4u; t = t + 1u) { xt[t] = sx[(t * 8u + tx) * SV + blk * 2u + hf]; }
+                for (var r = 0u; r < 4u; r = r + 1u) {
+                    for (var t = 0u; t < 4u; t = t + 1u) {
+                        isum[r * 4u + t] = isum[r * 4u + t] + dot4(wr[r], xt[t]);
+                    }
+                }
+            }
+            for (var r = 0u; r < 4u; r = r + 1u) {
+                let sv = ss[(ty * 4u + r) * NB + blk];
+                for (var t = 0u; t < 4u; t = t + 1u) {
+                    let xv = sm[(t * 8u + tx) * NB + blk];
+                    acc[r * 4u + t] = acc[r * 4u + t] + sv.x * xv.x * f32(isum[r * 4u + t]);
+                }
+            }
+        }
+"#;
+
+/// The products of a Q4_K step of four blocks: integer scales and minimums weigh the products
+/// and the activations' sums, and the floats come in once.
+const DOTS_Q4K: &str = r#"
+        var ai: array<i32, 16>;
+        var bi: array<i32, 16>;
+        for (var blk = 0u; blk < NB; blk = blk + 1u) {
+            var isum: array<i32, 16>;
+            for (var hf = 0u; hf < 2u; hf = hf + 1u) {
+                var wr: array<vec4<u32>, 4>;
+                var xt: array<vec4<u32>, 4>;
+                for (var r = 0u; r < 4u; r = r + 1u) { wr[r] = sw[(ty * 4u + r) * SV + blk * 2u + hf]; }
+                for (var t = 0u; t < 4u; t = t + 1u) { xt[t] = sx[(t * 8u + tx) * SV + blk * 2u + hf]; }
+                for (var r = 0u; r < 4u; r = r + 1u) {
+                    for (var t = 0u; t < 4u; t = t + 1u) {
+                        isum[r * 4u + t] = isum[r * 4u + t] + dot4(wr[r], xt[t]);
+                    }
+                }
+            }
+            var xs: array<i32, 4>;
+            for (var t = 0u; t < 4u; t = t + 1u) { xs[t] = sxs[(t * 8u + tx) * NB + blk]; }
+            for (var r = 0u; r < 4u; r = r + 1u) {
+                let sv = si[(ty * 4u + r) * 4u + blk];
+                for (var t = 0u; t < 4u; t = t + 1u) {
+                    ai[r * 4u + t] = ai[r * 4u + t] + sv.x * isum[r * 4u + t];
+                    bi[r * 4u + t] = bi[r * 4u + t] + sv.y * xs[t];
+                }
+            }
+        }
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let dd = sd[ty * 4u + r];
+            for (var t = 0u; t < 4u; t = t + 1u) {
+                let xd = sm[(t * 8u + tx) * NB].x;
+                acc[r * 4u + t] = acc[r * 4u + t] + xd * (dd.x * f32(ai[r * 4u + t]) - dd.y * f32(bi[r * 4u + t]));
+            }
+        }
+"#;
+
+/// The products of a Q6_K step of four blocks: an integer scale to each sixteen values.
+const DOTS_Q6K: &str = r#"
+        var ai: array<i32, 16>;
+        for (var blk = 0u; blk < NB; blk = blk + 1u) {
+            var i0: array<i32, 16>;
+            var i1: array<i32, 16>;
+            {
+                var wr: array<vec4<u32>, 4>;
+                var wr2: array<vec4<u32>, 4>;
+                var xt: array<vec4<u32>, 4>;
+                var xt2: array<vec4<u32>, 4>;
+                for (var r = 0u; r < 4u; r = r + 1u) {
+                    wr[r] = sw[(ty * 4u + r) * SV + blk * 2u];
+                    wr2[r] = sw[(ty * 4u + r) * SV + blk * 2u + 1u];
+                }
+                for (var t = 0u; t < 4u; t = t + 1u) {
+                    xt[t] = sx[(t * 8u + tx) * SV + blk * 2u];
+                    xt2[t] = sx[(t * 8u + tx) * SV + blk * 2u + 1u];
+                }
+                for (var r = 0u; r < 4u; r = r + 1u) {
+                    for (var t = 0u; t < 4u; t = t + 1u) {
+                        i0[r * 4u + t] = i0[r * 4u + t] + dot4(wr[r], xt[t]);
+                        i1[r * 4u + t] = i1[r * 4u + t] + dot4(wr2[r], xt2[t]);
+                    }
+                }
+            }
+            for (var r = 0u; r < 4u; r = r + 1u) {
+                let s0 = si[(ty * 4u + r) * 8u + 2u * blk].x;
+                let s1 = si[(ty * 4u + r) * 8u + 2u * blk + 1u].x;
+                for (var t = 0u; t < 4u; t = t + 1u) {
+                    ai[r * 4u + t] = ai[r * 4u + t] + s0 * i0[r * 4u + t] + s1 * i1[r * 4u + t];
+                }
+            }
+        }
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let dd = sd[ty * 4u + r];
+            for (var t = 0u; t < 4u; t = t + 1u) {
+                let xd = sm[(t * 8u + tx) * NB].x;
+                acc[r * 4u + t] = acc[r * 4u + t] + xd * dd.x * f32(ai[r * 4u + t]);
+            }
+        }
+"#;
+
+/// The staging of a Q4_K step of 128 columns: a lane takes the 32 bytes of nibbles of one group
+/// of 64 (its low nibbles are one block of 32, its high ones the next).
+const Q4K_LOAD: (&str, u32, &str, &str) = (
+    "vec4<u32>",
+    128,
+    "Q4K",
     r#"
-        let b = it >> 5u;
-        let wq = it & 31u;
-        let jp = wq >> 3u;
-        let base = (row * (k / 256u) + b) * 36u;
-        let dm = unpack2x16float(w[base]);
-        let s0 = w[base + 1u];
-        let s1 = w[base + 2u];
-        let s2 = w[base + 3u];
-        var sc: vec2<u32>;
-        var mn: vec2<u32>;
-        if (jp < 2u) {
-            sc = vec2<u32>(extractBits(s0, jp * 16u, 6u), extractBits(s0, jp * 16u + 8u, 6u));
-            mn = vec2<u32>(extractBits(s1, jp * 16u, 6u), extractBits(s1, jp * 16u + 8u, 6u));
-        } else {
-            let o = (jp - 2u) * 16u;
-            let hi = vec2<u32>(extractBits(s2, o, 8u), extractBits(s2, o + 8u, 8u));
-            sc = (hi & vec2<u32>(15u)) | (vec2<u32>(extractBits(s0, o + 6u, 2u), extractBits(s0, o + 14u, 2u)) << vec2<u32>(4u));
-            mn = (hi >> vec2<u32>(4u)) | (vec2<u32>(extractBits(s1, o + 6u, 2u), extractBits(s1, o + 14u, 2u)) << vec2<u32>(4u));
-        }
-        let dl = dm.x * vec2<f32>(sc);
-        let ml = dm.y * vec2<f32>(mn);
-        let v = w[base + 4u + wq];
-        let ql = vec4<f32>(f32(v & 15u), f32((v >> 8u) & 15u), f32((v >> 16u) & 15u), f32((v >> 24u) & 15u));
-        let qh = vec4<f32>(f32((v >> 4u) & 15u), f32((v >> 12u) & 15u), f32((v >> 20u) & 15u), f32(v >> 28u));
-        let col = b * 256u + jp * 64u + (wq & 7u) * 4u;
-        for (var t = 0u; t < nt; t = t + 1u) {
-            let xb = xo + t * xs + col;
-            let lo = vec4<f32>(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
-            let hi = vec4<f32>(x[xb + 32u], x[xb + 33u], x[xb + 34u], x[xb + 35u]);
-            acc[t] = acc[t] + dl.x * dot(ql, lo) - ml.x * (lo.x + lo.y + lo.z + lo.w)
-                + dl.y * dot(qh, hi) - ml.y * (hi.x + hi.y + hi.z + hi.w);
-        }
+            let row = li >> 1u;
+            let jj = li & 1u;
+            let gr = min(row0 + row, m - 1u);
+            let b = kk >> 8u;
+            let h2 = (kk >> 7u) & 1u;
+            let jg = 2u * h2 + jj;
+            let sb = (gr * (k / 256u) + b) * 9u;
+            let a = w[sb + 1u + 2u * jg];
+            let c = w[sb + 2u + 2u * jg];
+            let o = row * SV + jj * 4u;
+            sw[o] = a & M4;
+            sw[o + 1u] = c & M4;
+            sw[o + 2u] = (a >> vec4<u32>(4u)) & M4;
+            sw[o + 3u] = (c >> vec4<u32>(4u)) & M4;
+            let head = w[sb];
+            let s0 = q4k_sm(4u * h2 + 2u * jj, head.y, head.z, head.w);
+            let s1 = q4k_sm(4u * h2 + 2u * jj + 1u, head.y, head.z, head.w);
+            si[row * 4u + 2u * jj] = vec2<i32>(i32(s0.x), i32(s0.y));
+            si[row * 4u + 2u * jj + 1u] = vec2<i32>(i32(s1.x), i32(s1.y));
+            if (jj == 0u) { sd[row] = unpack2x16float(head.x); }
 "#,
 );
 
-/// Q6_K, repacked to 53 words a block: ql (32 words), qh (16), the int8 scales (4), d. An item
-/// is four lanes `l .. l + 4` of one half block: a word of each half of its ql, a word of its
-/// qh, sixteen values. Neighbouring lanes read neighbouring words.
-const Q6K_ITEM: (&str, &str) = (
-    "(k / 256u) * 16u",
+/// The staging of a Q6_K step of 128 columns, one half block: a lane takes sixteen columns of
+/// each of its four quarters.
+const Q6K_LOAD: (&str, u32, &str, &str) = (
+    "vec4<u32>",
+    128,
+    "Q6K",
     r#"
-        let b = it >> 4u;
-        let n = (it >> 3u) & 1u;
-        let lq = it & 7u;
-        let base = (row * (k / 256u) + b) * 53u;
-        let d = unpack2x16float(w[base + 52u]).x;
-        // The scales of lanes `l .. l + 4` are `is`, `is + 2`, `is + 4` and `is + 6`, with
-        // `is % 4` 0 or 1: the first two in one word, the last two in the next.
-        let is = n * 8u + lq / 4u;
-        let sw0 = bitcast<i32>(w[base + 48u + is / 4u]);
-        let sw1 = bitcast<i32>(w[base + 49u + is / 4u]);
-        let sh = (is % 4u) * 8u;
-        let sc0 = d * f32(extractBits(sw0, sh, 8u));
-        let sc2 = d * f32(extractBits(sw0, sh + 16u, 8u));
-        let sc4 = d * f32(extractBits(sw1, sh, 8u));
-        let sc6 = d * f32(extractBits(sw1, sh + 16u, 8u));
-        let wa = w[base + n * 16u + lq];
-        let wb = w[base + n * 16u + 8u + lq];
-        let wh = w[base + 32u + n * 8u + lq];
-        let sv = vec4<u32>(0u, 8u, 16u, 24u);
-        let av = (vec4<u32>(wa) >> sv) & vec4<u32>(255u);
-        let bv = (vec4<u32>(wb) >> sv) & vec4<u32>(255u);
-        let hv = (vec4<u32>(wh) >> sv) & vec4<u32>(255u);
-        let m32 = vec4<i32>(32);
-        let q1 = vec4<f32>(vec4<i32>((av & vec4<u32>(15u)) | ((hv & vec4<u32>(3u)) << vec4<u32>(4u))) - m32);
-        let q2 = vec4<f32>(vec4<i32>((bv & vec4<u32>(15u)) | (((hv >> vec4<u32>(2u)) & vec4<u32>(3u)) << vec4<u32>(4u))) - m32);
-        let q3 = vec4<f32>(vec4<i32>((av >> vec4<u32>(4u)) | (((hv >> vec4<u32>(4u)) & vec4<u32>(3u)) << vec4<u32>(4u))) - m32);
-        let q4 = vec4<f32>(vec4<i32>((bv >> vec4<u32>(4u)) | (((hv >> vec4<u32>(6u)) & vec4<u32>(3u)) << vec4<u32>(4u))) - m32);
-        let col = b * 256u + n * 128u + lq * 4u;
-        for (var t = 0u; t < nt; t = t + 1u) {
-            let xb = xo + t * xs + col;
-            let x1 = vec4<f32>(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
-            let x2 = vec4<f32>(x[xb + 32u], x[xb + 33u], x[xb + 34u], x[xb + 35u]);
-            let x3 = vec4<f32>(x[xb + 64u], x[xb + 65u], x[xb + 66u], x[xb + 67u]);
-            let x4 = vec4<f32>(x[xb + 96u], x[xb + 97u], x[xb + 98u], x[xb + 99u]);
-            acc[t] = acc[t] + sc0 * dot(q1, x1) + sc2 * dot(q2, x2) + sc4 * dot(q3, x3) + sc6 * dot(q4, x4);
-        }
+            let row = li >> 1u;
+            let hh = li & 1u;
+            let gr = min(row0 + row, m - 1u);
+            let b = kk >> 8u;
+            let n = (kk >> 7u) & 1u;
+            let sb = (gr * (k / 256u) + b) * 14u;
+            let wa = w[sb + n * 4u + hh];
+            let wb = w[sb + n * 4u + 2u + hh];
+            let wh = w[sb + 8u + n * 2u + hh];
+            let m3 = vec4<u32>(0x03030303u);
+            let u1 = sgn6((wa & M4) | ((wh & m3) << vec4<u32>(4u)));
+            let u2 = sgn6((wb & M4) | (((wh >> vec4<u32>(2u)) & m3) << vec4<u32>(4u)));
+            let u3 = sgn6(((wa >> vec4<u32>(4u)) & M4) | (((wh >> vec4<u32>(4u)) & m3) << vec4<u32>(4u)));
+            let u4 = sgn6(((wb >> vec4<u32>(4u)) & M4) | (((wh >> vec4<u32>(6u)) & m3) << vec4<u32>(4u)));
+            let o = row * SV + hh;
+            sw[o] = u1;
+            sw[o + 2u] = u2;
+            sw[o + 4u] = u3;
+            sw[o + 6u] = u4;
+            if (hh == 0u) {
+                let scw = w[sb + 12u];
+                sd[row] = vec2<f32>(unpack2x16float(w[sb + 13u].x).x, 0.0);
+                let sa = select(scw.xy, scw.zw, n == 1u);
+                for (var i = 0u; i < 4u; i = i + 1u) {
+                    let word = bitcast<i32>(select(sa.x, sa.y, i >= 2u));
+                    let sh = (i & 1u) * 16u;
+                    si[row * 8u + 2u * i] = vec2<i32>(extractBits(word, sh, 8u), 0);
+                    si[row * 8u + 2u * i + 1u] = vec2<i32>(extractBits(word, sh + 8u, 8u), 0);
+                }
+            }
 "#,
 );
 
-/// Q8_0, repacked to 9 words a block of 32: d, then the 32 int8. An item is one word of
-/// four values.
-const Q8_0_ITEM: (&str, &str) = (
-    "k / 4u",
+/// The staging of a Q8_0 step of 32 columns: a lane takes half a block.
+const Q8_0_LOAD: (&str, u32, &str, &str) = (
+    "u32",
+    32,
+    "BLOCKS",
     r#"
-        let b = it >> 3u;
-        let base = (row * (k / 32u) + b) * 9u;
-        let d = unpack2x16float(w[base]).x;
-        let v = bitcast<i32>(w[base + 1u + (it & 7u)]);
-        let q = vec4<f32>(f32(extractBits(v, 0u, 8u)), f32(extractBits(v, 8u, 8u)), f32(extractBits(v, 16u, 8u)), f32(extractBits(v, 24u, 8u)));
-        let col = it * 4u;
-        for (var t = 0u; t < nt; t = t + 1u) {
-            let xb = xo + t * xs + col;
-            acc[t] = acc[t] + d * dot(q, vec4<f32>(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]));
-        }
+            let row = li >> 1u;
+            let hf = li & 1u;
+            let gr = min(row0 + row, m - 1u);
+            let sb = (gr * (k / 32u) + kk / 32u) * 9u;
+            sw[row * SV + hf] = vec4<u32>(w[sb + 1u + hf * 4u], w[sb + 2u + hf * 4u], w[sb + 3u + hf * 4u], w[sb + 4u + hf * 4u]);
+            if (hf == 0u) {
+                let d = unpack2x16float(w[sb]).x;
+                ss[row] = vec4<f32>(d, d, 0.0, 0.0);
+            }
 "#,
 );
 
-/// F16, as stored: two values a word. An item is a word.
-const F16_ITEM: (&str, &str) = (
-    "k / 2u",
-    r#"
-        let v = unpack2x16float(w[row * (k / 2u) + it]);
-        for (var t = 0u; t < nt; t = t + 1u) {
-            let xb = xo + t * xs + it * 2u;
-            acc[t] = acc[t] + dot(v, vec2<f32>(x[xb], x[xb + 1u]));
+/// The F16 mat-mat: 64 rows by 32 tokens a workgroup of 128 lanes, each lane 4 by 4, against
+/// the f32 activations; a step stages 32 columns. Args as the mat-vec's.
+const MATMAT_F16: &str = r#"
+@group(0) @binding(0) var<storage, read> w: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(5) var<storage, read> xf: array<vec4<f32>>;
+var<workgroup> sw: array<f32, 2112>;
+var<workgroup> sx: array<f32, 1056>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let m = arg(0u);
+    let k = arg(1u);
+    let nt = arg(2u);
+    let row0 = wid.x * 64u;
+    let tok0 = wid.y * 32u;
+    let ty = li >> 3u;
+    let tx = li & 7u;
+    var acc: array<f32, 16>;
+    for (var kk = 0u; kk < k; kk = kk + 32u) {
+        for (var e = li; e < 256u; e = e + 128u) {
+            let r = e >> 2u;
+            let c = e & 3u;
+            let gr = min(row0 + r, m - 1u);
+            let v = w[gr * (k / 8u) + kk / 8u + c];
+            let a = unpack2x16float(v.x);
+            let b = unpack2x16float(v.y);
+            let cc = unpack2x16float(v.z);
+            let d = unpack2x16float(v.w);
+            let o = r * 33u + c * 8u;
+            sw[o] = a.x;
+            sw[o + 1u] = a.y;
+            sw[o + 2u] = b.x;
+            sw[o + 3u] = b.y;
+            sw[o + 4u] = cc.x;
+            sw[o + 5u] = cc.y;
+            sw[o + 6u] = d.x;
+            sw[o + 7u] = d.y;
         }
-"#,
-);
+        for (var e = li; e < 256u; e = e + 128u) {
+            let tk = e >> 3u;
+            let c = e & 7u;
+            var v = vec4<f32>(0.0);
+            if (tok0 + tk < nt) { v = xf[(tok0 + tk) * (k / 4u) + kk / 4u + c]; }
+            let o = tk * 33u + c * 4u;
+            sx[o] = v.x;
+            sx[o + 1u] = v.y;
+            sx[o + 2u] = v.z;
+            sx[o + 3u] = v.w;
+        }
+        workgroupBarrier();
+        for (var i = 0u; i < 32u; i = i + 1u) {
+            var wr: array<f32, 4>;
+            var xt: array<f32, 4>;
+            for (var r = 0u; r < 4u; r = r + 1u) { wr[r] = sw[(ty * 4u + r) * 33u + i]; }
+            for (var t = 0u; t < 4u; t = t + 1u) { xt[t] = sx[(tx * 4u + t) * 33u + i]; }
+            for (var r = 0u; r < 4u; r = r + 1u) {
+                for (var t = 0u; t < 4u; t = t + 1u) {
+                    acc[r * 4u + t] = acc[r * 4u + t] + wr[r] * xt[t];
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        let row = row0 + ty * 4u + r;
+        for (var t = 0u; t < 4u; t = t + 1u) {
+            let tk = tok0 + tx * 4u + t;
+            if (row < m && tk < nt) {
+                var v = acc[r * 4u + t];
+                let flags = arg(5u);
+                if ((flags & 2u) != 0u) { v = v + bias[row]; }
+                let at = arg(4u) + tk * arg(7u) + row;
+                if ((flags & 1u) != 0u) { v = v + y[at]; }
+                y[at] = v;
+            }
+        }
+    }
+}
+"#;
+
+/// Causal attention of sixteen consecutive tokens at once, for a head: the keys go through
+/// shared memory in tiles of 32 for all sixteen, with a running softmax. A lane takes one key
+/// against four tokens for the scores, then four dimensions of four tokens' outputs. Args:
+/// n_head, n_kv, hd, scale, -, tokens. One workgroup of 128 lanes per (head, block of sixteen
+/// tokens); `hd` is at most 128.
+const ATTENTION_TILED: &str = r#"
+@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> kc: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> vc: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(5) var<storage, read> step: array<u32>;
+var<workgroup> qs: array<vec4<f32>, 512>;
+var<workgroup> kt: array<vec4<u32>, 544>;
+var<workgroup> vt: array<vec2<u32>, 1024>;
+var<workgroup> pt: array<f32, 528>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let nh = arg(0u);
+    let nkv = arg(1u);
+    let hd = arg(2u);
+    let scale = argf(3u);
+    let ntok = arg(5u);
+    let h = wid.x;
+    let tb = wid.y * 16u;
+    let g = h / (nh / nkv);
+    let hv = hd / 8u;
+    let kj = li & 31u;
+    let qg = li >> 5u;
+    let p0 = step[0];
+    for (var e = li; e < 16u * hv * 2u; e = e + 128u) {
+        let qq = e / (hv * 2u);
+        let i = e % (hv * 2u);
+        let tt = tb + qq;
+        var v = vec4<f32>(0.0);
+        if (tt < ntok) { v = q[((tt * nh + h) * hd) / 4u + i]; }
+        qs[qq * 32u + i] = v;
+    }
+    var mrow = array<f32, 4>(-3.0e38, -3.0e38, -3.0e38, -3.0e38);
+    var lrow = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    var o = array<vec4<f32>, 4>(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
+    let kmax = p0 + min(tb + 16u, ntok);
+    for (var k0 = 0u; k0 < kmax; k0 = k0 + 32u) {
+        workgroupBarrier();
+        for (var e = li; e < 32u * hv; e = e + 128u) {
+            let r = e / hv;
+            let c = e % hv;
+            let j = min(k0 + r, kmax - 1u);
+            let base = (j * nkv + g) * hv + c;
+            kt[r * 17u + c] = kc[base];
+            let vv = vc[base];
+            vt[r * 32u + 2u * c] = vec2<u32>(vv.x, vv.y);
+            vt[r * 32u + 2u * c + 1u] = vec2<u32>(vv.z, vv.w);
+        }
+        workgroupBarrier();
+        var s = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        for (var i = 0u; i < hv; i = i + 1u) {
+            let kw = kt[kj * 17u + i];
+            let k0f = unpack2x16float(kw.x);
+            let k1f = unpack2x16float(kw.y);
+            let k2f = unpack2x16float(kw.z);
+            let k3f = unpack2x16float(kw.w);
+            for (var qq = 0u; qq < 4u; qq = qq + 1u) {
+                let qa = qs[(qg * 4u + qq) * 32u + 2u * i];
+                let qb = qs[(qg * 4u + qq) * 32u + 2u * i + 1u];
+                s[qq] = s[qq] + dot(k0f, qa.xy) + dot(k1f, qa.zw) + dot(k2f, qb.xy) + dot(k3f, qb.zw);
+            }
+        }
+        for (var qq = 0u; qq < 4u; qq = qq + 1u) {
+            let tq = tb + qg * 4u + qq;
+            let live = (k0 + kj) <= (p0 + tq) && tq < ntok;
+            let sc = select(-3.0e38, s[qq] * scale, live);
+            var mt = sc;
+            mt = max(mt, subgroupShuffleXor(mt, 16u));
+            mt = max(mt, subgroupShuffleXor(mt, 8u));
+            mt = max(mt, subgroupShuffleXor(mt, 4u));
+            mt = max(mt, subgroupShuffleXor(mt, 2u));
+            mt = max(mt, subgroupShuffleXor(mt, 1u));
+            let mnew = max(mrow[qq], mt);
+            let alpha = exp(mrow[qq] - mnew);
+            let p = select(0.0, exp(sc - mnew), live);
+            var ps = p;
+            ps = ps + subgroupShuffleXor(ps, 16u);
+            ps = ps + subgroupShuffleXor(ps, 8u);
+            ps = ps + subgroupShuffleXor(ps, 4u);
+            ps = ps + subgroupShuffleXor(ps, 2u);
+            ps = ps + subgroupShuffleXor(ps, 1u);
+            lrow[qq] = lrow[qq] * alpha + ps;
+            mrow[qq] = mnew;
+            pt[(qg * 4u + qq) * 33u + kj] = p;
+            o[qq] = o[qq] * alpha;
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < 32u; kk = kk + 1u) {
+            let vw = vt[kk * 32u + kj];
+            let vv = vec4<f32>(unpack2x16float(vw.x), unpack2x16float(vw.y));
+            for (var qq = 0u; qq < 4u; qq = qq + 1u) {
+                o[qq] = o[qq] + pt[(qg * 4u + qq) * 33u + kk] * vv;
+            }
+        }
+    }
+    for (var qq = 0u; qq < 4u; qq = qq + 1u) {
+        let tq = tb + qg * 4u + qq;
+        if (tq < ntok && 4u * kj < hd) {
+            let r = o[qq] / lrow[qq];
+            let ob = (tq * nh + h) * hd + 4u * kj;
+            out[ob] = r.x;
+            out[ob + 1u] = r.y;
+            out[ob + 2u] = r.z;
+            out[ob + 3u] = r.w;
+        }
+    }
+}
+"#;
 
 /// The per-head preparation of Q or of K and V: an optional RMS norm over the head with its
 /// weight, then RoPE at the token's position. Q lands in an f32 buffer, K and V in the f16
@@ -284,112 +833,203 @@ const PREP_KV_DST: &str = r#"
 @group(0) @binding(4) var<storage, read_write> vc: array<u32>;
 "#;
 
-/// Causal attention of one head of one token over the f16 cache: keys `[0, pos]`, the head's
-/// KV group, scores in a global scratch row. Args: n_head, n_kv, hd, scale, ctx.
+/// Causal attention of one head of one token over a slice of the f16 cache: keys `[0, pos]`
+/// cut into `splits` slices, one workgroup of 256 lanes per (head, token, slice). Sixteen groups
+/// of sixteen lanes take the slice's keys in turn; a group's lanes each own eight dimensions,
+/// dot a key with the query by a butterfly and keep a running softmax and output of their own,
+/// which the groups then merge. Writes the slice's unnormalised output, its maximum score and
+/// its sum of exponentials to `part` (rows of `hd + 2`); [`ATTENTION_JOIN`] puts the slices
+/// together. Args: n_head, n_kv, hd, scale, -, splits. `hd` is at most 128 and a multiple of 8.
 const ATTENTION: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> kc: array<u32>;
-@group(0) @binding(2) var<storage, read> vc: array<u32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<storage, read_write> sc: array<f32>;
+@group(0) @binding(1) var<storage, read> kc: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> vc: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> part: array<f32>;
 @group(0) @binding(5) var<storage, read> step: array<u32>;
-var<workgroup> qs: array<f32, 512>;
-var<workgroup> red: array<f32, 128>;
-@compute @workgroup_size(128)
+var<workgroup> qs: array<vec4<f32>, 32>;
+var<workgroup> msh: array<f32, 16>;
+var<workgroup> lsh: array<f32, 16>;
+var<workgroup> acc_sh: array<f32, 2048>;
+fn kdot(kw: vec4<u32>, qa: vec4<f32>, qb: vec4<f32>) -> f32 {
+    return dot(unpack2x16float(kw.x), qa.xy) + dot(unpack2x16float(kw.y), qa.zw)
+        + dot(unpack2x16float(kw.z), qb.xy) + dot(unpack2x16float(kw.w), qb.zw);
+}
+@compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let nh = arg(0u);
     let nkv = arg(1u);
     let hd = arg(2u);
     let scale = argf(3u);
-    let ctx = arg(4u);
+    let splits = arg(5u);
     let h = wid.x;
     let t = wid.y;
+    let part_ix = wid.z;
     let g = h / (nh / nkv);
-    let len = step[0] + t + 1u;
+    let total = step[0] + t + 1u;
+    let lo = total * part_ix / splits;
+    let hi = total * (part_ix + 1u) / splits;
     let qb = (t * nh + h) * hd;
-    let sb = (t * nh + h) * ctx;
-    let hw = hd / 2u;
-    for (var i = li; i < hd; i = i + 128u) { qs[i] = q[qb + i]; }
+    let hv = hd / 8u;
+    if (li < hd / 4u) { qs[li] = vec4<f32>(q[qb + li * 4u], q[qb + li * 4u + 1u], q[qb + li * 4u + 2u], q[qb + li * 4u + 3u]); }
     workgroupBarrier();
-    var mx = -3.0e38;
-    for (var j = li; j < len; j = j + 128u) {
-        let kb = (j * nkv + g) * hw;
-        var d = 0.0;
-        for (var i = 0u; i < hw; i = i + 1u) {
-            d = d + dot(unpack2x16float(kc[kb + i]), vec2<f32>(qs[2u * i], qs[2u * i + 1u]));
+    let sub = li & 15u;
+    let slot = li >> 4u;
+    let lane_on = sub < hv;
+    let c = min(sub, hv - 1u);
+    let qa = select(vec4<f32>(0.0), qs[2u * c], lane_on);
+    let qb2 = select(vec4<f32>(0.0), qs[2u * c + 1u], lane_on);
+    var m = -3.0e38;
+    var l = 0.0;
+    var acc = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (var j0 = lo; j0 < hi; j0 = j0 + 64u) {
+        var s: array<f32, 4>;
+        var vw: array<vec4<u32>, 4>;
+        var ok: array<bool, 4>;
+        for (var u = 0u; u < 4u; u = u + 1u) {
+            let j = j0 + slot + 16u * u;
+            let jj = min(j, hi - 1u);
+            ok[u] = j < hi;
+            s[u] = kdot(kc[(jj * nkv + g) * hv + c], qa, qb2);
+            vw[u] = vc[(jj * nkv + g) * hv + c];
         }
-        let s = d * scale;
-        sc[sb + j] = s;
-        mx = max(mx, s);
-    }
-    red[li] = mx;
-    workgroupBarrier();
-    for (var k = 64u; k > 0u; k = k >> 1u) {
-        if (li < k) { red[li] = max(red[li], red[li + k]); }
-        workgroupBarrier();
-    }
-    let m = red[0];
-    workgroupBarrier();
-    var sum = 0.0;
-    for (var j = li; j < len; j = j + 128u) {
-        let e = exp(sc[sb + j] - m);
-        sc[sb + j] = e;
-        sum = sum + e;
-    }
-    red[li] = sum;
-    storageBarrier();
-    workgroupBarrier();
-    for (var k = 64u; k > 0u; k = k >> 1u) {
-        if (li < k) { red[li] = red[li] + red[li + k]; }
-        workgroupBarrier();
-    }
-    let inv = 1.0 / red[0];
-    for (var i = li; i < hw; i = i + 128u) {
-        var acc = vec2<f32>(0.0, 0.0);
-        for (var j = 0u; j < len; j = j + 1u) {
-            acc = acc + sc[sb + j] * unpack2x16float(vc[(j * nkv + g) * hw + i]);
+        var mt = m;
+        for (var u = 0u; u < 4u; u = u + 1u) {
+            var x = s[u];
+            x = x + subgroupShuffleXor(x, 8u);
+            x = x + subgroupShuffleXor(x, 4u);
+            x = x + subgroupShuffleXor(x, 2u);
+            x = x + subgroupShuffleXor(x, 1u);
+            s[u] = x * scale;
+            mt = max(mt, select(-3.0e38, s[u], ok[u]));
         }
-        out[qb + 2u * i] = acc.x * inv;
-        out[qb + 2u * i + 1u] = acc.y * inv;
+        let alpha = exp(m - mt);
+        l = l * alpha;
+        for (var e = 0u; e < 8u; e = e + 1u) { acc[e] = acc[e] * alpha; }
+        for (var u = 0u; u < 4u; u = u + 1u) {
+            let p = select(0.0, exp(s[u] - mt), ok[u]);
+            l = l + p;
+            let a = unpack2x16float(vw[u].x);
+            let b = unpack2x16float(vw[u].y);
+            let cc = unpack2x16float(vw[u].z);
+            let dd = unpack2x16float(vw[u].w);
+            acc[0] = acc[0] + p * a.x;
+            acc[1] = acc[1] + p * a.y;
+            acc[2] = acc[2] + p * b.x;
+            acc[3] = acc[3] + p * b.y;
+            acc[4] = acc[4] + p * cc.x;
+            acc[5] = acc[5] + p * cc.y;
+            acc[6] = acc[6] + p * dd.x;
+            acc[7] = acc[7] + p * dd.y;
+        }
+        m = mt;
+    }
+    if (sub == 0u) {
+        msh[slot] = m;
+        lsh[slot] = l;
+    }
+    if (lane_on) {
+        for (var e = 0u; e < 8u; e = e + 1u) { acc_sh[slot * hd + sub * 8u + e] = acc[e]; }
+    }
+    workgroupBarrier();
+    var mm = -3.0e38;
+    for (var k = 0u; k < 16u; k = k + 1u) { mm = max(mm, msh[k]); }
+    let pb = (((t * nh + h) * splits) + part_ix) * (hd + 2u);
+    if (li < hd) {
+        var o = 0.0;
+        for (var k = 0u; k < 16u; k = k + 1u) { o = o + exp(msh[k] - mm) * acc_sh[k * hd + li]; }
+        part[pb + li] = o;
+    }
+    if (li == 0u) {
+        var ls = 0.0;
+        for (var k = 0u; k < 16u; k = k + 1u) { ls = ls + exp(msh[k] - mm) * lsh[k]; }
+        part[pb + hd] = mm;
+        part[pb + hd + 1u] = ls;
     }
 }
 "#;
 
-/// `g = silu(g) * u` over `n` values. Args: n.
-const SILU_MUL: &str = r#"
-@group(0) @binding(0) var<storage, read_write> g: array<f32>;
-@group(0) @binding(1) var<storage, read> u: array<f32>;
+/// The slices of [`ATTENTION`] put together: `out = sum_s exp(m_s - M) o_s / sum_s exp(m_s - M)
+/// l_s`. Args: n_head, n_kv, hd, -, -, splits. One workgroup of 256 lanes per (head, token).
+const ATTENTION_JOIN: &str = r#"
+@group(0) @binding(0) var<storage, read> part: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i < arg(0u)) {
-        let v = g[i];
-        g[i] = v / (1.0 + exp(-v)) * u[i];
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let nh = arg(0u);
+    let hd = arg(2u);
+    let splits = arg(5u);
+    let base = ((wid.y * nh + wid.x) * splits) * (hd + 2u);
+    var m = -3.0e38;
+    for (var s = 0u; s < splits; s = s + 1u) { m = max(m, part[base + s * (hd + 2u) + hd]); }
+    var l = 0.0;
+    var o = 0.0;
+    for (var s = 0u; s < splits; s = s + 1u) {
+        let at = base + s * (hd + 2u);
+        let wgt = exp(part[at + hd] - m);
+        l = l + wgt * part[at + hd + 1u];
+        if (li < hd) { o = o + wgt * part[at + li]; }
     }
+    if (li < hd) { out[(wid.y * nh + wid.x) * hd + li] = o / l; }
 }
 "#;
 
-/// The WGSL of kernel `name`.
-fn source(name: &str) -> anyhow::Result<String> {
-    let matvec = |(items, item): (&str, &str)| MATVEC.replace("ITEMS", items).replace("ITEM", item);
+/// The WGSL of kernel `name` for workgroups of `wg` lanes.
+fn source(name: &str, wg: u32) -> anyhow::Result<String> {
+    let lanes = lanes_per_row(name);
+    let shuffles: String = (0..lanes.ilog2())
+        .rev()
+        .map(|b| format!("        v = v + subgroupShuffleXor(v, {}u);\n", 1 << b))
+        .collect();
+    let matvec = |(wtype, items, item): (&str, &str, &str)| {
+        MATVEC
+            .replace("WTYPE", wtype)
+            .replace("SHUFFLES", &shuffles)
+            .replace("LPR", &lanes.to_string())
+            .replace("ITEMS", items)
+            .replace("ITEM", item)
+            .replace("MAXT", &super::stack::MV_TOKENS.to_string())
+            .replace("WG", &wg.to_string())
+    };
+    let matmat = |(wtype, bk, dots, load): (&str, u32, &str, &str)| {
+        let s = bk / 16 + 1;
+        let dots = match dots {
+            "Q4K" => DOTS_Q4K,
+            "Q6K" => DOTS_Q6K,
+            _ => DOTS_BLOCKS,
+        };
+        MATMAT
+            .replace("DOTS", dots)
+            .replace("WTYPE", wtype)
+            .replace("LOADW", load)
+            .replace("BKV", &bk.to_string())
+            .replace("SWN", &(64 * s).to_string())
+            .replace("SSN", &(64 * (bk / 32)).to_string())
+            .replace("SXN", &(32 * s).to_string())
+            .replace("SMN", &(32 * (bk / 32)).to_string())
+    };
     let body = match name {
-        "rms_norm" => RMS_NORM.to_string(),
+        "quant" => QUANT.to_string(),
         "mv_q4k" => matvec(Q4K_ITEM),
         "mv_q6k" => matvec(Q6K_ITEM),
         "mv_q8_0" => matvec(Q8_0_ITEM),
         "mv_f16" => matvec(F16_ITEM),
+        "mm_q4k" => matmat(Q4K_LOAD),
+        "mm_q6k" => matmat(Q6K_LOAD),
+        "mm_q8_0" => matmat(Q8_0_LOAD),
+        "mm_f16" => MATMAT_F16.to_string(),
+        "attn_tiled" => ATTENTION_TILED.to_string(),
         "prep_q" => format!("{PREP_Q_DST}{}", PREP.replace("STORE", PREP_Q_STORE)),
         "prep_kv" => format!("{PREP_KV_DST}{}", PREP.replace("STORE", PREP_KV_STORE)),
         "attention" => ATTENTION.to_string(),
-        "silu_mul" => SILU_MUL.to_string(),
+        "attention_join" => ATTENTION_JOIN.to_string(),
         other => anyhow::bail!("vulkan: no kernel {other}"),
     };
     Ok(format!("{HEAD}{body}"))
 }
 
-/// The SPIR-V words of kernel `name`.
-pub(super) fn spirv(name: &str) -> anyhow::Result<Vec<u32>> {
-    let src = source(name)?;
+/// The SPIR-V words of kernel `name` for workgroups of `wg` lanes.
+pub(super) fn spirv(name: &str, wg: u32) -> anyhow::Result<Vec<u32>> {
+    let src = source(name, wg)?;
     let module = naga::front::wgsl::parse_str(&src)
         .map_err(|e| anyhow::anyhow!("vulkan: {name}: {}", e.emit_to_string(&src)))?;
     let info = naga::valid::Validator::new(

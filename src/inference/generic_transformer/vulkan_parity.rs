@@ -63,7 +63,11 @@ struct Fixture {
 
 impl Fixture {
     fn open() -> Self {
-        let path = model_blob(TAG);
+        Self::open_tag(TAG)
+    }
+
+    fn open_tag(tag: &str) -> Self {
+        let path = model_blob(tag);
         let file = std::fs::File::open(&path).unwrap();
         let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
         let c = self_content(&mmap);
@@ -294,7 +298,7 @@ fn vulkan_first_layer_matches_the_host() {
             d.name
         );
         assert!(
-            err <= delta * 1e-3,
+            err <= max_err(&host_rows),
             "{}: layer 0 differs from the f32 reference by {err} against a change of {delta}",
             d.name
         );
@@ -375,6 +379,127 @@ fn vulkan_greedy_text_matches_the_host() {
     }
 }
 
+/// A prompt that crosses the chunk a step carries and several tiles of keys: the Vulkan argmax
+/// is the host's at the prompt's last row and at the steps that follow, unless the host's two
+/// best tokens tie.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_long_prompt_matches_the_host() {
+    let fx = Fixture::open();
+    let tokenizer =
+        crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
+            .unwrap();
+    let text = TEXT.repeat(14);
+    let prompt = tokenizer
+        .encode(text.as_str(), false)
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    assert!(prompt.len() > 2 * 128, "{} tokens", prompt.len());
+    for d in crate::inference::kernel::vulkan::devices() {
+        let mut host = fx.build(&fx.host());
+        let mut m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
+        let mut fed = prompt.clone();
+        let mut h = host_vec(&host.forward(&ids(&prompt), 0).unwrap());
+        let mut v = host_vec(&m.forward(&ids(&prompt), 0).unwrap());
+        for step in 0..8 {
+            let (h1, h2) = top2(&h);
+            let (v1, _) = top2(&v);
+            let margin = h[h1] - h[h2];
+            assert!(
+                v1 == h1 || margin < TIE,
+                "{}: step {step} of {} tokens: Vulkan picks {v1}, the host {h1} by {margin}",
+                d.name,
+                prompt.len()
+            );
+            fed.push(h1 as u32);
+            let t = [h1 as u32];
+            h = host_vec(&host.forward(&ids(&t), fed.len() - 1).unwrap());
+            v = host_vec(&m.forward(&ids(&t), fed.len() - 1).unwrap());
+        }
+        println!("{}: {} tokens: ok", d.name, prompt.len());
+    }
+}
+
+/// Root-mean-square and largest difference of two logit rows.
+fn logit_gap(a: &[f32], b: &[f32]) -> (f64, f32) {
+    let sq: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+    let max = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    ((sq / a.len() as f64).sqrt(), max)
+}
+
+/// How far the Vulkan and (where built) CUDA logits sit from the host's when fed the host's
+/// own tokens: each backend quantises its activations, so none equals another bit for bit.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_logit_noise() {
+    const NOISE_STEPS: usize = 12;
+    const NOISE_LIMIT: f64 = 1.2;
+    for tag in [TAG, "qwen3:1.7b"] {
+        let fx = Fixture::open_tag(tag);
+        let tokenizer = crate::inference::engine::llm_engine::build_tokenizer_from_gguf(
+            &self_content(&fx.mmap),
+        )
+        .unwrap();
+        let prompt = tokenizer.encode(TEXT, false).unwrap().get_ids().to_vec();
+        let mut host = fx.build(&fx.host());
+        let mut fed = prompt.clone();
+        let mut want = vec![host_vec(&host.forward(&ids(&prompt), 0).unwrap())];
+        for _ in 0..NOISE_STEPS {
+            let next = argmax(&Tensor::new(want[want.len() - 1].as_slice(), &Device::Cpu).unwrap());
+            fed.push(next);
+            want.push(host_vec(
+                &host.forward(&ids(&[next]), fed.len() - 1).unwrap(),
+            ));
+        }
+        drop(host);
+        let run = |name: String, mut m: GenericHeteroTransformer| {
+            let mut got = vec![host_vec(&m.forward(&ids(&prompt), 0).unwrap())];
+            for i in 0..NOISE_STEPS {
+                let t = [fed[prompt.len() + i]];
+                got.push(host_vec(&m.forward(&ids(&t), prompt.len() + i).unwrap()));
+            }
+            let gaps: Vec<(f64, f32)> = want
+                .iter()
+                .zip(&got)
+                .map(|(w, g)| logit_gap(w, g))
+                .collect();
+            let rms = gaps.iter().map(|g| g.0).sum::<f64>() / gaps.len() as f64;
+            println!(
+                "{tag} {name} against the host: logit rms {rms:.3}, largest {:.3}",
+                gaps.iter().fold(0f32, |m, g| m.max(g.1))
+            );
+            // The host's own activations are quantised: a faithful backend sits about
+            // 0.5 to 0.8 from it on these models, a faulty kernel far beyond.
+            assert!(
+                rms < NOISE_LIMIT,
+                "{tag} {name}: logit rms {rms} from the host"
+            );
+        };
+        for d in crate::inference::kernel::vulkan::devices() {
+            run(
+                format!("vulkan {}", d.name),
+                fx.build(&fx.on_vulkan(d.index, fx.n_layers)),
+            );
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let cards: HashMap<usize, Device> =
+                [(0, Device::new_cuda(0).unwrap())].into_iter().collect();
+            run(
+                "cuda 0".to_string(),
+                GenericHeteroTransformer::from_gguf(
+                    self_content(&fx.mmap),
+                    &fx.mmap[..],
+                    &cards,
+                    &HeteroPlan::forced_gpu(fx.n_layers, fx.n_layers, 0),
+                )
+                .unwrap(),
+            );
+        }
+    }
+}
+
 /// The same greedy answer on the first CUDA card, for the comparison of the two runtimes on one
 /// NVIDIA card.
 #[cfg(feature = "cuda")]
@@ -401,23 +526,132 @@ fn vulkan_reference_on_cuda() {
     );
 }
 
-/// Where a decode step's time goes on each Vulkan device, kernel by kernel.
+/// Where a decode step's time goes on each Vulkan device, kernel by kernel, after a prompt of
+/// `PROFILE_PROMPT` tokens.
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_decode_profile() {
-    let fx = Fixture::open();
+    decode_profile(TAG);
+}
+
+/// [`vulkan_decode_profile`] for the larger model of the speed benches.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_decode_profile_large() {
+    decode_profile("qwen3:1.7b");
+}
+
+fn decode_profile(tag: &str) {
+    const PROFILE_PROMPT: u32 = 1024;
+    const PROFILE_RUNS: usize = 8;
+    let prompt: Vec<u32> = (0..PROFILE_PROMPT)
+        .map(|i| 1000 + (i * 37) % 20000)
+        .collect();
+    let fx = Fixture::open_tag(tag);
     for d in crate::inference::kernel::vulkan::devices() {
         let mut m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
-        m.forward(&ids(&prompt()), 0).unwrap();
-        let by = m.vulkan.profile(prompt().len());
-        let total: f64 = by[0].iter().map(|(_, us)| us).sum();
-        println!(
-            "{}: {total:.0} us a step: {:?}",
-            d.name,
-            by[0]
-                .iter()
-                .map(|(k, us)| format!("{k} {us:.0}"))
-                .collect::<Vec<_>>()
-        );
+        m.forward(&ids(&prompt), 0).unwrap();
+        // Sustained work first: an idle card runs slow until its clock ramps up.
+        let warm = std::time::Instant::now();
+        while warm.elapsed() < std::time::Duration::from_secs(2) {
+            m.vulkan.profile(128, prompt.len());
+        }
+        for tokens in [1, 32, 128] {
+            // The card's clock wanders: the fastest of several runs is the kernels' own time.
+            let total_of =
+                |by: &Vec<Vec<(&'static str, f64)>>| by[0].iter().map(|(_, us)| us).sum::<f64>();
+            let by = (0..PROFILE_RUNS)
+                .map(|_| m.vulkan.profile(tokens, prompt.len()))
+                .min_by(|a, b| total_of(a).total_cmp(&total_of(b)))
+                .unwrap();
+            let total = total_of(&by);
+            println!(
+                "{}: {tokens} rows: {total:.0} us a step: {:?}",
+                d.name,
+                by[0]
+                    .iter()
+                    .map(|(k, us)| format!("{k} {us:.0}"))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
+}
+
+/// Prompt tokens and decode steps of the speed benches.
+const BENCH_PROMPT: usize = 1318;
+const BENCH_STEPS: usize = 64;
+const BENCH_RUNS: usize = 3;
+
+/// Prompt reading and decode rates of `m`, one line per run.
+fn bench_model(label: &str, m: &mut GenericHeteroTransformer) {
+    let prompt: Vec<u32> = (0..BENCH_PROMPT as u32)
+        .map(|i| 1000 + (i * 37) % 20000)
+        .collect();
+    for run in 0..=BENCH_RUNS {
+        let start = std::time::Instant::now();
+        let mut tok = argmax(&m.forward(&ids(&prompt), 0).unwrap());
+        let read = start.elapsed().as_secs_f64();
+        let start = std::time::Instant::now();
+        for i in 0..BENCH_STEPS {
+            tok = argmax(&m.forward(&ids(&[tok]), prompt.len() + i).unwrap());
+        }
+        let dec = start.elapsed().as_secs_f64();
+        if run > 0 {
+            println!(
+                "BENCH {label}: prompt {:.1} tok/s, decode {:.1} tok/s",
+                BENCH_PROMPT as f64 / read,
+                BENCH_STEPS as f64 / dec
+            );
+        }
+    }
+}
+
+/// Speed of `tag` on every Vulkan device.
+fn bench_vulkan(tag: &str) {
+    let fx = Fixture::open_tag(tag);
+    for d in crate::inference::kernel::vulkan::devices() {
+        let mut m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
+        bench_model(&format!("{tag} vulkan {}", d.name), &mut m);
+    }
+}
+
+/// Speed of `tag` on the first CUDA or ROCm card.
+#[cfg(feature = "gpu")]
+fn bench_gpu(tag: &str) {
+    let fx = Fixture::open_tag(tag);
+    let cards: HashMap<usize, Device> = [(0, Device::new_cuda(0).unwrap())].into_iter().collect();
+    let mut m = GenericHeteroTransformer::from_gguf(
+        self_content(&fx.mmap),
+        &fx.mmap[..],
+        &cards,
+        &HeteroPlan::forced_gpu(fx.n_layers, fx.n_layers, 0),
+    )
+    .unwrap();
+    bench_model(&format!("{tag} gpu"), &mut m);
+}
+
+#[test]
+#[ignore = "speed bench"]
+fn bench_vulkan_small() {
+    bench_vulkan("qwen3:0.6b");
+}
+
+#[test]
+#[ignore = "speed bench"]
+fn bench_vulkan_large() {
+    bench_vulkan("qwen3:1.7b");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "speed bench"]
+fn bench_gpu_small() {
+    bench_gpu("qwen3:0.6b");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "speed bench"]
+fn bench_gpu_large() {
+    bench_gpu("qwen3:1.7b");
 }

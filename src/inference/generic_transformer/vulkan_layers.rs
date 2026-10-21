@@ -115,12 +115,13 @@ impl VulkanLayers {
         None
     }
 
-    /// The kernel times of one decode step at `index_pos` on each segment, in microseconds.
+    /// The kernel times of one step of `tokens` rows at `index_pos` on each segment, in
+    /// microseconds.
     #[cfg(all(test, feature = "vulkan"))]
-    pub(crate) fn profile(&self, index_pos: usize) -> Vec<Vec<(&'static str, f64)>> {
+    pub(crate) fn profile(&self, tokens: usize, index_pos: usize) -> Vec<Vec<(&'static str, f64)>> {
         self.segments
             .iter()
-            .map(|s| s.stack.profile(1, index_pos).unwrap())
+            .map(|s| s.stack.profile(tokens, index_pos).unwrap())
             .collect()
     }
 
