@@ -27,6 +27,7 @@ unsafe impl Sync for CudaContext {}
 
 impl Drop for CudaContext {
     fn drop(&mut self) {
+        super::cache_alloc::trim(Some(self.ordinal as c_int));
         if !self.cu_ctx.is_null() {
             let _ = unsafe { sys::cuDevicePrimaryCtxRelease_v2(self.cu_device) };
         }
@@ -87,7 +88,12 @@ impl CudaContext {
     pub fn mem_get_info(&self) -> Result<(usize, usize), DriverError> {
         self.bind_to_thread()?;
         // PLACEMENT-EXEMPT: the runtime's reading itself; its callers read through `place/`.
-        result::mem_get_info()
+        let (free, total) = result::mem_get_info()?;
+        // The buffers the cache holds are free for any allocation: it hands them back on demand.
+        Ok((
+            free + super::cache_alloc::cached_bytes(self.ordinal as c_int),
+            total,
+        ))
     }
 
     /// The device handle.
@@ -458,7 +464,11 @@ impl<T> Drop for CudaSlice<T> {
             return;
         }
         ctx.record_err(ctx.bind_to_thread());
-        ctx.record_err(unsafe { result::free_sync(self.cu_device_ptr) });
+        super::cache_alloc::release(
+            ctx.ordinal as c_int,
+            self.stream.cu_stream() as usize,
+            self.cu_device_ptr,
+        );
     }
 }
 
@@ -1144,7 +1154,7 @@ impl CudaStream {
         let cu_device_ptr = if bytes == 0 {
             0
         } else {
-            unsafe { result::malloc_sync(bytes) }?
+            super::cache_alloc::alloc(self.ctx.ordinal as c_int, self.cu_stream() as usize, bytes)?
         };
         Ok(CudaSlice {
             cu_device_ptr,

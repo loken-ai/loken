@@ -1,5 +1,6 @@
 //! The driver: raw calls under their CUDA names, their `Result` forms, and the owning wrappers.
 
+mod cache_alloc;
 mod capture_hold;
 pub mod result;
 mod safe;

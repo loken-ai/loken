@@ -1239,6 +1239,9 @@ pub unsafe fn cuMemPoolSetAttribute(
 }
 
 pub unsafe fn cuMemPoolTrimTo(pool: CUmemoryPool, keep: usize) -> CUresult {
+    if keep == 0 {
+        super::cache_alloc::trim(None);
+    }
     unsafe { hip!(hipMemPoolTrimTo(pool, keep)) }
 }
 

@@ -26,7 +26,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         let ptrs = std::mem::take(self.0.get_mut().unwrap_or_else(|e| e.into_inner()));
         for p in ptrs {
-            let _ = unsafe { hip!(hipFree(p as *mut c_void)) };
+            super::cache_alloc::free_now(p as *mut c_void);
         }
     }
 }
