@@ -270,7 +270,7 @@ async fn decode_where_the_model_is(
         "transcription",
     );
     match catalogue::upload_multipart(&headers, body).await {
-        Ok(multipart) => audio_decode_endpoint(state, multipart, task).await,
+        Ok(multipart) => audio_decode_endpoint(state, headers, multipart, task).await,
         Err(e) => {
             use axum::response::IntoResponse;
             let code = axum::http::StatusCode::BAD_REQUEST;

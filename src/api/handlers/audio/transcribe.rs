@@ -36,8 +36,81 @@ pub(super) async fn decode_and_transcribe(
         })
 }
 
+/// Speech to text on a model that takes the clip in its prompt (an instruction-format
+/// speech tower), in the model's transcription mode: the clip alone in the user turn, the
+/// language and the transcription marker after it. `None` when `model` is not such a model,
+/// so the caller can try a speech recogniser of that name.
+async fn transcribe_with_audio_model(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    bytes: &[u8],
+    language: Option<&str>,
+    temperature: f32,
+) -> Result<Option<TranscribeResult>, ApiError> {
+    use crate::api::handlers::admission::{ensure_prompt_fits, LoadRequest};
+    use base64::Engine as _;
+    if bytes.is_empty() {
+        return Err(ApiError::Validation("the audio is empty".to_string()));
+    }
+    validate_audio_input_size(bytes.len()).map_err(ApiError::Validation)?;
+    let load = LoadRequest::from_headers(headers, state.get_effective_keep_alive(None));
+    let engine = match state.load_for_request(model, load).await {
+        Ok(engine) => engine,
+        Err(ApiError::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(tower) = engine.audio_input().await.filter(|t| t.instruction_format) else {
+        return Ok(None);
+    };
+    let prompt = crate::api::handlers::chat_prompt::transcription_prompt(&tower, language);
+    ensure_prompt_fits(&engine, &prompt).await?;
+    let priority = crate::api::gate::Priority::from_headers(headers)
+        .unwrap_or(crate::api::gate::Priority::Interactive);
+    let _admitted = state
+        .admit(
+            engine.clone(),
+            model,
+            priority,
+            "/v1/audio/transcriptions",
+            &[],
+        )
+        .await?;
+    let clip = base64::engine::general_purpose::STANDARD.encode(bytes);
+    state.admit_audio(&engine, Some(&clip)).await?;
+    let mut params = GenerationParams {
+        temperature: Some(temperature),
+        repeat_penalty: Some(1.0),
+        ..Default::default()
+    };
+    let _cancel = engine.cancel_guard(&mut params);
+    let out = engine
+        .generate(&prompt, params)
+        .await
+        .map_err(|e| ApiError::Internal(format!("transcribe: {e}")))?;
+    let text = out.text.trim().to_string();
+    let duration_s = audio_header_seconds(bytes).unwrap_or(0.0) as f32;
+    Ok(Some(TranscribeResult {
+        language: language.unwrap_or_default().to_string(),
+        duration_s,
+        tokens: Vec::new(),
+        segments: vec![crate::inference::engine::audio_engine::WhisperSegment {
+            start: 0.0,
+            end: duration_s,
+            text: text.clone(),
+            tokens: Vec::new(),
+            compression_ratio: 0.0,
+            temperature,
+            avg_logprob: 0.0,
+            no_speech_prob: 0.0,
+        }],
+        text,
+    }))
+}
+
 pub(super) async fn audio_decode_endpoint(
     axum::extract::State(state): axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     mut multipart: axum::extract::Multipart,
     task: WhisperTask,
 ) -> axum::response::Response {
@@ -203,6 +276,28 @@ pub(super) async fn audio_decode_endpoint(
     if let Some(name) = model_name.as_deref() {
         if let Err(e) = validate_model_id(name) {
             return e.into_response();
+        }
+    }
+    // A model that takes the clip in its prompt transcribes in its own mode; any other name
+    // is a speech recogniser and takes the path below.
+    if let Some(name) = model_name
+        .as_deref()
+        .filter(|n| !family::is_asr(&state.huggingface_models_dir, n))
+        .filter(|_| matches!(task, WhisperTask::Transcribe))
+    {
+        match transcribe_with_audio_model(
+            &state,
+            &headers,
+            name,
+            &bytes,
+            language.as_deref(),
+            temperature,
+        )
+        .await
+        {
+            Ok(Some(result)) => return format_transcribe_response(&response_format, &result, task),
+            Ok(None) => {}
+            Err(e) => return e.into_response(),
         }
     }
     let collect_metrics = matches!(response_format.as_str(), "verbose_json" | "srt" | "vtt");

@@ -252,6 +252,20 @@ pub(crate) fn prompt_template(format: &ChatFormat, instruction_format: bool) -> 
         .or_else(|| format.effective_template())
 }
 
+/// The prompt of a transcription on a model prompted in the bracket instruction format: the
+/// clip alone in the user turn, then the language when one is given and the transcription
+/// marker, which is what makes the model write the words instead of answering them.
+pub(crate) fn transcription_prompt(
+    tower: &crate::inference::engine::model_backend::AudioInput,
+    language: Option<&str>,
+) -> String {
+    let language = language.map(|l| format!("lang:{l}")).unwrap_or_default();
+    format!(
+        "[INST]{}{}[/INST]{language}[TRANSCRIBE]",
+        tower.begin, tower.placeholder
+    )
+}
+
 /// Whether any user turn carries audio.
 pub(crate) fn carries_audio(messages: &[Message]) -> bool {
     messages
@@ -561,6 +575,26 @@ mod tests {
             "[INST][BEGIN_AUDIO][AUDIO]Transcribe this audio[/INST]"
         );
         assert!(render(false).contains("You are an agent."));
+    }
+
+    /// A transcription on an instruction-format model holds the clip alone, the language and
+    /// the transcription marker; without a language the marker follows the turn directly.
+    #[test]
+    fn a_transcription_prompt_ends_in_the_marker() {
+        let tower = crate::inference::engine::model_backend::AudioInput {
+            sample_rate: 16_000,
+            placeholder: "[AUDIO]".to_string(),
+            begin: "[BEGIN_AUDIO]".to_string(),
+            instruction_format: true,
+        };
+        assert_eq!(
+            transcription_prompt(&tower, Some("en")),
+            "[INST][BEGIN_AUDIO][AUDIO][/INST]lang:en[TRANSCRIBE]"
+        );
+        assert_eq!(
+            transcription_prompt(&tower, None),
+            "[INST][BEGIN_AUDIO][AUDIO][/INST][TRANSCRIBE]"
+        );
     }
 
     /// `none` switches tools off in both dialects, and a structured output wins over a

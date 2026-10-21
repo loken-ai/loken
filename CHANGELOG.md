@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Audio: transcribe with Voxtral on the transcription route, in its own mode.
 - Vulkan: run mat-vec on int8 activations with the integer dot product.
 - Vulkan: read prompts through tiled mat-mat and attention kernels.
 - Vulkan: run the layers of a dense decoder on Vulkan devices.
