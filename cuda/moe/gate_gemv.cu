@@ -43,7 +43,10 @@ __global__ void gate_gemv_f32_kernel(
     #pragma unroll
     for (int r = 0; r < ROWS_PER_BLOCK; r++) acc[r] = 0.f;
 
-    // Walk hidden in WARP_SIZE-wide strides; each lane handles one column.
+    // Walk hidden in WARP_SIZE-wide strides; each lane handles one column. The unrolled loads
+    // are independent, so the walk waits on memory once per unrolled group, not once per column;
+    // each lane still adds its columns in the same order.
+    #pragma unroll 16
     for (int k = lane; k < hidden; k += WARP_SIZE) {
         const float xv = x_row[k];
         #pragma unroll
@@ -79,7 +82,7 @@ extern "C" void loken_gate_gemv_f32(
         return;  // a shape the lane-per-element walk cannot cover; the caller has a fallback
     }
 
-    constexpr int ROWS_PER_BLOCK = 4;
+    constexpr int ROWS_PER_BLOCK = 1;
     dim3 grid(ceil_div(n_experts, ROWS_PER_BLOCK), n_rows, 1);
     dim3 block(WARP_SIZE, 1, 1);
     ll_gate_gemv::gate_gemv_f32_kernel<ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(
