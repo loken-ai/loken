@@ -660,6 +660,66 @@ impl QKernelMatMul {
         crate::tensor::Tensor::from_cuda_storage(storage, device, odims).map(Some)
     }
 
+    /// `forward_quantized` of this weight and of `other` over one activation row, in one
+    /// launch: each output has the bits of its own `forward_quantized`. `None` where the pair
+    /// is not two weights of one format the one-row kernel serves.
+    #[cfg(feature = "gpu")]
+    pub fn forward_quantized_pair(
+        &self,
+        other: &Self,
+        a: &QuantizedActivation,
+    ) -> Result<Option<(crate::tensor::Tensor, crate::tensor::Tensor)>> {
+        let (
+            crate::tensor::Device::Cuda(qdev),
+            Some(blob0),
+            crate::tensor::Device::Cuda(odev),
+            Some(blob1),
+        ) = (
+            &self.device,
+            self.blob.as_ref(),
+            &other.device,
+            other.blob.as_ref(),
+        )
+        else {
+            return Ok(None);
+        };
+        if a.k != self.k
+            || other.k != self.k
+            || a.rows != 1
+            || a.dtype != crate::tensor::DType::F32
+            || self.dtype != other.dtype
+            || qdev.ordinal() != odev.ordinal()
+            || a.ordinal != qdev.ordinal()
+            || !self.takes_matvec(qdev, 1)
+            || !other.takes_matvec(qdev, 1)
+            || self.lora_fused.is_some()
+            || other.lora_fused.is_some()
+            || self.smallk_single(self.k)
+            || other.smallk_single(self.k)
+        {
+            return Ok(None);
+        }
+        let tag = self.kernel_tag()?;
+        let (y0, y1) = crate::tensor::cuda::mmvq_f32_dual(
+            qdev, tag, blob0, blob1, &a.q81, self.k, self.n, other.n,
+        )?;
+        let mut d0 = a.lead.clone();
+        d0.push(self.n);
+        let mut d1 = a.lead.clone();
+        d1.push(other.n);
+        let t0 = crate::tensor::Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(y0),
+            qdev.clone(),
+            d0,
+        )?;
+        let t1 = crate::tensor::Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(y1),
+            qdev.clone(),
+            d1,
+        )?;
+        Ok(Some((t0, t1)))
+    }
+
     /// [`Self::forward_quantized`] over one F32 row with `bias` (`[n]` F32 on the same card)
     /// added to each output in the kernel's store: the same bits as the product followed by a
     /// bias add, one launch fewer. `None` where another path serves the row.

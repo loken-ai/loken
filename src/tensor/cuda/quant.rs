@@ -118,8 +118,16 @@ pub(super) fn quantize_q8_1_rows_t<T: crate::tensor::gpu_runtime::driver::Device
     const QUANT_BLOCK: usize = 256;
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     let bytes = rows * (k_padded / 32 * 36); // block_q8_1 = 32 i8 + 2 f16
-    let func = dev.mmvq_fn(kernel)?;
     let stream = dev.stream();
+    // An f32 row the kernel that wrote it already quantised is taken as it is.
+    if rows == 1 && kernel == "mmvq_gguf_quantize_q8_1_f32" && x.len() == k {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        let (ptr, _guard) = x.device_ptr(&stream);
+        if let Some(q81) = prequant::take(ptr as usize, k) {
+            return Ok(q81);
+        }
+    }
+    let func = dev.mmvq_fn(kernel)?;
     // plain (uninit) alloc: the quantize grid covers every padded block and
     // writes all 36 bytes of each (zero data in the pad lanes), so the
     // per-call memset was pure launch/API overhead on the decode path.
@@ -2996,6 +3004,49 @@ pub fn mmvq_f32_bias(
         None,
     )?;
     Ok(dst)
+}
+
+/// Two one-row F32 mat-vecs of one format over the same activation, in one launch: `n0` rows
+/// of the first weight, then `n1` of the second. Every row has the bits of the one-row launch
+/// of its own matrix.
+#[allow(clippy::too_many_arguments)]
+pub fn mmvq_f32_dual(
+    dev: &CudaDevice,
+    tag: &str,
+    blob0: &CudaSlice<u8>,
+    blob1: &CudaSlice<u8>,
+    q8_1: &CudaSlice<u8>,
+    k: usize,
+    n0: usize,
+    n1: usize,
+) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
+    use crate::tensor::quantized::MATRIX_ROW_PADDING;
+    let kernel = format!("mmvq_gguf_{tag}_f32_plain_dual_cuda1");
+    let func = dev.mmvq_fn(&kernel)?;
+    let stream = dev.stream();
+    let mut dst0 = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<f32>(n0) })?;
+    let mut dst1 = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<f32>(n1) })?;
+    let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+    let stride_col_y = (k_padded / 32) as i32;
+    let (k_i, n0_i, n1_i, blocks0) = (k as i32, n0 as i32, n1 as i32, n0 as i32);
+    let cfg = LaunchConfig {
+        grid_dim: ((n0 + n1) as u32, 1, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&func);
+    b.arg(blob0);
+    b.arg(blob1);
+    b.arg(q8_1);
+    b.arg(&mut dst0);
+    b.arg(&mut dst1);
+    b.arg(&k_i);
+    b.arg(&n0_i);
+    b.arg(&n1_i);
+    b.arg(&stride_col_y);
+    b.arg(&blocks0);
+    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
+    Ok((dst0, dst1))
 }
 
 /// The largest batch the plain mat-vec kernels run with the warp count of a single column

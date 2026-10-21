@@ -604,6 +604,7 @@ extern "C" __global__ void NAME(                                              \
 FLASH_SPLITK_GQA_PARTIAL_KERNEL(flash_splitk_q8_gqa_partial_hd64,  64,  8)
 FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd64,  64,  8)
 FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd128, 128, 8)
+FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd256, 256, 8)
 // Up to 16 query heads per KV head; a separate build keeps the 8-head one's registers.
 FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_nq16_hd64,  64,  16)
 FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_nq16_hd128, 128, 16)
@@ -681,6 +682,33 @@ extern "C" __global__ void NAME(                                              \
     flash_splitk_gqa_combine_wide_inner<HD>(partials, out, nsplit,            \
         blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);                    \
 }
+// The slice a combine block wrote, as the q8_1 block of the row the output projection reads.
+// Rows are quantised the way `quantize_row_to_q8_1` does it: the code of each value against
+// the block's largest magnitude, and the pair (scale, sum). Only warp 0 wrote the slice. The
+// same warp quantises it, after its own stores, so each lane reads back its own value.
+static __device__ __forceinline__ void flash_splitk_quantize_slice(
+    const float * __restrict__ out, void * __restrict__ q81,
+    const int block_index, const int value_index, const int lane, const int warp) {
+    if (warp != 0) return;
+    const float xi = out[value_index + lane];
+    float amax = fabsf(xi);
+    float sum = xi;
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
+    }
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        sum += __shfl_xor_sync(0xffffffff, sum, mask, 32);
+    }
+    const float d = amax / 127;
+    unsigned char * blk = (unsigned char *) q81 + (size_t) block_index * 36;
+    ((signed char *) (blk + 4))[lane] = amax == 0.0f ? 0 : (signed char) roundf(xi / d);
+    if (lane == 0) {
+        *((half2 *) blk) = __floats2half2_rn(d, sum);
+    }
+}
+
 // Wide combine of the device-length partials: the same split count, from the same length.
 // Row `z` merges the partials of the token at the device position plus `z`.
 #define FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(NAME, HD)                 \
@@ -688,7 +716,8 @@ extern "C" __global__ void NAME(                                              \
     const float * __restrict__ partials,                                      \
     float       * __restrict__ out,                                           \
     const int32_t * __restrict__ seq_kv_dev,                                  \
-    int base, int chunk, int lo, int hi                                       \
+    int base, int chunk, int lo, int hi,                                      \
+    void * __restrict__ q81                                                   \
 ) {                                                                           \
     const int row = blockIdx.z;                                               \
     const int n_q = gridDim.x;                                                \
@@ -697,9 +726,16 @@ extern "C" __global__ void NAME(                                              \
         partials + (size_t)row * n_q * hi * (HD + 2),                         \
         out + (size_t)row * n_q * HD, nsplit,                                 \
         blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);                    \
+    if (q81 != nullptr) {                                                     \
+        flash_splitk_quantize_slice(                                          \
+            out + (size_t)row * n_q * HD, q81,                                \
+            blockIdx.x * (HD / 32) + blockIdx.y, blockIdx.x * HD + blockIdx.y * 32, \
+            threadIdx.x, threadIdx.y);                                        \
+    }                                                                         \
 }
 FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(flash_splitk_gqa_combine_wide_devlen_hd64,  64)
 FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(flash_splitk_gqa_combine_wide_devlen_hd128, 128)
+FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(flash_splitk_gqa_combine_wide_devlen_hd256, 256)
 
 FLASH_SPLITK_GQA_COMBINE_WIDE_KERNEL(flash_splitk_gqa_combine_wide_hd64,  64)
 FLASH_SPLITK_GQA_COMBINE_WIDE_KERNEL(flash_splitk_gqa_combine_wide_hd128, 128)

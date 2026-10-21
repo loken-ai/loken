@@ -516,13 +516,35 @@ pub fn fused_split_gelu_mul(gu: &Tensor) -> Result<Tensor> {
 
         let m_i32 = leading as i32;
         let n_i32 = n as i32;
-        let mut builder = func.builder();
-        builder.arg(&g_view);
-        builder.arg(o_slice);
-        builder.arg(&m_i32);
-        builder.arg(&n_i32);
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| crate::tensor::Error::msg(format!("fused_split_gelu_mul: {e}")))?;
+        let ndev = cuda_dev.native();
+        if crate::tensor::cuda::prequant_row(ndev, leading, n) {
+            // The product also leaves quantised, for the mat-vec that reads it.
+            let stream = ndev.stream();
+            let qf = ndev.mmvq_fn("split_gelu_mul_q8_1_f32")?;
+            let q81 = crate::tensor::cuda::alloc_q81(ndev, n)?;
+            let qcfg = crate::tensor::cuda_ext::LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = stream.launch_builder(&qf);
+            b.arg(&g_view);
+            b.arg(o_slice);
+            b.arg(&q81);
+            b.arg(&n_i32);
+            unsafe { b.launch(qcfg) }.map_err(|e| {
+                crate::tensor::Error::msg(format!("fused_split_gelu_mul q8_1: {e}"))
+            })?;
+            crate::tensor::cuda::stash_prequant(&stream, o_slice, n, q81);
+        } else {
+            let mut builder = func.builder();
+            builder.arg(&g_view);
+            builder.arg(o_slice);
+            builder.arg(&m_i32);
+            builder.arg(&n_i32);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| crate::tensor::Error::msg(format!("fused_split_gelu_mul: {e}")))?;
+        }
     }
 
     drop(gu_store);
@@ -593,13 +615,35 @@ pub fn fused_split_silu_mul(gu: &Tensor) -> Result<Tensor> {
 
         let m_i32 = leading as i32;
         let n_i32 = n as i32;
-        let mut builder = func.builder();
-        builder.arg(&g_view);
-        builder.arg(o_slice);
-        builder.arg(&m_i32);
-        builder.arg(&n_i32);
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| crate::tensor::Error::msg(format!("fused_split_silu_mul: {e}")))?;
+        let ndev = cuda_dev.native();
+        if crate::tensor::cuda::prequant_row(ndev, leading, n) {
+            // The product also leaves quantised, for the mat-vec that reads it.
+            let stream = ndev.stream();
+            let qf = ndev.mmvq_fn("split_silu_mul_q8_1_f32")?;
+            let q81 = crate::tensor::cuda::alloc_q81(ndev, n)?;
+            let qcfg = crate::tensor::cuda_ext::LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(256), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = stream.launch_builder(&qf);
+            b.arg(&g_view);
+            b.arg(o_slice);
+            b.arg(&q81);
+            b.arg(&n_i32);
+            unsafe { b.launch(qcfg) }.map_err(|e| {
+                crate::tensor::Error::msg(format!("fused_split_silu_mul q8_1: {e}"))
+            })?;
+            crate::tensor::cuda::stash_prequant(&stream, o_slice, n, q81);
+        } else {
+            let mut builder = func.builder();
+            builder.arg(&g_view);
+            builder.arg(o_slice);
+            builder.arg(&m_i32);
+            builder.arg(&n_i32);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| crate::tensor::Error::msg(format!("fused_split_silu_mul: {e}")))?;
+        }
     }
 
     drop(gu_store);
@@ -706,6 +750,73 @@ pub fn fused_gemma4_post_add_norm(
     Ok((x_out, x_norm_out))
 }
 
+/// The post-attention norm, the residual add and the feed-forward norm of one decode row in one
+/// launch, the normed row also left quantised for the mat-vec that reads it: `(x, x_norm)` with
+/// `x = rmsnorm(attn_out, w_post) + residual` and `x_norm = rmsnorm(x, w_ffn)`, the bits the
+/// three launches give. `None` where the row is not one the kernel serves; nothing has run then.
+pub fn fused_post_norm_add_norm(
+    attn_out: &Tensor,
+    w_post: &Tensor,
+    residual: &Tensor,
+    w_ffn: &Tensor,
+    eps_post: f32,
+    eps_ffn: f32,
+) -> Result<Option<(Tensor, Tensor)>> {
+    if !attn_out.device().runs_as_card() || attn_out.device().is_dry() {
+        return Ok(None);
+    }
+    let cols = *attn_out.dims().last().unwrap_or(&1);
+    let rows = attn_out.elem_count() / cols.max(1);
+    let f32s = [attn_out, w_post, residual, w_ffn]
+        .iter()
+        .all(|t| t.dtype() == DType::F32 && t.is_contiguous());
+    let cuda_dev = attn_out.device().as_cuda_device()?;
+    let ndev = cuda_dev.native();
+    if !f32s
+        || attn_out.shape() != residual.shape()
+        || !crate::tensor::cuda::wide_row_block(rows, cols)
+        || !crate::tensor::cuda::prequant_row(ndev, rows, cols)
+    {
+        return Ok(None);
+    }
+    let x_out = unsafe { Tensor::empty(attn_out.shape(), DType::F32, &attn_out.device())? };
+    let norm_out = unsafe { Tensor::empty(attn_out.shape(), DType::F32, &attn_out.device())? };
+    let (a_s, a_l) = attn_out.storage_and_layout();
+    let (r_s, r_l) = residual.storage_and_layout();
+    let (wp_s, _) = w_post.storage_and_layout();
+    let (wf_s, _) = w_ffn.storage_and_layout();
+    let (x_s, _) = x_out.storage_and_layout();
+    let (n_s, _) = norm_out.storage_and_layout();
+    use crate::tensor::StorageView::Cuda;
+    if let (Cuda(a), Cuda(r), Cuda(wp), Cuda(wf), Cuda(xo), Cuda(no)) =
+        (&*a_s, &*r_s, &*wp_s, &*wf_s, &*x_s, &*n_s)
+    {
+        let stream = ndev.stream();
+        let func = ndev.mmvq_fn("post_norm_add_norm_wide_q8_1_f32")?;
+        let q81 = crate::tensor::cuda::alloc_q81(ndev, cols)?;
+        let a_view = a.as_cuda_slice::<f32>()?.slice(a_l.start_offset()..);
+        let r_view = r.as_cuda_slice::<f32>()?.slice(r_l.start_offset()..);
+        let (xo_s, no_s) = (xo.as_cuda_slice::<f32>()?, no.as_cuda_slice::<f32>()?);
+        let cols_i32 = cols as i32;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&a_view);
+        b.arg(wp.as_cuda_slice::<f32>()?);
+        b.arg(&r_view);
+        b.arg(wf.as_cuda_slice::<f32>()?);
+        b.arg(xo_s);
+        b.arg(no_s);
+        b.arg(&q81);
+        b.arg(&eps_post);
+        b.arg(&eps_ffn);
+        b.arg(&cols_i32);
+        unsafe { b.launch(crate::tensor::cuda::row_norm_cfg(rows, cols, true)) }
+            .map_err(|e| crate::tensor::Error::msg(format!("fused_post_norm_add_norm: {e}")))?;
+        crate::tensor::cuda::stash_prequant(&stream, no_s, cols, q81);
+    }
+    drop((a_s, r_s, wp_s, wf_s, x_s, n_s));
+    Ok(Some((x_out, norm_out)))
+}
+
 pub fn fused_add_rmsnorm_dual(
     x: &Tensor,
     residual: &Tensor,
@@ -773,16 +884,39 @@ pub fn fused_add_rmsnorm_dual(
         let r_view = r_slice.slice(r_layout.start_offset()..);
 
         let cols_i32 = cols as i32;
-        let mut builder = func.builder();
-        builder.arg(&x_view);
-        builder.arg(&r_view);
-        builder.arg(w_slice);
-        builder.arg(s_slice);
-        builder.arg(n_slice);
-        builder.arg(&eps);
-        builder.arg(&cols_i32);
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| crate::tensor::Error::msg(format!("fused_add_rmsnorm_dual: {e}")))?;
+        let ndev = cuda_dev.native();
+        if kname == "fused_add_rmsnorm_dual_wide_f32"
+            && crate::tensor::cuda::prequant_row(ndev, rows, cols)
+        {
+            // The normed row also leaves quantised, for the mat-vec that reads it.
+            let stream = ndev.stream();
+            let qf = ndev.mmvq_fn("add_rmsnorm_dual_wide_q8_1_f32")?;
+            let q81 = crate::tensor::cuda::alloc_q81(ndev, cols)?;
+            let mut b = stream.launch_builder(&qf);
+            b.arg(&x_view);
+            b.arg(&r_view);
+            b.arg(w_slice);
+            b.arg(s_slice);
+            b.arg(n_slice);
+            b.arg(&q81);
+            b.arg(&eps);
+            b.arg(&cols_i32);
+            unsafe { b.launch(cfg) }.map_err(|e| {
+                crate::tensor::Error::msg(format!("fused_add_rmsnorm_dual q8_1: {e}"))
+            })?;
+            crate::tensor::cuda::stash_prequant(&stream, n_slice, cols, q81);
+        } else {
+            let mut builder = func.builder();
+            builder.arg(&x_view);
+            builder.arg(&r_view);
+            builder.arg(w_slice);
+            builder.arg(s_slice);
+            builder.arg(n_slice);
+            builder.arg(&eps);
+            builder.arg(&cols_i32);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| crate::tensor::Error::msg(format!("fused_add_rmsnorm_dual: {e}")))?;
+        }
     }
 
     drop(x_store);
@@ -864,23 +998,39 @@ pub fn fused_rmsnorm_then_add(
         let x_view = x_slice.slice(x_layout.start_offset()..);
         let r_view = r_slice.slice(r_layout.start_offset()..);
 
-        let block = 256u32.min(cols as u32).next_power_of_two();
-        let cfg = crate::tensor::cuda_ext::LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: block * 4,
-        };
-
         let cols_i32 = cols as i32;
-        let mut builder = func.builder();
-        builder.arg(&x_view);
-        builder.arg(w_slice);
-        builder.arg(&r_view);
-        builder.arg(o_slice);
-        builder.arg(&eps);
-        builder.arg(&cols_i32);
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| crate::tensor::Error::msg(format!("fused_rmsnorm_then_add: {e}")))?;
+        if crate::tensor::cuda::wide_row_block(rows, cols) {
+            // Few rows: the row is staged in shared memory by the whole block.
+            let ndev = cuda_dev.native();
+            let stream = ndev.stream();
+            let wf = ndev.mmvq_fn("rmsnorm_then_add_wide_f32")?;
+            let mut b = stream.launch_builder(&wf);
+            b.arg(&x_view);
+            b.arg(w_slice);
+            b.arg(&r_view);
+            b.arg(o_slice);
+            b.arg(&eps);
+            b.arg(&cols_i32);
+            unsafe { b.launch(crate::tensor::cuda::row_norm_cfg(rows, cols, true)) }.map_err(
+                |e| crate::tensor::Error::msg(format!("fused_rmsnorm_then_add wide: {e}")),
+            )?;
+        } else {
+            let block = 256u32.min(cols as u32).next_power_of_two();
+            let cfg = crate::tensor::cuda_ext::LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: block * 4,
+            };
+            let mut builder = func.builder();
+            builder.arg(&x_view);
+            builder.arg(w_slice);
+            builder.arg(&r_view);
+            builder.arg(o_slice);
+            builder.arg(&eps);
+            builder.arg(&cols_i32);
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| crate::tensor::Error::msg(format!("fused_rmsnorm_then_add: {e}")))?;
+        }
     }
 
     drop(x_store);

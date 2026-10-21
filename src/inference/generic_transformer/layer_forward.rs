@@ -664,6 +664,21 @@ impl GenericTransformerLayer {
         };
         #[cfg(not(feature = "gpu"))]
         let fused: Option<(Tensor, Tensor)> = None;
+        // A post-attention norm, its residual and the feed-forward norm in one launch.
+        #[cfg(feature = "gpu")]
+        let fused = match (fused, &self.post_attn_norm, &self.ffn_norm) {
+            (None, Some(post), Some(ffn)) => {
+                crate::inference::kernel::fused::fused_post_norm_add_norm(
+                    &attn_out,
+                    post.weight(),
+                    residual,
+                    ffn.weight(),
+                    post.eps() as f32,
+                    ffn.eps() as f32,
+                )?
+            }
+            (other, _, _) => other,
+        };
         let (x, x_norm) = match fused {
             Some(pair) => pair,
             None => {
@@ -691,21 +706,32 @@ impl GenericTransformerLayer {
                 .moe
                 .as_ref()
                 .is_some_and(|m| m.router_prenormed && m.can_fold_residual(&x_norm, residual));
-        let mut ffn_out = match self.moe.as_ref() {
-            Some(moe) if folded => moe.forward_folding(
+        // A dense layer's down projection adds the residual in its own store.
+        #[cfg(feature = "gpu")]
+        let folded_dense = if rs.is_none() && self.post_ffn_norm.is_none() && self.moe.is_none() {
+            self.forward_ffn_folding(&x_norm, residual)?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gpu"))]
+        let folded_dense: Option<Tensor> = None;
+        let folded = folded || folded_dense.is_some();
+        let mut ffn_out = match (folded_dense, self.moe.as_ref()) {
+            (Some(y), _) => y,
+            (None, Some(moe)) if folded => moe.forward_folding(
                 &x_norm,
                 residual,
                 self.embedding_length_for_moe,
                 self.ffn_norm_eps,
                 residual,
             )?,
-            Some(moe) => moe.forward_rows(
+            (None, Some(moe)) => moe.forward_rows(
                 &x_norm,
                 residual,
                 self.embedding_length_for_moe,
                 self.ffn_norm_eps,
             )?,
-            None => self.forward_ffn(&x_norm)?,
+            (None, None) => self.forward_ffn(&x_norm)?,
         };
         if let Some(s) = rs {
             ffn_out = (ffn_out * s)?;

@@ -273,6 +273,135 @@ impl GenericTransformerLayer {
         super::tp_sum(own, parts, comms.as_deref())
     }
 
+    /// `ffn_down(activated) + residual` for a decode row of the dense gate/up layer, the add
+    /// made in the down projection's store: the bits of the product followed by the add, one
+    /// launch fewer. `None` where the layer or the row is not one that serves; nothing has run then.
+    #[cfg(feature = "gpu")]
+    pub(super) fn forward_ffn_folding(
+        &mut self,
+        x: &Tensor,
+        residual: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let dense = self.tp_shards.is_empty()
+            && !self.flags.is_phi2_simple_ffn
+            && (self.flags.fused_ffn_gate_up || self.ffn_gate.is_none())
+            && self.ffn_down_bias.is_none()
+            && self.graph_ffn_down_buffer.is_none();
+        let i = self.flags.intermediate_size;
+        let row = x.dim(1).map(|d| d == 1).unwrap_or(false)
+            && x.dtype() == crate::tensor::DType::F32
+            && x.device().is_cuda()
+            && residual.dtype() == crate::tensor::DType::F32
+            && residual.is_contiguous()
+            && residual.elem_count() == self.ffn_down.out_dim()
+            && self.ffn_up.out_dim() == 2 * i;
+        if !(dense && row) {
+            return Ok(None);
+        }
+        let out = self.ffn_activated(x)?;
+        self.ffn_down.forward_bias(&out, residual).map(Some)
+    }
+
+    /// The activated hidden of a layer whose `ffn_up` holds `[gate || up]`: the projection, the
+    /// activation product, and the routing of both through the graph's stable buffers.
+    fn ffn_activated(&mut self, x: &Tensor) -> Result<Tensor> {
+        let i = self.flags.intermediate_size;
+        let raw_up = self.ffn_up.forward(x)?;
+        // route ffn_up matmul output through
+        // stable buffer when graph mode is in effect (gemma4 etc).
+        // The fresh-alloc from QMatMul.forward has CAPTURE-time
+        // addr baked into captured graph; goes stale on replay.
+        // Decode-only (seq=1) since prefill shape varies.
+        let up_states = if x.dim(1).map(|d| d == 1).unwrap_or(false) {
+            if let Some(buf) = self.graph_ffn_up_concat_buffer.as_ref() {
+                buf.slice_set(&raw_up, 0, 0)?;
+                buf.clone()
+            } else {
+                raw_up
+            }
+        } else {
+            raw_up
+        };
+        // GELU path: fused_split_gelu_mul reads the packed [B, T, 2N]
+        // matmul output directly and emits [B, T, N] in one kernel  -
+        // no `narrow -> contiguous -> narrow -> contiguous -> fused_gelu_mul`
+        // chain (the two narrow-then-contiguous copies were ~2
+        // launches per layer of pure data-shuffle).
+        #[cfg(feature = "gpu")]
+        let raw_out = if up_states.device().runs_as_card()
+            && up_states.dtype() == crate::tensor::DType::F32
+            && up_states
+                .dim(crate::tensor::D::Minus1)
+                .map(|d| d == 2 * i)
+                .unwrap_or(false)
+        {
+            if self.flags.use_gelu {
+                crate::inference::kernel::fused::fused_split_gelu_mul(&up_states)?
+            } else {
+                crate::inference::kernel::fused::fused_split_silu_mul(&up_states)?
+            }
+        } else if !self.flags.use_gelu {
+            // CPU (non-cuda device): read the packed [gate | up] projection
+            // once and emit silu(gate)*up in one vectorized pass, skipping
+            // the host round-trip + scalar exp + intermediate tensor of the
+            // separate silu-then-multiply. Off the fast path (strided/odd)
+            // fall back to the split-then-op chain.
+            if let Some(o) = crate::tensor::ops::split_silu_mul_f32(&up_states)? {
+                o
+            } else {
+                let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
+                let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
+                crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
+            }
+        } else {
+            let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
+            let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
+            crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
+        };
+        #[cfg(not(feature = "gpu"))]
+        let raw_out = {
+            // silu.mul: read the packed [gate | up] projection once and emit
+            // the activated result in a single vectorized pass, skipping the
+            // host round-trip + scalar exp + intermediate tensor of the
+            // separate silu-then-multiply. Off the fast path (gelu, non-F32,
+            // strided) fall back to the split-then-op chain.
+            if !self.flags.use_gelu {
+                if let Some(o) = crate::tensor::ops::split_silu_mul_f32(&up_states)? {
+                    o
+                } else {
+                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
+                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
+                    (up * crate::tensor::ops::silu(&gate)?)?
+                }
+            } else {
+                let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
+                let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
+                gate.gelu()?.mul(&up)?
+            }
+        };
+        // route split-gelu/silu_mul output through
+        // stable buffer for graph capture.
+        let out = if x.dim(1).map(|d| d == 1).unwrap_or(false) {
+            if let Some(buf) = self.graph_ffn_activated_buffer.as_ref() {
+                if buf
+                    .dim(crate::tensor::D::Minus1)
+                    .map(|d| d == i)
+                    .unwrap_or(false)
+                {
+                    buf.slice_set(&raw_out, 0, 0)?;
+                    buf.clone()
+                } else {
+                    raw_out
+                }
+            } else {
+                raw_out
+            }
+        } else {
+            raw_out
+        };
+        Ok(out)
+    }
+
     pub(super) fn forward_ffn_own(&mut self, x: &Tensor) -> Result<Tensor> {
         // Phi2 simple FFN: y = down(GELU(up(x) + up_bias)) + down_bias.
         // No gate. Uses tanh-approximated GELU (`gelu_new` in HF) - same
@@ -288,100 +417,7 @@ impl GenericTransformerLayer {
         // output dim. Triggered by Phi3 (native GGUF fused) AND by our
         // load-time fusion for qwen3/deepcoder (ffn_gate set to None).
         if self.flags.fused_ffn_gate_up || self.ffn_gate.is_none() {
-            let i = self.flags.intermediate_size;
-            let raw_up = self.ffn_up.forward(x)?;
-            // route ffn_up matmul output through
-            // stable buffer when graph mode is in effect (gemma4 etc).
-            // The fresh-alloc from QMatMul.forward has CAPTURE-time
-            // addr baked into captured graph; goes stale on replay.
-            // Decode-only (seq=1) since prefill shape varies.
-            let up_states = if x.dim(1).map(|d| d == 1).unwrap_or(false) {
-                if let Some(buf) = self.graph_ffn_up_concat_buffer.as_ref() {
-                    buf.slice_set(&raw_up, 0, 0)?;
-                    buf.clone()
-                } else {
-                    raw_up
-                }
-            } else {
-                raw_up
-            };
-            // GELU path: fused_split_gelu_mul reads the packed [B, T, 2N]
-            // matmul output directly and emits [B, T, N] in one kernel  -
-            // no `narrow -> contiguous -> narrow -> contiguous -> fused_gelu_mul`
-            // chain (the two narrow-then-contiguous copies were ~2
-            // launches per layer of pure data-shuffle).
-            #[cfg(feature = "gpu")]
-            let raw_out = if up_states.device().runs_as_card()
-                && up_states.dtype() == crate::tensor::DType::F32
-                && up_states
-                    .dim(crate::tensor::D::Minus1)
-                    .map(|d| d == 2 * i)
-                    .unwrap_or(false)
-            {
-                if self.flags.use_gelu {
-                    crate::inference::kernel::fused::fused_split_gelu_mul(&up_states)?
-                } else {
-                    crate::inference::kernel::fused::fused_split_silu_mul(&up_states)?
-                }
-            } else if !self.flags.use_gelu {
-                // CPU (non-cuda device): read the packed [gate | up] projection
-                // once and emit silu(gate)*up in one vectorized pass, skipping
-                // the host round-trip + scalar exp + intermediate tensor of the
-                // separate silu-then-multiply. Off the fast path (strided/odd)
-                // fall back to the split-then-op chain.
-                if let Some(o) = crate::tensor::ops::split_silu_mul_f32(&up_states)? {
-                    o
-                } else {
-                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                    crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
-                }
-            } else {
-                let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
-            };
-            #[cfg(not(feature = "gpu"))]
-            let raw_out = {
-                // silu.mul: read the packed [gate | up] projection once and emit
-                // the activated result in a single vectorized pass, skipping the
-                // host round-trip + scalar exp + intermediate tensor of the
-                // separate silu-then-multiply. Off the fast path (gelu, non-F32,
-                // strided) fall back to the split-then-op chain.
-                if !self.flags.use_gelu {
-                    if let Some(o) = crate::tensor::ops::split_silu_mul_f32(&up_states)? {
-                        o
-                    } else {
-                        let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                        let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                        (up * crate::tensor::ops::silu(&gate)?)?
-                    }
-                } else {
-                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                    gate.gelu()?.mul(&up)?
-                }
-            };
-            // route split-gelu/silu_mul output through
-            // stable buffer for graph capture.
-            let out = if x.dim(1).map(|d| d == 1).unwrap_or(false) {
-                if let Some(buf) = self.graph_ffn_activated_buffer.as_ref() {
-                    if buf
-                        .dim(crate::tensor::D::Minus1)
-                        .map(|d| d == i)
-                        .unwrap_or(false)
-                    {
-                        buf.slice_set(&raw_out, 0, 0)?;
-                        buf.clone()
-                    } else {
-                        raw_out
-                    }
-                } else {
-                    raw_out
-                }
-            } else {
-                raw_out
-            };
+            let out = self.ffn_activated(x)?;
             let raw_down = self.ffn_down.forward(&out)?;
             // route ffn_down output through stable buffer.
             if x.dim(1).map(|d| d == 1).unwrap_or(false) {

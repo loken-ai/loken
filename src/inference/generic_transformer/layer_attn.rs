@@ -213,6 +213,10 @@ impl GenericTransformerLayer {
         let Some(a) = wq.quantize_for_matvec(&x.contiguous()?)? else {
             return Ok(None);
         };
+        // Q and K of one format go in one launch.
+        if let Some((q, k)) = wq.forward_quantized_pair(wk, &a)? {
+            return Ok(wv.forward_quantized(&a)?.map(|v| (q, k, v)));
+        }
         match (
             wq.forward_quantized(&a)?,
             wk.forward_quantized(&a)?,
@@ -810,7 +814,7 @@ impl GenericTransformerLayer {
     /// takes) rather than the score and softmax-output pair, as `q8_decode_attention` picks.
     #[cfg(feature = "gpu")]
     fn decode_takes_splitk(&self) -> bool {
-        self.n_head > self.n_kv_head && (self.head_dim == 64 || self.head_dim == 128)
+        splitk_serves(self.n_head, self.n_kv_head, self.head_dim)
     }
 
     /// Whether the decode step of each of `rows` tokens at `index_pos..` on `device` appends to
@@ -2385,9 +2389,8 @@ impl GenericTransformerLayer {
         // the old "+4%" only appeared at long KV, which captioning never
         // reaches, so there is nothing for the KV-chunk split to divide.
         // On any kernel error the match below falls back to the chain.
-        let try_splitk = cache.n_kv_heads() > 0
-            && self.n_head > cache.n_kv_heads()
-            && (self.head_dim == 64 || self.head_dim == 128);
+        let try_splitk =
+            cache.n_kv_heads() > 0 && splitk_serves(self.n_head, cache.n_kv_heads(), self.head_dim);
         let softmax_scale = scale;
         // -- gemma4 windowed-SWA decode ------------------------------
         // SWA layers (self.sliding_window set) attend only to the last `w`
@@ -2738,3 +2741,18 @@ impl GenericTransformerLayer {
 #[cfg(all(test, feature = "gpu"))]
 #[path = "fused_decode_tests.rs"]
 mod fused_decode_parity;
+
+/// Whether the split-K decode kernels serve a layer's heads: a head dimension they are built
+/// for, and a query group of one to sixteen heads per KV head (eight at 256 wide).
+#[cfg(feature = "gpu")]
+fn splitk_serves(n_head: usize, n_kv_head: usize, head_dim: usize) -> bool {
+    if n_kv_head == 0 || n_head < n_kv_head || n_head % n_kv_head != 0 {
+        return false;
+    }
+    let group = n_head / n_kv_head;
+    match head_dim {
+        64 | 128 => group <= 16,
+        256 => group <= 8,
+        _ => false,
+    }
+}

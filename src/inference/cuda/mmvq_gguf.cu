@@ -118,7 +118,8 @@ static __device__ void mmvq_core_impl(
     dst_t *__restrict__ dst,
     const int ncols_x, const int nrows_x,
     const int stride_col_y, const int stride_col_dst,
-    combine_t combine, const float *__restrict__ bias = nullptr) {
+    combine_t combine, const float *__restrict__ bias = nullptr,
+    const int block_base = 0) {
 
   constexpr int block_warps =
       block_warps_fixed > 0 ? block_warps_fixed : mmvq_nwarps_for(ncols_dst);
@@ -131,7 +132,7 @@ static __device__ void mmvq_core_impl(
   const int warp = threadIdx.y % nwarps;
 
   const int tid = WARP_SIZE * warp + threadIdx.x;
-  const int row0 = rows_per_cuda_block * (ngroups * blockIdx.x + group);
+  const int row0 = rows_per_cuda_block * (ngroups * (blockIdx.x - block_base) + group);
   const int blocks_per_row = ncols_x / qk;
   constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
 
@@ -221,12 +222,12 @@ static __device__ void mmvq_core_plain(
     dst_t *__restrict__ dst,
     const int ncols_x, const int nrows_x,
     const int stride_col_y, const int stride_col_dst,
-    const float *__restrict__ bias = nullptr) {
+    const float *__restrict__ bias = nullptr, const int block_base = 0) {
   const void *const mats[1] = {vx};
   auto first = [] (const float * a) { return a[0]; };
   mmvq_core_impl<dst_t, qk, qi, block_q_t, vdr, dot_block, ncols_dst, 1, small_k,
                  decltype(first), group_warps, block_warps_fixed>(
-      mats, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, first, bias);
+      mats, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, first, bias, block_base);
 }
 
 /// Gate and up in one pass, the gate through its activation.
@@ -439,6 +440,28 @@ MMVQ_FORMATS(MMVQ_PLAIN_DECODE_ORDER_GROUP_SET)
                             f32, float)
 
 MMVQ_FORMATS(MMVQ_PLAIN_SMALLK_BATCH_SET)
+
+/// Two one-row F32 mat-vecs over the same activation in one launch: the first `blocks0` blocks
+/// run the first matrix, the rest the second, each as the one-row kernel runs it, so every
+/// output row has the bits of its own launch.
+#define MMVQ_PLAIN_DUAL_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)    \
+  extern "C" __global__ void mmvq_gguf_##tag##_f32_plain_dual_cuda1(             \
+      const void *__restrict__ vx0, const void *__restrict__ vx1,               \
+      const void *__restrict__ vy, float *__restrict__ dst0,                    \
+      float *__restrict__ dst1, const int ncols_x, const int nrows0,            \
+      const int nrows1, const int stride_col_y, const int blocks0) {            \
+    if ((int)blockIdx.x < blocks0) {                                            \
+      mmvq_core_plain<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot, 1>(   \
+          vx0, (const block_q8_1 *)vy, dst0, ncols_x, nrows0, stride_col_y,     \
+          nrows0, nullptr, 0);                                                  \
+    } else {                                                                    \
+      mmvq_core_plain<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot, 1>(   \
+          vx1, (const block_q8_1 *)vy, dst1, ncols_x, nrows1, stride_col_y,     \
+          nrows1, nullptr, blocks0);                                            \
+    }                                                                           \
+  }
+
+MMVQ_FORMATS(MMVQ_PLAIN_DUAL_SET)
 
 /// The one-row F32 kernels with a bias: each output row gets `bias[row]` added to its sum, the
 /// addition a separate bias kernel would make. `gw` 0 is the one-row kernel, 4, 2 and 1 the
@@ -660,6 +683,220 @@ mmvq_gguf_q4_k_bf16_fused_silu_cuda1(
 MMVQ_QUANTIZE_ENTRY(bf16, __nv_bfloat16)
 MMVQ_QUANTIZE_ENTRY(f16, half)
 MMVQ_QUANTIZE_ENTRY(f32, float)
+
+
+// Producers that hand the next mat-vec its activation already quantised.
+//
+// Each is a decode-step kernel that ends in the activation one mat-vec reads: the value a
+// thread computes goes to the f32 output as it always did, and the same value is quantised to
+// the q8_1 block its warp owns, with the code and the pair `quantize_row_to_q8_1` writes. The
+// mat-vec then skips its own quantise launch. The row length is a multiple of 512, so the
+// quantised row has no padding, and a warp holds 32 consecutive values of the row.
+
+/// One lane's value of a 32-value block to its q8_1 code, and the block's pair from lane 0.
+static __device__ __forceinline__ void quantize_lane_to_q8_1(block_q8_1 * y, const int i, const float xi) {
+    const float amax = warp_max(fabsf(xi));
+    const float sum = warp_sum(xi);
+    const float d = amax / 127;
+    y[i / QK8_1].qs[i % QK8_1] = amax == 0.0f ? 0 : roundf(xi / d);
+    if (i % QK8_1 == 0) {
+        y[i / QK8_1].ds = __floats2half2_rn(d, sum);
+    }
+}
+
+// `fused_rmsnorm_wide_f32` with the normed row also quantised. Same staging, same 256-lane
+// accumulation and tree, same scaling of each value.
+extern "C" __global__ void rmsnorm_wide_q8_1_f32(
+    const float* __restrict__ x, const float* __restrict__ weight, float* __restrict__ out,
+    void* __restrict__ vy, const float eps, const int cols) {
+  const int row = blockIdx.x;
+  extern __shared__ float srow_rq[];
+  __shared__ float stree_rq[256];
+  const int offset = row * cols;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    srow_rq[i] = x[offset + i];
+  }
+  __syncthreads();
+  if (threadIdx.x < 256) {
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) {
+      const float v = srow_rq[i];
+      thread_sum += v * v;
+    }
+    stree_rq[threadIdx.x] = thread_sum;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) stree_rq[threadIdx.x] += stree_rq[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float rms = rsqrtf(stree_rq[0] / (float)cols + eps);
+  block_q8_1 * y = (block_q8_1 *)vy + (size_t)row * (cols / QK8_1);
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float v = srow_rq[i] * rms * weight[i];
+    out[offset + i] = v;
+    quantize_lane_to_q8_1(y, i, v);
+  }
+}
+
+// `fused_add_rmsnorm_dual_wide_f32` with the normed row also quantised.
+extern "C" __global__ void add_rmsnorm_dual_wide_q8_1_f32(
+    const float* __restrict__ x, const float* __restrict__ residual,
+    const float* __restrict__ weight, float* __restrict__ sum_out,
+    float* __restrict__ norm_out, void* __restrict__ vy, const float eps, const int cols) {
+  const int row = blockIdx.x;
+  extern __shared__ float ssum_aq[];
+  __shared__ float stree_aq[256];
+  const int offset = row * cols;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float val = x[offset + i] + residual[offset + i];
+    ssum_aq[i] = val;
+    sum_out[offset + i] = val;
+  }
+  __syncthreads();
+  if (threadIdx.x < 256) {
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) {
+      const float v = ssum_aq[i];
+      thread_sum += v * v;
+    }
+    stree_aq[threadIdx.x] = thread_sum;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) stree_aq[threadIdx.x] += stree_aq[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float rms = rsqrtf(stree_aq[0] / (float)cols + eps);
+  block_q8_1 * y = (block_q8_1 *)vy + (size_t)row * (cols / QK8_1);
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float v = ssum_aq[i] * rms * weight[i];
+    norm_out[offset + i] = v;
+    quantize_lane_to_q8_1(y, i, v);
+  }
+}
+
+// Post-attention norm, residual add and feed-forward norm of one row in one kernel, the
+// normed row also quantised: x = rmsnorm(a, w_post) + residual; x_norm = rmsnorm(x, w_ffn).
+// Each product is rounded before it is added, as the separate kernels leave it, and both
+// reductions keep the wide norm's 256-lane accumulation and tree.
+extern "C" __global__ void post_norm_add_norm_wide_q8_1_f32(
+    const float* __restrict__ a, const float* __restrict__ w_post,
+    const float* __restrict__ residual, const float* __restrict__ w_ffn,
+    float* __restrict__ x_out, float* __restrict__ norm_out, void* __restrict__ vy,
+    const float eps_post, const float eps_ffn, const int cols) {
+  const int row = blockIdx.x;
+  extern __shared__ float srow_pn[];
+  __shared__ float stree_pn[256];
+  const int offset = row * cols;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    srow_pn[i] = a[offset + i];
+  }
+  __syncthreads();
+  if (threadIdx.x < 256) {
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) {
+      const float v = srow_pn[i];
+      thread_sum += v * v;
+    }
+    stree_pn[threadIdx.x] = thread_sum;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) stree_pn[threadIdx.x] += stree_pn[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float rms_post = rsqrtf(stree_pn[0] / (float)cols + eps_post);
+  __syncthreads();
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float y = __fmul_rn(__fmul_rn(srow_pn[i], rms_post), w_post[i]);
+    const float x = __fadd_rn(y, residual[offset + i]);
+    srow_pn[i] = x;
+    x_out[offset + i] = x;
+  }
+  __syncthreads();
+  if (threadIdx.x < 256) {
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) {
+      const float v = srow_pn[i];
+      thread_sum += v * v;
+    }
+    stree_pn[threadIdx.x] = thread_sum;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) stree_pn[threadIdx.x] += stree_pn[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float rms_ffn = rsqrtf(stree_pn[0] / (float)cols + eps_ffn);
+  block_q8_1 * y8 = (block_q8_1 *)vy + (size_t)row * (cols / QK8_1);
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float v = srow_pn[i] * rms_ffn * w_ffn[i];
+    norm_out[offset + i] = v;
+    quantize_lane_to_q8_1(y8, i, v);
+  }
+}
+
+// `fused_rmsnorm_then_add_f32` over the wide norm's staging: the same 256-lane accumulation
+// and tree, so the output has the narrow kernel's bits.
+extern "C" __global__ void rmsnorm_then_add_wide_f32(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    const float* __restrict__ residual, float* __restrict__ out,
+    const float eps, const int cols) {
+  const int row = blockIdx.x;
+  extern __shared__ float srow_ra[];
+  __shared__ float stree_ra[256];
+  const int offset = row * cols;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    srow_ra[i] = x[offset + i];
+  }
+  __syncthreads();
+  if (threadIdx.x < 256) {
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) {
+      const float v = srow_ra[i];
+      thread_sum += v * v;
+    }
+    stree_ra[threadIdx.x] = thread_sum;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) stree_ra[threadIdx.x] += stree_ra[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float rms = rsqrtf(stree_ra[0] / (float)cols + eps);
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    out[offset + i] = srow_ra[i] * rms * weight[i] + residual[offset + i];
+  }
+}
+
+// `fused_split_silu_mul_f32` and `fused_split_gelu_mul_f32` for one row, with the product also
+// quantised. `n` is a multiple of 32 and the block a multiple of 32, so a warp is whole.
+extern "C" __global__ void split_silu_mul_q8_1_f32(
+    const float* __restrict__ gu, float* __restrict__ out, void* __restrict__ vy, const int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  const float g = gu[idx];
+  const float u = gu[n + idx];
+  const float silu_g = g / (1.0f + expf(-g));
+  const float v = silu_g * u;
+  out[idx] = v;
+  quantize_lane_to_q8_1((block_q8_1 *)vy, idx, v);
+}
+
+extern "C" __global__ void split_gelu_mul_q8_1_f32(
+    const float* __restrict__ gu, float* __restrict__ out, void* __restrict__ vy, const int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  const float g = gu[idx];
+  const float u = gu[n + idx];
+  const float k0 = 0.7978845608028654f;
+  const float k1 = 0.044715f;
+  const float gelu_g = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+  const float v = gelu_g * u;
+  out[idx] = v;
+  quantize_lane_to_q8_1((block_q8_1 *)vy, idx, v);
+}
 
 // Host-side launchers, called through the kernel FFI boundary.
 

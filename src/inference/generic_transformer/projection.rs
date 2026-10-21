@@ -867,6 +867,20 @@ impl QMatMul {
         }
     }
 
+    /// [`Self::forward_quantized`] of this weight and of `other` in one launch; `None` where
+    /// the pair is not two weights the one-row kernel serves together.
+    #[cfg(feature = "gpu")]
+    pub fn forward_quantized_pair(
+        &self,
+        other: &QMatMul,
+        a: &crate::tensor::quantized::QuantizedActivation,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        match (self.bare_kernel(), other.bare_kernel()) {
+            (Some(k0), Some(k1)) => k0.forward_quantized_pair(k1, a),
+            _ => Ok(None),
+        }
+    }
+
     /// [`Self::forward_quantized`] with `bias` added in the mat-vec's store, the same bits as
     /// the product followed by a bias add; `None` where the row takes another path.
     #[cfg(feature = "gpu")]

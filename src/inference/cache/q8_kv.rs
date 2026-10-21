@@ -1366,8 +1366,6 @@ impl Q8KvCache {
     /// context). Same `[1, n_q_heads, 1, head_dim]` F32 output; nq_per_kv==1,
     /// head_dim in {64,128}.
     pub fn attn_flash_splitk_decode_graph(&self, q: &Tensor, scale: f32) -> Result<Tensor> {
-        use crate::inference::quantized_cuda::attn_flash_splitk_q8_decode_dev_pos;
-
         let pos_dev = self
             .core
             .is_primed()
@@ -1393,9 +1391,9 @@ impl Q8KvCache {
             ));
         }
         let n_q_per_kv = n_q_heads / self.n_kv_heads;
-        if !(self.head_dim == 64 || self.head_dim == 128) {
+        if !(self.head_dim == 64 || self.head_dim == 128 || self.head_dim == 256) {
             return Err(anyhow!(
-                "Q8KvCache::attn_flash_splitk_decode_graph: head_dim {} not in {{64,128}}",
+                "Q8KvCache::attn_flash_splitk_decode_graph: head_dim {} not in {{64,128,256}}",
                 self.head_dim
             ));
         }
@@ -1418,19 +1416,8 @@ impl Q8KvCache {
         };
         let q_view = q_cuda.as_cuda_slice::<f32>()?.slice(..);
 
-        let out_storage = if n_q_per_kv == 1 {
-            attn_flash_splitk_q8_decode_dev_pos(
-                &self.k_q8,
-                &self.v_q8,
-                &q_view,
-                pos_dev,
-                self.head_dim,
-                self.n_kv_heads,
-                scale,
-                &self.cuda_device,
-            )
-            .map_err(|e| anyhow!("Q8KvCache: attn_flash_splitk_q8_decode_dev_pos kernel: {e}"))?
-        } else {
+        // One query head per KV head is the group of one.
+        let out_storage = {
             let longest = self.launch_len();
             crate::inference::quantized_cuda::attn_flash_splitk_q8_gqa_decode_dev_pos(
                 &self.k_q8,

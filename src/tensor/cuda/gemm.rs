@@ -514,6 +514,35 @@ pub fn add_rms_norm_launch(rows: usize, cols: usize) -> (&'static str, LaunchCon
     (name, row_norm_cfg(rows, cols, wide))
 }
 
+/// Whether a decode row of `cols` values may leave its kernel already quantised for the
+/// mat-vec that reads it: one row whose quantised form has no padding, on a card that reports
+/// its buffer handouts (see [`prequant`]).
+pub fn prequant_row(dev: &CudaDevice, rows: usize, cols: usize) -> bool {
+    rows == 1
+        && cols.is_multiple_of(crate::tensor::quantized::MATRIX_ROW_PADDING)
+        && prequant::supported(dev.ordinal())
+}
+
+/// A buffer for the q8_1 form of one row of `cols` values.
+pub fn alloc_q81(dev: &CudaDevice, cols: usize) -> Result<CudaSlice<u8>> {
+    let stream = dev.stream();
+    with_oom_retry(dev, "q8_1 row", || unsafe {
+        stream.alloc::<u8>(cols / 32 * 36)
+    })
+}
+
+/// Keeps `q81`, the quantised form of the `k` values in `buf`, for the mat-vec that reads `buf`.
+pub fn stash_prequant(
+    stream: &std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+    buf: &CudaSlice<f32>,
+    k: usize,
+    q81: CudaSlice<u8>,
+) {
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
+    let (ptr, _guard) = buf.device_ptr(stream);
+    prequant::stash(ptr as usize, k, q81);
+}
+
 /// `fused_rmsnorm_f32` on a [rows, cols] device buffer.
 pub fn rms_norm_f32(
     dev: &CudaDevice,
@@ -524,12 +553,27 @@ pub fn rms_norm_f32(
     eps: f32,
 ) -> Result<CudaSlice<f32>> {
     let (kname, cfg) = rms_norm_launch(rows, cols);
-    let func = dev.fused_fn(kname)?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "rms_norm", || unsafe {
         stream.alloc::<f32>(rows * cols)
     })?;
     let cols_i32 = cols as i32;
+    if kname == "fused_rmsnorm_wide_f32" && prequant_row(dev, rows, cols) {
+        // The row also leaves quantised, for the mat-vec that reads it.
+        let func = dev.mmvq_fn("rmsnorm_wide_q8_1_f32")?;
+        let q81 = alloc_q81(dev, cols)?;
+        let mut b = stream.launch_builder(&func);
+        b.arg(x);
+        b.arg(w);
+        b.arg(&out);
+        b.arg(&q81);
+        b.arg(&eps);
+        b.arg(&cols_i32);
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("rms_norm q8_1 launch: {e}")))?;
+        stash_prequant(&stream, &out, cols, q81);
+        return Ok(out);
+    }
+    let func = dev.fused_fn(kname)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(w);

@@ -114,6 +114,8 @@ pub(crate) fn alloc(
                 c.cached = c.cached.saturating_sub(class);
             }
             s.live.insert(p, class);
+            drop(s);
+            crate::tensor::cuda::prequant::forget(p);
             return Ok(p as sys::CUdeviceptr);
         }
         if !s.cards.contains_key(&card) {
@@ -130,11 +132,13 @@ pub(crate) fn alloc(
         }
     };
     state().live.insert(ptr as usize, class);
+    crate::tensor::cuda::prequant::forget(ptr as usize);
     Ok(ptr)
 }
 
 /// Releases `ptr`: into the cache of `card` for `stream` when it fits, to the runtime otherwise.
 pub(crate) fn release(card: c_int, stream: usize, ptr: sys::CUdeviceptr) {
+    crate::tensor::cuda::prequant::forget(ptr as usize);
     let overflow = {
         let mut s = state();
         match s.live.remove(&(ptr as usize)) {
@@ -161,6 +165,7 @@ pub(crate) fn release(card: c_int, stream: usize, ptr: sys::CUdeviceptr) {
 
 /// Frees `ptr` outright, forgetting it when the cache handed it out.
 pub(crate) fn free_now(ptr: *mut c_void) {
+    crate::tensor::cuda::prequant::forget(ptr as usize);
     state().live.remove(&(ptr as usize));
     let _ = unsafe { hip!(hipFree(ptr)) };
 }

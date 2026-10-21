@@ -374,9 +374,9 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     // up to 8 by one build, up to 16 by the `nq16` one.
     const MAX_NQ: usize = 16;
     const NARROW_NQ: usize = 8;
-    if !(head_dim == 64 || head_dim == 128) {
+    if !(head_dim == 64 || head_dim == 128 || head_dim == 256) {
         anyhow::bail!(
-            "attn_flash_splitk_q8_gqa_decode_dev_pos: head_dim {head_dim} not in {{64,128}}"
+            "attn_flash_splitk_q8_gqa_decode_dev_pos: head_dim {head_dim} not in {{64,128,256}}"
         );
     }
     if n_q_per_kv == 0 || n_q_per_kv > MAX_NQ {
@@ -410,6 +410,13 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
         (128, true) => (
             "flash_splitk_q8_gqa_partial_devlen_nq16_hd128",
             "flash_splitk_gqa_combine_wide_devlen_hd128",
+        ),
+        (256, false) => (
+            "flash_splitk_q8_gqa_partial_devlen_hd256",
+            "flash_splitk_gqa_combine_wide_devlen_hd256",
+        ),
+        (256, true) => anyhow::bail!(
+            "attn_flash_splitk_q8_gqa_decode_dev_pos: head_dim 256 takes up to {NARROW_NQ} query heads per KV head"
         ),
         _ => unreachable!(),
     };
@@ -465,6 +472,13 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
         block_dim: (WARP_SIZE as u32, 8, 1),
         shared_mem_bytes: 0,
     };
+    // One row's output also leaves quantised, for the projection that reads it.
+    let q81 =
+        if rows == 1 && crate::tensor::cuda::prequant_row(dev.native(), 1, n_q_heads * head_dim) {
+            Some(unsafe { dev.alloc::<u8>(n_q_heads * head_dim / 32 * 36)? })
+        } else {
+            None
+        };
     let mut b2 = combine_func.builder();
     b2.arg(&partials);
     b2.arg(&dst);
@@ -476,7 +490,14 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
         GqaSplits::MIN as i32,
         GqaSplits::MAX as i32
     );
+    match q81.as_ref() {
+        Some(q) => b2.arg(q),
+        None => b2.arg(&0u64),
+    };
     unsafe { b2.launch(cfg2) }.map_err(|e| anyhow!("launch gqa combine: {e}"))?;
+    if let Some(q) = q81 {
+        crate::tensor::cuda::stash_prequant(&dev.cuda_stream(), &dst, n_q_heads * head_dim, q);
+    }
 
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
