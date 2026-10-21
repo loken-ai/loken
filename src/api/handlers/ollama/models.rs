@@ -846,6 +846,57 @@ pub(crate) async fn ollama_delete_model(
     }
 }
 
+/// What `/api/show` reports for a model held in the HuggingFace cache: the header of its
+/// weights, the capabilities its chat template gives, and the template itself.
+fn show_hub_model(
+    state: &APIServer,
+    model_name: &str,
+    weights: &std::path::Path,
+) -> OllamaShowResponse {
+    let (model_info, arch, gguf_quant, declared_params) = gguf_facts(weights);
+    let pools = arch.as_ref().map(|a| {
+        model_info
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&format!("{a}.pooling_type")))
+    });
+    let mut caps = capabilities_of(None, Some(pools.unwrap_or(false)));
+    if caps.iter().any(|c| c == "completion") && state.model_has_vision(model_name) {
+        caps.push("vision".to_string());
+    }
+    let template = state.read_chat_format(model_name).effective_template();
+    if let Some(t) = template.as_deref() {
+        if caps.iter().any(|c| c == "completion") {
+            if t.contains(".Tools") || t.contains("tools") {
+                caps.push("tools".to_string());
+            }
+            if crate::api::handlers::prompt_format::template_has_thinking(t) {
+                caps.push("thinking".to_string());
+            }
+        }
+    }
+    let model_info = model_info.map(|mut m| {
+        m.retain(|k, v| !(k.starts_with("tokenizer.ggml.") && v.is_array()));
+        m
+    });
+    OllamaShowResponse {
+        license: None,
+        modelfile: Some(format!("FROM {}\n", weights.display())),
+        parameters: None,
+        template,
+        details: Some(OllamaModelDetails {
+            format: "gguf".to_string(),
+            family: reported_family(None, arch, || file_architecture(weights)),
+            families: None,
+            parameter_size: declared_params
+                .map(format_parameter_count)
+                .unwrap_or_else(|| "unknown".to_string()),
+            quantization_level: gguf_quant,
+        }),
+        model_info,
+        capabilities: Some(caps),
+    }
+}
+
 /// Show model info (POST /api/show) - Ollama format
 pub(crate) async fn ollama_show_model(
     State(state): State<APIServer>,
@@ -1028,6 +1079,11 @@ pub(crate) async fn ollama_show_model(
                 capabilities,
             }))
         }
+        Err(_) if hf_gguf(&state.huggingface_models_dir, &model_name).is_some() => {
+            let weights =
+                hf_gguf(&state.huggingface_models_dir, &model_name).expect("checked by the guard");
+            Ok(Json(show_hub_model(&state, &model_name, &weights)))
+        }
         Err(e) => {
             error!("   ❌ Resolution failed for '{}': {}", model_name, e);
             error!("   📁 Searching in: {}", state.ollama_models_dir);
@@ -1129,6 +1185,45 @@ mod catalogue_tests {
         let (_, _, _, params) = gguf_facts(&first);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(params, Some(32));
+    }
+
+    /// A model held only in the Hugging Face store is shown from its weights' header, so a
+    /// client that asks for its context window and capabilities gets them.
+    #[tokio::test]
+    async fn show_answers_for_a_model_held_in_the_hub_store() {
+        let dir = scratch("hubshow");
+        let snap = dir.join("hub/models--org--quant/snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        let entry = GgufEntry {
+            name: "blk.0.attn_norm.weight".to_string(),
+            dims: vec![4, 4],
+            dtype: GgmlDType::F32,
+            data: [0f32.to_le_bytes(); 16].concat(),
+        };
+        let md = vec![
+            (
+                "general.architecture".to_string(),
+                Value::String("llama".into()),
+            ),
+            ("llama.context_length".to_string(), Value::U32(4096)),
+        ];
+        write_gguf_with_metadata(&snap.join("quant-q4.gguf"), &md, &[entry]).unwrap();
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            dir.to_string_lossy().to_string(),
+        );
+        let request: OllamaShowRequest =
+            serde_json::from_value(serde_json::json!({"model": "org/quant"})).unwrap();
+        let shown = ollama_show_model(axum::extract::State(state), OllamaJson(request)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let shown = shown.expect("a model in the hub store is shown").0;
+        let info = shown.model_info.expect("the header's keys");
+        assert_eq!(info["llama.context_length"], 4096);
+        assert_eq!(shown.details.unwrap().family, "llama");
+        assert!(shown
+            .capabilities
+            .unwrap()
+            .contains(&"completion".to_string()));
     }
 
     /// A GGUF in the Hugging Face store resolves to its file; a checkpoint of safetensors does not.
