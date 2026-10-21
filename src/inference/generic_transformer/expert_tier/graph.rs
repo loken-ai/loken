@@ -1267,6 +1267,35 @@ fn serve_loop(tiers: &[Arc<LayerTier>], stop: &AtomicBool, health: &Health) {
     }
 }
 
+/// How many times longer than `cpu` of its own processor time a thread takes, right now, to get
+/// `cpu` done: one on an idle machine, more where other threads hold the processors. Where the
+/// platform does not report a thread's processor time, one.
+fn scheduling_slowdown(cpu: std::time::Duration) -> f64 {
+    #[cfg(unix)]
+    {
+        let used = || {
+            let mut t = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // Safety: `t` is a valid timespec the call fills.
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+            t.tv_sec as u128 * 1_000_000_000 + t.tv_nsec as u128
+        };
+        let want = cpu.as_nanos().max(1);
+        let (wall, from) = (std::time::Instant::now(), used());
+        while used().saturating_sub(from) < want {
+            std::hint::spin_loop();
+        }
+        (wall.elapsed().as_nanos() as f64 / want as f64).max(1.0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cpu;
+        1.0
+    }
+}
+
 /// Watch the worker of `tiers`: a request left unanswered while the worker has not moved for
 /// longer than [`Health::bound`] releases every card waiting on the worker, and the decode
 /// fails on it. The watchdog sleeps until the worker has a measured request.
@@ -1291,6 +1320,15 @@ fn watch(tiers: &[(String, Arc<LayerTier>)], stop: &AtomicBool, health: &Health)
         let Some((at, mail, seq)) = health.pending() else {
             continue;
         };
+        // A worker that waits for the processor does not move either. The bound is the time a
+        // request takes at the pace measured, so it stretches by how much slower a thread runs
+        // now than it runs alone; on an idle machine the factor is one.
+        let slow = scheduling_slowdown(std::time::Duration::from_nanos(
+            bound / u64::from(LOOKS_A_BOUND),
+        ));
+        if (still as f64) < bound as f64 * slow {
+            continue;
+        }
         let name = |i: usize| tiers.get(i).map_or("a layer", |(n, _)| n.as_str());
         let worker_at = health.tier.load(Ordering::Relaxed);
         let step = STEPS[health.step.load(Ordering::Relaxed).min(STEPS.len() - 1)];

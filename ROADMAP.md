@@ -32,10 +32,10 @@ Major, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | One binary for NVIDIA and AMD cards | Backends | One binary uses NVIDIA and AMD cards at the same time, and one model can run across both. | Done |
-| Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Started |
+| Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Done |
 | A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card, at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, in decode and in prompt reading. | Started |
 | Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
-| Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Planned |
+| Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Started |
 | Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
 | Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
 | Load every format a model ships in | Models | Every model loads from each format its publisher ships, GGUF and safetensors in the Hugging Face and the native layouts, through the same placement as the others, checked by one loading test per architecture. | Started |

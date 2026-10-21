@@ -4266,6 +4266,13 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             tier.settle();
+            // A stall releases the card's wait, and the rows then read a product that was not
+            // answered: the mismatch is the stall's, so the stall is what fails the test.
+            assert!(
+                worker.failure().is_none(),
+                "round {round}: {:?}",
+                worker.failure()
+            );
             for r in 0..rows {
                 let (w, g) = (
                     &want[r * hidden..(r + 1) * hidden],
@@ -4423,6 +4430,13 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             tier.settle();
+            // A stall releases the card's wait, and the rows then read a product that was not
+            // answered: the mismatch is the stall's, so the stall is what fails the test.
+            assert!(
+                worker.failure().is_none(),
+                "round {round}: {:?}",
+                worker.failure()
+            );
             for r in 0..rows {
                 let (w, g) = (
                     &want[r * hidden..(r + 1) * hidden],

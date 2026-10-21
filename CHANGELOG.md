@@ -72,6 +72,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Tier: wait longer for a worker the processors are not running.
 - Serve: read only the tokens a turn adds on a model with a recurrent state.
 - Prefill: give back the kept conversation states before a chunk runs out of memory.
 - Serve: keep each conversation's state while others take turns, until a set lease ends.
