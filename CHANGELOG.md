@@ -48,6 +48,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Serve: warm the prefill path when a model loads.
 - Bench: report prefill, time to first token and decode cold and warm.
 - ROCm: cache device buffers instead of freeing each one.
 - Convert: keep the cards busy through a conversion, about seven times faster.

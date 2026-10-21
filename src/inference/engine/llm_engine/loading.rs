@@ -1472,6 +1472,21 @@ impl LlmEngine {
             // Free VRAM just changed by the size of a model.
             crate::inference::place::vram_manager::residency_changed();
             *guard = Some(new_state);
+            // --- Warm the prefill path ---
+            // The first prompt of a fresh server otherwise pays for the code objects, the
+            // device buffers, the card probes and the clocks it is the first to touch. It runs
+            // after the residency epoch moved, so the chunk sizing it memoises is the one the
+            // first request reads.
+            let warm_started = std::time::Instant::now();
+            if guard
+                .as_mut()
+                .is_some_and(|st| warm_prefill(st.model.as_mut(), &st.device))
+            {
+                info!(
+                    "prefill warmed in {:.0}ms",
+                    warm_started.elapsed().as_secs_f64() * 1e3
+                );
+            }
             drop(guard);  // Release lock early
 
             // Cache file_size for non-blocking stats queries
@@ -1697,4 +1712,37 @@ mod kv_bytes_tests {
         assert_eq!(kv_cache_bytes(KvQuant::Off, 2, 100), 200);
         assert_eq!(kv_cache_bytes(KvQuant::Off, 4, 100), 400);
     }
+}
+
+/// Runs prompts of a few lengths through a loaded text model and cuts the KV back to empty, so
+/// the first request finds the kernels loaded, the buffers sized and the card clocked up.
+/// Returns whether the warmup ran. A model that cannot cut its KV back, or that fails a pass,
+/// is left as loaded.
+fn warm_prefill(
+    model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
+    device: &Device,
+) -> bool {
+    const LENGTHS: [usize; 5] = [8, 24, 64, 160, 400];
+    if !model.capabilities().trim_kv || model.is_vision_model() {
+        return false;
+    }
+    let room = model.kv_capacity().unwrap_or(0) / 2;
+    let mut ran = false;
+    for n in LENGTHS.into_iter().filter(|n| *n <= room) {
+        let ids: Vec<u32> = (0..n as u32).map(|i| 10 + i % 1000).collect();
+        let pass = Tensor::new(&ids[..], device)
+            .and_then(|t| t.unsqueeze(0))
+            .and_then(|x| model.forward_prefill_chunked(&x, 0))
+            .and_then(|l| l.to_device(&Device::Cpu));
+        model.trim_kv(0);
+        match pass {
+            Ok(_) => ran = true,
+            Err(e) => {
+                debug!("prefill warmup stopped at {n} tokens: {e}");
+                break;
+            }
+        }
+    }
+    model.invalidate_graph_state();
+    ran
 }
