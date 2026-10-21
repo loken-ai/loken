@@ -231,6 +231,10 @@ pub fn settle_block_tokens(
 ) -> Option<usize> {
     let mut usable = true;
     let block = store.settle(scope, |s| {
+        // A store in memory has no file cost to amortise: the finest block is the best.
+        if s.is_in_memory() {
+            return granule.max(1);
+        }
         let room = s.room();
         let unit = granule.max(1) * token_bytes.max(1);
         let cap = usize::try_from(room / 2).unwrap_or(usize::MAX);
@@ -268,6 +272,12 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_store_in_memory_settles_without_a_directory() {
+        let store = super::super::state_disk::StateStore::in_memory(0, 0);
+        assert_eq!(settle_block_tokens(&store, &[7u8; 32], 4, 1000), Some(4));
+    }
 
     #[test]
     fn a_block_grows_with_the_disks_fixed_cost_and_shrinks_with_the_state_per_token() {

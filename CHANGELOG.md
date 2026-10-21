@@ -68,6 +68,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- State cache: keep prompt states in memory when no directory is set.
 - KV cache: keep both buffers whole when a growth runs out of memory.
 - Show: describe the models held in the Hugging Face store.
 - Chat: send the arguments of an Ollama tool call as an object, and read them back.
