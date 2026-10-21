@@ -345,7 +345,7 @@ impl AnthropicMessagesRequest {
             .map(|t| Tool::function(t.name, t.description, t.input_schema))
             .collect();
 
-        (messages, tools)
+        (super::types::lead_system_messages(messages), tools)
     }
 }
 
@@ -720,6 +720,37 @@ mod tests {
         assert_eq!(msgs[1].role, "user");
         assert_eq!(msgs[1].content, "hi");
         assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn a_system_message_after_a_turn_joins_the_leading_system_prompt() {
+        let req: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 100,
+            "system": [{"type": "text", "text": "be terse"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "system", "content": [{"type": "text", "text": "cwd is /w"}]}
+            ]
+        }))
+        .unwrap();
+        let (msgs, _) = req.into_internal();
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user"]);
+        assert_eq!(msgs[0].content, "be terse\n\ncwd is /w");
+    }
+
+    #[test]
+    fn a_late_system_message_leads_when_none_did() {
+        let msgs = vec![
+            Message::new("user".to_string(), "hi".to_string()),
+            Message::new("assistant".to_string(), "yo".to_string()),
+            Message::new("system".to_string(), "note".to_string()),
+        ];
+        let out = super::super::types::lead_system_messages(msgs);
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(out[0].content, "note");
     }
 
     #[test]

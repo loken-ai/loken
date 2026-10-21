@@ -957,6 +957,42 @@ impl TryFrom<MessageWire> for Message {
     }
 }
 
+/// Moves every system or developer message that follows a conversation turn into the
+/// leading system message, in order. A chat template that takes a system message only at
+/// the start (Qwen's raises on one later) then renders what a client sent mid-conversation.
+pub fn lead_system_messages(messages: Vec<Message>) -> Vec<Message> {
+    let is_system = |m: &Message| m.role == "system" || m.role == "developer";
+    let lead = messages.iter().take_while(|m| is_system(m)).count();
+    if !messages[lead..].iter().any(is_system) {
+        return messages;
+    }
+    let mut out = Vec::with_capacity(messages.len());
+    let mut late: Vec<String> = Vec::new();
+    for (i, m) in messages.into_iter().enumerate() {
+        if i >= lead && is_system(&m) {
+            if !m.content.is_empty() {
+                late.push(m.content);
+            }
+        } else {
+            out.push(m);
+        }
+    }
+    if late.is_empty() {
+        return out;
+    }
+    let late = late.join("\n\n");
+    match out[..lead].last_mut() {
+        Some(last) => {
+            if !last.content.is_empty() {
+                last.content.push_str("\n\n");
+            }
+            last.content.push_str(&late);
+        }
+        None => out.insert(0, Message::new("system".to_string(), late)),
+    }
+    out
+}
+
 impl Message {
     pub fn new(role: String, content: String) -> Self {
         Self {

@@ -459,6 +459,13 @@ fn python_string_methods(
     })
 }
 
+/// Whether a system or developer message follows a conversation turn.
+fn has_late_system(messages: &[Message]) -> bool {
+    let is_system = |m: &Message| m.role == "system" || m.role == "developer";
+    let lead = messages.iter().take_while(|m| is_system(m)).count();
+    messages[lead..].iter().any(is_system)
+}
+
 fn render_jinja_template(
     tmpl: &str,
     messages: &[Message],
@@ -467,6 +474,13 @@ fn render_jinja_template(
     thinking_off: bool,
 ) -> Option<String> {
     use minijinja::{context, Environment, Value};
+    let lifted;
+    let messages = if has_late_system(messages) {
+        lifted = crate::api::types::lead_system_messages(messages.to_vec());
+        &lifted[..]
+    } else {
+        messages
+    };
     // Declared before the environment so the borrow outlives every use of it.
     let stripped = strip_generation_tags(tmpl);
     let tmpl: &str = &stripped;
@@ -1540,6 +1554,18 @@ mod tests {
     /// reconstructed format instead of the one it declares - falcon3, granite3-moe,
     /// granite3.1-dense and llama3.2 all do that. The no-keyword form is pinned beside it
     /// because accepting keywords must not break the templates that pass none.
+    #[test]
+    fn a_system_message_sent_after_a_turn_renders_through_a_strict_template() {
+        let tmpl = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}\
+                    {{ raise_exception('late') }}{% endif %}{{ m.role }}:{{ m.content }};\
+                    {% endfor %}";
+        let msgs = vec![msg("user", "hi"), msg("system", "note")];
+        assert_eq!(
+            super::render_jinja_template(tmpl, &msgs, false, None, false).as_deref(),
+            Some("system:note;user:hi;")
+        );
+    }
+
     #[test]
     fn tojson_renders_with_and_without_an_indent_keyword() {
         let msgs = vec![msg("user", "hi")];
