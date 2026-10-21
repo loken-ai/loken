@@ -48,6 +48,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Serve: keep a losing prompt lookup waiting across requests.
 - ROCm: split the MoE router gemv across more blocks.
 - Serve: warm the prefill path when a model loads.
 - Bench: report prefill, time to first token and decode cold and warm.

@@ -599,13 +599,11 @@ impl PldCost {
         }
     }
 
-    /// What the next request starts from: the costs and the length of the wait that earlier
-    /// requests learned, and a trial at its first lookup hit.
+    /// What the next request starts from: the costs, the length of the wait and the plain
+    /// steps of it still to run, as the earlier requests left them. A lookup that was losing
+    /// stays held off across requests until its run of plain steps is over, then gets a trial.
     pub(crate) fn carried(&self) -> Self {
-        Self {
-            hold: 0,
-            ..self.clone()
-        }
+        self.clone()
     }
 
     /// A plain decode step took `secs`.
@@ -737,8 +735,45 @@ mod tests {
 
     use super::*;
 
-    /// A request starts from what the earlier ones learned: the costs and the longer wait, with a
-    /// trial at its first lookup hit.
+    /// What a request gets for a knob it leaves out: the model's own Modelfile value where it
+    /// states one, the Ollama API's default where it does not; a value the request names wins
+    /// over both.
+    #[test]
+    fn an_absent_option_takes_the_models_value_then_the_api_default() {
+        use crate::inference::engine::llm_engine::generation_defaults::*;
+        let none = GenerationParams::default();
+        let api = resolve_gen_params(&none, &GenerationDefaults::default(), 4096, 10);
+        assert_eq!(api.repeat_penalty, API_REPEAT_PENALTY);
+        assert_eq!(api.repeat_last_n, API_REPEAT_LAST_N);
+        assert_eq!(api.temperature, API_TEMPERATURE);
+        assert_eq!((api.top_k, api.top_p), (API_TOP_K, API_TOP_P));
+
+        let manifest = GenerationDefaults::from_ollama_params(
+            r#"{"repeat_penalty":1,"temperature":0.6,"top_k":20,"top_p":0.95}"#,
+        );
+        let model = resolve_gen_params(&none, &manifest, 4096, 10);
+        assert_eq!(model.repeat_penalty, 1.0);
+        assert_eq!(model.repeat_last_n, API_REPEAT_LAST_N);
+        assert_eq!(
+            (model.temperature, model.top_k, model.top_p),
+            (0.6, 20, 0.95)
+        );
+
+        let asked = GenerationParams {
+            repeat_penalty: Some(1.3),
+            repeat_last_n: Some(8),
+            temperature: Some(0.0),
+            ..GenerationParams::default()
+        };
+        let named = resolve_gen_params(&asked, &manifest, 4096, 10);
+        assert_eq!((named.repeat_penalty, named.repeat_last_n), (1.3, 8));
+        assert_eq!(named.temperature, 0.0);
+        assert_eq!(named.top_k, 20);
+    }
+
+    /// A request starts from what the earlier ones learned: the costs, and the wait they left
+    /// running. The lookup gets its trial once the plain steps of that wait are over, and a
+    /// trial that loses again holds it off for twice as long.
     #[test]
     fn a_request_starts_from_the_cost_the_earlier_ones_learned() {
         let mut c = PldCost::default();
@@ -749,11 +784,20 @@ mod tests {
             }
         }
         assert!(!c.worth_trying());
-        let next = c.carried();
-        assert!(next.worth_trying(), "a trial at the first hit");
-        let mut next = next;
+        let mut next = c.carried();
+        assert!(!next.worth_trying(), "the wait runs on across requests");
+        let waited = (0..PLD_RETRY_MAX)
+            .find(|_| {
+                next.plain_step(0.040);
+                next.worth_trying()
+            })
+            .expect("the wait ends");
+        assert!(waited < PLD_RETRY_MAX);
         next.round(0.180, 2);
-        assert!(!next.worth_trying());
+        assert!(
+            !next.worth_trying(),
+            "a trial that loses again holds it off"
+        );
         for _ in 0..PLD_RETRY_STEPS {
             next.plain_step(0.040);
         }
