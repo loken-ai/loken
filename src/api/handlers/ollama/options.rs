@@ -588,8 +588,8 @@ pub(crate) async fn ollama_chat(
                             "content": ""
                         });
                         if used_tools {
-                            message["tool_calls"] = serde_json::to_value(&tool_calls)
-                                .unwrap_or(serde_json::Value::Null);
+                            message["tool_calls"] =
+                                crate::api::types::ollama_tool_calls(&tool_calls);
                         }
                         let final_chunk = serde_json::json!({
                             "model": model_name_clone,

@@ -167,10 +167,56 @@ impl Tool {
     }
 }
 
+fn function_type() -> String {
+    "function".to_string()
+}
+
+/// The arguments of a call as the JSON text this server keeps them in: a string stays as it
+/// is, and the object an Ollama client sends is written out.
+fn deserialize_arguments<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(other) => Some(other.to_string()),
+    })
+}
+
+/// Tool calls the way Ollama states them: the arguments of each call are a JSON object,
+/// where the OpenAI protocol (and the type that holds them here) carries a string.
+pub fn ollama_tool_calls(calls: &[ToolCall]) -> serde_json::Value {
+    let mut value = serde_json::to_value(calls).unwrap_or(serde_json::Value::Null);
+    for call in value.as_array_mut().into_iter().flatten() {
+        let Some(function) = call.get_mut("function") else {
+            continue;
+        };
+        let text = function.get("arguments").and_then(|a| a.as_str());
+        let object = match text.map(serde_json::from_str::<serde_json::Value>) {
+            Some(Ok(parsed)) if parsed.is_object() => parsed,
+            _ => serde_json::json!({}),
+        };
+        function["arguments"] = object;
+    }
+    value
+}
+
+/// A chat message with its tool calls in Ollama's form.
+fn serialize_ollama_message<S: serde::Serializer>(
+    message: &Message,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(message).map_err(serde::ser::Error::custom)?;
+    if let Some(calls) = message.tool_calls.as_deref() {
+        value["tool_calls"] = ollama_tool_calls(calls);
+    }
+    value.serialize(serializer)
+}
+
 /// Model's tool call in response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    #[serde(default)]
     pub id: String,
+    #[serde(default = "function_type")]
     pub r#type: String, // "function"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<ToolCallFunction>,
@@ -180,7 +226,11 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFunction {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_arguments"
+    )]
     pub arguments: Option<String>, // JSON string of arguments
 }
 
@@ -277,6 +327,7 @@ impl OllamaChatRequest {
 pub struct OllamaChatResponse {
     pub model: String,
     pub created_at: String,
+    #[serde(serialize_with = "serialize_ollama_message")]
     pub message: Message,
     pub done: bool,
     /// Per token, when the request asked for them.
@@ -2041,5 +2092,52 @@ mod usage_tests {
         assert_eq!(base64_payload("data:audio/wav;base64,QUJD"), "QUJD");
         assert_eq!(base64_payload("data:image/png;base64,QUJD"), "QUJD");
         assert_eq!(data_url_base64("data:text/plain,hello"), None);
+    }
+}
+
+#[cfg(test)]
+mod ollama_tool_call_tests {
+    use super::*;
+
+    fn call(arguments: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            r#type: "function".to_string(),
+            function: Some(ToolCallFunction {
+                name: "bash".to_string(),
+                arguments: Some(arguments.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_ollama_chat_response_carries_the_arguments_as_an_object() {
+        let mut message = Message::new("assistant".to_string(), String::new());
+        message.tool_calls = Some(vec![call(r#"{"command":"ls"}"#), call("not json")]);
+        let response = OllamaChatResponse::new("m".to_string(), message);
+        let wire = serde_json::to_value(&response).unwrap();
+        let calls = &wire["message"]["tool_calls"];
+        assert_eq!(calls[0]["function"]["arguments"]["command"], "ls");
+        assert_eq!(calls[1]["function"]["arguments"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_call_sent_back_with_an_object_and_no_id_is_read() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "ls"}}}]
+        }))
+        .unwrap();
+        let calls = message.tool_calls.unwrap();
+        assert_eq!(calls[0].r#type, "function");
+        let function = calls[0].function.as_ref().unwrap();
+        assert_eq!(function.arguments.as_deref(), Some(r#"{"command":"ls"}"#));
+    }
+
+    #[test]
+    fn an_openai_call_keeps_its_arguments_as_a_string() {
+        let wire = serde_json::to_value(call(r#"{"a":1}"#)).unwrap();
+        assert_eq!(wire["function"]["arguments"], r#"{"a":1}"#);
     }
 }

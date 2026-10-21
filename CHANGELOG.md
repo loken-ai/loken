@@ -68,6 +68,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Chat: send the arguments of an Ollama tool call as an object, and read them back.
 - Messages: fold a system message sent after a turn into the system prompt.
 - Pull: answer a media checkpoint pulled without streaming instead of failing its load.
 - Offload: run card experts of two formats as two batches in one block.
