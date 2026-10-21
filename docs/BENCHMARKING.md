@@ -71,7 +71,9 @@ card through two backends is two pages.
 A record names its machine: `hardware_id` identifies the cards, processor and memory, so a card
 swap is a new hardware and the same machine keeps its `host_id`. `scripts/report.py` groups the
 store by `hardware_id` and writes one page per group, `docs/benchmarks/<hardware>.md`, with the
-hardware block, the dates and the loken builds read from its records.
+hardware block, the dates and the loken builds read from its records. Each rate is shown cold
+(first iteration) and warm (median of the later ones); see [BENCHMARKS.md](BENCHMARKS.md#cold-and-warm).
+The campaign itself is unchanged.
 
 ```
 scripts/report.py                      # regenerate the pages from the store

@@ -12,6 +12,8 @@ procedure that produces the runs is [BENCHMARKING.md](BENCHMARKING.md).
 | Hardware | Backend | Id | Runs from | Runs | Rows |
 |---|---|---|---|---|---|
 | [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/rtx5060ti-rtx5070ti-i910900k.md) | unstated | 91853bdab0a9d057 | 2026-09-03 to 2026-10-05 | 711 | 1366 |
+| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on AMD Ryzen 9 9950X3D 16-Core Processor](benchmarks/rtx5060ti-rtx5070ti-ryzen99950x3d16coreprocessor-cuda.md) | cuda | 45ed3ef839a07686 | 2026-10-18 to 2026-10-19 | 157 | 144 |
+| [NVIDIA GeForce GTX 1650 on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/gtx1650-i910900k.md) | unstated | b4fa5b0e3e6190aa | 2026-10-18 to 2026-10-21 | 74 | 144 |
 
 <!-- /benchmarks:index -->
 
@@ -63,7 +65,9 @@ over 128. Short rows are published; their Δ is blank.
 The `incoherent` gemma4 cells are a tracked defect here, not a verdict on the models: the same
 weights answer correctly under ollama on several of those rows.
 
-**Δ** compares loken to the best other engine, blank when token counts differ. **Energy** sums
+**Δ** compares loken to the best other engine, cold with cold and warm with warm, blank when
+token counts differ. A positive Δ means loken is better: faster for prefill and decode, a
+shorter time to first token, fewer joules. **Energy** sums
 NVML GPU draw with the RAPL package and DRAM domains. **vLLM rows read a different file** - an
 AWQ 4-bit checkpoint against the GGUF Q4_K_M the other two share - so every vLLM comparison
 carries that caveat, and their prefill column was not collected.
@@ -81,10 +85,27 @@ name it is published as. That is why `deepseek-r1:70b` sits under `llama` and
 `deepseek-r1:32b` under `qwen2`: they are distils, and what the kernels run is the
 architecture, not the brand.
 
-## The two rate columns
+## Cold and warm
 
-**Prefill** is prompt tokens over the median time to first token, measured by the bench, the
-same way for every engine.
+Every cell runs its prompt three times, the same prompt each time. An engine that keeps a
+prompt cache answers the second and third request from it, so one number per cell would
+mostly measure the cache. Each rate column therefore shows two figures, `cold / warm`.
+
+**Cold** is the first iteration of the cell: the first request, which no prompt cache has
+served. **Warm** is the median of the following iterations, served from the cache by an
+engine that keeps one. A cell of a single iteration shows its cold figure and a dash.
+
+The columns that split are Prefill, TTFT and Decode, and so are their three Δ columns, each
+printed `cold / warm`. A Δ is blank for a half that cannot be compared. Joules, E2E and the
+token count are taken over all iterations, as before. Non-stream rows have no time to first
+token, so their Prefill and TTFT are dashes. The scoreboard (`scripts/scoreboard.py`) prints
+one line for each: `N/M cells win on both axes`, throughput being the decode Δ of that half
+and the other axis the energy Δ.
+
+## The rate columns
+
+**Prefill** is prompt tokens over the time to first token, measured by the bench, the
+same way for every engine. **TTFT** is that time, in milliseconds.
 
 It used to be each engine's own `prompt_tok_s`, which is that engine's timer minus whatever it
 does not count - and they do not leave out the same things. On a 15-token prompt ollama
@@ -99,8 +120,8 @@ own bookkeeping and the third by the clock would compare the bookkeeping. Cells 
 itself, recorded so the two can be seen to disagree - at 2 ms a token the client's read loop
 costs about what the token does.
 
-**Both rates, and the joules, are medians over the iterations of a cell.** The first
-iteration of a cell is a cold load. Prefill took the median for that reason from the start;
+**The joules are a median over all the iterations of a cell** (the rates are split cold and
+warm, above). The first iteration of a cell is a cold load. Prefill took the median for that reason from the start;
 decode and energy took the mean, on the assumption that they did not carry the outlier. On a
 mixture too large to hold they do: qwen3next measured 3.8, 15.2, 15.2 tok/s and the mean
 published 11.4 for a model that decodes at 15.2. Energy was worse and flattered this engine -

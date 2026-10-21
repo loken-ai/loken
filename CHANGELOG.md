@@ -48,6 +48,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Bench: report prefill, time to first token and decode cold and warm.
 - ROCm: cache device buffers instead of freeing each one.
 - Convert: keep the cards busy through a conversion, about seven times faster.
 - GPU: verify the draft rows of an MHA model in one launch per kernel.

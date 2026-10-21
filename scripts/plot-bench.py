@@ -7,6 +7,9 @@ file opens from disk with no server and no network.
 """
 import json, glob, os, sys, datetime, pathlib
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import bench_row as B
+
 # Derived from where this script sits, so it renders the same tree whatever the caller's
 # working directory is.
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -22,11 +25,14 @@ for p in sorted(glob.glob(os.path.join(RESULTS, "*.json"))):
         st = r.get("stats", {})
         if "Completion tok/s" not in st:
             continue
+        its = r.get("iterations") or []
+        dec, pre = B.cold_warm(its, B._decode), B.cold_warm(its, B._prefill)
+        rd = lambda v: None if v is None else round(v, 1)
         rows.append(dict(
             model=r["model"], target=r["target"], ctx=r.get("num_ctx", 4096),
             prompt=r.get("prompt", "short"), device=dev,
-            decode=round(st["Completion tok/s"]["mean"], 1),
-            prefill=round(st.get("Prompt tok/s", {}).get("mean", 0), 1),
+            decode_c=rd(dec[0]), decode_w=rd(dec[1]),
+            prefill_c=rd(pre[0]), prefill_w=rd(pre[1]),
             tokens=round(st["Tokens generated"]["mean"]),
             e2e=round(st["E2E latency"]["mean"]),
             jtok=round(st.get("Energy J/tok", {}).get("mean", 0), 3),
@@ -78,11 +84,13 @@ th{color:var(--soft);font-weight:600}
 <div class="plot"><svg id="svg" viewBox="0 0 760 480" role="img" aria-label="Scatter plot"></svg></div>
 <p class="count" id="count"></p>
 <div class="card" id="card"></div>
-<p class="note">The energy mode compares joules per token, axes inverted so that "above the diagonal" still means loken ahead. Models whose two engines did not produce the same number of tokens are left out of the energy mode: a mean over answers of different lengths compares nothing.</p>
+<p class="note">Cold is the first request of a cell; warm is the median of the later ones, served from the prompt cache by an engine that keeps one. The energy mode compares joules per token, axes inverted so that "above the diagonal" still means loken ahead. Models whose two engines did not produce the same number of tokens are left out of the energy mode: a mean over answers of different lengths compares nothing.</p>
 </div>
 <script>
 const DATA=__DATA__;
-const S={metric:'debit',device:'GPU',ctx:'4096',prompt:'short'};
+const S={metric:'debit',temp:'warm',device:'GPU',ctx:'4096',prompt:'short'};
+const T=()=>S.temp==='cold'?'_c':'_w';
+const num=v=>v==null?'-':v;
 const uniq=k=>[...new Set(DATA.map(r=>String(r[k])))].sort();
 function pairs(){
   const m={};
@@ -94,7 +102,7 @@ function pairs(){
   for(const [model,by] of Object.entries(m)){
     const l=by.loken,o=by.ollama; if(!l||!o)continue;
     const same=Math.abs(l.tokens-o.tokens)<=0.02*Math.max(l.tokens,1);
-    if(S.metric==='debit') out.push({model,l,o,x:o.decode,y:l.decode,same});
+    if(S.metric==='debit'){const k='decode'+T(); if(o[k]!=null&&l[k]!=null) out.push({model,l,o,x:o[k],y:l[k],same});}
     else if(same&&l.jtok>0&&o.jtok>0) out.push({model,l,o,x:1/o.jtok,y:1/l.jtok,same});
   }
   return out;
@@ -102,7 +110,7 @@ function pairs(){
 function chip(lbl,k,vals){return `<div class="grp" role="group" aria-label="${lbl}">`+
   vals.map(v=>`<button data-k="${k}" data-v="${v}" aria-pressed="${String(S[k])===v}">${v}</button>`).join('')+'</div>';}
 function draw(){
-  document.getElementById('bar').innerHTML=chip('Mesure','metric',['debit','energie'])+
+  document.getElementById('bar').innerHTML=chip('Mesure','metric',['debit','energie'])+chip('Cache','temp',['cold','warm'])+
     chip('Materiel','device',uniq('device'))+chip('Contexte','ctx',uniq('ctx'))+chip('Prompt','prompt',uniq('prompt'));
   const P=pairs(), svg=document.getElementById('svg');
   const L=64,R=16,T=16,B=44,W=760,H=480;
@@ -140,9 +148,9 @@ function show(model){
   const c=document.getElementById('card');
   c.className='card on';
   c.innerHTML=`<h2>${p.model}</h2><table>
-   <tr><th>engine</th><th>decode tok/s</th><th>prefill tok/s</th><th>tokens</th><th>E2E ms</th><th>J/token</th><th>measured</th></tr>
-   <tr><td>ollama</td><td>${p.o.decode}</td><td>${p.o.prefill||'-'}</td><td>${p.o.tokens}</td><td>${p.o.e2e}</td><td>${p.o.jtok||'-'}</td><td>${p.o.when}</td></tr>
-   <tr><td>loken</td><td>${p.l.decode}</td><td>${p.l.prefill||'-'}</td><td>${p.l.tokens}</td><td>${p.l.e2e}</td><td>${p.l.jtok||'-'}</td><td>${p.l.when}</td></tr></table>`
+   <tr><th>engine</th><th>decode tok/s cold / warm</th><th>prefill tok/s cold / warm</th><th>tokens</th><th>E2E ms</th><th>J/token</th><th>measured</th></tr>
+   <tr><td>ollama</td><td>${num(p.o.decode_c)} / ${num(p.o.decode_w)}</td><td>${num(p.o.prefill_c)} / ${num(p.o.prefill_w)}</td><td>${p.o.tokens}</td><td>${p.o.e2e}</td><td>${p.o.jtok||'-'}</td><td>${p.o.when}</td></tr>
+   <tr><td>loken</td><td>${num(p.l.decode_c)} / ${num(p.l.decode_w)}</td><td>${num(p.l.prefill_c)} / ${num(p.l.prefill_w)}</td><td>${p.l.tokens}</td><td>${p.l.e2e}</td><td>${p.l.jtok||'-'}</td><td>${p.l.when}</td></tr></table>`
    +(p.same?'':'<p style="color:var(--soft);margin:8px 0 0">Different token counts: the energy gap is not comparable.</p>');
 }
 document.addEventListener('click',e=>{

@@ -19,6 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 IMG = ROOT / "docs" / "img"
 
+# Columns of a page's table (see bench_row.COLS). A rate cell reads "cold / warm".
+DECODE, DATE = 8, 17
+
 # The run every figure describes: streamed, short prompt, and the LATEST campaign day that
 # measured both engines on it. Derived rather than written down: the date used to be a
 # constant here, and the figures kept describing a run from a fortnight before the table
@@ -37,13 +40,19 @@ def primary_page():
     if not pages:
         sys.exit("no hardware page under docs/benchmarks: run scripts/report.py")
     newest = lambda p: max(
-        (c[14][:10] for c in ([x.strip() for x in ln.strip().strip("|").split("|")]
+        (c[DATE][:10] for c in ([x.strip() for x in ln.strip().strip("|").split("|")]
                               for ln in p.read_text().splitlines() if ln.startswith("| ") and not ln.startswith("| Model"))
-         if len(c) >= 15 and c[14][:4].isdigit()), default="")
+         if len(c) >= 19 and c[DATE][:4].isdigit()), default="")
     return max(pages, key=newest)
 
 
 BENCH_PAGE = primary_page()
+
+
+def rate(cell):
+    """The warm figure of a "cold / warm" rate cell, the cold one when the cell has no warm."""
+    cold, _, warm = re.sub(r"[*\s  ]", "", cell).partition("/")
+    return warm if warm not in ("", "-") else cold
 
 
 def latest_run_date():
@@ -55,9 +64,9 @@ def latest_run_date():
         if not line.startswith("| ") or line.startswith("|--"):
             continue
         c = [x.strip() for x in line.strip().strip("|").split("|")]
-        if len(c) < 15 or c[0] == "Model" or c[2] != PROMPT or c[3] != MODE:
+        if len(c) < 19 or c[0] == "Model" or c[2] != PROMPT or c[3] != MODE:
             continue
-        seen.setdefault(c[14][:10], set()).add(label(c[5]))
+        seen.setdefault(c[DATE][:10], set()).add(label(c[5]))
     days = [d for d, engs in seen.items()
             if any(e.startswith("Ollama") for e in engs) and loken_of(dict.fromkeys(engs, 0)) is not None]
     return max(days) if days else ""
@@ -87,12 +96,12 @@ def bench_rows():
         if not line.startswith("| ") or line.startswith("|--"):
             continue
         c = [x.strip() for x in line.strip().strip("|").split("|")]
-        if len(c) < 15 or c[0] == "Model":
+        if len(c) < 19 or c[0] == "Model":
             continue
-        if c[14][:10] != RUN_DATE or c[2] != PROMPT or c[3] != MODE:
+        if c[DATE][:10] != RUN_DATE or c[2] != PROMPT or c[3] != MODE:
             continue
         try:
-            decode = float(clean(c[7]))
+            decode = float(rate(c[DECODE]))
         except ValueError:
             continue
         out.setdefault(c[0], {})[label(c[5])] = decode
@@ -210,11 +219,11 @@ def section_cells():
         if section is None or not line.startswith("| ") or line.startswith("| Model"):
             continue
         c = [x.strip() for x in line.strip().strip("|").split("|")]
-        if len(c) < 15:
+        if len(c) < 19:
             continue
-        key = (c[0], c[1], c[2], c[3], c[4], c[14][:10])
+        key = (c[0], c[1], c[2], c[3], c[4], c[DATE][:10])
         try:
-            decode = float(clean(c[7]))
+            decode = float(rate(c[DECODE]))
         except ValueError:
             # A row marked impossible or failed carries no rate: an attempt, not a measure.
             continue

@@ -20,7 +20,7 @@ measurement in place could not see.
 The discipline that came out of nine months of this:
 
 - Measure from the client, the same way for every engine.
-- Take the median.
+- Take the median, and report the first request apart from the later ones: cold and warm.
 - Publish the token count beside the rate.
 - Say which build, which machine, which day.
 - Profile a representative slice before a run of hours.
@@ -32,7 +32,7 @@ The discipline that came out of nine months of this:
 | File | What it decides |
 |---|---|
 | [`../BENCHMARKS.md`](../BENCHMARKS.md#method) | The protocol: the cell, the prompts, which cards each engine may use, what a cell that publishes no rate means, the `Tokens` column beside the rate. |
-| [`../BENCHMARKS.md`](../BENCHMARKS.md#the-two-rate-columns) | Why prefill is prompt tokens over the client's time to first token, why decode is the client's span, and why both are medians. |
+| [`../BENCHMARKS.md`](../BENCHMARKS.md#the-rate-columns) | Why prefill is prompt tokens over the client's time to first token, why decode is the client's span, and why both are medians. Cold and warm figures: [BENCHMARKS.md](../BENCHMARKS.md#cold-and-warm). |
 | `scripts/bench`, `scripts/bench_row.py`, `scripts/scoreboard.py` | The harness: refuses a stale binary, stamps the build into every row, writes the rows into the page. |
 | `scripts/figures.py` | Regenerates the table in `STATUS.md` and the figures from one parse of `BENCHMARKS.md`, because the two pages once disagreed. |
 | `scripts/determinism.py` | The same prompt repeated, and a diff of the answers. |

@@ -147,7 +147,8 @@ def page(title, machine, group, merged, rows_, fam, replays, archived, backend):
            + (f" {replays} replayable record(s) of this hardware are in the store and not tabled." if replays else "")
            + (f" {archived} archived run(s) (superseded builds or another protocol) are held and not tabled." if archived else ""),
            "", "## Hardware", "", hardware_block(machine, group, backend), "## Results", "",
-           "Method and column definitions: [BENCHMARKS.md](../BENCHMARKS.md).", ""]
+           "Method and column definitions: [BENCHMARKS.md](../BENCHMARKS.md). Each rate reads `cold / warm`: "
+           "the first request of a cell, then the median of the later ones ([why](../BENCHMARKS.md#cold-and-warm)).", ""]
     by_family = {}
     for r in rows_:
         by_family.setdefault(fam.get(r[0].strip()) or "unfiled", []).append(r)
@@ -167,8 +168,8 @@ def decode_of(by, kind):
         picks = [v for k, v in by.items() if k.startswith("loken") and " + " not in k]
     else:
         picks = [v for k, v in by.items() if k.split("@")[0] == "ollama"]
-    picks = [v for v in picks if v.get("decode") and v.get("ntok") and v.get("coh") is not False]
-    return max(picks, key=lambda v: v["decode"]) if picks else None
+    picks = [v for v in picks if v.get("dec_w") and v.get("ntok") and v.get("coh") is not False]
+    return max(picks, key=lambda v: v["dec_w"]) if picks else None
 
 
 def main(argv):

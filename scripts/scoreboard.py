@@ -18,17 +18,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bench_row as B
 
 
-def pct(s):
-    """A delta cell as a number. Blank means the cell was not comparable."""
-    s = (s or "").replace("*", "").replace("%", "").strip()
-    if not s or s == "incoherent":
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
 def vintage(results_dir):
     """How many result files came from the binary that is on disk right now.
 
@@ -54,81 +43,89 @@ def vintage(results_dir):
     return fresh, total
 
 
-def main(results_dir, brief=False):
-    rows = B.cells(B.load_all(results_dir))
-    # Who was degenerate matters. A cell we cannot publish because OUR answer collapsed is a
-    # defect; one we cannot publish because the PEER's did is the gate refusing us a free
-    # win - qwen3:0.6b on the raw code-review prompt, where ollama emitted nothing but code
-    # fences and we answered. Counting both as "incomparable" hides the difference, and I
-    # reported "six degenerate models" when five were ours and the sixth was ollama's.
-    # A variant of this engine - the same binary plus a drafter, labelled "loken <version> + x" -
-    # is a documented extra, not the engine being scored. It shares the cell key with the plain
-    # row and would otherwise count twice for one cell.
-    plain = lambda label: "loken" in label and " + " not in label
-    ours = {tuple(r[:5]) for r in rows if plain(r[5]) and r[12] == "incoherent"}
-    peers = {tuple(r[:5]) for r in rows if "loken" not in r[5] and r[12] == "incoherent"}
-    # A cell where BOTH answers collapsed accuses neither engine: it is the model, or the
-    # prompt it was given. Counting it as ours read as a defect of ours - gemma4:26b, where
-    # ollama looped on "er_er_er" and we looped on "misterer/".
+TEMPS = (("cold", 0, "first request of a cell, no prompt cache hit"),
+         ("warm", 1, "median of the later iterations, cache served where the engine caches"))
+
+
+def tally(detail, t):
+    """Count the cells of one temperature (0 cold, 1 warm) that win, and why the others do not.
+
+    Who was degenerate matters. A cell we cannot publish because OUR answer collapsed is a
+    defect; one we cannot publish because the PEER's did is the gate refusing us a free
+    win - qwen3:0.6b on the raw code-review prompt, where ollama emitted nothing but code
+    fences and we answered. A cell where BOTH answers collapsed accuses neither engine: it is
+    the model, or the prompt. A cell whose loken row ran a single iteration has cold only.
+    """
+    # A variant of this engine - the same binary plus a drafter - shares the cell key with the
+    # plain row and is a documented extra, not the engine being scored.
+    ours = {i["key"] for _, i in detail if i["plain"] and i["mark"] == "incoherent"}
+    peers = {i["key"] for r, i in detail if "loken" not in r[5] and i["mark"] == "incoherent"}
     both = ours & peers
-    won = tied = lost_energy = lost_decode = 0
-    bad_ours = bad_peer = bad_both = uneven = 0
-    losses = []
-    for r in rows:
-        if not plain(r[5]):
+    c = dict(won=0, lost_energy=0, lost_decode=0, ours=0, peer=0, both=0, uneven=0, single=0, losses=[])
+    for r, i in detail:
+        if not i["plain"]:
             continue
-        d, e = pct(r[12]), pct(r[13])
+        d, e = i["dec"][t], i["energy"]
         if d is None or e is None:
-            key = tuple(r[:5])
-            if key in both:
-                bad_both += 1
-            elif key in ours:
-                bad_ours += 1
-            elif key in peers:
-                bad_peer += 1
+            if t and i["dec"][0] is not None and i["dec"][1] is None and e is not None:
+                c["single"] += 1
+            elif i["key"] in both:
+                c["both"] += 1
+            elif i["key"] in ours:
+                c["ours"] += 1
+            elif i["key"] in peers:
+                c["peer"] += 1
             else:
-                uneven += 1
+                c["uneven"] += 1
             continue
         where = f"{r[0]} {r[1]} {r[2]} {r[3]} {r[4]}"
         if d > 0 and e > 0:
-            won += 1
-        elif d <= 0 and e <= 0:
-            lost_decode += 1
-            losses.append((min(d, e), where, d, e))
-        elif d <= 0:
-            lost_decode += 1
-            losses.append((d, where, d, e))
+            c["won"] += 1
+        elif d > 0:
+            c["lost_energy"] += 1
+            c["losses"].append((e, where, d, e))
         else:
-            lost_energy += 1
-            losses.append((e, where, d, e))
-    total = won + lost_energy + lost_decode
-    if brief:
-        # One line, after every cell, because a campaign that only scores itself at the end
-        # cannot tell a correction from a regression while there is still time to act.
-        v = vintage(results_dir)
-        age = "" if not v or v[0] == v[1] else f"   [{v[0]}/{v[1]} from the current binary]"
-        print(f"  goal: {won}/{total} cells win on BOTH axes"
-              f"   ({lost_decode} throughput, {lost_energy} energy"
-              f" | blank: {bad_ours} ours, {bad_peer} peer, {bad_both} both,"
-              f" {uneven} uneven tokens){age}")
-        return 0 if total and won == total else 1
+            c["lost_decode"] += 1
+            c["losses"].append((d if e > 0 else min(d, e), where, d, e))
+    c["total"] = c["won"] + c["lost_energy"] + c["lost_decode"]
+    return c
+
+
+def main(results_dir, brief=False):
+    detail = B.cells_detail(B.load_all(results_dir))
+    counts = [(name, what, tally(detail, t)) for name, t, what in TEMPS]
     v = vintage(results_dir)
+    age = "" if not v or v[0] == v[1] else f"   [{v[0]}/{v[1]} from the current binary]"
+    complete = all(c["total"] and c["won"] == c["total"] for _, _, c in counts)
+    if brief:
+        # Two lines after every cell, because a campaign that only scores itself at the end
+        # cannot tell a correction from a regression while there is still time to act.
+        for name, _, c in counts:
+            print(f"  goal {name}: {c['won']}/{c['total']} cells win on BOTH axes"
+                  f"   ({c['lost_decode']} throughput, {c['lost_energy']} energy"
+                  f" | blank: {c['ours']} ours, {c['peer']} peer, {c['both']} both,"
+                  f" {c['uneven']} uneven tokens, {c['single']} cold only){age}")
+        return 0 if complete else 1
     if v and v[0] != v[1]:
         print(f"  WARNING: {v[1]-v[0]} of {v[1]} files come from an earlier binary.")
         print(f"  A trend read across a mixture of protocols is not a trend.")
-    print(f"  comparable cells        {total}")
-    print(f"  won on BOTH axes        {won}" + (f"   ({won*100//total}%)" if total else ""))
-    print(f"  lost on energy alone    {lost_energy}")
-    print(f"  lost on throughput      {lost_decode}")
-    print(f"  blank, our answer       {bad_ours}   (degenerate: the cell is a defect)")
-    print(f"  blank, peer answer      {bad_peer}   (degenerate: not a free win)")
-    print(f"  blank, both answers     {bad_both}   (degenerate on both: the model or the prompt)")
-    print(f"  blank, uneven tokens    {uneven}")
-    if losses:
-        print("\n  les 12 ecarts les plus grands:")
-        for _, where, d, e in sorted(losses)[:12]:
-            print(f"    {where:<52} throughput {d:+7.1f}%   energy {e:+7.1f}%")
-    return 0 if total and won == total else 1
+    for name, what, c in counts:
+        total = c["total"]
+        print(f"\n  {name.upper()}: {what}")
+        print(f"  {c['won']}/{total} cells win on BOTH axes" + (f"   ({c['won']*100//total}%)" if total else ""))
+        print(f"  lost on energy alone    {c['lost_energy']}")
+        print(f"  lost on throughput      {c['lost_decode']}")
+        print(f"  blank, our answer       {c['ours']}   (degenerate: the cell is a defect)")
+        print(f"  blank, peer answer      {c['peer']}   (degenerate: not a free win)")
+        print(f"  blank, both answers     {c['both']}   (degenerate on both: the model or the prompt)")
+        print(f"  blank, uneven tokens    {c['uneven']}")
+        if name == "warm":
+            print(f"  cold only               {c['single']}   (a single iteration: no warm figure)")
+        if c["losses"]:
+            print("\n  the 12 largest gaps:")
+            for _, where, d, e in sorted(c["losses"])[:12]:
+                print(f"    {where:<52} throughput {d:+7.1f}%   energy {e:+7.1f}%")
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":

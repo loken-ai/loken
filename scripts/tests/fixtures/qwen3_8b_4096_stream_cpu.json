@@ -1,0 +1,586 @@
+{
+ "schema": "assay/2",
+ "timestamp": "2026-10-21T07:52:43.280724226+00:00",
+ "machine": {
+  "cpu": "Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz",
+  "driver": "610.43.02",
+  "gpus": [
+   {
+    "index": 0,
+    "name": "NVIDIA GeForce GTX 1650",
+    "power_cap_w": 75,
+    "uuid": "GPU-57a38ca5-3ec5-eb52-c092-775beca609de",
+    "vram_mib": 4096
+   }
+  ],
+  "kernel": "6.12.90+deb13.1-amd64",
+  "os": "Debian GNU/Linux 13 (trixie)",
+  "ram_gib": 62,
+  "threads": 20
+ },
+ "protocol": {
+  "cards_by_uuid": null,
+  "engines_seen": [
+   "llama-server",
+   "ollama"
+  ],
+  "gpu_temps_c_at_start": [
+   32
+  ],
+  "iterations": 3,
+  "max_tokens": 128,
+  "prefix_reuse_offered": false,
+  "streaming": true,
+  "unique_prompt": false,
+  "warmup": 0
+ },
+ "subjects": {
+  "Ollama": {
+   "says": {
+    "version": "0.35.1"
+   },
+   "url": "http://127.0.0.1:11434"
+  },
+  "LOKEN": {
+   "says": {
+    "commit": "faf7af64e",
+    "loken": "0.3.1-dev+gfaf7af64e",
+    "version": "0.3.1-dev+gfaf7af64e"
+   },
+   "url": "http://127.0.0.1:11435"
+  }
+ },
+ "engine_build": 1792564833,
+ "idle_energy_baseline": null,
+ "config": {
+  "carbon_intensity_gco2_per_kwh": 50.0,
+  "custom_prompt": null,
+  "energy_measure": true,
+  "gpu_sample": true,
+  "iterations": 3,
+  "max_tokens": 128,
+  "models": [
+   "qwen3:8b"
+  ],
+  "num_ctx": [
+   4096
+  ],
+  "num_gpu": 0,
+  "prompts": [
+   "short"
+  ],
+  "session_id": null,
+  "streaming": true,
+  "unique_prompt": false,
+  "warmup": 0
+ },
+ "results": [
+  {
+   "coherence_pass": true,
+   "first_response_preview": "king who was known for his love of mathematics. He had a peculiar habit of asking his court mathematicians to solve comp...",
+   "iteration_errors": [],
+   "iterations": [
+    {
+     "completion_tok_s": 4.496995036548912,
+     "degenerate": false,
+     "e2e_latency_ms": 33748.752779999995,
+     "energy": {
+      "carbon_intensity_gco2_per_kwh": 50.0,
+      "cpu_pkg_decode_j": null,
+      "cpu_pkg_energy_j": 0.0,
+      "cpu_rapl_available": false,
+      "decode_duration_s": 28.264303439000003,
+      "decode_energy_j": 112.5425126921252,
+      "domains_counted": [
+       "gpu"
+      ],
+      "dram_decode_j": null,
+      "dram_energy_j": 0.0,
+      "dram_rapl_available": false,
+      "duration_s": 33.771864657,
+      "energy_j": 129.49500000011176,
+      "gco2_per_tok": 1.405110677084546e-05,
+      "gpu_decode_j": 112.5425126921252,
+      "gpu_energy_j": 129.49500000011176,
+      "gpu_path": "nvml_counter",
+      "j_per_decode_tok": 0.8792383804072281,
+      "j_per_tok": 1.0116796875008731,
+      "note": "CPU RAPL unavailable (needs root): energy_uj is permission-denied - run as root or `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`",
+      "wh_per_tok": 0.0002810221354169092
+     },
+     "iteration": 1,
+     "load_time_ms": 5090.334169,
+     "prompt_tok_s": 36.07920106217168,
+     "prompt_tokens": 15,
+     "server_decode_tok_s": 4.532382581104773,
+     "tokens_generated": 128,
+     "ttft_ms": 5507.561218,
+     "wall_clock_ms": 33748.752779999995
+    },
+    {
+     "completion_tok_s": 4.499277665043784,
+     "degenerate": false,
+     "e2e_latency_ms": 28453.694377,
+     "energy": {
+      "carbon_intensity_gco2_per_kwh": 50.0,
+      "cpu_pkg_decode_j": null,
+      "cpu_pkg_energy_j": 0.0,
+      "cpu_rapl_available": false,
+      "decode_duration_s": 28.24690634,
+      "decode_energy_j": 109.23386678983978,
+      "domains_counted": [
+       "gpu"
+      ],
+      "dram_decode_j": null,
+      "dram_energy_j": 0.0,
+      "dram_rapl_available": false,
+      "duration_s": 28.473740211,
+      "energy_j": 110.07500000018626,
+      "gco2_per_tok": 1.1943901909742434e-05,
+      "gpu_decode_j": 109.23386678983978,
+      "gpu_energy_j": 110.07500000018626,
+      "gpu_path": "nvml_counter",
+      "j_per_decode_tok": 0.8533895842956233,
+      "j_per_tok": 0.8599609375014552,
+      "note": "CPU RAPL unavailable (needs root): energy_uj is permission-denied - run as root or `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`",
+      "wh_per_tok": 0.00023887803819484866
+     },
+     "iteration": 2,
+     "load_time_ms": 2.153728,
+     "prompt_tok_s": 68.00870511425462,
+     "prompt_tokens": 15,
+     "server_decode_tok_s": 4.534684348062248,
+     "tokens_generated": 128,
+     "ttft_ms": 226.833871,
+     "wall_clock_ms": 28453.694377
+    },
+    {
+     "completion_tok_s": 4.494161564185479,
+     "degenerate": false,
+     "e2e_latency_ms": 28490.525495,
+     "energy": {
+      "carbon_intensity_gco2_per_kwh": 50.0,
+      "cpu_pkg_decode_j": null,
+      "cpu_pkg_energy_j": 0.0,
+      "cpu_rapl_available": false,
+      "decode_duration_s": 28.278888259,
+      "decode_energy_j": 107.74253934635075,
+      "domains_counted": [
+       "gpu"
+      ],
+      "dram_decode_j": null,
+      "dram_energy_j": 0.0,
+      "dram_rapl_available": false,
+      "duration_s": 28.510283437,
+      "energy_j": 108.6589999999851,
+      "gco2_per_tok": 1.1790256076387272e-05,
+      "gpu_decode_j": 107.74253934635075,
+      "gpu_energy_j": 108.6589999999851,
+      "gpu_path": "nvml_counter",
+      "j_per_decode_tok": 0.8417385886433653,
+      "j_per_tok": 0.8488984374998836,
+      "note": "CPU RAPL unavailable (needs root): energy_uj is permission-denied - run as root or `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`",
+      "wh_per_tok": 0.00023580512152774545
+     },
+     "iteration": 3,
+     "load_time_ms": 1.948655,
+     "prompt_tok_s": 67.82849339350474,
+     "prompt_tokens": 15,
+     "server_decode_tok_s": 4.529524805075615,
+     "tokens_generated": 128,
+     "ttft_ms": 231.39517800000002,
+     "wall_clock_ms": 28490.525495
+    }
+   ],
+   "load_error": null,
+   "load_time_ms": 3644.6734570000003,
+   "model": "qwen3:8b",
+   "model_fingerprint": {
+    "modified_at": "2026-07-04T15:18:33.96+02:00",
+    "parameter_size": "8.2B",
+    "quantization_level": "Q4_K_M"
+   },
+   "num_ctx": 4096,
+   "prompt": "short",
+   "prompt_chars": 58,
+   "stats": {
+    "Carbon gCO2/tok [gpu]": {
+     "count": 3,
+     "max": 1.405110677084546e-05,
+     "mean": 1.2595088252325055e-05,
+     "min": 1.1790256076387272e-05,
+     "p50": 1.1943901909742434e-05,
+     "p95": 1.3840386284735159e-05,
+     "stddev": 1.2632870636686726e-06,
+     "unit": "g"
+    },
+    "Completion tok/s": {
+     "count": 3,
+     "max": 4.499277665043784,
+     "mean": 4.496811421926059,
+     "min": 4.494161564185479,
+     "p50": 4.496995036548912,
+     "p95": 4.499049402194297,
+     "stddev": 0.0025629880501831285,
+     "unit": "tok/s"
+    },
+    "Decode ms/tok": {
+     "count": 3,
+     "max": 222.5109145984252,
+     "mean": 222.3798426824147,
+     "min": 222.25789881102364,
+     "p50": 222.3707146377953,
+     "p95": 222.4968946023622,
+     "stddev": 0.12675463726245803,
+     "unit": "ms"
+    },
+    "E2E latency": {
+     "count": 3,
+     "max": 33748.752779999995,
+     "mean": 30230.990884,
+     "min": 28453.694377,
+     "p50": 28490.525495,
+     "p95": 33222.93005149999,
+     "stddev": 3046.5268258338706,
+     "unit": "ms"
+    },
+    "Energy J/tok [gpu]": {
+     "count": 3,
+     "max": 1.0116796875008731,
+     "mean": 0.906846354167404,
+     "min": 0.8488984374998836,
+     "p50": 0.8599609375014552,
+     "p95": 0.9965078125009313,
+     "stddev": 0.0909566685841444,
+     "unit": "J"
+    },
+    "Energy Wh/tok [gpu]": {
+     "count": 3,
+     "max": 0.0002810221354169092,
+     "mean": 0.0002519017650465011,
+     "min": 0.00023580512152774545,
+     "p50": 0.00023887803819484866,
+     "p95": 0.0002768077256947031,
+     "stddev": 2.526574127337345e-05,
+     "unit": "Wh"
+    },
+    "Energy decode J/tok [gpu]": {
+     "count": 3,
+     "max": 0.8792383804072281,
+     "mean": 0.8581221844487388,
+     "min": 0.8417385886433653,
+     "p50": 0.8533895842956233,
+     "p95": 0.8766535007960676,
+     "stddev": 0.019192621596338052,
+     "unit": "J"
+    },
+    "ITL (per token)": {
+     "count": 381,
+     "max": 245.18867099999989,
+     "mean": 222.37984268241442,
+     "min": 220.82630000000063,
+     "p50": 222.21125200000097,
+     "p95": 223.57555499999944,
+     "stddev": 1.5680248226273243,
+     "unit": "ms"
+    },
+    "Model load": {
+     "count": 1,
+     "max": 3644.6734570000003,
+     "mean": 3644.6734570000003,
+     "min": 3644.6734570000003,
+     "p50": 3644.6734570000003,
+     "p95": 3644.6734570000003,
+     "stddev": 0.0,
+     "unit": "ms"
+    },
+    "Prompt tok/s": {
+     "count": 3,
+     "max": 68.00870511425462,
+     "mean": 57.30546652331035,
+     "min": 36.07920106217168,
+     "p50": 67.82849339350474,
+     "p95": 67.99068394217964,
+     "stddev": 18.382705952501123,
+     "unit": "tok/s"
+    },
+    "TTFT": {
+     "count": 3,
+     "max": 5507.561218,
+     "mean": 1988.5967556666665,
+     "min": 226.833871,
+     "p50": 231.39517800000002,
+     "p95": 4979.944614,
+     "stddev": 3047.5134727764666,
+     "unit": "ms"
+    },
+    "Tokens generated": {
+     "count": 3,
+     "max": 128.0,
+     "mean": 128.0,
+     "min": 128.0,
+     "p50": 128.0,
+     "p95": 128.0,
+     "stddev": 0.0,
+     "unit": "count"
+    }
+   },
+   "target": "Ollama",
+   "url": "http://127.0.0.1:11434"
+  },
+  {
+   "coherence_pass": true,
+   "first_response_preview": "king and his son. The king had a son, and the son had a son, and so on. The kingdom had a tradition that the king would ...",
+   "iteration_errors": [],
+   "iterations": [
+    {
+     "completion_tok_s": 4.7723680462505635,
+     "degenerate": false,
+     "e2e_latency_ms": 30058.951839999998,
+     "energy": {
+      "carbon_intensity_gco2_per_kwh": 50.0,
+      "cpu_pkg_decode_j": null,
+      "cpu_pkg_energy_j": 0.0,
+      "cpu_rapl_available": false,
+      "decode_duration_s": 26.631451708999997,
+      "decode_energy_j": 105.13353578216845,
+      "domains_counted": [
+       "gpu"
+      ],
+      "dram_decode_j": null,
+      "dram_energy_j": 0.0,
+      "dram_rapl_available": false,
+      "duration_s": 30.078829298,
+      "energy_j": 115.97800000011921,
+      "gco2_per_tok": 1.2584418402790713e-05,
+      "gpu_decode_j": 105.13353578216845,
+      "gpu_energy_j": 115.97800000011921,
+      "gpu_path": "nvml_counter",
+      "j_per_decode_tok": 0.821355748298191,
+      "j_per_tok": 0.9060781250009313,
+      "note": "CPU RAPL unavailable (needs root): energy_uj is permission-denied - run as root or `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`",
+      "wh_per_tok": 0.00025168836805581425
+     },
+     "iteration": 1,
+     "load_time_ms": null,
+     "prompt_tok_s": 4.604218918418827,
+     "prompt_tokens": 15,
+     "server_decode_tok_s": 4.810141078175195,
+     "tokens_generated": 128,
+     "ttft_ms": 3447.377589,
+     "wall_clock_ms": 30058.951839999998
+    },
+    {
+     "completion_tok_s": 4.789596105955514,
+     "degenerate": false,
+     "e2e_latency_ms": 26981.600071,
+     "energy": {
+      "carbon_intensity_gco2_per_kwh": 50.0,
+      "cpu_pkg_decode_j": null,
+      "cpu_pkg_energy_j": 0.0,
+      "cpu_rapl_available": false,
+      "decode_duration_s": 26.557776750000002,
+      "decode_energy_j": 99.89070355610683,
+      "domains_counted": [
+       "gpu"
+      ],
+      "dram_decode_j": null,
+      "dram_energy_j": 0.0,
+      "dram_rapl_available": false,
+      "duration_s": 27.023568169,
+      "energy_j": 102.5570000000298,
+      "gco2_per_tok": 1.1128146701392122e-05,
+      "gpu_decode_j": 99.89070355610683,
+      "gpu_energy_j": 102.5570000000298,
+      "gpu_path": "nvml_counter",
+      "j_per_decode_tok": 0.7803961215320846,
+      "j_per_tok": 0.8012265625002328,
+      "note": "CPU RAPL unavailable (needs root): energy_uj is permission-denied - run as root or `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`",
+      "wh_per_tok": 0.00022256293402784244
+     },
+     "iteration": 2,
+     "load_time_ms": null,
+     "prompt_tok_s": 32.3727007747888,
+     "prompt_tokens": 15,
+     "server_decode_tok_s": 4.827526534090763,
+     "tokens_generated": 128,
+     "ttft_ms": 465.79141899999996,
+     "wall_clock_ms": 26981.600071
+    },
+    {
+     "completion_tok_s": 4.781084363099227,
+     "degenerate": false,
+     "e2e_latency_ms": 26984.859669999998,
+     "energy": {
+      "carbon_intensity_gco2_per_kwh": 50.0,
+      "cpu_pkg_decode_j": null,
+      "cpu_pkg_energy_j": 0.0,
+      "cpu_rapl_available": false,
+      "decode_duration_s": 26.604861307,
+      "decode_energy_j": 101.31304069642576,
+      "domains_counted": [
+       "gpu"
+      ],
+      "dram_decode_j": null,
+      "dram_energy_j": 0.0,
+      "dram_rapl_available": false,
+      "duration_s": 27.026689566,
+      "energy_j": 102.0749999997206,
+      "gco2_per_tok": 1.107584635413635e-05,
+      "gpu_decode_j": 101.31304069642576,
+      "gpu_energy_j": 102.0749999997206,
+      "gpu_path": "nvml_counter",
+      "j_per_decode_tok": 0.7915081304408262,
+      "j_per_tok": 0.7974609374978172,
+      "note": "CPU RAPL unavailable (needs root): energy_uj is permission-denied - run as root or `sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj`",
+      "wh_per_tok": 0.000221516927082727
+     },
+     "iteration": 3,
+     "load_time_ms": null,
+     "prompt_tok_s": 35.76317977126213,
+     "prompt_tokens": 15,
+     "server_decode_tok_s": 4.818938561126274,
+     "tokens_generated": 128,
+     "ttft_ms": 421.828259,
+     "wall_clock_ms": 26984.859669999998
+    }
+   ],
+   "load_error": null,
+   "load_time_ms": 3123.1785840000002,
+   "model": "qwen3:8b",
+   "model_fingerprint": {
+    "modified_at": "",
+    "parameter_size": "8.2B",
+    "quantization_level": "Q4_K_M"
+   },
+   "num_ctx": 4096,
+   "prompt": "short",
+   "prompt_chars": 58,
+   "stats": {
+    "Carbon gCO2/tok [gpu]": {
+     "count": 3,
+     "max": 1.2584418402790713e-05,
+     "mean": 1.1596137152773061e-05,
+     "min": 1.107584635413635e-05,
+     "p50": 1.1128146701392122e-05,
+     "p95": 1.2438791232650854e-05,
+     "stddev": 8.562760673013739e-07,
+     "unit": "g"
+    },
+    "Completion tok/s": {
+     "count": 3,
+     "max": 4.789596105955514,
+     "mean": 4.781016171768434,
+     "min": 4.7723680462505635,
+     "p50": 4.781084363099227,
+     "p95": 4.788744931669886,
+     "stddev": 0.008614232283989774,
+     "unit": "tok/s"
+    },
+    "Decode ms/tok": {
+     "count": 3,
+     "max": 209.53958083464568,
+     "mean": 209.16100852755903,
+     "min": 208.7858721023622,
+     "p50": 209.1575726456693,
+     "p95": 209.50138001574805,
+     "stddev": 0.37686611315341795,
+     "unit": "ms"
+    },
+    "E2E latency": {
+     "count": 3,
+     "max": 30058.951839999998,
+     "mean": 28008.470526999998,
+     "min": 26981.600071,
+     "p50": 26984.859669999998,
+     "p95": 29751.542623,
+     "stddev": 1775.7696549575512,
+     "unit": "ms"
+    },
+    "Energy J/tok [gpu]": {
+     "count": 3,
+     "max": 0.9060781250009313,
+     "mean": 0.8349218749996604,
+     "min": 0.7974609374978172,
+     "p50": 0.8012265625002328,
+     "p95": 0.8955929687508615,
+     "stddev": 0.0616518768456989,
+     "unit": "J"
+    },
+    "Energy Wh/tok [gpu]": {
+     "count": 3,
+     "max": 0.00025168836805581425,
+     "mean": 0.0002319227430554612,
+     "min": 0.000221516927082727,
+     "p50": 0.00022256293402784244,
+     "p95": 0.00024877582465301706,
+     "stddev": 1.712552134602748e-05,
+     "unit": "Wh"
+    },
+    "Energy decode J/tok [gpu]": {
+     "count": 3,
+     "max": 0.821355748298191,
+     "mean": 0.7977533334237007,
+     "min": 0.7803961215320846,
+     "p50": 0.7915081304408262,
+     "p95": 0.8183709865124545,
+     "stddev": 0.021181942225104448,
+     "unit": "J"
+    },
+    "ITL (per token)": {
+     "count": 381,
+     "max": 341.8290300000008,
+     "mean": 209.16100852755898,
+     "min": 0.00045100000033926335,
+     "p50": 210.82570599999963,
+     "p95": 213.59632199999987,
+     "stddev": 37.503144685204106,
+     "unit": "ms"
+    },
+    "Model load": {
+     "count": 1,
+     "max": 3123.1785840000002,
+     "mean": 3123.1785840000002,
+     "min": 3123.1785840000002,
+     "p50": 3123.1785840000002,
+     "p95": 3123.1785840000002,
+     "stddev": 0.0,
+     "unit": "ms"
+    },
+    "Prompt tok/s": {
+     "count": 3,
+     "max": 35.76317977126213,
+     "mean": 24.246699821489916,
+     "min": 4.604218918418827,
+     "p50": 32.3727007747888,
+     "p95": 35.4241318716148,
+     "stddev": 17.09514928209216,
+     "unit": "tok/s"
+    },
+    "TTFT": {
+     "count": 3,
+     "max": 3447.377589,
+     "mean": 1444.9990890000001,
+     "min": 421.828259,
+     "p50": 465.79141899999996,
+     "p95": 3149.218972,
+     "stddev": 1734.249962608039,
+     "unit": "ms"
+    },
+    "Tokens generated": {
+     "count": 3,
+     "max": 128.0,
+     "mean": 128.0,
+     "min": 128.0,
+     "p50": 128.0,
+     "p95": 128.0,
+     "stddev": 0.0,
+     "unit": "count"
+    }
+   },
+   "target": "LOKEN",
+   "url": "http://127.0.0.1:11435"
+  }
+ ],
+ "ollama_version": "0.35.1"
+}

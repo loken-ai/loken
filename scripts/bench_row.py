@@ -70,28 +70,46 @@ def engine_label(target, version=None):
 # engine and the same campaign, so they are folded in rather than dropped - reading only the
 # current name would empty most of the table without saying anything was missing.
 RETIRED_TARGETS = {"llmuse": "loken", "llmserver": "loken"}
-COLS = ["Model", "Ctx", "Prompt", "Mode", "Device", "Engine", "Prefill tok/s", "Decode tok/s", "Tokens",
-        "E2E ms", "J/req", "J/token", "Δ decode", "Δ energy", "Date", "Run"]
+COLS = ["Model", "Ctx", "Prompt", "Mode", "Device", "Engine", "Prefill tok/s", "TTFT ms", "Decode tok/s",
+        "Tokens", "E2E ms", "J/req", "J/token", "Δ prefill", "Δ TTFT", "Δ decode", "Δ energy", "Date", "Run"]
 
-def measured_prefill(r, st):
-    """Prompt tokens divided by the measured time to first token, or nothing.
+
+def _prefill(i):
+    """Prompt tokens over the bench's own time to first token, for one iteration, or nothing.
 
     Blank rather than falling back to the engine's own figure: a column holding two
     definitions is the defect this replaces, not a lesser version of it.
     """
-    # The MEDIAN, where every other figure here takes the mean: the first iteration of a
-    # cell is a cold load, and its time to first token is seconds where the warm ones are
-    # milliseconds. Averaged in, it put ollama's prefill at 4 tok/s on a cell where it does
-    # 642. Decode tolerates the mean because it does not carry that outlier.
-    v = st.get("TTFT")
-    ttft = v.get("p50") if isinstance(v, dict) else v
-    if not ttft:
-        return None
-    toks = next((i.get("prompt_tokens") for i in (r.get("iterations") or [])
-                 if i.get("prompt_tokens")), None)
-    if not toks or ttft <= 0:
+    toks, ttft = i.get("prompt_tokens"), i.get("ttft_ms")
+    if not toks or not ttft or ttft <= 0:
         return None
     return toks / (ttft / 1000.0)
+
+
+def _ttft(i):
+    v = i.get("ttft_ms")
+    return v if v and v > 0 else None
+
+
+def _decode(i):
+    v = i.get("completion_tok_s")
+    return v if v and v > 0 else None
+
+
+def cold_warm(iterations, f):
+    """(cold, warm) of one figure over a cell's iterations.
+
+    Cold is the first iteration: the first request of the cell, which no prompt cache has
+    served. Warm is the median of the others, which an engine that caches the prompt serves
+    from the cache. A cell of a single iteration has no warm figure.
+    """
+    vals = [f(i) for i in iterations]
+    rest = sorted(v for v in vals[1:] if v is not None)
+    warm = None
+    if rest:
+        n = len(rest)
+        warm = rest[n // 2] if n % 2 else (rest[n // 2 - 1] + rest[n // 2]) / 2
+    return (vals[0] if vals else None), warm
 
 # Which family a model belongs to is a property of the model file - `general.architecture`
 # in its GGUF - not of the rows a previous run happened to leave behind. Reading it from the
@@ -267,6 +285,8 @@ def rows(d, mode, device):
     for r in d["results"]:
         st = r["stats"]
         jtok, jdom = energy_stat(st, "Energy J/tok")
+        its = r.get("iterations") or []
+        pre, ttft, dec = (cold_warm(its, f) for f in (_prefill, _ttft, _decode))
         ntok = stat(st, "Tokens generated")
         # The prompt is part of the key: two cells that differ only by it are two
         # measurements, and merging them silently keeps whichever was read last.
@@ -276,16 +296,15 @@ def rows(d, mode, device):
         target = r["target"].lower()
         target = RETIRED_TARGETS.get(target, target)
         out.setdefault((r["model"], r["num_ctx"], r.get("prompt", "short"), mode, device), {})[target] = {
-            # Prompt tokens over the time the bench itself measured to the first one.
-            #
-            # NOT each engine's own prompt_tok_s, which is that engine's timer minus whatever
-            # it does not count, and the engines do not leave out the same things: on a
-            # 15-token prompt ollama reported 652 tok/s where its own time to first token
-            # implies 35, and this engine 49 373 where its own implies 728. Published side by
-            # side those reversed the verdict on three cells of four. One definition, measured
-            # here, or the column is not a comparison.
-            "prefill": measured_prefill(r, st),
-            "decode":  stat_warm(st, "Completion tok/s"),
+            # Prefill is prompt tokens over the time the bench itself measured to the first
+            # one, NOT each engine's own prompt_tok_s, which is that engine's timer minus
+            # whatever it does not count, and the engines do not leave out the same things:
+            # on a 15-token prompt ollama reported 652 tok/s where its own time to first token
+            # implies 35. One definition, measured here, or the column is not a comparison.
+            # Each of the three rates is kept cold and warm (see `cold_warm`).
+            "pre_c": pre[0], "pre_w": pre[1],
+            "ttft_c": ttft[0], "ttft_w": ttft[1],
+            "dec_c": dec[0], "dec_w": dec[1],
             "e2e":     stat(st, "E2E latency"),
             # What the whole request cost. The per-token rate divides this by a token
             # count that is fixed per cell, so the two say the same thing at one size and
@@ -310,17 +329,52 @@ def rows(d, mode, device):
 def fmt(v, n=1):
     return " - " if v is None else f"{v:,.{n}f}".replace(",", " ")
 
+def pair(c, w, n=1, bold=False):
+    """A cold / warm cell. A figure the cell has no value for is a dash; a cell with neither is blank."""
+    if c is None and w is None:
+        return " - "
+    out = f"{fmt(c, n)} / {fmt(w, n)}" if w is not None else fmt(c, n) + " / -"
+    return f"**{out}**" if bold else out
+
+
+def delta(mine, others, lower_is_better=False):
+    """Percent by which `mine` beats the best of `others`, positive meaning better; None if not comparable."""
+    others = [o for o in others if o]
+    if not mine or not others:
+        return None
+    return (min(others) / mine - 1) * 100 if lower_is_better else (mine / max(others) - 1) * 100
+
+
+def sign(p):
+    return "" if p is None else (f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%")
+
+
+def pair_delta(c, w):
+    """A cold / warm delta cell, blank when neither side can be compared."""
+    if c is None and w is None:
+        return ""
+    return f"{sign(c) or '-'} / {sign(w) or '-'}"
+
+
 def cells(merged):
+    """The report's rows. See `cells_detail` for the numbers behind them."""
+    return [r for r, _ in cells_detail(merged)]
+
+
+def cells_detail(merged):
+    """(row, info) per cell and engine. `info` carries the deltas as numbers for the scoreboard:
+    `plain` (the unvaried loken row), `mark` (the word that replaces the rates, or ""), `key`,
+    and, for a loken row, `dec` = (cold, warm), `pre`, `ttft` and `energy` percentages."""
     out = []
     for key, by in sorted(merged.items(), key=lambda x: (x[0][0], x[0][1], x[0][2], x[0][3], x[0][4])):
         model, ctx, prompt, mode, device = key
-        # Neither comparison survives the two engines answering at different lengths. A
-        # model that stops on its own end token stops at a different point per engine, so
-        # the energies then differ by the length of the answer rather than by efficiency -
-        # and a rate averaged over a handful of steps carries the fixed cost of a request
-        # instead of the decode: the same engine on the same model measured 398 tok/s over
-        # 30 tokens and 417 over 128. Both deltas are therefore left blank unless the two
-        # sides produced the same amount.
+        # No comparison survives the two engines answering at different lengths. A model that
+        # stops on its own end token stops at a different point per engine, so the energies
+        # then differ by the length of the answer rather than by efficiency - and a rate
+        # averaged over a handful of steps carries the fixed cost of a request instead of the
+        # decode: the same engine on the same model measured 398 tok/s over 30 tokens and 417
+        # over 128. Every delta is therefore left blank unless the two sides produced the
+        # same amount.
         mine = by.get("loken", {}).get("ntok")
         same = lambda v: mine and v["ntok"] and abs(v["ntok"] - mine) <= 0.02 * mine
         # An engine that answered with a repeating pattern is not a baseline and not a
@@ -328,40 +382,41 @@ def cells(merged):
         # reference it would flatter us, and as our own cell it would publish a delta
         # against work nobody did.
         ok = lambda v: v.get("coh") is not False and not looks_looping(v.get("preview", ""))
-        others = [v["decode"] for k, v in by.items()
-                  if k.split("@")[0] in ("ollama", "vllm") and v["decode"] and same(v) and ok(v)]
-        # Comparable only when both sides counted the same domains: a total over the cards
-        # alone against one that also counted the host is not a delta.
+        peers = [v for k, v in by.items() if k.split("@")[0] in ("ollama", "vllm") and same(v) and ok(v)]
+        # Energy is comparable only when both sides counted the same domains: a total over the
+        # cards alone against one that also counted the host is not a delta.
         mydom = by.get("loken", {}).get("jdom")
-        othere = [v["jreq"] for k, v in by.items()
-                  if k.split("@")[0] in ("ollama", "vllm") and v["jreq"] and same(v) and ok(v)
-                  and v.get("jdom") == mydom]
+        othere = [v["jreq"] for v in peers if v["jreq"] and v.get("jdom") == mydom]
         ollama_cols = sorted(e for e in by if e.startswith("ollama@"))
         vllm_cols = sorted(e for e in by if e.startswith("vllm@"))
         variants = sorted(e for e in by if e.startswith("loken+"))
         for eng in ollama_cols + ["ollama"] + vllm_cols + ["vllm", "loken"] + variants:
             if eng not in by: continue
-            v = by[eng]; dd = de = ""
+            v = by[eng]
+            info = {"key": key, "plain": eng == "loken", "mark": "", "dec": (None, None),
+                    "pre": (None, None), "ttft": (None, None), "energy": None}
+            ds = ["", "", "", ""]
             if eng.startswith("loken") and ok(v):
-                if others and v["decode"]:
-                    p = (v["decode"] / max(others) - 1) * 100
-                    dd = f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%"
+                for n, (m, low) in enumerate((("pre", False), ("ttft", True), ("dec", False))):
+                    info[m] = tuple(delta(v[f"{m}_{t}"], [p[f"{m}_{t}"] for p in peers], low) for t in "cw")
+                    ds[n] = pair_delta(*info[m])
                 # Positive means loken spends less for the same request.
-                if othere and v["jreq"]:
-                    p = (min(othere) / v["jreq"] - 1) * 100
-                    de = f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%"
+                info["energy"] = delta(v["jreq"], othere, True)
+                ds[3] = sign(info["energy"])
             # Bold a loken cell to set our rows apart, but never an empty one: `**` around a
             # spaced dash (`** - **`) is not valid emphasis and shows the asterisks verbatim.
-            b = lambda x: f"**{x}**" if eng.startswith("loken") and str(x).strip() not in ("-", "") else str(x)
+            bold = eng.startswith("loken")
+            b = lambda x: f"**{x}**" if bold and str(x).strip() not in ("-", "") else str(x)
+            head = [model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version")))]
+            tail = [v.get("day", ""), v.get("run", "")]
             if v.get("impossible") or v.get("failed"):
                 # The engine was given the model and could not run it, or ran it and kept no
                 # iteration: the row says which, since a comparison that leaves a cell out reads
                 # as a cell that was not tried.
-                mark = "impossible" if v.get("impossible") else "failed"
-                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), " - ", " - ",
-                            " - ", " - ", " - ", " - ", mark, "", v.get("day", ""), v.get("run", "")])
+                info["mark"] = "impossible" if v.get("impossible") else "failed"
+                out.append((head + [" - "] * 7 + [info["mark"], "", "", ""] + tail, info))
                 continue
-            if not any(v[k] is not None for k in ("prefill", "decode", "ntok", "e2e", "jreq")):
+            if not any(v[k] is not None for k in ("pre_c", "dec_c", "ntok", "e2e", "jreq")):
                 # Nothing was measured, so there is no row. An all-dash line reads as a cell
                 # that was tried and yielded something unprintable, which is not what it means
                 # and not something a reader can act on - absence already shows the coverage
@@ -371,8 +426,9 @@ def cells(merged):
             if not ok(v):
                 # The rates are withheld rather than shown with a caveat: a number in a
                 # performance column is read as performance, whatever sits beside it.
-                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), " - ", " - ",
-                            b(fmt(v["ntok"], 0)), " - ", " - ", " - ", "incoherent", "", v.get("day", ""), v.get("run", "")])
+                info["mark"] = "incoherent"
+                out.append((head + [" - ", " - ", " - ", b(fmt(v["ntok"], 0)), " - ", " - ", " - ",
+                                    "", "", info["mark"], ""] + tail, info))
                 continue
             if v["ntok"] is not None and v["ntok"] <= 1:
                 # One token is not a rate. It divides by whatever interval the clock rounded
@@ -380,13 +436,15 @@ def cells(merged):
                 # tokens per second against a competitor, three times over, in cells where
                 # our own was empty. A cell that produced no answer says so. What the request
                 # itself cost still stands, because that part really was measured.
-                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), b(fmt(v["prefill"])),
-                            " - ", b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)), b(fmt(v["jreq"], 0)),
-                            " - ", "no answer", "", v.get("day", ""), v.get("run", "")])
+                info["mark"] = "no answer"
+                out.append((head + [pair(v["pre_c"], v["pre_w"], 1, bold),
+                                    pair(v["ttft_c"], v["ttft_w"], 0, bold), " - ",
+                                    b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)), b(fmt(v["jreq"], 0)),
+                                    " - ", "", "", info["mark"], ""] + tail, info))
                 continue
-            out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), b(fmt(v["prefill"])),
-                        b(fmt(v["decode"])), b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)),
-                        b(fmt(v["jreq"], 0)), b(fmt(v["j"], 3)), dd, de, v.get("day", ""), v.get("run", "")])
+            out.append((head + [pair(v["pre_c"], v["pre_w"], 1, bold), pair(v["ttft_c"], v["ttft_w"], 0, bold),
+                                pair(v["dec_c"], v["dec_w"], 1, bold), b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)),
+                                b(fmt(v["jreq"], 0)), b(fmt(v["j"], 3))] + ds + tail, info))
     return out
 
 def table(rows_):
