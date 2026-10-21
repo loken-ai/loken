@@ -192,6 +192,12 @@ pub(crate) async fn audio_transcriptions(
     .await
 }
 
+/// Whether a transcription request must first make room for a speech recogniser: not when the
+/// model it names is a resident language model.
+fn needs_recogniser_room(resident_model: bool) -> bool {
+    !resident_model
+}
+
 /// An upload goes to a node whose catalogue holds the transcription model when this
 /// one's does not; otherwise it is decoded here.
 async fn decode_where_the_model_is(
@@ -255,12 +261,18 @@ async fn decode_where_the_model_is(
     {
         return relayed;
     }
-    crate::inference::place::vram_manager::ensure_gpu_headroom(
-        "asr",
-        demand,
-        catalogue::WHOLE_LOAD_RESERVE,
-    )
-    .await;
+    // A language model that takes the clip in its prompt and is already loaded answers from
+    // where it is: reclaiming room for a recogniser would evict the very model asked for.
+    // Its load, when it has none, makes its own room.
+    let resident_model = !requested.is_empty() && state.get_engine(&requested).await.is_ok();
+    if needs_recogniser_room(resident_model) {
+        crate::inference::place::vram_manager::ensure_gpu_headroom(
+            "asr",
+            demand,
+            catalogue::WHOLE_LOAD_RESERVE,
+        )
+        .await;
+    }
     let _job = state.media_note(
         if requested.is_empty() {
             "whisper"
@@ -299,4 +311,17 @@ pub(crate) async fn audio_translations(
         "/v1/audio/translations",
     )
     .await
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::needs_recogniser_room;
+
+    /// A resident language model is never evicted to make room for a recogniser; any other
+    /// request still reclaims idle residents first.
+    #[test]
+    fn a_resident_model_keeps_its_room() {
+        assert!(!needs_recogniser_room(true));
+        assert!(needs_recogniser_room(false));
+    }
 }

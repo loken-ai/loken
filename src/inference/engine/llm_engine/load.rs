@@ -192,25 +192,12 @@ impl GenericWeights<'_> {
                 };
                 (block_bytes > 0).then_some((block_bytes, head_bytes))
             }
-            GenericWeights::Awq { shards, .. } => {
+            GenericWeights::Awq { dir, shards } => {
                 let st =
                     unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(shards) }.ok()?;
-                let block_bytes: u64 = st
-                    .byte_sizes()
-                    .iter()
-                    .filter(|(n, _)| n.starts_with("model.layers."))
-                    .map(|(_, b)| *b as u64)
-                    .sum();
-                // The head is uploaded as dense F16.
-                let head = if st.get("lm_head.weight").is_ok() {
-                    "lm_head.weight"
-                } else {
-                    "model.embed_tokens.weight"
-                };
-                let head_bytes = st
-                    .shape_of(head)
-                    .map_or(0, |d| d.iter().product::<usize>() as u64 * 2);
-                Some((block_bytes, head_bytes))
+                let native = crate::inference::load::awq_loader::parse_config_json(dir)
+                    .is_ok_and(|c| c.native);
+                crate::inference::generic_transformer::text_bytes(&st, native)
             }
         }
     }
@@ -222,19 +209,12 @@ impl GenericWeights<'_> {
 pub(super) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<String>)> {
     use crate::inference::load::awq_loader as awql;
     let cfg = awql::parse_config_json(dir)?;
-    let mut shards: Vec<String> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-    shards.sort();
-    if shards.is_empty() {
-        return Err(anyhow!("AWQ: no *.safetensors shards in {dir}"));
-    }
+    let (_, shards) = awql::checkpoint_shards(std::path::Path::new(dir))?;
     let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards)? };
+    let holds = |tail: &str| st.names().iter().any(|n| n.ends_with(tail));
     let present = awql::AwqTensorPresence {
-        has_q_bias: st.get("model.layers.0.self_attn.q_proj.bias").is_ok(),
-        has_qk_norm: st.get("model.layers.0.self_attn.q_norm.weight").is_ok(),
+        has_q_bias: holds("layers.0.self_attn.q_proj.bias") || holds("layers.0.attention.wq.bias"),
+        has_qk_norm: holds("layers.0.self_attn.q_norm.weight"),
     };
     let mut content = awql::synth_gguf_content(&cfg, present);
     let arch = cfg.gguf_arch.clone();

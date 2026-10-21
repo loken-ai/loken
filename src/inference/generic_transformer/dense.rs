@@ -29,6 +29,9 @@ pub struct DenseCheckpoint {
     pub(super) computed: (Content, Vec<u8>),
     /// The metadata of `base` and every tensor of every part.
     pub content: Content,
+    /// Rotary lanes are paired as a GGUF file pairs them (adjacent), which a vendor's native
+    /// layout does; the framework's layout pairs each lane with the one half a head away.
+    pub adjacent_rope: bool,
 }
 
 /// The loader's name for a layer tensor of the checkpoint's `part` (`self_attn.q_proj.weight`).
@@ -52,19 +55,68 @@ fn layer_name(part: &str) -> Option<&'static str> {
     })
 }
 
-/// Where the checkpoint keeps its text model: the prefix of `embed_tokens.weight` (`model.`, or
-/// that behind a wrapper's prefix) and the prefix its head would have.
-fn prefixes(names: &[String]) -> Result<(String, String)> {
+/// How a checkpoint names its text model's tensors.
+enum Naming {
+    /// The framework's names, under `model` (`model.`, or that behind a wrapper's prefix) and
+    /// with the head under `head`.
+    Framework { model: String, head: String },
+    /// The vendor's own: `tok_embeddings.weight`, `layers.N.attention.wq.weight`.
+    Native,
+}
+
+/// The loader's name for a layer tensor of a native layout's `part` (`attention.wq.weight`).
+fn native_layer_name(part: &str) -> Option<&'static str> {
+    Some(match part {
+        "attention_norm.weight" => "attn_norm.weight",
+        "ffn_norm.weight" => "ffn_norm.weight",
+        "attention.wq.weight" => "attn_q.weight",
+        "attention.wk.weight" => "attn_k.weight",
+        "attention.wv.weight" => "attn_v.weight",
+        "attention.wo.weight" => "attn_output.weight",
+        "attention.wq.bias" => "attn_q.bias",
+        "attention.wk.bias" => "attn_k.bias",
+        "attention.wv.bias" => "attn_v.bias",
+        "feed_forward.w1.weight" => "ffn_gate.weight",
+        "feed_forward.w3.weight" => "ffn_up.weight",
+        "feed_forward.w2.weight" => "ffn_down.weight",
+        _ => return None,
+    })
+}
+
+/// Where the checkpoint keeps its text model: for the framework's names, the prefix of
+/// `embed_tokens.weight` and the prefix its head would have.
+fn naming(names: &[String], native: bool) -> Result<Naming> {
+    if native {
+        return Ok(Naming::Native);
+    }
     let embed = names
         .iter()
         .find(|n| n.ends_with("embed_tokens.weight"))
         .ok_or_else(|| Error("the checkpoint has no embed_tokens.weight".to_string()))?;
     let model = embed.trim_end_matches("embed_tokens.weight").to_string();
     let head = model.strip_suffix("model.").unwrap_or(&model).to_string();
-    Ok((model, head))
+    Ok(Naming::Framework { model, head })
 }
 
-fn canonical(model: &str, head: &str, name: &str) -> Option<String> {
+fn canonical(naming: &Naming, name: &str) -> Option<String> {
+    let (model, head) = match naming {
+        Naming::Native => {
+            return match name {
+                // The vendor's multimodal release keeps the table in the tower's namespace.
+                "tok_embeddings.weight" | "mm_whisper_embeddings.tok_embeddings.weight" => {
+                    Some("token_embd.weight".into())
+                }
+                "norm.weight" => Some("output_norm.weight".into()),
+                "output.weight" => Some("output.weight".into()),
+                _ => {
+                    let (n, part) = name.strip_prefix("layers.")?.split_once('.')?;
+                    n.parse::<usize>().ok()?;
+                    Some(format!("blk.{n}.{}", native_layer_name(part)?))
+                }
+            };
+        }
+        Naming::Framework { model, head } => (model, head),
+    };
     if name == format!("{model}embed_tokens.weight") {
         return Some("token_embd.weight".into());
     }
@@ -74,10 +126,37 @@ fn canonical(model: &str, head: &str, name: &str) -> Option<String> {
     if name == format!("{head}lm_head.weight") {
         return Some("output.weight".into());
     }
-    let rest = name.strip_prefix(model)?.strip_prefix("layers.")?;
+    let rest = name.strip_prefix(model.as_str())?.strip_prefix("layers.")?;
     let (n, part) = rest.split_once('.')?;
     n.parse::<usize>().ok()?;
     Some(format!("blk.{n}.{}", layer_name(part)?))
+}
+
+/// Bytes the text model's blocks take as stored, and bytes its head takes uploaded as F16 (the
+/// embedding table standing in for an absent head), for a checkpoint's mapped shards. Tensors
+/// of other parts of a composite model (a speech tower) count for neither.
+pub fn text_bytes(
+    st: &crate::tensor::safetensors::MmapedSafetensors,
+    native: bool,
+) -> Option<(u64, u64)> {
+    let names: Vec<String> = st.names().iter().map(|n| n.to_string()).collect();
+    let naming = naming(&names, native).ok()?;
+    let block_bytes: u64 = st
+        .byte_sizes()
+        .iter()
+        .filter(|(n, _)| canonical(&naming, n).is_some_and(|c| c.starts_with("blk.")))
+        .map(|(_, b)| *b as u64)
+        .sum();
+    let holder = |want: &str| {
+        names
+            .iter()
+            .find(|n| canonical(&naming, n).as_deref() == Some(want))
+    };
+    let head = holder("output.weight").or_else(|| holder("token_embd.weight"))?;
+    let head_bytes = st
+        .shape_of(head)
+        .map_or(0, |d| d.iter().product::<usize>() as u64 * 2);
+    Some((block_bytes, head_bytes))
 }
 
 fn dtype_of(s: &str) -> Option<GgmlDType> {
@@ -147,13 +226,13 @@ impl DenseCheckpoint {
             all_names.extend(listing.iter().map(|l| l.0.clone()));
             mapped.push((Arc::new(mmap), listing, data_start));
         }
-        let (model, head) = prefixes(&all_names)?;
+        let naming = naming(&all_names, cfg.native)?;
         let mut parts = Vec::new();
         let mut union: HashMap<String, TensorInfo> = HashMap::new();
         for ((mmap, listing, data_start), path) in mapped.into_iter().zip(shards) {
             let mut infos = HashMap::new();
             for (name, dtype, shape, start) in listing {
-                let Some(canon) = canonical(&model, &head, &name) else {
+                let Some(canon) = canonical(&naming, &name) else {
                     continue;
                 };
                 let ggml_dtype = dtype_of(&dtype).ok_or_else(|| {
@@ -214,6 +293,7 @@ impl DenseCheckpoint {
             parts,
             computed: (computed, bytes),
             content,
+            adjacent_rope: cfg.native,
         })
     }
 }
@@ -232,8 +312,11 @@ mod tests {
 
     #[test]
     fn checkpoint_names_become_loader_names() {
-        let (m, h) = ("model.", "");
-        let c = |n: &str| canonical(m, h, n);
+        let fw = Naming::Framework {
+            model: "model.".into(),
+            head: String::new(),
+        };
+        let c = |n: &str| canonical(&fw, n);
         assert_eq!(
             c("model.embed_tokens.weight").as_deref(),
             Some("token_embd.weight")
@@ -248,14 +331,39 @@ mod tests {
         );
         assert_eq!(c("lm_head.weight").as_deref(), Some("output.weight"));
         assert_eq!(c("audio_tower.conv1.weight"), None);
-        let (m, h) = ("language_model.model.", "language_model.");
+        let wrapped = Naming::Framework {
+            model: "language_model.model.".into(),
+            head: "language_model.".into(),
+        };
         assert_eq!(
-            canonical(m, h, "language_model.lm_head.weight").as_deref(),
+            canonical(&wrapped, "language_model.lm_head.weight").as_deref(),
             Some("output.weight")
         );
         assert_eq!(
-            canonical(m, h, "language_model.model.norm.weight").as_deref(),
+            canonical(&wrapped, "language_model.model.norm.weight").as_deref(),
             Some("output_norm.weight")
+        );
+        let n = |name: &str| canonical(&Naming::Native, name);
+        assert_eq!(
+            n("tok_embeddings.weight").as_deref(),
+            Some("token_embd.weight")
+        );
+        assert_eq!(n("output.weight").as_deref(), Some("output.weight"));
+        assert_eq!(
+            n("layers.4.attention.wo.weight").as_deref(),
+            Some("blk.4.attn_output.weight")
+        );
+        assert_eq!(
+            n("layers.4.feed_forward.w3.weight").as_deref(),
+            Some("blk.4.ffn_up.weight")
+        );
+        assert_eq!(
+            n("mm_whisper_embeddings.tok_embeddings.weight").as_deref(),
+            Some("token_embd.weight")
+        );
+        assert_eq!(
+            n("mm_whisper_embeddings.audio_language_projection.0.weight"),
+            None
         );
     }
 

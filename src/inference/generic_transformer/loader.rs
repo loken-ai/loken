@@ -167,6 +167,8 @@ struct TensorSource<'a> {
     /// The Q and K rows are in the order the checkpoint's framework wrote them, not the
     /// order a GGUF converter leaves them in.
     hf_rows: bool,
+    /// The checkpoint's rows are already in the adjacent-pair order of a GGUF file.
+    adjacent_rope: bool,
     /// The split set, which says which tensors are stored one less than they are read.
     split: Option<&'a crate::tensor::quantized::gguf_source::SplitGguf>,
 }
@@ -240,6 +242,7 @@ impl<'a> TensorSource<'a> {
     fn one(content: &'a gguf_file::Content, bytes: &'a [u8]) -> Self {
         Self {
             hf_rows: false,
+            adjacent_rope: false,
             split: None,
             owner: HashMap::new(),
             parts: vec![TensorPart {
@@ -271,6 +274,7 @@ impl<'a> TensorSource<'a> {
             parts,
             owner,
             hf_rows: false,
+            adjacent_rope: false,
             split: Some(split),
         }
     }
@@ -304,6 +308,7 @@ impl<'a> TensorSource<'a> {
             parts,
             owner,
             hf_rows: true,
+            adjacent_rope: ck.adjacent_rope,
             split: None,
         }
     }
@@ -2915,7 +2920,7 @@ impl GenericHeteroTransformer {
         // The rows of a dense checkpoint pair each rotary lane with the one half a head away;
         // adjacent pairing belongs to GGUF files, whose converter reorders the rows of the
         // architectures that use it.
-        if source.hf_rows {
+        if source.hf_rows && !source.adjacent_rope {
             cfg.flags.use_rope_i = false;
         }
         // Cap the per-layer Q8/Q4 KV allocation at the user's configured
@@ -5019,6 +5024,7 @@ mod host_layer_bytes_tests {
             }],
             owner: HashMap::new(),
             hf_rows: false,
+            adjacent_rope: false,
             split: None,
         };
         let (owned, mapped) = part(None).host_layer_bytes(1);

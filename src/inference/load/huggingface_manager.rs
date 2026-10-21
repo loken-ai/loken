@@ -498,6 +498,15 @@ impl HuggingFaceManager {
                         return selector_names_file(sel, &f.rfilename);
                     }
                 }
+                if is_native_shard(&name)
+                    && model_info.siblings.iter().any(|s| {
+                        s.rfilename
+                            .eq_ignore_ascii_case("model.safetensors.index.json")
+                            || s.rfilename.eq_ignore_ascii_case("model.safetensors")
+                    })
+                {
+                    return false;
+                }
                 // Download model files and configs
                 name.ends_with(".safetensors")
                     || name.ends_with(".gguf")
@@ -744,6 +753,16 @@ impl HuggingFaceManager {
         }
 
         walk(snapshots_dir, "", &mut files, &mut total_size);
+        // A snapshot that holds the framework's layout beside a vendor's native weights
+        // serves the framework's: the native file is the same weights again.
+        if matches!(
+            crate::inference::load::awq_loader::checkpoint_shards(snapshots_dir),
+            Ok((false, _))
+        ) {
+            for f in files.iter().filter(|f| is_native_shard(f)) {
+                total_size -= std::fs::metadata(snapshots_dir.join(f)).map_or(0, |m| m.len());
+            }
+        }
         Ok((files, total_size))
     }
 
@@ -760,6 +779,11 @@ impl HuggingFaceManager {
         }
         Ok(0)
     }
+}
+
+/// Whether `name` is a vendor's native weight file (`consolidated*.safetensors`).
+fn is_native_shard(name: &str) -> bool {
+    name.to_lowercase().starts_with("consolidated") && name.to_lowercase().ends_with(".safetensors")
 }
 
 /// HuggingFace model entry (list response)
@@ -798,6 +822,15 @@ impl From<std::io::Error> for HuggingFaceError {
 #[cfg(test)]
 mod selector_tests {
     use super::*;
+
+    #[test]
+    fn a_native_weight_file_is_told_by_its_name() {
+        assert!(is_native_shard("consolidated.safetensors"));
+        assert!(is_native_shard("Consolidated-00001-of-00002.safetensors"));
+        assert!(!is_native_shard("model-00001-of-00002.safetensors"));
+        assert!(!is_native_shard("consolidated.json"));
+        assert!(!is_native_shard("sub/consolidated.safetensors"));
+    }
 
     #[test]
     fn a_selector_splits_off_the_repository_id() {

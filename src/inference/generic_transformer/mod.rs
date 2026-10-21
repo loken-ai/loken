@@ -92,7 +92,7 @@ mod vulkan_layers;
 mod vulkan_parity;
 mod wide;
 pub use config::*;
-pub use dense::DenseCheckpoint;
+pub use dense::{text_bytes, DenseCheckpoint};
 pub(crate) use loader::tp_file_refusal;
 pub use moe_weights::*;
 pub use segment::LayerRates;

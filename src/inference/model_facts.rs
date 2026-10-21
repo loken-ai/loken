@@ -315,6 +315,9 @@ pub struct AudioFacts {
     /// (`[INST]...[/INST]`, a system turn in `[SYSTEM_PROMPT]`), whatever chat template the
     /// file carries.
     pub instruction_format: bool,
+    /// The key under a native layout's `params.json` `multimodal` object that declares this
+    /// tower, `None` when the family ships no native layout.
+    pub native_key: Option<&'static str>,
 }
 
 const AUDIO: &[(&str, AudioFacts)] = &[
@@ -329,6 +332,7 @@ const AUDIO: &[(&str, AudioFacts)] = &[
             begin: "[BEGIN_AUDIO]",
             pads_to_window: true,
             instruction_format: true,
+            native_key: Some("whisper_model_args"),
         },
     ),
     // Not padded: the last window carries its own length. The placeholder is not a
@@ -341,6 +345,7 @@ const AUDIO: &[(&str, AudioFacts)] = &[
             begin: "",
             pads_to_window: false,
             instruction_format: false,
+            native_key: None,
         },
     ),
 ];
@@ -352,6 +357,16 @@ pub fn audio_facts(projector_type: &str) -> Option<&'static AudioFacts> {
         .iter()
         .find(|(k, _)| *k == projector_type)
         .map(|(_, f)| f)
+}
+
+/// The projector type whose tower a native layout's `params.json` declares under its
+/// `multimodal` object, `None` when it declares none the table has.
+pub fn audio_type_of_native(params: &serde_json::Value) -> Option<&'static str> {
+    let multimodal = params.get("multimodal")?;
+    AUDIO
+        .iter()
+        .find(|(_, f)| f.native_key.is_some_and(|k| multimodal.get(k).is_some()))
+        .map(|(k, _)| *k)
 }
 
 /// Period of the layers of `arch` that skip RoPE, `None` when every layer rotates.

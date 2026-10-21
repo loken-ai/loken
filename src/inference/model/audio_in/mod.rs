@@ -14,14 +14,14 @@ pub mod projector;
 pub mod source;
 
 use crate::inference::model::mmproj::MmprojAudio;
-use crate::inference::model_facts::{audio_facts, AudioFacts};
+use crate::inference::model_facts::{audio_facts, audio_type_of_native, AudioFacts};
 use crate::tensor::quantized::gguf_file;
 use crate::tensor::{Device, Error, Result, Tensor};
 use encoder::Encoder;
 use mel::MelSpec;
 use projector::Projector;
 use source::{Source, TensorReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The epsilon of the encoder's LayerNorms when the source does not carry one: the
 /// framework default the checkpoints were trained with.
@@ -46,56 +46,47 @@ impl AudioTower {
         Self::build(&source, geo, dev)
     }
 
-    /// The tower of a checkpoint directory whose `config.json` declares an `audio_config`.
+    /// The tower of a checkpoint directory: a `config.json` that declares an `audio_config`,
+    /// or a native layout's `params.json` that declares a speech tower.
     pub fn from_checkpoint(dir: &Path, dev: &Device) -> Result<Self> {
-        let config = read_config(dir)?;
-        let audio = config.get("audio_config").ok_or_else(|| {
-            Error(format!(
-                "{}: config.json has no audio_config",
-                dir.display()
-            ))
-        })?;
-        let projector_type = config
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error(format!("{}: config.json has no model_type", dir.display())))?
-            .to_string();
-        let number = |keys: &[&str]| -> Result<usize> {
-            keys.iter()
-                .find_map(|k| audio.get(*k).and_then(|v| v.as_u64()))
-                .map(|v| v as usize)
-                .ok_or_else(|| Error(format!("audio_config has none of {keys:?}")))
-        };
-        let shards = weight_files(dir)?;
+        let (native, shards) = checkpoint_layout(dir)?;
         let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards)? };
-        let source = Source::Checkpoint(st);
+        let params = Params::read(dir, native)?;
+        let source = if native {
+            Source::Native {
+                st,
+                positions: params.positions,
+            }
+        } else {
+            Source::Checkpoint(st)
+        };
         let reader = TensorReader {
             source: &source,
             dev,
         };
-        let width = number(&["d_model", "hidden_size"])?;
         let shape = |name: &str| {
             reader
                 .shape_of(name)
                 .ok_or_else(|| Error(format!("{name}: missing from the checkpoint")))
         };
-        let stack = shape("mm.a.mlp.1.weight")?[1] / width.max(1);
+        let stack = shape("mm.a.mlp.1.weight")?[1] / params.width.max(1);
         let projection = shape("mm.a.mlp.2.weight")?[0];
         let geo = MmprojAudio {
-            projector_type,
-            width,
-            heads: number(&["encoder_attention_heads", "num_attention_heads"])?,
-            blocks: number(&["encoder_layers", "num_hidden_layers"])?,
-            feed_forward: number(&["encoder_ffn_dim", "intermediate_size"])?,
-            n_mels: number(&["num_mel_bins"])?,
+            projector_type: params.projector_type,
+            width: params.width,
+            heads: params.heads,
+            blocks: params.blocks,
+            feed_forward: params.feed_forward,
+            n_mels: params.n_mels,
             stack,
             projection,
             eps: LAYER_NORM_EPS,
         };
-        if let Some(declared) = config.get("stack_factor").and_then(|v| v.as_u64()) {
-            if declared as usize != stack {
+        if let Some(declared) = params.stack_factor {
+            if declared != stack {
                 return Err(Error(format!(
-                    "config.json stack_factor {declared}, the projector's shape implies {stack}"
+                    "{}: the declared stack factor is {declared}, the projector's shape implies {stack}",
+                    dir.display()
                 )));
             }
         }
@@ -200,37 +191,113 @@ impl AudioTower {
     }
 }
 
-fn read_config(dir: &Path) -> Result<serde_json::Value> {
-    let path = dir.join("config.json");
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
-    serde_json::from_str(&text).map_err(|e| Error(format!("{}: {e}", path.display())))
+/// The geometry a checkpoint's configuration declares for its speech tower.
+struct Params {
+    projector_type: String,
+    width: usize,
+    heads: usize,
+    blocks: usize,
+    feed_forward: usize,
+    n_mels: usize,
+    stack_factor: Option<usize>,
+    /// Rows of the encoder's position table.
+    positions: usize,
 }
 
-/// The safetensors shards of a checkpoint directory, in name order.
-fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| Error(format!("{}: {e}", dir.display())))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(Error(format!("{}: no safetensors file", dir.display())));
+impl Params {
+    fn read(dir: &Path, native: bool) -> Result<Self> {
+        let file = if native { "params.json" } else { "config.json" };
+        let path = dir.join(file);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| Error(format!("{}: {e}", path.display())))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+        let missing = |what: &str| Error(format!("{}: {what}", path.display()));
+        if native {
+            let projector_type = audio_type_of_native(&json).ok_or_else(|| {
+                missing("no speech tower the facts table has a row for under multimodal")
+            })?;
+            let key = audio_facts(projector_type)
+                .and_then(|f| f.native_key)
+                .unwrap_or_default();
+            let encoder = json
+                .pointer(&format!("/multimodal/{key}/encoder_args"))
+                .ok_or_else(|| missing("no encoder_args"))?;
+            let number = |o: &serde_json::Value, k: &str| {
+                o.get(k)
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .ok_or_else(|| missing(&format!("no {k}")))
+            };
+            let encoding = encoder
+                .get("audio_encoding_args")
+                .ok_or_else(|| missing("no audio_encoding_args"))?;
+            return Ok(Self {
+                projector_type: projector_type.to_string(),
+                width: number(encoder, "dim")?,
+                heads: number(encoder, "n_heads")?,
+                blocks: number(encoder, "n_layers")?,
+                feed_forward: number(encoder, "hidden_dim")?,
+                n_mels: number(encoding, "num_mel_bins")?,
+                stack_factor: json
+                    .pointer(&format!(
+                        "/multimodal/{key}/downsample_args/downsample_factor"
+                    ))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+                positions: number(encoder, "max_source_positions")?,
+            });
+        }
+        let audio = json
+            .get("audio_config")
+            .ok_or_else(|| missing("no audio_config"))?;
+        let projector_type = json
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| missing("no model_type"))?
+            .to_string();
+        let number = |keys: &[&str]| -> Result<usize> {
+            keys.iter()
+                .find_map(|k| audio.get(*k).and_then(|v| v.as_u64()))
+                .map(|v| v as usize)
+                .ok_or_else(|| missing(&format!("audio_config has none of {keys:?}")))
+        };
+        Ok(Self {
+            projector_type,
+            width: number(&["d_model", "hidden_size"])?,
+            heads: number(&["encoder_attention_heads", "num_attention_heads"])?,
+            blocks: number(&["encoder_layers", "num_hidden_layers"])?,
+            feed_forward: number(&["encoder_ffn_dim", "intermediate_size"])?,
+            n_mels: number(&["num_mel_bins"])?,
+            stack_factor: json
+                .get("stack_factor")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            positions: 0,
+        })
     }
-    Ok(files)
+}
+
+/// Whether `dir` reads in the vendor's native layout, and its weight files; the error names
+/// what the directory lacks.
+fn checkpoint_layout(dir: &Path) -> Result<(bool, Vec<String>)> {
+    crate::inference::load::awq_loader::checkpoint_shards(dir).map_err(|e| Error(e.to_string()))
 }
 
 /// Whether `dir` is a checkpoint whose configuration declares a speech tower this build
-/// reads: an `audio_config` and a model type the facts table has a row for.
+/// reads: an `audio_config` and a model type the facts table has a row for, or a native
+/// layout's `multimodal` object the table has a row for.
 pub fn checkpoint_has_tower(dir: &Path) -> bool {
-    read_config(dir).is_ok_and(|c| {
-        c.get("audio_config").is_some()
+    let json = |file: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join(file)).ok()?).ok()
+    };
+    if let Some(c) = json("config.json") {
+        return c.get("audio_config").is_some()
             && c.get("model_type")
                 .and_then(|v| v.as_str())
-                .is_some_and(|t| audio_facts(t).is_some())
-    })
+                .is_some_and(|t| audio_facts(t).is_some());
+    }
+    json("params.json").is_some_and(|p| audio_type_of_native(&p).is_some())
 }
 
 /// Whether the GGUF at `path` is an `mmproj` carrying a speech tower this build reads.
@@ -245,7 +312,7 @@ pub fn mmproj_has_tower(path: &Path) -> bool {
 /// every tensor is F32 then.
 pub fn resident_bytes(path: &Path) -> u64 {
     if path.is_dir() {
-        let Ok(shards) = weight_files(path) else {
+        let Ok((native, shards)) = checkpoint_layout(path) else {
             return 0;
         };
         let Ok(st) = (unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards) })
@@ -255,7 +322,13 @@ pub fn resident_bytes(path: &Path) -> u64 {
         return st
             .names()
             .iter()
-            .filter(|n| n.starts_with("audio_tower.") || n.starts_with("multi_modal_projector."))
+            .filter(|n| {
+                if native {
+                    n.starts_with(source::NATIVE_TOWER) && !n.ends_with("tok_embeddings.weight")
+                } else {
+                    n.starts_with("audio_tower.") || n.starts_with("multi_modal_projector.")
+                }
+            })
             .filter_map(|n| st.shape_of(n))
             .map(|d| d.iter().product::<usize>() as u64 * std::mem::size_of::<f32>() as u64)
             .sum();
@@ -318,6 +391,7 @@ mod route_tests {
     use crate::tensor::quantized::gguf_file::Value;
     use crate::tensor::quantized::GgmlDType;
     use crate::tensor::safetensors::MmapedSafetensors;
+    use std::path::PathBuf;
 
     fn canonical_names(blocks: usize, gated: bool) -> Vec<String> {
         let mut names = Vec::new();
@@ -439,5 +513,105 @@ mod route_tests {
     #[test]
     fn a_gated_projector_reads_the_same_from_an_mmproj() {
         the_routes_agree("ultravox", "ultravox", 64, true);
+    }
+
+    /// Writes `tensors` (name, dims, values) as one F32 safetensors file.
+    fn write_checkpoint(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
+        let bytes: Vec<Vec<u8>> = tensors
+            .iter()
+            .map(|(_, _, v)| v.iter().flat_map(|x| x.to_le_bytes()).collect())
+            .collect();
+        let views: Vec<_> = tensors
+            .iter()
+            .zip(&bytes)
+            .map(|((n, d, _), b)| {
+                (
+                    n.clone(),
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, d.clone(), b)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(views, None, path).unwrap();
+    }
+
+    const TOY_PARAMS: &str = r#"{"multimodal": {"whisper_model_args": {
+        "encoder_args": {"dim": 32, "n_layers": 2, "head_dim": 8, "hidden_dim": 128,
+            "n_heads": 4, "vocab_size": 51866, "max_source_positions": 1500,
+            "audio_encoding_args": {"num_mel_bins": 16}},
+        "downsample_args": {"downsample_factor": 4}}}}"#;
+
+    /// The toy Voxtral tower written in both layouts of a checkpoint (the position table of
+    /// the framework's layout being the sinusoids the native one computes) gives the same
+    /// embeddings, and each layout is told apart by its files.
+    #[test]
+    fn both_checkpoint_layouts_give_the_same_tower() {
+        let toy = vectors("voxtral");
+        let st = unsafe { MmapedSafetensors::new(toy.join("model.safetensors")) }.unwrap();
+        let read = |name: &str| -> (Vec<usize>, Vec<f32>) {
+            let t = st.load(name, &Device::Cpu).unwrap();
+            (t.dims().to_vec(), super::gate::values(&t))
+        };
+        let root = std::env::temp_dir().join(format!("loken-layouts-{}", std::process::id()));
+        let (framework, native) = (root.join("framework"), root.join("native"));
+        std::fs::create_dir_all(&framework).unwrap();
+        std::fs::create_dir_all(&native).unwrap();
+        let mut fw = Vec::new();
+        let mut nv = Vec::new();
+        for name in canonical_names(2, false) {
+            let (dims, values) = if name == "a.position_embd.weight" {
+                let table = super::source::sinusoids(1500, 32, &Device::Cpu).unwrap();
+                (table.dims().to_vec(), super::gate::values(&table))
+            } else {
+                read(&checkpoint_name(&name).unwrap())
+            };
+            fw.push((
+                checkpoint_name(&name).unwrap(),
+                dims.clone(),
+                values.clone(),
+            ));
+            if let Some(n) = super::source::native_name(&name) {
+                nv.push((n, dims, values));
+            }
+        }
+        write_checkpoint(&framework.join("model.safetensors"), &fw);
+        write_checkpoint(&native.join("consolidated.safetensors"), &nv);
+        std::fs::copy(toy.join("config.json"), framework.join("config.json")).unwrap();
+        std::fs::write(native.join("params.json"), TOY_PARAMS).unwrap();
+
+        assert!(checkpoint_has_tower(&framework));
+        assert!(checkpoint_has_tower(&native));
+        assert!(!checkpoint_layout(&framework).unwrap().0);
+        assert!(checkpoint_layout(&native).unwrap().0);
+        assert_eq!(resident_bytes(&framework) > 0, resident_bytes(&native) > 0);
+        let a = AudioTower::from_checkpoint(&framework, &Device::Cpu).unwrap();
+        let b = AudioTower::from_checkpoint(&native, &Device::Cpu).unwrap();
+        let mel = tensor(&toy, "mel").unsqueeze(0).unwrap();
+        let ea = a.project(&a.encode_window(&mel).unwrap()).unwrap();
+        let eb = b.project(&b.encode_window(&mel).unwrap()).unwrap();
+        let (diff, _) = compare(&ea, &eb);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(diff, 0.0);
+        assert_eq!(b.embedding_width(), 24);
+    }
+
+    /// A directory with neither layout is refused with what it lacks of each.
+    #[test]
+    fn a_directory_of_no_known_layout_is_refused_by_what_it_lacks() {
+        let dir = std::env::temp_dir().join(format!("loken-no-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"architectures": ["X"]}"#).unwrap();
+        let message = match AudioTower::from_checkpoint(&dir, &Device::Cpu) {
+            Ok(_) => panic!("a directory with no weights loaded"),
+            Err(e) => e.to_string(),
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            message.contains("numbered *.safetensors shards"),
+            "{message}"
+        );
+        assert!(message.contains("params.json"), "{message}");
+        assert!(message.contains("consolidated*.safetensors"), "{message}");
+        assert!(!message.contains("lacks: config.json"), "{message}");
     }
 }

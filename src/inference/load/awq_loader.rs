@@ -44,6 +44,9 @@ pub struct AwqConfigJson {
     /// Whether the checkpoint carries a `quantization_config`; a dense one does not.
     pub quantized: bool,
     pub tie_word_embeddings: bool,
+    /// The weights are in the layout a vendor's own release writes (`params.json` and a
+    /// `consolidated` shard) and not in the framework's (`config.json` and numbered shards).
+    pub native: bool,
 }
 
 /// Map an HF `architectures[0]` to the engine's GGUF arch tag.
@@ -56,7 +59,8 @@ pub fn map_hf_arch(hf: &str) -> Result<&'static str> {
         "LlamaForCausalLM"
         | "MistralForCausalLM"
         | "Mistral3ForCausalLM"
-        | "MistralForConditionalGeneration" => "llama",
+        | "MistralForConditionalGeneration"
+        | "VoxtralForConditionalGeneration" => "llama",
         other => {
             return Err(anyhow!(
                 "unsupported checkpoint architecture {other} (dense qwen2/qwen3/llama/mistral only)"
@@ -65,12 +69,28 @@ pub fn map_hf_arch(hf: &str) -> Result<&'static str> {
     })
 }
 
-/// Parse the essentials out of a HF `config.json`.
+/// The text model's fields of a checkpoint: the `text_config` of a composite model's
+/// `config.json` when it has one, the file itself otherwise.
+fn text_fields(v: &serde_json::Value) -> &serde_json::Value {
+    v.get("text_config").filter(|t| t.is_object()).unwrap_or(v)
+}
+
+/// Parse the essentials out of a HF `config.json`, or out of the `params.json` of a native
+/// layout when the directory has no `config.json`.
 pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
     let path = format!("{dir}/config.json");
-    let txt = std::fs::read_to_string(&path).map_err(|e| anyhow!("read {path}: {e}"))?;
+    let txt = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return match std::fs::read_to_string(format!("{dir}/params.json")) {
+                Ok(p) => parse_params_json(&p),
+                Err(_) => Err(anyhow!("read {path}: {e}")),
+            }
+        }
+    };
     let v: serde_json::Value = serde_json::from_str(&txt)?;
-    let g = |k: &str| v.get(k);
+    let t = text_fields(&v);
+    let g = |k: &str| t.get(k).or_else(|| v.get(k));
     let u = |k: &str| g(k).and_then(|x| x.as_u64()).map(|x| x as usize);
     let f = |k: &str| g(k).and_then(|x| x.as_f64()).map(|x| x as f32);
 
@@ -158,6 +178,48 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         tie_word_embeddings: g("tie_word_embeddings")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        native: false,
+    })
+}
+
+/// The essentials of a native layout's `params.json`. The text model is the llama family's:
+/// that is what the vendor's own release of a decoder-only model is.
+fn parse_params_json(text: &str) -> Result<AwqConfigJson> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
+    let need = |k: &str| u(k).ok_or_else(|| anyhow!("params.json: missing {k}"));
+    if v.get("moe").is_some() {
+        return Err(anyhow!(
+            "params.json: a mixture-of-experts native layout is not read"
+        ));
+    }
+    let n_head = need("n_heads")?;
+    Ok(AwqConfigJson {
+        hf_arch: String::new(),
+        gguf_arch: "llama".to_string(),
+        hidden_size: need("dim")?,
+        n_layers: need("n_layers")?,
+        n_head,
+        n_kv_head: u("n_kv_heads").unwrap_or(n_head),
+        head_dim: u("head_dim"),
+        intermediate_size: need("hidden_dim")?,
+        vocab_size: need("vocab_size")?,
+        rope_theta: v
+            .get("rope_theta")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(10000.0) as f32,
+        rms_norm_eps: v.get("norm_eps").and_then(|x| x.as_f64()).unwrap_or(1e-5) as f32,
+        sliding_window: None,
+        group_size: 128,
+        awq_bits: 4,
+        yarn: None,
+        frequency_scaling: None,
+        quantized: v.get("quantization").is_some(),
+        tie_word_embeddings: v
+            .get("tied_embeddings")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        native: true,
     })
 }
 
@@ -314,10 +376,92 @@ pub fn frequency_factors(head_dim: usize, base: f32, scaling: (f32, f32, f32, f3
         .collect()
 }
 
+/// The weight files of a checkpoint directory, by layout. The framework's layout is a
+/// `config.json` and the shards its index names (every `*.safetensors` but a native one when
+/// there is no index); a vendor's native layout is a `params.json` and `consolidated*.safetensors`.
+/// A directory holding both is read in the framework's layout. The error names what the
+/// directory lacks of each.
+pub fn checkpoint_shards(dir: &std::path::Path) -> Result<(bool, Vec<String>)> {
+    let safetensors: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| anyhow!("{}: {e}", dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let is_native_shard = |p: &String| {
+        std::path::Path::new(p)
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("consolidated"))
+    };
+    let has_config = dir.join("config.json").is_file();
+    let mut framework: Vec<String> = safetensors
+        .iter()
+        .filter(|p| !is_native_shard(p))
+        .cloned()
+        .collect();
+    let mut native: Vec<String> = safetensors.into_iter().filter(is_native_shard).collect();
+    let has_params = dir.join("params.json").is_file();
+    if has_config && !framework.is_empty() {
+        if let Some(listed) = indexed_shards(dir) {
+            framework.retain(|p| listed.iter().any(|l| p.ends_with(l.as_str())));
+        }
+        framework.sort();
+        return Ok((false, framework));
+    }
+    if has_params && !native.is_empty() {
+        native.sort();
+        return Ok((true, native));
+    }
+    let lacks = |what: &[(bool, &str)]| {
+        what.iter()
+            .filter(|(present, _)| !present)
+            .map(|(_, n)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(anyhow!(
+        "{}: no loadable checkpoint layout. Framework layout lacks: {}. Native layout lacks: {}",
+        dir.display(),
+        lacks(&[
+            (has_config, "config.json"),
+            (!framework.is_empty(), "numbered *.safetensors shards"),
+        ]),
+        lacks(&[
+            (has_params, "params.json"),
+            (!native.is_empty(), "consolidated*.safetensors"),
+        ]),
+    ))
+}
+
+/// The file names a framework layout's `model.safetensors.index.json` lists, `None` when there
+/// is no index.
+fn indexed_shards(dir: &std::path::Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).ok()?;
+    let index: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut files: Vec<String> = index
+        .get("weight_map")?
+        .as_object()?
+        .values()
+        .filter_map(|f| f.as_str().map(str::to_string))
+        .collect();
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
 /// A checkpoint directory of dense floating-point weights this loader reads: no
-/// quantisation, a supported text architecture, and the layers' tensors in its shards.
+/// quantisation, a supported text architecture (a `config.json`'s `architectures`, or a
+/// native layout's `params.json`), and weight files for one of the two layouts.
 pub fn find_dense_model_dir(candidate: &str) -> Option<String> {
     let dir = std::path::Path::new(candidate);
+    let (native, _) = checkpoint_shards(dir).ok()?;
+    if native {
+        return parse_config_json(candidate)
+            .ok()
+            .filter(|c| !c.quantized)
+            .map(|_| candidate.to_string());
+    }
     let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
     if v.get("quantization_config").is_some() {
@@ -325,9 +469,104 @@ pub fn find_dense_model_dir(candidate: &str) -> Option<String> {
     }
     let arch = v.get("architectures")?.get(0)?.as_str()?;
     map_hf_arch(arch).ok()?;
-    let has_shard = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .any(|e| e.path().extension().is_some_and(|x| x == "safetensors"));
-    has_shard.then(|| candidate.to_string())
+    Some(candidate.to_string())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const COMPOSITE: &str = r#"{"architectures": ["VoxtralForConditionalGeneration"],
+        "hidden_size": 24, "vocab_size": 100,
+        "text_config": {"hidden_size": 24, "intermediate_size": 48, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+            "rope_theta": 1000000.0, "rms_norm_eps": 1e-5, "vocab_size": 100}}"#;
+    const NATIVE: &str = r#"{"dim": 24, "n_layers": 2, "head_dim": 8, "hidden_dim": 48,
+        "n_heads": 4, "n_kv_heads": 2, "rope_theta": 1000000.0, "norm_eps": 1e-5,
+        "vocab_size": 100}"#;
+
+    fn directory(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("loken-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, text) in files {
+            std::fs::write(dir.join(file), text).unwrap();
+        }
+        dir
+    }
+
+    /// The composite model's text fields are read from its `text_config`, the native
+    /// layout's from `params.json`; both describe the same text model.
+    #[test]
+    fn both_layouts_describe_the_same_text_model() {
+        let framework = directory("fw-config", &[("config.json", COMPOSITE)]);
+        let native = directory("native-config", &[("params.json", NATIVE)]);
+        let a = parse_config_json(framework.to_str().unwrap()).unwrap();
+        let b = parse_config_json(native.to_str().unwrap()).unwrap();
+        for d in [&framework, &native] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        assert!(!a.native && b.native);
+        assert_eq!(
+            (a.hidden_size, a.n_layers, a.n_head, a.n_kv_head, a.head_dim),
+            (b.hidden_size, b.n_layers, b.n_head, b.n_kv_head, b.head_dim)
+        );
+        assert_eq!(
+            (a.intermediate_size, a.vocab_size, a.rope_theta, a.gguf_arch),
+            (b.intermediate_size, b.vocab_size, b.rope_theta, b.gguf_arch)
+        );
+    }
+
+    /// Both layouts in one directory are read in the framework's, and only the shards its
+    /// index names; a directory of one layout is read in that one.
+    #[test]
+    fn the_layout_is_told_by_the_files() {
+        let both = directory(
+            "both-layouts",
+            &[
+                ("config.json", COMPOSITE),
+                ("params.json", NATIVE),
+                ("consolidated.safetensors", ""),
+                ("model-00001-of-00002.safetensors", ""),
+                ("model-00002-of-00002.safetensors", ""),
+                (
+                    "model.safetensors.index.json",
+                    r#"{"weight_map": {"a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors"}}"#,
+                ),
+            ],
+        );
+        let (native, shards) = checkpoint_shards(&both).unwrap();
+        assert!(!native);
+        assert_eq!(shards.len(), 2);
+        assert!(shards.iter().all(|s| s.contains("model-0000")));
+        std::fs::remove_file(both.join("config.json")).unwrap();
+        let (native, shards) = checkpoint_shards(&both).unwrap();
+        assert!(native && shards.len() == 1);
+        let _ = std::fs::remove_dir_all(&both);
+
+        let only = directory(
+            "native-only",
+            &[("params.json", NATIVE), ("consolidated.safetensors", "")],
+        );
+        let (native, shards) = checkpoint_shards(&only).unwrap();
+        assert!(native && shards.len() == 1);
+        assert!(find_dense_model_dir(only.to_str().unwrap()).is_some());
+        let _ = std::fs::remove_dir_all(&only);
+    }
+
+    /// A directory that is neither layout is refused with what each layout lacks.
+    #[test]
+    fn a_refusal_names_what_is_missing() {
+        let dir = directory("no-layout", &[("params.json", NATIVE)]);
+        let message = checkpoint_shards(&dir).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(message.contains("config.json"), "{message}");
+        assert!(
+            message.contains("numbered *.safetensors shards"),
+            "{message}"
+        );
+        assert!(message.contains("consolidated*.safetensors"), "{message}");
+        assert!(!message.contains("lacks: params.json"), "{message}");
+    }
 }
