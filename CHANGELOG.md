@@ -71,6 +71,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Bench: keep the store in bench/store, outside the server's configuration.
 
 ### Fixed
+- Memory: keep host budgets inside a container or service memory cap.
 
 - Chat: count a prompt restored from the state cache as already read.
 - Chat: keep a long prompt whole when the client allows a huge reply.

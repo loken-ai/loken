@@ -10,7 +10,54 @@ fn available_host_ram_bytes() -> u64 {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.available_memory()
+    let host = sys.available_memory();
+    // Under a memory cap (a container, a systemd unit) the process dies at the cap, not at the
+    // host's memory: what the cap leaves, less what the group holds, bounds what it may take.
+    match memory_cap() {
+        Some((limit, held)) => host.min(limit.saturating_sub(held)),
+        None => host,
+    }
+}
+
+/// The tightest memory limit on this process, looking from its own cgroup up to the root, and
+/// the anonymous memory the group that sets it holds. Page cache is left out: it is given back
+/// under pressure. `None` when no level sets a limit.
+fn memory_cap() -> Option<(u64, u64)> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let mut dir = root.join(cgroup_path(&own)?.trim_start_matches('/'));
+    let mut tightest: Option<(u64, u64)> = None;
+    loop {
+        let limit = std::fs::read_to_string(dir.join("memory.max"))
+            .ok()
+            .and_then(|s| parse_limit(&s));
+        if let Some(limit) = limit.filter(|l| tightest.is_none_or(|(t, _)| *l < t)) {
+            let held = std::fs::read_to_string(dir.join("memory.stat"))
+                .ok()
+                .and_then(|s| anonymous_bytes(&s))
+                .unwrap_or(0);
+            tightest = Some((limit, held));
+        }
+        if dir == root || !dir.pop() {
+            return tightest;
+        }
+    }
+}
+
+/// The cgroup path of a process in the unified hierarchy, from `/proc/<pid>/cgroup`.
+fn cgroup_path(proc_cgroup: &str) -> Option<&str> {
+    proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))
+}
+
+/// A `memory.max` value: bytes, `None` for `max` (no limit).
+fn parse_limit(text: &str) -> Option<u64> {
+    text.trim().parse().ok()
+}
+
+/// The `anon` line of a `memory.stat`.
+fn anonymous_bytes(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix("anon ")?.trim().parse().ok())
 }
 
 /// Safety headroom subtracted from `available_host_ram_bytes()` when budgeting the CPU spill.
@@ -30,7 +77,11 @@ fn host_ram_safety_headroom_bytes() -> u64 {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.total_memory() / 4
+    let total = match memory_cap() {
+        Some((limit, _)) => sys.total_memory().min(limit),
+        None => sys.total_memory(),
+    };
+    total / 4
 }
 
 /// What a component may take on the host right now without pushing the machine into
@@ -1890,5 +1941,25 @@ mod reserve_double_subtraction_gate {
              pass 0 there, and say so:\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_cap_tests {
+    use super::*;
+
+    #[test]
+    fn the_cap_is_read_from_the_cgroup_files() {
+        let own = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.service\n";
+        assert_eq!(
+            cgroup_path(own),
+            Some("/user.slice/user-1000.slice/user@1000.service/app.slice/x.service")
+        );
+        assert_eq!(cgroup_path("12:cpu:/a\n"), None);
+        assert_eq!(parse_limit("60129542144\n"), Some(60129542144));
+        assert_eq!(parse_limit("max\n"), None);
+        let stat = "anon 7340032\nfile 1048576\nkernel 4096\n";
+        assert_eq!(anonymous_bytes(stat), Some(7340032));
+        assert_eq!(anonymous_bytes("file 1\n"), None);
     }
 }
