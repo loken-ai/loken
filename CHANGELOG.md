@@ -71,6 +71,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Bench: keep the store in bench/store, outside the server's configuration.
 
 ### Fixed
+- Chat: give back cached states when the host memory runs short.
 - Chat: save a decoded state without copying it in memory.
 - Memory: keep host budgets inside a container or service memory cap.
 

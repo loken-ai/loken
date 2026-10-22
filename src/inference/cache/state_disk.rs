@@ -718,6 +718,7 @@ impl StateStore {
         let mut written = 0u64;
         if let Some(limit) = self.limit(self.held_bytes()) {
             if manifest.len() as u64 > limit {
+                self.relieve();
                 tracing::info!(
                     "state cache: a {} MiB manifest exceeds the {} MiB budget; not stored",
                     manifest.len() >> 20,
@@ -837,6 +838,25 @@ impl StateStore {
             }
         }
         Ok(())
+    }
+
+    /// Drop every state and return the bytes that held. A store in host memory is registered
+    /// with the host-memory registry through this, so any consumer short of memory can empty it.
+    pub fn release_all(&self) -> u64 {
+        let held = self.held_bytes();
+        let entries: Vec<Entry> = self.lock().entries.values().cloned().collect();
+        for e in entries {
+            self.unlink(&self.path_of(&e));
+            self.drop_entry(&e.key);
+        }
+        held
+    }
+
+    /// Give back what the store holds beyond its limit now. A store in host memory calls this
+    /// before a request takes the memory it needs, since its limit follows what the machine has
+    /// free and falls when other work takes it.
+    pub fn relieve(&self) {
+        self.evict(&Key::default());
     }
 
     /// Drop manifests, least recently used first and pinned ones last, until the manifests and the
@@ -1084,6 +1104,20 @@ mod tests {
         assert_eq!(store.stats().0, 1);
         assert_eq!(store.block_count(), 3);
         assert!(!store.dir().exists(), "a store in memory has no directory");
+    }
+
+    /// A consumer short of host memory empties a store in memory through the registry's hook.
+    #[test]
+    fn releasing_a_store_in_memory_gives_back_everything_it_held() {
+        let store = StateStore::in_memory(1 << 20, 8);
+        let t = seq(64, 5);
+        put(&store, &t, 24, b"m1");
+        put(&store, &t, 61, b"m3");
+        let held = store.stats().1;
+        assert!(held > 0);
+        assert_eq!(store.release_all(), held);
+        assert_eq!(store.stats(), (0, 0));
+        assert_eq!(store.block_count(), 0);
     }
 
     #[test]

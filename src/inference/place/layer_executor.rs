@@ -91,6 +91,17 @@ pub fn host_spill_budget_bytes() -> u64 {
     available_host_ram_bytes().saturating_sub(host_ram_safety_headroom_bytes())
 }
 
+/// Make `needed` bytes of host memory available to a consumer about to take them: when the
+/// budget is short, the registered host caches are emptied, biggest estimate first. Returns the
+/// bytes they gave back.
+pub fn make_host_room(needed: u64) -> u64 {
+    let have = host_spill_budget_bytes();
+    if have >= needed {
+        return 0;
+    }
+    super::vram_manager::reclaim_host_ram(needed - have)
+}
+
 // LayerExecutor (stub) removed - the module's real value is the
 // DeviceKind / DevicePlan / HeteroPlan / HeteroSegment types and
 // the create_causal_mask helper, all of which are used widely. The

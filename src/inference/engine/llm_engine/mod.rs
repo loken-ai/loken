@@ -1370,9 +1370,18 @@ fn open_state_cache(
     // that begins with one seen in this process's life skips prefilling it, and nothing is
     // written.
     let Some(dir) = config.state_cache_dir.as_ref() else {
-        return Some(Arc::new(
-            crate::inference::cache::state_disk::StateStore::in_memory(budget, 0),
+        let store = Arc::new(crate::inference::cache::state_disk::StateStore::in_memory(
+            budget, 0,
         ));
+        // A state is recomputable, so it is the first thing a consumer short of host memory
+        // takes back: the estimate puts it ahead of every other registered cache.
+        let weak = Arc::downgrade(&store);
+        crate::inference::place::vram_manager::register_host_cache(
+            "state-cache",
+            u64::MAX,
+            Box::new(move || weak.upgrade().map_or(0, |s| s.release_all())),
+        );
+        return Some(store);
     };
     match crate::inference::cache::state_disk::StateStore::open(
         std::path::PathBuf::from(dir),

@@ -218,6 +218,12 @@ impl StateCache {
                 return Ok((Tensor::from_vec(l, (1, n), &Device::Cpu)?, from));
             }
         }
+        // What the restore needed is read; the cache gives back what the prefill will need, the
+        // next state it writes being as large as the largest written so far.
+        self.store.relieve();
+        crate::inference::place::layer_executor::make_host_room(
+            self.store.tuning().get().largest_state,
+        );
         let grid = self.grid_points(from, ids.len());
         let started = std::time::Instant::now();
         let (out, windows) = if from == 0 {
