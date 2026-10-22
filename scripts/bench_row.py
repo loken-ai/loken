@@ -189,7 +189,7 @@ def arch_of(tag):
 def looks_looping(text):
     """A loop that emits no whitespace, which the harness's gate cannot see.
 
-    Every check in assay's `looks_degenerate` splits on whitespace first, so a 128-token
+    Every check in lokprof's `looks_degenerate` splits on whitespace first, so a 128-token
     answer that is one enormous word - "arousingerser_er_er_er...", "misterer/misterer/" -
     has fewer than twelve units and is declared fine. Both engines produced exactly that on
     gemma4:26b and both passed.

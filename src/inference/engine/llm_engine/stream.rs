@@ -286,7 +286,7 @@ impl LlmEngine {
         // chunk. compute_ns measures forward+sample work only,
         // EXCLUDING stream_token's tokenizer decode and the blocking_send
         // back-pressure - matches Ollama's eval_duration semantics so
-        // assay computes comparable tok/s in stream mode.
+        // lokprof computes comparable tok/s in stream mode.
         let stream_stats_slot = self.stream_stats_slot();
         // Spec-decode: capture the drafter engine + a runtime Handle. The stream
         // decode runs on a raw std::thread with NO tokio context, so the lazy drafter
@@ -3053,7 +3053,7 @@ impl LlmEngine {
                 compute_ns += t.elapsed().as_nanos() as u64;
             }
             // Publish compute-only timing for the HTTP handler. The
-            // stream final NDJSON chunk uses these so assay computes
+            // stream final NDJSON chunk uses these so lokprof computes
             // tok/s symmetrically with Ollama's kernel-only eval_duration.
             let total_duration_ns = stream_start.elapsed().as_nanos() as u64;
             let prompt_eval_duration_ns = match prefill_end {

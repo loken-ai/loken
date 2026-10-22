@@ -191,7 +191,7 @@ impl LoadedModelState {
 /// The language inference engine
 /// Engine-pure timing of the most recent completed stream. Used by
 /// `/api/generate` stream handler to emit accurate `eval_duration` in
-/// the final NDJSON chunk so assay can compute decode tok/s
+/// the final NDJSON chunk so lokprof can compute decode tok/s
 /// symmetrically with Ollama.
 ///
 /// `eval_duration_ns` measures only the compute work (forward + sample)

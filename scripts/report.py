@@ -5,7 +5,7 @@
     report.py file results/*.json     # file records into the store, then regenerate
     report.py learn docs/BENCHMARKS.md  # record which model sits in which family section
 
-The store (bench/store in this tree, filled by assay/scripts/store.py) holds every run
+The store (bench/store in this tree, filled by lokprof/scripts/store.py) holds every run
 once. This groups the runs by `hardware_id` and writes one page per group with the report's
 usual table. Nothing in a page is typed: the
 hardware block comes from the records, the dates from their timestamps, the builds from what
@@ -17,8 +17,8 @@ on disk keeps the family it was last seen under (`architectures.tsv` in the stor
 import json, pathlib, re, sys, tomllib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-# The record schema and the hardware identity belong to assay, the tool that writes the records.
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent / "assay" / "scripts"))
+# The record schema and the hardware identity belong to lokprof, the tool that writes the records.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent / "lokprof" / "scripts"))
 import bench_row as B
 import classes as C
 import hardware as H

@@ -70,7 +70,7 @@ export MODELS_DIR="$OLLAMA_STORE"
 # loken's /api/tags entries carry, per model, `capabilities` (model_capabilities: completion, tts,
 # asr, txt2img/img2img, music, ...) and `details.format` ("gguf" for an ollama-source model,
 # "safetensors" for a huggingface-source one - set at models.rs:71-81 from the model's source). Both
-# are read from THERE, never guessed from the name: the modality picks assay's clock, the format says
+# are read from THERE, never guessed from the name: the modality picks lokprof's clock, the format says
 # which peer engine can load the weights (gguf->ollama, safetensors->vLLM; loken serves both).
 # Emits "name<TAB>modality<TAB>format" per model.
 loken_models() {
@@ -85,17 +85,17 @@ def modality(caps):
     if "asr" in caps: return "asr"
     if "completion" in caps: return "text"
     if not caps: return "unserved"   # listed from the store, no engine in this build serves it
-    return sorted(caps)[0]           # embedding, video, midi...: no assay clock, an error cell
+    return sorted(caps)[0]           # embedding, video, midi...: no lokprof clock, an error cell
 for m in json.load(sys.stdin).get("models", []):
     fmt = (m.get("details") or {}).get("format") or ""
     print(m["name"] + "\t" + modality(m.get("capabilities")) + "\t" + fmt)
 ' 2>/dev/null
 }
 
-# The engines that can serve one cell, and how assay must run it, from the modality and the format.
+# The engines that can serve one cell, and how lokprof must run it, from the modality and the format.
 # One rule, no name heuristic, no curated peer list: the format loken declares says which peer can
 # load the weights; the modality says which clock and whether a peer speaks that endpoint at all.
-# Emits "engines<TAB>assay-modality<TAB>vllm-serve<TAB>error" (error non-empty => an error cell).
+# Emits "engines<TAB>lokprof-modality<TAB>vllm-serve<TAB>error" (error non-empty => an error cell).
 plan_cell() { # plan_cell <model> <modality> <format>
     local m="$1" mod="$2" fmt="$3"
     local engines="loken" amod="$mod" vserve="" err=""
@@ -120,7 +120,7 @@ plan_cell() { # plan_cell <model> <modality> <format>
             fi ;;
         unserved)
             err="not served by loken: it declares no capability" ;;
-        *)  err="no assay measurement for the '$mod' capability" ;;
+        *)  err="no lokprof measurement for the '$mod' capability" ;;
     esac
     # "|" separates the fields, not a tab: a tab is IFS whitespace, so an empty middle field (an
     # empty vLLM target) would collapse and shift the error into the wrong column. No field holds a

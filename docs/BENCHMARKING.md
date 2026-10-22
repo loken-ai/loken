@@ -9,11 +9,11 @@ A campaign compares loken against ollama and vLLM on the models loken serves, ac
 context, prompt, streaming and device, files every run in the store and writes the pages under
 `docs/benchmarks/`. Two layers:
 
-- **assay** (`../assay`) is the measurement tool. It benches one model against one engine and emits
+- **lokprof** (`../lokprof`) is the measurement tool. It benches one model against one engine and emits
   a result JSON. It measures every modality natively - text, vision, image generation, TTS, ASR -
   selected with `--modality`; it never guesses the modality from a model name.
 - **`scripts/bench`** is the driver. It reads the inputs from their single sources, provisions the
-  peer engines, drives assay through the isolation protocol, and regenerates the report.
+  peer engines, drives lokprof through the isolation protocol, and regenerates the report.
 
 Nothing about a campaign is retyped or maintained by hand:
 
@@ -48,14 +48,14 @@ other environment.
 
 ## Where results live
 
-Every run is a record of the assay schema, filed once in the store under the hash of its content
-(`runs/<run_id>.json`, written by `assay/scripts/store.py`). A rerun is a new file; nothing is
+Every run is a record of the lokprof schema, filed once in the store under the hash of its content
+(`runs/<run_id>.json`, written by `lokprof/scripts/store.py`). A rerun is a new file; nothing is
 overwritten, and a result file in `results/` is only the campaign's scratch copy. The store sits
 in `bench/store/`, out of git; the server's configuration does not name it.
 
 ```mermaid
 flowchart LR
-    D["scripts/bench"] --> A["assay: one record per run"]
+    D["scripts/bench"] --> A["lokprof: one record per run"]
     A -->|"host_id, hardware_id"| S[("store: runs/ by content hash")]
     O["old report or replay record"] -->|"convert-archive, ingest-benchrec, operator attestation"| S
     S --> R["scripts/report.py"]
@@ -63,7 +63,7 @@ flowchart LR
     R --> I["BENCHMARKS.md index"]
 ```
 
-A record also names the backend loken answered on: `assay` asks the server for the devices it
+A record also names the backend loken answered on: `lokprof` asks the server for the devices it
 detected (`/api/distributed/devices`) and the report takes the available non-CPU types, `cuda` for
 now. A server that does not answer, ollama and vLLM included, is `unstated`, never `cpu`. The same
 card through two backends is two pages.
@@ -81,7 +81,7 @@ scripts/report.py file results/*.json  # file records first
 ```
 
 A record taken before the runner described its machine can be attested by an operator
-(`assay/scripts/convert-archive.py --attest-machine`); the page says so. A record without a
+(`lokprof/scripts/convert-archive.py --attest-machine`); the page says so. A record without a
 machine is kept and tabled nowhere.
 
 ## AMD cards
@@ -97,7 +97,7 @@ GPU_VENDOR=amd LOKEN_BIN=<rocm build>/lokend scripts/bench run
 ## Modalities
 
 Each model is measured by the clock its modality warrants; the driver picks the modality from what
-loken declares and passes `--modality` to assay:
+loken declares and passes `--modality` to lokprof:
 
 | modality | endpoint | headline metric | gate |
 |---|---|---|---|
@@ -114,7 +114,7 @@ the checkpoint declares.
 
 A model loken lists but cannot measure is an **error cell**, visible in the report - never a
 silent skip. The reason says which side lacks it: a model no engine of this build serves (it
-declares no capability), or a capability assay has no clock for (embedding, video, midi).
+declares no capability), or a capability lokprof has no clock for (embedding, video, midi).
 
 ## What the driver guards (and why)
 
@@ -126,7 +126,7 @@ declares no capability), or a capability assay has no clock for (embedding, vide
 - **Peer presence** - a vLLM peer checkpoint absent from the cache is caught before vLLM is asked to
   serve it, so a campaign never downloads gigabytes mid-run.
 - **Thermal floor / one engine at a time** - the isolation protocol lives in
-  `../assay/scripts/fair-run.sh`: peers' processes are killed, cards return to an idle floor, and
+  `../lokprof/scripts/fair-run.sh`: peers' processes are killed, cards return to an idle floor, and
   each engine is measured alone. The driver does not reimplement it.
 
 ## The whole matrix

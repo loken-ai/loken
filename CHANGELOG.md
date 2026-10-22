@@ -53,6 +53,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Bench: find the measurement tool under its new name lokprof.
 - Cache: write every cache file in one binary format.
 - Chat: write the state cache index less often.
 - Scripts: take the vLLM environment from the caller.
@@ -76,7 +77,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Bench: sweep the whole matrix with FULL=1, one fair-run per prompt, in place of campaign.sh.
 - Whisper: transcribe with half-precision weights and a reserved decoder cache.
 - Placement: shrink a context nobody asked for until the cards hold a tensor split.
-- Bench: say in an error cell whether loken or assay lacks the model.
+- Bench: say in an error cell whether loken or lokprof lacks the model.
 - Bench: keep the store in bench/store, outside the server's configuration.
 
 ### Fixed

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Moved: the protocol now ships with the tool it drives, at assay/scripts/fair-run.sh, so a
+# Moved: the protocol now ships with the tool it drives, at lokprof/scripts/fair-run.sh, so a
 # third party can replay a fair comparison from that repository alone. Keeping a second copy
 # here is how the two drift - this is a shim, not an implementation.
 #
@@ -8,8 +8,8 @@
 # ollama itself reads) in your environment if they are not in the default location. A path
 # that is true on one machine does not belong in a file everyone gets.
 exec env \
-    ASSAY="${ASSAY:-../assay/target/release/assay}" \
+    LOKPROF="${LOKPROF:-../lokprof/target/release/lokprof}" \
     LOKEN_BIN="${LOKEN_BIN:-target/release/lokend}" \
     ${MODELS_DIR:+MODELS_DIR="$MODELS_DIR"} \
     ${OLLAMA_MODELS:+MODELS_DIR="$OLLAMA_MODELS"} \
-    ../assay/scripts/fair-run.sh "$@"
+    ../lokprof/scripts/fair-run.sh "$@"

@@ -37,7 +37,7 @@ The discipline that came out of nine months of this:
 | `scripts/figures.py` | Regenerates the table in `STATUS.md` and the figures from one parse of `BENCHMARKS.md`, because the two pages once disagreed. |
 | `scripts/determinism.py` | The same prompt repeated, and a diff of the answers. |
 | `src/inference/place/layer_perf.rs`, `src/energy.rs` | The per-layer timers of lesson 5, and the joules: host RAPL and card NVML summed over the request window. |
-| [assay](https://github.com/loken-ai/assay) | The bench tool: drives each engine through its own API, separates prefill from decode, records energy beside speed, makes the engines comparable before comparing them. |
+| [lokprof](https://github.com/loken-ai/lokprof) | The bench tool: drives each engine through its own API, separates prefill from decode, records energy beside speed, makes the engines comparable before comparing them. |
 
 ## What was measured
 
@@ -87,7 +87,7 @@ submission is quarantined until reproduced.
 One cell with the bench tool, against the daemon, three iterations:
 
 ```sh
-assay --loken http://localhost:11435 --models qwen3:0.6b --num-ctx 4096 \
+lokprof --loken http://localhost:11435 --models qwen3:0.6b --num-ctx 4096 \
       --prompts short --stream
 ```
 

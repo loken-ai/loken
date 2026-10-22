@@ -20,7 +20,7 @@
 //! CPU/DRAM energy without running the bench as root, grant read on the
 //! powercap counters, e.g.:
 //!
-//!   sudo setcap cap_dac_read_search+ep ./assay           # not reliable for sysfs
+//!   sudo setcap cap_dac_read_search+ep ./lokprof           # not reliable for sysfs
 //!   # or, more robustly, a udev rule / one-shot chmod:
 //!   sudo chmod -R a+r /sys/class/powercap/intel-rapl:*/energy_uj
 //!   # (resets on reboot; for persistence add a tmpfiles.d/udev rule)

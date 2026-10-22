@@ -22,7 +22,7 @@ Planned, or Waiting (for the hardware to measure it on).
 | A Linux binary | Packaging | One Linux archive runs on the CPU anywhere; a second one adds the CUDA libraries. | Done |
 | CPU kernels chosen at run time | CPU | One binary picks AVX2 or AVX-512 on the machine it runs on. | Done |
 | Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on one and two cards. | Partial |
-| A coding agent on large models | Agents | verve finishes a multi-step task on Qwen3.8 and DeepSeek V4.1. | Done |
+| A coding agent on large models | Agents | lokode finishes a multi-step task on Qwen3.8 and DeepSeek V4.1. | Done |
 | A faster test suite | Tests | The tests a change must pass run in a fraction of the old time. | Done |
 
 ## 0.4.0
@@ -35,7 +35,7 @@ Major, by priority:
 | Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Done |
 | A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card, at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, in decode and in prompt reading. | Started |
 | Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
-| Coding agents beyond verve | Agents | opencode, Claude Code and Cline finish the verve task on Qwen3.8 and DeepSeek V4.1. | Done |
+| Coding agents beyond lokode | Agents | opencode, Claude Code and Cline finish the lokode task on Qwen3.8 and DeepSeek V4.1. | Done |
 | Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
 | Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
 | Load every format a model ships in | Models | Every model loads from each format its publisher ships, GGUF and safetensors in the Hugging Face and the native layouts, through the same placement as the others, checked by one loading test per architecture. | Started |
