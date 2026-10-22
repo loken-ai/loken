@@ -43,8 +43,8 @@ pub type Key = [u8; 16];
 const SUFFIX: &str = "snap";
 const BLOCK_SUFFIX: &str = "blk";
 const BLOCK_DIR: &str = "blocks";
-const INDEX_FILE: &str = "index.json";
-const GEOMETRY_FILE: &str = "geometry.json";
+const INDEX_FILE: &str = "index.bin";
+const GEOMETRY_FILE: &str = "geometry.bin";
 const TMP_PREFIX: &str = ".tmp-";
 const MANIFEST_MAGIC: &[u8; 8] = b"LKSMAN01";
 /// Starts a block file that is stored compressed: the magic, the original length on 8 bytes, then
@@ -70,10 +70,71 @@ pub struct Entry {
     pub blocks: Vec<Key>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct IndexFile {
-    /// Key (hex) to `[last_used, hits]`.
-    uses: HashMap<String, (u64, u64)>,
+/// Starts the index file: the magic, then one 32-byte record per snapshot, its key, the time it
+/// was last used and the times it was used.
+const INDEX_MAGIC: &[u8; 8] = b"LKSIDX01";
+/// Starts the geometry file: the magic, then one 40-byte record per scope, its hash and the
+/// block size in tokens.
+const GEOMETRY_MAGIC: &[u8; 8] = b"LKSGEO01";
+
+/// How often and how recently each snapshot was used, which orders the evictions.
+fn encode_index(uses: &HashMap<Key, (u64, u64)>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + uses.len() * 32);
+    out.extend_from_slice(INDEX_MAGIC);
+    for (key, (last_used, hits)) in uses {
+        out.extend_from_slice(key);
+        out.extend_from_slice(&last_used.to_le_bytes());
+        out.extend_from_slice(&hits.to_le_bytes());
+    }
+    out
+}
+
+fn decode_index(bytes: &[u8]) -> Option<HashMap<Key, (u64, u64)>> {
+    let body = bytes.strip_prefix(INDEX_MAGIC.as_slice())?;
+    if body.len() % 32 != 0 {
+        return None;
+    }
+    Some(
+        body.chunks_exact(32)
+            .map(|r| {
+                (
+                    r[..16].try_into().unwrap(),
+                    (
+                        u64::from_le_bytes(r[16..24].try_into().unwrap()),
+                        u64::from_le_bytes(r[24..32].try_into().unwrap()),
+                    ),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn encode_geometry(geometry: &HashMap<[u8; 32], usize>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + geometry.len() * 40);
+    out.extend_from_slice(GEOMETRY_MAGIC);
+    for (scope, tokens) in geometry {
+        out.extend_from_slice(scope);
+        out.extend_from_slice(&(*tokens as u64).to_le_bytes());
+    }
+    out
+}
+
+fn decode_geometry(bytes: &[u8]) -> Option<HashMap<[u8; 32], usize>> {
+    let body = bytes.strip_prefix(GEOMETRY_MAGIC.as_slice())?;
+    if body.len() % 40 != 0 {
+        return None;
+    }
+    Some(
+        body.chunks_exact(40)
+            .map(|r| {
+                (
+                    r[..32].try_into().unwrap(),
+                    u64::from_le_bytes(r[32..40].try_into().unwrap()) as usize,
+                )
+            })
+            .filter(|(_, v)| *v > 0)
+            .collect(),
+    )
 }
 
 struct Inner {
@@ -101,6 +162,17 @@ pub struct StateStore {
     /// Bytes of writes waiting, and the turn they take on the disk one at a time.
     pending: Arc<AtomicU64>,
     turn: Arc<Mutex<()>>,
+    /// Uses recorded in memory that the index file does not hold yet. A use only orders the
+    /// evictions, so it is written with the next change and when the store closes, not on every read.
+    uses_dirty: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        if self.memory.is_none() && self.uses_dirty.load(Ordering::Relaxed) {
+            self.save_index();
+        }
+    }
 }
 
 /// A write admitted to the queue. Dropping it releases its bytes.
@@ -151,17 +223,6 @@ fn short(digest: impl AsRef<[u8]>) -> Key {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
 }
 
 fn unhex(s: &str) -> Option<Key> {
@@ -346,12 +407,12 @@ impl StateStore {
     pub fn open(dir: PathBuf, budget: u64, block_tokens: usize) -> Result<Self> {
         use std::io::Read;
         std::fs::create_dir_all(dir.join(BLOCK_DIR)).with_context(|| dir.display().to_string())?;
-        let index: IndexFile = match std::fs::read(dir.join(INDEX_FILE)) {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                tracing::warn!("state cache: index unreadable ({e}); rebuilt from the file names");
-                IndexFile::default()
+        let uses = match std::fs::read(dir.join(INDEX_FILE)) {
+            Ok(b) => decode_index(&b).unwrap_or_else(|| {
+                tracing::warn!("state cache: index unreadable; rebuilt from the file names");
+                HashMap::new()
             }),
-            Err(_) => IndexFile::default(),
+            Err(_) => HashMap::new(),
         };
         let mut block_bytes: HashMap<Key, u64> = HashMap::new();
         for item in std::fs::read_dir(dir.join(BLOCK_DIR))? {
@@ -414,7 +475,7 @@ impl StateStore {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
-            let (last_used, hits) = index.uses.get(&hex(&key)).copied().unwrap_or((mtime, 0));
+            let (last_used, hits) = uses.get(&key).copied().unwrap_or((mtime, 0));
             for b in &blocks {
                 *refs.entry(*b).or_default() += 1;
             }
@@ -444,13 +505,7 @@ impl StateStore {
         });
         let geometry: HashMap<[u8; 32], usize> = std::fs::read(dir.join(GEOMETRY_FILE))
             .ok()
-            .and_then(|b| serde_json::from_slice::<HashMap<String, usize>>(&b).ok())
-            .map(|m| {
-                m.into_iter()
-                    .filter_map(|(k, v)| Some((unhex32(&k)?, v)))
-                    .filter(|(_, v)| *v > 0)
-                    .collect()
-            })
+            .and_then(|b| decode_geometry(&b))
             .unwrap_or_default();
         Ok(Self {
             dir,
@@ -467,6 +522,7 @@ impl StateStore {
             tuning: Default::default(),
             pending: Arc::new(AtomicU64::new(0)),
             turn: Arc::new(Mutex::new(())),
+            uses_dirty: Default::default(),
         })
     }
 
@@ -489,6 +545,7 @@ impl StateStore {
             tuning: Default::default(),
             pending: Arc::new(AtomicU64::new(0)),
             turn: Arc::new(Mutex::new(())),
+            uses_dirty: Default::default(),
         }
     }
 
@@ -557,18 +614,12 @@ impl StateStore {
             return b;
         }
         let b = derive(self).max(1);
-        let json = {
+        let bytes = {
             let mut g = self.geometry.lock().unwrap_or_else(|e| e.into_inner());
             g.insert(*scope, b);
-            serde_json::to_vec(
-                &g.iter()
-                    .map(|(k, v)| (hex(k), *v))
-                    .collect::<HashMap<String, usize>>(),
-            )
+            encode_geometry(&g)
         };
-        if let Ok(json) = json {
-            let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &json, false);
-        }
+        let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &bytes, false);
         b
     }
 
@@ -697,7 +748,7 @@ impl StateStore {
                         e.hits += 1;
                     }
                 }
-                self.save_index();
+                self.uses_dirty.store(true, Ordering::Relaxed);
                 Ok(bytes)
             }
             Err(e) => {
@@ -995,20 +1046,15 @@ impl StateStore {
     }
 
     fn save_index(&self) {
-        let index = IndexFile {
-            uses: self
-                .lock()
-                .entries
-                .values()
-                .map(|e| (hex(&e.key), (e.last_used, e.hits)))
-                .collect(),
-        };
-        let Ok(json) = serde_json::to_vec(&index) else {
-            return;
-        };
-        let _ = self.write_file(&self.dir.join(INDEX_FILE), &json, false);
+        self.uses_dirty.store(false, Ordering::Relaxed);
+        let uses: HashMap<Key, (u64, u64)> = self
+            .lock()
+            .entries
+            .values()
+            .map(|e| (e.key, (e.last_used, e.hits)))
+            .collect();
+        let _ = self.write_file(&self.dir.join(INDEX_FILE), &encode_index(&uses), false);
     }
-
     /// Snapshots held and the bytes they and their blocks take.
     pub fn stats(&self) -> (usize, u64) {
         let g = self.lock();
@@ -1233,6 +1279,31 @@ mod tests {
         assert!(store.stats().1 < (few.len() + noise.len()) as u64);
     }
 
+    /// The index and the geometry are compact binary files that read back what they hold, and a
+    /// use recorded by a read survives closing the store.
+    #[test]
+    fn the_index_and_the_geometry_are_binary_and_survive_a_reopen() {
+        let uses: HashMap<Key, (u64, u64)> = [([7u8; 16], (5, 2)), ([9u8; 16], (8, 0))].into();
+        assert_eq!(decode_index(&encode_index(&uses)), Some(uses));
+        assert_eq!(decode_index(b"{\"uses\":{}}"), None);
+        let geo: HashMap<[u8; 32], usize> = [([3u8; 32], 64)].into();
+        assert_eq!(decode_geometry(&encode_geometry(&geo)), Some(geo));
+
+        let d = dir("reopen");
+        let t = seq(64, 5);
+        {
+            let store = StateStore::open(d.clone(), 0, 8).unwrap();
+            put(&store, &t, 24, b"m1");
+            let keys = store.keys(&SCOPE, &t);
+            let e = store.candidates(&keys, 64).remove(0);
+            store.read(&e).unwrap();
+        }
+        let store = StateStore::open(d, 0, 8).unwrap();
+        let keys = store.keys(&SCOPE, &t);
+        assert_eq!(store.candidates(&keys, 64).remove(0).hits, 1);
+        assert!(store.dir().join(INDEX_FILE).exists());
+    }
+
     #[test]
     fn snapshots_of_one_conversation_store_their_shared_blocks_once() {
         let d = dir("shared");
@@ -1397,7 +1468,7 @@ mod tests {
             let p = item.unwrap().path();
             text.push_str(&p.file_name().unwrap().to_string_lossy());
             if p.file_name().is_some_and(|n| n == INDEX_FILE) {
-                text.push_str(&std::fs::read_to_string(&p).unwrap());
+                text.push_str(&String::from_utf8_lossy(&std::fs::read(&p).unwrap()));
             }
         }
         for tok in &t {

@@ -568,7 +568,7 @@ fn a_derived_block_size_is_the_same_after_a_restart() {
         let cache = m.state_cache().unwrap();
         let block = cache.layout().block_tokens;
         assert!(block >= 1);
-        assert!(dir.join("geometry.json").exists());
+        assert!(dir.join("geometry.bin").exists());
         // A prompt of two blocks and a little, as far as the model's own context allows.
         let tokens = prompt((2 * block + 10).min(3000));
         if tokens.len() >= 2 * block {

@@ -49,6 +49,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Cache: write every cache file in one binary format.
+- Chat: write the state cache index less often.
 - Scripts: take the vLLM environment from the caller.
 - Bench: keep the engines it installs inside the repository's results folder.
 - ROCm: launch fewer kernels per decoded token, and take split-K attention for MHA models.
