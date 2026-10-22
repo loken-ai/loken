@@ -245,8 +245,9 @@ impl StateCache {
     }
 
     /// Write `state`, which stands after `tokens`, and the grid states a prefill passed on the
-    /// way. Encoding and writing run on their own thread over a copy, so the request is not held
-    /// for them. A state shorter than one block is not worth a file.
+    /// way. The blocks the store lacks are encoded here and written on their own thread, so the
+    /// request is not held for the disk and no copy of the state is made. A state shorter than
+    /// one block is not worth a file.
     fn save(
         &self,
         model: &DeepseekV41Model,
@@ -261,66 +262,77 @@ impl StateCache {
         }
         let m = self.store.tuning().get();
         let estimate = m.largest_state.max(m.manifest_bytes) * (grid.len() as u64 + 1);
+        // A store with no room keeps nothing, so nothing is encoded for it.
+        let room = self.store.room();
+        if room == 0 || m.manifest_bytes > room {
+            tracing::info!("state cache: a write is skipped, there is no room for it");
+            return;
+        }
         let Some(ticket) = self.store.admit(estimate, prefill_secs) else {
             tracing::info!("state cache: a write is skipped, the disk is still behind");
             return;
         };
-        let this = self.clone();
-        let (state, tokens) = (state.clone(), tokens.to_vec());
-        let grid: Vec<_> = grid
-            .into_iter()
-            .map(|(p, w)| (p, w, model.engram_after(&tokens[..p])))
+        // Everything that reads `state` runs here, and only the blocks the store lacks are
+        // encoded, so the writer thread holds those bytes and no copy of the state.
+        let layout = self.layout();
+        if let Err(why) = block_shape(state, &layout) {
+            tracing::info!("state cache: states are kept whole, not in blocks: {why}");
+        }
+        let keys = self.store.keys(&self.identity, tokens);
+        let mut points = Vec::new();
+        for (p, windows) in grid {
+            let point = GridPoint {
+                pos: p,
+                windows: &windows,
+                engram: model.engram_after(&tokens[..p]),
+            };
+            match encode_grid_manifest(state, &point, &self.identity, &layout) {
+                Some((manifest, nb)) => points.push((p, manifest, nb)),
+                None => tracing::info!(
+                    "state cache: no state kept at token {p}: the final state cannot be cut at that block boundary"
+                ),
+            }
+        }
+        let (manifest, nblocks) =
+            encode_manifest(state, logits.as_deref(), &self.identity, Some(&layout));
+        let top = points.iter().map(|x| x.2).max().unwrap_or(0).max(nblocks);
+        let mut blocks: std::collections::HashMap<usize, Vec<u8>> = (0..top)
+            .filter(|&b| !self.store.has_block(&keys, b))
+            .map(|b| (b, encode_block(state, b, &layout)))
             .collect();
+        let this = self.clone();
+        let tokens = tokens.to_vec();
         std::thread::spawn(move || {
             ticket.run(|| {
-            let layout = this.layout();
-            if let Err(why) = block_shape(&state, &layout) {
-                tracing::info!("state cache: states are kept whole, not in blocks: {why}");
-            }
-            let keys = this.store.keys(&this.identity, &tokens);
-            // The states the prefill passed, at block boundaries, so any prompt that shares a
-            // prefix with this one restores at the last of them it shares.
-            let mut kept = 0;
-            for (p, windows, engram) in grid {
-                let point = GridPoint {
-                    pos: p,
-                    windows: &windows,
-                    engram,
-                };
-                let Some((manifest, nb)) =
-                    encode_grid_manifest(&state, &point, &this.identity, &layout)
-                else {
-                    tracing::info!(
-                        "state cache: no state kept at token {p}: the final state cannot be cut at that block boundary"
-                    );
-                    continue;
-                };
-                match this.store.put(&keys, p, &manifest, nb, |b| {
-                    encode_block(&state, b, &layout)
-                }) {
-                    Ok(()) => kept += 1,
-                    Err(e) => tracing::warn!("state cache: not stored at {p}: {e}"),
+                let keys = this.store.keys(&this.identity, &tokens);
+                // The states the prefill passed, at block boundaries, so any prompt that shares
+                // a prefix with this one restores at the last of them it shares.
+                let mut kept = 0;
+                for (p, manifest, nb) in points {
+                    match this.store.put(&keys, p, &manifest, nb, |b| {
+                        blocks.remove(&b).unwrap_or_default()
+                    }) {
+                        Ok(()) => kept += 1,
+                        Err(e) => tracing::warn!("state cache: not stored at {p}: {e}"),
+                    }
                 }
-            }
-            if kept > 0 {
-                tracing::info!("state cache: kept {kept} states on the block grid");
-            }
-            let (manifest, nblocks) =
-                encode_manifest(&state, logits.as_deref(), &this.identity, Some(&layout));
-            let put = this
-                .store
-                .put(&keys, tokens.len(), &manifest, nblocks, |b| {
-                    encode_block(&state, b, &layout)
-                });
-            match put {
-                Ok(()) => tracing::info!(
-                    "state cache: stored a {}-token state ({} KiB manifest, {nblocks} blocks)",
-                    tokens.len(),
-                    manifest.len() >> 10
-                ),
-                Err(e) => tracing::warn!("state cache: not stored: {e}"),
-            }
-        })
+                if kept > 0 {
+                    tracing::info!("state cache: kept {kept} states on the block grid");
+                }
+                let put = this
+                    .store
+                    .put(&keys, tokens.len(), &manifest, nblocks, |b| {
+                        blocks.remove(&b).unwrap_or_default()
+                    });
+                match put {
+                    Ok(()) => tracing::info!(
+                        "state cache: stored a {}-token state ({} KiB manifest, {nblocks} blocks)",
+                        tokens.len(),
+                        manifest.len() >> 10
+                    ),
+                    Err(e) => tracing::warn!("state cache: not stored: {e}"),
+                }
+            })
         });
     }
 }

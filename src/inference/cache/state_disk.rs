@@ -572,6 +572,12 @@ impl StateStore {
         })
     }
 
+    /// Whether block `b` of the sequence `keys` hashes is held already.
+    pub fn has_block(&self, keys: &PrefixKeys, b: usize) -> bool {
+        keys.block_hash(b)
+            .is_some_and(|h| self.lock().block_bytes.contains_key(&h))
+    }
+
     /// The hashes of `tokens` under `scope`.
     pub fn keys<'a>(&self, scope: &[u8; 32], tokens: &'a [u32]) -> PrefixKeys<'a> {
         PrefixKeys::new(scope, self.block_tokens_of(scope), tokens)
@@ -758,6 +764,10 @@ impl StateStore {
                 continue;
             }
             let bytes = block(b);
+            if bytes.is_empty() {
+                release(self);
+                return Err(anyhow!("state cache: block {b} is not available"));
+            }
             if let Err(e) = self.write_file(&self.block_path(h), &bytes) {
                 release(self);
                 return Err(e);
