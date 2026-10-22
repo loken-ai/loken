@@ -42,7 +42,7 @@ step: it monopolizes the machine for hours.
 
 The campaign measures against the *current* ollama and vLLM, installed into a compartment that is
 the bench's alone - never your `~/vllm` venv or whatever `ollama` is on `PATH`. They live under the
-bench working tree (`~/bench-logs/engines/`), a fresh vLLM venv and a versioned ollama, and their
+bench working tree (`results/engines/` of the repository), a fresh vLLM venv and a versioned ollama, and their
 versions are recorded in the run record. Isolated so the comparison is reproducible and touches no
 other environment.
 

@@ -49,6 +49,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Bench: keep the engines it installs inside the repository's results folder.
 - ROCm: launch fewer kernels per decoded token, and take split-K attention for MHA models.
 - Serve: keep a losing prompt lookup waiting across requests.
 - ROCm: split the MoE router gemv across more blocks.

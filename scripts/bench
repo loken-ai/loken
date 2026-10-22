@@ -235,7 +235,7 @@ plan() {
 provision() {
     have uv || die "uv is required to provision the vLLM venv"
     have tar || die "tar is required to provision ollama"
-    local comp="$HOME/bench-logs/engines"
+    local comp="$LOKEN/results/engines"
     mkdir -p "$comp"
     local venv="$comp/vllm-venv"
     # The download cache stays in the compartment too, on the same disk as the venv it feeds.
