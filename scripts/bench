@@ -148,7 +148,7 @@ write_error_cell() { # write_error_cell <model> <reason> <out> <stamp>
 import json, sys, datetime
 model, reason, out, stamp = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 doc = {
-    "schema": "assay/2",
+    "schema": "loken/2",
     "engine_build": stamp,
     "timestamp": datetime.datetime.now().astimezone().isoformat(),
     "results": [{

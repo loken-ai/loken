@@ -53,6 +53,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Bench: write the records under the loken schema.
 - Bench: find the measurement tool under its new name lokprof.
 - Cache: write every cache file in one binary format.
 - Chat: write the state cache index less often.

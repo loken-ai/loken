@@ -33,7 +33,7 @@ Major, by priority:
 |---|---|---|---|
 | One binary for NVIDIA and AMD cards | Backends | One binary uses NVIDIA and AMD cards at the same time, and one model can run across both. | Done |
 | Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Done |
-| A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card, at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, in decode and in prompt reading. | Started |
+| A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card and answers as the host does, in decode and in prompt reading. | Done |
 | Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
 | Coding agents beyond lokode | Agents | opencode, Claude Code and Cline finish the lokode task on Qwen3.8 and DeepSeek V4.1. | Done |
 | Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
@@ -46,10 +46,8 @@ Smaller, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | AVX-512 host kernels for the IQ formats | CPU | IQ2_S, IQ3_XXS and IQ4_NL experts run faster with AVX-512 than with AVX2 on the same machine. | Done |
-| The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU, faster than on its CPU. | Partial |
+| The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU and answer as the CPU does. | Partial |
 | A routing profile kept per model | Performance | After a restart, a model's expert cache is already warm, with no setting needed. | Done |
-| Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
-| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
 | Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcribe a 20-clip set as well as the reference implementation. | Done |
 | Ultravox on its own | Audio | An Ultravox checkpoint answers audio with no extra GGUF beside it. | Done |
 | Media input limits | API | A request with too many images, pixels or audio seconds gets a 400 that names the limit. | Done |
@@ -58,6 +56,17 @@ Smaller, by priority:
 | Generated audio as mp3 and flac | Audio | Generated audio comes back as wav, mp3 or flac, as asked. | Done |
 | MIDI at the tempo asked | Music | A MIDI render has the tempo the request asks for. | Done |
 | Audio models in half precision | Audio | Stable Audio, EzAudio and ACE-Step keep their weights in F16, and Stable Audio fits in 2.5 GB. | Done |
+
+## 0.4.x
+
+What finishes or speeds up what 0.4.0 ships working, released as 0.4.1, 0.4.2 and so on:
+
+| Feature | Category | Done when | State |
+|---|---|---|---|
+| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for one model of each family. | Planned |
+| Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Planned |
+| OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
+| Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
 
 ## 0.5.0
 
@@ -70,6 +79,8 @@ Major, by priority:
 | Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Planned |
 | DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on two 16 GB cards and the host | Planned |
 | Experts chosen across quantised files | Performance | One model served from two GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10 % of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
+| Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
+| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
 
 Smaller, by priority:
 
