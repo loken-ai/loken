@@ -2200,6 +2200,7 @@ dependencies = [
  "validator",
  "walkdir",
  "which",
+ "zstd",
 ]
 
 [[package]]

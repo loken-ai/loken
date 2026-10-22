@@ -76,6 +76,9 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "fla
 # treats ratios > 2.4 as a hallucination signal.
 flate2 = "1.0"
 
+# Compression of the decode-state blocks a state cache writes to disk.
+zstd = "0.13"
+
 # GPU management - NVML for NVIDIA GPU support
 nvml-wrapper = "0.12"
 

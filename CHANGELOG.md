@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Chat: store the decode states a cache writes to disk compressed.
 - Serve: reuse the whole prompt when the same prompt comes back.
 - Voxtral: load the Hugging Face safetensors checkpoint in both layouts.
 - Audio: transcribe with Voxtral on the transcription route, in its own mode.

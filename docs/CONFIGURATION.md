@@ -116,6 +116,10 @@ V4.1 prompt costs one pass over the routed experts, read from disk; this cache s
 decode state after a prompt and after each finished turn, so a later prompt that begins with the
 same tokens restores it and prefills only the rest.
 
+On disk, each block of state is stored compressed when that makes it clearly smaller, and read
+back whole; a block that does not compress is stored as it is, and a store in memory is never
+compressed. Files hold floating-point state and token ids, no text, but they are not encrypted.
+
 The same keys open the same store for a generic-route model that carries a recurrent state beside
 its KV (a convolution, state-space or delta-rule mixer interleaved with attention). Such a state
 cannot be cut back to a shorter prefix, so no prefix of an earlier prompt can be reused by trimming

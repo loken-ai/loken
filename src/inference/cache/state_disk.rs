@@ -47,6 +47,13 @@ const INDEX_FILE: &str = "index.json";
 const GEOMETRY_FILE: &str = "geometry.json";
 const TMP_PREFIX: &str = ".tmp-";
 const MANIFEST_MAGIC: &[u8; 8] = b"LKSMAN01";
+/// Starts a block file that is stored compressed: the magic, the original length on 8 bytes, then
+/// the zstd frame of the block with its bytes regrouped by position in each 4-byte word.
+const PACKED_MAGIC: &[u8; 8] = b"LKZSTD01";
+/// A block smaller than this is stored as it is: the saving would not be worth a frame.
+const PACK_MIN_BYTES: usize = 4096;
+/// A block is stored compressed only when it comes out below this share of its size.
+const PACK_MAX_SHARE: f64 = 0.9;
 
 /// One stored snapshot: its manifest file and the blocks it references.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +264,64 @@ fn parse_name(name: &str) -> Option<(usize, u64, Key)> {
 }
 
 /// The blocks a manifest file names, from its header, and where the caller's payload starts.
+/// `bytes` with the bytes at each position of a 4-byte word gathered together, which gives a
+/// compressor long runs when the words are floats that carry few distinct values. A tail shorter
+/// than a word stays as it is.
+fn shuffle4(bytes: &[u8]) -> Vec<u8> {
+    let words = bytes.len() / 4;
+    let mut out = vec![0u8; bytes.len()];
+    for (i, w) in bytes.chunks_exact(4).enumerate() {
+        for (k, b) in w.iter().enumerate() {
+            out[k * words + i] = *b;
+        }
+    }
+    out[words * 4..].copy_from_slice(&bytes[words * 4..]);
+    out
+}
+
+/// The inverse of [`shuffle4`].
+fn unshuffle4(bytes: &[u8]) -> Vec<u8> {
+    let words = bytes.len() / 4;
+    let mut out = vec![0u8; bytes.len()];
+    for i in 0..words {
+        for k in 0..4 {
+            out[i * 4 + k] = bytes[k * words + i];
+        }
+    }
+    out[words * 4..].copy_from_slice(&bytes[words * 4..]);
+    out
+}
+
+/// What a block is written as: compressed when that saves enough, else as it is.
+fn pack(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < PACK_MIN_BYTES {
+        return None;
+    }
+    let body = zstd::bulk::compress(&shuffle4(bytes), 1).ok()?;
+    if (body.len() + 16) as f64 > bytes.len() as f64 * PACK_MAX_SHARE {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() + 16);
+    out.extend_from_slice(PACKED_MAGIC);
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+/// The block a file holds, whether it was stored compressed or not.
+fn unpack(file: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    if file.len() < 16 || &file[..8] != PACKED_MAGIC {
+        return Ok(file);
+    }
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let len = u64::from_le_bytes(file[8..16].try_into().unwrap()) as usize;
+    let shuffled = zstd::bulk::decompress(&file[16..], len).map_err(|e| bad(&e.to_string()))?;
+    if shuffled.len() != len {
+        return Err(bad("packed block has the wrong length"));
+    }
+    Ok(unshuffle4(&shuffled))
+}
+
 fn read_header(bytes: &[u8]) -> Option<(Vec<Key>, usize)> {
     if bytes.len() < 12 || &bytes[..8] != MANIFEST_MAGIC {
         return None;
@@ -441,7 +506,7 @@ impl StateStore {
                 .get(path)
                 .map(|b| b.as_ref().clone())
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)),
-            None => std::fs::read(path),
+            None => std::fs::read(path).and_then(unpack),
         }
     }
 
@@ -502,7 +567,7 @@ impl StateStore {
             )
         };
         if let Ok(json) = json {
-            let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &json);
+            let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &json, false);
         }
         b
     }
@@ -769,12 +834,15 @@ impl StateStore {
                 release(self);
                 return Err(anyhow!("state cache: block {b} is not available"));
             }
-            if let Err(e) = self.write_file(&self.block_path(h), &bytes) {
-                release(self);
-                return Err(e);
-            }
-            written += bytes.len() as u64;
-            self.lock().block_bytes.insert(*h, bytes.len() as u64);
+            let stored = match self.write_file(&self.block_path(h), &bytes, true) {
+                Ok(n) => n,
+                Err(e) => {
+                    release(self);
+                    return Err(e);
+                }
+            };
+            written += stored;
+            self.lock().block_bytes.insert(*h, stored);
         }
         let mut file = Vec::with_capacity(12 + hashes.len() * 16 + manifest.len());
         file.extend_from_slice(MANIFEST_MAGIC);
@@ -783,7 +851,7 @@ impl StateStore {
             file.extend_from_slice(h);
         }
         file.extend_from_slice(manifest);
-        let entry = Entry {
+        let mut entry = Entry {
             key,
             len,
             family,
@@ -792,11 +860,14 @@ impl StateStore {
             hits: 0,
             blocks: hashes.clone(),
         };
-        if let Err(e) = self.write_file(&self.path_of(&entry), &file) {
-            release(self);
-            return Err(e);
+        match self.write_file(&self.path_of(&entry), &file, false) {
+            Ok(n) => entry.bytes = n,
+            Err(e) => {
+                release(self);
+                return Err(e);
+            }
         }
-        written += file.len() as u64;
+        written += entry.bytes;
         let whole = file.len() as u64 + {
             let g = self.lock();
             hashes
@@ -814,14 +885,18 @@ impl StateStore {
     }
 
     /// `bytes` in a new file at `path`: written beside it, synced, renamed in.
-    fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+    /// Write `bytes` to `path` and return the bytes the file takes: a block (`pack`) is stored
+    /// compressed on disk when that saves enough; a store in memory keeps what it is given.
+    fn write_file(&self, path: &Path, bytes: &[u8], pack_it: bool) -> Result<u64> {
         if let Some(files) = &self.memory {
             files
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(path.to_path_buf(), Arc::new(bytes.to_vec()));
-            return Ok(());
+            return Ok(bytes.len() as u64);
         }
+        let packed = if pack_it { pack(bytes) } else { None };
+        let bytes = packed.as_deref().unwrap_or(bytes);
         let tmp = self.dir.join(format!(
             "{TMP_PREFIX}{}-{}",
             std::process::id(),
@@ -837,7 +912,7 @@ impl StateStore {
                 let _ = d.sync_all();
             }
         }
-        Ok(())
+        Ok(bytes.len() as u64)
     }
 
     /// Drop every state and return the bytes that held. A store in host memory is registered
@@ -931,7 +1006,7 @@ impl StateStore {
         let Ok(json) = serde_json::to_vec(&index) else {
             return;
         };
-        let _ = self.write_file(&self.dir.join(INDEX_FILE), &json);
+        let _ = self.write_file(&self.dir.join(INDEX_FILE), &json, false);
     }
 
     /// Snapshots held and the bytes they and their blocks take.
@@ -1118,6 +1193,44 @@ mod tests {
         assert_eq!(store.release_all(), held);
         assert_eq!(store.stats(), (0, 0));
         assert_eq!(store.block_count(), 0);
+    }
+
+    /// A block of floats with few distinct values is written smaller than it is, and reads back
+    /// as it was; a block that does not compress is written as it is.
+    #[test]
+    fn a_block_is_stored_compressed_when_that_saves_and_reads_back_whole() {
+        let d = dir("packed");
+        let store = StateStore::open(d.clone(), 0, 8).unwrap();
+        let t = seq(16, 5);
+        let keys = store.keys(&SCOPE, &t);
+        let few: Vec<u8> = (0..8192u32)
+            .flat_map(|i| ((i % 7) as f32 * 0.5).to_le_bytes())
+            .collect();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..32768)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        store
+            .put(&keys, 16, b"m", 2, |b| {
+                if b == 0 {
+                    few.clone()
+                } else {
+                    noise.clone()
+                }
+            })
+            .unwrap();
+        let e = store.candidates(&keys, 16).remove(0);
+        assert_eq!(store.read_block(&e.blocks[0]).unwrap(), few);
+        assert_eq!(store.read_block(&e.blocks[1]).unwrap(), noise);
+        let size = |h| std::fs::metadata(store.block_path(h)).unwrap().len();
+        assert!(size(&e.blocks[0]) < few.len() as u64 / 4);
+        assert_eq!(size(&e.blocks[1]), noise.len() as u64);
+        assert!(store.stats().1 < (few.len() + noise.len()) as u64);
     }
 
     #[test]
