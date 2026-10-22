@@ -8,6 +8,8 @@
 //! Without the `vulkan` feature the set is always empty.
 
 use super::*;
+#[cfg(feature = "vulkan")]
+use crate::tensor::quantized::GgmlDType;
 
 /// A tensor of the file, as stored: its format, rows, columns and bytes.
 #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
@@ -125,6 +127,12 @@ impl VulkanLayers {
             .collect()
     }
 
+    /// The stack of the first Vulkan segment, for a test to drive.
+    #[cfg(all(test, feature = "vulkan"))]
+    pub(crate) fn stack_mut(&mut self) -> &mut crate::inference::kernel::vulkan::VulkanStack {
+        &mut self.segments[0].stack
+    }
+
     /// Forgets the logits of an earlier step.
     pub(crate) fn clear_logits(&mut self) {
         #[cfg(feature = "vulkan")]
@@ -193,6 +201,24 @@ impl VulkanLayers {
     }
 }
 
+/// Whether the experts of a layer need more than a softmax router over silu-gated experts
+/// held as one stack each of gate, up and down.
+#[cfg(feature = "vulkan")]
+fn unsupported_experts(m: &super::moe_weights::MoeWeights) -> bool {
+    m.sigmoid_routing.is_some()
+        || m.shared_expert.is_some()
+        || m.up_relu2
+        || m.gelu
+        || m.swiglu_clamp.is_some()
+        || m.gate_inp_bias.is_some()
+        || m.gate_exps_bias.is_some()
+        || m.down_exps_scale.is_some()
+        || m.local.is_some()
+        || !m.router_prenormed
+        || !m.shards.is_empty()
+        || m.n_experts > 256
+}
+
 /// Why the stack cannot run this model's layers, or `None` when it can.
 #[cfg(feature = "vulkan")]
 fn refusal(
@@ -201,16 +227,13 @@ fn refusal(
 ) -> Option<String> {
     let c = config;
     let f = &c.flags;
-    let checks: [(bool, &str); 18] = [
-        (f.is_moe, "a mixture of experts"),
+    let checks: [(bool, &str); 14] = [
         (f.fused_qkv, "a fused QKV projection"),
         (
             f.fused_ffn_gate_up || f.is_phi2_simple_ffn,
             "a fused or gate-less FFN",
         ),
-        (f.use_gelu, "a GELU FFN"),
         (f.layer_norm_with_bias, "LayerNorm"),
-        (f.has_post_attn_norm || f.has_post_ffn_norm, "post norms"),
         (f.parallel_attn, "parallel attention"),
         (f.has_attn_sinks, "attention sinks"),
         (f.value_rms_norm, "normalised values"),
@@ -218,7 +241,6 @@ fn refusal(
             f.has_attn_output_bias || f.has_ffn_bias,
             "output or FFN biases",
         ),
-        (c.sliding_window.is_some(), "a sliding window"),
         (c.attn_logit_softcapping.is_some(), "attention softcapping"),
         (c.residual_scale.is_some(), "a residual scale"),
         (c.shared_kv_layers > 0, "shared KV layers"),
@@ -236,9 +258,15 @@ fn refusal(
     for l in layers {
         let shape = [
             (!l.attends(), "a recurrent layer"),
-            (l.moe.is_some(), "routed experts"),
+            (
+                l.moe.as_ref().is_some_and(unsupported_experts),
+                "routed experts of a kind the Vulkan layers do not run",
+            ),
             (l.ffn_norm.is_none(), "a layer without an FFN norm"),
-            (l.rope_freq_factors.is_some(), "RoPE frequency factors"),
+            (
+                l.rope_freq_factors.is_some() != layers[0].rope_freq_factors.is_some(),
+                "RoPE frequency factors on some layers only",
+            ),
             (l.attn_v_norm_ones.is_some(), "normalised values"),
             (
                 !matches!(l.attn_norm, super::config::WeightedNorm::Rms(_)),
@@ -264,7 +292,7 @@ fn build_stack(
     head_norm: Option<&Tensor>,
 ) -> anyhow::Result<crate::inference::kernel::vulkan::VulkanStack> {
     use crate::inference::kernel::vulkan::stack::{
-        runs_format, DenseSpec, LayerTensors, RawTensor,
+        runs_format, DenseSpec, FfnTensors, LayerTensors, RawTensor,
     };
     if let Some(why) = refusal(config, layers) {
         anyhow::bail!("the Vulkan layers do not run {why}");
@@ -295,7 +323,7 @@ fn build_stack(
         .rope_dim
         .filter(|&d| d > 0 && d < config.head_dim)
         .unwrap_or(config.head_dim);
-    let spec = DenseSpec {
+    let mut spec = DenseSpec {
         hidden: config.embedding_length,
         n_head: config.n_head,
         n_kv: config.n_kv_head,
@@ -308,6 +336,20 @@ fn build_stack(
             .attention_scale
             .unwrap_or_else(|| 1.0 / (config.head_dim as f64).sqrt()) as f32,
         ctx: config.effective_max_context(),
+        gelu: config.flags.use_gelu,
+        experts: layers
+            .iter()
+            .find_map(|l| l.moe.as_ref())
+            .map_or(0, |m| m.n_experts),
+        used: layers
+            .iter()
+            .find_map(|l| l.moe.as_ref())
+            .map_or(0, |m| m.n_experts_used),
+        expert_ffn: 0,
+        norm_topk: layers
+            .iter()
+            .find_map(|l| l.moe.as_ref())
+            .is_some_and(|m| m.norm_topk),
     };
     let mut tensors = Vec::with_capacity(layers.len());
     for (i, l) in layers.iter().enumerate() {
@@ -319,14 +361,47 @@ fn build_stack(
         let bias = |b: &Option<Tensor>| -> anyhow::Result<Option<Vec<f32>>> {
             b.as_ref().map(host).transpose()
         };
-        let ffn = raw(format!("{p}.ffn_gate.weight"))?;
-        if ffn.rows != spec.ffn {
-            anyhow::bail!(
-                "{p}: an FFN of {} rows, the config says {}",
-                ffn.rows,
-                spec.ffn
-            );
-        }
+        let ffn = match &l.moe {
+            Some(m) => {
+                let (dtype, rows, cols, bytes) = read(&format!("{p}.ffn_gate_inp.weight"))?
+                    .ok_or_else(|| anyhow::anyhow!("missing the router of {p}"))?;
+                if rows != m.n_experts || cols != spec.hidden {
+                    anyhow::bail!("{p}: a router of {rows}x{cols}");
+                }
+                let router = match dtype {
+                    GgmlDType::F32 => bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect(),
+                    GgmlDType::F16 => bytes
+                        .chunks_exact(2)
+                        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                        .collect(),
+                    other => anyhow::bail!("{p}: a router in {}", other.gguf_name()),
+                };
+                FfnTensors::Experts {
+                    router,
+                    gate: raw(format!("{p}.ffn_gate_exps.weight"))?,
+                    up: raw(format!("{p}.ffn_up_exps.weight"))?,
+                    down: raw(format!("{p}.ffn_down_exps.weight"))?,
+                }
+            }
+            None => {
+                let gate = raw(format!("{p}.ffn_gate.weight"))?;
+                if gate.rows != spec.ffn {
+                    anyhow::bail!(
+                        "{p}: an FFN of {} rows, the config says {}",
+                        gate.rows,
+                        spec.ffn
+                    );
+                }
+                FfnTensors::Dense {
+                    gate,
+                    up: raw(format!("{p}.ffn_up.weight"))?,
+                    down: raw(format!("{p}.ffn_down.weight"))?,
+                }
+            }
+        };
         tensors.push(LayerTensors {
             attn_norm: host(l.attn_norm.weight())?,
             q: raw(format!("{p}.attn_q.weight"))?,
@@ -344,20 +419,44 @@ fn build_stack(
                     .ok_or_else(|| anyhow::anyhow!("{p}: no FFN norm"))?
                     .weight(),
             )?,
-            gate: ffn,
-            up: raw(format!("{p}.ffn_up.weight"))?,
-            down: raw(format!("{p}.ffn_down.weight"))?,
+            ffn,
+            post_attn_norm: norm_of(&l.post_attn_norm)?,
+            post_ffn_norm: norm_of(&l.post_ffn_norm)?,
+            window: l.sliding_window.unwrap_or(0),
+            prefill_window: l.prefill_mask_window.unwrap_or(0),
+            rope: 0,
         });
     }
+    // The width of an expert is the columns of its down projection.
+    spec.expert_ffn = tensors
+        .iter()
+        .find_map(|t| match &t.ffn {
+            FfnTensors::Experts { down, .. } => Some(down.cols),
+            FfnTensors::Dense { .. } => None,
+        })
+        .unwrap_or(0);
+    let _ = sin;
+    // The tables the layers rotate by, one for each distinct set of phases.
+    let mut tables: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+    let mut table_of = Vec::with_capacity(layers.len());
+    for l in layers {
+        let (c, s) = l.rope_table().rows(0, cos.dim(0)?, &Device::Cpu)?;
+        let pair = (host(&c.contiguous()?)?, host(&s.contiguous()?)?);
+        let at = match tables.iter().position(|t| *t == pair) {
+            Some(i) => i,
+            None => {
+                tables.push(pair);
+                tables.len() - 1
+            }
+        };
+        table_of.push(at);
+    }
+    for (t, at) in tensors.iter_mut().zip(table_of) {
+        t.rope = at;
+    }
     let half = cos.dim(1)?;
-    let mut stack = crate::inference::kernel::vulkan::VulkanStack::new(
-        device,
-        spec,
-        tensors,
-        &host(cos)?,
-        &host(sin)?,
-        half,
-    )?;
+    let mut stack =
+        crate::inference::kernel::vulkan::VulkanStack::new(device, spec, tensors, &tables, half)?;
     // The head goes with the last layer when the file's projection is in a format the
     // mat-vec reads; otherwise the host keeps it.
     if let Some(norm) = head_norm {

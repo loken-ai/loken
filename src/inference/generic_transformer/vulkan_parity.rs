@@ -82,13 +82,20 @@ impl Fixture {
     }
 
     fn build(&self, plan: &HeteroPlan) -> GenericHeteroTransformer {
+        self.try_build(plan).unwrap()
+    }
+
+    fn try_build(
+        &self,
+        plan: &HeteroPlan,
+    ) -> std::result::Result<GenericHeteroTransformer, String> {
         GenericHeteroTransformer::from_gguf(
             self_content(&self.mmap),
             &self.mmap[..],
             &HashMap::new(),
             plan,
         )
-        .unwrap()
+        .map_err(|e| e.to_string())
     }
 
     fn host(&self) -> HeteroPlan {
@@ -334,19 +341,23 @@ fn top2(l: &[f32]) -> (usize, usize) {
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_greedy_text_matches_the_host() {
-    let fx = Fixture::open();
+    greedy_text_matches(TAG, TIE);
+}
+
+fn greedy_text_matches(tag: &str, tie: f32) {
+    let fx = Fixture::open_tag(tag);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
     let prompt = tokenizer.encode(TEXT, false).unwrap().get_ids().to_vec();
     let decode = |t: &[u32]| tokenizer.decode(t, false).unwrap_or_default();
     let (want, host_rate) = greedy(&mut fx.build(&fx.host()), &prompt);
-    println!("{TAG}: host {host_rate:.1} tok/s {:?}", decode(&want));
+    println!("{tag}: host {host_rate:.1} tok/s {:?}", decode(&want));
     for d in crate::inference::kernel::vulkan::devices() {
         let plan = fx.on_vulkan(d.index, fx.n_layers);
         let (got, rate) = greedy(&mut fx.build(&plan), &prompt);
         println!(
-            "{TAG}: vulkan {}: {rate:.1} tok/s {:?}",
+            "{tag}: vulkan {}: {rate:.1} tok/s {:?}",
             d.name,
             decode(&got)
         );
@@ -361,7 +372,7 @@ fn vulkan_greedy_text_matches_the_host() {
             let (v1, _) = top2(&v);
             let margin = h[h1] - h[h2];
             assert!(
-                v1 == h1 || margin < TIE,
+                v1 == h1 || margin < tie,
                 "{}: step {step}: Vulkan picks {v1}, the host {h1} by {margin}",
                 d.name
             );
@@ -385,11 +396,15 @@ fn vulkan_greedy_text_matches_the_host() {
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_long_prompt_matches_the_host() {
-    let fx = Fixture::open();
+    long_prompt_matches(TAG, TIE, 14);
+}
+
+fn long_prompt_matches(tag: &str, tie: f32, repeats: usize) {
+    let fx = Fixture::open_tag(tag);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
-    let text = TEXT.repeat(14);
+    let text = TEXT.repeat(repeats);
     let prompt = tokenizer
         .encode(text.as_str(), false)
         .unwrap()
@@ -407,7 +422,7 @@ fn vulkan_long_prompt_matches_the_host() {
             let (v1, _) = top2(&v);
             let margin = h[h1] - h[h2];
             assert!(
-                v1 == h1 || margin < TIE,
+                v1 == h1 || margin < tie,
                 "{}: step {step} of {} tokens: Vulkan picks {v1}, the host {h1} by {margin}",
                 d.name,
                 prompt.len()
@@ -419,6 +434,161 @@ fn vulkan_long_prompt_matches_the_host() {
         }
         println!("{}: {} tokens: ok", d.name, prompt.len());
     }
+}
+
+/// The rows after the first `layers` layers on every Vulkan device against the host's: the
+/// difference stays within a tenth of what the layers add to the residual.
+fn first_layers_match(tag: &str, layers: usize, tolerance: f32) {
+    let fx = Fixture::open_tag(tag);
+    let prompt = prompt();
+    let mut host = fx.build(&fx.host());
+    let (h, _) = host.embed_stage(&ids(&prompt), 0).unwrap();
+    let (want, _) = host
+        .run_layers_in(h.clone(), None, 0, prompt.len(), 0, layers)
+        .unwrap();
+    let want = host_vec(&want);
+    let embed = host_vec(&h);
+    let change = want
+        .iter()
+        .zip(&embed)
+        .fold(0f32, |m, (w, e)| m.max((w - e).abs()));
+    for d in crate::inference::kernel::vulkan::devices() {
+        let mut m = fx.build(&fx.on_vulkan(d.index, layers));
+        let (got, _) = m
+            .run_layers_in(h.clone(), None, 0, prompt.len(), 0, layers)
+            .unwrap();
+        let err = host_vec(&got)
+            .iter()
+            .zip(&want)
+            .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
+        println!(
+            "{tag} {layers} layers on {}: max error {err:.3e} of a change {change:.3e}",
+            d.name
+        );
+        assert!(err <= tolerance * change, "{}: {err} of {change}", d.name);
+    }
+}
+
+/// The experts' share of the first layer: the rows after attention and after the experts on
+/// Vulkan, against the host's experts fed the rows after attention.
+fn experts_match(tag: &str) {
+    let fx = Fixture::open_tag(tag);
+    let prompt = prompt();
+    let mut host = fx.build(&fx.host());
+    let (h, _) = host.embed_stage(&ids(&prompt), 0).unwrap();
+    let rows = host_vec(&h);
+    let hidden = rows.len() / prompt.len();
+    for d in crate::inference::kernel::vulkan::devices() {
+        let mut m = fx.build(&fx.on_vulkan(d.index, 1));
+        let stack = m.vulkan.stack_mut();
+        let router = stack.first_dispatch(prompt.len(), "router").unwrap();
+        // Stops at the norm that opens the experts' block.
+        stack.stop_after(Some(router - 1));
+        let attended = stack.forward(&rows, 0, 0, 1).unwrap();
+        stack.stop_after(None);
+        let full = stack.forward(&rows, 0, 0, 1).unwrap();
+        let got: Vec<f32> = full.iter().zip(&attended).map(|(f, a)| f - a).collect();
+        let x = Tensor::from_vec(attended, (1, prompt.len(), hidden), &Device::Cpu).unwrap();
+        let layer = &host.layers[0];
+        let normed = match layer.ffn_norm.as_ref().unwrap() {
+            super::config::WeightedNorm::Rms(n) => n.forward(&x).unwrap(),
+            _ => panic!("an RMS norm"),
+        };
+        let want = host_vec(
+            &layer
+                .moe
+                .as_ref()
+                .unwrap()
+                .forward_rows(
+                    &normed,
+                    &x,
+                    layer.embedding_length_for_moe,
+                    layer.ffn_norm_eps,
+                )
+                .unwrap(),
+        );
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let err = want
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (w, g)| m.max((w - g).abs()));
+        println!(
+            "{tag} experts on {}: max error {err:.3e} of {scale:.3e}",
+            d.name
+        );
+        assert!(err <= 0.01 * scale, "{}: {err} of {scale}", d.name);
+    }
+}
+
+/// The other model families: each must give the host's tokens, on a short prompt and on one
+/// that crosses several steps and tiles of keys, where the host's best two tokens are further
+/// apart than `tie` (a model whose logits spread wider has more noise to clear).
+macro_rules! family {
+    ($name:ident, $tag:expr, $tie:expr) => {
+        mod $name {
+            #[test]
+            #[ignore = "needs the model in the store and a Vulkan device"]
+            fn greedy_text() {
+                super::greedy_text_matches($tag, $tie);
+            }
+
+            #[test]
+            #[ignore = "needs the model in the store and a Vulkan device"]
+            fn long_prompt() {
+                super::long_prompt_matches($tag, $tie, 14);
+            }
+
+            #[test]
+            #[ignore = "needs the model in the store and a Vulkan device"]
+            fn first_layer() {
+                super::first_layers_match($tag, 1, 0.1);
+            }
+
+            #[test]
+            #[ignore = "needs the model in the store and a Vulkan device"]
+            fn logit_noise() {
+                super::logit_noise($tag, 1.5, false);
+            }
+        }
+    };
+}
+
+family!(llama, "llama3.2:1b", super::TIE);
+family!(gemma, "gemma3:latest", 2.0);
+
+/// A mixture of experts: where the host's best experts for a token are within rounding of the
+/// next ones, the two pick other experts and the logits part by more than rounding. The
+/// experts, the first layers and the logit spread are what these hold it to.
+mod olmoe {
+    const TAG: &str = "olmoe:latest";
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn experts() {
+        super::experts_match(TAG);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn layers() {
+        super::first_layers_match(TAG, 1, 0.1);
+        for layers in [4, 8] {
+            super::first_layers_match(TAG, layers, 0.01);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn logit_noise() {
+        super::logit_noise(TAG, 2.5, false);
+    }
+}
+
+/// A prompt longer than gemma3's window of 1024 keys: the Vulkan layers mask as the host does.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_gemma_window_matches_the_host() {
+    long_prompt_matches("gemma3:latest", 2.0, 40);
 }
 
 /// Root-mean-square and largest difference of two logit rows.
@@ -433,9 +603,16 @@ fn logit_gap(a: &[f32], b: &[f32]) -> (f64, f32) {
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_logit_noise() {
-    const NOISE_STEPS: usize = 12;
-    const NOISE_LIMIT: f64 = 1.2;
     for tag in [TAG, "qwen3:1.7b"] {
+        logit_noise(tag, 1.2, true);
+    }
+}
+
+/// The logit rms of every Vulkan device (and of CUDA card 0 with `with_cuda`) against the host
+/// over a prompt and a few steps, none above `limit`.
+fn logit_noise(tag: &str, limit: f64, with_cuda: bool) {
+    const NOISE_STEPS: usize = 12;
+    {
         let fx = Fixture::open_tag(tag);
         let tokenizer = crate::inference::engine::llm_engine::build_tokenizer_from_gguf(
             &self_content(&fx.mmap),
@@ -471,19 +648,24 @@ fn vulkan_logit_noise() {
             );
             // The host's own activations are quantised: a faithful backend sits about
             // 0.5 to 0.8 from it on these models, a faulty kernel far beyond.
-            assert!(
-                rms < NOISE_LIMIT,
-                "{tag} {name}: logit rms {rms} from the host"
-            );
+            assert!(rms < limit, "{tag} {name}: logit rms {rms} from the host");
         };
         for d in crate::inference::kernel::vulkan::devices() {
-            run(
-                format!("vulkan {}", d.name),
-                fx.build(&fx.on_vulkan(d.index, fx.n_layers)),
-            );
+            // A device that cannot hold every layer is skipped: the placement would split the
+            // model across devices and the host, which another test covers.
+            match fx.try_build(&fx.on_vulkan(d.index, fx.n_layers)) {
+                Ok(model) => run(format!("vulkan {}", d.name), model),
+                Err(why) if why.contains("out of memory") => {
+                    println!("{tag} vulkan {}: the model does not fit, skipped", d.name)
+                }
+                Err(why) => panic!("{tag} vulkan {}: {why}", d.name),
+            }
         }
         #[cfg(feature = "cuda")]
         {
+            if !with_cuda {
+                return;
+            }
             let cards: HashMap<usize, Device> =
                 [(0, Device::new_cuda(0).unwrap())].into_iter().collect();
             run(
@@ -580,6 +762,8 @@ fn decode_profile(tag: &str) {
 /// Prompt tokens and decode steps of the speed benches.
 const BENCH_PROMPT: usize = 1318;
 const BENCH_STEPS: usize = 64;
+/// Prompt tokens a forward takes, as the server's prefill does.
+const BENCH_CHUNK: usize = 512;
 const BENCH_RUNS: usize = 3;
 
 /// Prompt reading and decode rates of `m`, one line per run.
@@ -589,7 +773,10 @@ fn bench_model(label: &str, m: &mut GenericHeteroTransformer) {
         .collect();
     for run in 0..=BENCH_RUNS {
         let start = std::time::Instant::now();
-        let mut tok = argmax(&m.forward(&ids(&prompt), 0).unwrap());
+        let mut tok = 0;
+        for (i, chunk) in prompt.chunks(BENCH_CHUNK).enumerate() {
+            tok = argmax(&m.forward(&ids(chunk), i * BENCH_CHUNK).unwrap());
+        }
         let read = start.elapsed().as_secs_f64();
         let start = std::time::Instant::now();
         for i in 0..BENCH_STEPS {

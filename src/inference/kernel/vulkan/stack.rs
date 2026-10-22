@@ -18,7 +18,9 @@ pub const MAX_TOKENS: usize = 128;
 pub const MV_TOKENS: usize = 8;
 /// Rows and tokens of a mat-mat workgroup's tile.
 const MM_ROWS: u32 = 64;
-const MM_TOKENS: u32 = 32;
+use super::shaders::MM_TOKENS;
+/// Fewest tokens a step needs to take the cooperative-matrix kernels over the integer ones.
+const COOP_MIN_TOKENS: Option<usize> = Some(33);
 /// Rows of a mat-vec grid's x dimension; the rest go to y.
 const GRID_X: u32 = 32768;
 
@@ -33,6 +35,19 @@ use super::shaders::lanes_per_row;
 fn matvec_groups(kernel: &str, rows: u32, workgroup: u32) -> [u32; 3] {
     let groups = rows.div_ceil(workgroup / lanes_per_row(kernel));
     [groups.min(GRID_X), groups.div_ceil(GRID_X), 1]
+}
+
+/// The mat-mat kernel `w` runs on `tokens` tokens and the rows and tokens its workgroup covers;
+/// none where the mat-vec runs.
+fn mat_mat_for(w: &Matrix, tokens: usize) -> Option<(&'static str, (u32, u32))> {
+    if let (Some(k), Some(min)) = (w.coop_mat, COOP_MIN_TOKENS) {
+        if tokens >= min {
+            return Some((k, (super::coop::ROWS, super::coop::TOKENS)));
+        }
+    }
+    w.mat_mat
+        .filter(|_| tokens > MV_TOKENS)
+        .map(|k| (k, (MM_ROWS, MM_TOKENS)))
 }
 
 /// The shape of the decoder: what every layer of the stack shares.
@@ -51,6 +66,15 @@ pub struct DenseSpec {
     pub attn_scale: f32,
     /// Positions each layer's cache holds.
     pub ctx: usize,
+    /// The FFN's gate is GELU (tanh form) rather than SiLU.
+    pub gelu: bool,
+    /// Experts a routed FFN has, how many a token uses, and the width of one; zero experts for
+    /// a dense stack.
+    pub experts: usize,
+    pub used: usize,
+    pub expert_ffn: usize,
+    /// The chosen experts' weights are scaled to sum to one.
+    pub norm_topk: bool,
 }
 
 /// A weight as the file stores it.
@@ -60,6 +84,23 @@ pub struct RawTensor<'a> {
     pub rows: usize,
     pub cols: usize,
     pub bytes: Cow<'a, [u8]>,
+}
+
+/// The FFN of a layer as the file stores it.
+pub enum FfnTensors<'a> {
+    Dense {
+        gate: RawTensor<'a>,
+        up: RawTensor<'a>,
+        down: RawTensor<'a>,
+    },
+    /// A routed FFN: the router's weights, and each projection's experts stacked, rows of one
+    /// expert after the other.
+    Experts {
+        router: Vec<f32>,
+        gate: RawTensor<'a>,
+        up: RawTensor<'a>,
+        down: RawTensor<'a>,
+    },
 }
 
 /// One layer's tensors, read from the file.
@@ -75,9 +116,16 @@ pub struct LayerTensors<'a> {
     pub k_norm: Option<Vec<f32>>,
     pub o: RawTensor<'a>,
     pub ffn_norm: Vec<f32>,
-    pub gate: RawTensor<'a>,
-    pub up: RawTensor<'a>,
-    pub down: RawTensor<'a>,
+    pub ffn: FfnTensors<'a>,
+    /// Norms that close the attention and the FFN before their outputs join the residual.
+    pub post_attn_norm: Option<Vec<f32>>,
+    pub post_ffn_norm: Option<Vec<f32>>,
+    /// Keys the layer attends to, the last `window` of them, in a step of a few rows and in a
+    /// step of many; 0 for all.
+    pub window: usize,
+    pub prefill_window: usize,
+    /// Which of the stack's RoPE tables the layer rotates by.
+    pub rope: usize,
 }
 
 /// Whether the stack runs mat-vecs of `dtype`.
@@ -93,12 +141,14 @@ struct Matrix {
     kernel: &'static str,
     /// The mat-mat kernel of the format, when it has one.
     mat_mat: Option<&'static str>,
+    /// The cooperative-matrix mat-mat of the format, on a device that runs it.
+    coop_mat: Option<&'static str>,
     rows: usize,
     cols: usize,
 }
 
 impl Matrix {
-    fn upload(ctx: &Arc<Context>, t: &RawTensor) -> anyhow::Result<Self> {
+    fn upload(ctx: &Arc<Context>, t: &RawTensor, coop: bool) -> anyhow::Result<Self> {
         let block = t.dtype.block_size();
         let want = t.rows * t.cols / block * t.dtype.type_size();
         if !t.cols.is_multiple_of(block) || t.bytes.len() != want {
@@ -129,7 +179,9 @@ impl Matrix {
                 ),
                 other => anyhow::bail!("vulkan: no mat-vec for {}", other.gguf_name()),
             };
+        let coop_mat = mat_mat.filter(|_| coop && COOP_MIN_TOKENS.is_some());
         Ok(Self {
+            coop_mat: coop_mat.map(super::coop::kernel_for),
             buf: ctx.upload(&bytes)?,
             kernel,
             mat_mat,
@@ -160,6 +212,21 @@ fn repack_q8_0(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A layer's FFN on the device.
+enum Ffn {
+    Dense {
+        gate: Matrix,
+        up: Matrix,
+        down: Matrix,
+    },
+    Experts {
+        router: Buffer,
+        gate: Matrix,
+        up: Matrix,
+        down: Matrix,
+    },
+}
+
 struct Layer {
     attn_norm: Buffer,
     q: Matrix,
@@ -172,9 +239,13 @@ struct Layer {
     k_norm: Option<Buffer>,
     o: Matrix,
     ffn_norm: Buffer,
-    gate: Matrix,
-    up: Matrix,
-    down: Matrix,
+    ffn: Ffn,
+    qk_full: bool,
+    post_attn_norm: Option<Buffer>,
+    post_ffn_norm: Option<Buffer>,
+    window: u32,
+    prefill_window: u32,
+    rope: usize,
     k_cache: Buffer,
     v_cache: Buffer,
 }
@@ -210,8 +281,8 @@ pub struct VulkanStack {
     spec: DenseSpec,
     layers: Vec<Layer>,
     head: Option<Head>,
-    cos: Buffer,
-    sin: Buffer,
+    /// RoPE tables, a cosine and a sine buffer each.
+    ropes: Vec<(Buffer, Buffer)>,
     table_half: usize,
     table_len: usize,
     x: Buffer,
@@ -223,13 +294,24 @@ pub struct VulkanStack {
     v_raw: Buffer,
     q: Buffer,
     attn: Buffer,
+    /// The output of a block that a post norm closes.
+    block: Buffer,
     gate: Buffer,
     up: Buffer,
+    /// What the chosen experts of every token give: gate, up and down products.
+    moe_gate: Buffer,
+    moe_up: Buffer,
+    moe_down: Buffer,
+    /// The experts chosen for each token and their weights.
+    route: Buffer,
     part: Buffer,
     io: Buffer,
     step: Buffer,
     dummy: Buffer,
     programs: HashMap<(usize, usize, usize, bool), Program>,
+    /// Dispatches a step stops after, where a test wants the rows partway through.
+    #[cfg(test)]
+    stop_after: Option<usize>,
 }
 
 impl std::fmt::Debug for VulkanStack {
@@ -244,22 +326,22 @@ impl std::fmt::Debug for VulkanStack {
 }
 
 impl VulkanStack {
-    /// Uploads `layers` to Vulkan device `device`. `cos` and `sin` are the RoPE tables, rows of
-    /// `table_half` values per position.
+    /// Uploads `layers` to Vulkan device `device`. `tables` are the RoPE tables as cosines and
+    /// sines, rows of `table_half` values per position.
     pub fn new(
         device: usize,
         spec: DenseSpec,
         layers: Vec<LayerTensors<'_>>,
-        cos: &[f32],
-        sin: &[f32],
+        tables: &[(Vec<f32>, Vec<f32>)],
         table_half: usize,
     ) -> anyhow::Result<Self> {
         let ctx = super::context(device)?;
         let s = &spec;
-        if s.head_dim > 128
+        if s.head_dim > 256
             || !s.head_dim.is_multiple_of(8)
             || s.n_kv == 0
             || !s.n_head.is_multiple_of(s.n_kv)
+            || !(super::shaders::ATTN_ROWS as usize).is_multiple_of(s.n_head / s.n_kv)
         {
             anyhow::bail!(
                 "vulkan: heads of {} lanes in {}/{} groups",
@@ -275,6 +357,9 @@ impl VulkanStack {
                 table_half
             );
         }
+        if tables.is_empty() || layers.iter().any(|l| l.rope >= tables.len()) {
+            anyhow::bail!("vulkan: a layer names a RoPE table the stack lacks");
+        }
         let f32buf = |v: &[f32]| ctx.upload(&f32_bytes(v));
         let opt = |v: &Option<Vec<f32>>| v.as_deref().map(f32buf).transpose();
         let cache_bytes = (s.ctx * s.n_kv * s.head_dim * 2) as u64;
@@ -282,19 +367,43 @@ impl VulkanStack {
         for l in &layers {
             built.push(Layer {
                 attn_norm: f32buf(&l.attn_norm)?,
-                q: Matrix::upload(&ctx, &l.q)?,
-                k: Matrix::upload(&ctx, &l.k)?,
-                v: Matrix::upload(&ctx, &l.v)?,
+                q: Matrix::upload(&ctx, &l.q, ctx.coop())?,
+                k: Matrix::upload(&ctx, &l.k, ctx.coop())?,
+                v: Matrix::upload(&ctx, &l.v, ctx.coop())?,
                 q_bias: opt(&l.q_bias)?,
                 k_bias: opt(&l.k_bias)?,
                 v_bias: opt(&l.v_bias)?,
                 q_norm: opt(&l.q_norm)?,
                 k_norm: opt(&l.k_norm)?,
-                o: Matrix::upload(&ctx, &l.o)?,
+                o: Matrix::upload(&ctx, &l.o, ctx.coop())?,
                 ffn_norm: f32buf(&l.ffn_norm)?,
-                gate: Matrix::upload(&ctx, &l.gate)?,
-                up: Matrix::upload(&ctx, &l.up)?,
-                down: Matrix::upload(&ctx, &l.down)?,
+                ffn: match &l.ffn {
+                    FfnTensors::Dense { gate, up, down } => Ffn::Dense {
+                        gate: Matrix::upload(&ctx, gate, ctx.coop())?,
+                        up: Matrix::upload(&ctx, up, ctx.coop())?,
+                        down: Matrix::upload(&ctx, down, ctx.coop())?,
+                    },
+                    FfnTensors::Experts {
+                        router,
+                        gate,
+                        up,
+                        down,
+                    } => Ffn::Experts {
+                        router: f32buf(router)?,
+                        gate: Matrix::upload(&ctx, gate, false)?,
+                        up: Matrix::upload(&ctx, up, false)?,
+                        down: Matrix::upload(&ctx, down, false)?,
+                    },
+                },
+                qk_full: s.n_head * s.head_dim != s.head_dim
+                    && l.q_norm
+                        .as_ref()
+                        .is_some_and(|n| n.len() == s.n_head * s.head_dim),
+                post_attn_norm: opt(&l.post_attn_norm)?,
+                post_ffn_norm: opt(&l.post_ffn_norm)?,
+                window: l.window as u32,
+                prefill_window: l.prefill_window as u32,
+                rope: l.rope,
                 k_cache: ctx.buffer(cache_bytes, false)?,
                 v_cache: ctx.buffer(cache_bytes, false)?,
             });
@@ -304,29 +413,41 @@ impl VulkanStack {
         let qd = s.n_head * s.head_dim;
         let kvd = s.n_kv * s.head_dim;
         let kmax = s.hidden.max(qd).max(s.ffn);
+        let pairs = t * s.used;
+        // Rows the quantiser holds: a step's tokens, or with experts, every chosen pair.
+        let act = (t * kmax).max(pairs * s.expert_ffn);
         Ok(Self {
             layers: built,
             head: None,
-            cos: f32buf(cos)?,
-            sin: f32buf(sin)?,
+            ropes: tables
+                .iter()
+                .map(|(c, s)| Ok((f32buf(c)?, f32buf(s)?)))
+                .collect::<anyhow::Result<_>>()?,
             table_half,
-            table_len: cos.len() / table_half.max(1),
+            table_len: tables[0].0.len() / table_half.max(1),
             x: card(t * s.hidden)?,
             xn: card(t * kmax)?,
-            xq: card(t * kmax / 4)?,
-            xm: card(t * kmax / 8)?,
+            xq: card(act / 4)?,
+            xm: card(act / 8)?,
             q_raw: card(t * qd)?,
             k_raw: card(t * kvd)?,
             v_raw: card(t * kvd)?,
             q: card(t * qd)?,
             attn: card(t * qd)?,
+            block: card(t * s.hidden)?,
             gate: card(t * s.ffn)?,
             up: card(t * s.ffn)?,
+            moe_gate: card(pairs * s.expert_ffn + 4)?,
+            moe_up: card(pairs * s.expert_ffn + 4)?,
+            moe_down: card(pairs * s.hidden + 4)?,
+            route: ctx.buffer((pairs.max(1) * 8) as u64, false)?,
             part: card(MV_TOKENS * s.n_head * MAX_SPLITS * (s.head_dim + 2))?,
             io: ctx.buffer((t * s.hidden * 4) as u64, true)?,
             step: ctx.buffer(16, true)?,
             dummy: ctx.buffer(16, false)?,
             programs: HashMap::new(),
+            #[cfg(test)]
+            stop_after: None,
             ctx,
             spec,
         })
@@ -335,7 +456,7 @@ impl VulkanStack {
     /// Puts the model's final norm and output projection on the device, so a step that ends
     /// the stack hands back logits.
     pub fn attach_head(&mut self, norm: &[f32], proj: &RawTensor) -> anyhow::Result<()> {
-        let proj = Matrix::upload(&self.ctx, proj)?;
+        let proj = Matrix::upload(&self.ctx, proj, self.ctx.coop())?;
         if proj.cols != self.spec.hidden {
             anyhow::bail!("vulkan: an output head of {} columns", proj.cols);
         }
@@ -475,16 +596,12 @@ impl VulkanStack {
         ];
         let mut args = [0u32; 16];
         args[..8].copy_from_slice(&[rows, w.cols as u32, tokens as u32, 0, 0, flags, 0, rows]);
-        match w.mat_mat.filter(|_| tokens > MV_TOKENS) {
-            Some(kernel) => ops.push(self.op(
+        match mat_mat_for(w, tokens) {
+            Some((kernel, tile)) => ops.push(self.op(
                 kernel,
                 &bufs,
                 args,
-                [
-                    rows.div_ceil(MM_ROWS),
-                    (tokens as u32).div_ceil(MM_TOKENS),
-                    1,
-                ],
+                [rows.div_ceil(tile.0), (tokens as u32).div_ceil(tile.1), 1],
                 barrier,
             )),
             None => {
@@ -501,6 +618,113 @@ impl VulkanStack {
                 }
             }
         }
+    }
+
+    /// The routed FFN of a layer: route each token, run the chosen experts' gate and up, the
+    /// activation, their down, and weigh the results into the residual.
+    fn expert_ops(
+        &self,
+        ops: &mut Vec<Op>,
+        tokens: usize,
+        l: &Layer,
+        router: &Buffer,
+        gate: &Matrix,
+        up: &Matrix,
+        down: &Matrix,
+    ) {
+        let s = &self.spec;
+        let pairs = (tokens * s.used) as u32;
+        ops.push(self.quant(1, &self.x, &l.ffn_norm, tokens, s.hidden, 0, true));
+        let mut a = [0u32; 16];
+        a[..5].copy_from_slice(&[
+            tokens as u32,
+            s.hidden as u32,
+            s.experts as u32,
+            s.used as u32,
+            u32::from(s.norm_topk),
+        ]);
+        ops.push(self.op(
+            super::shaders::router_kernel(s.experts),
+            &[&self.xn, router, &self.route],
+            a,
+            [tokens as u32, 1, 1],
+            true,
+        ));
+        let rows_per = s.expert_ffn;
+        let product = |w: &Matrix, y: &Buffer, xmode: u32, rows: usize, barrier: bool| {
+            let mut a = [0u32; 16];
+            a[..8].copy_from_slice(&[
+                rows as u32,
+                w.cols as u32,
+                s.used as u32,
+                0,
+                0,
+                0,
+                xmode,
+                rows as u32,
+            ]);
+            let mut groups = matvec_groups(w.kernel, rows as u32, self.ctx.workgroup);
+            groups[2] = pairs;
+            self.op(
+                super::shaders::expert_kernel(w.kernel),
+                &[
+                    &w.buf,
+                    &self.xq,
+                    y,
+                    &self.dummy,
+                    &self.xm,
+                    &self.xn,
+                    &self.route,
+                ],
+                a,
+                groups,
+                barrier,
+            )
+        };
+        ops.push(product(gate, &self.moe_gate, 0, rows_per, true));
+        ops.push(product(up, &self.moe_up, 0, rows_per, false));
+        ops.push(self.quant(
+            if s.gelu { 3 } else { 2 },
+            &self.moe_gate,
+            &self.moe_up,
+            pairs as usize,
+            rows_per,
+            0,
+            Self::wants_f32(&[down]),
+        ));
+        ops.push(product(down, &self.moe_down, 1, s.hidden, true));
+        let mut a = [0u32; 16];
+        a[..4].copy_from_slice(&[tokens as u32, s.hidden as u32, 0, s.used as u32]);
+        ops.push(self.op(
+            "moe_combine",
+            &[&self.moe_down, &self.route, &self.x],
+            a,
+            [tokens as u32, 1, 1],
+            true,
+        ));
+    }
+
+    /// The product that ends a block: added to the residual, or with a post norm, normed first.
+    fn closing_product(&self, ops: &mut Vec<Op>, tokens: usize, w: &Matrix, norm: Option<&Buffer>) {
+        let Some(norm) = norm else {
+            self.products(ops, tokens, &[(w, &self.x, None, true)]);
+            return;
+        };
+        self.products(ops, tokens, &[(w, &self.block, None, false)]);
+        let mut args = [0u32; 16];
+        args[..4].copy_from_slice(&[
+            tokens as u32,
+            self.spec.hidden as u32,
+            0,
+            self.spec.eps.to_bits(),
+        ]);
+        ops.push(self.op(
+            "post_norm",
+            &[&self.block, norm, &self.x],
+            args,
+            [tokens as u32, 1, 1],
+            true,
+        ));
     }
 
     /// The products of the quantised activations: the first waits for them, the others run
@@ -597,6 +821,22 @@ impl VulkanStack {
                     (&l.v, &self.v_raw, l.v_bias.as_ref(), false),
                 ],
             );
+            if l.qk_full {
+                for (raw, norm, width) in [
+                    (&self.q_raw, l.q_norm.as_ref(), s.n_head * s.head_dim),
+                    (&self.k_raw, l.k_norm.as_ref(), s.n_kv * s.head_dim),
+                ] {
+                    let mut a = [0u32; 16];
+                    a[..4].copy_from_slice(&[tokens as u32, width as u32, 1, s.eps.to_bits()]);
+                    ops.push(self.op(
+                        "post_norm",
+                        &[raw, norm.unwrap_or(&self.dummy), raw],
+                        a,
+                        [t, 1, 1],
+                        true,
+                    ));
+                }
+            }
             let prep = |heads: usize, norm: Option<&Buffer>| {
                 let mut a = [0u32; 16];
                 a[..8].copy_from_slice(&[
@@ -611,38 +851,48 @@ impl VulkanStack {
                 ]);
                 a
             };
-            ops.push(self.op(
-                "prep_q",
-                &[
-                    &self.q_raw,
-                    l.q_norm.as_ref().unwrap_or(&self.dummy),
-                    &self.q,
-                    &self.dummy,
-                    &self.dummy,
-                    &self.step,
-                    &self.cos,
-                    &self.sin,
-                ],
-                prep(s.n_head, l.q_norm.as_ref()),
-                [s.n_head as u32, t, 1],
-                true,
-            ));
-            ops.push(self.op(
-                "prep_kv",
-                &[
-                    &self.k_raw,
-                    l.k_norm.as_ref().unwrap_or(&self.dummy),
-                    &l.k_cache,
-                    &self.v_raw,
-                    &l.v_cache,
-                    &self.step,
-                    &self.cos,
-                    &self.sin,
-                ],
-                prep(s.n_kv, l.k_norm.as_ref()),
-                [s.n_kv as u32, t, 1],
-                false,
-            ));
+            ops.push(
+                self.op(
+                    "prep_q",
+                    &[
+                        &self.q_raw,
+                        l.q_norm
+                            .as_ref()
+                            .filter(|_| !l.qk_full)
+                            .unwrap_or(&self.dummy),
+                        &self.q,
+                        &self.dummy,
+                        &self.dummy,
+                        &self.step,
+                        &self.ropes[l.rope].0,
+                        &self.ropes[l.rope].1,
+                    ],
+                    prep(s.n_head, l.q_norm.as_ref().filter(|_| !l.qk_full)),
+                    [s.n_head as u32, t, 1],
+                    true,
+                ),
+            );
+            ops.push(
+                self.op(
+                    "prep_kv",
+                    &[
+                        &self.k_raw,
+                        l.k_norm
+                            .as_ref()
+                            .filter(|_| !l.qk_full)
+                            .unwrap_or(&self.dummy),
+                        &l.k_cache,
+                        &self.v_raw,
+                        &l.v_cache,
+                        &self.step,
+                        &self.ropes[l.rope].0,
+                        &self.ropes[l.rope].1,
+                    ],
+                    prep(s.n_kv, l.k_norm.as_ref().filter(|_| !l.qk_full)),
+                    [s.n_kv as u32, t, 1],
+                    false,
+                ),
+            );
             let mut a = [0u32; 16];
             a[..5].copy_from_slice(&[
                 s.n_head as u32,
@@ -651,10 +901,16 @@ impl VulkanStack {
                 s.attn_scale.to_bits(),
                 s.ctx as u32,
             ]);
+            let wide = s.head_dim > 128;
             if tokens > MV_TOKENS {
                 a[5] = t;
+                a[6] = l.prefill_window;
                 ops.push(self.op(
-                    "attn_tiled",
+                    if wide {
+                        "attn_tiled_wide"
+                    } else {
+                        "attn_tiled"
+                    },
                     &[
                         &self.q,
                         &l.k_cache,
@@ -664,15 +920,20 @@ impl VulkanStack {
                         &self.step,
                     ],
                     a,
-                    [s.n_head as u32, t.div_ceil(16), 1],
+                    [
+                        s.n_kv as u32,
+                        t.div_ceil(super::shaders::ATTN_ROWS / (s.n_head / s.n_kv) as u32),
+                        1,
+                    ],
                     true,
                 ));
             } else {
                 // Enough workgroups to fill the card: the keys are cut into slices.
                 let splits = (ATTENTION_GROUPS / (s.n_head * tokens)).clamp(1, MAX_SPLITS) as u32;
                 a[5] = splits;
+                a[6] = l.window;
                 ops.push(self.op(
-                    "attention",
+                    if wide { "attention_wide" } else { "attention" },
                     &[
                         &self.q,
                         &l.k_cache,
@@ -702,34 +963,43 @@ impl VulkanStack {
                 0,
                 Self::wants_f32(&[&l.o]),
             ));
-            self.products(&mut ops, tokens, &[(&l.o, &self.x, None, true)]);
-            ops.push(self.quant(
-                1,
-                &self.x,
-                &l.ffn_norm,
-                tokens,
-                s.hidden,
-                0,
-                Self::wants_f32(&[&l.gate, &l.up]),
-            ));
-            self.products(
-                &mut ops,
-                tokens,
-                &[
-                    (&l.gate, &self.gate, None, false),
-                    (&l.up, &self.up, None, false),
-                ],
-            );
-            ops.push(self.quant(
-                2,
-                &self.gate,
-                &self.up,
-                tokens,
-                s.ffn,
-                0,
-                Self::wants_f32(&[&l.down]),
-            ));
-            self.products(&mut ops, tokens, &[(&l.down, &self.x, None, true)]);
+            self.closing_product(&mut ops, tokens, &l.o, l.post_attn_norm.as_ref());
+            match &l.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    ops.push(self.quant(
+                        1,
+                        &self.x,
+                        &l.ffn_norm,
+                        tokens,
+                        s.hidden,
+                        0,
+                        Self::wants_f32(&[gate, up]),
+                    ));
+                    self.products(
+                        &mut ops,
+                        tokens,
+                        &[(gate, &self.gate, None, false), (up, &self.up, None, false)],
+                    );
+                    ops.push(self.quant(
+                        if s.gelu { 3 } else { 2 },
+                        &self.gate,
+                        &self.up,
+                        tokens,
+                        s.ffn,
+                        0,
+                        Self::wants_f32(&[down]),
+                    ));
+                    self.closing_product(&mut ops, tokens, down, l.post_ffn_norm.as_ref());
+                }
+                Ffn::Experts {
+                    router,
+                    gate,
+                    up,
+                    down,
+                } => {
+                    self.expert_ops(&mut ops, tokens, l, router, gate, up, down);
+                }
+            }
         }
         if let Some(hd) = self.head.as_ref().filter(|_| head) {
             ops.push(self.quant(
@@ -747,7 +1017,12 @@ impl VulkanStack {
     }
 
     fn record(&self, tokens: usize, from: usize, to: usize, head: bool) -> anyhow::Result<Program> {
-        let ops = self.ops(tokens, from, to, head);
+        #[allow(unused_mut)]
+        let mut ops = self.ops(tokens, from, to, head);
+        #[cfg(test)]
+        if let Some(n) = self.stop_after {
+            ops.truncate(n);
+        }
         let dev = self.ctx.device();
         let sets = ops.len().max(1) as u32;
         let sizes = [vk::DescriptorPoolSize::default()
@@ -868,6 +1143,20 @@ impl VulkanStack {
 
 #[cfg(test)]
 impl VulkanStack {
+    /// Stops every step after its first `n` dispatches (all of them for `None`).
+    pub fn stop_after(&mut self, n: Option<usize>) {
+        self.stop_after = n;
+        self.programs.clear();
+    }
+
+    /// The position of the first dispatch of a step of `tokens` rows through layer 0 whose
+    /// kernel name starts with `prefix`.
+    pub fn first_dispatch(&self, tokens: usize, prefix: &str) -> Option<usize> {
+        self.ops(tokens, 0, 1, false)
+            .iter()
+            .position(|o| o.kernel.starts_with(prefix))
+    }
+
     /// Microseconds each kernel takes over one step of `tokens` rows at position `index_pos`
     /// through every layer and the head, summed by kernel.
     pub fn profile(
@@ -1059,9 +1348,10 @@ pub(super) fn matvec_probe(
     w: &RawTensor,
     x: &[f32],
     tokens: usize,
+    coop: bool,
 ) -> anyhow::Result<Vec<f32>> {
     let ctx = super::context(device)?;
-    let m = Matrix::upload(&ctx, w)?;
+    let m = Matrix::upload(&ctx, w, coop && ctx.coop())?;
     let xb = ctx.upload(&f32_bytes(x))?;
     let yb = ctx.buffer((tokens * m.rows * 4) as u64, false)?;
     let out = ctx.buffer((tokens * m.rows * 4) as u64, true)?;
@@ -1122,14 +1412,10 @@ pub(super) fn matvec_probe(
     let quant = words([tokens as u32, m.cols as u32, 0, 0, 1, 0, 0, 0]);
     let mv = words([rows, m.cols as u32, tokens as u32, 0, 0, 0, 0, rows]);
     let quant_pipe = ctx.pipeline("quant")?;
-    let (pipeline, groups) = match m.mat_mat.filter(|_| tokens > MV_TOKENS) {
-        Some(k) => (
+    let (pipeline, groups) = match mat_mat_for(&m, tokens) {
+        Some((k, tile)) => (
             ctx.pipeline(k)?,
-            [
-                rows.div_ceil(MM_ROWS),
-                (tokens as u32).div_ceil(MM_TOKENS),
-                1,
-            ],
+            [rows.div_ceil(tile.0), (tokens as u32).div_ceil(tile.1), 1],
         ),
         None => (
             ctx.pipeline(m.kernel)?,

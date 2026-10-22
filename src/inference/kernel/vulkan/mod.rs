@@ -7,6 +7,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+mod coop;
 mod shaders;
 pub mod stack;
 #[cfg(test)]
@@ -182,6 +183,42 @@ pub fn free_bytes(index: usize) -> u64 {
         .unwrap_or(info.total)
 }
 
+/// Whether device `pd` offers cooperative matrices of f16 inputs and f32 accumulators in 16 by 16
+/// by 16 tiles at subgroup scope, with the 16-bit float arithmetic the kernels convert with.
+fn has_coop_f16(inst: &Instance, pd: vk::PhysicalDevice) -> bool {
+    let exts =
+        unsafe { inst.instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+    let has = |n: &std::ffi::CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
+    if !has(ash::khr::cooperative_matrix::NAME) || !has(ash::khr::shader_float16_int8::NAME) {
+        return false;
+    }
+    let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let mut f16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut coop)
+        .push_next(&mut f16);
+    unsafe {
+        inst.instance
+            .get_physical_device_features2(pd, &mut features)
+    };
+    if coop.cooperative_matrix == vk::FALSE || f16.shader_float16 == vk::FALSE {
+        return false;
+    }
+    let loader = ash::khr::cooperative_matrix::Instance::new(&inst._entry, &inst.instance);
+    let Ok(shapes) = (unsafe { loader.get_physical_device_cooperative_matrix_properties(pd) })
+    else {
+        return false;
+    };
+    shapes.iter().any(|s| {
+        (s.m_size, s.n_size, s.k_size) == (16, 16, 16)
+            && s.a_type == vk::ComponentTypeKHR::FLOAT16
+            && s.b_type == vk::ComponentTypeKHR::FLOAT16
+            && s.c_type == vk::ComponentTypeKHR::FLOAT32
+            && s.result_type == vk::ComponentTypeKHR::FLOAT32
+            && s.scope == vk::ScopeKHR::SUBGROUP
+    })
+}
+
 /// An open device: one compute queue, the shared pipeline layout and the compiled kernels.
 pub struct Context {
     pub info: DeviceInfo,
@@ -196,6 +233,9 @@ pub struct Context {
     size_control: bool,
     /// Lanes of the workgroups the mat-vec kernels run.
     pub(crate) workgroup: u32,
+    /// Whether the device multiplies 16 by 16 f16 tiles into f32 with cooperative matrices
+    /// and the pipelines can ask for 32-lane subgroups.
+    coop: bool,
     /// Nanoseconds a timestamp tick lasts.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) timestamp_period: f32,
@@ -264,8 +304,13 @@ impl Context {
             .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::subgroup_size_control::NAME))
             && size_props.min_subgroup_size <= SUBGROUP_LANES
             && size_props.max_subgroup_size >= SUBGROUP_LANES;
+        let coop = size_control && has_coop_f16(inst, pd);
         let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
             .shader_integer_dot_product(true);
+        let mut coop_features =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut f16_features =
+            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
         let mut control =
             vk::PhysicalDeviceSubgroupSizeControlFeatures::default().subgroup_size_control(true);
         let mut extensions = vec![DOT_EXTENSION.as_ptr()];
@@ -275,6 +320,13 @@ impl Context {
         if size_control {
             extensions.push(ash::ext::subgroup_size_control::NAME.as_ptr());
             create = create.push_next(&mut control);
+        }
+        if coop {
+            extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+            extensions.push(ash::khr::shader_float16_int8::NAME.as_ptr());
+            create = create
+                .push_next(&mut coop_features)
+                .push_next(&mut f16_features);
         }
         let create = create.enabled_extension_names(&extensions);
         let device = unsafe { inst.instance.create_device(pd, &create, None)? };
@@ -325,6 +377,7 @@ impl Context {
             pipelines: Mutex::new(HashMap::new()),
             size_control,
             workgroup,
+            coop,
             timestamp_period,
         })
     }
@@ -520,6 +573,11 @@ impl Context {
         };
         unsafe { self.device.destroy_fence(fence, None) };
         result.map_err(|e| anyhow::anyhow!("vulkan: submit: {e}"))
+    }
+
+    /// Whether the device runs the cooperative-matrix mat-mat kernels.
+    pub(crate) fn coop(&self) -> bool {
+        self.coop
     }
 
     pub(crate) fn device(&self) -> &ash::Device {

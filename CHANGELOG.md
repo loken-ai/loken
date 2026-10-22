@@ -6,6 +6,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Vulkan: run attention over a sliding window.
+- Vulkan: run attention heads up to 256 wide.
+- Vulkan: run feed-forward layers that use GELU.
+- Vulkan: run routed mixtures of experts.
 - Chat: store the decode states a cache writes to disk compressed.
 - Serve: reuse the whole prompt when the same prompt comes back.
 - Voxtral: load the Hugging Face safetensors checkpoint in both layouts.

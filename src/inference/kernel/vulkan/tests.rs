@@ -18,7 +18,9 @@ fn values(n: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-fn check(dtype: GgmlDType, tokens: usize) {
+/// Runs `dtype` on `tokens` tokens through the integer kernels (`coop` false) or, where a device
+/// has them, the cooperative-matrix ones, whose f16 tiles round the weights and activations.
+fn check(dtype: GgmlDType, tokens: usize, coop: bool) {
     let (rows, cols) = (70, 512);
     let w = Tensor::from_vec(values(rows * cols, 7), (rows, cols), &Device::Cpu).unwrap();
     let q = QTensor::quantize(&w, dtype).unwrap();
@@ -62,7 +64,7 @@ fn check(dtype: GgmlDType, tokens: usize) {
         bytes: q.data().unwrap(),
     };
     for d in super::devices() {
-        let got = matvec_probe(d.index, &raw, &x, tokens).unwrap();
+        let got = matvec_probe(d.index, &raw, &x, tokens, coop).unwrap();
         let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         let err = got
             .iter()
@@ -74,7 +76,7 @@ fn check(dtype: GgmlDType, tokens: usize) {
             d.name
         );
         assert!(
-            err <= scale * 1e-4,
+            err <= scale * if coop { 2e-3 } else { 1e-4 },
             "{} on {}: error {err} of {scale}",
             dtype.gguf_name(),
             d.name
@@ -84,35 +86,60 @@ fn check(dtype: GgmlDType, tokens: usize) {
 
 #[test]
 fn matvec_q4k() {
-    check(GgmlDType::Q4K, 3);
+    check(GgmlDType::Q4K, 3, false);
 }
 
 #[test]
 fn matvec_q6k() {
-    check(GgmlDType::Q6K, 3);
+    check(GgmlDType::Q6K, 3, false);
 }
 
 #[test]
 fn matvec_q8_0() {
-    check(GgmlDType::Q8_0, 3);
+    check(GgmlDType::Q8_0, 3, false);
 }
 
 #[test]
 fn matvec_f16() {
-    check(GgmlDType::F16, 3);
+    check(GgmlDType::F16, 3, false);
 }
 
 #[test]
 fn matmat_q4k() {
-    check(GgmlDType::Q4K, 40);
+    check(GgmlDType::Q4K, 40, false);
 }
 
 #[test]
 fn matmat_q6k() {
-    check(GgmlDType::Q6K, 40);
+    check(GgmlDType::Q6K, 40, false);
 }
 
 #[test]
 fn matmat_q8_0() {
-    check(GgmlDType::Q8_0, 40);
+    check(GgmlDType::Q8_0, 40, false);
+}
+
+#[test]
+fn coop_q4k() {
+    check(GgmlDType::Q4K, 100, true);
+}
+
+#[test]
+fn coop_q6k() {
+    check(GgmlDType::Q6K, 100, true);
+}
+
+#[test]
+fn coop_q8_0() {
+    check(GgmlDType::Q8_0, 100, true);
+}
+
+#[test]
+fn coop_f16() {
+    check(GgmlDType::F16, 100, true);
+}
+
+#[test]
+fn matmat_f16() {
+    check(GgmlDType::F16, 40, false);
 }

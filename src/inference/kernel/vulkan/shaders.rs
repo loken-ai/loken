@@ -9,11 +9,16 @@
 //! sixteen int8 values. The mat-vec kernels take the integer dot product of the weight
 //! bytes with those values.
 
+/// Tokens a lane of the integer mat-mat takes, and tokens a workgroup of it takes (eight lanes
+/// across).
+pub(super) const MM_TT: u32 = 4;
+pub(super) const MM_TOKENS: u32 = 8 * MM_TT;
+
 /// Lanes that run one row of the mat-vec of `kernel`: more where a row has plenty of items
 /// and the format's loads are narrow enough to want the extra requests in flight.
 pub(super) fn lanes_per_row(kernel: &str) -> u32 {
     match kernel {
-        "mv_q4k" | "mv_f16" => 32,
+        "mv_q4k" | "mv_f16" | "mx_q4k" | "mx_f16" => 32,
         _ => 16,
     }
 }
@@ -32,7 +37,7 @@ fn dot4(a: vec4<u32>, b: vec4<u32>) -> i32 {
 /// Quantises rows of `n` values to int8 blocks (see the module comment), the scale shared by
 /// 128 values when `n` is a multiple of 128 and by 32 otherwise, after an optional
 /// transform of the source. Args: rows, n, src_off, eps, flags (1: also write the transformed
-/// values as f32 to `xn`), mode (0 copy, 1 RMS norm with weight `b`, 2 `silu(a) * b`).
+/// values as f32 to `xn`), mode (0 copy, 1 RMS norm with weight `b`, 2 `silu(a) * b`, 3 the same with GELU).
 /// One workgroup per row; eight values a lane, four lanes a block.
 const QUANT: &str = r#"
 @group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;
@@ -49,6 +54,11 @@ fn val(i: u32, base: u32, mode: u32, scale: f32) -> vec4<f32> {
     let v = a[base + i];
     if (mode == 1u) { return v * scale * b[i]; }
     if (mode == 2u) { return v / (vec4<f32>(1.0) + exp(-v)) * b[base + i]; }
+    if (mode == 3u) {
+        let u = 0.7978845608 * (v + 0.044715 * v * v * v);
+        let e = exp(-2.0 * clamp(u, vec4<f32>(-20.0), vec4<f32>(20.0)));
+        return 0.5 * v * (vec4<f32>(1.0) + (vec4<f32>(1.0) - e) / (vec4<f32>(1.0) + e)) * b[base + i];
+    }
     return v;
 }
 @compute @workgroup_size(256)
@@ -109,6 +119,113 @@ fn main(
                 xn[row * n4 + 2u * u + 1u] = v1;
             }
         }
+    }
+}
+"#;
+
+/// `x += rmsnorm(src) * w` for rows of `n` values: the norm that closes a block before its
+/// output joins the residual; with flag 1, `x = rmsnorm(src) * w` instead. Args: rows, n, flag,
+/// eps. One workgroup of 256 lanes a row.
+const POST_NORM: &str = r#"
+@group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> b: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> x: array<vec4<f32>>;
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(256)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) li: u32,
+    @builtin(subgroup_invocation_id) lane: u32,
+    @builtin(subgroup_id) sg: u32,
+    @builtin(num_subgroups) sgs: u32,
+) {
+    let n = arg(1u);
+    let n4 = n / 4u;
+    let base = wid.x * n4;
+    var s = 0.0;
+    for (var i = li; i < n4; i = i + 256u) { let v = a[base + i]; s = s + dot(v, v); }
+    s = subgroupAdd(s);
+    if (lane == 0u) { red[sg] = s; }
+    workgroupBarrier();
+    var tot = 0.0;
+    for (var i = 0u; i < sgs; i = i + 1u) { tot = tot + red[i]; }
+    let scale = inverseSqrt(tot / f32(n) + argf(3u));
+    let keep = select(1.0, 0.0, arg(2u) == 1u);
+    for (var i = li; i < n4; i = i + 256u) { x[base + i] = x[base + i] * keep + a[base + i] * scale * b[i]; }
+}
+"#;
+
+/// The router of a mixture of experts: for each token, the logits of every expert over the
+/// normed activations, their softmax, and the `K` best with their weights, written to `route` as
+/// (expert, weight bits). One workgroup of 256 lanes a token; `256 / EP` lanes an expert, `EP`
+/// the experts rounded up to a power of two. Args: tokens, hidden, experts, K, flag (1: the
+/// chosen weights are renormalised).
+const ROUTER: &str = r#"
+@group(0) @binding(0) var<storage, read> xnorm: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> rw: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> route: array<vec2<u32>>;
+var<workgroup> logit: array<f32, EP>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h4 = arg(1u) / 4u;
+    let ne = arg(2u);
+    let kk = arg(3u);
+    let e = li / (256u / EP);
+    let part = li % (256u / EP);
+    var s = 0.0;
+    if (e < ne) {
+        for (var i = part; i < h4; i = i + 256u / EP) { s = s + dot(xnorm[wid.x * h4 + i], rw[e * h4 + i]); }
+    }
+    SHUFFLE_SUM
+    if (part == 0u && e < ne) { logit[e] = s; }
+    workgroupBarrier();
+    if (li == 0u) {
+        var m = -3.0e38;
+        for (var j = 0u; j < ne; j = j + 1u) { m = max(m, logit[j]); }
+        var tot = 0.0;
+        for (var j = 0u; j < ne; j = j + 1u) {
+            let p = exp(logit[j] - m);
+            logit[j] = p;
+            tot = tot + p;
+        }
+        var chosen = 0.0;
+        var picks: array<u32, 16>;
+        var weights: array<f32, 16>;
+        for (var c = 0u; c < kk; c = c + 1u) {
+            var best = -1.0;
+            var at = 0u;
+            for (var j = 0u; j < ne; j = j + 1u) {
+                if (logit[j] > best) { best = logit[j]; at = j; }
+            }
+            picks[c] = at;
+            weights[c] = best / tot;
+            chosen = chosen + best / tot;
+            logit[at] = -2.0;
+        }
+        for (var c = 0u; c < kk; c = c + 1u) {
+            let w = select(weights[c], weights[c] / chosen, arg(4u) == 1u);
+            route[wid.x * kk + c] = vec2<u32>(picks[c], bitcast<u32>(w));
+        }
+    }
+}
+"#;
+
+/// The experts' outputs weighed into the residual: `x[t] += sum_c w[t, c] * y[t * K + c]`.
+/// Args: tokens, hidden, -, K. One workgroup of 256 lanes a token.
+const MOE_COMBINE: &str = r#"
+@group(0) @binding(0) var<storage, read> yd: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> route: array<vec2<u32>>;
+@group(0) @binding(2) var<storage, read_write> x: array<vec4<f32>>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h4 = arg(1u) / 4u;
+    let kk = arg(3u);
+    for (var i = li; i < h4; i = i + 256u) {
+        var acc = x[wid.x * h4 + i];
+        for (var c = 0u; c < kk; c = c + 1u) {
+            acc = acc + bitcast<f32>(route[wid.x * kk + c].y) * yd[(wid.x * kk + c) * h4 + i];
+        }
+        x[wid.x * h4 + i] = acc;
     }
 }
 "#;
@@ -321,22 +438,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let k = arg(1u);
     let nt = arg(2u);
     let row0 = wid.x * 64u;
-    let tok0 = wid.y * 32u;
+    let tok0 = wid.y * TOKT;
     let ty = li >> 3u;
     let tx = li & 7u;
-    var acc: array<f32, 16>;
+    var acc: array<f32, NACC>;
     for (var kk = 0u; kk < k; kk = kk + BK) {
         {
             LOADW
         }
-        for (var e = li; e < 32u * (BK / 16u); e = e + 128u) {
+        for (var e = li; e < TOKT * (BK / 16u); e = e + 128u) {
             let tk = e / (BK / 16u);
             let pv = e % (BK / 16u);
             var v = vec4<u32>(0u);
             if (tok0 + tk < nt) { v = xq[(tok0 + tk) * (k / 16u) + kk / 16u + pv]; }
             sx[tk * SV + pv] = v;
         }
-        for (var e = li; e < 32u * NB; e = e + 128u) {
+        for (var e = li; e < TOKT * NB; e = e + 128u) {
             let tk = e / NB;
             let bb = e % NB;
             var v = vec4<f32>(0.0);
@@ -350,10 +467,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }
     for (var r = 0u; r < 4u; r = r + 1u) {
         let row = row0 + ty * 4u + r;
-        for (var t = 0u; t < 4u; t = t + 1u) {
+        for (var t = 0u; t < TTu; t = t + 1u) {
             let tk = tok0 + t * 8u + tx;
             if (row < m && tk < nt) {
-                var v = acc[r * 4u + t];
+                var v = acc[r * TTu + t];
                 let flags = arg(5u);
                 if ((flags & 2u) != 0u) { v = v + bias[row]; }
                 let at = arg(4u) + tk * arg(7u) + row;
@@ -368,23 +485,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 /// The products of a step of formats with a float scale to each block of 32 (Q8_0).
 const DOTS_BLOCKS: &str = r#"
         for (var blk = 0u; blk < NB; blk = blk + 1u) {
-            var isum: array<i32, 16>;
+            var isum: array<i32, NACC>;
             for (var hf = 0u; hf < 2u; hf = hf + 1u) {
                 var wr: array<vec4<u32>, 4>;
-                var xt: array<vec4<u32>, 4>;
+                var xt: array<vec4<u32>, TT>;
                 for (var r = 0u; r < 4u; r = r + 1u) { wr[r] = sw[(ty * 4u + r) * SV + blk * 2u + hf]; }
-                for (var t = 0u; t < 4u; t = t + 1u) { xt[t] = sx[(t * 8u + tx) * SV + blk * 2u + hf]; }
+                for (var t = 0u; t < TTu; t = t + 1u) { xt[t] = sx[(t * 8u + tx) * SV + blk * 2u + hf]; }
                 for (var r = 0u; r < 4u; r = r + 1u) {
-                    for (var t = 0u; t < 4u; t = t + 1u) {
-                        isum[r * 4u + t] = isum[r * 4u + t] + dot4(wr[r], xt[t]);
+                    for (var t = 0u; t < TTu; t = t + 1u) {
+                        isum[r * TTu + t] = isum[r * TTu + t] + dot4(wr[r], xt[t]);
                     }
                 }
             }
             for (var r = 0u; r < 4u; r = r + 1u) {
                 let sv = ss[(ty * 4u + r) * NB + blk];
-                for (var t = 0u; t < 4u; t = t + 1u) {
+                for (var t = 0u; t < TTu; t = t + 1u) {
                     let xv = sm[(t * 8u + tx) * NB + blk];
-                    acc[r * 4u + t] = acc[r * 4u + t] + sv.x * xv.x * f32(isum[r * 4u + t]);
+                    acc[r * TTu + t] = acc[r * TTu + t] + sv.x * xv.x * f32(isum[r * TTu + t]);
                 }
             }
         }
@@ -393,79 +510,79 @@ const DOTS_BLOCKS: &str = r#"
 /// The products of a Q4_K step of four blocks: integer scales and minimums weigh the products
 /// and the activations' sums, and the floats come in once.
 const DOTS_Q4K: &str = r#"
-        var ai: array<i32, 16>;
-        var bi: array<i32, 16>;
+        var ai: array<i32, NACC>;
+        var bi: array<i32, NACC>;
         for (var blk = 0u; blk < NB; blk = blk + 1u) {
-            var isum: array<i32, 16>;
+            var isum: array<i32, NACC>;
             for (var hf = 0u; hf < 2u; hf = hf + 1u) {
                 var wr: array<vec4<u32>, 4>;
-                var xt: array<vec4<u32>, 4>;
+                var xt: array<vec4<u32>, TT>;
                 for (var r = 0u; r < 4u; r = r + 1u) { wr[r] = sw[(ty * 4u + r) * SV + blk * 2u + hf]; }
-                for (var t = 0u; t < 4u; t = t + 1u) { xt[t] = sx[(t * 8u + tx) * SV + blk * 2u + hf]; }
+                for (var t = 0u; t < TTu; t = t + 1u) { xt[t] = sx[(t * 8u + tx) * SV + blk * 2u + hf]; }
                 for (var r = 0u; r < 4u; r = r + 1u) {
-                    for (var t = 0u; t < 4u; t = t + 1u) {
-                        isum[r * 4u + t] = isum[r * 4u + t] + dot4(wr[r], xt[t]);
+                    for (var t = 0u; t < TTu; t = t + 1u) {
+                        isum[r * TTu + t] = isum[r * TTu + t] + dot4(wr[r], xt[t]);
                     }
                 }
             }
-            var xs: array<i32, 4>;
-            for (var t = 0u; t < 4u; t = t + 1u) { xs[t] = sxs[(t * 8u + tx) * NB + blk]; }
+            var xs: array<i32, TT>;
+            for (var t = 0u; t < TTu; t = t + 1u) { xs[t] = sxs[(t * 8u + tx) * NB + blk]; }
             for (var r = 0u; r < 4u; r = r + 1u) {
                 let sv = si[(ty * 4u + r) * 4u + blk];
-                for (var t = 0u; t < 4u; t = t + 1u) {
-                    ai[r * 4u + t] = ai[r * 4u + t] + sv.x * isum[r * 4u + t];
-                    bi[r * 4u + t] = bi[r * 4u + t] + sv.y * xs[t];
+                for (var t = 0u; t < TTu; t = t + 1u) {
+                    ai[r * TTu + t] = ai[r * TTu + t] + sv.x * isum[r * TTu + t];
+                    bi[r * TTu + t] = bi[r * TTu + t] + sv.y * xs[t];
                 }
             }
         }
         for (var r = 0u; r < 4u; r = r + 1u) {
             let dd = sd[ty * 4u + r];
-            for (var t = 0u; t < 4u; t = t + 1u) {
+            for (var t = 0u; t < TTu; t = t + 1u) {
                 let xd = sm[(t * 8u + tx) * NB].x;
-                acc[r * 4u + t] = acc[r * 4u + t] + xd * (dd.x * f32(ai[r * 4u + t]) - dd.y * f32(bi[r * 4u + t]));
+                acc[r * TTu + t] = acc[r * TTu + t] + xd * (dd.x * f32(ai[r * TTu + t]) - dd.y * f32(bi[r * TTu + t]));
             }
         }
 "#;
 
 /// The products of a Q6_K step of four blocks: an integer scale to each sixteen values.
 const DOTS_Q6K: &str = r#"
-        var ai: array<i32, 16>;
+        var ai: array<i32, NACC>;
         for (var blk = 0u; blk < NB; blk = blk + 1u) {
-            var i0: array<i32, 16>;
-            var i1: array<i32, 16>;
+            var i0: array<i32, NACC>;
+            var i1: array<i32, NACC>;
             {
                 var wr: array<vec4<u32>, 4>;
                 var wr2: array<vec4<u32>, 4>;
-                var xt: array<vec4<u32>, 4>;
-                var xt2: array<vec4<u32>, 4>;
+                var xt: array<vec4<u32>, TT>;
+                var xt2: array<vec4<u32>, TT>;
                 for (var r = 0u; r < 4u; r = r + 1u) {
                     wr[r] = sw[(ty * 4u + r) * SV + blk * 2u];
                     wr2[r] = sw[(ty * 4u + r) * SV + blk * 2u + 1u];
                 }
-                for (var t = 0u; t < 4u; t = t + 1u) {
+                for (var t = 0u; t < TTu; t = t + 1u) {
                     xt[t] = sx[(t * 8u + tx) * SV + blk * 2u];
                     xt2[t] = sx[(t * 8u + tx) * SV + blk * 2u + 1u];
                 }
                 for (var r = 0u; r < 4u; r = r + 1u) {
-                    for (var t = 0u; t < 4u; t = t + 1u) {
-                        i0[r * 4u + t] = i0[r * 4u + t] + dot4(wr[r], xt[t]);
-                        i1[r * 4u + t] = i1[r * 4u + t] + dot4(wr2[r], xt2[t]);
+                    for (var t = 0u; t < TTu; t = t + 1u) {
+                        i0[r * TTu + t] = i0[r * TTu + t] + dot4(wr[r], xt[t]);
+                        i1[r * TTu + t] = i1[r * TTu + t] + dot4(wr2[r], xt2[t]);
                     }
                 }
             }
             for (var r = 0u; r < 4u; r = r + 1u) {
                 let s0 = si[(ty * 4u + r) * 8u + 2u * blk].x;
                 let s1 = si[(ty * 4u + r) * 8u + 2u * blk + 1u].x;
-                for (var t = 0u; t < 4u; t = t + 1u) {
-                    ai[r * 4u + t] = ai[r * 4u + t] + s0 * i0[r * 4u + t] + s1 * i1[r * 4u + t];
+                for (var t = 0u; t < TTu; t = t + 1u) {
+                    ai[r * TTu + t] = ai[r * TTu + t] + s0 * i0[r * TTu + t] + s1 * i1[r * TTu + t];
                 }
             }
         }
         for (var r = 0u; r < 4u; r = r + 1u) {
             let dd = sd[ty * 4u + r];
-            for (var t = 0u; t < 4u; t = t + 1u) {
+            for (var t = 0u; t < TTu; t = t + 1u) {
                 let xd = sm[(t * 8u + tx) * NB].x;
-                acc[r * 4u + t] = acc[r * 4u + t] + xd * dd.x * f32(ai[r * 4u + t]);
+                acc[r * TTu + t] = acc[r * TTu + t] + xd * dd.x * f32(ai[r * TTu + t]);
             }
         }
 "#;
@@ -639,21 +756,40 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 "#;
 
-/// Causal attention of sixteen consecutive tokens at once, for a head: the keys go through
-/// shared memory in tiles of 32 for all sixteen, with a running softmax. A lane takes one key
-/// against four tokens for the scores, then four dimensions of four tokens' outputs. Args:
-/// n_head, n_kv, hd, scale, -, tokens. One workgroup of 128 lanes per (head, block of sixteen
-/// tokens); `hd` is at most 128.
+/// Causal attention of a block of query rows for a key-value head: a row is a token of one of
+/// the `n_head / n_kv` heads that share the head, `R` of them a workgroup of 128 lanes. The keys
+/// go through shared memory in tiles of `TK` for all rows, with a running softmax per row. The
+/// scores of a tile are `RR` rows by `KK` keys a lane; the weighted values are four rows by
+/// eight dimensions a lane. Args: n_head, n_kv, hd, scale, -, tokens, window (0 for none). One workgroup per (key-value
+/// head, block of `R / (n_head / n_kv)` tokens); `hd` is at most `HD` and a multiple of 8.
 const ATTENTION_TILED: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> kc: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> vc: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<storage, read> step: array<u32>;
-var<workgroup> qs: array<vec4<f32>, 512>;
-var<workgroup> kt: array<vec4<u32>, 544>;
-var<workgroup> vt: array<vec2<u32>, 1024>;
-var<workgroup> pt: array<f32, 528>;
+const R: u32 = RROWS;
+const TK: u32 = TKEYS;
+const HV: u32 = HDV / 8u;
+const QS: u32 = HDV / 4u + 1u;
+const KS: u32 = HV + 1u;
+const PS: u32 = TKEYS + 1u;
+const KG: u32 = TKEYS / KKEYS;
+const DG: u32 = HV;
+const RP: u32 = RROWS / (128u / HV);
+var<workgroup> qs: array<vec4<f32>, QSN>;
+var<workgroup> kt: array<vec4<u32>, KSN>;
+var<workgroup> vt: array<vec4<u32>, KSN>;
+var<workgroup> pt: array<f32, PSN>;
+var<workgroup> mrow: array<f32, RROWS>;
+var<workgroup> lrow: array<f32, RROWS>;
+var<workgroup> arow: array<f32, RROWS>;
+fn lo4(w: vec4<u32>) -> array<vec4<f32>, 2> {
+    return array<vec4<f32>, 2>(
+        vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)),
+        vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)),
+    );
+}
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let nh = arg(0u);
@@ -661,97 +797,169 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let hd = arg(2u);
     let scale = argf(3u);
     let ntok = arg(5u);
-    let h = wid.x;
-    let tb = wid.y * 16u;
-    let g = h / (nh / nkv);
+    let g = wid.x;
+    let gs = nh / nkv;
+    let per = R / gs;
+    let tb = wid.y * per;
     let hv = hd / 8u;
-    let kj = li & 31u;
-    let qg = li >> 5u;
     let p0 = step[0];
-    for (var e = li; e < 16u * hv * 2u; e = e + 128u) {
-        let qq = e / (hv * 2u);
+    for (var e = li; e < R * hv * 2u; e = e + 128u) {
+        let r = e / (hv * 2u);
         let i = e % (hv * 2u);
-        let tt = tb + qq;
+        let tt = tb + r / gs;
         var v = vec4<f32>(0.0);
-        if (tt < ntok) { v = q[((tt * nh + h) * hd) / 4u + i]; }
-        qs[qq * 32u + i] = v;
+        if (tt < ntok) { v = q[((tt * nh + g * gs + r % gs) * hd) / 4u + i]; }
+        qs[r * QS + i] = v;
     }
-    var mrow = array<f32, 4>(-3.0e38, -3.0e38, -3.0e38, -3.0e38);
-    var lrow = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
-    var o = array<vec4<f32>, 4>(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
-    let kmax = p0 + min(tb + 16u, ntok);
-    for (var k0 = 0u; k0 < kmax; k0 = k0 + 32u) {
+    if (li < R) { mrow[li] = -3.0e38; lrow[li] = 0.0; }
+    var o: array<vec4<f32>, ODIM>;
+    let kmax = p0 + min(tb + per, ntok);
+    let win = arg(6u);
+    var kstart = 0u;
+    if (win > 0u && p0 + tb + 1u > win) { kstart = p0 + tb + 1u - win; }
+    let kg = li % KG;
+    let rg = li / KG;
+    let dg = li % DG;
+    let rp = li / DG;
+    for (var k0 = kstart; k0 < kmax; k0 = k0 + TK) {
         workgroupBarrier();
-        for (var e = li; e < 32u * hv; e = e + 128u) {
+        for (var e = li; e < TK * hv; e = e + 128u) {
             let r = e / hv;
             let c = e % hv;
             let j = min(k0 + r, kmax - 1u);
             let base = (j * nkv + g) * hv + c;
-            kt[r * 17u + c] = kc[base];
-            let vv = vc[base];
-            vt[r * 32u + 2u * c] = vec2<u32>(vv.x, vv.y);
-            vt[r * 32u + 2u * c + 1u] = vec2<u32>(vv.z, vv.w);
+            kt[r * KS + c] = kc[base];
+            vt[r * KS + c] = vc[base];
         }
         workgroupBarrier();
-        var s = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        var s: array<f32, SCORES>;
         for (var i = 0u; i < hv; i = i + 1u) {
-            let kw = kt[kj * 17u + i];
-            let k0f = unpack2x16float(kw.x);
-            let k1f = unpack2x16float(kw.y);
-            let k2f = unpack2x16float(kw.z);
-            let k3f = unpack2x16float(kw.w);
-            for (var qq = 0u; qq < 4u; qq = qq + 1u) {
-                let qa = qs[(qg * 4u + qq) * 32u + 2u * i];
-                let qb = qs[(qg * 4u + qq) * 32u + 2u * i + 1u];
-                s[qq] = s[qq] + dot(k0f, qa.xy) + dot(k1f, qa.zw) + dot(k2f, qb.xy) + dot(k3f, qb.zw);
+            var kf: array<array<vec4<f32>, 2>, KKEYS>;
+            for (var kk = 0u; kk < KKEYS; kk = kk + 1u) { kf[kk] = lo4(kt[(kg + KG * kk) * KS + i]); }
+            for (var rr = 0u; rr < RROWS_LANE; rr = rr + 1u) {
+                let qrow = (rg * RROWS_LANE + rr) * QS + 2u * i;
+                let qa = qs[qrow];
+                let qb = qs[qrow + 1u];
+                for (var kk = 0u; kk < KKEYS; kk = kk + 1u) {
+                    s[rr * KKEYS + kk] = s[rr * KKEYS + kk] + dot(kf[kk][0], qa) + dot(kf[kk][1], qb);
+                }
             }
         }
-        for (var qq = 0u; qq < 4u; qq = qq + 1u) {
-            let tq = tb + qg * 4u + qq;
-            let live = (k0 + kj) <= (p0 + tq) && tq < ntok;
-            let sc = select(-3.0e38, s[qq] * scale, live);
-            var mt = sc;
-            mt = max(mt, subgroupShuffleXor(mt, 16u));
-            mt = max(mt, subgroupShuffleXor(mt, 8u));
-            mt = max(mt, subgroupShuffleXor(mt, 4u));
-            mt = max(mt, subgroupShuffleXor(mt, 2u));
-            mt = max(mt, subgroupShuffleXor(mt, 1u));
-            let mnew = max(mrow[qq], mt);
-            let alpha = exp(mrow[qq] - mnew);
-            let p = select(0.0, exp(sc - mnew), live);
-            var ps = p;
-            ps = ps + subgroupShuffleXor(ps, 16u);
-            ps = ps + subgroupShuffleXor(ps, 8u);
-            ps = ps + subgroupShuffleXor(ps, 4u);
-            ps = ps + subgroupShuffleXor(ps, 2u);
-            ps = ps + subgroupShuffleXor(ps, 1u);
-            lrow[qq] = lrow[qq] * alpha + ps;
-            mrow[qq] = mnew;
-            pt[(qg * 4u + qq) * 33u + kj] = p;
-            o[qq] = o[qq] * alpha;
+        for (var rr = 0u; rr < RROWS_LANE; rr = rr + 1u) {
+            let r = rg * RROWS_LANE + rr;
+            let tq = tb + r / gs;
+            for (var kk = 0u; kk < KKEYS; kk = kk + 1u) {
+                let key = kg + KG * kk;
+                let live = (k0 + key) <= (p0 + tq) && tq < ntok && (win == 0u || (k0 + key) + win > p0 + tq);
+                pt[r * PS + key] = select(-3.0e38, s[rr * KKEYS + kk] * scale, live);
+            }
         }
         workgroupBarrier();
-        for (var kk = 0u; kk < 32u; kk = kk + 1u) {
-            let vw = vt[kk * 32u + kj];
-            let vv = vec4<f32>(unpack2x16float(vw.x), unpack2x16float(vw.y));
-            for (var qq = 0u; qq < 4u; qq = qq + 1u) {
-                o[qq] = o[qq] + pt[(qg * 4u + qq) * 33u + kk] * vv;
+        {
+            let r = li / LPR;
+            let part = li % LPR;
+            var mt = -3.0e38;
+            for (var j = 0u; j < TK / LPR; j = j + 1u) { mt = max(mt, pt[r * PS + part * (TK / LPR) + j]); }
+            SHUFFLE_MAX
+            let mold = mrow[r];
+            let mnew = max(mold, mt);
+            let alpha = exp(mold - mnew);
+            var ps = 0.0;
+            for (var j = 0u; j < TK / LPR; j = j + 1u) {
+                let at = r * PS + part * (TK / LPR) + j;
+                let sc = pt[at];
+                let p = select(0.0, exp(sc - mnew), sc > -1.0e38);
+                pt[at] = p;
+                ps = ps + p;
+            }
+            SHUFFLE_SUM
+            if (part == 0u) {
+                lrow[r] = lrow[r] * alpha + ps;
+                mrow[r] = mnew;
+                arow[r] = alpha;
+            }
+        }
+        workgroupBarrier();
+        for (var rr = 0u; rr < RP; rr = rr + 1u) {
+            let a = arow[rp * RP + rr];
+            o[2u * rr] = o[2u * rr] * a;
+            o[2u * rr + 1u] = o[2u * rr + 1u] * a;
+        }
+        for (var key = 0u; key < TK; key = key + 1u) {
+            let vf = lo4(vt[key * KS + dg]);
+            for (var rr = 0u; rr < RP; rr = rr + 1u) {
+                let p = pt[(rp * RP + rr) * PS + key];
+                o[2u * rr] = o[2u * rr] + p * vf[0];
+                o[2u * rr + 1u] = o[2u * rr + 1u] + p * vf[1];
             }
         }
     }
-    for (var qq = 0u; qq < 4u; qq = qq + 1u) {
-        let tq = tb + qg * 4u + qq;
-        if (tq < ntok && 4u * kj < hd) {
-            let r = o[qq] / lrow[qq];
-            let ob = (tq * nh + h) * hd + 4u * kj;
-            out[ob] = r.x;
-            out[ob + 1u] = r.y;
-            out[ob + 2u] = r.z;
-            out[ob + 3u] = r.w;
+    if (dg < hv) {
+        for (var rr = 0u; rr < RP; rr = rr + 1u) {
+            let r = rp * RP + rr;
+            let tq = tb + r / gs;
+            if (tq < ntok) {
+                let inv = 1.0 / lrow[r];
+                let ob = (tq * nh + g * gs + r % gs) * hd + 8u * dg;
+                let a = o[2u * rr] * inv;
+                let b = o[2u * rr + 1u] * inv;
+                out[ob] = a.x;
+                out[ob + 1u] = a.y;
+                out[ob + 2u] = a.z;
+                out[ob + 3u] = a.w;
+                out[ob + 4u] = b.x;
+                out[ob + 5u] = b.y;
+                out[ob + 6u] = b.z;
+                out[ob + 7u] = b.w;
+            }
         }
     }
 }
 "#;
+
+/// Query rows a workgroup of the prompt attention kernel takes.
+pub(super) const ATTN_ROWS: u32 = 16;
+
+/// The WGSL of the prompt attention kernel for heads of at most `hd` lanes.
+fn attention_tiled(hd: u32) -> String {
+    let r = ATTN_ROWS;
+    let tk = if hd > 128 { 16 } else { 32 };
+    let rr = 2;
+    let kk = r * tk / 128 / rr;
+    let lpr = 128 / r;
+    let shuffles = |op: &str, var: &str| -> String {
+        (0..lpr.ilog2())
+            .map(|b| {
+                format!(
+                    "{var} = {op}({var}, subgroupShuffleXor({var}, {}u));\n",
+                    1 << b
+                )
+            })
+            .collect()
+    };
+    ATTENTION_TILED
+        .replace(
+            "SHUFFLE_MAX",
+            &shuffles("max", "mt").replace("= max(mt,", "= max(mt,"),
+        )
+        .replace(
+            "SHUFFLE_SUM",
+            &(0..lpr.ilog2())
+                .map(|b| format!("ps = ps + subgroupShuffleXor(ps, {}u);\n", 1 << b))
+                .collect::<String>(),
+        )
+        .replace("ODIM", &(2 * r / (128 / (hd / 8))).to_string())
+        .replace("RROWS_LANE", &rr.to_string())
+        .replace("RROWS", &r.to_string())
+        .replace("TKEYS", &tk.to_string())
+        .replace("KKEYS", &kk.to_string())
+        .replace("SCORES", &(rr * kk).to_string())
+        .replace("HDV", &hd.to_string())
+        .replace("QSN", &(r * (hd / 4 + 1)).to_string())
+        .replace("KSN", &(tk * (hd / 8 + 1)).to_string())
+        .replace("PSN", &(r * (tk + 1)).to_string())
+        .replace("LPR", &lpr.to_string())
+}
 
 /// The per-head preparation of Q or of K and V: an optional RMS norm over the head with its
 /// weight, then RoPE at the token's position. Q lands in an f32 buffer, K and V in the f16
@@ -839,17 +1047,18 @@ const PREP_KV_DST: &str = r#"
 /// dot a key with the query by a butterfly and keep a running softmax and output of their own,
 /// which the groups then merge. Writes the slice's unnormalised output, its maximum score and
 /// its sum of exponentials to `part` (rows of `hd + 2`); [`ATTENTION_JOIN`] puts the slices
-/// together. Args: n_head, n_kv, hd, scale, -, splits. `hd` is at most 128 and a multiple of 8.
+/// together. Args: n_head, n_kv, hd, scale, -, splits, window (0 for none). `hd` is at most 128
+/// times `CPL` and a multiple of 8; a lane owns `CPL` chunks of eight dimensions.
 const ATTENTION: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> kc: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> vc: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> part: array<f32>;
 @group(0) @binding(5) var<storage, read> step: array<u32>;
-var<workgroup> qs: array<vec4<f32>, 32>;
+var<workgroup> qs: array<vec4<f32>, QSN>;
 var<workgroup> msh: array<f32, 16>;
 var<workgroup> lsh: array<f32, 16>;
-var<workgroup> acc_sh: array<f32, 2048>;
+var<workgroup> acc_sh: array<f32, ASN>;
 fn kdot(kw: vec4<u32>, qa: vec4<f32>, qb: vec4<f32>) -> f32 {
     return dot(unpack2x16float(kw.x), qa.xy) + dot(unpack2x16float(kw.y), qa.zw)
         + dot(unpack2x16float(kw.z), qb.xy) + dot(unpack2x16float(kw.w), qb.zw);
@@ -866,31 +1075,46 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let part_ix = wid.z;
     let g = h / (nh / nkv);
     let total = step[0] + t + 1u;
-    let lo = total * part_ix / splits;
-    let hi = total * (part_ix + 1u) / splits;
+    let win = arg(6u);
+    var kst = 0u;
+    if (win > 0u && total > win) { kst = total - win; }
+    let span = total - kst;
+    let lo = kst + span * part_ix / splits;
+    let hi = kst + span * (part_ix + 1u) / splits;
     let qb = (t * nh + h) * hd;
     let hv = hd / 8u;
     if (li < hd / 4u) { qs[li] = vec4<f32>(q[qb + li * 4u], q[qb + li * 4u + 1u], q[qb + li * 4u + 2u], q[qb + li * 4u + 3u]); }
     workgroupBarrier();
     let sub = li & 15u;
     let slot = li >> 4u;
-    let lane_on = sub < hv;
-    let c = min(sub, hv - 1u);
-    let qa = select(vec4<f32>(0.0), qs[2u * c], lane_on);
-    let qb2 = select(vec4<f32>(0.0), qs[2u * c + 1u], lane_on);
+    var qa: array<vec4<f32>, CPL>;
+    var qb2: array<vec4<f32>, CPL>;
+    var cs: array<u32, CPL>;
+    for (var cc = 0u; cc < CPL; cc = cc + 1u) {
+        let ch = sub + 16u * cc;
+        let on = ch < hv;
+        let c = min(ch, hv - 1u);
+        cs[cc] = c;
+        qa[cc] = select(vec4<f32>(0.0), qs[2u * c], on);
+        qb2[cc] = select(vec4<f32>(0.0), qs[2u * c + 1u], on);
+    }
     var m = -3.0e38;
     var l = 0.0;
-    var acc = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var acc: array<f32, ACCN>;
     for (var j0 = lo; j0 < hi; j0 = j0 + 64u) {
         var s: array<f32, 4>;
-        var vw: array<vec4<u32>, 4>;
+        var vw: array<vec4<u32>, VWN>;
         var ok: array<bool, 4>;
         for (var u = 0u; u < 4u; u = u + 1u) {
             let j = j0 + slot + 16u * u;
             let jj = min(j, hi - 1u);
             ok[u] = j < hi;
-            s[u] = kdot(kc[(jj * nkv + g) * hv + c], qa, qb2);
-            vw[u] = vc[(jj * nkv + g) * hv + c];
+            var sd = 0.0;
+            for (var cc = 0u; cc < CPL; cc = cc + 1u) {
+                sd = sd + kdot(kc[(jj * nkv + g) * hv + cs[cc]], qa[cc], qb2[cc]);
+                vw[u * CPL + cc] = vc[(jj * nkv + g) * hv + cs[cc]];
+            }
+            s[u] = sd;
         }
         var mt = m;
         for (var u = 0u; u < 4u; u = u + 1u) {
@@ -904,22 +1128,25 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         }
         let alpha = exp(m - mt);
         l = l * alpha;
-        for (var e = 0u; e < 8u; e = e + 1u) { acc[e] = acc[e] * alpha; }
+        for (var e = 0u; e < ACCN; e = e + 1u) { acc[e] = acc[e] * alpha; }
         for (var u = 0u; u < 4u; u = u + 1u) {
             let p = select(0.0, exp(s[u] - mt), ok[u]);
             l = l + p;
-            let a = unpack2x16float(vw[u].x);
-            let b = unpack2x16float(vw[u].y);
-            let cc = unpack2x16float(vw[u].z);
-            let dd = unpack2x16float(vw[u].w);
-            acc[0] = acc[0] + p * a.x;
-            acc[1] = acc[1] + p * a.y;
-            acc[2] = acc[2] + p * b.x;
-            acc[3] = acc[3] + p * b.y;
-            acc[4] = acc[4] + p * cc.x;
-            acc[5] = acc[5] + p * cc.y;
-            acc[6] = acc[6] + p * dd.x;
-            acc[7] = acc[7] + p * dd.y;
+            for (var ch = 0u; ch < CPL; ch = ch + 1u) {
+                let w = vw[u * CPL + ch];
+                let a = unpack2x16float(w.x);
+                let b = unpack2x16float(w.y);
+                let cc = unpack2x16float(w.z);
+                let dd = unpack2x16float(w.w);
+                acc[ch * 8u] = acc[ch * 8u] + p * a.x;
+                acc[ch * 8u + 1u] = acc[ch * 8u + 1u] + p * a.y;
+                acc[ch * 8u + 2u] = acc[ch * 8u + 2u] + p * b.x;
+                acc[ch * 8u + 3u] = acc[ch * 8u + 3u] + p * b.y;
+                acc[ch * 8u + 4u] = acc[ch * 8u + 4u] + p * cc.x;
+                acc[ch * 8u + 5u] = acc[ch * 8u + 5u] + p * cc.y;
+                acc[ch * 8u + 6u] = acc[ch * 8u + 6u] + p * dd.x;
+                acc[ch * 8u + 7u] = acc[ch * 8u + 7u] + p * dd.y;
+            }
         }
         m = mt;
     }
@@ -927,8 +1154,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         msh[slot] = m;
         lsh[slot] = l;
     }
-    if (lane_on) {
-        for (var e = 0u; e < 8u; e = e + 1u) { acc_sh[slot * hd + sub * 8u + e] = acc[e]; }
+    for (var ch = 0u; ch < CPL; ch = ch + 1u) {
+        if (sub + 16u * ch < hv) {
+            for (var e = 0u; e < 8u; e = e + 1u) { acc_sh[slot * hd + (sub + 16u * ch) * 8u + e] = acc[ch * 8u + e]; }
+        }
     }
     workgroupBarrier();
     var mm = -3.0e38;
@@ -947,6 +1176,16 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }
 }
 "#;
+
+/// The WGSL of the decode attention for heads of at most `128 * cpl` lanes.
+fn attention(cpl: u32) -> String {
+    ATTENTION
+        .replace("QSN", &(32 * cpl).to_string())
+        .replace("ASN", &(2048 * cpl).to_string())
+        .replace("ACCN", &(8 * cpl).to_string())
+        .replace("VWN", &(4 * cpl).to_string())
+        .replace("CPL", &cpl.to_string())
+}
 
 /// The slices of [`ATTENTION`] put together: `out = sum_s exp(m_s - M) o_s / sum_s exp(m_s - M)
 /// l_s`. Args: n_head, n_kv, hd, -, -, splits. One workgroup of 256 lanes per (head, token).
@@ -973,6 +1212,27 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 "#;
 
+/// The router kernel for `experts` experts.
+pub(super) fn router_kernel(experts: usize) -> &'static str {
+    match experts {
+        0..=16 => "router16",
+        17..=32 => "router32",
+        33..=64 => "router64",
+        65..=128 => "router128",
+        _ => "router256",
+    }
+}
+
+/// The experts' version of mat-vec kernel `mv`.
+pub(super) fn expert_kernel(mv: &str) -> &'static str {
+    match mv {
+        "mv_q4k" => "mx_q4k",
+        "mv_q6k" => "mx_q6k",
+        "mv_q8_0" => "mx_q8_0",
+        _ => "mx_f16",
+    }
+}
+
 /// The WGSL of kernel `name` for workgroups of `wg` lanes.
 fn source(name: &str, wg: u32) -> anyhow::Result<String> {
     let lanes = lanes_per_row(name);
@@ -980,8 +1240,28 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
         .rev()
         .map(|b| format!("        v = v + subgroupShuffleXor(v, {}u);\n", 1 << b))
         .collect();
+    let experts = name.starts_with("mx_");
     let matvec = |(wtype, items, item): (&str, &str, &str)| {
-        MATVEC
+        let frame = if experts {
+            MATVEC
+                .replace("let nt = arg(2u);", "let nt = 1u;")
+                .replace(
+                    "let tb = arg(3u);",
+                    "let pair = wid.z;\n    let rt = route[pair];\n    let tb = select(pair / arg(2u), pair, arg(6u) == 1u);",
+                )
+                .replace(
+                    "let row = min(raw, m - 1u);",
+                    "let row = rt.x * m + min(raw, m - 1u);",
+                )
+                .replace("let at = arg(4u) + (tb + t) * arg(7u) + row;", "let at = pair * m + raw;")
+                .replace(
+                    "@group(0) @binding(5) var<storage, read> xf: array<vec4<f32>>;",
+                    "@group(0) @binding(5) var<storage, read> xf: array<vec4<f32>>;\n@group(0) @binding(6) var<storage, read> route: array<vec2<u32>>;",
+                )
+        } else {
+            MATVEC.to_string()
+        };
+        frame
             .replace("WTYPE", wtype)
             .replace("SHUFFLES", &shuffles)
             .replace("LPR", &lanes.to_string())
@@ -1004,23 +1284,49 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
             .replace("BKV", &bk.to_string())
             .replace("SWN", &(64 * s).to_string())
             .replace("SSN", &(64 * (bk / 32)).to_string())
-            .replace("SXN", &(32 * s).to_string())
-            .replace("SMN", &(32 * (bk / 32)).to_string())
+            .replace("SXN", &(MM_TOKENS * s).to_string())
+            .replace("SMN", &(MM_TOKENS * (bk / 32)).to_string())
+            .replace("NACC", &(4 * MM_TT).to_string())
+            .replace("TOKT", &format!("{}u", MM_TOKENS))
+            .replace("TTu", &format!("{}u", MM_TT))
+            .replace("TT", &MM_TT.to_string())
     };
+    if let Some(body) = super::coop::body(name) {
+        return Ok(format!(
+            "enable f16;\nenable wgpu_cooperative_matrix;\n{HEAD}{body}"
+        ));
+    }
+    if let Some(ep) = name
+        .strip_prefix("router")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        let lpe = 256 / ep;
+        let sum: String = (0..lpe.ilog2())
+            .map(|b| format!("    s = s + subgroupShuffleXor(s, {}u);\n", 1 << b))
+            .collect();
+        let body = ROUTER
+            .replace("SHUFFLE_SUM", &sum)
+            .replace("EP", &ep.to_string());
+        return Ok(format!("{HEAD}{body}"));
+    }
     let body = match name {
         "quant" => QUANT.to_string(),
-        "mv_q4k" => matvec(Q4K_ITEM),
-        "mv_q6k" => matvec(Q6K_ITEM),
-        "mv_q8_0" => matvec(Q8_0_ITEM),
-        "mv_f16" => matvec(F16_ITEM),
+        "post_norm" => POST_NORM.to_string(),
+        "mv_q4k" | "mx_q4k" => matvec(Q4K_ITEM),
+        "mv_q6k" | "mx_q6k" => matvec(Q6K_ITEM),
+        "mv_q8_0" | "mx_q8_0" => matvec(Q8_0_ITEM),
+        "mv_f16" | "mx_f16" => matvec(F16_ITEM),
+        "moe_combine" => MOE_COMBINE.to_string(),
         "mm_q4k" => matmat(Q4K_LOAD),
         "mm_q6k" => matmat(Q6K_LOAD),
         "mm_q8_0" => matmat(Q8_0_LOAD),
         "mm_f16" => MATMAT_F16.to_string(),
-        "attn_tiled" => ATTENTION_TILED.to_string(),
+        "attn_tiled" => attention_tiled(128),
+        "attn_tiled_wide" => attention_tiled(256),
+        "attention_wide" => attention(2),
         "prep_q" => format!("{PREP_Q_DST}{}", PREP.replace("STORE", PREP_Q_STORE)),
         "prep_kv" => format!("{PREP_KV_DST}{}", PREP.replace("STORE", PREP_KV_STORE)),
-        "attention" => ATTENTION.to_string(),
+        "attention" => attention(1),
         "attention_join" => ATTENTION_JOIN.to_string(),
         other => anyhow::bail!("vulkan: no kernel {other}"),
     };
@@ -1036,6 +1342,8 @@ pub(super) fn spirv(name: &str, wg: u32) -> anyhow::Result<Vec<u32>> {
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::IMMEDIATES
             | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+            | naga::valid::Capabilities::SHADER_FLOAT16
+            | naga::valid::Capabilities::COOPERATIVE_MATRIX
             | naga::valid::Capabilities::SUBGROUP,
     )
     .subgroup_stages(naga::valid::ShaderStages::COMPUTE)

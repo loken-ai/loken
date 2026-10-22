@@ -4319,7 +4319,10 @@ impl GenericHeteroTransformer {
                 let Some(t) = source.read_opt(name, &Device::Cpu)? else {
                     return Ok(None);
                 };
-                let (rows, cols) = t.shape().dims2()?;
+                // A stack of experts is read as the rows of one after the other.
+                let dims = t.shape().dims().to_vec();
+                let cols = dims.last().copied().unwrap_or(1);
+                let rows = dims[..dims.len().saturating_sub(1)].iter().product();
                 let bytes = t.data()?.into_owned();
                 Ok(Some((t.dtype(), rows, cols, bytes)))
             };
