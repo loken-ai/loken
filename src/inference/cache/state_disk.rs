@@ -46,14 +46,6 @@ const BLOCK_DIR: &str = "blocks";
 const INDEX_FILE: &str = "index.bin";
 const GEOMETRY_FILE: &str = "geometry.bin";
 const TMP_PREFIX: &str = ".tmp-";
-const MANIFEST_MAGIC: &[u8; 8] = b"LKSMAN01";
-/// Starts a block file that is stored compressed: the magic, the original length on 8 bytes, then
-/// the zstd frame of the block with its bytes regrouped by position in each 4-byte word.
-const PACKED_MAGIC: &[u8; 8] = b"LKZSTD01";
-/// A block smaller than this is stored as it is: the saving would not be worth a frame.
-const PACK_MIN_BYTES: usize = 4096;
-/// A block is stored compressed only when it comes out below this share of its size.
-const PACK_MAX_SHARE: f64 = 0.9;
 
 /// One stored snapshot: its manifest file and the blocks it references.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,27 +62,25 @@ pub struct Entry {
     pub blocks: Vec<Key>,
 }
 
-/// Starts the index file: the magic, then one 32-byte record per snapshot, its key, the time it
-/// was last used and the times it was used.
-const INDEX_MAGIC: &[u8; 8] = b"LKSIDX01";
-/// Starts the geometry file: the magic, then one 40-byte record per scope, its hash and the
-/// block size in tokens.
-const GEOMETRY_MAGIC: &[u8; 8] = b"LKSGEO01";
+use super::container::{self, STATE_BLOCK, STATE_GEOMETRY, STATE_INDEX, STATE_MANIFEST};
 
-/// How often and how recently each snapshot was used, which orders the evictions.
+/// The version every kind of file of this store is written at.
+const FILE_VERSION: u16 = 1;
+
+/// How often and how recently each snapshot was used, which orders the evictions: one 32-byte
+/// record per snapshot, its key, the time it was last used and the times it was used.
 fn encode_index(uses: &HashMap<Key, (u64, u64)>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + uses.len() * 32);
-    out.extend_from_slice(INDEX_MAGIC);
+    let mut body = Vec::with_capacity(uses.len() * 32);
     for (key, (last_used, hits)) in uses {
-        out.extend_from_slice(key);
-        out.extend_from_slice(&last_used.to_le_bytes());
-        out.extend_from_slice(&hits.to_le_bytes());
+        body.extend_from_slice(key);
+        body.extend_from_slice(&last_used.to_le_bytes());
+        body.extend_from_slice(&hits.to_le_bytes());
     }
-    out
+    container::seal(STATE_INDEX, FILE_VERSION, &body, false)
 }
 
-fn decode_index(bytes: &[u8]) -> Option<HashMap<Key, (u64, u64)>> {
-    let body = bytes.strip_prefix(INDEX_MAGIC.as_slice())?;
+fn decode_index(file: Vec<u8>) -> Option<HashMap<Key, (u64, u64)>> {
+    let (_, body) = container::open(STATE_INDEX, file).ok()?;
     if body.len() % 32 != 0 {
         return None;
     }
@@ -109,18 +99,18 @@ fn decode_index(bytes: &[u8]) -> Option<HashMap<Key, (u64, u64)>> {
     )
 }
 
+/// The block size of each scope: one 40-byte record per scope, its hash and the size in tokens.
 fn encode_geometry(geometry: &HashMap<[u8; 32], usize>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + geometry.len() * 40);
-    out.extend_from_slice(GEOMETRY_MAGIC);
+    let mut body = Vec::with_capacity(geometry.len() * 40);
     for (scope, tokens) in geometry {
-        out.extend_from_slice(scope);
-        out.extend_from_slice(&(*tokens as u64).to_le_bytes());
+        body.extend_from_slice(scope);
+        body.extend_from_slice(&(*tokens as u64).to_le_bytes());
     }
-    out
+    container::seal(STATE_GEOMETRY, FILE_VERSION, &body, false)
 }
 
-fn decode_geometry(bytes: &[u8]) -> Option<HashMap<[u8; 32], usize>> {
-    let body = bytes.strip_prefix(GEOMETRY_MAGIC.as_slice())?;
+fn decode_geometry(file: Vec<u8>) -> Option<HashMap<[u8; 32], usize>> {
+    let (_, body) = container::open(STATE_GEOMETRY, file).ok()?;
     if body.len() % 40 != 0 {
         return None;
     }
@@ -325,71 +315,12 @@ fn parse_name(name: &str) -> Option<(usize, u64, Key)> {
 }
 
 /// The blocks a manifest file names, from its header, and where the caller's payload starts.
-/// `bytes` with the bytes at each position of a 4-byte word gathered together, which gives a
-/// compressor long runs when the words are floats that carry few distinct values. A tail shorter
-/// than a word stays as it is.
-fn shuffle4(bytes: &[u8]) -> Vec<u8> {
-    let words = bytes.len() / 4;
-    let mut out = vec![0u8; bytes.len()];
-    for (i, w) in bytes.chunks_exact(4).enumerate() {
-        for (k, b) in w.iter().enumerate() {
-            out[k * words + i] = *b;
-        }
-    }
-    out[words * 4..].copy_from_slice(&bytes[words * 4..]);
-    out
-}
-
-/// The inverse of [`shuffle4`].
-fn unshuffle4(bytes: &[u8]) -> Vec<u8> {
-    let words = bytes.len() / 4;
-    let mut out = vec![0u8; bytes.len()];
-    for i in 0..words {
-        for k in 0..4 {
-            out[i * 4 + k] = bytes[k * words + i];
-        }
-    }
-    out[words * 4..].copy_from_slice(&bytes[words * 4..]);
-    out
-}
-
-/// What a block is written as: compressed when that saves enough, else as it is.
-fn pack(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() < PACK_MIN_BYTES {
-        return None;
-    }
-    let body = zstd::bulk::compress(&shuffle4(bytes), 1).ok()?;
-    if (body.len() + 16) as f64 > bytes.len() as f64 * PACK_MAX_SHARE {
-        return None;
-    }
-    let mut out = Vec::with_capacity(body.len() + 16);
-    out.extend_from_slice(PACKED_MAGIC);
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(&body);
-    Some(out)
-}
-
-/// The block a file holds, whether it was stored compressed or not.
-fn unpack(file: Vec<u8>) -> std::io::Result<Vec<u8>> {
-    if file.len() < 16 || &file[..8] != PACKED_MAGIC {
-        return Ok(file);
-    }
-    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-    let len = u64::from_le_bytes(file[8..16].try_into().unwrap()) as usize;
-    let shuffled = zstd::bulk::decompress(&file[16..], len).map_err(|e| bad(&e.to_string()))?;
-    if shuffled.len() != len {
-        return Err(bad("packed block has the wrong length"));
-    }
-    Ok(unshuffle4(&shuffled))
-}
-
-fn read_header(bytes: &[u8]) -> Option<(Vec<Key>, usize)> {
-    if bytes.len() < 12 || &bytes[..8] != MANIFEST_MAGIC {
-        return None;
-    }
-    let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let end = n.checked_mul(16)?.checked_add(12)?;
-    let hashes = bytes.get(12..end)?;
+/// The blocks a manifest body names and where its payload starts: the count, the hashes, then
+/// the payload.
+fn read_header(body: &[u8]) -> Option<(Vec<Key>, usize)> {
+    let n = u32::from_le_bytes(body.get(..4)?.try_into().ok()?) as usize;
+    let end = n.checked_mul(16)?.checked_add(4)?;
+    let hashes = body.get(4..end)?;
     Some((
         hashes
             .chunks_exact(16)
@@ -408,7 +339,7 @@ impl StateStore {
         use std::io::Read;
         std::fs::create_dir_all(dir.join(BLOCK_DIR)).with_context(|| dir.display().to_string())?;
         let uses = match std::fs::read(dir.join(INDEX_FILE)) {
-            Ok(b) => decode_index(&b).unwrap_or_else(|| {
+            Ok(b) => decode_index(b).unwrap_or_else(|| {
                 tracing::warn!("state cache: index unreadable; rebuilt from the file names");
                 HashMap::new()
             }),
@@ -450,17 +381,19 @@ impl StateStore {
             let mut head = Vec::new();
             let blocks = std::fs::File::open(item.path())
                 .and_then(|f| {
-                    // The header is 12 bytes and the hashes after it; read as many as it says.
-                    let mut f = f.take(12);
+                    // The file header and the block count, then as many hashes as it says.
+                    let mut f = f.take((container::HEADER_LEN + 4) as u64);
                     f.read_to_end(&mut head)?;
                     let n = head
-                        .get(8..12)
-                        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
-                    let mut f = f.into_inner().take(n as u64 * 16);
+                        .get(container::HEADER_LEN..)
+                        .and_then(|b| b.try_into().ok())
+                        .map_or(0, |b: [u8; 4]| u32::from_le_bytes(b) as u64);
+                    let mut f = f.into_inner().take(n * 16);
                     f.read_to_end(&mut head)
                 })
                 .ok()
-                .and_then(|_| read_header(&head))
+                .filter(|_| container::peek(STATE_MANIFEST, &head).is_some())
+                .and_then(|_| read_header(&head[container::HEADER_LEN..]))
                 .map(|(b, _)| b);
             let Some(blocks) = blocks.filter(|b| b.iter().all(|h| block_bytes.contains_key(h)))
             else {
@@ -505,7 +438,7 @@ impl StateStore {
         });
         let geometry: HashMap<[u8; 32], usize> = std::fs::read(dir.join(GEOMETRY_FILE))
             .ok()
-            .and_then(|b| decode_geometry(&b))
+            .and_then(decode_geometry)
             .unwrap_or_default();
         Ok(Self {
             dir,
@@ -563,7 +496,7 @@ impl StateStore {
                 .get(path)
                 .map(|b| b.as_ref().clone())
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)),
-            None => std::fs::read(path).and_then(unpack),
+            None => std::fs::read(path),
         }
     }
 
@@ -619,7 +552,7 @@ impl StateStore {
             g.insert(*scope, b);
             encode_geometry(&g)
         };
-        let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &bytes, false);
+        let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &bytes);
         b
     }
 
@@ -736,8 +669,9 @@ impl StateStore {
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
         let path = self.path_of(entry);
         let bytes = self.load(&path).map_err(anyhow::Error::from).and_then(|b| {
-            let (_, start) = read_header(&b).ok_or_else(|| anyhow!("manifest header"))?;
-            Ok(b[start..].to_vec())
+            let (_, body) = container::open(STATE_MANIFEST, b)?;
+            let (_, start) = read_header(&body).ok_or_else(|| anyhow!("manifest header"))?;
+            Ok(body[start..].to_vec())
         });
         match bytes {
             Ok(bytes) => {
@@ -763,6 +697,7 @@ impl StateStore {
     pub fn read_block(&self, hash: &Key) -> Result<Vec<u8>> {
         let path = self.block_path(hash);
         self.load(&path)
+            .and_then(|b| container::open(STATE_BLOCK, b).map(|(_, body)| body))
             .map_err(|e| anyhow!("{}: {e}", path.display()))
     }
 
@@ -885,7 +820,8 @@ impl StateStore {
                 release(self);
                 return Err(anyhow!("state cache: block {b} is not available"));
             }
-            let stored = match self.write_file(&self.block_path(h), &bytes, true) {
+            let sealed = container::seal(STATE_BLOCK, FILE_VERSION, &bytes, self.memory.is_none());
+            let stored = match self.write_file(&self.block_path(h), &sealed) {
                 Ok(n) => n,
                 Err(e) => {
                     release(self);
@@ -895,13 +831,14 @@ impl StateStore {
             written += stored;
             self.lock().block_bytes.insert(*h, stored);
         }
-        let mut file = Vec::with_capacity(12 + hashes.len() * 16 + manifest.len());
-        file.extend_from_slice(MANIFEST_MAGIC);
-        file.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+        let mut body = Vec::with_capacity(4 + hashes.len() * 16 + manifest.len());
+        body.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
         for h in &hashes {
-            file.extend_from_slice(h);
+            body.extend_from_slice(h);
         }
-        file.extend_from_slice(manifest);
+        body.extend_from_slice(manifest);
+        // Not compressed: a store that reopens reads the block names from the start of the file.
+        let file = container::seal(STATE_MANIFEST, FILE_VERSION, &body, false);
         let mut entry = Entry {
             key,
             len,
@@ -911,7 +848,7 @@ impl StateStore {
             hits: 0,
             blocks: hashes.clone(),
         };
-        match self.write_file(&self.path_of(&entry), &file, false) {
+        match self.write_file(&self.path_of(&entry), &file) {
             Ok(n) => entry.bytes = n,
             Err(e) => {
                 release(self);
@@ -936,9 +873,8 @@ impl StateStore {
     }
 
     /// `bytes` in a new file at `path`: written beside it, synced, renamed in.
-    /// Write `bytes` to `path` and return the bytes the file takes: a block (`pack`) is stored
-    /// compressed on disk when that saves enough; a store in memory keeps what it is given.
-    fn write_file(&self, path: &Path, bytes: &[u8], pack_it: bool) -> Result<u64> {
+    /// Write `bytes` to `path` and return the bytes the file takes.
+    fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<u64> {
         if let Some(files) = &self.memory {
             files
                 .lock()
@@ -946,8 +882,6 @@ impl StateStore {
                 .insert(path.to_path_buf(), Arc::new(bytes.to_vec()));
             return Ok(bytes.len() as u64);
         }
-        let packed = if pack_it { pack(bytes) } else { None };
-        let bytes = packed.as_deref().unwrap_or(bytes);
         let tmp = self.dir.join(format!(
             "{TMP_PREFIX}{}-{}",
             std::process::id(),
@@ -1053,7 +987,7 @@ impl StateStore {
             .values()
             .map(|e| (e.key, (e.last_used, e.hits)))
             .collect();
-        let _ = self.write_file(&self.dir.join(INDEX_FILE), &encode_index(&uses), false);
+        let _ = self.write_file(&self.dir.join(INDEX_FILE), &encode_index(&uses));
     }
     /// Snapshots held and the bytes they and their blocks take.
     pub fn stats(&self) -> (usize, u64) {
@@ -1275,7 +1209,10 @@ mod tests {
         assert_eq!(store.read_block(&e.blocks[1]).unwrap(), noise);
         let size = |h| std::fs::metadata(store.block_path(h)).unwrap().len();
         assert!(size(&e.blocks[0]) < few.len() as u64 / 4);
-        assert_eq!(size(&e.blocks[1]), noise.len() as u64);
+        assert_eq!(
+            size(&e.blocks[1]),
+            (noise.len() + container::HEADER_LEN) as u64
+        );
         assert!(store.stats().1 < (few.len() + noise.len()) as u64);
     }
 
@@ -1284,10 +1221,10 @@ mod tests {
     #[test]
     fn the_index_and_the_geometry_are_binary_and_survive_a_reopen() {
         let uses: HashMap<Key, (u64, u64)> = [([7u8; 16], (5, 2)), ([9u8; 16], (8, 0))].into();
-        assert_eq!(decode_index(&encode_index(&uses)), Some(uses));
-        assert_eq!(decode_index(b"{\"uses\":{}}"), None);
+        assert_eq!(decode_index(encode_index(&uses)), Some(uses));
+        assert_eq!(decode_index(b"{\"uses\":{}}".to_vec()), None);
         let geo: HashMap<[u8; 32], usize> = [([3u8; 32], 64)].into();
-        assert_eq!(decode_geometry(&encode_geometry(&geo)), Some(geo));
+        assert_eq!(decode_geometry(encode_geometry(&geo)), Some(geo));
 
         let d = dir("reopen");
         let t = seq(64, 5);
@@ -1332,8 +1269,9 @@ mod tests {
     #[test]
     fn the_least_recently_used_goes_first_and_the_pinned_prefix_last() {
         let d = dir("evict");
-        // Each snapshot is a 10-byte manifest plus 12 bytes of header; none has blocks.
-        let store = StateStore::open(d.clone(), 3 * 22, 8).unwrap();
+        // Each snapshot is a 10-byte manifest plus the 24 bytes of file header and count; none has
+        // blocks.
+        let store = StateStore::open(d.clone(), 3 * 34, 8).unwrap();
         let a = seq(7, 1);
         let b = seq(7, 5000);
         let c = seq(7, 9000);
@@ -1363,7 +1301,7 @@ mod tests {
         assert!(!store.candidates(&kc, 7).is_empty());
         // A manifest larger than the whole budget is not stored.
         let big = seq(7, 20000);
-        put(&store, &big, 7, &[0u8; 80]);
+        put(&store, &big, 7, &[0u8; 120]);
         assert!(store.candidates(&store.keys(&SCOPE, &big), 7).is_empty());
         let _ = std::fs::remove_dir_all(d);
     }
@@ -1371,15 +1309,16 @@ mod tests {
     #[test]
     fn eviction_counts_a_block_with_its_last_reference() {
         let d = dir("evictblocks");
-        // Blocks are 10 bytes, manifests 12 + 16 per block + payload. Budget for two of the three.
-        let store = StateStore::open(d.clone(), 200, 8).unwrap();
+        // Blocks are 30 bytes with their header, manifests 24 + 16 per block + payload. Budget for
+        // two of the three.
+        let store = StateStore::open(d.clone(), 300, 8).unwrap();
         let t = seq(48, 3);
-        put(&store, &t, 16, b"aa"); // 2 blocks: 20 + 12 + 32 + 2 = 66 bytes
-        put(&store, &t, 24, b"bb"); // + 1 block + 62 -> 138
+        put(&store, &t, 16, b"aa"); // 2 blocks: 60 + 24 + 32 + 2 = 118 bytes
+        put(&store, &t, 24, b"bb"); // + 1 block + 74 -> 222
         assert_eq!(store.stats().0, 2);
-        put(&store, &t, 32, b"cc"); // + 1 block + 78 -> 226, over 200: the oldest goes, leaving 180
+        put(&store, &t, 32, b"cc"); // + 1 block + 90 -> 342, over 300: the oldest goes, leaving 284
         assert_eq!(store.stats().0, 2);
-        assert!(store.stats().1 <= 200);
+        assert!(store.stats().1 <= 300);
         assert!(store.candidates(&store.keys(&SCOPE, &t), 16).is_empty());
         assert_eq!(store.candidates(&store.keys(&SCOPE, &t), 48)[0].len, 32);
         // Blocks 0..4 are all still named by the survivors.

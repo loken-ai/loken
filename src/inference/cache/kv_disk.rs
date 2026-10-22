@@ -15,7 +15,7 @@ use std::sync::Mutex;
 /// K then V; `None` for a layer that keeps no KV of its own.
 pub type LayerRows = Option<(Vec<f32>, Vec<f32>)>;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Manifest {
     pub model: String,
     pub layout: u64,
@@ -27,15 +27,60 @@ pub struct Manifest {
     pub last_used: u64,
     /// KV element dtype code (0 = F16, 1 = F32, 2 = BF16). A cold import rebuilds tensors
     /// the model's cache accepts; the dtype is only known while a model is warm, so it is
-    /// recorded here. Absent in manifests written before this field: default 0 (F16).
-    #[serde(default)]
+    /// recorded here.
     pub kv_dtype: u8,
     /// Hash of the side blob holding this snapshot's windowed layers, when it has any.
     /// A windowed layer's rows depend on the whole sequence, not on a token block, so
     /// they cannot share the content-addressed chain; the blob is per-manifest and reused
-    /// only when the whole prefix matches. Absent in older manifests.
-    #[serde(default)]
+    /// only when the whole prefix matches.
     pub window_blob: Option<u64>,
+}
+
+/// The version of the manifest file.
+const MANIFEST_VERSION: u16 = 1;
+
+impl Manifest {
+    /// The manifest as a file of the shared cache format.
+    fn encode(&self) -> Vec<u8> {
+        use super::container::Writer;
+        let mut w = Writer::default();
+        w.str(&self.model);
+        w.u64(self.layout);
+        w.u32s(&self.tokens);
+        w.u64(self.covered as u64);
+        w.u64s(&self.blocks);
+        w.u64(self.bytes);
+        w.u64(self.last_used);
+        w.u8(self.kv_dtype);
+        w.u8(u8::from(self.window_blob.is_some()));
+        w.u64(self.window_blob.unwrap_or(0));
+        super::container::seal(super::container::KV_MANIFEST, MANIFEST_VERSION, &w.0, false)
+    }
+
+    /// The manifest a file holds, `None` when it is not one this build reads.
+    fn decode(file: Vec<u8>) -> Option<Self> {
+        use super::container::{open, Reader, KV_MANIFEST};
+        let (version, body) = open(KV_MANIFEST, file).ok()?;
+        if version != MANIFEST_VERSION {
+            return None;
+        }
+        let mut r = Reader(&body);
+        let (model, layout, tokens) = (r.str()?, r.u64()?, r.u32s()?);
+        let (covered, blocks, bytes) = (r.u64()? as usize, r.u64s()?, r.u64()?);
+        let (last_used, kv_dtype) = (r.u64()?, r.u8()?);
+        let (has_window, window) = (r.u8()? != 0, r.u64()?);
+        Some(Self {
+            model,
+            layout,
+            tokens,
+            covered,
+            blocks,
+            bytes,
+            last_used,
+            kv_dtype,
+            window_blob: has_window.then_some(window),
+        })
+    }
 }
 
 pub struct KvDiskStore {
@@ -104,12 +149,12 @@ impl KvDiskStore {
         let mut index = Vec::new();
         for entry in std::fs::read_dir(dir.join("manifests"))? {
             let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            if path.extension().and_then(|e| e.to_str()) != Some("lkm") {
                 continue;
             }
             match std::fs::read(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|b| serde_json::from_slice::<Manifest>(&b).map_err(Into::into))
+                .and_then(|b| Manifest::decode(b).ok_or_else(|| anyhow!("not a manifest")))
             {
                 Ok(m) => index.push(m),
                 Err(e) => {
@@ -142,7 +187,7 @@ impl KvDiskStore {
 
     fn manifest_path(&self, m: &Manifest) -> PathBuf {
         let last = m.blocks.last().copied().unwrap_or(0);
-        self.dir.join("manifests").join(format!("{last:016x}.json"))
+        self.dir.join("manifests").join(format!("{last:016x}.lkm"))
     }
 
     /// The manifest sharing the longest block-aligned prefix with `prompt`, as
@@ -291,8 +336,7 @@ impl KvDiskStore {
             window_blob,
         };
         let path = self.manifest_path(&manifest);
-        let json = serde_json::to_vec(&manifest)?;
-        std::fs::write(&path, json).with_context(|| path.display().to_string())?;
+        std::fs::write(&path, manifest.encode()).with_context(|| path.display().to_string())?;
         {
             let mut g = self
                 .index
@@ -617,5 +661,32 @@ fn block_rows(view: &safetensors::tensor::TensorView) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn a_manifest_reads_back_what_was_written_and_nothing_else() {
+        let m = Manifest {
+            model: "some-model".into(),
+            layout: 77,
+            tokens: vec![1, 2, 3, 4_000_000_000],
+            covered: 4,
+            blocks: vec![u64::MAX, 9],
+            bytes: 1234,
+            last_used: 55,
+            kv_dtype: 2,
+            window_blob: Some(88),
+        };
+        assert_eq!(Manifest::decode(m.encode()), Some(m.clone()));
+        let plain = Manifest {
+            window_blob: None,
+            ..m
+        };
+        assert_eq!(Manifest::decode(plain.encode()), Some(plain));
+        assert_eq!(Manifest::decode(b"{\"model\":\"x\"}".to_vec()), None);
     }
 }

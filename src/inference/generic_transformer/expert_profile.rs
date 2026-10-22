@@ -11,10 +11,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::inference::cache::container;
 use crate::tensor::{Error, Result};
 
-const MAGIC: &[u8; 4] = b"LKXP";
-const VERSION: u32 = 1;
+/// Starts a profile written before the shared cache format: the magic, a version word of 1,
+/// the layer and expert counts, then the counts.
+const LEGACY_MAGIC: &[u8; 4] = b"LKXP";
+const VERSION: u16 = 1;
 
 /// Routing counts, `[layers * experts]`, layer by layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,25 +42,32 @@ impl ExpertProfile {
     }
 
     /// The file at `path`, refused when it is not a profile or holds fewer counts than its
-    /// header says.
+    /// header says. A profile written before the shared cache format is read as it was.
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::msg(format!("expert profile {}: {e}", path.display())))?;
-        let word = |at: usize| -> Result<u32> {
-            bytes
-                .get(at..at + 4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .ok_or_else(|| Error::msg(format!("expert profile {}: truncated", path.display())))
+        let refused = |why: &str| Error::msg(format!("expert profile {}: {why}", path.display()));
+        let file = std::fs::read(path).map_err(|e| refused(&e.to_string()))?;
+        let body = if file.starts_with(LEGACY_MAGIC) {
+            let mut body = Vec::with_capacity(file.len());
+            body.extend_from_slice(&file[8..]);
+            if file.get(4..8) != Some(&1u32.to_le_bytes()[..]) {
+                return Err(refused("not a profile this build reads"));
+            }
+            body
+        } else {
+            let (version, body) = container::open(container::EXPERT_PROFILE, file)
+                .map_err(|_| refused("not a profile this build reads"))?;
+            if version != VERSION {
+                return Err(refused("not a profile this build reads"));
+            }
+            body
         };
-        if bytes.get(..4) != Some(MAGIC.as_slice()) || word(4)? != VERSION {
-            return Err(Error::msg(format!(
-                "expert profile {}: not a profile this build reads",
-                path.display()
-            )));
-        }
-        let (layers, experts) = (word(8)? as usize, word(12)? as usize);
+        let mut r = container::Reader(&body);
+        let (layers, experts) = match (r.u32(), r.u32()) {
+            (Some(l), Some(e)) => (l as usize, e as usize),
+            _ => return Err(refused("truncated")),
+        };
         let counts = (0..layers * experts)
-            .map(|i| word(16 + 4 * i))
+            .map(|_| r.u32().ok_or_else(|| refused("truncated")))
             .collect::<Result<Vec<u32>>>()?;
         Ok(Self {
             layers,
@@ -68,20 +78,19 @@ impl ExpertProfile {
 
     /// The profile written at `path`, whole or not at all: a reader never sees a half file.
     pub fn write(&self, path: &Path) -> Result<()> {
-        let mut bytes = Vec::with_capacity(16 + 4 * self.counts.len());
-        bytes.extend_from_slice(MAGIC);
-        for word in [VERSION, self.layers as u32, self.experts as u32] {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
+        let mut w = container::Writer::default();
+        w.u32(self.layers as u32);
+        w.u32(self.experts as u32);
         for c in &self.counts {
-            bytes.extend_from_slice(&c.to_le_bytes());
+            w.u32(*c);
         }
+        let file = container::seal(container::EXPERT_PROFILE, VERSION, &w.0, true);
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
                 .map_err(|e| Error::msg(format!("expert profile {}: {e}", dir.display())))?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)
+        std::fs::write(&tmp, &file)
             .and_then(|()| std::fs::rename(&tmp, path))
             .map_err(|e| Error::msg(format!("expert profile {}: {e}", path.display())))
     }
@@ -164,6 +173,12 @@ mod tests {
         assert_eq!(ExpertProfile::read(&path).unwrap().layer(1), &[1, 2, 3]);
         std::fs::write(&path, b"LKXP\x02\x00\x00\x00").unwrap();
         assert!(ExpertProfile::read(&path).is_err());
+        let mut legacy = b"LKXP".to_vec();
+        for word in [1u32, 2, 3, 5, 0, 7, 1, 2, 3] {
+            legacy.extend_from_slice(&word.to_le_bytes());
+        }
+        std::fs::write(&path, legacy).unwrap();
+        assert_eq!(ExpertProfile::read(&path).unwrap(), profile);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

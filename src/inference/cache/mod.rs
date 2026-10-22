@@ -18,6 +18,7 @@
 /// that disagreement is either an out-of-memory or a placement nobody asked for.
 pub const KV_WORKING_WINDOW_TOKENS: usize = 4096;
 
+pub mod container;
 pub mod cpu_f16_kv;
 pub mod cpu_q8_kv;
 pub mod hf;

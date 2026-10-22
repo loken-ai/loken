@@ -4969,15 +4969,17 @@ mod oracle_gate {
         let cold = prompt_logits(&mut plain, &tokens);
 
         let version = super::super::snapshot::FORMAT_VERSION + 1;
-        // The manifest's snapshot payload starts after the store's header: magic, count, hashes.
-        let payload = 12 + 16 * 3;
+        // The manifest's snapshot payload starts after the store's file header, the block count
+        // and the hashes.
+        let header = crate::inference::cache::container::HEADER_LEN;
+        let payload = header + 4 + 16 * 3;
         let mut other_version = good_manifest.clone();
         other_version[payload + 8..payload + 12].copy_from_slice(&version.to_le_bytes());
         let mut flipped = good_manifest.clone();
         let mid = payload + (flipped.len() - payload) / 2;
         flipped[mid] ^= 0x01;
         let mut other_block = good_block.clone();
-        other_block[8..12].copy_from_slice(&version.to_le_bytes());
+        other_block[header + 8..header + 12].copy_from_slice(&version.to_le_bytes());
         let mut flipped_block = good_block.clone();
         let mid = flipped_block.len() / 2;
         flipped_block[mid] ^= 0x01;
