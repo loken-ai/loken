@@ -5,7 +5,7 @@ set -e
 # result against the wrong build.
 cd "${EAGLE_ROOT:?set EAGLE_ROOT to the checkout holding tools/eagle}"
 GGUF=${OLLAMA_MODELS:-$HOME/.ollama/models}/blobs/sha256-a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f
-PY="${VLLM_PY:-$HOME/vllm/bin/python}"; [ -x "$PY" ] || PY=python3
+PY="${VLLM_PY:-python3}"; [ -x "$PY" ] || PY=python3
 # wait for capture process (PID 736289) to exit
 while kill -0 736289 2>/dev/null; do sleep 15; done
 sleep 3

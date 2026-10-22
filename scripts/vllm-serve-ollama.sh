@@ -22,7 +22,7 @@
 #     --tokenizer <hf-repo> if startup hangs or errors on the tokenizer.
 set -euo pipefail
 
-VENV="${VLLM_VENV:-$HOME/vllm}"
+VENV="${VLLM_VENV:?set VLLM_VENV to a vLLM environment}"
 OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/.ollama/models}"
 PORT=8000
 GPU=1
