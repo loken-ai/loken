@@ -354,9 +354,33 @@ impl LoadedModelEntry {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Whether a request is running on any copy of the model.
+    pub(crate) fn busy(&self) -> bool {
+        std::iter::once(&self.engine)
+            .chain(self.replicas.iter())
+            .any(|e| e.in_flight() > 0)
+    }
+
     /// Record activity on this entry (for LRU eviction ordering).
     pub(crate) fn touch(&self) {
         self.last_used.store(now_millis(), Ordering::Relaxed);
+    }
+}
+
+/// Waits `period`, then until no request runs on the model, and returns the engine list locked.
+/// A model is idle when no request runs on it: a prompt read for minutes keeps the model, and
+/// the wait starts over once the request is done.
+async fn wait_until_idle<'a>(
+    engines: &'a tokio::sync::RwLock<Vec<LoadedModelEntry>>,
+    model_id: &str,
+    period: Duration,
+) -> tokio::sync::RwLockWriteGuard<'a, Vec<LoadedModelEntry>> {
+    loop {
+        tokio::time::sleep(period).await;
+        let guard = engines.write().await;
+        if !guard.iter().any(|e| e.model_id == model_id && e.busy()) {
+            return guard;
+        }
     }
 }
 
@@ -399,10 +423,7 @@ impl APIServer {
                 model_id, keep_alive_minutes
             );
 
-            tokio::time::sleep(duration).await;
-
-            // Time's up - unload the model
-            let mut engines_guard = engines.write().await;
+            let mut engines_guard = wait_until_idle(&engines, &model_id, duration).await;
             if let Some(pos) = engines_guard.iter().position(|e| e.model_id == model_id) {
                 let entry = engines_guard.remove(pos);
                 if let Err(e) = entry.unload_all().await {
@@ -1330,6 +1351,33 @@ mod tests {
                 "the pressure protocol addresses '{name}', which is not on the walk"
             );
         }
+    }
+
+    /// A model with a request running is not unloaded when its keep-alive runs out: a cold
+    /// prompt of a big model is read for longer than the keep-alive.
+    #[tokio::test]
+    async fn the_keep_alive_waits_for_a_request_running_on_the_model() {
+        let engine = Arc::new(LlmEngine::with_config(
+            crate::inference::engine::llm_engine::InferenceConfig::default(),
+        ));
+        let engines = tokio::sync::RwLock::new(vec![LoadedModelEntry::new(
+            "m".to_string(),
+            engine.clone(),
+            Some(1),
+        )]);
+        assert!(!engines.read().await[0].busy());
+        let request = engine.admit_request().await;
+        assert!(engines.read().await[0].busy());
+        let period = Duration::from_millis(20);
+        let waiting = wait_until_idle(&engines, "m", period);
+        tokio::pin!(waiting);
+        let early = tokio::time::timeout(Duration::from_millis(200), &mut waiting).await;
+        assert!(early.is_err(), "returned under a running request");
+        drop(request);
+        let guard = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+            .await
+            .expect("idle once the request is done");
+        assert_eq!(guard.len(), 1);
     }
 
     /// A server holding nothing frees nothing, and says so - for every engine on the
