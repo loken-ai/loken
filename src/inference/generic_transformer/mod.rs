@@ -71,6 +71,9 @@ mod loader;
 pub mod mixer;
 mod moe_weights;
 pub mod ngram;
+mod opencl_layers;
+#[cfg(all(test, feature = "opencl"))]
+mod opencl_parity;
 pub mod qsa;
 mod segment;
 mod speculate;
@@ -479,6 +482,8 @@ pub struct GenericHeteroTransformer {
     /// The layers the plan gives a Vulkan device, which run there instead of on their host
     /// build.
     vulkan: vulkan_layers::VulkanLayers,
+    /// The layers the plan gives an OpenCL device, which run there likewise.
+    opencl: opencl_layers::OpenClLayers,
     output_norm: WeightedNorm, // CPU or CUDA - RmsNorm or LayerNorm-with-bias
     output_proj: crate::tensor::quantized::QMatMul, // CPU fallback
     /// Per-vocabulary bias added to the logits (`output.bias`). Present on the

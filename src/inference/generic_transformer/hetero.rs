@@ -583,6 +583,9 @@ impl GenericHeteroTransformer {
         if !self.vulkan.is_empty() {
             return Some("layers run through Vulkan");
         }
+        if !self.opencl.is_empty() {
+            return Some("layers run through OpenCL");
+        }
         if self.is_recurrent() {
             return Some("recurrent mixer");
         }
@@ -2049,6 +2052,7 @@ impl GenericHeteroTransformer {
     ) -> Result<(Tensor, bool)> {
         let mut on_cuda = !hidden.device().is_cpu();
         self.vulkan.clear_logits();
+        self.opencl.clear_logits();
 
         // -- Layer-by-layer with segment-based transfers -------------------
         let mut seg_start = from;
@@ -2068,11 +2072,21 @@ impl GenericHeteroTransformer {
                 seg_start = end;
                 continue;
             }
+            // An OpenCL segment likewise.
+            if let Some(end) = self.opencl.end_of(seg_start) {
+                let end = end.min(upto);
+                hidden = self.opencl.run(hidden, index_pos, seg_start, end)?;
+                current_cuda_idx = None;
+                on_cuda = false;
+                seg_start = end;
+                continue;
+            }
             let seg_dev = &self.layer_devs[seg_start];
             let mut seg_end = seg_start + 1;
             while seg_end < upto
                 && &self.layer_devs[seg_end] == seg_dev
                 && self.vulkan.end_of(seg_end).is_none()
+                && self.opencl.end_of(seg_end).is_none()
             {
                 seg_end += 1;
             }
@@ -2472,6 +2486,9 @@ impl GenericHeteroTransformer {
             }
         } else if let Some(logits) = self.vulkan.take_logits().filter(|_| !all_positions) {
             // The output head ran on the Vulkan device of the last layer.
+            logits
+        } else if let Some(logits) = self.opencl.take_logits().filter(|_| !all_positions) {
+            // The output head ran on the OpenCL device of the last layer.
             logits
         } else {
             // Fallback: transfer to CPU, norm + matmul on CPU

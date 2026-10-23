@@ -171,6 +171,14 @@ window, loken spends 29 to 74 s (median 36 s): most of its time per clip.
 `scripts/asr_chat.py` reproduces loken's side against a running lokend
 (`--model`, `--prompt`, `--port`).
 
+## OpenCL
+
+The layers of a language model run on an Intel GPU through Intel's OpenCL runtime and give the
+host's text (qwen3 0.6b, greedy). They are slower than the host on the laptop's processor: 51 tokens
+per second against 74. Devices of Mesa's OpenCL platform are not offered for layers: the layers
+measured wrong on them. The image models' OpenCL block still differs from the host's by 15 % on
+a block, and is not shipped.
+
 ## Forecasting
 
 The forecast route serves Chronos-2 and the four Timestral checkpoints. On the fixed set of the

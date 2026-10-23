@@ -1262,10 +1262,16 @@ impl LlmEngine {
                             let vulkan = if crate::gpu::force_cpu() {
                                 Vec::new()
                             } else {
-                                crate::inference::place::ladder::vulkan_devices(
+                                let mut offered = crate::inference::place::ladder::vulkan_devices(
                                     &vulkan_devices,
                                     runtime_reserve_bytes,
-                                )
+                                );
+                                // The OpenCL GPUs no CUDA card stands for take their share
+                                // after them.
+                                offered.extend(crate::inference::place::ladder::accelerators(
+                                    runtime_reserve_bytes,
+                                ));
+                                offered
                             };
                             let model = crate::inference::place::ladder::load_planned(
                                 &arch,
@@ -1295,7 +1301,7 @@ impl LlmEngine {
                                     let on_vulkan = plan
                                         .segments
                                         .iter()
-                                        .any(|s| matches!(s.kind, DeviceKind::Vulkan(_)));
+                                        .any(|s| matches!(s.kind, DeviceKind::Vulkan(_) | DeviceKind::OpenCL(_)));
                                     let host_only = on_plan.is_empty() && !on_vulkan;
                                     let (kv, ctx) = if host_only {
                                         (KvQuant::Off, None)

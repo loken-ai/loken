@@ -198,3 +198,4 @@ to measure it on is available.
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | A backend for Apple silicon | Backends | One model of each family runs through Metal on an Apple Silicon Mac. | Waiting |
+| A native backend for Intel GPUs | Backends | One model of each family runs through Intel's Level Zero, with the matrix engines of an Arc card, faster than through Vulkan and OpenCL on the same card. | Waiting |

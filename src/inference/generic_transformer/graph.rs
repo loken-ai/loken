@@ -1810,6 +1810,7 @@ impl GenericHeteroTransformer {
             .all(|l| l.cpu_q8_kv.is_none() && l.context.is_none())
             && !self.is_recurrent()
             && self.vulkan.is_empty()
+            && self.opencl.is_empty()
     }
 
     /// Whether some layer's cache is cut over several cards.

@@ -32,6 +32,9 @@ impl GenericHeteroTransformer {
         if !self.vulkan.is_empty() {
             return Some("its layers run through Vulkan");
         }
+        if !self.opencl.is_empty() {
+            return Some("its layers run through OpenCL");
+        }
         if self.ple_dim > 0 {
             return Some("its layers take per-layer inputs built from the tokens");
         }
