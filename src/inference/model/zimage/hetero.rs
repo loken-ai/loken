@@ -813,8 +813,8 @@ impl HeteroZImage {
 
     /// Forward pass for an OpenCL segment.
     ///
-    /// Uses zero-copy buffers (CL_MEM_USE_HOST_PTR) on integrated GPUs with shared memory.
-    /// CPU-side `Vec<f32>` is directly accessible by the iGPU without any data transfer.
+    /// The inputs are wrapped as CL_MEM_USE_HOST_PTR buffers, which an integrated GPU with
+    /// shared memory may read without a copy; the result is read back explicitly.
     #[cfg(feature = "opencl")]
     fn forward_opencl_segment(
         &self,
@@ -854,9 +854,8 @@ impl HeteroZImage {
         let sin_data = sin_f32.flatten_all()?.to_vec1::<f32>()?;
         let adaln_data = adaln_f32.flatten_all()?.to_vec1::<f32>()?;
 
-        // Zero-copy: wrap CPU memory as OpenCL buffers (CL_MEM_USE_HOST_PTR)
-        // On integrated GPU (shared memory), this avoids ALL data transfers.
-        // On discrete GPU, the driver handles migration transparently.
+        // Wrap CPU memory as OpenCL buffers (CL_MEM_USE_HOST_PTR): an integrated GPU with
+        // shared memory may use it in place, any other device copies it in.
         let x_buf = unsafe {
             opencl3::memory::Buffer::<u8>::create(
                 &pipelines.context,
@@ -894,7 +893,7 @@ impl HeteroZImage {
             .map_err(|e| crate::tensor::Error::msg(format!("adaln zero-copy: {}", e)))?
         };
 
-        // Run each OpenCL block - x_buf is read/written in-place via shared memory
+        // Run each OpenCL block - x_buf is read and written in place on the device
         for i in seg.start..seg.end {
             let _timer =
                 crate::inference::place::layer_perf::LayerTimer::start_for(i, "z-image-turbo");
@@ -927,8 +926,22 @@ impl HeteroZImage {
             .finish()
             .map_err(|e| crate::tensor::Error::msg(format!("OpenCL finish: {}", e)))?;
 
-        // unified_data is already updated in-place (shared memory) - create tensor directly
-        let result = Tensor::from_slice(&unified_data, (1, seq_len, dim), &Device::Cpu)?;
+        // Read the result back explicitly. A CL_MEM_USE_HOST_PTR buffer only guarantees the
+        // host memory is current after a map or a read: a driver may run on its own copy (a
+        // discrete card always, Intel when the pointer is not page aligned), and then
+        // `unified_data` still holds the input.
+        let mut out_bytes = vec![0u8; unified_data.len() * 4];
+        unsafe {
+            pipelines
+                .queue
+                .enqueue_read_buffer(&x_buf, opencl3::types::CL_BLOCKING, 0, &mut out_bytes, &[])
+                .map_err(|e| crate::tensor::Error::msg(format!("OpenCL read back: {}", e)))?;
+        }
+        let out_data: Vec<f32> = out_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let result = Tensor::from_slice(&out_data, (1, seq_len, dim), &Device::Cpu)?;
 
         Ok(result)
     }

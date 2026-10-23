@@ -13,3 +13,5 @@ pub mod hetero;
 /// Intel Arc, via OpenCL kernels written against this architecture directly.
 #[cfg(all(feature = "opencl", feature = "image"))]
 pub mod opencl;
+#[cfg(all(test, feature = "opencl", feature = "image"))]
+mod opencl_stage;

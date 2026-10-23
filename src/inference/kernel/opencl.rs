@@ -520,6 +520,7 @@ pub struct OpenCLPipelines {
     pub f32_tiled_matmul_add: Kernel,
     pub f32_tiled_gate_up_silu: Kernel,
     pub image_attention: Kernel,
+    pub image_attention_token_major: Kernel,
     pub apply_rotary_emb: Kernel,
     pub scale_after_norm: Kernel,
     pub gated_residual: Kernel,
@@ -612,6 +613,7 @@ impl OpenCLPipelines {
         let f32_tiled_matmul_add = Kernel::create(&program, "f32_tiled_matmul_add")?;
         let f32_tiled_gate_up_silu = Kernel::create(&program, "f32_tiled_gate_up_silu")?;
         let image_attention = Kernel::create(&program, "image_attention")?;
+        let image_attention_token_major = Kernel::create(&program, "image_attention_token_major")?;
         let apply_rotary_emb = Kernel::create(&program, "apply_rotary_emb")?;
         let scale_after_norm = Kernel::create(&program, "scale_after_norm")?;
         let gated_residual = Kernel::create(&program, "gated_residual")?;
@@ -655,6 +657,7 @@ impl OpenCLPipelines {
             f32_tiled_matmul_add,
             f32_tiled_gate_up_silu,
             image_attention,
+            image_attention_token_major,
             apply_rotary_emb,
             scale_after_norm,
             gated_residual,

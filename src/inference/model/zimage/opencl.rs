@@ -978,9 +978,8 @@ impl OpenCLZImageBlock {
         p: &OpenCLPipelines,
     ) -> Result<()> {
         let attn = &self.attention;
-        // Apply RoPE to Q (in-place via temp buffer)
-        // Q is [seq_len, n_heads * head_dim] but RoPE needs [n_heads_total, seq_len, head_dim]
-        // Since it's already flat and the kernel works on pairs, we just dispatch correctly
+        // Apply RoPE to Q through a temp buffer. Q is [seq_len, n_heads, head_dim], the
+        // layout the kernel reads, and the angle of a pair is its token's.
         let q_total_pairs = (attn.n_heads * seq_len * attn.head_dim / 2) as u32;
         let n_head_total = attn.n_heads as u32;
         let seq = seq_len as u32;
@@ -1036,47 +1035,9 @@ impl OpenCLZImageBlock {
         p: &OpenCLPipelines,
     ) -> Result<()> {
         let attn = &self.attention;
-        let batch = 1u32;
 
-        // Q is [seq_len, n_heads * head_dim] laid out as [batch * n_heads, seq_len, head_dim]
-        // after reshape. Since batch=1 and data is contiguous, the layout matches.
-        // The attention kernel expects [batch*n_head, seq_len, head_dim] which is exactly
-        // [n_heads, seq_len, head_dim] - but our data is [seq_len, n_heads * head_dim].
-        // We need to think of this as already transposed: [n_heads, seq_len, head_dim] via reshape.
-        //
-        // Actually: QKV are [seq_len, n_heads * head_dim] = [seq_len, n_heads, head_dim] flat.
-        // The attention kernel needs [batch * n_heads, seq_len, head_dim].
-        // Our data has head as the inner dimension, but kernel expects head as outer.
-        // This is a TRANSPOSE issue. For now, dispatch with batch * n_head * seq_len work items
-        // where the kernel handles the indexing internally.
-        //
-        // Note: The image_attention kernel handles this with the layout:
-        //   [batch * n_head, seq_len, head_dim]
-        // We need our Q to be in this layout. Currently Q is [seq_len, n_heads * head_dim].
-        // Reshape to [seq_len, n_heads, head_dim], transpose to [n_heads, seq_len, head_dim].
-        // For batch=1 this is the same as [batch*n_heads, seq_len, head_dim].
-        //
-        // HOWEVER: doing a transpose on OpenCL requires an extra kernel or we handle it
-        // in the attention kernel itself. For simplicity, let's use a "strided" approach:
-        // The kernel can compute Q[b,h,q,d] = q_buf[q * n_heads * head_dim + h * head_dim + d]
-        // instead of q_buf[(b*n_head+h) * seq_len * head_dim + q * head_dim + d]
-        //
-        // This means our image_attention kernel needs a "transposed Q/K/V" variant.
-        // For now, let's use the existing kernel but note this layout mismatch needs fixing.
-        // TODO: Add a transpose kernel or modify image_attention to handle [seq, heads, dim] layout
-
-        // For correctness, we dispatch with the layout as-is. The kernel expects
-        // contiguous [batch*n_head, seq_len, head_dim], so we need a quick transpose.
-        // Since this would be complex to do efficiently on OpenCL, let's add a note
-        // and use a simple transpose kernel.
-
-        // Simple approach: the data is batch=1, so we can use n_head as the "batch" dim
-        // Q_transposed[h, s, d] = Q_orig[s, h, d]  - just swap the first two dims
-        // We can do this as part of the attention computation.
-
-        // For MVP: use a simple single-work-item-per-output transpose
-        // TODO: optimize with local memory tiling
-
+        // Q, K and V stay as the projections wrote them, [seq_len, heads, head_dim], and the
+        // output comes back the same way, which is what the output projection reads.
         let n_h = attn.n_heads as u32;
         let n_kvh = attn.n_kv_heads as u32;
         let seq = seq_len as u32;
@@ -1095,19 +1056,18 @@ impl OpenCLZImageBlock {
         };
 
         unsafe {
-            ExecuteKernel::new(&p.image_attention)
+            ExecuteKernel::new(&p.image_attention_token_major)
                 .set_arg(&scratch.q_buf)
                 .set_arg(&scratch.k_buf)
                 .set_arg(&scratch.v_buf)
                 .set_arg(mask_ref)
                 .set_arg(&scratch.attn_out)
-                .set_arg(&batch)
                 .set_arg(&n_h)
                 .set_arg(&n_kvh)
                 .set_arg(&seq)
                 .set_arg(&hd)
                 .set_arg(&mask_present)
-                .set_global_work_size((batch * n_h * seq) as usize)
+                .set_global_work_size((n_h * seq) as usize)
                 .enqueue_nd_range(&p.queue)?;
         }
 

@@ -46,7 +46,7 @@ Smaller, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | AVX-512 host kernels for the IQ formats | CPU | IQ2_S, IQ3_XXS and IQ4_NL experts run faster with AVX-512 than with AVX2 on the same machine. | Done |
-| The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU and answer as the CPU does. | Partial |
+| The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU and answer as the CPU does. | Done |
 | A routing profile kept per model | Performance | After a restart, a model's expert cache is already warm, with no setting needed. | Done |
 | Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcribe a 20-clip set as well as the reference implementation. | Done |
 | Ultravox on its own | Audio | An Ultravox checkpoint answers audio with no extra GGUF beside it. | Done |

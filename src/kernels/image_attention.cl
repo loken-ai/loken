@@ -107,23 +107,109 @@ __kernel void image_attention(
     }
 }
 
+// The same attention over token-major Q, K, V, the layout the Z-Image projections write
+// and its output projection reads - no transpose on either side:
+//   Q, output: [seq_len, n_head, head_dim]
+//   K, V:      [seq_len, n_kv_head, head_dim]
+// batch is 1. mask: optional [seq_len] - 1 for valid, 0 for padding.
+//
+// Dispatch: global_work_size = n_head * seq_len
+//           One work item per (head, query_position)
+__kernel void image_attention_token_major(
+    __global const float* q,
+    __global const float* k,
+    __global const float* v,
+    __global const float* mask,
+    __global float* output,
+    const uint n_head,
+    const uint n_kv_head,
+    const uint seq_len,
+    const uint head_dim,
+    const uint mask_present)
+{
+    uint gid = get_global_id(0);
+    if (gid >= n_head * seq_len) return;
+
+    uint q_pos = gid % seq_len;
+    uint h = gid / seq_len;
+
+    // GQA: map query head to KV head
+    uint kv_h = (h * n_kv_head) / n_head;
+
+    float scale = 1.0f / sqrt((float)head_dim);
+
+    // One token's row of a head is head_dim floats; consecutive tokens of the same head
+    // are kv_stride floats apart.
+    __global const float* q_ptr = q + ((ulong)q_pos * n_head + h) * head_dim;
+    ulong kv_stride = (ulong)n_kv_head * head_dim;
+    __global const float* k_base = k + (ulong)kv_h * head_dim;
+    __global const float* v_base = v + (ulong)kv_h * head_dim;
+
+    float4 q_cache[32]; // supports up to head_dim=128
+    uint vec_dim = head_dim >> 2;
+    for (uint d = 0; d < vec_dim && d < 32; d++) {
+        q_cache[d] = vload4(d, q_ptr);
+    }
+
+    // Online softmax: single pass over K/V positions
+    float max_score = -3.402823466e+38f;
+    float sum_exp = 0.0f;
+    float4 v_acc[32];
+    for (uint d = 0; d < vec_dim && d < 32; d++) v_acc[d] = (float4)(0.0f);
+
+    for (uint kp = 0; kp < seq_len; kp++) {
+        if (mask_present && mask[kp] == 0.0f) continue;
+
+        __global const float* k_ptr = k_base + kp * kv_stride;
+        float score = 0.0f;
+        for (uint d = 0; d < vec_dim && d < 32; d++) {
+            score += dot(q_cache[d], vload4(d, k_ptr));
+        }
+        score *= scale;
+
+        if (score > max_score) {
+            float correction = exp(max_score - score);
+            for (uint d = 0; d < vec_dim && d < 32; d++) {
+                v_acc[d] *= correction;
+            }
+            sum_exp *= correction;
+            max_score = score;
+        }
+
+        float w = exp(score - max_score);
+        sum_exp += w;
+
+        __global const float* v_ptr = v_base + kp * kv_stride;
+        for (uint d = 0; d < vec_dim && d < 32; d++) {
+            v_acc[d] += w * vload4(d, v_ptr);
+        }
+    }
+
+    float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    __global float* out_ptr = output + ((ulong)q_pos * n_head + h) * head_dim;
+    for (uint d = 0; d < vec_dim && d < 32; d++) {
+        vstore4(v_acc[d] * inv_sum, d, out_ptr);
+    }
+}
+
 // 3D RoPE application for Z-Image
 // cos/sin are precomputed: [seq_len, head_dim/2] (interleaved pairs)
+// x is token-major, as the q/k projections write it: [seq_len, n_head, head_dim]
 //
 // For each pair (x0, x1) at positions 2i, 2i+1:
 //   out[2i]   = x0 * cos[i] - x1 * sin[i]
 //   out[2i+1] = x0 * sin[i] + x1 * cos[i]
 //
 // Dispatch: global_work_size = total_elements / 2
-//   where total_elements = batch * n_head * seq_len * head_dim
+//   where total_elements = seq_len * n_head * head_dim
 //   (applied to Q and K separately)
 
 __kernel void apply_rotary_emb(
-    __global const float* input,     // [batch * n_head, seq_len, head_dim]
+    __global const float* input,     // [seq_len, n_head, head_dim]
     __global const float* cos_emb,   // [seq_len, head_dim/2]
     __global const float* sin_emb,   // [seq_len, head_dim/2]
-    __global float* output,          // [batch * n_head, seq_len, head_dim]
-    const uint n_head_total,         // batch * n_head
+    __global float* output,          // [seq_len, n_head, head_dim]
+    const uint n_head_total,         // n_head
     const uint seq_len,
     const uint head_dim)
 {
@@ -131,11 +217,11 @@ __kernel void apply_rotary_emb(
     uint total_pairs = n_head_total * seq_len * (head_dim >> 1);
     if (gid >= total_pairs) return;
 
-    // Decode pair index -> (head_seq_idx, pair_in_head)
+    // Decode pair index -> (row, pair_in_head); a row is one (token, head)
     uint half_dim = head_dim >> 1;
     uint pair_in_head = gid % half_dim;
     uint head_seq_idx = gid / half_dim;
-    uint seq_idx = head_seq_idx % seq_len;
+    uint seq_idx = head_seq_idx / n_head_total;
 
     // RoPE cos/sin are per (seq_pos, pair)
     uint rope_idx = seq_idx * half_dim + pair_in_head;
