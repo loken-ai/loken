@@ -1807,7 +1807,8 @@ impl GenericBackend {
     /// out of memory costs a reload.
     fn make_room_for_prefill(&mut self, tokens: usize) {
         let held = self.0.kv_snapshot_bytes();
-        if held == 0 {
+        // Without a card the kept states sit in host memory, which a prefill does not take.
+        if held == 0 || self.0.free_device_memory().is_none() {
             return;
         }
         let shape = self.prefill_shape();
@@ -1842,7 +1843,7 @@ impl GenericBackend {
             self.prefill_shape().cards,
         );
         let before = self.0.kv_snapshot_bytes();
-        if before == 0 {
+        if before == 0 || self.0.free_device_memory().is_none() {
             return false;
         }
         self.0

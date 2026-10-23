@@ -2157,7 +2157,9 @@ impl GenericHeteroTransformer {
         let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
         let budget = match self.free_device_memory() {
             Some(free) => (free + held).saturating_sub(self.snapshot_reserve()),
-            None => return,
+            // No card: the snapshots live in host memory, bounded by what the host can spare.
+            None => held
+                .saturating_add(crate::inference::place::layer_executor::host_spill_budget_bytes()),
         };
         let mut held = held;
         while held > budget && !self.kv_snapshots.is_empty() {

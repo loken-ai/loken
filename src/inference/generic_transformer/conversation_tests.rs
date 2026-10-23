@@ -112,6 +112,21 @@ fn interleaved_conversations_each_read_only_their_new_tokens() {
     assert_eq!(read(&mut b, &a3, 90).1, 15);
 }
 
+/// A model with no card keeps its states in host memory: a request for card room gives none back.
+#[test]
+fn states_of_a_model_without_a_card_are_not_given_back_for_card_room() {
+    let f = Fixture::new("conv-host-states");
+    let mut b = GenericBackend(f.model());
+    assert_eq!(b.free_device_memory(), None);
+    read(&mut b, &conversation(1, 70), 60);
+    read(&mut b, &conversation(2, 55), 45);
+    let held = b.0.kv_snapshot_bytes();
+    assert!(held > 0, "the two conversations' states are kept");
+    assert!(!b.reclaim_prefill_room(u64::MAX));
+    assert_eq!(b.0.kv_snapshot_bytes(), held);
+    assert_eq!(b.0.kv_snapshots.len(), 2);
+}
+
 /// A prompt the same as the last, read again, reads only what follows the shared point.
 #[test]
 fn the_same_prompt_again_reads_its_tail() {
