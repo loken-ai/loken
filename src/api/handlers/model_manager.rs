@@ -595,22 +595,11 @@ impl APIServer {
         }
         // A configured context of zero opens the window the model declares, which the
         // loaded engine reports.
-        if engine
-            .context_window()
-            .await
-            .is_some_and(|open| want <= open)
-        {
+        let open = engine.context_window().await;
+        let Some(want) = widened_context(want, current, open, || self.declared_context(model_id))
+        else {
             return Ok(());
-        }
-        // The model cannot open a window past what its checkpoint declares, so a larger
-        // request is clamped there before it can cost a reload that would change nothing.
-        let want = match self.declared_context(model_id) {
-            Some(declared) => want.min(declared),
-            None => want,
         };
-        if want <= current {
-            return Ok(());
-        }
         info!("num_ctx {want} above the configured context {current} for {model_id} - reloading model");
         self.unload_model(model_id).await.ok();
 
@@ -1165,8 +1154,42 @@ impl APIServer {
     }
 }
 
+/// The window a request for `want` tokens needs a reload to reach, or None when the engine
+/// serves it as it is. `current` is the configured context (zero opens the window the model
+/// declares), `open` the window the loaded engine reports and `declared` what the checkpoint
+/// declares: the model cannot open a window past that, so a larger request is clamped there
+/// before it can cost a reload that would change nothing.
+fn widened_context(
+    want: usize,
+    current: usize,
+    open: Option<usize>,
+    declared: impl FnOnce() -> Option<usize>,
+) -> Option<usize> {
+    if want <= current || open.is_some_and(|open| want <= open) {
+        return None;
+    }
+    let want = declared().map_or(want, |declared| want.min(declared));
+    (want > current.max(open.unwrap_or(0))).then_some(want)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_past_the_declared_window_does_not_reload_a_model_that_has_it() {
+        // Configured zero, window open at the declared 4096: any request is served as is.
+        assert_eq!(widened_context(131072, 0, Some(4096), || Some(4096)), None);
+        assert_eq!(widened_context(4096, 0, Some(4096), || Some(4096)), None);
+        // A wider window the checkpoint declares reloads at the clamped size.
+        assert_eq!(
+            widened_context(131072, 4096, Some(4096), || Some(32768)),
+            Some(32768)
+        );
+        // Nothing declared: the request is taken as asked.
+        assert_eq!(widened_context(8192, 4096, Some(4096), || None), Some(8192));
+        // A window already configured needs nothing.
+        assert_eq!(widened_context(2048, 4096, Some(4096), || Some(4096)), None);
+    }
+
     #[test]
     fn a_declared_context_is_read_once_per_file_stamp() {
         use super::{DeclaredContexts, FileStamp};

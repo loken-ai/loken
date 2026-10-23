@@ -86,6 +86,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Models: serve a request past the declared window without reloading.
 - Image: run the Z-Image blocks on OpenCL and read the result back.
 - Conversations: keep the states of a model without a card in host memory.
 - Models: read the header of a model file through a buffer.
