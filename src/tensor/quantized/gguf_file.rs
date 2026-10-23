@@ -722,9 +722,12 @@ pub fn read_header_bytes(bytes: &[u8]) -> Result<Content> {
 
 pub fn open_header<P: AsRef<std::path::Path>>(path: P) -> Result<Content> {
     let path = path.as_ref();
-    let mut f =
+    let f =
         std::fs::File::open(path).map_err(|e| Error(format!("open {}: {e}", path.display())))?;
-    Content::read(&mut f)
+    // The header is read value by value: unbuffered, every integer and string of a vocabulary
+    // of two hundred thousand tokens was a system call, and the first chat request waited
+    // half a second for it.
+    Content::read(&mut std::io::BufReader::with_capacity(1 << 20, f))
 }
 
 /// GGUF container version (the reader accepts v2/v3; one loader
