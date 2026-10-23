@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- API: name the backend of each device in the device list.
 - OpenCL: run the layers of a language model on an Intel GPU.
 - Vulkan: run attention over a sliding window.
 - Vulkan: run attention heads up to 256 wide.

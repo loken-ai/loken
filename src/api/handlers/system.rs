@@ -448,6 +448,21 @@ pub(crate) async fn stage_performance_endpoint(
 /// Pure transform from in-process LayerPerformance records to the wire
 /// JSON shape consumed by the GUI's LayerPerfRecord deserializer.
 /// Extracted so a unit test can pin the schema without spinning up axum.
+/// The runtime that drives a device: the backend a measurement names, where `type` keeps the
+/// device class (a card of either vendor is `CUDA` there).
+fn backend_of(d: &crate::distributed::ComputeDevice) -> &'static str {
+    use crate::distributed::DeviceType;
+    match d.device_type {
+        #[cfg(feature = "gpu")]
+        DeviceType::Cuda if crate::tensor::gpu_runtime::is_nvidia_ordinal(d.id) => "cuda",
+        DeviceType::Cuda => "rocm",
+        DeviceType::Cpu => "cpu",
+        DeviceType::IntelArc | DeviceType::IntelXe => "opencl",
+        DeviceType::Metal => "metal",
+        DeviceType::Remote => "remote",
+    }
+}
+
 fn layers_to_json(
     metrics: &[crate::inference::place::layer_perf::LayerPerformance],
 ) -> Vec<serde_json::Value> {
@@ -595,6 +610,7 @@ pub(crate) async fn list_devices(
         serde_json::json!({
             "id": d.id,
             "type": d.device_type.to_string(),
+            "backend": backend_of(d),
             "name": d.name,
             "memory_gb": d.memory_gb(),
             "memory_bytes": d.memory_bytes,
@@ -990,6 +1006,16 @@ pub(crate) async fn swap_layers_handler(
 
 #[cfg(test)]
 mod tests {
+    /// A device names the runtime that drives it, apart from its class.
+    #[test]
+    fn a_device_names_its_backend() {
+        use crate::distributed::{ComputeDevice, DeviceType};
+        let cpu = ComputeDevice::new(0, DeviceType::Cpu, "CPU".into(), 0);
+        assert_eq!(super::backend_of(&cpu), "cpu");
+        let arc = ComputeDevice::new(1, DeviceType::IntelArc, "Arc".into(), 0);
+        assert_eq!(super::backend_of(&arc), "opencl");
+    }
+
     use super::*;
 
     #[test]
