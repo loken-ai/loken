@@ -68,6 +68,8 @@ mod layer_ffn;
 mod layer_forward;
 mod layer_rows_cpu;
 mod loader;
+#[cfg(test)]
+mod loading_tests;
 pub mod mixer;
 mod moe_weights;
 pub mod ngram;

@@ -18,7 +18,7 @@ use super::*;
 /// Where a generic transformer's weights come from. The hetero route plans the placement
 /// and recovers from out-of-memory the same way for every source; only reading a layer
 /// differs.
-pub(super) enum GenericWeights<'a> {
+pub(crate) enum GenericWeights<'a> {
     Gguf {
         mmap_bytes: &'a [u8],
         mmap: &'a std::sync::Arc<memmap2::Mmap>,
@@ -37,7 +37,7 @@ pub(super) enum GenericWeights<'a> {
 impl GenericWeights<'_> {
     /// The model built on `plan`, its embedding table on the first layer's card when
     /// `stem_on_card` says the plan holds room for it there.
-    pub(super) fn build(
+    pub(crate) fn build(
         &self,
         cuda_devices: &std::collections::HashMap<usize, Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
@@ -206,7 +206,7 @@ impl GenericWeights<'_> {
 /// An AWQ checkpoint described as the header the loading route reads: its config, its
 /// tokenizer, its end-of-sequence ids and its declared context, beside the shards that
 /// carry the layers.
-pub(super) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<String>)> {
+pub(crate) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<String>)> {
     use crate::inference::load::awq_loader as awql;
     let cfg = awql::parse_config_json(dir)?;
     let (_, shards) = awql::checkpoint_shards(std::path::Path::new(dir))?;

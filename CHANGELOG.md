@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Docs: list the architectures the loader reads and the formats of each.
 - API: name the backend of each device in the device list.
 - OpenCL: run the layers of a language model on an Intel GPU.
 - Vulkan: run attention over a sliding window.
