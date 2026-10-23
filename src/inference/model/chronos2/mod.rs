@@ -516,6 +516,9 @@ pub fn weight_files(dir: &std::path::Path) -> anyhow::Result<Vec<std::path::Path
 }
 
 #[cfg(test)]
+mod fixed_set;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -171,6 +171,14 @@ window, loken spends 29 to 74 s (median 36 s): most of its time per clip.
 `scripts/asr_chat.py` reproduces loken's side against a running lokend
 (`--model`, `--prompt`, `--port`).
 
+## Forecasting
+
+The forecast route serves Chronos-2 and the four Timestral checkpoints. On the fixed set of the
+Timestral gate (eight series with their held-out continuation), the mean MASE of the median
+forecast is 0.85 for Chronos-2 and between 1.15 and 1.29 for the Timestral checkpoints, against
+2.71 for the seasonal naive forecast. Two tests fail when a model stops beating it:
+`chronos2_beats_seasonal_naive` and `checkpoints_match_the_reference_and_beat_seasonal_naive`.
+
 ## The qwen4exp family
 
 Three files of the architecture load through the generic route on the two-card machine: a

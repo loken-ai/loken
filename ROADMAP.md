@@ -36,7 +36,7 @@ Major, by priority:
 | A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card and answers as the host does, in decode and in prompt reading. | Done |
 | Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Started |
 | Coding agents beyond lokode | Agents | opencode, Claude Code and Cline finish the lokode task on Qwen3.8 and DeepSeek V4.1. | Done |
-| Forecasting and tabular models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Partial |
+| Forecasting models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Done |
 | Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
 | Load every format a model ships in | Models | Every model loads from each format its publisher ships, GGUF and safetensors in the Hugging Face and the native layouts, through the same placement as the others, checked by one loading test per architecture. | Started |
 | Mistral Timestral forecasts | Models | The four Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Done |

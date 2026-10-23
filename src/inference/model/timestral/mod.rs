@@ -841,4 +841,4 @@ pub fn read_config(dir: &std::path::Path) -> anyhow::Result<Config> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -9,14 +9,14 @@ fn toy() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/timestral/toy")
 }
 
-struct Vectors(MmapedSafetensors);
+pub(crate) struct Vectors(MmapedSafetensors);
 
 impl Vectors {
-    fn open(file: &Path) -> Self {
+    pub(crate) fn open(file: &Path) -> Self {
         Self(unsafe { MmapedSafetensors::new(file) }.unwrap())
     }
 
-    fn has(&self, name: &str) -> bool {
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.0.load(name, &Device::Cpu).is_ok()
     }
 
@@ -24,7 +24,7 @@ impl Vectors {
         self.0.load(name, &Device::Cpu).unwrap()
     }
 
-    fn values(&self, name: &str) -> Vec<f32> {
+    pub(crate) fn values(&self, name: &str) -> Vec<f32> {
         self.tensor(name)
             .flatten_all()
             .unwrap()
@@ -32,7 +32,7 @@ impl Vectors {
             .unwrap()
     }
 
-    fn rows(&self, name: &str) -> Vec<Vec<f32>> {
+    pub(crate) fn rows(&self, name: &str) -> Vec<Vec<f32>> {
         let t = self.tensor(name);
         let (r, l) = t.dims2().unwrap();
         let v = self.values(name);
@@ -176,12 +176,12 @@ fn the_schedule_says_whether_known_covariates_reach_a_target() {
 }
 
 /// The fixed set the reference forecast with every published checkpoint.
-fn fixed() -> PathBuf {
+pub(crate) fn fixed() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/timestral")
 }
 
 /// The series of the fixed set.
-const FIXED_SET: [&str; 8] = [
+pub(crate) const FIXED_SET: [&str; 8] = [
     "hourly",
     "weekly",
     "walk",
@@ -233,7 +233,7 @@ fn key_of(cfg: &Config) -> String {
 }
 
 /// The request of a series of the fixed set, and its held-out continuation and period.
-fn fixed_request(v: &Vectors, name: &str) -> (Request, Vec<f32>, usize) {
+pub(crate) fn fixed_request(v: &Vectors, name: &str) -> (Request, Vec<f32>, usize) {
     let meta = v.values(&format!("{name}.meta"));
     let (horizon, period) = (meta[0] as usize, meta[1] as usize);
     let rows = |part: &str| {
@@ -255,7 +255,7 @@ fn fixed_request(v: &Vectors, name: &str) -> (Request, Vec<f32>, usize) {
 }
 
 /// The last season repeated, a missing point taken from a season before it.
-fn seasonal_naive(history: &[f32], period: usize, horizon: usize) -> Vec<f32> {
+pub(crate) fn seasonal_naive(history: &[f32], period: usize, horizon: usize) -> Vec<f32> {
     let mut filled = history.to_vec();
     for t in 0..filled.len() {
         if !filled[t].is_finite() {
@@ -268,7 +268,7 @@ fn seasonal_naive(history: &[f32], period: usize, horizon: usize) -> Vec<f32> {
 
 /// The mean absolute step of the seasonal naive forecast over the history: the scale both
 /// MASE and the scaled CRPS divide by.
-fn naive_scale(history: &[f32], period: usize) -> f32 {
+pub(crate) fn naive_scale(history: &[f32], period: usize) -> f32 {
     let steps: Vec<f32> = (period..history.len())
         .map(|t| (history[t] - history[t - period]).abs())
         .filter(|d| d.is_finite())
@@ -288,7 +288,7 @@ fn crps(levels: &[f32], values: &[Vec<f32>], actual: &[f32]) -> f32 {
     sum / (levels.len() * actual.len()) as f32
 }
 
-fn mae(f: &[f32], y: &[f32]) -> f32 {
+pub(crate) fn mae(f: &[f32], y: &[f32]) -> f32 {
     f.iter().zip(y).map(|(a, b)| (a - b).abs()).sum::<f32>() / y.len() as f32
 }
 
