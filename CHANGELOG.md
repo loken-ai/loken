@@ -84,6 +84,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- ROCm: stop pinning file mappings the driver refused once.
 - Chat: give back cached states when the host memory runs short.
 - Chat: save a decoded state without copying it in memory.
 - Memory: keep host budgets inside a container or service memory cap.

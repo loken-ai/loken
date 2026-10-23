@@ -938,8 +938,25 @@ pub unsafe fn cuMemFreeHost(p: *mut c_void) -> CUresult {
     unsafe { hip!(hipHostFree(p)) }
 }
 
+/// Set once the driver has refused to pin a read-only mapping of a file. The kernel logs every
+/// refusal, and a caller that registers many ranges would flood its log with the same line, so
+/// after the first refusal the others are declined here without asking the driver.
+static READ_ONLY_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub unsafe fn cuMemHostRegister_v2(p: *mut c_void, bytes: usize, flags: c_uint) -> CUresult {
-    unsafe { hip!(hipHostRegister(p, bytes, flags)) }
+    use std::sync::atomic::Ordering::Relaxed;
+    const READ_ONLY: c_uint = 8;
+    let read_only = flags & READ_ONLY != 0;
+    if read_only && READ_ONLY_REFUSED.load(Relaxed) {
+        return CUresult::CUDA_ERROR_NOT_SUPPORTED;
+    }
+    let r = unsafe { hip!(hipHostRegister(p, bytes, flags)) };
+    if read_only && r != CUresult::CUDA_SUCCESS && !READ_ONLY_REFUSED.swap(true, Relaxed) {
+        tracing::warn!(
+            "the driver refused to pin a read-only file mapping; host memory is not pinned for copies"
+        );
+    }
+    r
 }
 
 pub unsafe fn cuMemHostUnregister(p: *mut c_void) -> CUresult {
