@@ -1876,6 +1876,9 @@ impl APIServer {
         } else {
             None
         };
+        // The chat format is read with the load, so the first request does not parse the
+        // file's vocabulary on its way to the first token.
+        let chat_format = self.read_chat_format(model_id);
         let mut engines = self.engines.write().await;
         // Final dedup: in case the lock was bypassed (e.g. an admin path),
         // refuse to push if an entry already exists.
@@ -1888,6 +1891,7 @@ impl APIServer {
             LoadedModelEntry::new(model_id.to_string(), engine, Some(keep_alive_minutes))
                 .with_replicas(replicas);
         entry.expire_handle = expire_handle;
+        entry.chat_format = Some(chat_format);
         engines.push(entry);
         Ok(())
     }
