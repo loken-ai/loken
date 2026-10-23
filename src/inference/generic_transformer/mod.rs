@@ -48,6 +48,7 @@ mod config;
 #[cfg(test)]
 mod conversion_tests;
 mod dense;
+mod dense_layouts;
 mod draft_head;
 pub use draft_head::set_probe_dir;
 mod context_parallel;

@@ -162,7 +162,7 @@ impl GenericLayerFlags {
         let ffn_norm = ffn_norm_stem(content);
         let facts = crate::inference::model_facts::facts_or_default(arch);
         Self {
-            has_qkv_bias: has_attn("attn_q.bias"),
+            has_qkv_bias: has_attn("attn_q.bias") || has_attn("attn_qkv.bias"),
             has_qk_norm: has_attn("attn_q_norm.weight"),
             // A file whose feed-forward norm carries this name has no post-attention norm.
             has_post_attn_norm: ffn_norm != "post_attention_norm"

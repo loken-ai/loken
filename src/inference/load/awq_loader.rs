@@ -14,6 +14,7 @@
 //! Target arches: dense Qwen2 / Qwen3 / Mistral (deepcoder, qwen3-8b, deepseek-r1,
 //! devstral). MoE AWQ (qwen3-coder) is out of scope for the first cut.
 
+use super::hf_config::{hf_class, lookup, lookup_b, lookup_f, lookup_u, rope_block};
 use crate::tensor::quantized::gguf_file::{Content, TensorInfo, Value};
 use crate::tensor::quantized::GgmlDType;
 use anyhow::{anyhow, Result};
@@ -47,32 +48,18 @@ pub struct AwqConfigJson {
     /// The weights are in the layout a vendor's own release writes (`params.json` and a
     /// `consolidated` shard) and not in the framework's (`config.json` and numbered shards).
     pub native: bool,
+    /// The parsed `config.json` (or `params.json`), for the keys only some classes carry.
+    pub root: serde_json::Value,
 }
 
 /// Map an HF `architectures[0]` to the engine's GGUF arch tag.
 pub fn map_hf_arch(hf: &str) -> Result<&'static str> {
-    // ARCH-NAME-EXEMPT: translates the checkpoint's HF `architectures` class into the tag
-    // the synthesised header is written with.
-    Ok(match hf {
-        "Qwen2ForCausalLM" => "qwen2",
-        "Qwen3ForCausalLM" => "qwen3",
-        "LlamaForCausalLM"
-        | "MistralForCausalLM"
-        | "Mistral3ForCausalLM"
-        | "MistralForConditionalGeneration"
-        | "VoxtralForConditionalGeneration" => "llama",
-        other => {
-            return Err(anyhow!(
-                "unsupported checkpoint architecture {other} (dense qwen2/qwen3/llama/mistral only)"
-            ))
-        }
-    })
-}
-
-/// The text model's fields of a checkpoint: the `text_config` of a composite model's
-/// `config.json` when it has one, the file itself otherwise.
-fn text_fields(v: &serde_json::Value) -> &serde_json::Value {
-    v.get("text_config").filter(|t| t.is_object()).unwrap_or(v)
+    match hf_class(hf) {
+        Some(c) => Ok(c.arch),
+        None => Err(anyhow!(
+            "unsupported checkpoint architecture {hf}: no row in the class table (hf_config.rs)"
+        )),
+    }
 }
 
 /// Parse the essentials out of a HF `config.json`, or out of the `params.json` of a native
@@ -89,10 +76,8 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         }
     };
     let v: serde_json::Value = serde_json::from_str(&txt)?;
-    let t = text_fields(&v);
-    let g = |k: &str| t.get(k).or_else(|| v.get(k));
-    let u = |k: &str| g(k).and_then(|x| x.as_u64()).map(|x| x as usize);
-    let f = |k: &str| g(k).and_then(|x| x.as_f64()).map(|x| x as f32);
+    let u = |keys: &[&str]| lookup_u(&v, keys);
+    let f = |keys: &[&str]| lookup_f(&v, keys);
 
     let hf_arch = v
         .get("architectures")
@@ -102,12 +87,24 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         .to_string();
     let gguf_arch = map_hf_arch(&hf_arch)?.to_string();
 
-    let hidden_size = u("hidden_size").ok_or_else(|| anyhow!("missing hidden_size"))?;
-    let n_head = u("num_attention_heads").ok_or_else(|| anyhow!("missing num_attention_heads"))?;
-    let n_kv_head = u("num_key_value_heads").unwrap_or(n_head);
+    let hidden_size =
+        u(&["hidden_size", "d_model", "n_embd"]).ok_or_else(|| anyhow!("missing hidden_size"))?;
+    let n_head = u(&["num_attention_heads", "n_heads", "n_head"])
+        .ok_or_else(|| anyhow!("missing num_attention_heads"))?;
+    let n_kv_head = u(&[
+        "num_key_value_heads",
+        "attn_config.kv_n_heads",
+        "multi_query_group_num",
+        "num_kv_heads",
+        "n_head_kv",
+    ])
+    .unwrap_or_else(|| match lookup_b(&v, &["multi_query"]) {
+        Some(true) => 1,
+        _ => n_head,
+    });
 
     // A dense checkpoint carries none; its group size and width are never read.
-    let qc = g("quantization_config");
+    let qc = lookup(&v, &["quantization_config"]);
     let group_size = qc
         .and_then(|q| q.get("group_size"))
         .and_then(|x| x.as_u64())
@@ -116,13 +113,13 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         .and_then(|q| q.get("bits"))
         .and_then(|x| x.as_u64())
         .unwrap_or(4) as usize;
-    let frequency_scaling = g("rope_scaling").and_then(|rs| {
-        let t = rs
-            .get("rope_type")
-            .or_else(|| rs.get("type"))
-            .and_then(|x| x.as_str());
+    let rope = rope_block(&v);
+    let rope_type = rope
+        .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
+        .and_then(|x| x.as_str());
+    let frequency_scaling = rope.and_then(|rs| {
         // ARCH-NAME-EXEMPT: the `rope_type` a checkpoint's configuration declares.
-        if t != Some("llama3") {
+        if rope_type != Some("llama3") {
             return None;
         }
         let f = |k: &str| rs.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
@@ -134,12 +131,8 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         ))
     });
 
-    let yarn = g("rope_scaling").and_then(|rs| {
-        let t = rs
-            .get("rope_type")
-            .or_else(|| rs.get("type"))
-            .and_then(|x| x.as_str());
-        if t == Some("yarn") {
+    let yarn = rope.and_then(|rs| {
+        if rope_type == Some("yarn") {
             let factor = rs.get("factor").and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
             let orig = rs
                 .get("original_max_position_embeddings")
@@ -151,34 +144,59 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         }
     });
 
-    let use_swa = g("use_sliding_window")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    let sliding_window = if use_swa { u("sliding_window") } else { None };
+    let use_swa = lookup_b(&v, &["use_sliding_window"]).unwrap_or(false);
+    let sliding_window = if use_swa {
+        u(&["sliding_window"])
+    } else {
+        None
+    };
+    let expansion = u(&["expansion_ratio"]).map(|r| r * hidden_size);
 
     Ok(AwqConfigJson {
         hf_arch,
         gguf_arch,
         hidden_size,
-        n_layers: u("num_hidden_layers").ok_or_else(|| anyhow!("missing num_hidden_layers"))?,
+        n_layers: u(&["num_hidden_layers", "n_layers", "num_layers", "n_layer"])
+            .ok_or_else(|| anyhow!("missing num_hidden_layers"))?,
         n_head,
         n_kv_head,
-        head_dim: u("head_dim"),
-        intermediate_size: u("intermediate_size")
-            .ok_or_else(|| anyhow!("missing intermediate_size"))?,
-        vocab_size: u("vocab_size").ok_or_else(|| anyhow!("missing vocab_size"))?,
-        rope_theta: f("rope_theta").unwrap_or(10000.0),
-        rms_norm_eps: f("rms_norm_eps").unwrap_or(1e-6),
+        head_dim: u(&["head_dim", "kv_channels"]),
+        // The configuration's own default, four times the width, when it has none.
+        intermediate_size: u(&[
+            "intermediate_size",
+            "ffn_hidden_size",
+            "ffn_config.ffn_hidden_size",
+            "n_inner",
+        ])
+        .or(expansion)
+        .unwrap_or(4 * hidden_size),
+        vocab_size: u(&["vocab_size", "padded_vocab_size"]).unwrap_or(0),
+        rope_theta: f(&[
+            "rope_theta",
+            "rope_parameters.rope_theta",
+            "attn_config.rope_theta",
+            "rotary_emb_base",
+        ])
+        .or_else(|| f(&["rope_ratio"]).map(|r| 10000.0 * r))
+        .unwrap_or(10000.0),
+        rms_norm_eps: f(&[
+            "rms_norm_eps",
+            "layer_norm_epsilon",
+            "layer_norm_eps",
+            "layernorm_epsilon",
+            "norm_eps",
+            "norm_epsilon",
+        ])
+        .unwrap_or(1e-5),
         sliding_window,
         group_size,
         awq_bits,
         yarn,
         frequency_scaling,
         quantized: qc.is_some(),
-        tie_word_embeddings: g("tie_word_embeddings")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false),
+        tie_word_embeddings: lookup_b(&v, &["tie_word_embeddings"]).unwrap_or(false),
         native: false,
+        root: v,
     })
 }
 
@@ -188,11 +206,6 @@ fn parse_params_json(text: &str) -> Result<AwqConfigJson> {
     let v: serde_json::Value = serde_json::from_str(text)?;
     let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
     let need = |k: &str| u(k).ok_or_else(|| anyhow!("params.json: missing {k}"));
-    if v.get("moe").is_some() {
-        return Err(anyhow!(
-            "params.json: a mixture-of-experts native layout is not read"
-        ));
-    }
     let n_head = need("n_heads")?;
     Ok(AwqConfigJson {
         hf_arch: String::new(),
@@ -220,6 +233,7 @@ fn parse_params_json(text: &str) -> Result<AwqConfigJson> {
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
         native: true,
+        root: v.clone(),
     })
 }
 
@@ -255,10 +269,12 @@ pub fn synth_gguf_content(cfg: &AwqConfigJson, present: AwqTensorPresence) -> Co
         format!("{a}.embedding_length"),
         Value::U32(cfg.hidden_size as u32),
     );
-    put(
-        format!("{a}.feed_forward_length"),
-        Value::U32(cfg.intermediate_size as u32),
-    );
+    if cfg.intermediate_size > 0 {
+        put(
+            format!("{a}.feed_forward_length"),
+            Value::U32(cfg.intermediate_size as u32),
+        );
+    }
     if let Some(hd) = cfg.head_dim {
         put(format!("{a}.attention.key_length"), Value::U32(hd as u32));
         put(format!("{a}.attention.value_length"), Value::U32(hd as u32));
@@ -284,6 +300,10 @@ pub fn synth_gguf_content(cfg: &AwqConfigJson, present: AwqTensorPresence) -> Co
             format!("{a}.rope.scaling.original_context_length"),
             Value::U32(orig as u32),
         );
+    }
+
+    for (k, v) in super::hf_config::hf_metadata(cfg) {
+        put(k, v);
     }
 
     // Tensor names probed by detect()/vocab. shape/dtype only - no data.

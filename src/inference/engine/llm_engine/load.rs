@@ -78,6 +78,16 @@ impl GenericWeights<'_> {
                     .map_err(|e| crate::tensor::Error::msg(e.to_string()))?
                     .quantized;
                 if quantized {
+                    let cfg = awql::parse_config_json(dir)
+                        .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                    if !crate::inference::load::hf_config::hf_class(&cfg.hf_arch)
+                        .is_some_and(|c| c.awq)
+                    {
+                        return Err(crate::tensor::Error::msg(format!(
+                            "a quantised checkpoint of class {} is not read; its dense weights are",
+                            cfg.hf_arch
+                        )));
+                    }
                     return GenericHeteroTransformer::from_awq_safetensors(
                         dir,
                         shards,
@@ -195,9 +205,8 @@ impl GenericWeights<'_> {
             GenericWeights::Awq { dir, shards } => {
                 let st =
                     unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(shards) }.ok()?;
-                let native = crate::inference::load::awq_loader::parse_config_json(dir)
-                    .is_ok_and(|c| c.native);
-                crate::inference::generic_transformer::text_bytes(&st, native)
+                let cfg = crate::inference::load::awq_loader::parse_config_json(dir).ok()?;
+                crate::inference::generic_transformer::text_bytes(&st, &cfg)
             }
         }
     }
@@ -264,10 +273,20 @@ pub(crate) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<St
         format!("{arch}.context_length"),
         gguf_file::Value::U32(declared_context(std::path::Path::new(dir)) as u32),
     );
-    meta.insert(
-        format!("{arch}.vocab_size"),
-        gguf_file::Value::U32(cfg.vocab_size as u32),
-    );
+    if cfg.vocab_size > 0 {
+        meta.insert(
+            format!("{arch}.vocab_size"),
+            gguf_file::Value::U32(cfg.vocab_size as u32),
+        );
+    }
+    // A dense checkpoint's header lists the tensors the loader will read, so what placement and
+    // the cache decide from them (the experts, the sinks, which blocks attend) is the model's.
+    if !cfg.quantized {
+        let ck =
+            crate::inference::generic_transformer::DenseCheckpoint::open(&content, &shards, &cfg)
+                .map_err(|e| anyhow!(e.to_string()))?;
+        content = ck.content;
+    }
     Ok((content, shards))
 }
 
@@ -451,7 +470,18 @@ pub(super) fn declared_context(dir: &std::path::Path) -> usize {
     std::fs::read_to_string(dir.join("config.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v.get("max_position_embeddings").and_then(|x| x.as_u64()))
+        .and_then(|v| {
+            crate::inference::load::hf_config::lookup_u(
+                &v,
+                &[
+                    "max_position_embeddings",
+                    "max_seq_len",
+                    "seq_length",
+                    "n_positions",
+                ],
+            )
+            .map(|x| x as u64)
+        })
         .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
             c as usize
         })

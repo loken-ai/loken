@@ -171,6 +171,8 @@ struct TensorSource<'a> {
     adjacent_rope: bool,
     /// The split set, which says which tensors are stored one less than they are read.
     split: Option<&'a crate::tensor::quantized::gguf_source::SplitGguf>,
+    /// The checkpoint that makes some of the tensors from stored ones.
+    dense: Option<&'a super::dense::DenseCheckpoint>,
 }
 
 struct TensorPart<'a> {
@@ -244,6 +246,7 @@ impl<'a> TensorSource<'a> {
             hf_rows: false,
             adjacent_rope: false,
             split: None,
+            dense: None,
             owner: HashMap::new(),
             parts: vec![TensorPart {
                 content,
@@ -276,6 +279,7 @@ impl<'a> TensorSource<'a> {
             hf_rows: false,
             adjacent_rope: false,
             split: Some(split),
+            dense: None,
         }
     }
 
@@ -310,6 +314,7 @@ impl<'a> TensorSource<'a> {
             hf_rows: true,
             adjacent_rope: ck.adjacent_rope,
             split: None,
+            dense: Some(ck),
         }
     }
 
@@ -332,6 +337,32 @@ impl<'a> TensorSource<'a> {
 
     /// `name` on `device`, `None` when no part carries it.
     fn read_opt(&self, name: &str, device: &Device) -> crate::tensor::Result<Option<QTensor>> {
+        // A tensor made of stored ones is built here, one at a time, and read as a stored one.
+        if let Some((dtype, dims, bytes)) = self
+            .dense
+            .map(|ck| ck.assemble(name))
+            .transpose()?
+            .flatten()
+        {
+            let content = gguf_file::Content {
+                magic: gguf_file::VersionedMagic::GgufV3,
+                metadata: HashMap::new(),
+                tensor_infos: HashMap::new(),
+                tensor_data_offset: 0,
+                mmap_owner: None,
+            };
+            let part = TensorPart {
+                content: &content,
+                bytes: &bytes,
+                owner: None,
+            };
+            let info = gguf_file::TensorInfo {
+                ggml_dtype: dtype,
+                shape: crate::tensor::Shape::from(dims),
+                offset: 0,
+            };
+            return self.read_stored(&part, &info, name, device).map(Some);
+        }
         let Some(part) = self.part_of(name) else {
             return Ok(None);
         };
@@ -365,6 +396,17 @@ impl<'a> TensorSource<'a> {
                 device,
             )?));
         }
+        self.read_stored(part, info, name, device).map(Some)
+    }
+
+    /// The tensor `info` lists in `part`, on `device`, in the width the kernels read.
+    fn read_stored(
+        &self,
+        part: &TensorPart<'_>,
+        info: &gguf_file::TensorInfo,
+        name: &str,
+        device: &Device,
+    ) -> crate::tensor::Result<QTensor> {
         if self.hf_rows
             && info.shape.dims().len() == 1
             && info.ggml_dtype != crate::tensor::quantized::GgmlDType::F32
@@ -390,11 +432,7 @@ impl<'a> TensorSource<'a> {
                 "a norm scale or bias is a small vector held F32",
             );
             // CONVERSION: held F32, declared above.
-            return Ok(Some(QTensor::quantize_onto(
-                &wide,
-                crate::tensor::quantized::GgmlDType::F32,
-                device,
-            )?));
+            return QTensor::quantize_onto(&wide, crate::tensor::quantized::GgmlDType::F32, device);
         }
         if self.hf_rows && info.ggml_dtype == crate::tensor::quantized::GgmlDType::BF16 {
             // CONVERSION: no kernel reads BF16 weights. On a card the narrowest width the kernels
@@ -425,7 +463,7 @@ impl<'a> TensorSource<'a> {
                 "no kernel reads BF16: F16 on a card, F32 on the host",
             );
             // CONVERSION: held at `width`, declared above.
-            return Ok(Some(QTensor::quantize_onto(&wide, width, device)?));
+            return QTensor::quantize_onto(&wide, width, device);
         }
         let qt = info.read_slice_owned(
             part.bytes,
@@ -438,13 +476,13 @@ impl<'a> TensorSource<'a> {
         if device.runs_as_card() && !name.contains("_exps") && codebook_format(qt.dtype()) {
             // CONVERSION: no dense kernel reads a codebook format on a card: dequantised, then held Q8_0.
             let values = qt.dequantize(&Device::Cpu)?;
-            return Ok(Some(QTensor::quantize_onto(
+            return QTensor::quantize_onto(
                 &values,
                 crate::tensor::quantized::GgmlDType::Q8_0,
                 device,
-            )?));
+            );
         }
-        Ok(Some(qt))
+        Ok(qt)
     }
 
     /// `name` on `device`; a name no part carries is an error that says so.
@@ -471,6 +509,14 @@ impl<'a> TensorSource<'a> {
                     mapped += bytes;
                 } else {
                     owned += bytes;
+                }
+            }
+        }
+        // The tensors made of stored ones are held in the process, not mapped.
+        if let Some(ck) = self.dense {
+            for (name, a) in &ck.computed.0.tensor_infos {
+                if ck.assembled.contains_key(name) && name.starts_with(&prefix) {
+                    owned += a.size_in_bytes() as u64;
                 }
             }
         }
@@ -525,6 +571,35 @@ fn qtensor_from_bytes(
 fn row_bytes(qt: &QTensor) -> usize {
     let cols = qt.shape().dims()[1];
     cols / qt.dtype().block_size() * qt.dtype().type_size()
+}
+
+/// The query, key and value biases of a fused projection's bias, the query's `q_rows` long and
+/// the key's and the value's the same, each held F32.
+fn split_fused_bias(
+    fused: &QTensor,
+    q_rows: usize,
+) -> crate::tensor::Result<(Option<QTensor>, Option<QTensor>, Option<QTensor>)> {
+    // CONVERSION: a bias is a small vector, widened to F32 on the host to be split.
+    let all = fused.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+    let total = all.elem_count();
+    let kv_rows = total.saturating_sub(q_rows) / 2;
+    if q_rows + 2 * kv_rows != total {
+        crate::tensor::bail!("a fused projection's bias of {total} values is not q, k and v");
+    }
+    // CONVERSION: a bias is a small vector, held F32 whatever the file stores.
+    let part = |at: usize, n: usize| -> crate::tensor::Result<Option<QTensor>> {
+        let t = all.narrow(0, at, n)?.contiguous()?;
+        Ok(Some(QTensor::quantize_onto(
+            &t,
+            crate::tensor::quantized::GgmlDType::F32,
+            &Device::Cpu,
+        )?))
+    };
+    Ok((
+        part(0, q_rows)?,
+        part(q_rows, kv_rows)?,
+        part(q_rows + kv_rows, kv_rows)?,
+    ))
 }
 
 /// Splits a Q projection whose rows hold, per head, the head's Q rows followed by as many
@@ -2920,8 +2995,8 @@ impl GenericHeteroTransformer {
         // The rows of a dense checkpoint pair each rotary lane with the one half a head away;
         // adjacent pairing belongs to GGUF files, whose converter reorders the rows of the
         // architectures that use it.
-        if source.hf_rows && !source.adjacent_rope {
-            cfg.flags.use_rope_i = false;
+        if source.hf_rows {
+            cfg.flags.use_rope_i = source.adjacent_rope;
         }
         // Cap the per-layer Q8/Q4 KV allocation at the user's configured
         // context_length when supplied - otherwise GGUF's native
@@ -3349,6 +3424,25 @@ impl GenericHeteroTransformer {
             let mixer_kind = super::mixer::layer_mixer_kind(content, idx);
             let attends = mixer_kind == super::mixer::MixerKind::Attention;
             let has_ffn = super::mixer::layer_has_ffn(content, idx);
+            // A block that holds the tail of a mixer and not its head is incomplete, not a block
+            // without a mixer.
+            if mixer_kind == super::mixer::MixerKind::Absent {
+                const TAILS: [&str; 5] = [
+                    "attn_output.weight",
+                    "attn_out.weight",
+                    "attn_q_norm.weight",
+                    "ssm_out.weight",
+                    "shortconv.out_proj.weight",
+                ];
+                if let Some(tail) = TAILS
+                    .iter()
+                    .find(|t| ti.contains_key(&format!("{prefix}.{t}")))
+                {
+                    return Err(crate::tensor::Error::msg(format!(
+                        "{prefix} holds {tail} and no projection to feed it: the block's mixer is incomplete"
+                    )));
+                }
+            }
             if ti.contains_key(&format!("{prefix}.ffn_latent_down.weight")) {
                 return Err(crate::tensor::Error::msg(format!(
                     "{prefix}: routed experts behind a latent projection are not supported"
@@ -3470,7 +3564,14 @@ impl GenericHeteroTransformer {
                 let bq = opt_cpu!(&format!("{prefix}.attn_q.bias"))?;
                 let bk = opt_cpu!(&format!("{prefix}.attn_k.bias"))?;
                 let bv = opt_cpu!(&format!("{prefix}.attn_v.bias"))?;
-                (bq, bk, bv)
+                match (bq, opt_cpu!(&format!("{prefix}.attn_qkv.bias"))?) {
+                    // A fused projection carries one bias: the query's, the key's and the
+                    // value's in turn.
+                    (None, Some(fused)) => {
+                        split_fused_bias(&fused, config.n_head * config.head_dim)?
+                    }
+                    (bq, _) => (bq, bk, bv),
+                }
             } else {
                 (None, None, None)
             };
@@ -3569,6 +3670,21 @@ impl GenericHeteroTransformer {
             let ple_proj = opt_dev!(&format!("{prefix}.proj.weight"))?;
             let ple_post_norm_qt = opt_cpu!(&format!("{prefix}.post_norm.weight"))?;
             let ple_output_scale_qt = opt_cpu!(&format!("{prefix}.layer_output_scale.weight"))?;
+
+            // A block that holds routed experts holds their router and their down projection too:
+            // the experts of a block with either missing would be read as a pass-through.
+            let routed_here = ["ffn_gate_exps", "ffn_up_exps", "ffn_gate_up_exps"]
+                .iter()
+                .any(|t| ti.contains_key(&format!("{prefix}.{t}.weight")));
+            if routed_here {
+                for need in ["ffn_gate_inp", "ffn_down_exps"] {
+                    if !ti.contains_key(&format!("{prefix}.{need}.weight")) {
+                        return Err(crate::tensor::Error::msg(format!(
+                            "missing tensor: {prefix}.{need}.weight"
+                        )));
+                    }
+                }
+            }
 
             // Gemma4-MoE per-layer weights
             let moe_gate_inp = if f.is_moe {
@@ -5077,6 +5193,7 @@ mod host_layer_bytes_tests {
             hf_rows: false,
             adjacent_rope: false,
             split: None,
+            dense: None,
         };
         let (owned, mapped) = part(None).host_layer_bytes(1);
         assert_eq!((owned, mapped), (total, 0));
