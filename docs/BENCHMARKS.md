@@ -11,16 +11,23 @@ procedure that produces the runs is [BENCHMARKING.md](BENCHMARKING.md).
 
 | Hardware | Backend | Id | Runs from | Runs | Rows |
 |---|---|---|---|---|---|
-| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/rtx5060ti-rtx5070ti-i910900k.md) | unstated | 91853bdab0a9d057 | 2026-09-03 to 2026-10-05 | 711 | 1366 |
-| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on AMD Ryzen 9 9950X3D 16-Core Processor](benchmarks/rtx5060ti-rtx5070ti-ryzen99950x3d16coreprocessor-cuda.md) | cuda | 45ed3ef839a07686 | 2026-10-18 to 2026-10-19 | 157 | 144 |
-| [NVIDIA GeForce GTX 1650 on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/gtx1650-i910900k.md) | unstated | b4fa5b0e3e6190aa | 2026-10-18 to 2026-10-21 | 74 | 144 |
+| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/rtx5060ti-rtx5070ti-i910900k.md) | unstated | 09d9924ce07a7b53 | 2026-09-03 to 2026-10-05 | 803 | 1366 |
+| [NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 5070 Ti on AMD Ryzen 9 9950X3D 16-Core Processor](benchmarks/rtx5060ti-rtx5070ti-ryzen99950x3d16coreprocessor-cuda.md) | cuda | de70d1e2f726faf5 | 2026-10-18 to 2026-10-19 | 157 | 144 |
+| [NVIDIA GeForce GTX 1650 on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/gtx1650-i910900k.md) | unstated | ac6e3d8a29d8dc56 | 2026-10-18 to 2026-10-21 | 146 | 144 |
+| [AMD Radeon RX 9070 XT on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/amdradeonrx9070xt-i910900k-rocm.md) | rocm | c9468b28761481b3 | 2026-10-23 to 2026-10-23 | 89 | 96 |
+| [AMD Radeon RX 9070 XT on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/amdradeonrx9070xt-i910900k-vulkan.md) | vulkan | c9468b28761481b3 | 2026-10-24 to 2026-10-24 | 63 | 96 |
+| [NVIDIA GeForce GTX 1650 on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/gtx1650-i910900kx-cuda.md) | cuda | ac6e3d8a29d8dc56 | 2026-10-21 to 2026-10-23 | 49 | 96 |
+| [NVIDIA GeForce GTX 1650 on Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz](benchmarks/gtx1650-i910900kx-cpu.md) | cpu | ac6e3d8a29d8dc56 | 2026-10-21 to 2026-10-23 | 48 | 48 |
+| [Intel(R) Arc(TM) Graphics on Intel(R) Core(TM) Ultra 7 155H](benchmarks/intelrarctmgraphics-ultra7155h-opencl.md) | opencl | f9d19fc43971a8e2 | 2026-10-24 to 2026-10-24 | 12 | 12 |
+
+19 run(s) in the store carry no machine and appear on no page.
 
 <!-- /benchmarks:index -->
 
 ## Method
 
 One cell is `(model, context, prompt, mode, device, engine)`, measured by
-[assay](https://github.com/loken-ai/assay): 3 iterations, greedy, 128 tokens.
+[lokprof](https://github.com/loken-ai/lokprof): 3 iterations, greedy, 128 tokens.
 
 `Ctx` is the window each engine was asked to reserve, not a window the prompt fills: the
 longest prompt is about 300 tokens. Ollama allocates the whole window up front, and at 131072
