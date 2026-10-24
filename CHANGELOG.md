@@ -66,6 +66,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Bench: fetch no peer engine to measure the OpenCL backend.
 - Serve: read only the tokens a conversation's next turn adds.
 - Models: stop the context where a model starts scaling its queries.
 - Models: keep the feed-forward output in 6 bits when float weights take 4.

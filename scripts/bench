@@ -243,6 +243,12 @@ plan() {
 # A fresh uv venv for vLLM and the latest ollama release, both under the bench working tree, so the
 # comparison runs against current engines without touching any other environment. Versions printed.
 provision() {
+    # loken alone is measured on OpenCL: no peer engine is fetched or run.
+    if [ "$BACKEND" = opencl ]; then
+        echo "engines: none provisioned (backend opencl measures loken alone)"
+        export OLLAMA_VER="" VLLM_VER=""
+        return 0
+    fi
     have uv || die "uv is required to provision the vLLM venv"
     have tar || die "tar is required to provision ollama"
     local comp="$LOKEN/results/engines"
