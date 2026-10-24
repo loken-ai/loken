@@ -25,7 +25,10 @@ impl GenericTransformerLayer {
         // arches use the Q8 store.
         let is_gemma = self.attn_v_norm_ones.is_some();
         let f16_store = is_gemma || self.attn_sinks.is_some();
+        // The Q8 store attends over the whole history; a windowed layer keeps the F16 store.
         let eligible = !is_shared
+            && self.alibi_slopes.is_none()
+            && (f16_store || self.sliding_window.is_none())
             && self.head_dim.is_multiple_of(32)
             && self.n_kv_head > 0
             && self.n_head.is_multiple_of(self.n_kv_head)
@@ -128,6 +131,25 @@ impl GenericTransformerLayer {
             }
             None => Ok(att),
         }
+    }
+
+    /// The scores `att` `[b, a, c, keys]` with the ALiBi bias added: `a * c` runs over the query
+    /// heads, then the queries, the first at absolute position `first`. Unchanged without slopes.
+    pub(super) fn alibi_scores(&self, att: Tensor, first: usize) -> Result<Tensor> {
+        let Some(slopes) = self.alibi_slopes.as_ref() else {
+            return Ok(att);
+        };
+        let (_, a, c, keys) = att.dims4()?;
+        let queries = (a * c) / slopes.len().max(1);
+        let mut bias = Vec::with_capacity(a * c * keys);
+        for slope in slopes {
+            for i in 0..queries {
+                let pos = (first + i) as f32;
+                bias.extend((0..keys).map(|j| slope * (j as f32 - pos)));
+            }
+        }
+        let bias = Tensor::from_vec(bias, (1, a, c, keys), &att.device())?.to_dtype(att.dtype())?;
+        att.broadcast_add(&bias)
     }
 
     pub(super) fn cpu_q8_attention(
@@ -755,6 +777,7 @@ impl GenericTransformerLayer {
                 att.affine(scale as f32, 0.0)?
             };
             let att = self.softcap_scores(att)?;
+            let att = self.alibi_scores(att, k.dims()[2] - 1)?;
             // Softmax in F32 (ollama parity) then back to kv dtype so p.v reads F16.
             let att = if kv_dt == crate::tensor::DType::F32 {
                 crate::tensor::ops::softmax_last_dim(&att)?
@@ -782,6 +805,7 @@ impl GenericTransformerLayer {
                 && q.dtype() == crate::tensor::DType::F32
                 && q.dims()[0] == 1
                 && self.attn_softcap.is_none()
+                && self.alibi_slopes.is_none()
             {
                 if let Some(m) = mask {
                     return Self::flash_attn_prefill_cpu(q, &k, &v, m, scale as f32, n_rep, None);
@@ -821,6 +845,7 @@ impl GenericTransformerLayer {
                     att.affine(scale as f32, 0.0)?
                 };
                 let att = self.softcap_scores(att)?;
+                let att = self.alibi_scores(att, seq_kv - seq_q + q_off)?;
                 let att = match mask {
                     None => att,
                     Some(m) => {

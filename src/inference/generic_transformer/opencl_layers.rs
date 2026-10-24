@@ -228,7 +228,7 @@ fn refusal(
             "a fused or gate-less FFN",
         ),
         (f.use_gelu, "a GELU FFN"),
-        (f.layer_norm_with_bias, "LayerNorm"),
+        (f.layer_norm, "LayerNorm"),
         (f.has_post_attn_norm || f.has_post_ffn_norm, "post norms"),
         (f.parallel_attn, "parallel attention"),
         (f.has_attn_sinks, "attention sinks"),

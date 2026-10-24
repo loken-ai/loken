@@ -843,9 +843,15 @@ impl DenseCheckpoint {
         // the listing of the tensors made from stored ones.
         let mut computed_infos = HashMap::new();
         let mut bytes = Vec::new();
-        if let Some(scaling) = cfg.frequency_scaling {
-            let head_dim = cfg.head_dim.unwrap_or(cfg.hidden_size / cfg.n_head);
-            let factors = frequency_factors(head_dim, cfg.rope_theta, scaling);
+        let head_dim = cfg.head_dim.unwrap_or(cfg.hidden_size / cfg.n_head);
+        let factors = match cfg.frequency_scaling {
+            Some(scaling) => Some(frequency_factors(head_dim, cfg.rope_theta, scaling)),
+            None => crate::inference::load::hf_config::proportional_factors(
+                &cfg.root,
+                crate::inference::load::hf_config::global_head_dim(&cfg.root).unwrap_or(head_dim),
+            ),
+        };
+        if let Some(factors) = factors {
             bytes = factors.iter().flat_map(|f| f.to_le_bytes()).collect();
             let info = TensorInfo {
                 ggml_dtype: GgmlDType::F32,

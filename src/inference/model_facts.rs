@@ -64,6 +64,8 @@ pub struct ArchFacts {
     pub gelu_ffn: bool,
     /// The attention values are RMS-normalised, without a weight, before they are cached.
     pub value_rms_norm: bool,
+    /// The norms subtract the mean, as a layer norm does, though the file holds no bias.
+    pub mean_norm: bool,
     /// Embeddings are multiplied by the square root of the model width when the file gives
     /// no `embedding_scale`.
     pub embed_scale_sqrt_width: bool,
@@ -102,6 +104,7 @@ impl ArchFacts {
             softmax_topk_renormalised: true,
             gelu_ffn: false,
             value_rms_norm: false,
+            mean_norm: false,
             embed_scale_sqrt_width: false,
             attention_scale: None,
             quantized_kv_degrades: false,
@@ -231,11 +234,23 @@ const FACTS: &[(&str, ArchFacts)] = &[
     ("moondream", HALF_SPLIT),
     ("falcon", HALF_SPLIT),
     ("falcon3", HALF_SPLIT),
-    // Routed, but half-split.
-    ("dbrx", HALF_SPLIT),
+    // Routed, but half-split; layer norms without a bias.
+    (
+        "dbrx",
+        ArchFacts {
+            mean_norm: true,
+            ..HALF_SPLIT
+        },
+    ),
     ("orion", HALF_SPLIT),
-    // Positions come from an attention bias.
-    ("mpt", UNUSED),
+    // Positions come from an attention bias; layer norms without a bias.
+    (
+        "mpt",
+        ArchFacts {
+            mean_norm: true,
+            ..UNUSED
+        },
+    ),
     // No attention layer rotates, and the router scores by sigmoid; the files carry neither.
     (
         "nemotron_h_moe",

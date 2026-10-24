@@ -209,7 +209,13 @@ impl GenericHeteroTransformer {
         index_pos: usize,
         cuda_idx: Option<usize>,
     ) -> Result<Tensor> {
-        self.make_mask_reaching(seq_q, index_pos, cuda_idx, self.sliding_window)
+        // A model windowed in every layer sees its last `sliding_window` keys; one with a
+        // per-layer pattern gives its windowed layers their own mask, and this one serves
+        // its global layers.
+        let window = self
+            .sliding_window
+            .filter(|_| self.config.swa_pattern.is_none());
+        self.make_layer_mask(seq_q, index_pos, cuda_idx, window)
     }
 
     /// The causal mask of one layer of a period-classified model: a windowed layer sees
@@ -2740,7 +2746,7 @@ impl GenericHeteroTransformer {
 /// a layer whose KV buffer holds `bounded_len` keys at ABSOLUTE positions
 /// `[buf_start, buf_start+bounded_len)` (the bounded sliding-window cache).
 /// Query local `i` (abs = `index_pos+i`) attends buffer key `j` (abs = `buf_start+j`)
-/// iff `abs_j <= abs_i` (causal) AND `abs_j >= abs_i-window` (SWA). The legacy
+/// iff `abs_j <= abs_i` (causal) AND `abs_j > abs_i-window` (SWA: the last `window` keys). The legacy
 /// unbounded `make_mask` windowing is exactly the special case `buf_start=0,
 /// bounded_len=index_pos+seq_q` (where `j == abs_j`). With buffer = `window+chunk`
 /// and slide-keep-last-window, a slid chunk has `buf_start = (index_pos+seq_q) -
@@ -2758,7 +2764,7 @@ fn swa_bounded_mask_data(
             (0..bounded_len).map(move |j| {
                 let abs_i = i + index_pos;
                 let abs_j = buf_start + j;
-                u8::from(abs_j > abs_i || abs_j + window < abs_i)
+                u8::from(abs_j > abs_i || abs_j + window <= abs_i)
             })
         })
         .collect()
@@ -2780,7 +2786,7 @@ mod swa_mask_tests {
             .flat_map(|i| {
                 (0..bounded_len).map(move |j| {
                     let abs_i = i + index_pos;
-                    u8::from(j > abs_i || j + w < abs_i)
+                    u8::from(j > abs_i || j + w <= abs_i)
                 })
             })
             .collect();
@@ -2795,13 +2801,14 @@ mod swa_mask_tests {
         let buf_start = (index_pos + seq_q) - bounded_len; // 512
         let m = swa_bounded_mask_data(seq_q, index_pos, bounded_len, buf_start, w);
         let at = |i: usize, j: usize| m[i * bounded_len + j];
-        // Query abs 1536 sees the oldest in-window key abs 512 (edge), not a future key.
-        assert_eq!(at(0, 0), 0);
+        // Query abs 1536 sees its last 1024 keys, abs 513 the oldest; not a future key.
+        assert_eq!(at(0, 0), 1);
+        assert_eq!(at(0, 1), 0);
         assert_eq!(at(0, 1025), 1); // abs 1537 future -> causal-masked
-                                    // Query abs 2047: key abs 1022 older-than-window masked; abs 1023 edge unmasked;
-                                    // abs 2047 (current) unmasked.
-        assert_eq!(at(511, 510), 1);
-        assert_eq!(at(511, 511), 0);
+                                    // Query abs 2047: key abs 1023 older than the window masked; abs 1024
+                                    // edge unmasked; abs 2047 (current) unmasked.
+        assert_eq!(at(511, 511), 1);
+        assert_eq!(at(511, 512), 0);
         assert_eq!(at(511, 1535), 0);
     }
 }

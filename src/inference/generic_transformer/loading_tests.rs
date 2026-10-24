@@ -1920,7 +1920,7 @@ fn starcoder() -> Publisher {
         &format!(
             r#""n_embd": {HIDDEN}, "n_head": {HEADS}, "n_layer": {}, "n_inner": {FFN},
             "head_dim": {HEAD_DIM}, "vocab_size": {VOCAB}, "n_positions": 256,
-            "layer_norm_epsilon": 1e-5, "multi_query": true, "num_key_value_heads": {KV_HEADS}"#,
+            "layer_norm_epsilon": 1e-5, "num_key_value_heads": {KV_HEADS}"#,
             recipe.mixers.len()
         ),
     );
@@ -2181,7 +2181,6 @@ fn falcon() -> Publisher {
         &format!(
             r#""hidden_size": {HIDDEN}, "num_hidden_layers": {}, "num_attention_heads": {HEADS},
             "num_kv_heads": {KV_HEADS}, "head_dim": {HEAD_DIM}, "ffn_hidden_size": {FFN},
-            "multi_query": true,
             "parallel_attn": true, "new_decoder_architecture": false, "vocab_size": {VOCAB},
             "layer_norm_epsilon": 1e-5, "rope_theta": 10000.0, "bias": false"#,
             recipe.mixers.len()
@@ -3132,8 +3131,12 @@ const READ_AS: [(&str, &str, &str); 4] = [
     ("falcon3", "llama", "LlamaForCausalLM"),
 ];
 
+/// Architectures whose safetensors are tested only against the reference's logits, in
+/// `hf_reference_tests.rs`: the architecture and its folder under `tests/vectors/hf`.
+const REFERENCE_TESTED: [(&str, &str); 1] = [("gemma4", "gemma4")];
+
 /// Architectures whose publisher ships no safetensors the loader can read, and why.
-const NO_SAFETENSORS: [(&str, &str); 3] = [
+const NO_SAFETENSORS: [(&str, &str); 2] = [
     (
         "moondream",
         "custom code only, tensor names that change with each revision, no transformers class",
@@ -3142,18 +3145,19 @@ const NO_SAFETENSORS: [(&str, &str); 3] = [
         "qwen4exp",
         "no transformers class and no published checkpoint; read from GGUF only",
     ),
-    (
-        "gemma4",
-        "the per-layer input, shared key-value and key-as-value tensors of its checkpoint are not known well enough to translate",
-    ),
 ];
 
 /// Every architecture with publisher safetensors has a test that loads them, every other one
 /// says why not, and `docs/ARCHITECTURES.md` says the same.
 fn safetensors_coverage(known: &std::collections::BTreeSet<&str>) {
     use crate::inference::load::hf_config::{hf_architectures, CLASSES};
-    let tested: std::collections::BTreeSet<&str> =
-        publisher_archs().into_iter().chain(FAMILY_TESTED).collect();
+    let reference: std::collections::BTreeSet<&str> =
+        REFERENCE_TESTED.iter().map(|r| r.0).collect();
+    let tested: std::collections::BTreeSet<&str> = publisher_archs()
+        .into_iter()
+        .chain(FAMILY_TESTED)
+        .chain(reference.iter().copied())
+        .collect();
     let read_as: std::collections::BTreeSet<&str> = READ_AS.iter().map(|r| r.0).collect();
     let none: std::collections::BTreeSet<&str> = NO_SAFETENSORS.iter().map(|r| r.0).collect();
     for arch in known {
@@ -3194,10 +3198,21 @@ fn safetensors_coverage(known: &std::collections::BTreeSet<&str>) {
     };
     for arch in known {
         let line = row(arch);
-        if tested.contains(arch) {
+        if tested.contains(arch) && !reference.contains(arch) {
             let test = format!("{arch}_loads_from_safetensors");
             assert!(line.contains(&test), "the row of {arch} lacks {test}");
         }
+    }
+    for (arch, folder) in REFERENCE_TESTED {
+        let test = format!("{folder}_matches_reference");
+        assert!(row(arch).contains(&test), "the row of {arch} lacks {test}");
+        assert!(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/vectors/hf")
+                .join(folder)
+                .is_dir(),
+            "{arch}: no reference folder {folder}"
+        );
     }
     for (arch, tag, class) in READ_AS {
         let line = row(arch);

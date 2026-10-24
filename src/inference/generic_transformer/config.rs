@@ -108,6 +108,9 @@ pub struct GenericLayerFlags {
     /// it's a full LayerNorm (subtract mean, divide std, scale, shift),
     /// NOT an RMSNorm. Detected by `blk.0.attn_norm.bias` presence.
     pub layer_norm_with_bias: bool,
+    /// The norms subtract the mean: a bias is present, or the architecture's norm is a layer
+    /// norm without one.
+    pub layer_norm: bool,
     /// Phi2: attn_qkv has `.bias`, attn_output has `.bias`, ffn_up has
     /// `.bias`, ffn_down has `.bias`. Existing `has_qkv_bias` is for
     /// Qwen2's per-projection biases (q/k/v) - phi2 has them on the
@@ -205,6 +208,7 @@ impl GenericLayerFlags {
                 && has("blk.0.ffn_up.weight")
                 && !has("blk.0.post_ffw_norm.weight"),
             layer_norm_with_bias: has("blk.0.attn_norm.bias"),
+            layer_norm: has("blk.0.attn_norm.bias") || facts.mean_norm,
             has_attn_output_bias: has_attn(&format!("{}.bias", attn_output_name(content))),
             has_ffn_bias: has("blk.0.ffn_down.bias"),
             has_attn_sinks: attn_sinks_name(content, attn).is_some(),
@@ -409,6 +413,8 @@ pub struct GenericTransformerConfig {
     pub final_logit_softcapping: Option<f64>,
     /// Gemma2: attention score softcapping -> tanh(scores/cap)*cap, before the mask.
     pub attn_logit_softcapping: Option<f64>,
+    /// ALiBi: the largest of the heads' linear position biases (`attention.max_alibi_bias`).
+    pub max_alibi_bias: Option<f32>,
     /// Per-layer sliding-window pattern (gemma4 `attention.sliding_window_pattern`,
     /// 1=SWA / 0=global). Authoritative SWA classification - preferred over the
     /// head_dim heuristic, which mis-classifies KV-shared layers whose Q dim does
@@ -585,6 +591,13 @@ impl GenericTransformerConfig {
                 .tensor_infos
                 .get(&format!("blk.{i}.ffn_gate.weight"))
                 .and_then(|t| t.shape.dims().first().copied())
+                .or_else(|| {
+                    // An ungated block: the down projection's input width.
+                    content
+                        .tensor_infos
+                        .get(&format!("blk.{i}.ffn_down.weight"))
+                        .and_then(|t| t.shape.dims().get(1).copied())
+                })
             {
                 *widths.entry(w).or_default() += 1;
             }
@@ -674,19 +687,18 @@ impl GenericTransformerConfig {
             Some(f) => f == GATING_SIGMOID,
             None => facts.sigmoid_expert_gating,
         };
-        let expert_weights_norm = facts.sigmoid_weights_norm.unwrap_or_else(|| {
-            content
-                .metadata
-                .get(&format!("{arch}.expert_weights_norm"))
-                .and_then(|v| v.to_bool().ok())
-                .unwrap_or(false)
-        });
         let meta_bool = |key: &str| {
             content
                 .metadata
                 .get(&format!("{arch}.{key}"))
                 .and_then(|v| v.to_bool().ok())
         };
+        // Sigmoid-routed weights are renormalised as the file says under either name.
+        let expert_weights_norm = facts.sigmoid_weights_norm.unwrap_or_else(|| {
+            meta_bool("expert_weights_norm")
+                .or_else(|| meta_bool("norm_top_k_prob"))
+                .unwrap_or(false)
+        });
         let expert_topk_norm = meta_bool("norm_top_k_prob")
             .or_else(|| meta_bool("expert_weights_norm"))
             .unwrap_or(facts.softmax_topk_renormalised);
@@ -741,6 +753,8 @@ impl GenericTransformerConfig {
         // Attention score softcapping (Gemma2: 50.0): tanh(scores/cap)*cap before the mask.
         let attn_logit_softcapping =
             meta_f32(content, arch, "attn_logit_softcapping").map(|v| v as f64);
+        let max_alibi_bias =
+            meta_f32(content, arch, "attention.max_alibi_bias").filter(|b| *b > 0.0);
 
         // Logit softcapping (Gemma4: 30.0)
         let final_logit_softcapping =
@@ -794,6 +808,7 @@ impl GenericTransformerConfig {
             residual_scale,
             final_logit_softcapping,
             attn_logit_softcapping,
+            max_alibi_bias,
             flags,
             kv_quant: crate::inference::engine::llm_engine::KvQuant::Off,
             max_q8_seq_len: 8192,

@@ -603,6 +603,9 @@ impl GenericTransformerLayer {
         pre_computed_qkv: Option<&Tensor>,
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     ) -> Result<Tensor> {
+        if self.alibi_slopes.is_some() && !matches!(x.device(), Device::Cpu) {
+            crate::tensor::bail!("ALiBi attention runs on the host only");
+        }
         if self.attends_rows_as_decode(x, &shared_kv)? {
             return self.forward_attn_rows_as_decode(x, index_pos, pre_computed_qkv, donor_f16);
         }
@@ -1467,6 +1470,7 @@ impl GenericTransformerLayer {
                 // scale already.
                 let in_place = self.kv_f16
                     && self.attn_softcap.is_none()
+                    && self.alibi_slopes.is_none()
                     && k_new.dtype() == crate::tensor::DType::F16;
                 let (k_full, v_full) = if in_place {
                     self.kv_cache.append_in_place(&k_new, &v_new)?;
@@ -1523,11 +1527,13 @@ impl GenericTransformerLayer {
                     let (bb, _n_head, _one, d) = qd.dims4()?;
                     let q_grouped = qd.reshape((bb, self.n_kv_head, n_rep, d))?;
                     let att = self.softcap_scores(q_grouped.matmul_t(&k_full)?)?;
+                    let att = self.alibi_scores(att, k_full.dims()[2] - 1)?;
                     let att = sm(&att)?;
                     let out = att.matmul(&v_full)?;
                     out.reshape((bb, self.n_head, 1, d))?
                 } else {
                     let att = self.softcap_scores(qd.matmul_t(&k_full)?)?;
+                    let att = self.alibi_scores(att, k_full.dims()[2] - 1)?;
                     let att = sm(&att)?;
                     att.matmul(&v_full.contiguous()?)?
                 };
@@ -1674,12 +1680,13 @@ impl GenericTransformerLayer {
         // RMS-norm the whole flat q/k projection BEFORE the head split, unlike the
         // per-head QK-norm of Gemma3/Qwen3 (applied after reshape below).
         let qk_norm_full = self.qk_norm_is_full();
+        // A layer reading another's keys and values may carry a query norm alone.
         if qk_norm_full {
-            if let (Some(q_norm), Some(k_norm)) = (&self.attn_q_norm, &self.attn_k_norm) {
+            if let Some(q_norm) = &self.attn_q_norm {
                 q = q_norm.forward(&q.contiguous()?)?;
-                if !is_shared_layer {
-                    k = k_norm.forward(&k.contiguous()?)?;
-                }
+            }
+            if let (Some(k_norm), false) = (&self.attn_k_norm, is_shared_layer) {
+                k = k_norm.forward(&k.contiguous()?)?;
             }
         }
         q = q.reshape((b, seq, n_head, head_dim))?.transpose(1, 2)?;
@@ -1691,11 +1698,11 @@ impl GenericTransformerLayer {
 
         // -- Optional QK norms (Gemma3/4) - PER-HEAD (skip if full-dim done above) --
         if self.flags.has_qk_norm && !qk_norm_full {
-            if let (Some(q_norm), Some(k_norm)) = (&self.attn_q_norm, &self.attn_k_norm) {
+            if let Some(q_norm) = &self.attn_q_norm {
                 q = q_norm.forward(&q.contiguous()?)?;
-                if !is_shared_layer {
-                    k = k_norm.forward(&k.contiguous()?)?;
-                }
+            }
+            if let (Some(k_norm), false) = (&self.attn_k_norm, is_shared_layer) {
+                k = k_norm.forward(&k.contiguous()?)?;
             }
             // Gemma4: V also gets RMS norm (without learnable weight).
             // Use the reference fused single-launch rms_norm with a unit-weight
@@ -1912,6 +1919,7 @@ impl GenericTransformerLayer {
                 if seq == 1
                     && k16.device().is_cuda()
                     && (self.attn_sinks.is_some() || self.attn_softcap.is_none())
+                    && self.alibi_slopes.is_none()
                 {
                     self.kv_cache.append_in_place(&k16, &v16)?;
                     match (self.kv_cache.k_buffer(), self.kv_cache.v_buffer()) {
@@ -1923,7 +1931,8 @@ impl GenericTransformerLayer {
                     // which reads the cache in place: no scores of the whole history are made.
                     flash_kv = flash_prefill_ok
                         && self.attn_sinks.is_none()
-                        && self.attn_softcap.is_none();
+                        && self.attn_softcap.is_none()
+                        && self.alibi_slopes.is_none();
                     self.kv_cache.append(&k16, &v16)?
                 }
             } else {
@@ -2698,8 +2707,9 @@ impl GenericTransformerLayer {
         // form when its shape/dtype guards don't hold, so it is never worse.
         if q.dims()[2] > 1 {
             let raw_att = q.matmul_t(&k)?;
-            let att = if self.attn_softcap.is_some() {
+            let att = if self.attn_softcap.is_some() || self.alibi_slopes.is_some() {
                 let capped = self.softcap_scores(raw_att.affine(scale as f32, 0.0)?)?;
+                let capped = self.alibi_scores(capped, k.dims()[2] - q.dims()[2])?;
                 crate::tensor::ops::softmax_last_dim_masked(&capped, mask)?
             } else {
                 crate::tensor::ops::softmax_scaled_masked(&raw_att, scale, mask)?
@@ -2708,6 +2718,7 @@ impl GenericTransformerLayer {
             return att.matmul(&v.contiguous()?);
         }
         let raw_att = self.softcap_scores(q.matmul_t(&k)?.affine(scale as f32, 0.0)?)?;
+        let raw_att = self.alibi_scores(raw_att, k.dims()[2] - 1)?;
         let att = if q.dims()[2] == 1 {
             if let Some(qk_buf) = self.graph_attn_qk_buffer.as_ref() {
                 qk_buf.slice_set(&raw_att, 0, 0)?;

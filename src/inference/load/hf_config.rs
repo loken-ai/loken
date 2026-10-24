@@ -31,6 +31,7 @@ pub enum LayoutKind {
     Mpt,
     Gemma,
     Gemma2,
+    Gemma4,
     GptOss,
     Lfm2,
     Lfm2Moe,
@@ -194,6 +195,12 @@ pub const CLASSES: &[HfClass] = &[
         ),
         6,
     ),
+    class("Gemma4ForCausalLM", "gemma4", LayoutKind::Gemma4),
+    class(
+        "Gemma4ForConditionalGeneration",
+        "gemma4",
+        LayoutKind::Gemma4,
+    ),
     class("GptOssForCausalLM", "gptoss", LayoutKind::GptOss),
     class("Lfm2ForCausalLM", "lfm2", LayoutKind::Lfm2),
     sigmoid(class("Lfm2MoeForCausalLM", "lfm2moe", LayoutKind::Lfm2Moe)),
@@ -243,9 +250,53 @@ pub fn lookup_b(root: &Json, keys: &[&str]) -> Option<bool> {
     lookup(root, keys).and_then(Json::as_bool)
 }
 
-/// The configuration's rope block: `rope_scaling`, or `rope_parameters` of a newer one.
+/// The configuration's rope block: `rope_scaling`, or `rope_parameters` of a newer one; of a
+/// block per layer kind, the global layers'.
 pub fn rope_block(root: &Json) -> Option<&Json> {
-    lookup(root, &["rope_scaling", "rope_parameters"]).filter(|b| b.is_object())
+    lookup(root, &["rope_scaling", "rope_parameters"])
+        .filter(|b| b.is_object())
+        .map(|b| {
+            b.get("full_attention")
+                .filter(|g| g.is_object())
+                .unwrap_or(b)
+        })
+}
+
+/// The head width of the global layers when it differs from the configuration's `head_dim`:
+/// `global_head_dim`, or the widest of a per-layer configuration.
+pub fn global_head_dim(root: &Json) -> Option<usize> {
+    lookup_u(root, &["global_head_dim"]).or_else(|| {
+        lookup(root, &["per_layer_config"])
+            .and_then(Json::as_object)
+            .and_then(|layers| {
+                layers
+                    .values()
+                    .filter_map(|l| l.get("head_dim").and_then(Json::as_u64))
+                    .max()
+            })
+            .map(|d| d as usize)
+    })
+}
+
+/// The rotary frequency factors of a proportional rotation: the first `share` of a head's
+/// frequencies turn at the base frequencies over `factor`, the rest stand still. `None` for
+/// another rotation.
+pub fn proportional_factors(root: &Json, head_dim: usize) -> Option<Vec<f32>> {
+    let block = rope_block(root)?;
+    if block.get("rope_type").and_then(Json::as_str) != Some("proportional") {
+        return None;
+    }
+    let share = block
+        .get("partial_rotary_factor")
+        .and_then(Json::as_f64)
+        .unwrap_or(1.0);
+    let factor = block.get("factor").and_then(Json::as_f64).unwrap_or(1.0) as f32;
+    let turning = (share * head_dim as f64) as usize / 2;
+    Some(
+        (0..head_dim / 2)
+            .map(|i| if i < turning { factor } else { f32::INFINITY })
+            .collect(),
+    )
 }
 
 /// The sliding-window layers of a model, `true` for a windowed one: its own list of layer
@@ -347,7 +398,13 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
             "attention.sliding_window_pattern",
             Value::Array(pattern.into_iter().map(Value::Bool).collect()),
         );
-        if let Some(local) = lookup_f(root, &["rope_local_base_freq"]) {
+        if let Some(local) = lookup_f(
+            root,
+            &[
+                "rope_local_base_freq",
+                "rope_parameters.sliding_attention.rope_theta",
+            ],
+        ) {
             put("rope.freq_base_swa", Value::F32(local));
         }
     }
@@ -364,6 +421,10 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
             put(key, Value::F32(v));
         }
     }
+    if lookup_b(root, &["attn_config.alibi", "alibi"]) == Some(true) {
+        let bias = lookup_f(root, &["attn_config.alibi_bias_max", "alibi_bias_max"]);
+        put("attention.max_alibi_bias", Value::F32(bias.unwrap_or(8.0)));
+    }
     if let Some(q) = lookup_f(root, &["query_pre_attn_scalar"]).filter(|q| *q > 0.0) {
         put("attention.scale", Value::F32(1.0 / q.sqrt()));
     }
@@ -379,6 +440,19 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
                 }
             }
         }
+    }
+
+    // The global layers' head width, the layers that read another's keys and values, and the
+    // width of the per-layer inputs.
+    if let Some(global) = global_head_dim(root).filter(|g| *g != head_dim) {
+        put("attention.key_length", Value::U32(global as u32));
+        put("attention.value_length", Value::U32(global as u32));
+    }
+    if let Some(n) = lookup_u(root, &["num_kv_shared_layers"]).filter(|n| *n > 0) {
+        put("attention.shared_kv_layers", Value::U32(n as u32));
+    }
+    if let Some(w) = lookup_u(root, &["hidden_size_per_layer_input"]).filter(|w| *w > 0) {
+        put("embedding_length_per_layer_input", Value::U32(w as u32));
     }
 
     // The recurrent mixers' shapes: the delta rule's, then the state-space model's.

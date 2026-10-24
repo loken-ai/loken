@@ -908,8 +908,14 @@ impl GenericTransformerLayer {
         // its ple_input slice + post-norm, else bail (can't half-apply). The PLE
         // block + output scale run at the end. Non-PLE arches: ple_input None.
         let has_ple = self.ple_inp_gate.is_some();
+        // The per-layer input's projections run in the block format: a layer whose weights the
+        // executor cannot read is refused here, before any cache is written.
+        let raw = |m: Option<&QMatMul>| m.is_some_and(|m| m.cpu_raw().is_some());
         if has_ple
-            && (ple_input.is_none() || self.ple_proj.is_none() || self.ple_post_norm.is_none())
+            && (ple_input.is_none()
+                || self.ple_post_norm.is_none()
+                || !raw(self.ple_inp_gate.as_ref())
+                || !raw(self.ple_proj.as_ref()))
         {
             return Ok(false);
         }
@@ -1356,7 +1362,8 @@ impl GenericTransformerLayer {
         // gemma4 PLE: this layer's per-layer-embedding slice [ple_dim] as f32.
         let ple_vec: Option<Vec<f32>> = match ple_layer_input {
             Some(t) => Some(
-                t.flatten_all()?
+                t.contiguous()?
+                    .flatten_all()?
                     .to_dtype(crate::tensor::DType::F32)?
                     .to_vec1::<f32>()?,
             ),
@@ -2147,6 +2154,14 @@ impl GenericTransformerLayer {
     pub(super) fn host_decode_arch_ok(&self, moe_prenormed: bool) -> bool {
         let (hd, is_gemma) = (self.head_dim, self.attn_v_norm_ones.is_some());
         !(self.flags.use_rope_i
+            // The Q8 store holds whole 32-lane blocks of a head, and attends over the whole
+            // history: a windowed layer reads it only through the F16 store.
+            || !hd.is_multiple_of(32)
+            || self.sliding_window.is_some() && !is_gemma && self.attn_sinks.is_none()
+            // The executor rotates by the plain table, without the frequency factors.
+            || self.rope_freq_factors.is_some()
+            // Nor does it add a position bias to the scores.
+            || self.alibi_slopes.is_some()
             || self.attn_v.is_none() && self.attn_qkv.is_none()
             || self.flags.is_phi2_simple_ffn
             || self.rope_dim != 0 && self.rope_dim != hd

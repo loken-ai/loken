@@ -509,6 +509,44 @@ const GEMMA2: Layout = Layout {
     ..LLAMA
 };
 
+/// Norm scales stored as they are applied, four around attention and the feed-forward, and
+/// the per-layer input: its gate, projection and norm, and the block's output scale.
+const GEMMA4_BLOCK: Table = &[
+    (
+        "post_attention_layernorm.weight",
+        Same("post_attention_norm.weight"),
+    ),
+    ("pre_feedforward_layernorm.weight", Same("ffn_norm.weight")),
+    (
+        "post_feedforward_layernorm.weight",
+        Same("post_ffw_norm.weight"),
+    ),
+    ("per_layer_input_gate.weight", Same("inp_gate.weight")),
+    ("per_layer_projection.weight", Same("proj.weight")),
+    ("post_per_layer_input_norm.weight", Same("post_norm.weight")),
+    ("layer_scalar", Same("layer_output_scale.weight")),
+];
+
+const GEMMA4: Layout = Layout {
+    top: &[
+        ("norm.weight", Same("output_norm.weight")),
+        (
+            "embed_tokens_per_layer.weight",
+            Same("per_layer_token_embd.weight"),
+        ),
+        (
+            "per_layer_model_projection.weight",
+            Same("per_layer_model_proj.weight"),
+        ),
+        (
+            "per_layer_projection_norm.weight",
+            Same("per_layer_proj_norm.weight"),
+        ),
+    ],
+    layer: &[GEMMA4_BLOCK, NORMS_AND_ATTENTION, GATED_MLP],
+    ..LLAMA
+};
+
 const GPTOSS: Layout = Layout {
     layer: &[
         &[
@@ -778,6 +816,7 @@ pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
         LayoutKind::Mpt => &MPT,
         LayoutKind::Gemma => &GEMMA,
         LayoutKind::Gemma2 => &GEMMA2,
+        LayoutKind::Gemma4 => &GEMMA4,
         LayoutKind::GptOss => &GPTOSS,
         LayoutKind::Lfm2 => &LFM2,
         LayoutKind::Lfm2Moe => &LFM2MOE,

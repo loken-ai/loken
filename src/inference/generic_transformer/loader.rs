@@ -704,6 +704,20 @@ impl LayerRopes {
 /// A float projection rebuilt as the block format `target` on `device`, and the ledger entry
 /// that says so. The block-quant kernels read it at a fraction of the float bytes and the
 /// fused projections need one format across a layer.
+/// The ALiBi slope of each of `n_head` heads for a largest bias of `max_bias`: the geometric
+/// sequence over the largest power of two of heads, the rest interleaved between its terms.
+fn alibi_slopes(n_head: usize, max_bias: f32) -> Vec<f32> {
+    let pow2 = 1usize << (usize::BITS - 1 - n_head.max(1).leading_zeros());
+    let m0 = 2f32.powf(-max_bias / pow2 as f32);
+    let m1 = 2f32.powf(-max_bias / 2.0 / pow2 as f32);
+    (0..n_head)
+        .map(|h| match h < pow2 {
+            true => m0.powi(h as i32 + 1),
+            false => m1.powi(2 * (h - pow2) as i32 + 1),
+        })
+        .collect()
+}
+
 fn requant_float_weight(
     qt: QTensor,
     target: crate::tensor::quantized::GgmlDType,
@@ -1197,6 +1211,14 @@ fn build_generic_layer(
 
     let build_norm_opt =
         |qt: Option<QTensor>| -> Result<Option<RmsNorm>> { qt.map(build_norm).transpose() };
+    // A norm's scale as an F32 tensor on the layer's device.
+    let norm_scale = |qt: QTensor| -> Result<Tensor> {
+        match on_gpu {
+            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
+            true => qt.dequantize(&Device::Cpu)?.to_device(device),
+            false => qt.dequantize(device),
+        }
+    };
 
     // The block format float projections are requantised to: the model's choice, unless a float
     // weight's rows are not whole blocks of it, in which case the layer's float weights all take
@@ -1295,13 +1317,15 @@ fn build_generic_layer(
             to_qmatmul(raw.attn_v)?,
             to_qmatmul(raw.attn_qkv)?,
         )
-    } else if raw.attn_v.is_none() {
-        // Gemma4 26B Global layers: attn_v missing (AttentionKEqV).
-        // Skip QKV byte-concat - Q,K projected separately, V reuses K
-        // at forward time.
+    } else if raw.attn_v.is_none() || raw.attn_k.is_none() {
+        // Gemma4 26B Global layers: attn_v missing (AttentionKEqV); a layer reading another's
+        // keys and values may have neither. Skip QKV byte-concat - Q,K projected separately,
+        // V reuses K at forward time.
         (
             Some(QMatMul::from_qtensor(requant_qt(raw.attn_q.unwrap())?)?),
-            Some(QMatMul::from_qtensor(requant_qt(raw.attn_k.unwrap())?)?),
+            raw.attn_k
+                .map(|k| QMatMul::from_qtensor(requant_qt(k)?))
+                .transpose()?,
             None,
             None,
         )
@@ -1577,6 +1601,8 @@ fn build_generic_layer(
                     bias_qt.dequantize(device)?
                 };
                 WeightedNorm::Layer(LayerNorm::new(weight_t, Some(bias_t), eps as f32))
+            } else if flags.layer_norm {
+                WeightedNorm::Layer(LayerNorm::new_no_bias(norm_scale(qt)?, eps))
             } else {
                 WeightedNorm::Rms(build_norm(qt)?)
             }
@@ -1625,7 +1651,7 @@ fn build_generic_layer(
     // The fused add+norm kernels normalise by RMS; a LayerNorm takes the unfused path.
     let ffn_norm_weight_for_fused = match &raw.ffn_norm_qt {
         // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
-        Some(qt) if on_gpu && raw.ffn_norm_bias_qt.is_none() => {
+        Some(qt) if on_gpu && raw.ffn_norm_bias_qt.is_none() && !flags.layer_norm => {
             Some(qt.dequantize(&Device::Cpu)?.to_device(device)?)
         }
         _ => None,
@@ -1643,6 +1669,10 @@ fn build_generic_layer(
                 eps as f32,
             )))
         }
+        (Some(qt), None) if flags.layer_norm => Some(WeightedNorm::Layer(LayerNorm::new_no_bias(
+            norm_scale(qt)?,
+            eps,
+        ))),
         (Some(qt), None) => Some(WeightedNorm::Rms(build_norm(qt)?)),
         // OLMo2 post-norm-only: no pre-ffn-norm tensor but post_ffw_norm IS present ->
         // identity pre-norm (the FFN sees raw h; post_ffn_norm normalises its output).
@@ -1701,32 +1731,47 @@ fn build_generic_layer(
 
     // Recompute RoPE when head_dim or rope_dim differs from the config-level precomputed tables.
     let effective_rope_dim = if rope_dim > 0 { rope_dim } else { head_dim };
-    let rope_base = if head_dim < config.head_dim {
-        // SWA layers (Gemma4) use a different RoPE freq base
+    // SWA classification: the explicit per-layer pattern (gemma4 `sliding_window_pattern`)
+    // when the file has one, else the architecture's period, else the head_dim heuristic
+    // (SWA layers have a smaller head than the global config).
+    let is_swa = match config
+        .swa_pattern
+        .as_ref()
+        .and_then(|p| p.get(raw.layer_idx))
+    {
+        Some(&s) => s,
+        None => match config.swa_period {
+            Some(period) => windowed_by_period(period, raw.layer_idx),
+            None => head_dim < config.head_dim,
+        },
+    };
+    // A sliding-window layer rotates at its own base when the file gives one.
+    let rope_base = if is_swa {
         config.rope_freq_base_swa.unwrap_or(config.rope_freq_base)
     } else {
         config.rope_freq_base
     };
-    let (cos, sin) = if head_dim != config.head_dim || rope_dim > 0 {
-        // YaRN applies to full-head-dim layers; SWA/partial layers (head_dim<config)
-        // keep plain rope (their lower freq base already shortens their context).
-        let yarn = if head_dim < config.head_dim {
-            None
+    let (cos, sin) =
+        if head_dim != config.head_dim || rope_dim > 0 || rope_base != config.rope_freq_base {
+            // YaRN applies to full-head-dim layers; SWA/partial layers (head_dim<config)
+            // keep plain rope (their lower freq base already shortens their context).
+            let yarn = if head_dim < config.head_dim {
+                None
+            } else {
+                config.yarn
+            };
+            ropes.table(
+                effective_rope_dim,
+                rope_base,
+                yarn,
+                config
+                    .effective_max_context()
+                    .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
+                device,
+            )?
         } else {
-            config.yarn
+            (cos.clone(), sin.clone())
         };
-        ropes.table(
-            effective_rope_dim,
-            rope_base,
-            yarn,
-            config
-                .effective_max_context()
-                .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
-            device,
-        )?
-    } else {
-        (cos.clone(), sin.clone())
-    };
     // (Tried: baking rope_freq_factors into cos/sin at load time to
     // skip per-call recompute. Math should be equivalent but the baked
     // tables produced wrong output for gemma4 - reverted. Likely
@@ -2125,20 +2170,6 @@ fn build_generic_layer(
         None
     };
 
-    // SWA classification: the explicit per-layer pattern (gemma4 `sliding_window_pattern`)
-    // when the file has one, else the architecture's period, else the head_dim heuristic
-    // (SWA layers have a smaller head than the global config).
-    let is_swa = match config
-        .swa_pattern
-        .as_ref()
-        .and_then(|p| p.get(raw.layer_idx))
-    {
-        Some(&s) => s,
-        None => match config.swa_period {
-            Some(period) => windowed_by_period(period, raw.layer_idx),
-            None => head_dim < config.head_dim,
-        },
-    };
     let layer_window = config.sliding_window.filter(|_| is_swa);
     let has_sinks = attn_sinks.is_some();
 
@@ -2222,7 +2253,9 @@ fn build_generic_layer(
         attn_output_bias,
         attn_sinks,
         attn_sinks_host,
+        // Positions come from learned embeddings or an ALiBi bias, or the layer skips them.
         no_rope: config.learned_positions
+            || config.max_alibi_bias.is_some()
             || crate::inference::model_facts::no_rope_layer_period(&config.arch)
                 .is_some_and(|period| (raw.layer_idx + 1).is_multiple_of(period)),
         attn_norm,
@@ -2456,7 +2489,7 @@ fn build_generic_layer(
         n_kv_head: n_kv_head_layer,
         head_dim,
         sliding_window: layer_window,
-        prefill_mask_window: if config.swa_period.is_some() {
+        prefill_mask_window: if config.swa_period.is_some() || config.swa_pattern.is_some() {
             layer_window
         } else {
             config.sliding_window
@@ -2466,6 +2499,9 @@ fn build_generic_layer(
         rope_base,
         attention_scale: config.attention_scale,
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
+        alibi_slopes: config
+            .max_alibi_bias
+            .map(|b| alibi_slopes(config.n_head, b)),
         residual_scale: config.residual_scale,
         flags,
         hyper,
@@ -2822,6 +2858,9 @@ fn build_awq_layer(
         no_rope: false,
         attention_scale: config.attention_scale,
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
+        alibi_slopes: config
+            .max_alibi_bias
+            .map(|b| alibi_slopes(config.n_head, b)),
         residual_scale: config.residual_scale,
         flags,
         hyper: None,
@@ -3180,6 +3219,10 @@ impl GenericHeteroTransformer {
                 norm_weight_cpu.clone(),
                 Some(bias.clone()),
                 config.rms_norm_eps as f32,
+            )),
+            None if flags.layer_norm => WeightedNorm::Layer(LayerNorm::new_no_bias(
+                norm_weight_cpu.clone(),
+                config.rms_norm_eps,
             )),
             None => WeightedNorm::Rms(RmsNorm::from_tensor(
                 norm_weight_cpu.clone(),
@@ -3546,11 +3589,18 @@ impl GenericHeteroTransformer {
                     }
                     false => q,
                 };
-                let k = req!(&format!("{prefix}.attn_k.weight"))?;
+                // A layer that reads another's keys and values may carry no projection of
+                // its own.
+                let shared = config.shared_kv_layers > 0
+                    && idx >= config.n_layers.saturating_sub(config.shared_kv_layers);
+                let k = match shared {
+                    true => source.read_opt(&format!("{prefix}.attn_k.weight"), weight_dev)?,
+                    false => Some(req!(&format!("{prefix}.attn_k.weight"))?),
+                };
                 // Gemma4 26B Global layers omit attn_v and reuse attn_k
                 // as V (AttentionKEqV pattern). Use opt-load for V.
                 let v = source.read_opt(&format!("{prefix}.attn_v.weight"), weight_dev)?;
-                (Some(q), Some(k), v, None)
+                (Some(q), k, v, None)
             };
 
             // Detect per-layer Q output dim from GGUF tensor shape.

@@ -97,22 +97,35 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         .ok_or_else(|| anyhow!("config.json: missing architectures[0]"))?
         .to_string();
     let gguf_arch = map_hf_arch(&hf_arch)?.to_string();
+    // A mixture added beside each block's feed-forward has tensors no layout names.
+    if lookup_b(&v, &["enable_moe_block"]) == Some(true) {
+        return Err(anyhow!(
+            "config.json: the experts beside each feed-forward (enable_moe_block) are not read"
+        ));
+    }
 
     let hidden_size =
         u(&["hidden_size", "d_model", "n_embd"]).ok_or_else(|| anyhow!("missing hidden_size"))?;
     let n_head = u(&["num_attention_heads", "n_heads", "n_head"])
         .ok_or_else(|| anyhow!("missing num_attention_heads"))?;
-    let n_kv_head = u(&[
-        "num_key_value_heads",
-        "attn_config.kv_n_heads",
-        "multi_query_group_num",
-        "num_kv_heads",
-        "n_head_kv",
-    ])
-    .unwrap_or_else(|| match lookup_b(&v, &["multi_query"]) {
-        Some(true) => 1,
-        _ => n_head,
-    });
+    // A multi-query decoder of the older layout shares one key-value head whatever head
+    // count its configuration also carries.
+    let one_kv = lookup_b(&v, &["multi_query"]) == Some(true)
+        && lookup_b(&v, &["new_decoder_architecture"]) != Some(true);
+    let n_kv_head = (if one_kv { Some(1) } else { None })
+        .or_else(|| {
+            u(&[
+                "num_key_value_heads",
+                "attn_config.kv_n_heads",
+                "multi_query_group_num",
+                "num_kv_heads",
+                "n_head_kv",
+            ])
+        })
+        .unwrap_or_else(|| match lookup_b(&v, &["multi_query"]) {
+            Some(true) => 1,
+            _ => n_head,
+        });
 
     // A dense checkpoint carries none; its group size and width are never read.
     let qc = lookup(&v, &["quantization_config"]);
@@ -167,7 +180,13 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         hf_arch,
         gguf_arch,
         hidden_size,
+        // A configuration that lists its blocks' kinds may leave their count out.
         n_layers: u(&["num_hidden_layers", "n_layers", "num_layers", "n_layer"])
+            .or_else(|| {
+                lookup(&v, &["layers_block_type", "layer_types"])
+                    .and_then(|t| t.as_array())
+                    .map(|t| t.len())
+            })
             .ok_or_else(|| anyhow!("missing num_hidden_layers"))?,
         n_head,
         n_kv_head,
@@ -185,6 +204,7 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         rope_theta: f(&[
             "rope_theta",
             "rope_parameters.rope_theta",
+            "rope_parameters.full_attention.rope_theta",
             "attn_config.rope_theta",
             "rotary_emb_base",
         ])

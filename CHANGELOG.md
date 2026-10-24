@@ -6,6 +6,9 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Models: check every architecture against reference logits.
+- Models: load Gemma 4 from its safetensors.
+- Models: apply ALiBi to MPT on the host.
 - Devices: list the Vulkan GPUs that placement offers.
 - Bench: measure a card through its Vulkan or OpenCL backend.
 - Models: read the vocabulary of a checkpoint from its tokenizer.model.
@@ -93,6 +96,9 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Models: give a multi-query Falcon one key-value head.
+- Models: read the layer norms of DBRX and MPT without a bias.
+- Models: size the sliding window of local attention layers as declared.
 - Build: link the tensor-core kernels in a build for older cards.
 - Models: skip the fused feed-forward norm of a layer that has no such norm.
 - Models: keep a prompt of several tokens out of the one-row graph buffers.

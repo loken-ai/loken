@@ -62,6 +62,8 @@ pub mod expert_tier;
 pub mod expert_tier;
 mod graph;
 pub mod hetero;
+#[cfg(test)]
+mod hf_reference_tests;
 pub mod hyper;
 mod layer_attn;
 mod layer_cpu_attn;
@@ -423,6 +425,10 @@ pub struct GenericTransformerLayer {
     /// Attention scores pass through tanh(s/cap)*cap before the mask (Gemma2). Only the
     /// unfused attention applies it; the fused and quantised paths step aside for it.
     pub attn_softcap: Option<f32>,
+    /// ALiBi slopes, one per query head: head `h` adds `slope * (key - query)` to its scores
+    /// before the mask. Only the unfused host attention applies them; the other paths step
+    /// aside, and a card's attention refuses the layer.
+    pub alibi_slopes: Option<Vec<f32>>,
     /// Residual connection multiplier (None = 1.0)
     pub residual_scale: Option<f64>,
     pub flags: Arc<GenericLayerFlags>,

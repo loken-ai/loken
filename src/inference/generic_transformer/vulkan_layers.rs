@@ -233,7 +233,7 @@ fn refusal(
             f.fused_ffn_gate_up || f.is_phi2_simple_ffn,
             "a fused or gate-less FFN",
         ),
-        (f.layer_norm_with_bias, "LayerNorm"),
+        (f.layer_norm, "LayerNorm"),
         (f.parallel_attn, "parallel attention"),
         (f.has_attn_sinks, "attention sinks"),
         (f.value_rms_norm, "normalised values"),
