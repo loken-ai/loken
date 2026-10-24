@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Devices: list the OpenCL GPUs that placement offers.
 - Bench: publish the pages of the ROCm, Vulkan and OpenCL campaigns.
 - Models: load the routed experts of Gemma 4 from its safetensors.
 - Models: check every architecture against reference logits.

@@ -664,6 +664,44 @@ pub(crate) async fn list_devices(
         devices
     };
 
+    // The OpenCL GPUs the layers run on. The host-side probes list a device by its vendor
+    // library and miss the ones OpenCL alone reaches; one already listed keeps its row.
+    #[cfg(feature = "opencl")]
+    let devices = {
+        let mut devices = devices;
+        for (i, id) in crate::inference::kernel::opencl::enumerate_opencl_devices()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, id)| crate::inference::kernel::opencl_stack::runs_layers(*id))
+        {
+            let name = opencl3::device::Device::new(id).name().unwrap_or_default();
+            if devices.iter().any(|d| d["name"] == name.as_str()) {
+                continue;
+            }
+            let total = crate::inference::kernel::opencl::get_opencl_device_memory(id);
+            devices.push(serde_json::json!({
+                "id": i,
+                "type": "OpenCL",
+                "backend": "opencl",
+                "name": name,
+                "memory_gb": total as f64 / (1024.0 * 1024.0 * 1024.0),
+                "memory_bytes": total,
+                "free_bytes": total,
+                "utilization_gpu_percent": null,
+                "utilization_memory_percent": null,
+                "temperature_c": null,
+                "power_watts": null,
+                "power_limit_watts": null,
+                "priority": 70,
+                "status": "available",
+                "reason": null,
+                "suggestion": null,
+                "usable_memory_gb": total as f64 / (1024.0 * 1024.0 * 1024.0),
+            }));
+        }
+        devices
+    };
+
     let available_count = devices
         .iter()
         .filter(|d| d["status"] == "available")
