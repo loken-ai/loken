@@ -638,8 +638,12 @@ impl GenericTransformerLayer {
                         let n = act.dim(crate::tensor::D::Minus1)?;
                         act.reshape((1, 1, n))?
                     } else {
+                        // The stable buffers hold one row: only a decode step goes through them.
+                        let one_row = x.dim(1).map(|d| d == 1).unwrap_or(false);
                         let raw_gate = self.ffn_gate.as_ref().unwrap().forward(x)?;
-                        let gate = if let Some(buf) = self.graph_ffn_gate_out.as_ref() {
+                        let gate = if let Some(buf) =
+                            self.graph_ffn_gate_out.as_ref().filter(|_| one_row)
+                        {
                             buf.slice_set(&raw_gate, 0, 0)?;
                             self.graph_alive_tensors.push(raw_gate);
                             buf.clone()
@@ -647,7 +651,9 @@ impl GenericTransformerLayer {
                             raw_gate
                         };
                         let raw_up = self.ffn_up.forward(x)?;
-                        let up = if let Some(buf) = self.graph_ffn_up_buffer.as_ref() {
+                        let up = if let Some(buf) =
+                            self.graph_ffn_up_buffer.as_ref().filter(|_| one_row)
+                        {
                             let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);
                             let raw_d = raw_up.dim(crate::tensor::D::Minus1).unwrap_or(0);
                             if buf_d == raw_d && buf_d > 0 {
@@ -666,7 +672,11 @@ impl GenericTransformerLayer {
                             crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
                         }
                     };
-                    if let Some(buf) = self.graph_ffn_activated_buffer.as_ref() {
+                    if let Some(buf) = self
+                        .graph_ffn_activated_buffer
+                        .as_ref()
+                        .filter(|_| x.dim(1).map(|d| d == 1).unwrap_or(false))
+                    {
                         let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);
                         let raw_d = raw_act.dim(crate::tensor::D::Minus1).unwrap_or(0);
                         if buf_d == raw_d && buf_d > 0 {

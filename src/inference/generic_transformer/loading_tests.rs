@@ -3398,3 +3398,20 @@ fn a_learned_position_table_places_the_tokens() {
         .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
     assert!(worst > 1e-3, "the position table changes nothing ({worst})");
 }
+
+/// A prompt of several tokens does not go through the one-row buffers a decode step keeps for
+/// its graph: they are present after a graph was captured, and a longer verify or prefill
+/// follows.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_prompt_of_several_tokens_skips_the_one_row_graph_buffers() {
+    let recipe = dense("llama");
+    let mut model = build_gguf(&recipe, None).unwrap();
+    for layer in model.layers.iter_mut() {
+        let i = layer.flags.intermediate_size;
+        let row = || Tensor::zeros_on((1usize, 1usize, i), DType::F32, &Device::Cpu).unwrap();
+        layer.graph_ffn_up_buffer = Some(row());
+        layer.graph_ffn_activated_buffer = Some(row());
+    }
+    assert_runs("llama with the graph buffers set", &mut model, VOCAB);
+}
