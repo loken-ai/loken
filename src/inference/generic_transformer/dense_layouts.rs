@@ -527,6 +527,28 @@ const GEMMA4_BLOCK: Table = &[
     ("layer_scalar", Same("layer_output_scale.weight")),
 ];
 
+/// The routed experts beside the dense feed-forward: the router's projection, input scale and
+/// per-expert output scale, the fused gate and up stack, and the norms around the branch.
+const GEMMA4_EXPERTS: Table = &[
+    ("router.proj.weight", Same("ffn_gate_inp.weight")),
+    ("router.scale", Same("ffn_gate_inp.scale")),
+    ("router.per_expert_scale", Same("ffn_down_exps.scale")),
+    ("experts.gate_up_proj", Same("ffn_gate_up_exps.weight")),
+    ("experts.down_proj", Same("ffn_down_exps.weight")),
+    (
+        "pre_feedforward_layernorm_2.weight",
+        Same("pre_ffw_norm_2.weight"),
+    ),
+    (
+        "post_feedforward_layernorm_1.weight",
+        Same("post_ffw_norm_1.weight"),
+    ),
+    (
+        "post_feedforward_layernorm_2.weight",
+        Same("post_ffw_norm_2.weight"),
+    ),
+];
+
 const GEMMA4: Layout = Layout {
     top: &[
         ("norm.weight", Same("output_norm.weight")),
@@ -543,7 +565,7 @@ const GEMMA4: Layout = Layout {
             Same("per_layer_proj_norm.weight"),
         ),
     ],
-    layer: &[GEMMA4_BLOCK, NORMS_AND_ATTENTION, GATED_MLP],
+    layer: &[GEMMA4_BLOCK, GEMMA4_EXPERTS, NORMS_AND_ATTENTION, GATED_MLP],
     ..LLAMA
 };
 

@@ -120,6 +120,11 @@ pub const CLASSES: &[HfClass] = &[
         LayoutKind::Llama,
     )),
     awq(class(
+        "Mistral3ForConditionalGeneration",
+        "llama",
+        LayoutKind::Llama,
+    )),
+    awq(class(
         "VoxtralForConditionalGeneration",
         "llama",
         LayoutKind::Llama,
@@ -299,6 +304,29 @@ pub fn proportional_factors(root: &Json, head_dim: usize) -> Option<Vec<f32>> {
     )
 }
 
+/// The scale of a YaRN rotation's cos and sin tables: `attention_factor`, else the ratio of
+/// `0.1 * m * ln(factor) + 1` at `mscale` over the same at `mscale_all_dim` when both are given
+/// and not zero, else the same at one. One for a factor of at most one.
+fn yarn_attention_factor(block: &Json) -> Option<f32> {
+    let get = |k: &str| block.get(k).and_then(Json::as_f64);
+    if let Some(f) = get("attention_factor") {
+        return Some(f as f32);
+    }
+    let factor = get("factor")?;
+    let scale = |m: f64| {
+        if factor <= 1.0 {
+            1.0
+        } else {
+            0.1 * m * factor.ln() + 1.0
+        }
+    };
+    let f = match (get("mscale"), get("mscale_all_dim")) {
+        (Some(m), Some(all)) if m != 0.0 && all != 0.0 => scale(m) / scale(all),
+        _ => scale(1.0),
+    };
+    Some(f as f32)
+}
+
 /// The sliding-window layers of a model, `true` for a windowed one: its own list of layer
 /// types, else the class's period. `None` when no layer is windowed.
 fn window_pattern(cfg: &AwqConfigJson, class: Option<&HfClass>) -> Option<Vec<bool>> {
@@ -363,6 +391,7 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
             root,
             &[
                 "num_experts_per_tok",
+                "top_k_experts",
                 "experts_per_token",
                 "moe_top_k",
                 "ffn_config.moe_top_k",
@@ -429,6 +458,20 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
         put("attention.scale", Value::F32(1.0 / q.sqrt()));
     }
 
+    // The query scale `1 + beta * ln(1 + floor(position / length))` of the rope block.
+    if let Some(block) = rope_block(root) {
+        // ARCH-NAME-EXEMPT: the keys of the library's query scale.
+        let beta = block.get("llama_4_scaling_beta").and_then(Json::as_f64);
+        // ARCH-NAME-EXEMPT: the keys of the library's query scale.
+        let length = ["llama_4_scaling_length", "original_max_position_embeddings"]
+            .iter()
+            .find_map(|k| block.get(*k).and_then(Json::as_f64));
+        if let (Some(beta), Some(length)) = (beta.filter(|b| *b > 0.0), length) {
+            put("attention.temperature_scale", Value::F32(beta as f32));
+            put("attention.temperature_length", Value::U32(length as u32));
+        }
+    }
+
     if cfg.yarn.is_some() {
         if let Some(block) = rope_block(root) {
             for (key, name) in [
@@ -438,6 +481,9 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
                 if let Some(v) = block.get(name).and_then(Json::as_f64) {
                     put(key, Value::F32(v as f32));
                 }
+            }
+            if let Some(f) = yarn_attention_factor(block) {
+                put("rope.scaling.attn_factor", Value::F32(f));
             }
         }
     }

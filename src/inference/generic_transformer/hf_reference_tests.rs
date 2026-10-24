@@ -28,9 +28,14 @@ fn vectors_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/hf")
 }
 
+/// A directory of its own for each call, the tests of one folder running side by side.
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("loken-hf-reference-{name}-{}", std::process::id()));
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "loken-hf-reference-{name}-{}-{call}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -69,13 +74,18 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     (dot / (na * nb)) as f32
 }
 
-/// The folder's checkpoint, copied to a scratch directory with an empty tokenizer, built as the
-/// server builds a dense safetensors checkpoint on a host-only plan.
-fn load(name: &str) -> GenericHeteroTransformer {
+/// The files of the checkpoint in the library's layout.
+const COMPOSITE: &[&str] = &["config.json", "model.safetensors"];
+/// The files of the same weights in the vendor's native layout.
+const NATIVE: &[&str] = &["params.json", "consolidated.safetensors"];
+
+/// The folder's checkpoint in `files`, copied to a scratch directory with an empty tokenizer,
+/// built as the server builds a dense safetensors checkpoint on a host-only plan.
+fn load_files(name: &str, files: &[&str]) -> GenericHeteroTransformer {
     use crate::inference::load::awq_loader as awql;
     let src = vectors_root().join(name);
     let dir = scratch(name);
-    for f in ["config.json", "model.safetensors"] {
+    for f in files {
         std::fs::copy(src.join(f), dir.join(f)).unwrap_or_else(|e| panic!("{name}: {f}: {e}"));
     }
     std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
@@ -118,22 +128,37 @@ fn logits(model: &mut GenericHeteroTransformer, ids: &[u32], pos: usize) -> Vec<
         .unwrap()
 }
 
-/// The folder's checkpoint gives the reference's logits over the prompt and at each next
-/// token, the reference's greedy ids fed back in turn.
-fn check(name: &str) {
+fn reference_of(name: &str) -> Json {
     let text = std::fs::read_to_string(vectors_root().join(name).join("reference.json"))
         .unwrap_or_else(|e| panic!("{name}: reference.json: {e}"));
-    let reference: Json = serde_json::from_str(&text).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The reference's prompt and its greedy ids.
+fn prompt_and_next(reference: &Json) -> (Vec<u32>, Vec<u32>) {
     let prompt: Vec<u32> = reference["prompt"]
         .as_array()
         .unwrap()
         .iter()
         .map(|x| x.as_u64().unwrap() as u32)
         .collect();
-    let next: Vec<u32> = floats(&reference, "next_ids")
+    let next: Vec<u32> = floats(reference, "next_ids")
         .iter()
         .map(|x| *x as u32)
         .collect();
+    (prompt, next)
+}
+
+/// The folder's checkpoint gives the reference's logits over the prompt and at each next
+/// token, the reference's greedy ids fed back in turn.
+fn check(name: &str) {
+    check_files(name, COMPOSITE);
+}
+
+/// [`check`] of the folder's `files`.
+fn check_files(name: &str, files: &[&str]) {
+    let reference = reference_of(name);
+    let (prompt, next) = prompt_and_next(&reference);
     let margins = floats(&reference, "next_margins");
     let steps: Vec<Vec<f32>> = reference["step_logits"]
         .as_array()
@@ -149,7 +174,7 @@ fn check(name: &str) {
         .collect();
     assert_eq!(steps.len(), next.len(), "{name}: logits for every step");
 
-    let mut model = load(name);
+    let mut model = load_files(name, files);
     let mut tie = 0f32;
     for (i, want) in steps.iter().enumerate() {
         let got = match i {
@@ -241,6 +266,109 @@ reference_logits! {
     lfm2moe_matches_reference: "lfm2moe";
     nemotron_h_moe_matches_reference: "nemotron_h_moe";
     gemma4_keqv_matches_reference: "gemma4_keqv";
+    gemma4_moe_matches_reference: "gemma4_moe";
+    mistral3_matches_reference: "mistral3";
+    voxtral_matches_reference: "voxtral";
+}
+
+/// The checkpoint whose attention adds an ALiBi bias is read as one only the host runs; one
+/// with rotary positions is not.
+#[test]
+fn an_alibi_checkpoint_runs_on_the_host_only() {
+    use crate::inference::load::awq_loader as awql;
+    for (name, host_only) in [("mpt", true), ("llama", false)] {
+        let dir = vectors_root().join(name);
+        let cfg = awql::parse_config_json(&dir.to_string_lossy()).unwrap();
+        let content = awql::synth_gguf_content(&cfg, awql::AwqTensorPresence::default());
+        assert_eq!(
+            host_only_reason(&content, &cfg.gguf_arch).is_some(),
+            host_only,
+            "{name}"
+        );
+    }
+}
+
+/// The native layout of the folder's weights gives the composite's logits over the prompt and
+/// at each next token: the loader reads the two layouts as one model.
+fn native_matches_composite(name: &str) {
+    let reference = reference_of(name);
+    let (prompt, next) = prompt_and_next(&reference);
+    let mut composite = load_files(name, COMPOSITE);
+    let mut native = load_files(name, NATIVE);
+    for i in 0..next.len() {
+        let (ids, pos) = match i {
+            0 => (prompt.clone(), 0),
+            _ => (vec![next[i - 1]], prompt.len() + i - 1),
+        };
+        let want = logits(&mut composite, &ids, pos);
+        let got = logits(&mut native, &ids, pos);
+        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let error = got
+            .iter()
+            .zip(&want)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            error <= 1e-4 * scale,
+            "{name}: step {i}: the native layout's logits are {error} from the composite's"
+        );
+    }
+}
+
+/// The two layouts of the folder's weights give the same rotary and query-scale header.
+#[test]
+fn mistral3_layouts_give_one_header() {
+    use crate::inference::load::awq_loader as awql;
+    let header = |files: &[&str]| {
+        let dir = scratch("mistral3-header");
+        for f in files {
+            std::fs::copy(vectors_root().join("mistral3").join(f), dir.join(f)).unwrap();
+        }
+        let cfg = awql::parse_config_json(&dir.to_string_lossy()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let content = awql::synth_gguf_content(&cfg, awql::AwqTensorPresence::default());
+        let mut keys: Vec<(String, String)> = content
+            .metadata
+            .iter()
+            .filter(|(k, _)| k.contains(".rope.") || k.contains(".attention.temperature"))
+            .map(|(k, v)| (k.clone(), format!("{v:?}")))
+            .collect();
+        keys.sort();
+        keys
+    };
+    let composite = header(&["config.json"]);
+    assert!(
+        composite
+            .iter()
+            .any(|(k, _)| k.ends_with("attention.temperature_length")),
+        "{composite:?}"
+    );
+    assert!(
+        composite
+            .iter()
+            .any(|(k, _)| k.ends_with("rope.scaling.attn_factor")),
+        "{composite:?}"
+    );
+    assert_eq!(header(&["params.json"]), composite);
+}
+
+#[test]
+fn mistral3_native_matches_reference() {
+    check_files("mistral3", NATIVE);
+}
+
+#[test]
+fn mistral3_native_matches_composite() {
+    native_matches_composite("mistral3");
+}
+
+#[test]
+fn voxtral_native_matches_reference() {
+    check_files("voxtral", NATIVE);
+}
+
+#[test]
+fn voxtral_native_matches_composite() {
+    native_matches_composite("voxtral");
 }
 
 /// Every folder under `tests/vectors/hf` has a test above, and every test its folder.

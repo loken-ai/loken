@@ -1,0 +1,27 @@
+{
+ "dim": 32,
+ "n_layers": 2,
+ "head_dim": 32,
+ "hidden_dim": 64,
+ "n_heads": 2,
+ "n_kv_heads": 1,
+ "norm_eps": 1e-05,
+ "vocab_size": 128,
+ "rope_theta": 1000000.0,
+ "tied_embeddings": false,
+ "max_position_embeddings": 256,
+ "yarn": {
+  "original_max_position_embeddings": 64,
+  "factor": 4.0,
+  "apply_scale": true,
+  "beta": 32.0,
+  "alpha": 1.0
+ },
+ "llama_4_scaling": {
+  "original_max_position_embeddings": 64,
+  "beta": 0.1
+ },
+ "vision_encoder": {
+  "hidden_size": 32
+ }
+}

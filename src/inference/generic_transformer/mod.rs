@@ -427,7 +427,8 @@ pub struct GenericTransformerLayer {
     pub attn_softcap: Option<f32>,
     /// ALiBi slopes, one per query head: head `h` adds `slope * (key - query)` to its scores
     /// before the mask. Only the unfused host attention applies them; the other paths step
-    /// aside, and a card's attention refuses the layer.
+    /// aside, the load offers such a model no card (`host_only_reason`), and a card's
+    /// attention refuses the layer.
     pub alibi_slopes: Option<Vec<f32>>,
     /// Residual connection multiplier (None = 1.0)
     pub residual_scale: Option<f64>,

@@ -529,8 +529,18 @@ impl LlmEngine {
                         .map(|v| v as u32)
                 })
                 .unwrap_or(32000) as usize;
-            let context_length = trained_context(&content, &arch)
+            let trained = trained_context(&content, &arch)
                 .unwrap_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+            // The context stops where the model would start scaling its queries by position.
+            let context_length = match super::gguf::unscaled_query_reach(&content, &arch) {
+                Some(reach) if reach < trained => {
+                    warn!(
+                        "{arch}: the context stops at {reach} tokens of the {trained} trained: past                          them the model scales its queries by position, which the attention does not apply"
+                    );
+                    reach
+                }
+                _ => trained,
+            };
             // No window asked for: the model's own.
             let window_asked = user_context_length != 0;
             let user_context_length = if user_context_length == 0 {
@@ -695,8 +705,15 @@ impl LlmEngine {
                     &get_gguf_string(&content, "general.architecture").unwrap_or_default(),
                 ),
             );
+            // A model whose layers only the host runs is offered no card and no accelerator.
+            let host_only = crate::inference::generic_transformer::host_only_reason(&content, &arch);
+            if let Some(why) = host_only {
+                info!("🖥️  {arch}: every layer stays on the host: {why}");
+            }
             let offer = if disable_cuda {
                 debug!("CUDA disabled by config (disable_cuda=true)");
+                crate::inference::place::llm::Offer::default()
+            } else if host_only.is_some() {
                 crate::inference::place::llm::Offer::default()
             } else {
                 crate::inference::place::llm::offer(
@@ -1259,7 +1276,7 @@ impl LlmEngine {
                                 std::collections::HashMap::new();
                             // The Vulkan devices take the layers a rung leaves on the host
                             // before the host does.
-                            let vulkan = if crate::gpu::force_cpu() {
+                            let vulkan = if crate::gpu::force_cpu() || host_only.is_some() {
                                 Vec::new()
                             } else {
                                 let mut offered = crate::inference::place::ladder::vulkan_devices(

@@ -7,12 +7,18 @@ folder holds `config.json`, `model.safetensors` and `reference.json`: the logits
 position of the prompt, the greedy ids of the next tokens with the logits each was chosen from
 and the gap between their two top values.
 
+A composite checkpoint whose vendor also releases a native layout gets that layout beside it,
+`params.json` and `consolidated.safetensors`, written from the same weights: the library's own
+converter of the native layout is run on it and must give back the composite's text model.
+
 Usage: hf_vectors.py OUT_DIR [ARCH ...]
 """
 
 import json
 import copy
+import importlib
 import math
+import re
 import shutil
 import sys
 import tempfile
@@ -20,6 +26,7 @@ from pathlib import Path
 
 import torch
 import transformers as tf
+from safetensors.torch import load_file, save_file
 
 PROMPT = [1, 17, 42, 99, 5, 73]
 STEPS = 4
@@ -60,6 +67,24 @@ DELTA = dict(
     linear_value_head_dim=8,
     linear_num_key_heads=2,
     linear_num_value_heads=4,
+)
+
+# The text model of a composite release beside a tower too small to matter.
+VISION = dict(hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, head_dim=16, image_size=32, patch_size=16)
+AUDIO = dict(hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, head_dim=16, num_mel_bins=16, max_source_positions=8)
+
+# A rotation stretched by YaRN with its tables scaled (`apply_scale`), and the query scale that
+# grows past the original context.
+YARN = dict(
+    rope_type="yarn",
+    rope_theta=1000000.0,
+    factor=4.0,
+    original_max_position_embeddings=64,
+    beta_fast=32.0,
+    beta_slow=1.0,
+    mscale=1.0,
+    mscale_all_dim=0.0,
+    llama_4_scaling_beta=0.1,
 )
 
 # Folder name: (config class, model class, configuration keys).
@@ -196,6 +221,43 @@ ARCHS = {
             final_logit_softcapping=30.0,
         ),
     ),
+    "mistral3": (
+        "Mistral3Config",
+        "Mistral3ForConditionalGeneration",
+        dict(
+            text_config=dict(model_type="ministral3", **base(rope_parameters=YARN)),
+            vision_config=VISION,
+            tie_word_embeddings=False,
+        ),
+    ),
+    "voxtral": (
+        "VoxtralConfig",
+        "VoxtralForConditionalGeneration",
+        dict(
+            text_config=dict(model_type="llama", **base(rope_theta=1000000.0)),
+            audio_config=AUDIO,
+            tie_word_embeddings=False,
+        ),
+    ),
+    "gemma4_moe": (
+        "Gemma4TextConfig",
+        "Gemma4ForCausalLM",
+        base(
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            global_head_dim=64,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            sliding_window=4,
+            layer_types=["sliding_attention", "full_attention"],
+            hidden_size_per_layer_input=0,
+            enable_moe_block=True,
+            num_experts=4,
+            top_k_experts=2,
+            moe_intermediate_size=HIDDEN,
+            final_logit_softcapping=30.0,
+        ),
+    ),
     "gptoss": (
         "GptOssConfig",
         "GptOssForCausalLM",
@@ -249,28 +311,192 @@ ARCHS = {
 }
 
 
+def unpermute(t, heads):
+    """The rows of a query or key projection in the native layout's order: each head's halves
+    interleaved, the inverse of the converter's `permute_for_rope`."""
+    rows, cols = t.shape
+    return t.view(heads, 2, rows // heads // 2, cols).transpose(1, 2).reshape(rows, cols)
+
+
+NATIVE_BLOCK = {
+    "input_layernorm.weight": "attention_norm.weight",
+    "post_attention_layernorm.weight": "ffn_norm.weight",
+    "self_attn.q_proj.weight": "attention.wq.weight",
+    "self_attn.k_proj.weight": "attention.wk.weight",
+    "self_attn.v_proj.weight": "attention.wv.weight",
+    "self_attn.o_proj.weight": "attention.wo.weight",
+    "mlp.gate_proj.weight": "feed_forward.w1.weight",
+    "mlp.down_proj.weight": "feed_forward.w2.weight",
+    "mlp.up_proj.weight": "feed_forward.w3.weight",
+}
+
+
+def native_text(state, text, model, head, table):
+    """The text model of `state` under the native layout's names: `model` is the prefix of its
+    blocks, `head` the name of its output head, `table` the native name of its embedding."""
+    out = {}
+    for key, t in state.items():
+        if key == head:
+            # A head tied to the table is the table.
+            if not text.tie_word_embeddings:
+                out["output.weight"] = t
+        elif key == f"{model}.norm.weight":
+            out["norm.weight"] = t
+        elif key == f"{model}.embed_tokens.weight":
+            out[table] = t
+        else:
+            m = re.fullmatch(re.escape(model) + r"\.layers\.(\d+)\.(.+)", key)
+            if m is None or m.group(2) not in NATIVE_BLOCK:
+                continue
+            part = m.group(2)
+            if part == "self_attn.q_proj.weight":
+                t = unpermute(t, text.num_attention_heads)
+            elif part == "self_attn.k_proj.weight":
+                t = unpermute(t, text.num_key_value_heads)
+            out[f"layers.{m.group(1)}.{NATIVE_BLOCK[part]}"] = t
+    return {k: v.contiguous() for k, v in out.items()}
+
+
+def native_params(text):
+    """The text model's `params.json` keys."""
+    out = dict(
+        dim=text.hidden_size,
+        n_layers=text.num_hidden_layers,
+        head_dim=text.head_dim,
+        hidden_dim=text.intermediate_size,
+        n_heads=text.num_attention_heads,
+        n_kv_heads=text.num_key_value_heads,
+        norm_eps=text.rms_norm_eps,
+        vocab_size=text.vocab_size,
+        rope_theta=text.rope_parameters["rope_theta"],
+        tied_embeddings=bool(text.tie_word_embeddings),
+        max_position_embeddings=text.max_position_embeddings,
+    )
+    rope = text.rope_parameters
+    if rope.get("rope_type") == "yarn":
+        orig = rope["original_max_position_embeddings"]
+        out["yarn"] = dict(
+            original_max_position_embeddings=orig,
+            factor=rope["factor"],
+            apply_scale=rope.get("mscale_all_dim") == 0.0,
+            beta=rope["beta_fast"],
+            alpha=rope["beta_slow"],
+        )
+        if rope.get("llama_4_scaling_beta"):
+            out["llama_4_scaling"] = dict(original_max_position_embeddings=orig, beta=rope["llama_4_scaling_beta"])
+    return out
+
+
+def mistral3_native(model, config):
+    text = config.text_config
+    params = native_params(text)
+    params["vision_encoder"] = dict(hidden_size=config.vision_config.hidden_size)
+    state = native_text(model.state_dict(), text, "model.language_model", "lm_head.weight", "tok_embeddings.weight")
+    convert = importlib.import_module("transformers.models.ministral3.convert_ministral3_weights_to_hf")
+    back = convert.convert_state_dict(state, config)
+    library = convert.convert_config(json.loads(json.dumps({k: v for k, v in params.items() if k != "vision_encoder"})), is_vision=False)
+    return params, state, back, library
+
+
+def voxtral_native(model, config):
+    text = config.text_config
+    audio = config.audio_config
+    params = native_params(text)
+    params["multimodal"] = dict(
+        whisper_model_args=dict(
+            encoder_args=dict(
+                dim=audio.hidden_size,
+                n_layers=audio.num_hidden_layers,
+                hidden_dim=audio.intermediate_size,
+                n_heads=audio.num_attention_heads,
+                head_dim=audio.head_dim,
+                vocab_size=audio.vocab_size,
+            )
+        )
+    )
+    # The release keeps the embedding table in the audio tower's namespace.
+    state = native_text(
+        model.state_dict(), text, "model.language_model", "lm_head.weight", "mm_whisper_embeddings.tok_embeddings.weight"
+    )
+    convert = importlib.import_module("transformers.models.voxtral.convert_voxtral_weights_to_hf")
+    back = convert.convert_state_dict(state, text)
+    library = convert.convert_config(json.loads(json.dumps(params))).text_config
+    return params, state, back, library
+
+
+# Folder name: (what the library writes, what the vendor's releases name it), for a prefix the
+# library writes otherwise than the published checkpoints.
+RELEASED_PREFIX = {"voxtral": ("language_model.model.model.", "language_model.model.")}
+
+
+def released_names(name, path):
+    """The checkpoint at `path` with its tensors under the names the releases use."""
+    if name not in RELEASED_PREFIX:
+        return
+    wrote, released = RELEASED_PREFIX[name]
+    tensors = load_file(str(path))
+    save_file({(released + k[len(wrote):] if k.startswith(wrote) else k): v for k, v in tensors.items()}, str(path), metadata={"format": "pt"})
+
+
+# Folder name: the native layout of the same weights, with the composite's tensors and text
+# configuration the library's converter gives back from it.
+NATIVE = {"mistral3": mistral3_native, "voxtral": voxtral_native}
+
+
+def text_key(key):
+    """A tensor of the text model under one name whichever prefix the library or a release
+    puts it under."""
+    key = re.sub(r"^(model\.language_model|language_model\.model)\.", "text.", key)
+    return re.sub(r"^(language_model\.)?lm_head\.", "head.", key)
+
+
+def write_native(name, model, config, out):
+    params, state, back, library = NATIVE[name](model, config)
+    want = {text_key(k): v for k, v in model.state_dict().items()}
+    back = {text_key(k): v for k, v in back.items()}
+    assert len(back) == len(state), f"{name}: the converter merges tensors"
+    assert back.keys() <= want.keys(), f"{name}: the converter names {sorted(back.keys() - want.keys())}"
+    for key, t in back.items():
+        assert torch.equal(t, want[key]), f"{name}: the converter gives another {key}"
+    text = config.text_config
+    for key in ("hidden_size", "num_hidden_layers", "intermediate_size", "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size"):
+        assert getattr(library, key) == getattr(text, key), f"{name}: params.json gives another {key}"
+    for key in ("rope_type", "rope_theta", "factor", "original_max_position_embeddings", "beta_fast", "beta_slow", "llama_4_scaling_beta"):
+        got, wanted = library.rope_parameters.get(key), text.rope_parameters.get(key)
+        assert got == wanted or (key == "rope_type" and wanted == "default"), f"{name}: params.json gives {key} {got}, not {wanted}"
+    (out / "params.json").write_text(json.dumps(params, indent=1) + "\n")
+    save_file(state, str(out / "consolidated.safetensors"))
+
+
 def seed_of(name):
     return sum((i + 1) * ord(c) for i, c in enumerate(name))
 
 
 def randomise(model, seed):
     """Weights large enough that the logits spread: projections scaled by their fan-in, norm
-    scales and biases perturbed. Convolutions and the state-space parameters keep their init."""
+    scales and biases perturbed, other scales drawn positive. Convolutions and the state-space
+    parameters keep their init."""
     g = torch.Generator().manual_seed(seed)
 
     def normal(t, std):
         return torch.randn(t.shape, generator=g, dtype=t.dtype) * std
 
     with torch.no_grad():
-        for module in model.modules():
+        for path, module in model.named_modules():
             kind = type(module).__name__
             if isinstance(module, torch.nn.Conv1d):
                 continue
             for name, p in module.named_parameters(recurse=False):
-                if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)) and name == "weight":
+                if path.endswith(".router.proj") and name == "weight":
+                    # The router scales its input to unit norm before this projection.
+                    p.copy_(normal(p, 1.0))
+                elif isinstance(module, (torch.nn.Linear, torch.nn.Embedding)) and name == "weight":
                     p.copy_(normal(p, 1.0 / math.sqrt(p.shape[-1])))
                 elif "Norm" in kind and name == "weight":
                     p.add_(normal(p, 0.1))
+                elif p.ndim == 1 and "scale" in name:
+                    # Positive scales spread wide enough that reading them as one is seen.
+                    p.copy_(torch.exp(normal(p, 0.5)))
                 elif "bias" in name:
                     p.copy_(normal(p, 0.1))
                 elif p.ndim >= 2:
@@ -309,7 +535,7 @@ def route_gap(model, ids, used):
     handles = [
         m.register_forward_pre_hook(hook)
         for n, m in model.named_modules()
-        if n.endswith((".gate", ".router", ".router.layer"))
+        if n.endswith((".gate", ".router", ".router.layer", ".router.proj"))
         and getattr(m, "weight", None) is not None
         and m.weight.ndim == 2
     ]
@@ -409,6 +635,7 @@ def build(name, out_root):
         out.mkdir(parents=True, exist_ok=True)
         for f in ("config.json", "model.safetensors"):
             shutil.copy(Path(tmp) / f, out / f)
+    released_names(name, out / "model.safetensors")
     reference = {
         "class": ARCHS[name][1],
         "prompt": PROMPT,
@@ -421,6 +648,8 @@ def build(name, out_root):
         reference["route_gap"] = gap
     reference["rounding_cosine"] = rounding
     (out / "reference.json").write_text(json.dumps(reference, indent=1) + "\n")
+    if name in NATIVE:
+        write_native(name, model, model.config, out)
     size = sum(f.stat().st_size for f in out.iterdir())
     print(f"{name}: {size} bytes, next {nexts}, margins {[round(m, 3) for m in margins]}, route gap {gap:.3f}, rounding {rounding:.5f}")
 

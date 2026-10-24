@@ -33,6 +33,25 @@ pub(super) fn trained_context(ct: &gguf_file::Content, arch: &str) -> Option<usi
     (reached >= 1.0).then_some(reached as usize)
 }
 
+/// The positions before which a model's queries are not scaled by position: the file's
+/// `attention.temperature_length` when its `attention.temperature_scale` is positive, `None`
+/// for a model whose queries are never scaled. Past it the queries are scaled by
+/// `1 + scale * ln(1 + floor(position / length))`, which the attention does not apply.
+pub(super) fn unscaled_query_reach(ct: &gguf_file::Content, arch: &str) -> Option<usize> {
+    let scale = match ct
+        .metadata
+        .get(&format!("{arch}.attention.temperature_scale"))?
+    {
+        gguf_file::Value::F32(f) => *f as f64,
+        gguf_file::Value::F64(f) => *f,
+        _ => return None,
+    };
+    if scale <= 0.0 {
+        return None;
+    }
+    get_gguf_u32(ct, &format!("{arch}.attention.temperature_length")).map(|n| n as usize)
+}
+
 /// Helper: get u32 value from GGUF metadata
 pub(super) fn get_gguf_u32(ct: &gguf_file::Content, key: &str) -> Option<u32> {
     match ct.metadata.get(key)? {

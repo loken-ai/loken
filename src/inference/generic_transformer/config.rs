@@ -515,6 +515,14 @@ fn meta_f32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<f32> {
         .and_then(|v| v.to_f32().ok())
 }
 
+/// Why every layer of the file `content` of architecture `arch` runs on the host, `None` when a
+/// card can run them: only the host's attention adds an ALiBi position bias.
+pub fn host_only_reason(content: &gguf_file::Content, arch: &str) -> Option<&'static str> {
+    meta_f32(content, arch, "attention.max_alibi_bias")
+        .filter(|b| *b > 0.0)
+        .map(|_| "its attention adds an ALiBi position bias, which only the host applies")
+}
+
 /// Read a GGUF array-of-int metadata key as `Vec<u64>`; `None` if absent, not an array, or
 /// holding a value that is not a non-negative whole number.
 pub(super) fn meta_u64_array(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<Vec<u64>> {
@@ -647,11 +655,12 @@ impl GenericTransformerConfig {
                                 .unwrap_or(32.0),
                             beta_slow: meta_f32(content, arch, "rope.scaling.beta_slow")
                                 .unwrap_or(1.0),
-                            attn_factor: if facts.yarn_attention_factor {
-                                1.0 + 0.1 * factor.ln()
-                            } else {
-                                1.0
-                            },
+                            attn_factor: meta_f32(content, arch, "rope.scaling.attn_factor")
+                                .unwrap_or(if facts.yarn_attention_factor {
+                                    1.0 + 0.1 * factor.ln()
+                                } else {
+                                    1.0
+                                }),
                         })
                     } else {
                         None

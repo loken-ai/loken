@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Models: load the routed experts of Gemma 4 from its safetensors.
 - Models: check every architecture against reference logits.
 - Models: load Gemma 4 from its safetensors.
 - Models: apply ALiBi to MPT on the host.
@@ -63,6 +64,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Models: stop the context where a model starts scaling its queries.
 - Models: keep the feed-forward output in 6 bits when float weights take 4.
 - Models: rebuild float weights in 8 bits when the checkpoint fits its memory.
 - Serve: read the chat format once when a model loads.
@@ -96,6 +98,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Models: read the text model of Mistral 3 and Voxtral checkpoints.
+- Models: keep a model with an ALiBi bias off the cards.
 - Vulkan: cut the cache window to what the card holds beside the weights.
 - Models: give a multi-query Falcon one key-value head.
 - Models: read the layer norms of DBRX and MPT without a bias.

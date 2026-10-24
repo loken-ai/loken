@@ -929,8 +929,9 @@ fn fix_metadata(content: &mut Content, cfg: &AwqConfigJson) {
             .metadata
             .insert(format!("{a}.attention.head_count_kv"), heads);
     }
-    let experts =
-        dim(content, "ffn_up_exps.weight", 1).or_else(|| dim(content, "ffn_gate_exps.weight", 1));
+    let experts = dim(content, "ffn_up_exps.weight", 1)
+        .or_else(|| dim(content, "ffn_gate_exps.weight", 1))
+        .or_else(|| dim(content, "ffn_gate_up_exps.weight", 1).map(|rows| rows / 2));
     if let Some(width) = experts {
         content.metadata.insert(
             format!("{a}.expert_feed_forward_length"),

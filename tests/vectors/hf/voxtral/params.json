@@ -1,0 +1,25 @@
+{
+ "dim": 32,
+ "n_layers": 2,
+ "head_dim": 32,
+ "hidden_dim": 64,
+ "n_heads": 2,
+ "n_kv_heads": 1,
+ "norm_eps": 1e-05,
+ "vocab_size": 128,
+ "rope_theta": 1000000.0,
+ "tied_embeddings": false,
+ "max_position_embeddings": 256,
+ "multimodal": {
+  "whisper_model_args": {
+   "encoder_args": {
+    "dim": 32,
+    "n_layers": 1,
+    "hidden_dim": 64,
+    "n_heads": 2,
+    "head_dim": 16,
+    "vocab_size": 51866
+   }
+  }
+ }
+}

@@ -1432,3 +1432,87 @@ mod cancel_tests {
         assert!(raised(&second));
     }
 }
+
+#[cfg(test)]
+mod alibi_placement_tests {
+    use super::*;
+    use crate::tensor::DType;
+
+    /// A checkpoint whose attention adds an ALiBi bias loads, with the cards visible, on the
+    /// host alone, and gives the reference library's logits over its prompt.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a card the placement would otherwise use"]
+    async fn an_alibi_model_stays_off_the_cards() {
+        use tokenizers::models::wordlevel::WordLevel;
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/hf/mpt");
+        let dir =
+            std::env::temp_dir().join(format!("loken-alibi-placement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["config.json", "model.safetensors"] {
+            std::fs::copy(src.join(f), dir.join(f)).unwrap();
+        }
+        let reference: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(src.join("reference.json")).unwrap())
+                .unwrap();
+        let want: Vec<f32> = reference["logits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        let vocab: ahash::AHashMap<String, u32> = (0..want.len() as u32)
+            .map(|i| (format!("t{i}"), i))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("t0".into())
+            .build()
+            .unwrap();
+        Tokenizer::new(model)
+            .save(dir.join("tokenizer.json"), false)
+            .unwrap();
+
+        let engine = LlmEngine::with_config(InferenceConfig {
+            model_id: dir.to_string_lossy().to_string(),
+            context_length: 64,
+            ..InferenceConfig::default()
+        });
+        let loaded = engine.load_model().await;
+        let got = async {
+            loaded.map_err(|e| e.to_string())?;
+            let mut guard = engine.model_state.lock().await;
+            let state = guard.as_mut().ok_or("a loaded model")?;
+            assert!(
+                matches!(state.device, Device::Cpu),
+                "the model is placed on {:?}",
+                state.device
+            );
+            let prompt: Vec<u32> = reference["prompt"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &Device::Cpu)
+                .map_err(|e| e.to_string())?;
+            let all = state
+                .model
+                .forward(&input, 0)
+                .and_then(|t| t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>())
+                .map_err(|e| e.to_string())?;
+            Ok::<Vec<f32>, String>(all[all.len() - want.len()..].to_vec())
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.unwrap_or_else(|e| panic!("the ALiBi model runs: {e}"));
+        let dot: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64) * (*b as f64))
+            .sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (norm(&got) * norm(&want));
+        assert!(cos >= 0.998, "cosine {cos} with the reference's logits");
+    }
+}

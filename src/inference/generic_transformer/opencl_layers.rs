@@ -220,7 +220,7 @@ fn refusal(
 ) -> Option<String> {
     let c = config;
     let f = &c.flags;
-    let checks: [(bool, &str); 18] = [
+    let checks: [(bool, &str); 19] = [
         (f.is_moe, "a mixture of experts"),
         (f.fused_qkv, "a fused QKV projection"),
         (
@@ -248,6 +248,7 @@ fn refusal(
         ),
         (c.attn_output_gate, "a gated attention output"),
         (c.indexer.is_some(), "sparse attention"),
+        (c.max_alibi_bias.is_some(), "an ALiBi position bias"),
     ];
     if let Some((_, why)) = checks.iter().find(|(on, _)| *on) {
         return Some(why.to_string());

@@ -97,12 +97,6 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         .ok_or_else(|| anyhow!("config.json: missing architectures[0]"))?
         .to_string();
     let gguf_arch = map_hf_arch(&hf_arch)?.to_string();
-    // A mixture added beside each block's feed-forward has tensors no layout names.
-    if lookup_b(&v, &["enable_moe_block"]) == Some(true) {
-        return Err(anyhow!(
-            "config.json: the experts beside each feed-forward (enable_moe_block) are not read"
-        ));
-    }
 
     let hidden_size =
         u(&["hidden_size", "d_model", "n_embd"]).ok_or_else(|| anyhow!("missing hidden_size"))?;
@@ -234,7 +228,16 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
 /// The essentials of a native layout's `params.json`. The text model is the llama family's:
 /// that is what the vendor's own release of a decoder-only model is.
 fn parse_params_json(text: &str) -> Result<AwqConfigJson> {
-    let v: serde_json::Value = serde_json::from_str(text)?;
+    let mut v: serde_json::Value = serde_json::from_str(text)?;
+    // The `yarn` and `llama_4_scaling` blocks as the rope block of the library's configuration.
+    let rope = native_rope_block(&v);
+    if let (Some(rope), Some(root)) = (rope, v.as_object_mut()) {
+        root.insert("rope_parameters".into(), rope);
+    }
+    let yarn = rope_block(&v).map(|rs| {
+        let f = |k: &str| rs.get(k).and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
+        (f("factor"), f("original_max_position_embeddings"))
+    });
     let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
     let need = |k: &str| u(k).ok_or_else(|| anyhow!("params.json: missing {k}"));
     let n_head = need("n_heads")?;
@@ -256,7 +259,7 @@ fn parse_params_json(text: &str) -> Result<AwqConfigJson> {
         sliding_window: None,
         group_size: 128,
         awq_bits: 4,
-        yarn: None,
+        yarn,
         frequency_scaling: None,
         quantized: v.get("quantization").is_some(),
         tie_word_embeddings: v
@@ -266,6 +269,38 @@ fn parse_params_json(text: &str) -> Result<AwqConfigJson> {
         native: true,
         root: v.clone(),
     })
+}
+
+/// The rope block a native layout's `params.json` stands for, `None` without a `yarn` block:
+/// its factor and original context, `beta` and `alpha` as the fast and slow betas, `apply_scale`
+/// as the magnitude scale of every dimension, and the `llama_4_scaling` query scale.
+fn native_rope_block(v: &serde_json::Value) -> Option<serde_json::Value> {
+    let yarn = v.get("yarn").filter(|y| y.is_object())?;
+    let f = |k: &str, default: f64| yarn.get(k).and_then(|x| x.as_f64()).unwrap_or(default);
+    let apply_scale = yarn
+        .get("apply_scale")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let mut block = serde_json::json!({
+        "rope_type": "yarn",
+        "factor": f("factor", 1.0),
+        "original_max_position_embeddings": f("original_max_position_embeddings", 8192.0),
+        "beta_fast": f("beta", 32.0),
+        "beta_slow": f("alpha", 1.0),
+        "mscale": 1.0,
+        "mscale_all_dim": if apply_scale { 0.0 } else { 1.0 },
+    });
+    // ARCH-NAME-EXEMPT: the keys of a native layout's and the library's query scale.
+    if let Some(beta) = v.pointer("/llama_4_scaling/beta").and_then(|x| x.as_f64()) {
+        block["llama_4_scaling_beta"] = beta.into();
+        if let Some(reach) = v
+            .pointer("/llama_4_scaling/original_max_position_embeddings")
+            .and_then(|x| x.as_f64())
+        {
+            block["llama_4_scaling_length"] = reach.into();
+        }
+    }
+    Some(block)
 }
 
 /// Which optional per-layer tensors exist (drives `GenericLayerFlags::detect`).
