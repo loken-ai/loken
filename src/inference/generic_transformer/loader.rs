@@ -1181,6 +1181,55 @@ fn ffn_down_format(
     }
 }
 
+/// The tokens a cache of `per_token` bytes holds on a card with `free` bytes, `weights` of them
+/// taken. A tenth of the card, and never less than the work buffers of a step, stays free for
+/// them, for the driver and for whatever else holds the card; the cache takes most of the rest,
+/// not all of it, because a card that overflows moves its cache into host memory without a word.
+#[cfg(feature = "vulkan")]
+fn cache_tokens_that_fit(free: u64, weights: u64, per_token: u64) -> usize {
+    const MIN_RESERVE: u64 = 512 << 20;
+    let reserve = MIN_RESERVE.max(free / 10);
+    let room = free.saturating_sub(weights).saturating_sub(reserve) / 20 * 17;
+    (room / per_token.max(1)) as usize / 256 * 256
+}
+
+/// The tokens of cache every layer a Vulkan device runs can hold beside the weights it runs,
+/// the least over the devices of the plan; `None` when the plan gives none a layer. Sixteen bits
+/// a key and a value, the work buffers of a step kept free.
+#[cfg(feature = "vulkan")]
+fn vulkan_context_fit(
+    config: &GenericTransformerConfig,
+    content: &gguf_file::Content,
+    plan: &HeteroPlan,
+) -> Option<usize> {
+    let per_layer_token = 2 * (config.n_kv_head * config.head_dim) as u64 * 2;
+    let mut least: Option<usize> = None;
+    for seg in &plan.segments {
+        let DeviceKind::Vulkan(index) = seg.kind else {
+            continue;
+        };
+        let weights: u64 = content
+            .tensor_infos
+            .iter()
+            .filter(|(name, _)| {
+                name.strip_prefix("blk.")
+                    .and_then(|rest| rest.split('.').next())
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|n| (seg.layer_start..seg.layer_end).contains(&n))
+            })
+            .map(|(_, info)| info.size_in_bytes() as u64)
+            .sum();
+        let free = crate::inference::kernel::vulkan::free_bytes(index);
+        let fit = cache_tokens_that_fit(
+            free,
+            weights,
+            per_layer_token * seg.num_layers().max(1) as u64,
+        );
+        least = Some(least.map_or(fit, |l: usize| l.min(fit)));
+    }
+    least
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -3103,6 +3152,19 @@ impl GenericHeteroTransformer {
         // (often 128K/256K) eagerly allocates gigabytes that may OOM.
         if let Some(n) = max_kv_seq_len {
             cfg.max_q8_seq_len = n;
+        }
+        // The caches of the layers a Vulkan device runs are allocated at the window the model
+        // may reach; a window that does not fit beside the weights spills the cache into host
+        // memory, and every token then reads it across the bus.
+        #[cfg(feature = "vulkan")]
+        if let Some(fit) = vulkan_context_fit(&cfg, content, plan) {
+            if fit < cfg.max_q8_seq_len {
+                info!(
+                    "vulkan: the cache window is cut from {} to {fit} tokens to fit beside the weights",
+                    cfg.max_q8_seq_len
+                );
+                cfg.max_q8_seq_len = fit;
+            }
         }
         cfg.flags.float_format = float_projection_format(
             plan,
@@ -5060,6 +5122,27 @@ mod host_spill_admission_tests {
 #[cfg(test)]
 mod split_tests {
     use super::*;
+
+    /// A cache window is cut to what the card holds beside the weights, with room left over.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_cache_window_leaves_the_card_room() {
+        let gib = 1u64 << 30;
+        // Sixteen GiB, three of weights, a 136 KiB token over the whole stack.
+        let fit = cache_tokens_that_fit(16 * gib, 3 * gib, 136 * 1024);
+        assert!(fit % 256 == 0);
+        let held = fit as u64 * 136 * 1024 + 3 * gib;
+        assert!(
+            held < 14 * gib,
+            "the cache and weights take {held} of 16 GiB"
+        );
+        assert!(
+            fit > 60_000,
+            "the cache is not cut more than it needs: {fit}"
+        );
+        // Weights alone fill the card: no cache.
+        assert_eq!(cache_tokens_that_fit(4 * gib, 4 * gib, 136 * 1024), 0);
+    }
 
     /// Four-bit float weights keep the feed-forward's output projection in six bits.
     #[test]

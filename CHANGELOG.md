@@ -96,6 +96,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Vulkan: cut the cache window to what the card holds beside the weights.
 - Models: give a multi-query Falcon one key-value head.
 - Models: read the layer norms of DBRX and MPT without a bias.
 - Models: size the sliding window of local attention layers as declared.

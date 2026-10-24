@@ -723,6 +723,14 @@ fn vulkan_decode_profile_large() {
     decode_profile("qwen3:1.7b");
 }
 
+/// [`vulkan_decode_profile`] for a model with 256-wide heads, sliding windows and a large
+/// vocabulary.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_decode_profile_wide() {
+    decode_profile("gemma3:latest");
+}
+
 fn decode_profile(tag: &str) {
     const PROFILE_PROMPT: u32 = 1024;
     const PROFILE_RUNS: usize = 8;
@@ -731,6 +739,10 @@ fn decode_profile(tag: &str) {
         .collect();
     let fx = Fixture::open_tag(tag);
     for d in crate::inference::kernel::vulkan::devices() {
+        // A card too small for the model has nothing to profile.
+        if d.total < 8 << 30 {
+            continue;
+        }
         let mut m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
         m.forward(&ids(&prompt), 0).unwrap();
         // Sustained work first: an idle card runs slow until its clock ramps up.
