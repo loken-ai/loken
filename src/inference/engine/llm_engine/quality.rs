@@ -877,7 +877,7 @@ mod real_models {
                             &mut |x, p| cell.borrow_mut().forward_all(x, p),
                             &mut || cell.borrow_mut().reset_kv_from(0),
                             &device,
-                            &tokens,
+                            tokens,
                             c,
                             reference.as_ref(),
                         )
