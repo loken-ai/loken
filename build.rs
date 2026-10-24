@@ -531,7 +531,7 @@ fn portable_gencodes() -> Vec<String> {
 /// site declines instead of launching a kernel that was never compiled for it.
 #[cfg(feature = "cuda")]
 fn gencodes_from(floor: u32) -> Vec<String> {
-    portable_gencodes()
+    let kept: Vec<String> = portable_gencodes()
         .into_iter()
         .filter(|g| {
             g.rsplit("code=sm_")
@@ -539,7 +539,14 @@ fn gencodes_from(floor: u32) -> Vec<String> {
                 .and_then(|s| s.trim_end_matches('a').parse::<u32>().ok())
                 .is_none_or(|cc| cc * 10 >= floor)
         })
-        .collect()
+        .collect();
+    // A development build for cards below the floor still has to link these kernels: they carry
+    // the PTX of the floor architecture, which no card of the build loads.
+    if kept.is_empty() {
+        let cc = floor / 10;
+        return vec![format!("-gencode=arch=compute_{cc},code=compute_{cc}")];
+    }
+    kept
 }
 
 /// Compile the query-head-packed tensor-core flash-DECODE kernel (cuda/flashdecode_tc/,

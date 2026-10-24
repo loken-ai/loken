@@ -1146,7 +1146,66 @@ fn a_graph_step_decodes_like_the_plain_step() {
             );
         }
     }
-    for step in 0..6 {
+    // Layer by layer on the second step, after a first step run whole on each side.
+    {
+        let (mut plain2, mut stepped2) = (build(), build());
+        let _ = plain2.forward(&input, 0).unwrap();
+        let _ = stepped2.forward(&input, 0).unwrap();
+        stepped2.ensure_graph_workspaces();
+        let pos0 = prompt.len();
+        let tok0 = Tensor::new(&[token], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let want0 = flat(&plain2.forward(&tok0, pos0).unwrap());
+        stepped2.update_graph_state(pos0).unwrap();
+        stepped2
+            .embed_for_graph(&tok0.to_device(&card).unwrap())
+            .unwrap();
+        let got0 = {
+            let _step = graph::GraphStep::enter();
+            flat(&stepped2.forward_from_hidden().unwrap())
+        };
+        stepped2.sync_kv_len_for_graph(pos0 + 1);
+        println!(
+            "second-step study, first step cosine {:.6}",
+            cosine(&want0, &got0)
+        );
+        let next = want0
+            .iter()
+            .enumerate()
+            .fold(
+                (0usize, f32::MIN),
+                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+            )
+            .0 as u32;
+        let pos = pos0 + 1;
+        let tok = Tensor::new(&[next], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        stepped2.update_graph_state(pos).unwrap();
+        stepped2
+            .embed_for_graph(&tok.to_device(&card).unwrap())
+            .unwrap();
+        let start = stepped2.graph_hidden_buffer.clone().unwrap();
+        let mut plain_h = start.force_contiguous().unwrap();
+        let mut graph_h = start.force_contiguous().unwrap();
+        for li in 0..n_layers {
+            plain_h = plain2.layers[li]
+                .forward(&plain_h, None, pos, None, None, None, None)
+                .unwrap();
+            graph_h = {
+                let _step = graph::GraphStep::enter();
+                stepped2.layers[li].forward_graph(&graph_h).unwrap()
+            };
+            println!(
+                "second step, layer {li:>2}: cosine {:.6}",
+                cosine(&flat(&plain_h), &flat(&graph_h))
+            );
+        }
+    }
+    for step in 0..10 {
         let pos = prompt.len() + step;
         let tok = Tensor::new(&[token], &Device::Cpu)
             .unwrap()
@@ -1158,7 +1217,12 @@ fn a_graph_step_decodes_like_the_plain_step() {
         stepped.embed_for_graph(&tok_card).unwrap();
         let got = {
             let _step = graph::GraphStep::enter();
-            flat(&stepped.forward_from_hidden().unwrap())
+            let logits = stepped.forward_from_hidden().unwrap();
+            // The step's kernels run on the model's own stream: wait before reading the answer.
+            if let Some(stream) = stepped.cuda_stream() {
+                stream.synchronize().unwrap();
+            }
+            flat(&logits)
         };
         stepped.sync_kv_len_for_graph(pos + 1);
         let arg = |v: &[f32]| {

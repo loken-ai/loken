@@ -90,6 +90,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Build: link the tensor-core kernels in a build for older cards.
 - Models: skip the fused feed-forward norm of a layer that has no such norm.
 - Models: keep a prompt of several tokens out of the one-row graph buffers.
 - Models: detect a checkpoint whose weights are MXFP4.
