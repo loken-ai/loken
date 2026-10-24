@@ -77,6 +77,9 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
 | `vulkan_devices` | none | The Vulkan devices placement may give layers to, by index or by a part of their name. Empty offers those no other runtime of the build drives. Needs the `vulkan` feature. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
+| `kv_lease_secs` | `1800` | Seconds a conversation's kept state stays after its last turn; past it the state is dropped and the next turn reads its prompt again. `0` keeps a state until the memory is needed. |
+
+The next turn of a conversation keeps the rows of what it shares with the turn before, up to the last turn marker of the chat template, and reads only the answer and the new turn: a conversation of seven thousand tokens reads thirty at its second turn, and a short one reads the few it adds. Several conversations are kept side by side, each restored when its turn comes, for as long as the lease holds. The usage of a reply names the tokens a kept state served (`cached_tokens`), on the chat route and on the Responses route, where `previous_response_id` names the conversation. A prompt with no turn marker keeps what a cold read of it would have produced, in whole blocks.
 
 ### Prompts read by another instance
 

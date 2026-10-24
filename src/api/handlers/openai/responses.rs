@@ -296,9 +296,14 @@ fn usage_object(usage: Option<&Value>) -> Value {
         .and_then(|u| u.get("completion_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
+    // The prompt tokens a kept state served, as the chat completion that carried the turn counted them.
+    let cached = usage
+        .and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     json!({
         "input_tokens": input,
-        "input_tokens_details": {"cached_tokens": 0},
+        "input_tokens_details": {"cached_tokens": cached},
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": input + output,
@@ -740,6 +745,22 @@ mod tests {
         );
         let no = json!({"tools": [{"type": "web_search"}]});
         assert!(lower_tools(&no).is_err());
+    }
+
+    #[test]
+    fn the_usage_names_the_tokens_a_kept_state_served() {
+        let usage = json!({
+            "prompt_tokens": 7220,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 7190},
+        });
+        let object = usage_object(Some(&usage));
+        assert_eq!(object["input_tokens"], 7220);
+        assert_eq!(object["input_tokens_details"]["cached_tokens"], 7190);
+        assert_eq!(
+            usage_object(None)["input_tokens_details"]["cached_tokens"],
+            0
+        );
     }
 
     #[test]

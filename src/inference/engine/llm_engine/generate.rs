@@ -321,6 +321,8 @@ impl LlmEngine {
                         peer,
                     );
                 }
+                // The tokens a tokenizer never merges with their neighbours open a turn.
+                let added = state.tokenizer.get_added_tokens_decoder();
                 kv_reuse_start(
                     state.model.as_mut(),
                     &sessions,
@@ -328,6 +330,7 @@ impl LlmEngine {
                     &prompt_tokens,
                     disabled,
                     kv_disk.as_deref(),
+                    &|t| added.contains_key(&t),
                 )
             };
 

@@ -96,7 +96,7 @@ Smaller, by priority:
 | Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
-| Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds; the Responses API's previous response names the conversation. | Started |
+| Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds; the Responses API's previous response names the conversation. | Done |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Planned |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |

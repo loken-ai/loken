@@ -65,6 +65,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Serve: read only the tokens a conversation's next turn adds.
 - Models: stop the context where a model starts scaling its queries.
 - Models: keep the feed-forward output in 6 bits when float weights take 4.
 - Models: rebuild float weights in 8 bits when the checkpoint fits its memory.
@@ -99,6 +100,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Responses: report the prompt tokens a kept state served.
 - Models: read the text model of Mistral 3 and Voxtral checkpoints.
 - Models: keep a model with an ALiBi bias off the cards.
 - Vulkan: cut the cache window to what the card holds beside the weights.

@@ -1130,6 +1130,7 @@ pub(crate) fn kv_reuse_start(
     prompt_tokens: &[u32],
     disabled: bool,
     disk: Option<&crate::inference::cache::kv_disk::KvDiskStore>,
+    turn_marker: &dyn Fn(u32) -> bool,
 ) -> usize {
     let mut reuse = if disabled || !model.capabilities().trim_kv {
         None
@@ -1151,15 +1152,16 @@ pub(crate) fn kv_reuse_start(
     // The chunk the model's own prefill runs at, from the same sizing.
     let chunk =
         crate::inference::engine::model_backend::adaptive_prefill_chunk(model.prefill_shape());
+    // The next turn of a conversation shares the rows up to its last turn marker: those are
+    // kept as they stand, the answer and the new turn are the only tokens read.
+    let kept_of = |common: usize| turn_keep(common, prompt_tokens, chunk, turn_marker);
     // A snapshot of another conversation that shares more of this prompt than the
     // resident KV does becomes the resident: the resident sequence itself was copied
     // aside when its request ended, so nothing is lost by the swap.
     if !disabled && model.capabilities().trim_kv {
-        let cur_keep = reuse
-            .map(|c| chunk_aligned_keep(c, prompt_tokens.len(), chunk))
-            .unwrap_or(0);
+        let cur_keep = reuse.map(kept_of).unwrap_or(0);
         if let Some((index, snap_common)) = model.best_kv_snapshot(prompt_tokens) {
-            if chunk_aligned_keep(snap_common, prompt_tokens.len(), chunk) > cur_keep {
+            if kept_of(snap_common) > cur_keep {
                 match model.restore_kv_snapshot(index) {
                     Ok((tokens, kv_len)) => {
                         let mut g = sessions.blocking_lock();
@@ -1188,17 +1190,14 @@ pub(crate) fn kv_reuse_start(
     // a snapshot, which is restored like the others.
     if let (Some(store), false) = (disk, disabled) {
         if let Some((n_layers, _, _)) = model.kv_layout() {
-            let cur_keep = reuse
-                .map(|c| chunk_aligned_keep(c, prompt_tokens.len(), chunk))
-                .unwrap_or(0);
+            let cur_keep = reuse.map(kept_of).unwrap_or(0);
             let layout = kv_layout_id(model);
             if let Some((mi, covered)) = store.best(model_name, layout, prompt_tokens) {
                 // A windowed manifest's side blob describes one exact prefix length; reuse
                 // it only when the whole prefix matches, never a shorter shared run.
                 let windowed_ok =
                     !store.manifest_windowed(mi) || covered == store.manifest_covered(mi);
-                if windowed_ok && chunk_aligned_keep(covered, prompt_tokens.len(), chunk) > cur_keep
-                {
+                if windowed_ok && kept_of(covered) > cur_keep {
                     let blocks = covered / store.block_tokens();
                     let loaded = store
                         .load(mi, blocks, n_layers)
@@ -1287,9 +1286,7 @@ pub(crate) fn kv_reuse_start(
     }
     let keep = match shifted {
         Some(kept) => kept.min(prompt_tokens.len().saturating_sub(1)),
-        None => reuse
-            .map(|common| chunk_aligned_keep(common, prompt_tokens.len(), chunk))
-            .unwrap_or(0),
+        None => reuse.map(kept_of).unwrap_or(0),
     };
     if model.capabilities().trim_kv {
         model.trim_kv(keep);
@@ -1474,6 +1471,25 @@ pub(crate) fn stable_prefix_tokens(
     (cut > 0).then_some(cut)
 }
 
+/// The rows of a shared prefix of `common` tokens that the next request keeps. A prompt that
+/// goes on after a turn marker keeps the rows up to the last marker the prefix holds, whatever
+/// their number: the tokens of the answer and of the new turn are read, and nothing before them.
+/// Where the prefix holds no marker, or the chunk grid keeps more, the rows are the ones a cold
+/// prefill's chunks would have produced.
+pub(crate) fn turn_keep(
+    common: usize,
+    prompt: &[u32],
+    chunk: usize,
+    turn_marker: &dyn Fn(u32) -> bool,
+) -> usize {
+    let capped = common.min(prompt.len().saturating_sub(1));
+    let at_marker = (1..=capped)
+        .rev()
+        .find(|&i| turn_marker(prompt[i]))
+        .unwrap_or(0);
+    at_marker.max(chunk_aligned_keep(common, prompt.len(), chunk))
+}
+
 pub(crate) fn chunk_aligned_keep(common: usize, prompt_len: usize, chunk: usize) -> usize {
     let capped = common.min(prompt_len.saturating_sub(1));
     capped - capped % chunk.max(1)
@@ -1538,7 +1554,25 @@ mod prompt_cache_reuse_tests {
         );
     }
 
-    use super::{chunk_aligned_keep, reusable_prefix};
+    use super::{chunk_aligned_keep, reusable_prefix, turn_keep};
+
+    /// A conversation's next turn keeps everything up to its last turn marker: the answer and
+    /// the new turn are the only tokens read, however short the conversation.
+    #[test]
+    fn the_next_turn_keeps_the_rows_up_to_its_last_marker() {
+        // 10 is the turn marker. The new prompt repeats 14 tokens of the old one, then differs.
+        let prompt: Vec<u32> = vec![1, 2, 3, 10, 4, 5, 6, 7, 10, 8, 9, 3, 3, 3, 40, 41, 10, 50];
+        let marker = |t: u32| t == 10;
+        // The prefix holds markers at 3 and 8: the rows before the last one are kept.
+        assert_eq!(turn_keep(14, &prompt, 2048, &marker), 8);
+        // A marker past the shared prefix is not a place the rows are known to be right.
+        assert_eq!(turn_keep(7, &prompt, 2048, &marker), 3);
+        // No marker in the prefix: the cold chunk grid decides, and below a chunk nothing is kept.
+        assert_eq!(turn_keep(2, &prompt, 2048, &marker), 0);
+        // A grid that keeps more than the marker wins.
+        let long: Vec<u32> = (0..5000).map(|i| if i == 100 { 10 } else { 1 }).collect();
+        assert_eq!(turn_keep(4900, &long, 2048, &marker), 4096);
+    }
 
     /// Reuse snaps DOWN to the chunk grid of a cold prefill: the warm tail must be the
     /// cold run's exact tail chunks, or the boundary arithmetic differs and greedy flips.
