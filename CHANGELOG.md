@@ -58,7 +58,6 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
-- Models: rebuild float weights in 8 bits to keep a small model's answers.
 - Serve: read the chat format once when a model loads.
 - Bench: write the records under the loken schema.
 - Bench: find the measurement tool under its new name lokprof.

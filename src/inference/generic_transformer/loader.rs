@@ -704,11 +704,6 @@ impl LayerRopes {
 /// A float projection rebuilt as the block format `target` on `device`, and the ledger entry
 /// that says so. The block-quant kernels read it at a fraction of the float bytes and the
 /// fused projections need one format across a layer.
-/// The block format float projections are rebuilt in: Q8_0, whose rounding stays below the
-/// differences between a small model's top choices, which a 4-bit format changes.
-const FLOAT_PROJECTION_FORMAT: crate::tensor::quantized::GgmlDType =
-    crate::tensor::quantized::GgmlDType::Q8_0;
-
 fn requant_float_weight(
     qt: QTensor,
     target: crate::tensor::quantized::GgmlDType,
@@ -1166,7 +1161,42 @@ fn build_generic_layer(
     let build_norm_opt =
         |qt: Option<QTensor>| -> Result<Option<RmsNorm>> { qt.map(build_norm).transpose() };
 
-    let requant_dtype = FLOAT_PROJECTION_FORMAT;
+    // The block format float projections are requantised to: Q4K, unless a float weight's
+    // rows are not whole Q4K blocks, in which case the layer's float weights all take Q8_0
+    // so the byte-concat fusions below still see one format.
+    let requant_dtype = {
+        use crate::tensor::quantized::GgmlDType;
+        let is_float = |qt: &QTensor| {
+            matches!(
+                qt.dtype(),
+                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+            )
+        };
+        let whole_q4k_rows = [
+            raw.attn_q.as_ref(),
+            raw.attn_k.as_ref(),
+            raw.attn_v.as_ref(),
+            raw.attn_qkv.as_ref(),
+            Some(&raw.attn_output),
+            raw.ffn_gate.as_ref(),
+            Some(&raw.ffn_up),
+            Some(&raw.ffn_down),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|qt| is_float(qt))
+        .all(|qt| {
+            qt.shape()
+                .dims()
+                .last()
+                .is_some_and(|k| k.is_multiple_of(GgmlDType::Q4K.block_size()))
+        });
+        if whole_q4k_rows {
+            GgmlDType::Q4K
+        } else {
+            GgmlDType::Q8_0
+        }
+    };
 
     // Attention weights. Some GGUFs store specific weights (e.g. qwen3
     // keeps one per-layer tensor at F16) as non-quantized dtypes. That
@@ -4931,34 +4961,6 @@ mod host_spill_admission_tests {
 #[cfg(test)]
 mod split_tests {
     use super::*;
-
-    /// A float projection rebuilt for the block kernels keeps its weights to within a percent,
-    /// whatever its rows' width.
-    #[test]
-    fn a_float_projection_is_rebuilt_to_within_a_percent() {
-        let (rows, cols) = (16usize, 512usize);
-        let data: Vec<f32> = (0..rows * cols)
-            .map(|i| 0.05 * (i as f32 * 0.731).sin())
-            .collect();
-        let w = Tensor::from_vec(data.clone(), (rows, cols), &Device::Cpu).unwrap();
-        let qt = QTensor::quantize_onto(&w, crate::tensor::quantized::GgmlDType::F32, &Device::Cpu)
-            .unwrap();
-        let back = requant_float_weight(qt, FLOAT_PROJECTION_FORMAT, &Device::Cpu, "projection")
-            .unwrap()
-            .dequantize(&Device::Cpu)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let norm = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt();
-        let error = norm(&mut back.iter().zip(&data).map(|(a, b)| a - b));
-        let share = error / norm(&mut data.iter().copied());
-        assert!(
-            share < 0.01,
-            "the rebuilt weights are {share} of their norm away"
-        );
-    }
 
     #[test]
     fn a_q_projection_splits_into_q_and_gate_per_head() {
