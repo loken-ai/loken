@@ -137,6 +137,14 @@ def span(docs):
     return (days[0], days[-1]) if days else ("?", "?")
 
 
+def backend_note(backend):
+    """The line a page carries when no reference engine runs its backend."""
+    if backend == "opencl":
+        return ["No reference engine runs a language model through OpenCL on a GPU (ollama and "
+                "vLLM do not), so this page holds loken alone.", ""]
+    return []
+
+
 def page(title, machine, group, merged, rows_, fam, replays, archived, backend):
     first, last = span(group)
     builds = sorted({e["version"] for by in merged.values() for k, e in by.items()
@@ -149,6 +157,7 @@ def page(title, machine, group, merged, rows_, fam, replays, archived, backend):
            "", "## Hardware", "", hardware_block(machine, group, backend), "## Results", "",
            "Method and column definitions: [BENCHMARKS.md](../BENCHMARKS.md). Each rate reads `cold / warm`: "
            "the first request of a cell, then the median of the later ones ([why](../BENCHMARKS.md#cold-and-warm)).", ""]
+    out += backend_note(backend)
     by_family = {}
     for r in rows_:
         by_family.setdefault(fam.get(r[0].strip()) or "unfiled", []).append(r)

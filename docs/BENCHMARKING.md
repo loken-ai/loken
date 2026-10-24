@@ -94,6 +94,34 @@ build named by `LOKEN_BIN`, and ollama gets its ROCm libraries, unpacked over it
 GPU_VENDOR=amd LOKEN_BIN=<rocm build>/lokend scripts/bench run
 ```
 
+## Backends
+
+A card is measured through its native runtime unless `BACKEND` says otherwise:
+
+| `BACKEND` | What runs | Who is measured |
+|---|---|---|
+| `native` (default) | CUDA on an NVIDIA card, ROCm on an AMD card, and the host | loken, ollama, vLLM |
+| `vulkan` | the card's Vulkan device, the vendor runtimes hidden from every engine | loken and ollama |
+| `opencl` | the OpenCL GPU | loken alone |
+
+```sh
+GPU_VENDOR=amd BACKEND=vulkan LOKEN_BIN=<build with --features vulkan>/lokend scripts/bench run
+```
+
+`VULKAN_CARD` names the card by a part of its name when the vendor's own is not the one (the
+default is `AMD`, `NVIDIA` or `Intel` by `GPU_VENDOR`). loken is given the card through
+`vulkan_devices` in a copy of its configuration, ollama through `OLLAMA_VULKAN=1` and the card's
+place among the Vulkan GPUs. Neither can fall back to CUDA, ROCm or the host for the run. An
+ollama without a Vulkan backend is not run, and the campaign says so. vLLM does not run on
+Vulkan or OpenCL and is left out; no reference engine runs a language model through OpenCL, and
+the page of that backend says so.
+
+A backend campaign measures the GPU sweep only and writes its cells beside the native ones
+(`results/<model>_<context>_<mode>_vulkan.json`). Each record names the backend loken answered on,
+read from the devices route (`cuda`, `rocm`, `vulkan`, `opencl`, `cpu`), and the report makes one
+page per hardware and backend: loken on its native backend and on Vulkan sit side by side in the
+index, and the ollama rows of a page are the ones measured on the same backend.
+
 ## Modalities
 
 Each model is measured by the clock its modality warrants; the driver picks the modality from what

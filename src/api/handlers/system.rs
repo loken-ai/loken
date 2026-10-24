@@ -631,6 +631,39 @@ pub(crate) async fn list_devices(
         })
     }).collect();
 
+    // The Vulkan devices placement may give layers to: no other runtime of the build stands for
+    // them, so the host-side probes above do not list them.
+    #[cfg(feature = "vulkan")]
+    let devices = {
+        let mut devices = devices;
+        for d in crate::inference::kernel::vulkan::offered(
+            &state.default_inference_config.vulkan_devices,
+        ) {
+            let free = crate::inference::kernel::vulkan::free_bytes(d.index);
+            devices.push(serde_json::json!({
+                "id": d.index,
+                "type": "Vulkan",
+                "backend": "vulkan",
+                // The driver's own suffix, as in "(RADV GFX1201)", is not part of the card's name.
+                "name": d.name.split(" (").next().unwrap_or(&d.name),
+                "memory_gb": d.total as f64 / (1024.0 * 1024.0 * 1024.0),
+                "memory_bytes": d.total,
+                "free_bytes": free,
+                "utilization_gpu_percent": null,
+                "utilization_memory_percent": null,
+                "temperature_c": null,
+                "power_watts": null,
+                "power_limit_watts": null,
+                "priority": 60,
+                "status": "available",
+                "reason": null,
+                "suggestion": null,
+                "usable_memory_gb": free as f64 / (1024.0 * 1024.0 * 1024.0),
+            }));
+        }
+        devices
+    };
+
     let available_count = devices
         .iter()
         .filter(|d| d["status"] == "available")
@@ -662,6 +695,7 @@ pub(crate) async fn list_devices(
             "compiled_features": {
                 "cuda": cfg!(feature = "gpu"),
                 "opencl": cfg!(feature = "opencl"),
+                "vulkan": cfg!(feature = "vulkan"),
                 "image": cfg!(feature = "image"),
                 "video": cfg!(feature = "video"),
                 "audio": cfg!(feature = "audio"),

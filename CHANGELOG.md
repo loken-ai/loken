@@ -6,6 +6,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Devices: list the Vulkan GPUs that placement offers.
+- Bench: measure a card through its Vulkan or OpenCL backend.
 - Models: read the vocabulary of a checkpoint from its tokenizer.model.
 - Models: load architectures from the safetensors their publisher ships.
 - Docs: list the architectures the loader reads and the formats of each.
