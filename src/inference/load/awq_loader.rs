@@ -42,7 +42,8 @@ pub struct AwqConfigJson {
     /// The frequency-dependent rope scaling of a long-context checkpoint:
     /// `(factor, low_freq_factor, high_freq_factor, original_max_position)`.
     pub frequency_scaling: Option<(f32, f32, f32, f32)>,
-    /// Whether the checkpoint carries a `quantization_config`; a dense one does not.
+    /// Whether the checkpoint's `quantization_config` names a format the quantised route reads;
+    /// a dense checkpoint, or one whose quantised tensors the dense layouts read, has none.
     pub quantized: bool,
     pub tie_word_embeddings: bool,
     /// The weights are in the layout a vendor's own release writes (`params.json` and a
@@ -50,6 +51,16 @@ pub struct AwqConfigJson {
     pub native: bool,
     /// The parsed `config.json` (or `params.json`), for the keys only some classes carry.
     pub root: serde_json::Value,
+}
+
+/// Whether a `quantization_config` sends the checkpoint down the quantised route: any but one
+/// whose method stores its tensors as MXFP4 blocks and scales, which the dense layouts read.
+pub fn quantized_route(qc: Option<&serde_json::Value>) -> bool {
+    qc.is_some_and(|q| {
+        !q.get("quant_method")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m.eq_ignore_ascii_case("mxfp4"))
+    })
 }
 
 /// Map an HF `architectures[0]` to the engine's GGUF arch tag.
@@ -193,7 +204,7 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         awq_bits,
         yarn,
         frequency_scaling,
-        quantized: qc.is_some(),
+        quantized: quantized_route(qc),
         tie_word_embeddings: lookup_b(&v, &["tie_word_embeddings"]).unwrap_or(false),
         native: false,
         root: v,
@@ -484,7 +495,7 @@ pub fn find_dense_model_dir(candidate: &str) -> Option<String> {
     }
     let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-    if v.get("quantization_config").is_some() {
+    if quantized_route(v.get("quantization_config")) {
         return None;
     }
     let arch = v.get("architectures")?.get(0)?.as_str()?;

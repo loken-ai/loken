@@ -141,10 +141,72 @@ fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
         .chain(tokenizer.iter())
         .chain(tekken.iter())
         .flat_map(added_tokens);
+    // A checkpoint whose tokenizer configuration declares no template is a chat model only
+    // when it stops on a token that closes a turn; any other is prompted as given.
+    let base = template.is_none()
+        && config.is_some()
+        && !stop_tokens(dir, config.as_ref(), tokenizer.as_ref())
+            .iter()
+            .any(|t| TURN_ENDS.contains(&t.as_str()));
     ChatFormat {
         template,
-        vocabulary: vocabulary_markers(tokens),
+        vocabulary: match base {
+            true => String::new(),
+            false => vocabulary_markers(tokens),
+        },
     }
+}
+
+/// The tokens that close an assistant's turn in the chat formats `FORMAT_MARKERS` names.
+const TURN_ENDS: &[&str] = &[
+    "<|im_end|>",
+    "<end_of_turn>",
+    "<turn|>",
+    "<|return|>",
+    "<|call|>",
+    "<|end|>",
+    "<|eot_id|>",
+    "<|end_of_role|>",
+];
+
+/// The text of the tokens a checkpoint directory stops on: the `eos_token_id` of
+/// `generation_config.json` and `config.json`, read through the added tokens of the tokenizer
+/// files, and the `eos_token` of the tokenizer configuration.
+fn stop_tokens(
+    dir: &std::path::Path,
+    config: Option<&serde_json::Value>,
+    tokenizer: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join(name)).ok()?).ok()
+    };
+    let ids: Vec<u64> = ["generation_config.json", "config.json"]
+        .iter()
+        .filter_map(|f| read_json(f)?.get("eos_token_id").cloned())
+        .flat_map(|v| match v {
+            serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_u64()).collect(),
+            v => v.as_u64().into_iter().collect::<Vec<_>>(),
+        })
+        .collect();
+    let listed = tokenizer
+        .and_then(|t| t.get("added_tokens")?.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| Some((t.get("id")?.as_u64()?, t.get("content")?.as_str()?)));
+    let decoded = config
+        .and_then(|c| c.get("added_tokens_decoder")?.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, t)| Some((id.parse().ok()?, t.get("content")?.as_str()?)));
+    let mut stops: Vec<String> = listed
+        .chain(decoded)
+        .filter(|(id, _)| ids.contains(id))
+        .map(|(_, text)| text.to_string())
+        .collect();
+    let eos = config.and_then(|c| c.get("eos_token"));
+    let eos = eos.and_then(|e| e.as_str().or_else(|| e.get("content")?.as_str()));
+    stops.extend(eos.map(str::to_string));
+    stops
 }
 
 /// A `chat_template` entry: a template, or a list of named ones of which `default` (else
@@ -777,6 +839,35 @@ mod tests {
             None,
         );
         assert!(p.prompt.contains("[INST]hi[/INST]"), "{}", p.prompt);
+    }
+
+    /// A checkpoint whose tokenizer configuration declares no template is prompted as given
+    /// when it stops on the plain end of text, and in its vocabulary's format when it stops
+    /// on the token that closes that format's turn.
+    #[test]
+    fn a_checkpoint_declaring_no_template_is_prompted_by_its_stop_tokens() {
+        let format_with = |eos: u64| {
+            let dir = std::env::temp_dir().join(format!("loken-base-{eos}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = serde_json::json!({
+                "eos_token": "<eos>",
+                "added_tokens_decoder": {
+                    "1": {"content": "<eos>", "special": true},
+                    "106": {"content": "<start_of_turn>", "special": true},
+                    "107": {"content": "<end_of_turn>", "special": true},
+                },
+            });
+            std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+            let generation = serde_json::json!({"eos_token_id": [1, eos]});
+            std::fs::write(dir.join("generation_config.json"), generation.to_string()).unwrap();
+            let format = path_chat_format(&dir);
+            std::fs::remove_dir_all(&dir).ok();
+            format
+        };
+        assert_eq!(format_with(1).effective_template(), None);
+        assert!(format_with(107)
+            .effective_template()
+            .is_some_and(|t| t.contains("<start_of_turn>")));
     }
 
     /// The part of a prompt the conversation's next turn renders the same ends where the template

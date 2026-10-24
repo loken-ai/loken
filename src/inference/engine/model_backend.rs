@@ -2287,7 +2287,8 @@ impl ModelBackend for GenericBackend {
             // the exclusion is lifted; the cold/warm probe on a routed model is the gate
             // that must hold.
             trim_kv: true,
-            shift_kv: true,
+            // A position learned for each slot cannot be given to another.
+            shift_kv: !self.0.has_learned_positions(),
             pld: true,
             graph_mode: true,
             ..Capabilities::default()

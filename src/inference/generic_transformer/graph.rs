@@ -1171,6 +1171,7 @@ impl GenericHeteroTransformer {
             Some(table) => self.embed_rows_on_card(table, input_ids)?,
             None => self.embeddings.forward(input_ids)?,
         };
+        hidden = self.add_positions(hidden, self.graph_pos)?;
         if let Some(scale) = self.config.embed_scale {
             hidden = (hidden * scale)?;
         }
@@ -2494,7 +2495,7 @@ impl GenericHeteroTransformer {
             input_local = input_ids.to_device(&emb_device)?;
             &input_local
         };
-        let mut hidden = self.embeddings.forward(input_ids)?;
+        let mut hidden = self.add_positions(self.embeddings.forward(input_ids)?, index_pos)?;
         // FIX: apply embed_scale (gemma4: x√2560 ≈ 50.6).
         // forward_inner (line 5964) and embed_for_graph (line 7278) both
         // scale; prepare_all_kv was MISSING it -> split-path hidden was 50.6x

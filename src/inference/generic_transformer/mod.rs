@@ -467,6 +467,9 @@ pub struct GenericHeteroTransformer {
     kept_graphs_at: Option<u64>,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
+    /// The learned table of absolute positions `[positions, dim]`, F32 on the host, added to
+    /// the token embeddings of a model that has one.
+    position_embd: Option<Tensor>,
     /// The stored embedding table on each card of the plan, when its format is gathered there:
     /// a token's row is decoded on the card that needs it instead of on the host.
     embed_cards: Vec<Arc<crate::tensor::quantized::QTensor>>,

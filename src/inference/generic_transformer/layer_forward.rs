@@ -2157,6 +2157,9 @@ impl GenericTransformerLayer {
             // mis-apply the [1] ones tensor as a norm. Route it to the regular forward
             // (where WeightedNorm::Identity::forward returns x unchanged, correctly).
             || matches!(self.attn_norm, WeightedNorm::Identity(_))
+            // A LayerNorm: the executor normalises by RMS.
+            || matches!(self.attn_norm, WeightedNorm::Layer(_))
+            || matches!(self.ffn_norm, Some(WeightedNorm::Layer(_)))
             // Capped attention scores (Gemma2): the executor's attention does not cap.
             || self.attn_softcap.is_some()
             // Gated attention output: the executor projects the attention output ungated.

@@ -597,6 +597,9 @@ impl GenericHeteroTransformer {
         if c.embed_scale.is_some() {
             return Some("embed_scale");
         }
+        if self.position_embd.is_some() {
+            return Some("learned positions");
+        }
         if c.logit_scale.is_some() {
             return Some("logit_scale");
         }
@@ -655,6 +658,25 @@ impl GenericHeteroTransformer {
     /// True if this model can be served through the continuous-batch worker.
     pub fn cb_eligible(&self) -> bool {
         self.cb_unsupported_reason().is_none()
+    }
+
+    /// Whether the tokens' positions come from a learned table added to their embeddings.
+    pub fn has_learned_positions(&self) -> bool {
+        self.position_embd.is_some()
+    }
+
+    /// `hidden` `[1, seq, width]` of the tokens at `index_pos..` with their rows of the learned
+    /// position table added, when the model has one.
+    pub(super) fn add_positions(&self, hidden: Tensor, index_pos: usize) -> Result<Tensor> {
+        let Some(table) = self.position_embd.as_ref() else {
+            return Ok(hidden);
+        };
+        let seq = hidden.dim(1)?;
+        let rows = table
+            .narrow(0, index_pos, seq)?
+            .to_device(&hidden.device())?
+            .to_dtype(hidden.dtype())?;
+        hidden.broadcast_add(&rows.unsqueeze(0)?)
     }
 
     pub fn rope_base(&self) -> f32 {
@@ -1908,7 +1930,7 @@ impl GenericHeteroTransformer {
             input_local = input_ids.to_device(&emb_device)?;
             &input_local
         };
-        let hidden = self.embeddings.forward(input_ids)?;
+        let hidden = self.add_positions(self.embeddings.forward(input_ids)?, index_pos)?;
         // Embedding scaling (Gemma: √embed_len, Granite: explicit value)
         let hidden = if let Some(scale) = self.config.embed_scale {
             (hidden * scale)?

@@ -264,6 +264,7 @@ const BIGCODE: Layout = Layout {
     embed: &["wte.weight"],
     layers: "h",
     top: &[
+        ("wpe.weight", Same("position_embd.weight")),
         ("ln_f.weight", Same("output_norm.weight")),
         ("ln_f.bias", Same("output_norm.bias")),
     ],

@@ -20,6 +20,8 @@ const KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 32;
 const FFN: usize = 128;
 const VOCAB: usize = 96;
+/// Rows of a learned position table: the context the tiny files declare.
+const POSITIONS: usize = 256;
 const EXPERTS: usize = 4;
 const EXPERTS_USED: usize = 2;
 const EXPERT_FFN: usize = 64;
@@ -107,6 +109,8 @@ struct Recipe {
     window: bool,
     /// Biases of the routed experts.
     expert_bias: bool,
+    /// A learned table of absolute positions in place of the rotation.
+    positions: bool,
 }
 
 impl Recipe {
@@ -140,7 +144,13 @@ impl Recipe {
             scales: false,
             window: false,
             expert_bias: false,
+            positions: false,
         }
+    }
+
+    fn positions(mut self) -> Self {
+        self.positions = true;
+        self
     }
 
     fn bias(mut self) -> Self {
@@ -315,6 +325,9 @@ impl Recipe {
         let mut t: Vec<(String, Vec<usize>)> = Vec::new();
         let mut put = |name: &str, dims: &[usize]| t.push((name.to_string(), dims.to_vec()));
         put("token_embd.weight", &[VOCAB, HIDDEN]);
+        if self.positions {
+            put("position_embd.weight", &[POSITIONS, HIDDEN]);
+        }
         if self.embedding_norm {
             put("token_embd_norm.weight", &[HIDDEN]);
         } else {
@@ -744,7 +757,7 @@ gguf_loads! {
     granitemoe_loads_from_gguf: dense("granitemoe").moe();
     yi_loads_from_gguf: dense("yi");
     internlm2_loads_from_gguf: dense("internlm2");
-    starcoder_loads_from_gguf: dense("starcoder").classic().fused().bias();
+    starcoder_loads_from_gguf: dense("starcoder").classic().fused().bias().positions();
     starcoder2_loads_from_gguf: dense("starcoder2").classic().bias();
     qwen2_loads_from_gguf: dense("qwen2").bias();
     qwen3_loads_from_gguf: dense("qwen3").qk();
@@ -1664,6 +1677,8 @@ struct Publisher {
     bf16: bool,
     /// The experts are stored as MXFP4 blocks and scales, in the GGUF file as MXFP4 blocks.
     mx: bool,
+    /// Every tensor is stored F16.
+    f16: bool,
 }
 
 /// The keys the llama family's configurations carry, with the norm epsilon under `eps_key`
@@ -1709,6 +1724,7 @@ fn llama_publisher(recipe: Recipe, class: &'static str, pairing: Pairing) -> Pub
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -1759,6 +1775,7 @@ fn styled(
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -1880,6 +1897,7 @@ fn internlm2() -> Publisher {
 fn starcoder() -> Publisher {
     const NAMES: [&[(&str, &str, Xf)]; 1] = [&[
         ("token_embd.weight", "transformer.wte.weight", Id),
+        ("position_embd.weight", "transformer.wpe.weight", Id),
         ("output_norm.weight", "transformer.ln_f.weight", Id),
         ("output_norm.bias", "transformer.ln_f.bias", Id),
         ("output.weight", "lm_head.weight", Id),
@@ -1920,6 +1938,7 @@ fn starcoder() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2053,6 +2072,7 @@ fn chatglm() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2181,6 +2201,7 @@ fn falcon() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2230,6 +2251,7 @@ fn dbrx() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2284,6 +2306,7 @@ fn mpt() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2391,6 +2414,7 @@ fn gemma3() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2420,6 +2444,23 @@ fn gptoss() -> Publisher {
         down: "mlp.experts.down_proj",
     });
     p
+}
+
+/// The MXFP4 release: the experts as blocks and scales, and the `quantization_config` that
+/// names them, which the publisher ships with them.
+fn gptoss_mxfp4() -> Publisher {
+    let p = gptoss();
+    let config = p.config.replacen(
+        '{',
+        r#"{"quantization_config": {"quant_method": "mxfp4",
+        "modules_to_not_convert": ["model.layers.*.self_attn", "lm_head"]}, "#,
+        1,
+    );
+    Publisher {
+        mx: true,
+        config,
+        ..p
+    }
 }
 
 const LFM2_NAMES: [(&str, &str, Xf); 14] = [
@@ -2620,6 +2661,7 @@ fn delta_publisher(arch: &str, class: &'static str, composite: bool) -> Publishe
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2720,6 +2762,7 @@ fn nemotron() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2760,6 +2803,7 @@ fn mixtral() -> Publisher {
         native: false,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2807,6 +2851,7 @@ fn mixtral_native() -> Publisher {
         native: true,
         bf16: false,
         mx: false,
+        f16: false,
     }
 }
 
@@ -2922,10 +2967,21 @@ fn publisher_model(
     }
     tensors.retain(|(n, _, _)| Some(n.as_str()) != without);
     let dir = scratch(tag);
-    let dtype = if p.bf16 { "BF16" } else { "F32" };
+    let dtype = match (p.bf16, p.f16) {
+        (true, _) => "BF16",
+        (_, true) => "F16",
+        _ => "F32",
+    };
+    let bytes = |vals: &[f32]| match p.f16 {
+        true => vals
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect(),
+        false => stored(p.bf16, vals),
+    };
     let mut files: Vec<Stored> = tensors
         .iter()
-        .map(|(name, dims, vals)| (name.clone(), dtype, dims.clone(), stored(p.bf16, vals)))
+        .map(|(name, dims, vals)| (name.clone(), dtype, dims.clone(), bytes(vals)))
         .collect();
     files.extend(quantised);
     let (shard, config) = if p.native {
@@ -2996,7 +3052,7 @@ fn publisher_error(tag: &str, p: &Publisher) -> f32 {
 /// stored in half width, and the GGUF file holds the weights in full.
 fn load_publisher(tag: &str, p: &Publisher) {
     let error = publisher_error(tag, p);
-    let tolerance = if p.bf16 { 5e-2 } else { 2e-3 };
+    let tolerance = if p.bf16 || p.f16 { 5e-2 } else { 2e-3 };
     assert!(
         error < tolerance,
         "{tag}: the checkpoint's logits are {error} (of their range) from the GGUF file's"
@@ -3050,10 +3106,11 @@ publisher_loads! {
     lfm2_loads_from_safetensors ("lfm2"): lfm2();
     lfm2moe_loads_from_safetensors ("lfm2moe"): lfm2moe();
     nemotron_h_moe_loads_from_safetensors ("nemotron_h_moe"): nemotron();
-    gptoss_loads_from_mxfp4_safetensors ("gptoss"): Publisher { mx: true, ..gptoss() };
+    gptoss_loads_from_mxfp4_safetensors ("gptoss"): gptoss_mxfp4();
     gptoss_loads_from_bf16_safetensors ("gptoss"): Publisher { bf16: true, ..gptoss() };
     qwen3next_loads_from_bf16_safetensors ("qwen3next"): Publisher { bf16: true, ..qwen3next() };
     gemma3_loads_from_bf16_safetensors ("gemma3"): Publisher { bf16: true, ..gemma3() };
+    starcoder_loads_from_f16_safetensors ("starcoder"): Publisher { f16: true, ..starcoder() };
     llama_safetensors_equal_gguf ("llama"): llama_publisher(recipe_of("llama"), "LlamaForCausalLM", Pairing::AdjacentToHalf);
     qwen2_safetensors_equal_gguf ("qwen2"): llama_publisher(recipe_of("qwen2"), "Qwen2ForCausalLM", Pairing::Same);
     qwen3_safetensors_equal_gguf ("qwen3"): llama_publisher(recipe_of("qwen3"), "Qwen3ForCausalLM", Pairing::Same);
@@ -3208,4 +3265,136 @@ fn a_checkpoint_missing_a_tensor_is_refused() {
         let (built, _) = publisher_model("refused", &p, Some(without));
         assert!(built.is_err(), "{} without {without} loads", p.class);
     }
+}
+
+/// A serialised SentencePiece `ModelProto`: each piece with its score and type, and the
+/// normaliser's `add_dummy_prefix`.
+fn spm_model_bytes(pieces: &[(&str, f32, i32)], add_dummy_prefix: bool) -> Vec<u8> {
+    fn varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn message(out: &mut Vec<u8>, field: u64, body: &[u8]) {
+        varint(out, field << 3 | 2);
+        varint(out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+    let mut out = Vec::new();
+    for (text, score, ptype) in pieces {
+        let mut piece = Vec::new();
+        message(&mut piece, 1, text.as_bytes());
+        varint(&mut piece, 2 << 3 | 5);
+        piece.extend_from_slice(&score.to_le_bytes());
+        varint(&mut piece, 3 << 3);
+        varint(&mut piece, *ptype as u64);
+        message(&mut out, 1, &piece);
+    }
+    let mut spec = Vec::new();
+    message(&mut spec, 1, b"identity");
+    varint(&mut spec, 3 << 3);
+    varint(&mut spec, add_dummy_prefix as u64);
+    message(&mut out, 3, &spec);
+    out
+}
+
+/// A checkpoint that ships a SentencePiece `tokenizer.model` and no `tokenizer.json` takes its
+/// vocabulary from the model file: the prompt is split into the pieces it holds whole.
+#[test]
+fn a_checkpoint_without_tokenizer_json_reads_its_sentencepiece_model() {
+    const PIECES: [(&str, f32, i32); 22] = [
+        ("<unk>", 0.0, 2),
+        ("<s>", 0.0, 3),
+        ("</s>", 0.0, 3),
+        ("\u{2581}", -1.0, 1),
+        ("h", -2.0, 1),
+        ("e", -2.0, 1),
+        ("l", -2.0, 1),
+        ("o", -2.0, 1),
+        ("w", -2.0, 1),
+        ("r", -2.0, 1),
+        ("d", -2.0, 1),
+        ("he", -3.0, 1),
+        ("ll", -3.1, 1),
+        ("llo", -3.2, 1),
+        ("hello", -3.3, 1),
+        ("\u{2581}hello", -3.4, 1),
+        ("wo", -3.5, 1),
+        ("wor", -3.6, 1),
+        ("worl", -3.7, 1),
+        ("world", -3.8, 1),
+        ("\u{2581}world", -3.9, 1),
+        ("<|im_start|>", 0.0, 4),
+    ];
+    let p = internlm2();
+    let weights = recipe_weights(&p.recipe);
+    let files: Vec<Stored> = hf_tensors(&p.recipe, &p.style, &weights)
+        .iter()
+        .map(|(name, dims, vals)| (name.clone(), "F32", dims.clone(), stored(false, vals)))
+        .collect();
+    let dir = scratch("spm-tokenizer");
+    write_stored(&dir.join("model.safetensors"), &files);
+    std::fs::write(dir.join("config.json"), &p.config).unwrap();
+    std::fs::write(dir.join("tokenizer.model"), spm_model_bytes(&PIECES, true)).unwrap();
+    let header = crate::inference::engine::llm_engine::awq_checkpoint(&dir.to_string_lossy());
+    let _ = std::fs::remove_dir_all(&dir);
+    let (header, _) = header.unwrap_or_else(|e| panic!("the checkpoint is refused: {e}"));
+    let tokenizer = crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&header)
+        .unwrap_or_else(|e| panic!("no tokenizer from the model file: {e}"));
+    let encoding = tokenizer.encode("hello world", false).unwrap();
+    assert_eq!(encoding.get_ids(), &[15, 20]);
+    assert_eq!(tokenizer.decode(&[15, 20], false).unwrap(), " hello world");
+}
+
+/// A feed-forward norm stored with a bias is a LayerNorm: its bias reaches the logits.
+#[test]
+fn a_feed_forward_layer_norm_applies_its_bias() {
+    let recipe = recipe_of("starcoder2");
+    let shifted: Replaced = (0..recipe.mixers.len())
+        .map(|il| {
+            let bytes = (0..HIDDEN).flat_map(|_| 0.5f32.to_le_bytes()).collect();
+            (format!("blk.{il}.ffn_norm.bias"), (GgmlDType::F32, bytes))
+        })
+        .collect();
+    let mut plain = build_gguf(&recipe, None).unwrap();
+    let mut moved = build_gguf_with(&recipe, None, &shifted).unwrap();
+    let a = assert_runs("starcoder2", &mut plain, VOCAB);
+    let b = assert_runs("starcoder2, other bias", &mut moved, VOCAB);
+    let worst = a
+        .iter()
+        .zip(&b)
+        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    assert!(
+        worst > 1e-3,
+        "the feed-forward norm's bias changes nothing ({worst})"
+    );
+}
+
+/// A learned table of absolute positions is added to the token embeddings, and the heads of a
+/// model that has one are not rotated.
+#[test]
+fn a_learned_position_table_places_the_tokens() {
+    let recipe = recipe_of("starcoder");
+    let table = (0..POSITIONS * HIDDEN).flat_map(|i| (i as f32 * 0.1).sin().to_le_bytes());
+    let moved: Replaced = [(
+        "position_embd.weight".to_string(),
+        (GgmlDType::F32, table.collect()),
+    )]
+    .into_iter()
+    .collect();
+    let mut plain = build_gguf(&recipe, None).unwrap();
+    assert!(
+        plain.layers.iter().all(|l| l.no_rope),
+        "a model with learned positions rotates its heads"
+    );
+    let mut other = build_gguf_with(&recipe, None, &moved).unwrap();
+    let a = assert_runs("starcoder", &mut plain, VOCAB);
+    let b = assert_runs("starcoder, other positions", &mut other, VOCAB);
+    let worst = a
+        .iter()
+        .zip(&b)
+        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    assert!(worst > 1e-3, "the position table changes nothing ({worst})");
 }

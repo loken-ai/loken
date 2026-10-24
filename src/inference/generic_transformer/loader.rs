@@ -43,6 +43,8 @@ struct RawGenericLayer {
     attn_norm_bias_qt: Option<QTensor>,
     post_attn_norm_qt: Option<QTensor>,
     ffn_norm_qt: Option<QTensor>,
+    /// The feed-forward norm's bias: that norm is a full LayerNorm.
+    ffn_norm_bias_qt: Option<QTensor>,
     post_ffn_norm_qt: Option<QTensor>,
     // FFN weights
     ffn_gate: Option<QTensor>,
@@ -434,12 +436,16 @@ impl<'a> TensorSource<'a> {
             // CONVERSION: held F32, declared above.
             return QTensor::quantize_onto(&wide, crate::tensor::quantized::GgmlDType::F32, device);
         }
-        if self.hf_rows && info.ggml_dtype == crate::tensor::quantized::GgmlDType::BF16 {
+        let host_f16 =
+            device.is_cpu() && info.ggml_dtype == crate::tensor::quantized::GgmlDType::F16;
+        if self.hf_rows
+            && (info.ggml_dtype == crate::tensor::quantized::GgmlDType::BF16 || host_f16)
+        {
             // CONVERSION: no kernel reads BF16 weights. On a card the narrowest width the kernels
             // read is F16, the same size; a weight below F16's smallest normal loses precision,
             // one past its range would overflow (none of a trained model's does). On the host
-            // the kernels read F32 or blocks, so the weight widens to F32, twice its size. Each
-            // weight passes through F32 on the host, one tensor at a time.
+            // the kernels read F32 or blocks, so a BF16 or F16 weight widens to F32, twice its
+            // size. Each weight passes through F32 on the host, one tensor at a time.
             let stored = info.read_slice_owned(
                 part.bytes,
                 part.content.tensor_data_offset,
@@ -456,11 +462,11 @@ impl<'a> TensorSource<'a> {
             let n = wide.elem_count() as u64;
             crate::tensor::conversion::record_kept(
                 "weight",
-                "bf16",
+                info.ggml_dtype.gguf_name(),
                 width.gguf_name(),
                 n * 2,
                 n * width.type_size() as u64,
-                "no kernel reads BF16: F16 on a card, F32 on the host",
+                "no kernel reads BF16, the host's read F32: F16 on a card, F32 on the host",
             );
             // CONVERSION: held at `width`, declared above.
             return QTensor::quantize_onto(&wide, width, device);
@@ -698,6 +704,11 @@ impl LayerRopes {
 /// A float projection rebuilt as the block format `target` on `device`, and the ledger entry
 /// that says so. The block-quant kernels read it at a fraction of the float bytes and the
 /// fused projections need one format across a layer.
+/// The block format float projections are rebuilt in: Q8_0, whose rounding stays below the
+/// differences between a small model's top choices, which a 4-bit format changes.
+const FLOAT_PROJECTION_FORMAT: crate::tensor::quantized::GgmlDType =
+    crate::tensor::quantized::GgmlDType::Q8_0;
+
 fn requant_float_weight(
     qt: QTensor,
     target: crate::tensor::quantized::GgmlDType,
@@ -1057,6 +1068,7 @@ fn tp_share(
         attn_norm_bias_qt: whole(&raw.attn_norm_bias_qt)?,
         post_attn_norm_qt: whole(&raw.post_attn_norm_qt)?,
         ffn_norm_qt: whole(&raw.ffn_norm_qt)?,
+        ffn_norm_bias_qt: whole(&raw.ffn_norm_bias_qt)?,
         post_ffn_norm_qt: whole(&raw.post_ffn_norm_qt)?,
         ffn_gate: if routed {
             None
@@ -1154,42 +1166,7 @@ fn build_generic_layer(
     let build_norm_opt =
         |qt: Option<QTensor>| -> Result<Option<RmsNorm>> { qt.map(build_norm).transpose() };
 
-    // The block format float projections are requantised to: Q4K, unless a float weight's
-    // rows are not whole Q4K blocks, in which case the layer's float weights all take Q8_0
-    // so the byte-concat fusions below still see one format.
-    let requant_dtype = {
-        use crate::tensor::quantized::GgmlDType;
-        let is_float = |qt: &QTensor| {
-            matches!(
-                qt.dtype(),
-                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-            )
-        };
-        let whole_q4k_rows = [
-            raw.attn_q.as_ref(),
-            raw.attn_k.as_ref(),
-            raw.attn_v.as_ref(),
-            raw.attn_qkv.as_ref(),
-            Some(&raw.attn_output),
-            raw.ffn_gate.as_ref(),
-            Some(&raw.ffn_up),
-            Some(&raw.ffn_down),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|qt| is_float(qt))
-        .all(|qt| {
-            qt.shape()
-                .dims()
-                .last()
-                .is_some_and(|k| k.is_multiple_of(GgmlDType::Q4K.block_size()))
-        });
-        if whole_q4k_rows {
-            GgmlDType::Q4K
-        } else {
-            GgmlDType::Q8_0
-        }
-    };
+    let requant_dtype = FLOAT_PROJECTION_FORMAT;
 
     // Attention weights. Some GGUFs store specific weights (e.g. qwen3
     // keeps one per-layer tensor at F16) as non-quantized dtypes. That
@@ -1208,12 +1185,10 @@ fn build_generic_layer(
                 | crate::tensor::quantized::GgmlDType::F16
                 | crate::tensor::quantized::GgmlDType::BF16
         );
-        // Requant F16/BF16/F32 weights to Q4K on BOTH cuda and cpu. On GPU it
-        // enables the QKV/FFN byte-concat fusions; on CPU it's a decode win in
-        // its own right - the reference QMatMul runs a dense F32 GEMM for F16-stored
-        // weights, so on a memory-bound CPU those matmuls read 4 B/param instead
-        // of Q4K's ~0.6 B. Requanting also makes CPU numerics match GPU (which
-        // already requants to Q4K). The byte-concat *fusion* stays GPU-only.
+        // Requant F16/BF16/F32 weights to the block format on BOTH cuda and cpu. On GPU
+        // it enables the QKV/FFN byte-concat fusions; on CPU the block kernels read about
+        // a quarter of the bytes of a dense F32 GEMM. The host's numerics match the card's.
+        // The byte-concat *fusion* stays GPU-only.
         if needs_requant {
             // One block format for every per-layer weight, so that the QKV and FFN
             // gate+up fusions apply.
@@ -1227,7 +1202,7 @@ fn build_generic_layer(
     // (after requant), concatenate raw bytes into [q_out+k_out+v_out, hidden].
     // Saves 2 matmul launches + 2 q8_1 quantize launches per layer.
     //
-    // Helper: requant a QTensor to Q4K if it's F16/F32/BF16 (returns QTensor, not QMatMul).
+    // Helper: requant a QTensor to the block format if it's F16/F32/BF16 (returns QTensor).
     let requant_qt = |qt: QTensor| -> Result<QTensor> {
         let dtype = qt.dtype();
         let needs = matches!(
@@ -1577,19 +1552,34 @@ fn build_generic_layer(
     let ffn_up_bias = bias_to_device(raw.ffn_up_bias_qt)?;
     let ffn_down_bias = bias_to_device(raw.ffn_down_bias_qt)?;
     // Extract raw weight for fused add+rmsnorm kernel before build_norm consumes QTensor
+    // The fused add+norm kernels normalise by RMS; a LayerNorm takes the unfused path.
     let ffn_norm_weight_for_fused = match &raw.ffn_norm_qt {
         // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
-        Some(qt) if on_gpu => Some(qt.dequantize(&Device::Cpu)?.to_device(device)?),
+        Some(qt) if on_gpu && raw.ffn_norm_bias_qt.is_none() => {
+            Some(qt.dequantize(&Device::Cpu)?.to_device(device)?)
+        }
         _ => None,
     };
-    let ffn_norm = match raw.ffn_norm_qt {
-        Some(qt) => Some(WeightedNorm::Rms(build_norm(qt)?)),
+    let ffn_norm = match (raw.ffn_norm_qt, raw.ffn_norm_bias_qt) {
+        (Some(qt), Some(bias_qt)) => {
+            let place = |t: QTensor| match on_gpu {
+                // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
+                true => t.dequantize(&Device::Cpu)?.to_device(device),
+                false => t.dequantize(device),
+            };
+            Some(WeightedNorm::Layer(LayerNorm::new(
+                place(qt)?,
+                Some(place(bias_qt)?),
+                eps as f32,
+            )))
+        }
+        (Some(qt), None) => Some(WeightedNorm::Rms(build_norm(qt)?)),
         // OLMo2 post-norm-only: no pre-ffn-norm tensor but post_ffw_norm IS present ->
         // identity pre-norm (the FFN sees raw h; post_ffn_norm normalises its output).
-        None if raw.post_ffn_norm_qt.is_some() => Some(WeightedNorm::Identity(
+        (None, _) if raw.post_ffn_norm_qt.is_some() => Some(WeightedNorm::Identity(
             crate::tensor::Tensor::ones((1usize,), crate::tensor::DType::F32, device)?,
         )),
-        None => None,
+        (None, _) => None,
     };
     let post_ffn_norm = build_norm_opt(raw.post_ffn_norm_qt)?;
 
@@ -2162,8 +2152,9 @@ fn build_generic_layer(
         attn_output_bias,
         attn_sinks,
         attn_sinks_host,
-        no_rope: crate::inference::model_facts::no_rope_layer_period(&config.arch)
-            .is_some_and(|period| (raw.layer_idx + 1).is_multiple_of(period)),
+        no_rope: config.learned_positions
+            || crate::inference::model_facts::no_rope_layer_period(&config.arch)
+                .is_some_and(|period| (raw.layer_idx + 1).is_multiple_of(period)),
         attn_norm,
         attn_norm_weight_f32,
         post_attn_norm,
@@ -3052,6 +3043,17 @@ impl GenericHeteroTransformer {
             }
         }
         let embeddings = Embedding::from_stored(emb_qt)?;
+        // The learned table of absolute positions, F32 on the host.
+        let position_embd = match config.learned_positions {
+            true => Some(
+                source
+                    .read("position_embd.weight", &Device::Cpu)?
+                    // CONVERSION: the table is added to the F32 residual stream.
+                    .dequantize(&Device::Cpu)?
+                    .to_dtype(DType::F32)?,
+            ),
+            false => None,
+        };
         info!(
             "✅ Loaded embeddings: vocab={}, dim={} ({} MB stored, decoded per lookup on {:?})",
             config.vocab_size,
@@ -3614,6 +3616,14 @@ impl GenericHeteroTransformer {
                     config.ffn_norm_stem
                 ))?)
             };
+            // A feed-forward norm read under the stem the file names carries a bias when it is a
+            // full LayerNorm.
+            let ffn_norm_bias_qt = match (&ffn_norm_qt, f.layer_norm_with_bias) {
+                (Some(_), true) if mixer_kind != super::mixer::MixerKind::Absent => {
+                    opt_cpu!(&format!("{prefix}.{}.bias", config.ffn_norm_stem))?
+                }
+                _ => None,
+            };
             let post_ffn_norm_qt = if f.has_post_ffn_norm {
                 opt_cpu!(&format!("{prefix}.post_ffw_norm.weight"))?
             } else {
@@ -3825,6 +3835,7 @@ impl GenericHeteroTransformer {
                 attn_norm_bias_qt,
                 post_attn_norm_qt,
                 ffn_norm_qt,
+                ffn_norm_bias_qt,
                 post_ffn_norm_qt,
                 ffn_gate,
                 ffn_up,
@@ -4366,6 +4377,7 @@ impl GenericHeteroTransformer {
             adapters: Vec::new(),
             config,
             embeddings,
+            position_embd,
             embed_cards,
             layers,
             first_layer: share_start,
@@ -4808,6 +4820,7 @@ impl GenericHeteroTransformer {
             adapters: Vec::new(),
             config,
             embeddings,
+            position_embd: None,
             embed_cards: Vec::new(),
             layers,
             first_layer: 0,
@@ -4918,6 +4931,34 @@ mod host_spill_admission_tests {
 #[cfg(test)]
 mod split_tests {
     use super::*;
+
+    /// A float projection rebuilt for the block kernels keeps its weights to within a percent,
+    /// whatever its rows' width.
+    #[test]
+    fn a_float_projection_is_rebuilt_to_within_a_percent() {
+        let (rows, cols) = (16usize, 512usize);
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| 0.05 * (i as f32 * 0.731).sin())
+            .collect();
+        let w = Tensor::from_vec(data.clone(), (rows, cols), &Device::Cpu).unwrap();
+        let qt = QTensor::quantize_onto(&w, crate::tensor::quantized::GgmlDType::F32, &Device::Cpu)
+            .unwrap();
+        let back = requant_float_weight(qt, FLOAT_PROJECTION_FORMAT, &Device::Cpu, "projection")
+            .unwrap()
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let norm = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt();
+        let error = norm(&mut back.iter().zip(&data).map(|(a, b)| a - b));
+        let share = error / norm(&mut data.iter().copied());
+        assert!(
+            share < 0.01,
+            "the rebuilt weights are {share} of their norm away"
+        );
+    }
 
     #[test]
     fn a_q_projection_splits_into_q_and_gate_per_head() {

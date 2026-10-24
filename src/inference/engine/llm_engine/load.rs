@@ -212,6 +212,40 @@ impl GenericWeights<'_> {
     }
 }
 
+/// The vocabulary keys of a GGUF file's SentencePiece tokenizer, read from a serialised
+/// `tokenizer.model`: the pieces in id order, their scores and types, and the leading space.
+pub(crate) fn spm_vocabulary(model: &[u8]) -> Vec<(String, gguf_file::Value)> {
+    use gguf_file::Value;
+    let spm = crate::inference::token::sentencepiece::model_pieces(model);
+    let column =
+        |f: &dyn Fn(&(String, f32, i32)) -> Value| Value::Array(spm.pieces.iter().map(f).collect());
+    let mut keys = vec![
+        (
+            "tokenizer.ggml.model".to_string(),
+            Value::String("llama".into()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            column(&|p| Value::String(p.0.clone())),
+        ),
+        (
+            "tokenizer.ggml.scores".to_string(),
+            column(&|p| Value::F32(p.1)),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            column(&|p| Value::I32(p.2)),
+        ),
+    ];
+    if let Some(prefix) = spm.add_dummy_prefix {
+        keys.push((
+            "tokenizer.ggml.add_space_prefix".to_string(),
+            Value::Bool(prefix),
+        ));
+    }
+    keys
+}
+
 /// An AWQ checkpoint described as the header the loading route reads: its config, its
 /// tokenizer, its end-of-sequence ids and its declared context, beside the shards that
 /// carry the layers.
@@ -228,25 +262,36 @@ pub(crate) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<St
     let mut content = awql::synth_gguf_content(&cfg, present);
     let arch = cfg.gguf_arch.clone();
     let meta = &mut content.metadata;
-    // The checkpoint's tokenizer.json, else its tekken.json read into the same form.
+    // The checkpoint's tokenizer.json, else its tekken.json read into the same form, else its
+    // SentencePiece tokenizer.model as the vocabulary keys a GGUF file carries.
     let tokenizer_json = std::path::Path::new(dir).join("tokenizer.json");
     let tekken_json = std::path::Path::new(dir).join(super::tekken::TEKKEN_FILE);
-    let (tokenizer, tekken) = if tokenizer_json.exists() || !tekken_json.exists() {
-        let json = std::fs::read_to_string(&tokenizer_json)
-            .map_err(|e| anyhow!("AWQ tokenizer {}: {e}", tokenizer_json.display()))?;
-        (json, None)
+    let spm_model = std::path::Path::new(dir).join("tokenizer.model");
+    let spm_only = !tokenizer_json.exists() && !tekken_json.exists() && spm_model.exists();
+    let tekken = if spm_only {
+        let bytes = std::fs::read(&spm_model)
+            .map_err(|e| anyhow!("tokenizer {}: {e}", spm_model.display()))?;
+        meta.extend(spm_vocabulary(&bytes));
+        None
     } else {
-        let tekken = super::tekken::Tekken::open(&tekken_json)?;
-        let json = tekken
-            .build()?
-            .to_string(false)
-            .map_err(|e| anyhow!("AWQ tokenizer {}: {e}", tekken_json.display()))?;
-        (json, Some(tekken))
+        let (tokenizer, tekken) = if tokenizer_json.exists() || !tekken_json.exists() {
+            let json = std::fs::read_to_string(&tokenizer_json)
+                .map_err(|e| anyhow!("AWQ tokenizer {}: {e}", tokenizer_json.display()))?;
+            (json, None)
+        } else {
+            let tekken = super::tekken::Tekken::open(&tekken_json)?;
+            let json = tekken
+                .build()?
+                .to_string(false)
+                .map_err(|e| anyhow!("AWQ tokenizer {}: {e}", tekken_json.display()))?;
+            (json, Some(tekken))
+        };
+        meta.insert(
+            super::gguf::EMBEDDED_TOKENIZER_KEY.to_string(),
+            gguf_file::Value::String(tokenizer),
+        );
+        tekken
     };
-    meta.insert(
-        super::gguf::EMBEDDED_TOKENIZER_KEY.to_string(),
-        gguf_file::Value::String(tokenizer),
-    );
     // With no end-of-sequence id declared anywhere, the sampler still honours the
     // tokenizer's own stops.
     let (eos, extra) = awq_eos_tokens(dir)

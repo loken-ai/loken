@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Models: read the vocabulary of a checkpoint from its tokenizer.model.
 - Models: load architectures from the safetensors their publisher ships.
 - Docs: list the architectures the loader reads and the formats of each.
 - API: name the backend of each device in the device list.
@@ -57,6 +58,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Models: rebuild float weights in 8 bits to keep a small model's answers.
 - Serve: read the chat format once when a model loads.
 - Bench: write the records under the loken schema.
 - Bench: find the measurement tool under its new name lokprof.
@@ -88,6 +90,11 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Models: detect a checkpoint whose weights are MXFP4.
+- Chat: keep the prompt of a base model out of chat turns.
+- Models: check draft rows of a model with one query head per key head.
+- Models: read the learned positions of a GPT BigCode checkpoint.
+- Models: apply the feed-forward norm bias of a LayerNorm model.
 - Build: link the image attention kernel in a build for older cards.
 - Models: read the fused QKV bias of a GGUF file.
 - Models: serve a request past the declared window without reloading.

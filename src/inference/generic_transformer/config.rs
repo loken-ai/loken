@@ -383,6 +383,9 @@ pub struct GenericTransformerConfig {
     /// Number of dimensions RoPE applies to (partial RoPE: StableLM uses 16 of 64).
     /// None or 0 = full head_dim.
     pub rope_dim: Option<usize>,
+    /// The file holds a learned table of absolute positions (`position_embd.weight`), added to
+    /// the token embeddings; its heads are not rotated.
+    pub learned_positions: bool,
     /// YaRN rope context-extension scaling (mistral3 devstral-small-2, deepseek).
     /// When Some, the rope tables interpolate inverse-freqs per the YaRN ramp.
     pub yarn: Option<crate::inference::generic_transformer::rope::YarnParams>,
@@ -762,6 +765,7 @@ impl GenericTransformerConfig {
             rope_freq_base,
             rope_freq_base_swa,
             rope_dim,
+            learned_positions: content.tensor_infos.contains_key("position_embd.weight"),
             yarn,
             rms_norm_eps,
             sliding_window,

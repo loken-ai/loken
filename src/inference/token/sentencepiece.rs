@@ -39,6 +39,80 @@ fn varint(b: &[u8], i: &mut usize) -> u64 {
     out
 }
 
+/// The pieces of a `tokenizer.model` in id order, and what its normaliser says of a leading
+/// space.
+pub struct ModelPieces {
+    /// Piece text, score and type, the id being the position.
+    pub pieces: Vec<(String, f32, i32)>,
+    /// The normaliser's `add_dummy_prefix`, `None` when the file does not set it.
+    pub add_dummy_prefix: Option<bool>,
+}
+
+/// The field `field` of a protobuf message, each occurrence's payload: the bytes of a
+/// length-delimited field, the little-endian bytes of a fixed one, the varint as eight bytes.
+fn fields(b: &[u8], field: u64) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let tag = varint(b, &mut i);
+        let payload = match tag & 7 {
+            0 => varint(b, &mut i).to_le_bytes().to_vec(),
+            1 if i + 8 <= b.len() => {
+                i += 8;
+                b[i - 8..i].to_vec()
+            }
+            2 => {
+                let len = varint(b, &mut i) as usize;
+                if i + len > b.len() {
+                    break;
+                }
+                i += len;
+                b[i - len..i].to_vec()
+            }
+            5 if i + 4 <= b.len() => {
+                i += 4;
+                b[i - 4..i].to_vec()
+            }
+            _ => break,
+        };
+        if tag >> 3 == field {
+            out.push(payload);
+        }
+    }
+    out
+}
+
+/// Reads a serialised `ModelProto`: field 1 the repeated pieces (text 1, score 2, type 3),
+/// field 3 the normaliser spec (`add_dummy_prefix` 3).
+pub fn model_pieces(b: &[u8]) -> ModelPieces {
+    let pieces = fields(b, 1)
+        .iter()
+        .map(|sub| {
+            let text = fields(sub, 1)
+                .pop()
+                .map(|t| String::from_utf8_lossy(&t).into_owned())
+                .unwrap_or_default();
+            let score = fields(sub, 2)
+                .pop()
+                .and_then(|f| Some(f32::from_le_bytes(f.get(..4)?.try_into().ok()?)))
+                .unwrap_or(0.0);
+            let ptype = fields(sub, 3)
+                .pop()
+                .and_then(|v| Some(u64::from_le_bytes(v.try_into().ok()?) as i32))
+                .unwrap_or(TYPE_NORMAL);
+            (text, score, ptype)
+        })
+        .collect();
+    let add_dummy_prefix = fields(b, 3)
+        .pop()
+        .and_then(|spec| fields(&spec, 3).pop())
+        .and_then(|v| Some(u64::from_le_bytes(v.try_into().ok()?) != 0));
+    ModelPieces {
+        pieces,
+        add_dummy_prefix,
+    }
+}
+
 impl SentencePiece {
     pub fn from_file(path: &str) -> std::io::Result<Self> {
         let b = std::fs::read(path)?;
@@ -46,63 +120,15 @@ impl SentencePiece {
         let mut byte_base: Option<u32> = None;
         let mut max_len = 1usize;
         let mut min_score = 0f32;
-        let mut id = 0u32;
-        let mut i = 0usize;
-        // Top-level ModelProto: field 1 (`pieces`) is a repeated length-delimited message.
-        while i < b.len() {
-            let tag = varint(&b, &mut i);
-            let (field, wire) = ((tag >> 3) as u32, (tag & 7) as u32);
-            match wire {
-                2 => {
-                    let len = varint(&b, &mut i) as usize;
-                    let sub = &b[i..i + len];
-                    i += len;
-                    if field == 1 {
-                        // SentencePiece sub-message: f1 piece (string), f2 score (float), f3 type.
-                        let (mut j, mut piece, mut score, mut ptype) =
-                            (0usize, String::new(), 0f32, TYPE_NORMAL);
-                        while j < sub.len() {
-                            let t2 = varint(sub, &mut j);
-                            match (t2 >> 3, t2 & 7) {
-                                (1, 2) => {
-                                    let l = varint(sub, &mut j) as usize;
-                                    piece = String::from_utf8_lossy(&sub[j..j + l]).into_owned();
-                                    j += l;
-                                }
-                                (2, 5) => {
-                                    score = f32::from_le_bytes(sub[j..j + 4].try_into().unwrap());
-                                    j += 4;
-                                }
-                                (3, 0) => ptype = varint(sub, &mut j) as i32,
-                                (_, 0) => {
-                                    varint(sub, &mut j);
-                                }
-                                (_, 2) => {
-                                    let l = varint(sub, &mut j) as usize;
-                                    j += l;
-                                }
-                                (_, 5) => j += 4,
-                                (_, 1) => j += 8,
-                                _ => break,
-                            }
-                        }
-                        if ptype == TYPE_BYTE && byte_base.is_none() && piece == "<0x00>" {
-                            byte_base = Some(id);
-                        }
-                        if ptype == TYPE_NORMAL || ptype == TYPE_USER_DEFINED {
-                            max_len = max_len.max(piece.chars().count());
-                            min_score = min_score.min(score);
-                            map.insert(piece, (id, score));
-                        }
-                        id += 1;
-                    }
-                }
-                0 => {
-                    varint(&b, &mut i);
-                }
-                5 => i += 4,
-                1 => i += 8,
-                _ => break,
+        for (id, (piece, score, ptype)) in model_pieces(&b).pieces.into_iter().enumerate() {
+            let id = id as u32;
+            if ptype == TYPE_BYTE && byte_base.is_none() && piece == "<0x00>" {
+                byte_base = Some(id);
+            }
+            if ptype == TYPE_NORMAL || ptype == TYPE_USER_DEFINED {
+                max_len = max_len.max(piece.chars().count());
+                min_score = min_score.min(score);
+                map.insert(piece, (id, score));
             }
         }
         Ok(Self {

@@ -1486,11 +1486,10 @@ impl Q8KvCache {
             || q.elem_count() != rows * n_q_heads * self.head_dim
             || self.n_kv_heads == 0
             || !n_q_heads.is_multiple_of(self.n_kv_heads)
-            || n_q_heads == self.n_kv_heads
             || capture_active_on(&self.cuda_device.cuda_stream())
         {
             return Err(anyhow!(
-                "Q8KvCache::attn_flash_splitk_decode_rows: {rows} GQA rows of {:?} over {len} keys",
+                "Q8KvCache::attn_flash_splitk_decode_rows: {rows} rows of {:?} over {len} keys",
                 q.dims()
             ));
         }
@@ -2000,5 +1999,69 @@ mod dev_pos_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+
+    fn values(n: usize, seed: f32) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 * 0.37 + seed).sin()).collect()
+    }
+
+    /// The rows of a verify over a cache with one query head per key-value head attend as the
+    /// decode step of the last row does.
+    #[test]
+    fn rows_of_one_query_head_per_kv_head_match_the_decode_step() {
+        let Ok(device) = Device::new_cuda(0) else {
+            eprintln!("no card: the rows run on a card only");
+            return;
+        };
+        let (n_kv, hd, before, rows) = (4usize, 128usize, 5usize, 3usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut cache = Q8KvCache::new(64, n_kv, hd, &device).unwrap();
+        let held = |seed| {
+            Tensor::from_vec(
+                values(n_kv * before * hd, seed),
+                (1, n_kv, before, hd),
+                &device,
+            )
+        };
+        cache
+            .append(&held(0.1).unwrap(), &held(0.2).unwrap())
+            .unwrap();
+        let packed =
+            |seed| Tensor::from_vec(values(rows * n_kv * hd, seed), (rows * n_kv, hd), &device);
+        cache
+            .append_rows(&packed(0.3).unwrap(), &packed(0.4).unwrap(), rows)
+            .unwrap();
+        let q = values(rows * n_kv * hd, 0.5);
+        let q_rows = Tensor::from_vec(q.clone(), (rows * n_kv, hd), &device).unwrap();
+        let y = cache
+            .attn_flash_splitk_decode_rows(&q_rows, rows, scale)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        cache.update_graph_state(before + rows - 1).unwrap();
+        let last = Tensor::from_vec(
+            q[(rows - 1) * n_kv * hd..].to_vec(),
+            (1, n_kv, 1, hd),
+            &device,
+        );
+        let step = cache
+            .attn_flash_splitk_decode_graph(&last.unwrap(), scale)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let worst = y[(rows - 1) * n_kv * hd..]
+            .iter()
+            .zip(&step)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(worst < 1e-4, "the last row is {worst} from its decode step");
     }
 }
