@@ -1130,6 +1130,30 @@ fn tp_share_config(
     share
 }
 
+/// The block format float projections are rebuilt in. Eight bits keep a small model's answers;
+/// four bits halve what a large one takes. The plan decides: a stack kept on one kind of memory
+/// holds the checkpoint as it is, so eight bits fit; a stack split between cards and the host
+/// had to spill, so it takes four. A stack on the host alone is checked against `spare`, the
+/// memory the host can give. The rule reads the plan and the file, never the backend.
+fn float_projection_format(
+    plan: &HeteroPlan,
+    stored: u64,
+    spare: u64,
+) -> crate::tensor::quantized::GgmlDType {
+    use crate::tensor::quantized::GgmlDType;
+    let on_host = |s: &crate::inference::place::layer_executor::HeteroSegment| {
+        matches!(s.kind, DeviceKind::Cpu)
+    };
+    let hosted = plan.segments.iter().any(on_host);
+    let carded = plan.segments.iter().any(|s| !on_host(s));
+    match (hosted, carded) {
+        (true, true) => GgmlDType::Q4K,
+        (false, true) => GgmlDType::Q8_0,
+        _ if stored <= spare => GgmlDType::Q8_0,
+        _ => GgmlDType::Q4K,
+    }
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -1161,9 +1185,9 @@ fn build_generic_layer(
     let build_norm_opt =
         |qt: Option<QTensor>| -> Result<Option<RmsNorm>> { qt.map(build_norm).transpose() };
 
-    // The block format float projections are requantised to: Q4K, unless a float weight's
-    // rows are not whole Q4K blocks, in which case the layer's float weights all take Q8_0
-    // so the byte-concat fusions below still see one format.
+    // The block format float projections are requantised to: the model's choice, unless a float
+    // weight's rows are not whole blocks of it, in which case the layer's float weights all take
+    // Q8_0 so the byte-concat fusions below still see one format.
     let requant_dtype = {
         use crate::tensor::quantized::GgmlDType;
         let is_float = |qt: &QTensor| {
@@ -1189,10 +1213,10 @@ fn build_generic_layer(
             qt.shape()
                 .dims()
                 .last()
-                .is_some_and(|k| k.is_multiple_of(GgmlDType::Q4K.block_size()))
+                .is_some_and(|k| k.is_multiple_of(flags.float_format.block_size()))
         });
         if whole_q4k_rows {
-            GgmlDType::Q4K
+            flags.float_format
         } else {
             GgmlDType::Q8_0
         }
@@ -3025,6 +3049,15 @@ impl GenericHeteroTransformer {
         if let Some(n) = max_kv_seq_len {
             cfg.max_q8_seq_len = n;
         }
+        cfg.flags.float_format = float_projection_format(
+            plan,
+            content
+                .tensor_infos
+                .values()
+                .map(|info| info.size_in_bytes() as u64)
+                .sum(),
+            crate::inference::place::layer_executor::host_spill_budget_bytes(),
+        );
         let config = Arc::new(cfg);
         let flags = Arc::new(config.flags.clone());
         let n_layers = config.n_layers;
@@ -4961,6 +4994,36 @@ mod host_spill_admission_tests {
 #[cfg(test)]
 mod split_tests {
     use super::*;
+
+    /// Float projections are rebuilt in eight bits where the stack stays on one kind of memory
+    /// and the checkpoint fits it, and in four bits where the stack spills.
+    #[test]
+    fn float_projections_take_eight_bits_where_the_checkpoint_fits() {
+        use crate::inference::place::layer_executor::HeteroSegment;
+        use crate::tensor::quantized::GgmlDType;
+        let seg = |kind, start, end| HeteroSegment {
+            kind,
+            layer_start: start,
+            layer_end: end,
+            free_memory_bytes: 0,
+        };
+        let plan = |segments| HeteroPlan {
+            segments,
+            tp_cards: None,
+            total_layers: 4,
+            host_experts_from: None,
+        };
+        let cards = plan(vec![seg(DeviceKind::Cuda(0), 0, 4)]);
+        let split = plan(vec![
+            seg(DeviceKind::Cuda(0), 0, 2),
+            seg(DeviceKind::Cpu, 2, 4),
+        ]);
+        let host = plan(vec![seg(DeviceKind::Cpu, 0, 4)]);
+        assert_eq!(float_projection_format(&cards, 1 << 40, 0), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&split, 1, 1 << 40), GgmlDType::Q4K);
+        assert_eq!(float_projection_format(&host, 100, 200), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&host, 300, 200), GgmlDType::Q4K);
+    }
 
     #[test]
     fn a_q_projection_splits_into_q_and_gate_per_head() {

@@ -72,6 +72,9 @@ impl WeightedNorm {
 /// Per-model architectural variant flags, detected at load time from GGUF.
 #[derive(Debug, Clone)]
 pub struct GenericLayerFlags {
+    /// The block format a float projection is rebuilt in: eight bits where the checkpoint fits
+    /// the memory the plan gives it as it is, four bits where it has to spill.
+    pub float_format: crate::tensor::quantized::GgmlDType,
     /// Qwen2: `blk.0.attn_q.bias` exists
     pub has_qkv_bias: bool,
     /// Gemma3: `blk.0.attn_q_norm.weight` exists
@@ -162,6 +165,7 @@ impl GenericLayerFlags {
         let ffn_norm = ffn_norm_stem(content);
         let facts = crate::inference::model_facts::facts_or_default(arch);
         Self {
+            float_format: crate::tensor::quantized::GgmlDType::Q4K,
             has_qkv_bias: has_attn("attn_q.bias") || has_attn("attn_qkv.bias"),
             has_qk_norm: has_attn("attn_q_norm.weight"),
             // A file whose feed-forward norm carries this name has no post-attention norm.

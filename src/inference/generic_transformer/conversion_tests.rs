@@ -24,19 +24,19 @@ const DECLARED: &[(&str, &str, &str, &str)] = &[
     (
         "projection",
         "f32",
-        "q4_K",
+        "q8_0",
         "float projection rebuilt as a block format for the block-quant kernels and fused projections",
     ),
     (
         "projection",
         "f16",
-        "q4_K",
+        "q8_0",
         "float projection rebuilt as a block format for the block-quant kernels and fused projections",
     ),
     (
         "projection",
         "bf16",
-        "q4_K",
+        "q8_0",
         "float projection rebuilt as a block format for the block-quant kernels and fused projections",
     ),
 ];
