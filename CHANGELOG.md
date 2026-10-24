@@ -58,6 +58,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Models: keep the feed-forward output in 6 bits when float weights take 4.
 - Models: rebuild float weights in 8 bits when the checkpoint fits its memory.
 - Serve: read the chat format once when a model loads.
 - Bench: write the records under the loken schema.

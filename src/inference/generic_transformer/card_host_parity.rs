@@ -1243,3 +1243,81 @@ fn a_graph_step_decodes_like_the_plain_step() {
         token = arg(&want) as u32;
     }
 }
+
+/// The words a checkpoint folder (`LOKEN_PARITY_DIR`) gives for the prompt `The capital of France
+/// is` when the whole stack sits on the card, and when half of it spills to the host, which
+/// rebuilds the float weights in four bits instead of eight. Prints the token ids of each
+/// answer: a tokenizer outside the test turns them back into words.
+#[test]
+#[ignore = "needs a checkpoint folder and a CUDA card"]
+fn a_checkpoint_answers_in_each_precision() {
+    let dir = parity_dir();
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("no CUDA device");
+        return;
+    };
+    let cards: HashMap<usize, Device> = [(0usize, card)].into_iter().collect();
+    let (header, shards) =
+        crate::inference::engine::llm_engine::awq_checkpoint(&dir).expect("a checkpoint folder");
+    let arch = header.metadata["general.architecture"]
+        .to_string()
+        .unwrap()
+        .clone();
+    let n_layers = GenericTransformerConfig::from_gguf(&header, &arch)
+        .unwrap()
+        .n_layers;
+    let prompt: Vec<u32> = vec![700, 9689, 315, 10298, 357];
+    for (label, on_card) in [
+        ("all on the card (8 bits)", n_layers),
+        ("half on the host (4 bits)", n_layers / 2),
+    ] {
+        let plan = HeteroPlan::forced_gpu(n_layers, on_card, 0);
+        let mut m = crate::inference::engine::llm_engine::GenericWeights::Awq {
+            dir: &dir,
+            shards: &shards,
+        }
+        .build(
+            &cards,
+            &plan,
+            crate::inference::engine::llm_engine::KvQuant::Q8,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut input = Tensor::new(prompt.as_slice(), &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let (mut pos, mut ids) = (0, Vec::new());
+        for _ in 0..24 {
+            let n = input.dims()[1];
+            let l = m
+                .forward(&input, pos)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            pos += n;
+            let t = l
+                .iter()
+                .enumerate()
+                .fold(
+                    (0usize, f32::MIN),
+                    |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+                )
+                .0 as u32;
+            ids.push(t);
+            input = Tensor::new(&[t], &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+        }
+        println!("IDS {label}: {ids:?}");
+    }
+}

@@ -1154,6 +1154,19 @@ fn float_projection_format(
     }
 }
 
+/// The block format the feed-forward's output projection takes when float weights are rebuilt
+/// in `base`. In four bits it stays in six, as the K-quant mixes of llama.cpp do: its error
+/// reaches the residual stream directly, and no other weight is fused with it.
+fn ffn_down_format(
+    base: crate::tensor::quantized::GgmlDType,
+) -> crate::tensor::quantized::GgmlDType {
+    use crate::tensor::quantized::GgmlDType;
+    match base {
+        GgmlDType::Q4K => GgmlDType::Q6K,
+        other => other,
+    }
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -1228,7 +1241,9 @@ fn build_generic_layer(
     // on a path that our fast `mul_mat_vec_q*_K_q8_1` kernel dominates.
     // Requantize them to Q6_K at load time so every per-layer matmul
     // takes the fast path.
-    let to_qmatmul = |qt: Option<QTensor>| -> Result<Option<QMatMul>> {
+    let to_qmatmul_as = |qt: Option<QTensor>,
+                         requant_dtype: crate::tensor::quantized::GgmlDType|
+     -> Result<Option<QMatMul>> {
         let Some(qt) = qt else {
             return Ok(None);
         };
@@ -1252,6 +1267,7 @@ fn build_generic_layer(
             Ok(Some(QMatMul::from_qtensor(qt)?))
         }
     };
+    let to_qmatmul = |qt: Option<QTensor>| to_qmatmul_as(qt, requant_dtype);
     // QKV fusion: if Q, K, V all exist with the same quantization type
     // (after requant), concatenate raw bytes into [q_out+k_out+v_out, hidden].
     // Saves 2 matmul launches + 2 q8_1 quantize launches per layer.
@@ -1534,7 +1550,7 @@ fn build_generic_layer(
     };
     let ffn_gate = ffn_gate_final;
     let ffn_up = ffn_up_final;
-    let ffn_down = to_qmatmul(Some(raw.ffn_down))?.unwrap();
+    let ffn_down = to_qmatmul_as(Some(raw.ffn_down), ffn_down_format(requant_dtype))?.unwrap();
 
     // Build attn_norm - LayerNorm-with-bias for phi2/gpt-neox, RmsNorm
     // for everyone else. Detected via `attn_norm_bias_qt` presence.
@@ -4994,6 +5010,14 @@ mod host_spill_admission_tests {
 #[cfg(test)]
 mod split_tests {
     use super::*;
+
+    /// Four-bit float weights keep the feed-forward's output projection in six bits.
+    #[test]
+    fn the_output_projection_of_the_feed_forward_keeps_six_bits_in_a_four_bit_stack() {
+        use crate::tensor::quantized::GgmlDType;
+        assert_eq!(ffn_down_format(GgmlDType::Q4K), GgmlDType::Q6K);
+        assert_eq!(ffn_down_format(GgmlDType::Q8_0), GgmlDType::Q8_0);
+    }
 
     /// Float projections are rebuilt in eight bits where the stack stays on one kind of memory
     /// and the checkpoint fits it, and in four bits where the stack spills.
