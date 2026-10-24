@@ -16,7 +16,7 @@ const ENV_READS: &[(&str, usize)] = &[
     ("inference/engine/audio_engine.rs", 1),
     ("inference/engine/llm_engine/gguf.rs", 2),
     ("inference/engine/tts_engine.rs", 1),
-    ("inference/generic_transformer/card_host_parity.rs", 7),
+    ("inference/generic_transformer/card_host_parity.rs", 8),
     ("inference/generic_transformer/verify_decode_parity.rs", 3),
     ("inference/load/huggingface_manager.rs", 1),
     ("inference/model/boogu/dit.rs", 2),

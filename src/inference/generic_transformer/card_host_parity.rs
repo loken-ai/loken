@@ -25,6 +25,11 @@ fn model_blob(tag: &str) -> std::path::PathBuf {
     store.join("blobs").join(digest)
 }
 
+/// The checkpoint folder the folder-based parity tests read.
+fn parity_dir() -> String {
+    std::env::var("LOKEN_PARITY_DIR").expect("LOKEN_PARITY_DIR names the checkpoint folder")
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -922,8 +927,7 @@ fn qwen3next_generic_route_matches_the_reference() {
 #[test]
 #[ignore = "needs a checkpoint folder and a CUDA card"]
 fn a_checkpoint_decodes_alike_on_the_card_and_the_host() {
-    let dir =
-        std::env::var("LOKEN_PARITY_DIR").expect("LOKEN_PARITY_DIR names the checkpoint folder");
+    let dir = parity_dir();
     let Ok(card) = Device::new_cuda(0) else {
         eprintln!("no CUDA device");
         return;
@@ -1007,8 +1011,7 @@ fn a_checkpoint_decodes_alike_on_the_card_and_the_host() {
 #[test]
 #[ignore = "needs a checkpoint folder and a CUDA card"]
 fn a_graph_step_decodes_like_the_plain_step() {
-    let dir =
-        std::env::var("LOKEN_PARITY_DIR").expect("LOKEN_PARITY_DIR names the checkpoint folder");
+    let dir = parity_dir();
     let Ok(card) = Device::new_cuda(0) else {
         eprintln!("no CUDA device");
         return;
