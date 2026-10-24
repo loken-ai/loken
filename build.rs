@@ -576,6 +576,13 @@ fn compile_flashdecode_tc_kernels() {
         .into_iter()
         .filter(|g| g.contains("90a") || g.contains("120a"))
         .collect();
+    // A development build for cards below that line still has to link the kernel: it carries
+    // the PTX of the newest architecture, which no card of the build loads.
+    let dit_gencodes = if dit_gencodes.is_empty() {
+        vec!["-gencode=arch=compute_120a,code=compute_120a".to_string()]
+    } else {
+        dit_gencodes
+    };
     let srcs = [
         (
             "cuda/flashdecode_tc/flashdecode_tc.cu",

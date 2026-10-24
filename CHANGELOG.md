@@ -88,6 +88,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Build: link the image attention kernel in a build for older cards.
 - Models: read the fused QKV bias of a GGUF file.
 - Models: serve a request past the declared window without reloading.
 - Image: run the Z-Image blocks on OpenCL and read the result back.
