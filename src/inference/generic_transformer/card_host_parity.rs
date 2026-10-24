@@ -915,3 +915,264 @@ fn qwen3next_generic_route_matches_the_reference() {
         "qwen3next_latest_greedy.json",
     );
 }
+
+/// A checkpoint folder of safetensors (`LOKEN_PARITY_DIR`), loaded as the server loads it: a short
+/// prompt, then decoded tokens, on the card and on the host from the same inputs. The first step at
+/// which the card parts from the host names the stage the card computes differently.
+#[test]
+#[ignore = "needs a checkpoint folder and a CUDA card"]
+fn a_checkpoint_decodes_alike_on_the_card_and_the_host() {
+    let dir =
+        std::env::var("LOKEN_PARITY_DIR").expect("LOKEN_PARITY_DIR names the checkpoint folder");
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("no CUDA device");
+        return;
+    };
+    let cards: HashMap<usize, Device> = [(0usize, card)].into_iter().collect();
+    let (header, shards) =
+        crate::inference::engine::llm_engine::awq_checkpoint(&dir).expect("a checkpoint folder");
+    let arch = header.metadata["general.architecture"]
+        .to_string()
+        .unwrap()
+        .clone();
+    let n_layers = GenericTransformerConfig::from_gguf(&header, &arch)
+        .unwrap()
+        .n_layers;
+    let prompt: Vec<u32> = vec![5, 17, 300, 42, 99];
+    for kv in [
+        crate::inference::engine::llm_engine::KvQuant::Off,
+        crate::inference::engine::llm_engine::KvQuant::Q8,
+    ] {
+        let run = |on_card: usize| -> Vec<(u32, Vec<f32>)> {
+            let plan = HeteroPlan::forced_gpu(n_layers, on_card, 0);
+            let mut m = crate::inference::engine::llm_engine::GenericWeights::Awq {
+                dir: &dir,
+                shards: &shards,
+            }
+            .build(&cards, &plan, kv, None, false, false)
+            .unwrap();
+            let mut out = Vec::new();
+            let mut input = Tensor::new(prompt.as_slice(), &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            let mut pos = 0;
+            for _ in 0..12 {
+                let n = input.dims()[1];
+                let logits = m.forward(&input, pos).unwrap();
+                pos += n;
+                let l = logits
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let t = l
+                    .iter()
+                    .enumerate()
+                    .fold(
+                        (0usize, f32::MIN),
+                        |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+                    )
+                    .0 as u32;
+                out.push((t, l));
+                input = Tensor::new(&[t], &Device::Cpu)
+                    .unwrap()
+                    .unsqueeze(0)
+                    .unwrap();
+            }
+            out
+        };
+        let host = run(0);
+        let on_card = run(n_layers);
+        println!("{kv:?}: {n_layers} layers on the card");
+        for (i, ((ht, hl), (ct, cl))) in host.iter().zip(&on_card).enumerate() {
+            println!(
+                "step {i:>2}: host {ht:>6} card {ct:>6}  logits cosine {:.6}",
+                cosine(hl, cl)
+            );
+            if ht != ct {
+                break;
+            }
+        }
+    }
+}
+
+/// The decode step the graph records, run eagerly (the per-step buffers filled, no capture),
+/// against the plain decode of the same token on the same card: the first token at which they
+/// part names whether the graph's state or its kernels are wrong.
+#[test]
+#[ignore = "needs a checkpoint folder and a CUDA card"]
+fn a_graph_step_decodes_like_the_plain_step() {
+    let dir =
+        std::env::var("LOKEN_PARITY_DIR").expect("LOKEN_PARITY_DIR names the checkpoint folder");
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("no CUDA device");
+        return;
+    };
+    let cards: HashMap<usize, Device> = [(0usize, card.clone())].into_iter().collect();
+    let (header, shards) =
+        crate::inference::engine::llm_engine::awq_checkpoint(&dir).expect("a checkpoint folder");
+    let arch = header.metadata["general.architecture"]
+        .to_string()
+        .unwrap()
+        .clone();
+    let n_layers = GenericTransformerConfig::from_gguf(&header, &arch)
+        .unwrap()
+        .n_layers;
+    let kv = crate::inference::engine::llm_engine::KvQuant::Q8;
+    let build = || {
+        crate::inference::engine::llm_engine::GenericWeights::Awq {
+            dir: &dir,
+            shards: &shards,
+        }
+        .build(
+            &cards,
+            &HeteroPlan::forced_gpu(n_layers, n_layers, 0),
+            kv,
+            None,
+            false,
+            false,
+        )
+        .unwrap()
+    };
+    let (mut plain, mut stepped) = (build(), build());
+    let prompt: Vec<u32> = vec![5, 17, 300, 42, 99];
+    let input = Tensor::new(prompt.as_slice(), &Device::Cpu)
+        .unwrap()
+        .unsqueeze(0)
+        .unwrap();
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let first = flat(&plain.forward(&input, 0).unwrap());
+    let _ = stepped.forward(&input, 0).unwrap();
+    let mut token = first
+        .iter()
+        .enumerate()
+        .fold(
+            (0usize, f32::MIN),
+            |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+        )
+        .0 as u32;
+    stepped.ensure_graph_workspaces();
+    println!(
+        "graph capture decision: {:?}",
+        stepped.graph_capture_decision()
+    );
+    // Layer 0 alone, by three routes, each on a model of its own so the caches start alike.
+    {
+        let pos = prompt.len();
+        let tok = Tensor::new(&[token], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        for route in ["plain", "forward in the step", "forward_graph"] {
+            let mut m = build();
+            let _ = m.forward(&input, 0).unwrap();
+            m.ensure_graph_workspaces();
+            m.update_graph_state(pos).unwrap();
+            m.embed_for_graph(&tok.to_device(&card).unwrap()).unwrap();
+            let start = m
+                .graph_hidden_buffer
+                .clone()
+                .unwrap()
+                .force_contiguous()
+                .unwrap();
+            let mut reference = build();
+            let _ = reference.forward(&input, 0).unwrap();
+            let want = reference.layers[0]
+                .forward(&start, None, pos, None, None, None, None)
+                .unwrap();
+            let got = match route {
+                "plain" => m.layers[0]
+                    .forward(&start, None, pos, None, None, None, None)
+                    .unwrap(),
+                "forward in the step" => {
+                    let _step = graph::GraphStep::enter();
+                    m.layers[0]
+                        .forward(&start, None, pos, None, None, None, None)
+                        .unwrap()
+                }
+                _ => {
+                    let _step = graph::GraphStep::enter();
+                    m.layers[0].forward_graph(&start).unwrap()
+                }
+            };
+            println!(
+                "layer 0 by {route}: cosine {:.6}",
+                cosine(&flat(&want), &flat(&got))
+            );
+        }
+    }
+    // The layers one by one on the first step: where the graph's layer parts from the plain one.
+    {
+        let pos = prompt.len();
+        let tok = Tensor::new(&[token], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        stepped.update_graph_state(pos).unwrap();
+        stepped
+            .embed_for_graph(&tok.to_device(&card).unwrap())
+            .unwrap();
+        let start = stepped.graph_hidden_buffer.clone().unwrap();
+        let mut plain_h = start.force_contiguous().unwrap();
+        let mut graph_h = start.force_contiguous().unwrap();
+        for li in 0..n_layers {
+            plain_h = plain.layers[li]
+                .forward(&plain_h, None, pos, None, None, None, None)
+                .unwrap();
+            graph_h = {
+                let _step = graph::GraphStep::enter();
+                stepped.layers[li].forward_graph(&graph_h).unwrap()
+            };
+            println!(
+                "layer {li:>2}: cosine {:.6}",
+                cosine(&flat(&plain_h), &flat(&graph_h))
+            );
+        }
+    }
+    for step in 0..6 {
+        let pos = prompt.len() + step;
+        let tok = Tensor::new(&[token], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let want = flat(&plain.forward(&tok, pos).unwrap());
+        stepped.update_graph_state(pos).unwrap();
+        let tok_card = tok.to_device(&card).unwrap();
+        stepped.embed_for_graph(&tok_card).unwrap();
+        let got = {
+            let _step = graph::GraphStep::enter();
+            flat(&stepped.forward_from_hidden().unwrap())
+        };
+        stepped.sync_kv_len_for_graph(pos + 1);
+        let arg = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold(
+                    (0usize, f32::MIN),
+                    |b, (i, &x)| if x > b.1 { (i, x) } else { b },
+                )
+                .0
+        };
+        println!(
+            "step {step}: plain {} graph-step {}  logits cosine {:.6}",
+            arg(&want),
+            arg(&got),
+            cosine(&want, &got)
+        );
+        token = arg(&want) as u32;
+    }
+}

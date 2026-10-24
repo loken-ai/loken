@@ -2063,5 +2063,48 @@ mod rows_tests {
             .zip(&step)
             .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(worst < 1e-4, "the last row is {worst} from its decode step");
+        // The decode step against the attention computed in plain floats.
+        let (hk, hv) = (
+            values(n_kv * before * hd, 0.1),
+            values(n_kv * before * hd, 0.2),
+        );
+        let (pk, pv) = (values(rows * n_kv * hd, 0.3), values(rows * n_kv * hd, 0.4));
+        let mut reference = vec![0f32; n_kv * hd];
+        for h in 0..n_kv {
+            let key = |t: usize, d: usize| {
+                if t < before {
+                    hk[(h * before + t) * hd + d]
+                } else {
+                    pk[((t - before) * n_kv + h) * hd + d]
+                }
+            };
+            let value = |t: usize, d: usize| {
+                if t < before {
+                    hv[(h * before + t) * hd + d]
+                } else {
+                    pv[((t - before) * n_kv + h) * hd + d]
+                }
+            };
+            let qh = &q[(rows - 1) * n_kv * hd + h * hd..(rows - 1) * n_kv * hd + (h + 1) * hd];
+            let scores: Vec<f32> = (0..before + rows)
+                .map(|t| scale * (0..hd).map(|d| qh[d] * key(t, d)).sum::<f32>())
+                .collect();
+            let top = scores.iter().cloned().fold(f32::MIN, f32::max);
+            let weights: Vec<f32> = scores.iter().map(|s| (s - top).exp()).collect();
+            let total: f32 = weights.iter().sum();
+            for d in 0..hd {
+                reference[h * hd + d] = (0..before + rows)
+                    .map(|t| weights[t] / total * value(t, d))
+                    .sum();
+            }
+        }
+        let off = step
+            .iter()
+            .zip(&reference)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            off < 2e-2,
+            "the decode step is {off} from the plain attention"
+        );
     }
 }

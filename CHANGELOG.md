@@ -89,6 +89,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 - Models: keep a model loaded while a request runs on it after its keep-alive ends.
+- Models: skip the fused feed-forward norm of a layer that has no such norm.
 - Models: keep a prompt of several tokens out of the one-row graph buffers.
 - Models: detect a checkpoint whose weights are MXFP4.
 - Chat: keep the prompt of a base model out of chat turns.

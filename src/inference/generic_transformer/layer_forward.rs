@@ -667,7 +667,8 @@ impl GenericTransformerLayer {
         // A post-attention norm, its residual and the feed-forward norm in one launch.
         #[cfg(feature = "gpu")]
         let fused = match (fused, &self.post_attn_norm, &self.ffn_norm) {
-            (None, Some(post), Some(ffn)) => {
+            // A feed-forward without a norm of its own (an identity) has no weight to fuse.
+            (None, Some(post), Some(ffn)) if !matches!(ffn, WeightedNorm::Identity(_)) => {
                 crate::inference::kernel::fused::fused_post_norm_add_norm(
                     &attn_out,
                     post.weight(),
