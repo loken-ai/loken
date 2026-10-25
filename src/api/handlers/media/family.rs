@@ -425,6 +425,7 @@ pub(crate) fn family_runtime_bytes(
                 requested_checkpoint(hf_models_dir, model_name).as_deref(),
                 geom.width,
                 geom.height,
+                geom.frames,
             )
         }
         // The SAME helper the Z-Image loader uses to decide single-card vs split, for

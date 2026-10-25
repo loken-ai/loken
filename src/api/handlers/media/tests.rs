@@ -835,6 +835,7 @@ fn oracle_runtime_bytes(
                 requested_checkpoint(dir, model_name).as_deref(),
                 geom.width,
                 geom.height,
+                geom.frames,
             )
         }
         ImageFamily::ZImage => crate::inference::engine::image_engine::zimage_runtime_demand_for(

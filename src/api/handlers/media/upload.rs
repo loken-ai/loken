@@ -304,7 +304,9 @@ impl ImageFormFields {
         let (default_steps, default_guidance) = (defaults.steps, defaults.guidance);
         // Bound once: the placement reserves for this geometry, and a render that runs out
         // anyway re-plans against the same one.
-        let geom = crate::inference::place::runtime_demand::RequestGeometry::new(width, height);
+        // An edit attends over the noise and the source image's latent: two frames.
+        let geom = crate::inference::place::runtime_demand::RequestGeometry::new(width, height)
+            .with_frames(2);
         if let Err(e) = ensure_image_model_loaded(state, &model_name, geom).await {
             return Err(form_error(http_status_for_load_error(&e), e));
         }

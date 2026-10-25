@@ -124,8 +124,9 @@ pub fn runtime_headroom_bytes(
     local_ckpt: Option<&std::path::Path>,
     width: usize,
     height: usize,
+    frames: usize,
 ) -> u64 {
-    runtime_reserve(&dit_path(hf_models_dir, local_ckpt), width, height)
+    runtime_reserve(&dit_path(hf_models_dir, local_ckpt), width, height, frames)
 }
 
 /// The sigma schedule a checkpoint samples with: diffusers' FlowMatchEuler base
@@ -196,12 +197,18 @@ const VAE_STRIDE: usize = 8;
 /// Caption token budget the reserve accounts for.
 const MAX_TEXT_TOKENS: usize = 1024;
 
+/// Image tokens the DiT attends over for a request of `frames` frames.
+fn image_tokens(width: usize, height: usize, patch: usize, frames: usize) -> u64 {
+    crate::inference::place::runtime_demand::latent_tokens(height, width, VAE_STRIDE, patch) as u64
+        * frames.max(1) as u64
+}
+
 /// Per-device VRAM reserved for ONE generation's runtime scratch, DERIVED from the architecture
 /// and the checkpoint instead of a fixed constant (same structural terms as the Boogu engine):
 /// concurrently-live `[seq, dim]` F32 activation buffers of the dual-stream forward, the tiled
 /// attention scores, the largest GGUF weight's F32 dequant + BF16 GEMM scratch (from the header,
 /// no tensor data read), and the VAE decode's conv buffers on the shared device.
-fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u64 {
+fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize, frames: usize) -> u64 {
     let f32b = 4u64;
     // VAE decode conv buffers on the shared device.
     let vae_tile_px = (64 * 8) as u64;
@@ -215,22 +222,14 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u
         }
     };
     let dim = cfg.dim() as u64;
-    // The resident checkpoint of this engine serves EDITS as well as txt2img, and
-    // an edit runs the DiT over [noise tokens ; clean image latent tokens] - TWICE
-    // the image tokens of a plain generation. Sizing for one frame is what left the
-    // card with ~3 GB and OOM'd every 1024^2 edit mid-denoise.
-    const EDIT_FRAMES: u64 = 2;
+    // An edit runs the DiT over [noise tokens ; clean image latent tokens] - TWICE the image
+    // tokens of a plain generation - so the request says how many frames it attends over, and a
+    // plain generation does not pay for a source image it does not carry.
     // From the REQUESTED geometry, not the resolution the family was trained at.
     // Sizing every request as if it were 1024^2 is wrong in both directions: it
     // over-reserves at 512^2, refusing placements that would have run, and
     // under-reserves above it, admitting a load that then cannot denoise.
-    let img_tokens = crate::inference::place::runtime_demand::latent_tokens(
-        height,
-        width,
-        VAE_STRIDE,
-        cfg.patch_size,
-    ) as u64
-        * EDIT_FRAMES;
+    let img_tokens = image_tokens(width, height, cfg.patch_size, frames);
     let seq = img_tokens + MAX_TEXT_TOKENS as u64;
     let buf = |tokens: u64, width: u64| tokens * width * f32b;
 
@@ -335,7 +334,7 @@ pub fn load(
 
     // Plan the hot DiT first (undivided on the fastest GPU that fits), then the one-shot encoder
     // on what the cards offer with the DiT resident.
-    let gpu_reserve = runtime_reserve(&dit_path, geom.width, geom.height);
+    let gpu_reserve = runtime_reserve(&dit_path, geom.width, geom.height, geom.frames);
     tracing::info!(
         "Qwen-Image runtime reserve for {}x{} (arch-derived): {:.2} GB/GPU",
         geom.width,
@@ -934,6 +933,16 @@ mod tests {
             sigmas(SigmaShift::Dynamic, 8, 1024),
             sigmas(SigmaShift::Dynamic, 8, 4096)
         );
+    }
+
+    /// An edit attends over the noise and the source image's latent, so it reserves twice the
+    /// image tokens of a plain generation at the same size.
+    #[test]
+    fn an_edit_attends_over_twice_the_image_tokens_of_a_generation() {
+        let generation = image_tokens(1024, 1024, 2, 1);
+        assert_eq!(generation, 64 * 64);
+        assert_eq!(image_tokens(1024, 1024, 2, 2), 2 * generation);
+        assert_eq!(image_tokens(1024, 1024, 2, 0), generation);
     }
 
     /// Guidance 1 is the identity, so the second branch must not be run: that is where

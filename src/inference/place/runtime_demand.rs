@@ -244,11 +244,26 @@ pub fn weight_budget_share() -> f64 {
 pub struct RequestGeometry {
     pub width: usize,
     pub height: usize,
+    /// Image frames the denoiser attends over: 1 for a plain generation, 2 for an instruction
+    /// edit, which carries the source image's latent beside the noise.
+    pub frames: usize,
 }
 
 impl RequestGeometry {
     pub fn new(width: usize, height: usize) -> Self {
-        Self { width, height }
+        Self {
+            width,
+            height,
+            frames: 1,
+        }
+    }
+
+    /// The same geometry for a request that attends over `frames` image frames.
+    pub fn with_frames(self, frames: usize) -> Self {
+        Self {
+            frames: frames.max(1),
+            ..self
+        }
     }
 
     /// Tokens this request's latent becomes for a patchifying transformer.

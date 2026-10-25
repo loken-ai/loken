@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- Images: reserve for one frame on a Qwen-Image generation and two on an edit.
+
 ### Removed
 
 - Bench: move the campaign, its method, its reports and its results to the benchmarks repository.
