@@ -153,6 +153,41 @@ impl Demand {
         self.for_one_stream_by(plan, cards, card_bandwidth)
     }
 
+    /// Seconds a decoded token spends reading the weights of `plan`, in units of bytes over
+    /// GB/s, each block on the card that holds it and the head on the card of the last block.
+    /// `None` when a block is on the host or a card's bandwidth is not known.
+    pub fn token_cost(
+        &self,
+        plan: &HeteroPlan,
+        bandwidth: &impl Fn(usize) -> Option<f64>,
+    ) -> Option<f64> {
+        let per_layer = (self.block_bytes / self.layers.max(1) as u64) as f64;
+        let mut total = 0.0;
+        for segment in &plan.segments {
+            match segment.kind {
+                DeviceKind::Cuda(idx) => {
+                    total += segment.num_layers() as f64 * per_layer / bandwidth(idx)?;
+                }
+                _ => return None,
+            }
+        }
+        if let Some(DeviceKind::Cuda(idx)) = plan.segments.last().map(|s| s.kind) {
+            total += self.head_bytes as f64 / bandwidth(idx)?;
+        }
+        Some(total)
+    }
+
+    /// The first rung as a token running through the blocks in turn prefers it, for the
+    /// bandwidths given: [`Self::plan`], rearranged by [`Self::for_one_stream`] where that is
+    /// faster.
+    pub fn plan_for_one_stream_by(
+        &self,
+        cards: &[(usize, u64)],
+        bandwidth: impl Fn(usize) -> Option<f64>,
+    ) -> HeteroPlan {
+        self.for_one_stream_by(self.plan(cards), cards, bandwidth)
+    }
+
     /// [`Self::for_one_stream`] with the cards' bandwidths given.
     fn for_one_stream_by(
         &self,
@@ -328,7 +363,7 @@ impl Demand {
 
 /// A card's memory bandwidth in GB/s, read once: what a decode step of a bandwidth-bound
 /// model is paced by. `None` where the driver does not say.
-fn card_bandwidth(idx: usize) -> Option<f64> {
+pub fn card_bandwidth(idx: usize) -> Option<f64> {
     #[cfg(feature = "gpu")]
     {
         static BW: std::sync::OnceLock<Vec<(usize, f64)>> = std::sync::OnceLock::new();

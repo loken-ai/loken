@@ -112,13 +112,15 @@ fn cards_used(demand: &Demand, cards: &[(usize, u64)]) -> usize {
 }
 
 /// The context a model's cache is sized for: `full`, halved down to `floor` while the first
-/// plan of `demand_at` that context would send blocks to the host, or would spread the model over
-/// more cards than the plan at `floor` needs. A context nobody opens costs nothing, a block on
-/// the host costs every token, and so does a hop between two cards.
+/// plan of `demand_at` that context would send blocks to the host, spread the model over more
+/// cards than the plan at `floor` needs, or leave the weights a token reads on slower cards than
+/// that plan does (by the cards' `bandwidth`, within a few percent). A context nobody opens costs
+/// nothing; a block on the host and a hop between two cards cost every token.
 pub fn context_the_cards_hold(
     full: u64,
     floor: u64,
     cards: &[(usize, u64)],
+    bandwidth: impl Fn(usize) -> Option<f64>,
     demand_at: impl Fn(u64) -> Demand,
 ) -> u64 {
     if cards.is_empty() {
@@ -126,17 +128,29 @@ pub fn context_the_cards_hold(
     }
     let floor = floor.min(full);
     let fewest = cards_used(&demand_at(floor), cards);
+    // Seconds per token (bytes over GB/s) of the plan a token takes at `ctx`.
+    let token = |ctx: u64| -> Option<f64> {
+        let demand = demand_at(ctx);
+        let plan = demand.plan_for_one_stream_by(cards, &bandwidth);
+        demand.token_cost(&plan, &bandwidth)
+    };
+    let best = token(floor);
+    let slower = |ctx: u64| match (best, token(ctx)) {
+        (Some(best), Some(now)) => now > best * 1.03,
+        _ => false,
+    };
     let mut chosen = full;
     while chosen > floor
         && (host_blocks(&demand_at(chosen), cards) > 0
-            || cards_used(&demand_at(chosen), cards) > fewest)
+            || cards_used(&demand_at(chosen), cards) > fewest
+            || slower(chosen))
     {
         chosen = (chosen / 2).max(floor);
     }
     if chosen < full {
         let demand = demand_at(full);
         tracing::info!(
-            "KV context {full} -> {chosen}: at {full}, {} of {} blocks would have gone to the host and the model would have spread over {} cards instead of {fewest}",
+            "KV context {full} -> {chosen}: at {full}, {} of {} blocks would have gone to the host, the model would have spread over {} cards instead of {fewest}, or a token would have read its weights more slowly",
             host_blocks(&demand, cards),
             demand.layers,
             cards_used(&demand, cards)
@@ -211,9 +225,18 @@ mod tests {
             kv_bytes_per_layer: ctx * (GB / 32768),
             ..demand(8, 8)
         };
-        assert_eq!(context_the_cards_hold(32768, 4096, &cards, at), 8192);
-        assert_eq!(context_the_cards_hold(32768, 4096, &[], at), 32768);
-        assert_eq!(context_the_cards_hold(32768, 32768, &cards, at), 32768);
+        assert_eq!(
+            context_the_cards_hold(32768, 4096, &cards, |_| None, at),
+            8192
+        );
+        assert_eq!(
+            context_the_cards_hold(32768, 4096, &[], |_| None, at),
+            32768
+        );
+        assert_eq!(
+            context_the_cards_hold(32768, 32768, &cards, |_| None, at),
+            32768
+        );
     }
 
     /// A model one card holds at a smaller context is not spread over two cards for a context
@@ -227,7 +250,7 @@ mod tests {
         };
         // At 131072 the cache is 32 GB over the 8 blocks: two cards hold it, one does not.
         assert_eq!(cards_used(&at(131072), &cards), 2);
-        let held = context_the_cards_hold(131072, 4096, &cards, at);
+        let held = context_the_cards_hold(131072, 4096, &cards, |_| None, at);
         assert_eq!(cards_used(&at(held), &cards), 1);
         assert!(held >= 4096 && held < 131072);
         // A model that needs two cards at the floor keeps its context.
@@ -235,7 +258,46 @@ mod tests {
             kv_bytes_per_layer: ctx * (GB / 32768),
             ..demand(8, 20)
         };
-        assert_eq!(context_the_cards_hold(8192, 4096, &cards, big), 8192);
+        assert_eq!(
+            context_the_cards_hold(8192, 4096, &cards, |_| None, big),
+            8192
+        );
+    }
+
+    /// Two cards hold the model at any context, but the larger one leaves fewer blocks on the
+    /// faster card: the context gives way until the fast card holds as many as it can.
+    #[test]
+    fn the_context_gives_way_until_the_fast_card_holds_the_most() {
+        let cards = [(0, 16 * GB), (1, 16 * GB)];
+        let bandwidth = |idx: usize| Some(if idx == 0 { 900.0 } else { 450.0 });
+        // 64 blocks of 0.375 GB; the cache of a block is 0.25 GB at 32768 keys.
+        let at = |ctx: u64| Demand {
+            layers: 64,
+            block_bytes: 24 * GB,
+            kv_bytes_per_layer: ctx * (GB / 4) / 32768,
+            runtime_reserve: GB,
+            ..Demand::default()
+        };
+        let on_fast = |ctx: u64| {
+            at(ctx)
+                .plan_for_one_stream_by(&cards, bandwidth)
+                .segments
+                .iter()
+                .filter(|s| s.kind == super::super::layer_executor::DeviceKind::Cuda(0))
+                .map(|s| s.num_layers())
+                .sum::<usize>()
+        };
+        assert!(on_fast(131072) < on_fast(4096));
+        let held = context_the_cards_hold(131072, 4096, &cards, bandwidth, at);
+        assert!(held < 131072);
+        let cost = |ctx: u64| {
+            let d = at(ctx);
+            d.token_cost(&d.plan_for_one_stream_by(&cards, bandwidth), &bandwidth)
+                .unwrap()
+        };
+        assert!(cost(held) <= cost(4096) * 1.03);
+        // Without bandwidths the speeds are unknown: only the host and the card count give way.
+        assert!(context_the_cards_hold(131072, 4096, &cards, |_| None, at) >= held);
     }
 
     #[test]
