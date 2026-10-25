@@ -80,7 +80,7 @@ fn main() {
         compile_imma_kernels();
         compile_mmq_kernels();
         compile_marlin_kernels();
-        compile_flashdecode_tc_kernels();
+        compile_flash_wmma_kernels();
     }
     // The same kernels for AMD cards, through HIP: alone when ROCm is the only runtime, beside
     // the CUDA ones under a prefix of their own when both are.
@@ -224,7 +224,6 @@ fn compile_hip_kernels() {
         .filter(|s| !nvidia_only.contains(s))
         .collect();
     sources.extend([
-        "cuda/flashdecode_tc/flashdecode_tc.cu",
         "cuda/flash_prefill_f16.cu",
         "cuda/flash_prefill_gqa_amd.cu",
         "cuda/flash_dit_amd.cu",
@@ -471,7 +470,7 @@ fn link_cxx_runtime_statically() {
 ///     with compute_80 PTX      4 981 byte PNG, mean 0.00, std 0.00
 ///     SASS only               664 921 byte PNG, mean 127.6, std 63.1
 ///
-/// The note on `compile_flashdecode_tc_kernels` below already said this - "the PTX-only
+/// The note on `compile_flash_wmma_kernels` below already said this - "the PTX-only
 /// compute_80 IMMA build cannot host the 16x16x16 f16 MMA forward-JIT cleanly on
 /// sm_120" - and I honoured it there while adding the same PTX to MMQ and Marlin, which
 /// run the same class of tensor-core kernel.
@@ -549,15 +548,13 @@ fn gencodes_from(floor: u32) -> Vec<String> {
     kept
 }
 
-/// Compile the query-head-packed tensor-core flash-DECODE kernel (cuda/flashdecode_tc/,
-/// see there) into a static lib. Uses nvcuda::wmma m16n8k16 HMMA +
-/// cp.async-class staging, so it needs real per-arch SASS (compute>=90a suffix,
-/// like the Marlin build) - the PTX-only compute_80 IMMA build cannot host the
-/// 16x16x16 f16 MMA forward-JIT cleanly on sm_120. Falls back to a compute_90a
-/// PTX when no GPU is visible at build time. Driven via `extern "C"` from
-/// inference::flash_decode_tc.
+/// Compile the tensor-core flash attention kernels (the F16 KV prefill, the causal GQA prefill and
+/// the BF16 diffusion attention) into a static lib. They use nvcuda::wmma m16n8k16 HMMA, so they
+/// need real per-arch SASS (compute>=90a suffix, like the Marlin build) - the PTX-only compute_80
+/// IMMA build cannot host the 16x16x16 f16 MMA forward-JIT cleanly on sm_120. Falls back to a
+/// compute_90a PTX when no GPU is visible at build time.
 #[cfg(feature = "cuda")]
-fn compile_flashdecode_tc_kernels() {
+fn compile_flash_wmma_kernels() {
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -567,12 +564,11 @@ fn compile_flashdecode_tc_kernels() {
         .unwrap_or_else(|_| "/usr/local/cuda".to_string());
     let nvcc = PathBuf::from(&cuda_path).join("bin").join("nvcc");
     if !nvcc.exists() {
-        panic!("nvcc not found at {nvcc:?}; set CUDA_PATH (needed for flashdecode_tc kernels)");
+        panic!(
+            "nvcc not found at {nvcc:?}; set CUDA_PATH (needed for the flash attention kernels)"
+        );
     }
     let gencodes = portable_gencodes();
-    // Both the tensor-core flash-DECODE (Q8 KV) and the tensor-core flash-PREFILL
-    // (F16 KV) kernels live in this lib - same WMMA HMMA path, same gencode.
-    println!("cargo:rerun-if-changed=cuda/flashdecode_tc");
     println!("cargo:rerun-if-changed=cuda/flash_prefill_f16.cu");
     println!("cargo:rerun-if-changed=cuda/flash_prefill_gqa.cu");
     println!("cargo:rerun-if-changed=cuda/flash_dit_bf16.cu");
@@ -591,11 +587,6 @@ fn compile_flashdecode_tc_kernels() {
         dit_gencodes
     };
     let srcs = [
-        (
-            "cuda/flashdecode_tc/flashdecode_tc.cu",
-            "flashdecode_tc.o",
-            &gencodes,
-        ),
         (
             "cuda/flash_prefill_f16.cu",
             "flash_prefill_f16.o",
@@ -629,7 +620,7 @@ fn compile_flashdecode_tc_kernels() {
         objs.push(obj);
     }
 
-    let lib = out_dir.join("libloken_flashdecode_tc.a");
+    let lib = out_dir.join("libloken_flash_wmma.a");
     // `ar rcs` REPLACES the members it is given and leaves the rest alone, so an object
     // whose source was deleted stays in the archive and keeps linking - which is exactly
     // how a removed kernel produced a duplicate symbol. Start from nothing.
@@ -640,10 +631,10 @@ fn compile_flashdecode_tc_kernels() {
         .args(&ar_args)
         .status()
         .expect("failed to run ar");
-    assert!(ar.success(), "ar failed for libloken_flashdecode_tc.a");
+    assert!(ar.success(), "ar failed for libloken_flash_wmma.a");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=loken_flashdecode_tc");
+    println!("cargo:rustc-link-lib=static=loken_flash_wmma");
 }
 
 /// Compile the Marlin W4A16 tensor-core GEMM kernels (vLLM/IST-DASLab lineage,

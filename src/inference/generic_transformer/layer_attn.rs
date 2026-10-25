@@ -822,22 +822,12 @@ impl GenericTransformerLayer {
 
     /// Whether the decode step of each of `rows` tokens at `index_pos..` on `device` appends to
     /// the Q8 cache and attends through the kernel pair [`Self::attend_rows_q8`] runs for it:
-    /// an eager step over a layer of its own, heads a pair takes, no window, sinks or V norm,
-    /// and short of the tensor-core decode.
+    /// an eager step over a layer of its own, heads a pair takes, and no window, sinks or V norm.
     #[cfg(feature = "gpu")]
     fn rows_take_q8_decode(&self, device: &Device, index_pos: usize, rows: usize) -> bool {
         let n_q_per_kv = self.n_head / self.n_kv_head.max(1);
-        let tc_card = self.head_dim == 128
-            && device
-                .as_cuda_device()
-                .map(|d| d.has_ampere_tensor_cores())
-                .unwrap_or(false);
         let heads_ok = match self.decode_takes_splitk() {
-            true => {
-                (1..=16).contains(&n_q_per_kv)
-                    && !(tc_card
-                        && index_pos + rows >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV)
-            }
+            true => (1..=16).contains(&n_q_per_kv),
             false => {
                 crate::inference::cache::kv_core::kv_shape_supported(self.head_dim, n_q_per_kv)
             }
@@ -2421,54 +2411,20 @@ impl GenericTransformerLayer {
                     crate::tensor::Error::msg(format!("Q8 SWA attn_softmax_output_graph: {e}"))
                 })?
         } else if try_splitk {
-            // Query-head-packed tensor-core flash decode. It needs the fragments
-            // Ampere brought, a head dimension of 128, and enough KV to be worth
-            // the deeper grid. Any Err falls through to split-K, which falls
-            // through to the two-kernel chain, so a card that cannot run it loses
-            // nothing.
-            let tc_card = self.head_dim == 128
-                && q.device()
-                    .as_cuda_device()
-                    .map(|d| d.has_ampere_tensor_cores())
-                    .unwrap_or(false);
-            let try_tc = tc_card
-                && cache.current_seq_len() >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV;
-            if tc_card && !try_tc && crate::tensor::cuda_ext::capture_active(&q.device()) {
-                // Split-K is recorded; from TC_MIN_KV keys an eager step takes the
-                // tensor-core kernel, so the graph replays no further.
-                cache.note_kernel_bound(crate::inference::kernel::flash_decode_tc::TC_MIN_KV - 1);
-            }
-            let tc_out = if try_tc {
-                match cache.attn_flash_tc_decode_graph(q, softmax_scale) {
-                    Ok(y) => Some(y),
-                    Err(e) => {
-                        tracing::warn!("attn_flash_tc_decode_graph fallback to split-K: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(y) = tc_out {
-                y
-            } else {
-                match cache.attn_flash_splitk_decode_graph(q, softmax_scale) {
-                    Ok(y) => y,
-                    Err(e) => {
-                        tracing::warn!(
-                            "attn_flash_splitk_decode_graph fallback to 2-kernel chain: {e}"
-                        );
-                        let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
-                            crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
-                        })?;
-                        cache
-                            .attn_softmax_output_graph(&scores, softmax_scale, 0)
-                            .map_err(|e| {
-                                crate::tensor::Error::msg(format!(
-                                    "Q8 attn_softmax_output_graph: {e}"
-                                ))
-                            })?
-                    }
+            match cache.attn_flash_splitk_decode_graph(q, softmax_scale) {
+                Ok(y) => y,
+                Err(e) => {
+                    tracing::warn!(
+                        "attn_flash_splitk_decode_graph fallback to 2-kernel chain: {e}"
+                    );
+                    let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
+                        crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
+                    })?;
+                    cache
+                        .attn_softmax_output_graph(&scores, softmax_scale, 0)
+                        .map_err(|e| {
+                            crate::tensor::Error::msg(format!("Q8 attn_softmax_output_graph: {e}"))
+                        })?
                 }
             }
         } else if try_fused {

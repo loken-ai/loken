@@ -35,7 +35,6 @@ that fits a card, verification costs about what drafting saves.
 | `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model and verifying in one target pass; the comment states the greedy restriction and what temperature would need. |
 | `src/inference/serve/speculative_config.rs` | Whether drafting is worth it, decided from measured device timings rather than assumed. |
 | `src/inference/serve/spec_kv_cache.rs` | A cache that can drop the rejected tail. |
-| `src/inference/kernel/flash_decode_tc.rs` | The tensor-core decode attention, which packs the verify tokens into the matrix dimension the grouped-query heads already fill. |
 
 How loken picks a drafter, and the attach route, are in [`../guides/drafter.md`](../guides/drafter.md).
 

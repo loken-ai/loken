@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- Decode: attend over a long context with the split-K kernel only.
+
 ### Fixed
 
 - Images: place the Flux VAE on the fastest card that has room for it.
