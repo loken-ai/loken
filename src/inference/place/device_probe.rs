@@ -36,10 +36,9 @@ pub struct CudaGpuInfo {
     pub sm_clock: u32,
     /// CUDA core count (NVML `nvmlDeviceGetNumGpuCores`), 0 if unavailable.
     pub num_cores: u32,
-    /// Compute-throughput proxy used to rank GPUs fastest-first:
-    /// `num_cores x sm_clock`, falling back to `sm_clock` alone when the core
-    /// count is unavailable. Clock alone misranks a high-boost / low-core card
-    /// (e.g. a xx60 whose boost clock exceeds a faster xx70's) as the fastest.
+    /// Compute throughput in GFLOP/s used to rank GPUs fastest-first: the card's
+    /// single-precision matrix product, timed once per process, so cards of different makers
+    /// compare. Falls back to two operations per core per cycle when the card cannot be timed.
     pub perf_score: u64,
     /// Physical capacity (NVML `mem.total`). Unlike the free-VRAM fields this does
     /// not move, so it is the ceiling on what waiting for a gap could ever deliver.
@@ -66,11 +65,49 @@ fn pcie_lane_gbs(generation: u32) -> f64 {
 }
 
 /// Enumerate every visible CUDA GPU via NVML, process-aware, sorted by compute
-/// throughput (CUDA cores x SM clock)
+/// throughput (timed matrix product)
 /// (fastest first). This is the SINGLE source of the stable-free logic; both the
 /// generic LLM engine and ACE-Step consume it. Returns empty (-> CPU placement)
 /// when NVML init fails - never panics.
 ///
+/// Single-precision matrix throughput of device `ordinal` in GFLOP/s, timed once per process on
+/// a matrix product. Cores times clock cannot rank cards of different makers: a core is not
+/// the same unit on every runtime, and the card with the larger count of smaller units came out
+/// as the slower one. `None` when the card has too little free memory to time, or cannot run
+/// the product.
+#[cfg(feature = "gpu")]
+fn measured_gflops(ordinal: usize, free_bytes: u64) -> Option<u64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEASURED: OnceLock<Mutex<HashMap<usize, Option<u64>>>> = OnceLock::new();
+    let table = MEASURED.get_or_init(Default::default);
+    if let Some(known) = table.lock().ok()?.get(&ordinal) {
+        return *known;
+    }
+    // Three square matrices of f32, with the same again for the workspace.
+    const SIDE: usize = 1536;
+    const REPS: u32 = 4;
+    if free_bytes < 6 * (SIDE * SIDE * 4) as u64 + (256 << 20) {
+        return None;
+    }
+    let timed = (|| -> Option<u64> {
+        let device = crate::tensor::Device::new_cuda(ordinal).ok()?;
+        let a =
+            crate::tensor::Tensor::ones((SIDE, SIDE), crate::tensor::DType::F32, &device).ok()?;
+        a.matmul(&a).ok()?;
+        device.synchronize().ok()?;
+        let start = std::time::Instant::now();
+        for _ in 0..REPS {
+            a.matmul(&a).ok()?;
+        }
+        device.synchronize().ok()?;
+        let seconds = start.elapsed().as_secs_f64();
+        (seconds > 0.0).then(|| (2.0 * (SIDE as f64).powi(3) * REPS as f64 / seconds / 1e9) as u64)
+    })();
+    table.lock().ok()?.insert(ordinal, timed);
+    timed
+}
+
 /// Memory bandwidth of one CUDA device in GB/s, from the driver's own attributes
 /// (DDR memory clock x bus width). NVML lacks the bus width on recent cards, the
 /// driver never does. 0.0 when CUDA is absent or the query fails.
@@ -488,13 +525,13 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
                             _ => 0.0,
                         };
                         let num_cores = gpu.num_cores().unwrap_or(0);
-                        // Throughput proxy: cores x clock. Falls back to clock
-                        // alone if the core count is unavailable.
-                        let perf_score = if num_cores > 0 {
-                            num_cores as u64 * sm_clock as u64
-                        } else {
-                            sm_clock as u64
-                        };
+                        // Throughput in GFLOP/s, timed; two floating-point operations per
+                        // core per cycle when the card cannot be timed.
+                        let estimate = 2 * (num_cores.max(1) as u64) * sm_clock as u64 / 1000;
+                        #[cfg(feature = "gpu")]
+                        let perf_score = measured_gflops(i, stable_free).unwrap_or(estimate);
+                        #[cfg(not(feature = "gpu"))]
+                        let perf_score = estimate;
                         info!("✓ GPU {}: {} - {:.1} GB free / {:.1} GB total, stable {:.1} GB, {} cores @ {} MHz (perf {})",
                             i, name,
                             mem.free as f64 / 1e9,
@@ -517,7 +554,7 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
                     }
                 }
             }
-            // Rank by compute throughput (CUDA cores x SM clock), fastest first,
+            // Rank by compute throughput (timed matrix product), fastest first,
             // with the GPU index as a stable tiebreaker. SM clock alone misranks
             // a high-boost but low-core card as fastest.
         }
@@ -564,7 +601,10 @@ fn probe_runtime_gpus() -> Vec<CudaGpuInfo> {
         let (free, total) = (free as u64, total as u64);
         let sm_clock = attr(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE) / 1000;
         let num_cores = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
-        let perf_score = (num_cores.max(1) as u64) * sm_clock as u64;
+        // Throughput in GFLOP/s, timed; a compute unit of 64 lanes at two operations per cycle
+        // when the card cannot be timed.
+        let perf_score = measured_gflops(i, free)
+            .unwrap_or_else(|| 2 * 64 * (num_cores.max(1) as u64) * sm_clock as u64 / 1000);
         let host_link_gbs = pci_host_link_gbs(
             attr(A::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID),
             attr(A::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID),
@@ -826,5 +866,25 @@ mod visible_tests {
                 "ordinal {ordinal} is NVML card {index}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod measured_tests {
+    use super::*;
+
+    /// A card that opens reports a positive, repeatable throughput, and a card too full to time
+    /// reports none.
+    #[test]
+    fn a_card_that_opens_is_timed_once_and_a_full_one_is_not() {
+        let Ok(device) = crate::tensor::Device::new_cuda(0) else {
+            return;
+        };
+        drop(device);
+        let first = measured_gflops(0, 8 << 30).expect("the card runs the product");
+        assert!(first > 0);
+        assert_eq!(measured_gflops(0, 8 << 30), Some(first));
+        assert_eq!(measured_gflops(0, 1 << 20), Some(first));
+        assert_eq!(measured_gflops(usize::MAX, 1 << 20), None);
     }
 }
