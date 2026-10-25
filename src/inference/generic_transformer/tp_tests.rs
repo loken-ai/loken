@@ -167,3 +167,49 @@ fn a_mixture_split_across_two_cards_computes_the_whole_layer() {
     });
     tiny_model::remove(&path);
 }
+
+/// A group of one card sums a block onto itself through the same communicators the split layers
+/// use, so a library that cannot sum is found here and not at a layer.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_group_of_one_card_sums_through_nccl() {
+    use crate::tensor::{DType, Device, Tensor};
+    let Ok(device) = Device::new_cuda(0) else {
+        return;
+    };
+    let Some(group) = super::TpComms::new(std::slice::from_ref(&device)) else {
+        return;
+    };
+    let part = Tensor::ones((4096,), DType::F32, &device).unwrap();
+    let summed = group.all_reduce(&[part]).expect("the group sums");
+    device.synchronize().unwrap();
+    let got = summed[0].to_vec1::<f32>().unwrap();
+    assert!(got.iter().all(|&v| v == 1.0));
+}
+
+/// Two cards sum a block through the communicators the split layers use.
+#[cfg(feature = "gpu")]
+#[test]
+fn two_cards_sum_through_nccl() {
+    use crate::tensor::{DType, Device, Tensor};
+    let (Ok(first), Ok(second)) = (Device::new_cuda(0), Device::new_cuda(1)) else {
+        return;
+    };
+    let devices = [first, second];
+    // The planner measures the link between the two cards before it weighs a sum across them.
+    let _ = crate::inference::place::device_probe::card_pair_link(0, 1);
+    let Some(group) = super::TpComms::new(&devices) else {
+        return;
+    };
+    let parts: Vec<Tensor> = devices
+        .iter()
+        .map(|d| Tensor::ones((4096,), DType::F32, d).unwrap())
+        .collect();
+    let summed = group.all_reduce(&parts).expect("the group sums");
+    for d in &devices {
+        d.synchronize().unwrap();
+    }
+    for s in &summed {
+        assert!(s.to_vec1::<f32>().unwrap().iter().all(|&v| v == 2.0));
+    }
+}

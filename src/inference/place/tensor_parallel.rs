@@ -161,8 +161,16 @@ pub fn split_pays(
 ) -> bool {
     cards.len() > 1
         && [1, prompt_rows].iter().all(|&rows| {
-            split_us(stack, cards, flops, sum, rows)
-                < layered_us(stack, cards, flops, layers_on, rows)
+            let (split, layered) = (
+                split_us(stack, cards, flops, sum, rows),
+                layered_us(stack, cards, flops, layers_on, rows),
+            );
+            tracing::info!(
+                "{rows} row(s) through {} layers: {split:.0} us split over {} cards, {layered:.0} us layer by layer",
+                stack.layers,
+                cards.len()
+            );
+            split < layered
         })
 }
 
@@ -191,6 +199,7 @@ pub fn pays_over(
     let mut shard_cards = Vec::with_capacity(cards.len());
     for &c in cards {
         let Some(&rate) = read.get(&c).filter(|r| **r > 0.0) else {
+            tracing::info!("tensor parallelism not weighed: card {c} has no memory read rate");
             return false;
         };
         let (link_us, link_bytes_per_us) = if c == owner {
@@ -198,7 +207,12 @@ pub fn pays_over(
         } else {
             match super::device_probe::card_pair_link(owner, c) {
                 Some(l) => l,
-                None => return false,
+                None => {
+                    tracing::info!(
+                        "tensor parallelism not weighed: no link measured from card {owner} to {c}"
+                    );
+                    return false;
+                }
             }
         };
         shard_cards.push(ShardCard {
@@ -221,6 +235,7 @@ pub fn pays_over(
         })
         .collect();
     let Some((us, bytes_per_us)) = super::device_probe::group_sum(cards) else {
+        tracing::info!("tensor parallelism not weighed: no sum measured across cards {cards:?}");
         return false;
     };
     let Some(flops) = cards
@@ -228,6 +243,9 @@ pub fn pays_over(
         .map(|&c| super::device_probe::card_matmul_rate(c))
         .collect::<Option<Vec<f64>>>()
     else {
+        tracing::info!(
+            "tensor parallelism not weighed: no projection rate measured on cards {cards:?}"
+        );
         return false;
     };
     let stack = DenseStack {

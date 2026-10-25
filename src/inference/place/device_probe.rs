@@ -37,7 +37,7 @@ pub struct CudaGpuInfo {
     /// CUDA core count (NVML `nvmlDeviceGetNumGpuCores`), 0 if unavailable.
     pub num_cores: u32,
     /// Compute throughput in GFLOP/s used to rank GPUs fastest-first: the card's
-    /// single-precision matrix product, timed once per process, so cards of different makers
+    /// half-precision matrix product, timed once per process, so cards of different makers
     /// compare. Falls back to two operations per core per cycle when the card cannot be timed.
     pub perf_score: u64,
     /// Physical capacity (NVML `mem.total`). Unlike the free-VRAM fields this does
@@ -70,7 +70,7 @@ fn pcie_lane_gbs(generation: u32) -> f64 {
 /// generic LLM engine and ACE-Step consume it. Returns empty (-> CPU placement)
 /// when NVML init fails - never panics.
 ///
-/// Single-precision matrix throughput of device `ordinal` in GFLOP/s, timed once per process on
+/// Half-precision matrix throughput of device `ordinal` in GFLOP/s, timed once per process on
 /// a matrix product. Cores times clock cannot rank cards of different makers: a core is not
 /// the same unit on every runtime, and the card with the larger count of smaller units came out
 /// as the slower one. `None` when the card has too little free memory to time, or cannot run
@@ -84,7 +84,7 @@ fn measured_gflops(ordinal: usize, free_bytes: u64) -> Option<u64> {
     if let Some(known) = table.lock().ok()?.get(&ordinal) {
         return *known;
     }
-    // Three square matrices of f32, with the same again for the workspace.
+    // Three square matrices of f16, with the same again for the workspace.
     const SIDE: usize = 1536;
     const REPS: u32 = 4;
     if free_bytes < 6 * (SIDE * SIDE * 4) as u64 + (256 << 20) {
@@ -93,7 +93,7 @@ fn measured_gflops(ordinal: usize, free_bytes: u64) -> Option<u64> {
     let timed = (|| -> Option<u64> {
         let device = crate::tensor::Device::new_cuda(ordinal).ok()?;
         let a =
-            crate::tensor::Tensor::ones((SIDE, SIDE), crate::tensor::DType::F32, &device).ok()?;
+            crate::tensor::Tensor::ones((SIDE, SIDE), crate::tensor::DType::F16, &device).ok()?;
         a.matmul(&a).ok()?;
         device.synchronize().ok()?;
         let start = std::time::Instant::now();
@@ -318,7 +318,6 @@ pub fn card_pair_link(_from: usize, _to: usize) -> Option<(f64, f64)> {
 /// `None` when a card cannot be opened or NCCL does not take the group.
 #[cfg(feature = "gpu")]
 pub fn group_sum(cards: &[usize]) -> Option<(f64, f64)> {
-    use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start, Comm, ReduceOp};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static GROUPS: OnceLock<Mutex<HashMap<Vec<usize>, Option<(f64, f64)>>>> = OnceLock::new();
@@ -327,34 +326,33 @@ pub fn group_sum(cards: &[usize]) -> Option<(f64, f64)> {
         return *known;
     }
     let measured = (|| -> Option<(f64, f64)> {
+        use crate::tensor::{DType, Device, Tensor};
         if cards.len() < 2 || !crate::tensor::cuda::runtime::nccl_present() {
+            tracing::info!("cards {cards:?} cannot sum through NCCL: it does not open");
             return None;
         }
-        let streams = cards
+        let devices = cards
             .iter()
-            .map(|&c| {
-                let dev = crate::tensor::Device::new_cuda(c).ok()?;
-                dev.as_cuda_device().ok().map(|d| d.cuda_stream())
-            })
+            .map(|&c| Device::new_cuda(c).ok())
             .collect::<Option<Vec<_>>>()?;
-        let comms = Comm::from_devices(streams.clone()).ok()?;
+        // The group the split layers sum through, so what is timed is what they will pay.
+        let group = crate::inference::generic_transformer::TpComms::new(&devices)?;
         // A row of activations and a block far larger than any latency.
         let (small, large) = (4096usize, 8usize << 20);
         let time = |elems: usize, times: usize| -> Option<f64> {
-            let mut bufs = streams
+            let parts = devices
                 .iter()
-                .map(|s| s.alloc_zeros::<f32>(elems).ok())
+                .map(|d| Tensor::zeros_on((elems,), DType::F32, d).ok())
                 .collect::<Option<Vec<_>>>()?;
-            let settled = || streams.iter().all(|s| s.synchronize().is_ok());
+            let settled = || devices.iter().all(|d| d.synchronize().is_ok());
             settled().then_some(())?;
             let mut runs: Vec<f64> = (0..times)
                 .filter_map(|_| {
                     let start = std::time::Instant::now();
-                    group_start().ok()?;
-                    for (comm, buf) in comms.iter().zip(bufs.iter_mut()) {
-                        comm.all_reduce_in_place(buf, &ReduceOp::Sum).ok()?;
-                    }
-                    group_end().ok()?;
+                    group
+                        .all_reduce(&parts)
+                        .map_err(|e| tracing::info!("cards {cards:?}: a sum failed: {e}"))
+                        .ok()?;
                     settled().then_some(())?;
                     Some(start.elapsed().as_secs_f64() * 1e6)
                 })

@@ -835,7 +835,7 @@ impl TpComms {
 
     /// Every rank's `parts[rank]` summed onto every rank's card. Each part is a contiguous F32
     /// tensor on its rank's card.
-    pub(super) fn all_reduce(&self, parts: &[Tensor]) -> Result<Vec<Tensor>> {
+    pub(crate) fn all_reduce(&self, parts: &[Tensor]) -> Result<Vec<Tensor>> {
         use crate::tensor::gpu_runtime::nccl::safe::{group_end, group_start, ReduceOp};
         let nccl = |e: crate::tensor::gpu_runtime::nccl::result::NcclError| {
             crate::tensor::Error::msg(format!("nccl: {e:?}"))
