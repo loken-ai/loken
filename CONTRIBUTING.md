@@ -5,8 +5,8 @@ Issues and pull requests welcome. A few things first.
 ## What a change should bring
 
 - **A measurement, not an argument.** Performance claims need a number and its conditions  - 
-  which card, which model, what else was running. `docs/BENCHMARKS.md` has the protocol,
-  `scripts/` has the harness.
+  which card, which model, what else was running. the [benchmarks](https://github.com/loken-ai/benchmarks)
+  repository has the protocol and the harness.
 - **A test that can fail.** Kernel and arithmetic changes want a reference computed a *different*
   way - a host reference, not a second GPU path - and seen to go red. Defects have shipped here
   because a kernel had no such test; one produced wrong answers for two days.

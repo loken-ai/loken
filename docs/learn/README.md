@@ -29,5 +29,5 @@ already carried the defect.
 
 Every figure carries a date and the machine it came from; the machine is the one
 [`../STATUS.md`](../STATUS.md) describes unless a lesson says otherwise. The figures in
-[`../BENCHMARKS.md`](../BENCHMARKS.md) are the protocol's; the ones here are the
+[benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's; the ones here are the
 experiments'. The diagrams are hand-written SVG in `../img/learn-*.svg`.

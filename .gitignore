@@ -27,7 +27,6 @@ test_model_cache/
 # one machine at one moment and should be regenerated rather than committed.
 results/
 !results/.gitkeep
-bench/store/
 *.log
 tmp/
 local/
@@ -45,9 +44,6 @@ perf.data*
 *.webp
 *.bmp
 *.wav
-# The golden recording the ASR bench cells transcribe, and the clip set of the audio-input check.
-!bench/asr/*.wav
-!bench/asr/librispeech-20/*.wav
 *.mp3
 *.flac
 *.ogg

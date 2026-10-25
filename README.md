@@ -102,8 +102,8 @@ can delete models. Turn both on in `config.toml` before it listens on anything b
 - [`docs/STATUS.md`](docs/STATUS.md) - **what is measured, what is known to be slower, what is
   written but not wired, and what has never run.** Read this one before deciding whether the
   engine suits you
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) - measurements against other engines and the
-  protocol that makes the comparison fair, including the cells where this engine loses
+- [benchmarks](https://github.com/loken-ai/benchmarks) - the bench campaign, and the measurements against other engines
+  published at https://loken-ai.github.io/benchmarks/, including the cells where this engine loses
 - [`docs/CLUSTER.md`](docs/CLUSTER.md) - spreading work across more than one machine
 - [`ROADMAP.md`](ROADMAP.md) - what the next releases bring, and the state of each feature
 

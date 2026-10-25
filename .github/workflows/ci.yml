@@ -15,7 +15,7 @@ env:
   RUSTFLAGS: -D warnings
 
 # A runner has no CUDA toolkit and no card, so every job here builds the host path. The
-# device backends are exercised on the machines that have them; see docs/BENCHMARKS.md.
+# device backends are exercised on the machines that have them; see the benchmarks repository.
 #
 # RUSTFLAGS set here replaces the rustflags of .cargo/config.toml, so the jobs below build
 # the portable x86-64 binary, without the SIMD paths a native build takes. The `native`

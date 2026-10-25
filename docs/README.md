@@ -16,7 +16,8 @@ Read in this order.
    troubleshooting.
 8. [`STATUS.md`](STATUS.md): what is measured, what is slower, what is written and wired to
    nothing. Read it before relying on a feature.
-9. [`BENCHMARKS.md`](BENCHMARKS.md): the measurements and the protocol behind them.
+9. The [benchmarks](https://github.com/loken-ai/benchmarks) repository: the campaign, the measurements and the protocol behind
+   them, published at https://loken-ai.github.io/benchmarks/.
 10. [`CLUSTER.md`](CLUSTER.md): serving from more than one machine.
 11. [`REFERENCES.md`](REFERENCES.md): the papers and implementations this work draws on.
 

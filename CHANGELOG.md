@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Removed
+
+- Bench: move the campaign, its method, its reports and its results to the benchmarks repository.
+
 ## [0.4.0] - 2026-10-24
 
 ### Added

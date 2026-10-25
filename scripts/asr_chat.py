@@ -7,7 +7,7 @@ scored against the clip set's ground truth by word error rate, both sides normal
 way (lowercase, punctuation stripped). The real-time factor is the request's wall time over
 the clip's duration.
 
-    python3 scripts/asr_chat.py --model <name> [--clips bench/asr/librispeech-20]
+    python3 scripts/asr_chat.py --model <name> --clips <directory of wav clips and transcripts.txt>
                                 [--port 11435] [--prompt TEXT] [--out results.json]
 
 The clip directory holds `<id>.wav` files and `transcripts.txt`, one `<id> <text>` per line.
@@ -96,10 +96,9 @@ def transcribe(model, path, port, prompt=PROMPT):
 
 
 def main():
-    here = pathlib.Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--clips", default=str(here / "bench/asr/librispeech-20"))
+    ap.add_argument("--clips", required=True)
     ap.add_argument("--port", type=int, default=11435)
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--limit", type=int, help="score only the first N clips")
