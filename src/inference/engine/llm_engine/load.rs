@@ -206,7 +206,18 @@ impl GenericWeights<'_> {
                 let st =
                     unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(shards) }.ok()?;
                 let cfg = crate::inference::load::awq_loader::parse_config_json(dir).ok()?;
-                crate::inference::generic_transformer::text_bytes(&st, &cfg)
+                let (block_bytes, head_bytes) =
+                    crate::inference::generic_transformer::text_bytes(&st, &cfg)?;
+                // The dense reader counts the norms and the like; the packed projections of a
+                // quantised block (weights, zero points, scales) are stored under their own
+                // names and are most of what the block holds.
+                let packed: u64 = st
+                    .byte_sizes()
+                    .into_iter()
+                    .filter(|(name, _)| packed_projection_in_block(name))
+                    .map(|(_, bytes)| bytes as u64)
+                    .sum();
+                Some((block_bytes + packed, head_bytes))
             }
         }
     }
@@ -1657,4 +1668,37 @@ mod reuse_tests {
 pub(crate) fn is_routed_expert_tensor(tail: &str) -> bool {
     let stem = tail.split('.').next().unwrap_or(tail);
     stem.ends_with("_exps")
+}
+
+/// Whether a checkpoint tensor is a packed projection (weights, zero points or scales) of a
+/// transformer block.
+fn packed_projection_in_block(name: &str) -> bool {
+    name.contains(".layers.")
+        && [".qweight", ".qzeros", ".scales"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+#[cfg(test)]
+mod packed_projection_tests {
+    use super::packed_projection_in_block;
+
+    #[test]
+    fn the_packed_projections_of_a_block_are_counted_and_nothing_else() {
+        for name in [
+            "model.layers.3.self_attn.q_proj.qweight",
+            "model.layers.3.mlp.down_proj.qzeros",
+            "model.layers.35.mlp.up_proj.scales",
+        ] {
+            assert!(packed_projection_in_block(name), "{name}");
+        }
+        for name in [
+            "model.embed_tokens.weight",
+            "model.layers.3.input_layernorm.weight",
+            "lm_head.weight",
+            "model.layers.3.self_attn.q_proj.bias",
+        ] {
+            assert!(!packed_projection_in_block(name), "{name}");
+        }
+    }
 }
