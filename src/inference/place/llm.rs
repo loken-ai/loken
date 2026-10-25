@@ -106,9 +106,15 @@ fn host_blocks(demand: &Demand, cards: &[(usize, u64)]) -> usize {
         .sum()
 }
 
+/// Cards the first plan of `demand` runs on.
+fn cards_used(demand: &Demand, cards: &[(usize, u64)]) -> usize {
+    super::ladder::cards_of(&demand.plan(cards)).len()
+}
+
 /// The context a model's cache is sized for: `full`, halved down to `floor` while the first
-/// plan of `demand_at` that context would send blocks to the host. A context nobody opens
-/// costs nothing, a block on the host costs every token.
+/// plan of `demand_at` that context would send blocks to the host, or would spread the model over
+/// more cards than the plan at `floor` needs. A context nobody opens costs nothing, a block on
+/// the host costs every token, and so does a hop between two cards.
 pub fn context_the_cards_hold(
     full: u64,
     floor: u64,
@@ -119,16 +125,21 @@ pub fn context_the_cards_hold(
         return full;
     }
     let floor = floor.min(full);
+    let fewest = cards_used(&demand_at(floor), cards);
     let mut chosen = full;
-    while chosen > floor && host_blocks(&demand_at(chosen), cards) > 0 {
+    while chosen > floor
+        && (host_blocks(&demand_at(chosen), cards) > 0
+            || cards_used(&demand_at(chosen), cards) > fewest)
+    {
         chosen = (chosen / 2).max(floor);
     }
     if chosen < full {
         let demand = demand_at(full);
         tracing::info!(
-            "KV context {full} -> {chosen}: at {full}, {} of {} blocks would have gone to the host",
+            "KV context {full} -> {chosen}: at {full}, {} of {} blocks would have gone to the host and the model would have spread over {} cards instead of {fewest}",
             host_blocks(&demand, cards),
-            demand.layers
+            demand.layers,
+            cards_used(&demand, cards)
         );
     }
     chosen
@@ -203,6 +214,28 @@ mod tests {
         assert_eq!(context_the_cards_hold(32768, 4096, &cards, at), 8192);
         assert_eq!(context_the_cards_hold(32768, 4096, &[], at), 32768);
         assert_eq!(context_the_cards_hold(32768, 32768, &cards, at), 32768);
+    }
+
+    /// A model one card holds at a smaller context is not spread over two cards for a context
+    /// nobody asked for: a hop between cards costs every token.
+    #[test]
+    fn the_context_halves_until_one_card_holds_the_model() {
+        let cards = [(0, 12 * GB), (1, 12 * GB)];
+        let at = |ctx: u64| Demand {
+            kv_bytes_per_layer: ctx * (GB / 32768),
+            ..demand(8, 8)
+        };
+        // At 131072 the cache is 32 GB over the 8 blocks: two cards hold it, one does not.
+        assert_eq!(cards_used(&at(131072), &cards), 2);
+        let held = context_the_cards_hold(131072, 4096, &cards, at);
+        assert_eq!(cards_used(&at(held), &cards), 1);
+        assert!(held >= 4096 && held < 131072);
+        // A model that needs two cards at the floor keeps its context.
+        let big = |ctx: u64| Demand {
+            kv_bytes_per_layer: ctx * (GB / 32768),
+            ..demand(8, 20)
+        };
+        assert_eq!(context_the_cards_hold(8192, 4096, &cards, big), 8192);
     }
 
     #[test]
