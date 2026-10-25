@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Images: place the Flux VAE on the fastest card that has room for it.
 - Devices: rank the cards by a timed matrix product.
 - Placement: count the packed weights of an AWQ checkpoint.
 - Images: reserve for one frame on a Qwen-Image generation and two on an edit.

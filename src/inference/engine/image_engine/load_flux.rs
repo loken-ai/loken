@@ -511,7 +511,7 @@ impl ImageEngine {
                 "Flux VAE",
                 vae_need,
                 vae_want,
-                &aux_cards,
+                &crate::inference::place::ladder::fastest_first(&aux_cards),
                 cancel.as_ref(),
                 |dev| {
                     let vb = unsafe {

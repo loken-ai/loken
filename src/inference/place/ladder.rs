@@ -481,6 +481,25 @@ pub fn aside(cards: &[(usize, u64)], hot: &[usize], keep: u64) -> Vec<(usize, u6
     cold.chain(shared).collect()
 }
 
+/// `cards` ranked by `speed`, the fastest first, and by the room they offer among cards of the
+/// same speed. A one-shot component that is heavy on compute runs where the compute is.
+pub fn ranked_by_speed(cards: &[(usize, u64)], speed: impl Fn(usize) -> u64) -> Vec<(usize, u64)> {
+    let mut ranked = cards.to_vec();
+    ranked.sort_by(|a, b| speed(b.0).cmp(&speed(a.0)).then(b.1.cmp(&a.1)));
+    ranked
+}
+
+/// [`ranked_by_speed`] by the measured throughput of each card.
+pub fn fastest_first(cards: &[(usize, u64)]) -> Vec<(usize, u64)> {
+    let probed = super::device_probe::probe_cuda_gpus();
+    ranked_by_speed(cards, |idx| {
+        probed
+            .iter()
+            .find(|g| g.index == idx)
+            .map_or(0, |g| g.perf_score)
+    })
+}
+
 /// `cards` with `card` offered first, when it is one of them.
 pub fn prefer(cards: &[(usize, u64)], card: Option<usize>) -> Vec<(usize, u64)> {
     let mut ranked = cards.to_vec();
@@ -1081,6 +1100,17 @@ mod tests {
             .iter()
             .map(|s| format!("{}", s.kind))
             .collect()
+    }
+
+    /// A component heavy on compute is offered the fastest card first, then the roomiest among
+    /// cards of the same speed.
+    #[test]
+    fn the_fastest_card_is_offered_first_and_equal_cards_by_room() {
+        let cards = [(0, 4 * GB), (1, 9 * GB), (2, 12 * GB), (3, 6 * GB)];
+        let speed = |idx: usize| if idx == 1 { 40_000 } else { 3_000 };
+        let order: Vec<usize> = ranked_by_speed(&cards, speed).iter().map(|c| c.0).collect();
+        assert_eq!(order, [1, 2, 3, 0]);
+        assert!(ranked_by_speed(&[], speed).is_empty());
     }
 
     /// A token passes through the cards in turn, so the fastest card takes as many blocks and
