@@ -1473,6 +1473,16 @@ fn hashed_gpu_weight(
     seed: u32,
     device: &Device,
 ) -> QKernelMatMul {
+    let bytes = hashed_weight_bytes(dtype, n, k, seed);
+    let qt = QHostTensor::from_bytes(&bytes, dtype, vec![n, k])
+        .unwrap_or_else(|e| panic!("{dtype:?}: from_bytes: {e}"));
+    QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), device)
+        .unwrap_or_else(|e| panic!("{dtype:?}: upload: {e}"))
+}
+
+/// The blocks of an `n` x `k` weight in `dtype`, from values hashed off `seed`.
+#[cfg(feature = "gpu")]
+fn hashed_weight_bytes(dtype: GgmlDType, n: usize, k: usize, seed: u32) -> Vec<u8> {
     let wf: Vec<f32> = (0..n * k)
         .map(|i| {
             let h = (i as u32 ^ seed)
@@ -1481,12 +1491,8 @@ fn hashed_gpu_weight(
             ((h >> 8) as f32 / (1 << 24) as f32 - 0.5) * 2.4
         })
         .collect();
-    let bytes = crate::tensor::quant_cpu::from_float_bytes(dtype, &wf)
-        .unwrap_or_else(|e| panic!("{dtype:?}: encode: {e}"));
-    let qt = QHostTensor::from_bytes(&bytes, dtype, vec![n, k])
-        .unwrap_or_else(|e| panic!("{dtype:?}: from_bytes: {e}"));
-    QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), device)
-        .unwrap_or_else(|e| panic!("{dtype:?}: upload: {e}"))
+    crate::tensor::quant_cpu::from_float_bytes(dtype, &wf)
+        .unwrap_or_else(|e| panic!("{dtype:?}: encode: {e}"))
 }
 
 /// The BF16 dequantisers write exactly the F32 dequantisers' output rounded to BF16, and the
@@ -1500,15 +1506,57 @@ fn hashed_gpu_weight(
 #[cfg(feature = "gpu")]
 #[test]
 fn the_bf16_dequantised_gemm_matches_the_f32_route() {
-    use crate::tensor::{cuda::CudaDevice, DType, Tensor};
-    let Ok(dev) = CudaDevice::new(0) else {
-        eprintln!("no CUDA device; the BF16 dequantised GEMM is NOT covered by this run");
+    let cards = crate::inference::place::device_probe::card_count();
+    if cards == 0 {
+        eprintln!("no card; the BF16 dequantised GEMM is NOT covered by this run");
+    }
+    for ordinal in 0..cards {
+        bf16_dequantised_gemm_matches_the_f32_route_on(ordinal);
+    }
+}
+
+/// [`the_bf16_dequantised_gemm_matches_the_f32_route`] on card `ordinal`.
+#[cfg(feature = "gpu")]
+fn bf16_dequantised_gemm_matches_the_f32_route_on(ordinal: usize) {
+    use crate::tensor::cuda::CudaDevice;
+    let Ok(dev) = CudaDevice::new(ordinal) else {
         return;
     };
     let device = Device::Cuda(dev.clone());
-    let (n, k) = (96usize, 512usize);
-    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0] {
+    for (n, k, rows) in [
+        (96usize, 512usize, &[1usize, 7, 64, 513][..]),
+        (3072, 12288, &[4160][..]),
+    ] {
+        bf16_dequantised_gemm_matches_at(&dev, &device, n, k, rows);
+    }
+}
+
+/// [`the_bf16_dequantised_gemm_matches_the_f32_route`] for an `n` x `k` weight and `rows` rows.
+#[cfg(feature = "gpu")]
+fn bf16_dequantised_gemm_matches_at(
+    dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
+    device: &Device,
+    n: usize,
+    k: usize,
+    rows: &[usize],
+) {
+    use crate::tensor::{DType, Tensor};
+    let dev = dev.clone();
+    let device = device.clone();
+    for dtype in [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ] {
         let qm = hashed_gpu_weight(dtype, n, k, 0x5eed, &device);
+        let mut host = vec![0f32; n * k];
+        crate::tensor::quant_cpu::to_float_bytes(
+            dtype,
+            &hashed_weight_bytes(dtype, n, k, 0x5eed),
+            &mut host,
+        )
+        .unwrap();
 
         let fast = qm
             .dequant_weight_bf16()
@@ -1533,6 +1581,27 @@ fn the_bf16_dequantised_gemm_matches_the_f32_route() {
         .unwrap()
         .to_vec_f32();
         assert_eq!(fast.len(), n * k, "{dtype:?}: dequantised length");
+        let exact = Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(qm.dequant_f32_gpu().unwrap().unwrap()),
+            dev.clone(),
+            vec![n, k],
+        )
+        .unwrap()
+        .to_vec_f32();
+        let off: Vec<usize> = (0..n * k)
+            // The card's route keeps the block scales in half precision.
+            .filter(|&i| (exact[i] - host[i]).abs() > host[i].abs() / 256.0 + 1e-3)
+            .collect();
+        assert!(
+            off.is_empty(),
+            "{dtype:?} on card {}: {} of {} weights differ from the host, first [{}] {} vs {}",
+            dev.ordinal(),
+            off.len(),
+            n * k,
+            off[0],
+            exact[off[0]],
+            host[off[0]]
+        );
         for (i, (a, b)) in fast.iter().zip(&slow).enumerate() {
             assert_eq!(
                 a.to_bits(),
@@ -1545,7 +1614,7 @@ fn the_bf16_dequantised_gemm_matches_the_f32_route() {
             eprintln!("{dtype:?}: no BF16 matrix units; the BF16 GEMM route is NOT covered");
             continue;
         }
-        for m in [1usize, 7, 64, 513] {
+        for &m in rows {
             let x: Vec<f32> = (0..m * k)
                 .map(|i| (((i * 7919 + 13) % 2003) as f32 / 1001.0 - 1.0) * 1.5)
                 .collect();
