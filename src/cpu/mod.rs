@@ -11,5 +11,6 @@ pub use level::{
     hardware_has_avx512, hardware_level, set_level_cap, supported_levels, CpuLevel,
 };
 pub use topology::{
-    detect_cpu_topology, set_thread_affinity, simd_capabilities, CoreType, CpuTopology,
+    detect_cpu_topology, main_thread_stack_bytes, set_thread_affinity, simd_capabilities,
+    worker_pool_builder, CoreType, CpuTopology,
 };

@@ -332,6 +332,34 @@ fn detect_windows_topology(total_cores: usize) -> Result<CpuTopology, String> {
     })
 }
 
+/// The stack the process gives its main thread, from the stack limit (`ulimit -s`). `None`
+/// when the limit is unlimited or unreadable, or the platform has no such limit.
+pub fn main_thread_stack_bytes() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let read = unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut lim) } == 0;
+        (read && lim.rlim_cur != libc::RLIM_INFINITY).then_some(lim.rlim_cur as usize)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// A worker pool whose threads get the main thread's stack, so the nested parallel work a
+/// worker runs while it waits has the depth the same work has on the main thread.
+pub fn worker_pool_builder() -> rayon::ThreadPoolBuilder {
+    let builder = rayon::ThreadPoolBuilder::new();
+    match main_thread_stack_bytes() {
+        Some(bytes) => builder.stack_size(bytes),
+        None => builder,
+    }
+}
+
 /// Set thread affinity to specific CPU cores
 pub fn set_thread_affinity(core_ids: &[usize]) -> Result<(), String> {
     if core_ids.is_empty() {

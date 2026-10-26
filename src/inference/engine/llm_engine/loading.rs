@@ -192,7 +192,7 @@ pub fn configure_thread_pool() {
         // physical-core-count pool itself (it idles memory-stalled
         // workers so cores drop P-state); count is the lever, not pin.
         let pin_workers = topo.is_hybrid && !p_cores.is_empty();
-        let mut builder = rayon::ThreadPoolBuilder::new().num_threads(n);
+        let mut builder = crate::cpu::worker_pool_builder().num_threads(n);
         if pin_workers {
             // Cycle assignments across the P-core list so each
             // rayon worker thread gets pinned to a distinct P-core

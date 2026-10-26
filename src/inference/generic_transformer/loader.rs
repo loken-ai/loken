@@ -4450,7 +4450,7 @@ impl GenericHeteroTransformer {
                 post_phase1_free as f64 / 1e6,
                 per_worker as f64 / 1e6
             );
-            let pool = rayon::ThreadPoolBuilder::new()
+            let pool = crate::cpu::worker_pool_builder()
                 .num_threads(workers)
                 .build()
                 .map_err(|e| crate::tensor::Error::msg(format!("Phase 2 pool: {e}")))?;

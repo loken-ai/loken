@@ -10,6 +10,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: answer requests batched together on an NVIDIA card.
 - Serving: send the requests queued at the gate to the batch worker together.
 - Serving: continue a preempted request where it stopped.
+- Loading: give the loader's worker threads the main thread's stack.
 
 ## [0.4.2] - 2026-10-28
 
