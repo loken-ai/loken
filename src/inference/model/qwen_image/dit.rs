@@ -309,7 +309,10 @@ impl Linear {
     #[cfg(feature = "gpu")]
     fn dequant_bf16(&self) -> Result<Option<NT>> {
         match self {
-            Linear::F32 { w, .. } => Ok(Some(w.to_dtype(crate::tensor::DType::BF16)?)),
+            // Held as [in, out] for `x.matmul(w)`; the dense caller multiplies by the transpose.
+            Linear::F32 { w, .. } => Ok(Some(
+                w.t()?.contiguous()?.to_dtype(crate::tensor::DType::BF16)?,
+            )),
             Linear::Quant { qm, .. } => qm.dequant_weight_bf16(),
         }
     }
@@ -1234,5 +1237,278 @@ mod tests {
         assert_eq!(oi.shape().dims(), &[24, dim]);
         assert_eq!(ot.shape().dims(), &[3, dim]);
         assert!(oi.to_vec_f32().iter().all(|x| x.is_finite()));
+    }
+
+    /// A linear in `dtype` on `dev`, beside the host linear holding the values it decodes to.
+    #[cfg(feature = "gpu")]
+    fn linear_pair(
+        inn: usize,
+        out: usize,
+        seed: f32,
+        dtype: crate::tensor::quantized::GgmlDType,
+        dev: &crate::tensor::Device,
+    ) -> (Linear, Linear) {
+        use crate::tensor::quantized::{QHostTensor, QKernelMatMul};
+        let wave: Vec<f32> = (0..inn * out)
+            .map(|i| (i as f32 * seed).sin() * 0.05)
+            .collect();
+        let bytes = crate::tensor::quant_cpu::from_float_bytes(dtype, &wave).unwrap();
+        let mut back = vec![0f32; inn * out];
+        crate::tensor::quant_cpu::to_float_bytes(dtype, &bytes, &mut back).unwrap();
+        let host = NT::from_vec_f32(back, (out, inn))
+            .unwrap()
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let qt = QHostTensor::from_bytes(&bytes, dtype, vec![out, inn]).unwrap();
+        let qm = QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), dev).unwrap();
+        (
+            Linear::F32 { w: host, b: None },
+            Linear::Quant { qm, b: None },
+        )
+    }
+
+    /// The cosine of two vectors.
+    #[cfg(feature = "gpu")]
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            ab += (*x as f64) * (*y as f64);
+            aa += (*x as f64) * (*x as f64);
+            bb += (*y as f64) * (*y as f64);
+        }
+        ab / (aa.sqrt() * bb.sqrt()).max(1e-30)
+    }
+
+    /// A host block and a block on `dev` with the same weights, K-quants on the card.
+    #[cfg(feature = "gpu")]
+    fn block_pair(
+        dim: usize,
+        heads: usize,
+        hd: usize,
+        eps: f64,
+        seed: f32,
+        dev: &crate::tensor::Device,
+    ) -> (Block, Block) {
+        use crate::tensor::quantized::GgmlDType;
+        let shapes = [
+            (dim, 6 * dim),
+            (dim, 6 * dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, dim),
+            (dim, 4 * dim),
+            (4 * dim, dim),
+            (dim, 4 * dim),
+            (4 * dim, dim),
+        ];
+        let (mut host, mut card) = (Vec::new(), Vec::new());
+        for (i, (inn, out)) in shapes.into_iter().enumerate() {
+            let dtype = if i % 2 == 0 {
+                GgmlDType::Q4K
+            } else {
+                GgmlDType::Q6K
+            };
+            let (a, b) = linear_pair(inn, out, seed + i as f32 * 0.07, dtype, dev);
+            host.push(a);
+            card.push(b);
+        }
+        let ones = |d: usize| NT::from_vec_f32(vec![1.0f32; d], (d,)).unwrap();
+        let build = |mut l: Vec<Linear>, d: crate::tensor::Device| {
+            let norm = || ones(hd).to_device(&d).unwrap();
+            let mut take = || l.remove(0);
+            Block {
+                img_mod: take(),
+                txt_mod: take(),
+                to_q: take(),
+                to_k: take(),
+                to_v: take(),
+                add_q: take(),
+                add_k: take(),
+                add_v: take(),
+                to_out: take(),
+                to_add_out: take(),
+                img_mlp: (take(), take()),
+                txt_mlp: (take(), take()),
+                norm_q: norm(),
+                norm_k: norm(),
+                norm_add_q: norm(),
+                norm_add_k: norm(),
+                heads,
+                head_dim: hd,
+                eps,
+                device: d,
+            }
+        };
+        (
+            build(host, crate::tensor::Device::Cpu),
+            build(card, dev.clone()),
+        )
+    }
+
+    /// One block on each card against the same block on the host, with K-quant weights and
+    /// enough image tokens to take the card's wide routes: the dequantised GEMMs, the chunked
+    /// feed-forward and the flash attention.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_block_on_a_card_matches_the_host() {
+        use crate::tensor::Device;
+        let c = qwen_image();
+        let (heads, hd) = (4usize, c.attention_head_dim);
+        let dim = heads * hd;
+        let (h, w, st) = (30usize, 70usize, 16usize);
+        let si = h * w;
+        let rope = QwenEmbedRope::new(c.theta, c.axes_dims_rope, true).unwrap();
+        let ((ic, is), (tc, ts)) = rope.forward(1, h, w, st).unwrap();
+        let wave = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n).map(|i| (i as f32 * seed).sin() * 0.5).collect()
+        };
+        let img = NT::from_vec_f32(wave(si * dim, 0.013), (si, dim)).unwrap();
+        let txt = NT::from_vec_f32(wave(st * dim, 0.021), (st, dim)).unwrap();
+        let temb = NT::from_vec_f32(wave(dim, 0.031), (1usize, dim)).unwrap();
+        for ordinal in 0..crate::inference::place::device_probe::card_count() {
+            let Ok(cd) = crate::tensor::cuda::CudaDevice::new(ordinal) else {
+                continue;
+            };
+            let dev = Device::Cuda(cd);
+            let (host, card) = block_pair(dim, heads, hd, c.eps, 0.1, &dev);
+            let (want_i, want_t) = host.forward(&img, &txt, &temb, &ic, &is, &tc, &ts).unwrap();
+            let on = |t: &NT| t.to_device(&dev).unwrap();
+            let (got_i, got_t) = card
+                .forward(
+                    &on(&img),
+                    &on(&txt),
+                    &on(&temb),
+                    &on(&ic),
+                    &on(&is),
+                    &on(&tc),
+                    &on(&ts),
+                )
+                .unwrap();
+            for (name, want, got) in [("image", want_i, got_i), ("text", want_t, got_t)] {
+                let (want, got) = (want.to_vec_f32(), got.to_vec_f32());
+                let cos = cosine(&want, &got);
+                assert!(
+                    got.iter().all(|x| x.is_finite()) && cos > 0.99,
+                    "card {ordinal}: the {name} stream's cosine to the host is {cos}"
+                );
+            }
+        }
+    }
+
+    /// The whole model on each card against the host: BF16 input and output linears as the
+    /// checkpoint stores them, two K-quant blocks, a real image's token count.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_model_on_a_card_matches_the_host() {
+        use crate::tensor::quantized::GgmlDType;
+        use crate::tensor::Device;
+        let mut c = qwen_image();
+        c.num_attention_heads = 4;
+        c.num_layers = 2;
+        let (dim, hd, heads) = (c.dim(), c.attention_head_dim, c.num_attention_heads);
+        let (f, h, w, st) = (1usize, 64usize, 64usize, 24usize);
+        let wave = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n).map(|i| (i as f32 * seed).sin() * 0.5).collect()
+        };
+        let img = NT::from_vec_f32(
+            wave(f * h * w * c.in_channels, 0.017),
+            (f * h * w, c.in_channels),
+        )
+        .unwrap();
+        let txt = NT::from_vec_f32(
+            wave(st * c.joint_attention_dim, 0.023),
+            (st, c.joint_attention_dim),
+        )
+        .unwrap();
+        let out_dim = c.out_channels * c.patch_size * c.patch_size;
+        let mut failed = false;
+        for ordinal in 0..crate::inference::place::device_probe::card_count() {
+            let Ok(cd) = crate::tensor::cuda::CudaDevice::new(ordinal) else {
+                continue;
+            };
+            let dev = Device::Cuda(cd);
+            let io = |inn: usize, out: usize, seed: f32| {
+                linear_pair(inn, out, seed, GgmlDType::BF16, &dev)
+            };
+            let (img_in, img_in_c) = io(c.in_channels, dim, 0.11);
+            let (txt_in, txt_in_c) = io(c.joint_attention_dim, dim, 0.13);
+            let (time1, time1_c) = io(256, dim, 0.17);
+            let (time2, time2_c) = io(dim, dim, 0.19);
+            let (norm_out, norm_out_c) = io(dim, 2 * dim, 0.23);
+            let (proj_out, proj_out_c) = io(dim, out_dim, 0.29);
+            let (b0, b0_c) = block_pair(dim, heads, hd, c.eps, 0.31, &dev);
+            let (b1, b1_c) = block_pair(dim, heads, hd, c.eps, 0.37, &dev);
+            let gamma =
+                NT::from_vec_f32(vec![1f32; c.joint_attention_dim], (c.joint_attention_dim,))
+                    .unwrap();
+            let rope = || QwenEmbedRope::new(c.theta, c.axes_dims_rope, true).unwrap();
+            let host = Model {
+                img_in,
+                txt_norm: gamma.clone(),
+                txt_in,
+                time1,
+                time2,
+                blocks: vec![b0, b1],
+                norm_out,
+                proj_out,
+                cfg: c.clone(),
+                rope: rope(),
+                input_device: Device::Cpu,
+            };
+            let card = Model {
+                img_in: img_in_c,
+                txt_norm: gamma.to_device(&dev).unwrap(),
+                txt_in: txt_in_c,
+                time1: time1_c,
+                time2: time2_c,
+                blocks: vec![b0_c, b1_c],
+                norm_out: norm_out_c,
+                proj_out: proj_out_c,
+                cfg: c.clone(),
+                rope: rope(),
+                input_device: dev.clone(),
+            };
+            let want = host.forward(&img, &txt, 0.6, f, h, w).unwrap().to_vec_f32();
+            // On memory left full of NaN, a kernel that skips part of its output shows.
+            poison(&dev);
+            let got = card.forward(&img, &txt, 0.6, f, h, w).unwrap().to_vec_f32();
+            let bad = |v: &[f32]| v.iter().filter(|x| !x.is_finite()).count();
+            let cos = cosine(&want, &got);
+            eprintln!(
+                "card {ordinal}: cosine {cos}, {} of {} host values and {} card values not finite",
+                bad(&want),
+                want.len(),
+                bad(&got)
+            );
+            failed |= !(bad(&want) == 0 && bad(&got) == 0 && cos > 0.99);
+        }
+        assert!(!failed, "a card's velocity differs from the host's");
+    }
+
+    /// Fills the card's pool with NaN and hands it back, so a kernel that reads memory it did
+    /// not write reads NaN.
+    #[cfg(feature = "gpu")]
+    fn poison(dev: &crate::tensor::Device) {
+        let mut held = Vec::new();
+        for mb in [8usize, 16, 17, 32, 34, 64, 68, 128] {
+            for _ in 0..2 {
+                held.push(
+                    NT::zeros((mb << 18,), crate::tensor::DType::F32)
+                        .unwrap()
+                        .to_device(dev)
+                        .unwrap()
+                        .affine(0.0, f32::NAN)
+                        .unwrap(),
+                );
+            }
+        }
+        drop(held);
     }
 }

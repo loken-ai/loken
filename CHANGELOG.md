@@ -19,6 +19,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Images: run the feed-forward of a large Qwen-Image F32 checkpoint.
 - Images: run the DiT flash attention only on the cards the build has it for.
 - Placement: after a card runs out of memory, take blocks off that card alone.
 - Placement: keep the context a request asks for.
