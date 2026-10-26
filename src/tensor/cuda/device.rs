@@ -1115,6 +1115,11 @@ pub(crate) fn dev_const_i32(dev: &CudaDevice, vals: &[i32]) -> Result<Arc<CudaSl
     let d = stream
         .clone_htod(vals)
         .map_err(|e| Error(format!("dev_const upload: {e}")))?;
+    // The copy may read `vals` after the call returns, and the caller frees them once it has
+    // launched; the constant is cached, so the wait is paid once per shape.
+    stream
+        .synchronize()
+        .map_err(|e| Error(format!("dev_const upload barrier: {e}")))?;
     let arc = Arc::new(d);
     map.lock()
         .unwrap_or_else(|e| e.into_inner())

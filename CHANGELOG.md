@@ -19,6 +19,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Devices: wait for a cached kernel constant to reach the card.
 - ROCm: copy every row of a large strided copy, so Qwen-Image renders.
 - Loading: send a layer's fused weights to the card once.
 - Images: decode a Qwen-Image in smaller tiles on a card before the host.
