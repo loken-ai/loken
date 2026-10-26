@@ -1408,7 +1408,7 @@ impl LlmEngine {
                                         .join(", ");
                                     info!("✅ {arch} loaded: layers {placement} (kv_quant={kv:?}, kv_ctx={ctx:?})");
                                     #[cfg(feature = "gpu")]
-                                    for card in crate::inference::place::ladder::cards_of(&plan) {
+                                    for card in crate::inference::place::ladder::cards_of(plan) {
                                         if let Some((used, reserved)) = crate::inference::place::device_probe::pool_bytes(card) {
                                             info!(
                                                 "card {card} after the load: pool holds {:.2} GB of live buffers and {:.2} GB cached",
