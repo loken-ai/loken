@@ -102,6 +102,7 @@ Smaller, by priority:
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
+| Model directories on several disks | Models | Several model directories, on several disks, form one catalogue, and a model being pulled lands on the directory that holds it and reads it fastest, judged on its size, the free space and the measured speed of each disk. | Planned |
 
 ## 0.6.0
 
