@@ -1099,6 +1099,7 @@ impl LlmEngine {
                             lazy_kv_initial_cap,
                             &cuda_devices,
                             crate::inference::place::ladder::card_bandwidth,
+                            window_asked,
                             demand_at,
                         )
                     };
