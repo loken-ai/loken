@@ -69,8 +69,12 @@ impl QKernelMatMul {
         // its own activation over the blocks this stream's matmul has yet to read, which is
         // exactly what it did: about one prefill in ten came back with whole columns of
         // another caller's numbers, and only when two GPU users ran at once. Ordering the
-        // reuse on the device costs one event and stops the host nowhere.
-        if let Some(ev) = slot.last_use.as_ref() {
+        // reuse on the device costs one event and stops the host nowhere. A graph being
+        // recorded neither waits nor marks: the work before it was settled when it began,
+        // its own nodes run in the stream's order, and a capture may not wait on work
+        // outside it.
+        let recording = crate::tensor::cuda_ext::capture_active_on(stream);
+        if let Some(ev) = slot.last_use.as_ref().filter(|_| !recording) {
             stream
                 .wait(ev)
                 .map_err(|e| Error(format!("mmq workspace ordering: {e}")))?;
@@ -128,6 +132,9 @@ impl QKernelMatMul {
 
         // Publish our own mark before the mutex goes: from here the buffers are ours until
         // these two kernels retire, and the next taker waits on this.
+        if recording {
+            return Ok(out);
+        }
         let ev = match slot.last_use.take() {
             Some(e) => e,
             None => dev.new_event()?,

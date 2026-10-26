@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - CUDA: run the kernels on a driver older than the bundled NVRTC.
+- Serving: answer requests batched together on an NVIDIA card.
 
 ## [0.4.2] - 2026-10-28
 

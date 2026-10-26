@@ -536,18 +536,12 @@ impl GenericHeteroTransformer {
     /// Final norm and output projection for rows computed on a card: both run where the
     /// projection lives, the card-resident quantised head when there is one.
     fn head_on_device(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.to_dtype(crate::tensor::DType::F32)?;
-        #[cfg(feature = "gpu")]
-        if let (Some(proj), Some(dev)) = (
-            self.output_proj_cuda_qmm.as_ref(),
-            self.output_proj_dev.as_ref(),
-        ) {
-            let x = x.to_device(dev)?;
-            let f = self.final_norm_on_device(&x)?;
-            return self.apply_output_bias(proj.forward(&f)?);
+        let mut x = x.to_dtype(crate::tensor::DType::F32)?;
+        if let Some(dev) = self.output_proj_dev.as_ref() {
+            x = x.to_device(dev)?;
         }
         let f = self.final_norm_on_device(&x)?;
-        self.apply_output_bias(self.output_proj.forward(&f)?)
+        self.lm_head(&f)
     }
 
     pub(crate) fn apply_output_bias(&self, logits: Tensor) -> Result<Tensor> {
@@ -1357,24 +1351,38 @@ impl GenericHeteroTransformer {
     /// stays GPU-only even when output_proj lives on CPU.
     pub fn lm_head(&self, f: &Tensor) -> Result<Tensor> {
         // `f` is the POST-final-norm hidden (the caller - decode_layers_gpu /
-        // forward_from_hidden - already applied output_norm). Prefer the GPU
-        // quantized projection when it's resident: it keeps the feature on-device
-        // (no DtoH download), which is both faster per decode step AND mandatory
-        // for the CUDA-graph CB path - a CPU output_proj would host-download the
-        // graph-produced hidden buffer mid-replay (uninitialized/unready read).
-        if let Some(proj) = self.output_proj_cuda_qmm.as_ref() {
-            let dev = self
-                .output_proj_dev
-                .clone()
-                .unwrap_or_else(|| f.device().clone());
-            let fq = if f.device().same_device(&dev) {
-                f.clone()
+        // forward_from_hidden - already applied output_norm). The head on the card is
+        // preferred: it keeps the feature on-device (no DtoH download), which is both
+        // faster per decode step AND mandatory for the CUDA-graph CB path - a host head
+        // would download the graph-produced hidden buffer mid-replay. A quantised head
+        // runs as a quantised matmul, a float head as the F16 matmul against the
+        // `[vocab, hidden]` copy; without either, the host projection reads the hidden
+        // state downloaded to the host.
+        let dev = self
+            .output_proj_dev
+            .clone()
+            .unwrap_or_else(|| f.device().clone());
+        let on_dev = |f: &Tensor| -> Result<Tensor> {
+            if f.device().same_device(&dev) {
+                Ok(f.clone())
             } else {
-                f.to_device(&dev)?
-            };
-            return self.apply_output_bias(proj.forward(&fq)?);
-        }
-        self.apply_output_bias(self.output_proj.forward(f)?)
+                f.to_device(&dev)
+            }
+        };
+        let logits = if let Some(proj) = self.output_proj_cuda_qmm.as_ref() {
+            proj.forward(&on_dev(f)?)?
+        } else if let Some(proj) = self.output_proj_cuda.as_ref() {
+            on_dev(f)?
+                .to_dtype(crate::tensor::DType::F16)?
+                .matmul_t(proj)?
+                .to_dtype(crate::tensor::DType::F32)?
+        } else {
+            let host = f
+                .to_dtype(crate::tensor::DType::F32)?
+                .to_device(&Device::Cpu)?;
+            self.output_proj.forward(&host)?
+        };
+        self.apply_output_bias(logits)
     }
 
     /// True when the lm-head runs on GPU (quantized projection resident) - a

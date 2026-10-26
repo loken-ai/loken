@@ -494,4 +494,28 @@ mod tests {
         graph.launch().unwrap();
         assert_eq!(stream.clone_dtoh(&data).unwrap(), [0; 4]);
     }
+
+    /// A capture on a card that the driver invalidates is ended by `end_capture`: the card's
+    /// stream records nothing afterwards and takes ordinary work again.
+    #[test]
+    fn an_invalidated_capture_on_a_card_ends() {
+        let Ok(dev) = crate::tensor::cuda::CudaDevice::new(0) else {
+            return;
+        };
+        let card = dev.stream().clone();
+        let other = dev.context().new_stream().unwrap();
+        let mark = dev.new_event().unwrap();
+        mark.record(&other).unwrap();
+        card.synchronize().unwrap();
+
+        begin_capture(&card, CAPTURE).unwrap();
+        assert!(crate::tensor::cuda_ext::capture_active_on(dev.stream()));
+        // Waiting on work outside the capture invalidates it.
+        let _ = dev.stream().wait(&mark);
+        let _ = end_capture(&card, default_flags());
+
+        assert!(!crate::tensor::cuda_ext::capture_active_on(dev.stream()));
+        dev.stream().clone_htod(&[1u32; 4]).unwrap();
+        dev.stream().synchronize().unwrap();
+    }
 }
