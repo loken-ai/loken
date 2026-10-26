@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- Serving: log the pace of batched steps once a second.
+
 ### Fixed
 
 - CUDA: run the kernels on a driver older than the bundled NVRTC.

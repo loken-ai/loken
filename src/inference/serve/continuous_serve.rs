@@ -61,6 +61,44 @@ struct GhBatched {
     // Set once if capture ever fails -> permanently use the eager path.
     #[cfg(feature = "gpu")]
     graph_failed: bool,
+    pace: StepPace,
+}
+
+/// The time the batched steps of the last second took, logged once a second while the
+/// server works: what a batch costs against its width.
+#[derive(Default)]
+struct StepPace {
+    since: Option<std::time::Instant>,
+    decode_steps: u32,
+    decode_rows: u32,
+    decode: std::time::Duration,
+    prompts: u32,
+    prompt_tokens: u32,
+    prefill: std::time::Duration,
+}
+
+impl StepPace {
+    fn report_each_second(&mut self) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let steps = self.decode_steps.max(1);
+        tracing::info!(
+            "CB pace: {} decode steps, {:.1} rows each, {:.2} ms a step; {} prompts of {} tokens \
+             in {:.0} ms",
+            self.decode_steps,
+            self.decode_rows as f64 / steps as f64,
+            self.decode.as_secs_f64() * 1e3 / steps as f64,
+            self.prompts,
+            self.prompt_tokens,
+            self.prefill.as_secs_f64() * 1e3
+        );
+        *self = Self {
+            since: Some(std::time::Instant::now()),
+            ..Self::default()
+        };
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -288,6 +326,7 @@ impl BatchedModel for GhBatched {
         let mut out = vec![0u32; items.len()];
         // -- batched decode (B = #decode items, one forward) --
         let dec: Vec<usize> = (0..items.len()).filter(|&i| !items[i].is_prefill).collect();
+        let decode_start = std::time::Instant::now();
         if !dec.is_empty() {
             let toks: Vec<u32> = dec.iter().map(|&i| items[i].tokens[0]).collect();
             let pos: Vec<usize> = dec.iter().map(|&i| items[i].context_len - 1).collect();
@@ -452,9 +491,17 @@ impl BatchedModel for GhBatched {
                 }
             }
         }
+        if !dec.is_empty() {
+            self.pace.decode_steps += 1;
+            self.pace.decode_rows += dec.len() as u32;
+            self.pace.decode += decode_start.elapsed();
+        }
         // -- prefills: each prompt in ONE forward (the TTFT lever) --
+        let prefill_start = std::time::Instant::now();
         for (i, it) in items.iter().enumerate() {
             if it.is_prefill {
+                self.pace.prompts += 1;
+                self.pace.prompt_tokens += it.tokens.len() as u32;
                 let l = if it.cached_len > 0 {
                     // Prefix-cached: compute only the suffix, gather the prefix KV.
                     self.model.paged_prefill_seq_cached(
@@ -471,6 +518,8 @@ impl BatchedModel for GhBatched {
                 out[i] = sample_row(&l, 0, &it.sampling, &it.recent_tokens)?;
             }
         }
+        self.pace.prefill += prefill_start.elapsed();
+        self.pace.report_each_second();
         Ok(out)
     }
 }
@@ -769,6 +818,7 @@ impl ContinuousServer {
             graphs: std::collections::HashMap::new(),
             #[cfg(feature = "gpu")]
             graph_failed: false,
+            pace: StepPace::default(),
         });
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
 
