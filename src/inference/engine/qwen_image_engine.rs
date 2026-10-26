@@ -197,11 +197,32 @@ const VAE_STRIDE: usize = 8;
 /// Caption token budget the reserve accounts for.
 const MAX_TEXT_TOKENS: usize = 1024;
 
+/// Whether `device` runs the diffusion attention in the flash kernel and dequantises GGUF weights
+/// straight to BF16: a card with BF16 matrix instructions the kernel ships for (an AMD card with
+/// them, an NVIDIA card from compute capability 9.0, whose shared memory holds its tile).
+#[cfg(feature = "gpu")]
+fn fused_attention_on(device: &Device) -> bool {
+    device.as_cuda_device().is_ok_and(|d| {
+        let card = d.native();
+        card.has_bf16_matrix_cores()
+            && (!card.is_nvidia() || card.mmq_device_info().is_ok_and(|i| i.cc >= 900))
+    })
+}
+
+#[cfg(not(feature = "gpu"))]
+fn fused_attention_on(_device: &Device) -> bool {
+    false
+}
+
 /// Image tokens the DiT attends over for a request of `frames` frames.
 fn image_tokens(width: usize, height: usize, patch: usize, frames: usize) -> u64 {
     crate::inference::place::runtime_demand::latent_tokens(height, width, VAE_STRIDE, patch) as u64
         * frames.max(1) as u64
 }
+
+/// What the allocator's pool holds over the live peak of a denoise step on the card it runs on,
+/// measured on this engine (see `runtime_reserve`).
+const POOL_FACTOR: u64 = 3;
 
 /// Per-device VRAM reserved for ONE generation's runtime scratch, DERIVED from the architecture
 /// and the checkpoint instead of a fixed constant (same structural terms as the Boogu engine):
@@ -209,6 +230,8 @@ fn image_tokens(width: usize, height: usize, patch: usize, frames: usize) -> u64
 /// attention scores, the largest GGUF weight's F32 dequant + BF16 GEMM scratch (from the header,
 /// no tensor data read), and the VAE decode's conv buffers on the shared device.
 fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize, frames: usize) -> u64 {
+    // The denoise runs mostly on the fastest card: its kernels decide what the step holds.
+    let fused = crate::inference::place::ladder::fastest().is_some_and(|d| fused_attention_on(&d));
     let f32b = 4u64;
     // VAE decode conv buffers on the shared device.
     let vae_tile_px = (64 * 8) as u64;
@@ -248,7 +271,12 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize, fram
     // Must match QUERY_TILE in the DiT's block attention - under-accounting it is
     // what made a "fits" verdict starve at generation time.
     let attn_tile = 512u64;
-    let scores = 2 * attn_tile * seq * cfg.num_attention_heads as u64 * f32b;
+    // The flash kernel keeps its scores on chip; the tiled path holds a tile of them.
+    let scores = if fused {
+        0
+    } else {
+        2 * attn_tile * seq * cfg.num_attention_heads as u64 * f32b
+    };
     // Sampler state carried ACROSS steps: the latent, the CFG pair and the step delta.
     let sampler = 4 * buf(img_tokens, cfg.in_channels as u64 * 4);
     // Largest 2-D weight's dequant + GEMM scratch, read from the checkpoint's HEADER
@@ -266,7 +294,13 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize, fram
                 .unwrap_or(0)
         })
         .unwrap_or_else(|| crate::inference::load::fp8_scaled::largest_2d_elems(dit_path));
-    let dequant = largest_2d * 6;
+    // A card with BF16 matrix instructions dequantises straight to BF16 into a buffer reused by
+    // every projection; another one dequantises each weight to F32 and casts it.
+    let dequant = if fused {
+        largest_2d * 2
+    } else {
+        largest_2d * 6
+    };
     // The denoise and the VAE decode are SEQUENTIAL phases: the DiT activations are
     // freed before the decoder allocates, so the reserve is the max of the two peaks,
     // not their sum. Summing them cost ~0.8 GB of headroom and was enough to refuse a
@@ -281,7 +315,7 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize, fram
     // analytic terms by that measured factor so placement plans against what the
     // allocator actually does; under-reserving is what OOM'd mid-denoise, and
     // over-reserving only shifts a model to the next card or a split.
-    let pool_factor = 3;
+    let pool_factor = POOL_FACTOR;
     let reserve = peak * pool_factor;
     tracing::info!(
         "Qwen-Image reserve terms: analytic peak {:.2} GB (dit {:.2}, vae {:.2}) x{pool_factor} \
@@ -358,10 +392,38 @@ pub fn load(
     let dit_layers = DitConfig::from_checkpoint(&dit_path)
         .map_err(|e| anyhow!("Qwen-Image DiT: {e}"))?
         .num_layers;
-    let dit = crate::inference::place::ladder::load_blocks_reserving(
+    // The card the denoise runs most on keeps the whole reserve, the allocator's pooling of the
+    // step's churn included; a card that takes only the blocks the first cannot hold keeps the
+    // live peak of one block, so a small second card takes the remaining blocks instead of
+    // leaving one on the host, where a block of a denoiser costs seconds a step.
+    // A card that holds the whole stack runs all of it and keeps the whole reserve.
+    let whole = crate::inference::place::ladder::cards(gpu_reserve);
+    let dit_cards = if whole.iter().any(|&(_, free)| free >= dit_sz) {
+        whole
+    } else {
+        // A card that keeps only part of the reserve takes only part of the stack: offered the
+        // whole of it, the first rung would run every block there on the smaller reserve.
+        let first =
+            crate::inference::place::ladder::cards_keeping(gpu_reserve, gpu_reserve / POOL_FACTOR);
+        first
+            .iter()
+            .enumerate()
+            .map(|(rank, &(idx, free))| {
+                (
+                    idx,
+                    if rank == 0 {
+                        free
+                    } else {
+                        free.min(dit_sz.saturating_sub(1))
+                    },
+                )
+            })
+            .collect()
+    };
+    let dit = crate::inference::place::ladder::load_blocks(
         dit_layers,
         dit_sz,
-        gpu_reserve,
+        &dit_cards,
         "Qwen-Image DiT",
         cancel,
         |plan| DitModel::load_hetero(&dit_path_str, plan, cancel).map_err(|e| anyhow!("{e}")),

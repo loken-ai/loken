@@ -427,6 +427,28 @@ pub fn cards(reserve: u64) -> Vec<(usize, u64)> {
         .collect()
 }
 
+/// `cards` with `first` kept free on the card a component starts on and `rest` on each of the
+/// others: the work of a request is paid in full where the component runs most, and a card that
+/// holds a few blocks of it keeps what those blocks use.
+pub fn keeping(cards: &[(usize, u64)], first: u64, rest: u64) -> Vec<(usize, u64)> {
+    cards
+        .iter()
+        .enumerate()
+        .map(|(rank, &(idx, free))| {
+            (
+                idx,
+                free.saturating_sub(if rank == 0 { first } else { rest }),
+            )
+        })
+        .filter(|(_, free)| *free > 0)
+        .collect()
+}
+
+/// [`cards`] with a reserve of `first` on the fastest card and `rest` on the others.
+pub fn cards_keeping(first: u64, rest: u64) -> Vec<(usize, u64)> {
+    keeping(&cards(0), first, rest)
+}
+
 /// [`cards`] as `owner` sees them while it runs: net of what other owners declared they
 /// are about to allocate, and read without handing the pools back, so it may be asked
 /// between the steps of a render.
@@ -1135,6 +1157,16 @@ mod tests {
             .iter()
             .map(|s| format!("{}", s.kind))
             .collect()
+    }
+
+    #[test]
+    fn the_first_card_keeps_more_free_than_the_others() {
+        let cards = [(0, 16 * GB), (1, 4 * GB), (2, GB)];
+        assert_eq!(
+            keeping(&cards, 5 * GB, 2 * GB),
+            vec![(0, 11 * GB), (1, 2 * GB)]
+        );
+        assert_eq!(keeping(&[], GB, GB), vec![]);
     }
 
     /// A component heavy on compute is offered the fastest card first, then the roomiest among

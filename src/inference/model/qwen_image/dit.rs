@@ -614,15 +614,26 @@ impl Block {
             const QUERY_TILE: usize = 512;
             let kv_len = k.shape().dims()[1];
             let tile = QUERY_TILE.min(kv_len.max(1));
-            // BF16 GEMMs on tensor cores, F32 softmax: attention measured 71% of a
-            // 1024^2 edit's forward time as an F32 GEMM. BF16 keeps F32's exponent
-            // range (this DiT's activations reach ~1e9, which F16 could not hold) and
-            // cuBLAS accumulates in F32.
-            crate::inference::model::sdpa::sdpa_tiled_dt(
-                &q, &k, &v, None, false, scale, 1.0, tile, true,
-            )?
-            .transpose(0, 1)?
-            .contiguous()?
+            // The flash kernel keeps the scores in registers and shared memory: no score slab
+            // in device memory, one launch per head block. A card or a head width it does not
+            // cover takes the tiled path: BF16 GEMMs on tensor cores and an F32 softmax. BF16
+            // keeps F32's exponent range (this DiT's activations reach ~1e9, which F16 could
+            // not hold) and cuBLAS accumulates in F32.
+            let flash = crate::inference::kernel::fused::flash_dit_bf16(
+                &q.unsqueeze(0)?,
+                &k.unsqueeze(0)?,
+                &v.unsqueeze(0)?,
+                scale,
+                0,
+                0,
+            );
+            let heads = match flash {
+                Ok(Some(o)) => o.squeeze(0)?.to_dtype(crate::tensor::DType::F32)?,
+                _ => crate::inference::model::sdpa::sdpa_tiled_dt(
+                    &q, &k, &v, None, false, scale, 1.0, tile, true,
+                )?,
+            };
+            heads.transpose(0, 1)?.contiguous()?
         };
         let out = out.reshape((st + si, dim))?;
         let txt_a = self.to_add_out.forward(&out.narrow(0, 0, st)?)?;
@@ -735,11 +746,11 @@ impl Model {
         // residual stream legitimately reaches ~1e9; our f32/MMVQ path holds it, so no fp16 clip.
         let mut cur = idev.clone();
         for b in &self.blocks {
+            // A move between cards orders itself against the source card's stream with an
+            // event, so the host does not wait at the hop.
             if b.device.location() != cur.location() {
-                cur.synchronize()?;
                 hs = hs.to_device(&b.device)?;
                 eh = eh.to_device(&b.device)?;
-                b.device.synchronize()?;
                 cur = b.device.clone();
             }
             let (temb, ic, is, tc, ts) = &cache[&b.device.location()];
@@ -749,9 +760,7 @@ impl Model {
         }
         // Back to the input device for norm_out + proj_out (temb_in already lives there).
         if cur.location() != idev.location() {
-            cur.synchronize()?;
             hs = hs.to_device(idev)?;
-            idev.synchronize()?;
         }
         // AdaLayerNormContinuous: LN(hs)*(1+scale)+shift, (scale,shift)=norm_out(SiLU(temb)).
         let ss = self.norm_out.forward(&Self::silu(&temb_in)?)?; // [1, 2*dim]
