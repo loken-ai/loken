@@ -906,13 +906,35 @@ mod flash_dit_tests {
     #[test]
     #[ignore]
     fn it_matches_the_tiled_path() {
-        let dev = match crate::tensor::cuda::CudaDevice::new(0) {
-            Ok(d) => Device::Cuda(d),
-            Err(_) => {
-                eprintln!("no cuda; skip");
-                return;
+        for ordinal in 0..crate::inference::place::device_probe::card_count() {
+            // The kernel runs on the cards the build carries it for; any other card is refused,
+            // so its caller takes the tiled path.
+            if let Ok(d) = crate::tensor::cuda::CudaDevice::new(ordinal) {
+                if crate::inference::kernel::fused::flash_dit_ships_for(&d) {
+                    matches_the_tiled_path_on(Device::Cuda(d));
+                } else {
+                    let dev = Device::Cuda(d);
+                    let t = Tensor::zeros(
+                        (1usize, 1usize, 64usize, 64usize),
+                        crate::tensor::DType::F32,
+                    )
+                    .unwrap()
+                    .to_device(&dev)
+                    .unwrap();
+                    let got =
+                        crate::inference::kernel::fused::flash_dit_bf16(&t, &t, &t, 1.0, 0, 0)
+                            .unwrap();
+                    assert!(
+                        got.is_none(),
+                        "card {ordinal} has no build of the kernel, yet ran it"
+                    );
+                }
             }
-        };
+        }
+    }
+
+    /// [`it_matches_the_tiled_path`] on `dev`, for a card the kernel ships for.
+    fn matches_the_tiled_path_on(dev: Device) {
         let mut seed = 0x243F6A8885A308D3u64;
         // Shapes that exercise the awkward cases: a sequence that is not a multiple of the
         // block, one head, several heads, both head dimensions.
@@ -922,6 +944,7 @@ mod flash_dit_tests {
             (1, 4, 256, 128),
             (1, 12, 1024, 128),
             (1, 3, 333, 128),
+            (1, 24, 4160, 128),
         ] {
             let n = b * h * s * hd;
             let q = Tensor::from_vec(rand_vec(&mut seed, n), (b, h, s, hd), &dev).unwrap();
@@ -933,7 +956,9 @@ mod flash_dit_tests {
                 .to_vec_f32();
             let got = crate::inference::kernel::fused::flash_dit_bf16(&q, &k, &v, scale, 0, 0)
                 .unwrap()
-                .unwrap_or_else(|| panic!("kernel declined [{b},{h},{s},{hd}]"))
+                .unwrap_or_else(|| {
+                    panic!("kernel declined [{b},{h},{s},{hd}] on {:?}", dev.location())
+                })
                 .to_vec_f32();
             assert_eq!(want.len(), got.len());
             let mut num = 0.0f64;

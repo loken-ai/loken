@@ -19,6 +19,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Images: run the DiT flash attention only on the cards the build has it for.
 - Placement: after a card runs out of memory, take blocks off that card alone.
 - Placement: keep the context a request asks for.
 - Tensor parallelism: open one copy of NCCL and sum outside the decode graph.

@@ -161,6 +161,18 @@ pub(super) fn pick_prefill_nsplit(n_head: usize, seq_q: usize, seq_kv: usize) ->
     by_fill.min(by_work).clamp(1, MAX_NSPLIT)
 }
 
+/// Whether the build carries the DiT flash kernel for `card`: the AMD build for a card with
+/// BF16 matrix instructions, the NVIDIA builds for compute capabilities 9.0 and 12.0 only, the
+/// architectures whose shared memory holds its tile.
+#[cfg(feature = "gpu")]
+pub fn flash_dit_ships_for(card: &crate::tensor::cuda::CudaDevice) -> bool {
+    card.has_bf16_matrix_cores()
+        && (!card.is_nvidia()
+            || card
+                .mmq_device_info()
+                .is_ok_and(|i| matches!(i.cc, 900 | 1200)))
+}
+
 /// Fused FlashAttention-2-style PREFILL for GQA over F16 K/V (seq_q > 1, causal).
 ///
 /// Replaces the `q.kᵀ -> softmax -> att.v` chain that materializes the
@@ -206,9 +218,9 @@ pub fn flash_dit_bf16(
     if k.dims4()? != v.dims4()? {
         return Ok(None);
     }
-    // The kernel has an NVIDIA build and an AMD build for cards with matrix instructions; any
-    // other card has no build of it.
-    if !q.device().is_nvidia() && !q.device().as_cuda_device()?.has_bf16_matrix_cores() {
+    // A card the build carries no image of the kernel for runs the launch without writing the
+    // output, and the launch reports nothing.
+    if !flash_dit_ships_for(q.device().as_cuda_device()?.native()) {
         return Ok(None);
     }
     // This kernel ships SASS only for the architectures whose shared memory fits its

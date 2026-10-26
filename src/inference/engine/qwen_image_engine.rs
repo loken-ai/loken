@@ -202,11 +202,9 @@ const MAX_TEXT_TOKENS: usize = 1024;
 /// them, an NVIDIA card from compute capability 9.0, whose shared memory holds its tile).
 #[cfg(feature = "gpu")]
 fn fused_attention_on(device: &Device) -> bool {
-    device.as_cuda_device().is_ok_and(|d| {
-        let card = d.native();
-        card.has_bf16_matrix_cores()
-            && (!card.is_nvidia() || card.mmq_device_info().is_ok_and(|i| i.cc >= 900))
-    })
+    device
+        .as_cuda_device()
+        .is_ok_and(|d| crate::inference::kernel::fused::flash_dit_ships_for(d.native()))
 }
 
 #[cfg(not(feature = "gpu"))]
