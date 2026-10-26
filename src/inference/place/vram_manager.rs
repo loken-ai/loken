@@ -75,6 +75,12 @@ pub fn probe_under_pressure(reserve: u64) -> Vec<(usize, u64, crate::tensor::Dev
         return Vec::new();
     }
     probe(reserve.saturating_add(vram_reserve_boost()))
+        .into_iter()
+        .filter_map(|(idx, free, dev)| {
+            let free = free.saturating_sub(card_pressure(idx));
+            (free > 0).then_some((idx, free, dev))
+        })
+        .collect()
 }
 
 pub fn probe(reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
@@ -1412,6 +1418,65 @@ pub fn vram_reserve_boost() -> u64 {
 /// even a 2-GPU split can't hold the weights do layers land on CPU.
 pub fn vram_force_cpu() -> bool {
     vram_degrade_level() >= crate::inference::place::ladder::PRESSURE_RUNGS
+}
+
+/// Bytes a card keeps back on top of the global pressure: raised for the card that ran out of
+/// memory, so the next placement takes blocks off that card alone and leaves the others as
+/// they are.
+static CARD_PRESSURE: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// The card that last ran out of memory, `usize::MAX` for none since it was read.
+static LAST_OOM_CARD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Notes that card `card` ran out of memory.
+pub fn note_card_oom(card: usize) {
+    LAST_OOM_CARD.store(card, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The card that ran out of memory since the last call, if one did.
+pub fn take_oom_card() -> Option<usize> {
+    let card = LAST_OOM_CARD.swap(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+    (card != usize::MAX).then_some(card)
+}
+
+/// What card `card` keeps back for the out-of-memory errors it has had.
+pub fn card_pressure(card: usize) -> u64 {
+    CARD_PRESSURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(idx, _)| *idx == card)
+        .map_or(0, |(_, bytes)| *bytes)
+}
+
+/// Raises what card `card` keeps back: doubled, and at least a sixteenth of its memory. Returns
+/// the bytes added.
+pub fn raise_card_pressure(card: usize) -> u64 {
+    let total = crate::inference::place::device_probe::probe_cuda_gpus()
+        .iter()
+        .find(|g| g.index == card)
+        .map_or(0, |g| g.total);
+    let mut table = CARD_PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = match table.iter_mut().find(|(idx, _)| *idx == card) {
+        Some(entry) => entry,
+        None => {
+            table.push((card, 0));
+            table.last_mut().expect("pushed above")
+        }
+    };
+    let added = entry.1.max(total / 16).max(1);
+    entry.1 = entry.1.saturating_add(added);
+    added
+}
+
+/// Takes back `bytes` card `card` was made to keep back.
+pub fn lower_card_pressure(card: usize, bytes: u64) {
+    let mut table = CARD_PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = table.iter_mut().find(|(idx, _)| *idx == card) {
+        entry.1 = entry.1.saturating_sub(bytes);
+    }
+    table.retain(|(_, bytes)| *bytes > 0);
 }
 
 /// Reset the degradation level to 0 (optimistic placement). Called at the START of a

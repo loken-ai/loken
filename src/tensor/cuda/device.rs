@@ -196,7 +196,10 @@ pub(crate) fn with_oom_retry<T>(
                 }
             );
             emergency_reclaim(dev);
-            f().map_err(|e2| alloc_err(ctx, e2))
+            f().map_err(|e2| {
+                crate::inference::place::vram_manager::note_card_oom(dev.ordinal());
+                alloc_err(ctx, e2)
+            })
         }
         Err(e) => Err(alloc_err(ctx, e)),
     }

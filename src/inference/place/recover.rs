@@ -50,6 +50,8 @@ pub fn hold_scratch(owner: &'static str, bytes: u64) -> super::vram_manager::Dem
 #[derive(Debug, Default)]
 pub struct Pressure {
     raised: u64,
+    /// The bytes each card was made to keep back, taken back when the request ends.
+    cards: Vec<(usize, u64)>,
 }
 
 impl Pressure {
@@ -71,6 +73,22 @@ impl Pressure {
         Some(level)
     }
 
+    /// Makes card `card`, which ran out of memory, keep more back, and returns whether it may:
+    /// a card is raised a few times before the pressure on every card is.
+    pub fn raise_card(&mut self, what: &str, card: usize, err: &dyn std::fmt::Display) -> bool {
+        const CARD_RUNGS: usize = 4;
+        if self.cards.iter().filter(|(c, _)| *c == card).count() >= CARD_RUNGS {
+            return false;
+        }
+        let added = super::vram_manager::raise_card_pressure(card);
+        self.cards.push((card, added));
+        tracing::warn!(
+            "{what}: card {card} out of memory ({err}); re-planning with {:.2} GB more kept free there and the other cards unchanged",
+            added as f64 / 1e9
+        );
+        true
+    }
+
     /// Whether this request has walked every rung.
     pub fn spent(&self) -> bool {
         self.raised >= PRESSURE_RUNGS
@@ -79,6 +97,9 @@ impl Pressure {
 
 impl Drop for Pressure {
     fn drop(&mut self) {
+        for &(card, bytes) in &self.cards {
+            super::vram_manager::lower_card_pressure(card, bytes);
+        }
         super::vram_manager::vram_degrade_lower(self.raised);
     }
 }
@@ -140,6 +161,25 @@ where
         tracing::warn!("{what}: still out of memory after unloading an idle resident");
     }
     let mut pressure = Pressure::new();
+    // The card that ran out keeps more back first, the others unchanged: the blocks that leave
+    // it go to a card with room, or to the host only for what no card holds.
+    while let Some(card) = super::vram_manager::take_oom_card() {
+        if !pressure.raise_card(what, card, &message) {
+            break;
+        }
+        release();
+        if let Some(stop) = replan(super::vram_manager::vram_degrade_level(), message.clone()).await
+        {
+            return stop;
+        }
+        message = {
+            let outcome = attempt().await;
+            match oom(&outcome) {
+                Some(message) => message,
+                None => return outcome,
+            }
+        };
+    }
     while let Some(level) = pressure.raise(what, &message) {
         release();
         if let Some(stop) = replan(level, message.clone()).await {
@@ -286,5 +326,40 @@ mod tests {
     #[test]
     fn a_replan_that_fails_ends_the_walk() {
         assert_eq!(run(&[], 0, 0).0, usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod card_pressure_tests {
+    use super::Pressure;
+    use crate::inference::place::vram_manager as vm;
+
+    /// A card's own pressure is raised for it alone and taken back when the request ends.
+    #[test]
+    fn a_card_that_ran_out_keeps_more_back_until_the_request_ends() {
+        const CARD: usize = 7_000;
+        let before = vm::card_pressure(CARD);
+        {
+            let mut pressure = Pressure::new();
+            assert!(pressure.raise_card("test", CARD, &"oom"));
+            assert!(vm::card_pressure(CARD) > before);
+            assert_eq!(vm::card_pressure(CARD + 1), 0);
+            for _ in 0..3 {
+                assert!(pressure.raise_card("test", CARD, &"oom"));
+            }
+            assert!(
+                !pressure.raise_card("test", CARD, &"oom"),
+                "the rungs of one card end"
+            );
+        }
+        assert_eq!(vm::card_pressure(CARD), before);
+    }
+
+    /// The card that ran out is read once.
+    #[test]
+    fn the_card_that_ran_out_is_read_once() {
+        vm::note_card_oom(3);
+        assert_eq!(vm::take_oom_card(), Some(3));
+        assert_eq!(vm::take_oom_card(), None);
     }
 }

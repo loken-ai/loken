@@ -80,7 +80,10 @@ fn read(staging: u64) -> Vec<(usize, u64)> {
         .map(|g| {
             (
                 g.index,
-                g.stable_free.saturating_sub(boost).saturating_sub(staging),
+                g.stable_free
+                    .saturating_sub(boost)
+                    .saturating_sub(staging)
+                    .saturating_sub(super::vram_manager::card_pressure(g.index)),
             )
         })
         .filter(|(_, free)| *free > 0)
