@@ -135,9 +135,13 @@ impl APIServer {
             Some(acquire_gate(self, priority, model_name.to_string(), endpoint).await?)
         };
         // The move into the batch worker is made under the serial gate, which every serial
-        // generation holds to its end; the gate is not needed past it.
-        if active.wants_batched() && gate.is_some() {
-            engine.serve_batched().await;
+        // generation holds to its end; the gate is not needed past it. A request that waited
+        // at the gate while the model moved into its batch worker gives the gate up too, and
+        // the requests queued behind it reach the worker at once.
+        if gate.is_some() {
+            if active.wants_batched() {
+                engine.serve_batched().await;
+            }
             if engine.is_continuous().await {
                 gate = None;
             }
