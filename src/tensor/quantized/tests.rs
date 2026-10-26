@@ -1706,3 +1706,61 @@ fn the_bf16_dequant_scratch_is_reused_across_calls() {
         "the same call gave two answers"
     );
 }
+
+/// A BF16 product of a diffusion model's widest shape on each card against the exact product of
+/// the same BF16 values on the host: the card sums in F32, so the only error left is the
+/// rounding of the output.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_bf16_gemm_sums_in_f32_on_every_card() {
+    use crate::tensor::{DType, Tensor};
+    let (m, k, n) = (64usize, 12288usize, 3072usize);
+    let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.37).sin()).collect();
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32) * 0.11).cos() * 0.05)
+        .collect();
+    let round = |v: &[f32]| -> Vec<f32> {
+        v.iter()
+            .map(|&a| half::bf16::from_f32(a).to_f32())
+            .collect()
+    };
+    let (xr, wr) = (round(&x), round(&w));
+    let mut want = vec![0f64; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            want[r * n + c] = (0..k)
+                .map(|i| xr[r * k + i] as f64 * wr[c * k + i] as f64)
+                .sum();
+        }
+    }
+    let mut failed = false;
+    for ordinal in 0..crate::inference::place::device_probe::card_count() {
+        let Ok(dev) = crate::tensor::cuda::CudaDevice::new(ordinal) else {
+            continue;
+        };
+        let device = Device::Cuda(dev);
+        let on = |v: &[f32], rows: usize| {
+            Tensor::from_vec_f32(v.to_vec(), vec![rows, k])
+                .unwrap()
+                .to_device(&device)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let got = on(&x, m)
+            .matmul_t(&on(&w, n))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32();
+        let (mut num, mut den) = (0f64, 0f64);
+        for (a, b) in got.iter().zip(&want) {
+            num += (*a as f64 - b).powi(2);
+            den += b.powi(2);
+        }
+        let rel = (num / den.max(1e-30)).sqrt();
+        eprintln!("card {ordinal}: BF16 product relative error {rel:.5}");
+        failed |= !(rel < 5e-3);
+    }
+    assert!(!failed, "a card's BF16 product does not sum in F32");
+}

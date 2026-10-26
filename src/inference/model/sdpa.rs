@@ -938,16 +938,22 @@ mod flash_dit_tests {
         let mut seed = 0x243F6A8885A308D3u64;
         // Shapes that exercise the awkward cases: a sequence that is not a multiple of the
         // block, one head, several heads, both head dimensions.
-        for (b, h, s, hd) in [
+        for ((b, h, s, hd), amp) in [
             (1usize, 1usize, 64usize, 64usize),
             (1, 2, 130, 64),
             (1, 4, 256, 128),
             (1, 12, 1024, 128),
             (1, 3, 333, 128),
             (1, 24, 4160, 128),
-        ] {
+        ]
+        .into_iter()
+        // Scores of the size a trained model's normalised queries and keys reach, where the
+        // running maximum moves from one key tile to the next.
+        .flat_map(|shape| [(shape, 1.0f32), (shape, 24.0)])
+        {
             let n = b * h * s * hd;
-            let q = Tensor::from_vec(rand_vec(&mut seed, n), (b, h, s, hd), &dev).unwrap();
+            let qv: Vec<f32> = rand_vec(&mut seed, n).iter().map(|x| x * amp).collect();
+            let q = Tensor::from_vec(qv, (b, h, s, hd), &dev).unwrap();
             let k = Tensor::from_vec(rand_vec(&mut seed, n), (b, h, s, hd), &dev).unwrap();
             let v = Tensor::from_vec(rand_vec(&mut seed, n), (b, h, s, hd), &dev).unwrap();
             let scale = 1.0 / (hd as f32).sqrt();
@@ -970,9 +976,9 @@ mod flash_dit_tests {
             let rel = (num / den.max(1e-30)).sqrt();
             assert!(
                 rel < 2e-2,
-                "[{b},{h},{s},{hd}]: relative error {rel:.4} against the tiled path"
+                "[{b},{h},{s},{hd}] x{amp}: relative error {rel:.4} against the tiled path"
             );
-            eprintln!("  [{b},{h},{s},{hd}] rel {rel:.5} ok");
+            eprintln!("  [{b},{h},{s},{hd}] x{amp} rel {rel:.5} ok");
         }
     }
 
