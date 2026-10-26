@@ -65,11 +65,12 @@ pub(super) fn fleet_sources() -> Vec<std::path::PathBuf> {
     out
 }
 
-/// The part of a file that ships. Fixtures in a test module name concrete devices and
-/// concrete byte counts on purpose - that is how they pin behaviour - so only production
-/// code is read.
+/// The part of a file that ships: what precedes its first test module. Fixtures in a test
+/// module name concrete devices and concrete byte counts on purpose - that is how they pin
+/// behaviour - so only production code is read; an item kept for tests alone above the
+/// module does not end it.
 pub(super) fn production(text: &str) -> &str {
-    text.split("#[cfg(test)]").next().unwrap_or("")
+    text.split("#[cfg(test)]\nmod ").next().unwrap_or("")
 }
 
 /// Whether a whole FILE is test code.

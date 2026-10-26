@@ -356,6 +356,25 @@ impl Linear {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The intermediate values a test asked for, by stage, while it is set.
+    pub(crate) static TRACE: std::cell::RefCell<Option<Vec<(&'static str, Vec<f32>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records `t` under `name` while a test traces this thread.
+macro_rules! trace {
+    ($name:expr, $t:expr) => {
+        #[cfg(test)]
+        TRACE.with(|tr| {
+            if let Some(v) = tr.borrow_mut().as_mut() {
+                v.push(($name, $t.to_vec_f32()));
+            }
+        });
+    };
+}
+
 /// LayerNorm over the last dim, `elementwise_affine=False` (fused GPU kernel). The all-ones
 /// weight is CACHED per (device, dim): rebuilding + uploading it on every call put a host
 /// alloc + H2D copy on the hot path ~hundreds of times per denoise step.
@@ -554,6 +573,7 @@ impl Block {
         let smod = silu(temb)?;
         let img_mod = self.img_mod.forward(&smod)?; // [1, 6*dim]
         let txt_mod = self.txt_mod.forward(&smod)?;
+        trace!("img_mod", img_mod);
         let (im1, im2) = (
             img_mod.narrow(1, 0, 3 * dim)?,
             img_mod.narrow(1, 3 * dim, 3 * dim)?,
@@ -565,6 +585,9 @@ impl Block {
 
         let (img_m, img_g1) = Self::modulate(&layernorm_noaffine(img, self.eps)?, &im1, dim)?;
         let (txt_m, txt_g1) = Self::modulate(&layernorm_noaffine(txt, self.eps)?, &tm1, dim)?;
+        trace!("img_ln", layernorm_noaffine(img, self.eps).unwrap());
+        trace!("img_m", img_m);
+        trace!("txt_m", txt_m);
 
         // qkv + head split
         let iq = rmsnorm(
@@ -578,6 +601,10 @@ impl Block {
             self.eps,
         )?;
         let iv = self.heads_split(&self.to_v.forward(&img_m)?, si)?;
+        trace!("to_q", self.to_q.forward(&img_m).unwrap());
+        trace!("iq_rms", iq);
+        trace!("ik_rms", ik);
+        trace!("iv", iv);
         let tq = rmsnorm(
             &self.heads_split(&self.add_q.forward(&txt_m)?, st)?,
             &self.norm_add_q,
@@ -593,6 +620,8 @@ impl Block {
         let ik = apply_rope(&ik, img_cos, img_sin)?;
         let tq = apply_rope(&tq, txt_cos, txt_sin)?;
         let tk = apply_rope(&tk, txt_cos, txt_sin)?;
+        trace!("iq_rope", iq);
+        trace!("tq_rope", tq);
         // joint cat [txt, img] on the sequence dim
         let q = NT::cat(&[&tq, &iq], 0)?; // [S, H, D]
         let k = NT::cat(&[&tk, &ik], 0)?;
@@ -639,13 +668,17 @@ impl Block {
             heads.transpose(0, 1)?.contiguous()?
         };
         let out = out.reshape((st + si, dim))?;
+        trace!("attention", out);
         let txt_a = self.to_add_out.forward(&out.narrow(0, 0, st)?)?;
         let img_a = self.to_out.forward(&out.narrow(0, st, si)?)?;
+        trace!("img_a", img_a);
         // gated residual + MLP
         let img = img.add(&img_a.broadcast_mul(&img_g1)?)?;
         let txt = txt.add(&txt_a.broadcast_mul(&txt_g1)?)?;
         let (img_m2, img_g2) = Self::modulate(&layernorm_noaffine(&img, self.eps)?, &im2, dim)?;
         let (txt_m2, txt_g2) = Self::modulate(&layernorm_noaffine(&txt, self.eps)?, &tm2, dim)?;
+        trace!("img_res1", img);
+        trace!("img_m2", img_m2);
         // The MLP is the widest tensor in the graph: its hidden width is 4x dim, so at
         // edit-sized sequences (image tokens doubled by the [noise ; clean] pair) the
         // up-projection and its GELU alone hold hundreds of megabytes of F32 - the
@@ -654,8 +687,11 @@ impl Block {
         // caps that peak; only sequences long enough to matter pay the extra launches.
         let img_ff = Self::mlp_token_chunked(&self.img_mlp.0, &self.img_mlp.1, &img_m2)?;
         let txt_ff = Self::mlp_token_chunked(&self.txt_mlp.0, &self.txt_mlp.1, &txt_m2)?;
+        trace!("img_ff", img_ff);
+        trace!("txt_ff", txt_ff);
         let img = img.add(&img_ff.broadcast_mul(&img_g2)?)?;
         let txt = txt.add(&txt_ff.broadcast_mul(&txt_g2)?)?;
+        trace!("img_out", img);
         Ok((img, txt))
     }
 }
@@ -695,6 +731,13 @@ pub struct Model {
 }
 
 impl Model {
+    /// Keeps the first `n` blocks, so a test can run the real weights at a real image size on
+    /// the host in minutes.
+    #[cfg(test)]
+    pub(crate) fn keep_blocks(&mut self, n: usize) {
+        self.blocks.truncate(n);
+    }
+
     fn silu(x: &NT) -> Result<NT> {
         // x*sigmoid(x) = x/(1+e^-x)
         let neg = x.affine(-1.0, 0.0)?.exp()?.affine(1.0, 1.0)?; // 1+e^-x
@@ -727,8 +770,11 @@ impl Model {
         let temb_in = self
             .time2
             .forward(&Self::silu(&self.time1.forward(&tf)?)?)?; // [1, dim] on idev
-                                                                // rope/temb are small; pre-materialize them on EACH distinct block device (cache), so a
-                                                                // block only reads tensors already on its own device.
+        trace!("img_in", hs);
+        trace!("txt_in", eh);
+        trace!("temb", temb_in);
+        // rope/temb are small; pre-materialize them on EACH distinct block device (cache), so a
+        // block only reads tensors already on its own device.
         let ((ic0, is0), (tc0, ts0)) = self.rope.forward(f, h, w, txt.shape().dims()[0])?; // on CPU
         let mut cache: std::collections::HashMap<DeviceLocation, (NT, NT, NT, NT, NT)> =
             std::collections::HashMap::new();
@@ -1510,5 +1556,62 @@ mod tests {
             }
         }
         drop(held);
+    }
+
+    /// The rotary embedding on each card against the host at the sequence lengths a render
+    /// reaches, stage by stage.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn apply_rope_on_a_card_matches_the_host() {
+        use crate::tensor::Device;
+        let c = qwen_image();
+        let rope = QwenEmbedRope::new(c.theta, c.axes_dims_rope, true).unwrap();
+        let (heads, hd) = (24usize, c.attention_head_dim);
+        let half = hd / 2;
+        let mut failed = false;
+        for (h, w) in [(4usize, 6usize), (32, 32), (64, 64)] {
+            let ((ic, is), _) = rope.forward(1, h, w, 3).unwrap();
+            let seq = h * w;
+            let x = NT::from_vec_f32(
+                (0..seq * heads * hd)
+                    .map(|i| (i as f32 * 0.0137).sin())
+                    .collect(),
+                (seq, heads, hd),
+            )
+            .unwrap();
+            let stages = |x: &NT, cos: &NT, sin: &NT| -> Vec<(&'static str, Vec<f32>)> {
+                let xp = x.reshape((seq, heads, half, 2)).unwrap();
+                let x1 = xp
+                    .narrow(3, 1, 1)
+                    .unwrap()
+                    .reshape((seq, heads, half))
+                    .unwrap();
+                let c3 = cos.reshape((seq, 1, half)).unwrap();
+                vec![
+                    ("x1", x1.to_vec_f32()),
+                    ("x1*cos", x1.broadcast_mul(&c3).unwrap().to_vec_f32()),
+                    ("rope", apply_rope(x, cos, sin).unwrap().to_vec_f32()),
+                ]
+            };
+            let want = stages(&x, &ic, &is);
+            for ordinal in 0..crate::inference::place::device_probe::card_count() {
+                let Ok(cd) = crate::tensor::cuda::CudaDevice::new(ordinal) else {
+                    continue;
+                };
+                let dev = Device::Cuda(cd);
+                let on = |t: &NT| t.to_device(&dev).unwrap();
+                let got = stages(&on(&x), &on(&ic), &on(&is));
+                for ((name, a), (_, b)) in want.iter().zip(&got) {
+                    let worst = a
+                        .iter()
+                        .zip(b)
+                        .map(|(p, q)| (p - q).abs())
+                        .fold(0f32, f32::max);
+                    eprintln!("card {ordinal} seq {seq}: {name} worst difference {worst}");
+                    failed |= !(worst < 1e-4);
+                }
+            }
+        }
+        assert!(!failed, "a card's rotary embedding differs from the host's");
     }
 }

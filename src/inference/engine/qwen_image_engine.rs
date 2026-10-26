@@ -1032,4 +1032,140 @@ mod tests {
         assert!(needs_guidance_branch(4.0));
         assert!(needs_guidance_branch(3.5));
     }
+
+    /// The real text encoder and DiT on each card against the same checkpoints on the host, at
+    /// a small image so the host forward stays short. A card without room for a component says
+    /// so and is skipped for it.
+    ///
+    /// ```text
+    /// cargo test --release -p loken --lib --features cuda,media -- --ignored --nocapture \
+    ///     qwen_image_engine::tests::the_real_encoder_and_dit_on_each_card_match_the_host
+    /// ```
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "needs the local Qwen-Image checkpoints"]
+    fn the_real_encoder_and_dit_on_each_card_match_the_host() {
+        use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan, HeteroSegment};
+        let dir = crate::config::Config::load_test().get_hf_models_dir();
+        let (enc, dit) = (dir.join(REL_ENC_GGUF), dir.join(REL_DIT_GGUF));
+        if !enc.is_file() || !dit.is_file() {
+            eprintln!("no Qwen-Image checkpoint under {}", dir.display());
+            return;
+        }
+        let (enc, dit) = (
+            enc.to_string_lossy().to_string(),
+            dit.to_string_lossy().to_string(),
+        );
+        let plan = |kind: DeviceKind, n: usize| HeteroPlan {
+            tp_cards: None,
+            segments: vec![HeteroSegment {
+                kind,
+                layer_start: 0,
+                layer_end: n,
+                free_memory_bytes: 0,
+            }],
+            total_layers: n,
+            host_experts_from: None,
+        };
+        let enc_layers = crate::inference::load::shapes::Shapes::read(&[&enc])
+            .and_then(|s| s.meta_usize("block_count"))
+            .unwrap();
+        let cfg = DitConfig::from_checkpoint(std::path::Path::new(&dit)).unwrap();
+        let ids: Vec<u32> = (0..24u32).map(|i| 1000 + 37 * i).collect();
+        let (f, h, w) = (1usize, 64usize, 64usize);
+        let img = NT::from_vec_f32(
+            (0..h * w * cfg.in_channels)
+                .map(|i| (i as f32 * 0.017).sin())
+                .collect(),
+            (h * w, cfg.in_channels),
+        )
+        .unwrap();
+        let cosine = |a: &[f32], b: &[f32]| {
+            let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+            for (x, y) in a.iter().zip(b) {
+                ab += (*x as f64) * (*y as f64);
+                aa += (*x as f64) * (*x as f64);
+                bb += (*y as f64) * (*y as f64);
+            }
+            ab / (aa.sqrt() * bb.sqrt()).max(1e-30)
+        };
+        let txt = Qwen2TextEncoder::from_gguf_hetero(&enc, &plan(DeviceKind::Cpu, enc_layers))
+            .unwrap()
+            .forward(&ids)
+            .unwrap();
+        let want_txt = txt.to_vec_f32();
+        // The first blocks only: the host forward of all of them at this size takes an hour.
+        const BLOCKS: usize = 3;
+        let mut host_dit =
+            DitModel::load_hetero(&dit, &plan(DeviceKind::Cpu, cfg.num_layers), None).unwrap();
+        host_dit.keep_blocks(BLOCKS);
+        use crate::inference::model::qwen_image::dit::TRACE;
+        let traced = |m: &DitModel| {
+            TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+            let v = m.forward(&img, &txt, 0.6, f, h, w).unwrap().to_vec_f32();
+            (v, TRACE.with(|t| t.borrow_mut().take().unwrap()))
+        };
+        let (want_v, want_trace) = traced(&host_dit);
+        drop(host_dit);
+        let mut failed = false;
+        for ordinal in 0..crate::inference::place::device_probe::card_count() {
+            let on = plan(DeviceKind::Cuda(ordinal), enc_layers);
+            match Qwen2TextEncoder::from_gguf_hetero(&enc, &on) {
+                Ok(e) => {
+                    let got = e.forward(&ids).unwrap().to_vec_f32();
+                    let cos = cosine(&want_txt, &got);
+                    eprintln!("card {ordinal}: encoder cosine {cos}");
+                    failed |= !(cos > 0.99);
+                }
+                Err(e) => eprintln!("card {ordinal}: encoder not loaded ({e})"),
+            }
+            match DitModel::load_hetero(
+                &dit,
+                &plan(DeviceKind::Cuda(ordinal), cfg.num_layers),
+                None,
+            ) {
+                Ok(mut m) => {
+                    m.keep_blocks(BLOCKS);
+                    let (got, got_trace) = traced(&m);
+                    for ((name, a), (_, b)) in want_trace.iter().zip(&got_trace) {
+                        eprintln!("card {ordinal}: {name} cosine {}", cosine(a, b));
+                    }
+                    let cos = cosine(&want_v, &got);
+                    eprintln!("card {ordinal}: DiT cosine {cos}");
+                    failed |= !(cos > 0.99);
+                }
+                Err(e) => eprintln!("card {ordinal}: DiT not loaded ({e})"),
+            }
+        }
+        // The VAE on a latent of a quarter of the image's side, whole and in tiles.
+        let vae =
+            load_wan_vae_decoder_safetensors(dir.join(REL_VAE).to_string_lossy().as_ref()).unwrap();
+        let (c, lh, lw) = (cfg.out_channels, 32usize, 32usize);
+        let lat = NT::from_vec_f32(
+            (0..c * lh * lw).map(|i| (i as f32 * 0.029).sin()).collect(),
+            (c, 1usize, lh, lw),
+        )
+        .unwrap();
+        let want_px = vae.decode_whole(&lat).unwrap().to_vec_f32();
+        for ordinal in 0..crate::inference::place::device_probe::card_count() {
+            let Ok(d) = crate::tensor::cuda::CudaDevice::new(ordinal) else {
+                continue;
+            };
+            let d = Device::Cuda(d);
+            let on = vae.to_device(&d).unwrap();
+            let l = lat.to_device(&d).unwrap();
+            let whole = on.decode_whole(&l).unwrap().to_vec_f32();
+            let tiled = on
+                .decode_spatial_tiled(&l, 16, VAE_TILE_OVERLAP)
+                .unwrap()
+                .to_vec_f32();
+            let (cw, ct) = (cosine(&want_px, &whole), cosine(&want_px, &tiled));
+            eprintln!("card {ordinal}: VAE cosine whole {cw}, tiled {ct}");
+            failed |= !(cw > 0.99 && ct > 0.98);
+        }
+        assert!(
+            !failed,
+            "a card's encoder, DiT or VAE differs from the host's"
+        );
+    }
 }

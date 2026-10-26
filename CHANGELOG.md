@@ -19,6 +19,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- ROCm: copy every row of a large strided copy, so Qwen-Image renders.
 - Loading: send a layer's fused weights to the card once.
 - Images: decode a Qwen-Image in smaller tiles on a card before the host.
 - Images: run the feed-forward of a large Qwen-Image F32 checkpoint.

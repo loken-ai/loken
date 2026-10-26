@@ -1047,27 +1047,43 @@ pub unsafe fn cuMemcpyDtoDAsync_v2(
     unsafe { hip!(hipMemcpyDtoDAsync(ptr(dst), ptr(src), bytes, stream)) }
 }
 
+/// Rows one HIP 2D copy moves at most: the runtime copies only the rows a grid's y dimension
+/// reaches and reports success for the others.
+const MEMCPY_2D_ROWS: usize = 65_535;
+
 pub unsafe fn cuMemcpy2DAsync_v2(desc: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult {
     let d = unsafe { &*desc };
-    let hip_desc = HipMemcpy2D {
-        src_x_in_bytes: d.srcXInBytes,
-        src_y: d.srcY,
-        src_memory_type: d.srcMemoryType.to_hip(),
-        src_host: d.srcHost,
-        src_device: ptr(d.srcDevice),
-        src_array: d.srcArray as *mut c_void,
-        src_pitch: d.srcPitch,
-        dst_x_in_bytes: d.dstXInBytes,
-        dst_y: d.dstY,
-        dst_memory_type: d.dstMemoryType.to_hip(),
-        dst_host: d.dstHost,
-        dst_device: ptr(d.dstDevice),
-        dst_array: d.dstArray as *mut c_void,
-        dst_pitch: d.dstPitch,
-        width_in_bytes: d.WidthInBytes,
-        height: d.Height,
-    };
-    unsafe { hip!(hipMemcpyParam2DAsync(&hip_desc, stream)) }
+    // A copy of more rows goes as several of at most `MEMCPY_2D_ROWS`, each starting where the
+    // one before ended on both sides.
+    let mut first = 0;
+    while first < d.Height.max(1) {
+        let rows = (d.Height - first).min(MEMCPY_2D_ROWS);
+        let (src_skip, dst_skip) = (first * d.srcPitch, first * d.dstPitch);
+        let hip_desc = HipMemcpy2D {
+            src_x_in_bytes: d.srcXInBytes,
+            src_y: d.srcY,
+            src_memory_type: d.srcMemoryType.to_hip(),
+            src_host: d.srcHost.wrapping_byte_add(src_skip),
+            src_device: ptr(d.srcDevice + src_skip as CUdeviceptr),
+            src_array: d.srcArray as *mut c_void,
+            src_pitch: d.srcPitch,
+            dst_x_in_bytes: d.dstXInBytes,
+            dst_y: d.dstY,
+            dst_memory_type: d.dstMemoryType.to_hip(),
+            dst_host: d.dstHost.wrapping_byte_add(dst_skip),
+            dst_device: ptr(d.dstDevice + dst_skip as CUdeviceptr),
+            dst_array: d.dstArray as *mut c_void,
+            dst_pitch: d.dstPitch,
+            width_in_bytes: d.WidthInBytes,
+            height: rows,
+        };
+        let r = unsafe { hip!(hipMemcpyParam2DAsync(&hip_desc, stream)) };
+        if r != CUresult::CUDA_SUCCESS || d.Height == 0 {
+            return r;
+        }
+        first += rows;
+    }
+    CUresult::CUDA_SUCCESS
 }
 
 pub unsafe fn cuMemsetD8_v2(dst: CUdeviceptr, value: u8, n: usize) -> CUresult {

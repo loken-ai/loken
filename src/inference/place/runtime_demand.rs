@@ -674,7 +674,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{rel} is listed here but unreadable: {e}"));
             // Fixtures in a test module are allowed to name concrete byte counts -
             // that is how they pin behaviour. Only production code is gated.
-            let production = text.split("#[cfg(test)]").next().unwrap_or("");
+            // What precedes the first test module ships.
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap_or("");
             let lines: Vec<&str> = production.lines().collect();
             for (n, line) in lines.iter().enumerate() {
                 let trimmed = line.trim_start();
@@ -868,7 +869,8 @@ mod tests {
             // without reading anything - twenty-six of these paths had moved.
             let text = std::fs::read_to_string(root.join(rel))
                 .unwrap_or_else(|e| panic!("{rel} is listed here but unreadable: {e}"));
-            let production = text.split("#[cfg(test)]").next().unwrap_or("");
+            // What precedes the first test module ships.
+            let production = text.split("#[cfg(test)]\nmod ").next().unwrap_or("");
             if !MULTI_DEVICE_MARKERS.iter().any(|m| production.contains(m)) {
                 single.push(rel);
             }
