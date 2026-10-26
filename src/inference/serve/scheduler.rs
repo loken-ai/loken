@@ -220,7 +220,6 @@ impl Scheduler {
                 plan.preempted.push(v.id);
                 let mut v = v;
                 v.status = SeqStatus::Waiting;
-                v.generated = 0;
                 self.waiting.push_front(v);
             } else {
                 // Only the current sequence remains and it still can't grow ->
@@ -230,7 +229,6 @@ impl Scheduler {
                 plan.preempted.push(v.id);
                 let mut v = v;
                 v.status = SeqStatus::Waiting;
-                v.generated = 0;
                 self.waiting.push_front(v);
                 break;
             }
@@ -243,7 +241,9 @@ impl Scheduler {
             let Some(front) = self.waiting.front() else {
                 break;
             };
-            let need = front.prompt_len;
+            // A preempted sequence comes back with the tokens it generated: its prefill
+            // recomputes them with the prompt and continues where it stopped.
+            let need = front.ctx_len();
             if need > prefill_budget && !plan.prefills.is_empty() {
                 break; // keep the step bounded; admit it next step
             }
@@ -260,6 +260,11 @@ impl Scheduler {
                     .alloc
                     .allocate_with_prefix(s.id, &s.prompt)
                     .expect("can_append checked");
+                if need > s.prompt_len {
+                    self.alloc
+                        .append(s.id, need - s.prompt_len)
+                        .expect("can_append checked");
+                }
                 let slots = self.alloc.slots_for_range(s.id, cached, need);
                 let bt = self
                     .alloc

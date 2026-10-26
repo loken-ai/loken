@@ -210,10 +210,14 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
             let r = self.reqs.get_mut(&p.seq).expect("submitted");
             r.last_was_prefill = true;
             let recent = recent_window(&r.prompt, &r.generated, r.sampling.repeat_last_n);
+            // A sequence preempted after generating prefills its generated tokens with its
+            // prompt, and its next token continues the stream the client already holds.
+            let mut tokens = r.prompt.clone();
+            tokens.extend_from_slice(&r.generated);
             items.push(StepItem {
                 seq: p.seq,
                 is_prefill: true,
-                tokens: r.prompt.clone(),
+                tokens,
                 slots: p.slots.clone(),
                 // Full prefill: self-attends over its own slots (no block table).
                 // Prefix-cached prefill (cached_len>0): the block table lets the
@@ -340,6 +344,62 @@ mod tests {
             seen_prefill: Default::default(),
         };
         ContinuousBatchEngine::new(m, vec![0], num_blocks, 16, 8, 4096).unwrap()
+    }
+
+    /// Model whose next token depends on every token of the sequence so far: a prefill
+    /// gives it the whole history, a decode the token that extends it.
+    #[derive(Default)]
+    struct HistoryModel {
+        history: HashMap<SeqId, Vec<u32>>,
+        prefills: usize,
+    }
+    impl BatchedModel for HistoryModel {
+        fn step(&mut self, items: &[StepItem]) -> Result<Vec<u32>> {
+            Ok(items
+                .iter()
+                .map(|it| {
+                    let h = self.history.entry(it.seq).or_default();
+                    if it.is_prefill {
+                        *h = it.tokens.clone();
+                        self.prefills += 1;
+                    } else {
+                        h.push(it.tokens[0]);
+                    }
+                    let mix = h.iter().fold(h.len() as u64, |a, &t| {
+                        a.wrapping_mul(31).wrapping_add(t as u64)
+                    });
+                    10 + (mix % 900) as u32
+                })
+                .collect())
+        }
+    }
+
+    fn generations(num_blocks: usize) -> (HashMap<u64, Vec<u32>>, usize) {
+        let mut e =
+            ContinuousBatchEngine::new(HistoryModel::default(), vec![0], num_blocks, 16, 8, 4096)
+                .unwrap();
+        for id in 1..=4u64 {
+            e.submit(GenReq {
+                id,
+                prompt: (0..20).map(|t| t + id as u32).collect(),
+                max_new: 40,
+                sampling: SamplingParams::greedy(),
+            });
+        }
+        let done = e.run_to_idle().unwrap();
+        (
+            done.into_iter().map(|d| (d.id, d.tokens)).collect(),
+            e.model.prefills,
+        )
+    }
+
+    #[test]
+    fn a_preempted_sequence_continues_the_tokens_it_had_generated() {
+        let (roomy, roomy_prefills) = generations(64);
+        let (tight, tight_prefills) = generations(8);
+        assert_eq!((roomy.len(), roomy_prefills), (4, 4));
+        assert!(tight_prefills > 4, "the tight cache preempts");
+        assert_eq!(tight, roomy);
     }
 
     #[test]
