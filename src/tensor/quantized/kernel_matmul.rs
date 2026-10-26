@@ -365,10 +365,31 @@ impl QKernelMatMul {
         x32.matmul_t(&wt)
     }
 
-    /// GPU-dequant weight -> dense F32 on-device -> parallel cuBLAS F32 GEMM. High GPU util AND F32
-    /// accumulation (holds the DiT's ~1e9 activations that overflow the quantized MMQ path). No
-    /// weight cache -> no OOM; the dequant buffer is freed after the matmul. Falls back to the CPU
-    /// dequant for non-K-quant or CPU tensors. Q4_K_M DiT = Q4_K/Q5_K/Q6_K.
+    /// The whole weight dequantised on its card to a fresh dense F32 buffer of `n * k` values.
+    /// `None` for a weight that is not a GPU K-quant (Q4_K, Q5_K, Q6_K) or Q8_0 blob.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn dequant_f32_gpu(
+        &self,
+    ) -> Result<Option<crate::tensor::gpu_runtime::driver::CudaSlice<f32>>> {
+        let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
+        else {
+            return Ok(None);
+        };
+        let total = self.n * self.k;
+        // K-quants use the 256-value superblock kernels; Q8_0 (32-value blocks) has its own
+        // launcher.
+        let kquant = |kernel: &str, threads: u32| {
+            crate::tensor::cuda::dequantize_kquant_f32(qdev, kernel, blob, total, threads)
+        };
+        Ok(match self.dtype {
+            GgmlDType::Q4K => Some(kquant("dequantize_block_q4_K_f32", 32)?),
+            GgmlDType::Q5K => Some(kquant("dequantize_block_q5_K_f32", 64)?),
+            GgmlDType::Q6K => Some(kquant("dequantize_block_q6_K_f32", 64)?),
+            GgmlDType::Q8_0 => Some(crate::tensor::cuda::dequantize_q8_0_f32(qdev, blob, total)?),
+            _ => None,
+        })
+    }
+
     /// Dequantize this weight ONCE into a dense BF16 device tensor `[n, k]`, for
     /// callers that run several GEMMs against the same weight (e.g. a token-chunked
     /// MLP). `Ok(None)` when the weight is not a GPU K-quant/Q8_0 blob - the caller
@@ -380,33 +401,18 @@ impl QKernelMatMul {
         else {
             return Ok(None);
         };
-        let total = self.n * self.k;
-        let w = match self.dtype {
-            GgmlDType::Q4K => Some(crate::tensor::cuda::dequantize_kquant_f32(
-                qdev,
-                "dequantize_block_q4_K_f32",
-                blob,
-                total,
-                32,
-            )?),
-            GgmlDType::Q5K => Some(crate::tensor::cuda::dequantize_kquant_f32(
-                qdev,
-                "dequantize_block_q5_K_f32",
-                blob,
-                total,
-                64,
-            )?),
-            GgmlDType::Q6K => Some(crate::tensor::cuda::dequantize_kquant_f32(
-                qdev,
-                "dequantize_block_q6_K_f32",
-                blob,
-                total,
-                64,
-            )?),
-            GgmlDType::Q8_0 => Some(crate::tensor::cuda::dequantize_q8_0_f32(qdev, blob, total)?),
-            _ => None,
-        };
-        match w {
+        // Straight to BF16 where the dtype has a BF16 dequantiser: the same values as the F32
+        // route cast to BF16, without the F32 copy.
+        if let Some(dq) = crate::tensor::cuda::DequantBf16::resolve(qdev, self.dtype) {
+            let w = dq.to_new(qdev, blob, self.n * self.k)?;
+            return crate::tensor::Tensor::from_cuda_storage(
+                crate::tensor::cuda::CudaStorage::BF16(w),
+                qdev.clone(),
+                vec![self.n, self.k],
+            )
+            .map(Some);
+        }
+        match self.dequant_f32_gpu()? {
             Some(w) => {
                 let wt = crate::tensor::Tensor::from_cuda_storage(
                     crate::tensor::cuda::CudaStorage::F32(w),
@@ -419,60 +425,115 @@ impl QKernelMatMul {
         }
     }
 
+    /// `x [.., k] @ W^T` with the weight dequantised on its card and one cuBLAS BF16 GEMM
+    /// accumulating in F32: the wide calls of a DiT, whose activations overflow the quantised
+    /// tile path. The output is BF16 for a BF16 activation and F32 otherwise.
+    ///
+    /// The weight is dequantised straight to BF16 into the stream's reused scratch where that
+    /// route applies ([`Self::forward_dequant_bf16`]), else to a fresh F32 copy cast to BF16, else
+    /// on the host for a dtype or device no GPU dequantiser serves. Callers on the GPU hot path
+    /// must use a dtype one of the GPU routes serves, else the matmul silently runs on the CPU.
     pub fn forward_dequant_gpu(&self, x: &crate::tensor::Tensor) -> Result<crate::tensor::Tensor> {
         #[cfg(feature = "gpu")]
-        if let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
         {
-            let total = self.n * self.k;
-            // GPU-dequant the weight to a dense F32 device buffer. K-quants use the 256-superblock
-            // kernels; Q8_0 (32-wide blocks) uses its own launcher. Anything unsupported yields None
-            // and falls through to the CPU path below - callers on the GPU hot path MUST use a dtype
-            // handled here, else the "GPU" matmul silently runs on CPU.
-            let w = match self.dtype {
-                GgmlDType::Q4K => Some(crate::tensor::cuda::dequantize_kquant_f32(
-                    qdev,
-                    "dequantize_block_q4_K_f32",
-                    blob,
-                    total,
-                    32,
-                )?),
-                GgmlDType::Q5K => Some(crate::tensor::cuda::dequantize_kquant_f32(
-                    qdev,
-                    "dequantize_block_q5_K_f32",
-                    blob,
-                    total,
-                    64,
-                )?),
-                GgmlDType::Q6K => Some(crate::tensor::cuda::dequantize_kquant_f32(
-                    qdev,
-                    "dequantize_block_q6_K_f32",
-                    blob,
-                    total,
-                    64,
-                )?),
-                GgmlDType::Q8_0 => {
-                    Some(crate::tensor::cuda::dequantize_q8_0_f32(qdev, blob, total)?)
-                }
-                _ => None,
-            };
-            if let Some(w) = w {
-                let wt = crate::tensor::Tensor::from_cuda_storage(
-                    crate::tensor::cuda::CudaStorage::F32(w),
-                    qdev.clone(),
-                    vec![self.n, self.k],
-                )?;
-                // BF16 on the tensor cores: its eight-bit exponent holds the DiT's ~1e9
-                // activations where f16 overflows, cuBLAS accumulates the products in F32 anyway,
-                // and it is four to eight times an F32 GEMM.
-                if x.dtype() == crate::tensor::DType::BF16 {
-                    return x.matmul_t(&wt.to_dtype(crate::tensor::DType::BF16)?);
-                }
-                let xb = x.to_dtype(crate::tensor::DType::BF16)?;
-                let y = xb.matmul_t(&wt.to_dtype(crate::tensor::DType::BF16)?)?;
-                return y.to_dtype(crate::tensor::DType::F32);
+            if let Some(y) = self.forward_dequant_bf16(x)? {
+                return Ok(y);
+            }
+            if let Some(y) = self.forward_dequant_gpu_f32(x)? {
+                return Ok(y);
             }
         }
         self.forward_dequant_f32(x)
+    }
+
+    /// The dequantised GEMM over a BF16 copy of the weight written by the dtype's BF16
+    /// dequantiser into the scratch of the device's stream, reused across calls.
+    ///
+    /// The GEMM reads BF16 operands, sums in F32 and writes F32 directly for an F32 or F16
+    /// activation, so neither the weight nor the output is cast. The weight's values are the
+    /// F32 route's rounded once to BF16, so the two routes differ only by the F32 route's
+    /// rounding of its output to BF16. `None` where the route does not apply: no BF16
+    /// dequantiser for the dtype, a card without BF16 matrix units, an activation that is not
+    /// on the weight's card, a dry run, or a stream recording a graph.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn forward_dequant_bf16(
+        &self,
+        x: &crate::tensor::Tensor,
+    ) -> Result<Option<crate::tensor::Tensor>> {
+        use crate::tensor::DType;
+        let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
+        else {
+            return Ok(None);
+        };
+        let crate::tensor::Device::Cuda(xdev) = x.device() else {
+            return Ok(None);
+        };
+        let dims = x.dims().to_vec();
+        let rows = x.elem_count() / self.k.max(1);
+        if xdev.ordinal() != qdev.ordinal()
+            || dims.last() != Some(&self.k)
+            || rows == 0
+            || !qdev.has_bf16_matrix_cores()
+            || crate::tensor::cuda_ext::capture_active_on(qdev.stream())
+        {
+            return Ok(None);
+        }
+        let Some(dq) = crate::tensor::cuda::DequantBf16::resolve(qdev, self.dtype) else {
+            return Ok(None);
+        };
+        let (n, k) = (self.n, self.k);
+        let bf16_out = x.dtype() == DType::BF16;
+        let xb = x.to_dtype(DType::BF16)?.contiguous()?;
+        let (xs, _) = xb.cuda_bf16_slice()?;
+        let storage = crate::tensor::cuda::with_dequant_scratch_bf16(qdev, n * k, |w| {
+            dq.launch(qdev, blob, w, n * k)?;
+            Ok(if bf16_out {
+                crate::tensor::cuda::CudaStorage::BF16(crate::tensor::cuda::matmul_nt_bf16(
+                    qdev, xs, w, 1, rows, k, n,
+                )?)
+            } else {
+                crate::tensor::cuda::CudaStorage::F32(crate::tensor::cuda::matmul_nt_bf16_f32(
+                    qdev, xs, w, 1, rows, k, n,
+                )?)
+            })
+        })?;
+        let mut odims = dims;
+        if let Some(last) = odims.last_mut() {
+            *last = n;
+        }
+        crate::tensor::Tensor::from_cuda_storage(storage, qdev.clone(), odims).map(Some)
+    }
+
+    /// The dequantised GEMM over a fresh F32 copy of the weight, cast to BF16 with the
+    /// activation, the output cast back to F32 for a non-BF16 activation. `None` for a weight
+    /// [`Self::dequant_f32_gpu`] does not serve.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn forward_dequant_gpu_f32(
+        &self,
+        x: &crate::tensor::Tensor,
+    ) -> Result<Option<crate::tensor::Tensor>> {
+        let crate::tensor::Device::Cuda(qdev) = &self.device else {
+            return Ok(None);
+        };
+        let Some(w) = self.dequant_f32_gpu()? else {
+            return Ok(None);
+        };
+        let wt = crate::tensor::Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(w),
+            qdev.clone(),
+            vec![self.n, self.k],
+        )?;
+        // BF16 on the tensor cores: its eight-bit exponent holds the DiT's ~1e9
+        // activations where f16 overflows, cuBLAS accumulates the products in F32 anyway,
+        // and it is four to eight times an F32 GEMM.
+        if x.dtype() == crate::tensor::DType::BF16 {
+            return x
+                .matmul_t(&wt.to_dtype(crate::tensor::DType::BF16)?)
+                .map(Some);
+        }
+        let xb = x.to_dtype(crate::tensor::DType::BF16)?;
+        let y = xb.matmul_t(&wt.to_dtype(crate::tensor::DType::BF16)?)?;
+        y.to_dtype(crate::tensor::DType::F32).map(Some)
     }
 
     /// Attach a low-rank correction on top of the quantised weight.

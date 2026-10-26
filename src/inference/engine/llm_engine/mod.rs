@@ -1050,6 +1050,7 @@ pub fn release_cuda_pools() {
     // exposes a `release_workspaces()` for exactly this teardown step.
     crate::tensor::quantized::fast_mmvq::release_workspaces();
     crate::tensor::quantized::release_mmq_workspaces();
+    crate::tensor::cuda::release_dequant_scratch();
     // Forget the devices nobody holds. The registry holds them weakly, so a card in use keeps
     // its one shared device and stream; a card nobody uses is released by
     // `release_idle_cards`.

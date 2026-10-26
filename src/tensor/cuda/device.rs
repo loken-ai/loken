@@ -25,6 +25,7 @@ pub fn reclaim_pool(dev: &CudaDevice) {
 pub(super) fn emergency_reclaim(dev: &CudaDevice) {
     crate::tensor::quantized::fast_mmvq::release_workspaces();
     crate::tensor::quantized::release_mmq_workspaces();
+    super::quant::release_dequant_scratch();
     let _ = dev.stream().synchronize();
     trim_pool(dev.ordinal());
 }
@@ -418,6 +419,7 @@ fn purge_card_caches(ordinal: usize) -> bool {
     }
     crate::tensor::quantized::fast_mmvq::release_workspaces_of(ordinal)
         && crate::tensor::quantized::release_mmq_workspaces_of(ordinal)
+        && super::quant::release_dequant_scratch_of(ordinal)
         && super::quant::release_copy_stream(ordinal)
 }
 

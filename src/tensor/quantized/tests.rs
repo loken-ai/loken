@@ -922,7 +922,7 @@ fn every_kernel_name_the_quantised_module_is_asked_for_resolves() {
     );
 
     // The dequantisers and the KV-staging quantisers are reached through generated names, so
-    // they are stated here - they are the eight entry points the rest of the engine needs.
+    // they are stated here - they are the twelve entry points the rest of the engine needs.
     for k in [
         "quantize_q4_0",
         "quantize_q4_0_f16",
@@ -932,6 +932,10 @@ fn every_kernel_name_the_quantised_module_is_asked_for_resolves() {
         "dequantize_block_q5_K_f32",
         "dequantize_block_q6_K_f32",
         "dequantize_block_q8_0_f32",
+        "dequantize_block_q4_K_bf16",
+        "dequantize_block_q5_K_bf16",
+        "dequantize_block_q6_K_bf16",
+        "dequantize_block_q8_0_bf16",
         // Reached through the custom-module path rather than `quantized_fn`, which is how
         // one of them went missing without this test noticing.
         "quantize_q8_1",
@@ -1458,4 +1462,178 @@ fn a_store_embedding_is_not_widened() {
     let got = emb.forward(&ids).unwrap().to_vec_f32();
     let want = dense.index_select(&ids, 0).unwrap().to_vec_f32();
     assert_eq!(got, want);
+}
+
+/// A weight of `dtype`, `[n, k]`, drawn from a fixed hash and uploaded to `device`.
+#[cfg(feature = "gpu")]
+fn hashed_gpu_weight(
+    dtype: GgmlDType,
+    n: usize,
+    k: usize,
+    seed: u32,
+    device: &Device,
+) -> QKernelMatMul {
+    let wf: Vec<f32> = (0..n * k)
+        .map(|i| {
+            let h = (i as u32 ^ seed)
+                .wrapping_mul(2_246_822_519)
+                .wrapping_add(374_761_393);
+            ((h >> 8) as f32 / (1 << 24) as f32 - 0.5) * 2.4
+        })
+        .collect();
+    let bytes = crate::tensor::quant_cpu::from_float_bytes(dtype, &wf)
+        .unwrap_or_else(|e| panic!("{dtype:?}: encode: {e}"));
+    let qt = QHostTensor::from_bytes(&bytes, dtype, vec![n, k])
+        .unwrap_or_else(|e| panic!("{dtype:?}: from_bytes: {e}"));
+    QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), device)
+        .unwrap_or_else(|e| panic!("{dtype:?}: upload: {e}"))
+}
+
+/// The BF16 dequantisers write exactly the F32 dequantisers' output rounded to BF16, and the
+/// GEMM over them agrees with the F32 route within that route's own rounding of its output.
+///
+/// The weights are compared bit for bit: both routes compute each value in F32 and round it
+/// once to nearest even. The GEMM outputs differ by the F32 route's rounding of its product to
+/// BF16 before widening it back, at most half a BF16 step of the value, so the bound is a whole
+/// step of the value plus a ten-thousandth of the row's scale for the summation order of two
+/// cuBLAS kernels. A dequantiser off by one scale step moves an output by far more.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_bf16_dequantised_gemm_matches_the_f32_route() {
+    use crate::tensor::{cuda::CudaDevice, DType, Tensor};
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the BF16 dequantised GEMM is NOT covered by this run");
+        return;
+    };
+    let device = Device::Cuda(dev.clone());
+    let (n, k) = (96usize, 512usize);
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0] {
+        let qm = hashed_gpu_weight(dtype, n, k, 0x5eed, &device);
+
+        let fast = qm
+            .dequant_weight_bf16()
+            .unwrap()
+            .expect("a GPU weight dequantises")
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32();
+        let w32 = qm
+            .dequant_f32_gpu()
+            .unwrap()
+            .expect("a GPU weight dequantises");
+        let slow = Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(w32),
+            dev.clone(),
+            vec![n, k],
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec_f32();
+        assert_eq!(fast.len(), n * k, "{dtype:?}: dequantised length");
+        for (i, (a, b)) in fast.iter().zip(&slow).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{dtype:?}: weight [{i}] dequantised to BF16 is {a}, the F32 route cast is {b}"
+            );
+        }
+
+        if !dev.has_bf16_matrix_cores() {
+            eprintln!("{dtype:?}: no BF16 matrix units; the BF16 GEMM route is NOT covered");
+            continue;
+        }
+        for m in [1usize, 7, 64, 513] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| (((i * 7919 + 13) % 2003) as f32 / 1001.0 - 1.0) * 1.5)
+                .collect();
+            let x = Tensor::from_vec_f32(x, vec![m, k])
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            for xt in [DType::F32, DType::BF16] {
+                let xi = x.to_dtype(xt).unwrap();
+                let new = qm
+                    .forward_dequant_bf16(&xi)
+                    .unwrap()
+                    .expect("the BF16 route serves this weight");
+                let old = qm
+                    .forward_dequant_gpu_f32(&xi)
+                    .unwrap()
+                    .expect("the F32 route serves this weight");
+                assert_eq!(
+                    new.dtype(),
+                    old.dtype(),
+                    "{dtype:?} m={m} {xt:?}: output dtype"
+                );
+                assert_eq!(new.dims(), &[m, n], "{dtype:?} m={m} {xt:?}: output shape");
+                let new = new.to_dtype(DType::F32).unwrap().to_vec_f32();
+                let old = old.to_dtype(DType::F32).unwrap().to_vec_f32();
+                let step = 1.0 / 256.0;
+                for r in 0..m {
+                    let row = &old[r * n..(r + 1) * n];
+                    let scale = row.iter().fold(0f32, |s, v| s.max(v.abs())) as f64;
+                    for o in 0..n {
+                        let (a, b) = (new[r * n + o] as f64, row[o] as f64);
+                        assert!(
+                            (a - b).abs() <= step * b.abs() + 1e-4 * scale,
+                            "{dtype:?} m={m} {xt:?} [{r}, {o}]: BF16 route {a}, F32 route {b} \
+                             (row scale {scale})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A second dequantised GEMM of the same shape on the same stream runs in the same scratch:
+/// same address, same length, nothing allocated.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_bf16_dequant_scratch_is_reused_across_calls() {
+    use crate::tensor::{cuda::CudaDevice, Tensor};
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the dequantisation scratch is NOT covered by this run");
+        return;
+    };
+    if !dev.has_bf16_matrix_cores() {
+        eprintln!("no BF16 matrix units; the dequantisation scratch is NOT covered by this run");
+        return;
+    }
+    let device = Device::Cuda(dev.clone());
+    // Larger than any other weight this suite dequantises, so no other test grows the scratch
+    // between the two calls.
+    let (n, k, m) = (1536usize, 1024usize, 9usize);
+    let qm = hashed_gpu_weight(GgmlDType::Q4K, n, k, 0x0dd, &device);
+    let x = Tensor::from_vec_f32(
+        (0..m * k)
+            .map(|i| ((i % 61) as f32 - 30.0) / 31.0)
+            .collect(),
+        vec![m, k],
+    )
+    .unwrap()
+    .to_device(&device)
+    .unwrap();
+    let first = qm.forward_dequant_bf16(&x).unwrap().expect("BF16 route");
+    let before = crate::tensor::cuda::dequant_scratch_state(&dev).expect("a scratch after a call");
+    assert!(
+        before.1 >= n * k,
+        "the scratch holds {} of {} values",
+        before.1,
+        n * k
+    );
+    let second = qm.forward_dequant_bf16(&x).unwrap().expect("BF16 route");
+    let after = crate::tensor::cuda::dequant_scratch_state(&dev).expect("a scratch after a call");
+    assert_eq!(
+        before, after,
+        "the second call of the same shape moved or grew the scratch"
+    );
+    assert_eq!(
+        first.to_vec_f32(),
+        second.to_vec_f32(),
+        "the same call gave two answers"
+    );
 }

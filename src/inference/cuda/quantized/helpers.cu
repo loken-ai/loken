@@ -185,23 +185,27 @@ static __device__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t
         dequantize_block_##FMT(vx, y, nb32);                                   \
     }
 
-// Both destinations, from one generator. The suffix and the type travel together because a
-// kernel is resolved by name at runtime, so its name has to spell what it writes.
-#define SUPERBLOCK_PAIR(FMT)                 \
-    SUPERBLOCK_ENTRY(FMT, f32, float)        \
-    SUPERBLOCK_ENTRY(FMT, f16, half)
+// Every destination, from one generator. The suffix and the type travel together because a
+// kernel is resolved by name at runtime, so its name has to spell what it writes. A value is
+// computed as the f32 entry computes it and rounded once on the store, to nearest even for
+// bf16, so the bf16 entry writes exactly what the f32 entry's output cast to bf16 holds.
+#define SUPERBLOCK_DESTINATIONS(FMT)            \
+    SUPERBLOCK_ENTRY(FMT, f32, float)           \
+    SUPERBLOCK_ENTRY(FMT, f16, half)            \
+    SUPERBLOCK_ENTRY(FMT, bf16, nv_bfloat16)
 
-#define BLOCK32_PAIR(FMT)                    \
-    BLOCK32_ENTRY(FMT, f32, float)           \
-    BLOCK32_ENTRY(FMT, f16, half)
+#define BLOCK32_DESTINATIONS(FMT)               \
+    BLOCK32_ENTRY(FMT, f32, float)              \
+    BLOCK32_ENTRY(FMT, f16, half)               \
+    BLOCK32_ENTRY(FMT, bf16, nv_bfloat16)
 
 // Each family's formats, stated once. A generator is pasted over the list rather than repeated
 // under it, so a format added here reaches every entry point that has to exist for it.
 #define SUPERBLOCK_FORMATS(EMIT) EMIT(q2_K) EMIT(q3_K) EMIT(q4_K) EMIT(q5_K) EMIT(q6_K) EMIT(q8_K)
 #define BLOCK32_FORMATS(EMIT)    EMIT(q4_0) EMIT(q4_1) EMIT(q5_0) EMIT(q5_1) EMIT(q8_0)
 
-SUPERBLOCK_FORMATS(SUPERBLOCK_PAIR)
-BLOCK32_FORMATS(BLOCK32_PAIR)
+SUPERBLOCK_FORMATS(SUPERBLOCK_DESTINATIONS)
+BLOCK32_FORMATS(BLOCK32_DESTINATIONS)
 
 
 // GPU-native Q8_0 quantizer, writing the format's own block: 32 signed codes and the one half

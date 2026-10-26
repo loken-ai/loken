@@ -208,6 +208,210 @@ pub fn dequantize_kquant_f32(
     Ok(dst)
 }
 
+/// How a whole-weight dequantiser covers its tensor.
+#[derive(Clone, Copy)]
+enum DequantGrid {
+    /// One CUDA block per 256-value superblock; the kernel takes `(blob, out)`.
+    Superblock,
+    /// One CUDA block per eight 32-value blocks; the kernel takes `(blob, out, nb32)` and
+    /// bounds itself, so the last CUDA block may overrun the tensor.
+    Block32,
+}
+
+/// A whole-weight dequantiser writing BF16, resolved on one card.
+///
+/// Each value is computed as the F32 dequantiser computes it and rounded once to nearest-even
+/// BF16, so the output holds exactly the F32 output cast to BF16.
+pub struct DequantBf16 {
+    func: CudaFunction,
+    name: &'static str,
+    threads: u32,
+    grid: DequantGrid,
+}
+
+impl DequantBf16 {
+    /// The BF16 dequantiser of `dtype` on `dev`, or `None` when the dtype has none wired here or
+    /// the card's module does not export it; the caller then takes the F32 route.
+    pub fn resolve(dev: &CudaDevice, dtype: GgmlDType) -> Option<Self> {
+        let (name, threads, grid) = match dtype {
+            GgmlDType::Q4K => ("dequantize_block_q4_K_bf16", 32, DequantGrid::Superblock),
+            GgmlDType::Q5K => ("dequantize_block_q5_K_bf16", 64, DequantGrid::Superblock),
+            GgmlDType::Q6K => ("dequantize_block_q6_K_bf16", 64, DequantGrid::Superblock),
+            GgmlDType::Q8_0 => ("dequantize_block_q8_0_bf16", 32, DequantGrid::Block32),
+            _ => return None,
+        };
+        let func = dev.quantized_fn(name).ok()?;
+        Some(Self {
+            func,
+            name,
+            threads,
+            grid,
+        })
+    }
+
+    /// Dequantises the `total` values of `weight_blob` into the first `total` elements of
+    /// `dst`, on the device's stream.
+    pub fn launch(
+        &self,
+        dev: &CudaDevice,
+        weight_blob: &CudaSlice<u8>,
+        dst: &mut CudaSlice<half::bf16>,
+        total: usize,
+    ) -> Result<()> {
+        if dst.len() < total {
+            return Err(Error(format!(
+                "{}: {total} values into a buffer of {}",
+                self.name,
+                dst.len()
+            )));
+        }
+        let blocks = match self.grid {
+            DequantGrid::Superblock => total / 256,
+            DequantGrid::Block32 => total.div_ceil(256),
+        };
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (self.threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let nb32 = (total / 32) as i32;
+        let stream = dev.stream();
+        let mut b = stream.launch_builder(&self.func);
+        b.arg(weight_blob);
+        b.arg(dst);
+        if let DequantGrid::Block32 = self.grid {
+            b.arg(&nb32);
+        }
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{} launch: {e}", self.name)))?;
+        Ok(())
+    }
+
+    /// Dequantises the `total` values of `weight_blob` into a fresh BF16 buffer.
+    pub fn to_new(
+        &self,
+        dev: &CudaDevice,
+        weight_blob: &CudaSlice<u8>,
+        total: usize,
+    ) -> Result<CudaSlice<half::bf16>> {
+        let stream = dev.stream();
+        let mut dst = with_oom_retry(dev, "dequant bf16", || unsafe {
+            stream.alloc::<half::bf16>(total)
+        })?;
+        self.launch(dev, weight_blob, &mut dst, total)?;
+        Ok(dst)
+    }
+}
+
+/// One stream's BF16 buffer for a dequantised weight, as large as the largest weight it held.
+type DequantScratch = Arc<std::sync::Mutex<Option<CudaSlice<half::bf16>>>>;
+
+/// The dequantisation scratch of every stream that ran a dequantised GEMM, keyed by
+/// (card ordinal, stream).
+///
+/// A user dequantises a weight into its stream's scratch and the GEMM it launches next reads
+/// it. The entry's lock is held from the dequantisation's launch to the GEMM's, so the stream
+/// runs that pair before the next user's dequantisation is queued, with no event. Two streams
+/// never share an entry, and the map's own lock is held only to find one.
+static DEQUANT_SCRATCH: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, usize), DequantScratch>>,
+> = OnceLock::new();
+
+fn dequant_scratch_key(dev: &CudaDevice) -> (usize, usize) {
+    use crate::tensor::gpu_runtime::driver::sys::CUstream;
+    (dev.ordinal(), dev.stream().cu_stream() as CUstream as usize)
+}
+
+/// Runs `f` over the BF16 dequantisation scratch of the device's stream, grown first to hold at
+/// least `elems` values.
+///
+/// Everything `f` queues against the scratch must be queued on the device's stream before it
+/// returns: the next user of the stream writes the scratch as soon as `f` is done. The stream
+/// must not be capturing, since a graph would keep the address of a buffer that a later growth
+/// frees.
+pub fn with_dequant_scratch_bf16<T>(
+    dev: &CudaDevice,
+    elems: usize,
+    f: impl FnOnce(&mut CudaSlice<half::bf16>) -> Result<T>,
+) -> Result<T> {
+    let entry = {
+        let map = DEQUANT_SCRATCH.get_or_init(Default::default);
+        let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(dequant_scratch_key(dev)).or_default().clone()
+    };
+    let mut slot = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().is_none_or(|s| s.len() < elems) {
+        // The smaller buffer goes back to the pool first, ordered on the stream after the work
+        // that read it, so a growth never holds both.
+        *slot = None;
+        let stream = dev.stream();
+        *slot = Some(with_oom_retry(dev, "dequant scratch", || unsafe {
+            stream.alloc::<half::bf16>(elems)
+        })?);
+    }
+    match slot.as_mut() {
+        Some(scratch) => f(scratch),
+        None => Err(Error("dequant scratch: no buffer after growth".into())),
+    }
+}
+
+/// Drops the dequantisation scratch of the streams `which` selects by card ordinal. A scratch
+/// whose lock is held is kept, since its holder's kernels still address it. False when the map
+/// or one of the selected entries is busy.
+fn release_dequant_scratch_where(which: impl Fn(usize) -> bool) -> bool {
+    let Some(map) = DEQUANT_SCRATCH.get() else {
+        return true;
+    };
+    let Ok(mut g) = map.try_lock() else {
+        return false;
+    };
+    let mut all = true;
+    g.retain(|(ordinal, _), entry| {
+        if !which(*ordinal) {
+            return true;
+        }
+        match entry.try_lock() {
+            Ok(mut slot) => {
+                *slot = None;
+                false
+            }
+            Err(_) => {
+                all = false;
+                true
+            }
+        }
+    });
+    all
+}
+
+/// Drops every dequantisation scratch no GEMM holds (model unload, an allocation's OOM retry).
+/// Never blocks: it runs inside a forward that may hold one of the locks.
+pub fn release_dequant_scratch() {
+    let _ = release_dequant_scratch_where(|_| true);
+}
+
+/// Drops the dequantisation scratch of card `ordinal`. False when one of them is busy.
+pub fn release_dequant_scratch_of(ordinal: usize) -> bool {
+    release_dequant_scratch_where(|o| o == ordinal)
+}
+
+/// The device address and length of the device stream's dequantisation scratch, if it has one.
+#[cfg(test)]
+pub(crate) fn dequant_scratch_state(
+    dev: &CudaDevice,
+) -> Option<(impl PartialEq + std::fmt::Debug, usize)> {
+    use crate::tensor::gpu_runtime::driver::DevicePtr;
+    let entry = DEQUANT_SCRATCH
+        .get()?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dequant_scratch_key(dev))?
+        .clone();
+    let slot = entry.lock().unwrap_or_else(|e| e.into_inner());
+    let s = slot.as_ref()?;
+    let (ptr, _guard) = s.device_ptr(dev.stream());
+    Some((ptr, s.len()))
+}
+
 /// Quantise an f32 buffer to Q8_0 GGUF blocks on the GPU, returning the block bytes.
 ///
 /// `f32s.len()` must be a multiple of 32. The output is the exact GGUF Q8_0 layout (34 bytes per
