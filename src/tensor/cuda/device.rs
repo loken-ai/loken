@@ -851,9 +851,8 @@ impl CudaDevice {
                 arch: crate::inference::quantized_cuda::nvrtc_arch_of_ordinal(self.ordinal()),
                 ..Default::default()
             };
-            let ptx =
-                crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(ELEMENTWISE_SRC, opts)
-                    .map_err(|e| Error(format!("elementwise nvrtc: {e}")))?;
+            let ptx = super::compile::compile(ELEMENTWISE_SRC, opts)
+                .map_err(|e| Error(format!("elementwise nvrtc: {e}")))?;
             let module = self
                 .ctx
                 .load_module(ptx)
@@ -872,11 +871,9 @@ impl CudaDevice {
                 arch: crate::inference::quantized_cuda::nvrtc_arch_of_ordinal(self.ordinal()),
                 ..Default::default()
             };
-            let ptx = crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(
-                crate::inference::kernel::fused::fused_cuda_src(),
-                opts,
-            )
-            .map_err(|e| Error(format!("fused kernel nvrtc: {e}")))?;
+            let ptx =
+                super::compile::compile(crate::inference::kernel::fused::fused_cuda_src(), opts)
+                    .map_err(|e| Error(format!("fused kernel nvrtc: {e}")))?;
             let module = self
                 .ctx
                 .load_module(ptx)
@@ -891,13 +888,11 @@ impl CudaDevice {
     /// exact kernels the live decode path runs for GGUF weights).
     pub fn mmvq_fn(&self, name: &str) -> Result<CudaFunction> {
         if self.mmvq_module.get().is_none() {
-            let ptx_src =
-                crate::inference::quantized_cuda::get_mmvq_ptx_for_ordinal(self.ordinal())
-                    .map_err(|e| Error(format!("mmvq ptx: {e}")))?;
-            let ptx = crate::tensor::gpu_runtime::nvrtc::Ptx::from_src(ptx_src);
+            let ptx = crate::inference::quantized_cuda::get_mmvq_ptx_for_ordinal(self.ordinal())
+                .map_err(|e| Error(format!("mmvq ptx: {e}")))?;
             let module = self
                 .ctx
-                .load_module(ptx)
+                .load_module(ptx.clone())
                 .map_err(|e| Error(format!("mmvq module load: {e}")))?;
             let _ = self.mmvq_module.set(module);
         }
@@ -910,13 +905,12 @@ impl CudaDevice {
     /// same cached PTX the inference launchers compile).
     pub fn quantized_fn(&self, name: &str) -> Result<CudaFunction> {
         if self.quantized_module.get().is_none() {
-            let ptx_src =
+            let ptx =
                 crate::inference::quantized_cuda::get_quantized_ptx_for_ordinal(self.ordinal())
                     .map_err(|e| Error(format!("quantized ptx: {e}")))?;
-            let ptx = crate::tensor::gpu_runtime::nvrtc::Ptx::from_src(ptx_src);
             let module = self
                 .ctx
-                .load_module(ptx)
+                .load_module(ptx.clone())
                 .map_err(|e| Error(format!("quantized module load: {e}")))?;
             let _ = self.quantized_module.set(module);
         }
@@ -951,10 +945,15 @@ impl CudaDevice {
         Ok(self.alt_stream.get().unwrap().clone())
     }
 
-    /// Load `fn_name` from the custom module `module_name`, compiling/loading
+    /// Load `fn_name` from the custom module `module_name`, loading the compiled
     /// `ptx` once per device (compat boundary for the fork's
     /// `get_or_load_custom_func` call sites).
-    pub fn custom_fn(&self, module_name: &str, ptx: &str, fn_name: &str) -> Result<CudaFunction> {
+    pub fn custom_fn(
+        &self,
+        module_name: &str,
+        ptx: &crate::tensor::gpu_runtime::nvrtc::Ptx,
+        fn_name: &str,
+    ) -> Result<CudaFunction> {
         let mut g = self
             .custom_modules
             .lock()
@@ -962,7 +961,7 @@ impl CudaDevice {
         if !g.contains_key(module_name) {
             let module = self
                 .ctx
-                .load_module(crate::tensor::gpu_runtime::nvrtc::Ptx::from_src(ptx))
+                .load_module(ptx.clone())
                 .map_err(|e| Error(format!("custom module `{module_name}` load: {e}")))?;
             g.insert(module_name.to_string(), module);
         }

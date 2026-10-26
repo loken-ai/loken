@@ -34,53 +34,33 @@ pub(super) fn awq_kchunk(k: usize, n: usize, _group_size: usize) -> usize {
     kc
 }
 
-/// AWQ uniform-4-bit decode GEMV kernel. NVRTC-compiled into PTX, cached.
+/// AWQ uniform-4-bit decode GEMV kernel. NVRTC-compiled, cached.
 pub(super) const AWQ_GEMV_CU: &str = include_str!("../cuda/awq_gemv.cu");
 pub(super) static AWQ_GEMV_PTX: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>,
+    std::sync::Mutex<std::collections::HashMap<&'static str, super::Compiled>>,
 > = OnceLock::new();
 
-/// NVRTC-compile awq_gemv.cu (cached). Returns the PTX source.
-pub fn get_awq_gemv_ptx(dev: &CudaDevice) -> Result<&'static str> {
-    // One PTX per architecture present: each card loads code compiled for itself, and a
+/// NVRTC-compile awq_gemv.cu (cached). Returns the compiled code.
+pub fn get_awq_gemv_ptx(
+    dev: &CudaDevice,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
+    // One module per architecture present: each card loads code compiled for itself, and a
     // mixed machine never JITs one card's PTX onto another.
     let arch = nvrtc_arch_of(dev);
     let map = AWQ_GEMV_PTX.get_or_init(Default::default);
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
     let key = arch.unwrap_or("default");
-    if let Some(p) = g.get(key) {
-        if p.is_empty() {
-            return Err(anyhow!("NVRTC compile previously failed for {key}"));
-        }
-        return Ok(p);
-    }
-    let compiled: String = {
+    let compiled = *g.entry(key).or_insert_with(|| {
         let opts = crate::tensor::gpu_runtime::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
             ..Default::default()
         };
-        let src = format!("{NVRTC_COMPAT_H}\n{AWQ_GEMV_CU}");
-        match crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx_with_opts(src, opts) {
-            Ok(ptx) => {
-                let s = ptx.to_src();
-                tracing::info!(
-                    "quantized_cuda: NVRTC-compiled awq_gemv.cu OK ({} KB PTX)",
-                    s.len() / 1024
-                );
-                s
-            }
-            Err(e) => {
-                tracing::error!("quantized_cuda: awq_gemv.cu NVRTC compile FAILED: {e}");
-                String::new()
-            }
-        }
-    };
-    let leaked: &'static str = Box::leak(compiled.into_boxed_str());
-    g.insert(key, leaked);
-    let ptx = leaked;
-    if ptx.is_empty() {
-        return Err(anyhow!("awq_gemv.cu failed to NVRTC-compile"));
-    }
-    Ok(ptx)
+        super::compile_logged(
+            format!("{NVRTC_COMPAT_H}\n{AWQ_GEMV_CU}"),
+            opts,
+            "awq_gemv.cu",
+        )
+    });
+    compiled.ok_or_else(|| anyhow!("awq_gemv.cu failed to NVRTC-compile for {key}"))
 }

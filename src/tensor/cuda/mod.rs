@@ -29,6 +29,7 @@ pub(crate) fn alloc_err(ctx: &str, e: crate::tensor::gpu_runtime::driver::Driver
 mod captured_graph;
 pub use captured_graph::*;
 
+pub mod compile;
 mod device;
 pub mod runtime;
 pub use device::*;

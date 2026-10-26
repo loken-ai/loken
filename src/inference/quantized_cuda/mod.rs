@@ -68,7 +68,7 @@ const QUANTIZED_REQUANT_CU: &str = include_str!("../cuda/quantized/requant.cu");
 /// kernel source so the `.cu` stays free of compiler-workaround cruft.
 const NVRTC_COMPAT_H: &str = include_str!("../cuda/nvrtc_compat.h");
 static QUANTIZED_PTX: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>,
+    std::sync::Mutex<std::collections::HashMap<&'static str, Compiled>>,
 > = OnceLock::new();
 
 /// The block layouts and dot products the mat-vec kernels walk. Shared with the MoE and MMQ
@@ -78,11 +78,33 @@ static QUANTIZED_PTX: OnceLock<
 const GGUF_BLOCKS_CUH: &str = include_str!("../../../cuda/moe/gguf.cuh");
 /// The mat-vec kernels themselves: the warp-per-row reduction and the entry points.
 const MMVQ_CU: &str = include_str!("../cuda/mmvq_gguf.cu");
-static MMVQ_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>> =
+static MMVQ_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, Compiled>>> =
     OnceLock::new();
 
-// NVRTC-compile the relocated mmvq_gguf.cu (cached). Returns the PTX.
-// pub(crate): the native tensor substrate loads the same PTX (tensor).
+/// A module compiled once for the process: its code, or `None` when the compile failed, so the
+/// failure is not retried on every call.
+pub(crate) type Compiled = Option<&'static crate::tensor::gpu_runtime::nvrtc::Ptx>;
+
+/// `src` compiled with `opts` (see `tensor::cuda::compile`), logged under `what`.
+pub(crate) fn compile_logged(
+    src: String,
+    opts: crate::tensor::gpu_runtime::nvrtc::CompileOptions,
+    what: &str,
+) -> Compiled {
+    match crate::tensor::cuda::compile::compile(src, opts) {
+        Ok(code) => {
+            tracing::info!("quantized_cuda: NVRTC-compiled {what} OK");
+            Some(Box::leak(Box::new(code)))
+        }
+        Err(e) => {
+            tracing::error!("quantized_cuda: {what} NVRTC compile FAILED: {e}");
+            None
+        }
+    }
+}
+
+// NVRTC-compile the relocated mmvq_gguf.cu (cached). Returns the compiled code.
+// pub(crate): the native tensor substrate loads the same code (tensor).
 
 /// The `--gpu-architecture` NVRTC compiles for: the LOWEST compute capability among the
 /// cards actually present, so one PTX serves a mixed machine and JITs upward.
@@ -160,52 +182,31 @@ pub(crate) fn nvrtc_arch() -> Option<&'static str> {
     })
 }
 
-pub(crate) fn get_mmvq_ptx(dev: &CudaDevice) -> Result<&'static str> {
+pub(crate) fn get_mmvq_ptx(
+    dev: &CudaDevice,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
     get_mmvq_ptx_for_ordinal(dev.ordinal())
 }
 
-pub(crate) fn get_mmvq_ptx_for_ordinal(ordinal: usize) -> Result<&'static str> {
-    // One PTX per architecture present: each card loads code compiled for itself, and a
+pub(crate) fn get_mmvq_ptx_for_ordinal(
+    ordinal: usize,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
+    // One module per architecture present: each card loads code compiled for itself, and a
     // mixed machine never JITs one card's PTX onto another.
     let arch = nvrtc_arch_of_ordinal(ordinal);
     let map = MMVQ_PTX.get_or_init(Default::default);
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
     let key = arch.unwrap_or("default");
-    if let Some(p) = g.get(key) {
-        if p.is_empty() {
-            return Err(anyhow!("NVRTC compile previously failed for {key}"));
-        }
-        return Ok(p);
-    }
-    let compiled: String = {
+    let compiled = *g.entry(key).or_insert_with(|| {
         let opts = crate::tensor::gpu_runtime::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
             ..Default::default()
         };
         let src = format!("{NVRTC_COMPAT_H}\n{GGUF_BLOCKS_CUH}\n{MMVQ_CU}");
-        match crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx_with_opts(src, opts) {
-            Ok(ptx) => {
-                let s = ptx.to_src();
-                tracing::info!(
-                    "quantized_cuda: NVRTC-compiled mmvq_gguf.cu OK ({} KB PTX)",
-                    s.len() / 1024
-                );
-                s
-            }
-            Err(e) => {
-                tracing::error!("quantized_cuda: mmvq_gguf.cu NVRTC compile FAILED: {e}");
-                String::new()
-            }
-        }
-    };
-    let leaked: &'static str = Box::leak(compiled.into_boxed_str());
-    g.insert(key, leaked);
-    let ptx = leaked;
-    if ptx.is_empty() {
-        return Err(anyhow!("mmvq_gguf.cu failed to NVRTC-compile"));
-    }
-    Ok(ptx)
+        compile_logged(src, opts, "mmvq_gguf.cu")
+    });
+    compiled.ok_or_else(|| anyhow!("mmvq_gguf.cu failed to NVRTC-compile for {key}"))
 }
 
 mod ptx;
@@ -241,16 +242,15 @@ mod nvrtc_cost {
             return;
         };
         let start = std::time::Instant::now();
-        let ptx = super::get_mmvq_ptx_for_ordinal(dev.ordinal()).expect("nvrtc");
+        let _ = super::get_mmvq_ptx_for_ordinal(dev.ordinal()).expect("nvrtc");
         let first = start.elapsed();
         let start = std::time::Instant::now();
         let _ = super::get_mmvq_ptx_for_ordinal(dev.ordinal()).expect("nvrtc");
         let cached = start.elapsed();
         eprintln!(
-            "NVRTC mat-vec kernels: {:.2} s cold, {:.1} us cached, {} KB of PTX",
+            "NVRTC mat-vec kernels: {:.2} s cold, {:.1} us cached",
             first.as_secs_f64(),
-            cached.as_secs_f64() * 1e6,
-            ptx.len() / 1024
+            cached.as_secs_f64() * 1e6
         );
     }
 }

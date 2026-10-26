@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- CUDA: run the kernels on a driver older than the bundled NVRTC.
+
 ## [0.4.2] - 2026-10-28
 
 ### Changed

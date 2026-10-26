@@ -221,7 +221,9 @@ pub(super) const FUSED_CUDA_SRC: &str = include_str!("../../../cuda/fused.cu");
 /// PTX compiled for its own capability - one card's code JIT'd onto another is the
 /// silent-garbage class the quantized module already guards against.
 pub(super) static COMPILED_PTX: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>,
+    std::sync::Mutex<
+        std::collections::HashMap<&'static str, crate::inference::quantized_cuda::Compiled>,
+    >,
 > = OnceLock::new();
 
 /// Pre-warm all custom fused kernels on the given CUDA device: compile
@@ -268,7 +270,9 @@ pub fn prewarm_fused_kernels(cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice) 
     Ok(())
 }
 
-pub(super) fn get_ptx(cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice) -> Result<&'static str> {
+pub(super) fn get_ptx(
+    cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
     // Same arch rule as every other NVRTC site: target THIS card, never generic PTX,
     // and never a sibling card's PTX on a mixed machine.
     let arch = crate::inference::quantized_cuda::nvrtc_arch_of(cuda_dev)
@@ -276,34 +280,22 @@ pub(super) fn get_ptx(cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice) -> Resu
         .unwrap_or("generic");
     let map = COMPILED_PTX.get_or_init(Default::default);
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
-    let ptx: &'static str = match g.get(arch) {
-        Some(p) => p,
-        None => {
-            let opts = crate::tensor::gpu_runtime::nvrtc::CompileOptions {
-                arch: (arch != "generic").then_some(arch),
-                ..Default::default()
-            };
-            let src = match crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(
-                FUSED_CUDA_SRC,
-                opts,
-            ) {
-                Ok(ptx) => ptx.to_src(),
-                Err(e) => {
-                    tracing::error!("NVRTC compile failed for {arch}: {e}");
-                    String::new()
-                }
-            };
-            let leaked: &'static str = Box::leak(src.into_boxed_str());
-            g.insert(arch, leaked);
-            leaked
+    let compiled = *g.entry(arch).or_insert_with(|| {
+        let opts = crate::tensor::gpu_runtime::nvrtc::CompileOptions {
+            arch: (arch != "generic").then_some(arch),
+            ..Default::default()
+        };
+        match crate::tensor::cuda::compile::compile(FUSED_CUDA_SRC, opts) {
+            Ok(code) => Some(&*Box::leak(Box::new(code))),
+            Err(e) => {
+                tracing::error!("NVRTC compile failed for {arch}: {e}");
+                None
+            }
         }
-    };
-    if ptx.is_empty() {
-        return Err(crate::tensor::Error::msg(
-            "Fused CUDA kernels failed to compile".to_string(),
-        ));
-    }
-    Ok(ptx)
+    });
+    compiled.ok_or_else(|| {
+        crate::tensor::Error::msg("Fused CUDA kernels failed to compile".to_string())
+    })
 }
 
 /// Fused three-way elementwise add: returns `a + b + c` in one launch

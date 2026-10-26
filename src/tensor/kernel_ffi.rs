@@ -442,12 +442,12 @@ impl CudaDevice {
     }
 
     /// fork-compat: load `fn_name` from an NVRTC-compiled module cached by
-    /// `module_name` (PTX compiled once per device).
+    /// `module_name` (the code compiled once per device).
     pub fn get_or_load_custom_func(
         &self,
         fn_name: &str,
         module_name: &str,
-        ptx: &str,
+        ptx: &crate::tensor::gpu_runtime::nvrtc::Ptx,
     ) -> Result<CudaFunc> {
         // The module is compiled on the first call for this device and cached under
         // `module_name`; every later call for the same PTX only looks the function up.

@@ -285,10 +285,12 @@ pub(crate) fn cuda_include_paths() -> Vec<String> {
     })
 }
 
-/// NVRTC-compile the full relocated quantized.cu (cached). Returns the PTX.
+/// NVRTC-compile the full relocated quantized.cu (cached). Returns the compiled code.
 // pub(crate) (was private): the native substrate's CudaDevice loads the same
 // module for the compat QCudaStorage quantize kernels.
-pub(crate) fn get_quantized_ptx(dev: &CudaDevice) -> Result<&'static str> {
+pub(crate) fn get_quantized_ptx(
+    dev: &CudaDevice,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
     get_quantized_ptx_for_ordinal(dev.ordinal())
 }
 
@@ -304,50 +306,30 @@ fn quantized_source() -> String {
     )
 }
 
-/// NVRTC-compiles `src` for `arch`, or returns an empty string after logging the failure so
-/// the cache remembers it and the compile is not retried on every call.
-fn compile_or_empty(src: String, arch: Option<&'static str>, what: &str) -> String {
+/// `src` compiled for `arch`, or `None` after logging the failure so the cache remembers it and
+/// the compile is not retried on every call.
+fn compile_or_none(src: String, arch: Option<&'static str>, what: &str) -> super::Compiled {
     let opts = crate::tensor::gpu_runtime::nvrtc::safe::CompileOptions {
         include_paths: cuda_include_paths(),
         arch,
         ..Default::default()
     };
-    match crate::tensor::gpu_runtime::nvrtc::safe::compile_ptx_with_opts(src, opts) {
-        Ok(ptx) => {
-            let s = ptx.to_src();
-            tracing::info!(
-                "quantized_cuda: NVRTC-compiled {what} OK ({} KB PTX)",
-                s.len() / 1024
-            );
-            s
-        }
-        Err(e) => {
-            tracing::error!("quantized_cuda: {what} NVRTC compile FAILED: {e}");
-            String::new()
-        }
-    }
+    super::compile_logged(src, opts, what)
 }
 
-pub(crate) fn get_quantized_ptx_for_ordinal(ordinal: usize) -> Result<&'static str> {
-    // One PTX per architecture present: each card loads code compiled for itself, and a
+pub(crate) fn get_quantized_ptx_for_ordinal(
+    ordinal: usize,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
+    // One module per architecture present: each card loads code compiled for itself, and a
     // mixed machine never JITs one card's PTX onto another.
     let arch = nvrtc_arch_of_ordinal(ordinal);
     let map = QUANTIZED_PTX.get_or_init(Default::default);
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
     let key = arch.unwrap_or("default");
-    if let Some(p) = g.get(key) {
-        if p.is_empty() {
-            return Err(anyhow!("NVRTC compile previously failed for {key}"));
-        }
-        return Ok(p);
-    }
-    let compiled = compile_or_empty(quantized_source(), arch, "quantized.cu");
-    let leaked: &'static str = Box::leak(compiled.into_boxed_str());
-    g.insert(key, leaked);
-    if leaked.is_empty() {
-        return Err(anyhow!("quantized.cu failed to NVRTC-compile"));
-    }
-    Ok(leaked)
+    let compiled = *g
+        .entry(key)
+        .or_insert_with(|| compile_or_none(quantized_source(), arch, "quantized.cu"));
+    compiled.ok_or_else(|| anyhow!("quantized.cu failed to NVRTC-compile for {key}"))
 }
 
 /// The attention kernels templated on the head size and on the query heads each KV head
@@ -403,40 +385,35 @@ pub use crate::inference::cache::kv_core::kv_shape_supported;
 use crate::inference::cache::kv_core::{SHAPE_MAX_HEAD_DIM, SHAPE_MAX_Q_PER_KV};
 
 type ShapeKey = (&'static str, usize, usize);
-static SHAPE_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<ShapeKey, &'static str>>> =
+static SHAPE_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<ShapeKey, super::Compiled>>> =
     OnceLock::new();
 
 /// The quantised unit with every shape kernel instantiated for `(head_dim, n_q_per_kv)`,
 /// compiled once per architecture and shape.
-fn shape_ptx(ordinal: usize, head_dim: usize, n_q_per_kv: usize) -> Result<&'static str> {
+fn shape_ptx(
+    ordinal: usize,
+    head_dim: usize,
+    n_q_per_kv: usize,
+) -> Result<&'static crate::tensor::gpu_runtime::nvrtc::Ptx> {
     let arch = nvrtc_arch_of_ordinal(ordinal);
     let key = (arch.unwrap_or("default"), head_dim, n_q_per_kv);
     let map = SHAPE_PTX.get_or_init(Default::default);
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = g.get(&key) {
-        if p.is_empty() {
-            return Err(anyhow!("NVRTC compile previously failed for {key:?}"));
-        }
-        return Ok(p);
-    }
-    let mut src = quantized_source();
-    for (mac, base) in SHAPE_KERNELS {
-        src.push_str(&format!(
-            "\n{mac}({base}_hd{head_dim}_nq{n_q_per_kv}, {head_dim}, {n_q_per_kv})"
-        ));
-    }
-    for (mac, base) in HEAD_KERNELS {
-        src.push_str(&format!("\n{mac}({base}_hd{head_dim}, {head_dim})"));
-    }
-    src.push('\n');
     let what = format!("attention kernels hd{head_dim} nq{n_q_per_kv}");
-    let compiled = compile_or_empty(src, arch, &what);
-    let leaked: &'static str = Box::leak(compiled.into_boxed_str());
-    g.insert(key, leaked);
-    if leaked.is_empty() {
-        return Err(anyhow!("{what} failed to NVRTC-compile"));
-    }
-    Ok(leaked)
+    let compiled = *g.entry(key).or_insert_with(|| {
+        let mut src = quantized_source();
+        for (mac, base) in SHAPE_KERNELS {
+            src.push_str(&format!(
+                "\n{mac}({base}_hd{head_dim}_nq{n_q_per_kv}, {head_dim}, {n_q_per_kv})"
+            ));
+        }
+        for (mac, base) in HEAD_KERNELS {
+            src.push_str(&format!("\n{mac}({base}_hd{head_dim}, {head_dim})"));
+        }
+        src.push('\n');
+        compile_or_none(src, arch, &what)
+    });
+    compiled.ok_or_else(|| anyhow!("{what} failed to NVRTC-compile"))
 }
 
 /// Compiles the shape module for every CUDA card present. Failures are logged by the compile
