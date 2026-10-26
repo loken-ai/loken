@@ -1336,6 +1336,13 @@ fn build_generic_layer(
     // on a path that our fast `mul_mat_vec_q*_K_q8_1` kernel dominates.
     // Requantize them to Q6_K at load time so every per-layer matmul
     // takes the fast path.
+    // A weight read on the host for a fusion the build does not make goes to the layer's card.
+    let to_card = |qt: QTensor| -> Result<QTensor> {
+        match on_gpu && qt.device().is_cpu() {
+            true => qt.to_device(device),
+            false => Ok(qt),
+        }
+    };
     let to_qmatmul_as = |qt: Option<QTensor>,
                          requant_dtype: crate::tensor::quantized::GgmlDType|
      -> Result<Option<QMatMul>> {
@@ -1359,7 +1366,7 @@ fn build_generic_layer(
             let qt_q4 = requant_float_weight(qt, requant_dtype, device, "projection")?;
             Ok(Some(QMatMul::from_qtensor(qt_q4)?))
         } else {
-            Ok(Some(QMatMul::from_qtensor(qt)?))
+            Ok(Some(QMatMul::from_qtensor(to_card(qt)?)?))
         }
     };
     let to_qmatmul = |qt: Option<QTensor>| to_qmatmul_as(qt, requant_dtype);
@@ -1395,9 +1402,11 @@ fn build_generic_layer(
         // keys and values may have neither. Skip QKV byte-concat - Q,K projected separately,
         // V reuses K at forward time.
         (
-            Some(QMatMul::from_qtensor(requant_qt(raw.attn_q.unwrap())?)?),
+            Some(QMatMul::from_qtensor(to_card(requant_qt(
+                raw.attn_q.unwrap(),
+            )?)?)?),
             raw.attn_k
-                .map(|k| QMatMul::from_qtensor(requant_qt(k)?))
+                .map(|k| QMatMul::from_qtensor(to_card(requant_qt(k)?)?))
                 .transpose()?,
             None,
             None,
@@ -1489,9 +1498,9 @@ fn build_generic_layer(
             (None, None, None, Some(QMatMul::from_qtensor(fused_qt)?))
         } else {
             (
-                Some(QMatMul::from_qtensor(q)?),
-                Some(QMatMul::from_qtensor(k)?),
-                Some(QMatMul::from_qtensor(v)?),
+                Some(QMatMul::from_qtensor(to_card(q)?)?),
+                Some(QMatMul::from_qtensor(to_card(k)?)?),
+                Some(QMatMul::from_qtensor(to_card(v)?)?),
                 None,
             )
         }
@@ -1637,7 +1646,7 @@ fn build_generic_layer(
             } else {
                 // Shape mismatch - fall back to separate.
                 (
-                    Some(QMatMul::from_qtensor(gate)?),
+                    Some(QMatMul::from_qtensor(to_card(gate)?)?),
                     to_qmatmul(Some(up))?.unwrap(),
                 )
             }
@@ -3734,6 +3743,51 @@ impl GenericHeteroTransformer {
                     source.read($name, weight_dev)
                 };
             }
+            // The weights the layer build fuses into one buffer are read on the host, where the
+            // fusion reads them, so the card receives the fused buffer alone. Read onto the
+            // card, each would be read back, fused and freed, leaving holes in the pool between
+            // the buffers that stay, which the driver then counts as taken.
+            use crate::tensor::quantized::GgmlDType;
+            let fused_on_host = |names: &[String], formats: &dyn Fn(GgmlDType) -> bool| -> bool {
+                weight_dev.is_cuda()
+                    && names.iter().all(|n| ti.contains_key(n))
+                    && names.windows(2).all(|w| {
+                        let (a, b) = (&ti[&w[0]], &ti[&w[1]]);
+                        a.ggml_dtype == b.ggml_dtype
+                            && a.shape.dims().get(1) == b.shape.dims().get(1)
+                    })
+                    && formats(ti[&names[0]].ggml_dtype)
+            };
+            let attn_names: Vec<String> = ["attn_q", "attn_k", "attn_v"]
+                .iter()
+                .map(|t| format!("{prefix}.{t}.weight"))
+                .collect();
+            let qkv_dev = match !config.attn_output_gate
+                && fused_on_host(&attn_names, &|d| {
+                    !matches!(d, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+                }) {
+                true => &Device::Cpu,
+                false => weight_dev,
+            };
+            let ffn_names: Vec<String> = ["ffn_gate", "ffn_up"]
+                .iter()
+                .map(|t| format!("{prefix}.{t}.weight"))
+                .collect();
+            let ffn_dev = match fused_on_host(&ffn_names, &|d| {
+                matches!(
+                    d,
+                    GgmlDType::Q4K
+                        | GgmlDType::Q5K
+                        | GgmlDType::Q6K
+                        | GgmlDType::Q8_0
+                        | GgmlDType::Q4_0
+                )
+            }) && ti[&ffn_names[0]].shape.dims()
+                == ti[&ffn_names[1]].shape.dims()
+            {
+                true => &Device::Cpu,
+                false => weight_dev,
+            };
             // Biases and norms always on CPU
             macro_rules! opt_cpu {
                 ($name:expr) => {
@@ -3788,7 +3842,7 @@ impl GenericHeteroTransformer {
                 let qkv = req!(&format!("{prefix}.attn_qkv.weight"))?;
                 (None, None, None, Some(qkv))
             } else {
-                let q = req!(&format!("{prefix}.attn_q.weight"))?;
+                let q = source.read(&format!("{prefix}.attn_q.weight"), qkv_dev)?;
                 let q = match config.attn_output_gate {
                     true => {
                         let (q, gate) = split_q_gate(q, config.n_head, weight_dev)?;
@@ -3803,11 +3857,11 @@ impl GenericHeteroTransformer {
                     && idx >= config.n_layers.saturating_sub(config.shared_kv_layers);
                 let k = match shared {
                     true => source.read_opt(&format!("{prefix}.attn_k.weight"), weight_dev)?,
-                    false => Some(req!(&format!("{prefix}.attn_k.weight"))?),
+                    false => Some(source.read(&format!("{prefix}.attn_k.weight"), qkv_dev)?),
                 };
                 // Gemma4 26B Global layers omit attn_v and reuse attn_k
                 // as V (AttentionKEqV pattern). Use opt-load for V.
-                let v = source.read_opt(&format!("{prefix}.attn_v.weight"), weight_dev)?;
+                let v = source.read_opt(&format!("{prefix}.attn_v.weight"), qkv_dev)?;
                 (Some(q), k, v, None)
             };
 
@@ -3982,8 +4036,8 @@ impl GenericHeteroTransformer {
                 let down = req!(&format!("{prefix}.ffn_down.weight"))?;
                 (None, up, down)
             } else {
-                let gate = req!(&format!("{prefix}.ffn_gate.weight"))?;
-                let up = req!(&format!("{prefix}.ffn_up.weight"))?;
+                let gate = source.read(&format!("{prefix}.ffn_gate.weight"), ffn_dev)?;
+                let up = source.read(&format!("{prefix}.ffn_up.weight"), ffn_dev)?;
                 let down = req!(&format!("{prefix}.ffn_down.weight"))?;
                 (Some(gate), up, down)
             };

@@ -188,6 +188,36 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
     (0..all).map(|i| (i as usize, i)).collect()
 }
 
+/// The bytes card `ordinal`'s default memory pool hands out to live buffers and the bytes it
+/// holds from the driver, live or cached. `None` when the pool cannot be read.
+#[cfg(feature = "gpu")]
+pub fn pool_bytes(ordinal: usize) -> Option<(u64, u64)> {
+    use crate::tensor::gpu_runtime::driver::sys::{
+        cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cudaError_enum, CUmemPool_attribute,
+        CUmemoryPool,
+    };
+    let mut pool: CUmemoryPool = std::ptr::null_mut();
+    let read = |pool: CUmemoryPool, attr: CUmemPool_attribute| -> Option<u64> {
+        let mut v: u64 = 0;
+        (unsafe { cuMemPoolGetAttribute(pool, attr, &mut v as *mut u64 as *mut std::ffi::c_void) }
+            == cudaError_enum::CUDA_SUCCESS)
+            .then_some(v)
+    };
+    if unsafe { cuDeviceGetDefaultMemPool(&mut pool, ordinal as i32) }
+        != cudaError_enum::CUDA_SUCCESS
+        || pool.is_null()
+    {
+        return None;
+    }
+    Some((
+        read(pool, CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        read(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+        )?,
+    ))
+}
+
 /// How many cards this process can open: the ones NVML lists and the process sees on an
 /// NVIDIA runtime, the runtime's own count otherwise.
 pub fn card_count() -> usize {
