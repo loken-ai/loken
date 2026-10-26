@@ -4,6 +4,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-26
+
 ### Added
 
 - Tensor parallelism: split the layers of an AWQ checkpoint across cards.
