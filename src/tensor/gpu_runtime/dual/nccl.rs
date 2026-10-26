@@ -45,9 +45,13 @@ pub mod result {
         }
     }
 
-    fn nccl_present() -> bool {
-        crate::tensor::gpu_runtime::dual::cuda_usable()
-            && unsafe { cudarc::nccl::sys::is_culib_present() }
+    /// Whether NCCL opens, read once: the library is not opened and closed at every group.
+    pub(crate) fn nccl_present() -> bool {
+        static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PRESENT.get_or_init(|| {
+            crate::tensor::gpu_runtime::dual::cuda_usable()
+                && unsafe { cudarc::nccl::sys::is_culib_present() }
+        })
     }
 
     /// Opens a group of calls issued together, in every collective library that opens.
@@ -57,7 +61,12 @@ pub mod result {
             out = outcome(cudarc::nccl::result::group_start());
         }
         if unsafe { crate::tensor::gpu_runtime::hip::nccl::sys::is_culib_present() } {
-            out = out.and(crate::tensor::gpu_runtime::hip::nccl::result::group_start());
+            let rccl = crate::tensor::gpu_runtime::hip::nccl::result::group_start();
+            // A group RCCL refuses closes the one NCCL opened, so neither stays open.
+            if rccl.is_err() && out.is_ok() && nccl_present() {
+                let _ = outcome(cudarc::nccl::result::group_end());
+            }
+            out = out.and(rccl);
         }
         out
     }
@@ -162,6 +171,21 @@ pub mod safe {
                 outcome(unsafe {
                     cr::comm_init_all(comms.as_mut_ptr(), n as c_int, ordinals.as_ptr())
                 })?;
+                // A communicator is used once its initialisation has finished: a collective
+                // issued while one is still in progress finds it not ready.
+                for &c in &comms {
+                    let mut state = cs::ncclResult_t::ncclInProgress;
+                    while state == cs::ncclResult_t::ncclInProgress {
+                        unsafe { cs::ncclCommGetAsyncError(c, &mut state) };
+                        if state == cs::ncclResult_t::ncclInProgress {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if state != cs::ncclResult_t::ncclSuccess {
+                        tracing::info!("an NCCL communicator did not initialise: {state:?}");
+                        return Err(NcclError(sys::ncclResult_t::ncclInternalError));
+                    }
+                }
                 comms.into_iter().map(Handle::Cuda).collect()
             } else if amd {
                 let mut comms = vec![std::ptr::null_mut(); n];

@@ -2,6 +2,9 @@
 // This script runs during the cargo build process when the cuda feature is enabled
 
 fn main() {
+    // The binaries look for shared libraries in lib/ beside themselves before the system's, so a
+    // library the release archive carries is the only copy a process opens.
+    println!("cargo:rustc-link-arg-bins=-Wl,--enable-new-dtags,-rpath,$ORIGIN/lib");
     // The commit these bytes came from, stamped at build time so a running server can say
     // which build is answering. A version number alone cannot tell two builds of one release
     // apart, which is exactly what a benchmark row has to do. Read here rather than at run

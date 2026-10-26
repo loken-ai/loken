@@ -186,7 +186,8 @@ tar --sort=name --owner=0 --group=0 --numeric-owner -C "$STAGE" -czf "$DIST/$NAM
 (cd "$DIST" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" && cat "$NAME.tar.gz.sha256")
 ls -l "$DIST/$NAME.tar.gz"
 
-# The CUDA-libraries archive: each library under its SONAME, which is the name the binary asks for.
+# The CUDA-libraries archive: each library under its SONAME, which is the name the binary asks for,
+# and its unversioned name. The binaries look in lib/ beside themselves first (their RUNPATH).
 LIBS_NAME="$NAME-cuda-libs"
 LIBS_STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE" "$LIBS_STAGE"' EXIT
@@ -198,6 +199,9 @@ bundle() {
     soname="$(soname_of "$real")"
     [ -n "$soname" ] || { echo "no SONAME in $1" >&2; exit 1; }
     cp "$real" "$LIBS_STAGE/$NAME/lib/$soname"
+    # The unversioned name too: a loader that asks for it first finds this copy, not another one
+    # the machine has installed, which a process would then hold beside it.
+    ln -sf "$soname" "$LIBS_STAGE/$NAME/lib/${soname%%.so*}.so"
     echo "$soname"
 }
 bundled=""

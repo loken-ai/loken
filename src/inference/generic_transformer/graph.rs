@@ -285,6 +285,13 @@ impl GenericHeteroTransformer {
         if !l.tp_shards.is_empty() && l.tp_comms.is_none() {
             return Some("its shares move their activations through copies to the host");
         }
+        // The shares' streams wait on the owner card's events and sum through NCCL on their own
+        // streams: a capture on the owner's stream does not join them back.
+        if !l.tp_shards.is_empty() {
+            return Some(
+                "its shares sum on the other cards' streams, which the capture does not join",
+            );
+        }
         if l.context.is_some() {
             return Some("its cache is cut over several cards, whose parts it combines");
         }

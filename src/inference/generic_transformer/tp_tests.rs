@@ -213,3 +213,43 @@ fn two_cards_sum_through_nccl() {
         assert!(s.to_vec1::<f32>().unwrap().iter().all(|&v| v == 2.0));
     }
 }
+
+/// The measurements the planner takes before it weighs a split, in its order, then the sum.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_planner_measurements_then_a_sum_across_two_cards() {
+    use crate::inference::place::device_probe as probe;
+    if crate::tensor::Device::new_cuda(1).is_err() {
+        return;
+    }
+    let steps: Vec<(&str, Box<dyn Fn() -> bool>)> = vec![
+        ("probe", Box::new(|| !probe::probe_cuda_gpus().is_empty())),
+        ("link", Box::new(|| probe::card_pair_link(0, 1).is_some())),
+        (
+            "read rates",
+            Box::new(|| !crate::inference::place::expert_parallel::card_read_rates().is_empty()),
+        ),
+        (
+            "matmul 0",
+            Box::new(|| probe::card_matmul_rate(0).is_some()),
+        ),
+        (
+            "matmul 1",
+            Box::new(|| probe::card_matmul_rate(1).is_some()),
+        ),
+    ];
+    for (what, step) in &steps {
+        eprintln!("step {what}: {}", step());
+    }
+    // Two cards NCCL does not join, of two makers or without NCCL, never sum across.
+    let devices: Vec<crate::tensor::Device> = (0..2)
+        .map(|i| crate::tensor::Device::new_cuda(i).unwrap())
+        .collect();
+    if super::TpComms::new(&devices).is_none() {
+        return;
+    }
+    assert!(
+        probe::group_sum(&[0, 1]).is_some(),
+        "the sum across the two cards failed"
+    );
+}

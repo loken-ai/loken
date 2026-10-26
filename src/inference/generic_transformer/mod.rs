@@ -819,12 +819,16 @@ impl TpComms {
             .map(|c| unsafe { c.stream().alloc::<f32>(n) })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| crate::tensor::Error::msg(format!("{e:?}")))?;
+        // The group is closed on every path: a group left open on a thread defers every later
+        // collective of that thread.
         group_start().map_err(nccl)?;
-        for (rank, out) in outs.iter_mut().enumerate() {
-            self.comms[0].send(&view, rank as i32 + 1).map_err(nccl)?;
-            self.comms[rank + 1].recv(out, 0).map_err(nccl)?;
-        }
-        group_end().map_err(nccl)?;
+        let issued = outs.iter_mut().enumerate().try_for_each(|(rank, out)| {
+            self.comms[0].send(&view, rank as i32 + 1)?;
+            self.comms[rank + 1].recv(out, 0).map(|_| ())
+        });
+        let ended = group_end();
+        issued.map_err(nccl)?;
+        ended.map_err(nccl)?;
         outs.into_iter()
             .zip(to)
             .map(|(out, dev)| {
@@ -856,10 +860,17 @@ impl TpComms {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| crate::tensor::Error::msg(format!("{e:?}")))?;
         group_start().map_err(nccl)?;
-        for ((comm, view), out) in self.comms.iter().zip(&views).zip(outs.iter_mut()) {
-            comm.all_reduce(view, out, &ReduceOp::Sum).map_err(nccl)?;
-        }
-        group_end().map_err(nccl)?;
+        let issued = self
+            .comms
+            .iter()
+            .zip(&views)
+            .zip(outs.iter_mut())
+            .try_for_each(|((comm, view), out)| {
+                comm.all_reduce(view, out, &ReduceOp::Sum).map(|_| ())
+            });
+        let ended = group_end();
+        issued.map_err(nccl)?;
+        ended.map_err(nccl)?;
         outs.into_iter()
             .zip(parts)
             .map(|(out, p)| {
@@ -934,19 +945,25 @@ impl TpComms {
         let mut out = unsafe { self.comms[0].stream().alloc::<f32>(own.elem_count()) }
             .map_err(|e| crate::tensor::Error::msg(format!("{e:?}")))?;
         group_start().map_err(nccl)?;
-        self.comms[0]
+        let issued = self.comms[0]
             .reduce(&views[0], Some(&mut out), &ReduceOp::Sum, 0)
-            .map_err(nccl)?;
-        for (comm, view) in self.comms[1..].iter().zip(&views[1..]) {
-            comm.reduce(
-                view,
-                None::<&mut crate::tensor::gpu_runtime::driver::CudaSlice<f32>>,
-                &ReduceOp::Sum,
-                0,
-            )
-            .map_err(nccl)?;
-        }
-        group_end().map_err(nccl)?;
+            .and_then(|_| {
+                self.comms[1..]
+                    .iter()
+                    .zip(&views[1..])
+                    .try_for_each(|(comm, view)| {
+                        comm.reduce(
+                            view,
+                            None::<&mut crate::tensor::gpu_runtime::driver::CudaSlice<f32>>,
+                            &ReduceOp::Sum,
+                            0,
+                        )
+                        .map(|_| ())
+                    })
+            });
+        let ended = group_end();
+        issued.map_err(nccl)?;
+        ended.map_err(nccl)?;
         self.join()?;
         crate::tensor::cuda_ext::tensor_from_f32_slice(out, own.shape().clone(), &own.device())
     }

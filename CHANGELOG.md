@@ -12,6 +12,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Tensor parallelism: open one copy of NCCL and sum outside the decode graph.
 - Devices: time the half-precision product and say why a sum is not weighed.
 - Images: place the Flux VAE on the fastest card that has room for it.
 - Devices: rank the cards by a timed matrix product.
