@@ -1,6 +1,10 @@
 //! How a batched server shares the card it runs on: the work a request does, the capture
 //! arena its decode graphs live in, and the paged cache its lanes hold their context in.
 //! Every figure comes from the model's shape and what the card has free.
+//!
+//! The lanes share the cache: each is sure of the blocks of the tokens it is priced at, a
+//! lane that grows past them takes the blocks the others leave, and when none are left the
+//! scheduler preempts the newest lane, which later recomputes its context and goes on.
 
 /// f32 outputs one token's decode step keeps per layer at the model width: q, k, v, the
 /// attention output and the residual.
@@ -17,7 +21,7 @@ pub struct PagedShape {
     /// Cache bytes of one block of `block_size` tokens, every layer, K and V.
     pub block_bytes: u64,
     pub block_size: usize,
-    /// Tokens a lane is priced at.
+    /// Tokens a lane is sure to hold.
     pub window: usize,
     /// Arena bytes one lane's captured decode step keeps.
     pub lane_step_bytes: u64,
@@ -53,8 +57,9 @@ fn captured_widths(lanes: usize) -> u64 {
 }
 
 /// The plan for a server on a card with `free` bytes: the most lanes whose cache at the
-/// window, whose decode graphs and whose work fit, each lane holding a window of blocks.
-/// `None` when fewer than two lanes fit, and batching gains nothing over serial decode.
+/// window, whose decode graphs and whose work fit, and a cache of every block the room
+/// left by the graphs and the work holds. `None` when fewer than two lanes fit, and
+/// batching gains nothing over serial decode.
 pub fn plan_in(free: u64, shape: &PagedShape) -> Option<PagedPlan> {
     let lane_blocks = shape.window.div_ceil(shape.block_size.max(1));
     let lane_cache = shape.block_bytes.saturating_mul(lane_blocks as u64);
@@ -68,10 +73,11 @@ pub fn plan_in(free: u64, shape: &PagedShape) -> Option<PagedPlan> {
     while lanes >= 2 && need(lanes) > room {
         lanes -= 1;
     }
+    let arena = shape.lane_step_bytes.saturating_mul(captured_widths(lanes));
     (lanes >= 2).then(|| PagedPlan {
-        blocks: lanes * lane_blocks,
+        blocks: (room.saturating_sub(arena) / shape.block_bytes.max(1)) as usize,
         lanes,
-        arena: shape.lane_step_bytes.saturating_mul(captured_widths(lanes)),
+        arena,
     })
 }
 
@@ -100,7 +106,9 @@ mod tests {
     fn the_lanes_take_what_the_cache_graphs_and_work_leave() {
         let p = plan_in(10 * 1024 * MB, &shape()).unwrap();
         let lane_cache = 256 * 2 * MB;
-        assert_eq!(p.blocks, p.lanes * 256);
+        assert!(p.blocks >= p.lanes * 256);
+        assert!(p.blocks as u64 * 2 * MB + p.arena + 512 * MB <= 10 * 1024 * MB);
+        assert!((p.blocks as u64 + 1) * 2 * MB + p.arena + 512 * MB > 10 * 1024 * MB);
         assert!(p.lanes as u64 * lane_cache + p.arena + 512 * MB <= 10 * 1024 * MB);
         let one_more =
             (p.lanes as u64 + 1) * lane_cache + 8 * MB * captured_widths(p.lanes + 1) + 512 * MB;

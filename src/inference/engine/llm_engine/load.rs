@@ -775,7 +775,8 @@ pub(super) fn try_spawn_continuous(
     let shape = paged::PagedShape {
         block_bytes,
         block_size,
-        window: context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS),
+        // A lane is sure of one prompt chunk; longer contexts share the rest of the pool.
+        window: context_length.min(PREFILL_CHUNK_TOKENS),
         lane_step_bytes: paged::lane_step_bytes(n_layers, hidden, ffn),
         work_reserve: runtime_demand::llm_work_reserve(hidden.max(ffn), PREFILL_CHUNK_TOKENS),
     };
