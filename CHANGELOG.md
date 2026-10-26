@@ -10,6 +10,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Images: add the Qwen-Image feed-forward bias on the card.
 - Images: run Qwen-Image attention in the flash kernel.
 - Quantised projections: dequantise straight to BF16 for many rows.
 - AWQ: read a projection left on the host as eight-bit blocks, unpacked once.

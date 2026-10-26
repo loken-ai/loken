@@ -539,9 +539,9 @@ impl Block {
             let y = match &dense {
                 Some((w0, w1)) => {
                     let xb = xi.to_dtype(crate::tensor::DType::BF16)?;
-                    let h = xb.matmul_t(w0)?;
-                    let h = l0.add_bias(&h)?;
-                    let h = h.to_dtype(crate::tensor::DType::F32)?.gelu_erf()?;
+                    // The bias is F32: the sum is taken in F32, on the card.
+                    let h = xb.matmul_t(w0)?.to_dtype(crate::tensor::DType::F32)?;
+                    let h = l0.add_bias(&h)?.gelu_erf()?;
                     let hb = h.to_dtype(crate::tensor::DType::BF16)?;
                     let o = hb.matmul_t(w1)?;
                     l1.add_bias(&o.to_dtype(crate::tensor::DType::F32)?)?
@@ -1309,9 +1309,23 @@ mod tests {
             .unwrap();
         let qt = QHostTensor::from_bytes(&bytes, dtype, vec![out, inn]).unwrap();
         let qm = QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), dev).unwrap();
+        // A bias, as every linear of the checkpoint carries one.
+        let bias = NT::from_vec_f32(
+            (0..out)
+                .map(|i| (i as f32 * seed * 3.1).cos() * 0.1)
+                .collect(),
+            (out,),
+        )
+        .unwrap();
         (
-            Linear::F32 { w: host, b: None },
-            Linear::Quant { qm, b: None },
+            Linear::F32 {
+                w: host,
+                b: Some(bias.clone()),
+            },
+            Linear::Quant {
+                qm,
+                b: Some(bias.to_device(dev).unwrap()),
+            },
         )
     }
 
