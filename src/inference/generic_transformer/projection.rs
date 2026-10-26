@@ -77,6 +77,9 @@ pub struct AwqWeight {
     /// Built once at load per [`awq_marlin_policy`]; `None` = unsupported
     /// shape / policy off / VRAM headroom exhausted.
     pub marlin: std::sync::OnceLock<Option<MarlinSlot>>,
+    /// The weight in a host block format, built at the first forward on the host: a host
+    /// forward reads it as it is instead of unpacking the whole projection at every call.
+    pub host: std::sync::OnceLock<crate::tensor::quantized::QMatMul>,
 }
 
 impl Clone for AwqWeight {
@@ -89,6 +92,10 @@ impl Clone for AwqWeight {
         if let Some(v) = self.marlin.get() {
             let _ = marlin.set(v.clone());
         }
+        let host = std::sync::OnceLock::new();
+        if let Some(v) = self.host.get() {
+            let _ = host.set(v.clone());
+        }
         Self {
             qweight: self.qweight.clone(),
             qzeros: self.qzeros.clone(),
@@ -99,6 +106,7 @@ impl Clone for AwqWeight {
             group_size: self.group_size,
             repacked,
             marlin,
+            host,
         }
     }
 }
@@ -356,10 +364,41 @@ impl AwqWeight {
         y.reshape(out_shape)
     }
 
-    /// CPU fallback (CPU-only build, or AWQ tensors landed on CPU): dequantize via
-    /// the `awq` reference into an f32 `[K, N]` weight and matmul. Slow - AWQ is a
-    /// GPU decode lever - but keeps the non-cuda build correct.
+    /// Host forward (a layer the plan leaves on the host, or a build without cards): the
+    /// weight unpacked once into eight-bit blocks of the host kernels, which a decode step
+    /// then reads like any quantised projection of a GGUF file.
     fn forward_cpu(&self, xs: &Tensor) -> Result<Tensor> {
+        let host = match self.host.get() {
+            Some(h) => h,
+            None => {
+                let built = self.host_projection()?;
+                let _ = self.host.set(built);
+                self.host.get().expect("set just above")
+            }
+        };
+        let dims = xs.dims();
+        let tokens: usize = dims[..dims.len() - 1].iter().product();
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
+        out_shape.push(self.n);
+        let x2 = xs.reshape((tokens, self.k))?.to_dtype(DType::F32)?;
+        let y = crate::tensor::Module::forward(host, &x2)?;
+        let y = self.add_bias(y)?;
+        y.reshape(out_shape)
+    }
+
+    /// The weight as an `[N, K]` projection in eight-bit blocks, on the host.
+    fn host_projection(&self) -> Result<crate::tensor::quantized::QMatMul> {
+        let w_kn = self.dequant_host()?;
+        // CONVERSION: AWQ nibbles to eight-bit blocks once, for the host kernels.
+        let q = crate::tensor::quantized::QTensor::quantize(
+            &w_kn.t()?.contiguous()?,
+            crate::tensor::quantized::GgmlDType::Q8_0,
+        )?;
+        crate::tensor::quantized::QMatMul::from_qtensor(q)
+    }
+
+    /// The weight unpacked to f32 `[K, N]` on the host.
+    fn dequant_host(&self) -> Result<Tensor> {
         use crate::inference::load::awq::AwqTensor;
         let qweight = self.qweight.flatten_all()?.to_vec1::<i32>()?;
         let qzeros = self.qzeros.flatten_all()?.to_vec1::<i32>()?;
@@ -370,17 +409,8 @@ impl AwqWeight {
             .to_vec1::<f32>()?;
         let scales: Vec<half::f16> = scales_f32.into_iter().map(half::f16::from_f32).collect();
         let t = AwqTensor::new(self.k, self.n, self.group_size, qweight, qzeros, scales);
-        let w = t.dequant(); // [K, N] row-major = W^T
-        let dev = xs.device();
-        let w_kn = Tensor::from_vec(w, (self.k, self.n), &dev)?;
-        let dims = xs.dims();
-        let tokens: usize = dims[..dims.len() - 1].iter().product();
-        let mut out_shape = dims[..dims.len() - 1].to_vec();
-        out_shape.push(self.n);
-        let x2 = xs.reshape((tokens, self.k))?.to_dtype(DType::F32)?;
-        let y = x2.matmul(&w_kn)?;
-        let y = self.add_bias(y)?;
-        y.reshape(out_shape)
+        // [K, N] row-major = W^T
+        Tensor::from_vec(t.dequant(), (self.k, self.n), &Device::Cpu)
     }
 }
 
@@ -1008,6 +1038,7 @@ mod marlin_parity {
                     group_size: gs,
                     repacked: std::sync::OnceLock::new(),
                     marlin: std::sync::OnceLock::new(),
+                    host: std::sync::OnceLock::new(),
                 }
             };
 
@@ -1039,9 +1070,15 @@ mod marlin_parity {
                 let x_cpu = Tensor::from_vec_f32(xv, vec![rows, k]).unwrap();
 
                 let got = on_gpu.forward(&x_gpu).unwrap().to_vec_f32();
-                // CPU-FALLBACK-OK: not a fallback - this IS the judge. The host path is what
-                // the device result is being compared against, so running it is the point.
-                let want = on_cpu.forward(&x_cpu).unwrap().to_vec_f32();
+                // The judge is the exact product with the unpacked weight: the host forward
+                // reads eight-bit blocks, which round both operands.
+                let want = match &on_cpu.inner {
+                    QMatMulKind::Awq(w) => w
+                        .add_bias(x_cpu.matmul(&w.dequant_host().unwrap()).unwrap())
+                        .unwrap()
+                        .to_vec_f32(),
+                    _ => unreachable!("built from an AWQ weight"),
+                };
                 assert_eq!(got.len(), rows * n, "rows={rows}: wrong output length");
 
                 // The row's own largest output is the scale: a column that cancelled to near zero

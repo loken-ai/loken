@@ -2628,6 +2628,7 @@ fn build_awq_layer(
                 group_size,
                 repacked: std::sync::OnceLock::new(),
                 marlin: std::sync::OnceLock::new(),
+                host: std::sync::OnceLock::new(),
             },
             keep_free,
         ))
@@ -2694,6 +2695,7 @@ fn build_awq_layer(
                 group_size,
                 repacked: std::sync::OnceLock::new(),
                 marlin: std::sync::OnceLock::new(),
+                host: std::sync::OnceLock::new(),
             },
             keep_free,
         ))

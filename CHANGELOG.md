@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- AWQ: read a projection left on the host as eight-bit blocks, unpacked once.
 - Placement: choose the context by how fast a token reads its weights.
 - Placement: hold a model on one card at a smaller context before spreading it.
 - Decode: attend over a long context with the split-K kernel only.
