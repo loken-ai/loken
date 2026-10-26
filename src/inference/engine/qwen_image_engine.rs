@@ -883,16 +883,15 @@ fn tokens_to_png(
     // tried, fastest first, the next one when a card still runs out, then the CPU.
     // Decoding in overlapping tiles bounds the peak by ONE tile instead of the whole
     // image, so the demand no longer grows with the requested resolution.
-    let transient = VAE_TILE_TRANSIENT_BYTES;
     // The resident decoder is pinned to `vae_device`; the CPU copy is the movable
-    // one, so any other target is served by moving that copy.
-    let decode_on = |dev: &Device, whole: bool| -> crate::tensor::Result<NT> {
+    // one, so any other target is served by moving that copy. `tile` is the side of a tile in
+    // latent pixels, `None` for the whole image.
+    let decode_on = |dev: &Device, tile: Option<usize>| -> crate::tensor::Result<NT> {
         let tiled = |v: &WanVaeDecoder, d: &Device| -> crate::tensor::Result<NT> {
             let l = lat.to_device(d)?;
-            if whole {
-                v.decode_whole(&l)
-            } else {
-                v.decode_spatial_tiled(&l, VAE_TILE_LATENT, VAE_TILE_OVERLAP)
+            match tile {
+                None => v.decode_whole(&l),
+                Some(t) => v.decode_spatial_tiled(&l, t, VAE_TILE_OVERLAP),
             }
         };
         let img = if Device::same_device(dev, &state.vae_device) {
@@ -930,7 +929,7 @@ fn tokens_to_png(
         whole_transient,
         &cards,
         false,
-        |d| decode_on(d, true),
+        |d| decode_on(d, None),
     )
     .and_then(|r| match r {
         Ok(img) => Some(img),
@@ -939,14 +938,33 @@ fn tokens_to_png(
             None
         }
     });
-    let img = match whole_first {
+    // Tiled on a card next, at the full tile and then at half its side, a quarter of its
+    // transients: a card the denoise left a little room on decodes in smaller tiles faster than
+    // the host decodes in large ones. The host takes the full tile last.
+    let tiled_on_cards = || {
+        [VAE_TILE_LATENT, VAE_TILE_LATENT / 2]
+            .into_iter()
+            .find_map(|tile| {
+                let scale = (tile * tile) as u64;
+                let full = (VAE_TILE_LATENT * VAE_TILE_LATENT) as u64;
+                crate::inference::place::ladder::run_whole_on(
+                    "Qwen-Image VAE decode",
+                    VAE_TILE_TRANSIENT_BYTES * scale / full,
+                    &cards,
+                    false,
+                    |d| decode_on(d, Some(tile)),
+                )
+                .and_then(|r| r.ok())
+            })
+    };
+    let img = match whole_first.or_else(tiled_on_cards) {
         Some(img) => img,
         None => crate::inference::place::ladder::run_whole_on(
             "Qwen-Image VAE decode",
-            transient,
-            &cards,
+            VAE_TILE_TRANSIENT_BYTES,
+            &[],
             true,
-            |d| decode_on(d, false),
+            |d| decode_on(d, Some(VAE_TILE_LATENT)),
         )
         .unwrap_or_else(|| Err(crate::tensor::Error("no device to decode on".to_string())))
         .map_err(|e| anyhow!("Qwen-Image VAE decode: {e}"))?,
