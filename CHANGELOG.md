@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- Tensor parallelism: split the layers of an AWQ checkpoint across cards.
+
 ### Changed
 
 - AWQ: read a projection left on the host as eight-bit blocks, unpacked once.

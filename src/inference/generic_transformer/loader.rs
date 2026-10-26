@@ -759,6 +759,30 @@ pub(crate) fn moe_stack_served_as_stored(
 /// Why the file `content` of architecture `arch` cannot run tensor-parallel over `ranks` cards,
 /// or `None` when every one of its layers can: the per-layer reasons of [`tp_refusal`] read from
 /// the file's tensor names and widths before anything is loaded.
+/// Why the layers of an AWQ checkpoint of this architecture cannot be split into `ranks` tensor-
+/// parallel shares, `None` when they can: heads and feed-forward rows that divide among the ranks
+/// on the groups of inputs one row of scales covers. An AWQ stack is dense, with separate q, k
+/// and v, which the loader fuses for each share.
+pub(crate) fn tp_awq_refusal(
+    content: &gguf_file::Content,
+    arch: &str,
+    ranks: usize,
+    group_size: usize,
+) -> Option<String> {
+    let config = match GenericTransformerConfig::from_gguf(content, arch) {
+        Ok(c) => c,
+        Err(e) => return Some(e.to_string()),
+    };
+    tp_layout(
+        &config,
+        &vec![1.0; ranks],
+        group_size,
+        Some(group_size),
+        None,
+    )
+    .err()
+}
+
 pub(crate) fn tp_file_refusal(
     content: &gguf_file::Content,
     arch: &str,
@@ -2580,6 +2604,83 @@ fn build_generic_layer(
     Ok(layer)
 }
 
+/// The part of an AWQ projection a tensor-parallel rank holds. The weights and zero points pack
+/// eight outputs to a word, so a share of the outputs starts and ends on a multiple of eight; a
+/// share of the inputs starts and ends on a multiple of the group size, which is what one row of
+/// scales and zero points covers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum AwqSlice {
+    Whole,
+    /// `(first, count)` outputs.
+    Outputs(usize, usize),
+    /// `(first, count)` inputs.
+    Inputs(usize, usize),
+}
+
+/// The packed weights, zero points and scales of one AWQ projection, on the host, cut to `slice`.
+/// `qweight` is `[k, n / 8]`, `qzeros` `[k / group, n / 8]` and `scales` `[k / group, n]`.
+pub(super) fn awq_slice(
+    qweight: &Tensor,
+    qzeros: &Tensor,
+    scales: &Tensor,
+    group_size: usize,
+    slice: AwqSlice,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let aligned = |what: &str, (first, count): (usize, usize), unit: usize| {
+        if first % unit != 0 || count % unit != 0 {
+            crate::tensor::bail!("{what} {first}+{count} do not fall on blocks of {unit}");
+        }
+        Ok(())
+    };
+    match slice {
+        AwqSlice::Whole => Ok((qweight.clone(), qzeros.clone(), scales.clone())),
+        AwqSlice::Outputs(first, count) => {
+            aligned("outputs", (first, count), 8)?;
+            Ok((
+                qweight.narrow(1, first / 8, count / 8)?.contiguous()?,
+                qzeros.narrow(1, first / 8, count / 8)?.contiguous()?,
+                scales.narrow(1, first, count)?.contiguous()?,
+            ))
+        }
+        AwqSlice::Inputs(first, count) => {
+            aligned("inputs", (first, count), group_size)?;
+            Ok((
+                qweight.narrow(0, first, count)?.contiguous()?,
+                qzeros
+                    .narrow(0, first / group_size, count / group_size)?
+                    .contiguous()?,
+                scales
+                    .narrow(0, first / group_size, count / group_size)?
+                    .contiguous()?,
+            ))
+        }
+    }
+}
+
+/// What rank `rank` of a tensor-parallel group holds of one AWQ layer: its query heads, its
+/// key and value heads and its rows of the feed-forward, as `(first, count)` of the full
+/// projections' outputs.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AwqShare {
+    pub q: (usize, usize),
+    pub kv: (usize, usize),
+    pub ffn: (usize, usize),
+}
+
+impl AwqShare {
+    fn of(layout: &TpLayout, rank: usize, head_dim: usize) -> Self {
+        let (kv_from, ffn_from, _) = layout.offsets(rank);
+        Self {
+            q: (
+                kv_from * layout.group * head_dim,
+                layout.kv[rank] * layout.group * head_dim,
+            ),
+            kv: (kv_from * head_dim, layout.kv[rank] * head_dim),
+            ffn: (ffn_from, layout.ffn.get(rank).copied().unwrap_or(0)),
+        }
+    }
+}
+
 /// Build one `GenericTransformerLayer` from an AWQ checkpoint. Dense
 /// Qwen2/Qwen3/Mistral: separate q/k/v (so the GGUF-byte APQ fast path gates off
 /// and `standard_attention` - which works with any `QMatMul` - runs), f16 norms,
@@ -2595,26 +2696,45 @@ fn build_awq_layer(
     sin: &Tensor,
     group_size: usize,
     keep_free: usize,
+    share: Option<&AwqShare>,
 ) -> Result<GenericTransformerLayer> {
     use crate::inference::generic_transformer::projection::AwqWeight;
     let eps = config.rms_norm_eps;
     let p = format!("model.layers.{layer_idx}");
 
-    // One AWQ projection -> QMatMul::Awq. k = in (qweight rows), n = out (scales cols).
-    let load_awq = |proj: &str| -> Result<QMatMul> {
+    // One AWQ projection -> QMatMul::Awq. k = in (qweight rows), n = out (scales cols). A
+    // tensor-parallel share cuts the projection to `slice` on the host first.
+    let load_awq = |proj: &str, slice: AwqSlice| -> Result<QMatMul> {
         // Force contiguous, offset-0 device buffers - the AWQ kernels take raw
         // `as_cuda_slice`s and assume a packed layout from the buffer start.
-        let qweight = st
-            .load(&format!("{p}.{proj}.qweight"), device)?
-            .contiguous()?;
-        let qzeros = st
-            .load(&format!("{p}.{proj}.qzeros"), device)?
-            .contiguous()?;
-        let scales = st
-            .load(&format!("{p}.{proj}.scales"), device)?
-            // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
-            .to_dtype(DType::F16)?
-            .contiguous()?;
+        let (qweight, qzeros, scales) = if slice == AwqSlice::Whole {
+            (
+                st.load(&format!("{p}.{proj}.qweight"), device)?
+                    .contiguous()?,
+                st.load(&format!("{p}.{proj}.qzeros"), device)?
+                    .contiguous()?,
+                st.load(&format!("{p}.{proj}.scales"), device)?
+                    // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
+                    .to_dtype(DType::F16)?
+                    .contiguous()?,
+            )
+        } else {
+            let host = Device::Cpu;
+            let (w, z, s) = awq_slice(
+                &st.load(&format!("{p}.{proj}.qweight"), &host)?,
+                &st.load(&format!("{p}.{proj}.qzeros"), &host)?,
+                // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
+                &st.load(&format!("{p}.{proj}.scales"), &host)?
+                    .to_dtype(DType::F16)?,
+                group_size,
+                slice,
+            )?;
+            (
+                w.to_device(device)?,
+                z.to_device(device)?,
+                s.to_device(device)?,
+            )
+        };
         let k = qweight.dim(0)?;
         let n = scales.dim(1)?;
         Ok(QMatMul::from_awq(
@@ -2651,24 +2771,24 @@ fn build_awq_layer(
     // Fuse several projections (same K, same group_size) along the output dim
     // into ONE AwqWeight - qweight/qzeros are [K|K/gs, N/8] (cat dim 1), scales
     // [K/gs, N] (cat dim 1). One GEMV + one launch instead of N.
-    let fuse_awq = |projs: &[&str]| -> Result<QMatMul> {
+    let fuse_awq = |projs: &[(&str, AwqSlice)]| -> Result<QMatMul> {
         // Concatenate on the host: there is no i32 concat CUDA kernel (cat on i32
         // device tensors -> "named symbol not found"). Load each shard to CPU, cat,
         // then move the fused tensor to the device once.
-        let load_cpu = |proj: &str| -> Result<(Tensor, Tensor, Tensor)> {
+        let load_cpu = |proj: &str, slice: AwqSlice| -> Result<(Tensor, Tensor, Tensor)> {
             let w = st.load(&format!("{p}.{proj}.qweight"), &Device::Cpu)?;
             let z = st.load(&format!("{p}.{proj}.qzeros"), &Device::Cpu)?;
             let s = st
                 .load(&format!("{p}.{proj}.scales"), &Device::Cpu)?
                 // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
                 .to_dtype(DType::F16)?;
-            Ok((w, z, s))
+            awq_slice(&w, &z, &s, group_size, slice)
         };
         let mut qws = Vec::new();
         let mut qzs = Vec::new();
         let mut scs = Vec::new();
-        for pr in projs {
-            let (w, z, s) = load_cpu(pr)?;
+        for (pr, slice) in projs {
+            let (w, z, s) = load_cpu(pr, *slice)?;
             qws.push(w);
             qzs.push(z);
             scs.push(s);
@@ -2702,13 +2822,34 @@ fn build_awq_layer(
     };
     let _ = &load_raw;
     // Optional bias -> F32 on device.
-    let load_bias = |proj: &str| -> Result<Option<Tensor>> {
+    let load_bias = |proj: &str, range: Option<(usize, usize)>| -> Result<Option<Tensor>> {
         match st.load(&format!("{p}.{proj}.bias"), device) {
             // CONVERSION: a bias is a small vector held F32.
-            Ok(t) => Ok(Some(t.to_dtype(DType::F32)?)),
+            Ok(t) => {
+                let t = t.to_dtype(DType::F32)?;
+                match range {
+                    Some((first, count)) => Ok(Some(t.narrow(0, first, count)?.contiguous()?)),
+                    None => Ok(Some(t)),
+                }
+            }
             Err(_) => Ok(None),
         }
     };
+    // The outputs of q, of k and v, of the feed-forward, and the inputs of the projections that
+    // read them back, for this rank of a tensor-parallel group, or the whole of each.
+    let out_slice = |range: Option<(usize, usize)>| match range {
+        Some((first, count)) => AwqSlice::Outputs(first, count),
+        None => AwqSlice::Whole,
+    };
+    let in_slice = |range: Option<(usize, usize)>| match range {
+        Some((first, count)) => AwqSlice::Inputs(first, count),
+        None => AwqSlice::Whole,
+    };
+    let (q_range, kv_range, ffn_range) = (
+        share.map(|s| s.q),
+        share.map(|s| s.kv),
+        share.map(|s| s.ffn),
+    );
     let load_norm = |name: &str| -> Result<RmsNorm> {
         let w = st
             .load(&format!("{p}.{name}"), device)?
@@ -2724,33 +2865,33 @@ fn build_awq_layer(
     let (attn_q, attn_k, attn_v, attn_qkv, attn_q_bias, attn_k_bias, attn_v_bias, attn_qkv_bias);
     if fuse_qkv {
         attn_qkv = Some(fuse_awq(&[
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
+            ("self_attn.q_proj", out_slice(q_range)),
+            ("self_attn.k_proj", out_slice(kv_range)),
+            ("self_attn.v_proj", out_slice(kv_range)),
         ])?);
         (attn_q, attn_k, attn_v) = (None, None, None);
         // Fused bias = q||k||v (or None if absent).
-        let qb = load_bias("self_attn.q_proj")?;
+        let qb = load_bias("self_attn.q_proj", q_range)?;
         attn_qkv_bias = match (
             &qb,
-            load_bias("self_attn.k_proj")?,
-            load_bias("self_attn.v_proj")?,
+            load_bias("self_attn.k_proj", kv_range)?,
+            load_bias("self_attn.v_proj", kv_range)?,
         ) {
             (Some(q), Some(k), Some(v)) => Some(Tensor::cat(&[q, &k, &v], 0)?.contiguous()?),
             _ => None,
         };
         (attn_q_bias, attn_k_bias, attn_v_bias) = (None, None, None);
     } else {
-        attn_q = Some(load_awq("self_attn.q_proj")?);
-        attn_k = Some(load_awq("self_attn.k_proj")?);
-        attn_v = Some(load_awq("self_attn.v_proj")?);
+        attn_q = Some(load_awq("self_attn.q_proj", out_slice(q_range))?);
+        attn_k = Some(load_awq("self_attn.k_proj", out_slice(kv_range))?);
+        attn_v = Some(load_awq("self_attn.v_proj", out_slice(kv_range))?);
         attn_qkv = None;
         attn_qkv_bias = None;
-        attn_q_bias = load_bias("self_attn.q_proj")?;
-        attn_k_bias = load_bias("self_attn.k_proj")?;
-        attn_v_bias = load_bias("self_attn.v_proj")?;
+        attn_q_bias = load_bias("self_attn.q_proj", q_range)?;
+        attn_k_bias = load_bias("self_attn.k_proj", kv_range)?;
+        attn_v_bias = load_bias("self_attn.v_proj", kv_range)?;
     }
-    let attn_output = load_awq("self_attn.o_proj")?;
+    let attn_output = load_awq("self_attn.o_proj", in_slice(q_range))?;
     let (attn_q_norm, attn_k_norm) = if flags.has_qk_norm {
         (
             Some(load_norm("self_attn.q_norm.weight")?),
@@ -2760,8 +2901,11 @@ fn build_awq_layer(
         (None, None)
     };
     let ffn_gate: Option<QMatMul> = None;
-    let ffn_up = fuse_awq(&["mlp.gate_proj", "mlp.up_proj"])?;
-    let ffn_down = load_awq("mlp.down_proj")?;
+    let ffn_up = fuse_awq(&[
+        ("mlp.gate_proj", out_slice(ffn_range)),
+        ("mlp.up_proj", out_slice(ffn_range)),
+    ])?;
+    let ffn_down = load_awq("mlp.down_proj", in_slice(ffn_range))?;
     let attn_norm = WeightedNorm::Rms(load_norm("input_layernorm.weight")?);
     let ffn_norm = Some(WeightedNorm::Rms(load_norm(
         "post_attention_layernorm.weight",
@@ -4903,16 +5047,47 @@ impl GenericHeteroTransformer {
         // found" (a facade module-cache quirk after many custom-module loads);
         // prewarming first sidesteps it.
         #[cfg(feature = "gpu")]
-        for idx in &used {
-            if let Ok(cd) = cuda_devices[idx].as_cuda_device() {
+        for idx in used
+            .iter()
+            .copied()
+            .chain(plan.tp_cards.iter().flatten().map(|c| c.index))
+        {
+            if let Ok(cd) = cuda_devices[&idx].as_cuda_device() {
                 let _ = crate::inference::kernel::fused::prewarm_fused_kernels(&cd);
             }
         }
 
+        // A tensor-parallel group splits every layer's heads and feed-forward among its cards,
+        // each holding the packed weights of its share.
+        let tp = plan.tp_cards.as_ref().filter(|c| c.len() > 1);
+        let tp_layout_of_group = match tp {
+            Some(cards) => {
+                let weights: Vec<f64> = cards.iter().map(|c| c.weight).collect();
+                Some(
+                    tp_layout(&config, &weights, group_size, Some(group_size), None)
+                        .map_err(crate::tensor::Error::msg)?,
+                )
+            }
+            None => None,
+        };
+        #[cfg(feature = "gpu")]
+        let tp_comms = tp.and_then(|cards| {
+            let devices = cards
+                .iter()
+                .map(|c| cuda_devices.get(&c.index).cloned())
+                .collect::<Option<Vec<_>>>()?;
+            TpComms::new(&devices).map(Arc::new)
+        });
+        #[cfg(not(feature = "gpu"))]
+        let tp_comms: Option<Arc<TpComms>> = None;
+
         // RoPE tables (full head_dim, YaRN if configured), sized to the KV window, one per
         // device a layer runs on.
         let mut rope: HashMap<Option<usize>, (Tensor, Tensor)> = HashMap::new();
-        for &card in &layer_card {
+        let group_cards = tp
+            .into_iter()
+            .flat_map(|cards| cards.iter().map(|c| Some(c.index)));
+        for card in layer_card.iter().copied().chain(group_cards) {
             if let std::collections::hash_map::Entry::Vacant(slot) = rope.entry(card) {
                 let (dev, _) = device_of(card);
                 slot.insert(
@@ -4968,6 +5143,47 @@ impl GenericHeteroTransformer {
             let card = layer_card[li];
             let (dev, dev_enum) = device_of(card);
             let (cos, sin) = &rope[&card];
+            if let (Some(cards), Some(layout)) = (tp, tp_layout_of_group.as_ref()) {
+                // Every card keeps its share of the layers still to load, of the caches and
+                // of the work beside the layer it builds now.
+                let ranks = cards.len() as u64;
+                let still_to_load: u64 = (li + 1..config.n_layers).map(|l| layer_bytes[l]).sum();
+                let keep_free =
+                    (still_to_load + kv_per_layer * config.n_layers as u64) / ranks + work;
+                let mut shares = Vec::with_capacity(cards.len());
+                for (rank, tp_card) in cards.iter().enumerate() {
+                    let rank_dev = cuda_devices.get(&tp_card.index).ok_or_else(|| {
+                        crate::tensor::Error::msg(format!(
+                            "card {} of the tensor-parallel group is not open",
+                            tp_card.index
+                        ))
+                    })?;
+                    let (rank_cos, rank_sin) = &rope[&Some(tp_card.index)];
+                    let share_config = tp_share_config(&config, layout, rank);
+                    let share_flags = Arc::new(GenericLayerFlags {
+                        intermediate_size: layout.ffn.get(rank).copied().unwrap_or(0),
+                        ..(*flags).clone()
+                    });
+                    shares.push(build_awq_layer(
+                        &st,
+                        li,
+                        rank_dev,
+                        &share_config,
+                        share_flags,
+                        rank_cos,
+                        rank_sin,
+                        group_size,
+                        keep_free as usize,
+                        Some(&AwqShare::of(layout, rank, config.head_dim)),
+                    )?);
+                }
+                let mut owner = shares.remove(0);
+                owner.tp_shards = shares;
+                owner.tp_comms = tp_comms.clone();
+                layers.push(owner);
+                layer_devs.push(LayerDevice::Cuda(cards[0].index));
+                continue;
+            }
             // What the card must keep beside this layer's second Marlin layout: the layers
             // after it, the caches of all its layers and the work.
             let still_to_load: u64 = (li + 1..config.n_layers)
@@ -4986,6 +5202,7 @@ impl GenericHeteroTransformer {
                 sin,
                 group_size,
                 keep_free as usize,
+                None,
             )?);
             layer_devs.push(dev_enum);
         }

@@ -402,6 +402,25 @@ pub fn synth_gguf_content(cfg: &AwqConfigJson, present: AwqTensorPresence) -> Co
         "blk.0.ffn_down.weight".into(),
         vec![cfg.hidden_size, cfg.intermediate_size],
     );
+    // The attention projections, so that what a row costs through a layer can be read from the
+    // header as it is from a GGUF file's.
+    let hd = cfg.head_dim.unwrap_or(cfg.hidden_size / cfg.n_head);
+    ti(
+        "blk.0.attn_q.weight".into(),
+        vec![cfg.n_head * hd, cfg.hidden_size],
+    );
+    ti(
+        "blk.0.attn_k.weight".into(),
+        vec![cfg.n_kv_head * hd, cfg.hidden_size],
+    );
+    ti(
+        "blk.0.attn_v.weight".into(),
+        vec![cfg.n_kv_head * hd, cfg.hidden_size],
+    );
+    ti(
+        "blk.0.attn_output.weight".into(),
+        vec![cfg.hidden_size, cfg.n_head * hd],
+    );
     if present.has_q_bias {
         ti(
             "blk.0.attn_q.bias".into(),

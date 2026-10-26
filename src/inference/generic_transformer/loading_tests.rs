@@ -3432,3 +3432,78 @@ fn a_prompt_of_several_tokens_skips_the_one_row_graph_buffers() {
     }
     assert_runs("llama with the graph buffers set", &mut model, VOCAB);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The shares of an AWQ projection a tensor-parallel group cuts.
+// ---------------------------------------------------------------------------------------------
+
+mod awq_shares {
+    use super::super::loader::{awq_slice, AwqSlice};
+    use crate::tensor::{DType, Device, Tensor};
+
+    const GROUP: usize = 32;
+    const K: usize = 128;
+    const N: usize = 64;
+
+    fn projection() -> (Tensor, Tensor, Tensor) {
+        let host = Device::Cpu;
+        let ints = |rows: usize, cols: usize| -> Tensor {
+            let v: Vec<i32> = (0..(rows * cols) as i32).collect();
+            Tensor::from_vec(v, (rows, cols), &host).unwrap()
+        };
+        let scales: Vec<f32> = (0..(K / GROUP * N)).map(|i| i as f32).collect();
+        (
+            ints(K, N / 8),
+            ints(K / GROUP, N / 8),
+            Tensor::from_vec(scales, (K / GROUP, N), &host)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap(),
+        )
+    }
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// Cut by outputs, the shares laid side by side are the projection.
+    #[test]
+    fn output_shares_put_side_by_side_are_the_projection() {
+        let (w, z, s) = projection();
+        let a = awq_slice(&w, &z, &s, GROUP, AwqSlice::Outputs(0, 24)).unwrap();
+        let b = awq_slice(&w, &z, &s, GROUP, AwqSlice::Outputs(24, 40)).unwrap();
+        assert_eq!(a.0.dims(), &[K, 3]);
+        assert_eq!(b.2.dims(), &[K / GROUP, 40]);
+        for (whole, left, right) in [(&w, &a.0, &b.0), (&z, &a.1, &b.1), (&s, &a.2, &b.2)] {
+            let joined = Tensor::cat(&[left, right], 1).unwrap();
+            assert_eq!(flat(&joined), flat(whole));
+        }
+    }
+
+    /// Cut by inputs, the shares stacked are the projection.
+    #[test]
+    fn input_shares_stacked_are_the_projection() {
+        let (w, z, s) = projection();
+        let a = awq_slice(&w, &z, &s, GROUP, AwqSlice::Inputs(0, 96)).unwrap();
+        let b = awq_slice(&w, &z, &s, GROUP, AwqSlice::Inputs(96, 32)).unwrap();
+        assert_eq!(a.1.dims(), &[3, N / 8]);
+        assert_eq!(b.2.dims(), &[1, N]);
+        for (whole, top, bottom) in [(&w, &a.0, &b.0), (&z, &a.1, &b.1), (&s, &a.2, &b.2)] {
+            let joined = Tensor::cat(&[top, bottom], 0).unwrap();
+            assert_eq!(flat(&joined), flat(whole));
+        }
+    }
+
+    /// A cut that does not fall on a packed word or a group is refused.
+    #[test]
+    fn a_cut_off_a_block_is_refused() {
+        let (w, z, s) = projection();
+        assert!(awq_slice(&w, &z, &s, GROUP, AwqSlice::Outputs(4, 20)).is_err());
+        assert!(awq_slice(&w, &z, &s, GROUP, AwqSlice::Inputs(16, 32)).is_err());
+    }
+}

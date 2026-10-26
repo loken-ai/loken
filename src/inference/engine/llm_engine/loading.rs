@@ -1150,7 +1150,14 @@ impl LlmEngine {
                     let blocks = || content.tensor_infos.iter().filter(|(name, _)| name.starts_with("blk."));
                     let expert_count = get_gguf_u32(&content, &format!("{arch}.expert_count")).unwrap_or(0) as usize;
                     let expert_used = get_gguf_u32(&content, &format!("{arch}.expert_used_count")).unwrap_or(0) as usize;
-                    let per_layer = |v: f64| v / num_layers.max(1) as f64;
+                    // Per layer over the layers the header describes: a synthesised header (an AWQ
+                    // checkpoint's) describes the first layer only.
+                    let described = blocks()
+                        .filter_map(|(name, _)| name.strip_prefix("blk.")?.split('.').next()?.parse::<usize>().ok())
+                        .collect::<std::collections::HashSet<usize>>()
+                        .len()
+                        .clamp(1, num_layers.max(1));
+                    let per_layer = |v: f64| v / described as f64;
                     let routed = (expert_count > 0 && expert_used > 0).then(|| {
                         let bytes: u64 = blocks()
                             .filter(|(name, _)| name.contains("_exps."))
@@ -1183,7 +1190,7 @@ impl LlmEngine {
                     // down to the working window, until each card holds its share of it beside
                     // its share of the weights. An asked context is kept.
                     let mut tp_ctx = None;
-                    let tp_plan = (awq.is_none() && layer_share.is_none() && split.is_none())
+                    let tp_plan = (layer_share.is_none() && split.is_none())
                         .then(|| {
                             let rates = crate::inference::place::expert_parallel::card_read_rates();
                             let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
@@ -1213,7 +1220,16 @@ impl LlmEngine {
                                 row_flops,
                                 routed,
                                 super::PREFILL_CHUNK_TOKENS,
-                                |ranks| crate::inference::generic_transformer::tp_file_refusal(&content, &arch, ranks),
+                                |ranks| match &awq {
+                                    Some((dir, _)) => crate::inference::load::awq_loader::parse_config_json(dir)
+                                        .map_err(|e| e.to_string())
+                                        .map_or_else(Some, |cfg| {
+                                            crate::inference::generic_transformer::tp_awq_refusal(
+                                                &content, &arch, ranks, cfg.group_size,
+                                            )
+                                        }),
+                                    None => crate::inference::generic_transformer::tp_file_refusal(&content, &arch, ranks),
+                                },
                             );
                             if p.is_some() && ctx < ctx_for_planning {
                                 info!("KV context {ctx_for_planning} -> {ctx}: each card holds its share of the split there");
