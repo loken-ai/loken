@@ -541,8 +541,9 @@ impl LlmEngine {
         }
     }
 
-    /// Spec-decode: prefill the drafter with the prompt tokens (forward at
-    /// pos 0 resets + fills its KV -> length = tokens.len()). Returns false on error.
+    /// Spec-decode: prefill the drafter with the prompt tokens, in the chunks its free memory
+    /// affords, as a target prefills (a forward at pos 0 resets and fills its KV -> length =
+    /// tokens.len()). Returns false on error.
     pub fn draft_prefill(&self, tokens: &[u32]) -> bool {
         let g = self.draft_engine.blocking_lock();
         let d = match g.as_ref() {
@@ -558,7 +559,7 @@ impl LlmEngine {
             Ok(x) => x,
             Err(_) => return false,
         };
-        st.model.forward(&x, 0).is_ok()
+        st.model.forward_prefill_chunked(&x, 0).is_ok()
     }
 
     /// Spec-decode: greedily draft `k` tokens. Feeds `first_token` at
