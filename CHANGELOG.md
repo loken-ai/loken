@@ -26,6 +26,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: prefill no more prompt tokens in a step than the reserve holds.
 - Speculative decoding: prefill the drafter in chunks, as its target is.
 - Serving: go on from the failed chunk when a long prompt runs out of card memory.
+- Inference: size the attention scores of a prompt on a card from its free memory.
 - Vision: place the text after a tall image as the reference does.
 - Models: load the model of an Ollama manifest that lists its projector first.
 - Serving: keep the images of a vision model when requests arrive together.

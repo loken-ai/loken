@@ -6,6 +6,10 @@ use super::*;
 /// Bytes the transient scores of one query tile may hold in a multi-row attention that
 /// materialises them.
 const SCORES_TILE_BYTES: usize = 256 << 20;
+/// Shares of a card's free memory one query tile of a materialised attention divides it into:
+/// the scores and the copy derived from them (scaled, masked, normalised) live two at a time,
+/// and the rest of the layer's step keeps the others.
+const SCORES_SHARES_OF_FREE: usize = 4;
 
 impl GenericTransformerLayer {
     /// Append the new token(s) `k`/`v` (`[1, n_kv, seq, hd]`, post-RoPE,
@@ -380,6 +384,14 @@ impl GenericTransformerLayer {
         Tensor::from_vec(out, (b, n_head, seq_q, d), &q.device())
     }
 
+    /// Bytes the scores of one query tile may hold on `device`: [`SCORES_TILE_BYTES`], less on
+    /// a card whose free memory gives a tile a smaller share.
+    fn scores_budget(device: &crate::tensor::Device) -> usize {
+        crate::inference::place::vram_manager::free_now(device).map_or(SCORES_TILE_BYTES, |free| {
+            SCORES_TILE_BYTES.min(free as usize / SCORES_SHARES_OF_FREE)
+        })
+    }
+
     /// Attention of a layer with per-head sinks: `q` `[b, n_head, seq, hd]` against the
     /// first `kv_len` positions of `k`/`v` `[b, n_kv, >= kv_len, hd]`, `mask` `[seq, kv_len]`
     /// u8 (1 hides a key) or `None` at decode. Returns `[b, n_head, seq, hd]` in `q`'s dtype.
@@ -616,22 +628,22 @@ impl GenericTransformerLayer {
             let kt = k.t()?; // [b,n_head,d,seq_kv] view, reused across tiles
             let seq_q = qd.dims()[2];
             let seq_kv = k.dims()[2];
-            // Tile so the transient scores stay under a fixed budget REGARDLESS of seq:
-            // tile auto-shrinks as seq grows (sized from the shape + a memory ceiling, not
-            // a magic switch). seq_q <= tile ⇒ a single matmul, identical to before.
+            // Tile so the transient scores stay under a budget REGARDLESS of seq: tile
+            // auto-shrinks as seq grows, and on a card it also shrinks to what the card has
+            // free. seq_q <= tile ⇒ a single matmul, identical to before.
             let per_row = (qd.dims()[0] * self.n_head * seq_kv).max(1) * 4;
-            let tile = (SCORES_TILE_BYTES / per_row).clamp(1, seq_q);
+            let tile = (Self::scores_budget(&qd.device()) / per_row).clamp(1, seq_q);
             let attend = |qt: &Tensor, q_off: usize| -> Result<Tensor> {
                 let tlen = qt.dims()[2];
-                let att = qt.matmul(&kt)?; // [b,n_head,tlen,seq_kv]
-                let att = if scale_is_one {
-                    att
-                } else {
-                    att.affine(scale as f32, 0.0)?
-                };
-                let att = self.softcap_scores(att)?;
-                let att = self.alibi_scores(att, seq_kv - seq_q + q_off)?;
-                let att = match mask {
+                // Each step replaces the scores it read, so no more than two copies of a
+                // tile's scores are alive at once.
+                let mut att = qt.matmul(&kt)?; // [b,n_head,tlen,seq_kv]
+                if !scale_is_one {
+                    att = att.affine(scale as f32, 0.0)?;
+                }
+                att = self.softcap_scores(att)?;
+                att = self.alibi_scores(att, seq_kv - seq_q + q_off)?;
+                att = match mask {
                     None => att,
                     Some(m) => {
                         // Slice the mask's query rows to this tile (its query axis is the
@@ -651,7 +663,7 @@ impl GenericTransformerLayer {
                         mb.where_cond(&neg.broadcast_as(att.dims())?, &att)?
                     }
                 };
-                let att = if kv_dt == crate::tensor::DType::F32 {
+                att = if kv_dt == crate::tensor::DType::F32 {
                     crate::tensor::ops::softmax_last_dim(&att)?
                 } else {
                     crate::tensor::ops::softmax_last_dim(&att.to_dtype(crate::tensor::DType::F32)?)?

@@ -137,6 +137,19 @@ pub fn free_on_cards(cards: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// What the card `device` has free now as its driver reads it, the blocks the pools keep counted
+/// as used; `None` off a card. A step sizes a transient from it; nothing is placed by it.
+pub fn free_now(device: &crate::tensor::Device) -> Option<u64> {
+    #[cfg(feature = "gpu")]
+    if matches!(device, crate::tensor::Device::Cuda(_)) {
+        return crate::tensor::cuda_ext::mem_get_info(device)
+            .ok()
+            .map(|(free, _)| free as u64);
+    }
+    let _ = device;
+    None
+}
+
 /// What the tightest of the cards in `cards` (the bits of their indices) has free; with no bits
 /// set, of every card. A forward holds each card's own layers' activations, so it is the
 /// tightest card that decides how much it can take at once, not the sum.
