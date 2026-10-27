@@ -75,7 +75,7 @@ impl LlmEngine {
     pub(super) fn stream_via_cb(
         &self,
         server: std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
-        tokenizer: Tokenizer,
+        tokenizer: std::sync::Arc<Tokenizer>,
         eos_set: Vec<u32>,
         ctx_len: usize,
         defaults: super::generation_defaults::GenerationDefaults,
@@ -251,7 +251,7 @@ impl LlmEngine {
                 None => return Err("Model not loaded.".into()),
                 Some(state) => {
                     if let Some(server) = state.model.batched_server() {
-                        let tokenizer = (*state.tokenizer).clone();
+                        let tokenizer = std::sync::Arc::clone(&state.tokenizer);
                         let mut eos_set = state.eos_token_ids_extra.clone();
                         eos_set.push(state.eos_token_id);
                         let ctx_len = state.context_length;
