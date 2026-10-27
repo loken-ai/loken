@@ -3,7 +3,9 @@
 
 use super::state_cache_tests::{argmax, floats, prompt, Fixture, VOCAB};
 use super::*;
-use crate::inference::engine::model_backend::{GenericBackend, ModelBackend, FORCED_CHUNK_ROWS};
+use crate::inference::engine::model_backend::{
+    GenericBackend, ModelBackend, FORCED_CHUNK_ROWS, FORCED_LATE_OOM, PREFILL_ROWS_READ,
+};
 
 /// `n` tokens that begin with `first`, so two conversations share nothing.
 fn conversation(first: u32, n: usize) -> Vec<u32> {
@@ -232,4 +234,29 @@ fn a_chunk_that_runs_out_of_memory_is_retried_smaller() {
     assert_eq!(n, 150, "the span read was the same");
     // Reading in chunks of 35, the first half of the span that fits, from each span's start.
     assert_close(&logits, &cold(&f, &second, &[50, 85, 120, 155, 190]));
+}
+
+/// A pass that runs out of memory after some chunks went through goes on from the first chunk
+/// that did not, smaller: the rows read before it are not read again, and the prompt reads as
+/// one that never failed.
+#[test]
+fn a_late_failure_goes_on_from_the_chunk_that_failed() {
+    let f = Fixture::new("conv-late-oom");
+    let mut b = GenericBackend(f.model());
+    let first = prompt(60);
+    read(&mut b, &first, 50);
+    let second = next_turn(&first, 50, 150, 3);
+
+    FORCED_LATE_OOM.with(|c| c.set((100, 50)));
+    PREFILL_ROWS_READ.with(|c| c.set(0));
+    let (logits, n) = read(&mut b, &second, 120);
+    let rows = PREFILL_ROWS_READ.with(|c| c.get());
+    FORCED_LATE_OOM.with(|c| c.set((usize::MAX, usize::MAX)));
+    crate::inference::engine::llm_engine::reset_adaptive_prefill_chunk();
+
+    assert_eq!(n, 150, "the span read was the same");
+    assert_eq!(rows, 150, "each row of the span was read once");
+    // The first chunk of the span (120 rows) went through whole; the rest followed in a
+    // smaller one.
+    assert_close(&logits, &cold(&f, &second, &[50, 170]));
 }

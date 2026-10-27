@@ -181,6 +181,11 @@ fn prefill_sizing_uncached(shape: PrefillShape) -> PrefillSizing {
 thread_local! {
     /// The most rows a chunk may have before the card runs out of memory, for a test.
     pub(crate) static FORCED_CHUNK_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// `(rows, chunk)`: a pass in chunks wider than `chunk` runs out of memory once it has read
+    /// `rows` rows of its span, for a test.
+    pub(crate) static FORCED_LATE_OOM: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((usize::MAX, usize::MAX)) };
+    /// Rows the chunked prefill passes have read, for a test.
+    pub(crate) static PREFILL_ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Rows of a chunk that `free` card bytes afford a model of `shape`: a share of the free memory,
@@ -367,10 +372,12 @@ pub(crate) trait ModelBackend: Send {
         let chunk_start = sizing.chunk;
         // A prompt that fits one chunk runs as one forward; a longer one starts from the last
         // chunk that fit this model, clamped into [MIN, default]. Each out-of-memory failure
-        // halves the chunk down to the floor and replays the prefill from `index_pos`, which
-        // shrinks the activation peak, the attention scores and the KV growth transient
-        // without changing the final chunk's logits. At the floor the card is full of
-        // something else, so room is asked for once before the failure surfaces.
+        // halves the chunk down to the floor, which shrinks the activation peak, the attention
+        // scores and the KV growth transient without changing the final chunk's logits, and
+        // goes on from the first chunk that did not complete: the rows read before it keep
+        // their cache. A recurrent state cannot be cut back to that row, so such a model, or one
+        // whose cache cannot be cut, reads again from `index_pos`. At the floor the card is full
+        // of something else, so room is asked for once before the failure surfaces.
         let (per_token, fixed) = {
             let sh = self.prefill_shape();
             (sh.bytes_per_token, sh.fixed_bytes)
@@ -384,6 +391,8 @@ pub(crate) trait ModelBackend: Send {
             None => seq_len,
             Some(free) => start_chunk(chunk_start, per_token, free),
         };
+        let resumes = self.capabilities().trim_kv && !self.is_recurrent();
+        let mut done = 0usize;
         let mut replay = false;
         let mut replay_measures = false;
         let (logits, chunk_tokens) = crate::inference::place::recover::shrink_on_oom(
@@ -400,11 +409,14 @@ pub(crate) trait ModelBackend: Send {
             },
             |chunk| {
                 // A failed pass leaves partial KV behind; the session prefix [0, index_pos)
-                // stays.
+                // and the chunks the pass completed stay.
                 if replay {
                     // A failed pass is answered first by the memory only later requests use.
                     self.reclaim_prefill_room((chunk * per_token.max(1) + fixed) as u64);
-                    self.reset_kv_from(index_pos);
+                    if !resumes {
+                        done = 0;
+                    }
+                    self.reset_kv_from(index_pos + done);
                 }
                 replay = true;
                 // A card with room for the pass three times over is not drained behind each stage
@@ -418,7 +430,7 @@ pub(crate) trait ModelBackend: Send {
                 };
                 replay_measures = true;
                 crate::inference::generic_transformer::set_prefill_settle(room < pass);
-                let r = self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk);
+                let r = self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk, &mut done);
                 crate::inference::generic_transformer::set_prefill_settle(false);
                 r
             },
@@ -438,23 +450,26 @@ pub(crate) trait ModelBackend: Send {
     }
 
     /// One chunked-prefill pass over `x` (shape `[1, seq_len]`) using a fixed
-    /// `chunk_tokens` compute batch. Factored out of `forward_prefill_chunked`
-    /// so the OOM-adaptive wrapper can replay it with a smaller chunk.
+    /// `chunk_tokens` compute batch, from row `done` of `x`, which it moves past each chunk it
+    /// completes. Factored out of `forward_prefill_chunked` so the OOM-adaptive wrapper can go
+    /// on with a smaller chunk.
     fn forward_prefill_with_chunk(
         &mut self,
         x: &Tensor,
         index_pos: usize,
         seq_len: usize,
         chunk_tokens: usize,
+        done: &mut usize,
     ) -> crate::tensor::Result<Tensor> {
         let chunk_tokens = chunk_tokens.max(1);
-        let mut off = 0usize;
+        let mut off = *done;
         let mut last: Option<Tensor> = None;
         while off < seq_len {
             let n = chunk_tokens.min(seq_len - off);
             let chunk = x.narrow(1, off, n)?;
             last = Some(self.forward(&chunk, index_pos + off)?);
             off += n;
+            *done = off;
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))
     }
@@ -910,6 +925,11 @@ pub(crate) trait ModelBackend: Send {
 
     /// A request's decode took `bytes` of a card beyond what it had at its start.
     fn note_decode_reserve(&mut self, _bytes: u64) {}
+
+    /// Whether a layer carries a recurrent state beside its KV cache.
+    fn is_recurrent(&self) -> bool {
+        false
+    }
 
     /// Every recurrent state, copied: what lets a decode step be run a second time from the
     /// state the first started from, as the probation of a recorded step does. Empty for a
@@ -1773,6 +1793,8 @@ impl GenericBackend {
         let (per_token, fixed) = (shape.bytes_per_token, shape.fixed_bytes);
         let free_now = crate::inference::place::vram_manager::free_on_cards(shape.cards) as usize;
         let first = start_chunk(chunk, per_token, free_now).min(rows.max(1));
+        let resumes = !self.0.is_recurrent();
+        let mut done = 0usize;
         let mut replay = false;
         let (logits, used) = crate::inference::place::recover::shrink_on_oom(
             "prefill",
@@ -1786,13 +1808,16 @@ impl GenericBackend {
                 if replay {
                     // A failed pass is answered first by the memory only later requests use.
                     self.reclaim_for_chunk((c * per_token.max(1) + fixed) as u64);
-                    self.0.trim_kv(from);
-                    if let Some(saved) = &checkpoint {
+                    if !resumes {
+                        done = 0;
+                    }
+                    self.0.trim_kv(from + done);
+                    if let (false, Some(saved)) = (resumes, &checkpoint) {
                         self.0.recurrent_rewind(saved)?;
                     }
                 }
                 replay = true;
-                self.forward_prefill_with_chunk(&span, from, rows, c)
+                self.forward_prefill_with_chunk(&span, from, rows, c, &mut done)
             },
         )?;
         remember_shrunk_chunk(used, chunk, rows, free_now);
@@ -1887,26 +1912,43 @@ impl ModelBackend for GenericBackend {
         index_pos: usize,
         seq_len: usize,
         chunk_tokens: usize,
+        done: &mut usize,
     ) -> crate::tensor::Result<Tensor> {
         #[cfg(test)]
         if chunk_tokens > FORCED_CHUNK_ROWS.with(|c| c.get()) {
             // A card with room for fewer rows than asked: the failure lands after part of the
             // chunk was read, as a real one does.
-            self.forward(&x.narrow(1, 0, 1)?, index_pos)?;
+            self.forward(&x.narrow(1, *done, 1)?, index_pos + *done)?;
             return Err(crate::tensor::Error::msg(
                 "alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".to_string(),
             ));
         }
-        if self.0.layer_major_pays(seq_len, chunk_tokens) {
-            return self
-                .0
-                .forward_prefill_layer_major(x, index_pos, chunk_tokens);
+        if self.0.layer_major_pays(seq_len - *done, chunk_tokens) {
+            // Every layer sees every row before the next layer starts: the pass completes
+            // whole or not at all.
+            let rest = x.narrow(1, *done, seq_len - *done)?;
+            let logits =
+                self.0
+                    .forward_prefill_layer_major(&rest, index_pos + *done, chunk_tokens)?;
+            *done = seq_len;
+            return Ok(logits);
         }
         let chunk_tokens = chunk_tokens.max(1);
-        let mut off = 0usize;
+        let mut off = *done;
         let mut last: Option<Tensor> = None;
         while off < seq_len {
             let n = chunk_tokens.min(seq_len - off);
+            #[cfg(test)]
+            {
+                let (rows, wider) = FORCED_LATE_OOM.with(|c| c.get());
+                if chunk_tokens > wider && off >= rows {
+                    return Err(crate::tensor::Error::msg(
+                        "alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+                            .to_string(),
+                    ));
+                }
+                PREFILL_ROWS_READ.with(|c| c.set(c.get() + n));
+            }
             let chunk = x.narrow(1, off, n)?;
             last = Some(self.forward(&chunk, index_pos + off)?);
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1919,6 +1961,7 @@ impl ModelBackend for GenericBackend {
                 );
             }
             off += n;
+            *done = off;
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))
     }
@@ -2380,6 +2423,10 @@ impl ModelBackend for GenericBackend {
         self.0.note_decode_reserve(bytes)
     }
 
+    fn is_recurrent(&self) -> bool {
+        self.0.is_recurrent()
+    }
+
     fn recurrent_checkpoint(
         &self,
     ) -> crate::tensor::Result<Vec<Option<crate::inference::generic_transformer::mixer::MixerState>>>
@@ -2599,6 +2646,10 @@ impl ModelBackend for GenericVisionBackend {
 
     fn note_decode_reserve(&mut self, bytes: u64) {
         self.text.note_decode_reserve(bytes)
+    }
+
+    fn is_recurrent(&self) -> bool {
+        self.text.is_recurrent()
     }
 
     fn recurrent_checkpoint(

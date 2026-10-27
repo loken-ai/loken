@@ -229,8 +229,12 @@ mod tests {
 
         // A prompt prefilled in chunks of two, then decode steps.
         let prompt = ids(&[1, 4, 2, 9, 3, 5]);
-        let want = row(&whole.forward_prefill_with_chunk(&prompt, 0, 6, 2).unwrap());
-        let got = row(&head.forward_prefill_with_chunk(&prompt, 0, 6, 2).unwrap());
+        let want = row(&whole
+            .forward_prefill_with_chunk(&prompt, 0, 6, 2, &mut 0)
+            .unwrap());
+        let got = row(&head
+            .forward_prefill_with_chunk(&prompt, 0, 6, 2, &mut 0)
+            .unwrap());
         assert_eq!(got, want, "prefill");
         for (i, t) in [8u32, 2, 7].into_iter().enumerate() {
             let want = row(&whole.forward(&ids(&[t]), 6 + i).unwrap());
