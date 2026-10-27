@@ -801,7 +801,8 @@ pub(super) fn try_spawn_continuous(
         num_blocks,
         block_size,
         max_running,
-        1 << 20,
+        // The prompt tokens one step prefills: the rows the work reserve was sized for.
+        PREFILL_CHUNK_TOKENS,
     ) {
         Ok(s) => Ok(s),
         Err(e) => {
