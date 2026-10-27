@@ -5,6 +5,8 @@
 //! answers to another file. Moderation is a judgement by a configured model.
 
 use super::*;
+use crate::api::gate::Priority;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -257,27 +259,21 @@ fn batch_update(id: &str, f: impl FnOnce(&mut Value)) {
     }
 }
 
-/// The headers a batch line runs with: the batch priority, so queued work yields the
-/// gate to interactive requests.
-fn batch_headers() -> axum::http::HeaderMap {
-    let mut h = axum::http::HeaderMap::new();
-    h.insert(
-        crate::api::gate::Priority::HEADER,
-        axum::http::HeaderValue::from_static("batch"),
-    );
-    h
-}
-
 /// One request line of a batch, run through the handler its `url` names.
 async fn run_batch_line(state: APIServer, url: &str, body: Value) -> (u16, Value) {
     let resp: Result<Response, ApiError> = match url {
         "/v1/chat/completions" => match serde_json::from_value::<ChatCompletionRequest>(body) {
-            Ok(req) => chat_completion(State(state), batch_headers(), OpenAIJson(req)).await,
+            Ok(req) => chat_completion_at(state, HeaderMap::new(), req, Priority::Batch).await,
             Err(e) => Err(ApiError::Validation(e.to_string())),
         },
-        "/v1/completions" => text_completions(State(state), batch_headers(), Json(body)).await,
-        "/v1/responses" => openai_responses(State(state), batch_headers(), OpenAIJson(body)).await,
-        "/v1/embeddings" => Ok(openai_embeddings(State(state), batch_headers(), Json(body)).await),
+        "/v1/completions" => {
+            text_completions_at(state, HeaderMap::new(), body, Priority::Batch).await
+        }
+        "/v1/responses" => {
+            super::responses::openai_responses_at(state, HeaderMap::new(), body, Priority::Batch)
+                .await
+        }
+        "/v1/embeddings" => Ok(openai_embeddings(State(state), HeaderMap::new(), Json(body)).await),
         other => Err(ApiError::Validation(format!(
             "batch endpoint '{other}' is not served"
         ))),
@@ -534,10 +530,11 @@ pub(crate) async fn anthropic_batches_create(
             >(params)
             {
                 Ok(req) => {
-                    let resp = super::super::anthropic_api::anthropic_messages(
-                        State(runner_state.clone()),
-                        batch_headers(),
-                        AnthropicJson(req),
+                    let resp = super::super::anthropic_api::anthropic_messages_at(
+                        runner_state.clone(),
+                        HeaderMap::new(),
+                        req,
+                        Priority::Batch,
                     )
                     .await;
                     let status = resp.status().as_u16();

@@ -38,7 +38,19 @@ pub(crate) fn anthropic_api_error(e: ApiError) -> Response {
 pub(crate) async fn anthropic_messages(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
-    AnthropicJson(mut req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
+    AnthropicJson(req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
+) -> Response {
+    let priority = crate::api::gate::Priority::of_request(&headers, false);
+    anthropic_messages_at(state, headers, req, priority).await
+}
+
+/// A message run at `priority`: the route's own, or the batch priority of a line of the
+/// message batches API.
+pub(crate) async fn anthropic_messages_at(
+    state: APIServer,
+    headers: axum::http::HeaderMap,
+    mut req: crate::api::anthropic::AnthropicMessagesRequest,
+    priority: crate::api::gate::Priority,
 ) -> Response {
     use crate::api::anthropic;
     use axum::http::StatusCode;
@@ -87,6 +99,7 @@ pub(crate) async fn anthropic_messages(
             max_tokens,
             &super::MESSAGES,
             &body,
+            priority,
         )
         .await
         {
@@ -110,10 +123,8 @@ pub(crate) async fn anthropic_messages(
         );
     }
 
-    // Loaded on demand (Claude Code expects to just name a model), in the window and
-    // cache format the headers ask for.
-    let load =
-        super::admission::LoadRequest::from_headers(&headers, state.get_effective_keep_alive(None));
+    // Loaded on demand (Claude Code expects to just name a model).
+    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
     let engine = match state.load_for_request(&model_name, load).await {
         Ok(e) => e,
         Err(e) => return anthropic_api_error(e),
@@ -161,12 +172,15 @@ pub(crate) async fn anthropic_messages(
         ..sampling.into_params()
     };
 
-    if let Err(e) = super::admission::ensure_prompt_fits(&engine, &prompt).await {
-        return anthropic_api_error(e);
-    }
+    // A window that holds the prompt and what the request may write.
+    let engine = match state
+        .fit_window(engine, &model_name, &prompt, Some(max_tokens), load)
+        .await
+    {
+        Ok(e) => e,
+        Err(e) => return anthropic_api_error(e),
+    };
     // The gate, the in-flight count and the last user turn's images.
-    let priority = crate::api::gate::Priority::from_headers(&headers)
-        .unwrap_or(crate::api::gate::Priority::Interactive);
     let admission = match state
         .admit(
             engine.clone(),

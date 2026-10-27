@@ -392,6 +392,18 @@ pub(crate) async fn openai_responses(
     headers: axum::http::HeaderMap,
     OpenAIJson(req): OpenAIJson<Value>,
 ) -> Result<Response, ApiError> {
+    let priority = crate::api::gate::Priority::of_request(&headers, false);
+    openai_responses_at(state, headers, req, priority).await
+}
+
+/// A response run at `priority`: the route's own, or the batch priority of a line of the
+/// batch API.
+pub(crate) async fn openai_responses_at(
+    state: APIServer,
+    headers: axum::http::HeaderMap,
+    req: Value,
+    priority: crate::api::gate::Priority,
+) -> Result<Response, ApiError> {
     let model = req
         .get("model")
         .and_then(Value::as_str)
@@ -411,7 +423,7 @@ pub(crate) async fn openai_responses(
     let id = new_id("resp");
     let created = chrono::Utc::now().timestamp();
     let history = messages.clone();
-    let inner = chat_completion(State(state), headers, OpenAIJson(chat_req)).await?;
+    let inner = super::chat_completion_at(state, headers, chat_req, priority).await?;
     if !inner.status().is_success() {
         return Ok(inner);
     }

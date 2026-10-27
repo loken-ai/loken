@@ -269,13 +269,22 @@ pub async fn forward_request(
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
+    if !relay_marked(headers) {
+        request = request.header(FORWARDED_HEADER, "1");
+    }
     let resp = request
-        .header(FORWARDED_HEADER, "1")
         .json(body)
         .send()
         .await
         .map_err(|e| format!("forward to {url}: {e}"))?;
     Ok((resp.status(), resp.headers().clone(), resp))
+}
+
+/// Whether `headers` already carry the relay marker, set by a caller that relays batch work.
+fn relay_marked(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(FORWARDED_HEADER))
 }
 
 /// Post a body as it arrived, with its content type: the shape a multipart upload keeps.
@@ -298,8 +307,10 @@ pub async fn forward_request_bytes(
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
+    if !relay_marked(headers) {
+        request = request.header(FORWARDED_HEADER, "1");
+    }
     let resp = request
-        .header(FORWARDED_HEADER, "1")
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .body(body)
         .send()

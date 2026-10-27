@@ -54,7 +54,7 @@ async fn transcribe_with_audio_model(
         return Err(ApiError::Validation("the audio is empty".to_string()));
     }
     validate_audio_input_size(bytes.len()).map_err(ApiError::Validation)?;
-    let load = LoadRequest::from_headers(headers, state.get_effective_keep_alive(None));
+    let load = LoadRequest::new(state.get_effective_keep_alive(None));
     let engine = match state.load_for_request(model, load).await {
         Ok(engine) => engine,
         Err(ApiError::NotFound(_)) => return Ok(None),
@@ -65,8 +65,7 @@ async fn transcribe_with_audio_model(
     };
     let prompt = crate::api::handlers::chat_prompt::transcription_prompt(&tower, language);
     ensure_prompt_fits(&engine, &prompt).await?;
-    let priority = crate::api::gate::Priority::from_headers(headers)
-        .unwrap_or(crate::api::gate::Priority::Interactive);
+    let priority = crate::api::gate::Priority::of_request(headers, false);
     let _admitted = state
         .admit(
             engine.clone(),

@@ -33,84 +33,18 @@ pub enum Priority {
 }
 
 impl Priority {
-    /// The priority a request declares in its headers, if it declares one.
-    ///
-    /// The OpenAI-compatible body has no field for this and adding one would put a
-    /// private extension in a shape other servers parse. A header carries a transport
-    /// hint without touching the schema, and a client that does not send it is
-    /// interactive, which is what a client that has not thought about it should be.
-    pub const HEADER: &'static str = "x-loken-priority";
-
-    pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
-        headers
-            .get(Self::HEADER)
+    /// The priority a request runs at, derived from the request and never asked for: work a
+    /// peer relayed at the batch priority keeps it, a fill-in-the-middle completion jumps the
+    /// queue, the rest is interactive.
+    pub fn of_request(headers: &axum::http::HeaderMap, fim: bool) -> Self {
+        let relayed_batch = headers
+            .get(crate::distributed::cluster::FORWARDED_HEADER)
             .and_then(|v| v.to_str().ok())
-            .and_then(Self::parse)
-    }
-
-    /// Parse from an Ollama `options.priority` string. Unknown values map
-    /// to None so the caller can fall back to a default.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "fim" | "high" | "critical" => Some(Self::Fim),
-            "interactive" | "normal" => Some(Self::Interactive),
-            "batch" | "low" => Some(Self::Batch),
-            _ => None,
-        }
-    }
-}
-
-/// The context window a request asks the model to be served with.
-///
-/// The Ollama surface says this in `options.num_ctx`; the OpenAI-compatible body has
-/// nowhere to say it, and adding a field would put a private extension in a shape other
-/// servers parse. So it travels as a header, like the priority beside it. A client that
-/// does not send one is served with the configured window.
-///
-/// Without it an OpenAI client cannot reach past the server-wide default, whatever the
-/// model can do: an agent talking to a node configured for a small model was reading
-/// files a few hundred characters at a time and had no way to say otherwise.
-pub struct Window;
-
-impl Window {
-    pub const HEADER: &'static str = "x-loken-num-ctx";
-
-    /// The window a request declares in its headers, if it declares one.
-    pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<usize> {
-        headers
-            .get(Self::HEADER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0)
-    }
-}
-
-/// How a request asks for the key-value cache to be stored.
-///
-/// The Ollama surface says this in `options.kv_quant`; the OpenAI-compatible body has
-/// nowhere to say it, so it travels as a header like the window and the priority beside
-/// it. It is what makes a long window affordable: the cache is linear in the window, and
-/// halving each entry is the difference between a context that fits on the cards and one
-/// that does not.
-pub struct KvFormat;
-
-impl KvFormat {
-    pub const HEADER: &'static str = "x-loken-kv-quant";
-
-    /// The format a request declares in its headers, if it declares one.
-    ///
-    /// The same words the Ollama option takes, so one client speaking either surface
-    /// spells it one way.
-    pub fn from_headers(
-        headers: &axum::http::HeaderMap,
-    ) -> Option<crate::inference::engine::llm_engine::KvQuant> {
-        use crate::inference::engine::llm_engine::KvQuant;
-        let s = headers.get(Self::HEADER)?.to_str().ok()?;
-        match s.trim().to_ascii_lowercase().as_str() {
-            "off" | "none" | "f16" | "f32" => Some(KvQuant::Off),
-            "q8" | "q8_0" => Some(KvQuant::Q8),
-            "q4" | "q4_0" => Some(KvQuant::Q4),
-            _ => None,
+            == Some(crate::distributed::cluster::FORWARDED_BATCH);
+        match (relayed_batch, fim) {
+            (true, _) => Self::Batch,
+            (false, true) => Self::Fim,
+            (false, false) => Self::Interactive,
         }
     }
 }
@@ -407,57 +341,29 @@ impl Drop for RequestGuard {
 
 #[cfg(test)]
 mod tests {
-    /// The cache format a client asks for, in the words the Ollama option takes.
-    #[test]
-    fn the_cache_format_is_read_from_the_header_it_travels_in() {
-        use crate::inference::engine::llm_engine::KvQuant;
-        let mut h = axum::http::HeaderMap::new();
-        assert_eq!(KvFormat::from_headers(&h), None);
-        h.insert(KvFormat::HEADER, "q8".parse().unwrap());
-        assert_eq!(KvFormat::from_headers(&h), Some(KvQuant::Q8));
-        h.insert(KvFormat::HEADER, "Q4_0".parse().unwrap());
-        assert_eq!(KvFormat::from_headers(&h), Some(KvQuant::Q4));
-        h.insert(KvFormat::HEADER, "f16".parse().unwrap());
-        assert_eq!(KvFormat::from_headers(&h), Some(KvQuant::Off));
-        h.insert(KvFormat::HEADER, "sometimes".parse().unwrap());
-        assert_eq!(KvFormat::from_headers(&h), None);
-    }
-
-    /// The window a client asks for, and what an absent or unusable header means.
-    #[test]
-    fn the_window_is_read_from_the_header_it_travels_in() {
-        let mut h = axum::http::HeaderMap::new();
-        assert_eq!(Window::from_headers(&h), None);
-        h.insert(Window::HEADER, "32768".parse().unwrap());
-        assert_eq!(Window::from_headers(&h), Some(32768));
-        // A window of zero is not a window; the configured one stands.
-        h.insert(Window::HEADER, "0".parse().unwrap());
-        assert_eq!(Window::from_headers(&h), None);
-        h.insert(Window::HEADER, "lots".parse().unwrap());
-        assert_eq!(Window::from_headers(&h), None);
-    }
-
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A request is interactive unless it is a fill-in-the-middle completion or batch work a
+    /// peer relayed; relayed batch work stays batch whatever else it is.
     #[test]
-    fn priority_parse_maps_documented_aliases_case_insensitively() {
-        // Pin the Ollama options.priority alias map. Drift would
-        // silently route requests into the wrong scheduling tier.
-        assert_eq!(Priority::parse("fim"), Some(Priority::Fim));
-        assert_eq!(Priority::parse("FIM"), Some(Priority::Fim));
-        assert_eq!(Priority::parse("high"), Some(Priority::Fim));
-        assert_eq!(Priority::parse("critical"), Some(Priority::Fim));
-        assert_eq!(Priority::parse("interactive"), Some(Priority::Interactive));
-        assert_eq!(Priority::parse("Normal"), Some(Priority::Interactive));
-        assert_eq!(Priority::parse("batch"), Some(Priority::Batch));
-        assert_eq!(Priority::parse("low"), Some(Priority::Batch));
-        // Unknown -> None so the caller can fall back to its own default
-        // (typically Interactive). Silent mapping to a default tier
-        // would mask client typos.
-        assert_eq!(Priority::parse(""), None);
-        assert_eq!(Priority::parse("urgent"), None);
-        assert_eq!(Priority::parse("medium"), None);
+    fn a_request_runs_at_the_priority_its_kind_gives() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(Priority::of_request(&h, false), Priority::Interactive);
+        assert_eq!(Priority::of_request(&h, true), Priority::Fim);
+        h.insert(
+            crate::distributed::cluster::FORWARDED_HEADER,
+            "1".parse().unwrap(),
+        );
+        assert_eq!(Priority::of_request(&h, false), Priority::Interactive);
+        h.insert(
+            crate::distributed::cluster::FORWARDED_HEADER,
+            crate::distributed::cluster::FORWARDED_BATCH
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(Priority::of_request(&h, false), Priority::Batch);
+        assert_eq!(Priority::of_request(&h, true), Priority::Batch);
     }
 
     #[test]
@@ -681,29 +587,5 @@ mod tests {
             let _ = h.await;
         }
         assert_eq!(order.lock().unwrap().clone(), vec![0, 1, 2, 3, 4]);
-    }
-}
-
-#[cfg(test)]
-mod header_tests {
-    use super::Priority;
-
-    /// A client with background work says so in a header, because the body it sends is a
-    /// shape other servers parse and a private field there would not be understood.
-    #[test]
-    fn the_header_says_what_the_body_cannot() {
-        let mut headers = axum::http::HeaderMap::new();
-        assert_eq!(Priority::from_headers(&headers), None);
-
-        headers.insert(Priority::HEADER, "batch".parse().unwrap());
-        assert_eq!(Priority::from_headers(&headers), Some(Priority::Batch));
-
-        headers.insert(Priority::HEADER, "LOW".parse().unwrap());
-        assert_eq!(Priority::from_headers(&headers), Some(Priority::Batch));
-
-        // A value nobody defined is not a priority, and answering None lets the caller
-        // fall back rather than take a guess as an instruction.
-        headers.insert(Priority::HEADER, "whenever".parse().unwrap());
-        assert_eq!(Priority::from_headers(&headers), None);
     }
 }

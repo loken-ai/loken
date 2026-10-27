@@ -403,31 +403,6 @@ fn estimate_parameter_size_scales_with_format() {
 }
 
 #[test]
-fn extract_kv_quant_override_maps_aliases_case_insensitively() {
-    use crate::inference::engine::llm_engine::KvQuant;
-    let pick = |s: &str| {
-        let v = serde_json::json!({"kv_quant": s});
-        extract_kv_quant_override(Some(&v))
-    };
-    assert!(matches!(pick("off"), Some(KvQuant::Off)));
-    assert!(matches!(pick("NONE"), Some(KvQuant::Off)));
-    assert!(matches!(pick("f16"), Some(KvQuant::Off)));
-    assert!(matches!(pick("F32"), Some(KvQuant::Off)));
-    assert!(matches!(pick("q8"), Some(KvQuant::Q8)));
-    assert!(matches!(pick("Q8_0"), Some(KvQuant::Q8)));
-    assert!(matches!(pick("q4"), Some(KvQuant::Q4)));
-    assert!(matches!(pick("q4_0"), Some(KvQuant::Q4)));
-    // Unknown values yield None (caller treats as 'no override' and
-    // falls back to the model config default).
-    assert!(pick("q2").is_none());
-    assert!(pick("garbage").is_none());
-    // Wrong shapes return None gracefully - never error.
-    assert!(extract_kv_quant_override(None).is_none());
-    assert!(extract_kv_quant_override(Some(&serde_json::json!({}))).is_none());
-    assert!(extract_kv_quant_override(Some(&serde_json::json!({"kv_quant": 4}))).is_none());
-}
-
-#[test]
 fn validate_ollama_options_accepts_in_range_and_omitted_fields() {
     // None options -> always Ok.
     assert!(validate_ollama_options(None).is_ok());

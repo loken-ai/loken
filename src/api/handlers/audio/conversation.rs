@@ -197,11 +197,8 @@ pub(super) async fn classify_route_llm(
     text: &str,
 ) -> Option<ConvRoute> {
     // Keep the router tiny + warm; if it isn't present this loads it once.
-    let load = crate::api::handlers::admission::LoadRequest {
-        keep_alive_minutes: state.get_effective_keep_alive(None),
-        window: None,
-        kv_quant: None,
-    };
+    let load =
+        crate::api::handlers::admission::LoadRequest::new(state.get_effective_keep_alive(None));
     let engine = match state.load_for_request(router_model, load).await {
         Ok(e) => e,
         Err(e) => {
@@ -575,8 +572,7 @@ pub(crate) async fn conversation_handler(
             // failing the turn. No model-name knowledge here.
             let hint = s("model");
             let default_model = state.default_inference_config.model_id.clone();
-            let load = crate::api::handlers::admission::LoadRequest::from_headers(
-                &headers,
+            let load = crate::api::handlers::admission::LoadRequest::new(
                 state.get_effective_keep_alive(None),
             );
             let mut model = hint.clone().unwrap_or_else(|| default_model.clone());
@@ -601,8 +597,7 @@ pub(crate) async fn conversation_handler(
             } else {
                 &[]
             };
-            let priority = crate::api::gate::Priority::from_headers(&headers)
-                .unwrap_or(crate::api::gate::Priority::Interactive);
+            let priority = crate::api::gate::Priority::of_request(&headers, false);
             let _admitted = match state
                 .admit(
                     engine.clone(),
@@ -875,18 +870,15 @@ pub(crate) async fn voice_handler(
         "user".to_string(),
         transcript.clone(),
     ));
-    let load = crate::api::handlers::admission::LoadRequest::from_headers(
-        &headers,
-        state.get_effective_keep_alive(None),
-    );
+    let load =
+        crate::api::handlers::admission::LoadRequest::new(state.get_effective_keep_alive(None));
     let engine = match state.load_for_request(&model, load).await {
         Ok(e) => e,
         Err(e) => return e.into_response(),
     };
     // The gate, the in-flight count, and no images: a voice turn carries none, and what
     // an earlier request encoded must not answer this one.
-    let priority = crate::api::gate::Priority::from_headers(&headers)
-        .unwrap_or(crate::api::gate::Priority::Interactive);
+    let priority = crate::api::gate::Priority::of_request(&headers, false);
     let admitted = match state
         .admit(engine.clone(), &model, priority, "/voice", &[])
         .await

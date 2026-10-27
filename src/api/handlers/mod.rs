@@ -698,7 +698,15 @@ pub(crate) async fn route_media_to_holder(
     cluster_handle_publish(state).await;
     let (cluster, peer, url, now) =
         media_holder(state, headers, model, served_here, fits_here, demand, holds)?;
-    match forward_to_peer(&url, relay, headers, body).await {
+    match forward_to_peer(
+        &url,
+        relay,
+        headers,
+        body,
+        crate::api::gate::Priority::Interactive,
+    )
+    .await
+    {
         Ok(relayed) => Some(relayed),
         Err(e) => {
             tracing::warn!("cluster: hand-over to {peer} failed ({e}) - serving here instead");
@@ -780,6 +788,7 @@ pub(crate) async fn route_to_holder(
     max_tokens: u32,
     relay: &Relay,
     body: &serde_json::Value,
+    priority: crate::api::gate::Priority,
 ) -> Option<axum::response::Response> {
     let cluster = state.cluster_handle()?;
     let already_forwarded = headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER);
@@ -789,10 +798,7 @@ pub(crate) async fn route_to_holder(
         // priced on the same prompt, so an estimate biases them identically.
         prompt_tokens: (prompt.len() / 4).max(1) as u32,
         max_tokens,
-        yields: matches!(
-            crate::api::gate::Priority::from_headers(headers),
-            Some(crate::api::gate::Priority::Batch)
-        ),
+        yields: priority == crate::api::gate::Priority::Batch,
     };
     let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
     // This node sits in its own routing table, described as its peers describe it.
@@ -827,7 +833,7 @@ pub(crate) async fn route_to_holder(
         return None;
     };
     tracing::info!("forwarding to {peer}: {reason}");
-    match forward_to_peer(&url, relay, headers, body).await {
+    match forward_to_peer(&url, relay, headers, body, priority).await {
         Ok(relayed) => Some(relayed),
         // The peer never got as far as answering; nothing has reached the client, so the
         // request is served here rather than failed with someone else's outage.
@@ -840,16 +846,12 @@ pub(crate) async fn route_to_holder(
 }
 
 /// The request headers a peer serves the request by: the credential its own
-/// authentication checks, and the priority, window and cache format the request asked
-/// for.
+/// authentication checks and the API version it reads.
 pub(crate) fn relayed_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
     [
         axum::http::header::AUTHORIZATION.as_str(),
         "x-api-key",
         "anthropic-version",
-        crate::api::gate::Priority::HEADER,
-        crate::api::gate::Window::HEADER,
-        crate::api::gate::KvFormat::HEADER,
     ]
     .into_iter()
     .filter_map(|name| {
@@ -864,16 +866,21 @@ pub(crate) async fn forward_to_peer(
     relay: &Relay,
     request_headers: &axum::http::HeaderMap,
     body: &serde_json::Value,
+    priority: crate::api::gate::Priority,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
-    let (status, headers, resp) = crate::distributed::cluster_runtime::forward_request(
-        url,
-        relay.path,
-        &relayed_headers(request_headers),
-        body,
-    )
-    .await
-    .map_err(ApiError::Internal)?;
+    let mut relayed = relayed_headers(request_headers);
+    // The peer runs relayed batch work at the batch priority, as this node would have.
+    if priority == crate::api::gate::Priority::Batch {
+        relayed.push((
+            crate::distributed::cluster::FORWARDED_HEADER.to_string(),
+            crate::distributed::cluster::FORWARDED_BATCH.to_string(),
+        ));
+    }
+    let (status, headers, resp) =
+        crate::distributed::cluster_runtime::forward_request(url, relay.path, &relayed, body)
+            .await
+            .map_err(ApiError::Internal)?;
     let code = axum::http::StatusCode::from_u16(status.as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
     let content_type = headers
@@ -1663,25 +1670,11 @@ impl APIServer {
     ///
     /// Bounded by what the checkpoint declares, as the widening path is: a model cannot
     /// open a window past its own.
-    async fn ensure_loaded_with_window(
+    pub(crate) async fn ensure_loaded_with_window(
         &self,
         model_id: &str,
         keep_alive_minutes: i64,
         window: Option<usize>,
-    ) -> Result<(), String> {
-        self.ensure_loaded_with(model_id, keep_alive_minutes, window, None)
-            .await
-    }
-
-    /// [`Self::ensure_loaded_with_window`] with the KV-cache format a request asked for,
-    /// so a cold load opens the cache in that format rather than loading once more to
-    /// change it.
-    async fn ensure_loaded_with(
-        &self,
-        model_id: &str,
-        keep_alive_minutes: i64,
-        window: Option<usize>,
-        kv_quant: Option<crate::inference::engine::llm_engine::KvQuant>,
     ) -> Result<(), String> {
         // Fast path: already loaded, and still able to serve.
         if self.engine_serves(model_id).await {
@@ -1721,9 +1714,6 @@ impl APIServer {
             if want > config.context_length {
                 config.context_length = want;
             }
-        }
-        if let Some(kv) = kv_quant {
-            config.kv_quant = kv;
         }
         // Pressure protocol: idle MEDIA residents (image/video/TTS engines) hold
         // VRAM this LLM may need. Same rule as the media loads in reverse -
@@ -3681,22 +3671,16 @@ mod relay_terminator_tests {
             .any(|w| w == super::TERMINAL_MARKER));
     }
 
-    /// A peer is handed the credential and the serving headers, nothing else.
+    /// A peer is handed the credential and the API version, nothing else.
     #[test]
-    fn a_relay_carries_the_serving_headers() {
+    fn a_relay_carries_the_credential_only() {
         let mut h = axum::http::HeaderMap::new();
         h.insert("authorization", "Bearer k".parse().unwrap());
-        h.insert(crate::api::gate::Priority::HEADER, "batch".parse().unwrap());
-        h.insert(crate::api::gate::Window::HEADER, "32768".parse().unwrap());
-        h.insert(crate::api::gate::KvFormat::HEADER, "q8".parse().unwrap());
+        h.insert("anthropic-version", "2023-06-01".parse().unwrap());
         h.insert("cookie", "session=1".parse().unwrap());
         let relayed = super::relayed_headers(&h);
         let names: Vec<&str> = relayed.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"authorization"));
-        assert!(names.contains(&crate::api::gate::Priority::HEADER));
-        assert!(names.contains(&crate::api::gate::Window::HEADER));
-        assert!(names.contains(&crate::api::gate::KvFormat::HEADER));
-        assert!(!names.contains(&"cookie"));
+        assert_eq!(names, ["authorization", "anthropic-version"]);
     }
 
     /// The SSE relays match the framed terminator: a model writing the bare word in its

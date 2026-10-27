@@ -670,6 +670,10 @@ impl Cluster {
 /// Header marking a request that has already been handed over once - the loop guard.
 pub const FORWARDED_HEADER: &str = "x-loken-forwarded";
 
+/// The value of [`FORWARDED_HEADER`] on work relayed at the batch priority; any other value
+/// marks interactive work.
+pub const FORWARDED_BATCH: &str = "batch";
+
 #[cfg(test)]
 mod tests {
     use super::*;

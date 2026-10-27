@@ -1,30 +1,28 @@
 //! Getting a generation onto an engine, the same way for every route that runs one.
 //!
-//! A request loads its model in the window and cache format it asked for, is told apart
+//! A request loads its model with a window that holds it, is told apart
 //! a model that did not fit from one that does not exist, waits its turn at the gate
 //! unless the model batches concurrent requests itself, is counted in flight while it
 //! runs, and hands the vision encoder the images of its last user turn - or clears what
 //! an earlier request left there.
 
 use super::*;
-use crate::inference::engine::llm_engine::KvQuant;
 
 /// How a request wants its model loaded.
 #[derive(Clone, Copy)]
 pub(crate) struct LoadRequest {
     pub keep_alive_minutes: i64,
-    /// The context window asked for, bounded by the checkpoint at load.
+    /// The context window asked for, bounded by the checkpoint at load: the Ollama
+    /// `options.num_ctx`, or the window a prompt needs (see [`APIServer::fit_window`]).
     pub window: Option<usize>,
-    pub kv_quant: Option<KvQuant>,
 }
 
 impl LoadRequest {
-    /// The window and cache format a request's headers ask for.
-    pub(crate) fn from_headers(headers: &axum::http::HeaderMap, keep_alive_minutes: i64) -> Self {
+    /// A load in the window the model is configured with, kept for `keep_alive_minutes`.
+    pub(crate) fn new(keep_alive_minutes: i64) -> Self {
         Self {
             keep_alive_minutes,
-            window: crate::api::gate::Window::from_headers(headers),
-            kv_quant: crate::api::gate::KvFormat::from_headers(headers),
+            window: None,
         }
     }
 }
@@ -71,30 +69,16 @@ pub(crate) struct Admission {
 
 impl APIServer {
     /// The engine serving `model_name`, loaded as `load` asks: a cold load opens the
-    /// requested window and cache format at once, a loaded model is reloaded only when
-    /// the format differs or the window is wider than the one it holds.
+    /// requested window at once, a loaded model is reloaded only when the window is wider
+    /// than the one it holds. The cache format is the placement's.
     pub(crate) async fn load_for_request(
         &self,
         model_name: &str,
         load: LoadRequest,
     ) -> Result<Arc<LlmEngine>, ApiError> {
-        self.ensure_loaded_with(
-            model_name,
-            load.keep_alive_minutes,
-            load.window,
-            load.kv_quant,
-        )
-        .await
-        .map_err(|e| load_error(model_name, &e))?;
-        // The format before the window: the format decides what a window costs, and
-        // settling it second would size the cache twice.
-        if let Some(want) = load.kv_quant {
-            self.ensure_engine_kv_quant(model_name, want)
-                .await
-                .map_err(|e| {
-                    ApiError::Internal(format!("kv_quant {want:?} for '{model_name}': {e}"))
-                })?;
-        }
+        self.ensure_loaded_with_window(model_name, load.keep_alive_minutes, load.window)
+            .await
+            .map_err(|e| load_error(model_name, &e))?;
         if let Some(want) = load.window {
             self.ensure_engine_context(model_name, want)
                 .await
@@ -108,6 +92,39 @@ impl APIServer {
             ))
         })?;
         self.reset_expiration(model_name).await;
+        Ok(engine)
+    }
+
+    /// The engine serving `model_name` with a window that holds `prompt` and the
+    /// `max_tokens` the request may write: `engine` when its window already does, else the
+    /// model reloaded with a wider window (see [`grown_window`]), as far as the checkpoint
+    /// declares. A prompt longer than the widest window the model takes is refused.
+    pub(crate) async fn fit_window(
+        &self,
+        engine: Arc<LlmEngine>,
+        model_name: &str,
+        prompt: &str,
+        max_tokens: Option<usize>,
+        load: LoadRequest,
+    ) -> Result<Arc<LlmEngine>, ApiError> {
+        let need = engine
+            .count_tokens(prompt)
+            .await
+            .map(|tokens| tokens + max_tokens.unwrap_or(1));
+        let engine = match (need, engine.context_window().await) {
+            (Some(need), Some(window)) if need > window => {
+                self.load_for_request(
+                    model_name,
+                    LoadRequest {
+                        window: Some(grown_window(need, window)),
+                        ..load
+                    },
+                )
+                .await?
+            }
+            _ => engine,
+        };
+        ensure_prompt_fits(&engine, prompt).await?;
         Ok(engine)
     }
 
@@ -271,6 +288,14 @@ impl APIServer {
     }
 }
 
+/// The window a model reloads with when a request needs `need` positions and its window holds
+/// `window`: at least twice the window, so a conversation that grows a turn at a time reloads a
+/// handful of times rather than at every turn, and an answer without a cap keeps room to run.
+/// The load bounds it by what the checkpoint declares.
+fn grown_window(need: usize, window: usize) -> usize {
+    need.max(window.saturating_mul(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,14 +317,11 @@ mod tests {
         ));
     }
 
+    /// A window that must grow at least doubles, and grows further when the request needs it.
     #[test]
-    fn the_headers_carry_window_and_format() {
-        let mut h = axum::http::HeaderMap::new();
-        h.insert(crate::api::gate::Window::HEADER, "32768".parse().unwrap());
-        h.insert(crate::api::gate::KvFormat::HEADER, "q8".parse().unwrap());
-        let l = LoadRequest::from_headers(&h, 5);
-        assert_eq!(l.window, Some(32768));
-        assert!(matches!(l.kv_quant, Some(KvQuant::Q8)));
-        assert_eq!(l.keep_alive_minutes, 5);
+    fn a_window_that_grows_at_least_doubles() {
+        assert_eq!(grown_window(2049, 2048), 4096);
+        assert_eq!(grown_window(3746, 2048), 4096);
+        assert_eq!(grown_window(9000, 2048), 9000);
     }
 }

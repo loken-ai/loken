@@ -103,6 +103,7 @@ Smaller, by priority:
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
 | Model directories on several disks | Models | Several model directories, on several disks, form one catalogue, and a model being pulled lands on the directory that holds it and reads it fastest, judged on its size, the free space and the measured speed of each disk. | Planned |
+| Serving without custom settings | API | A client gets the window, the cache format and the priority a request needs without any loken header or option: the server derives them from the request and the machine. | Done |
 
 ## 0.6.0
 

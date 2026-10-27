@@ -4,63 +4,22 @@
 
 use super::*;
 
-/// Parse an optional `kv_quant` override from the Ollama `options` field.
-/// Returns Some(kv_quant) if the caller asked for a specific KV cache format
-/// different from the server default. Accepts "off"/"none", "q8", "q4".
-pub(super) fn extract_kv_quant_override(
-    options: Option<&serde_json::Value>,
-) -> Option<crate::inference::engine::llm_engine::KvQuant> {
-    use crate::inference::engine::llm_engine::KvQuant;
-    let s = options?.get("kv_quant")?.as_str()?;
-    match s.to_ascii_lowercase().as_str() {
-        "off" | "none" | "f16" | "f32" => Some(KvQuant::Off),
-        "q8" | "q8_0" => Some(KvQuant::Q8),
-        "q4" | "q4_0" => Some(KvQuant::Q4),
-        _ => None,
-    }
-}
-
-/// How an Ollama request wants its model loaded: `options.num_ctx` and
-/// `options.kv_quant` first, the headers every route reads otherwise.
+/// How an Ollama request wants its model loaded: the window `options.num_ctx` asks for, if
+/// it asks for one.
 pub(super) fn ollama_load_request(
     state: &APIServer,
     options: Option<&serde_json::Value>,
-    headers: &axum::http::HeaderMap,
     keep_alive: Option<&str>,
 ) -> crate::api::handlers::admission::LoadRequest {
-    let from_headers = crate::api::handlers::admission::LoadRequest::from_headers(
-        headers,
-        state.get_effective_keep_alive(keep_alive),
-    );
     crate::api::handlers::admission::LoadRequest {
         window: options
             .and_then(|o| o.get("num_ctx"))
             .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize)
-            .or(from_headers.window),
-        kv_quant: extract_kv_quant_override(options).or(from_headers.kv_quant),
-        ..from_headers
+            .map(|v| v as usize),
+        ..crate::api::handlers::admission::LoadRequest::new(
+            state.get_effective_keep_alive(keep_alive),
+        )
     }
-}
-
-/// The gate priority an Ollama request asks for: `options.priority`, else the header
-/// every route reads, else Fim for a fill-in-the-middle request and Interactive for the
-/// rest.
-pub(super) fn ollama_priority(
-    options: Option<&serde_json::Value>,
-    headers: &axum::http::HeaderMap,
-    fim: bool,
-) -> crate::api::gate::Priority {
-    options
-        .and_then(|v| v.get("priority"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(crate::api::gate::Priority::parse)
-        .or_else(|| crate::api::gate::Priority::from_headers(headers))
-        .unwrap_or(if fim {
-            crate::api::gate::Priority::Fim
-        } else {
-            crate::api::gate::Priority::Interactive
-        })
 }
 
 /// Range-validate the Ollama options bag with the bounds every dialect shares.
@@ -137,6 +96,7 @@ pub(crate) async fn ollama_chat(
                 max_tokens,
                 &crate::api::handlers::OLLAMA_CHAT,
                 &body,
+                crate::api::gate::Priority::of_request(&headers, false),
             )
             .await
             {
@@ -343,19 +303,13 @@ pub(crate) async fn ollama_chat(
         params.grammar = ollama_format_to_grammar(request.format.as_ref());
     }
 
-    // Loaded on first use (Ollama-compatible), in the context and cache format the
-    // options or the headers ask for.
-    let engine = state
-        .load_for_request(
-            &model_name,
-            ollama_load_request(
-                &state,
-                request.options.as_ref(),
-                &headers,
-                request.keep_alive.as_deref(),
-            ),
-        )
-        .await?;
+    // Loaded on first use (Ollama-compatible), in the context the options ask for.
+    let load = ollama_load_request(
+        &state,
+        request.options.as_ref(),
+        request.keep_alive.as_deref(),
+    );
+    let engine = state.load_for_request(&model_name, load).await?;
 
     // The model's template with the tools in its own syntax, the thinking preference,
     // the Qwen3-VL vision sentinel, and the call object as the grammar when a call is
@@ -399,13 +353,15 @@ pub(crate) async fn ollama_chat(
         info!("Chat: {} stop sequence(s)", params.stop_sequences.len());
     }
 
-    crate::api::handlers::admission::ensure_prompt_fits(&engine, &prompt).await?;
+    let engine = state
+        .fit_window(engine, &model_name, &prompt, params.max_tokens, load)
+        .await?;
     // The gate, the in-flight count and the last user turn's images.
     let admission = state
         .admit(
             engine.clone(),
             &model_name,
-            ollama_priority(request.options.as_ref(), &headers, false),
+            crate::api::gate::Priority::of_request(&headers, false),
             "/api/chat",
             &crate::api::handlers::chat_prompt::last_user_images(&request.messages),
         )
@@ -873,6 +829,10 @@ pub(crate) async fn ollama_generate(
                 max_tokens,
                 &crate::api::handlers::OLLAMA_GENERATE,
                 &body,
+                crate::api::gate::Priority::of_request(
+                    &headers,
+                    request.suffix.as_deref().is_some_and(|s| !s.is_empty()),
+                ),
             )
             .await
             {
@@ -994,19 +954,13 @@ pub(crate) async fn ollama_generate(
         return handle_image_generation(&state, &model_name, &request).await;
     }
 
-    // Loaded on first use (Ollama-compatible), in the context and cache format the
-    // options or the headers ask for.
-    let engine = state
-        .load_for_request(
-            &model_name,
-            ollama_load_request(
-                &state,
-                request.options.as_ref(),
-                &headers,
-                request.keep_alive.as_deref(),
-            ),
-        )
-        .await?;
+    // Loaded on first use (Ollama-compatible), in the context the options ask for.
+    let load = ollama_load_request(
+        &state,
+        request.options.as_ref(),
+        request.keep_alive.as_deref(),
+    );
+    let engine = state.load_for_request(&model_name, load).await?;
 
     // Detect fill-in-the-middle (FIM) intent. Either the caller set `suffix`
     // (Ollama-style FIM - we auto-wrap), or the prompt already contains the
@@ -1079,13 +1033,21 @@ pub(crate) async fn ollama_generate(
         info!("Generate: {} stop sequence(s)", params.stop_sequences.len());
     }
 
-    crate::api::handlers::admission::ensure_prompt_fits(&engine, &effective_prompt).await?;
+    let engine = state
+        .fit_window(
+            engine,
+            &model_name,
+            &effective_prompt,
+            params.max_tokens,
+            load,
+        )
+        .await?;
     // The gate (FIM auto-promotes its priority), the in-flight count and the images.
     let admission = state
         .admit(
             engine.clone(),
             &model_name,
-            ollama_priority(request.options.as_ref(), &headers, is_fim),
+            crate::api::gate::Priority::of_request(&headers, is_fim),
             "/api/generate",
             request.images.as_deref().unwrap_or_default(),
         )

@@ -179,6 +179,18 @@ pub(crate) async fn chat_completion(
     headers: axum::http::HeaderMap,
     OpenAIJson(request): OpenAIJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    let priority = crate::api::gate::Priority::of_request(&headers, false);
+    chat_completion_at(state, headers, request, priority).await
+}
+
+/// A chat completion run at `priority`: the route's own, or the batch priority of a line of
+/// the batch API.
+pub(crate) async fn chat_completion_at(
+    state: APIServer,
+    headers: axum::http::HeaderMap,
+    request: ChatCompletionRequest,
+    priority: crate::api::gate::Priority,
+) -> Result<Response, ApiError> {
     validate_request(&request)?;
 
     // Cap aggregate prompt size up front (mirror /v1/completions guard).
@@ -298,6 +310,7 @@ pub(crate) async fn chat_completion(
             max_tokens,
             &super::OPENAI_CHAT,
             &body,
+            priority,
         )
         .await
         {
@@ -375,23 +388,9 @@ pub(crate) async fn chat_completion(
     // Anthropic shim. OpenAI-compatible coding agents (Cline, Continue,
     // Aider) just name a model and expect it to be served - a 404 on the
     // first request breaks them. Falls through to the 404 below only if
-    // the model genuinely can't be loaded (missing weights, bad arch). The window and
-    // cache format asked in the headers are opened by the load itself.
-    let engine = state
-        .load_for_request(
-            &model_name,
-            super::admission::LoadRequest::from_headers(
-                &headers,
-                state.get_effective_keep_alive(None),
-            ),
-        )
-        .await?;
-
-    // What the model is actually served with, echoed back in the same header the request
-    // may have asked in. A client that asks and is quietly clamped - by the checkpoint or
-    // by what the cards hold - would otherwise size its prompts for a window it never got,
-    // and the server would truncate them from the front without either side saying so.
-    let served_window = engine.context_window().await;
+    // the model genuinely can't be loaded (missing weights, bad arch).
+    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
+    let engine = state.load_for_request(&model_name, load).await?;
 
     // The model's template with the tools in its own syntax, the caller's reasoning
     // effort, and the grammar a structured output or a required call imposes.
@@ -413,19 +412,16 @@ pub(crate) async fn chat_completion(
         ..sampling.into_params()
     };
 
-    // The body has no field for this, so it is read from the headers: a client with
-    // background work needs a way to say so on the route it speaks, and a client that
-    // says nothing is interactive.
-    let oai_priority = crate::api::gate::Priority::from_headers(&headers)
-        .unwrap_or(crate::api::gate::Priority::Interactive);
-
-    super::admission::ensure_prompt_fits(&engine, &prompt).await?;
+    // A window that holds the prompt and what the request may write.
+    let engine = state
+        .fit_window(engine, &model_name, &prompt, request.completion_cap(), load)
+        .await?;
     // The gate, the in-flight count and the last user turn's images.
     let admission = state
         .admit(
             engine.clone(),
             &model_name,
-            oai_priority,
+            priority,
             "/v1/chat/completions",
             &super::chat_prompt::last_user_images(&request.messages),
         )
@@ -732,17 +728,9 @@ pub(crate) async fn chat_completion(
                     yield Ok(Event::default().data("[DONE]"));
                 };
 
-                let mut response = Sse::new(stream)
+                Ok(Sse::new(stream)
                     .keep_alive(KeepAlive::default())
-                    .into_response();
-                if let Some(n) = served_window {
-                    if let Ok(hv) = axum::http::HeaderValue::from_str(&n.to_string()) {
-                        response
-                            .headers_mut()
-                            .insert(crate::api::gate::Window::HEADER, hv);
-                    }
-                }
-                Ok(response)
+                    .into_response())
             }
             Err(e) => {
                 error!(
@@ -887,11 +875,6 @@ pub(crate) async fn chat_completion(
                 headers.insert("server-timing", hv);
             }
         }
-        if let Some(n) = served_window {
-            if let Ok(hv) = axum::http::HeaderValue::from_str(&n.to_string()) {
-                headers.insert(crate::api::gate::Window::HEADER, hv);
-            }
-        }
         Ok((headers, Json(response)).into_response())
     }
 }
@@ -978,6 +961,20 @@ pub(crate) async fn text_completions(
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
+    // A completion with a suffix is an editor filling in the middle: it jumps the queue.
+    let fim = body["suffix"].as_str().is_some_and(|s| !s.is_empty());
+    let priority = crate::api::gate::Priority::of_request(&headers, fim);
+    text_completions_at(state, headers, body, priority).await
+}
+
+/// A text completion run at `priority`: the route's own, or the batch priority of a line of
+/// the batch API.
+pub(crate) async fn text_completions_at(
+    state: APIServer,
+    headers: axum::http::HeaderMap,
+    body: serde_json::Value,
+    priority: crate::api::gate::Priority,
+) -> Result<Response, ApiError> {
     let model = text_field(&body, "model");
     // The completion goes where the model is.
     {
@@ -995,6 +992,7 @@ pub(crate) async fn text_completions(
             max_tokens,
             &super::OPENAI_COMPLETIONS,
             &body,
+            priority,
         )
         .await
         {
@@ -1207,17 +1205,9 @@ pub(crate) async fn text_completions(
         },
     );
 
-    // Loaded on first use, as on the chat route, in the window and cache format the
-    // headers ask for: an editor sending a long prefix needs the same say.
-    let engine = state
-        .load_for_request(
-            &model_name,
-            super::admission::LoadRequest::from_headers(
-                &headers,
-                state.get_effective_keep_alive(None),
-            ),
-        )
-        .await?;
+    // Loaded on first use, as on the chat route.
+    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
+    let engine = state.load_for_request(&model_name, load).await?;
 
     // `response_format` is documented on /v1/chat/completions and several SDKs send it
     // here too: the same grammar engine serves both.
@@ -1226,13 +1216,14 @@ pub(crate) async fn text_completions(
         ..sampling.into_params()
     };
 
-    let oai_priority = crate::api::gate::Priority::from_headers(&headers)
-        .unwrap_or(crate::api::gate::Priority::Interactive);
     let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     // The prompt count a stream reports when the engine publishes no statistics.
     let prompt_tokens_est = estimate_token_count(&prompt) as u32;
-    super::admission::ensure_prompt_fits(&engine, &prompt).await?;
+    // A window that holds the prompt and what the request may write.
+    let engine = state
+        .fit_window(engine, &model_name, &prompt, params.max_tokens, load)
+        .await?;
     // The gate (a continuously batching model takes concurrent requests in its own
     // worker), the in-flight count, and no images: a completion carries none, and what an
     // earlier request encoded must not answer this one.
@@ -1240,7 +1231,7 @@ pub(crate) async fn text_completions(
         .admit(
             engine.clone(),
             &model_name,
-            oai_priority,
+            priority,
             "/v1/completions",
             &[],
         )
@@ -1565,6 +1556,9 @@ pub(crate) async fn openai_list_models(
                 .map(|t| t.timestamp())
                 .unwrap_or(now);
             let is_loaded = loaded_ids.contains(&m.id);
+            // The widest window the model takes, as vLLM names it: a request is served
+            // with the window it needs up to this one, so a client sizes its prompts by it.
+            let max_model_len = state.declared_context(&m.id);
             data.push(serde_json::json!({
                 "id": m.id,
                 "object": "model",
@@ -1573,6 +1567,7 @@ pub(crate) async fn openai_list_models(
                 "kind": "chat",
                 "size_bytes": m.size,
                 "is_loaded": is_loaded,
+                "max_model_len": max_model_len,
             }));
         }
     }

@@ -27,6 +27,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Models: load the model of an Ollama manifest that lists its projector first.
 - Serving: keep the images of a vision model when requests arrive together.
 
+### Removed
+
+- API: derive window, cache format and priority instead of loken headers and options.
+
 ## [0.4.2] - 2026-10-28
 
 ### Changed
