@@ -38,7 +38,7 @@ template <int HD, int NW>
 __global__ void __launch_bounds__(NW * Core::wave)
     flash_prefill_gqa_amd(const float* __restrict__ Q, const _Float16* __restrict__ K,
                           const _Float16* __restrict__ V, float* __restrict__ O, int n_head,
-                          int n_kv, int seq_q, int seq_kv, long long kv_tok_stride,
+                          int n_kv, int seq_q, int seq_kv, long long q_head_stride, long long kv_tok_stride,
                           long long kv_head_stride, float scale_log2, int window, int pos_off,
                           float* __restrict__ ML) {
     constexpr int BN = tile_keys(HD);
@@ -78,7 +78,7 @@ __global__ void __launch_bounds__(NW * Core::wave)
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
             if (rr < rows) {
                 const int tok = rr / G, head = kvh * G + rr % G;
-                v = *reinterpret_cast<const float4*>(Q + ((long long) head * seq_q + tok) * HD + c);
+                v = *reinterpret_cast<const float4*>(Q + ((long long) head * q_head_stride + tok) * HD + c);
             }
             _Float16* d = qs + row * LD + c;
             d[0] = (_Float16) (v.x * scale_log2);
@@ -215,7 +215,8 @@ __global__ void __launch_bounds__(NW * Core::wave)
 
 template <int HD, int NW>
 int launch(const float* Q, const _Float16* K, const _Float16* V, float* O, int n_head, int n_kv,
-           int seq_q, int seq_kv, long long tok_stride, long long head_stride, float scale,
+           int seq_q, int seq_kv, long long q_head_stride, long long tok_stride,
+           long long head_stride, float scale,
            int window, int pos_off, float* ML, hipStream_t stream) {
     constexpr int BM = NW * 16;
     const int G = n_head / n_kv;
@@ -224,14 +225,14 @@ int launch(const float* Q, const _Float16* K, const _Float16* V, float* O, int n
     // The check below reads this launch's error, not one an earlier call left on the thread.
     (void) hipGetLastError();
     flash_prefill_gqa_amd<HD, NW><<<grid, NW * Core::wave, 0, stream>>>(
-        Q, K, V, O, n_head, n_kv, seq_q, seq_kv, tok_stride, head_stride, scale * log2e, window,
+        Q, K, V, O, n_head, n_kv, seq_q, seq_kv, q_head_stride, tok_stride, head_stride, scale * log2e, window,
         pos_off, ML);
     return hipGetLastError() == hipSuccess ? 0 : 4;
 }
 
 int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, int n_head,
-             int n_kv, int seq_q, int seq_kv, int head_dim, long long kv_tok_stride,
-             long long kv_head_stride, float scale, int window, int pos_off,
+             int n_kv, int seq_q, int seq_kv, int head_dim, long long q_head_stride,
+             long long kv_tok_stride, long long kv_head_stride, float scale, int window, int pos_off,
              long long stream_i64) {
     hipStream_t stream = (hipStream_t) stream_i64;
     const float* q = (const float*) Q;
@@ -240,13 +241,13 @@ int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, in
     float* o = (float*) O;
     switch (head_dim) {
         case 64:
-            return launch<64, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+            return launch<64, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                  kv_head_stride, scale, window, pos_off, ML, stream);
         case 128:
-            return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+            return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                   kv_head_stride, scale, window, pos_off, ML, stream);
         case 256:
-            return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+            return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                   kv_head_stride, scale, window, pos_off, ML, stream);
         default:
             return 1;
@@ -261,7 +262,7 @@ extern "C" int loken_flash_prefill_gqa_f16kv(const void* Q, const void* K, const
                                              int seq_kv, int head_dim, long long kv_tok_stride,
                                              long long kv_head_stride, float scale, int window,
                                              long long stream_i64) {
-    return dispatch(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, kv_tok_stride,
+    return dispatch(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
                     kv_head_stride, scale, window, seq_kv - seq_q, stream_i64);
 }
 
@@ -271,6 +272,28 @@ extern "C" int loken_flash_prefill_gqa_parts_f16kv(const void* Q, const void* K,
                                                    long long kv_tok_stride,
                                                    long long kv_head_stride, float scale,
                                                    int pos_off, long long stream_i64) {
-    return dispatch(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, kv_tok_stride,
+    return dispatch(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
                     kv_head_stride, scale, 0, pos_off, stream_i64);
+}
+
+// The causal attention of several sequences laid end to end, each over its own tokens only:
+// sequence i holds `lens[i]` tokens from token `starts[i]`. `Q` is F32 `[n_head, tokens, HD]`
+// with `q_head_stride` tokens between heads, `K` and `V` hold the tokens at `kv_tok_stride`
+// elements apart, and `O` is F32 `[tokens, n_head, HD]`. Returns the first nonzero code of
+// the per-sequence launches, as `loken_flash_prefill_gqa_f16kv` reports them.
+extern "C" int loken_flash_prefill_gqa_varlen_f16kv(
+    const void* Q, const void* K, const void* V, void* O, const int* starts, const int* lens,
+    int n_seq, int n_head, int n_kv, int head_dim, long long q_head_stride,
+    long long kv_tok_stride, long long kv_head_stride, float scale, long long stream_i64) {
+    for (int i = 0; i < n_seq; ++i) {
+        const long long t0 = starts[i];
+        const int rc = dispatch((const float*) Q + t0 * head_dim,
+                                (const _Float16*) K + t0 * kv_tok_stride,
+                                (const _Float16*) V + t0 * kv_tok_stride,
+                                (float*) O + t0 * n_head * head_dim, nullptr, n_head, n_kv,
+                                lens[i], lens[i], head_dim, q_head_stride, kv_tok_stride,
+                                kv_head_stride, scale, 0, 0, stream_i64);
+        if (rc != 0) return rc;
+    }
+    return 0;
 }

@@ -1623,23 +1623,10 @@ impl GenericHeteroTransformer {
                 &k_rot.reshape(&[t, nkv * hd][..])?,
                 &v_f.reshape(&[t, nkv * hd][..])?,
             )?;
-            let attn = starts
-                .iter()
-                .zip(&lens)
-                .map(|(&start, &n)| {
-                    crate::inference::cache::paged_attention::paged_prefill_attn_tensor(
-                        &q_rot.narrow(0, start, n)?,
-                        &k_rot.narrow(0, start, n)?,
-                        &v_f.narrow(0, start, n)?,
-                        nh,
-                        nkv,
-                        hd,
-                        scale,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let attn =
-                Tensor::cat(&attn.iter().collect::<Vec<_>>(), 0)?.reshape(&[t, nh * hd][..])?;
+            let attn = crate::inference::cache::paged_attention::paged_prefill_attn_seqs(
+                &q_rot, &k_rot, &v_f, &lens, nh, nkv, hd, scale,
+            )?
+            .reshape(&[t, nh * hd][..])?;
             let o = attn
                 .to_dtype(cdt)
                 .and_then(|a| layer.attn_output.forward(&a))?

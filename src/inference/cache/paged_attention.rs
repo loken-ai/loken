@@ -323,6 +323,52 @@ fn fused_causal(
     Ok(None)
 }
 
+/// Causal GQA attention of several sequences laid end to end, each over its own tokens only:
+/// `q` `[t, nh, hd]` and `k`, `v` `[t, nkv, hd]`, sequence `i` holding `lens[i]` tokens after
+/// the tokens of the ones before it. Returns `[t, nh, hd]` in the dtype of `q`: one launch of
+/// the fused kernel where the card has it, else each sequence on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_attn_seqs(
+    q: &crate::tensor::Tensor,
+    k: &crate::tensor::Tensor,
+    v: &crate::tensor::Tensor,
+    lens: &[usize],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+) -> crate::tensor::Result<crate::tensor::Tensor> {
+    #[cfg(feature = "gpu")]
+    if q.device().is_cuda() {
+        use crate::tensor::DType;
+        let f16 = |x: &crate::tensor::Tensor| x.to_dtype(DType::F16)?.contiguous();
+        if let Some(y) = crate::inference::kernel::fused::flash_prefill_gqa_varlen(
+            q,
+            &f16(k)?,
+            &f16(v)?,
+            lens,
+            scale,
+        )? {
+            return y.reshape(&[q.dims()[0], nh, hd][..])?.to_dtype(q.dtype());
+        }
+    }
+    let mut start = 0;
+    let mut parts = Vec::with_capacity(lens.len());
+    for &n in lens {
+        parts.push(paged_prefill_attn_tensor(
+            &q.narrow(0, start, n)?,
+            &k.narrow(0, start, n)?,
+            &v.narrow(0, start, n)?,
+            nh,
+            nkv,
+            hd,
+            scale,
+        )?);
+        start += n;
+    }
+    crate::tensor::Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)
+}
+
 /// Causal multi-token PREFILL attention for ONE sequence (GQA). Processes all T
 /// prompt positions in one shot - q,k,v are [T, heads, hd]. Returns [T, nh, hd].
 /// This is the prefill counterpart to the decode paths: one forward over the
@@ -867,5 +913,38 @@ mod tests {
         )
         .unwrap();
         close(rows(got), rows(want), "suffix of a cached prefix");
+
+        // Sequences laid end to end, each over its own tokens.
+        let lens = [5usize, 31, 1];
+        let want = paged_prefill_attn_seqs(&q, &k, &v, &lens, nh, nkv, hd, scale).unwrap();
+        let cuts = |x: &Tensor, n: usize| -> Tensor { x.narrow(0, 0, n).unwrap() };
+        let mut start = 0;
+        let mut each = Vec::new();
+        for &n in &lens {
+            let part = |x: &Tensor| x.narrow(0, start, n).unwrap();
+            each.push(
+                paged_prefill_attn_tensor(&part(&q), &part(&k), &part(&v), nh, nkv, hd, scale)
+                    .unwrap(),
+            );
+            start += n;
+        }
+        let each = Tensor::cat(&each.iter().collect::<Vec<_>>(), 0).unwrap();
+        close(rows(want.clone()), rows(each), "sequences on the host");
+        let t3: usize = lens.iter().sum();
+        let (cq, ck, cv) = (
+            on_card(&cuts(&q, t3)),
+            on_card(&cuts(&k, t3)),
+            on_card(&cuts(&v, t3)),
+        );
+        let fused =
+            crate::inference::kernel::fused::flash_prefill_gqa_varlen(&cq, &ck, &cv, &lens, scale)
+                .unwrap();
+        assert_eq!(
+            fused.is_some(),
+            has_kernel,
+            "the fused kernel runs the sequences where the card has it"
+        );
+        let got = paged_prefill_attn_seqs(&cq, &ck, &cv, &lens, nh, nkv, hd, scale).unwrap();
+        close(rows(got), rows(want), "sequences on the card");
     }
 }

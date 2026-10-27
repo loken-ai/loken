@@ -92,7 +92,7 @@ template <int HD, int NW>
 __global__ void __launch_bounds__(NW * 32)
 flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K,
                          const half* __restrict__ V, float* __restrict__ O,
-                         int n_head, int n_kv, int seq_q, int seq_kv,
+                         int n_head, int n_kv, int seq_q, int seq_kv, long long q_head_stride,
                          long long kv_tok_stride, long long kv_head_stride,
                          float scale_log2, int window, int pos_off,
                          float* __restrict__ ML) {
@@ -142,7 +142,7 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
             for (int h = 0; h < 2; ++h) {       // row half: g / g + 8
                 float2 v = make_float2(0.f, 0.f);
                 if (r_ok[h]) {
-                    const float* qp = Q + ((long long)r_head[h] * seq_q + r_tok[h]) * HD
+                    const float* qp = Q + ((long long)r_head[h] * q_head_stride + r_tok[h]) * HD
                                     + kk * 16 + hi * 8 + 2 * tq;
                     v = *reinterpret_cast<const float2*>(qp);
                 }
@@ -308,7 +308,8 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
 
 template <int HD, int NW>
 int launch(const float* Q, const half* K, const half* V, float* O, int n_head, int n_kv,
-           int seq_q, int seq_kv, long long tok_stride, long long head_stride, float scale,
+           int seq_q, int seq_kv, long long q_head_stride, long long tok_stride,
+           long long head_stride, float scale,
            int window, int pos_off, float* ML, cudaStream_t stream) {
     constexpr int BM = NW * 16;
     const size_t smem = 2 * (size_t)BN * (HD + KPAD) * sizeof(half);
@@ -322,7 +323,7 @@ int launch(const float* Q, const half* K, const half* V, float* O, int n_head, i
     const float log2e = 1.4426950408889634f;
     // The check below reads this launch's error, not one an earlier call left on the thread.
     (void) cudaGetLastError();
-    kern<<<grid, NW * 32, smem, stream>>>(Q, K, V, O, n_head, n_kv, seq_q, seq_kv, tok_stride,
+    kern<<<grid, NW * 32, smem, stream>>>(Q, K, V, O, n_head, n_kv, seq_q, seq_kv, q_head_stride, tok_stride,
                                           head_stride, scale * log2e, window, pos_off, ML);
     return cudaGetLastError() == cudaSuccess ? 0 : 4;
 }
@@ -331,8 +332,8 @@ int launch(const float* Q, const half* K, const half* V, float* O, int n_head, i
 
 namespace {
 int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, int n_head,
-             int n_kv, int seq_q, int seq_kv, int head_dim, long long kv_tok_stride,
-             long long kv_head_stride, float scale, int window, int pos_off,
+             int n_kv, int seq_q, int seq_kv, int head_dim, long long q_head_stride,
+             long long kv_tok_stride, long long kv_head_stride, float scale, int window, int pos_off,
              long long stream_i64) {
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
@@ -345,15 +346,15 @@ int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, in
     float* o = (float*)O;
     switch (head_dim) {
         case 64:
-            return launch<64, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+            return launch<64, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                  kv_head_stride, scale, window, pos_off, ML, stream);
         case 128:
-            return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+            return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                   kv_head_stride, scale, window, pos_off, ML, stream);
         case 256:
             // Half the warps of the narrower sizes: the O accumulator and the Q fragments of a
             // 256-wide head fill the register file at four warps' worth of rows.
-            return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+            return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                   kv_head_stride, scale, window, pos_off, ML, stream);
         default:
             return 1;
@@ -367,7 +368,7 @@ extern "C" int loken_flash_prefill_gqa_f16kv(
     const void* Q, const void* K, const void* V, void* O, int n_head, int n_kv, int seq_q,
     int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride, float scale,
     int window, long long stream_i64) {
-    return dispatch(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, kv_tok_stride,
+    return dispatch(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
                     kv_head_stride, scale, window, seq_kv - seq_q, stream_i64);
 }
 
@@ -378,6 +379,28 @@ extern "C" int loken_flash_prefill_gqa_parts_f16kv(
     const void* Q, const void* K, const void* V, void* O, float* ML, int n_head, int n_kv,
     int seq_q, int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride,
     float scale, int pos_off, long long stream_i64) {
-    return dispatch(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, kv_tok_stride,
+    return dispatch(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
                     kv_head_stride, scale, 0, pos_off, stream_i64);
+}
+
+// The causal attention of several sequences laid end to end, each over its own tokens only:
+// sequence i holds `lens[i]` tokens from token `starts[i]`. `Q` is F32 `[n_head, tokens, HD]`
+// with `q_head_stride` tokens between heads, `K` and `V` hold the tokens at `kv_tok_stride`
+// elements apart, and `O` is F32 `[tokens, n_head, HD]`. Returns the first nonzero code of
+// the per-sequence launches, as `loken_flash_prefill_gqa_f16kv` reports them.
+extern "C" int loken_flash_prefill_gqa_varlen_f16kv(
+    const void* Q, const void* K, const void* V, void* O, const int* starts, const int* lens,
+    int n_seq, int n_head, int n_kv, int head_dim, long long q_head_stride,
+    long long kv_tok_stride, long long kv_head_stride, float scale, long long stream_i64) {
+    for (int i = 0; i < n_seq; ++i) {
+        const long long t0 = starts[i];
+        const int rc = dispatch((const float*) Q + t0 * head_dim,
+                                (const half*) K + t0 * kv_tok_stride,
+                                (const half*) V + t0 * kv_tok_stride,
+                                (float*) O + t0 * n_head * head_dim, nullptr, n_head, n_kv,
+                                lens[i], lens[i], head_dim, q_head_stride, kv_tok_stride,
+                                kv_head_stride, scale, 0, 0, stream_i64);
+        if (rc != 0) return rc;
+    }
+    return 0;
 }
