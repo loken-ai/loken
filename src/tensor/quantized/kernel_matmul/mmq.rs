@@ -10,11 +10,15 @@ impl QKernelMatMul {
     /// (the same compiled kernels the current serving path uses - FFI boundary,
     /// raw pointers + stream, like the MoE family).
     #[cfg(feature = "gpu")]
-    pub(super) fn mmq_forward(
+    ///
+    /// `x_slice` holds the activation rows as F32, or as F16 when `type_x` is the ggml id of F16:
+    /// the quantiser reads either.
+    pub(super) fn mmq_forward<T>(
         &self,
         dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
         blob: &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
-        x_slice: &crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
+        x_slice: &crate::tensor::gpu_runtime::driver::CudaSlice<T>,
+        type_x: i32,
         rows: usize,
     ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<f32>> {
         use crate::tensor::gpu_runtime::driver::DevicePtr;
@@ -110,7 +114,7 @@ impl QKernelMatMul {
                 x_ptr,
                 std::ptr::null(),
                 ws_ptr,
-                0,
+                type_x,
                 self.k as i64,
                 self.k as i64,
                 0,

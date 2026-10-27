@@ -41,8 +41,19 @@ static __device__ __forceinline__ float reduce_over_group(float v, op combine) {
     return v;
 }
 
-template <mmq_q8_1_ds_layout ds_layout>
-static __global__ void quantize_mmq_q8_1(const float *__restrict__ x,
+/// Four consecutive activation values as floats, from an F32 or an F16 row.
+static __device__ __forceinline__ float4 load4(const float *x, int64_t at) {
+    return ((const float4 *) x)[at / 4];
+}
+static __device__ __forceinline__ float4 load4(const half *x, int64_t at) {
+    const half2 *h = (const half2 *) (x + at);
+    const float2 a = __half22float2(h[0]);
+    const float2 b = __half22float2(h[1]);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+template <mmq_q8_1_ds_layout ds_layout, typename T>
+static __global__ void quantize_mmq_q8_1(const T *__restrict__ x,
                                          const int32_t *__restrict__ ids, void *__restrict__ vy,
                                          const int64_t ne00, const int64_t s01, const int64_t s02,
                                          const int64_t s03, const int64_t ne0, const int ne1,
@@ -71,10 +82,8 @@ static __global__ void quantize_mmq_q8_1(const float *__restrict__ x,
 
     // Past the end of the real row is padding the matmul still reads, so it must be a
     // deterministic zero rather than whatever the allocation held.
-    const float4 *x4 = (const float4 *) x;
-    const float4 xi = i0 < ne00
-                          ? x4[(sample * s03 + channel * s02 + src_row * s01 + i0) / 4]
-                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 xi = i0 < ne00 ? load4(x, sample * s03 + channel * s02 + src_row * s01 + i0)
+                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     const float amax = reduce_over_group<vals_per_scale>(
         fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w))),
@@ -127,22 +136,29 @@ static __global__ void quantize_mmq_q8_1(const float *__restrict__ x,
     }
 }
 
+/// The ggml type id of an F16 activation; any other `type_x` reads the row as F32.
+#define MMQ_QUANTIZE_TYPE_F16 1
+
 /// The C entry point for one metadata arrangement. The three differ in that alone, so the
 /// grid - one block per row, enough of them to cover the padded row length - is stated once.
 ///
-/// `type_x` is accepted because the Rust declaration passes it; the arrangement is already
-/// fixed by which of these three it called.
+/// `type_x` is the activation's ggml type: F16 rows are read as they are, anything else as
+/// F32. The arrangement is fixed by which of these three it called.
 #define MMQ_QUANTIZE_ENTRY_POINT(layout, suffix)                                              \
     extern "C" void launch_mmq_quantize_q8_1_##suffix(                                        \
-        const void *x_f32, const int32_t *ids, void *vy, int type_x, int64_t ne00,            \
-        int64_t s01, int64_t s02, int64_t s03, int64_t ne0, int64_t ne1, int64_t ne2,         \
-        int64_t ne3, void *stream) {                                                          \
-        (void) type_x;                                                                        \
+        const void *x, const int32_t *ids, void *vy, int type_x, int64_t ne00, int64_t s01,   \
+        int64_t s02, int64_t s03, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,         \
+        void *stream) {                                                                       \
         constexpr int per_block = 4 * MMQ_QUANTIZE_THREADS;                                   \
         const dim3 grid(ne1, (ne0 + per_block - 1) / per_block, ne2 *ne3);                    \
         const dim3 threads(MMQ_QUANTIZE_THREADS, 1, 1);                                       \
-        quantize_mmq_q8_1<layout><<<grid, threads, 0, (cudaStream_t) stream>>>(               \
-            (const float *) x_f32, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);              \
+        if (type_x == MMQ_QUANTIZE_TYPE_F16) {                                                \
+            quantize_mmq_q8_1<layout, half><<<grid, threads, 0, (cudaStream_t) stream>>>(     \
+                (const half *) x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);               \
+        } else {                                                                              \
+            quantize_mmq_q8_1<layout, float><<<grid, threads, 0, (cudaStream_t) stream>>>(    \
+                (const float *) x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);              \
+        }                                                                                     \
     }
 
 MMQ_QUANTIZE_ENTRY_POINT(MMQ_Q8_1_DS_LAYOUT_D4, D4)

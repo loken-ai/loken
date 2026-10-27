@@ -1328,17 +1328,28 @@ impl QKernelMatMul {
             }
 
             // batch>8: tiled quantized matmul (the production prefill MMQ
-            // kernel family) when the dtype supports it... MMQ quantizes from
-            // f32: half inputs take a device cast in and back out, exactly
-            // like the fork's fast_mmq::try_fwd.
+            // kernel family) when the dtype supports it. The quantiser reads F32 or F16
+            // rows; a BF16 input, or an F16 view it cannot read whole, takes a device cast
+            // in. The output is F32 and is cast back to the input's dtype.
             if rows > 1
                 && mmq_supports(self.dtype)
                 && self.k.is_multiple_of(mmq_qk(self.dtype))
                 && !kat_bad(&KAT_BAD_MMQ, qdev.ordinal())
             {
                 if matches!(xdt, crate::tensor::DType::F16 | crate::tensor::DType::BF16) {
-                    let x32 = x.to_dtype(crate::tensor::DType::F32)?;
-                    let (x_slice, dev) = x32.cuda_f32_slice()?;
+                    // The ggml type id of an F16 activation, which the quantiser reads as is.
+                    const GGML_TYPE_F16: i32 = 1;
+                    let whole_f16 = xdt == crate::tensor::DType::F16
+                        && x.is_contiguous()
+                        && x.layout().start_offset() == 0;
+                    let x32 = match whole_f16 {
+                        true => None,
+                        false => Some(x.to_dtype(crate::tensor::DType::F32)?),
+                    };
+                    let dev = match &x32 {
+                        Some(x32) => x32.cuda_f32_slice()?.1,
+                        None => x.cuda_f16_slice()?.1,
+                    };
                     if dev.ordinal() != qdev.ordinal() {
                         return Err(Error(
                             "QKernelMatMul: input on a different cuda device".into(),
@@ -1349,7 +1360,13 @@ impl QKernelMatMul {
                     // had - even after the reclaim - degrades to it instead of failing the
                     // request. An OOM must never reach the caller while a slower path is
                     // still available.
-                    match self.mmq_forward(qdev, blob, x_slice, rows) {
+                    let y = match &x32 {
+                        Some(x32) => self.mmq_forward(qdev, blob, x32.cuda_f32_slice()?.0, 0, rows),
+                        None => {
+                            self.mmq_forward(qdev, blob, x.cuda_f16_slice()?.0, GGML_TYPE_F16, rows)
+                        }
+                    };
+                    match y {
                         Ok(y) => {
                             let out = crate::tensor::Tensor::from_cuda_storage(
                                 crate::tensor::cuda::CudaStorage::F32(y),
@@ -1379,7 +1396,7 @@ impl QKernelMatMul {
                     // had - even after the reclaim - degrades to it instead of failing the
                     // request. An OOM must never reach the caller while a slower path is
                     // still available.
-                    match self.mmq_forward(qdev, blob, x_slice, rows) {
+                    match self.mmq_forward(qdev, blob, x_slice, 0, rows) {
                         Ok(y) => {
                             return crate::tensor::Tensor::from_cuda_storage(
                                 crate::tensor::cuda::CudaStorage::F32(y),

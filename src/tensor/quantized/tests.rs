@@ -1658,6 +1658,49 @@ fn bf16_dequantised_gemm_matches_at(
     }
 }
 
+/// The tiled matmul reads F16 activations as they are: the product equals the one it gives for
+/// the same values sent as F32, bit for bit, since both quantise the same numbers.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_tiled_matmul_reads_half_activations_as_floats() {
+    use crate::tensor::{cuda::CudaDevice, DType, Tensor};
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the F16 activations of the tiled matmul are NOT covered");
+        return;
+    };
+    let device = Device::Cuda(dev.clone());
+    let (n, k, rows) = (256usize, 512usize, 64usize);
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0, GgmlDType::Q6K] {
+        let qm = hashed_gpu_weight(dtype, n, k, 0x3f1, &device);
+        let x = Tensor::from_vec_f32(
+            (0..rows * k)
+                .map(|i| ((i % 89) as f32 - 44.0) / 23.0)
+                .collect(),
+            vec![rows, k],
+        )
+        .unwrap()
+        .to_device(&device)
+        .unwrap();
+        let half = x.to_dtype(DType::F16).unwrap();
+        let as_floats = half.to_dtype(DType::F32).unwrap();
+        let want = qm
+            .forward(&as_floats)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32();
+        let got = qm
+            .forward(&half)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec_f32();
+        assert_eq!(got, want, "{dtype:?}");
+    }
+}
+
 /// A graph captured over the tiled matmul writes into the workspace it was recorded with: a
 /// later call over many more rows grows the workspace and keeps that one, and the graph replays
 /// the answer it was captured with.
