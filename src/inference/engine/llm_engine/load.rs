@@ -513,7 +513,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
         device: Device::Cpu,
         image_embeds: None,
         audio: None,
-        qwen35_image: None,
+        qwen35_vision: Vec::new(),
         image_embed_cache: None,
         grammar_factory: std::sync::OnceLock::new(),
         generation_defaults: Default::default(),
@@ -1003,11 +1003,12 @@ pub(crate) struct LoadedModelState {
     pub(super) image_embeds: Option<Tensor>,
     /// The clip of the current request, encoded (speech models only).
     pub(super) audio: Option<AudioClip>,
-    /// qwen35moe (Qwen3-VL) raw preprocessed image for the current request:
-    /// `(pixel_values [n_patches,1536], patch grid (gh,gw))`. Unlike moondream
-    /// (pre-encoded + prepended), qwen35 keeps the raw patches and runs the ViT
-    /// + splice inside `forward_with_image` at prefill. None = no image.
-    pub(super) qwen35_image: Option<(Tensor, (usize, usize))>,
+    /// qwen35moe (Qwen3-VL) vision items of the current request, in the order of their
+    /// sentinels in the prompt: an image, or one temporal patch of a clip, each as
+    /// `(pixel_values [n_patches, patch_dim], patch grid (gh, gw))`. Unlike moondream
+    /// (pre-encoded + prepended), qwen35 keeps the raw patches and runs the ViT + splice at
+    /// prefill. Empty = no image.
+    pub(super) qwen35_vision: Vec<(Tensor, (usize, usize))>,
     /// One-slot cache for the most-recent vision encode: (image_hash,
     /// projector_output). Same-image requests (bench, chat with shared
     /// image, multi-turn captioning) skip the CLIP forward and reuse the

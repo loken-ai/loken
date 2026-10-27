@@ -770,7 +770,7 @@ impl LlmEngine {
                         pp,
                         &state.device,
                     )?;
-                    state.qwen35_image = Some((px, grid));
+                    state.qwen35_vision = vec![(px, grid)];
                 }
                 return Ok(());
             }
@@ -865,13 +865,66 @@ impl LlmEngine {
             .map(|e| e.get_ids().len())
     }
 
+    /// The times the prompt states for the temporal patches of the clip in `b64`, base64 of
+    /// any container ffmpeg reads, as the loaded model samples it; the clip is probed, not
+    /// decoded. `None` when the model reads no clip.
+    pub async fn clip_patch_times(&self, b64: &str) -> Result<Option<Vec<f64>>, String> {
+        if !self.is_qwen35_vision().await {
+            return Ok(None);
+        }
+        let bytes = decode_clip(b64)?;
+        let facts = &crate::inference::model::qwen35::vision::VIDEO;
+        tokio::task::spawn_blocking(move || {
+            let (indices, fps) =
+                crate::inference::media::video_io::probe_clip(&bytes, &facts.sampling)?;
+            Ok(Some(crate::inference::media::video_io::patch_times(
+                &indices,
+                fps,
+                facts.sampling.temporal,
+            )))
+        })
+        .await
+        .map_err(|e| format!("clip task: {e}"))?
+    }
+
+    /// Decodes the clip in `b64` and appends its temporal patches to the vision items of the
+    /// next generation, after its images: the prompt states them in that order.
+    pub async fn set_video(&self, b64: &str) -> Result<(), String> {
+        let bytes = decode_clip(b64)?;
+        let model_state = self.model_state.clone();
+        tokio::task::spawn_blocking(move || {
+            let facts = &crate::inference::model::qwen35::vision::VIDEO;
+            let clip = crate::inference::media::video_io::read_clip(&bytes, &facts.sampling)?;
+            let mut guard = model_state.blocking_lock();
+            let state = guard.as_mut().ok_or("Model not loaded")?;
+            if !state.model.is_qwen35_vision() {
+                return Err("this model reads no video".to_string());
+            }
+            let items = crate::inference::media::image_processor::preprocess_qwen35vl_video(
+                &clip.frames,
+                crate::inference::media::image_processor::Qwen35VisionPreproc {
+                    temporal: facts.sampling.temporal,
+                    ..Default::default()
+                },
+                facts.min_pixels,
+                facts.max_pixels,
+                &state.device,
+            )
+            .map_err(|e| e.to_string())?;
+            state.qwen35_vision.extend(items);
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("clip task: {e}"))?
+    }
+
     /// Clear any stored image embeddings, the Qwen3-VL patches awaiting prefill and the
     /// clip of the last audio request.
     pub async fn clear_images(&self) {
         let mut guard = self.model_state.lock().await;
         if let Some(state) = guard.as_mut() {
             state.image_embeds = None;
-            state.qwen35_image = None;
+            state.qwen35_vision.clear();
             state.audio = None;
         }
     }
@@ -1406,6 +1459,15 @@ fn open_state_cache(
 
 /// See `LlmEngine::cancel_guard`.
 pub struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
+
+/// The bytes of a clip sent as base64, bare or as a `data:` URL.
+fn decode_clip(b64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let payload = b64.split_once(";base64,").map_or(b64, |(_, p)| p);
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|e| format!("video: not base64 ({e})"))
+}
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {

@@ -2014,6 +2014,7 @@ mod tests {
             content: String::new(),
             images: None,
             audios: None,
+            videos: None,
             thinking: None,
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
@@ -2032,6 +2033,7 @@ mod tests {
             content: "42".into(),
             images: None,
             audios: None,
+            videos: None,
             thinking: None,
             reasoning_content: None,
             tool_calls: None,

@@ -199,59 +199,151 @@ pub fn preprocess_qwen35vl(
         hbar as u32,
         image::imageops::FilterType::Triangle,
     );
-    let rgb = resized.to_rgb8();
-    let raw = rgb.as_raw(); // HWC, row-major
-    let (h, w, c) = (hbar, wbar, p.channels);
-    // CHW normalized
-    let mut chw = vec![0f32; c * h * w];
+    let chw = normalized_chw(&resized.to_rgb8());
+    // A still image fills every frame of its temporal patch.
+    let frames = vec![chw.as_slice(); p.temporal];
+    let out = qwen35vl_patches(&frames, hbar, wbar, p);
+    let grid = (hbar / p.patch_size, wbar / p.patch_size);
+    let patch_dim = p.channels * p.temporal * p.patch_size * p.patch_size;
+    let t = Tensor::from_vec(out, (grid.0 * grid.1, patch_dim), &Device::Cpu)?.to_device(device)?;
+    Ok((t, grid))
+}
+
+/// `img` as `[channel, height, width]` values in `[-1, 1]`.
+fn normalized_chw(img: &image::RgbImage) -> Vec<f32> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let raw = img.as_raw(); // HWC, row-major
+    let mut chw = vec![0f32; 3 * h * w];
     for y in 0..h {
         for x in 0..w {
-            for ch in 0..c {
-                let v = raw[(y * w + x) * 3 + ch] as f32 * (2.0 / 255.0) - 1.0;
-                chw[ch * h * w + y * w + x] = v;
+            for ch in 0..3 {
+                chw[ch * h * w + y * w + x] =
+                    raw[(y * w + x) * 3 + ch] as f32 * (2.0 / 255.0) - 1.0;
             }
         }
     }
-    let grid_h = h / p.patch_size;
-    let grid_w = w / p.patch_size;
-    let patch_dim = c * p.temporal * p.patch_size * p.patch_size;
-    let num_patches = grid_h * grid_w;
-    let mut out = vec![0f32; num_patches * patch_dim];
-    let ms = p.merge_size;
-    let ps = p.patch_size;
+    chw
+}
+
+/// The patches of one temporal patch, `frames` holding its `p.temporal` frames as
+/// [`normalized_chw`] lays them out over `h x w`: `[grid_h * grid_w, patch_dim]`, the patches in
+/// 2x2-merge-grouped order and each patch's values by channel, frame, row and column.
+fn qwen35vl_patches(frames: &[&[f32]], h: usize, w: usize, p: Qwen35VisionPreproc) -> Vec<f32> {
+    let (c, ps, ms) = (p.channels, p.patch_size, p.merge_size);
+    let (grid_h, grid_w) = (h / ps, w / ps);
+    let patch_dim = c * p.temporal * ps * ps;
     let frame = ps * ps;
+    let mut out = vec![0f32; grid_h * grid_w * patch_dim];
     let mut pidx = 0usize;
-    let mut gh = 0;
-    while gh < grid_h {
-        let mut gw = 0;
-        while gw < grid_w {
+    for gh in (0..grid_h).step_by(ms) {
+        for gw in (0..grid_w).step_by(ms) {
             for mh in 0..ms {
                 for mw in 0..ms {
                     let base = pidx * patch_dim;
                     for ch in 0..c {
-                        let ch_off = base + ch * p.temporal * frame;
-                        for py in 0..ps {
-                            for px in 0..ps {
-                                let y = (gh + mh) * ps + py;
-                                let x = (gw + mw) * ps + px;
-                                out[ch_off + py * ps + px] = chw[ch * h * w + y * w + x];
+                        for (t, chw) in frames.iter().enumerate() {
+                            let off = base + (ch * p.temporal + t) * frame;
+                            for py in 0..ps {
+                                for px in 0..ps {
+                                    let y = (gh + mh) * ps + py;
+                                    let x = (gw + mw) * ps + px;
+                                    out[off + py * ps + px] = chw[ch * h * w + y * w + x];
+                                }
                             }
-                        }
-                        // duplicate first frame across temporal frames
-                        for t in 1..p.temporal {
-                            let dst = ch_off + t * frame;
-                            out.copy_within(ch_off..ch_off + frame, dst);
                         }
                     }
                     pidx += 1;
                 }
             }
-            gw += ms;
         }
-        gh += ms;
     }
-    let t = Tensor::from_vec(out, (num_patches, patch_dim), &Device::Cpu)?.to_device(device)?;
-    Ok((t, (grid_h, grid_w)))
+    out
+}
+
+/// The size every frame of a `frames`-frame clip of `h x w` is resized to: each side a multiple
+/// of `factor`, the clip's pixels over its temporal patches within `[min_pixels, max_pixels]`.
+fn smart_resize_video(
+    frames: usize,
+    h: usize,
+    w: usize,
+    factor: usize,
+    temporal: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    let (mut hf, mut wf) = (h as f64, w as f64);
+    let ff = factor as f64;
+    if hf < ff || wf < ff {
+        let scale = (ff / hf).max(ff / wf);
+        hf = (hf * scale).floor();
+        wf = (wf * scale).floor();
+    }
+    let side = |v: f64| ((v / ff).round_ties_even() * ff) as usize;
+    let (mut hbar, mut wbar) = (side(hf), side(wf));
+    let tbar = ((frames as f64 / temporal as f64).round_ties_even() as usize) * temporal;
+    let n = frames as f64 * hf * wf;
+    if tbar * hbar * wbar > max_pixels {
+        let beta = (n / max_pixels as f64).sqrt();
+        hbar = (((hf / beta / ff).floor() * ff) as usize).max(factor);
+        wbar = (((wf / beta / ff).floor() * ff) as usize).max(factor);
+    } else if tbar * hbar * wbar < min_pixels {
+        let beta = (min_pixels as f64 / n).sqrt();
+        hbar = ((hf * beta / ff).ceil() * ff) as usize;
+        wbar = ((wf * beta / ff).ceil() * ff) as usize;
+    }
+    (hbar, wbar)
+}
+
+/// The temporal patches of a clip's `frames` for a qwen35moe vision tower: every frame resized
+/// to one size, the clip's pixels within `[min_pixels, max_pixels]`, then grouped in runs of
+/// `p.temporal`, a short last run repeating the last frame. One `(pixel_values, (grid_h,
+/// grid_w))` per run, as [`preprocess_qwen35vl`] gives for an image.
+pub fn preprocess_qwen35vl_video(
+    frames: &[image::RgbImage],
+    p: Qwen35VisionPreproc,
+    min_pixels: usize,
+    max_pixels: usize,
+    device: &Device,
+) -> Result<Vec<(Tensor, (usize, usize))>> {
+    let first = frames
+        .first()
+        .ok_or_else(|| anyhow!("a clip without frames"))?;
+    let factor = p.patch_size * p.merge_size;
+    let (h0, w0) = (first.height() as usize, first.width() as usize);
+    let (hbar, wbar) = smart_resize_video(
+        frames.len(),
+        h0,
+        w0,
+        factor,
+        p.temporal,
+        min_pixels,
+        max_pixels,
+    );
+    let chws: Vec<Vec<f32>> = frames
+        .iter()
+        .map(|f| {
+            normalized_chw(&image::imageops::resize(
+                f,
+                wbar as u32,
+                hbar as u32,
+                image::imageops::FilterType::CatmullRom,
+            ))
+        })
+        .collect();
+    let grid = (hbar / p.patch_size, wbar / p.patch_size);
+    let patch_dim = p.channels * p.temporal * p.patch_size * p.patch_size;
+    chws.chunks(p.temporal)
+        .map(|run| {
+            let mut group: Vec<&[f32]> = run.iter().map(Vec::as_slice).collect();
+            while group.len() < p.temporal {
+                group.push(group[group.len() - 1]);
+            }
+            let out = qwen35vl_patches(&group, hbar, wbar, p);
+            let t = Tensor::from_vec(out, (grid.0 * grid.1, patch_dim), &Device::Cpu)?
+                .to_device(device)?;
+            Ok((t, grid))
+        })
+        .collect()
 }
 
 /// Interleaved RGB8 of `width x height` -> base64 PNG, the string every image render

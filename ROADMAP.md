@@ -74,8 +74,8 @@ Major, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Planned |
-| Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Planned |
+| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
+| Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Started |
 | Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Planned |
 | DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on two 16 GB cards and the host | Planned |
 | Experts chosen across quantised files | Performance | One model served from two GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10 % of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |

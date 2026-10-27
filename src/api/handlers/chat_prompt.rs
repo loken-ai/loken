@@ -347,6 +347,39 @@ pub(crate) fn last_user_audio(messages: &[Message]) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The clip the vision tower reads: the first clip of the last user turn that carries one.
+pub(crate) fn last_user_video(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .find_map(|m| m.videos.as_ref()?.first())
+        .map(String::as_str)
+}
+
+/// Where a clip's embeddings go in a Qwen3-VL prompt: each temporal patch at its time, as
+/// `<t seconds>` and the image sentinel, the whole clip between the vision markers.
+fn clip_placeholder(times: &[f64]) -> String {
+    let patches: String = times
+        .iter()
+        .map(|t| format!("<{t:.1} seconds>{QWEN35_IMAGE_SENTINEL}"))
+        .collect();
+    format!("<|vision_start|>{patches}<|vision_end|>")
+}
+
+/// The messages with `placeholder` put in front of the last user turn that carries a clip.
+fn with_clip_placeholder(messages: &[Message], placeholder: &str) -> Vec<Message> {
+    let mut msgs = messages.to_vec();
+    if let Some(um) = msgs
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "user" && m.videos.as_ref().is_some_and(|v| !v.is_empty()))
+    {
+        um.content = format!("{placeholder}{}", um.content);
+    }
+    msgs
+}
+
 /// Whether any user turn carries an image.
 pub(crate) fn carries_images(messages: &[Message]) -> bool {
     messages
@@ -513,6 +546,26 @@ impl APIServer {
         spec: &PromptSpec<'_>,
     ) -> PreparedPrompt {
         let format = self.chat_format_for(model_name).await;
+        // A clip the loaded model reads: the prompt states each of its temporal patches, at its
+        // time, where the tower's embeddings go. A clip it cannot read is refused at admission.
+        let with_clip = match (engine, last_user_video(spec.messages)) {
+            (Some(e), Some(clip)) => match e.clip_patch_times(clip).await {
+                Ok(Some(times)) => Some(with_clip_placeholder(
+                    spec.messages,
+                    &clip_placeholder(&times),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        let clip_spec = with_clip.as_deref().map(|messages| PromptSpec {
+            messages,
+            tools: spec.tools,
+            tool_choice: spec.tool_choice,
+            thinking: spec.thinking,
+            output_grammar: spec.output_grammar.clone(),
+        });
+        let spec = clip_spec.as_ref().unwrap_or(spec);
         let vision = match engine {
             Some(e) if carries_images(spec.messages) => e.is_qwen35_vision().await,
             _ => false,

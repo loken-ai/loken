@@ -72,11 +72,6 @@ pub fn mrope_cos_sin(
 }
 
 impl GenericHeteroTransformer {
-    /// The placeholder token a spliced image expands, when the model carries a tower.
-    pub fn spliced_image_token(&self) -> Option<u32> {
-        self.spliced_vision.as_ref().map(|v| v.image_token)
-    }
-
     /// Splices the output of `tower` into the text stream at runs of `image_token`, for a tower
     /// read from a projector file beside the model's.
     pub fn attach_spliced_vision(
@@ -87,53 +82,83 @@ impl GenericHeteroTransformer {
         self.spliced_vision = Some(SplicedVision { tower, image_token });
     }
 
-    /// Prefills `prompt` with its one placeholder expanded to the image's merged grid and
-    /// the tower's embeddings over it. Returns the last logits and the next decode position,
-    /// the logical position past every prefilled one rather than the sequence length.
-    pub fn forward_spliced_image(
+    /// The placeholder token a spliced image expands, when the model carries a tower.
+    pub fn spliced_image_token(&self) -> Option<u32> {
+        self.spliced_vision.as_ref().map(|v| v.image_token)
+    }
+
+    /// Prefills `prompt` with each of its placeholders expanded to the merged grid of the vision
+    /// item of the same rank, an image or one temporal patch of a clip, and the tower's
+    /// embeddings over it. `items` holds each item's patches and grid. Returns the last logits
+    /// and the next decode position, the logical position past every prefilled one rather than
+    /// the sequence length.
+    pub fn forward_spliced_vision(
         &mut self,
         prompt: &[u32],
-        pixels: &Tensor,
-        gh: usize,
-        gw: usize,
+        items: &[(Tensor, (usize, usize))],
     ) -> Result<(Tensor, usize)> {
         let vision = self
             .spliced_vision
             .as_ref()
             .ok_or_else(|| crate::tensor::Error::msg("the model carries no vision tower"))?;
         let token = vision.image_token;
-        let img = vision.tower.forward(pixels, gh, gw)?;
-        let n_img = img.dim(0)?;
-        // The tower merges the patch grid in squares of two.
-        let (mh, mw) = (gh / 2, gw / 2);
-        if n_img != mh * mw {
+        let sentinels = prompt.iter().filter(|&&t| t == token).count();
+        if sentinels != items.len() {
             return Err(crate::tensor::Error::msg(format!(
-                "the tower gave {n_img} rows for a {mh}x{mw} merged grid"
+                "the prompt holds {sentinels} vision placeholders for {} items",
+                items.len()
             )));
         }
-        let start = prompt.iter().position(|&t| t == token).ok_or_else(|| {
-            crate::tensor::Error::msg("image placeholder missing from the prompt")
-        })?;
-        let mut ids = prompt[..start].to_vec();
-        ids.extend(std::iter::repeat_n(token, n_img));
-        ids.extend_from_slice(&prompt[start + 1..]);
-
         let emb_device = self.embeddings.embeddings().device().clone();
+        let mut embeds = Vec::with_capacity(items.len());
+        let mut grids = Vec::with_capacity(items.len());
+        for (pixels, (gh, gw)) in items {
+            let img = vision.tower.forward(pixels, *gh, *gw)?;
+            // The tower merges the patch grid in squares of two.
+            let (mh, mw) = (gh / 2, gw / 2);
+            if img.dim(0)? != mh * mw {
+                return Err(crate::tensor::Error::msg(format!(
+                    "the tower gave {} rows for a {mh}x{mw} merged grid",
+                    img.dim(0)?
+                )));
+            }
+            embeds.push(img.to_device(&emb_device)?);
+            grids.push((mh, mw));
+        }
+        let mut ids =
+            Vec::with_capacity(prompt.len() + embeds.iter().map(|e| e.dims()[0]).sum::<usize>());
+        // Where each item's run starts in the expanded ids.
+        let mut runs = Vec::with_capacity(items.len());
+        let mut item = 0;
+        for &t in prompt {
+            if t == token {
+                runs.push(ids.len());
+                ids.extend(std::iter::repeat_n(token, grids[item].0 * grids[item].1));
+                item += 1;
+            } else {
+                ids.push(t);
+            }
+        }
+
         let id_tensor = Tensor::new(ids.as_slice(), &emb_device)?.unsqueeze(0)?;
         let text = self.embeddings.forward(&id_tensor)?;
         let hidden = text.dim(2)?;
-        let img = img
-            .to_device(&emb_device)?
-            .to_dtype(text.dtype())?
-            .reshape((1, n_img, hidden))?;
-        let mut parts = vec![text.narrow(1, 0, start)?, img];
-        let after = ids.len() - start - n_img;
-        if after > 0 {
-            parts.push(text.narrow(1, start + n_img, after)?);
+        let mut parts = Vec::with_capacity(2 * items.len() + 1);
+        let mut at = 0;
+        for (start, img) in runs.iter().zip(&embeds) {
+            if *start > at {
+                parts.push(text.narrow(1, at, start - at)?);
+            }
+            let n = img.dim(0)?;
+            parts.push(img.to_dtype(text.dtype())?.reshape((1, n, hidden))?);
+            at = start + n;
+        }
+        if ids.len() > at {
+            parts.push(text.narrow(1, at, ids.len() - at)?);
         }
         let spliced = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?;
 
-        let pos = mrope_positions(&ids, token, &[(mh, mw)]);
+        let pos = mrope_positions(&ids, token, &grids);
         let next = pos
             .iter()
             .flat_map(|p| p.iter().copied())

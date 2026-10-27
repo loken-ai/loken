@@ -245,7 +245,7 @@ impl LlmEngine {
             // outright when the image alone can't fit the window.
             let kv_window = effective_kv_window(state.context_length, config.context_length, params.context_length);
             let vision_extra = vision_extra_kv(state.image_embeds.as_ref())
-                + qwen35_vision_extra_kv(state.qwen35_image.as_ref());
+                + qwen35_vision_extra_kv(&state.qwen35_vision);
             if vision_extra >= kv_window {
                 return Err(anyhow!(
                     "image occupies {vision_extra} KV positions but the context window is only \
@@ -254,7 +254,7 @@ impl LlmEngine {
             }
             // qwen35-VL keeps its image as a single in-prompt sentinel token  - 
             // clamp around it (the generic BOS+tail clamp would drop it).
-            let qwen35_sentinel = if state.qwen35_image.is_some() {
+            let qwen35_sentinel = if !state.qwen35_vision.is_empty() {
                 state.model.qwen35_image_token()
             } else { None };
             // A clip's embeddings replace the placeholder inside the prompt; the prompt is
@@ -308,7 +308,7 @@ impl LlmEngine {
             state.exact_prefill = None;
             let cache_session_start: usize = {
                 let is_vision_req = (state.model.is_vision_model() && state.image_embeds.is_some())
-                    || state.qwen35_image.is_some()
+                    || !state.qwen35_vision.is_empty()
                     || audio_split.is_some();
                 let disabled = is_vision_req
                     || false;
@@ -401,7 +401,7 @@ impl LlmEngine {
             let mut prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
             // Where the prompt stops being the same in the conversation's next turn: a model
             // that cannot rewind its state keeps the state there.
-            let boundary = if audio_split.is_none() && state.qwen35_image.is_none() {
+            let boundary = if audio_split.is_none() && state.qwen35_vision.is_empty() {
                 params.stable_prefix.and_then(|bytes| stable_prefix_tokens(&state.tokenizer, &encoding, bytes, prompt_tokens.len()))
             } else {
                 None
@@ -423,7 +423,7 @@ impl LlmEngine {
             // splice at the image_token sentinel + mRoPE-2D); `pos` becomes the
             // continuing logical mRoPE position. Otherwise the moondream prepend
             // path (or plain text).
-            let qwen35_img = state.qwen35_image.take();
+            let qwen35_items = std::mem::take(&mut state.qwen35_vision);
             let (vision_prefix_len, mut logits, qwen35_pos) = if let Some(ref a) = audio_split {
                 // The embeddings were encoded for this request; the sequence they make is as
                 // long as the prefill says, which is where decoding continues.
@@ -431,8 +431,8 @@ impl LlmEngine {
                     .ok_or_else(|| anyhow!("the audio was cleared before the prefill"))?;
                 let (lg, total) = state.model.forward_audio_spliced(&prompt_tokens, a.at, &embeds)?;
                 (None, lg, Some(total))
-            } else if let Some((ref px, (gh, gw))) = qwen35_img {
-                let (lg, next_pos) = state.model.forward_qwen35_image(&prompt_tokens, px, gh, gw, device)?;
+            } else if !qwen35_items.is_empty() {
+                let (lg, next_pos) = state.model.forward_qwen35_vision(&prompt_tokens, &qwen35_items, device)?;
                 (None, lg, Some(next_pos))
             } else if let Some(image_embeds) = state
                 .image_embeds
@@ -454,7 +454,7 @@ impl LlmEngine {
                     let image_embeds = state.image_embeds.as_ref().unwrap();
                     let bos_token = Tensor::new(&[state.eos_token_id], device)?.unsqueeze(0)?;
                     state.model.forward_with_img(&bos_token, &x, image_embeds)?
-                } else if state.qwen35_image.is_some() {
+                } else if !state.qwen35_vision.is_empty() {
                     // Image-conditioned: the snapshot keys on text tokens alone,
                     // so it would collide across different images. Always prefill.
                     state.model.forward_prefill_chunked(&x, cache_session_start)?

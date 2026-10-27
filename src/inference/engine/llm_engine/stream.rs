@@ -384,7 +384,7 @@ impl LlmEngine {
                     params.context_length,
                 );
                 let vision_extra = vision_extra_kv(state.image_embeds.as_ref())
-                    + qwen35_vision_extra_kv(state.qwen35_image.as_ref());
+                    + qwen35_vision_extra_kv(&state.qwen35_vision);
                 if vision_extra >= kv_window {
                     let _ = tx.blocking_send(Err(format!(
                         "image occupies {vision_extra} KV positions but the context window is only \
@@ -394,7 +394,7 @@ impl LlmEngine {
                 }
                 // qwen35-VL keeps its image as a single in-prompt sentinel token  -
                 // clamp around it (the generic BOS+tail clamp would drop it).
-                let qwen35_sentinel = if state.qwen35_image.is_some() {
+                let qwen35_sentinel = if !state.qwen35_vision.is_empty() {
                     state.model.qwen35_image_token()
                 } else {
                     None
@@ -841,13 +841,14 @@ impl LlmEngine {
                             return;
                         }
                     }
-                } else if let Some((px, (gh, gw))) = state.qwen35_image.take() {
+                } else if !state.qwen35_vision.is_empty() {
+                    let items = std::mem::take(&mut state.qwen35_vision);
                     // qwen35moe (Qwen3-VL) cold vision prefill: ViT + splice at
                     // the image_token sentinel + mRoPE-2D. Returns the continuing
                     // logical decode position (image compresses positions).
                     match state
                         .model
-                        .forward_qwen35_image(&prompt_tokens, &px, gh, gw, &device)
+                        .forward_qwen35_vision(&prompt_tokens, &items, &device)
                     {
                         Ok((l, np)) => {
                             qwen35_next_pos = Some(np);

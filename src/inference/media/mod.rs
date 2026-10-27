@@ -9,3 +9,4 @@ pub mod image_processor;
 #[cfg(feature = "midi")]
 pub mod midi;
 pub mod precision;
+pub mod video_io;

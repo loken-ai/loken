@@ -416,6 +416,12 @@ pub(crate) async fn ollama_chat(
             crate::api::handlers::chat_prompt::last_user_audio(&request.messages),
         )
         .await?;
+    state
+        .admit_video(
+            &engine,
+            crate::api::handlers::chat_prompt::last_user_video(&request.messages),
+        )
+        .await?;
 
     // Check if streaming is requested
     if request.stream {

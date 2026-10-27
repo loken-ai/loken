@@ -1088,22 +1088,20 @@ pub(crate) trait ModelBackend: Send {
         ))
     }
 
-    /// qwen35moe (Qwen3-VL) vision prefill. `prompt_tokens` carries ONE
-    /// `image_token` sentinel (handler-injected via `<|image_pad|>`); expand it
-    /// to `n_merged=(gh/2)*(gw/2)` copies, then run `forward_with_image` (ViT +
-    /// splice + mRoPE-2D). Returns `(last_logits, next_decode_pos)` - the decode
-    /// loop must use `next_decode_pos` (the continuing logical mRoPE position),
-    /// not the sequence length.
-    fn forward_qwen35_image(
+    /// qwen35moe (Qwen3-VL) vision prefill. `prompt_tokens` carries one `image_token`
+    /// sentinel per item of `items`, an image or one temporal patch of a clip, each given by
+    /// its patches and grid `(gh, gw)`; each sentinel expands to `(gh/2)*(gw/2)` copies, then
+    /// the tower's embeddings are spliced over them with the multi-axis rotary positions.
+    /// Returns `(last_logits, next_decode_pos)` - the decode loop must use `next_decode_pos`
+    /// (the continuing logical mRoPE position), not the sequence length.
+    fn forward_qwen35_vision(
         &mut self,
         _prompt_tokens: &[u32],
-        _px: &Tensor,
-        _gh: usize,
-        _gw: usize,
+        _items: &[(Tensor, (usize, usize))],
         _device: &Device,
     ) -> crate::tensor::Result<(Tensor, usize)> {
         Err(crate::tensor::Error::msg(
-            "forward_qwen35_image on non-qwen35 (or non-CUDA build)".to_string(),
+            "forward_qwen35_vision on non-qwen35 (or non-CUDA build)".to_string(),
         ))
     }
 
@@ -2452,15 +2450,13 @@ impl ModelBackend for GenericBackend {
         self.0.spliced_image_token()
     }
 
-    fn forward_qwen35_image(
+    fn forward_qwen35_vision(
         &mut self,
         prompt_tokens: &[u32],
-        px: &Tensor,
-        gh: usize,
-        gw: usize,
+        items: &[(Tensor, (usize, usize))],
         _device: &Device,
     ) -> crate::tensor::Result<(Tensor, usize)> {
-        self.0.forward_spliced_image(prompt_tokens, px, gh, gw)
+        self.0.forward_spliced_vision(prompt_tokens, items)
     }
 
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {

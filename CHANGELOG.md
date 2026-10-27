@@ -8,6 +8,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 - Serving: log the pace of batched steps once a second.
 - Vision: read the Qwen3.5 vision tower from a separate projector file.
+- Vision: answer about a video clip sent as a video_url part.
 
 ### Changed
 

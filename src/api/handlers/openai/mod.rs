@@ -436,6 +436,12 @@ pub(crate) async fn chat_completion(
             super::chat_prompt::last_user_audio(&request.messages),
         )
         .await?;
+    state
+        .admit_video(
+            &engine,
+            super::chat_prompt::last_user_video(&request.messages),
+        )
+        .await?;
 
     if stream {
         let max_tokens_cap = request.completion_cap();

@@ -164,6 +164,26 @@ impl APIServer {
         })
     }
 
+    /// Hand the loaded model the video clip of a chat request, after [`Self::admit`] set its
+    /// images: the clip's temporal patches follow them, as the prompt states them. A request
+    /// without a clip does nothing; a clip for a model that reads none, or one that does not
+    /// decode, is refused.
+    pub(crate) async fn admit_video(
+        &self,
+        engine: &LlmEngine,
+        clip: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let Some(clip) = clip else {
+            return Ok(());
+        };
+        if let Err(e) = engine.set_video(clip).await {
+            // What an earlier request encoded must not answer for this clip.
+            engine.clear_images().await;
+            return Err(ApiError::Validation(format!("video: {e}")));
+        }
+        Ok(())
+    }
+
     /// Hand the loaded model the clip of a chat request: `clip`, base64 in any container the
     /// server reads, decoded to mono at the tower's rate and encoded. Called after
     /// [`Self::admit`], which holds the gate and cleared what an earlier request held. A

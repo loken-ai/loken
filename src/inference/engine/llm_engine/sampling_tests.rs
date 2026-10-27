@@ -97,12 +97,17 @@ fn qwen35_vision_extra_kv_counts_merged_grid_minus_sentinel() {
     // already holds ONE sentinel, so the extra KV is n_merged - 1.
     let px = Tensor::zeros_on((1usize, 4usize), crate::tensor::DType::F32, &Device::Cpu).unwrap();
     assert_eq!(
-        qwen35_vision_extra_kv(Some(&(px.clone(), (64, 48)))),
+        qwen35_vision_extra_kv(&[(px.clone(), (64, 48))]),
         32 * 24 - 1
     );
-    assert_eq!(qwen35_vision_extra_kv(None), 0);
+    assert_eq!(qwen35_vision_extra_kv(&[]), 0);
     // Degenerate 2x2 grid -> 1 merged token -> sentinel covers it -> 0 extra.
-    assert_eq!(qwen35_vision_extra_kv(Some(&(px, (2, 2)))), 0);
+    assert_eq!(qwen35_vision_extra_kv(&[(px.clone(), (2, 2))]), 0);
+    // A clip's temporal patches each hold one sentinel.
+    assert_eq!(
+        qwen35_vision_extra_kv(&[(px.clone(), (16, 20)), (px, (16, 20))]),
+        2 * (8 * 10 - 1)
+    );
 }
 
 #[test]

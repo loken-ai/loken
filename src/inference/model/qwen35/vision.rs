@@ -20,6 +20,28 @@ use std::io::{Read, Seek};
 fn ld<R: Read + Seek>(c: &gguf_file::Content, r: &mut R, name: &str, d: &Device) -> Result<Tensor> {
     c.tensor(r, name, d)?.dequantize(d)?.to_dtype(DType::F32)
 }
+/// How the family reads a clip, as its video processor does: frames sampled at a rate within a
+/// floor and a ceiling, each resized so the clip's pixels over its temporal patches stay within
+/// a range.
+pub struct VideoFacts {
+    pub sampling: crate::inference::media::video_io::Sampling,
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+}
+
+/// The family's clip reading (`video_preprocessor_config.json`: `size.shortest_edge` and
+/// `size.longest_edge`; the processor's `fps`, `min_frames`, `max_frames`).
+pub const VIDEO: VideoFacts = VideoFacts {
+    sampling: crate::inference::media::video_io::Sampling {
+        fps: 2.0,
+        min_frames: 4,
+        max_frames: 768,
+        temporal: 2,
+    },
+    min_pixels: 4096,
+    max_pixels: 25_165_824,
+};
+
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
     pub n_layers: usize,      // 27

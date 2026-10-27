@@ -67,16 +67,17 @@ pub(super) fn vision_extra_kv(image_embeds: Option<&Tensor>) -> usize {
         .unwrap_or(0)
 }
 
-/// Same accounting for the qwen35moe (Qwen3-VL) vision path: the prompt
-/// carries ONE `image_token` sentinel that `forward_qwen35_image` expands in
-/// place to `n_merged = (gh/2).(gw/2)` copies (spatial_merge_size=2) BEFORE
-/// the ViT splice, so the real prefill length exceeds the tokenized prompt by
-/// `n_merged - 1`. Without reserving these, a large image + long question
-/// overflows the context window as a single monolithic prefill (`heads x
-/// seq² x f32` attention scores -> VRAM OOM at long context).
-pub(super) fn qwen35_vision_extra_kv(img: Option<&(Tensor, (usize, usize))>) -> usize {
-    img.map(|&(_, (gh, gw))| ((gh / 2) * (gw / 2)).saturating_sub(1))
-        .unwrap_or(0)
+/// Same accounting for the qwen35moe (Qwen3-VL) vision path: the prompt carries one
+/// `image_token` sentinel per vision item that `forward_qwen35_vision` expands in place to
+/// `n_merged = (gh/2).(gw/2)` copies (spatial_merge_size=2) BEFORE the ViT splice, so the real
+/// prefill length exceeds the tokenized prompt by `n_merged - 1` per item. Without reserving
+/// these, a large image + long question overflows the context window as a single monolithic
+/// prefill (`heads x seq² x f32` attention scores -> VRAM OOM at long context).
+pub(super) fn qwen35_vision_extra_kv(items: &[(Tensor, (usize, usize))]) -> usize {
+    items
+        .iter()
+        .map(|&(_, (gh, gw))| ((gh / 2) * (gw / 2)).saturating_sub(1))
+        .sum()
 }
 
 /// Prompt clamp for qwen35-VL: the image lives IN the token stream as a single
@@ -91,7 +92,8 @@ pub(super) fn clamp_qwen35_prompt_to_window(
     want_gen: usize,
     sentinel: u32,
 ) -> Vec<u32> {
-    let Some(si) = tokens.iter().position(|&t| t == sentinel) else {
+    // The head is kept through the last sentinel: every vision item stays in the prompt.
+    let Some(si) = tokens.iter().rposition(|&t| t == sentinel) else {
         return clamp_prompt_to_window(tokens, kv_window, want_gen);
     };
     if kv_window == 0 || tokens.len() <= 1 {

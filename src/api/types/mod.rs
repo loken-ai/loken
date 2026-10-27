@@ -845,6 +845,11 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(length(max = 16))]
     pub audios: Option<Vec<String>>,
+    /// Video clips for vision models that read them, base64, in any container ffmpeg reads.
+    /// On a user message: the clips the model is asked about, read from the last such message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(length(max = 16))]
+    pub videos: Option<Vec<String>>,
     /// Tool calls emitted by the model (assistant turns) or replayed from
     /// conversation history. Populated in responses when the model invokes
     /// a function; accepted in requests so a multi-turn agentic loop can
@@ -863,8 +868,8 @@ pub struct Message {
 }
 
 /// A message as OpenAI clients send it: `content` is a string, null, or an array of
-/// parts (`text`, `image_url`, `input_audio`). Parts are folded into `Message`: the texts
-/// joined, the images and the audio carried as base64. What is not carried is refused rather
+/// parts (`text`, `image_url`, `input_audio`, `video_url`). Parts are folded into `Message`:
+/// the texts joined, the images, the audio and the video carried as base64. What is not carried is refused rather
 /// than dropped, so a client learns at once that a remote image reached a server that does
 /// not fetch them.
 #[derive(Deserialize)]
@@ -881,6 +886,8 @@ struct MessageWire {
     #[serde(default)]
     audios: Option<Vec<String>>,
     #[serde(default)]
+    videos: Option<Vec<String>>,
+    #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(default)]
     tool_call_id: Option<String>,
@@ -888,12 +895,13 @@ struct MessageWire {
     name: Option<String>,
 }
 
-/// What the parts of a `content` value carry: the texts joined, the base64 images and the
-/// base64 audio clips.
+/// What the parts of a `content` value carry: the texts joined, the base64 images, audio clips
+/// and video clips.
 struct FoldedContent {
     text: String,
     images: Vec<String>,
     audios: Vec<String>,
+    videos: Vec<String>,
 }
 
 /// Text, base64 images and base64 audio of a `content` value.
@@ -905,6 +913,7 @@ fn fold_content_parts(v: Option<serde_json::Value>) -> Result<FoldedContent, Str
                 text: String::new(),
                 images: Vec::new(),
                 audios: Vec::new(),
+                videos: Vec::new(),
             })
         }
         Some(Value::String(s)) => {
@@ -912,6 +921,7 @@ fn fold_content_parts(v: Option<serde_json::Value>) -> Result<FoldedContent, Str
                 text: s,
                 images: Vec::new(),
                 audios: Vec::new(),
+                videos: Vec::new(),
             })
         }
         Some(Value::Array(parts)) => parts,
@@ -920,6 +930,7 @@ fn fold_content_parts(v: Option<serde_json::Value>) -> Result<FoldedContent, Str
     let mut text = String::new();
     let mut images = Vec::new();
     let mut audios = Vec::new();
+    let mut videos = Vec::new();
     for part in parts {
         let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
@@ -957,6 +968,20 @@ fn fold_content_parts(v: Option<serde_json::Value>) -> Result<FoldedContent, Str
                     .ok_or("an `input_audio` part needs `input_audio.data`, a base64 string")?;
                 audios.push(base64_payload(data).to_string());
             }
+            "video_url" => {
+                let url = match part.get("video_url") {
+                    Some(Value::String(u)) => u.as_str(),
+                    Some(Value::Object(o)) => o.get("url").and_then(Value::as_str).unwrap_or(""),
+                    _ => "",
+                };
+                let Some(b64) = data_url_base64(url) else {
+                    return Err(
+                        "`video_url` must be a data: URL carrying base64; remote videos are not fetched"
+                            .to_string(),
+                    );
+                };
+                videos.push(b64.to_string());
+            }
             other => return Err(format!("unsupported content part type '{other}'")),
         }
     }
@@ -964,6 +989,7 @@ fn fold_content_parts(v: Option<serde_json::Value>) -> Result<FoldedContent, Str
         text,
         images,
         audios,
+        videos,
     })
 }
 
@@ -987,12 +1013,16 @@ impl TryFrom<MessageWire> for Message {
             text: content,
             mut images,
             mut audios,
+            mut videos,
         } = fold_content_parts(w.content)?;
         if let Some(more) = w.images {
             images.extend(more);
         }
         if let Some(more) = w.audios {
             audios.extend(more);
+        }
+        if let Some(more) = w.videos {
+            videos.extend(more);
         }
         Ok(Self {
             role: w.role,
@@ -1001,6 +1031,7 @@ impl TryFrom<MessageWire> for Message {
             reasoning_content: w.reasoning_content,
             images: (!images.is_empty()).then_some(images),
             audios: (!audios.is_empty()).then_some(audios),
+            videos: (!videos.is_empty()).then_some(videos),
             tool_calls: w.tool_calls,
             tool_call_id: w.tool_call_id,
             name: w.name,
@@ -1053,6 +1084,7 @@ impl Message {
             reasoning_content: None,
             images: None,
             audios: None,
+            videos: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -1070,6 +1102,7 @@ impl Message {
             reasoning_content: None,
             images: None,
             audios: None,
+            videos: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             name: None,
