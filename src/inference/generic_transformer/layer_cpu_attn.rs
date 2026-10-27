@@ -328,184 +328,11 @@ impl GenericTransformerLayer {
         Ok(Some(t))
     }
 
-    /// AVX2 f32 dot (two accumulators for ILP) with a scalar fallback. Used by
-    /// the flash-attention inner Q.K product, which Rust won't auto-vectorise
-    /// (float reduction order is not reassociated without fast-math).
-    // NOT cfg-gated. The canonical binary is the CUDA build run with
-    // `--cpu`; gating this `not(feature="cuda")` compiled the fused CPU prefill
-    // attention OUT of it (the same trap as the decode-attention stub), leaving
-    // CPU prefill on the naive O(seq²) scores path. Runtime device check gates it.
-    /// `acc[i] += p * v[i]`, a vector at a time. The value-accumulate of the
-    /// attention output; scalar it is one multiply-add per element per key.
-    #[inline]
-    fn faxpy(p: f32, v: &[f32], acc: &mut [f32]) {
-        let n = v.len();
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu::dispatch_avx512() {
-            // SAFETY: dispatch_avx512 implies the CPU has every feature `faxpy_avx512` enables.
-            return unsafe { Self::faxpy_avx512(p, v, acc) };
-        }
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu::dispatch_avx2() {
-            // SAFETY: dispatch_avx2 implies the CPU has every feature `faxpy_avx2` enables.
-            return unsafe { Self::faxpy_avx2(p, v, acc) };
-        }
-        for i in 0..n {
-            acc[i] += p * v[i];
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-    unsafe fn faxpy_avx2(p: f32, v: &[f32], acc: &mut [f32]) {
-        let n = v.len();
-        unsafe {
-            use std::arch::x86_64::*;
-            let pv = _mm256_set1_ps(p);
-            let mut c = 0;
-            while c + 8 <= n {
-                let a = _mm256_fmadd_ps(
-                    pv,
-                    _mm256_loadu_ps(v.as_ptr().add(c)),
-                    _mm256_loadu_ps(acc.as_ptr().add(c)),
-                );
-                _mm256_storeu_ps(acc.as_mut_ptr().add(c), a);
-                c += 8;
-            }
-            while c < n {
-                *acc.get_unchecked_mut(c) += p * *v.get_unchecked(c);
-                c += 1;
-            }
-        }
-    }
-
-    /// [`Self::faxpy_avx2`] sixteen lanes at a time. Each element is the same fused multiply-add,
-    /// so the result has the bits of the AVX2 kernel.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
-    unsafe fn faxpy_avx512(p: f32, v: &[f32], acc: &mut [f32]) {
-        let n = v.len();
-        unsafe {
-            use std::arch::x86_64::*;
-            let pv = _mm512_set1_ps(p);
-            let mut c = 0;
-            while c + 16 <= n {
-                let a = _mm512_fmadd_ps(
-                    pv,
-                    _mm512_loadu_ps(v.as_ptr().add(c)),
-                    _mm512_loadu_ps(acc.as_ptr().add(c)),
-                );
-                _mm512_storeu_ps(acc.as_mut_ptr().add(c), a);
-                c += 16;
-            }
-            // The AVX2 kernel fuses its last whole group of eight too; the tail past it is not.
-            if c + 8 <= n {
-                let a = _mm256_fmadd_ps(
-                    _mm256_set1_ps(p),
-                    _mm256_loadu_ps(v.as_ptr().add(c)),
-                    _mm256_loadu_ps(acc.as_ptr().add(c)),
-                );
-                _mm256_storeu_ps(acc.as_mut_ptr().add(c), a);
-                c += 8;
-            }
-            while c < n {
-                *acc.get_unchecked_mut(c) += p * *v.get_unchecked(c);
-                c += 1;
-            }
-        }
-    }
-
-    /// [`Self::fdot_avx2`] with its two accumulators held as the two halves of one zmm: every lane
-    /// sees the same fused multiply-adds, and the halves are added at the end as before, so the
-    /// result has the bits of the AVX2 kernel.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
-    unsafe fn fdot_avx512(a: &[f32], b: &[f32]) -> f32 {
-        unsafe {
-            use std::arch::x86_64::*;
-            let n = a.len();
-            let (pa, pb) = (a.as_ptr(), b.as_ptr());
-            let mut acc = _mm512_setzero_ps();
-            let mut c = 0;
-            while c + 16 <= n {
-                acc = _mm512_fmadd_ps(_mm512_loadu_ps(pa.add(c)), _mm512_loadu_ps(pb.add(c)), acc);
-                c += 16;
-            }
-            let acc = _mm256_add_ps(
-                _mm512_castps512_ps256(acc),
-                _mm512_extractf32x8_ps::<1>(acc),
-            );
-            let q = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-            let q = _mm_hadd_ps(q, q);
-            let q = _mm_hadd_ps(q, q);
-            let mut sum = _mm_cvtss_f32(q);
-            while c < n {
-                sum += *pa.add(c) * *pb.add(c);
-                c += 1;
-            }
-            sum
-        }
-    }
-
-    fn fdot(a: &[f32], b: &[f32]) -> f32 {
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu::dispatch_avx512() {
-            // SAFETY: dispatch_avx512 implies the CPU has every feature `fdot_avx512` enables.
-            return unsafe { Self::fdot_avx512(a, b) };
-        }
-        #[cfg(target_arch = "x86_64")]
-        if crate::cpu::dispatch_avx2() {
-            // SAFETY: dispatch_avx2 implies the CPU has every feature `fdot_avx2` enables.
-            return unsafe { Self::fdot_avx2(a, b) };
-        }
-        {
-            a.iter().zip(b).map(|(x, y)| x * y).sum()
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
-    unsafe fn fdot_avx2(a: &[f32], b: &[f32]) -> f32 {
-        unsafe {
-            use std::arch::x86_64::*;
-            let n = a.len();
-            let (pa, pb) = (a.as_ptr(), b.as_ptr());
-            let mut acc0 = _mm256_setzero_ps();
-            let mut acc1 = _mm256_setzero_ps();
-            let mut c = 0;
-            while c + 16 <= n {
-                acc0 =
-                    _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(c)), _mm256_loadu_ps(pb.add(c)), acc0);
-                acc1 = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(pa.add(c + 8)),
-                    _mm256_loadu_ps(pb.add(c + 8)),
-                    acc1,
-                );
-                c += 16;
-            }
-            let acc = _mm256_add_ps(acc0, acc1);
-            let q = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-            let q = _mm_hadd_ps(q, q);
-            let q = _mm_hadd_ps(q, q);
-            let mut sum = _mm_cvtss_f32(q);
-            while c < n {
-                sum += *pa.add(c) * *pb.add(c);
-                c += 1;
-            }
-            sum
-        }
-    }
-
-    /// CPU prefill flash-attention (online softmax, ggml-style): per
-    /// (head, query) a single streaming pass over KV maintaining a running max
-    /// `m`, denominator `s` and accumulator - NO [seq_q x seq_kv] scores matrix
-    /// is materialised and there is no separate softmax pass (the naive 3-step
-    /// path writes + re-reads the full O(seq²) scores three times). GQA handled
-    /// inline (kv head = h / n_rep), so K/V need not be repeat-expanded. F32 CPU
-    /// only; the float reduction order differs from the batched softmax so it is
-    /// gated + validated for coherence, like the decode-side fused CPU kernels.
-    /// NOT cfg-gated (runs on the canonical CUDA binary under `--cpu`); the
-    /// runtime `q.device()==Cpu` check at the call site gates it, no-op on GPU.
+    /// CPU prefill flash-attention (online softmax): no `[seq_q x seq_kv]` scores matrix is
+    /// materialised. One work item holds the query heads that read the same key/value head,
+    /// for a block of queries, and walks the keys a tile at a time: each key tile is read
+    /// once for all of those rows, each row keeps a running max, denominator and output.
+    /// F32 CPU only; the runtime `q.device()==Cpu` check at the call site gates it.
     /// `sinks`, one logit per query head, join each row's denominator unscaled.
     fn flash_attn_prefill_cpu(
         q: &Tensor,
@@ -517,7 +344,7 @@ impl GenericTransformerLayer {
         sinks: Option<&[f32]>,
     ) -> Result<Tensor> {
         let (b, n_head, seq_q, d) = q.dims4()?;
-        let (_, _n_kv, seq_kv, _) = k.dims4()?;
+        let (_, n_kv, seq_kv, _) = k.dims4()?;
         let qd = q.flatten_all()?.to_vec1::<f32>()?;
         let kd = k.flatten_all()?.to_vec1::<f32>()?;
         let vd = v.flatten_all()?.to_vec1::<f32>()?;
@@ -527,70 +354,28 @@ impl GenericTransformerLayer {
             .flatten_all()?
             .to_dtype(crate::tensor::DType::F32)?
             .to_vec1::<f32>()?;
-        let head_independent = md.len() == seq_q * seq_kv;
         let mut out = vec![0f32; b * n_head * seq_q * d];
-        // Parallelise the per-query-row attention on the shared prefill spin-pool
-        // (dynamic atomic chunk-grab -> balances the uneven causal-mask rows) rather
-        // than rayon. This keeps the whole prefill forward on ONE pool, so rayon's
-        // workers park instead of spin-stealing SMT cycles between the quantized
-        // GEMM regions.
-        crate::tensor::quant_cpu::pool_par_chunks_mut_prefill(&mut out, d, &|hi, o| {
-            // out layout is [b=1, n_head, seq_q, d] row-major -> chunk hi = head*seq_q + qi
-            let head = hi / seq_q;
-            let qi = hi % seq_q;
-            let kvh = head / n_rep;
-            let qrow = &qd[(head * seq_q + qi) * d..(head * seq_q + qi + 1) * d];
-            let mrow_off = if head_independent {
-                qi * seq_kv
-            } else {
-                (head * seq_q + qi) * seq_kv
-            };
-            // Two passes over the kept keys: first the scaled dots into a scratch
-            // (each dot already vectorised) while tracking the row max; then one
-            // vectorised exp sweep with that max known, so the exp, the running-
-            // max rescale and the value-accumulate all run a vector at a time
-            // instead of one float per key. Only unmasked keys enter the scratch,
-            // so masking costs no wasted work.
-            let mut sc: Vec<f32> = Vec::with_capacity(seq_kv);
-            let mut kept: Vec<usize> = Vec::with_capacity(seq_kv);
-            let mut m = f32::NEG_INFINITY;
-            for j in 0..seq_kv {
-                if md[mrow_off + j] != 0.0 {
-                    continue;
-                }
-                let krow = &kd[(kvh * seq_kv + j) * d..(kvh * seq_kv + j + 1) * d];
-                let dot = Self::fdot(qrow, krow) * scale;
-                sc.push(dot);
-                kept.push(j);
-                if dot > m {
-                    m = dot;
-                }
-            }
-            // The sink raises the stabilising maximum when it is the largest logit.
-            let sink = sinks.map(|s| s[head]);
-            if let Some(sl) = sink {
-                if sl > m {
-                    m = sl;
-                }
-            }
-            // exp(sc - m) in place, returns Σ; the same vectorised primitive the
-            // decode/lfm2 softmax scans use.
-            let s = if m.is_finite() {
-                crate::inference::kernel::cpu_decode_exec::exp_sub_max_sum(&mut sc, m)
-                    + sink.map_or(0.0, |sl| (sl - m).exp())
-            } else {
-                0.0
-            };
-            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-            let mut acc = vec![0f32; d];
-            for (idx, &j) in kept.iter().enumerate() {
-                let p = sc[idx];
-                let vrow = &vd[(kvh * seq_kv + j) * d..(kvh * seq_kv + j + 1) * d];
-                Self::faxpy(p, vrow, &mut acc);
-            }
-            for c in 0..d {
-                o[c] = acc[c] * inv;
-            }
+        let job = HostPrefillAttn {
+            q: &qd,
+            k: &kd,
+            v: &vd,
+            mask: &md,
+            head_independent: md.len() == seq_q * seq_kv,
+            seq_q,
+            seq_kv,
+            d,
+            n_rep,
+            scale,
+            sinks,
+        };
+        let per_block = (HOST_PREFILL_ROWS_PER_ITEM / n_rep).clamp(1, seq_q.max(1));
+        let blocks = seq_q.div_ceil(per_block);
+        let dst = HostPrefillOut(out.as_mut_ptr());
+        crate::tensor::quant_cpu::prefill_pool_run(n_kv * blocks, &|item| {
+            let kvh = item / blocks;
+            let q0 = (item % blocks) * per_block;
+            let q1 = (q0 + per_block).min(seq_q);
+            job.run(kvh, q0, q1, &dst);
         });
         Tensor::from_vec(out, (b, n_head, seq_q, d), &q.device())
     }
@@ -896,6 +681,395 @@ impl GenericTransformerLayer {
     }
 }
 
+/// Keys the host prefill attention scores at a time, for every row of a work item.
+const HOST_PREFILL_KEYS_PER_TILE: usize = 32;
+/// Output lanes the host prefill attention accumulates at a time over a key tile.
+const HOST_PREFILL_LANES: usize = 32;
+/// Rows the host prefill attention runs together, so that each element of a key tile and of a
+/// value row it loads serves all of them.
+const HOST_PREFILL_ROWS_TOGETHER: usize = 2;
+/// Query rows (the heads sharing a key/value head, times queries) one work item of the host
+/// prefill attention carries over each key tile.
+const HOST_PREFILL_ROWS_PER_ITEM: usize = 64;
+
+/// The output of the host prefill attention, written by work items that own disjoint rows.
+struct HostPrefillOut(*mut f32);
+// SAFETY: each work item writes only the rows of its own key/value head and query block.
+unsafe impl Sync for HostPrefillOut {}
+
+/// One host prefill attention call: `q` `[n_head][seq_q][d]`, `k`/`v` `[n_kv][seq_kv][d]`,
+/// `mask` `[seq_q][seq_kv]` or `[n_head][seq_q][seq_kv]` (0 keeps a key).
+struct HostPrefillAttn<'a> {
+    q: &'a [f32],
+    k: &'a [f32],
+    v: &'a [f32],
+    mask: &'a [f32],
+    head_independent: bool,
+    seq_q: usize,
+    seq_kv: usize,
+    d: usize,
+    n_rep: usize,
+    scale: f32,
+    sinks: Option<&'a [f32]>,
+}
+
+impl HostPrefillAttn<'_> {
+    /// The rows of key/value head `kvh` for the queries `q0..q1`, at the widest vector unit.
+    fn run(&self, kvh: usize, q0: usize, q1: usize, out: &HostPrefillOut) {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `run_avx512` enables.
+            return unsafe { self.run_avx512(kvh, q0, q1, out) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `run_avx2` enables.
+            return unsafe { self.run_avx2(kvh, q0, q1, out) };
+        }
+        self.rows::<{ HostLanes::Scalar as u8 }>(kvh, q0, q1, out)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn run_avx2(&self, kvh: usize, q0: usize, q1: usize, out: &HostPrefillOut) {
+        self.rows::<{ HostLanes::Avx2 as u8 }>(kvh, q0, q1, out)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    unsafe fn run_avx512(&self, kvh: usize, q0: usize, q1: usize, out: &HostPrefillOut) {
+        self.rows::<{ HostLanes::Avx512 as u8 }>(kvh, q0, q1, out)
+    }
+
+    /// Row `r` of a work item is query `q0 + r % nq` of head `kvh * n_rep + r / nq`, with the
+    /// products on the vector unit `W` (a [`HostLanes`]). Every product is an element-wise
+    /// fused multiply-add in a fixed order, so the vector width does not change the result.
+    #[inline(always)]
+    fn rows<const W: u8>(&self, kvh: usize, q0: usize, q1: usize, out: &HostPrefillOut) {
+        const BK: usize = HOST_PREFILL_KEYS_PER_TILE;
+        let (d, nq, seq_kv) = (self.d, q1 - q0, self.seq_kv);
+        let rows = self.n_rep * nq;
+        let head = |r: usize| kvh * self.n_rep + r / nq;
+        let query = |r: usize| q0 + r % nq;
+        let mask_row = |r: usize| {
+            let qi = query(r);
+            if self.head_independent {
+                qi * seq_kv
+            } else {
+                (head(r) * self.seq_q + qi) * seq_kv
+            }
+        };
+        let mut qs = vec![0f32; rows * d];
+        for r in 0..rows {
+            let at = (head(r) * self.seq_q + query(r)) * d;
+            qs[r * d..(r + 1) * d].copy_from_slice(&self.q[at..at + d]);
+        }
+        let mut acc = vec![0f32; rows * d];
+        let mut max = vec![f32::NEG_INFINITY; rows];
+        let mut den = vec![0f32; rows];
+        if let Some(s) = self.sinks {
+            for r in 0..rows {
+                max[r] = s[head(r)];
+                den[r] = 1.0;
+            }
+        }
+        // The tile's keys transposed, `kt[c * BK + t]` = element `c` of key `t`.
+        let mut kt = vec![0f32; d * BK];
+        let mut p = vec![0f32; rows * BK];
+        let mut kept = vec![false; rows * BK];
+        let mut live = vec![false; rows];
+        let mut j0 = 0;
+        while j0 < seq_kv {
+            let nk = BK.min(seq_kv - j0);
+            let mut any = false;
+            for r in 0..rows {
+                let m = &self.mask[mask_row(r) + j0..mask_row(r) + j0 + nk];
+                let kr = &mut kept[r * BK..r * BK + nk];
+                let mut n = 0;
+                for (t, x) in m.iter().enumerate() {
+                    kr[t] = *x == 0.0;
+                    n += usize::from(kr[t]);
+                }
+                live[r] = n > 0;
+                any |= live[r];
+            }
+            if !any {
+                j0 += nk;
+                continue;
+            }
+            for t in 0..BK {
+                let src = (t < nk).then(|| &self.k[(kvh * seq_kv + j0 + t) * d..][..d]);
+                for c in 0..d {
+                    kt[c * BK + t] = src.map_or(0.0, |s| s[c]);
+                }
+            }
+            let lived: Vec<usize> = (0..rows).filter(|&r| live[r]).collect();
+            let mut pairs = lived.chunks_exact(HOST_PREFILL_ROWS_TOGETHER);
+            for pair in pairs.by_ref() {
+                Self::scores::<W, 2>([pair[0], pair[1]], &qs, &kt, d, &mut p);
+            }
+            for &r in pairs.remainder() {
+                Self::scores::<W, 1>([r], &qs, &kt, d, &mut p);
+            }
+            for &r in &lived {
+                let kr = &kept[r * BK..r * BK + nk];
+                let s = &mut p[r * BK..r * BK + nk];
+                let mut top = f32::NEG_INFINITY;
+                for t in 0..nk {
+                    s[t] *= self.scale;
+                    if kr[t] && s[t] > top {
+                        top = s[t];
+                    }
+                }
+                let m = max[r].max(top);
+                let alpha = (max[r] - m).exp();
+                crate::inference::kernel::cpu_decode_exec::exp_sub_max_sum(s, m);
+                let mut sum = 0f32;
+                for t in 0..nk {
+                    if !kr[t] {
+                        s[t] = 0.0;
+                    }
+                    sum += s[t];
+                }
+                den[r] = den[r] * alpha + sum;
+                max[r] = m;
+                if alpha != 1.0 {
+                    for x in acc[r * d..(r + 1) * d].iter_mut() {
+                        *x *= alpha;
+                    }
+                }
+            }
+            let vt = &self.v[(kvh * seq_kv + j0) * d..(kvh * seq_kv + j0 + nk) * d];
+            let mut pairs = lived.chunks_exact(HOST_PREFILL_ROWS_TOGETHER);
+            for pair in pairs.by_ref() {
+                Self::values::<W, 2>([pair[0], pair[1]], &p, vt, nk, d, &mut acc);
+            }
+            for &r in pairs.remainder() {
+                Self::values::<W, 1>([r], &p, vt, nk, d, &mut acc);
+            }
+            j0 += nk;
+        }
+        for r in 0..rows {
+            let inv = if den[r] > 0.0 { 1.0 / den[r] } else { 0.0 };
+            let at = (head(r) * self.seq_q + query(r)) * d;
+            // SAFETY: row `r` of this work item is written by this work item only, and `at + d`
+            // is within the output, which holds `n_head * seq_q * d` floats.
+            let o = unsafe { std::slice::from_raw_parts_mut(out.0.add(at), d) };
+            for c in 0..d {
+                o[c] = acc[r * d + c] * inv;
+            }
+        }
+    }
+
+    /// The raw scores of rows `rs` against the key tile `kt` (`kt[c * BK + t]` = element `c` of
+    /// key `t`) into their rows of `p`, `BK` per row, on the vector unit `W`.
+    #[inline(always)]
+    fn scores<const W: u8, const R: usize>(
+        rs: [usize; R],
+        qs: &[f32],
+        kt: &[f32],
+        d: usize,
+        p: &mut [f32],
+    ) {
+        const BK: usize = HOST_PREFILL_KEYS_PER_TILE;
+        assert!(kt.len() >= d * BK && rs.iter().all(|&r| qs.len() >= (r + 1) * d));
+        assert!(rs.iter().all(|&r| p.len() >= (r + 1) * BK));
+        #[cfg(target_arch = "x86_64")]
+        if W == HostLanes::Avx512 as u8 {
+            // SAFETY: `W` is Avx512 only inside `run_avx512`, whose features the kernel enables;
+            // the asserts above bound every index it reads and writes.
+            return unsafe { host_scores_avx512(rs, qs, kt, d, p) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if W == HostLanes::Avx2 as u8 {
+            // SAFETY: as above, inside `run_avx2`.
+            return unsafe { host_scores_avx2(rs, qs, kt, d, p) };
+        }
+        for &r in &rs {
+            let mut s = [0f32; BK];
+            for c in 0..d {
+                let qc = qs[r * d + c];
+                for t in 0..BK {
+                    s[t] = qc.mul_add(kt[c * BK + t], s[t]);
+                }
+            }
+            p[r * BK..(r + 1) * BK].copy_from_slice(&s);
+        }
+    }
+
+    /// Adds the weights of rows `rs` in `p` times the `nk` value rows of `vt` to their rows of
+    /// `acc`, `d` per row, on the vector unit `W`.
+    #[inline(always)]
+    fn values<const W: u8, const R: usize>(
+        rs: [usize; R],
+        p: &[f32],
+        vt: &[f32],
+        nk: usize,
+        d: usize,
+        acc: &mut [f32],
+    ) {
+        const BK: usize = HOST_PREFILL_KEYS_PER_TILE;
+        assert!(nk <= BK && vt.len() >= nk * d);
+        assert!(rs
+            .iter()
+            .all(|&r| p.len() >= (r + 1) * BK && acc.len() >= (r + 1) * d));
+        let whole = d - d % HOST_PREFILL_LANES;
+        #[cfg(target_arch = "x86_64")]
+        if W == HostLanes::Avx512 as u8 {
+            // SAFETY: `W` is Avx512 only inside `run_avx512`, whose features the kernel enables;
+            // the asserts above bound every index it reads and writes.
+            unsafe { host_values_avx512(rs, p, vt, nk, d, whole, acc) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if W == HostLanes::Avx2 as u8 {
+            // SAFETY: as above, inside `run_avx2`.
+            unsafe { host_values_avx2(rs, p, vt, nk, d, whole, acc) };
+        }
+        let from = if W == HostLanes::Scalar as u8 {
+            0
+        } else {
+            whole
+        };
+        for &r in &rs {
+            for t in 0..nk {
+                let pt = p[r * BK + t];
+                for c in from..d {
+                    acc[r * d + c] = pt.mul_add(vt[t * d + c], acc[r * d + c]);
+                }
+            }
+        }
+    }
+}
+
+/// The vector unit a host prefill attention kernel runs its products on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum HostLanes {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+/// The score and value kernels of the host prefill attention at one vector width: `$n` lanes
+/// of type `$v`. Each output element is the same chain of fused multiply-adds whatever the
+/// width.
+macro_rules! host_prefill_kernels {
+    ($scores:ident, $values:ident, $feat:literal, $v:ty, $n:literal,
+     $zero:ident, $set1:ident, $load:ident, $store:ident, $fmadd:ident) => {
+        /// [`HostPrefillAttn::scores`] on this vector width. The caller bounds the indices.
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = $feat)]
+        unsafe fn $scores<const R: usize>(
+            rs: [usize; R],
+            qs: &[f32],
+            kt: &[f32],
+            d: usize,
+            p: &mut [f32],
+        ) {
+            use std::arch::x86_64::*;
+            const BK: usize = HOST_PREFILL_KEYS_PER_TILE;
+            const V: usize = BK / $n;
+            unsafe {
+                let mut s: [[$v; V]; R] = [[$zero(); V]; R];
+                for c in 0..d {
+                    let kc = kt.as_ptr().add(c * BK);
+                    let mut k: [$v; V] = [$zero(); V];
+                    for j in 0..V {
+                        k[j] = $load(kc.add(j * $n));
+                    }
+                    for i in 0..R {
+                        let q = $set1(*qs.get_unchecked(rs[i] * d + c));
+                        for j in 0..V {
+                            s[i][j] = $fmadd(q, k[j], s[i][j]);
+                        }
+                    }
+                }
+                for i in 0..R {
+                    for j in 0..V {
+                        $store(p.as_mut_ptr().add(rs[i] * BK + j * $n), s[i][j]);
+                    }
+                }
+            }
+        }
+
+        /// [`HostPrefillAttn::values`] on this vector width, over the first `whole` elements
+        /// of each row (a multiple of the lanes). The caller bounds the indices.
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = $feat)]
+        unsafe fn $values<const R: usize>(
+            rs: [usize; R],
+            p: &[f32],
+            vt: &[f32],
+            nk: usize,
+            d: usize,
+            whole: usize,
+            acc: &mut [f32],
+        ) {
+            use std::arch::x86_64::*;
+            const BK: usize = HOST_PREFILL_KEYS_PER_TILE;
+            const LANES: usize = HOST_PREFILL_LANES;
+            const V: usize = LANES / $n;
+            unsafe {
+                let mut c0 = 0;
+                while c0 < whole {
+                    let mut lane: [[$v; V]; R] = [[$zero(); V]; R];
+                    for i in 0..R {
+                        let a = acc.as_ptr().add(rs[i] * d + c0);
+                        for j in 0..V {
+                            lane[i][j] = $load(a.add(j * $n));
+                        }
+                    }
+                    for t in 0..nk {
+                        let vr = vt.as_ptr().add(t * d + c0);
+                        let mut v: [$v; V] = [$zero(); V];
+                        for j in 0..V {
+                            v[j] = $load(vr.add(j * $n));
+                        }
+                        for i in 0..R {
+                            let pt = $set1(*p.get_unchecked(rs[i] * BK + t));
+                            for j in 0..V {
+                                lane[i][j] = $fmadd(pt, v[j], lane[i][j]);
+                            }
+                        }
+                    }
+                    for i in 0..R {
+                        let a = acc.as_mut_ptr().add(rs[i] * d + c0);
+                        for j in 0..V {
+                            $store(a.add(j * $n), lane[i][j]);
+                        }
+                    }
+                    c0 += LANES;
+                }
+            }
+        }
+    };
+}
+
+host_prefill_kernels!(
+    host_scores_avx2,
+    host_values_avx2,
+    "avx2,fma,f16c,bmi2",
+    __m256,
+    8,
+    _mm256_setzero_ps,
+    _mm256_set1_ps,
+    _mm256_loadu_ps,
+    _mm256_storeu_ps,
+    _mm256_fmadd_ps
+);
+host_prefill_kernels!(
+    host_scores_avx512,
+    host_values_avx512,
+    "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni",
+    __m512,
+    16,
+    _mm512_setzero_ps,
+    _mm512_set1_ps,
+    _mm512_loadu_ps,
+    _mm512_storeu_ps,
+    _mm512_fmadd_ps
+);
+
 /// Keys each split of a card decode over an F16 cache covers at full capacity, and the
 /// bounds on the split count: enough splits to fill the card at short context, few enough
 /// that the combine stays cheap.
@@ -1001,32 +1175,6 @@ mod sink_attention_tests {
                 ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
             })
             .collect()
-    }
-
-    /// The 512-bit `fdot` and `faxpy` return the bits of the AVX2 ones, at every length around
-    /// the 16-lane step (head sizes 64 and 128 included).
-    #[test]
-    fn avx512_attention_helpers_have_the_bits_of_the_avx2_ones() {
-        if !crate::cpu::hardware_has_avx512() {
-            return;
-        }
-        for n in [0usize, 1, 7, 8, 15, 16, 17, 31, 32, 33, 64, 100, 128, 129] {
-            let (a, b) = (values(n, 3, 2.0), values(n, 5, 2.0));
-            let (want, got) = unsafe {
-                (
-                    GenericTransformerLayer::fdot_avx2(&a, &b),
-                    GenericTransformerLayer::fdot_avx512(&a, &b),
-                )
-            };
-            assert_eq!(got.to_bits(), want.to_bits(), "fdot, n={n}");
-            let (mut x, mut y) = (values(n, 7, 1.0), values(n, 7, 1.0));
-            unsafe {
-                GenericTransformerLayer::faxpy_avx2(0.37, &a, &mut x);
-                GenericTransformerLayer::faxpy_avx512(0.37, &a, &mut y);
-            }
-            let same = x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits());
-            assert!(same, "faxpy, n={n}");
-        }
     }
 
     /// Scalar attention with sinks: query row `i` at absolute position `base + i` sees the
@@ -1209,6 +1357,127 @@ mod sink_attention_tests {
             scale,
         );
         assert!(max_diff(&got, &want) < 1e-5);
+    }
+
+    /// The host prefill attention matches the reference across key tiles, query blocks and a
+    /// head wider than one accumulator, with and without a window and a sink.
+    #[test]
+    fn the_host_flash_prefill_matches_the_reference_across_tiles() {
+        let (nh, nkv, hd) = (6usize, 2usize, 80usize);
+        let (seq, base) = (37usize, 150usize);
+        let kv = base + seq;
+        let qv = values(nh * seq * hd, 11, 1.0);
+        let kvv = values(nkv * kv * hd, 12, 1.0);
+        let vv = values(nkv * kv * hd, 13, 1.0);
+        let sv = values(nh, 14, 2.0);
+        let dev = Device::Cpu;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = Tensor::from_vec(qv.clone(), (1, nh, seq, hd), &dev).unwrap();
+        let k = Tensor::from_vec(kvv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+        let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+        for window in [None, Some(70)] {
+            for sinks in [None, Some(&sv)] {
+                let mask = causal_mask(seq, base, window);
+                let got = GenericTransformerLayer::flash_attn_prefill_cpu(
+                    &q,
+                    &k,
+                    &v,
+                    &mask,
+                    scale,
+                    nh / nkv,
+                    sinks.map(|s| s.as_slice()),
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+                let silent = vec![f32::NEG_INFINITY; nh];
+                let want = reference(
+                    &qv,
+                    &kvv,
+                    &vv,
+                    sinks.unwrap_or(&silent),
+                    (nh, nkv, seq, kv, hd),
+                    base,
+                    window,
+                    scale,
+                );
+                assert!(max_diff(&got, &want) < 1e-5, "window {window:?}");
+            }
+        }
+    }
+
+    /// The 512-bit host prefill attention returns the bits of the AVX2 one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx512_host_flash_prefill_has_the_bits_of_the_avx2_one() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        let (nh, nkv, hd) = (8usize, 2usize, 128usize);
+        let (seq, base) = (40usize, 100usize);
+        let kv = base + seq;
+        let qv = values(nh * seq * hd, 21, 1.0);
+        let kvv = values(nkv * kv * hd, 22, 1.0);
+        let vv = values(nkv * kv * hd, 23, 1.0);
+        let md: Vec<f32> = (0..seq)
+            .flat_map(|i| (0..kv).map(move |j| if j > base + i { 1.0 } else { 0.0 }))
+            .collect();
+        let job = HostPrefillAttn {
+            q: &qv,
+            k: &kvv,
+            v: &vv,
+            mask: &md,
+            head_independent: true,
+            seq_q: seq,
+            seq_kv: kv,
+            d: hd,
+            n_rep: nh / nkv,
+            scale: 0.1,
+            sinks: None,
+        };
+        let (mut a, mut b) = (vec![0f32; nh * seq * hd], vec![0f32; nh * seq * hd]);
+        let (pa, pb) = (
+            HostPrefillOut(a.as_mut_ptr()),
+            HostPrefillOut(b.as_mut_ptr()),
+        );
+        for kvh in 0..nkv {
+            // SAFETY: the CPU has AVX-512, which implies every feature both kernels enable.
+            unsafe {
+                job.run_avx2(kvh, 0, seq, &pa);
+                job.run_avx512(kvh, 0, seq, &pb);
+            }
+        }
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    }
+
+    /// Time of one host prefill attention call at a long-context chunk: a prompt chunk of 512
+    /// queries against 10 007 keys, 64 query heads over 8 key/value heads of 128.
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn host_prefill_attention_timing() {
+        let (nh, nkv, hd, seq, kv) = (64usize, 8usize, 128usize, 512usize, 10_007usize);
+        let dev = Device::Cpu;
+        let q = Tensor::from_vec(values(nh * seq * hd, 1, 1.0), (1, nh, seq, hd), &dev).unwrap();
+        let k = Tensor::from_vec(values(nkv * kv * hd, 2, 1.0), (1, nkv, kv, hd), &dev).unwrap();
+        let v = Tensor::from_vec(values(nkv * kv * hd, 3, 1.0), (1, nkv, kv, hd), &dev).unwrap();
+        let mask = causal_mask(seq, kv - seq, None);
+        let scale = 1.0 / (hd as f32).sqrt();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            GenericTransformerLayer::flash_attn_prefill_cpu(
+                &q,
+                &k,
+                &v,
+                &mask,
+                scale,
+                nh / nkv,
+                None,
+            )
+            .unwrap();
+            eprintln!("host prefill attention: {:?}", t.elapsed());
+        }
     }
 
     #[test]
