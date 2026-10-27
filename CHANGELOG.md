@@ -22,6 +22,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: keep serving when many prompts arrive at once on a card.
 - Serving: prefill no more prompt tokens in a step than the reserve holds.
 - Vision: place the text after a tall image as the reference does.
+- Models: load the model of an Ollama manifest that lists its projector first.
 
 ## [0.4.2] - 2026-10-28
 

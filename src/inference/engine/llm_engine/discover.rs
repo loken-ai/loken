@@ -55,9 +55,13 @@ impl LlmEngine {
     pub(super) fn load_from_manifest(&self, manifest_path: &std::path::Path) -> Option<PathBuf> {
         if let Ok(content) = std::fs::read_to_string(manifest_path) {
             if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
-                // Try to get the first layer's digest (should be the model file)
+                // The model layer, wherever the manifest lists it: a vision model may list its
+                // projector first.
                 if let Some(layers) = manifest.get("layers").and_then(|l| l.as_array()) {
-                    if let Some(layer) = layers.first() {
+                    if let Some(layer) = layers.iter().find(|l| {
+                        l.get("mediaType").and_then(|m| m.as_str())
+                            == Some("application/vnd.ollama.image.model")
+                    }) {
                         if let Some(digest) = layer.get("digest").and_then(|d| d.as_str()) {
                             // Extract models root
                             if let Some(root) = Self::extract_models_root(manifest_path) {
@@ -755,6 +759,44 @@ mod hub_gguf_tests {
             Some(2)
         );
         assert_eq!(split_part(std::path::Path::new("a-of-b.gguf")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    /// The model blob of a manifest is its model layer, though a vision model lists its
+    /// projector first.
+    #[test]
+    fn the_model_layer_is_read_wherever_the_manifest_lists_it() {
+        let root = std::env::temp_dir().join(format!("loken-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest = root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join("library")
+            .join("m")
+            .join("t");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        for hash in ["aaaa", "bbbb"] {
+            std::fs::write(root.join("blobs").join(format!("sha256-{hash}")), b"x").unwrap();
+        }
+        std::fs::write(
+            &manifest,
+            r#"{"layers": [
+                {"mediaType": "application/vnd.ollama.image.projector", "digest": "sha256:aaaa"},
+                {"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:bbbb"}
+            ]}"#,
+        )
+        .unwrap();
+        let engine = <LlmEngine as crate::inference::engine::InferenceEngine>::new();
+        assert_eq!(
+            engine.load_from_manifest(&manifest),
+            Some(root.join("blobs").join("sha256-bbbb"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
