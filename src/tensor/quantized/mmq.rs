@@ -15,6 +15,11 @@ pub(super) struct MmqWorkspace {
     /// an LLM and an image engine sharing a card, two requests in flight - and the mutex
     /// below only orders the *host*, which stops mattering the moment a launch returns.
     pub(super) last_use: Option<crate::tensor::gpu_runtime::driver::CudaEvent>,
+    /// Whether a captured graph addresses `main`: its replays write there for as long as
+    /// the graph lives, so a larger workspace takes its place in `held` instead of freeing it.
+    pub(super) main_in_graph: bool,
+    /// Workspaces that captured graphs still address, kept until the slot is released.
+    pub(super) held: Vec<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
 }
 
 #[cfg(feature = "gpu")]

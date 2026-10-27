@@ -1658,6 +1658,64 @@ fn bf16_dequantised_gemm_matches_at(
     }
 }
 
+/// A graph captured over the tiled matmul writes into the workspace it was recorded with: a
+/// later call over many more rows grows the workspace and keeps that one, and the graph replays
+/// the answer it was captured with.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_larger_matmul_keeps_the_workspace_a_graph_writes_into() {
+    use crate::tensor::{cuda::CudaDevice, gpu_runtime::driver::DevicePtr, DType, Tensor};
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the workspace a graph holds is NOT covered by this run");
+        return;
+    };
+    let device = Device::Cuda(dev.clone());
+    let (n, k) = (256usize, 512usize);
+    let qm = hashed_gpu_weight(GgmlDType::Q4K, n, k, 0x9a9, &device);
+    let rows_of = |m: usize| {
+        Tensor::from_vec_f32(
+            (0..m * k)
+                .map(|i| ((i % 61) as f32 - 30.0) / 31.0)
+                .collect(),
+            vec![m, k],
+        )
+        .unwrap()
+        .to_device(&device)
+        .unwrap()
+    };
+    let small = rows_of(16);
+    let want = qm.forward(&small).unwrap().to_vec_f32();
+    let stream = dev.stream().clone();
+    let out = Tensor::zeros_on((16usize, n), DType::F32, &device).unwrap();
+    crate::tensor::cuda_ext::begin_capture(&stream).unwrap();
+    let y = qm.forward(&small).unwrap();
+    out.slice_set(&y, 0, 0).unwrap();
+    let graph = crate::tensor::cuda_ext::end_capture(&stream)
+        .unwrap()
+        .expect("a graph");
+    let ptrs = |main: bool| -> Vec<u64> {
+        let map = super::mmq::MMQ_WORKSPACES.get().unwrap().lock().unwrap();
+        let slot = &map[&dev.ordinal()];
+        match main {
+            true => slot.main.iter().collect::<Vec<_>>(),
+            false => slot.held.iter().collect(),
+        }
+        .into_iter()
+        .map(|b| b.device_ptr(&stream).0)
+        .collect()
+    };
+    let addressed = ptrs(true);
+    // Far more rows than any other test of this suite runs through the tiled matmul.
+    let _ = qm.forward(&rows_of(8192)).unwrap().to_vec_f32();
+    let held = ptrs(false);
+    assert!(
+        addressed.iter().all(|p| held.contains(p)),
+        "the workspace the graph writes into was freed when a larger call grew it"
+    );
+    graph.launch().unwrap();
+    assert_eq!(out.to_vec_f32(), want, "the replay gave another answer");
+}
+
 /// A second dequantised GEMM of the same shape on the same stream runs in the same scratch:
 /// same address, same length, nothing allocated.
 #[cfg(feature = "gpu")]

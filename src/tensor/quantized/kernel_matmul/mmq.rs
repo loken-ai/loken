@@ -38,6 +38,16 @@ impl QKernelMatMul {
         let mut ws_guard = ws_map.lock().unwrap_or_else(|e| e.into_inner());
         let slot = ws_guard.entry(dev.ordinal()).or_default();
         if slot.main.as_ref().map(|s| s.len()) < Some(ws_bytes) || slot.main.is_none() {
+            // A workspace a captured graph writes into stays allocated; the new one at least
+            // doubles it, so the ones kept never add up to more than the one in use.
+            let mut ws_bytes = ws_bytes;
+            if slot.main_in_graph {
+                if let Some(old) = slot.main.take() {
+                    ws_bytes = ws_bytes.max(2 * old.len());
+                    slot.held.push(old);
+                }
+                slot.main_in_graph = false;
+            }
             // RELEASE THE OLD ONE FIRST. `slot.main = Some(alloc(..))` evaluates the
             // allocation before the assignment, so the previous (smaller) buffer was
             // still live while the bigger one was being carved out - double peak at
@@ -133,6 +143,7 @@ impl QKernelMatMul {
         // Publish our own mark before the mutex goes: from here the buffers are ours until
         // these two kernels retire, and the next taker waits on this.
         if recording {
+            slot.main_in_graph = true;
             return Ok(out);
         }
         let ev = match slot.last_use.take() {
