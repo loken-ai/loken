@@ -4,7 +4,7 @@
 //! A text token at scalar position `p` rotates at `(p, p, p)`, which is the one-axis
 //! rotation, so text-only requests never come here. An image run of a `gh x gw` merged grid
 //! starting at `p0` gives its `i`-th token `(p0, p0 + i / gw, p0 + i % gw)`, and the text
-//! after it resumes at `p0 + gw`. Rotary pair `j` rotates by axis `j % 3`.
+//! after it resumes at `p0 + max(gh, gw)`. Rotary pair `j` rotates by axis `j % 3`.
 
 #[allow(unused_imports)]
 use super::*;
@@ -35,7 +35,7 @@ pub fn mrope_positions(ids: &[u32], image_token: u32, grids: &[(usize, usize)]) 
             for k in 0..n {
                 out.push([p, p + (k / gw) as i32, p + (k % gw) as i32]);
             }
-            p += gw as i32;
+            p += gh.max(gw) as i32;
             i += n;
             image += 1;
         } else {
@@ -251,6 +251,26 @@ mod tests {
                 [2, 3, 2],
                 [2, 3, 3],
                 [4, 4, 4],
+            ]
+        );
+    }
+
+    /// The text after an image taller than wide resumes past its height, and the runs of a
+    /// video's frames take their grids in turn.
+    #[test]
+    fn the_text_resumes_past_the_larger_side_of_each_grid() {
+        let img = 7u32;
+        let ids = [img, img, img, 30, img, img, 40];
+        assert_eq!(
+            mrope_positions(&ids, img, &[(3, 1), (1, 2)]),
+            vec![
+                [0, 0, 0],
+                [0, 1, 0],
+                [0, 2, 0],
+                [3, 3, 3],
+                [4, 4, 4],
+                [4, 4, 5],
+                [6, 6, 6],
             ]
         );
     }
