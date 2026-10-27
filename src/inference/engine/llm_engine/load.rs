@@ -587,10 +587,18 @@ pub(super) fn awq_eos_tokens(dir: &str) -> Option<(u32, Vec<u32>)> {
     Some((first, rest.to_vec()))
 }
 
+/// A vision tower as the load placed it: one that runs beside the text model, or one whose
+/// embeddings splice into the text stream.
+enum Placed {
+    Tower(VisionTower),
+    Spliced(crate::inference::model::qwen35::vision::Qwen35Vision),
+}
+
 pub(super) fn try_wrap_with_vision(
-    text: GenericHeteroTransformer,
+    mut text: GenericHeteroTransformer,
     projector_blob: Option<&std::path::Path>,
     keep: u64,
+    vocab: &[(&'static str, u32)],
 ) -> AnyResult<BoxedModelBackend> {
     let Some(blob) = projector_blob else {
         return Ok(Box::new(GenericBackend(text)));
@@ -609,7 +617,21 @@ pub(super) fn try_wrap_with_vision(
     if crate::inference::model_facts::audio_facts(&projector_type).is_some() {
         return Ok(attach_audio_tower(text, blob, keep));
     }
-    if !matches!(projector_type.as_str(), "pixtral" | "mlp") {
+    // A tower whose embeddings splice into the text stream at a vocabulary entry.
+    let spliced = crate::inference::model_facts::vision_facts(&projector_type).map(|facts| {
+        vocab
+            .iter()
+            .find(|(placeholder, _)| *placeholder == facts.placeholder)
+            .map(|&(_, id)| id)
+    });
+    if let Some(None) = spliced {
+        info!(
+            "📷 projector {} splices at a token the vocabulary lacks; text only",
+            blob.display()
+        );
+        return Ok(Box::new(GenericBackend(text)));
+    }
+    if spliced.is_none() && !matches!(projector_type.as_str(), "pixtral" | "mlp") {
         info!(
             "📷 projector {} has type {:?}, which no tower here loads; text only",
             blob.display(),
@@ -620,10 +642,10 @@ pub(super) fn try_wrap_with_vision(
     // The tower runs once per image, so it is offered the cards the text model holds no
     // layer on first, then the text model's cards with `keep` left free for its work and
     // cache. It holds its weights and the staging of loading them.
-    let tower = if projector_type == "pixtral" {
-        "Pixtral"
-    } else {
-        "CLIP"
+    let tower = match projector_type.as_str() {
+        "pixtral" => "Pixtral",
+        "mlp" => "CLIP",
+        other => other,
     };
     let bytes = std::fs::metadata(blob).map(|m| m.len()).unwrap_or(0);
     let need = bytes.saturating_add(crate::inference::place::runtime_demand::load_runtime_floor(
@@ -655,26 +677,47 @@ pub(super) fn try_wrap_with_vision(
                 blob.display(),
                 device.location()
             );
-            if projector_type == "pixtral" {
+            if spliced.is_some() {
+                // The spliced tower runs on a card.
+                if device.is_cpu() {
+                    return Err(anyhow!("no card holds the tower"));
+                }
+                let mut file = std::fs::File::open(blob)?;
+                let content = crate::tensor::quantized::gguf_file::Content::read(&mut file)
+                    .map_err(|e| anyhow!("{e}"))?;
+                crate::inference::model::qwen35::vision::Qwen35Vision::from_gguf(
+                    &content,
+                    &mut file,
+                    text.hidden_size(),
+                    &device,
+                )
+                .map(Placed::Spliced)
+                .map_err(|e| anyhow!("{e}"))
+            } else if projector_type == "pixtral" {
                 crate::inference::model::pixtral::PixtralVision::load_mmproj(
                     &blob.to_string_lossy(),
                     &device,
                 )
-                .map(VisionTower::Pixtral)
+                .map(|v| Placed::Tower(VisionTower::Pixtral(v)))
                 .map_err(|e| anyhow!("{e}"))
             } else {
                 crate::inference::model::moondream::vision::MoondreamVisionEncoder::from_clip_gguf(
                     blob, &device,
                 )
-                .map(VisionTower::Clip)
+                .map(|v| Placed::Tower(VisionTower::Clip(v)))
                 .map_err(|e| anyhow!("{e}"))
             }
         },
     );
     match placed {
-        Ok((vision, _)) => {
+        Ok((Placed::Tower(vision), _)) => {
             info!("✅ Vision tower loaded in {} ms", t0.elapsed().as_millis());
             Ok(Box::new(GenericVisionBackend { text, vision }))
+        }
+        Ok((Placed::Spliced(tower), _)) => {
+            info!("✅ Vision tower loaded in {} ms", t0.elapsed().as_millis());
+            text.attach_spliced_vision(tower, spliced.flatten().unwrap_or_default());
+            Ok(Box::new(GenericBackend(text)))
         }
         Err(e) => {
             warn!("⚠️  {tower} vision load failed ({e}); model will work for text only");

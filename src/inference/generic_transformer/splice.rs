@@ -77,6 +77,16 @@ impl GenericHeteroTransformer {
         self.spliced_vision.as_ref().map(|v| v.image_token)
     }
 
+    /// Splices the output of `tower` into the text stream at runs of `image_token`, for a tower
+    /// read from a projector file beside the model's.
+    pub fn attach_spliced_vision(
+        &mut self,
+        tower: crate::inference::model::qwen35::vision::Qwen35Vision,
+        image_token: u32,
+    ) {
+        self.spliced_vision = Some(SplicedVision { tower, image_token });
+    }
+
     /// Prefills `prompt` with its one placeholder expanded to the image's merged grid and
     /// the tower's embeddings over it. Returns the last logits and the next decode position,
     /// the logical position past every prefilled one rather than the sequence length.

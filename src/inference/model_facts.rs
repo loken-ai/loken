@@ -365,6 +365,36 @@ const AUDIO: &[(&str, AudioFacts)] = &[
     ),
 ];
 
+/// What a vision projector whose embeddings splice into the text stream needs from the text
+/// model.
+pub struct VisionFacts {
+    /// The vocabulary entry a prompt carries where the image's embeddings go.
+    pub placeholder: &'static str,
+}
+
+const VISION: &[(&str, VisionFacts)] = &[
+    // The merger of the Qwen3-VL family: its embeddings replace a run of the image pad.
+    (
+        "qwen3vl_merger",
+        VisionFacts {
+            placeholder: "<|image_pad|>",
+        },
+    ),
+];
+
+/// The vision facts of a projector type, `None` when its tower is not spliced into the text.
+pub fn vision_facts(projector_type: &str) -> Option<&'static VisionFacts> {
+    VISION
+        .iter()
+        .find(|(k, _)| *k == projector_type)
+        .map(|(_, f)| f)
+}
+
+/// Every placeholder a spliced vision projector may ask the text model's vocabulary for.
+pub fn vision_placeholders() -> impl Iterator<Item = &'static str> {
+    VISION.iter().map(|(_, f)| f.placeholder)
+}
+
 /// The audio facts of a projector type (or checkpoint model type), `None` when the table has
 /// no row for it.
 pub fn audio_facts(projector_type: &str) -> Option<&'static AudioFacts> {

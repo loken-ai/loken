@@ -125,45 +125,108 @@ impl Qwen35Vision {
         device: &Device,
     ) -> Result<Self> {
         let mut cfg = VisionConfig::from_gguf(c, text_hidden);
-        // patch_embed weight [16,16,2,3456] = 1152x1536 elems -> Linear(1536->1152).
-        let pw = ld(c, r, "v.patch_embed.weight", device)?;
-        let patch_dim = pw.elem_count() / cfg.hidden;
-        let patch_w = pw.reshape((cfg.hidden, patch_dim))?;
-        let patch_b = ld(c, r, "v.patch_embed.bias", device)?;
-        let pos_embed = ld(c, r, "v.pos_embed.weight", device)?; // [n_pos, hidden]
+        // Two namings: the tower inside an ollama model's file, and a llama.cpp projector file,
+        // which holds the patch embedding as one slice per frame of a temporal patch, fuses the
+        // attention projections and calls the merger by position.
+        let projector = c.tensor_infos.contains_key("v.patch_embd.weight");
+        let (patch_w, patch_b, pos_embed) = if projector {
+            let mut slice = |name: &str| -> Result<Tensor> {
+                let w = ld(c, r, name, device)?;
+                let per_channel = w.elem_count() / (cfg.hidden * 3);
+                w.reshape((cfg.hidden, 3, 1, per_channel))
+            };
+            // [hidden, channel, frame, pixel]: the order the patches are laid out in.
+            let w = Tensor::cat(
+                &[
+                    &slice("v.patch_embd.weight")?,
+                    &slice("v.patch_embd.weight.1")?,
+                ],
+                2,
+            )?;
+            let patch_dim = w.elem_count() / cfg.hidden;
+            (
+                w.reshape((cfg.hidden, patch_dim))?,
+                ld(c, r, "v.patch_embd.bias", device)?,
+                ld(c, r, "v.position_embd.weight", device)?,
+            )
+        } else {
+            // patch_embed weight [16,16,2,3456] = 1152x1536 elems -> Linear(1536->1152).
+            let pw = ld(c, r, "v.patch_embed.weight", device)?;
+            let patch_dim = pw.elem_count() / cfg.hidden;
+            (
+                pw.reshape((cfg.hidden, patch_dim))?,
+                ld(c, r, "v.patch_embed.bias", device)?,
+                ld(c, r, "v.pos_embed.weight", device)?,
+            )
+        };
+        let pos_embed = pos_embed.reshape((pos_embed.elem_count() / cfg.hidden, cfg.hidden))?;
         cfg.grid_per_side = (pos_embed.dim(0)? as f64).sqrt().round() as usize;
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("v.blk.{i}");
-            blocks.push(VBlock {
-                q: ld(c, r, &format!("{p}.attn_q.weight"), device)?,
-                qb: ld(c, r, &format!("{p}.attn_q.bias"), device)?,
-                k: ld(c, r, &format!("{p}.attn_k.weight"), device)?,
-                kb: ld(c, r, &format!("{p}.attn_k.bias"), device)?,
-                v: ld(c, r, &format!("{p}.attn_v.weight"), device)?,
-                vb: ld(c, r, &format!("{p}.attn_v.bias"), device)?,
-                o: ld(c, r, &format!("{p}.attn_out.weight"), device)?,
-                ob: ld(c, r, &format!("{p}.attn_out.bias"), device)?,
-                n1w: ld(c, r, &format!("{p}.norm1.weight"), device)?,
-                n1b: ld(c, r, &format!("{p}.norm1.bias"), device)?,
-                n2w: ld(c, r, &format!("{p}.norm2.weight"), device)?,
-                n2b: ld(c, r, &format!("{p}.norm2.bias"), device)?,
-                fc1: ld(c, r, &format!("{p}.mlp.linear_fc1.weight"), device)?,
-                fc1b: ld(c, r, &format!("{p}.mlp.linear_fc1.bias"), device)?,
-                fc2: ld(c, r, &format!("{p}.mlp.linear_fc2.weight"), device)?,
-                fc2b: ld(c, r, &format!("{p}.mlp.linear_fc2.bias"), device)?,
+            let mut w = |name: &str| ld(c, r, &format!("{p}.{name}"), device);
+            blocks.push(if projector {
+                let h = cfg.hidden;
+                let qkv = w("attn_qkv.weight")?.reshape((3 * h, h))?;
+                let qkvb = w("attn_qkv.bias")?;
+                let part = |t: &Tensor, i: usize| t.narrow(0, i * h, h)?.contiguous();
+                VBlock {
+                    q: part(&qkv, 0)?,
+                    qb: part(&qkvb, 0)?,
+                    k: part(&qkv, 1)?,
+                    kb: part(&qkvb, 1)?,
+                    v: part(&qkv, 2)?,
+                    vb: part(&qkvb, 2)?,
+                    o: w("attn_out.weight")?,
+                    ob: w("attn_out.bias")?,
+                    n1w: w("ln1.weight")?,
+                    n1b: w("ln1.bias")?,
+                    n2w: w("ln2.weight")?,
+                    n2b: w("ln2.bias")?,
+                    fc1: w("ffn_up.weight")?,
+                    fc1b: w("ffn_up.bias")?,
+                    fc2: w("ffn_down.weight")?,
+                    fc2b: w("ffn_down.bias")?,
+                }
+            } else {
+                VBlock {
+                    q: w("attn_q.weight")?,
+                    qb: w("attn_q.bias")?,
+                    k: w("attn_k.weight")?,
+                    kb: w("attn_k.bias")?,
+                    v: w("attn_v.weight")?,
+                    vb: w("attn_v.bias")?,
+                    o: w("attn_out.weight")?,
+                    ob: w("attn_out.bias")?,
+                    n1w: w("norm1.weight")?,
+                    n1b: w("norm1.bias")?,
+                    n2w: w("norm2.weight")?,
+                    n2b: w("norm2.bias")?,
+                    fc1: w("mlp.linear_fc1.weight")?,
+                    fc1b: w("mlp.linear_fc1.bias")?,
+                    fc2: w("mlp.linear_fc2.weight")?,
+                    fc2b: w("mlp.linear_fc2.bias")?,
+                }
             });
         }
+        let mut merger = |ollama: &str, projector_name: &str| {
+            ld(
+                c,
+                r,
+                if projector { projector_name } else { ollama },
+                device,
+            )
+        };
         Ok(Self {
             patch_w,
             patch_b,
             pos_embed,
-            merger_nw: ld(c, r, "v.merger.norm.weight", device)?,
-            merger_nb: ld(c, r, "v.merger.norm.bias", device)?,
-            merger_fc1: ld(c, r, "v.merger.linear_fc1.weight", device)?,
-            merger_fc1b: ld(c, r, "v.merger.linear_fc1.bias", device)?,
-            merger_fc2: ld(c, r, "v.merger.linear_fc2.weight", device)?,
-            merger_fc2b: ld(c, r, "v.merger.linear_fc2.bias", device)?,
+            merger_nw: merger("v.merger.norm.weight", "v.post_ln.weight")?,
+            merger_nb: merger("v.merger.norm.bias", "v.post_ln.bias")?,
+            merger_fc1: merger("v.merger.linear_fc1.weight", "mm.0.weight")?,
+            merger_fc1b: merger("v.merger.linear_fc1.bias", "mm.0.bias")?,
+            merger_fc2: merger("v.merger.linear_fc2.weight", "mm.2.weight")?,
+            merger_fc2b: merger("v.merger.linear_fc2.bias", "mm.2.bias")?,
             cfg,
             blocks,
             device: device.clone(),

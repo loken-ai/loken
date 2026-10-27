@@ -457,6 +457,11 @@ impl LlmEngine {
                 Some(s) => s.merged_content(),
                 None => content,
             };
+            // The placeholders a spliced vision projector may ask the vocabulary for.
+            let vision_vocab: Vec<(&'static str, u32)> =
+                crate::inference::model_facts::vision_placeholders()
+                    .filter_map(|p| super::gguf::gguf_token_id(&content, p).map(|id| (p, id)))
+                    .collect();
             // What the cards will hold: the shards of an AWQ checkpoint, the parts of a set, the
             // file otherwise.
             let file_size = match (&awq, &split) {
@@ -1425,6 +1430,7 @@ impl LlmEngine {
                                 model,
                                 projector_blob.as_deref().filter(|_| layer_share.is_none()),
                                 demand.whole().saturating_sub(demand.block_bytes + demand.head_bytes),
+                                &vision_vocab,
                             )?
                         }
 
