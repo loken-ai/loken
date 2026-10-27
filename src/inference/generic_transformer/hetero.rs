@@ -594,6 +594,9 @@ impl GenericHeteroTransformer {
         if self.spliced_audio.is_some() {
             return Some("speech tower");
         }
+        if self.spliced_vision.is_some() {
+            return Some("vision tower");
+        }
         if c.embed_scale.is_some() {
             return Some("embed_scale");
         }
