@@ -576,7 +576,7 @@ impl GenericHeteroTransformer {
     }
 
     /// Why this model can't use the continuous-batch paged path (None = eligible).
-    /// Shared by `batched_paged_decode`/`paged_prefill_seq` (the gate) and the
+    /// Shared by `batched_paged_decode`/`paged_prefill_batch` (the gate) and the
     /// serving layer (to decide whether to route a model through ContinuousServer).
     pub fn cb_unsupported_reason(&self) -> Option<&'static str> {
         let c = &self.config;
@@ -1510,30 +1510,46 @@ impl GenericHeteroTransformer {
         Some(n)
     }
 
-    /// PREFILL one sequence's whole prompt in ONE forward (vs T single-token
-    /// decodes), writing all T positions' K/V into the paged stores at `slots`
-    /// and returning the LAST position's logits `[1, vocab]`. Same dense-arch
-    /// support + compute dtype as `batched_paged_decode`. This is the TTFT lever
-    /// for continuous-batch serving - without it each request pays T serial
-    /// memory-bound single-token forwards before its first token.
-    pub fn paged_prefill_seq(
+    /// PREFILL the whole prompts of several sequences in ONE forward, `seqs` holding each
+    /// sequence's tokens and the paged-store slots of their K/V. The projections run over the
+    /// tokens of every sequence together and the attention over each sequence's own tokens;
+    /// all positions' K/V are written into the paged stores. Returns the LAST position's
+    /// logits of each sequence, `[seqs.len(), vocab]`. Same dense-arch support + compute
+    /// dtype as `batched_paged_decode`.
+    pub fn paged_prefill_batch(
         &self,
-        tokens: &[u32],
-        slots: &[usize],
+        seqs: &[(&[u32], &[usize])],
         stores: &mut [crate::inference::cache::paged_kv::PagedKvStore],
     ) -> Result<Tensor> {
         use crate::tensor::Tensor;
         let c = &self.config;
-        let t = tokens.len();
+        let lens: Vec<usize> = seqs.iter().map(|(tokens, _)| tokens.len()).collect();
+        let starts: Vec<usize> = lens
+            .iter()
+            .scan(0, |at, &n| {
+                let start = *at;
+                *at += n;
+                Some(start)
+            })
+            .collect();
+        let t: usize = lens.iter().sum();
+        let tokens: Vec<u32> = seqs
+            .iter()
+            .flat_map(|(tokens, _)| tokens.iter().copied())
+            .collect();
+        let slots: Vec<usize> = seqs
+            .iter()
+            .flat_map(|(_, slots)| slots.iter().copied())
+            .collect();
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let scale = 1.0f32 / (hd as f32).sqrt();
         let base = c.rope_freq_base;
         let edev = self.embeddings.embeddings().device().clone();
         let dev = self.compute_device();
         let cdt = Self::residual_dtype(&dev);
-        let positions: Vec<usize> = (0..t).collect();
+        let positions: Vec<usize> = lens.iter().flat_map(|&n| 0..n).collect();
 
-        let ids = Tensor::from_vec(tokens.to_vec(), &[t, 1][..], &edev)?;
+        let ids = Tensor::from_vec(tokens, &[t, 1][..], &edev)?;
         let mut x = self
             .embeddings
             .forward(&ids)?
@@ -1603,14 +1619,27 @@ impl GenericHeteroTransformer {
             let v_f = v.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
             // persist all T positions' K/V for the subsequent decode phase
             stores[li].write(
-                slots,
+                &slots,
                 &k_rot.reshape(&[t, nkv * hd][..])?,
                 &v_f.reshape(&[t, nkv * hd][..])?,
             )?;
-            let attn = crate::inference::cache::paged_attention::paged_prefill_attn_tensor(
-                &q_rot, &k_rot, &v_f, nh, nkv, hd, scale,
-            )?
-            .reshape(&[t, nh * hd][..])?;
+            let attn = starts
+                .iter()
+                .zip(&lens)
+                .map(|(&start, &n)| {
+                    crate::inference::cache::paged_attention::paged_prefill_attn_tensor(
+                        &q_rot.narrow(0, start, n)?,
+                        &k_rot.narrow(0, start, n)?,
+                        &v_f.narrow(0, start, n)?,
+                        nh,
+                        nkv,
+                        hd,
+                        scale,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let attn =
+                Tensor::cat(&attn.iter().collect::<Vec<_>>(), 0)?.reshape(&[t, nh * hd][..])?;
             let o = attn
                 .to_dtype(cdt)
                 .and_then(|a| layer.attn_output.forward(&a))?
@@ -1644,9 +1673,13 @@ impl GenericHeteroTransformer {
             x = residual2.broadcast_add(&d)?;
             note_if_non_finite(&format!("layer {li}"), &x);
         }
-        // logits for the last position only
-        let last = x.narrow(0, t - 1, 1)?;
-        self.head_on_device(&last)
+        // logits for the last position of each sequence only
+        let last = starts
+            .iter()
+            .zip(&lens)
+            .map(|(&start, &n)| x.narrow(0, start + n - 1, 1))
+            .collect::<Result<Vec<_>>>()?;
+        self.head_on_device(&Tensor::cat(&last.iter().collect::<Vec<_>>(), 0)?)
     }
 
     /// Prefix-cached prefill: compute ONLY the suffix `tokens[cached_len..]`,
@@ -1654,7 +1687,7 @@ impl GenericHeteroTransformer {
     /// from each layer's store via `block_table`) for attention instead of
     /// recomputing it. `suffix_slots` are the KV slots for the suffix positions
     /// (length `t - cached_len`). Returns the LAST position's logits - equivalent to
-    /// `paged_prefill_seq` over the whole prompt (validated) but skips the prefix's
+    /// `paged_prefill_batch` over the whole prompt (validated) but skips the prefix's
     /// projections + FFN (the multi-turn / shared-system-prompt win). `cached_len`
     /// must be block-aligned (a whole number of cached blocks).
     pub fn paged_prefill_seq_cached(

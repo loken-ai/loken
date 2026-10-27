@@ -288,6 +288,41 @@ pub fn paged_attn_decode_ragged_tensor(
     out.reshape(&[b, nh, hd][..])
 }
 
+/// Causal GQA attention of `q` `[tq, nh, hd]` over `k`, `v` `[tk, nkv, hd]` by the fused prefill
+/// kernel, query `i` at position `i + tk - tq`: `[tq, nh, hd]` in the dtype of `q`, or `None`
+/// where the device or shape has no kernel.
+fn fused_causal(
+    q: &crate::tensor::Tensor,
+    k: &crate::tensor::Tensor,
+    v: &crate::tensor::Tensor,
+    scale: f32,
+) -> crate::tensor::Result<Option<crate::tensor::Tensor>> {
+    #[cfg(feature = "gpu")]
+    if q.device().is_cuda() {
+        use crate::tensor::DType;
+        let (tq, nh, hd) = q.dims3()?;
+        let heads_first = |t: &crate::tensor::Tensor| -> crate::tensor::Result<_> {
+            t.to_dtype(DType::F16)?
+                .contiguous()?
+                .unsqueeze(0)?
+                .transpose(1, 2)
+        };
+        let q4 = q.unsqueeze(0)?.transpose(1, 2)?;
+        let y = crate::inference::kernel::fused::flash_prefill_gqa(
+            &q4,
+            &heads_first(k)?,
+            &heads_first(v)?,
+            scale,
+            0,
+        )?;
+        return y
+            .map(|y| y.reshape(&[tq, nh, hd][..])?.to_dtype(q.dtype()))
+            .transpose();
+    }
+    let _ = (q, k, v, scale);
+    Ok(None)
+}
+
 /// Causal multi-token PREFILL attention for ONE sequence (GQA). Processes all T
 /// prompt positions in one shot - q,k,v are [T, heads, hd]. Returns [T, nh, hd].
 /// This is the prefill counterpart to the decode paths: one forward over the
@@ -302,6 +337,9 @@ pub fn paged_prefill_attn_tensor(
     scale: f32,
 ) -> crate::tensor::Result<crate::tensor::Tensor> {
     use crate::tensor::ops::softmax_last_dim;
+    if let Some(y) = fused_causal(q, k, v, scale)? {
+        return Ok(y);
+    }
     let t = q.dims()[0];
     let g = nh / nkv;
     let dt = q.dtype();
@@ -357,6 +395,9 @@ pub fn paged_prefill_attn_suffix(
     use crate::tensor::ops::softmax_last_dim;
     let tsfx = q.dims()[0];
     let t = k.dims()[0];
+    if let Some(y) = fused_causal(q, k, v, scale)? {
+        return Ok(y);
+    }
     debug_assert_eq!(
         t,
         cached + tsfx,
@@ -752,5 +793,79 @@ mod tests {
         paged_attn_decode_seq(&mut s, 1, 1, 2, 0.123);
         assert!((out[0] - 42.0).abs() < 1e-6);
         assert!((out[1] + 9.0).abs() < 1e-6);
+    }
+
+    /// The fused kernel a card runs gives the attention the host computes, over a whole prompt
+    /// and over the suffix of a cached prefix.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_card_attends_a_prompt_as_the_host_does() {
+        use crate::tensor::{DType, Device, Tensor};
+        let Ok(card) = Device::new_cuda(0) else {
+            return;
+        };
+        let (t, nh, nkv, hd) = (37usize, 8usize, 2usize, 64usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 31 + seed * 17) % 97) as f32 / 97.0 - 0.5) * 2.0)
+                .collect()
+        };
+        let q = Tensor::from_vec(fill(t * nh * hd, 1), &[t, nh, hd][..], &Device::Cpu).unwrap();
+        let k = Tensor::from_vec(fill(t * nkv * hd, 2), &[t, nkv, hd][..], &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(fill(t * nkv * hd, 3), &[t, nkv, hd][..], &Device::Cpu).unwrap();
+        let on_card = |x: &Tensor| x.to_dtype(DType::F16).unwrap().to_device(&card).unwrap();
+        let rows = |x: Tensor| -> Vec<f32> {
+            x.to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let close = |got: Vec<f32>, want: Vec<f32>, what: &str| {
+            assert_eq!(got.len(), want.len(), "{what}");
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-2, "{what}: worst difference {worst}");
+        };
+        // The kernel's builds: NVIDIA from compute capability 8.0, AMD with matrix instructions.
+        let cuda = card.as_cuda_device().unwrap();
+        let has_kernel = match card.is_nvidia() {
+            true => cuda.has_ampere_tensor_cores(),
+            false => cuda.has_bf16_matrix_cores(),
+        };
+        let fused = fused_causal(&on_card(&q), &on_card(&k), &on_card(&v), scale).unwrap();
+        assert_eq!(
+            fused.is_some(),
+            has_kernel,
+            "the fused kernel runs where the card has it"
+        );
+        let want = paged_prefill_attn_tensor(&q, &k, &v, nh, nkv, hd, scale).unwrap();
+        let got =
+            paged_prefill_attn_tensor(&on_card(&q), &on_card(&k), &on_card(&v), nh, nkv, hd, scale)
+                .unwrap();
+        close(rows(got), rows(want), "whole prompt");
+
+        let cached = 16;
+        let sq = q.narrow(0, cached, t - cached).unwrap();
+        let want = paged_prefill_attn_suffix(&sq, &k, &v, cached, nh, nkv, hd, scale).unwrap();
+        let got = paged_prefill_attn_suffix(
+            &on_card(&sq),
+            &on_card(&k),
+            &on_card(&v),
+            cached,
+            nh,
+            nkv,
+            hd,
+            scale,
+        )
+        .unwrap();
+        close(rows(got), rows(want), "suffix of a cached prefix");
     }
 }

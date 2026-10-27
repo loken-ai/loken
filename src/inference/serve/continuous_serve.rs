@@ -496,26 +496,37 @@ impl BatchedModel for GhBatched {
             self.pace.decode_rows += dec.len() as u32;
             self.pace.decode += decode_start.elapsed();
         }
-        // -- prefills: each prompt in ONE forward (the TTFT lever) --
+        // -- prefills: the prompts without a cached prefix together in ONE forward, a
+        // prefix-cached prompt alone over its suffix --
         let prefill_start = std::time::Instant::now();
+        let mut whole = Vec::new();
         for (i, it) in items.iter().enumerate() {
-            if it.is_prefill {
-                self.pace.prompts += 1;
-                self.pace.prompt_tokens += it.tokens.len() as u32;
-                let l = if it.cached_len > 0 {
-                    // Prefix-cached: compute only the suffix, gather the prefix KV.
-                    self.model.paged_prefill_seq_cached(
-                        &it.tokens,
-                        &it.slots,
-                        it.cached_len,
-                        &it.block_table,
-                        &mut self.stores,
-                    )?
-                } else {
-                    self.model
-                        .paged_prefill_seq(&it.tokens, &it.slots, &mut self.stores)?
-                };
-                out[i] = sample_row(&l, 0, &it.sampling, &it.recent_tokens)?;
+            if !it.is_prefill {
+                continue;
+            }
+            self.pace.prompts += 1;
+            self.pace.prompt_tokens += it.tokens.len() as u32;
+            if it.cached_len == 0 {
+                whole.push(i);
+                continue;
+            }
+            let l = self.model.paged_prefill_seq_cached(
+                &it.tokens,
+                &it.slots,
+                it.cached_len,
+                &it.block_table,
+                &mut self.stores,
+            )?;
+            out[i] = sample_row(&l, 0, &it.sampling, &it.recent_tokens)?;
+        }
+        if !whole.is_empty() {
+            let seqs: Vec<(&[u32], &[usize])> = whole
+                .iter()
+                .map(|&i| (items[i].tokens.as_slice(), items[i].slots.as_slice()))
+                .collect();
+            let l = self.model.paged_prefill_batch(&seqs, &mut self.stores)?;
+            for (row, &i) in whole.iter().enumerate() {
+                out[i] = sample_row(&l, row, &items[i].sampling, &items[i].recent_tokens)?;
             }
         }
         self.pace.prefill += prefill_start.elapsed();
