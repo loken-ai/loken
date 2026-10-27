@@ -90,6 +90,12 @@ cuda_launchers! {
         out: *mut c_void, part_m: *mut f32, part_l: *mut f32, part_acc: *mut f32,
         batch: i32, n_head: i32, n_kv: i32, nsplit: i32, head_dim: i32, scale: f32,
         block_size: i32, max_blocks: i32, feat: i32);
+    loken_paged_flash_decode_gqa_f16(
+        q: *const c_void, kp: *const c_void,
+        vp: *const c_void, block_table: *const i32, seq_lens: *const i32,
+        out: *mut c_void, part_m: *mut f32, part_l: *mut f32, part_acc: *mut f32,
+        batch: i32, n_head: i32, n_kv: i32, nsplit: i32, gb: i32, head_dim: i32, scale: f32,
+        block_size: i32, max_blocks: i32, feat: i32);
 }
 
 /// The launchers whose safe wrappers keep the launcher's own name: declared apart and imported
@@ -139,3 +145,5 @@ mod cuda_numerics_tests;
 mod flash_prefill_gqa_parity;
 #[cfg(all(test, feature = "gpu"))]
 mod flash_prefill_parity;
+#[cfg(all(test, feature = "gpu"))]
+mod paged_decode_parity;

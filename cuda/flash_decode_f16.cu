@@ -473,6 +473,208 @@ extern "C" void loken_paged_flash_decode_split_f16(
         part_m, part_l, part_acc, (__half*)out, n_head, nsplit, head_dim);
 }
 
+// -- PAGED GQA flash-decode: the paged gather of the kernels above, one block of PGQ_WARPS
+// warps per (group of GB query heads sharing a KV head, batch, split). Each K/V row is read
+// once for the GB heads, in 16-byte runs: HD/8 lanes hold a row, so a warp holds 32/(HD/8)
+// tokens at a time and every lane keeps its own online softmax over the tokens it visits;
+// the states are merged across the lanes of a warp, then across the warps through shared
+// memory. With nsplit == 1 the result is written to `out`; otherwise each split leaves the
+// partials `loken_flash_decode_combine_f16_kernel` reads. ----------------------------------
+#define PGQ_WARPS 4
+
+// Eight halves, read and written as one 16-byte run.
+union Half8 {
+    uint4 u;
+    __half2 h[4];
+};
+
+template <int GB>
+__device__ __forceinline__ void pgq_merge(float* m, float* l, float (*acc)[8],
+                                          float om, float ol, const float* oacc, int g) {
+    const float nm = fmaxf(m[g], om);
+    if (nm == -INFINITY) return;
+    const float a = (m[g] == -INFINITY) ? 0.0f : expf(m[g] - nm);
+    const float b = (om == -INFINITY) ? 0.0f : expf(om - nm);
+    l[g] = l[g] * a + ol * b;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) acc[g][i] = acc[g][i] * a + oacc[i] * b;
+    m[g] = nm;
+}
+
+template <int HD, int GB>
+__global__ void __launch_bounds__(PGQ_WARPS * 32) loken_paged_flash_decode_gqa_f16_kernel(
+    const __half* __restrict__ Q, const __half* __restrict__ Kp, const __half* __restrict__ Vp,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    __half* __restrict__ out, float* __restrict__ part_m, float* __restrict__ part_l,
+    float* __restrict__ part_acc, int n_head, int n_kv, int nsplit, float scale,
+    int block_size, int max_blocks, int feat
+) {
+    constexpr int RL = HD / 8;             // lanes holding one row, 8 halves each
+    constexpr int TPW = 32 / RL;           // tokens a warp holds at a time
+    constexpr int STEP = TPW * PGQ_WARPS;  // tokens a block holds at a time
+    const int head0 = blockIdx.x * GB;     // first query head of this block
+    const int bi = blockIdx.y;
+    const int split = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int sub = lane / RL;
+    const int r = lane % RL;
+    const int kvh = head0 / (n_head / n_kv);
+    const int kv_len = seq_lens[bi];
+    const int split_len = (kv_len + nsplit - 1) / nsplit;
+    const int j0 = split * split_len;
+    const int j1 = min(j0 + split_len, kv_len);
+    const int* bt = block_table + (long)bi * max_blocks;
+
+    float q[GB][8];
+    #pragma unroll
+    for (int g = 0; g < GB; ++g) {
+        Half8 u;
+        u.u = *reinterpret_cast<const uint4*>(Q + ((long)bi * n_head + head0 + g) * HD + r * 8);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(u.h[i]);
+            q[g][2 * i] = f.x * scale;
+            q[g][2 * i + 1] = f.y * scale;
+        }
+    }
+    float m[GB], l[GB], acc[GB][8];
+    #pragma unroll
+    for (int g = 0; g < GB; ++g) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[g][i] = 0.0f;
+    }
+
+    // The loop runs the same trips on every lane of a warp, so the shuffles see all of them; a
+    // lane past the last token reads nothing and keeps its state.
+    for (int jw = j0 + warp * TPW; jw < j1; jw += STEP) {
+        const int j = jw + sub;
+        const bool live = j < j1;
+        Half8 k, v;
+        k.u = make_uint4(0, 0, 0, 0);
+        v.u = make_uint4(0, 0, 0, 0);
+        if (live) {
+            const long slot = (long)bt[j / block_size] * block_size + (j % block_size);
+            const long off = slot * feat + (long)kvh * HD + r * 8;
+            k.u = *reinterpret_cast<const uint4*>(Kp + off);
+            v.u = *reinterpret_cast<const uint4*>(Vp + off);
+        }
+        float kf[8], vf[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 a = __half22float2(k.h[i]);
+            const float2 b = __half22float2(v.h[i]);
+            kf[2 * i] = a.x; kf[2 * i + 1] = a.y;
+            vf[2 * i] = b.x; vf[2 * i + 1] = b.y;
+        }
+        #pragma unroll
+        for (int g = 0; g < GB; ++g) {
+            float s = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) s += q[g][i] * kf[i];
+            #pragma unroll
+            for (int o = RL / 2; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+            if (!live) continue;
+            const float nm = fmaxf(m[g], s);
+            const float a = expf(m[g] - nm);
+            const float p = expf(s - nm);
+            l[g] = l[g] * a + p;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) acc[g][i] = acc[g][i] * a + p * vf[i];
+            m[g] = nm;
+        }
+    }
+    // The lanes of a warp holding the same dims merge their tokens' states.
+    #pragma unroll
+    for (int o = RL; o < 32; o <<= 1) {
+        #pragma unroll
+        for (int g = 0; g < GB; ++g) {
+            const float om = __shfl_xor_sync(0xffffffff, m[g], o);
+            const float ol = __shfl_xor_sync(0xffffffff, l[g], o);
+            float oacc[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) oacc[i] = __shfl_xor_sync(0xffffffff, acc[g][i], o);
+            pgq_merge<GB>(m, l, acc, om, ol, oacc, g);
+        }
+    }
+    // Then the warps, through shared memory: lanes 0..RL-1 of each warp hold its state.
+    __shared__ float sm[PGQ_WARPS][GB][2 + HD];
+    if (sub == 0) {
+        #pragma unroll
+        for (int g = 0; g < GB; ++g) {
+            if (r == 0) { sm[warp][g][0] = m[g]; sm[warp][g][1] = l[g]; }
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) sm[warp][g][2 + r * 8 + i] = acc[g][i];
+        }
+    }
+    __syncthreads();
+    if (warp != 0 || sub != 0) return;
+    #pragma unroll
+    for (int w = 1; w < PGQ_WARPS; ++w) {
+        #pragma unroll
+        for (int g = 0; g < GB; ++g) pgq_merge<GB>(m, l, acc, sm[w][g][0], sm[w][g][1], &sm[w][g][2 + r * 8], g);
+    }
+    #pragma unroll
+    for (int g = 0; g < GB; ++g) {
+        const long row = (long)bi * n_head + head0 + g;
+        if (nsplit == 1) {
+            const float inv = (l[g] > 0.0f) ? (1.0f / l[g]) : 0.0f;
+            Half8 h;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) h.h[i] = __floats2half2_rn(acc[g][2 * i] * inv, acc[g][2 * i + 1] * inv);
+            *reinterpret_cast<uint4*>(out + row * HD + r * 8) = h.u;
+        } else {
+            const long pidx = row * nsplit + split;
+            if (r == 0) { part_m[pidx] = m[g]; part_l[pidx] = l[g]; }
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) part_acc[pidx * HD + r * 8 + i] = acc[g][i];
+        }
+    }
+}
+
+template <int HD, int GB>
+static void pgq_launch(const void* Q, const void* Kp, const void* Vp, const int* block_table,
+                       const int* seq_lens, void* out, float* part_m, float* part_l,
+                       float* part_acc, int batch, int n_head, int n_kv, int nsplit, float scale,
+                       int block_size, int max_blocks, int feat, cudaStream_t stream) {
+    dim3 grid(n_head / GB, batch, nsplit);
+    loken_paged_flash_decode_gqa_f16_kernel<HD, GB><<<grid, PGQ_WARPS * 32, 0, stream>>>(
+        (const __half*)Q, (const __half*)Kp, (const __half*)Vp, block_table, seq_lens,
+        (__half*)out, part_m, part_l, part_acc, n_head, n_kv, nsplit, scale, block_size,
+        max_blocks, feat);
+}
+
+template <int HD>
+static void pgq_launch_gb(int gb, const void* Q, const void* Kp, const void* Vp,
+                          const int* block_table, const int* seq_lens, void* out, float* part_m,
+                          float* part_l, float* part_acc, int batch, int n_head, int n_kv,
+                          int nsplit, float scale, int block_size, int max_blocks, int feat,
+                          cudaStream_t stream) {
+    if (gb == 4) pgq_launch<HD, 4>(Q, Kp, Vp, block_table, seq_lens, out, part_m, part_l, part_acc, batch, n_head, n_kv, nsplit, scale, block_size, max_blocks, feat, stream);
+    else if (gb == 2) pgq_launch<HD, 2>(Q, Kp, Vp, block_table, seq_lens, out, part_m, part_l, part_acc, batch, n_head, n_kv, nsplit, scale, block_size, max_blocks, feat, stream);
+    else pgq_launch<HD, 1>(Q, Kp, Vp, block_table, seq_lens, out, part_m, part_l, part_acc, batch, n_head, n_kv, nsplit, scale, block_size, max_blocks, feat, stream);
+}
+
+// The caller checks the shape: head_dim 64, 128 or 256, gb 1, 2 or 4 dividing n_head / n_kv,
+// 16-byte aligned rows. With nsplit > 1 the partials are combined into `out`.
+extern "C" void loken_paged_flash_decode_gqa_f16(
+    const void* Q, const void* Kp, const void* Vp, const int* block_table, const int* seq_lens,
+    void* out, float* part_m, float* part_l, float* part_acc,
+    int batch, int n_head, int n_kv, int nsplit, int gb, int head_dim, float scale,
+    int block_size, int max_blocks, int feat, cudaStream_t stream
+) {
+    if (head_dim == 64) pgq_launch_gb<64>(gb, Q, Kp, Vp, block_table, seq_lens, out, part_m, part_l, part_acc, batch, n_head, n_kv, nsplit, scale, block_size, max_blocks, feat, stream);
+    else if (head_dim == 128) pgq_launch_gb<128>(gb, Q, Kp, Vp, block_table, seq_lens, out, part_m, part_l, part_acc, batch, n_head, n_kv, nsplit, scale, block_size, max_blocks, feat, stream);
+    else if (head_dim == 256) pgq_launch_gb<256>(gb, Q, Kp, Vp, block_table, seq_lens, out, part_m, part_l, part_acc, batch, n_head, n_kv, nsplit, scale, block_size, max_blocks, feat, stream);
+    else return;
+    if (nsplit > 1) {
+        loken_flash_decode_combine_f16_kernel<<<dim3(n_head, batch, 1), dim3(32, 1, 1), 0, stream>>>(
+            part_m, part_l, part_acc, (__half*)out, n_head, nsplit, head_dim);
+    }
+}
+
 // -- PAGED KV write: scatter B new tokens' K/V (each [feat]) into the flat paged
 // store at slot_dev[bi] (slot read from a DEVICE buffer -> capture-safe scatter,
 // unlike a tensor-level scatter_set, which host-bakes the index). grid(batch), one block. -

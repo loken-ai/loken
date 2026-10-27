@@ -52,7 +52,14 @@ pub fn paged_flash_decode(
     // The residual N=8 vs-vLLM gap is in the mmq GEMM / attention kernel, NOT here.
     const TARGET_WARPS: usize = 1024;
     const MAX_NSPLIT: usize = 64;
-    let lanes = (batch * n_head).max(1);
+    // The query heads one block of the GQA kernel serves, sharing their KV head; `None` for a
+    // shape only the one-warp-per-head kernels take.
+    let gqa_heads = paged_gqa_heads(n_head, n_kv, head_dim, feat, q.layout().start_offset());
+    let lanes = match gqa_heads {
+        Some(gb) => batch * (n_head / gb) * PAGED_GQA_WARPS,
+        None => batch * n_head,
+    }
+    .max(1);
     let nsplit = TARGET_WARPS.div_ceil(lanes).clamp(1, MAX_NSPLIT);
     let parts = if nsplit > 1 {
         let n = batch * n_head * nsplit;
@@ -84,6 +91,52 @@ pub fn paged_flash_decode(
         let slp =
             (slsl.device_ptr(slsl.stream()).0 + (sll.start_offset() * 4) as u64) as *const i32;
         let op = osl.device_ptr(osl.stream()).0 as *mut c_void;
+        if let Some(gb) = gqa_heads {
+            let (mut pmp, mut plp, mut pap) = (
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if let Some((pm, pl, pa)) = parts.as_ref() {
+                let (pms, _) = pm.storage_and_layout();
+                let (pls, _) = pl.storage_and_layout();
+                let (pas, _) = pa.storage_and_layout();
+                let (C(pmc), C(plc), C(pac)) = (&*pms, &*pls, &*pas) else {
+                    return Ok(None);
+                };
+                let pmsl = pmc.as_cuda_slice::<f32>()?;
+                let plsl = plc.as_cuda_slice::<f32>()?;
+                let pasl = pac.as_cuda_slice::<f32>()?;
+                pmp = pmsl.device_ptr(pmsl.stream()).0 as *mut f32;
+                plp = plsl.device_ptr(plsl.stream()).0 as *mut f32;
+                pap = pasl.device_ptr(pasl.stream()).0 as *mut f32;
+            }
+            unsafe {
+                loken_paged_flash_decode_gqa_f16(
+                    qp,
+                    kpp,
+                    vpp,
+                    btp,
+                    slp,
+                    op,
+                    pmp,
+                    plp,
+                    pap,
+                    batch as i32,
+                    n_head as i32,
+                    n_kv as i32,
+                    nsplit as i32,
+                    gb as i32,
+                    head_dim as i32,
+                    scale,
+                    block_size as i32,
+                    max_blocks as i32,
+                    feat as i32,
+                    stream,
+                );
+            }
+            return Ok(Some(out));
+        }
         if let Some((pm, pl, pa)) = parts.as_ref() {
             let (pms, _) = pm.storage_and_layout();
             let (pls, _) = pl.storage_and_layout();
@@ -143,6 +196,32 @@ pub fn paged_flash_decode(
         return Ok(Some(out));
     }
     Ok(None)
+}
+
+/// The warps of one block of the paged GQA decode kernel (`PGQ_WARPS` in `flash_decode_f16.cu`).
+const PAGED_GQA_WARPS: usize = 4;
+
+/// The query heads one block of the paged GQA decode kernel serves: the most of 4, 2 and 1
+/// that divides the heads sharing a KV head. `None` where the kernel has no build for the head
+/// size or its 16-byte runs would not be aligned: the query's start, the slot width `feat`.
+fn paged_gqa_heads(
+    n_head: usize,
+    n_kv: usize,
+    head_dim: usize,
+    feat: usize,
+    q_start: usize,
+) -> Option<usize> {
+    const HALVES_PER_RUN: usize = 8;
+    if ![64, 128, 256].contains(&head_dim)
+        || n_kv == 0
+        || !n_head.is_multiple_of(n_kv)
+        || !feat.is_multiple_of(HALVES_PER_RUN)
+        || !q_start.is_multiple_of(HALVES_PER_RUN)
+    {
+        return None;
+    }
+    let groups = n_head / n_kv;
+    [4, 2, 1].into_iter().find(|gb| groups.is_multiple_of(*gb))
 }
 
 /// Split count over the KV axis for flash-prefill (batch==1). The plain grid has
