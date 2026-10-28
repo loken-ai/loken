@@ -925,45 +925,121 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 // the weight plane: Q4_K's is nibbles alone, Q5_K adds a fifth bit from a plane covering the
 // whole superblock, and which bit of it a lane wants is the quarter it is reading.
 
-/// Four bits per weight.
-#define VEC_DOT_QUARTER(name, block, qr)                                                      \
-    static __device__ __forceinline__ float name(                                             \
-        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) { \
-        const block * bq = (const block *) vbq;                                               \
-        const int quarter = qr * ((iqs/2) / (QI8_1/2));                                       \
-        const int * q = (const int *)(bq->qs + 16 * quarter + 4 * ((iqs/2) % 4));             \
-        int v[2] = { q[0], q[4] };                                                            \
-        uint8_t sm[4];  /* {sc0, sc1, m0, m1} */                                              \
-        unpack_quarter_scales_q45_K(bq->scales, quarter, sm);                                 \
-        int   u[2*qr];                                                                        \
-        float d8[qr];                                                                         \
-        gather_q8_1<qr, 1, 2>(bq8_1, quarter, (iqs/2) % (QI8_1/2), u, d8);                    \
-        return name##_impl_vmmq(v, u, sm, sm + 2, bq->dm, d8);                                 \
+/// The sixteen header bytes of a q4_K or q5_K block, `dm` and the twelve packed scale bytes,
+/// read as one aligned vector. Both block sizes are multiples of sixteen bytes, so a block's
+/// header always sits on a sixteen-byte boundary.
+struct q45_K_header { uint32_t dm; uint32_t s[3]; };
+
+static __device__ __forceinline__ q45_K_header q45_K_header_of(const void * __restrict__ bq) {
+    const uint4 h = *(const uint4 *) bq;
+    q45_K_header r;
+    r.dm = h.x;
+    r.s[0] = h.y;
+    r.s[1] = h.z;
+    r.s[2] = h.w;
+    return r;
+}
+
+/// `unpack_quarter_scales_q45_K` from the header held in registers: the (scale, minimum)
+/// pairs of sub-blocks `quarter` and `quarter + 1`, laid out as `{sc0, sc1, m0, m1}`, with
+/// the bytes `get_scale_min_k4` would read taken out of the three scale words.
+///
+/// `quarter` is even. The first two words hold the first four pairs whole and the top two
+/// bits of the last four; the third holds the last four's low nibbles. The shift selects the
+/// two bytes of each word the quarter's pair sits in.
+static __device__ __forceinline__ void unpack_quarter_scales_q45_K(
+    const q45_K_header & h, const int quarter, uint8_t * __restrict__ out) {
+    constexpr uint32_t field = 0x3F;
+    const int shift = 8 * (quarter & 2);
+    const uint32_t a = h.s[0] >> shift;
+    const uint32_t b = h.s[1] >> shift;
+    const uint32_t c = h.s[2] >> shift;
+    if (quarter < 4) {
+        out[0] = a & field;
+        out[1] = (a >> 8) & field;
+        out[2] = b & field;
+        out[3] = (b >> 8) & field;
+    } else {
+        out[0] = (c & 0xF) | (((a >> 6) & 3) << 4);
+        out[1] = ((c >> 8) & 0xF) | (((a >> 14) & 3) << 4);
+        out[2] = ((c >> 4) & 0xF) | (((b >> 6) & 3) << 4);
+        out[3] = ((c >> 12) & 0xF) | (((b >> 14) & 3) << 4);
     }
+}
 
-/// Five bits: the fifth in a plane of its own, shifted down by the quarter this lane holds.
-#define VEC_DOT_QUARTER_PLUS_ONE(name, block, qr)                                             \
-    static __device__ __forceinline__ float name(                                             \
-        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) { \
-        const block * bq = (const block *) vbq;                                               \
-        const int quarter = qr * ((iqs/2) / (QI8_1/2));                                       \
-        const int * ql = (const int *)(bq->qs + 16 * quarter + 4 * ((iqs/2) % 4));            \
-        const int * qh = (const int *)(bq->qh + 4 * ((iqs/2) % 4));                           \
-        int vl[2] = { ql[0], ql[4] };                                                         \
-        int vh[2] = { qh[0] >> quarter, qh[4] >> quarter };                                   \
-        uint8_t sm[4];  /* {sc0, sc1, m0, m1} */                                              \
-        unpack_quarter_scales_q45_K(bq->scales, quarter, sm);                                 \
-        int   u[2*qr];                                                                        \
-        float d8[qr];                                                                         \
-        gather_q8_1<qr, 1, 2>(bq8_1, quarter, (iqs/2) % (QI8_1/2), u, d8);                    \
-        return name##_impl_vmmq(vl, vh, u, sm, sm + 2, bq->dm, d8);                            \
-    }
+/// What a lane reads of one activation column for a q4_K or q5_K quarter: two words from
+/// each of the quarter's two q8_1 blocks and the blocks' scales, as `gather_q8_1<2, 1, 2>`
+/// reads them. A batch reads it once for all the rows a block serves.
+struct q45_K_act { int u[2*QR4_K]; float d8[QR4_K]; };
 
-VEC_DOT_QUARTER(vec_dot_q4_K_q8_1, block_q4_K, QR4_K)
-VEC_DOT_QUARTER_PLUS_ONE(vec_dot_q5_K_q8_1, block_q5_K, QR5_K)
+static __device__ __forceinline__ q45_K_act q45_K_act_of(
+    const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    q45_K_act a;
+    gather_q8_1<QR4_K, 1, 2>(bq8_1, QR4_K * ((iqs/2) / (QI8_1/2)), (iqs/2) % (QI8_1/2), a.u, a.d8);
+    return a;
+}
 
-#undef VEC_DOT_QUARTER
-#undef VEC_DOT_QUARTER_PLUS_ONE
+/// What a lane reads of a q4_K block: its two words of codes, its quarter's scales and minima
+/// ({sc0, sc1, m0, m1}) and the block's scale and minimum. A batch reads it once for all its
+/// activation columns.
+struct q4_K_share { int v[2]; uint8_t sm[4]; half2 dm; };
+
+static __device__ __forceinline__ q4_K_share q4_K_share_of(
+    const block_q4_K * __restrict__ bq, const int & iqs) {
+    q4_K_share w;
+    const int quarter = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int * q = (const int *)(bq->qs + 16 * quarter + 4 * ((iqs/2) % 4));
+    w.v[0] = q[0];
+    w.v[1] = q[4];
+    const q45_K_header h = q45_K_header_of(bq);
+    unpack_quarter_scales_q45_K(h, quarter, w.sm);
+    w.dm = *(const half2 *) &h.dm;
+    return w;
+}
+
+/// Four bits per weight: a lane's share against one column's gathered activation.
+static __device__ __forceinline__ float vec_dot_q4_K_share(
+    const q4_K_share & w, const q45_K_act & a) {
+    return vec_dot_q4_K_q8_1_impl_vmmq(w.v, a.u, w.sm, w.sm + 2, w.dm, a.d8);
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    return vec_dot_q4_K_share(q4_K_share_of((const block_q4_K *) vbq, iqs),
+                              q45_K_act_of(bq8_1, iqs));
+}
+
+/// What a lane reads of a q5_K block: the q4_K share and the lane's words of the fifth-bit
+/// plane, shifted down by the quarter it holds.
+struct q5_K_share { int vl[2]; int vh[2]; uint8_t sm[4]; half2 dm; };
+
+static __device__ __forceinline__ q5_K_share q5_K_share_of(
+    const block_q5_K * __restrict__ bq, const int & iqs) {
+    q5_K_share w;
+    const int quarter = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq->qs + 16 * quarter + 4 * ((iqs/2) % 4));
+    const int * qh = (const int *)(bq->qh + 4 * ((iqs/2) % 4));
+    w.vl[0] = ql[0];
+    w.vl[1] = ql[4];
+    w.vh[0] = qh[0] >> quarter;
+    w.vh[1] = qh[4] >> quarter;
+    const q45_K_header h = q45_K_header_of(bq);
+    unpack_quarter_scales_q45_K(h, quarter, w.sm);
+    w.dm = *(const half2 *) &h.dm;
+    return w;
+}
+
+/// Five bits: a lane's share against one column's gathered activation.
+static __device__ __forceinline__ float vec_dot_q5_K_share(
+    const q5_K_share & w, const q45_K_act & a) {
+    return vec_dot_q5_K_q8_1_impl_vmmq(w.vl, w.vh, a.u, w.sm, w.sm + 2, w.dm, a.d8);
+}
+
+static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    return vec_dot_q5_K_share(q5_K_share_of((const block_q5_K *) vbq, iqs),
+                              q45_K_act_of(bq8_1, iqs));
+}
 
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(

@@ -50,6 +50,47 @@ MMVQ_INDEXED(mmvq_dot_q6_K, block_q6_K, vec_dot_q6_K_q8_1)
 
 #undef MMVQ_INDEXED
 
+/// A format whose dot product splits into what a lane reads of the weight block, what it
+/// reads of an activation column, and the arithmetic between them: `dot(load(..), gather(..))`
+/// computes `dot_block`, so a batch reads and unpacks each weight share once for all its
+/// columns and each column's activation once for all the rows a block serves. A format splits
+/// where that is faster than the dot product per column.
+template <mmvq_dot_t dot_block> struct mmvq_lane {
+  static constexpr bool split = false;
+};
+
+/// q4_K: the lane's share of the block (`q4_K_share_of`) against each column's quarter.
+template <> struct mmvq_lane<mmvq_dot_q4_K> {
+  static constexpr bool split = true;
+  using act = q45_K_act;
+  static __device__ __forceinline__ act gather(const block_q8_1 *__restrict__ y, const int iqs) {
+    return q45_K_act_of(y, iqs);
+  }
+  static __device__ __forceinline__ q4_K_share load(const void *__restrict__ vx, const int kbx,
+                                                    const int iqs) {
+    return q4_K_share_of((const block_q4_K *) vx + kbx, iqs);
+  }
+  static __device__ __forceinline__ float dot(const q4_K_share &w, const act &a) {
+    return vec_dot_q4_K_share(w, a);
+  }
+};
+
+/// q5_K: the lane's share of the block (`q5_K_share_of`) against each column's quarter.
+template <> struct mmvq_lane<mmvq_dot_q5_K> {
+  static constexpr bool split = true;
+  using act = q45_K_act;
+  static __device__ __forceinline__ act gather(const block_q8_1 *__restrict__ y, const int iqs) {
+    return q45_K_act_of(y, iqs);
+  }
+  static __device__ __forceinline__ q5_K_share load(const void *__restrict__ vx, const int kbx,
+                                                    const int iqs) {
+    return q5_K_share_of((const block_q5_K *) vx + kbx, iqs);
+  }
+  static __device__ __forceinline__ float dot(const q5_K_share &w, const act &a) {
+    return vec_dot_q5_K_share(w, a);
+  }
+};
+
 static constexpr __device__ int mmvq_nwarps_for(int ncols_dst) {
   return (ncols_dst <= 4) ? 4 : 2;
 }
@@ -144,15 +185,42 @@ static __device__ void mmvq_core_impl(
     const int act_block = block * (qk / QK8_1);
     const int lane_in_block = vdr * (tid % (qi / vdr));
 
+    if constexpr (mmvq_lane<dot_block>::split && ncols_dst > 1 && ncols_dst <= 8) {
+      // Each column's activation is gathered once for the block's rows, and the lane's share
+      // of each weight block is read and unpacked once for the columns: the sums are the same
+      // as the dot product's, column by column. Past eight columns the gathered activations
+      // no longer fit the registers.
+      typename mmvq_lane<dot_block>::act act[ncols_dst];
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+      for (int j = 0; j < ncols_dst; ++j) {
+        act[j] = mmvq_lane<dot_block>::gather(&y[j * stride_col_y + act_block], lane_in_block);
+      }
 #pragma unroll
       for (int i = 0; i < rows_per_cuda_block; ++i) {
-        const block_q8_1 *y_block = &y[j * stride_col_y + act_block];
-        const int weight_block = (row0 + i) * blocks_per_row + block;
+        // A block past the last row reads the last row again; its store is guarded.
+        const int row = min(row0 + i, nrows_x - 1);
+        const int weight_block = row * blocks_per_row + block;
 #pragma unroll
         for (int m = 0; m < nmat; ++m) {
-          acc[m][j][i] += dot_block(vx[m], y_block, weight_block, lane_in_block);
+          const auto w = mmvq_lane<dot_block>::load(vx[m], weight_block, lane_in_block);
+#pragma unroll
+          for (int j = 0; j < ncols_dst; ++j) {
+            acc[m][j][i] += mmvq_lane<dot_block>::dot(w, act[j]);
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+          const block_q8_1 *y_block = &y[j * stride_col_y + act_block];
+          // A block past the last row reads the last row again; its store is guarded.
+          const int weight_block = min(row0 + i, nrows_x - 1) * blocks_per_row + block;
+#pragma unroll
+          for (int m = 0; m < nmat; ++m) {
+            acc[m][j][i] += dot_block(vx[m], y_block, weight_block, lane_in_block);
+          }
         }
       }
     }

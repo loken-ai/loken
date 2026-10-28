@@ -14,6 +14,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 - Serving: decode and prefill more requests in one batch, sharing the cache and fusing the attention.
 - Inference: run the host attention of a long prompt over tiles of keys and rows.
+- Inference: read each weight and each row's activation once for all the rows of a small batch.
 
 ### Fixed
 

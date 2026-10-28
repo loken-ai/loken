@@ -3807,6 +3807,93 @@ mod mat_vec_throughput {
     }
 }
 
+/// What the mat-vec costs by batch: each shape runs every batch the launcher takes, as plain
+/// columns and in decode order, on zeroed weights, against the one-row launch.
+#[cfg(test)]
+mod mat_vec_batch_cost {
+    #[test]
+    #[ignore = "measurement: needs a CUDA device"]
+    fn what_each_batch_costs() {
+        use crate::tensor::cuda::CudaDevice;
+        use crate::tensor::quantized::{GgmlDType, MATRIX_ROW_PADDING};
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device");
+            return;
+        };
+        let stream = dev.stream().clone();
+        let ctx = stream.context();
+        let shapes = [
+            ("q4_k", GgmlDType::Q4K, 4096, 4096),
+            ("q4_k", GgmlDType::Q4K, 4096, 12288),
+            ("q6_k", GgmlDType::Q6K, 12288, 4096),
+        ];
+        for (tag, dtype, k, n) in shapes {
+            let bytes = n * (k / dtype.block_size()) * dtype.type_size();
+            let weights = stream.alloc_zeros::<u8>(bytes).unwrap();
+            let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+            let rows_most = super::MMVQ_DECODE_ORDER_WIDE;
+            let q8_1 = stream
+                .alloc_zeros::<u8>(rows_most * k_padded / 32 * 36)
+                .unwrap();
+            let mut dst = stream.alloc_zeros::<f32>(rows_most * n).unwrap();
+            let group = super::decode_order_group(tag, "f32", k, n);
+            let mut one = None;
+            for b in 1..=rows_most {
+                for order in [None, Some(group)] {
+                    if order.is_none() && b > 8 {
+                        continue;
+                    }
+                    let launch = |dst: &mut crate::tensor::gpu_runtime::driver::CudaSlice<f32>| {
+                        super::launch_mmvq(
+                            &dev,
+                            tag,
+                            "f32",
+                            &weights,
+                            &q8_1.slice(..),
+                            &mut dst.slice_mut(..),
+                            k,
+                            n,
+                            b,
+                            false,
+                            None,
+                            order,
+                        )
+                        .unwrap();
+                    };
+                    for _ in 0..20 {
+                        launch(&mut dst);
+                    }
+                    const RUNS: usize = 200;
+                    let flags =
+                        crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+                    let (a, e) = (
+                        ctx.new_event(Some(flags)).unwrap(),
+                        ctx.new_event(Some(flags)).unwrap(),
+                    );
+                    a.record(&stream).unwrap();
+                    for _ in 0..RUNS {
+                        launch(&mut dst);
+                    }
+                    e.record(&stream).unwrap();
+                    e.synchronize().unwrap();
+                    let us = a.elapsed_ms(&e).unwrap() as f64 * 1e3 / RUNS as f64;
+                    let base = *one.get_or_insert(us);
+                    eprintln!(
+                        "{tag} k={k} n={n} rows={b} {}: {us:.1} us, {:.2} x one row, {:.0} GB/s",
+                        if order.is_some() {
+                            "decode order"
+                        } else {
+                            "plain"
+                        },
+                        us / base,
+                        bytes as f64 / us / 1e3
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// What resolving a kernel by name costs, per launch.
 ///
 /// The mat-vec launcher builds its symbol with `format!` and then asks the module for it on
