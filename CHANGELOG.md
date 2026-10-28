@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- Inference: open the configured context window for a model on the host alone.
+
 ## [0.4.1] - 2026-10-26
 
 ### Added

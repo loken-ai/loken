@@ -1338,8 +1338,10 @@ impl LlmEngine {
                                         .iter()
                                         .any(|s| matches!(s.kind, DeviceKind::Vulkan(_) | DeviceKind::OpenCL(_)));
                                     let host_only = on_plan.is_empty() && !on_vulkan;
+                                    // The host's caches grow as a request needs, so a model
+                                    // on the host alone opens the whole configured window.
                                     let (kv, ctx) = if host_only {
-                                        (KvQuant::Off, None)
+                                        (KvQuant::Off, Some(user_context_length.min(context_length)))
                                     } else {
                                         (kv_quant, Some(effective_ctx))
                                     };
