@@ -319,14 +319,6 @@ pub(crate) fn encode_prompt(
     Ok(encoding)
 }
 
-fn char_safe_suffix(s: &str, from: usize) -> String {
-    let mut i = from.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    s[i..].to_string()
-}
-
 impl LlmEngine {
     /// Create new engine with config
     pub fn with_config(config: InferenceConfig) -> Self {

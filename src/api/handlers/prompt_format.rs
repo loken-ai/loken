@@ -802,6 +802,7 @@ pub(crate) fn format_mistral_tools(
     out
 }
 
+#[cfg(test)]
 /// `format_chat_prompt` with the tools handed to a template that renders them.
 pub(crate) fn format_chat_prompt_with_tools(
     messages: &[Message],
