@@ -2410,6 +2410,10 @@ fn build_generic_layer(
             c
         },
         cpu_q8_kv: None,
+        host_q8_kv: !matches!(
+            config.kv_quant,
+            crate::inference::engine::llm_engine::KvQuant::Off
+        ),
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,
@@ -2983,6 +2987,10 @@ fn build_awq_layer(
                 .min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS),
         ),
         cpu_q8_kv: None,
+        host_q8_kv: !matches!(
+            config.kv_quant,
+            crate::inference::engine::llm_engine::KvQuant::Off
+        ),
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,

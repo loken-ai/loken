@@ -44,6 +44,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Vision: place the text after a tall image as the reference does.
 - Models: load the model of an Ollama manifest that lists its projector first.
 - Serving: keep the images of a vision model when requests arrive together.
+- Inference: attend over the full-width cache on the host when kv_quant is off.
 
 ### Removed
 

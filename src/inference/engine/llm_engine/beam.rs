@@ -1025,14 +1025,14 @@ mod tests {
         let ids = |t: &[u32]| Tensor::new(t, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
         let path = tiny_model::write_quant("beam-rows", LAYERS);
         let plain = |beam: &[u32]| -> Vec<f64> {
-            let mut m = GenericBackend(tiny_model::load(&path, LAYERS));
+            let mut m = GenericBackend(tiny_model::load_q8_kv(&path, LAYERS));
             let mut logits = m.forward(&ids(&PROMPT), 0).unwrap();
             for (i, &t) in beam.iter().enumerate() {
                 logits = m.forward(&ids(&[t]), PROMPT.len() + i).unwrap();
             }
             log_softmax(&host_row(&logits).unwrap())
         };
-        let mut m = GenericBackend(tiny_model::load(&path, LAYERS));
+        let mut m = GenericBackend(tiny_model::load_q8_kv(&path, LAYERS));
         m.forward(&ids(&PROMPT), 0).unwrap();
         let mut resident = Vec::new();
         let mut forwards = 0;

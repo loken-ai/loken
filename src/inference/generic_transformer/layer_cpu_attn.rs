@@ -29,10 +29,11 @@ impl GenericTransformerLayer {
         // arches use the Q8 store.
         let is_gemma = self.attn_v_norm_ones.is_some();
         let f16_store = is_gemma || self.attn_sinks.is_some();
-        // The Q8 store attends over the whole history; a windowed layer keeps the F16 store.
+        // The Q8 store attends over the whole history; a windowed layer keeps the F16 store,
+        // and a layer whose configured cache is unquantised keeps no Q8 store.
         let eligible = !is_shared
             && self.alibi_slopes.is_none()
-            && (f16_store || self.sliding_window.is_none())
+            && (f16_store || (self.host_q8_kv && self.sliding_window.is_none()))
             && self.head_dim.is_multiple_of(32)
             && self.n_kv_head > 0
             && self.n_head.is_multiple_of(self.n_kv_head)

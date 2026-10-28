@@ -936,9 +936,11 @@ impl GenericTransformerLayer {
             .as_ref()
             .map(|m| m.router_prenormed)
             .unwrap_or(false);
+        // The Q8 store holds the history only when the configured cache is quantised.
         if !self.host_decode_arch_ok(moe_prenormed)
             || x.len() != arena.hidden
             || arena.ffn != self.flags.intermediate_size
+            || (!f16_store && !self.host_q8_kv)
         {
             return Ok(false);
         }

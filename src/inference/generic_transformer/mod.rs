@@ -221,6 +221,10 @@ pub struct GenericTransformerLayer {
     /// Populated alongside the F16 `kv_cache` (which stays the safe fallback);
     /// read only at single-token CPU decode for eligible dense arches.
     pub cpu_q8_kv: Option<crate::inference::cache::cpu_q8_kv::CpuQ8Kv>,
+    /// Whether the host keeps `cpu_q8_kv` at all: set when `config.kv_quant` asks for a
+    /// quantised cache. Unset, the host decode attends over the F-dtype `kv_cache`, the
+    /// precision the configuration names.
+    pub host_q8_kv: bool,
     /// gemma4 F16 windowed KV (Q8 degenerate at hd512). Per-layer window.
     pub cpu_f16_kv: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     /// Persistent zero-alloc decode scratch (lazily built, reused/token).

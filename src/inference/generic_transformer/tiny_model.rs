@@ -201,8 +201,30 @@ pub(crate) fn remove(path: &std::path::Path) {
     }
 }
 
-/// The model at `path` loaded whole on the host.
+/// The model at `path` loaded whole on the host, its cache unquantised.
 pub(crate) fn load(path: &std::path::Path, layers: usize) -> super::GenericHeteroTransformer {
+    load_with_kv(
+        path,
+        layers,
+        crate::inference::engine::llm_engine::KvQuant::Off,
+    )
+}
+
+/// The model at `path` loaded whole on the host with the Q8 cache the server gives a model whose
+/// head shape the quantised kernels serve: the host decode attends over its Q8 store.
+pub(crate) fn load_q8_kv(path: &std::path::Path, layers: usize) -> super::GenericHeteroTransformer {
+    load_with_kv(
+        path,
+        layers,
+        crate::inference::engine::llm_engine::KvQuant::Q8,
+    )
+}
+
+fn load_with_kv(
+    path: &std::path::Path,
+    layers: usize,
+    kv_quant: crate::inference::engine::llm_engine::KvQuant,
+) -> super::GenericHeteroTransformer {
     let plan = crate::inference::place::layer_executor::HeteroPlan::calculate_with_kv(
         layers,
         1 << 20,
@@ -213,11 +235,13 @@ pub(crate) fn load(path: &std::path::Path, layers: usize) -> super::GenericHeter
     );
     let g = crate::tensor::quantized::gguf_file::open_mapped(path).unwrap();
     let bytes = g.mmap.clone();
-    super::GenericHeteroTransformer::from_gguf(
+    super::GenericHeteroTransformer::from_gguf_with_kv_quant(
         g.content,
         &bytes[..],
         &std::collections::HashMap::new(),
         &plan,
+        kv_quant,
+        None,
     )
     .unwrap()
 }

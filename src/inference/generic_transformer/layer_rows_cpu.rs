@@ -45,6 +45,7 @@ impl GenericTransformerLayer {
             || self.flags.intermediate_size == 0
             || self.ffn_norm.is_none()
             || hd == 0
+            || !self.host_q8_kv
         {
             return Ok(false);
         }

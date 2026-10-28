@@ -39,9 +39,9 @@ fn decode_steps(m: &mut GenericHeteroTransformer) -> Vec<Vec<f32>> {
 #[test]
 fn verify_rows_match_decode_steps_on_the_host() {
     let path = tiny_model::write_quant("verify-rows", LAYERS);
-    let mut stepped = tiny_model::load(&path, LAYERS);
+    let mut stepped = tiny_model::load_q8_kv(&path, LAYERS);
     let want = decode_steps(&mut stepped);
-    let mut verified = tiny_model::load(&path, LAYERS);
+    let mut verified = tiny_model::load_q8_kv(&path, LAYERS);
     verified.forward(&ids(&PROMPT), 0).unwrap();
     for width in 2..=VERIFY_ROWS {
         let got = rows(
@@ -74,8 +74,8 @@ fn verify_rows_match_decode_steps_on_the_host() {
 #[test]
 fn host_decode_is_reproducible() {
     let path = tiny_model::write_quant("reproducible", LAYERS);
-    let first = decode_steps(&mut tiny_model::load(&path, LAYERS));
-    let second = decode_steps(&mut tiny_model::load(&path, LAYERS));
+    let first = decode_steps(&mut tiny_model::load_q8_kv(&path, LAYERS));
+    let second = decode_steps(&mut tiny_model::load_q8_kv(&path, LAYERS));
     assert!(first == second);
     tiny_model::remove(&path);
 }
