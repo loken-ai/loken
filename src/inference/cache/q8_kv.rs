@@ -540,6 +540,18 @@ impl Q8KvCache {
         v_new: &Tensor,
         row_width: usize,
     ) -> Result<()> {
+        self.append_kv_paired_dev_slot_rows(k_new, v_new, row_width, 1)
+    }
+
+    /// `append_kv_paired_dev_slot` over `rows` tokens packed one after the other: they land in
+    /// the `rows` slots from the one `cur_pos_dev` names.
+    fn append_kv_paired_dev_slot_rows(
+        &mut self,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        row_width: usize,
+        rows: usize,
+    ) -> Result<()> {
         use crate::inference::quantized_cuda::quantize_q8_0_kv_paired_f32_dev_slot;
         let k_f32 = if k_new.dtype() == DType::F32 {
             k_new.clone()
@@ -563,14 +575,15 @@ impl Q8KvCache {
             StorageView::Cuda(c) => c,
             _ => return Err(anyhow!("Q8KvCache: V must be on CUDA")),
         };
+        let total = row_width * rows;
         let k_view = k_cuda
             .as_cuda_slice::<f32>()
             .map_err(|e| anyhow!("Q8KvCache: K slice cast: {e}"))?
-            .slice(k_lo.start_offset()..k_lo.start_offset() + row_width);
+            .slice(k_lo.start_offset()..k_lo.start_offset() + total);
         let v_view = v_cuda
             .as_cuda_slice::<f32>()
             .map_err(|e| anyhow!("Q8KvCache: V slice cast: {e}"))?
-            .slice(v_lo.start_offset()..v_lo.start_offset() + row_width);
+            .slice(v_lo.start_offset()..v_lo.start_offset() + total);
         let slot_dev = self
             .core
             .is_primed()
@@ -583,10 +596,122 @@ impl Q8KvCache {
             &mut self.v_q8,
             slot_dev,
             row_width,
+            rows,
             &self.cuda_device,
         )
         .map_err(|e| anyhow!("Q8KvCache: paired dev_slot quantize failed: {e}"))?;
         Ok(())
+    }
+
+    /// Room for `rows` more tokens, the buffers grown now if they have to be: a window is
+    /// recorded against buffers that do not move under it. Refused while a graph is live
+    /// over buffers too small for the rows.
+    pub fn reserve_rows(&mut self, rows: usize) -> Result<()> {
+        if let Some(need) = self
+            .core
+            .room_for(rows)
+            .map_err(|e| anyhow!("Q8KvCache::reserve_rows: {e}"))?
+        {
+            self.grow_to(need)?;
+        }
+        Ok(())
+    }
+
+    /// The rows of a recorded verify appended in one launch at the slot the device position
+    /// names: `k_rows` and `v_rows` hold `rows` tokens' K and V packed as `[rows * n_kv,
+    /// head_dim]` (any float carrier), each token's blocks the ones a one-token append writes.
+    /// The position is primed at the first row's slot and the buffers hold the rows already
+    /// ([`Self::reserve_rows`]); what a graph records of it replays at the position of its day.
+    pub fn append_rows_recorded(
+        &mut self,
+        k_rows: &Tensor,
+        v_rows: &Tensor,
+        rows: usize,
+    ) -> Result<()> {
+        let row_width = self.n_kv_heads * self.head_dim;
+        if rows == 0
+            || k_rows.elem_count() != rows * row_width
+            || v_rows.elem_count() != rows * row_width
+        {
+            return Err(anyhow!(
+                "Q8KvCache::append_rows_recorded: {rows} rows of {row_width} expected"
+            ));
+        }
+        if self
+            .core
+            .room_for(rows)
+            .map_err(|e| anyhow!("Q8KvCache::append_rows_recorded: {e}"))?
+            .is_some()
+        {
+            return Err(anyhow!(
+                "Q8KvCache::append_rows_recorded: no room for {rows} rows after {} of {}",
+                self.core.len(),
+                self.core.cap()
+            ));
+        }
+        self.append_kv_paired_dev_slot_rows(k_rows, v_rows, row_width, rows)?;
+        self.core.commit(rows);
+        Ok(())
+    }
+
+    /// [`Self::attn_flash_splitk_decode_rows`] for a recorded verify: row `r` attends over
+    /// the keys up to the slot the device position names plus `r`, the position primed by
+    /// the caller, and the launch serves the longest length a replay may reach.
+    pub fn attn_flash_splitk_decode_rows_recorded(
+        &self,
+        q: &Tensor,
+        rows: usize,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let n_q_heads = q.elem_count() / (rows.max(1) * self.head_dim);
+        if rows == 0
+            || !self.core.is_primed()
+            || q.dtype() != DType::F32
+            || q.elem_count() != rows * n_q_heads * self.head_dim
+            || self.n_kv_heads == 0
+            || !n_q_heads.is_multiple_of(self.n_kv_heads)
+        {
+            return Err(anyhow!(
+                "Q8KvCache::attn_flash_splitk_decode_rows_recorded: {rows} rows of {:?}, primed {}",
+                q.dims(),
+                self.core.is_primed()
+            ));
+        }
+        let q_flat = q.contiguous()?;
+        let (q_guard, q_layout) = q_flat.storage_and_layout();
+        let q_cuda = match &*q_guard {
+            StorageView::Cuda(c) => c,
+            _ => {
+                return Err(anyhow!(
+                    "Q8KvCache::attn_flash_splitk_decode_rows_recorded: Q not on CUDA"
+                ))
+            }
+        };
+        let start = q_layout.start_offset();
+        let q_view = q_cuda
+            .as_cuda_slice::<f32>()?
+            .slice(start..start + q.elem_count());
+        let longest = self.launch_len();
+        let out = crate::inference::quantized_cuda::attn_flash_splitk_q8_gqa_decode_dev_pos(
+            &self.k_q8,
+            &self.v_q8,
+            &q_view,
+            self.pos.slice(),
+            self.head_dim,
+            self.n_kv_heads,
+            n_q_heads / self.n_kv_heads,
+            longest,
+            rows,
+            scale,
+            &self.cuda_device,
+        )
+        .map_err(|e| {
+            anyhow!("Q8KvCache: attn_flash_splitk_q8_gqa_decode_dev_pos recorded rows: {e}")
+        })?;
+        Ok(tensor_from_cuda_storage(
+            out,
+            (rows * n_q_heads, self.head_dim),
+        )?)
     }
 
     /// Shared path used by both the K and V branches of `append`. Permutes
@@ -1648,6 +1773,55 @@ mod dev_pos_tests {
         let v_full = Tensor::randn(0.0f32, 1.0, (1, n_kv_heads, seq_kv, head_dim), dev).unwrap();
         cache.append(&k_full, &v_full).expect("Q8KvCache::append");
         (cache, k_full, v_full)
+    }
+
+    /// The q8_1 row the split-K combine leaves for the output projection is the row the
+    /// quantise kernel makes of the combine's output, byte for byte.
+    #[test]
+    fn splitk_combine_row_equals_the_quantise_kernels() {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        let Some(dev) = try_open_cuda() else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let ndev = dev.as_cuda_device().unwrap().native().clone();
+        if !crate::tensor::cuda::prequant::supported(ndev.ordinal()) {
+            return;
+        }
+        let stream = ndev.stream();
+        for &(n_kv_heads, n_q_per_kv, head_dim) in &[(8usize, 4usize, 128usize), (2, 7, 64)] {
+            for &seq_kv in &[25usize, 90, 700] {
+                let (mut cache, _, _) = build_filled_cache(seq_kv, n_kv_heads, head_dim, &dev);
+                let n_q = n_kv_heads * n_q_per_kv;
+                let cols = n_q * head_dim;
+                if !crate::tensor::cuda::prequant_row(&ndev, 1, cols) {
+                    continue;
+                }
+                let q = Tensor::randn(0f32, 1.0, (1, n_q, 1, head_dim), &dev).unwrap();
+                cache.update_graph_state(seq_kv - 1).unwrap();
+                let out = cache.attn_flash_splitk_decode_graph(&q, 0.1).unwrap();
+                let (guard, _) = out.storage_and_layout();
+                let slice = match &*guard {
+                    StorageView::Cuda(c) => c.as_cuda_slice::<f32>().unwrap(),
+                    _ => unreachable!(),
+                };
+                let (ptr, _g) = slice.device_ptr(&stream);
+                let fused = crate::tensor::cuda::prequant::take(ptr as usize, cols)
+                    .expect("the combine leaves its row");
+                let plain = crate::tensor::cuda::quantize_q8_1(&ndev, slice, cols).unwrap();
+                let (a, b) = (
+                    stream.clone_dtoh(&fused).unwrap(),
+                    stream.clone_dtoh(&plain).unwrap(),
+                );
+                ndev.synchronize().unwrap();
+                let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    differing, 0,
+                    "n_kv {n_kv_heads} x {n_q_per_kv} hd {head_dim} at {seq_kv} keys: {differing} of {} bytes differ",
+                    a.len()
+                );
+            }
+        }
     }
 
     #[test]

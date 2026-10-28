@@ -17,6 +17,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: decode and prefill more requests in one batch, sharing the cache and fusing the attention.
 - Inference: run the host attention of a long prompt over tiles of keys and rows.
 - Inference: read each weight and each row's activation once for all the rows of a small batch.
+- Speculative decoding: record the draft verify and the drafter step as graphs, and cost a cycle by its replays.
 
 ### Fixed
 
@@ -30,6 +31,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Speculative decoding: prefill the drafter in chunks, as its target is.
 - Speculative decoding: accept a drafter whose vocabulary is padded to fewer rows.
 - Speculative decoding: draft one token first and lengthen drafts a row at a time.
+- Speculative decoding: verify a Qwen3 draft's rows exactly as their decode steps.
 - Serving: go on from the failed chunk when a long prompt runs out of card memory.
 - Inference: size the attention scores of a prompt on a card from its free memory.
 - Vision: place the text after a tall image as the reference does.

@@ -174,6 +174,8 @@ pub fn quantize_q8_0_f32_dev_slot(
 /// Paired K+V twin of `quantize_q8_0_f32_dev_slot`: one launch quantizes both
 /// the K and V rows into their buffers at the replay-time slot (gridDim.z
 /// selects the side). Saves one graph node + inter-node gap per layer.
+/// `rows` tokens of `k` values each, packed one after the other, land in the `rows` slots
+/// from the one the device names.
 pub fn quantize_q8_0_kv_paired_f32_dev_slot(
     src_k: &CudaView<f32>,
     src_v: &CudaView<f32>,
@@ -181,23 +183,24 @@ pub fn quantize_q8_0_kv_paired_f32_dev_slot(
     dst_v: &mut CudaSlice<u8>,
     slot_dev: &CudaSlice<i32>,
     k: usize,
+    rows: usize,
     dev: &CudaDevice,
 ) -> Result<()> {
+    let total = k * rows;
     // z=2 -> one block group for K, one for V.
-    let staging = q8_0_row_staging(k, 2, dev)
+    let staging = q8_0_row_staging(total, 2, dev)
         .map_err(|e| anyhow!("quantize_q8_0_kv_paired_f32_dev_slot: {e}"))?;
-    if src_k.len() < k || src_v.len() < k {
+    if rows == 0 || src_k.len() < total || src_v.len() < total {
         anyhow::bail!(
-            "quantize_q8_0_kv_paired_f32_dev_slot: src has {}/{} elems, expected {} (k)",
+            "quantize_q8_0_kv_paired_f32_dev_slot: src has {}/{} elems, expected {rows} x {k}",
             src_k.len(),
             src_v.len(),
-            k
         );
     }
 
     let func = quantized_kernel(dev, "quantize_q8_0_kv_paired_dev_slot")?;
-    let src_k_chunk = src_k.slice(0..k);
-    let src_v_chunk = src_v.slice(0..k);
+    let src_k_chunk = src_k.slice(0..total);
+    let src_v_chunk = src_v.slice(0..total);
 
     let mut builder = func.builder();
     builder.arg(&src_k_chunk);
@@ -207,9 +210,9 @@ pub fn quantize_q8_0_kv_paired_f32_dev_slot(
     builder.arg(slot_dev);
     barg!(
         builder,
-        k as i32,
+        total as i32,
         staging.kx_padded as i32,
-        (staging.kx_padded / Q8_0_BLOCK_SIZE) as i32
+        (k / Q8_0_BLOCK_SIZE) as i32
     );
     unsafe { builder.launch(staging.cfg) }
         .map_err(|e| anyhow!("launch quantize_q8_0_kv_paired_dev_slot: {e}"))?;

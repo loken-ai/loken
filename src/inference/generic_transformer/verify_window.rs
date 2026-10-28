@@ -8,6 +8,11 @@
 //! before the rows (its recurrent state, the inputs of its recurrence, its convolution's rows,
 //! its token mixer's input), so that it can take in the kept rows again from there. The logits
 //! of each window size land in a buffer of their own.
+//!
+//! A wide residual's layers carry the rows through their own recorded forward; a plain
+//! residual's layers run the recorded step's forward over the rows, their attention taking the
+//! rows' positions from the Q8 cache's device position and their rotation from the verify's
+//! tables, so that a window runs the recorded step's kernels over its rows.
 
 use super::*;
 use crate::inference::engine::decode_step::VERIFY_ROWS;
@@ -322,6 +327,49 @@ impl GenericTransformerLayer {
         Ok(())
     }
 
+    /// The rotation tables of a verify's `rows` rows at `pos`, in this layer's buffers of
+    /// `VERIFY_ROWS` rows on `dev`, made at the first verify and written again after.
+    fn verify_rope_rows_ready(&mut self, pos: usize, rows: usize, dev: &Device) -> Result<()> {
+        let (cos, sin) = self.rope_table().rows(pos, rows, dev)?;
+        match (&self.verify_rope_cos, &self.verify_rope_sin) {
+            (Some(c), Some(s)) => {
+                c.slice_set(&cos, 0, 0)?;
+                s.slice_set(&sin, 0, 0)?;
+            }
+            _ => {
+                let (c, s) = self.rope_table().rows(0, VERIFY_ROWS, dev)?;
+                let (c, s) = (c.force_contiguous()?, s.force_contiguous()?);
+                c.slice_set(&cos, 0, 0)?;
+                s.slice_set(&sin, 0, 0)?;
+                self.verify_rope_cos = Some(c);
+                self.verify_rope_sin = Some(s);
+            }
+        }
+        Ok(())
+    }
+
+    /// Why the rows of a recorded verify cannot go through this plain-residual layer as the
+    /// kernels of the recorded step, `None` when they can: plain attention over a Q8 cache
+    /// ([`Self::recorded_rows_block`]) followed by a dense or routed feed-forward.
+    fn plain_window_block(&self) -> Option<&'static str> {
+        if self.is_hybrid() {
+            return Some("its block is not attention then a feed-forward");
+        }
+        if self.ngram.is_some() {
+            return Some("an n-gram table joins its rows");
+        }
+        if self.sparse.is_some() {
+            return Some("indexed attention");
+        }
+        if self.flags.parallel_attn {
+            return Some("its attention and feed-forward run side by side");
+        }
+        if self.ple_inp_gate.is_some() {
+            return Some("per-layer embeddings join its rows");
+        }
+        self.recorded_rows_block()
+    }
+
     /// Forget the buffers of a recorded verify.
     pub(super) fn clear_verify_state(&mut self) {
         self.verify_pos_i32 = None;
@@ -336,17 +384,30 @@ impl GenericTransformerLayer {
 #[cfg(feature = "gpu")]
 impl GenericHeteroTransformer {
     /// Why this model records no verify, `None` when it does: every layer has to be recorded,
-    /// on one card, with a wide residual and the head on the card.
+    /// on cards, with the head on the card; a wide residual's layers on any number of cards,
+    /// a plain residual's layers all plain attention then a feed-forward, on one card.
     pub fn verify_window_block(&self) -> Option<String> {
-        if self.config.hyper.is_none() {
-            return Some("the residual is not wide".into());
-        }
-        if self.graph_segments().is_empty() {
+        let segments = self.graph_segments().len();
+        if segments == 0 {
             return Some("the layers are not all on cards".into());
         }
-        if self.output_hyper.is_none()
-            || (self.output_proj_cuda_qmm.is_none() && self.output_proj_cuda.is_none())
-        {
+        if self.output_proj_cuda_qmm.is_none() && self.output_proj_cuda.is_none() {
+            return Some("the head is not on the card".into());
+        }
+        if self.config.hyper.is_none() {
+            if segments > 1 {
+                return Some("the layers are not all on one card".into());
+            }
+            if self.output_norm_cuda_weight.is_none() {
+                return Some("the head's norm is not on the card".into());
+            }
+            return (0..self.layers.len()).find_map(|i| {
+                self.layer_eager_reason(i)
+                    .or_else(|| self.layers[i].plain_window_block())
+                    .map(|why| format!("layer {i}: {why}"))
+            });
+        }
+        if self.output_hyper.is_none() {
             return Some("the head is not on the card".into());
         }
         (0..self.layers.len()).find_map(|i| {
@@ -399,6 +460,9 @@ impl GenericHeteroTransformer {
             ids: ids.to_vec(),
             ngram: ngram_before,
         });
+        if self.config.hyper.is_none() {
+            return self.verify_window_prepare_plain(pos, ids);
+        }
         let card = self
             .layers
             .first()
@@ -450,22 +514,7 @@ impl GenericHeteroTransformer {
                 // which may be a layer that does not attend.
                 let leader = rope_group[i];
                 if filled.insert(leader) {
-                    let layer = &mut self.layers[leader];
-                    let (cos, sin) = layer.rope_table().rows(pos, rows, &dev)?;
-                    match (&layer.verify_rope_cos, &layer.verify_rope_sin) {
-                        (Some(c), Some(s)) => {
-                            c.slice_set(&cos, 0, 0)?;
-                            s.slice_set(&sin, 0, 0)?;
-                        }
-                        _ => {
-                            let (c, s) = layer.rope_table().rows(0, VERIFY_ROWS, &dev)?;
-                            let (c, s) = (c.force_contiguous()?, s.force_contiguous()?);
-                            c.slice_set(&cos, 0, 0)?;
-                            s.slice_set(&sin, 0, 0)?;
-                            layer.verify_rope_cos = Some(c);
-                            layer.verify_rope_sin = Some(s);
-                        }
-                    }
+                    self.layers[leader].verify_rope_rows_ready(pos, rows, &dev)?;
                 }
                 // The cache has room for the rows and keeps the buffers a recorded window
                 // reads; a cache that outgrew them ends the recorded windows.
@@ -577,6 +626,92 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
+    /// [`Self::verify_window_prepare`] for a plain residual: the caches cut to `pos` and primed
+    /// there, the step's buffers refreshed as for a step at `pos`, each rope group's tables of
+    /// the rows, room in every cache for the rows, and the rows' embeddings in their buffer.
+    fn verify_window_prepare_plain(&mut self, pos: usize, ids: &[u32]) -> Result<()> {
+        let rows = ids.len();
+        let card = self
+            .layers
+            .first()
+            .map(|l| l.cos.device().clone())
+            .filter(|d| d.is_cuda())
+            .ok_or_else(|| crate::tensor::Error::msg("a recorded verify runs on a card"))?;
+        // A plain step held against the window left its row past the window's base.
+        for layer in &mut self.layers {
+            if layer.cached_len() > pos {
+                layer.trim_kv_to(pos);
+            }
+        }
+        self.update_graph_state(pos)?;
+        let rope_group = self
+            .graph_state_groups
+            .as_ref()
+            .expect("made by the step's state")
+            .rope
+            .clone();
+        let mut filled: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for i in 0..self.layers.len() {
+            let dev = self.layers[i].cos.device().clone();
+            let leader = rope_group[i];
+            if filled.insert(leader) {
+                self.layers[leader].verify_rope_rows_ready(pos, rows, &dev)?;
+            }
+            // The cache has room for the rows and keeps the buffers a recorded window reads; a
+            // cache that outgrew them ends the recorded windows.
+            if let Some(cache) = self.layers[i].q8_kv_mut() {
+                if let Some(limit) = cache.graph_seq_limit().filter(|&l| pos + rows > l) {
+                    crate::tensor::bail!(
+                        "graph_state: rows {pos}..{} outgrew the cache a recorded step reads, {limit} tokens (layer {i})",
+                        pos + rows
+                    );
+                }
+                cache
+                    .reserve_rows(rows)
+                    .map_err(|e| crate::tensor::Error::msg(format!("layer {i}: {e}")))?;
+            }
+        }
+        for i in 0..self.layers.len() {
+            let leader = rope_group[i];
+            if leader != i {
+                let (c, s) = (
+                    self.layers[leader].verify_rope_cos.clone(),
+                    self.layers[leader].verify_rope_sin.clone(),
+                );
+                self.layers[i].verify_rope_cos = c;
+                self.layers[i].verify_rope_sin = s;
+            }
+        }
+        // The rows' embeddings, gathered on the card when it holds the table.
+        let ids_t = Tensor::from_vec(ids.to_vec(), (1, rows), &Device::Cpu)?;
+        let emb_device = self.embeddings.embeddings().device().clone();
+        let mut hidden = match self.embed_table_on(&card) {
+            Some(table) => self.embed_rows_on_card(table, &ids_t)?,
+            None => self.embeddings.forward(&ids_t.to_device(&emb_device)?)?,
+        };
+        hidden = self.add_positions(hidden, pos)?;
+        if let Some(scale) = self.config.embed_scale {
+            hidden = (hidden * scale)?;
+        }
+        let hidden = hidden.to_device(&card)?;
+        match self.verify.hidden.as_ref() {
+            Some(buffer) => buffer.slice_set(&hidden, 1, 0)?,
+            None => {
+                let width = hidden.dim(2)?;
+                let buffer = Tensor::zeros_on((1, VERIFY_ROWS, width), hidden.dtype(), &card)?;
+                buffer.slice_set(&hidden, 1, 0)?;
+                self.verify.hidden = Some(buffer);
+                // The last layer's rows: what the draft head reads.
+                self.verify.out = Some(Tensor::zeros_on(
+                    (1, VERIFY_ROWS, width),
+                    DType::F32,
+                    &card,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
     /// The ops of a recorded verify, in order: each card's segment of layers, with the rows'
     /// hop before every segment but the first; the head ends the last segment.
     fn verify_plan(&self) -> Vec<VerifyOp> {
@@ -660,6 +795,14 @@ impl GenericHeteroTransformer {
                 let mut xn: Option<Tensor> = None;
                 let run = segs[seg].0.clone();
                 for li in run.clone() {
+                    // A plain layer runs the recorded step's forward over the rows, its
+                    // attention taking the rows' positions and tables from the verify's
+                    // buffers.
+                    if !self.layers[li].is_wide() {
+                        let _step = super::graph::GraphStep::enter();
+                        h = self.layers[li].forward_graph(&h)?;
+                        continue;
+                    }
                     let next = (li + 1 < run.end)
                         .then(|| self.layers[li + 1].chained_attn_norm())
                         .flatten();
@@ -706,13 +849,22 @@ impl GenericHeteroTransformer {
         if let Some(out) = self.verify.out.as_ref() {
             out.slice_set(&h.to_dtype(DType::F32)?, 1, 0)?;
         }
-        let oh = self
-            .output_hyper
-            .as_ref()
-            .ok_or_else(|| crate::tensor::Error::msg("a wide residual's head runs on a card"))?;
-        let xn = oh.normed_on_card(&h)?;
-        let (mixed, _) = oh.mix_on_card(&xn, false)?;
-        let normed = mixed.reshape((rows, self.config.embedding_length))?;
+        let width = self.config.embedding_length;
+        // The norm and the head apart, as the eager decode and the recorded step run them.
+        let normed = match self.output_hyper.as_ref() {
+            Some(oh) => {
+                let xn = oh.normed_on_card(&h)?;
+                let (mixed, _) = oh.mix_on_card(&xn, false)?;
+                mixed.reshape((rows, width))?
+            }
+            None => {
+                let w = self.output_norm_cuda_weight.as_ref().ok_or_else(|| {
+                    crate::tensor::Error::msg("a recorded verify needs the head's norm on the card")
+                })?;
+                let last = h.to_dtype(DType::F32)?.reshape((rows, width))?;
+                crate::tensor::ops::rms_norm(&last, w, self.config.rms_norm_eps as f32)?
+            }
+        };
         // The quantised head where the card has one, else the float head read in place.
         let mut logits = match (&self.output_proj_cuda_qmm, &self.output_proj_cuda) {
             (Some(qmm), _) => qmm.forward(&normed)?,
