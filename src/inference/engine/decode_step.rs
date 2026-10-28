@@ -508,7 +508,8 @@ impl DraftLength {
     }
 
     /// Records what a cycle that drafted `k` tokens accepted, and nothing of what it cost: a
-    /// cycle whose verify was recorded as it ran paid the recording too.
+    /// cycle that recorded its verify window or primed the drafter's step as it ran paid that
+    /// once, and the class is costed by the cycles that replay.
     pub(crate) fn record_accepted(&mut self, k: usize, accepted: usize) {
         let k = k.min(DRAFT_MAX);
         for i in 0..k.min(accepted + 1) {
@@ -958,6 +959,65 @@ mod tests {
         d.record(2, 2, 0.2, 3.0);
         let (cycle, _) = d.cycle[2].expect("measured");
         assert!((cycle - 2.5).abs() < 1e-9, "{cycle}");
+    }
+
+    #[test]
+    fn a_recorded_cycle_is_not_a_cost_sample() {
+        let mut d = DraftLength::default();
+        for _ in 0..DRAFT_PROBES {
+            d.record(1, 1, 0.003, 0.016);
+        }
+        let (cycle, draft_token) = (d.cycle, d.draft_token);
+        // A cycle that recorded its window, or primed the drafter, as it ran.
+        d.record_accepted(1, 1);
+        d.record_accepted(2, 1);
+        assert_eq!(d.cycle, cycle, "no class's cost moved");
+        assert_eq!(d.draft_token, draft_token, "nor the drafter's token");
+        assert_eq!(d.samples[1], DRAFT_PROBES);
+        assert_eq!(d.samples[2], 0);
+        assert_eq!(
+            (d.reached[0], d.kept[0]),
+            (DRAFT_PROBES + 2, DRAFT_PROBES + 2),
+            "its acceptance counts"
+        );
+        assert_eq!((d.reached[1], d.kept[1]), (1, 0));
+    }
+
+    /// Cycles of an always-agreeing drafter after a run of plain steps: each window size is
+    /// recorded by the first cycle that verifies at it (a cycle four times a replayed one),
+    /// replayed by the next ones. Whether the drafter is still on after them.
+    fn drafts_after_recordings(charge_recordings: bool) -> Result<(), String> {
+        const PLAIN: f64 = 0.010;
+        const ROW: f64 = 0.003;
+        const DRAFT_TOKEN: f64 = 0.003;
+        const RECORDING: f64 = 0.048;
+        let mut d = DraftLength::default();
+        for _ in 0..DRAFT_RETRY_STEPS {
+            d.record(0, 0, 0.0, PLAIN);
+        }
+        let mut recorded = [false; DRAFT_MAX + 1];
+        for cycle in 0..64 {
+            let k = d.next();
+            if k == 0 {
+                return Err(format!("stopped at cycle {cycle}: {}", d.summary()));
+            }
+            let draft = DRAFT_TOKEN * k as f64;
+            match (std::mem::replace(&mut recorded[k], true), charge_recordings) {
+                (false, false) => d.record_accepted(k, k),
+                (false, true) => d.record(k, k, draft, RECORDING),
+                (true, _) => d.record(k, k, draft, draft + PLAIN + ROW * k as f64),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cheap_replays_after_one_expensive_recording_keep_drafting() {
+        drafts_after_recordings(false).unwrap();
+        assert!(
+            drafts_after_recordings(true).is_err(),
+            "the same cycles charged for their recordings stop the drafter"
+        );
     }
 
     #[test]

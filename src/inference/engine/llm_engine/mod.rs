@@ -548,7 +548,8 @@ impl LlmEngine {
 
     /// Spec-decode: prefill the drafter with the prompt tokens, in the chunks its free memory
     /// affords, as a target prefills (a forward at pos 0 resets and fills its KV -> length =
-    /// tokens.len()). Returns false on error.
+    /// tokens.len()). Returns false on error. The drafter's recorded step is kept for this
+    /// request while the prefill moved none of the buffers it reads, and dropped otherwise.
     pub fn draft_prefill(&self, tokens: &[u32]) -> bool {
         let g = self.draft_engine.blocking_lock();
         let d = match g.as_ref() {
@@ -564,7 +565,40 @@ impl LlmEngine {
             Ok(x) => x,
             Err(_) => return false,
         };
-        st.model.forward_prefill_chunked(&x, 0).is_ok()
+        #[cfg(feature = "gpu")]
+        let kept = st.draft_graph.current(st.model.graph_generation());
+        #[cfg(feature = "gpu")]
+        {
+            if kept {
+                st.model.suspend_graph_captured();
+            } else {
+                drop_draft_graph(st);
+            }
+            st.draft_step = DraftStep::Undecided;
+        }
+        st.draft_primed = false;
+        let prefilled = st.model.forward_prefill_chunked(&x, 0).is_ok();
+        #[cfg(feature = "gpu")]
+        if kept {
+            if st.draft_graph.current(st.model.graph_generation()) {
+                st.model.resume_graph_captured();
+            } else {
+                drop_draft_graph(st);
+            }
+        }
+        prefilled
+    }
+
+    /// Whether a drafter step since the last call primed or recorded the drafter's step: the
+    /// cycle it ran in paid that once, and its time is not what a cycle costs.
+    pub fn draft_primed_take(&self) -> bool {
+        let g = self.draft_engine.blocking_lock();
+        let Some(d) = g.as_ref() else {
+            return false;
+        };
+        let mut sg = d.model_state.blocking_lock();
+        sg.as_mut()
+            .is_some_and(|st| std::mem::take(&mut st.draft_primed))
     }
 
     /// Spec-decode: greedily draft `k` tokens. Feeds `first_token` at
@@ -611,11 +645,7 @@ impl LlmEngine {
         let mut tok = first_token;
         let mut pos = start_pos;
         for _ in 0..k {
-            let x = match Tensor::new(&[tok], &st.device).and_then(|t| t.unsqueeze(0)) {
-                Ok(x) => x,
-                Err(_) => break,
-            };
-            let logits = match st.model.forward(&x, pos) {
+            let logits = match drafter_step(st, tok, pos) {
                 Ok(l) => l,
                 Err(_) => break,
             };
@@ -1095,6 +1125,131 @@ pub struct ModelGeometry {
 /// Wrapped in a per-process call so we don't pay it per dropped tensor.
 #[cfg(not(feature = "gpu"))]
 pub fn trim_cuda_pools() {}
+
+/// How a drafter's next draft token runs in a request: its recorded step replays from the
+/// third token on, once a token in graph mode has primed the step's buffers and the second has
+/// been recorded, and from the first token on when the step was kept from an earlier request.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DraftStep {
+    /// The request's first draft token decides.
+    #[default]
+    Undecided,
+    /// Eagerly: the model records no step, or its recording failed in this request.
+    Eager,
+    /// The next token runs in graph mode, uncaptured, to prime the step's buffers.
+    Cold,
+    /// The next token is recorded.
+    Warm,
+}
+
+/// Drops the drafter's recorded step with the graph state it reads, when one is held.
+#[cfg(feature = "gpu")]
+fn drop_draft_graph(st: &mut LoadedModelState) {
+    if !st.draft_graph.is_empty() {
+        st.draft_graph.clear();
+        st.model.note_graphs_kept(None);
+        st.model.invalidate_graph_state();
+    }
+}
+
+/// One draft token through the drafter at `pos`: its recorded step where the model records one,
+/// an eager forward otherwise. The drafter only proposes and the target verifies every token,
+/// so a replay is not held against an eager step: a wrong proposal costs acceptance, never the
+/// answer.
+fn drafter_step(st: &mut LoadedModelState, tok: u32, pos: usize) -> crate::tensor::Result<Tensor> {
+    #[cfg(feature = "gpu")]
+    {
+        if st.draft_step == DraftStep::Undecided {
+            // A step is kept between requests by the generation of the buffers it reads: a
+            // model that does not count their moves records none.
+            let m = &st.model;
+            let records = m.capabilities().graph_mode
+                && m.graph_capture_auto_on()
+                && m.kv_state_graph_safe()
+                && !m.needs_split_graph_path()
+                && !m.recapture_each_token()
+                && !m.is_recurrent()
+                && m.graph_generation().is_some()
+                && m.model_cuda_stream().is_some();
+            st.draft_step = match records {
+                true => DraftStep::Cold,
+                false => DraftStep::Eager,
+            };
+        }
+        if st.draft_step != DraftStep::Eager {
+            match drafter_step_recorded(st, tok, pos) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    warn!("drafter: recorded step given up at pos={pos}: {e}; eager drafts for the rest of the request");
+                    st.draft_primed = true;
+                    st.draft_graph.clear();
+                    st.model.note_graphs_kept(None);
+                    st.model.invalidate_graph_state();
+                    st.draft_step = DraftStep::Eager;
+                }
+            }
+        }
+    }
+    let x = Tensor::new(&[tok], &st.device)?.unsqueeze(0)?;
+    st.model.forward(&x, pos)
+}
+
+/// [`drafter_step`] in graph mode: the step's buffers are set for `tok` at `pos`, then the
+/// recorded step replays, or the step runs uncaptured to prime them, or it is recorded and kept
+/// with the generation the model is at.
+#[cfg(feature = "gpu")]
+fn drafter_step_recorded(
+    st: &mut LoadedModelState,
+    tok: u32,
+    pos: usize,
+) -> crate::tensor::Result<Tensor> {
+    let stream = st
+        .model
+        .model_cuda_stream()
+        .ok_or_else(|| crate::tensor::Error::msg("the drafter has no card stream"))?;
+    let sync = |s: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>| {
+        s.synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("drafter stream: {e:?}")))
+    };
+    let x = Tensor::new(&[tok], &Device::Cpu)?.unsqueeze(0)?;
+    st.model.update_graph_state(pos)?;
+    st.model.embed_for_graph(&x)?;
+    let logits = match (st.draft_graph.held(), st.draft_step) {
+        (Some(recorded), _) => {
+            sync(&stream)?;
+            recorded.graph.launch(&mut st.model)?;
+            recorded.logits.clone()
+        }
+        (None, DraftStep::Cold) => {
+            st.draft_primed = true;
+            let logits = st.model.forward_from_hidden()?;
+            st.draft_step = DraftStep::Warm;
+            logits
+        }
+        (None, _) => {
+            st.draft_primed = true;
+            sync(&stream)?;
+            let (graph, logits) = decode::capture_decode_graph(&mut st.model, &stream, pos, false)
+                .ok_or_else(|| crate::tensor::Error::msg("the step was not recorded"))?;
+            graph.launch(&mut st.model)?;
+            st.model.mark_graph_captured();
+            let at = st.model.graph_generation();
+            st.draft_graph.keep(
+                decode::DraftGraph {
+                    graph,
+                    logits: logits.clone(),
+                },
+                at,
+            );
+            st.model
+                .note_graphs_kept(at.map(|(_, generation)| generation));
+            logits
+        }
+    };
+    st.model.sync_kv_len_for_graph(pos + 1);
+    Ok(logits)
+}
 
 /// The owner name the room held for a planned drafter is declared under.
 const DRAFTER_DEMAND: &str = "drafter";

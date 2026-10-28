@@ -1776,7 +1776,11 @@ impl LlmEngine {
                         let windows_given_up = verify_graphs.disabled;
                         #[cfg(not(feature = "gpu"))]
                         let windows_given_up = false;
-                        let replay_secs = recorded.as_ref().and_then(|r| r.1);
+                        // The verify recorded or held its window, or gave the windows up.
+                        #[cfg(feature = "gpu")]
+                        let window_recorded = std::mem::take(&mut verify_graphs.recorded_last);
+                        #[cfg(not(feature = "gpu"))]
+                        let window_recorded = false;
                         // An eager verify costs the head more than the plain steps it stands
                         // for: once the windows are given up, the head stops guessing.
                         if head_on && windows_served && !recorded_window && windows_given_up {
@@ -1785,7 +1789,7 @@ impl LlmEngine {
                         }
                         // A cycle pays its way only when its window replayed: one recorded as it
                         // ran, or verified eagerly where windows serve, counts its acceptance alone.
-                        let charged = replay_secs.is_none() && (recorded_window || !windows_served);
+                        let charged = !window_recorded && (recorded_window || !windows_served);
                         let mut draft = draft;
                         let logits = match recorded {
                             Some((l, _)) => l,
@@ -1880,9 +1884,15 @@ impl LlmEngine {
                             spec_drafted += k as u64;
                             spec_accepted += accepted_drafts as u64;
                             spec_draft_lockstep(&spec_engine, &draft, accepted_drafts, pos);
-                            spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
-                                k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64(),
-                            );
+                            // A cycle that recorded its window or primed the drafter paid that
+                            // once: its acceptance counts, its cost does not.
+                            let primed = spec_engine.draft_primed_take();
+                            let mut length = spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner());
+                            if window_recorded || primed {
+                                length.record_accepted(k, accepted_drafts);
+                            } else {
+                                length.record(k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64());
+                            }
                         }
 
                         // Set next_token to the last committed sample - the

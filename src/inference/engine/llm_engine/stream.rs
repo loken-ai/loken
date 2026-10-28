@@ -9,11 +9,6 @@ use super::*;
 use crate::inference::engine::decode_step::record_logprobs;
 use crate::inference::place::ladder::is_out_of_memory;
 
-/// The seconds a window just recorded replayed in, when a verify recorded one.
-fn replay_secs_of(recorded: &Option<(Tensor, Option<f64>)>) -> Option<f64> {
-    recorded.as_ref().and_then(|r| r.1)
-}
-
 impl LlmEngine {
     /// Generate stream - returns channel receiver for streaming tokens with real model inference
     /// True if the loaded model is served through the continuous-batch worker
@@ -2501,6 +2496,11 @@ impl LlmEngine {
                             let windows_given_up = verify_graphs.disabled;
                             #[cfg(not(feature = "gpu"))]
                             let windows_given_up = false;
+                            // The verify recorded or held its window, or gave the windows up.
+                            #[cfg(feature = "gpu")]
+                            let window_recorded = std::mem::take(&mut verify_graphs.recorded_last);
+                            #[cfg(not(feature = "gpu"))]
+                            let window_recorded = false;
                             if recorded_window {
                                 replay_sum += replaying.elapsed().as_secs_f64();
                             }
@@ -2513,11 +2513,7 @@ impl LlmEngine {
                             // A cycle pays its way only when its window replayed: one recorded
                             // as it ran, or verified eagerly where windows serve, counts its
                             // acceptance alone.
-                            let charged = replay_secs_of(&recorded).is_none()
-                                && (recorded_window || !windows_served);
-                            // A window recorded for this verify cost its recording too: the
-                            // cycle is charged the replay alone, which is what the next ones cost.
-                            let replay_secs = recorded.as_ref().and_then(|r| r.1);
+                            let charged = !window_recorded && (recorded_window || !windows_served);
                             let logits_res = match recorded {
                                 Some((l, _)) => Ok(l),
                                 None => state.model.forward_all(&x, pos).and_then(|l| {
@@ -2626,7 +2622,7 @@ impl LlmEngine {
                                 // A cycle whose window was recorded as it ran paid the recording:
                                 // its acceptance counts, its cost does not.
                                 let cycle_secs = cycle_start.elapsed().as_secs_f64();
-                                if !spec_on && !head_on && replay_secs.is_none() {
+                                if !spec_on && !head_on && !window_recorded {
                                     pld_cost.round(cycle_secs, n_committed);
                                 }
                                 if pld_enabled {
@@ -2686,16 +2682,23 @@ impl LlmEngine {
                                         accepted_drafts,
                                         new_pos,
                                     );
-                                    spec_engine
+                                    // A cycle that recorded its window or primed the drafter
+                                    // paid that once: its acceptance counts, its cost does not.
+                                    let primed = spec_engine.draft_primed_take();
+                                    let mut length = spec_engine
                                         .draft_length
                                         .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .record(
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if window_recorded || primed {
+                                        length.record_accepted(k, accepted_drafts);
+                                    } else {
+                                        length.record(
                                             k,
                                             accepted_drafts,
                                             draft_secs,
                                             cycle_start.elapsed().as_secs_f64(),
                                         );
+                                    }
                                 }
 
                                 // Path B3 carry-through: when the FINAL sampled

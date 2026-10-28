@@ -1536,6 +1536,11 @@ impl LlmEngine {
                 moondream_decode_count: 0,
                 #[cfg(feature = "gpu")]
                 kept_graphs: Default::default(),
+                #[cfg(feature = "gpu")]
+                draft_graph: Default::default(),
+                #[cfg(feature = "gpu")]
+                draft_step: Default::default(),
+                draft_primed: false,
                 exact_prefill: None,
                 eos_token_ids_extra,
                 file_size,

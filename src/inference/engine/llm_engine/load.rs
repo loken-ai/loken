@@ -505,6 +505,11 @@ pub(super) fn load_deepseek_v41_checkpoint(
         moondream_decode_count: 0,
         #[cfg(feature = "gpu")]
         kept_graphs: Default::default(),
+        #[cfg(feature = "gpu")]
+        draft_graph: Default::default(),
+        #[cfg(feature = "gpu")]
+        draft_step: Default::default(),
+        draft_primed: false,
         exact_prefill: None,
         eos_token_ids_extra: Vec::new(),
         file_size,
@@ -985,6 +990,15 @@ pub(crate) struct LoadedModelState {
     /// The decode's recorded graphs, kept between requests while nothing they read has moved.
     #[cfg(feature = "gpu")]
     pub(super) kept_graphs: super::decode::KeptGraphs<super::decode::DecodeGraphs>,
+    /// A drafter's recorded step and the logits buffer its replays write, kept between
+    /// requests while nothing it reads has moved.
+    #[cfg(feature = "gpu")]
+    pub(super) draft_graph: super::decode::KeptGraphs<super::decode::DraftGraph>,
+    /// How a drafter's next draft token runs in the request under way.
+    #[cfg(feature = "gpu")]
+    pub(super) draft_step: super::DraftStep,
+    /// A drafter step primed or recorded the drafter's step since the decode last asked.
+    pub(super) draft_primed: bool,
     /// The prompt of the last text prefill and the logits it ended on, valid while the resident
     /// KV still holds that prompt's rows. Any request that touches the KV another way clears it.
     pub(super) exact_prefill: Option<(Vec<u32>, Tensor)>,

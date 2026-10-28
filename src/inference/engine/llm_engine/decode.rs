@@ -336,6 +336,11 @@ impl<T> KeptGraphs<T> {
         held.filter(|_| current)
     }
 
+    /// The kept graphs, current or not.
+    pub(crate) fn held(&self) -> Option<&T> {
+        self.held.as_ref().map(|(graphs, _)| graphs)
+    }
+
     /// Drops the kept graphs. Done before the buffers they read are dropped.
     pub(crate) fn clear(&mut self) {
         self.held = None;
@@ -359,6 +364,17 @@ pub(crate) struct DecodeGraphs {
 // the model's stream from whichever thread holds it, as the model itself is.
 #[cfg(feature = "gpu")]
 unsafe impl Send for DecodeGraphs {}
+
+/// A drafter's recorded step and the logits buffer its replays write.
+#[cfg(feature = "gpu")]
+pub(crate) struct DraftGraph {
+    pub(super) graph: DecodeGraph,
+    pub(super) logits: Tensor,
+}
+
+// Reached as `DecodeGraphs` is: through the drafter's state, behind its mutex.
+#[cfg(feature = "gpu")]
+unsafe impl Send for DraftGraph {}
 
 /// Where the graphs of a request were recorded: the generation of the first recording, and
 /// whether a later one saw another. Graphs of one generation only are kept past the request.
@@ -414,6 +430,9 @@ pub(super) struct VerifyGraphs {
     mismatches: usize,
     /// The step's buffers were dropped with a window: the step's graph is recorded again.
     pub(super) step_stale: bool,
+    /// The last verify recorded its window, held a kept one against its eager run, or gave the
+    /// windows up: its time is not what the verify costs from then on.
+    pub(super) recorded_last: bool,
     /// Seconds spent readying the replays' buffers, and in the replays themselves, summed.
     pub(super) prepare_secs: f64,
     pub(super) launch_secs: f64,
@@ -428,6 +447,7 @@ impl Default for VerifyGraphs {
             disabled: false,
             mismatches: 0,
             step_stale: false,
+            recorded_last: false,
             prepare_secs: 0.0,
             launch_secs: 0.0,
         }
@@ -449,6 +469,7 @@ impl VerifyGraphs {
         self.disabled = false;
         self.mismatches = 0;
         self.step_stale = false;
+        self.recorded_last = false;
         self.prepare_secs = 0.0;
         self.launch_secs = 0.0;
     }
@@ -554,7 +575,8 @@ const WAIT_TELLS_AFTER_SECS: f64 = 3.0;
 /// recording's own cost would hide); `None` when the verify has to run eagerly, the model's
 /// state as it was. The first verify of each window size runs eagerly first, is recorded,
 /// replayed, and the replay has to name the eager tokens, or recorded verifies are given up on
-/// for the request.
+/// for the request. [`VerifyGraphs::recorded_last`] says whether the verify did more than a
+/// replay or an eager run.
 #[cfg(feature = "gpu")]
 pub(super) fn verify_recorded(
     model: &mut BoxedModelBackend,
@@ -564,14 +586,19 @@ pub(super) fn verify_recorded(
     ids: &[u32],
 ) -> Option<(Tensor, Option<f64>)> {
     let rows = ids.len();
+    graphs.recorded_last = false;
     if graphs.disabled || rows < 2 || rows > model.verify_window_rows() {
         return None;
     }
+    // A window not recorded yet is recorded by this verify; one kept from an earlier request
+    // is held against its eager run first.
+    graphs.recorded_last = !graphs.by_rows.contains_key(&rows) || graphs.unheld.contains(&rows);
     // The buffers the step's graph reads go with the state, so the step is recorded again:
     // a graph replayed over dropped buffers reads freed memory.
     let give_up = |model: &mut BoxedModelBackend, graphs: &mut VerifyGraphs, why: String| {
         warn!("recorded verify given up at pos={pos}: {why}; eager verifies for the rest of the request");
         graphs.disabled = true;
+        graphs.recorded_last = true;
         graphs.clear();
         if let Err(e) = model.verify_window_settle(0) {
             warn!("the model did not return to the rows before the verify: {e}");
@@ -731,6 +758,7 @@ pub(super) fn verify_recorded(
             if !agrees {
                 // The window, the step and their buffers are recorded again from here.
                 warn!("a kept verify window of {rows} rows at pos={pos} named other tokens than its eager rows; recorded again");
+                graphs.recorded_last = true;
                 graphs.clear();
                 if let Err(e) = model.verify_window_settle(0) {
                     warn!("the model did not return to the rows before the verify: {e}");
@@ -1316,6 +1344,7 @@ mod kept_graphs_tests {
         let mut kept = KeptGraphs::default();
         kept.keep(7u32, Some((1, 5)));
         assert!(kept.current(Some((1, 5))));
+        assert_eq!(kept.held(), Some(&7), "held across a check");
         assert_eq!(kept.take_current(Some((1, 5))), Some((7, (1, 5))));
         assert!(kept.is_empty());
     }
@@ -1330,6 +1359,7 @@ mod kept_graphs_tests {
         assert_eq!(kept.take_current(Some((1, 6))), None);
         assert!(kept.is_empty(), "stale graphs are dropped");
         kept.keep(8, None);
+        assert_eq!(kept.held(), None);
         assert!(
             kept.is_empty(),
             "a model without a generation keeps nothing"
