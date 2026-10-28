@@ -23,6 +23,12 @@ impl QMatMul {
             GgmlDType::BF16 if qt.device().is_cuda() => Self::bf16_onto(&qt, qt.device()),
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {
                 let t = qt.dequantize(qt.device())?;
+                let t = if qt.device().is_cpu() && t.dtype() == crate::tensor::DType::BF16 {
+                    // CONVERSION: the host's dense product reads F32 and F16 weights, not BF16.
+                    t.to_dtype(crate::tensor::DType::F32)?
+                } else {
+                    t
+                };
                 Ok(Self::Tensor(t))
             }
             _ => Ok(Self::QTensor(qt)),

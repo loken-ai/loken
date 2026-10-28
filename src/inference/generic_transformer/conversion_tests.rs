@@ -39,6 +39,12 @@ const DECLARED: &[(&str, &str, &str, &str)] = &[
         "q8_0",
         "float projection rebuilt as a block format for the block-quant kernels and fused projections",
     ),
+    (
+        "output",
+        "bf16",
+        "f32",
+        "the host's dense product reads F32 and F16 weights, not BF16",
+    ),
 ];
 
 /// The formats the loader accepts for a weight, by the name GGUF spells them with.
@@ -214,11 +220,16 @@ fn a_load_keeps_every_class_in_its_stored_format_unless_declared() {
             "{stored}: the projections were not found: {:?}",
             classes.iter().map(|c| c.1).collect::<Vec<_>>()
         );
+        let head_declared = |got: &str| {
+            DECLARED.iter().any(|(c, from, to, why)| {
+                *c == "output" && *from == stored && *to == got && !why.is_empty()
+            })
+        };
         match &m.output_proj {
             crate::tensor::quantized::QMatMul::QTensor(q) if q.dtype() == dtype => {}
             crate::tensor::quantized::QMatMul::Tensor(t)
             | crate::tensor::quantized::QMatMul::TensorF16(t)
-                if t.dtype().as_str() == stored => {}
+                if t.dtype().as_str() == stored || head_declared(t.dtype().as_str()) => {}
             other => problems.push(format!(
                 "{stored}: the output head is resident as {other:?}"
             )),

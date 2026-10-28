@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Inference: open the configured context window for a model on the host alone.
+- Inference: serve a model whose BF16 output head runs on the host.
 
 ## [0.4.1] - 2026-10-26
 
