@@ -847,6 +847,52 @@ impl LlmEngine {
         ))
     }
 
+    /// The loaded model's tokens for `text` and each token's text: the special tokens added
+    /// as a prompt is read when `special`, none otherwise. `None` with no model loaded.
+    pub async fn tokenize(
+        &self,
+        text: &str,
+        special: bool,
+    ) -> Option<Result<(Vec<u32>, Vec<String>), String>> {
+        let guard = self.model_state.lock().await;
+        let tokenizer = &guard.as_ref()?.tokenizer;
+        let encoded = if special {
+            encode_prompt(tokenizer, text)
+        } else {
+            tokenizer.encode(text, false)
+        };
+        Some(encoded.map_err(|e| e.to_string()).map(|e| {
+            let ids = e.get_ids().to_vec();
+            let pieces = ids
+                .iter()
+                .map(|&id| tokenizer.id_to_token(id).unwrap_or_default())
+                .collect();
+            (ids, pieces)
+        }))
+    }
+
+    /// The text of `ids` in the loaded model's vocabulary, special tokens kept. `None` with no
+    /// model loaded.
+    pub async fn detokenize(&self, ids: &[u32]) -> Option<Result<String, String>> {
+        let guard = self.model_state.lock().await;
+        let tokenizer = &guard.as_ref()?.tokenizer;
+        Some(tokenizer.decode(ids, false).map_err(|e| e.to_string()))
+    }
+
+    /// Drops what the loaded model keeps of earlier prompts for reuse: the records of the
+    /// resident KV, the KV itself and the logits of the last prefill. `false` with no model
+    /// loaded.
+    pub async fn reset_prefix_cache(&self) -> bool {
+        let mut guard = self.model_state.lock().await;
+        let Some(state) = guard.as_mut() else {
+            return false;
+        };
+        self.sessions.lock().await.clear();
+        state.exact_prefill = None;
+        state.model.reset_kv_from(0);
+        true
+    }
+
     /// The log-probabilities a stream has drawn since the last call.
     pub fn take_logprobs(&self) -> Vec<TokenLogprob> {
         self.logprob_queue
@@ -1321,6 +1367,7 @@ fn grammar_factory_for(
 ///   - `"json_object"`              -> bare JSON object
 ///   - `"json_schema:{<schema>}"`   -> user-supplied JSON schema
 ///   - `"lark:<grammar text>"`      -> Lark grammar
+///   - `"regex:<pattern>"`          -> text the pattern matches whole
 fn parse_grammar_spec(spec: &str) -> AnyResult<llguidance::api::TopLevelGrammar> {
     let trimmed = spec.trim();
     if trimmed.eq_ignore_ascii_case("json_object") {
@@ -1338,8 +1385,11 @@ fn parse_grammar_spec(spec: &str) -> AnyResult<llguidance::api::TopLevelGrammar>
             rest.to_string(),
         ));
     }
+    if let Some(rest) = spec.trim_start().strip_prefix("regex:") {
+        return Ok(llguidance::api::TopLevelGrammar::from_regex(rest));
+    }
     Err(anyhow!(
-        "unrecognized grammar spec '{}': expected 'json_object', 'json_schema:...', or 'lark:...'",
+        "unrecognized grammar spec '{}': expected 'json_object', 'json_schema:...', 'lark:...' or 'regex:...'",
         spec
     ))
 }
@@ -1399,10 +1449,10 @@ mod grammar_spec_tests {
 
     #[test]
     fn parse_grammar_spec_rejects_unknown_discriminator_with_guidance() {
-        // Unknown form -> error must name the THREE supported
+        // Unknown form -> error must name the supported
         // discriminators so the caller can fix their request
         // without consulting the source.
-        let err = parse_grammar_spec("regex:^.*$").unwrap_err();
+        let err = parse_grammar_spec("ebnf:root ::= x").unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("json_object"),
@@ -1413,6 +1463,12 @@ mod grammar_spec_tests {
             "must mention json_schema: {msg}"
         );
         assert!(msg.contains("lark"), "must mention lark: {msg}");
+        assert!(msg.contains("regex"), "must mention regex: {msg}");
+    }
+
+    #[test]
+    fn parse_grammar_spec_accepts_a_regex() {
+        assert!(parse_grammar_spec("regex:[0-9]{3}").is_ok());
     }
 }
 
@@ -1449,6 +1505,7 @@ pub(crate) use loading::per_card_reserve;
 // The pool must be sized from `main`, before anything can build rayon's global one.
 pub use loading::configure_thread_pool;
 mod query;
+mod sequential;
 pub use query::SegmentInputs;
 mod spec;
 mod stream;

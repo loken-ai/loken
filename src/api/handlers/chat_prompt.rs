@@ -21,7 +21,12 @@ pub(crate) struct PromptSpec<'a> {
     /// The grammar the caller's structured-output field asks for. It takes precedence
     /// over the call object a required tool call would impose.
     pub output_grammar: Option<String>,
+    /// How the template renders the conversation: the turn it opens, a continued last
+    /// message, the variables it is handed.
+    pub template: TemplateOptions,
 }
+
+pub(crate) use super::prompt_format::TemplateOptions;
 
 /// What a model's files say about how it is prompted: the chat template it declares and
 /// the format markers its vocabulary holds (`vocabulary_markers`).
@@ -278,6 +283,37 @@ pub(crate) fn thinking_from_effort(effort: Option<&str>) -> Option<&'static str>
     })
 }
 
+/// `thinking` from the template variables a request hands the template: `enable_thinking`
+/// false switches thinking off, true leaves it on.
+pub(crate) fn thinking_from_variables(
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    match variables.get("enable_thinking")?.as_bool()? {
+        false => Some("disabled"),
+        true => Some("enabled"),
+    }
+}
+
+/// The prompt cut right after the last message's content, so the model continues that
+/// message instead of closing it. Unchanged when the content is empty or the template did not
+/// write it as given.
+fn continued(prompt: String, messages: &[Message]) -> String {
+    let Some(last) = messages
+        .last()
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty())
+    else {
+        return prompt;
+    };
+    match prompt.rfind(last) {
+        Some(at) => prompt[..at + last.len()].to_string(),
+        None => {
+            tracing::warn!("the template does not write the final message as given; not continued");
+            prompt
+        }
+    }
+}
+
 /// The messages with the vision sentinel put in front of the last user turn that carries
 /// images, the only turn whose images reach the encoder.
 fn with_vision_sentinel(messages: &[Message]) -> Vec<Message> {
@@ -437,7 +473,7 @@ pub(crate) fn build_prompt(
     let render = |messages: &[Message]| -> String {
         let mut prompt = match spec.tools.filter(|_| tools_active) {
             Some(tools) if template_takes_tools(template) => {
-                format_chat_prompt_with_tools(messages, template, tools)
+                format_chat_prompt_with_tools_opts(messages, template, tools, &spec.template)
             }
             Some(tools) if template_is_harmony(template) => format_harmony(messages, Some(tools)),
             Some(tools) if template_is_mistral_tools(template) => {
@@ -451,11 +487,14 @@ pub(crate) fn build_prompt(
                     tools,
                     directive.as_deref(),
                 );
-                format_chat_prompt_thinking(&flat, template, thinking_off)
+                format_chat_prompt_opts(&flat, template, thinking_off, &spec.template)
             }
-            None => format_chat_prompt_thinking(messages, template, thinking_off),
+            None => format_chat_prompt_opts(messages, template, thinking_off, &spec.template),
         };
         apply_thinking_preference(&mut prompt, thinking, template);
+        if spec.template.continue_final_message {
+            prompt = continued(prompt, messages);
+        }
         prompt
     };
     let prompt = render(messages);
@@ -564,6 +603,7 @@ impl APIServer {
             tool_choice: spec.tool_choice,
             thinking: spec.thinking,
             output_grammar: spec.output_grammar.clone(),
+            template: spec.template.clone(),
         });
         let spec = clip_spec.as_ref().unwrap_or(spec);
         let vision = match engine {
@@ -622,6 +662,7 @@ mod tests {
             tool_choice: choice,
             thinking: None,
             output_grammar: None,
+            template: Default::default(),
         }
     }
 
@@ -959,6 +1000,59 @@ mod tests {
         assert!(render(&next).starts_with(&prompt[..shared]));
         let again = stable_prefix_len(&next, &render(&next), &render).unwrap();
         assert!(render(&next)[..again].starts_with(&prompt[..shared]));
+    }
+
+    /// vLLM's template options: no assistant opener without `add_generation_prompt`, a
+    /// continued final message left open, and the request's variables in the template.
+    #[test]
+    fn the_template_options_reach_the_render() {
+        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}{% if greeting is defined %}{{ greeting }}{% endif %}";
+        let msgs = [user("hi", None)];
+        let render = |opts: TemplateOptions, msgs: &[Message]| {
+            let mut sp = spec(msgs, None, None);
+            sp.template = opts;
+            build_prompt(&sp, Some(template), "", false, None).prompt
+        };
+        assert_eq!(
+            render(TemplateOptions::default(), &msgs),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let closed = TemplateOptions {
+            add_generation_prompt: false,
+            ..TemplateOptions::default()
+        };
+        assert_eq!(render(closed, &msgs), "<|im_start|>user\nhi<|im_end|>\n");
+        let mut vars = serde_json::Map::new();
+        vars.insert("greeting".into(), serde_json::json!("hello"));
+        let with_vars = TemplateOptions {
+            variables: vars,
+            ..TemplateOptions::default()
+        };
+        assert!(render(with_vars, &msgs).ends_with("assistant\nhello"));
+        let prefilled = [
+            user("hi", None),
+            Message::new("assistant".to_string(), "The answer is".to_string()),
+        ];
+        let continued = TemplateOptions {
+            add_generation_prompt: false,
+            continue_final_message: true,
+            ..TemplateOptions::default()
+        };
+        assert_eq!(
+            render(continued, &prefilled),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nThe answer is"
+        );
+    }
+
+    /// `enable_thinking` among the template variables is the thinking preference.
+    #[test]
+    fn enable_thinking_is_the_thinking_preference() {
+        let mut vars = serde_json::Map::new();
+        assert_eq!(thinking_from_variables(&vars), None);
+        vars.insert("enable_thinking".into(), serde_json::json!(false));
+        assert_eq!(thinking_from_variables(&vars), Some("disabled"));
+        vars.insert("enable_thinking".into(), serde_json::json!(true));
+        assert_eq!(thinking_from_variables(&vars), Some("enabled"));
     }
 
     /// A conversation that already ends on an answer has no turn to share.

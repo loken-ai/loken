@@ -939,7 +939,7 @@ fn worker_loop(
 ) {
     let mut engine = match ContinuousBatchEngine::new(
         model,
-        eos.clone(),
+        eos,
         num_blocks,
         block_size,
         max_running,
@@ -1039,8 +1039,11 @@ fn worker_loop(
         }
         for (id, tok) in emits {
             if let Some(tx) = chans.get(&id) {
-                // Suppress the terminal EOS as a content token; Done carries it.
-                if !eos.contains(&tok) {
+                // The token a sequence ended on is no content; Done carries it.
+                let ended = done
+                    .iter()
+                    .any(|d| d.id == id && d.reason == FinishReason::Eos);
+                if !ended {
                     let _ = tx.send(CbToken::Tok(tok));
                 }
             }

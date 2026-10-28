@@ -70,6 +70,7 @@ pub(crate) async fn ollama_chat(
                     tool_choice: request.tool_choice.as_ref(),
                     thinking: request.thinking_preference(),
                     output_grammar: None,
+                    template: Default::default(),
                 },
             )
             .await
@@ -331,6 +332,7 @@ pub(crate) async fn ollama_chat(
                 tool_choice: request.tool_choice.as_ref(),
                 thinking: request.thinking_preference(),
                 output_grammar: params.grammar.take(),
+                template: Default::default(),
             },
         )
         .await;

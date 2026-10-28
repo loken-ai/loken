@@ -6,6 +6,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use validator::Validate;
 
+pub mod vllm;
+
 /// Deserialise a `keep_alive` field that may arrive as either a string
 /// ("0", "5m", "10s") or an integer (0, 60, -1) - Ollama's HTTP API
 /// accepts both forms, and the bench / many third-party clients send
@@ -1242,6 +1244,9 @@ pub struct ChatCompletionRequest {
     /// names don't require a struct change.
     #[serde(default)]
     pub service_tier: Option<String>,
+    /// vLLM's extensions: sampling rules, structured outputs, template options.
+    #[serde(flatten)]
+    pub vllm: vllm::VllmFields,
 }
 
 impl ChatCompletionRequest {
@@ -1317,6 +1322,7 @@ impl ChatCompletionRequest {
             logit_bias: None,
             reasoning_effort: None,
             modalities: None,
+            vllm: Default::default(),
         }
     }
 

@@ -5,7 +5,7 @@ the Messages API under `/v1/messages`. A client written for any of the three wor
 Bodies are read as JSON whatever `Content-Type` says, and every surface answers a malformed
 body in its own error envelope.
 
-Every route but `/health` demands a key when `[server] require_auth` is on, as
+Every route but `/health` and `/ping` demands a key when `[server] require_auth` is on, as
 `Authorization: Bearer <key>` or `X-API-Key: <key>`.
 
 ## Ollama surface
@@ -34,14 +34,19 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 
 | Route | What it does |
 |---|---|
-| `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`. Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. |
-| `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, and an array of prompts. `prompt_embeds` sends the prompt as embedding rows of the model's width instead of text, in one of the forms under [Prompt embeddings](#prompt-embeddings); not served while the model batches concurrent requests. |
+| `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`, and vLLM's extensions (below). Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. A stop sequence is not part of the text. |
+| `POST /v1/chat/completions/batch` | vLLM's batch of conversations: `messages` is a list of conversations, each answered as its own chat completion, one choice per conversation. No `stream`, `tools` or `n` above 1. |
+| `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, an array of prompts, `logit_bias`, `response_format`, and vLLM's extensions (below). `prompt_embeds` sends the prompt as embedding rows of the model's width instead of text, in one of the forms under [Prompt embeddings](#prompt-embeddings); not served while the model batches concurrent requests. |
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. `input_image` (`image_url` as a base64 data URL, or `file_id` of an upload) and `input_audio` (`data`, `format`) parts are ingested as the `image_url` and `input_audio` parts of a chat completion; another part type answers 400 naming it. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. |
 | `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. |
 | `POST /v2/rerank` | The same in Cohere's shape: `documents` as strings or `{text}` objects, `top_n`, `return_documents`; answers `{id, results, meta}`. |
 | `POST /v2/embed` | Embeddings in Cohere's shape: `texts`, answered as `embeddings.float`. Only `float` is served. |
 | `POST /score`, `POST /v1/score` | vLLM's pair scoring: `text_1` against `text_2`, one score per pair, `data[].score`. |
+| `POST /pooling` | vLLM's pooling shape over the embeddings route: `data[].data` is the pooled vector. |
+| `POST /tokenize` | vLLM's tokenizer route: a `prompt`, or chat `messages` rendered by the model's template (`add_generation_prompt`, `continue_final_message`, `chat_template_kwargs`, `tools`), with `add_special_tokens` and `return_token_strs`. Answers `count`, `max_model_len`, `tokens`, `token_strs`. |
+| `POST /detokenize` | `tokens` back to `prompt`, special tokens kept. |
+| `POST /invocations` | SageMaker's route, as vLLM serves it: a body with `messages` goes to chat, one with `prompt` to completions, one with `input` to embeddings. |
 | `POST /v1/forecast` | Continue a time series with a forecaster checkpoint: `model`, `series` (numbers, `null` for a missing point), `horizon` (steps, up to what the checkpoint answers), optional `quantiles` (levels, read between the checkpoint's own by a straight line). A checkpoint that reads covariates also takes `past_covariates` (rows as long as `series`), `known_covariates` (rows covering `series` and the horizon), and their `categorical_` forms, whose values are any strings or numbers; each field is an array of rows or an object of named rows. Answers `median` and `quantiles[].{level, values}`, one value per future step. Runs on a card when one has room, else on the host. |
 | `GET /v1/models` | The models on this machine, with `max_model_len`, the widest window each takes, then those the peers hold with the holder as `owned_by`. A request is served with the window its prompt and `max_tokens` need, up to that one; a window that must grow for it at least doubles. Answers in the Messages API's shape to a client sending its version header. |
 | `GET /v1/models/{id}`, `DELETE /v1/models/{id}` | One model, ids with slashes included. |
@@ -110,6 +115,38 @@ checked against its CRC-32, and anything else is refused. Compressed or big-endi
 torch's legacy format, sparse and quantized tensors, and tensors carrying attributes or hooks are
 refused.
 
+### vLLM's extensions
+
+`/v1/completions` and `/v1/chat/completions` read the fields vLLM's server adds to OpenAI's.
+
+| Field | What it does |
+|---|---|
+| `repetition_penalty` | A multiplicative penalty, in (0, 4], on every token already in the prompt and the answer. It wins over `frequency_penalty` and `presence_penalty`. |
+| `min_p` | Drops the tokens less probable than this share of the most probable one. |
+| `allowed_token_ids` | The only tokens that may be drawn. |
+| `bad_words` | Words never written: the last token of each is banned after the tokens before it, at the start of a text and after a space. |
+| `min_tokens` | Tokens written before an end token, a stop token or a stop sequence may end the answer. |
+| `ignore_eos` | The model's end tokens and its default stop sequences end nothing; the answer runs to `max_tokens`. |
+| `stop_token_ids` | Tokens that end the answer besides the model's own. |
+| `include_stop_str_in_output` | Keeps the stop sequence the answer ended on in the text. |
+| `skip_special_tokens` | `false` keeps the special tokens drawn in the text. |
+| `truncate_prompt_tokens`, `truncation_side` | Reads only this many prompt tokens, the last ones (`left`, the default) or the first ones (`right`); `-1` is the model's window. |
+| `return_tokens_as_token_ids` | Writes each log-probability token as `token_id:<id>`. |
+| `structured_outputs` | One constraint: `json` (a schema, as an object or a string), `regex`, `choice` (a list of strings), `grammar` (Lark, or llama.cpp's GBNF), `json_object`; with `disable_any_whitespace`, `disable_additional_properties` and `whitespace_pattern` for a JSON one. `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` and `guided_whitespace_pattern` are read the same way. `structural_tag` answers 400. |
+| `cache_salt` | The request reuses no cached prompt prefix and leaves none for another. |
+| `echo` (chat) | Writes the final assistant message in front of the answer. |
+| `add_generation_prompt` (chat) | `false` renders the conversation without opening the assistant's turn, with a Jinja template. |
+| `continue_final_message` (chat) | The answer continues the final assistant message instead of opening a new turn. |
+| `chat_template_kwargs`, `documents` (chat) | Variables handed to the model's template; `enable_thinking` is also the thinking preference. |
+| `include_reasoning` (chat) | `false` leaves the reasoning out of the answer. |
+
+`min_p`, `allowed_token_ids`, `bad_words`, `min_tokens`, `skip_special_tokens: false`,
+`cache_salt` and a structured output decode one token per step, without prompt-lookup drafts,
+captured graphs or prefix reuse. `use_beam_search`, `prompt_logprobs`, a request
+`chat_template` and `continue_final_message` with `add_generation_prompt: true` answer 400.
+`priority`, `request_id`, `length_penalty`, `spaces_between_special_tokens`,
+`add_special_tokens`, `stream_interval` and the disaggregation fields are accepted without effect.
+
 ### Files and batches
 
 | Route | What it does |
@@ -163,7 +200,10 @@ A part the server cannot take, such as a document block, is refused with the rea
 
 | Route | What it does |
 |---|---|
-| `GET /health` | Uptime and time. The one route exempt from authentication. |
+| `GET /health` | Uptime and time. Exempt from authentication, as `GET /ping` and `POST /ping` (an empty 200, for SageMaker and vLLM clients). |
+| `GET /version` | The server's version, in vLLM's shape. |
+| `GET /load` | Requests running and queued, as vLLM's `server_load`. |
+| `POST /reset_prefix_cache` | Every loaded language model drops its session records, its resident KV and the logits of its last prefill. The KV snapshots, the disk tier and the batch worker's prefix cache stay. |
 | `GET /metrics` | OpenMetrics, with the `metrics` feature only: uptime, resident models, gate depth, in-flight generations, decode rates, devices, energy totals, and per model a histogram over requests of the wait at the gate, the wait for the model, the prompt's reading, the answer's writing, the prompt and answer tokens and the prompt tokens served from the cache. |
 | `GET /api/models`, `GET /api/models/loaded` | The catalogue, and what is resident with its placement per device. Every family lists its layers by device: a text or image model as one entry, a voice, transcription, sound or separation model and what the video pipeline stages on the host as one entry per part, named `model (part)`. A render in progress is listed the same way, one entry per part it has loaded, with a `status` of the form `rendering sound: codes 12/300`; before its first part loads, the render is one entry with the status alone. The free memory published beside these is what the driver has: what a finished job freed is returned to it when the job ends. |
 | `POST /api/models/validate`, `POST /api/models/repair` | Check a model's files, and fetch what is missing. |

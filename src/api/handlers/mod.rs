@@ -1045,7 +1045,7 @@ fn cors_origin(auth: &AuthGate) -> tower_http::cors::AllowOrigin {
 
 /// Endpoints an orchestrator must reach without a credential and without a quota.
 fn is_health_path(path: &str) -> bool {
-    matches!(path, "/health" | "/healthz" | "/api/health")
+    matches!(path, "/health" | "/healthz" | "/api/health" | "/ping")
 }
 
 /// Apply the per-client rate limit, if one is configured.
@@ -2771,6 +2771,10 @@ impl APIServer {
                 axum::routing::post(chat_completion),
             )
             .route("/v1/chat/completions", axum::routing::post(chat_completion))
+            .route(
+                "/v1/chat/completions/batch",
+                axum::routing::post(openai::vllm::chat_batch),
+            )
             .route("/v1/responses", axum::routing::post(openai_responses))
             .route(
                 "/v1/files",
@@ -2829,6 +2833,25 @@ impl APIServer {
             // `text_completion` object form with `choices[*].text`
             // instead of `choices[*].message.content`.
             .route("/v1/completions", axum::routing::post(text_completions))
+            // vLLM's own routes, beside its OpenAI ones: the tokenizer, the health and version
+            // probes, the load, the prefix cache reset, pooling and SageMaker's invocations.
+            .route("/tokenize", axum::routing::post(openai::vllm::tokenize))
+            .route("/detokenize", axum::routing::post(openai::vllm::detokenize))
+            .route(
+                "/ping",
+                axum::routing::get(openai::vllm::ping).post(openai::vllm::ping),
+            )
+            .route("/version", axum::routing::get(openai::vllm::version))
+            .route("/load", axum::routing::get(openai::vllm::load))
+            .route(
+                "/reset_prefix_cache",
+                axum::routing::post(openai::vllm::reset_prefix_cache),
+            )
+            .route("/pooling", axum::routing::post(openai::vllm::pooling))
+            .route(
+                "/invocations",
+                axum::routing::post(openai::vllm::invocations),
+            )
             // (Removed: /v1/images/cache/{filename}. Generated images no
             // longer touch the filesystem - privacy fix. Callers using
             // response_format=url now get the same b64_json payload as

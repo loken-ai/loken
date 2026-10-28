@@ -630,6 +630,7 @@ pub(crate) async fn conversation_handler(
                         tool_choice: None,
                         thinking: None,
                         output_grammar: None,
+                        template: Default::default(),
                     },
                 )
                 .await
@@ -897,6 +898,7 @@ pub(crate) async fn voice_handler(
                 tool_choice: None,
                 thinking: None,
                 output_grammar: None,
+                template: Default::default(),
             },
         )
         .await;

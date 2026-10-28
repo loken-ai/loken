@@ -263,8 +263,7 @@ pub(crate) fn pld_verify_commit(
     recent_tokens: &mut Vec<u32>,
     pld_cache: &mut NgramDraftCache,
     pld_enabled: bool,
-    eos_primary: u32,
-    eos_extra: &[u32],
+    ends: &[u32],
     committed_base: usize,
     max_tokens: usize,
     sampler: &mut dyn FnMut(&Tensor, &[u32]) -> crate::tensor::Result<(u32, Option<Tensor>)>,
@@ -295,7 +294,7 @@ pub(crate) fn pld_verify_commit(
 
         // Stop conditions evaluated on the new sample: EOS / max_tokens ->
         // the caller's outer loop will catch them when next_token is set.
-        if sampled == eos_primary || eos_extra.contains(&sampled) {
+        if ends.contains(&sampled) {
             break;
         }
         if committed_base + committed_out.len() + 1 >= max_tokens {

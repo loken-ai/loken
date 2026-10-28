@@ -35,12 +35,11 @@ fn penalise_recent(logits: &mut [f32], recent_tokens: &[u32], penalty: f32, last
         return;
     }
     let start = recent_tokens.len().saturating_sub(last_n);
-    let mut seen: Vec<u32> = Vec::with_capacity(recent_tokens.len() - start);
-    for &tok in &recent_tokens[start..] {
-        if seen.contains(&tok) {
-            continue;
-        }
-        seen.push(tok);
+    // Sorted and deduplicated: a window as long as the whole sequence stays n log n.
+    let mut distinct: Vec<u32> = recent_tokens[start..].to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    for tok in distinct {
         if let Some(l) = logits.get_mut(tok as usize) {
             *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
         }

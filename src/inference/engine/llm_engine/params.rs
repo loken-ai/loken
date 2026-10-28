@@ -445,15 +445,106 @@ pub struct GenerationParams {
     /// Raised when the request's client goes away; the generation loops read it between tokens.
     /// Each request carries its own, so a request that ends never stops another.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The token rules, stop tokens and prompt cut a request adds to the knobs above.
+    pub rules: RequestRules,
+}
+
+/// Which end of a prompt a cut to `truncate_prompt_tokens` keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TruncationSide {
+    /// Drops the start: the last tokens stay.
+    #[default]
+    Left,
+    /// Drops the end: the first tokens stay.
+    Right,
+}
+
+/// A prompt cut to a number of tokens, from one side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptTruncation {
+    pub keep: usize,
+    pub side: TruncationSide,
+}
+
+/// What a request asks of the draw and of the end of its generation beyond the shared knobs:
+/// tokens it bans or allows, a floor under the probabilities, a length before which it may not
+/// end, the tokens that end it, how its text is decoded and how much of its prompt is read.
+#[derive(Debug, Clone, Default)]
+pub struct RequestRules {
+    /// Tokens whose probability is below this share of the most probable token's are dropped.
+    pub min_p: Option<f32>,
+    /// The only tokens that may be drawn.
+    pub allowed_token_ids: Option<Vec<u32>>,
+    /// Words the generation never writes: their last token is banned wherever the tokens
+    /// before it were just written.
+    pub bad_words: Vec<String>,
+    /// Tokens generated before an end token or a stop sequence may end the generation.
+    pub min_tokens: usize,
+    /// The model's end tokens and its default stop sequences end nothing.
+    pub ignore_eos: bool,
+    /// Tokens that end the generation besides the model's own.
+    pub stop_token_ids: Vec<u32>,
+    /// The text keeps the special tokens the generation drew.
+    pub keep_special_tokens: bool,
+    /// The prompt is cut to this many tokens before it is read.
+    pub truncate_prompt: Option<PromptTruncation>,
+    /// A prefix cached for this request is shared only with requests naming the same salt.
+    pub cache_salt: Option<String>,
+}
+
+impl RequestRules {
+    /// Whether the request decodes one token per step on the sequential path: its rules read
+    /// the tokens already generated, or mask the whole row, or keep its prefix to itself.
+    pub fn decodes_sequentially(&self) -> bool {
+        self.min_p.is_some()
+            || self.allowed_token_ids.is_some()
+            || !self.bad_words.is_empty()
+            || self.min_tokens > 0
+            || self.keep_special_tokens
+            || self.cache_salt.is_some()
+    }
+
+    /// The tokens that end this request: the model's end tokens, unless the request ignores
+    /// them, and the request's stop tokens.
+    pub fn end_tokens(&self, eos: u32, eos_extra: &[u32]) -> Vec<u32> {
+        let mut ends = if self.ignore_eos {
+            Vec::new()
+        } else {
+            std::iter::once(eos)
+                .chain(eos_extra.iter().copied())
+                .collect()
+        };
+        for &t in &self.stop_token_ids {
+            if !ends.contains(&t) {
+                ends.push(t);
+            }
+        }
+        ends
+    }
 }
 
 impl GenerationParams {
-    /// The model's stop sequences when the request names none of its own.
+    /// The model's stop sequences when the request names none of its own. A request that
+    /// ignores the model's end keeps none of them: they are that end written as text.
     pub fn with_default_stops(mut self, stops: &[String]) -> Self {
-        if self.stop_sequences.is_empty() {
+        if self.stop_sequences.is_empty() && !self.rules.ignore_eos {
             self.stop_sequences = stops.to_vec();
         }
         self
+    }
+}
+
+/// The prompt's tokens as the request reads them: the `context` prefix ahead of the freshly
+/// tokenized prompt, then cut to the request's `truncate_prompt_tokens`. Applied before the
+/// window clamp, so the window trims what the request kept.
+pub(super) fn request_prompt_tokens(params: &GenerationParams, ids: &[u32]) -> Vec<u32> {
+    let tokens = with_prefix_tokens(params, ids);
+    match params.rules.truncate_prompt {
+        Some(cut) if cut.keep < tokens.len() => match cut.side {
+            TruncationSide::Left => tokens[tokens.len() - cut.keep..].to_vec(),
+            TruncationSide::Right => tokens[..cut.keep].to_vec(),
+        },
+        _ => tokens,
     }
 }
 
@@ -569,6 +660,56 @@ fn whole_prompt_embeds(
 /// positions a clip's embeddings take beyond the one placeholder token they replace.
 pub(super) fn prompt_eval_positions(tokens: usize, reused: usize, audio_extra: usize) -> u64 {
     (tokens.saturating_sub(reused) + audio_extra) as u64
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    /// The model's end tokens end a request unless it ignores them; its stop tokens always do.
+    #[test]
+    fn the_end_tokens_follow_the_request() {
+        let mut rules = RequestRules::default();
+        assert_eq!(rules.end_tokens(2, &[3]), vec![2, 3]);
+        rules.stop_token_ids = vec![3, 9];
+        assert_eq!(rules.end_tokens(2, &[3]), vec![2, 3, 9]);
+        rules.ignore_eos = true;
+        assert_eq!(rules.end_tokens(2, &[3]), vec![3, 9]);
+    }
+
+    /// The prompt is cut after the replayed context is put in front of it, from the side asked.
+    #[test]
+    fn the_prompt_is_cut_to_the_tokens_asked() {
+        let mut params = GenerationParams {
+            prefix_tokens: Some(vec![1, 2]),
+            ..Default::default()
+        };
+        assert_eq!(
+            request_prompt_tokens(&params, &[3, 4, 5]),
+            vec![1, 2, 3, 4, 5]
+        );
+        params.rules.truncate_prompt = Some(PromptTruncation {
+            keep: 2,
+            side: TruncationSide::Left,
+        });
+        assert_eq!(request_prompt_tokens(&params, &[3, 4, 5]), vec![4, 5]);
+        params.rules.truncate_prompt = Some(PromptTruncation {
+            keep: 2,
+            side: TruncationSide::Right,
+        });
+        assert_eq!(request_prompt_tokens(&params, &[3, 4, 5]), vec![1, 2]);
+    }
+
+    /// A request ignoring the model's end keeps none of its default stop sequences.
+    #[test]
+    fn ignoring_the_end_drops_the_default_stops() {
+        let stops = ["<end>".to_string()];
+        let p = GenerationParams::default().with_default_stops(&stops);
+        assert_eq!(p.stop_sequences, stops);
+        let mut p = GenerationParams::default();
+        p.rules.ignore_eos = true;
+        assert!(p.with_default_stops(&stops).stop_sequences.is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -97,6 +97,9 @@ pub(crate) struct SamplingRequest {
     pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
     pub early_exit_threshold: Option<f64>,
     pub grammar: Option<String>,
+    /// vLLM's multiplicative penalty over every token of the prompt and the answer.
+    pub repetition_penalty: Option<f64>,
+    pub rules: crate::inference::engine::llm_engine::RequestRules,
 }
 
 fn f64_of(v: &serde_json::Value, key: &str) -> Option<f64> {
@@ -140,7 +143,19 @@ impl SamplingRequest {
             logit_bias: None,
             early_exit_threshold: None,
             grammar: None,
+            repetition_penalty: None,
+            rules: Default::default(),
         }
+    }
+
+    /// The request with vLLM's sampling extensions read in, each bounded.
+    pub(crate) fn with_vllm(
+        mut self,
+        fields: &crate::api::types::vllm::VllmFields,
+    ) -> Result<Self, ApiError> {
+        self.repetition_penalty = fields.repetition_penalty()?;
+        self.rules = fields.rules(self.max_tokens)?;
+        Ok(self)
     }
 
     /// `/v1/chat/completions`. `top_k` is read as an extension field.
@@ -190,6 +205,14 @@ impl SamplingRequest {
                 Some(serde_json::Value::Bool(true)) => Some(0),
                 _ => None,
             },
+            logit_bias: body
+                .get("logit_bias")
+                .and_then(serde_json::Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.parse::<u32>().ok()?, v.as_f64()? as f32)))
+                        .collect()
+                }),
             ..Self::empty(&OPENAI_FIELDS)
         }
     }
@@ -310,11 +333,17 @@ impl SamplingRequest {
         )
     }
 
-    /// The engine's parameters. An explicit `repeat_penalty` wins over the OpenAI
-    /// penalties folded into one.
+    /// The engine's parameters. An explicit `repeat_penalty` or `repetition_penalty` wins
+    /// over the OpenAI penalties folded into one; `repetition_penalty` reads the whole
+    /// sequence, as vLLM applies it.
     pub(crate) fn into_params(self) -> GenerationParams {
         let named = self.frequency_penalty.is_some() || self.presence_penalty.is_some();
-        let repeat_penalty = self.repeat_penalty.map(|v| v as f32).or_else(|| {
+        let repeat_last_n = match self.repetition_penalty {
+            Some(_) => Some(REPEAT_LAST_N_MAX),
+            None => self.repeat_last_n,
+        };
+        let explicit = self.repeat_penalty.or(self.repetition_penalty);
+        let repeat_penalty = explicit.map(|v| v as f32).or_else(|| {
             (named || self.fields.unnamed_penalty_is_none).then(|| {
                 crate::api::types::repeat_penalty_from_openai(
                     self.frequency_penalty.map(|v| v as f32),
@@ -334,13 +363,14 @@ impl SamplingRequest {
             stop_sequences: self.stop,
             early_exit_threshold: self.early_exit_threshold.map(|v| v as f32),
             repeat_penalty,
-            repeat_last_n: self.repeat_last_n.and_then(|v| usize::try_from(v).ok()),
+            repeat_last_n: repeat_last_n.and_then(|v| usize::try_from(v).ok()),
             context_length: self.num_ctx.and_then(|v| usize::try_from(v).ok()),
             session_id: self.session_id,
             grammar: self.grammar,
             logit_bias: self.logit_bias,
             top_logprobs: self.top_logprobs.map(|v| v as usize),
             cancel: None,
+            rules: self.rules,
         }
     }
 }
@@ -443,6 +473,33 @@ mod tests {
             SamplingRequest::from_openai(&req).into_params().top_k,
             Some(40)
         );
+    }
+
+    /// `repetition_penalty` becomes the repeat penalty over the whole sequence, and the rules
+    /// travel to the engine.
+    #[test]
+    fn vllm_fields_reach_the_engine() {
+        let body = serde_json::json!({
+            "max_tokens": 8, "repetition_penalty": 1.3, "ignore_eos": true, "min_tokens": 2,
+            "logit_bias": {"5": -100.0},
+        });
+        let fields = crate::api::types::vllm::VllmFields::of_body(&body).unwrap();
+        let p = SamplingRequest::from_completions(&body)
+            .with_vllm(&fields)
+            .unwrap()
+            .into_params();
+        assert_eq!(p.repeat_penalty, Some(1.3));
+        assert_eq!(p.repeat_last_n, Some(REPEAT_LAST_N_MAX as usize));
+        assert!(p.rules.ignore_eos);
+        assert_eq!(p.rules.min_tokens, 2);
+        assert_eq!(p.logit_bias.unwrap()[&5], -100.0);
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [], "max_tokens": 1, "min_tokens": 2
+        }))
+        .unwrap();
+        assert!(SamplingRequest::from_openai(&req)
+            .with_vllm(&req.vllm)
+            .is_err());
     }
 
     /// Ollama's `-1` asks for no cap.

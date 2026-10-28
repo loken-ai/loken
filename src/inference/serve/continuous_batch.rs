@@ -54,6 +54,8 @@ pub struct SamplingParams {
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
     pub seed: u64,
+    /// The tokens that end this request, when they are not the worker's own.
+    pub ends: Option<Vec<u32>>,
 }
 
 impl Default for SamplingParams {
@@ -65,6 +67,7 @@ impl Default for SamplingParams {
             repeat_penalty: 1.0,
             repeat_last_n: 0,
             seed: 0,
+            ends: None,
         }
     }
 }
@@ -290,7 +293,8 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         for (it, &tok) in items.iter().zip(sampled.iter()) {
             self.reqs.get_mut(&it.seq).unwrap().generated.push(tok);
             emits.push((it.seq, tok));
-            results.push((it.seq, self.eos.contains(&tok)));
+            let ends = it.sampling.ends.as_deref().unwrap_or(&self.eos);
+            results.push((it.seq, ends.contains(&tok)));
         }
         let finished = self.sched.on_step_done(&results);
 
@@ -499,6 +503,41 @@ mod tests {
         assert_eq!(done[0].reason, FinishReason::Eos);
         assert!(done[0].tokens.len() < 100); // stopped early on EOS
         assert_eq!(*done[0].tokens.last().unwrap(), 0); // last token is EOS
+    }
+
+    /// A request's own end tokens replace the worker's: with none, the EOS the model draws
+    /// ends nothing and the request runs to `max_new`; with the request's token, that token
+    /// ends it.
+    #[test]
+    fn a_requests_end_tokens_replace_the_workers() {
+        let mut stop = HashMap::new();
+        stop.insert(1u64, 5usize);
+        let mut e = engine(64, stop);
+        e.submit(GenReq {
+            id: 1,
+            prompt: vec![9, 9, 9],
+            max_new: 12,
+            sampling: SamplingParams {
+                ends: Some(Vec::new()),
+                ..SamplingParams::greedy()
+            },
+        });
+        let done = e.run_to_idle().unwrap();
+        assert_eq!(done[0].reason, FinishReason::Length);
+        assert_eq!(done[0].tokens.len(), 12);
+        let mut e = engine(64, HashMap::new());
+        e.submit(GenReq {
+            id: 2,
+            prompt: vec![9],
+            max_new: 12,
+            sampling: SamplingParams {
+                ends: Some(vec![1002]),
+                ..SamplingParams::greedy()
+            },
+        });
+        let done = e.run_to_idle().unwrap();
+        assert_eq!(done[0].reason, FinishReason::Eos);
+        assert_eq!(done[0].tokens, vec![1002]);
     }
 
     #[test]

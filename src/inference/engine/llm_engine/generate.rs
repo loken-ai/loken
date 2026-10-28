@@ -130,10 +130,9 @@ impl LlmEngine {
         prompt: &str,
         params: GenerationParams,
     ) -> Result<GenerationResult, Box<dyn std::error::Error>> {
-        // Grammar-constrained decoding takes a dedicated, simpler path that
-        // bypasses PLD/graph branches.
-        if params.grammar.is_some() {
-            return self.generate_with_grammar(prompt.to_string(), params).await;
+        // A grammar or token rules take the sequential path, one forward per token.
+        if params.grammar.is_some() || params.rules.decodes_sequentially() {
+            return self.generate_sequential(prompt.to_string(), params).await;
         }
         // CB-served models: drive the non-stream path through the same worker
         // delegation, collecting the streamed chunks into one result.
@@ -274,11 +273,11 @@ impl LlmEngine {
             let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
                 (Some(a), _) => a.tokens.clone(),
                 (None, Some(sent)) => clamp_qwen35_prompt_to_window(
-                    with_prefix_tokens(&params, encoding.get_ids()),
+                    request_prompt_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
                     params.max_tokens.unwrap_or(0), sent),
                 (None, None) => clamp_prompt_to_window(
-                    with_prefix_tokens(&params, encoding.get_ids()),
+                    request_prompt_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
                     params.max_tokens.unwrap_or(0)),
             };
@@ -379,6 +378,7 @@ impl LlmEngine {
             // allocated KV cap (Q8 append fails there -> degenerate output).
             let resolved = resolve_gen_params(&params, &state.generation_defaults, effective_context, prompt_tokens.len() + vision_extra);
             let params = params.with_default_stops(&state.generation_defaults.stop);
+            let ends = params.rules.end_tokens(state.eos_token_id, &state.eos_token_ids_extra);
             let ResolvedGenParams {
                 max_tokens, repeat_penalty, repeat_last_n, ..
             } = resolved;
@@ -564,13 +564,8 @@ impl LlmEngine {
             // reads as already complete, such as a raw document - that one draw is taken again
             // with every end-of-sequence token suppressed, so at least one token is produced.
             // On the architecture-neutral sampling path, so it holds for every model.
-            if max_tokens >= 1
-                && (next_token == state.eos_token_id
-                    || state.eos_token_ids_extra.contains(&next_token))
-            {
-                let mut stops = state.eos_token_ids_extra.clone();
-                stops.push(state.eos_token_id);
-                next_token = logits_processor.sample_avoiding(&logits, &stops)?;
+            if max_tokens >= 1 && ends.contains(&next_token) {
+                next_token = logits_processor.sample_avoiding(&logits, &ends)?;
             }
             record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
 
@@ -791,8 +786,7 @@ impl LlmEngine {
             // --- Unified Generation Loop ------------------------------
             let gen_start = std::time::Instant::now();
             let mut decode_diag_first_call = true;
-            while next_token != state.eos_token_id
-                && !state.eos_token_ids_extra.contains(&next_token)
+            while !ends.contains(&next_token)
                 && generated.len() < max_tokens
                 && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let step_start = std::time::Instant::now();
@@ -1813,7 +1807,7 @@ impl LlmEngine {
                         let outcome = pld_verify_commit(
                             &logits, &draft, &mut generated, &mut recent_tokens,
                             &mut pld_cache, pld_enabled,
-                            state.eos_token_id, &state.eos_token_ids_extra,
+                            &ends,
                             /* committed_base */ 0, max_tokens,
                             &mut |row, recent| {
                                 sample_row_sync(
@@ -2119,9 +2113,7 @@ impl LlmEngine {
                 FinishReason::Disconnect
             } else if let Some(hit) = stop_tracker.matched() {
                 FinishReason::StopSequence(hit.to_string())
-            } else if next_token == state.eos_token_id
-                || state.eos_token_ids_extra.contains(&next_token)
-            {
+            } else if ends.contains(&next_token) {
                 FinishReason::Eos
             } else {
                 FinishReason::MaxTokens
@@ -2150,486 +2142,5 @@ impl LlmEngine {
             Ok(Err(e)) => Err(e.into()),
             Err(e) => Err(e),
         }
-    }
-
-    /// Grammar-constrained sequential decode path. Routed to from `generate()`
-    /// when `params.grammar` is set. Plain forward + sample loop with a
-    /// per-token logit mask from llguidance - no PLD, no graph capture.
-    /// Streaming variant is not implemented yet.
-    pub(super) async fn generate_with_grammar(
-        &self,
-        prompt: String,
-        params: GenerationParams,
-    ) -> Result<GenerationResult, Box<dyn std::error::Error>> {
-        let model_state = self.model_state.clone();
-        let config = self.config.clone();
-
-        let cancel = params.cancel.clone().unwrap_or_default();
-        let arrived = std::time::Instant::now();
-        let inner = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
-            let mut guard = model_state.blocking_lock();
-            let queue_s = arrived.elapsed().as_secs_f64();
-            let state = guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("Model not loaded. Load a model first."))?;
-
-            if state.audio.is_some() {
-                return Err(anyhow!("a request with a grammar cannot carry audio"));
-            }
-            let factory = grammar_factory_for(state)?;
-            let grammar_str = params.grammar.as_deref().unwrap_or("json_object");
-            let top_grammar = parse_grammar_spec(grammar_str)?;
-            let parser = factory
-                .create_parser(top_grammar)
-                .map_err(|e| anyhow!("create_parser: {e}"))?;
-            let mut constraint = llguidance::Constraint::new(parser);
-            info!("🎯 Grammar-constrained decode: spec={}", grammar_str);
-
-            let encoding = super::encode_prompt(&state.tokenizer, prompt.as_str())
-                .map_err(|e| anyhow!("Tokenization error: {}", e))?;
-            let prompt_tokens: Vec<u32> = clamp_prompt_to_window(
-                with_prefix_tokens(&params, encoding.get_ids()),
-                effective_kv_window(
-                    state.context_length,
-                    config.context_length,
-                    params.context_length,
-                ),
-                params.max_tokens.unwrap_or(0),
-            );
-
-            let effective_context = params
-                .context_length
-                .map(|c| c.min(state.context_length))
-                .unwrap_or(state.context_length);
-            let ResolvedGenParams {
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                seed,
-                repeat_penalty,
-                repeat_last_n,
-            } = resolve_gen_params(
-                &params,
-                &state.generation_defaults,
-                effective_context,
-                prompt_tokens.len(),
-            );
-            let device = state.device.clone();
-
-            let sampling = build_sampling_from(temperature, top_p, top_k);
-            let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
-            logits_processor.set_logit_bias(params.logit_bias.clone());
-            logits_processor.set_top_logprobs(params.top_logprobs);
-            let mut logprob_acc: Vec<TokenLogprob> = Vec::new();
-
-            state
-                .model
-                .set_early_exit_threshold(params.early_exit_threshold);
-
-            // Request-start graph hygiene: a prior graph-mode request's
-            // per-layer buffers (graph_rope_cos etc.) would make this
-            // path's single-token decode forwards read frozen rope values.
-            // The graphs kept from it go first, with the buffers they read.
-            #[cfg(feature = "gpu")]
-            state.kept_graphs.clear();
-            state.model.note_graphs_kept(None);
-            state.model.invalidate_graph_state();
-
-            let prefill_start = std::time::Instant::now();
-            let x = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
-            let mut logits = state.model.forward_prefill_chunked(&x, 0)?;
-            let prompt_eval_duration = prefill_start.elapsed().as_nanos() as u64;
-            let mut pos = prompt_tokens.len();
-
-            let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
-            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
-            let mut grammar_stopped = false;
-            let decode_start = std::time::Instant::now();
-
-            for step in 0..max_tokens {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                let logits_cpu = match logits.device() {
-                    Device::Cpu => logits.clone(),
-                    _ => logits.to_device(&Device::Cpu)?,
-                };
-                let mut logits_vec = apply_repeat_penalty(
-                    &logits_cpu.squeeze(0)?,
-                    &recent_tokens,
-                    repeat_penalty,
-                    repeat_last_n,
-                )?
-                .to_dtype(crate::tensor::DType::F32)?
-                .to_vec1::<f32>()?;
-
-                let res = constraint
-                    .compute_mask()
-                    .map_err(|e| anyhow!("compute_mask: {e}"))?;
-                if res.is_stop() {
-                    grammar_stopped = true;
-                    debug!("Grammar reached stop state at step {}", step);
-                    break;
-                }
-                if let Some(mask) = res.sample_mask.as_ref() {
-                    for (i, l) in logits_vec.iter_mut().enumerate() {
-                        if !mask.is_allowed(i as u32) {
-                            *l = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-
-                let logits_t = Tensor::from_vec(logits_vec, (state.vocab_size,), &Device::Cpu)?;
-                let next_token = logits_processor.sample(&logits_t)?;
-                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
-
-                let commit = constraint
-                    .commit_token(Some(next_token))
-                    .map_err(|e| anyhow!("commit_token: {e}"))?;
-
-                generated_tokens.push(next_token);
-                recent_tokens.push(next_token);
-
-                if commit.stop {
-                    debug!("Grammar committed final token; stopping");
-                    break;
-                }
-                if next_token == state.eos_token_id
-                    || state.eos_token_ids_extra.contains(&next_token)
-                {
-                    break;
-                }
-
-                let x = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-                // stepd (non-stream decode): use state.forward
-                // so moondream gets graph capture.
-                logits = state.forward(&x, pos)?;
-                pos += 1;
-            }
-
-            let eval_duration = decode_start.elapsed().as_nanos() as u64;
-            let text = state
-                .tokenizer
-                .decode(&generated_tokens, true)
-                .map_err(|e| anyhow!("decode: {e}"))?;
-            crate::request_metrics::record(
-                &config.model_id,
-                &crate::request_metrics::RequestFigures {
-                    queue_s,
-                    prefill_s: prompt_eval_duration as f64 / 1e9,
-                    decode_s: eval_duration as f64 / 1e9,
-                    prompt_tokens: prompt_tokens.len() as u64,
-                    cached_prompt_tokens: 0,
-                    generated_tokens: generated_tokens.len() as u64,
-                },
-            );
-
-            Ok(GenerationResult {
-                text,
-                tokens: {
-                    let mut full = prompt_tokens.clone();
-                    full.extend_from_slice(&generated_tokens);
-                    full
-                },
-                prompt_eval_count: prompt_tokens.len() as u64,
-                prompt_eval_duration,
-                cached_prompt_tokens: 0,
-                finish_reason: if grammar_stopped {
-                    FinishReason::Grammar
-                } else if generated_tokens.len() >= max_tokens {
-                    FinishReason::MaxTokens
-                } else {
-                    FinishReason::Eos
-                },
-                logprobs: logprob_acc,
-                eval_count: generated_tokens.len() as u64,
-                eval_duration,
-            })
-        })
-        .await;
-
-        match inner {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(e)) => Err(e.into()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Streaming counterpart of `generate_with_grammar`. Same simple sequential
-    /// loop but pushes each decoded token's text onto the returned channel as
-    /// soon as it's sampled. Cancellation: a dropped receiver makes the next
-    /// `tx.blocking_send` return Err and the loop bails (mirrors the behaviour
-    /// of the unconstrained streaming path).
-    pub(super) async fn generate_stream_with_grammar(
-        &self,
-        prompt: String,
-        params: GenerationParams,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
-    {
-        let arrived = std::time::Instant::now();
-        let guard = self.model_state.lock().await;
-        match guard.as_ref() {
-            None => return Err("Model not loaded.".into()),
-            // The constrained loop prefills token ids; a clip's embeddings would be dropped.
-            Some(s) if s.audio.is_some() => {
-                return Err("a request with a grammar cannot carry audio".into())
-            }
-            Some(_) => {}
-        }
-        drop(guard);
-
-        let model_state = self.model_state.clone();
-        let config = self.config.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
-
-        let logprob_queue = self.logprob_queue.clone();
-        std::thread::spawn(move || {
-            let mut guard = model_state.blocking_lock();
-            let locked = std::time::Instant::now();
-            let state = match guard.as_mut() {
-                Some(s) => s,
-                None => {
-                    let _ = tx.blocking_send(Err("Model not loaded".to_string()));
-                    return;
-                }
-            };
-
-            let factory = match grammar_factory_for(state) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(format!("grammar factory: {e}")));
-                    return;
-                }
-            };
-            let grammar_str = params.grammar.as_deref().unwrap_or("json_object");
-            let top_grammar = match parse_grammar_spec(grammar_str) {
-                Ok(g) => g,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(format!("parse_grammar_spec: {e}")));
-                    return;
-                }
-            };
-            let parser = match factory.create_parser(top_grammar) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(format!("create_parser: {e}")));
-                    return;
-                }
-            };
-            let mut constraint = llguidance::Constraint::new(parser);
-            info!("🎯 Grammar-constrained streaming: spec={}", grammar_str);
-
-            let encoding = match super::encode_prompt(&state.tokenizer, prompt.as_str()) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(format!("Tokenization: {e}")));
-                    return;
-                }
-            };
-            let prompt_tokens: Vec<u32> = clamp_prompt_to_window(
-                with_prefix_tokens(&params, encoding.get_ids()),
-                effective_kv_window(
-                    state.context_length,
-                    config.context_length,
-                    params.context_length,
-                ),
-                params.max_tokens.unwrap_or(0),
-            );
-
-            let effective_context = params
-                .context_length
-                .map(|c| c.min(state.context_length))
-                .unwrap_or(state.context_length);
-            let ResolvedGenParams {
-                max_tokens,
-                temperature,
-                top_p,
-                top_k,
-                seed,
-                repeat_penalty,
-                repeat_last_n,
-            } = resolve_gen_params(
-                &params,
-                &state.generation_defaults,
-                effective_context,
-                prompt_tokens.len(),
-            );
-            let device = state.device.clone();
-
-            let sampling = build_sampling_from(temperature, top_p, top_k);
-            let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
-            logits_processor.set_logit_bias(params.logit_bias.clone());
-            logits_processor.set_top_logprobs(params.top_logprobs);
-            let mut logprob_acc: Vec<TokenLogprob> = Vec::new();
-
-            state
-                .model
-                .set_early_exit_threshold(params.early_exit_threshold);
-
-            // Request-start graph hygiene (see generate_with_grammar).
-            #[cfg(feature = "gpu")]
-            state.kept_graphs.clear();
-            state.model.note_graphs_kept(None);
-            state.model.invalidate_graph_state();
-
-            let x =
-                match Tensor::new(prompt_tokens.as_slice(), &device).and_then(|t| t.unsqueeze(0)) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("Prompt tensor: {e}")));
-                        return;
-                    }
-                };
-            let mut logits = match state.model.forward_prefill_chunked(&x, 0) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(format!("Prefill: {e}")));
-                    return;
-                }
-            };
-            let prefilled = std::time::Instant::now();
-            let mut pos = prompt_tokens.len();
-
-            let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
-            // Cumulative-decode bookkeeping for grammar streaming  -
-            // see stream_token in the unified loop for rationale.
-            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
-            let mut sent_text_len: usize = 0;
-
-            for _step in 0..max_tokens {
-                let logits_cpu = match logits.device() {
-                    Device::Cpu => logits.clone(),
-                    _ => match logits.to_device(&Device::Cpu) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(format!("Logits to CPU: {e}")));
-                            return;
-                        }
-                    },
-                };
-                let mut logits_vec = match logits_cpu
-                    .squeeze(0)
-                    .and_then(|l| {
-                        apply_repeat_penalty(&l, &recent_tokens, repeat_penalty, repeat_last_n)
-                    })
-                    .and_then(|l| l.to_dtype(crate::tensor::DType::F32))
-                    .and_then(|l| l.to_vec1::<f32>())
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("Logits prep: {e}")));
-                        return;
-                    }
-                };
-
-                let res = match constraint.compute_mask() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("compute_mask: {e}")));
-                        return;
-                    }
-                };
-                if res.is_stop() {
-                    debug!("Grammar reached stop state");
-                    break;
-                }
-                if let Some(mask) = res.sample_mask.as_ref() {
-                    for (i, l) in logits_vec.iter_mut().enumerate() {
-                        if !mask.is_allowed(i as u32) {
-                            *l = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-
-                let logits_t = match Tensor::from_vec(logits_vec, (state.vocab_size,), &Device::Cpu)
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("Tensor::from_vec: {e}")));
-                        return;
-                    }
-                };
-                let next_token = match logits_processor.sample(&logits_t) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("Sample: {e}")));
-                        return;
-                    }
-                };
-                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
-                if !logprob_acc.is_empty() {
-                    if let Ok(mut q) = logprob_queue.lock() {
-                        q.append(&mut logprob_acc);
-                    }
-                }
-
-                let commit = match constraint.commit_token(Some(next_token)) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("commit_token: {e}")));
-                        return;
-                    }
-                };
-
-                generated_tokens.push(next_token);
-                let cumulative = state
-                    .tokenizer
-                    .decode(&generated_tokens, true)
-                    .unwrap_or_default();
-                let chunk = if cumulative.len() >= sent_text_len {
-                    char_safe_suffix(&cumulative, sent_text_len)
-                } else {
-                    // rewound - `sent_text_len = cumulative.len()` below covers it
-                    cumulative.clone()
-                };
-                sent_text_len = cumulative.len();
-                if tx.blocking_send(Ok(chunk)).is_err() {
-                    debug!("🛑 Grammar streaming stopped - client disconnected");
-                    return;
-                }
-
-                recent_tokens.push(next_token);
-
-                if commit.stop
-                    || next_token == state.eos_token_id
-                    || state.eos_token_ids_extra.contains(&next_token)
-                {
-                    break;
-                }
-
-                let x = match Tensor::new(&[next_token], &device).and_then(|t| t.unsqueeze(0)) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("Token tensor: {e}")));
-                        return;
-                    }
-                };
-                // stepd: use LoadedModelState::forward so
-                // moondream gets graph capture/launch when warmed up.
-                // Other variants delegate to model.forward unchanged.
-                logits = match state.forward(&x, pos) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(format!("Decode forward: {e}")));
-                        return;
-                    }
-                };
-                pos += 1;
-            }
-            crate::request_metrics::record(
-                &config.model_id,
-                &crate::request_metrics::RequestFigures {
-                    queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
-                    prefill_s: prefilled.saturating_duration_since(locked).as_secs_f64(),
-                    decode_s: prefilled.elapsed().as_secs_f64(),
-                    prompt_tokens: prompt_tokens.len() as u64,
-                    cached_prompt_tokens: 0,
-                    generated_tokens: generated_tokens.len() as u64,
-                },
-            );
-        });
-
-        Ok(rx)
     }
 }

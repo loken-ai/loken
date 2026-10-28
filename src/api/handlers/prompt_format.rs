@@ -466,12 +466,53 @@ fn has_late_system(messages: &[Message]) -> bool {
     messages[lead..].iter().any(is_system)
 }
 
+/// How a chat template is rendered beyond the conversation: whether it opens the assistant's
+/// turn, whether the last message is continued rather than closed, and the variables a request
+/// hands the template (vLLM's `chat_template_kwargs` and `documents`).
+#[derive(Debug, Clone)]
+pub(crate) struct TemplateOptions {
+    pub add_generation_prompt: bool,
+    pub continue_final_message: bool,
+    pub variables: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for TemplateOptions {
+    fn default() -> Self {
+        Self {
+            add_generation_prompt: true,
+            continue_final_message: false,
+            variables: serde_json::Map::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 fn render_jinja_template(
     tmpl: &str,
     messages: &[Message],
     add_generation_prompt: bool,
     tools: Option<&[Tool]>,
     thinking_off: bool,
+) -> Option<String> {
+    render_jinja_template_with(
+        tmpl,
+        messages,
+        add_generation_prompt,
+        tools,
+        thinking_off,
+        &serde_json::Map::new(),
+    )
+}
+
+/// [`render_jinja_template`] with `variables` in the template's context; a variable the
+/// render sets itself keeps the render's value.
+fn render_jinja_template_with(
+    tmpl: &str,
+    messages: &[Message],
+    add_generation_prompt: bool,
+    tools: Option<&[Tool]>,
+    thinking_off: bool,
+    variables: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
     use minijinja::{context, Environment, Value};
     let lifted;
@@ -627,6 +668,7 @@ fn render_jinja_template(
         add_generation_prompt => add_generation_prompt,
         tools => tools_value,
         enable_thinking => enable_thinking,
+        ..Value::from_serialize(variables)
     }) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -766,17 +808,34 @@ pub(crate) fn format_chat_prompt_with_tools(
     template: Option<&str>,
     tools: &[Tool],
 ) -> String {
+    format_chat_prompt_with_tools_opts(messages, template, tools, &TemplateOptions::default())
+}
+
+/// [`format_chat_prompt_with_tools`] rendered with `opts`.
+pub(crate) fn format_chat_prompt_with_tools_opts(
+    messages: &[Message],
+    template: Option<&str>,
+    tools: &[Tool],
+    opts: &TemplateOptions,
+) -> String {
     if let Some(tmpl) = template {
         if template_takes_tools(Some(tmpl)) {
-            if let Some(rendered) = render_jinja_template(tmpl, messages, true, Some(tools), false)
-            {
+            if let Some(rendered) = render_jinja_template_with(
+                tmpl,
+                messages,
+                opts.add_generation_prompt,
+                Some(tools),
+                false,
+                &opts.variables,
+            ) {
                 return rendered;
             }
         }
     }
-    format_chat_prompt(messages, template)
+    format_chat_prompt_opts(messages, template, false, opts)
 }
 
+#[cfg(test)]
 pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -> String {
     format_chat_prompt_thinking(messages, template, false)
 }
@@ -787,6 +846,22 @@ pub(crate) fn format_chat_prompt_thinking(
     messages: &[Message],
     template: Option<&str>,
     thinking_off: bool,
+) -> String {
+    format_chat_prompt_opts(
+        messages,
+        template,
+        thinking_off,
+        &TemplateOptions::default(),
+    )
+}
+
+/// [`format_chat_prompt_thinking`] rendered with `opts`. The formats written here rather than
+/// by a Jinja template always open the assistant's turn.
+pub(crate) fn format_chat_prompt_opts(
+    messages: &[Message],
+    template: Option<&str>,
+    thinking_off: bool,
+    opts: &TemplateOptions,
 ) -> String {
     // Extract system prompt and last user message for legacy templates
     let system = messages
@@ -807,8 +882,14 @@ pub(crate) fn format_chat_prompt_thinking(
         // Jinja has statement blocks, the Go templates a distributor wraps its
         // models in do not.
         if tmpl.contains("{%") {
-            if let Some(rendered) = render_jinja_template(tmpl, messages, true, None, thinking_off)
-            {
+            if let Some(rendered) = render_jinja_template_with(
+                tmpl,
+                messages,
+                opts.add_generation_prompt,
+                None,
+                thinking_off,
+                &opts.variables,
+            ) {
                 return rendered;
             }
         }

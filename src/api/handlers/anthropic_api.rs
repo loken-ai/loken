@@ -83,6 +83,7 @@ pub(crate) async fn anthropic_messages_at(
                     tool_choice: tool_choice.as_ref(),
                     thinking,
                     output_grammar: None,
+                    template: Default::default(),
                 },
             )
             .await
@@ -161,6 +162,7 @@ pub(crate) async fn anthropic_messages_at(
                 tool_choice: tool_choice.as_ref(),
                 thinking,
                 output_grammar,
+                template: Default::default(),
             },
         )
         .await;
@@ -490,6 +492,7 @@ pub(crate) async fn anthropic_count_tokens(
                 tool_choice: tool_choice.as_ref(),
                 thinking,
                 output_grammar: None,
+                template: Default::default(),
             },
         )
         .await

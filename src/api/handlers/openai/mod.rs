@@ -5,6 +5,7 @@ use super::*;
 
 pub(crate) mod forecast;
 pub(crate) mod pooling;
+pub(crate) mod vllm;
 
 /// The string a request field holds, empty when it is absent or is not a string.
 ///
@@ -182,14 +183,25 @@ fn fim_wrapped(body: &serde_json::Value, prompt: String) -> String {
 }
 
 /// What a chat-completion request says about its prompt: the tools in the model's own
-/// syntax, the reasoning effort, and the grammar a structured output imposes.
+/// syntax, the reasoning effort or the template's `enable_thinking`, the grammar a structured
+/// output imposes, and the template options. The vLLM fields are validated by the handler
+/// before this reads them.
 fn chat_prompt_spec(request: &ChatCompletionRequest) -> super::chat_prompt::PromptSpec<'_> {
+    let template = request.vllm.template_options().unwrap_or_default();
+    let thinking = super::chat_prompt::thinking_from_effort(request.reasoning_effort.as_deref())
+        .or_else(|| super::chat_prompt::thinking_from_variables(&template.variables));
     super::chat_prompt::PromptSpec {
         messages: &request.messages,
         tools: request.tools.as_ref(),
         tool_choice: request.tool_choice.as_ref(),
-        thinking: super::chat_prompt::thinking_from_effort(request.reasoning_effort.as_deref()),
-        output_grammar: response_format_to_grammar(request.response_format.as_ref()),
+        thinking,
+        output_grammar: request
+            .vllm
+            .grammar()
+            .ok()
+            .flatten()
+            .or_else(|| response_format_to_grammar(request.response_format.as_ref())),
+        template,
     }
 }
 
@@ -234,10 +246,22 @@ pub(crate) async fn chat_completion_at(
     // returns the same 400 envelope ("messages length must be in [1, 4096]")
     // before we get here. Imperative check removed.
 
-    // The sampling knobs, `stop`, `top_logprobs` and the `user` session key, bounded
-    // as on every other route.
-    let sampling = super::sampling::SamplingRequest::from_openai(&request);
+    // The sampling knobs, `stop`, `top_logprobs`, the `user` session key and vLLM's
+    // extensions, bounded as on every other route.
+    let sampling =
+        super::sampling::SamplingRequest::from_openai(&request).with_vllm(&request.vllm)?;
     sampling.validate()?;
+    request.vllm.grammar()?;
+    request.vllm.template_options()?;
+    let keep_stop = request.vllm.keeps_stop();
+    let stops = sampling.stop.clone();
+    let ids_as_tokens = request.vllm.return_tokens_as_token_ids == Some(true);
+    let include_reasoning = request.vllm.include_reasoning != Some(false);
+    // `echo` writes the final assistant message in front of the answer.
+    let echo_text = match request.messages.last() {
+        Some(m) if request.vllm.echo == Some(true) && m.role == "assistant" => m.content.clone(),
+        _ => String::new(),
+    };
 
     // OpenAI's allowed message roles. Anything else is a 400 - the
     // chat template would otherwise silently fold an unknown role
@@ -515,6 +539,8 @@ pub(crate) async fn chat_completion_at(
                     };
                     let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut reasoning_acc = String::new();
+                    let mut holdback = vllm::StopHoldback::new(&stops, keep_stop);
+                    let mut echo_pending = echo_text;
 
                     while let Some(result) = rx.recv().await {
                         match result {
@@ -523,10 +549,18 @@ pub(crate) async fn chat_completion_at(
                                     first_token_at = Some(std::time::Instant::now());
                                 }
                                 token_count += 1;
+                                let chunk_text = format!(
+                                    "{}{}",
+                                    std::mem::take(&mut echo_pending),
+                                    holdback.push(&chunk_text)
+                                );
                                 for seg in splitter.push(&chunk_text) {
                                     let delta = match seg {
                                         crate::api::thinking::Segment::Thinking(t) => {
                                             reasoning_acc.push_str(&t);
+                                            if !include_reasoning {
+                                                continue;
+                                            }
                                             ChunkDelta::reasoning(t)
                                         }
                                         crate::api::thinking::Segment::Content(c) => {
@@ -550,7 +584,10 @@ pub(crate) async fn chat_completion_at(
                                     );
                                     chunk.service_tier = service_tier.clone();
                                     if wants_logprobs {
-                                        let drawn = engine_for_stats.take_logprobs();
+                                        let mut drawn = engine_for_stats.take_logprobs();
+                                        if ids_as_tokens {
+                                            vllm::tokens_as_ids(&mut drawn);
+                                        }
                                         if !drawn.is_empty() {
                                             if let Some(c) = chunk.choices.first_mut() {
                                                 c.logprobs = Some(serde_json::json!({
@@ -596,8 +633,22 @@ pub(crate) async fn chat_completion_at(
                     // structured calls and emit them as a single delta
                     // before the terminal chunk. finish_reason flips to
                     // "tool_calls" when the model invoked functions.
-                    for seg in splitter.finish() {
+                    // The text held back for a stop sequence goes first, without the stop.
+                    let stats = engine_for_stats.take_last_stream_stats();
+                    let held = format!(
+                        "{echo_pending}{}",
+                        holdback.finish(stats.as_ref().map(|s| &s.finish_reason))
+                    );
+                    let tail: Vec<_> = splitter
+                        .push(&held)
+                        .into_iter()
+                        .chain(splitter.finish())
+                        .collect();
+                    for seg in tail {
                         let delta = match seg {
+                            crate::api::thinking::Segment::Thinking(_) if !include_reasoning => {
+                                continue
+                            }
                             crate::api::thinking::Segment::Thinking(t) => ChunkDelta::reasoning(t),
                             crate::api::thinking::Segment::Content(c) => {
                                 let emit = match tool_scanner.as_mut() {
@@ -664,7 +715,6 @@ pub(crate) async fn chat_completion_at(
                             yield Ok(Event::default().data(to_json_string!(&chunk)));
                         }
                     }
-                    let stats = engine_for_stats.take_last_stream_stats();
                     let finish_reason = if used_tools {
                         "tool_calls"
                     } else if let Some(s) = stats.as_ref() {
@@ -771,11 +821,14 @@ pub(crate) async fn chat_completion_at(
         let timing_decode_ms: Option<f64>;
         let mut params = params;
         let _cancel = engine.cancel_guard(&mut params);
-        let result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
+        let mut result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
         let (content, finish_reason, completion_tokens, prompt_tokens, cached_tokens) =
             match engine.generate(&prompt, params).await {
                 Ok(result) => {
                     result_logprobs = result.logprobs.clone();
+                    if ids_as_tokens {
+                        vllm::tokens_as_ids(&mut result_logprobs);
+                    }
                     // OpenAI's `finish_reason`: `length` when we hit
                     // max_tokens, `stop` when the model emitted an EOS
                     // token / stop sequence. Inferred from eval_count vs
@@ -785,7 +838,10 @@ pub(crate) async fn chat_completion_at(
                     timing_prefill_ms = Some(result.prompt_eval_duration as f64 / 1_000_000.0);
                     timing_decode_ms = Some(result.eval_duration as f64 / 1_000_000.0);
                     (
-                        result.text,
+                        format!(
+                            "{echo_text}{}",
+                            vllm::strip_stop(result.text, &result.finish_reason, keep_stop)
+                        ),
                         reason.to_string(),
                         result.eval_count as i32,
                         result.prompt_eval_count,
@@ -831,7 +887,7 @@ pub(crate) async fn chat_completion_at(
             )
         };
         let mut message = message;
-        message.reasoning_content = reasoning.clone();
+        message.reasoning_content = reasoning.clone().filter(|_| include_reasoning);
         let finish_for_log = finish_reason.clone();
         let mut choice = Choice::new(0, message, finish_reason);
         if !result_logprobs.is_empty() {
@@ -1117,9 +1173,15 @@ pub(crate) async fn text_completions_at(
     // The sampling knobs, `stop`, `logprobs` and the `user` session key, bounded as on
     // every other route. `logprobs: n` asks for each token's log-probability with `n`
     // alternatives.
-    let sampling = super::sampling::SamplingRequest::from_completions(&body);
+    let vllm_fields = crate::api::types::vllm::VllmFields::of_body(&body)?;
+    let sampling =
+        super::sampling::SamplingRequest::from_completions(&body).with_vllm(&vllm_fields)?;
     sampling.validate()?;
     let completion_logprobs = sampling.top_logprobs.map(|v| v as usize);
+    let output_grammar = vllm_fields.grammar()?;
+    let keep_stop = vllm_fields.keeps_stop();
+    let stops = sampling.stop.clone();
+    let ids_as_tokens = vllm_fields.return_tokens_as_token_ids == Some(true);
 
     // `best_of` samples that many completions and returns the `n` with the highest mean token
     // log-probability; every sampled completion counts in the usage, as it is billed upstream.
@@ -1253,9 +1315,9 @@ pub(crate) async fn text_completions_at(
     let engine = state.load_for_request(&model_name, load).await?;
 
     // `response_format` is documented on /v1/chat/completions and several SDKs send it
-    // here too: the same grammar engine serves both.
+    // here too: the same grammar engine serves both. vLLM's structured outputs win over it.
     let params = GenerationParams {
-        grammar: response_format_to_grammar(body.get("response_format")),
+        grammar: output_grammar.or_else(|| response_format_to_grammar(body.get("response_format"))),
         ..sampling.into_params()
     };
 
@@ -1301,6 +1363,7 @@ pub(crate) async fn text_completions_at(
         let mn = model_name.clone();
         let mut echo_pending = echo_text.clone();
         let mut text_offset = echo_text.len();
+        let mut holdback = vllm::StopHoldback::new(&stops, keep_stop);
         let stream = async_stream::stream! {
             let _admitted = admission;
             let mut rx = rx;
@@ -1314,13 +1377,17 @@ pub(crate) async fn text_completions_at(
                             first_token_at = Some(std::time::Instant::now());
                         }
                         tokens += 1;
+                        let text = holdback.push(&text);
                         let piece = format!("{echo_pending}{text}");
                         echo_pending.clear();
-                        let drawn = if completion_logprobs.is_some() {
+                        let mut drawn = if completion_logprobs.is_some() {
                             engine_for_stats.take_logprobs()
                         } else {
                             Vec::new()
                         };
+                        if ids_as_tokens {
+                            vllm::tokens_as_ids(&mut drawn);
+                        }
                         let logprobs_value = if drawn.is_empty() {
                             serde_json::Value::Null
                         } else {
@@ -1366,6 +1433,23 @@ pub(crate) async fn text_completions_at(
             // two terminal markers (same fix as the chat-completion +
             // /api/chat streams).
             let stats = engine_for_stats.take_last_stream_stats();
+            // The text held back for a stop sequence, without the stop.
+            let held = holdback.finish(stats.as_ref().map(|s| &s.finish_reason));
+            if !errored && !held.is_empty() {
+                let chunk = serde_json::json!({
+                    "id": cid,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": mn,
+                    "choices": [{
+                        "text": format!("{echo_pending}{held}"),
+                        "index": 0,
+                        "logprobs": serde_json::Value::Null,
+                        "finish_reason": serde_json::Value::Null,
+                    }],
+                });
+                yield Ok(Event::default().data(chunk.to_string()));
+            }
             if !errored {
                 // Match the non-stream path's `finish_reason` logic:
                 // "length" when we produced exactly `max_tokens`,
@@ -1431,18 +1515,23 @@ pub(crate) async fn text_completions_at(
     let finish = result.finish_reason.openai();
     let prefill_ms = result.prompt_eval_duration as f64 / 1_000_000.0;
     let decode_ms = result.eval_duration as f64 / 1_000_000.0;
+    let text = vllm::strip_stop(result.text, &result.finish_reason, keep_stop);
+    let mut result_logprobs = result.logprobs;
+    if ids_as_tokens {
+        vllm::tokens_as_ids(&mut result_logprobs);
+    }
     let response = serde_json::json!({
         "id": completion_id,
         "object": "text_completion",
         "created": created,
         "model": model_name,
         "choices": [{
-            "text": format!("{echo_text}{}", result.text),
+            "text": format!("{echo_text}{text}"),
             "index": 0,
-            "logprobs": if result.logprobs.is_empty() {
+            "logprobs": if result_logprobs.is_empty() {
                 serde_json::Value::Null
             } else {
-                completions_logprobs(&result.logprobs, echo_text.len())
+                completions_logprobs(&result_logprobs, echo_text.len())
             },
             "finish_reason": finish,
         }],

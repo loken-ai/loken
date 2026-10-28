@@ -71,7 +71,8 @@ impl LlmEngine {
     /// Stream a request through the continuous-batch worker: tokenize, submit
     /// with the resolved sampling controls, and pump the worker's token channel
     /// back as incrementally-detokenized text chunks (same NDJSON shape the
-    /// serial path emits). Stops on any EOS token, a stop sequence, or max_tokens.
+    /// serial path emits). Stops on any of the request's end tokens, a stop sequence, or
+    /// max_tokens.
     pub(super) fn stream_via_cb(
         &self,
         server: std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
@@ -84,12 +85,10 @@ impl LlmEngine {
     ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
         use crate::inference::serve::continuous_batch::SamplingParams;
         use crate::inference::serve::continuous_serve::CbToken;
-        if params.stop_sequences.is_empty() {
-            params.stop_sequences = defaults.stop.clone();
-        }
+        params = params.with_default_stops(&defaults.stop);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(4096);
         let tokens: Vec<u32> = match super::encode_prompt(&tokenizer, prompt) {
-            Ok(e) => with_prefix_tokens(&params, e.get_ids()),
+            Ok(e) => request_prompt_tokens(&params, e.get_ids()),
             Err(e) => {
                 let _ = tx.try_send(Err(format!("Tokenization: {e}")));
                 return rx;
@@ -114,6 +113,9 @@ impl LlmEngine {
             repeat_penalty: resolved.repeat_penalty,
             repeat_last_n: resolved.repeat_last_n,
             seed: resolved.seed,
+            // The worker's own end tokens unless the request changes them.
+            ends: (params.rules.ignore_eos || !params.rules.stop_token_ids.is_empty())
+                .then(|| eos_set.clone()),
         };
         let stops = params.stop_sequences.clone();
         let (model_id, prompt_len) = (self.config.model_id.clone(), tokens.len());
@@ -264,12 +266,10 @@ impl LlmEngine {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
         let arrived = std::time::Instant::now();
-        // Grammar-constrained streaming path. Same fast path as
-        // generate_with_grammar, but emits tokens to a channel as they're
-        // sampled. Bypasses PLD/graph branches.
-        if params.grammar.is_some() {
+        // A grammar or token rules take the sequential path, one forward per token.
+        if params.grammar.is_some() || params.rules.decodes_sequentially() {
             return self
-                .generate_stream_with_grammar(prompt.to_string(), params)
+                .generate_stream_sequential(prompt.to_string(), params)
                 .await;
         }
         // Continuous-batch delegation: a CB-served model bypasses the serial
@@ -283,8 +283,9 @@ impl LlmEngine {
                 Some(state) => {
                     if let Some(server) = state.model.batched_server() {
                         let tokenizer = std::sync::Arc::clone(&state.tokenizer);
-                        let mut eos_set = state.eos_token_ids_extra.clone();
-                        eos_set.push(state.eos_token_id);
+                        let eos_set = params
+                            .rules
+                            .end_tokens(state.eos_token_id, &state.eos_token_ids_extra);
                         let ctx_len = state.context_length;
                         let defaults = state.generation_defaults.clone();
                         drop(guard);
@@ -377,8 +378,7 @@ impl LlmEngine {
             let (
                 mut next_token,
                 mut pos,
-                eos_token_id,
-                eos_extra,
+                end_tokens,
                 resolved,
                 device_clone,
                 mut logits_processor,
@@ -453,13 +453,13 @@ impl LlmEngine {
                 let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
                     (Some(a), _) => a.tokens.clone(),
                     (None, Some(sent)) => clamp_qwen35_prompt_to_window(
-                        with_prefix_tokens(&params, encoding.get_ids()),
+                        request_prompt_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
                         params.max_tokens.unwrap_or(0),
                         sent,
                     ),
                     (None, None) => clamp_prompt_to_window(
-                        with_prefix_tokens(&params, encoding.get_ids()),
+                        request_prompt_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
                         params.max_tokens.unwrap_or(0),
                     ),
@@ -1089,13 +1089,12 @@ impl LlmEngine {
                 // taken again with every end-of-sequence token suppressed, so at least one token
                 // is produced. Later tokens stop on them as before. On the architecture-neutral
                 // sampling path, so it holds for every model.
-                if resolved.max_tokens >= 1 {
-                    let mut stops = state.eos_token_ids_extra.clone();
-                    stops.push(state.eos_token_id);
-                    if stops.contains(&next_token) {
-                        if let Ok(alt) = logits_processor.sample_avoiding(&penalized, &stops) {
-                            next_token = alt;
-                        }
+                let ends = params
+                    .rules
+                    .end_tokens(state.eos_token_id, &state.eos_token_ids_extra);
+                if resolved.max_tokens >= 1 && ends.contains(&next_token) {
+                    if let Ok(alt) = logits_processor.sample_avoiding(&penalized, &ends) {
+                        next_token = alt;
                     }
                 }
                 record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_buf);
@@ -1119,8 +1118,7 @@ impl LlmEngine {
                 (
                     next_token,
                     pos,
-                    state.eos_token_id,
-                    state.eos_token_ids_extra.clone(),
+                    ends,
                     resolved,
                     // Moved, not cloned: nothing above reads it again, and a device handle
                     // carries the context and the stream along with it.
@@ -1441,10 +1439,10 @@ impl LlmEngine {
             // (PLD verify/draft, temperature > 0 sampling).
             let mut next_token_dev: Option<Tensor> = None;
 
-            // Every token the model ends a turn with stops the stream, as it stops the whole
-            // answer: the extra ones are control tokens a decode drops, so no text stop sees
-            // them.
-            let ends = |t: u32| t == eos_token_id || eos_extra.contains(&t);
+            // Every token the request ends on stops the stream, as it stops the whole answer:
+            // the model's extra end tokens are control tokens a decode drops, so no text stop
+            // sees them.
+            let ends = |t: u32| end_tokens.contains(&t);
             // The stage profile's view of a token: the whole iteration, and its parts below.
             use crate::inference::offload::prof_record;
             let mut last_top: Option<Instant> = None;
@@ -2560,8 +2558,7 @@ impl LlmEngine {
                                     &mut recent_tokens,
                                     &mut pld_cache,
                                     pld_enabled,
-                                    eos_token_id,
-                                    &eos_extra,
+                                    &end_tokens,
                                     /* committed_base */ token_count,
                                     max_tokens,
                                     &mut |row, recent| {
