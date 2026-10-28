@@ -44,9 +44,13 @@ a mixture of 235B parameters, runs on the two cards and the host at 7.0 tok/s pr
 
 ## Context shift
 
-A prompt longer than the window keeps its first token and its tail, as ollama does. Once a
-conversation outgrows the window, the prefix it shares with the resident KV is that first
-token alone, and a cold run re-prefills the whole window every turn. loken keeps the tail
+A prompt longer than the window is refused on every route, where ollama would cut it: a cut
+prompt can lose its system prompt or its tool instructions and still read as a plausible
+answer. Before refusing, loken reloads the model with a wider window when the model and the
+request's `num_ctx` allow it. A prompt that fits but leaves too little room for the answer
+keeps its first token and its tail. Once a conversation reaches that point, the prefix it
+shares with the resident KV is that first token alone, and a cold run re-prefills the whole
+window every turn. loken keeps the tail
 instead: the resident keys are pulled down to their new positions and
 re-phased in place (the rotary phase of the shift is read off the layer's own table, so
 YaRN and factored frequencies need nothing special), and only the new tokens are prefilled.
