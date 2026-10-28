@@ -281,3 +281,32 @@ fn the_time_to_first_token_runs_from_the_request_to_the_first_token() {
     assert_eq!(time_to_first_token_ms(started, Some(first)), 1500);
     assert_eq!(time_to_first_token_ms(started, None), 0);
 }
+
+/// `prompt_embeds` reads as base64 of little-endian f32 or as rows of numbers, the same values
+/// either way; anything else is refused. The other forms are tested in
+/// `inference::prompt_embeds`.
+#[test]
+fn prompt_embeds_read_from_base64_or_rows() {
+    use base64::Engine as _;
+    let values = [0.5f32, -1.25, 3.0, 0.0];
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let read = |field: serde_json::Value| {
+        prompt_embeds_of(&serde_json::json!({ "prompt_embeds": field }))
+            .unwrap()
+            .unwrap()
+            .into_values(2, 64)
+            .unwrap()
+    };
+    assert_eq!(read(serde_json::json!(b64)), values);
+    assert_eq!(read(serde_json::json!([[0.5, -1.25], [3.0, 0.0]])), values);
+    assert!(prompt_embeds_of(&serde_json::json!({})).unwrap().is_none());
+    assert!(prompt_embeds_of(&serde_json::json!({ "prompt_embeds": "AAA" })).is_err());
+    assert!(prompt_embeds_of(&serde_json::json!({ "prompt_embeds": [["x"]] })).is_err());
+    assert!(prompt_embeds_of(&serde_json::json!({ "prompt_embeds": 3 })).is_err());
+    // An array of base64 strings is one prompt per string; an array of rows is one prompt.
+    let list = serde_json::json!({ "prompt_embeds": [b64.clone(), b64] });
+    assert_eq!(prompt_embeds_list(&list).map(Vec::len), Some(2));
+    let rows = serde_json::json!({ "prompt_embeds": [[0.5, -1.25]] });
+    assert!(prompt_embeds_list(&rows).is_none());
+}

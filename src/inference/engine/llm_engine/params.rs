@@ -524,10 +524,16 @@ pub(super) fn audio_split_for(
     params: &GenerationParams,
     kv_window: usize,
 ) -> Result<Option<AudioPrompt>, String> {
-    let (Some(clip), Some(input)) = (state.audio.as_ref(), state.model.audio_input()) else {
+    let Some(clip) = state.audio.as_ref() else {
         return Ok(None);
     };
     let embeds = clip.embeds.dim(1).map_err(|e| e.to_string())?;
+    if clip.whole_prompt {
+        return whole_prompt_embeds(state.eos_token_id, embeds, kv_window).map(Some);
+    }
+    let Some(input) = state.model.audio_input() else {
+        return Ok(None);
+    };
     tokenize_around_audio(
         &state.tokenizer,
         prompt,
@@ -540,6 +546,25 @@ pub(super) fn audio_split_for(
     .map(Some)
 }
 
+/// A prompt sent as `embeds` rows: one stand-in token that the rows replace at prefill. Refused
+/// when the rows do not fit the KV window.
+fn whole_prompt_embeds(
+    stand_in: u32,
+    embeds: usize,
+    kv_window: usize,
+) -> Result<AudioPrompt, String> {
+    if embeds >= kv_window {
+        return Err(format!(
+            "the prompt embeddings occupy {embeds} KV positions but the context window is only \
+             {kv_window}; increase context_length / num_ctx or send a shorter prompt"
+        ));
+    }
+    Ok(AudioPrompt {
+        tokens: vec![stand_in],
+        at: 0,
+    })
+}
+
 /// The positions a prefill evaluated: the prompt's tokens less those the cache held, plus the
 /// positions a clip's embeddings take beyond the one placeholder token they replace.
 pub(super) fn prompt_eval_positions(tokens: usize, reused: usize, audio_extra: usize) -> u64 {
@@ -549,6 +574,15 @@ pub(super) fn prompt_eval_positions(tokens: usize, reused: usize, audio_extra: u
 #[cfg(test)]
 mod audio_position_tests {
     use super::*;
+
+    /// A prompt of embeddings is one stand-in token at the start, and is refused when its rows
+    /// fill the window.
+    #[test]
+    fn a_prompt_of_embeddings_is_one_stand_in_replaced_at_the_start() {
+        let p = whole_prompt_embeds(7, 10, 64).unwrap();
+        assert_eq!((p.tokens, p.at), (vec![7], 0));
+        assert!(whole_prompt_embeds(7, 64, 64).is_err());
+    }
 
     /// A clip of 375 embeddings in a prompt of 20 tokens (the placeholder one of them) is 394
     /// positions; a prompt with no clip is its tokens less the reused ones.

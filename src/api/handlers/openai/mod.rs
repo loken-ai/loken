@@ -135,6 +135,26 @@ where
     Ok(Json(out).into_response())
 }
 
+/// A completion's `prompt_embeds`, its structure checked: base64 of loken's format, of
+/// `torch.save` bytes or of bare little-endian f32 values, or a JSON array of rows of numbers.
+/// `None` when the request sends none.
+fn prompt_embeds_of(
+    body: &serde_json::Value,
+) -> Result<Option<crate::inference::prompt_embeds::PromptEmbeds>, String> {
+    match body.get("prompt_embeds") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(field) => crate::inference::prompt_embeds::PromptEmbeds::from_json(field).map(Some),
+    }
+}
+
+/// The payloads of a `prompt_embeds` array of base64 strings, one prompt each, as vLLM's
+/// clients send several prompts; `None` for any other shape.
+fn prompt_embeds_list(body: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    body.get("prompt_embeds")
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty() && items.iter().all(serde_json::Value::is_string))
+}
+
 /// A completions `prompt`: the string, or the strings of an array joined by newlines;
 /// `None` for any other shape.
 fn completion_prompt_text(body: &serde_json::Value) -> Option<String> {
@@ -999,47 +1019,70 @@ pub(crate) async fn text_completions_at(
             return Ok(relayed);
         }
     }
-    // Several prompts are several completions, one per prompt, gathered into one
-    // response with their indexes; a stream carries one prompt.
-    if let Some(arr) = body.get("prompt").and_then(serde_json::Value::as_array) {
-        if arr.len() > 1 {
-            if body
-                .get("stream")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                return Err(ApiError::Validation(
-                    "an array `prompt` is not supported with `stream`; send one prompt per stream"
-                        .into(),
-                ));
-            }
-            return merge_runs(arr.len(), true, None, |i| {
-                let mut single = body.clone();
-                single["prompt"] = arr[i].clone();
-                Box::pin(text_completions(
-                    State(state.clone()),
-                    headers.clone(),
-                    Json(single),
-                ))
-            })
-            .await;
+    // Several prompts, as text or as embeddings, are several completions, one per prompt,
+    // gathered into one response with their indexes; a stream carries one prompt.
+    let several = body
+        .get("prompt")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| ("prompt", arr))
+        .filter(|(_, arr)| arr.len() > 1)
+        .or_else(|| {
+            prompt_embeds_list(&body)
+                .filter(|arr| arr.len() > 1)
+                .map(|arr| ("prompt_embeds", arr))
+        });
+    if let Some((field, arr)) = several {
+        if body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(ApiError::Validation(format!(
+                "an array `{field}` is not supported with `stream`; send one prompt per stream"
+            )));
         }
+        return merge_runs(arr.len(), true, None, |i| {
+            let mut single = body.clone();
+            single[field] = arr[i].clone();
+            Box::pin(text_completions(
+                State(state.clone()),
+                headers.clone(),
+                Json(single),
+            ))
+        })
+        .await;
     }
     // Empty / whitespace-only / oversized / path-traversal model IDs are
     // all rejected by `validate_model_id` below with the same 400 envelope  -
     // no separate early check needed.
-    // OpenAI accepts a string or an array of strings for `prompt`; an array of several
-    // was fanned out above.
-    let Some(prompt) = completion_prompt_text(&body) else {
-        return Err(ApiError::Validation(
-            "`prompt` must be a string or array of strings".to_string(),
-        ));
+    // A prompt sent as embeddings takes the place of the text.
+    let prompt_embeds = prompt_embeds_of(&body).map_err(ApiError::Validation)?;
+    let prompt = match (&prompt_embeds, completion_prompt_text(&body)) {
+        (Some(_), Some(text)) if !text.is_empty() => {
+            return Err(ApiError::Validation(
+                "send either `prompt` or `prompt_embeds`, not both".to_string(),
+            ));
+        }
+        (Some(_), _) if body["suffix"].as_str().is_some_and(|s| !s.is_empty()) => {
+            return Err(ApiError::Validation(
+                "`suffix` needs a text `prompt`, not `prompt_embeds`".to_string(),
+            ));
+        }
+        (Some(_), _) => String::new(),
+        // OpenAI accepts a string or an array of strings for `prompt`; an array of several
+        // was fanned out above.
+        (None, Some(text)) if text.trim().is_empty() => {
+            return Err(ApiError::Validation(
+                "`prompt` must not be empty".to_string(),
+            ));
+        }
+        (None, Some(text)) => text,
+        (None, None) => {
+            return Err(ApiError::Validation(
+                "`prompt` must be a string or array of strings".to_string(),
+            ));
+        }
     };
-    if prompt.trim().is_empty() {
-        return Err(ApiError::Validation(
-            "`prompt` must not be empty".to_string(),
-        ));
-    }
     // Cap prompt length up front so a pathological multi-megabyte
     // prompt doesn't tie up the prefill path (the body limit sizes
     // media uploads and would otherwise let one through). 256k chars ~ 64k tokens at
@@ -1236,6 +1279,12 @@ pub(crate) async fn text_completions_at(
             &[],
         )
         .await?;
+    if let Some(embeds) = prompt_embeds {
+        engine
+            .set_prompt_embeds(embeds)
+            .await
+            .map_err(ApiError::Validation)?;
+    }
 
     if stream {
         // Capture max_tokens before moving params so the terminal

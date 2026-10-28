@@ -36,6 +36,7 @@ pub mod media;
 pub mod model;
 pub mod offload;
 pub mod place;
+pub mod prompt_embeds;
 pub mod sample;
 pub mod serve;
 pub mod token;

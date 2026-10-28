@@ -35,7 +35,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 | Route | What it does |
 |---|---|
 | `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`. Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. |
-| `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, and an array of prompts. |
+| `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, and an array of prompts. `prompt_embeds` sends the prompt as embedding rows of the model's width instead of text, in one of the forms under [Prompt embeddings](#prompt-embeddings); not served while the model batches concurrent requests. |
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. `input_image` (`image_url` as a base64 data URL, or `file_id` of an upload) and `input_audio` (`data`, `format`) parts are ingested as the `image_url` and `input_audio` parts of a chat completion; another part type answers 400 naming it. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. |
 | `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. |
@@ -46,6 +46,69 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 | `GET /v1/models` | The models on this machine, with `max_model_len`, the widest window each takes, then those the peers hold with the holder as `owned_by`. A request is served with the window its prompt and `max_tokens` need, up to that one; a window that must grow for it at least doubles. Answers in the Messages API's shape to a client sending its version header. |
 | `GET /v1/models/{id}`, `DELETE /v1/models/{id}` | One model, ids with slashes included. |
 | `POST /v1/moderations` | Category scores from the configured classifier, with the family's own labels under `hazards`. 501 until `moderation_model` is set. |
+
+### Prompt embeddings
+
+`prompt_embeds` on `/v1/completions` takes a base64 string, an array of base64 strings (one
+prompt each, answered as an array of prompts), or an array of rows of numbers. A base64 payload
+is read by its first bytes:
+
+| Form | First bytes | Width | Dtypes |
+|---|---|---|---|
+| loken's format | `00 00 C0 FF 4C 4B 45 4D` | in the header | float32, float16, bfloat16 |
+| `torch.save` of one tensor, as vLLM clients send it | `PK 03 04` | the tensor's last dimension | float32, float16, bfloat16, float64 |
+| bare little-endian f32, as `/v1/embeddings` returns them | anything else | the model's | float32 |
+
+Every form is refused with a 400 naming the fault, before a value is converted, when the rows
+are not the model's width or fill the served context window; and after, when a value is not
+finite.
+
+#### loken's format
+
+Little-endian throughout:
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 8 | magic `00 00 C0 FF 4C 4B 45 4D`; its first four bytes are an f32 NaN, which a bare f32 payload may not carry, so the two never collide |
+| 8 | 2 | version, `1` |
+| 10 | 1 | dtype: `0` float32, `1` float16, `2` bfloat16 |
+| 11 | 1 | reserved, `0` |
+| 12 | 4 | rows (u32) |
+| 16 | 4 | width (u32) |
+| 20 | 4 | reserved, `0` |
+| 24 | rows x width x dtype size | values, row after row |
+| end - 4 | 4 | CRC-32 of every byte before it (zlib's `crc32`) |
+
+A payload whose length is not exactly 28 bytes plus the values is refused as truncated or
+padded; one whose CRC-32 does not match, header included, as corrupted. Half precision takes half
+the bytes of f32: a 256 MiB request body carries about 24,000 rows of width 4096 in float16 or
+bfloat16, 12,000 in float32. A request body of raw bytes is not offered: base64 costs a third
+more bytes and one decode pass, small next to the prefill of those rows.
+
+```python
+import struct, zlib
+import numpy as np
+
+def encode_loken(rows: np.ndarray) -> bytes:  # float32 or float16, shape (rows, width)
+    code = {np.dtype("<f4"): 0, np.dtype("<f2"): 1}[rows.dtype.newbyteorder("<")]
+    head = b"\x00\x00\xc0\xffLKEM" + struct.pack("<HBBIII", 1, code, 0, *rows.shape, 0)
+    body = head + np.ascontiguousarray(rows, rows.dtype.newbyteorder("<")).tobytes()
+    return body + struct.pack("<I", zlib.crc32(body))
+```
+
+bfloat16 is the top half of each float32: `(rows.astype("<f4").view("<u4") >> 16).astype("<u2")`
+with code `2`.
+
+#### torch.save
+
+The archive `torch.save(tensor, buffer)` writes, base64-encoded: shape `(tokens, hidden_size)`
+or `(1, tokens, hidden_size)`, any strides and storage offset, on any device. It is read without
+running the pickle: only the opcodes, globals (`torch._utils._rebuild_tensor_v2`,
+`collections.OrderedDict`, `torch.FloatStorage`, `HalfStorage`, `BFloat16Storage`,
+`DoubleStorage`) and persistent references of one plain tensor are accepted, every entry used is
+checked against its CRC-32, and anything else is refused. Compressed or big-endian archives,
+torch's legacy format, sparse and quantized tensors, and tensors carrying attributes or hooks are
+refused.
 
 ### Files and batches
 

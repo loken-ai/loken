@@ -1026,9 +1026,13 @@ pub(crate) struct LoadedModelState {
 
 /// A request's clip as the model reads it: the embeddings that replace the prompt's
 /// placeholder, and a hash of the clip that keeps the prompt cache from matching across clips.
+/// A request that sends its prompt as embeddings holds them here too, standing for the whole
+/// prompt.
 pub(super) struct AudioClip {
     pub embeds: Tensor,
     pub hash: u64,
+    /// Whether the embeddings are the whole prompt rather than a placeholder's replacement.
+    pub whole_prompt: bool,
 }
 
 /// Snapshot of one session's cached conversation state. The KV cache itself

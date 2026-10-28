@@ -1080,8 +1080,8 @@ pub(crate) trait ModelBackend: Send {
         0
     }
 
-    /// Prefill `prompt` with the token at `at` replaced by the audio `embeds`. Returns the
-    /// last logits and the sequence length, which is the next decode position.
+    /// Prefill `prompt` with the token at `at` replaced by `embeds`, a clip's or the prompt's
+    /// own. Returns the last logits and the sequence length, which is the next decode position.
     fn forward_audio_spliced(
         &mut self,
         _prompt: &[u32],
@@ -1089,7 +1089,7 @@ pub(crate) trait ModelBackend: Send {
         _embeds: &Tensor,
     ) -> crate::tensor::Result<(Tensor, usize)> {
         Err(crate::tensor::Error::msg(
-            "this model carries no speech tower".to_string(),
+            "this model takes no embeddings in its prompt".to_string(),
         ))
     }
 
@@ -1992,7 +1992,6 @@ impl ModelBackend for GenericBackend {
         self.0.audio_tower().map_or(0, |t| t.embeds_for(samples))
     }
 
-    #[cfg(feature = "audio")]
     fn forward_audio_spliced(
         &mut self,
         prompt: &[u32],

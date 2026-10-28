@@ -937,6 +937,44 @@ impl LlmEngine {
         }
     }
 
+    /// Hold `embeds`, rows of the model's embedding width, as the prompt of the next generation
+    /// call in place of its text: they go through the layers as the embeddings of prompt tokens
+    /// would. Refused when no model is loaded, while the model batches requests, whose worker
+    /// reads token ids, when the rows are not the model's width or fill the served context
+    /// window, checked before a value is converted, and when a value is not finite.
+    /// Returns the number of rows.
+    pub async fn set_prompt_embeds(
+        &self,
+        embeds: crate::inference::prompt_embeds::PromptEmbeds,
+    ) -> Result<usize, String> {
+        use std::hash::{Hash, Hasher};
+        let mut guard = self.model_state.lock().await;
+        let state = guard.as_mut().ok_or("Model not loaded")?;
+        if state.model.batched_server().is_some() {
+            return Err(
+                "prompt embeddings are not served while the model batches concurrent requests"
+                    .into(),
+            );
+        }
+        let width = state.hidden_size;
+        let window =
+            params::effective_kv_window(state.context_length, self.config.context_length, None);
+        let values = embeds.into_values(width, window)?;
+        let rows = values.len() / width;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for v in &values {
+            v.to_bits().hash(&mut hasher);
+        }
+        let embeds =
+            Tensor::from_vec(values, (1, rows, width), &Device::Cpu).map_err(|e| e.to_string())?;
+        state.audio = Some(load::AudioClip {
+            embeds,
+            hash: hasher.finish(),
+            whole_prompt: true,
+        });
+        Ok(rows)
+    }
+
     /// How the loaded model takes audio, `None` when it carries no speech tower or no model
     /// is loaded.
     pub async fn audio_input(&self) -> Option<crate::inference::engine::model_backend::AudioInput> {
@@ -977,6 +1015,7 @@ impl LlmEngine {
             state.audio = Some(load::AudioClip {
                 embeds,
                 hash: hasher.finish(),
+                whole_prompt: false,
             });
             Ok(())
         })

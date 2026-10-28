@@ -2714,11 +2714,17 @@ impl GenericHeteroTransformer {
         };
         let prefix_emb = embed(prefix_ids)?;
         let suffix_emb = embed(suffix_ids)?;
-        let like = prefix_emb.as_ref().or(suffix_emb.as_ref()).ok_or_else(|| {
-            crate::tensor::Error::msg(
-                "forward_with_audio_embeds: no text around the embeds".to_string(),
-            )
-        })?;
+        // Embeds with no text around them take the device and dtype of a row of the table.
+        let probe;
+        let like = match prefix_emb.as_ref().or(suffix_emb.as_ref()) {
+            Some(text) => text,
+            None => {
+                probe = self
+                    .embeddings
+                    .forward(&Tensor::new(&[0u32], &emb_device)?.unsqueeze(0)?)?;
+                &probe
+            }
+        };
         let (like_device, like_dtype) = (like.device(), like.dtype());
         let aud = if embeds.device().same_device(&like_device) {
             embeds.clone()
