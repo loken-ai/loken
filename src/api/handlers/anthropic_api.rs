@@ -12,6 +12,7 @@ pub(crate) fn anthropic_error_response(
     kind: &str,
     message: String,
 ) -> Response {
+    tracing::warn!("answered {}: {message}", status.as_u16());
     let body = crate::api::anthropic::AnthropicError::new(kind, message);
     (status, Json(body)).into_response()
 }

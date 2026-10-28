@@ -3384,6 +3384,7 @@ where
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         lenient_json(req, state).await.map(Self).map_err(|msg| {
+            tracing::warn!("answered 400: {msg}");
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": msg})),
@@ -3401,6 +3402,9 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::Busy(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
+        // Every refusal and failure is in the server's log with its reason, not only in the
+        // body the client may discard.
+        tracing::warn!("answered {}: {error_message}", status.as_u16());
 
         // Use the OpenAI error envelope shape so SDKs that match on
         // `error.message` / `error.type` (most of them) can parse our
