@@ -76,23 +76,75 @@ pub(crate) async fn cohere_rerank(
     .into_response()
 }
 
-/// Cohere `/v2/embed`: `{model, texts, input_type, embedding_types}` answered with
-/// `{id, embeddings: {float: [[..]]}, texts, meta}`. Only float embeddings are served.
+/// The embedding types `/v2/embed` serves.
+const COHERE_TYPES: [&str; 2] = ["float", "base64"];
+
+/// The OpenAI embeddings body a Cohere `/v2/embed` body stands for: `texts` as `input`;
+/// `images` (data URIs) and `inputs` (content lists) as one conversation each in
+/// `messages`. Exactly one of the three, non-empty, as Cohere requires.
+pub(crate) fn cohere_embed_request(body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::{json, Value};
+    let given: Vec<&str> = ["texts", "images", "inputs"]
+        .into_iter()
+        .filter(|k| body.get(*k).is_some_and(|v| !v.is_null()))
+        .collect();
+    let [field] = given.as_slice() else {
+        return Err("exactly one of `texts`, `images` or `inputs` must be given".into());
+    };
+    let items = body[*field]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| format!("`{field}` must be a non-empty array"))?;
+    let user = |content: Value| json!([{"role": "user", "content": content}]);
+    let mut adapted = json!({"model": body.get("model").cloned().unwrap_or_default()});
+    match *field {
+        "texts" => {
+            let texts: Option<Vec<&str>> = items.iter().map(Value::as_str).collect();
+            adapted["input"] = json!(texts.ok_or("`texts` must be an array of strings")?);
+        }
+        "images" => {
+            let conversations: Option<Vec<Value>> = items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(|url| user(json!([{"type": "image_url", "image_url": {"url": url}}])))
+                })
+                .collect();
+            adapted["messages"] =
+                json!(conversations.ok_or("`images` must be an array of data URIs")?);
+        }
+        _ => {
+            let conversations: Option<Vec<Value>> = items
+                .iter()
+                .map(|v| v.get("content").filter(|c| c.is_array()).cloned().map(user))
+                .collect();
+            adapted["messages"] =
+                json!(conversations.ok_or("each of `inputs` needs a `content` array")?);
+        }
+    }
+    if let Some(d) = body.get("output_dimension").filter(|d| !d.is_null()) {
+        adapted["dimensions"] = d.clone();
+    }
+    Ok(adapted)
+}
+
+/// Cohere `/v2/embed`: `{model, texts | images | inputs, input_type, embedding_types,
+/// output_dimension}` answered with `{id, embeddings: {float, base64}, texts, meta,
+/// response_type}`. Float and base64 (little-endian f32) embeddings are served.
 pub(crate) async fn cohere_embed(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let texts: Vec<String> = match body.get("texts").and_then(serde_json::Value::as_array) {
-        Some(items) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        None => {
-            return ApiError::Validation("`texts` must be an array of strings".into())
-                .into_response()
-        }
+    let adapted = match cohere_embed_request(&body) {
+        Ok(a) => a,
+        Err(why) => return ApiError::Validation(why).into_response(),
     };
+    let texts: Option<Vec<String>> = adapted["input"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    });
     let types: Vec<String> = body
         .get("embedding_types")
         .and_then(serde_json::Value::as_array)
@@ -102,16 +154,12 @@ pub(crate) async fn cohere_embed(
                 .collect()
         })
         .unwrap_or_else(|| vec!["float".to_string()]);
-    if let Some(other) = types.iter().find(|t| *t != "float") {
+    if let Some(other) = types.iter().find(|t| !COHERE_TYPES.contains(&t.as_str())) {
         return ApiError::Validation(format!(
-            "embedding type `{other}` is not served; ask for `float`"
+            "embedding type `{other}` is not served; ask for `float` or `base64`"
         ))
         .into_response();
     }
-    let adapted = serde_json::json!({
-        "model": body.get("model").cloned().unwrap_or_default(),
-        "input": texts,
-    });
     let (status, v) = answer(openai_embeddings(State(state), headers, Json(adapted)).await).await;
     if !status.is_success() {
         return (status, Json(v)).into_response();
@@ -122,13 +170,38 @@ pub(crate) async fn cohere_embed(
         .flatten()
         .map(|d| d["embedding"].clone())
         .collect();
-    Json(serde_json::json!({
+    let mut embeddings = serde_json::Map::new();
+    for t in &types {
+        let encoded: Vec<serde_json::Value> = match t.as_str() {
+            "base64" => vectors.iter().map(base64_vector).collect(),
+            _ => vectors.clone(),
+        };
+        embeddings.insert(t.clone(), serde_json::Value::Array(encoded));
+    }
+    let mut out = serde_json::json!({
         "id": request_id(),
-        "embeddings": {"float": vectors},
-        "texts": texts,
+        "embeddings": embeddings,
         "meta": {"api_version": {"version": "2"}},
-    }))
-    .into_response()
+        "response_type": "embeddings_by_type",
+    });
+    if let Some(texts) = texts {
+        out["texts"] = serde_json::json!(texts);
+    }
+    Json(out).into_response()
+}
+
+/// A float vector as base64 of its little-endian f32 bytes, the way `/v1/embeddings`
+/// encodes it.
+fn base64_vector(v: &serde_json::Value) -> serde_json::Value {
+    use base64::Engine as _;
+    let bytes: Vec<u8> = v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_f64)
+        .flat_map(|x| (x as f32).to_le_bytes())
+        .collect();
+    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 /// The pairs a score request names: `text_1` against each of `text_2` when one is a string, or
@@ -222,6 +295,41 @@ mod tests {
         assert_eq!(got, ["a", "b"]);
         assert!(document_texts(&json!(["a", 3])).is_none());
         assert!(document_texts(&json!({"text": "a"})).is_none());
+    }
+
+    /// Cohere's three input fields map onto `input` and `messages`; one, and only one, is
+    /// taken, and `output_dimension` becomes `dimensions`.
+    #[test]
+    fn a_cohere_embed_body_maps_onto_the_openai_one() {
+        let t = cohere_embed_request(&json!({"model": "m", "texts": ["a", "b"],
+            "output_dimension": 8}))
+        .unwrap();
+        assert_eq!(
+            t,
+            json!({"model": "m", "input": ["a", "b"], "dimensions": 8})
+        );
+        let i = cohere_embed_request(&json!({"model": "m",
+            "images": ["data:image/png;base64,AAAA"]}))
+        .unwrap();
+        assert_eq!(
+            i["messages"],
+            json!([[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]])
+        );
+        let parts = json!([{"type": "text", "text": "a cat"}]);
+        let n = cohere_embed_request(&json!({"inputs": [{"content": parts}]})).unwrap();
+        assert_eq!(n["messages"], json!([[{"role": "user", "content": parts}]]));
+        assert!(cohere_embed_request(&json!({"texts": ["a"], "images": ["x"]})).is_err());
+        assert!(cohere_embed_request(&json!({"texts": []})).is_err());
+        assert!(cohere_embed_request(&json!({})).is_err());
+        assert!(cohere_embed_request(&json!({"inputs": [{"content": "a"}]})).is_err());
+    }
+
+    /// A base64 vector is the little-endian f32 bytes of the floats.
+    #[test]
+    fn a_base64_vector_is_little_endian_f32() {
+        let got = base64_vector(&json!([1.0, -2.5]));
+        assert_eq!(got, json!("AACAPwAAIMA="));
     }
 
     #[test]

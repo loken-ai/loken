@@ -16,6 +16,11 @@ impl LlmEngine {
         &self,
         input: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        // A text-image pair embeds the text with its own text tower.
+        if let Some(pair) = self.dual_encoder() {
+            let input = input.to_string();
+            return Ok(tokio::task::spawn_blocking(move || pair.embed_text(&input)).await??);
+        }
         // Route through the ALREADY-LOADED model (last-token hidden + L2 norm), exactly
         // as rerank routes through its logits. Works with any dense llama-arch GGUF  -
         // an embedding model (qwen3-embedding, e5-mistral, ...) or a chat model as a
@@ -50,5 +55,36 @@ impl LlmEngine {
             Ok(Err(e)) => Err(e.into()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The text-image pair this engine serves, if it serves one.
+    fn dual_encoder(&self) -> Option<Arc<crate::inference::model::clip::pair::DualEncoder>> {
+        self.dual_encoder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether this engine embeds images: it serves a text-image pair.
+    pub fn embeds_images(&self) -> bool {
+        self.dual_encoder().is_some()
+    }
+
+    /// The L2-normalised embedding of an encoded image (any format the server decodes),
+    /// from the text-image pair this engine serves.
+    pub async fn generate_image_embedding(&self, bytes: Vec<u8>) -> Result<Vec<f32>, String> {
+        let pair = self
+            .dual_encoder()
+            .ok_or("this model embeds texts only; an image needs a CLIP or SigLIP model")?;
+        tokio::task::spawn_blocking(move || {
+            let image = crate::inference::media::image_processor::decode_image_oriented(&bytes)
+                .map_err(|e| e.to_string())?
+                .to_rgb8();
+            let (w, h) = (image.width() as usize, image.height() as usize);
+            pair.embed_image(image.as_raw(), w, h)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 }

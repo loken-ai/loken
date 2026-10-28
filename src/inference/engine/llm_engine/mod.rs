@@ -247,6 +247,10 @@ pub struct LlmEngine {
     /// Lazily-built text-embedding model for `/v1/embeddings` & `/api/embed`,
     /// loaded from this engine's own GGUF on first request (cached behind `&self`).
     embedding_model: Arc<Mutex<Option<Arc<crate::inference::model::embedding::EmbeddingModel>>>>,
+    /// The text-image pair this engine serves in place of a language model, when its
+    /// checkpoint is one.
+    dual_encoder:
+        Arc<std::sync::Mutex<Option<Arc<crate::inference::model::clip::pair::DualEncoder>>>>,
     /// Requests admitted and not yet finished.
     active: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether requests have been overlapping, which decides serial or batched serving.
@@ -273,6 +277,7 @@ impl InferenceEngine for LlmEngine {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             last_stream_stats: Arc::new(std::sync::Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
+            dual_encoder: Arc::default(),
             active: Arc::default(),
             batching: Arc::default(),
             drafter_choice: Arc::default(),
@@ -337,6 +342,7 @@ impl LlmEngine {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             last_stream_stats: Arc::new(std::sync::Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
+            dual_encoder: Arc::default(),
             active: Arc::default(),
             batching: Arc::default(),
             drafter_choice: Arc::default(),

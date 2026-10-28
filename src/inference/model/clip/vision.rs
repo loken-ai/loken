@@ -1,4 +1,8 @@
-//! CLIP ViT-H/14 vision tower.
+//! CLIP's ViT vision tower, and SigLIP's: the same encoder blocks, read from the tensors
+//! the checkpoint stores. A class token, a norm before the blocks and a bias on the patch
+//! projection are each present or not; the pooled output is the class token through
+//! `post_layernorm` when the tower has one, else the attention-pool head over every token
+//! after `post_layernorm`.
 //!
 //! Wan's image-to-video conditioning is two things: the reference image encoded by the
 //! VAE (which becomes extra input channels), and a semantic embedding of that image,
@@ -22,15 +26,32 @@
 //! would just mean failing to find the weight.
 
 use crate::tensor::layer::{
-    conv2d_no_bias, layer_norm, linear, Conv2d, Conv2dConfig, LayerNorm, Linear,
+    conv2d, conv2d_no_bias, layer_norm, linear, Conv2d, Conv2dConfig, LayerNorm, Linear,
 };
+use crate::tensor::ops::Activation;
 use crate::tensor::Module;
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Result, Tensor};
 
-/// The attention's head count. The checkpoint ships without a config and its tensors do
-/// not state it; ViT-H splits its width into this many heads.
-const ATTENTION_HEADS: usize = 16;
+/// What the tensors of a vision tower do not state: its head count, its norm epsilon and
+/// its activation, and whether the pooled output is wanted.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    pub heads: usize,
+    pub layer_norm_eps: f32,
+    pub activation: Activation,
+    /// Load `post_layernorm` and the attention-pool head, which only the pooled output reads.
+    pub pooled: bool,
+}
+
+/// A tower loaded from a lone weights file, without a config: ViT-H's 16 heads, the OpenAI
+/// norm epsilon and quick GELU, unpooled.
+const LONE_FILE_TOWER: Config = Config {
+    heads: 16,
+    layer_norm_eps: 1e-5,
+    activation: Activation::QuickGelu,
+    pooled: false,
+};
 
 /// The tower's shape, read from the stored tensors.
 #[derive(Debug, Clone, Copy)]
@@ -41,19 +62,28 @@ struct Geometry {
     /// Pixels on a side of a patch, and patches on a side of the image.
     patch: usize,
     grid: usize,
+    /// Whether a class token leads the patches.
+    class_token: bool,
 }
 
 impl Geometry {
     fn read(v: &VarBuilder) -> Result<Self> {
         let e = v.pp("embeddings");
-        let width = e.shape_of("class_embedding")?[0];
-        let patch = e.pp("patch_embedding").shape_of("weight")?[2];
+        let patch_shape = e.pp("patch_embedding").shape_of("weight")?;
+        let (width, patch) = (patch_shape[0], patch_shape[2]);
         let positions = e.pp("position_embedding").shape_of("weight")?[0];
-        // The positions are the class token and a square grid of patches.
-        let grid = (positions.saturating_sub(1) as f64).sqrt().round() as usize;
-        if grid * grid + 1 != positions {
+        let class_token = e.contains("class_embedding");
+        // The positions are the class token, when there is one, and a square grid of patches.
+        let patches = positions.saturating_sub(usize::from(class_token));
+        let grid = (patches as f64).sqrt().round() as usize;
+        if grid * grid != patches {
             return Err(crate::tensor::Error(format!(
-                "clip vision: {positions} positions are not a square grid and a class token"
+                "clip vision: {positions} positions are not a square grid{}",
+                if class_token {
+                    " and a class token"
+                } else {
+                    ""
+                }
             )));
         }
         let enc = v.pp("encoder").pp("layers");
@@ -63,11 +93,12 @@ impl Geometry {
             mlp: enc.pp("0").pp("mlp").pp("fc1").shape_of("weight")?[0],
             patch,
             grid,
+            class_token,
         })
     }
 
     fn tokens(&self) -> usize {
-        self.grid * self.grid + 1
+        self.grid * self.grid + usize::from(self.class_token)
     }
 
     fn image_size(&self) -> usize {
@@ -91,20 +122,48 @@ struct Attention {
     v: Linear,
     out: Linear,
     width: usize,
+    heads: usize,
 }
 
 impl Attention {
-    fn new(vb: &VarBuilder, width: usize) -> Result<Self> {
+    fn new(vb: &VarBuilder, width: usize, heads: usize) -> Result<Self> {
         Ok(Self {
             q: linear(width, width, &vb.pp("q_proj"))?,
             k: linear(width, width, &vb.pp("k_proj"))?,
             v: linear(width, width, &vb.pp("v_proj"))?,
             out: linear(width, width, &vb.pp("out_proj"))?,
             width,
+            heads,
         })
     }
 
-    /// `xs`: `[tokens, width]`.
+    /// The attention a pooling head stores packed: one `in_proj_weight` of query, key and
+    /// value rows in that order, one `in_proj_bias` beside it, and `out_proj`.
+    fn packed(vb: &VarBuilder, width: usize, heads: usize) -> Result<Self> {
+        let w = vb.get((3 * width, width), "in_proj_weight")?;
+        let b = vb.get(3 * width, "in_proj_bias")?;
+        let part = |i: usize| -> Result<Linear> {
+            Linear::new(
+                w.narrow(0, i * width, width)?.contiguous()?,
+                Some(b.narrow(0, i * width, width)?.contiguous()?),
+            )
+        };
+        Ok(Self {
+            q: part(0)?,
+            k: part(1)?,
+            v: part(2)?,
+            out: linear(width, width, &vb.pp("out_proj"))?,
+            width,
+            heads,
+        })
+    }
+
+    /// `xs`: `[tokens, width]`, attending to itself.
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.attend(xs, xs)
+    }
+
+    /// `queries`: `[rows, width]`, attending to `source`: `[tokens, width]`.
     ///
     /// The scores are formed, softmaxed and applied here, in one pass over the whole token
     /// square, and the scale multiplies them AFTER the first product rather than being folded
@@ -113,17 +172,18 @@ impl Attention {
     /// query tiles is a different sequence of accumulations again. What is consumed downstream
     /// is a conditioning embedding that nothing compares against a reference, so a drift here
     /// is invisible at every later step.
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let n = xs.dims()[0];
-        let hd = self.width / ATTENTION_HEADS;
-        let split = |t: Tensor| -> Result<Tensor> {
-            t.reshape(vec![n, ATTENTION_HEADS, hd])?
+    fn attend(&self, queries: &Tensor, source: &Tensor) -> Result<Tensor> {
+        let (rows, n) = (queries.dims()[0], source.dims()[0]);
+        let heads = self.heads;
+        let hd = self.width / heads;
+        let split = |t: Tensor, len: usize| -> Result<Tensor> {
+            t.reshape(vec![len, heads, hd])?
                 .transpose(0, 1)?
                 .contiguous()
         };
-        let q = split(self.q.forward(xs)?)?;
-        let k = split(self.k.forward(xs)?)?;
-        let v = split(self.v.forward(xs)?)?;
+        let q = split(self.q.forward(queries)?, rows)?;
+        let k = split(self.k.forward(source)?, n)?;
+        let v = split(self.v.forward(source)?, n)?;
         let scale = 1.0 / (hd as f32).sqrt();
         let scores = q
             .matmul(&k.transpose(1, 2)?.contiguous()?)?
@@ -133,9 +193,26 @@ impl Attention {
             .matmul(&v)?
             .transpose(0, 1)?
             .contiguous()?
-            .reshape(vec![n, self.width])?;
+            .reshape(vec![rows, self.width])?;
         self.out.forward(&o)
     }
+}
+
+/// The block's feed-forward, `fc1` and `fc2` around the tower's activation.
+///
+/// CLIP uses the sigmoid approximation of GELU (`quick_gelu`) and SigLIP the tanh one; the
+/// error-function form drifts the activations enough to matter over the tower's depth.
+fn mlp(
+    vb: &VarBuilder,
+    width: usize,
+    hidden: usize,
+    c: &Config,
+) -> Result<crate::tensor::layer::Mlp> {
+    Ok(crate::tensor::layer::Mlp::new(
+        linear(width, hidden, &vb.pp("fc1"))?,
+        c.activation,
+        linear(hidden, width, &vb.pp("fc2"))?,
+    ))
 }
 
 struct Layer {
@@ -146,20 +223,13 @@ struct Layer {
 }
 
 impl Layer {
-    fn new(vb: &VarBuilder, g: &Geometry) -> Result<Self> {
-        let (width, mlp) = (g.width, g.mlp);
+    fn new(vb: &VarBuilder, g: &Geometry, c: &Config) -> Result<Self> {
+        let (width, eps) = (g.width, c.layer_norm_eps);
         Ok(Self {
-            norm1: layer_norm(width, 1e-5, &vb.pp("layer_norm1"))?,
-            attn: Attention::new(&vb.pp("self_attn"), width)?,
-            norm2: layer_norm(width, 1e-5, &vb.pp("layer_norm2"))?,
-            // CLIP uses the sigmoid approximation of GELU (`quick_gelu` in this checkpoint's
-            // config); the error-function form drifts the activations enough to matter over
-            // the tower's depth.
-            mlp: crate::tensor::layer::Mlp::new(
-                linear(width, mlp, &vb.pp("mlp").pp("fc1"))?,
-                crate::tensor::ops::Activation::QuickGelu,
-                linear(mlp, width, &vb.pp("mlp").pp("fc2"))?,
-            ),
+            norm1: layer_norm(width, eps, &vb.pp("layer_norm1"))?,
+            attn: Attention::new(&vb.pp("self_attn"), width, c.heads)?,
+            norm2: layer_norm(width, eps, &vb.pp("layer_norm2"))?,
+            mlp: mlp(&vb.pp("mlp"), width, g.mlp, c)?,
         })
     }
 
@@ -170,23 +240,67 @@ impl Layer {
     }
 }
 
+/// The attention-pool head: a learned probe attends to every token, then a norm and a
+/// feed-forward are added back onto it.
+struct PoolHead {
+    probe: Tensor,
+    attn: Attention,
+    norm: LayerNorm,
+    mlp: crate::tensor::layer::Mlp,
+}
+
+impl PoolHead {
+    fn new(vb: &VarBuilder, g: &Geometry, c: &Config) -> Result<Self> {
+        let width = g.width;
+        let hidden = vb.pp("mlp").pp("fc1").shape_of("weight")?[0];
+        Ok(Self {
+            probe: vb.get((1, 1, width), "probe")?.reshape(vec![1, width])?,
+            attn: Attention::packed(&vb.pp("attention"), width, c.heads)?,
+            norm: layer_norm(width, c.layer_norm_eps, &vb.pp("layernorm"))?,
+            mlp: mlp(&vb.pp("mlp"), width, hidden, c)?,
+        })
+    }
+
+    /// `[tokens, width]` -> `[1, width]`.
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let h = self.attn.attend(&self.probe, xs)?;
+        let m = self.mlp.forward(&self.norm.forward(&h)?)?;
+        h.add(&m)
+    }
+}
+
+/// How the tower reduces its tokens to one vector.
+enum Pool {
+    /// The class token through `post_layernorm`.
+    ClassToken(LayerNorm),
+    /// Every token through `post_layernorm`, then the attention-pool head.
+    Head(LayerNorm, PoolHead),
+}
+
 /// The tower, resident.
-pub struct ClipVisionH {
+pub struct VisionTower {
     patch: Conv2d,
-    class_embedding: Tensor,
+    class_embedding: Option<Tensor>,
     position_embedding: Tensor,
-    pre_norm: LayerNorm,
+    pre_norm: Option<LayerNorm>,
     layers: Vec<Layer>,
+    pool: Option<Pool>,
     g: Geometry,
     device: Device,
 }
 
-impl ClipVisionH {
+impl VisionTower {
+    /// A lone weights file holding `vision_model.*`, unpooled.
     pub fn load(path: &str, device: &Device) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, device) }?;
-        let v = vb.pp("vision_model");
-        let g = Geometry::read(&v)?;
+        Self::new(&vb.pp("vision_model"), &LONE_FILE_TOWER, device)
+    }
+
+    /// The tower rooted at `v` (`vision_model` in a checkpoint).
+    pub fn new(v: &VarBuilder, c: &Config, device: &Device) -> Result<Self> {
+        let g = Geometry::read(v)?;
         let (width, patch) = (g.width, g.patch);
+        let eps = c.layer_norm_eps;
         let cfg = Conv2dConfig {
             padding: 0,
             stride: patch,
@@ -195,25 +309,43 @@ impl ClipVisionH {
         let mut layers = Vec::with_capacity(g.layers);
         let enc = v.pp("encoder").pp("layers");
         for i in 0..g.layers {
-            layers.push(Layer::new(&enc.pp(i.to_string()), &g)?);
+            layers.push(Layer::new(&enc.pp(i.to_string()), &g, c)?);
         }
+        let e = v.pp("embeddings");
+        let patch_vb = e.pp("patch_embedding");
+        let patch_conv = if patch_vb.contains("bias") {
+            conv2d(3, width, patch, cfg, &patch_vb)?
+        } else {
+            conv2d_no_bias(3, width, patch, cfg, &patch_vb)?
+        };
+        let pool = if c.pooled {
+            let post = layer_norm(width, eps, &v.pp("post_layernorm"))?;
+            Some(if g.class_token {
+                Pool::ClassToken(post)
+            } else {
+                Pool::Head(post, PoolHead::new(&v.pp("head"), &g, c)?)
+            })
+        } else {
+            None
+        };
         Ok(Self {
-            // The patch projection carries no bias in this checkpoint.
-            patch: conv2d_no_bias(
-                3,
-                width,
-                patch,
-                cfg,
-                &v.pp("embeddings").pp("patch_embedding"),
-            )?,
-            class_embedding: v.pp("embeddings").get(width, "class_embedding")?,
-            position_embedding: v
-                .pp("embeddings")
+            patch: patch_conv,
+            class_embedding: if g.class_token {
+                Some(e.get(width, "class_embedding")?)
+            } else {
+                None
+            },
+            position_embedding: e
                 .pp("position_embedding")
                 .get((g.tokens(), width), "weight")?,
             // Checkpoint spelling, typo included.
-            pre_norm: layer_norm(width, 1e-5, &v.pp("pre_layrnorm"))?,
+            pre_norm: if v.contains("pre_layrnorm.weight") {
+                Some(layer_norm(width, eps, &v.pp("pre_layrnorm"))?)
+            } else {
+                None
+            },
             layers,
+            pool,
             g,
             device: device.clone(),
         })
@@ -221,6 +353,25 @@ impl ClipVisionH {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Pixels on a side of the image the tower reads.
+    pub fn image_size(&self) -> usize {
+        self.g.image_size()
+    }
+
+    /// Normalised `[1, 3, S, S]` -> the pooled vector `[1, width]`, after every layer.
+    pub fn pooled(&self, pixels: &Tensor) -> Result<Tensor> {
+        let Some(pool) = &self.pool else {
+            return Err(crate::tensor::Error(
+                "clip vision: the tower was loaded without its pooling".into(),
+            ));
+        };
+        let x = self.run(pixels, self.layers.len())?;
+        match pool {
+            Pool::ClassToken(post) => post.forward(&x.narrow(0, 0, 1)?),
+            Pool::Head(post, head) => head.forward(&post.forward(&x)?),
+        }
     }
 
     /// Interleaved RGB8 at any size -> the penultimate hidden states `[tokens, width]`.
@@ -263,7 +414,16 @@ impl ClipVisionH {
     }
 
     /// `[1, 3, S, S]` -> `[tokens, width]` after the penultimate layer.
+    ///
+    /// Stops at the penultimate layer's OUTPUT. Running the last one and discarding it
+    /// would waste a layer; taking the last one instead would be a different conditioning
+    /// that nothing downstream could flag.
     fn forward(&self, pixels: &Tensor) -> Result<Tensor> {
+        self.run(pixels, self.g.penultimate() + 1)
+    }
+
+    /// `[1, 3, S, S]` -> `[tokens, width]` after the first `depth` layers.
+    fn run(&self, pixels: &Tensor, depth: usize) -> Result<Tensor> {
         let (width, grid) = (self.g.width, self.g.grid);
         // Patch projection: [1, width, grid, grid] -> [grid*grid, width].
         let p = self.patch.forward(pixels)?;
@@ -271,19 +431,17 @@ impl ClipVisionH {
             .reshape(vec![width, grid * grid])?
             .transpose(0, 1)?
             .contiguous()?;
-        // Class token first, then the patches, then positions.
-        let cls = self.class_embedding.reshape(vec![1, width])?;
-        let x = Tensor::cat(&[&cls, &p], 0)?;
-        let x = x.add(&self.position_embedding)?;
-        let mut x = self.pre_norm.forward(&x)?;
-        for (i, l) in self.layers.iter().enumerate() {
+        // Class token first when there is one, then the patches, then positions.
+        let x = match &self.class_embedding {
+            Some(cls) => Tensor::cat(&[&cls.reshape(vec![1, width])?, &p], 0)?,
+            None => p,
+        };
+        let mut x = x.add(&self.position_embedding)?;
+        if let Some(norm) = &self.pre_norm {
+            x = norm.forward(&x)?;
+        }
+        for l in self.layers.iter().take(depth) {
             x = l.forward(&x)?;
-            // Stop at the penultimate layer's OUTPUT. Running the last one and
-            // discarding it would waste a layer; taking the last one instead would be a
-            // different conditioning that nothing downstream could flag.
-            if i == self.g.penultimate() {
-                return Ok(x);
-            }
         }
         Ok(x)
     }
@@ -333,6 +491,56 @@ mod tests {
         assert_eq!(g.penultimate(), layers - 2);
     }
 
+    /// A tower without a class token reads its grid from the whole position table.
+    #[test]
+    fn a_tower_without_a_class_token_is_all_patches() {
+        let mut m = std::collections::HashMap::new();
+        let z = |d: &[usize]| Tensor::zeros(d.to_vec(), DType::F32).unwrap();
+        let (width, patch, grid) = (8, 2, 3);
+        m.insert(
+            "embeddings.patch_embedding.weight".into(),
+            z(&[width, 3, patch, patch]),
+        );
+        m.insert(
+            "embeddings.position_embedding.weight".into(),
+            z(&[grid * grid, width]),
+        );
+        m.insert("encoder.layers.0.mlp.fc1.weight".into(), z(&[12, width]));
+        let vb = VarBuilder::from_tensors(m, DType::F32, &Device::Cpu);
+        let g = Geometry::read(&vb).unwrap();
+        assert!(!g.class_token);
+        assert_eq!((g.grid, g.tokens()), (grid, grid * grid));
+    }
+
+    /// The pooling head's packed attention splits its rows into query, key and value in
+    /// that order: with one token to attend to, the probe's answer is that token's value
+    /// projection through `out_proj`, whatever the query and key rows hold.
+    #[test]
+    fn a_packed_attention_reads_query_key_value_in_order() {
+        let width = 2;
+        let mut m = std::collections::HashMap::new();
+        let t = |v: Vec<f32>, d: &[usize]| Tensor::from_vec_f32(v, d.to_vec()).unwrap();
+        // Query and key rows are arbitrary; the value rows double the input.
+        let w = vec![
+            1.0, 2.0, 3.0, 4.0, // q
+            5.0, 6.0, 7.0, 8.0, // k
+            2.0, 0.0, 0.0, 2.0, // v
+        ];
+        m.insert("in_proj_weight".into(), t(w, &[3 * width, width]));
+        m.insert("in_proj_bias".into(), t(vec![0.0; 3 * width], &[3 * width]));
+        m.insert(
+            "out_proj.weight".into(),
+            t(vec![1.0, 0.0, 0.0, 1.0], &[2, 2]),
+        );
+        m.insert("out_proj.bias".into(), t(vec![0.5, -0.5], &[2]));
+        let vb = VarBuilder::from_tensors(m, DType::F32, &Device::Cpu);
+        let attn = Attention::packed(&vb, width, 1).unwrap();
+        let probe = t(vec![0.3, -0.7], &[1, width]);
+        let token = t(vec![1.5, 2.5], &[1, width]);
+        let got = attn.attend(&probe, &token).unwrap().to_vec_f32();
+        assert_eq!(got, vec![3.5, 4.5]);
+    }
+
     /// The activation the blocks are built with is quick GELU, not the erf form:
     /// `x * sigmoid(1.702x)`.
     #[test]
@@ -365,7 +573,7 @@ mod tests {
             return;
         }
         let dev = Device::Cpu;
-        let m = ClipVisionH::load(p.to_str().unwrap(), &dev).expect("load");
+        let m = VisionTower::load(p.to_str().unwrap(), &dev).expect("load");
         // A deterministic non-uniform image: a flat one makes every attention row equal
         // and would hide a transposed reshape.
         let (w, h) = (320usize, 200usize);
@@ -400,7 +608,7 @@ mod tests {
     }
 }
 
-impl ClipVisionH {
+impl VisionTower {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
         crate::inference::serve::progress::placement::whole(&self.device, self.layers.len())

@@ -22,6 +22,7 @@ impl LlmEngine {
             sessions: self.sessions.clone(),
             last_stream_stats: self.last_stream_stats.clone(),
             embedding_model: self.embedding_model.clone(),
+            dual_encoder: self.dual_encoder.clone(),
             active: self.active.clone(),
             batching: self.batching.clone(),
             drafter_choice: self.drafter_choice.clone(),

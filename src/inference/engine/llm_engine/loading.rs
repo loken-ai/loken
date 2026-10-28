@@ -326,6 +326,24 @@ impl LlmEngine {
         let model_file =
             discover::composite_text_dir(&model_file, &self.hub_roots()).unwrap_or(model_file);
 
+        // A text-image pair is served on the embeddings routes, beside no language model.
+        if crate::inference::model::clip::pair::claims_checkpoint_dir(&model_file) {
+            let dir = model_file.clone();
+            let pair = tokio::task::spawn_blocking(move || {
+                crate::inference::model::clip::pair::DualEncoder::load(&dir)
+            })
+            .await??;
+            info!(
+                "Text-image pair {model_id} loaded: {}-wide vectors in {:.1}s",
+                pair.dim(),
+                load_start.elapsed().as_secs_f64()
+            );
+            *self.dual_encoder.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(pair));
+            *self.cached_model_size.lock().await =
+                crate::inference::model::clip::pair::weight_bytes(&model_file);
+            return Ok(());
+        }
+
         // Load model in blocking thread since GGUF parsing and weight loading are CPU-intensive
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
             crate::inference::place::device_probe::debug_vram_by_card("closure-start");

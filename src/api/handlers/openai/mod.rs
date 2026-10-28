@@ -2142,29 +2142,33 @@ pub(crate) async fn openai_embeddings(
     let model = text_field(&body, "model");
     // Empty / whitespace-only / oversized / path-traversal model IDs are
     // rejected by `validate_model_id` below with the same 400 envelope.
-    let inputs: Vec<String> = match body.get("input") {
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-            .collect(),
-        _ => {
-            return err(
-                axum::http::StatusCode::BAD_REQUEST,
-                "`input` must be a string or array of strings".to_string(),
-            )
-        }
+    // Texts in `input`, or conversations in `messages` (or in `input`) whose
+    // `image_url` parts a text-image model embeds, as vLLM reads them.
+    let items = match embed_items(&body) {
+        Ok(items) => items,
+        Err(why) => return err(axum::http::StatusCode::BAD_REQUEST, why),
     };
-    if inputs.is_empty() {
+    if items.is_empty() {
         return err(
             axum::http::StatusCode::BAD_REQUEST,
             "`input` must not be empty".to_string(),
         );
     }
+    // The texts, for the length checks and the usage count; an image has none.
+    let inputs: Vec<String> = items
+        .iter()
+        .filter_map(|i| match i {
+            EmbedItem::Text(s) => Some(s.clone()),
+            EmbedItem::Image(_) => None,
+        })
+        .collect();
     // Reject empty strings - OpenAI returns 400 here. The engine
     // tolerates them and returns a degenerate constant embedding,
     // which is worse than failing fast for the caller.
-    if let Some(idx) = inputs.iter().position(|s| s.trim().is_empty()) {
+    if let Some(idx) = items
+        .iter()
+        .position(|i| matches!(i, EmbedItem::Text(s) if s.trim().is_empty()))
+    {
         return err(
             axum::http::StatusCode::BAD_REQUEST,
             format!("`input[{idx}]` is empty; embeddings require non-empty text"),
@@ -2176,11 +2180,10 @@ pub(crate) async fn openai_embeddings(
     // Cap array size at 2048 entries (OpenAI's documented batch cap).
     const EMBED_MAX_CHARS: usize = 8192;
     const EMBED_MAX_BATCH: usize = 2048;
-    if let Some((idx, s)) = inputs
-        .iter()
-        .enumerate()
-        .find(|(_, s)| s.chars().count() > EMBED_MAX_CHARS)
-    {
+    if let Some((idx, s)) = items.iter().enumerate().find_map(|(idx, i)| match i {
+        EmbedItem::Text(s) if s.chars().count() > EMBED_MAX_CHARS => Some((idx, s)),
+        _ => None,
+    }) {
         return err(
             axum::http::StatusCode::BAD_REQUEST,
             format!(
@@ -2189,12 +2192,12 @@ pub(crate) async fn openai_embeddings(
             ),
         );
     }
-    if inputs.len() > EMBED_MAX_BATCH {
+    if items.len() > EMBED_MAX_BATCH {
         return err(
             axum::http::StatusCode::BAD_REQUEST,
             format!(
                 "`input` has {} entries; limit is {EMBED_MAX_BATCH}",
-                inputs.len()
+                items.len()
             ),
         );
     }
@@ -2256,16 +2259,35 @@ pub(crate) async fn openai_embeddings(
         }
     };
     state.reset_expiration(&model_name).await;
+    let images = items.len() - inputs.len();
+    if images > 0 && !engine.embeds_images() {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "model '{model_name}' embeds texts only; an image needs a CLIP or SigLIP model"
+            ),
+        );
+    }
 
     let embed_start = std::time::Instant::now();
-    let mut data = Vec::with_capacity(inputs.len());
+    let mut data = Vec::with_capacity(items.len());
     // Capture the true embedding vector length (post-truncation) once
     // so the log reports the actual dim regardless of encoding format
     // - base64 strings have a length that's unrelated to the vector
     // size, which used to mislead the log.
     let mut emb_dim: usize = 0;
-    for (index, input) in inputs.iter().enumerate() {
-        match engine.generate_embeddings(input).await {
+    for (index, item) in items.iter().enumerate() {
+        let embedded = match item {
+            EmbedItem::Text(input) => engine
+                .generate_embeddings(input)
+                .await
+                .map_err(|e| e.to_string()),
+            EmbedItem::Image(url) => match image_bytes(&state, url, index + 1).await {
+                Ok(bytes) => engine.generate_image_embedding(bytes).await,
+                Err(why) => return err(axum::http::StatusCode::BAD_REQUEST, why),
+            },
+        };
+        match embedded {
             Ok(mut embedding) => {
                 if let Some(d) = dims_req {
                     if d < embedding.len() {
@@ -2303,8 +2325,8 @@ pub(crate) async fn openai_embeddings(
     }
     let embed_ms = embed_start.elapsed().as_secs_f64() * 1000.0;
     info!(
-        "Embeddings: model={model_name} n={} dim={emb_dim} encoding={encoding_format} embed={embed_ms:.0}ms",
-        inputs.len(),
+        "Embeddings: model={model_name} n={} images={images} dim={emb_dim} encoding={encoding_format} embed={embed_ms:.0}ms",
+        items.len(),
     );
 
     // OpenAI's `usage.{prompt_tokens, total_tokens}` - embeddings don't
@@ -2329,6 +2351,8 @@ pub(crate) async fn openai_embeddings(
     (headers, body).into_response()
 }
 
+mod embed_items;
+use embed_items::{embed_items, image_bytes, EmbedItem};
 mod files;
 pub(crate) use files::*;
 mod moderation;

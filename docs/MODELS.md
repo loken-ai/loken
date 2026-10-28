@@ -140,7 +140,9 @@ file. Shapes come from the configuration, the tensors are read in their stored w
 long-context rope declared there is turned into the frequency table a GGUF file would carry.
 
 Embeddings and reranking: BERT-shaped encoders (`nomic`, `bge` and the like) answer
-`/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`.
+`/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`. A CLIP
+or SigLIP checkpoint directory embeds texts and images in one space on `/v1/embeddings` and
+`/v2/embed` ([guide](guides/embeddings.md)).
 
 ### The qwen4exp family
 

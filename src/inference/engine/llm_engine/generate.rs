@@ -16,6 +16,10 @@ impl LlmEngine {
             info!("🔌 Unloading model: {}", model.name);
             crate::inference::place::vram_manager::residency_changed();
         }
+        self.dual_encoder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // THE PROMPT CACHE DESCRIBES A KV THAT NO LONGER EXISTS.
         //
         // Each entry records how many rows the resident cache held when it was written.

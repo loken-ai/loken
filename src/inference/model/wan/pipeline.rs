@@ -985,7 +985,7 @@ pub fn render_many_sampled(
             clip_resident,
             crate::inference::place::runtime_demand::load_runtime_floor(clip_resident) + vae_act,
             |dev| {
-                crate::inference::model::clip::vision::ClipVisionH::load(
+                crate::inference::model::clip::vision::VisionTower::load(
                     clip_path.to_str().unwrap_or_default(),
                     dev,
                 )

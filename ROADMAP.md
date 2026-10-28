@@ -87,7 +87,7 @@ Smaller, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
-| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Planned |
+| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Done |
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
 | Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Done |

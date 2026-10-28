@@ -104,7 +104,7 @@ impl EmbeddingModel {
 }
 
 /// In-place L2 normalization; leaves an all-zero vector unchanged (degenerate input).
-fn l2_normalize(v: &mut [f32]) {
+pub(crate) fn l2_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         let inv = 1.0 / norm;

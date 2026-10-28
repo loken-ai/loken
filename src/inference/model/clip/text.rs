@@ -26,11 +26,17 @@ pub struct Config {
     pub max_position_embeddings: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
+    pub layer_norm_eps: f32,
+    /// Whether a token attends only to those before it (CLIP) or to the whole row (SigLIP).
+    pub causal: bool,
 }
 
 /// Width of one attention head across the CLIP family; the checkpoint stores the fused
 /// width only.
 pub const HEAD_WIDTH: usize = 64;
+
+/// The norm epsilon of the OpenAI-layout towers whose checkpoint ships without a config.
+const OPENAI_LAYER_NORM_EPS: f32 = 1e-5;
 
 impl Config {
     /// The OpenAI-layout tower rooted at `root` in `shapes` (`text_model` in its own file):
@@ -55,6 +61,8 @@ impl Config {
                 .dim(&format!("{root}.embeddings.position_embedding.weight"), 0)?,
             num_hidden_layers: shapes.blocks(&format!("{root}.encoder.layers")),
             num_attention_heads: embed_dim / HEAD_WIDTH,
+            layer_norm_eps: OPENAI_LAYER_NORM_EPS,
+            causal: true,
         })
     }
 }
@@ -126,9 +134,9 @@ impl EncoderLayer {
     fn new(vs: &VarBuilder, c: &Config) -> tensor::Result<Self> {
         Ok(Self {
             self_attn: attention(&vs.pp("self_attn"), c)?,
-            layer_norm1: layer_norm(c.embed_dim, 1e-5, &vs.pp("layer_norm1"))?,
+            layer_norm1: layer_norm(c.embed_dim, c.layer_norm_eps, &vs.pp("layer_norm1"))?,
             mlp: mlp(&vs.pp("mlp"), c)?,
-            layer_norm2: layer_norm(c.embed_dim, 1e-5, &vs.pp("layer_norm2"))?,
+            layer_norm2: layer_norm(c.embed_dim, c.layer_norm_eps, &vs.pp("layer_norm2"))?,
         })
     }
 
@@ -198,6 +206,7 @@ pub struct Transformer {
     embeddings: Embeddings,
     encoder: Encoder,
     final_layer_norm: LayerNorm,
+    causal: bool,
 }
 
 impl Transformer {
@@ -206,7 +215,12 @@ impl Transformer {
         Ok(Self {
             embeddings: Embeddings::new(&vs.pp("embeddings"), c)?,
             encoder: Encoder::new(&vs.pp("encoder"), c)?,
-            final_layer_norm: layer_norm(c.embed_dim, 1e-5, &vs.pp("final_layer_norm"))?,
+            final_layer_norm: layer_norm(
+                c.embed_dim,
+                c.layer_norm_eps,
+                &vs.pp("final_layer_norm"),
+            )?,
+            causal: c.causal,
         })
     }
 
@@ -234,9 +248,21 @@ impl Transformer {
     ) -> tensor::Result<Tensor> {
         let input_ids = Tensor::from_vec_u32(ids.to_vec(), vec![b, seq])?;
         let xs = self.embeddings.forward(&input_ids)?;
-        let mask = Self::causal_mask(seq, mask_after)?;
-        let xs = self.encoder.forward(&xs, Some(&mask))?;
+        let mask = if self.causal {
+            Some(Self::causal_mask(seq, mask_after)?)
+        } else {
+            None
+        };
+        let xs = self.encoder.forward(&xs, mask.as_ref())?;
         self.final_layer_norm.forward(&xs)
+    }
+
+    /// The final-norm state of every position of one sequence, `[seq, embed_dim]`.
+    pub fn final_states(&self, ids: &[u32]) -> tensor::Result<Tensor> {
+        let seq = ids.len();
+        let out = self.forward_ids(ids, 1, seq, usize::MAX)?;
+        let dim = out.dims()[2];
+        out.reshape(vec![seq, dim])
     }
 
     /// The state after `num_hidden_layers - skip` layers, with NO final norm - the
