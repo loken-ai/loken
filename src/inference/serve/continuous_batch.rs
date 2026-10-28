@@ -124,6 +124,8 @@ struct ReqState {
     generated: Vec<u32>,
     last_was_prefill: bool,
     sampling: SamplingParams,
+    /// Whether a step has started this request's prompt.
+    admitted: bool,
 }
 
 pub struct ContinuousBatchEngine<M: BatchedModel> {
@@ -133,6 +135,9 @@ pub struct ContinuousBatchEngine<M: BatchedModel> {
     /// tokens.
     eos: Vec<u32>,
     reqs: HashMap<SeqId, ReqState>,
+    /// The requests whose prompt a step started since the last [`Self::take_admitted`]: when,
+    /// and how many of its tokens the prefix cache served.
+    admitted: Vec<(SeqId, std::time::Instant, usize)>,
 }
 
 impl<M: BatchedModel> ContinuousBatchEngine<M> {
@@ -159,6 +164,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
             model,
             eos,
             reqs: HashMap::new(),
+            admitted: Vec::new(),
         })
     }
 
@@ -172,8 +178,15 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
                 generated: Vec::new(),
                 last_was_prefill: false,
                 sampling: req.sampling,
+                admitted: false,
             },
         );
+    }
+
+    /// The requests whose prompt a step started since the last call: when, and how many of
+    /// its tokens the prefix cache served.
+    pub fn take_admitted(&mut self) -> Vec<(SeqId, std::time::Instant, usize)> {
+        std::mem::take(&mut self.admitted)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -205,10 +218,15 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
             return Ok((Vec::new(), Vec::new()));
         }
         // Build model inputs from the plan + per-request token state.
+        let started = std::time::Instant::now();
         let mut items = Vec::with_capacity(plan.num_seqs());
         for p in &plan.prefills {
             let r = self.reqs.get_mut(&p.seq).expect("submitted");
             r.last_was_prefill = true;
+            if !r.admitted {
+                r.admitted = true;
+                self.admitted.push((p.seq, started, p.cached_len));
+            }
             let recent = recent_window(&r.prompt, &r.generated, r.sampling.repeat_last_n);
             // A sequence preempted after generating prefills its generated tokens with its
             // prompt, and its next token continues the stream the client already holds.

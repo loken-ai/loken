@@ -166,19 +166,25 @@ fn argmax(flat: &[f32], row: usize, vocab: usize) -> u32 {
 /// failure or an empty budget ends the request at once.
 fn admit(sm: &SendModel, sub: Submission, active: &mut Vec<Seq>) {
     let mut state = sm.model.new_decode_state();
+    let at = std::time::Instant::now();
     // A prefix the cache holds is restored and the sequence goes on from there as any other.
-    let logits = match under(&sm.offload, || match &sm.cache {
-        Some(cache) => cache
-            .prefill(&sm.model, &sub.prompt, &mut state)
-            .map(|(logits, _)| logits),
-        None => sm.model.prefill_into(&sub.prompt, &mut state),
+    let (logits, cached_prompt_tokens) = match under(&sm.offload, || match &sm.cache {
+        Some(cache) => cache.prefill(&sm.model, &sub.prompt, &mut state),
+        None => sm
+            .model
+            .prefill_into(&sub.prompt, &mut state)
+            .map(|logits| (logits, 0)),
     }) {
-        Ok(l) => l,
+        Ok(read) => read,
         Err(_) => {
             let _ = sub.tx.send(CbToken::Done(FinishReason::Stop));
             return;
         }
     };
+    let _ = sub.tx.send(CbToken::Admitted {
+        at,
+        cached_prompt_tokens,
+    });
     let flat = match logits.dims2().and_then(|(rows, vocab)| {
         logits
             .flatten_all()?

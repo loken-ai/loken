@@ -116,6 +116,8 @@ impl LlmEngine {
             seed: resolved.seed,
         };
         let stops = params.stop_sequences.clone();
+        let (model_id, prompt_len) = (self.config.model_id.clone(), tokens.len());
+        let submitted = std::time::Instant::now();
         let cb_rx = server.submit_cb(tokens, max_new, sampling);
         std::thread::spawn(move || {
             let mut gen: Vec<u32> = Vec::new();
@@ -141,7 +143,20 @@ impl LlmEngine {
                 tokenizer.decode(&gen[..keep], skip_special).ok()
             };
             let mut stopped_early = false;
-            while let Ok(CbToken::Tok(t)) = cb_rx.recv() {
+            let (mut admitted, mut first_token) = (None, None);
+            loop {
+                let t = match cb_rx.recv() {
+                    Ok(CbToken::Tok(t)) => t,
+                    Ok(CbToken::Admitted {
+                        at,
+                        cached_prompt_tokens,
+                    }) => {
+                        admitted = Some((at, cached_prompt_tokens));
+                        continue;
+                    }
+                    _ => break,
+                };
+                first_token.get_or_insert_with(std::time::Instant::now);
                 if eos_set.contains(&t) {
                     break;
                 }
@@ -183,6 +198,21 @@ impl LlmEngine {
                         let _ = tx.blocking_send(Ok(full[emitted.len()..cut].to_string()));
                     }
                 }
+            }
+            let done = std::time::Instant::now();
+            if let Some((at, cached)) = admitted {
+                let first = first_token.unwrap_or(done);
+                crate::request_metrics::record(
+                    &model_id,
+                    &crate::request_metrics::RequestFigures {
+                        queue_s: at.saturating_duration_since(submitted).as_secs_f64(),
+                        prefill_s: first.saturating_duration_since(at).as_secs_f64(),
+                        decode_s: done.saturating_duration_since(first).as_secs_f64(),
+                        prompt_tokens: prompt_len as u64,
+                        cached_prompt_tokens: cached as u64,
+                        generated_tokens: gen.len() as u64,
+                    },
+                );
             }
         });
         rx
@@ -233,6 +263,7 @@ impl LlmEngine {
         params: GenerationParams,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
+        let arrived = std::time::Instant::now();
         // Grammar-constrained streaming path. Same fast path as
         // generate_with_grammar, but emits tokens to a channel as they're
         // sampled. Bypasses PLD/graph branches.
@@ -298,6 +329,7 @@ impl LlmEngine {
 
         std::thread::spawn(move || {
             let stream_start = std::time::Instant::now();
+            let locked;
             #[allow(unused_assignments)]
             let mut prefill_end: Option<std::time::Instant> = None;
             // Accumulates compute (forward + sample) between stream_token
@@ -356,6 +388,8 @@ impl LlmEngine {
                 default_stops,
             ) = {
                 let mut guard = model_state.blocking_lock();
+                // Requests to one model take it in turn: the wait for it is the request's queue.
+                locked = std::time::Instant::now();
                 let state = match guard.as_mut() {
                     Some(s) => s,
                     None => {
@@ -3086,6 +3120,19 @@ impl LlmEngine {
                 } else {
                     FinishReason::Disconnect
                 };
+                crate::request_metrics::record(
+                    &config.model_id,
+                    &crate::request_metrics::RequestFigures {
+                        queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
+                        prefill_s: prefill_end.map_or(0.0, |end| {
+                            end.saturating_duration_since(locked).as_secs_f64()
+                        }),
+                        decode_s: compute_ns as f64 / 1e9,
+                        prompt_tokens: prompt_tokens.len() as u64,
+                        cached_prompt_tokens: reused_prompt_tokens as u64,
+                        generated_tokens: token_count as u64,
+                    },
+                );
                 *slot = Some(StreamStats {
                     eval_count: token_count as u64,
                     eval_duration_ns: compute_ns,

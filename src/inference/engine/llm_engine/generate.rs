@@ -194,8 +194,11 @@ impl LlmEngine {
         let metered_model = self.config.model_id.clone();
         let prefill_peer = self.config.prefill_peer.clone();
 
+        let arrived = std::time::Instant::now();
         let inner_result = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
             let mut guard = model_state.blocking_lock();
+            // Requests to one model take it in turn: the wait for it is the request's queue.
+            let queue_s = arrived.elapsed().as_secs_f64();
             let state = guard.as_mut()
                 .ok_or_else(|| anyhow!("Model not loaded. Load a model first."))?;
 
@@ -2070,6 +2073,17 @@ impl LlmEngine {
             };
             crate::distributed::rate_meter::record_generation(
                 &metered_model, prefill_tok_s, decode_tok_s, eval_count);
+            crate::request_metrics::record(
+                &metered_model,
+                &crate::request_metrics::RequestFigures {
+                    queue_s,
+                    prefill_s: prompt_eval_duration as f64 / 1e9,
+                    decode_s: eval_duration as f64 / 1e9,
+                    prompt_tokens: prompt_tokens.len() as u64,
+                    cached_prompt_tokens: cached_tokens as u64,
+                    generated_tokens: eval_count,
+                },
+            );
             // The acceptance rate is the only number that says whether speculation is
             // paying for itself. This path was counting it and throwing it away, so a
             // drafter that had stopped helping would have looked exactly like one that
@@ -2151,8 +2165,10 @@ impl LlmEngine {
         let config = self.config.clone();
 
         let cancel = params.cancel.clone().unwrap_or_default();
+        let arrived = std::time::Instant::now();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
             let mut guard = model_state.blocking_lock();
+            let queue_s = arrived.elapsed().as_secs_f64();
             let state = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("Model not loaded. Load a model first."))?;
@@ -2297,6 +2313,17 @@ impl LlmEngine {
                 .tokenizer
                 .decode(&generated_tokens, true)
                 .map_err(|e| anyhow!("decode: {e}"))?;
+            crate::request_metrics::record(
+                &config.model_id,
+                &crate::request_metrics::RequestFigures {
+                    queue_s,
+                    prefill_s: prompt_eval_duration as f64 / 1e9,
+                    decode_s: eval_duration as f64 / 1e9,
+                    prompt_tokens: prompt_tokens.len() as u64,
+                    cached_prompt_tokens: 0,
+                    generated_tokens: generated_tokens.len() as u64,
+                },
+            );
 
             Ok(GenerationResult {
                 text,
@@ -2340,6 +2367,7 @@ impl LlmEngine {
         params: GenerationParams,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
+        let arrived = std::time::Instant::now();
         let guard = self.model_state.lock().await;
         match guard.as_ref() {
             None => return Err("Model not loaded.".into()),
@@ -2358,6 +2386,7 @@ impl LlmEngine {
         let logprob_queue = self.logprob_queue.clone();
         std::thread::spawn(move || {
             let mut guard = model_state.blocking_lock();
+            let locked = std::time::Instant::now();
             let state = match guard.as_mut() {
                 Some(s) => s,
                 None => {
@@ -2459,6 +2488,7 @@ impl LlmEngine {
                     return;
                 }
             };
+            let prefilled = std::time::Instant::now();
             let mut pos = prompt_tokens.len();
 
             let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
@@ -2587,6 +2617,17 @@ impl LlmEngine {
                 };
                 pos += 1;
             }
+            crate::request_metrics::record(
+                &config.model_id,
+                &crate::request_metrics::RequestFigures {
+                    queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
+                    prefill_s: prefilled.saturating_duration_since(locked).as_secs_f64(),
+                    decode_s: prefilled.elapsed().as_secs_f64(),
+                    prompt_tokens: prompt_tokens.len() as u64,
+                    cached_prompt_tokens: 0,
+                    generated_tokens: generated_tokens.len() as u64,
+                },
+            );
         });
 
         Ok(rx)

@@ -144,6 +144,7 @@ impl APIServer {
             .media_limits
             .check_images(images)
             .map_err(ApiError::Validation)?;
+        let arrived = std::time::Instant::now();
         let in_flight = crate::distributed::rate_meter::InFlight::enter();
         let active = engine.admit_request().await;
         let mut gate = if engine.is_continuous().await {
@@ -163,6 +164,7 @@ impl APIServer {
                 gate = None;
             }
         }
+        crate::request_metrics::record_gate_wait(model_name, arrived.elapsed().as_secs_f64());
         if images.is_empty() {
             engine.clear_images().await;
         } else {

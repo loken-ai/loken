@@ -26,6 +26,12 @@ use std::sync::Arc;
 
 /// One token (or terminal marker) streamed back to a request.
 pub enum CbToken {
+    /// The request's prompt started at `at`, `cached_prompt_tokens` of it served from the
+    /// cache; its tokens follow.
+    Admitted {
+        at: std::time::Instant,
+        cached_prompt_tokens: usize,
+    },
     Tok(u32),
     Done(FinishReason),
 }
@@ -1023,6 +1029,14 @@ fn worker_loop(
                 continue;
             }
         };
+        for (id, at, cached_prompt_tokens) in engine.take_admitted() {
+            if let Some(tx) = chans.get(&id) {
+                let _ = tx.send(CbToken::Admitted {
+                    at,
+                    cached_prompt_tokens,
+                });
+            }
+        }
         for (id, tok) in emits {
             if let Some(tx) = chans.get(&id) {
                 // Suppress the terminal EOS as a content token; Done carries it.

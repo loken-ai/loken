@@ -90,7 +90,7 @@ Smaller, by priority:
 | Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Planned |
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
-| Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Planned |
+| Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Done |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Planned |
 | Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Planned |
 | Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |

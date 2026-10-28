@@ -101,7 +101,7 @@ A part the server cannot take, such as a document block, is refused with the rea
 | Route | What it does |
 |---|---|
 | `GET /health` | Uptime and time. The one route exempt from authentication. |
-| `GET /metrics` | OpenMetrics, with the `metrics` feature only: uptime, resident models, gate depth, in-flight generations, decode rates, devices, energy totals. |
+| `GET /metrics` | OpenMetrics, with the `metrics` feature only: uptime, resident models, gate depth, in-flight generations, decode rates, devices, energy totals, and per model a histogram over requests of the wait at the gate, the wait for the model, the prompt's reading, the answer's writing, the prompt and answer tokens and the prompt tokens served from the cache. |
 | `GET /api/models`, `GET /api/models/loaded` | The catalogue, and what is resident with its placement per device. Every family lists its layers by device: a text or image model as one entry, a voice, transcription, sound or separation model and what the video pipeline stages on the host as one entry per part, named `model (part)`. A render in progress is listed the same way, one entry per part it has loaded, with a `status` of the form `rendering sound: codes 12/300`; before its first part loads, the render is one entry with the status alone. The free memory published beside these is what the driver has: what a finished job freed is returned to it when the job ends. |
 | `POST /api/models/validate`, `POST /api/models/repair` | Check a model's files, and fetch what is missing. |
 | `POST /api/swap` | Replace the resident model. |

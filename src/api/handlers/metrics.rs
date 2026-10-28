@@ -6,9 +6,10 @@
 //! other route - the inventory of GPUs, the models resident and the uptime are not public facts.
 //!
 //! No measurement happens here. Every figure is one `/health`, `/api/inflight` or
-//! `/api/distributed/devices` already returns, so a scrape at any cadence costs what reading a
-//! few counters costs - in particular the device list is the one probed once at startup, never
-//! a fresh NVML pass.
+//! `/api/distributed/devices` already returns, or one the serving paths recorded as each request
+//! went through (`crate::request_metrics`), so a scrape at any cadence costs what reading a few
+//! counters costs - in particular the device list is the one probed once at startup, never a
+//! fresh NVML pass.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -27,6 +28,44 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str, samples: &[(Stri
         } else {
             out.push_str(&format!("{name}{{{labels}}} {value}\n"));
         }
+    }
+}
+
+/// One histogram family: per label set, its cumulative buckets, their sum and their count.
+fn histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    samples: &[(String, &crate::request_metrics::Histogram)],
+) {
+    if samples.is_empty() {
+        return;
+    }
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+    for (labels, h) in samples {
+        let joined = |extra: &str| match labels.is_empty() {
+            true => extra.to_string(),
+            false if extra.is_empty() => labels.clone(),
+            false => format!("{labels},{extra}"),
+        };
+        let bounds = h
+            .bounds
+            .iter()
+            .map(|b| b.to_string())
+            .chain(["+Inf".into()]);
+        for (bound, total) in bounds.zip(h.cumulative()) {
+            out.push_str(&format!(
+                "{name}_bucket{{{}}} {total}\n",
+                joined(&format!("le=\"{bound}\""))
+            ));
+        }
+        let plain = joined("");
+        let braces = match plain.is_empty() {
+            true => String::new(),
+            false => format!("{{{plain}}}"),
+        };
+        out.push_str(&format!("{name}_sum{braces} {}\n", h.sum));
+        out.push_str(&format!("{name}_count{braces} {}\n", h.count));
     }
 }
 
@@ -116,6 +155,54 @@ pub(crate) async fn metrics(State(state): State<APIServer>) -> Response {
         );
     }
 
+    let requests = crate::request_metrics::snapshot();
+    let by_model =
+        |pick: fn(&crate::request_metrics::ModelRequests) -> &crate::request_metrics::Histogram| {
+            requests
+                .iter()
+                .map(|(model, r)| (format!("model=\"{}\"", label(model)), pick(r)))
+                .collect::<Vec<_>>()
+        };
+    for (name, help, pick) in [
+        (
+            "loken_request_gate_seconds",
+            "Seconds an admitted request waited at the admission gate.",
+            (|r| &r.gate_s) as fn(&crate::request_metrics::ModelRequests) -> &_,
+        ),
+        (
+            "loken_request_queue_seconds",
+            "Seconds a finished request waited, once admitted, before the model took it.",
+            |r| &r.queue_s,
+        ),
+        (
+            "loken_request_prefill_seconds",
+            "Seconds a finished request spent reading its prompt, to its first token.",
+            |r| &r.prefill_s,
+        ),
+        (
+            "loken_request_decode_seconds",
+            "Seconds a finished request spent writing its answer after the first token.",
+            |r| &r.decode_s,
+        ),
+        (
+            "loken_request_prompt_tokens",
+            "Prompt tokens of a finished request.",
+            |r| &r.prompt_tokens,
+        ),
+        (
+            "loken_request_cached_prompt_tokens",
+            "Prompt tokens of a finished request served from the cache instead of read.",
+            |r| &r.cached_prompt_tokens,
+        ),
+        (
+            "loken_request_generation_tokens",
+            "Answer tokens of a finished request.",
+            |r| &r.generated_tokens,
+        ),
+    ] {
+        histogram(&mut out, name, help, &by_model(pick));
+    }
+
     if let Some(gpu) = state.gpu_manager.as_ref() {
         use crate::gpu::GPUManagerInterface;
         let devices = gpu.get_devices();
@@ -191,6 +278,34 @@ mod tests {
         family(&mut out, "m", "gauge", "h", &[(l, 1.0)]);
         assert_eq!(out.lines().count(), 3, "one HELP, one TYPE, one sample");
         assert!(out.ends_with("} 1\n"));
+    }
+
+    /// A histogram publishes one cumulative bucket per bound and the open one, each with the
+    /// series' labels, then its sum and its count.
+    #[test]
+    fn a_histogram_publishes_cumulative_buckets_then_sum_and_count() {
+        let model = "metrics-histogram-test";
+        crate::request_metrics::record(
+            model,
+            &crate::request_metrics::RequestFigures {
+                prefill_s: 0.25,
+                ..Default::default()
+            },
+        );
+        let all = crate::request_metrics::snapshot();
+        let h = &all[model].prefill_s;
+        let mut out = String::new();
+        histogram(&mut out, "m", "h", &[("model=\"x\"".to_string(), h)]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2 + h.bounds.len() + 1 + 2);
+        assert_eq!(lines[1], "# TYPE m histogram");
+        assert!(lines[2].starts_with("m_bucket{model=\"x\",le=\""));
+        assert_eq!(
+            lines[2 + h.bounds.len()],
+            "m_bucket{model=\"x\",le=\"+Inf\"} 1"
+        );
+        assert_eq!(lines[lines.len() - 2], "m_sum{model=\"x\"} 0.25");
+        assert_eq!(lines[lines.len() - 1], "m_count{model=\"x\"} 1");
     }
 
     /// The shape a scraper parses: header pair then samples, labels inside braces.

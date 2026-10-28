@@ -3861,6 +3861,7 @@ mod oracle_gate {
                 while let Ok(t) = rx.recv() {
                     match t {
                         CbToken::Tok(x) => seq.push(x),
+                        CbToken::Admitted { .. } => {}
                         CbToken::Done(_) => break,
                     }
                 }
@@ -3887,6 +3888,7 @@ mod oracle_gate {
             while let Ok(t) = rx.recv() {
                 match t {
                     CbToken::Tok(x) => seq.push(x),
+                    CbToken::Admitted { .. } => {}
                     CbToken::Done(_) => break,
                 }
             }

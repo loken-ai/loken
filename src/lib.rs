@@ -77,6 +77,7 @@ pub mod gpu;
 pub mod inference;
 mod notice_gate;
 pub mod privacy;
+pub mod request_metrics;
 pub mod stats;
 // Tensor substrate (in-crate native implementation).
 pub mod tensor;
