@@ -60,11 +60,15 @@ pub struct VllmFields {
     pub prompt_logprobs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_tokens_as_token_ids: Option<bool>,
+    /// `n` beams answered, the beam width being `n`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_beam_search: Option<bool>,
     /// Read by beam search alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length_penalty: Option<f64>,
+    /// Read by beam search alone: `true`, `false` or `"never"`, as transformers reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_stopping: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_outputs: Option<StructuredOutputs>,
     /// The constraints vLLM read before `structured_outputs`, served the same way.

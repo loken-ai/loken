@@ -91,7 +91,7 @@ Smaller, by priority:
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
 | Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Done |
-| Beam search | Decoding | Beam search gives the same result as the reference implementation. | Planned |
+| Beam search | Decoding | Beam search gives the same result as the reference implementation. | Partial |
 | Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Done |
 | Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |

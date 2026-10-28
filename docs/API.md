@@ -134,6 +134,7 @@ refused.
 | `return_tokens_as_token_ids` | Writes each log-probability token as `token_id:<id>`. |
 | `structured_outputs` | One constraint: `json` (a schema, as an object or a string), `regex`, `choice` (a list of strings), `grammar` (Lark, or llama.cpp's GBNF), `json_object`; with `disable_any_whitespace`, `disable_additional_properties` and `whitespace_pattern` for a JSON one. `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar` and `guided_whitespace_pattern` are read the same way. `structural_tag` answers 400. |
 | `cache_salt` | The request reuses no cached prompt prefix and leaves none for another. |
+| `use_beam_search`, `length_penalty`, `early_stopping` | Answers the `n` best beams of a beam search of width `n`, best first (see below). |
 | `echo` (chat) | Writes the final assistant message in front of the answer. |
 | `add_generation_prompt` (chat) | `false` renders the conversation without opening the assistant's turn, with a Jinja template. |
 | `continue_final_message` (chat) | The answer continues the final assistant message instead of opening a new turn. |
@@ -142,10 +143,37 @@ refused.
 
 `min_p`, `allowed_token_ids`, `bad_words`, `min_tokens`, `skip_special_tokens: false`,
 `cache_salt` and a structured output decode one token per step, without prompt-lookup drafts,
-captured graphs or prefix reuse. `use_beam_search`, `prompt_logprobs`, a request
+captured graphs or prefix reuse. `prompt_logprobs`, a request
 `chat_template` and `continue_final_message` with `add_generation_prompt: true` answer 400.
-`priority`, `request_id`, `length_penalty`, `spaces_between_special_tokens`,
+`priority`, `request_id`, `spaces_between_special_tokens`,
 `add_special_tokens`, `stream_interval` and the disaggregation fields are accepted without effect.
+
+#### Beam search
+
+`use_beam_search: true` scores and stops as transformers' `generate(num_beams=n,
+length_penalty=..., early_stopping=...)` does:
+
+- Each step ranks every continuation of the running beams by cumulative log-probability, read
+  from the raw logits. Of the first `n`, those ending on an end token, and on the last step all
+  of them, finish. The first `n` that do not end run on.
+- A finished beam scores its cumulative log-probability over its generated length, the end
+  token counted, raised to `length_penalty` (default 1).
+- `early_stopping`: `false` (default) stops once `n` beams are finished and the best running
+  one cannot beat the worst of them at its current length; `true` stops once `n` are finished;
+  `"never"` scores the running beam at `max_tokens` when `length_penalty` is positive.
+- Ties rank the earlier beam, then the lower token id, first.
+
+The choices are the beams, best first. The text leaves out the end token; `logprobs` carry
+every generated token, the end token included, so they sum to the beam's cumulative
+log-probability. The model's end tokens and `stop_token_ids` end a beam; `ignore_eos` runs every
+beam to `max_tokens`. Temperature, the sampling knobs, penalties, stop sequences and token rules
+are not read. `stream`, `prompt_embeds`, `best_of` above `n`, a structured output and a required
+tool call answer 400. A model whose KV cache cannot be cut back to a shorter sequence (a
+recurrent or sliding-window layer, a backend other than the generic transformer) answers 500.
+
+vLLM's own beam search differs from transformers': it divides by the prompt and generated
+length without the end token, finishes every end token among a beam's best `2n` candidates and
+always runs to `max_tokens`.
 
 ### Files and batches
 

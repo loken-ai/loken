@@ -205,6 +205,53 @@ fn chat_prompt_spec(request: &ChatCompletionRequest) -> super::chat_prompt::Prom
     }
 }
 
+/// How the text of a chat answer becomes the assistant's message.
+#[derive(Clone, Copy)]
+struct ReplyShape {
+    /// Whether the template already opened the thinking block.
+    thinking_opened: bool,
+    tools_active: bool,
+    tool_format: crate::api::tool_calls::ToolFormat,
+    single_tool_call: bool,
+    include_reasoning: bool,
+}
+
+/// The reasoning, the assistant's message and the finish reason of a chat answer's text. When
+/// tools were offered, the tool-call markers become structured tool calls and the finish reason
+/// `tool_calls`; an answer without markers passes through unchanged.
+fn assistant_message(
+    shape: &ReplyShape,
+    content: &str,
+    finish_reason: String,
+) -> (Option<String>, Message, String) {
+    let (reasoning, content) =
+        crate::api::thinking::split_thinking_opened(shape.thinking_opened, content);
+    let (mut message, finish_reason) = if shape.tools_active {
+        let mut parsed = crate::api::tool_calls::parse_tool_calls(shape.tool_format, &content);
+        if shape.single_tool_call {
+            parsed.calls.truncate(1);
+        }
+        if parsed.calls.is_empty() {
+            (
+                Message::new("assistant".to_string(), content),
+                finish_reason,
+            )
+        } else {
+            (
+                Message::with_tool_calls(parsed.content, parsed.calls),
+                "tool_calls".to_string(),
+            )
+        }
+    } else {
+        (
+            Message::new("assistant".to_string(), content),
+            finish_reason,
+        )
+    };
+    message.reasoning_content = reasoning.clone().filter(|_| shape.include_reasoning);
+    (reasoning, message, finish_reason)
+}
+
 /// Chat completion (OpenAI-compatible format)
 pub(crate) async fn chat_completion(
     State(state): State<APIServer>,
@@ -289,7 +336,13 @@ pub(crate) async fn chat_completion_at(
     // `n` > 1 is n completions of the same request, each with its own seed, gathered
     // into one response as on /v1/completions; a stream carries one completion.
     let n = super::sampling::completions_asked(request.n.map(u64::from))?;
-    if n > 1 {
+    // `use_beam_search` answers the `n` best beams of one search; the grammar a template or a
+    // tool choice imposes is checked once the prompt is rendered.
+    let beam = request.vllm.beam_search(n)?;
+    if beam.is_some() {
+        vllm::check_beam_request(request.stream.unwrap_or(false), false)?;
+    }
+    if n > 1 && beam.is_none() {
         if request.stream.unwrap_or(false) {
             return Err(ApiError::Validation(
                 "`n` > 1 is not supported with `stream`".into(),
@@ -812,6 +865,13 @@ pub(crate) async fn chat_completion_at(
         }
     } else {
         let _admitted = admission;
+        let reply = ReplyShape {
+            thinking_opened,
+            tools_active,
+            tool_format,
+            single_tool_call,
+            include_reasoning,
+        };
         // `mut` bindings with `None` defaults trigger an
         // "assigned-never-read" warning because the only path that
         // reads timing is the Ok arm (which always overwrites).
@@ -821,6 +881,49 @@ pub(crate) async fn chat_completion_at(
         let timing_decode_ms: Option<f64>;
         let mut params = params;
         let _cancel = engine.cancel_guard(&mut params);
+        if let Some(search) = beam {
+            vllm::check_beam_request(false, params.grammar.is_some())?;
+            let out = engine
+                .generate_beams(&prompt, params, search)
+                .await
+                .map_err(|e| ApiError::Internal(format!("beam search: {e}")))?;
+            let mut completion_tokens = 0u64;
+            let mut choices = Vec::with_capacity(out.beams.len());
+            for (i, b) in out.beams.into_iter().enumerate() {
+                completion_tokens += b.tokens.len() as u64;
+                let content = format!("{echo_text}{}", b.text);
+                let (_, message, finish) =
+                    assistant_message(&reply, &content, b.finish_reason.openai().to_string());
+                let mut choice = Choice::new(i, message, finish);
+                let mut lps = b.logprobs;
+                if ids_as_tokens {
+                    vllm::tokens_as_ids(&mut lps);
+                }
+                if !lps.is_empty() {
+                    choice.logprobs = Some(serde_json::json!({
+                        "content": openai_logprobs_content(&lps)
+                    }));
+                }
+                choices.push(choice);
+            }
+            info!(
+                "Chat completion (beam search): prompt_tokens={} beams={} forwards={} decode={:.0}ms",
+                out.prompt_eval_count,
+                choices.len(),
+                out.forwards,
+                out.eval_duration as f64 / 1_000_000.0,
+            );
+            let mut response = ChatCompletionResponse::new(
+                format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                model_name,
+                choices,
+                Usage::from_counts(out.prompt_eval_count, 0, completion_tokens),
+            );
+            if let Some(tier) = request.service_tier.as_deref() {
+                response.service_tier = tier.to_string();
+            }
+            return Ok(Json(response).into_response());
+        }
         let mut result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
         let (content, finish_reason, completion_tokens, prompt_tokens, cached_tokens) =
             match engine.generate(&prompt, params).await {
@@ -858,36 +961,8 @@ pub(crate) async fn chat_completion_at(
                 }
             };
 
-        // When tools were injected, lift any tool-call markers out of the
-        // model output into structured tool_calls and switch finish_reason
-        // to "tool_calls" (OpenAI's contract). Plain answers (no markers)
-        // pass through unchanged.
-        let (reasoning, content) =
-            crate::api::thinking::split_thinking_opened(thinking_opened, &content);
-        let (message, finish_reason) = if tools_active {
-            let mut parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &content);
-            if single_tool_call {
-                parsed.calls.truncate(1);
-            }
-            if parsed.calls.is_empty() {
-                (
-                    Message::new("assistant".to_string(), content),
-                    finish_reason,
-                )
-            } else {
-                (
-                    Message::with_tool_calls(parsed.content, parsed.calls),
-                    "tool_calls".to_string(),
-                )
-            }
-        } else {
-            (
-                Message::new("assistant".to_string(), content),
-                finish_reason,
-            )
-        };
-        let mut message = message;
-        message.reasoning_content = reasoning.clone().filter(|_| include_reasoning);
+        let (reasoning, message, finish_reason) =
+            assistant_message(&reply, &content, finish_reason);
         let finish_for_log = finish_reason.clone();
         let mut choice = Choice::new(0, message, finish_reason);
         if !result_logprobs.is_empty() {
@@ -1218,7 +1293,24 @@ pub(crate) async fn text_completions_at(
             "`best_of` = {b} must be at least `n` = {n}"
         )));
     }
-    if let Some(b) = best_of.filter(|b| *b > n) {
+    // `use_beam_search` answers the `n` best beams of one search.
+    let beam = vllm_fields.beam_search(n)?;
+    if beam.is_some() {
+        let grammar = output_grammar.is_some()
+            || response_format_to_grammar(body.get("response_format")).is_some();
+        vllm::check_beam_request(stream, grammar)?;
+        if prompt_embeds.is_some() {
+            return Err(ApiError::Validation(
+                "`prompt_embeds` is not supported with beam search".into(),
+            ));
+        }
+        if best_of.is_some_and(|b| b > n) {
+            return Err(ApiError::Validation(
+                "`best_of` is not supported with beam search".into(),
+            ));
+        }
+    }
+    if let Some(b) = best_of.filter(|b| *b > n && beam.is_none()) {
         if stream {
             return Err(ApiError::Validation(
                 "`best_of` is not supported with `stream`".into(),
@@ -1252,7 +1344,7 @@ pub(crate) async fn text_completions_at(
         )
         .await;
     }
-    if n > 1 {
+    if n > 1 && beam.is_none() {
         if stream {
             return Err(ApiError::Validation(
                 "`n` > 1 is not supported with `stream`".into(),
@@ -1508,6 +1600,51 @@ pub(crate) async fn text_completions_at(
     let _admitted = admission;
     let mut params = params;
     let _cancel = engine.cancel_guard(&mut params);
+    if let Some(search) = beam {
+        let out = engine
+            .generate_beams(&prompt, params, search)
+            .await
+            .map_err(|e| ApiError::Internal(format!("beam search: {e}")))?;
+        let mut completion_tokens = 0u64;
+        let choices: Vec<serde_json::Value> = out
+            .beams
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| {
+                completion_tokens += b.tokens.len() as u64;
+                let mut lps = b.logprobs;
+                if ids_as_tokens {
+                    vllm::tokens_as_ids(&mut lps);
+                }
+                serde_json::json!({
+                    "text": format!("{echo_text}{}", b.text),
+                    "index": i,
+                    "logprobs": if lps.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        completions_logprobs(&lps, echo_text.len())
+                    },
+                    "finish_reason": b.finish_reason.openai(),
+                })
+            })
+            .collect();
+        info!(
+            "Text completion (beam search): prompt_tokens={} beams={} forwards={} decode={:.0}ms",
+            out.prompt_eval_count,
+            choices.len(),
+            out.forwards,
+            out.eval_duration as f64 / 1_000_000.0,
+        );
+        return Ok(Json(serde_json::json!({
+            "id": completion_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_name,
+            "choices": choices,
+            "usage": Usage::from_counts(out.prompt_eval_count, 0, completion_tokens),
+        }))
+        .into_response());
+    }
     let result = engine
         .generate(&prompt, params)
         .await

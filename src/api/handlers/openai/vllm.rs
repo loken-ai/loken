@@ -8,7 +8,8 @@
 use super::*;
 use crate::api::types::vllm::{StructuredOutputs, VllmFields};
 use crate::inference::engine::llm_engine::{
-    FinishReason, PromptTruncation, RequestRules, TokenLogprob, TruncationSide,
+    BeamSearch, EarlyStopping, FinishReason, PromptTruncation, RequestRules, TokenLogprob,
+    TruncationSide,
 };
 use axum::response::IntoResponse;
 
@@ -23,9 +24,26 @@ const REPETITION_PENALTY_MAX: f64 = 4.0;
 const TOKEN_LIST_MAX: usize = 1_048_576;
 /// The `truncate_prompt_tokens` value that asks for the model's whole window.
 const TRUNCATE_TO_WINDOW: i64 = -1;
+/// The `length_penalty` of a beam search that names none: the cumulative log-probability over
+/// the generated length.
+const LENGTH_PENALTY_DEFAULT: f64 = 1.0;
 
 fn invalid(msg: impl Into<String>) -> ApiError {
     ApiError::Validation(msg.into())
+}
+
+/// Refuses what a beam search is not served with: a stream, as vLLM refuses it, and a
+/// structured output.
+pub(crate) fn check_beam_request(stream: bool, grammar: bool) -> Result<(), ApiError> {
+    if stream {
+        return Err(invalid("`stream` is not supported with beam search"));
+    }
+    if grammar {
+        return Err(invalid(
+            "a structured output or a required tool call is not supported with beam search",
+        ));
+    }
+    Ok(())
 }
 
 impl VllmFields {
@@ -36,9 +54,6 @@ impl VllmFields {
 
     /// The engine's rules, each field bounded, with `max_tokens` the request's completion cap.
     pub(crate) fn rules(&self, max_tokens: Option<i64>) -> Result<RequestRules, ApiError> {
-        if self.use_beam_search == Some(true) {
-            return Err(invalid("`use_beam_search` is not served"));
-        }
         if self.prompt_logprobs.is_some_and(|n| n > 0) {
             return Err(invalid("`prompt_logprobs` is not served"));
         }
@@ -127,6 +142,29 @@ impl VllmFields {
             truncate_prompt,
             cache_salt: self.cache_salt.clone(),
         })
+    }
+
+    /// The beam search the request asks for, `None` without `use_beam_search`. `n` is the beam
+    /// width and the number of beams answered.
+    pub(crate) fn beam_search(&self, n: usize) -> Result<Option<BeamSearch>, ApiError> {
+        if self.use_beam_search != Some(true) {
+            return Ok(None);
+        }
+        let early_stopping = match &self.early_stopping {
+            None | Some(serde_json::Value::Bool(false)) => EarlyStopping::Heuristic,
+            Some(serde_json::Value::Bool(true)) => EarlyStopping::Done,
+            Some(serde_json::Value::String(s)) if s == "never" => EarlyStopping::Never,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "`early_stopping` must be true, false or \"never\"; got {other}"
+                )))
+            }
+        };
+        Ok(Some(BeamSearch {
+            width: n,
+            length_penalty: self.length_penalty.unwrap_or(LENGTH_PENALTY_DEFAULT),
+            early_stopping,
+        }))
     }
 
     /// `repetition_penalty`, bounded: above zero, 1 for none.
@@ -804,7 +842,6 @@ mod tests {
         assert!(bad(serde_json::json!({"truncate_prompt_tokens": 0})).contains("truncate"));
         assert!(bad(serde_json::json!({"truncation_side": "middle"})).contains("truncation_side"));
         assert!(bad(serde_json::json!({"cache_salt": ""})).contains("cache_salt"));
-        assert!(bad(serde_json::json!({"use_beam_search": true})).contains("beam"));
         assert!(bad(serde_json::json!({"prompt_logprobs": 1})).contains("prompt_logprobs"));
         let words = vec!["w"; BAD_WORDS_MAX + 1];
         assert!(bad(serde_json::json!({ "bad_words": words })).contains("bad_words"));
@@ -820,6 +857,57 @@ mod tests {
             Some(1.2)
         );
         assert!(VllmFields::of_body(&serde_json::json!({"min_tokens": "three"})).is_err());
+    }
+
+    /// `use_beam_search` asks for `n` beams; `length_penalty` and `early_stopping` are read as
+    /// transformers reads them; a stream or a structured output is refused beside it.
+    #[test]
+    fn beam_search_reads_its_fields() {
+        assert!(fields(serde_json::json!({}))
+            .beam_search(3)
+            .unwrap()
+            .is_none());
+        let off = fields(serde_json::json!({"use_beam_search": false, "length_penalty": 2.0}));
+        assert!(off.beam_search(3).unwrap().is_none());
+        let s = fields(serde_json::json!({"use_beam_search": true}))
+            .beam_search(3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s,
+            BeamSearch {
+                width: 3,
+                length_penalty: LENGTH_PENALTY_DEFAULT,
+                early_stopping: EarlyStopping::Heuristic,
+            }
+        );
+        // The request's rules still read: beam search no longer refuses them.
+        assert!(fields(serde_json::json!({"use_beam_search": true}))
+            .rules(Some(4))
+            .is_ok());
+        let es = |v: serde_json::Value| {
+            fields(serde_json::json!({"use_beam_search": true, "early_stopping": v})).beam_search(2)
+        };
+        assert_eq!(
+            es(serde_json::json!(true)).unwrap().unwrap().early_stopping,
+            EarlyStopping::Done
+        );
+        assert_eq!(
+            es(serde_json::json!("never"))
+                .unwrap()
+                .unwrap()
+                .early_stopping,
+            EarlyStopping::Never
+        );
+        assert!(refused(es(serde_json::json!("soon"))).contains("early_stopping"));
+        let lp = fields(serde_json::json!({"use_beam_search": true, "length_penalty": -0.5}))
+            .beam_search(2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lp.length_penalty, -0.5);
+        assert!(refused(check_beam_request(true, false)).contains("stream"));
+        assert!(refused(check_beam_request(false, true)).contains("structured"));
+        assert!(check_beam_request(false, false).is_ok());
     }
 
     /// Each structured output is the grammar spec the engine reads; the older `guided_*`

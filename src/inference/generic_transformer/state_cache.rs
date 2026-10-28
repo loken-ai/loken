@@ -1023,6 +1023,13 @@ impl GenericHeteroTransformer {
         }
     }
 
+    /// Whether the KV cache is the whole decode state and keeps every position written to it,
+    /// so that `trim_kv` to a shorter length leaves exactly the state of that shorter sequence:
+    /// no recurrent mixer, no windowed layer.
+    pub(crate) fn kv_rolls_back(&self) -> bool {
+        !self.is_recurrent() && !self.layers.iter().any(|l| l.kv_cache.is_windowed())
+    }
+
     /// Whether this model's decode state is more than rows of KV (a recurrent mixer, a windowed
     /// layer) and can still travel in a state handover: no wide-residual layer, no host q8 cache,
     /// no layer split over cards or cut over cards.

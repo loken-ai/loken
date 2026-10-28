@@ -625,6 +625,13 @@ pub(crate) trait ModelBackend: Send {
     /// no-op.
     fn reset_kv_from(&mut self, _keep: usize) {}
 
+    /// Whether [`Self::reset_kv_from`] leaves exactly the decode state of the shorter sequence:
+    /// the KV cache is the whole state and keeps every position written to it. False unless the
+    /// backend says so.
+    fn kv_rolls_back(&self) -> bool {
+        false
+    }
+
     /// Context shift: drop positions `[from - discard, from)` and pull the tail down by
     /// `discard`, keys re-phased (`GenericHeteroTransformer::shift_kv_tail`). On `Err`
     /// the caches are in no defined state and the caller must `trim_kv(0)`.
@@ -2162,6 +2169,10 @@ impl ModelBackend for GenericBackend {
 
     fn reset_kv_from(&mut self, keep: usize) {
         self.0.trim_kv(keep)
+    }
+
+    fn kv_rolls_back(&self) -> bool {
+        self.0.kv_rolls_back()
     }
 
     fn kv_len(&self) -> Option<usize> {

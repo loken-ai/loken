@@ -1493,6 +1493,8 @@ use std::time::Instant;
 
 mod batching;
 pub use batching::ActiveRequest;
+mod beam;
+pub use beam::{BeamAnswer, BeamOutcome, BeamSearch, EarlyStopping};
 pub(crate) mod discover;
 mod embed;
 mod generate;
