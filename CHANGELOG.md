@@ -23,6 +23,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- ROCm: run the hardware 8-bit dot product on RDNA3 and RDNA4 cards.
 - Serving: honour stop sequences on the grammar path.
 - CUDA: run the kernels on a driver older than the bundled NVRTC.
 - Serving: answer requests batched together on an NVIDIA card.

@@ -165,7 +165,7 @@ static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || \
     defined(__gfx950__) || defined(__gfx1030__)
     return __builtin_amdgcn_sdot4(a, b, c, false);
-#elif defined(__gfx11__) || defined(__gfx12__)
+#elif defined(__GFX11__) || defined(__GFX12__)
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
     const int8_t* x = reinterpret_cast<const int8_t*>(&a);
