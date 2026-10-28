@@ -434,8 +434,8 @@ impl DraftLength {
                 Some((c, _)) => c,
                 None => match scaled_verify(k) {
                     Some(v) => v + k as f64 * draft_token,
-                    // Nothing measured yet: every length costs the same.
-                    None => 1.0,
+                    // Nothing measured yet: each row a verify carries costs a step.
+                    None => (k + 1) as f64,
                 },
             };
             let rate = expected / cost.max(f64::EPSILON);
@@ -452,9 +452,13 @@ impl DraftLength {
         {
             return best_drafting.0;
         }
-        // The next class up is measured again once its cost is old: a longer draft is judged
-        // on this run's windows, not on the first ones.
-        if best.0 > 0 && best.0 < top && self.stale(best.0 + 1) {
+        // The next class up is measured once, then again once its cost is old: the drafts grow
+        // a row at a time from the shortest, and a longer draft is judged on this run's windows,
+        // not on the first ones.
+        if best.0 > 0
+            && best.0 < top
+            && (self.cycle[best.0 + 1].is_none() || self.stale(best.0 + 1))
+        {
             return best.0 + 1;
         }
         best.0
@@ -851,6 +855,13 @@ mod tests {
             c.plain_step(0.040);
         }
         assert!(c.worth_trying(), "the wait is the short one again");
+    }
+
+    /// Before any cycle is measured, the first probe drafts one token: the cheapest cycle tells
+    /// what a row costs before a longer one is risked.
+    #[test]
+    fn the_first_probe_drafts_one_token() {
+        assert_eq!(DraftLength::default().next(), 1);
     }
 
     #[test]

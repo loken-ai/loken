@@ -28,6 +28,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: prefill no more prompt tokens in a step than the reserve holds.
 - Speculative decoding: prefill the drafter in chunks, as its target is.
 - Speculative decoding: accept a drafter whose vocabulary is padded to fewer rows.
+- Speculative decoding: draft one token first and lengthen drafts a row at a time.
 - Serving: go on from the failed chunk when a long prompt runs out of card memory.
 - Inference: size the attention scores of a prompt on a card from its free memory.
 - Vision: place the text after a tall image as the reference does.
