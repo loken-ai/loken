@@ -449,8 +449,15 @@ impl LlmEngine {
             warn!("spec-decode: drafter '{id}' failed to load: {e}; spec-decode OFF");
             return;
         }
-        let same = self.tokenizer_fingerprint().await == nested.tokenizer_fingerprint().await
-            && self.vocab_size().await == nested.vocab_size().await;
+        let same = match (
+            self.tokenizer_fingerprint().await,
+            self.vocab_size().await,
+            nested.tokenizer_fingerprint().await,
+            nested.vocab_size().await,
+        ) {
+            (Some(tf), Some(tv), Some(df), Some(dv)) => can_draft(tf, tv, df, dv),
+            _ => false,
+        };
         if !same {
             warn!("spec-decode: the drafter does not share the target's vocabulary; OFF");
             let _ = nested.unload().await;
@@ -1016,6 +1023,27 @@ struct PlannedDrafter {
     room: crate::inference::place::vram_manager::DemandLease,
 }
 
+/// Whether a model whose ordinary vocabulary hashes to `drafter_fp`, with `drafter_vocab`
+/// logits, can draft for a target with `target_fp` and `target_vocab`: the ordinary pieces sit
+/// at the same ids on both sides, and every id the drafter answers is a row of the target's
+/// logits. A drafter whose vocabulary is padded to fewer rows than the target's proposes only
+/// ids the target has.
+pub(crate) fn can_draft(
+    target_fp: u64,
+    target_vocab: usize,
+    drafter_fp: u64,
+    drafter_vocab: usize,
+) -> bool {
+    target_fp == drafter_fp && (1..=target_vocab).contains(&drafter_vocab)
+}
+
+/// Whether a drafter placed as it is can make its target faster: a target held on the cards
+/// verifies a draft at about the cost of a plain step, so a drafter with no layer on a card
+/// costs it more per token than the drafts save.
+pub(crate) fn placement_can_pay(target_on_host: bool, drafter_on_card: bool) -> bool {
+    target_on_host || drafter_on_card
+}
+
 /// Warm one card, once per opening of its context: a tiny matmul allocates the cuBLAS handle
 /// and workspace, which latches the primary context until the card is released - the
 /// deliberate cost that makes every later budget probe of this card read the same world.
@@ -1578,5 +1606,31 @@ mod alibi_placement_tests {
         let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         let cos = dot / (norm(&got) * norm(&want));
         assert!(cos >= 0.998, "cosine {cos} with the reference's logits");
+    }
+}
+
+#[cfg(test)]
+mod drafter_choice_tests {
+    use super::can_draft;
+
+    /// A drafter on the host alone pays only for a target that is on the host too.
+    #[test]
+    fn a_drafter_on_the_host_pays_only_for_a_target_on_the_host() {
+        use super::placement_can_pay;
+        assert!(placement_can_pay(true, false));
+        assert!(placement_can_pay(false, true));
+        assert!(placement_can_pay(true, true));
+        assert!(!placement_can_pay(false, false));
+    }
+
+    /// A drafter padded to fewer logit rows than its target drafts for it; one with more rows,
+    /// or another ordinary vocabulary, does not.
+    #[test]
+    fn a_drafter_padded_to_fewer_rows_drafts() {
+        assert!(can_draft(7, 152_064, 7, 151_936));
+        assert!(can_draft(7, 151_936, 7, 151_936));
+        assert!(!can_draft(7, 151_936, 7, 152_064));
+        assert!(!can_draft(7, 151_936, 8, 151_936));
+        assert!(!can_draft(7, 151_936, 7, 0));
     }
 }

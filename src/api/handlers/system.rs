@@ -192,10 +192,10 @@ pub(crate) async fn cluster_prefill(
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-/// Attach a speculative draft model to a target. Validates that
-/// the tokenizers are byte-identical (same fingerprint, same vocab size)
-/// before the attach succeeds; otherwise the call returns an error and
-/// the target is left untouched.
+/// Attach a speculative draft model to a target. Validates that the ordinary
+/// vocabularies agree and that every id the draft answers is a row of the
+/// target's logits before the attach succeeds; otherwise the call returns an
+/// error and the target is left untouched.
 pub(crate) async fn draft_attach(
     State(state): State<APIServer>,
     Json(request): Json<DraftAttachRequest>,
@@ -237,14 +237,36 @@ pub(crate) async fn draft_attach(
         .ok_or_else(|| ApiError::Internal("Draft model has no tokenizer".into()))?;
     let draft_vocab = draft_engine.vocab_size().await.unwrap_or(0);
 
-    let fp_match = target_fp == draft_fp && target_vocab == draft_vocab;
+    let fp_match = crate::inference::engine::llm_engine::can_draft(
+        target_fp,
+        target_vocab,
+        draft_fp,
+        draft_vocab,
+    );
     if !fp_match {
         // Drop the draft engine's resources before erroring out.
         let _ = draft_engine.unload().await;
         return Err(ApiError::Validation(format!(
             "Tokenizer fingerprint mismatch: target {} (vocab {}) vs draft {} (vocab {}). \
-             Speculative decoding requires byte-identical tokenizers.",
+             Speculative decoding requires the same ordinary vocabulary, and no more \
+             logits on the draft than on the target.",
             target_fp, target_vocab, draft_fp, draft_vocab
+        )));
+    }
+
+    let target_on_host = target_engine
+        .layers_on_host_and_cards()
+        .await
+        .is_some_and(|(host, _)| host);
+    let drafter_on_card = draft_engine
+        .layers_on_host_and_cards()
+        .await
+        .is_some_and(|(_, card)| card);
+    if !crate::inference::engine::llm_engine::placement_can_pay(target_on_host, drafter_on_card) {
+        let _ = draft_engine.unload().await;
+        return Err(ApiError::Validation(format!(
+            "No card has room for the draft '{draft_name}', and a draft on the host cannot \
+             speed up '{target_name}', which is held on the cards."
         )));
     }
 

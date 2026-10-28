@@ -3246,7 +3246,8 @@ impl LlmEngine {
     /// deepseek-r1:70b and llama3.2:1b share 128000 of 128256 pieces, and the 256 they do not
     /// are `<|begin_of_text|>`, `<think>` and their kind, which no drafter proposes from prose.
     /// Hashing the whole file refused that pair as a different vocabulary. The caller still
-    /// requires equal vocab sizes, so an id that exists on one side only cannot pass.
+    /// requires that every id the drafter answers is a row of the target's logits
+    /// ([`super::can_draft`]).
     pub async fn tokenizer_fingerprint(&self) -> Option<u64> {
         let guard = self.model_state.lock().await;
         let state = guard.as_ref()?;

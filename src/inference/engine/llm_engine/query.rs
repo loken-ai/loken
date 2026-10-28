@@ -116,6 +116,23 @@ impl LlmEngine {
             .and_then(|s| s.model.placement_model_inputs())
     }
 
+    /// Where the loaded model's weights are read from: whether some are on the host (a layer,
+    /// or experts streamed from there), and whether some layers are on a card. `None` when no
+    /// model is loaded.
+    pub async fn layers_on_host_and_cards(&self) -> Option<(bool, bool)> {
+        let guard = self.model_state.lock().await;
+        let s = guard.as_ref()?;
+        let streams = s.model.placement_model_inputs().is_some();
+        let segs = s.model.device_layer_distribution();
+        if segs.is_empty() {
+            return Some((streams || !s.device.is_cuda(), s.device.is_cuda()));
+        }
+        Some((
+            streams || segs.iter().any(|(dev, ..)| dev == "CPU"),
+            segs.iter().any(|(dev, ..)| dev != "CPU"),
+        ))
+    }
+
     /// What the cluster's planner needs to place this model's layers on nodes: each layer's
     /// bytes with its cache, the output head's bytes, and what a layer costs on this node's
     /// cards and host, zero for a device no layer ran on. `None` when the model cannot be cut

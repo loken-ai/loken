@@ -8,7 +8,8 @@ on a model that fits, verification costs about what drafting saves.
 ## Automatic
 
 When a model is predicted to spill, loken looks in the store for the smallest model with the
-same ordinary vocabulary (same pieces at the same ids, the added control tokens aside), loads
+same ordinary vocabulary (same pieces at the same ids, the added control tokens aside, and no
+more logit rows than the target's, so a vocabulary padded to a different size still drafts), loads
 it on the fastest card before the target, and places the target around it. If the target ends
 up on the cards after all, or the vocabularies differ, the drafter is released.
 
@@ -22,7 +23,8 @@ drafter attached to a model that fits the cards, it is dropped.
 `POST /api/draft/attach` with `target` and `draft` attaches a drafter to a loaded model after
 the same vocabulary check, on the fastest card unless the request's `device_index` names one;
 `/api/draft/detach` removes it and `/api/draft/status` lists the pairs and their current draft
-length. These endpoints are loken's own; the Ollama API has none.
+length. A drafter that finds no room on a card is refused for a target held on the cards, since
+on the host it would cost the target more than it saves. These endpoints are loken's own; the Ollama API has none.
 
 ## What to expect
 
