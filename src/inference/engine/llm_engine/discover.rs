@@ -122,12 +122,36 @@ impl LlmEngine {
         dir.map(GenerationDefaults::from_hf_dir).unwrap_or_default()
     }
 
-    /// Every GGUF model in the Ollama store, as `(tag, weights blob)`: each manifest under
-    /// `manifests/{registry}/{namespace}/{name}/{tag}` whose model layer resolves to a blob.
+    /// Every GGUF model in the Ollama stores, as `(tag, weights blob)`: each manifest under
+    /// `manifests/{registry}/{namespace}/{name}/{tag}` whose model layer resolves to a blob,
+    /// in the configured models directory, then in every configured Ollama directory of the
+    /// catalogue it belongs to. A tag held by several is listed once, from the first.
     pub(super) fn store_models(&self) -> Vec<(String, PathBuf)> {
-        let Some(root) = self.config.models_dir.as_ref() else {
+        let Some(models_dir) = self.config.models_dir.as_ref() else {
             return Vec::new();
         };
+        let mut roots = vec![models_dir.clone()];
+        let configured = crate::config::ollama_models_dirs();
+        if configured.contains(models_dir) {
+            roots.extend(
+                crate::inference::load::model_dirs::read_order(&configured)
+                    .into_iter()
+                    .filter(|d| d != models_dir),
+            );
+        }
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        for root in &roots {
+            for (tag, blob) in Self::store_models_in(root) {
+                if !out.iter().any(|(t, _)| *t == tag) {
+                    out.push((tag, blob));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every GGUF model of one Ollama store, as `(tag, weights blob)`.
+    fn store_models_in(root: &std::path::Path) -> Vec<(String, PathBuf)> {
         let mut out = Vec::new();
         let read_dirs = |p: &std::path::Path| -> Vec<PathBuf> {
             std::fs::read_dir(p)
@@ -306,18 +330,22 @@ impl LlmEngine {
     }
 
     /// The directories a hub repository id is looked up in: the configured models directory's
-    /// `huggingface/hub` and itself, then the configured HuggingFace hub root.
+    /// `huggingface/hub` and itself, then every configured HuggingFace hub root in the order a
+    /// repository held by several is read.
     pub(super) fn hub_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
         if let Some(md) = &self.config.models_dir {
             roots.push(md.join("huggingface").join("hub"));
             roots.push(md.clone());
         }
-        // The configured HuggingFace hub root (from config.toml, OS-default fallback) - never
+        // The configured HuggingFace hub roots (from config.toml, OS-default fallback) - never
         // a hardcoded absolute path.
-        if let Ok(cfg) = crate::config::Config::load_default() {
-            roots.push(hub_root(cfg.get_hf_models_dir()));
-        }
+        let hf = crate::config::hf_models_dirs();
+        roots.extend(
+            crate::inference::load::model_dirs::read_order(&hf)
+                .into_iter()
+                .map(hub_root),
+        );
         roots
     }
 

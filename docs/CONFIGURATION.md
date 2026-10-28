@@ -20,9 +20,35 @@ render: it reports what was last known.
 
 | Key | Default | What it does |
 |---|---|---|
-| `ollama_models_dir` | `~/.ollama/models` | The Ollama-style store: manifests and blobs. `OLLAMA_MODELS` in the environment overrides it. |
-| `huggingface_models_dir` | `~/.cache/huggingface/hub` | The Hugging Face store. A bare GGUF placed at its root, or under its `hub/`, is found by file name. |
-| `lora_dir` | `loras` beside the Ollama store | Where adapters live. Requests name an adapter, never a path. |
+| `ollama_models_dir` | `~/.ollama/models` | The Ollama-style store: manifests and blobs. One directory as a string, or several as a list: see [Model directories on several disks](#model-directories-on-several-disks). `OLLAMA_MODELS` in the environment overrides it. |
+| `huggingface_models_dir` | `~/.cache/huggingface/hub` | The Hugging Face store, as a string or a list. A bare GGUF placed at its root, or under its `hub/`, is found by file name. |
+| `lora_dir` | `loras` beside the first Hugging Face store | Where adapters live. Requests name an adapter, never a path. |
+
+### Model directories on several disks
+
+```toml
+ollama_models_dir = ["/mnt/nvme/ollama", "/mnt/hdd/ollama"]
+huggingface_models_dir = ["/mnt/nvme/huggingface", "/mnt/hdd/huggingface"]
+```
+
+The directories of each key form one catalogue: the model listings and every load see the models
+of all of them. The order of the list is the order of preference: put the fastest disk first.
+
+| Case | What happens |
+|---|---|
+| A model held by several directories | It is listed once and read from the first of them in the list. The log says once which copy is read. |
+| A pull | It lands on the directory already holding the model (its manifest or weights blob, its repository) when that directory has room for the bytes it lacks. Otherwise it lands on the first directory in the list with room for the whole model. With no room anywhere it fails and names each directory's free space. |
+| A pull that replaces an Ollama model held elsewhere | The manifest in the other directory is removed. Its blobs stay until a delete prunes them. |
+| A model built here (`/api/create`, `/api/blobs`, conversions) | It is written to the first directory listed. A manifest goes to the first directory holding every blob it names. |
+| A copy (`/api/copy`) | It stays in the directory of its source, beside the blobs it shares. |
+| A delete | Every copy is removed. |
+
+A manifest and every blob it names stay in one directory. A Hugging Face repository stays whole
+in one directory.
+
+The single-string form of both keys still reads as before. The checkpoints some media families
+read from fixed paths under the store (`boogu/`, `wan/`, `flux-kontext-q4km.gguf`,
+`qwen-image-edit/`) are looked up in the first Hugging Face directory only.
 
 ## `[server]`
 

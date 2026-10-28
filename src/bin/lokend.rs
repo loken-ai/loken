@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some(dir) = models_dir.as_ref() {
-                config.ollama_models_dir = Some(dir.clone());
+                config.ollama_models_dir = Some(loken::config::DirList::one(dir.clone()));
             }
 
             // Energy reporting: initialise the global settings from config so every
@@ -285,12 +285,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let topology = HardwareTopology::from_device_manager(&device_manager);
             topology.log_summary();
 
-            // Get configured directories from config or use OS-aware defaults
-            let ollama_models_dir = config.get_ollama_models_dir().to_string_lossy().to_string();
-            let huggingface_models_dir = config.get_hf_models_dir().to_string_lossy().to_string();
+            // Get configured directories from config or use OS-aware defaults. The server is
+            // built on the first of each kind; its managers read every directory listed.
+            let ollama_models_dirs = config.get_ollama_models_dirs();
+            let huggingface_models_dirs = config.get_hf_models_dirs();
+            let ollama_models_dir = ollama_models_dirs[0].to_string_lossy().to_string();
+            let huggingface_models_dir = huggingface_models_dirs[0].to_string_lossy().to_string();
+            for dir in ollama_models_dirs.iter().chain(&huggingface_models_dirs) {
+                info!("Model directory: {}", dir.display());
+            }
 
             // Loaders without a server handle read the stores this daemon serves.
-            loken::config::install_stores(&ollama_models_dir, &huggingface_models_dir);
+            loken::config::install_stores(&ollama_models_dirs, &huggingface_models_dirs);
 
             // Adapters are named, not pathed: fix the one directory they resolve inside
             // before any request can arrive.

@@ -1946,14 +1946,14 @@ impl APIServer {
         let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
             &self.ollama_models_dir,
         ));
-        let manifest: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(ollama.get_model_path(&name, tag)?).ok()?,
-        )
-        .ok()?;
+        let manifest_path = ollama.get_model_path(&name, tag)?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).ok()?).ok()?;
         let digest = manifest.get("config")?.get("digest")?.as_str()?;
-        let blob = PathBuf::from(&self.ollama_models_dir)
-            .join("blobs")
-            .join(digest.replace(':', "-"));
+        let blob = crate::inference::load::ollama_manager::OllamaManager::blob_for(
+            &manifest_path,
+            digest,
+        )?;
         serde_json::from_str(&std::fs::read_to_string(blob).ok()?).ok()
     }
 
@@ -1988,10 +1988,9 @@ impl APIServer {
         let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
             &self.ollama_models_dir,
         ));
-        let manifest: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(ollama.get_model_path(&name, tag)?).ok()?,
-        )
-        .ok()?;
+        let manifest_path = ollama.get_model_path(&name, tag)?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).ok()?).ok()?;
         for layer in manifest.get("layers")?.as_array()? {
             let media = layer
                 .get("mediaType")
@@ -1999,10 +1998,9 @@ impl APIServer {
                 .unwrap_or("");
             if media.rsplit('.').next() == Some(kind) {
                 let digest = layer.get("digest").and_then(|v| v.as_str())?;
-                return Some(
-                    PathBuf::from(&self.ollama_models_dir)
-                        .join("blobs")
-                        .join(digest.replace(':', "-")),
+                return crate::inference::load::ollama_manager::OllamaManager::blob_for(
+                    &manifest_path,
+                    digest,
                 );
             }
         }
@@ -2069,36 +2067,34 @@ impl APIServer {
         let content = std::fs::read_to_string(&manifest_path).ok()?;
         let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
         let layers = manifest.get("layers")?.as_array()?;
-        let mut model_blob: Option<String> = None;
+        let mut model_blob: Option<PathBuf> = None;
         let mut packaged: Option<String> = None;
         for layer in layers {
             let media_type = layer
                 .get("mediaType")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let blob = || {
+                layer.get("digest").and_then(|v| v.as_str()).and_then(|d| {
+                    crate::inference::load::ollama_manager::OllamaManager::blob_for(
+                        &manifest_path,
+                        d,
+                    )
+                })
+            };
             if media_type.contains("template") {
-                if let Some(digest) = layer.get("digest").and_then(|v| v.as_str()) {
-                    let blob_path = PathBuf::from(&self.ollama_models_dir)
-                        .join("blobs")
-                        .join(digest.replace(':', "-"));
+                if let Some(blob_path) = blob() {
                     packaged = std::fs::read_to_string(&blob_path).ok();
                 }
             }
             if media_type.contains("model") {
-                model_blob = layer
-                    .get("digest")
-                    .and_then(|v| v.as_str())
-                    .map(|d| d.replace(':', "-"));
+                model_blob = blob();
             }
         }
         // The weights' Jinja template is evaluated exactly; the packaged Go template is only
         // approximated by pattern-matching, so the Jinja one wins when both exist.
         let weights = model_blob
-            .map(|b| {
-                chat_prompt::path_chat_format(
-                    &PathBuf::from(&self.ollama_models_dir).join("blobs").join(b),
-                )
-            })
+            .map(|b| chat_prompt::path_chat_format(&b))
             .unwrap_or_default();
         let template = match weights.template {
             Some(j) if j.contains("{%") => Some(j),
@@ -2569,8 +2565,19 @@ impl APIServer {
                 config.models_dir = Some(path);
             }
         } else {
-            // Default to Ollama models dir
-            config.models_dir = Some(PathBuf::from(&self.ollama_models_dir));
+            // The Ollama directory holding the model, else the first one.
+            let (name, tag) = match model_id.split_once(':') {
+                Some((n, t)) => (n.to_lowercase(), t),
+                None => (model_id.to_lowercase(), "latest"),
+            };
+            let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
+                &self.ollama_models_dir,
+            ));
+            config.models_dir = Some(
+                ollama
+                    .model_root(&name, tag)
+                    .unwrap_or_else(|| PathBuf::from(&self.ollama_models_dir)),
+            );
         }
 
         // Without a configured profile, the model reads and writes its own in the store.

@@ -4,6 +4,8 @@
 # Uncomment to override:
 # ollama_models_dir = '/path/to/ollama/models'
 # huggingface_models_dir = '/path/to/huggingface/models'
+# Several directories, on several disks, form one catalogue (docs/CONFIGURATION.md):
+# ollama_models_dir = ['/disk1/ollama/models', '/disk2/ollama/models']
 
 [server]
 host = "127.0.0.1"

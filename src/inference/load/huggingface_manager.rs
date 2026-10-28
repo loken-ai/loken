@@ -4,12 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
 
+use super::model_dirs;
+
 /// Progress callback for download tracking (bytes_downloaded, total_bytes)
 pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-/// HuggingFace Manager for native HF cache directory structure
+/// HuggingFace Manager for native HF cache directory structure, over one cache or several
+/// read as one catalogue. A repository lives whole in one cache.
 pub struct HuggingFaceManager {
-    models_dir: PathBuf,
+    /// The cache roots in the order configured.
+    dirs: Vec<PathBuf>,
     hf_token: Option<String>,
 }
 
@@ -140,30 +144,80 @@ impl HuggingFaceManager {
     /// exists we transparently descend into it so users can set
     /// `huggingface_models_dir = "/path/to/HF_HOME"` in config.toml
     /// without having to remember to append `/hub`.
+    ///
+    /// When `models_dir` is one of the configured Hugging Face directories, the manager reads
+    /// every configured one.
     pub fn new(models_dir: PathBuf) -> Self {
-        Self {
-            models_dir: resolve_hub_dir(models_dir),
-            hf_token: None,
-        }
+        Self::with_dirs(model_dirs::catalogue_of(
+            models_dir,
+            crate::config::hf_models_dirs(),
+        ))
     }
 
     /// Create a new manager with HuggingFace token for private repos
     pub fn with_token(models_dir: PathBuf, token: String) -> Self {
         Self {
-            models_dir: resolve_hub_dir(models_dir),
             hf_token: Some(token),
+            ..Self::new(models_dir)
         }
     }
 
-    /// List all HuggingFace models in the cache directory
+    /// A manager reading the caches `dirs` as one catalogue, each resolved as [`Self::new`]
+    /// resolves its directory. No directory at all is the default one.
+    pub fn with_dirs(dirs: Vec<PathBuf>) -> Self {
+        let dirs = if dirs.is_empty() {
+            vec![crate::config::Config::default_hf_models_dir()]
+        } else {
+            dirs
+        };
+        Self {
+            dirs: dirs.into_iter().map(resolve_hub_dir).collect(),
+            hf_token: None,
+        }
+    }
+
+    /// The caches in the order a repository held by several is read.
+    fn read_dirs(&self) -> Vec<PathBuf> {
+        model_dirs::read_order(&self.dirs)
+    }
+
+    /// List all HuggingFace models across the caches. A model held by several caches is
+    /// listed once, from the cache it is read from.
+    pub fn list_models(&self) -> Result<Vec<HFModelEntry>> {
+        let mut models: Vec<HFModelEntry> = Vec::new();
+        let mut copies: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+        for dir in self.read_dirs() {
+            let found = match self.list_models_in(&dir) {
+                Ok(found) => found,
+                Err(e) if self.dirs.len() == 1 => return Err(e),
+                Err(e) => {
+                    tracing::warn!("Hugging Face directory {} skipped: {e}", dir.display());
+                    continue;
+                }
+            };
+            for model in found {
+                let holders = copies.entry(model.id.clone()).or_default();
+                holders.push(dir.clone());
+                if holders.len() == 1 {
+                    models.push(model);
+                }
+            }
+        }
+        for (id, holders) in &copies {
+            model_dirs::report_copies(id, holders);
+        }
+        Ok(models)
+    }
+
+    /// List all HuggingFace models in one cache directory
     /// Supports two layouts:
     /// 1. HF cache format: models--user--repo/snapshots/revision/
     /// 2. Flat local-dir format: directory with GGUF files directly (from `hf download --local-dir`)
-    pub fn list_models(&self) -> Result<Vec<HFModelEntry>> {
-        if !self.models_dir.exists() {
+    fn list_models_in(&self, models_dir: &Path) -> Result<Vec<HFModelEntry>> {
+        if !models_dir.exists() {
             debug!(
                 "HuggingFace cache directory does not exist: {:?}",
-                self.models_dir
+                models_dir
             );
             return Ok(vec![]);
         }
@@ -171,7 +225,7 @@ impl HuggingFaceManager {
         let mut models = vec![];
         let mut found_cache_format = false;
 
-        for entry in std::fs::read_dir(&self.models_dir)? {
+        for entry in std::fs::read_dir(models_dir)? {
             let path = entry?.path();
             if !path.is_dir() {
                 continue;
@@ -224,7 +278,7 @@ impl HuggingFaceManager {
 
         // If no models--* dirs found, scan for flat local-dir layout (GGUF files directly in dir)
         if !found_cache_format {
-            models.extend(self.scan_flat_directory()?);
+            models.extend(Self::scan_flat_directory(models_dir)?);
         }
 
         Ok(models)
@@ -232,13 +286,13 @@ impl HuggingFaceManager {
 
     /// Scan a flat directory for GGUF model files (from `hf download --local-dir`)
     /// Each GGUF file becomes a separate model entry
-    fn scan_flat_directory(&self) -> Result<Vec<HFModelEntry>> {
+    fn scan_flat_directory(models_dir: &Path) -> Result<Vec<HFModelEntry>> {
         let mut models = vec![];
 
         // Try to extract repo name from .cache metadata or README
-        let repo_name = self.detect_repo_name().unwrap_or_default();
+        let repo_name = Self::detect_repo_name(models_dir).unwrap_or_default();
 
-        for entry in std::fs::read_dir(&self.models_dir)? {
+        for entry in std::fs::read_dir(models_dir)? {
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {
@@ -290,7 +344,7 @@ impl HuggingFaceManager {
             info!(
                 "Found {} GGUF models in flat HF directory {:?}",
                 models.len(),
-                self.models_dir
+                models_dir
             );
         }
 
@@ -298,10 +352,10 @@ impl HuggingFaceManager {
     }
 
     /// Try to detect the HuggingFace repo name from .cache metadata or README
-    fn detect_repo_name(&self) -> Option<String> {
+    fn detect_repo_name(models_dir: &Path) -> Option<String> {
         // Check .cache/huggingface/download/*.metadata for commit hashes
         // The README.md often has the repo info in YAML frontmatter
-        let readme = self.models_dir.join("README.md");
+        let readme = models_dir.join("README.md");
         if readme.exists() {
             if let Ok(content) = std::fs::read_to_string(&readme) {
                 // Look for "repo_url:" or "base_model:" or the HF URL pattern
@@ -324,10 +378,25 @@ impl HuggingFaceManager {
     /// 1. HF cache format: returns snapshots/revision/ directory
     /// 2. Flat local-dir: returns path to the GGUF file directly
     /// 3. model_id can be a filename like "flux1-schnell-Q4_K_S.gguf"
+    ///
+    /// A model held by several caches is read from the first in read order, and reported once
+    /// with the reason.
     pub fn get_model_path(&self, model_id: &str) -> Option<PathBuf> {
+        let found: Vec<(PathBuf, PathBuf)> = self
+            .read_dirs()
+            .into_iter()
+            .filter_map(|d| Self::model_path_in(&d, model_id).map(|p| (d, p)))
+            .collect();
+        let holders: Vec<PathBuf> = found.iter().map(|(d, _)| d.clone()).collect();
+        model_dirs::report_copies(model_id, &holders);
+        found.into_iter().next().map(|(_, path)| path)
+    }
+
+    /// The files of `model_id` in one cache directory.
+    fn model_path_in(models_dir: &Path, model_id: &str) -> Option<PathBuf> {
         // Try HF cache format first: models--user--repo/snapshots/revision/
         let dir_name = format!("models--{}", model_id.replace('/', "--"));
-        let model_dir = self.models_dir.join(&dir_name);
+        let model_dir = models_dir.join(&dir_name);
 
         let refs_main = model_dir.join("refs").join("main");
         if refs_main.exists() {
@@ -356,9 +425,9 @@ impl HuggingFaceManager {
         // file on disk carries no tag.
         let bare = model_id.strip_suffix(":latest").unwrap_or(model_id);
         let gguf_path = if bare.ends_with(".gguf") {
-            self.models_dir.join(bare)
+            models_dir.join(bare)
         } else {
-            self.models_dir.join(format!("{}.gguf", bare))
+            models_dir.join(format!("{}.gguf", bare))
         };
         if gguf_path.exists() {
             return Some(gguf_path);
@@ -367,8 +436,8 @@ impl HuggingFaceManager {
         // Try matching by stem (e.g. "repo/stem" -> "stem.gguf")
         // The configured directory may be an HF_HOME whose `hub/` this manager resolved to;
         // a file dropped at the configured root is found as well.
-        if self.models_dir.file_name().and_then(|n| n.to_str()) == Some("hub") {
-            if let Some(root) = self.models_dir.parent() {
+        if models_dir.file_name().and_then(|n| n.to_str()) == Some("hub") {
+            if let Some(root) = models_dir.parent() {
                 let at_root = root.join(gguf_path.file_name().unwrap_or_default());
                 if at_root.exists() {
                     return Some(at_root);
@@ -378,7 +447,7 @@ impl HuggingFaceManager {
 
         if model_id.contains('/') {
             if let Some(stem) = model_id.rsplit('/').next() {
-                let gguf_path = self.models_dir.join(format!("{}.gguf", stem));
+                let gguf_path = models_dir.join(format!("{}.gguf", stem));
                 if gguf_path.exists() {
                     return Some(gguf_path);
                 }
@@ -390,23 +459,29 @@ impl HuggingFaceManager {
 
     /// The id of the cached repository `name` names: its full id, or its name without the
     /// owner, either compared without regard to case. `None` when no cached repository
-    /// answers to it, or when two owners' repositories share the name.
+    /// answers to it, or when two owners' repositories share the name. One repository held by
+    /// several caches is one repository.
     pub fn repository_named(&self, name: &str) -> Option<String> {
         let mut found: Option<String> = None;
-        for entry in std::fs::read_dir(&self.models_dir).ok()?.flatten() {
-            let dir = entry.file_name().to_string_lossy().to_string();
-            let Some(id) = dir.strip_prefix("models--").map(|s| s.replace("--", "/")) else {
+        for models_dir in self.read_dirs() {
+            let Ok(entries) = std::fs::read_dir(&models_dir) else {
                 continue;
             };
-            let short = id.rsplit('/').next().unwrap_or(&id);
-            if id.eq_ignore_ascii_case(name) {
-                return Some(id);
-            }
-            if short.eq_ignore_ascii_case(name) {
-                if found.is_some() {
-                    return None;
+            for entry in entries.flatten() {
+                let dir = entry.file_name().to_string_lossy().to_string();
+                let Some(id) = dir.strip_prefix("models--").map(|s| s.replace("--", "/")) else {
+                    continue;
+                };
+                let short = id.rsplit('/').next().unwrap_or(&id);
+                if id.eq_ignore_ascii_case(name) {
+                    return Some(id);
                 }
-                found = Some(id);
+                if short.eq_ignore_ascii_case(name) {
+                    if found.as_ref().is_some_and(|f| *f != id) {
+                        return None;
+                    }
+                    found = Some(id);
+                }
             }
         }
         found
@@ -431,13 +506,6 @@ impl HuggingFaceManager {
         }
 
         let dir_name = format!("models--{}", model_id.replace('/', "--"));
-        let model_dir = self.models_dir.join(&dir_name);
-
-        // Ensure directories exist
-        std::fs::create_dir_all(&model_dir)?;
-        std::fs::create_dir_all(model_dir.join("blobs"))?;
-        std::fs::create_dir_all(model_dir.join("refs"))?;
-        std::fs::create_dir_all(model_dir.join("snapshots"))?;
 
         let client = reqwest::Client::new();
 
@@ -524,6 +592,20 @@ impl HuggingFaceManager {
             files_to_download.len(),
             total_size / (1024 * 1024)
         );
+
+        let wanted: Vec<(&str, Option<u64>)> = files_to_download
+            .iter()
+            .map(|f| (f.rfilename.as_str(), f.size))
+            .collect();
+        let dest = self.destination(&dir_name, &revision, &wanted, total_size)?;
+        info!("   ✓ {} goes to {}", model_id, dest.display());
+        let model_dir = dest.join(&dir_name);
+
+        // Ensure directories exist
+        std::fs::create_dir_all(&model_dir)?;
+        std::fs::create_dir_all(model_dir.join("blobs"))?;
+        std::fs::create_dir_all(model_dir.join("refs"))?;
+        std::fs::create_dir_all(model_dir.join("snapshots"))?;
 
         let snapshots_dir = model_dir.join("snapshots").join(&revision);
         std::fs::create_dir_all(&snapshots_dir)?;
@@ -675,8 +757,7 @@ impl HuggingFaceManager {
         let Some(text_id) = discover::named_text_model(&config) else {
             return Ok(());
         };
-        if discover::composite_text_dir(snapshot, std::slice::from_ref(&self.models_dir)).is_some()
-        {
+        if discover::composite_text_dir(snapshot, &self.read_dirs()).is_some() {
             return Ok(());
         }
         info!("   🔗 The checkpoint names its text model {text_id}; pulling it");
@@ -690,16 +771,47 @@ impl HuggingFaceManager {
             })
     }
 
-    /// Delete a model
+    /// The cache a pull of the repository `dir_name` at `revision` lands on, `wanted` its files
+    /// with their sizes: the cache holding the repository when it has room for the files it
+    /// lacks, else the fastest-reading cache with room for them all.
+    fn destination(
+        &self,
+        dir_name: &str,
+        revision: &str,
+        wanted: &[(&str, Option<u64>)],
+        size: u64,
+    ) -> Result<PathBuf> {
+        let facts = model_dirs::facts(&self.dirs, |dir| {
+            let repo = dir.join(dir_name);
+            let snapshot = repo.join("snapshots").join(revision);
+            let held: u64 = wanted
+                .iter()
+                .filter_map(|(file, want)| {
+                    let have = std::fs::metadata(snapshot.join(file)).ok()?.len();
+                    (Some(have) == *want).then_some(have)
+                })
+                .sum();
+            (held, repo.is_dir())
+        });
+        let i = model_dirs::choose_destination(&facts, size).map_err(|e| anyhow!(e))?;
+        Ok(facts[i].dir.clone())
+    }
+
+    /// Delete a model: its repository in every cache holding it.
     pub fn delete_model(&self, model_id: &str) -> Result<()> {
         info!("Deleting HuggingFace model: {}", model_id);
 
         let dir_name = format!("models--{}", model_id.replace('/', "--"));
-        let model_dir = self.models_dir.join(&dir_name);
-
-        if model_dir.exists() {
-            std::fs::remove_dir_all(&model_dir)?;
-            info!("Successfully deleted {}", model_id);
+        let mut deleted = false;
+        for dir in &self.dirs {
+            let model_dir = dir.join(&dir_name);
+            if model_dir.exists() {
+                std::fs::remove_dir_all(&model_dir)?;
+                info!("Successfully deleted {} from {}", model_id, dir.display());
+                deleted = true;
+            }
+        }
+        if deleted {
             Ok(())
         } else {
             Err(anyhow!("Model not found: {}", model_id))
@@ -1032,5 +1144,99 @@ mod gguf_lookup_tests {
         let m = HuggingFaceManager::new(home.clone());
         assert_eq!(m.get_model_path("z"), Some(home.join("z.gguf")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod several_caches_tests {
+    use super::*;
+
+    /// Writes a cached repository `id` in `hub` at revision `rev` with one weights file.
+    fn put_repo(hub: &Path, id: &str, rev: &str, weights: &str) {
+        let repo = hub.join(format!("models--{}", id.replace('/', "--")));
+        let snap = repo.join("snapshots").join(rev);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), rev).unwrap();
+        std::fs::write(snap.join("model.safetensors"), weights).unwrap();
+    }
+
+    /// Two caches form one catalogue: each repository is listed once, one held by both is
+    /// read from the first listed when their disks read as fast, and a short name finds a
+    /// repository whichever cache holds it.
+    #[test]
+    fn two_caches_form_one_catalogue() {
+        let scratch = super::model_dirs::tests::scratch;
+        let (a, b) = (scratch("hf-a"), scratch("hf-b"));
+        put_repo(&a, "org/only-a", "r1", "a");
+        put_repo(&b, "org/only-b", "r2", "bb");
+        put_repo(&a, "org/both", "r3", "ccc");
+        put_repo(&b, "org/both", "r4", "dddd");
+        let m = HuggingFaceManager::with_dirs(vec![a.clone(), b.clone()]);
+        let mut listed: Vec<(String, String)> = m
+            .list_models()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.id, e.revision))
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                ("org/both".to_string(), "r3".to_string()),
+                ("org/only-a".to_string(), "r1".to_string()),
+                ("org/only-b".to_string(), "r2".to_string()),
+            ]
+        );
+        let snap = |hub: &Path, repo: &str, rev: &str| hub.join(repo).join("snapshots").join(rev);
+        assert_eq!(
+            m.get_model_path("org/both"),
+            Some(snap(&a, "models--org--both", "r3"))
+        );
+        assert_eq!(
+            m.get_model_path("org/only-b"),
+            Some(snap(&b, "models--org--only-b", "r2"))
+        );
+        let reversed = HuggingFaceManager::with_dirs(vec![b.clone(), a.clone()]);
+        assert_eq!(
+            reversed.get_model_path("org/both"),
+            Some(snap(&b, "models--org--both", "r4"))
+        );
+        assert_eq!(m.repository_named("only-b"), Some("org/only-b".to_string()));
+        assert_eq!(m.repository_named("both"), Some("org/both".to_string()));
+        // Deleting a repository removes every copy.
+        m.delete_model("org/both").unwrap();
+        assert_eq!(m.get_model_path("org/both"), None);
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A pull resumes in the cache holding the repository; a repository held nowhere lands on
+    /// the first listed of equally fast disks; one larger than any disk lands nowhere.
+    #[test]
+    fn a_pull_resumes_where_the_repository_is() {
+        let scratch = super::model_dirs::tests::scratch;
+        let (a, b) = (scratch("hf-pull-a"), scratch("hf-pull-b"));
+        put_repo(&b, "org/partial", "rev", "half");
+        let m = HuggingFaceManager::with_dirs(vec![a.clone(), b.clone()]);
+        let wanted = [
+            ("model.safetensors", Some(4)),
+            ("rest.safetensors", Some(10)),
+        ];
+        assert_eq!(
+            m.destination("models--org--partial", "rev", &wanted, 14)
+                .unwrap(),
+            b
+        );
+        assert_eq!(
+            m.destination("models--org--new", "rev", &wanted, 14)
+                .unwrap(),
+            a
+        );
+        assert!(m
+            .destination("models--org--new", "rev", &wanted, u64::MAX)
+            .is_err());
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }

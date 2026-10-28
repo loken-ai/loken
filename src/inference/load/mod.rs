@@ -11,6 +11,7 @@ pub mod compensate;
 pub mod fp8_scaled;
 pub mod hf_config;
 pub mod huggingface_manager;
+pub mod model_dirs;
 pub mod model_manager;
 pub mod mtp_head;
 pub mod ollama_manager;

@@ -234,8 +234,10 @@ pub struct Config {
     pub server: Option<ServerConfig>,
     #[serde(default)]
     pub inference: InferenceConfigToml,
-    pub ollama_models_dir: Option<String>,
-    pub huggingface_models_dir: Option<String>,
+    /// The Ollama stores: one directory, or a list of them read as one catalogue.
+    pub ollama_models_dir: Option<DirList>,
+    /// The Hugging Face stores, as `ollama_models_dir`.
+    pub huggingface_models_dir: Option<DirList>,
     /// Where LoRA adapters are kept. Requests name an adapter, never a path, and the
     /// name is resolved inside this directory - see `native_lora::resolve`.
     pub lora_dir: Option<String>,
@@ -246,6 +248,51 @@ pub struct Config {
     /// Clustering policy. Absent = this node runs alone, and every cluster path is skipped.
     #[serde(default)]
     pub cluster: Option<ClusterConfigToml>,
+}
+
+/// One model directory or several, as `ollama_models_dir` and `huggingface_models_dir` take
+/// them: a string, or a list of strings. The first listed receives the models built here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirList(pub Vec<String>);
+
+impl DirList {
+    /// A single directory.
+    pub fn one(dir: impl Into<String>) -> Self {
+        Self(vec![dir.into()])
+    }
+
+    /// The directories as paths, empty entries left out.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.0
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for DirList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match Form::deserialize(d)? {
+            Form::One(dir) => DirList(vec![dir]),
+            Form::Many(dirs) => DirList(dirs),
+        })
+    }
+}
+
+impl serde::Serialize for DirList {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [one] => s.serialize_str(one),
+            many => serde::Serialize::serialize(many, s),
+        }
+    }
 }
 
 /// What clustering needs told to it. The fabric is discovered; only policy is configured.
@@ -462,12 +509,23 @@ impl Config {
         }
     }
 
-    /// Get the configured Ollama models directory (or default)
-    pub fn get_ollama_models_dir(&self) -> PathBuf {
-        self.ollama_models_dir
+    /// The configured Ollama models directories in the order listed, or the default one.
+    pub fn get_ollama_models_dirs(&self) -> Vec<PathBuf> {
+        let dirs = self
+            .ollama_models_dir
             .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::default_ollama_models_dir)
+            .map(DirList::paths)
+            .unwrap_or_default();
+        if dirs.is_empty() {
+            vec![Self::default_ollama_models_dir()]
+        } else {
+            dirs
+        }
+    }
+
+    /// The first configured Ollama models directory (or default): where models built here go.
+    pub fn get_ollama_models_dir(&self) -> PathBuf {
+        self.get_ollama_models_dirs().swap_remove(0)
     }
 
     /// Get the configured LoRA directory (or a `loras` sibling of the model store).
@@ -481,12 +539,23 @@ impl Config {
             })
     }
 
-    /// Get the configured HuggingFace models directory (or default)
-    pub fn get_hf_models_dir(&self) -> PathBuf {
-        self.huggingface_models_dir
+    /// The configured HuggingFace models directories in the order listed, or the default one.
+    pub fn get_hf_models_dirs(&self) -> Vec<PathBuf> {
+        let dirs = self
+            .huggingface_models_dir
             .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::default_hf_models_dir)
+            .map(DirList::paths)
+            .unwrap_or_default();
+        if dirs.is_empty() {
+            vec![Self::default_hf_models_dir()]
+        } else {
+            dirs
+        }
+    }
+
+    /// The first configured HuggingFace models directory (or default).
+    pub fn get_hf_models_dir(&self) -> PathBuf {
+        self.get_hf_models_dirs().swap_remove(0)
     }
 
     /// The separate configuration the ignored tests read, so that they resolve the model
@@ -560,10 +629,64 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.ollama_models_dir.as_deref(), Some("/models"));
+        assert_eq!(config.ollama_models_dir, Some(DirList::one("/models")));
         assert_eq!(config.server().port, 11436);
         assert_eq!(config.inference.model_id, DEFAULT_MODEL_ID);
         assert_eq!(config.inference.replicas, 1);
+    }
+
+    #[test]
+    fn a_models_directory_is_one_string_or_a_list() {
+        let old: Config = toml::from_str(
+            "ollama_models_dir = \"/disk1/ollama\"\nhuggingface_models_dir = \"/disk1/hf\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            old.get_ollama_models_dirs(),
+            [PathBuf::from("/disk1/ollama")]
+        );
+        assert_eq!(old.get_ollama_models_dir(), PathBuf::from("/disk1/ollama"));
+        assert_eq!(old.get_hf_models_dir(), PathBuf::from("/disk1/hf"));
+        let many: Config = toml::from_str(
+            "ollama_models_dir = [\"/disk1/ollama\", \"/disk2/ollama\"]\n\
+             huggingface_models_dir = [\"/disk2/hf\", \"\", \"/disk1/hf\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            many.get_ollama_models_dirs(),
+            [
+                PathBuf::from("/disk1/ollama"),
+                PathBuf::from("/disk2/ollama")
+            ]
+        );
+        assert_eq!(many.get_ollama_models_dir(), PathBuf::from("/disk1/ollama"));
+        assert_eq!(
+            many.get_hf_models_dirs(),
+            [PathBuf::from("/disk2/hf"), PathBuf::from("/disk1/hf")]
+        );
+        // An empty list is the default directory, as an absent key is.
+        let empty: Config = toml::from_str("ollama_models_dir = []\n").unwrap();
+        assert_eq!(
+            empty.get_ollama_models_dirs(),
+            [Config::default_ollama_models_dir()]
+        );
+        // A single directory is written back in the old form, several as a list.
+        #[derive(serde::Serialize)]
+        struct Written {
+            ollama_models_dir: DirList,
+        }
+        let one = toml::to_string(&Written {
+            ollama_models_dir: DirList::one("/disk1/ollama"),
+        })
+        .unwrap();
+        assert_eq!(one.trim(), "ollama_models_dir = \"/disk1/ollama\"");
+        let list = many.ollama_models_dir.clone().unwrap();
+        let written = toml::to_string(&Written {
+            ollama_models_dir: list.clone(),
+        })
+        .unwrap();
+        let again: Config = toml::from_str(&written).unwrap();
+        assert_eq!(again.ollama_models_dir, Some(list));
     }
 
     #[test]
@@ -598,32 +721,46 @@ mod tests {
 /// music pipelines among them - reads these, so that every family looks in the store the
 /// configuration names. Without them, one such loader read the test configuration and
 /// looked for weights in a store the daemon was never given.
-static STORES: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+/// The directories of each kind, in the order the configuration lists them.
+type Stores = (Vec<PathBuf>, Vec<PathBuf>);
 
-/// Record the Ollama and Hugging Face stores of this process; the daemon calls it once at
-/// start. The first call wins. A server built in a test installs nothing, so a test that
-/// opens a real checkpoint reads the test configuration's store.
-pub fn install_stores(ollama: &str, huggingface: &str) {
-    let _ = STORES.set((PathBuf::from(ollama), PathBuf::from(huggingface)));
+static STORES: std::sync::OnceLock<Stores> = std::sync::OnceLock::new();
+
+/// Record the Ollama and Hugging Face directories of this process, in the order the
+/// configuration lists them; the daemon calls it once at start. The first call wins. A server
+/// built in a test installs nothing, so a test that opens a real checkpoint reads the test
+/// configuration's stores.
+pub fn install_stores(ollama: &[PathBuf], huggingface: &[PathBuf]) {
+    let _ = STORES.set((ollama.to_vec(), huggingface.to_vec()));
 }
 
-fn stores() -> (PathBuf, PathBuf) {
+fn stores() -> Stores {
     if let Some(installed) = STORES.get() {
         return installed.clone();
     }
     let cfg = Config::load_default().unwrap_or_else(|_| Config::load_test());
-    (cfg.get_ollama_models_dir(), cfg.get_hf_models_dir())
+    (cfg.get_ollama_models_dirs(), cfg.get_hf_models_dirs())
 }
 
-/// The Ollama store of this process: installed, else the default configuration, else the
-/// test one.
-pub fn ollama_models_dir() -> PathBuf {
+/// Every Ollama directory of this process, in the order listed: installed, else the default
+/// configuration's, else the test one's. Never empty.
+pub fn ollama_models_dirs() -> Vec<PathBuf> {
     stores().0
 }
 
-/// The Hugging Face store of this process, resolved like [`ollama_models_dir`].
-pub fn hf_models_dir() -> PathBuf {
+/// Every Hugging Face directory of this process, resolved like [`ollama_models_dirs`].
+pub fn hf_models_dirs() -> Vec<PathBuf> {
     stores().1
+}
+
+/// The first Ollama directory of this process: where models built here go.
+pub fn ollama_models_dir() -> PathBuf {
+    stores().0.swap_remove(0)
+}
+
+/// The first Hugging Face directory of this process.
+pub fn hf_models_dir() -> PathBuf {
+    stores().1.swap_remove(0)
 }
 
 #[cfg(test)]
@@ -633,14 +770,16 @@ mod store_tests {
         // The stores installed are the test configuration's, the ones every test that opens a
         // real checkpoint reads, so this test changes nothing for them.
         let cfg = super::Config::load_test();
+        super::install_stores(&cfg.get_ollama_models_dirs(), &cfg.get_hf_models_dirs());
+        let (ollama, hf) = (super::ollama_models_dirs(), super::hf_models_dirs());
+        assert!(!ollama.is_empty() && !hf.is_empty());
+        assert_eq!(super::ollama_models_dir(), ollama[0]);
+        assert_eq!(super::hf_models_dir(), hf[0]);
         super::install_stores(
-            &cfg.get_ollama_models_dir().to_string_lossy(),
-            &cfg.get_hf_models_dir().to_string_lossy(),
+            &[std::path::PathBuf::from("/other/ollama")],
+            &[std::path::PathBuf::from("/other/hf")],
         );
-        let (ollama, hf) = (super::ollama_models_dir(), super::hf_models_dir());
-        assert!(!ollama.as_os_str().is_empty() && !hf.as_os_str().is_empty());
-        super::install_stores("/other/ollama", "/other/hf");
-        assert_eq!(super::ollama_models_dir(), ollama);
-        assert_eq!(super::hf_models_dir(), hf);
+        assert_eq!(super::ollama_models_dirs(), ollama);
+        assert_eq!(super::hf_models_dirs(), hf);
     }
 }

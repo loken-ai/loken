@@ -6,7 +6,8 @@
 //! - Direct URLs
 //!
 //! Storage approach:
-//! - Models stored directly in ollama_models_dir or huggingface_models_dir based on source
+//! - Models stored directly in ollama_models_dir or huggingface_models_dir based on source;
+//!   each may list several directories, read as one catalogue (see `model_dirs`)
 //! - No manifest or hash-based storage system
 //! - Direct directory-based resolution
 

@@ -20,13 +20,12 @@ pub fn models_dir() -> String {
         .into_owned()
 }
 
-/// The `hub/` directory holding the cached repositories.
+/// The `hub/` directory under a configured models directory.
 ///
 /// The configured value may point at the cache root or at `hub/` itself; both are
 /// written in the wild, so both are accepted and normalised here rather than at each
 /// of the call sites.
-pub fn hub() -> PathBuf {
-    let dir = crate::config::hf_models_dir();
+fn hub_of(dir: PathBuf) -> PathBuf {
     if dir.file_name().is_some_and(|n| n == "hub") {
         dir
     } else {
@@ -34,12 +33,30 @@ pub fn hub() -> PathBuf {
     }
 }
 
-/// Where a repository's snapshots live, whether or not any has been downloaded.
+/// The `hub/` directory of the first configured models directory.
+pub fn hub() -> PathBuf {
+    hub_of(crate::config::hf_models_dir())
+}
+
+/// Every configured `hub/` directory, in the order a repository held by several is read.
+pub fn hubs() -> Vec<PathBuf> {
+    crate::inference::load::model_dirs::read_order(&crate::config::hf_models_dirs())
+        .into_iter()
+        .map(hub_of)
+        .collect()
+}
+
+/// Where a repository's snapshots live, whether or not any has been downloaded: in the
+/// first hub holding the repository, else in the first configured one.
 ///
 /// Returned even when it does not exist so an error can name the directory the
 /// weights were expected in.
 pub fn snapshots(repo: &str) -> PathBuf {
-    hub().join(repo).join("snapshots")
+    hubs()
+        .into_iter()
+        .map(|h| h.join(repo).join("snapshots"))
+        .find(|s| s.is_dir())
+        .unwrap_or_else(|| hub().join(repo).join("snapshots"))
 }
 
 /// The snapshot of `repo` holding `marker`, if one is present.
