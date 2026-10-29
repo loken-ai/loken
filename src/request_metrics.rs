@@ -3,10 +3,14 @@
 //! the prompt's share served from the cache among them.
 //!
 //! Each serving path records a request once, where it already holds these figures, and the
-//! metrics endpoint reads them as histograms. Nothing here measures.
+//! metrics endpoint reads them as histograms. A request that carries a [`RequestProbe`] also
+//! gets its own figures back through it. Nothing here measures.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// The upper bound of the first time bucket, in seconds; each next bound doubles it.
 const SECONDS_FIRST_BOUND: f64 = 0.001;
@@ -128,6 +132,150 @@ impl ModelRequests {
     }
 }
 
+/// A request's sequence in the KV cache when it ended, and the tokens the cache holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvPlace {
+    pub used_tokens: u64,
+    pub capacity_tokens: u64,
+}
+
+impl KvPlace {
+    /// The place, when the backend reports both its sequence length and its capacity.
+    pub fn of(used: Option<usize>, capacity: Option<usize>) -> Option<Self> {
+        Some(Self {
+            used_tokens: used? as u64,
+            capacity_tokens: capacity? as u64,
+        })
+    }
+}
+
+/// What one request's decode path saw once it ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RequestOutcome {
+    pub figures: RequestFigures,
+    /// Tokens proposed by speculation and verified by the model.
+    pub drafted: u64,
+    /// Proposed tokens the model kept.
+    pub accepted: u64,
+    /// `None` when the backend does not report its cache.
+    pub kv: Option<KvPlace>,
+}
+
+/// One request's line from its decode path back to its handler: how far the prompt is read
+/// while it is read, and the outcome once the request ends. Shared by the clones of the
+/// request's parameters.
+#[derive(Debug, Default)]
+pub struct RequestProbe {
+    prefill_done: AtomicU64,
+    prefill_total: AtomicU64,
+    prefill_started: OnceLock<Instant>,
+    /// Tokens generated so far.
+    decoded: AtomicU64,
+    outcome: Mutex<Option<RequestOutcome>>,
+}
+
+impl RequestProbe {
+    /// Tokens of the prompt read so far and tokens to read; `(0, 0)` before the reading starts.
+    pub fn prefill(&self) -> (u64, u64) {
+        (
+            self.prefill_done.load(Ordering::Relaxed),
+            self.prefill_total.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Time since the reading of the prompt started; `None` before it starts.
+    pub fn prefill_elapsed(&self) -> Option<Duration> {
+        self.prefill_started.get().map(Instant::elapsed)
+    }
+
+    pub fn note_prefill(&self, done: u64, total: u64) {
+        self.prefill_started.get_or_init(Instant::now);
+        self.prefill_total.store(total, Ordering::Relaxed);
+        self.prefill_done.store(done, Ordering::Relaxed);
+    }
+
+    pub fn note_decoded(&self, generated: u64) {
+        self.decoded.store(generated, Ordering::Relaxed);
+    }
+
+    /// Tokens the model has computed for the request so far: its prompt read and its answer
+    /// generated. Each costs the model about the same operations, which is what the energy
+    /// of overlapping requests is shared by.
+    pub fn work(&self) -> u64 {
+        self.prefill_done.load(Ordering::Relaxed) + self.decoded.load(Ordering::Relaxed)
+    }
+
+    pub fn finish(&self, outcome: RequestOutcome) {
+        self.note_decoded(outcome.figures.generated_tokens);
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    }
+
+    pub fn outcome(&self) -> Option<RequestOutcome> {
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+thread_local! {
+    /// The probe of the request whose prompt this thread reads.
+    static PREFILL_PROBE: RefCell<Option<Arc<RequestProbe>>> = const { RefCell::new(None) };
+}
+
+/// Binds `probe` to this thread until the guard drops: the chunked prefill run on the thread
+/// reports its progress to it.
+pub fn bind_prefill(probe: Option<Arc<RequestProbe>>) -> PrefillBinding {
+    let previous = PREFILL_PROBE.with(|p| p.replace(probe));
+    PrefillBinding { previous }
+}
+
+/// Restores the thread's previous probe when dropped.
+pub struct PrefillBinding {
+    previous: Option<Arc<RequestProbe>>,
+}
+
+impl Drop for PrefillBinding {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        PREFILL_PROBE.with(|p| *p.borrow_mut() = previous);
+    }
+}
+
+/// Milliseconds a prefill reporting to a bound probe pauses after each report short of the
+/// whole prompt: a slow prefill for the tests of the routes that report it.
+#[cfg(test)]
+pub static PREFILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Reports `done` of `total` prompt tokens read to the probe bound to this thread, if any.
+pub fn note_prefill(done: usize, total: usize) {
+    PREFILL_PROBE.with(|p| {
+        if let Some(probe) = p.borrow().as_ref() {
+            probe.note_prefill(done as u64, total as u64);
+            #[cfg(test)]
+            if done < total {
+                std::thread::sleep(Duration::from_millis(
+                    PREFILL_PAUSE_MS.load(Ordering::Relaxed),
+                ));
+            }
+        }
+    });
+}
+
+/// Reports the tokens generated so far to the probe bound to this thread, if any.
+pub fn note_decoded(generated: usize) {
+    PREFILL_PROBE.with(|p| {
+        if let Some(probe) = p.borrow().as_ref() {
+            probe.note_decoded(generated as u64);
+        }
+    });
+}
+
+/// Takes in one finished request of `model` and hands its outcome to the request's probe.
+pub fn record_outcome(model: &str, probe: Option<&RequestProbe>, outcome: RequestOutcome) {
+    record(model, &outcome.figures);
+    if let Some(p) = probe {
+        p.finish(outcome);
+    }
+}
+
 static BY_MODEL: Mutex<BTreeMap<String, ModelRequests>> = Mutex::new(BTreeMap::new());
 
 /// Takes in one finished request of `model`.
@@ -204,5 +352,29 @@ mod tests {
         assert_eq!((all[a].gate_s.count, all[b].gate_s.sum), (0, 0.5));
         assert_eq!(all[a].cached_prompt_tokens.sum, 128.0);
         assert_eq!(all[a].decode_s.sum, 4.0);
+    }
+
+    /// The prefill on a thread reports to the probe bound there, and to none once the binding
+    /// drops; the outcome reaches the probe it was recorded with.
+    #[test]
+    fn a_bound_probe_hears_the_prefill_and_the_outcome() {
+        let probe = Arc::new(RequestProbe::default());
+        note_prefill(1, 9);
+        assert_eq!(probe.prefill(), (0, 0));
+        {
+            let _bound = bind_prefill(Some(probe.clone()));
+            note_prefill(4, 9);
+        }
+        note_prefill(7, 9);
+        assert_eq!(probe.prefill(), (4, 9));
+        let outcome = RequestOutcome {
+            drafted: 5,
+            accepted: 3,
+            kv: KvPlace::of(Some(12), Some(64)),
+            ..Default::default()
+        };
+        record_outcome("request-metrics-test-probe", Some(&probe), outcome);
+        assert_eq!(probe.outcome(), Some(outcome));
+        assert_eq!(KvPlace::of(Some(12), None), None);
     }
 }

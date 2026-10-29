@@ -115,6 +115,7 @@ impl LlmEngine {
         let stops = params.stop_sequences.clone();
         let (model_id, prompt_len) = (self.config.model_id.clone(), tokens.len());
         let submitted = std::time::Instant::now();
+        let probe = params.probe.clone();
         let cb_rx = server.submit_cb(tokens, max_new, sampling);
         std::thread::spawn(move || {
             let mut gen: Vec<u32> = Vec::new();
@@ -199,15 +200,20 @@ impl LlmEngine {
             let done = std::time::Instant::now();
             if let Some((at, cached)) = admitted {
                 let first = first_token.unwrap_or(done);
-                crate::request_metrics::record(
+                // The worker speculates and keeps the cache on its own: neither is reported.
+                crate::request_metrics::record_outcome(
                     &model_id,
-                    &crate::request_metrics::RequestFigures {
-                        queue_s: at.saturating_duration_since(submitted).as_secs_f64(),
-                        prefill_s: first.saturating_duration_since(at).as_secs_f64(),
-                        decode_s: done.saturating_duration_since(first).as_secs_f64(),
-                        prompt_tokens: prompt_len as u64,
-                        cached_prompt_tokens: cached as u64,
-                        generated_tokens: gen.len() as u64,
+                    probe.as_deref(),
+                    crate::request_metrics::RequestOutcome {
+                        figures: crate::request_metrics::RequestFigures {
+                            queue_s: at.saturating_duration_since(submitted).as_secs_f64(),
+                            prefill_s: first.saturating_duration_since(at).as_secs_f64(),
+                            decode_s: done.saturating_duration_since(first).as_secs_f64(),
+                            prompt_tokens: prompt_len as u64,
+                            cached_prompt_tokens: cached as u64,
+                            generated_tokens: gen.len() as u64,
+                        },
+                        ..Default::default()
                     },
                 );
             }
@@ -322,8 +328,10 @@ impl LlmEngine {
         // unchanged - the drafter only proposes).
         let spec_engine = self.clone_for_spec();
         let spec_rt = tokio::runtime::Handle::current();
+        let probe = params.probe.clone();
 
         std::thread::spawn(move || {
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
             let stream_start = std::time::Instant::now();
             let locked;
             #[allow(unused_assignments)]
@@ -1442,6 +1450,7 @@ impl LlmEngine {
             use crate::inference::offload::prof_record;
             let mut last_top: Option<Instant> = None;
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
+                crate::request_metrics::note_decoded(token_count);
                 let step_start = Instant::now();
                 if let Some(t) = last_top.replace(step_start) {
                     prof_record("token: iteration", t.elapsed().as_nanos() as u64);
@@ -3105,6 +3114,9 @@ impl LlmEngine {
                 prompt_tokens.len().saturating_sub(reused_prompt_tokens),
                 prompt_eval_duration_ns / 1_000_000
             );
+            let kv = model_state.blocking_lock().as_ref().and_then(|s| {
+                crate::request_metrics::KvPlace::of(s.model.kv_len(), s.model.kv_capacity())
+            });
             if let Ok(mut slot) = stream_stats_slot.lock() {
                 if !logprob_buf.is_empty() {
                     if let Ok(mut q) = logprob_queue.lock() {
@@ -3120,17 +3132,23 @@ impl LlmEngine {
                 } else {
                     FinishReason::Disconnect
                 };
-                crate::request_metrics::record(
+                crate::request_metrics::record_outcome(
                     &config.model_id,
-                    &crate::request_metrics::RequestFigures {
-                        queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
-                        prefill_s: prefill_end.map_or(0.0, |end| {
-                            end.saturating_duration_since(locked).as_secs_f64()
-                        }),
-                        decode_s: compute_ns as f64 / 1e9,
-                        prompt_tokens: prompt_tokens.len() as u64,
-                        cached_prompt_tokens: reused_prompt_tokens as u64,
-                        generated_tokens: token_count as u64,
+                    probe.as_deref(),
+                    crate::request_metrics::RequestOutcome {
+                        figures: crate::request_metrics::RequestFigures {
+                            queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
+                            prefill_s: prefill_end.map_or(0.0, |end| {
+                                end.saturating_duration_since(locked).as_secs_f64()
+                            }),
+                            decode_s: compute_ns as f64 / 1e9,
+                            prompt_tokens: prompt_tokens.len() as u64,
+                            cached_prompt_tokens: reused_prompt_tokens as u64,
+                            generated_tokens: token_count as u64,
+                        },
+                        drafted: spec_drafted + copy_drafted + pld_stats_drafted,
+                        accepted: spec_accepted + copy_accepted + pld_stats_accepted,
+                        kv,
                     },
                 );
                 *slot = Some(StreamStats {

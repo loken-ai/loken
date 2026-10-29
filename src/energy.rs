@@ -158,13 +158,23 @@ impl EnergyMeter {
     }
 
     /// Close the window and return the energy drawn across the available domains.
-    pub fn stop(self) -> EnergyWindow {
-        let duration_s = self.t0.elapsed().as_secs_f64();
+    pub fn stop(mut self) -> EnergyWindow {
+        self.lap()
+    }
+
+    /// The energy drawn since the window opened or since the last lap, read once; the next
+    /// window opens at that reading, so consecutive laps cover the time without a gap.
+    pub fn lap(&mut self) -> EnergyWindow {
+        let now = Instant::now();
+        let duration_s = now.saturating_duration_since(self.t0).as_secs_f64();
         let (domains, rapl_readable) = rapl_domains_cached();
         let rapl_end = rapl_snapshot(domains);
         let (pkg_j, dram_j) = rapl_delta_j(domains, &self.rapl_start, &rapl_end);
         let gpu_end_j = nvml_cached().and_then(nvml_counter_sum_j);
-        let (gpu_energy_j, gpu_path) = match (self.gpu_start_j, gpu_end_j) {
+        let gpu_start_j = std::mem::replace(&mut self.gpu_start_j, gpu_end_j);
+        self.rapl_start = rapl_end;
+        self.t0 = now;
+        let (gpu_energy_j, gpu_path) = match (gpu_start_j, gpu_end_j) {
             (Some(s), Some(e)) => ((e - s).max(0.0), GpuEnergyPath::NvmlCounter),
             _ => (0.0, GpuEnergyPath::None),
         };

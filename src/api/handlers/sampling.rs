@@ -371,6 +371,7 @@ impl SamplingRequest {
             top_logprobs: self.top_logprobs.map(|v| v as usize),
             cancel: None,
             rules: self.rules,
+            probe: None,
         }
     }
 }

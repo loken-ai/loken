@@ -3572,6 +3572,8 @@ mod panic_isolation_gate {
 }
 
 #[cfg(test)]
+mod request_figures_tests;
+#[cfg(test)]
 mod tests;
 
 /// Renders in flight, by identifier.

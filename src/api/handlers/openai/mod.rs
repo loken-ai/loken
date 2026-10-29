@@ -133,6 +133,10 @@ where
     out["usage"]["prompt_tokens"] = serde_json::json!(prompt_tokens);
     out["usage"]["completion_tokens"] = serde_json::json!(completion_tokens);
     out["usage"]["total_tokens"] = serde_json::json!(prompt_tokens + completion_tokens);
+    // The figures of one run do not describe the merged answer.
+    if let Some(usage) = out["usage"].as_object_mut() {
+        usage.remove("loken");
+    }
     Ok(Json(out).into_response())
 }
 
@@ -555,8 +559,25 @@ pub(crate) async fn chat_completion_at(
         // Taken before the engine reads the prompt: the first message of a stream only comes
         // once the prefill is done, and a time to first token counted from after it is zero.
         let stream_started = std::time::Instant::now();
-        match engine.generate_stream(&prompt, params.clone()).await {
-            Ok(mut rx) => {
+        // The request's own figures come back through the probe; its energy is metered from
+        // here to the end of its answer.
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        let energy = crate::energy_report::begin_with(Some(probe.clone()));
+        let start = {
+            let (engine, prompt) = (engine.clone(), prompt.clone());
+            let params = GenerationParams {
+                probe: Some(probe.clone()),
+                ..params.clone()
+            };
+            Box::pin(async move {
+                engine
+                    .generate_stream(&prompt, params)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        };
+        match crate::api::request_figures::open_stream(start).await {
+            Ok(opening) => {
                 let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
                 let model_name_clone = model_name.clone();
                 // Fixed at request time so every chunk in this stream
@@ -578,6 +599,47 @@ pub(crate) async fn chat_completion_at(
                     );
                     role_chunk.service_tier = service_tier.clone();
                     yield Ok::<_, axum::Error>(Event::default().data(to_json_string!(&role_chunk)));
+
+                    // A prompt still being read reports its reading as comment lines.
+                    let mut rx = match opening {
+                        crate::api::request_figures::Opening::Open(rx) => rx,
+                        crate::api::request_figures::Opening::Reading(start) => {
+                            let mut reading = Box::pin(crate::api::request_figures::read_prompt(
+                                start,
+                                probe.clone(),
+                            ));
+                            let mut opened = None;
+                            while let Some(r) = futures::StreamExt::next(&mut reading).await {
+                                match r {
+                                    crate::api::request_figures::Reading::Progress { done, total } => {
+                                        yield Ok(Event::default().comment(
+                                            crate::api::request_figures::prefill_comment(done, total),
+                                        ));
+                                    }
+                                    crate::api::request_figures::Reading::Started(r) => opened = Some(r),
+                                }
+                            }
+                            match opened {
+                                Some(Ok(rx)) => rx,
+                                Some(Err(e)) => {
+                                    error!("Generation error (OpenAI chat completion stream-init): {e}");
+                                    let mut err_chunk = ChatCompletionChunk::new_delta_at(
+                                        &completion_id,
+                                        &model_name_clone,
+                                        created_at,
+                                        0,
+                                        ChunkDelta::content(format!("[Error: generate_stream: {e}]")),
+                                        Some("stop".to_string()),
+                                    );
+                                    err_chunk.service_tier = service_tier.clone();
+                                    yield Ok(Event::default().data(to_json_string!(&err_chunk)));
+                                    yield Ok(Event::default().data("[DONE]"));
+                                    return;
+                                }
+                                None => return,
+                            }
+                        }
+                    };
 
                     let mut token_count: i32 = 0;
                     let mut first_token_at: Option<std::time::Instant> = None;
@@ -688,6 +750,7 @@ pub(crate) async fn chat_completion_at(
                     // "tool_calls" when the model invoked functions.
                     // The text held back for a stop sequence goes first, without the stop.
                     let stats = engine_for_stats.take_last_stream_stats();
+                    let energy = crate::energy_report::end_share(energy, "text", "[/v1/chat/completions]");
                     let held = format!(
                         "{echo_pending}{}",
                         holdback.finish(stats.as_ref().map(|s| &s.finish_reason))
@@ -811,7 +874,8 @@ pub(crate) async fn chat_completion_at(
                             s.eval_count,
                         ),
                         None => Usage::new(prompt_tokens, token_count),
-                    };
+                    }
+                    .with_request(probe.outcome().as_ref(), energy.as_ref());
                     let (in_tokens, out_tokens) = (usage.prompt_tokens, usage.completion_tokens);
                     if include_usage {
                         if !reasoning_acc.is_empty() {
@@ -924,6 +988,9 @@ pub(crate) async fn chat_completion_at(
             }
             return Ok(Json(response).into_response());
         }
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        params.probe = Some(probe.clone());
+        let energy = crate::energy_report::begin_with(Some(probe.clone()));
         let mut result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
         let (content, finish_reason, completion_tokens, prompt_tokens, cached_tokens) =
             match engine.generate(&prompt, params).await {
@@ -960,6 +1027,7 @@ pub(crate) async fn chat_completion_at(
                     return Err(ApiError::Internal(format!("generate: {e}")));
                 }
             };
+        let energy = crate::energy_report::end_share(energy, "text", "[/v1/chat/completions]");
 
         let (reasoning, message, finish_reason) =
             assistant_message(&reply, &content, finish_reason);
@@ -974,7 +1042,8 @@ pub(crate) async fn chat_completion_at(
             format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             model_name,
             vec![choice],
-            Usage::from_counts(prompt_tokens, cached_tokens, completion_tokens as u64),
+            Usage::from_counts(prompt_tokens, cached_tokens, completion_tokens as u64)
+                .with_request(probe.outcome().as_ref(), energy.as_ref()),
         );
         if let Some(r) = reasoning.as_deref() {
             if let (Some(n), Some(d)) = (

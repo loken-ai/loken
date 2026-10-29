@@ -1661,6 +1661,9 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// The request's own times, energy and cache place, on a chat answer's final usage.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub loken: Option<crate::api::request_figures::LokenUsage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1691,7 +1694,26 @@ impl Usage {
             total_tokens: prompt_tokens + completion_tokens,
             prompt_tokens_details: Some(PromptTokensDetails::default()),
             completion_tokens_details: Some(CompletionTokensDetails::default()),
+            loken: None,
         }
+    }
+
+    /// Adds what the request reported about itself: the speculation's kept and refused
+    /// proposals, and the `loken` object.
+    pub fn with_request(
+        mut self,
+        outcome: Option<&crate::request_metrics::RequestOutcome>,
+        energy: Option<&crate::energy_report::EnergyShare>,
+    ) -> Self {
+        let (accepted, rejected) = crate::api::request_figures::prediction_tokens(outcome);
+        if let Some(d) = self.completion_tokens_details.as_mut() {
+            d.accepted_prediction_tokens = accepted as i32;
+            d.rejected_prediction_tokens = rejected as i32;
+        }
+        self.loken = Some(crate::api::request_figures::LokenUsage::new(
+            outcome, energy,
+        ));
+        self
     }
 
     /// Usage from what the engine counted: the prompt is the tokens it prefilled plus

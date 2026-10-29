@@ -13,7 +13,7 @@
 use crate::energy::{EnergyWindow, GpuEnergyPath};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Default grid carbon intensity (gCO₂eq / kWh). France's low-carbon grid; override
 /// per region via config (`carbon_intensity`). World average ≈ 480, coal-heavy ≈ 800.
@@ -109,6 +109,32 @@ impl EnergyReport {
             duration_s: w.duration_s,
             estimated,
             unmeasured,
+            domains,
+            equiv: EnergyEquivalents::from_joules(energy_j),
+        }
+    }
+
+    /// Build from one request's share of the samples it was active in.
+    pub fn from_share(share: &EnergyShare, carbon_intensity: f64, water_l_per_kwh: f64) -> Self {
+        let energy_j = share.joules().unwrap_or(0.0);
+        let mut domains = Vec::new();
+        if share.gpu_j.is_some() {
+            domains.push("gpu".to_string());
+        }
+        match (share.cpu_j, share.cpu_estimated) {
+            (Some(_), false) => domains.push("cpu_pkg".to_string()),
+            (Some(_), true) => domains.push("cpu_est".to_string()),
+            (None, _) => {}
+        }
+        let wh = energy_j / 3600.0;
+        Self {
+            energy_j,
+            wh,
+            gco2: wh * carbon_intensity / 1000.0,
+            water_liters: wh / 1000.0 * water_l_per_kwh,
+            duration_s: share.duration_s,
+            estimated: share.cpu_estimated && share.cpu_j.is_some(),
+            unmeasured: energy_j <= 0.0,
             domains,
             equiv: EnergyEquivalents::from_joules(energy_j),
         }
@@ -394,30 +420,226 @@ pub fn tracker() -> &'static EnergyTracker {
     TRACKER.get_or_init(EnergyTracker::new)
 }
 
-/// Start a per-request meter iff energy reporting is enabled (else `None`, zero cost).
+// -- per-request shares of the energy drawn while requests overlap --
+
+/// One request's part of the energy drawn while it ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EnergyShare {
+    /// GPU joules from the hardware counter; `None` when no counter was read.
+    pub gpu_j: Option<f64>,
+    /// CPU package and DRAM joules, read from RAPL or estimated from the configured TDP;
+    /// `None` when neither reads them.
+    pub cpu_j: Option<f64>,
+    /// The CPU part was not read from RAPL.
+    pub cpu_estimated: bool,
+    /// Another request was active during at least one of its samples.
+    pub shared: bool,
+    /// Seconds from its start to its end.
+    pub duration_s: f64,
+}
+
+impl EnergyShare {
+    /// The domains read, summed; `None` when no domain was read.
+    pub fn joules(&self) -> Option<f64> {
+        sum(self.gpu_j, self.cpu_j)
+    }
+}
+
+fn sum(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+    }
+}
+
+/// One metered request: what it has drawn so far, and its work as last sampled.
+#[derive(Default)]
+struct Entry {
+    share: EnergyShare,
+    /// The request's work counter (tokens computed); `None` when nothing reports it.
+    probe: Option<Arc<crate::request_metrics::RequestProbe>>,
+    work_sampled: u64,
+}
+
+/// The requests being metered and what each has drawn so far. A sample is the energy read
+/// between two consecutive starts or ends of requests, so the set of active requests is the
+/// same over the whole sample; it is split among them by the work each did over it.
+#[derive(Default)]
+struct Ledger {
+    active: HashMap<u64, Entry>,
+}
+
+impl Ledger {
+    /// Splits the sample `w` among the requests active over it, each by its part of the tokens
+    /// computed over the sample; evenly when none reports any. Without RAPL the CPU part is
+    /// `cpu_tdp_w` over the sample's duration when a TDP is configured.
+    fn sample(&mut self, w: &EnergyWindow, cpu_tdp_w: f64) {
+        let n = self.active.len();
+        if n == 0 {
+            return;
+        }
+        let gpu = (w.gpu_path == GpuEnergyPath::NvmlCounter).then_some(w.gpu_energy_j);
+        let cpu = if w.cpu_rapl_available {
+            Some(w.cpu_pkg_energy_j + w.dram_energy_j)
+        } else if cpu_tdp_w > 0.0 {
+            Some(cpu_tdp_w * w.duration_s)
+        } else {
+            None
+        };
+        let done: Vec<(u64, u64)> = self
+            .active
+            .iter()
+            .map(|(&id, e)| {
+                let now = e.probe.as_ref().map_or(e.work_sampled, |p| p.work());
+                (id, now.saturating_sub(e.work_sampled))
+            })
+            .collect();
+        let total: u64 = done.iter().map(|&(_, d)| d).sum();
+        for (id, d) in done {
+            let part = if total > 0 {
+                d as f64 / total as f64
+            } else {
+                1.0 / n as f64
+            };
+            let e = self.active.get_mut(&id).expect("an active request");
+            e.work_sampled += d;
+            let s = &mut e.share;
+            s.gpu_j = sum(s.gpu_j, gpu.map(|j| j * part));
+            s.cpu_j = sum(s.cpu_j, cpu.map(|j| j * part));
+            s.cpu_estimated |= !w.cpu_rapl_available;
+            s.shared |= n > 1;
+        }
+    }
+}
+
+/// The meter read at every start and end of a metered request, open while one is active.
+#[derive(Default)]
+struct Meters {
+    meter: Option<crate::energy::EnergyMeter>,
+    ledger: Ledger,
+    next_id: u64,
+}
+
+static METERS: OnceLock<Mutex<Meters>> = OnceLock::new();
+
+fn meters() -> std::sync::MutexGuard<'static, Meters> {
+    METERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// One request's place in the shared meter, from [`begin`] to [`end_share`]. Dropped without
+/// being ended, it leaves the meter and its share is discarded.
+pub struct RequestEnergy {
+    id: u64,
+    started: std::time::Instant,
+    open: bool,
+}
+
+impl RequestEnergy {
+    fn open(probe: Option<Arc<crate::request_metrics::RequestProbe>>) -> Self {
+        let tdp = settings().cpu_tdp_w;
+        let mut guard = meters();
+        let m = &mut *guard;
+        match m.meter.as_mut() {
+            Some(meter) => m.ledger.sample(&meter.lap(), tdp),
+            None => m.meter = Some(crate::energy::EnergyMeter::start()),
+        }
+        let id = m.next_id;
+        m.next_id += 1;
+        let work_sampled = probe.as_ref().map_or(0, |p| p.work());
+        m.ledger.active.insert(
+            id,
+            Entry {
+                share: EnergyShare::default(),
+                probe,
+                work_sampled,
+            },
+        );
+        Self {
+            id,
+            started: std::time::Instant::now(),
+            open: true,
+        }
+    }
+
+    /// Leaves the meter, returning the share drawn since [`Self::open`].
+    fn close(mut self) -> EnergyShare {
+        self.open = false;
+        let mut share = close_entry(self.id);
+        share.duration_s = self.started.elapsed().as_secs_f64();
+        share
+    }
+}
+
+impl Drop for RequestEnergy {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = close_entry(self.id);
+        }
+    }
+}
+
+/// Reads the meter, splits the sample, and removes request `id`; the meter closes with the
+/// last active request.
+fn close_entry(id: u64) -> EnergyShare {
+    let tdp = settings().cpu_tdp_w;
+    let mut guard = meters();
+    let m = &mut *guard;
+    if let Some(meter) = m.meter.as_mut() {
+        m.ledger.sample(&meter.lap(), tdp);
+    }
+    let share = m
+        .ledger
+        .active
+        .remove(&id)
+        .map(|e| e.share)
+        .unwrap_or_default();
+    if m.ledger.active.is_empty() {
+        m.meter = None;
+    }
+    share
+}
+
+/// Start metering one request iff energy reporting is enabled (else `None`, zero cost).
 /// Pair with [`end`] around the inference call:
 /// ```ignore
 /// let m = energy_report::begin();
 /// // ... run inference ...
 /// energy_report::end(m, "text", "[/api/generate]");
 /// ```
-pub fn begin() -> Option<crate::energy::EnergyMeter> {
-    is_enabled().then(crate::energy::EnergyMeter::start)
+pub fn begin() -> Option<RequestEnergy> {
+    begin_with(None)
+}
+
+/// [`begin`] for a request whose probe counts its work, so that energy drawn while it overlaps
+/// others is shared by the work each did.
+pub fn begin_with(
+    probe: Option<Arc<crate::request_metrics::RequestProbe>>,
+) -> Option<RequestEnergy> {
+    is_enabled().then(|| RequestEnergy::open(probe))
 }
 
 /// Close a meter from [`begin`], emit the per-request log line + record to the session.
-pub fn end(meter: Option<crate::energy::EnergyMeter>, modality: &str, label: &str) {
-    let _ = end_measured(meter, modality, label);
+pub fn end(meter: Option<RequestEnergy>, modality: &str, label: &str) {
+    let _ = end_share(meter, modality, label);
 }
 
-/// [`end`] returning the measured joules (total across available domains), so
-/// handlers can include the figure in their response payloads.
-pub fn end_measured(
-    meter: Option<crate::energy::EnergyMeter>,
-    modality: &str,
-    label: &str,
-) -> Option<f64> {
-    meter.map(|m| report_window(modality, label, &m.stop()).energy_j)
+/// [`end`] returning the joules of the request's share (total across available domains),
+/// so handlers can include the figure in their response payloads.
+pub fn end_measured(meter: Option<RequestEnergy>, modality: &str, label: &str) -> Option<f64> {
+    end_share(meter, modality, label).map(|s| s.joules().unwrap_or(0.0))
+}
+
+/// [`end`] returning the request's share by domain and how it was shared.
+pub fn end_share(meter: Option<RequestEnergy>, modality: &str, label: &str) -> Option<EnergyShare> {
+    let share = meter?.close();
+    let s = settings();
+    let r = EnergyReport::from_share(&share, s.carbon_intensity, s.water_l_per_kwh);
+    tracing::info!("{label} {}", r.human_line());
+    tracker().record(modality, &r);
+    Some(share)
 }
 
 /// Build a report from a measured window using global settings, emit the per-request
@@ -485,5 +707,124 @@ mod tests {
         assert!(!r50.human_line().is_empty());
         assert!(!r50.estimated && !r50.unmeasured);
         assert!((r800.gco2 / r50.gco2 - 16.0).abs() < 1e-6); // CO₂ linear in carbon intensity
+    }
+
+    /// A sample of `gpu` joules from the counter (none when `None`) and `cpu` joules from
+    /// RAPL (unreadable when `None`), over `duration_s`.
+    fn sample(gpu: Option<f64>, cpu: Option<f64>, duration_s: f64) -> EnergyWindow {
+        EnergyWindow {
+            gpu_energy_j: gpu.unwrap_or(0.0),
+            cpu_pkg_energy_j: cpu.unwrap_or(0.0),
+            dram_energy_j: 0.0,
+            energy_j: gpu.unwrap_or(0.0) + cpu.unwrap_or(0.0),
+            duration_s,
+            gpu_path: if gpu.is_some() {
+                GpuEnergyPath::NvmlCounter
+            } else {
+                GpuEnergyPath::None
+            },
+            cpu_rapl_available: cpu.is_some(),
+            dram_rapl_available: false,
+            domains_counted: Vec::new(),
+            note: None,
+            gpu_decode_j: None,
+            cpu_pkg_decode_j: None,
+            dram_decode_j: None,
+            decode_energy_j: None,
+            decode_duration_s: None,
+        }
+    }
+
+    /// A request alone keeps every sample whole and is not marked shared.
+    #[test]
+    fn a_request_alone_keeps_every_sample() {
+        let mut l = Ledger::default();
+        l.active.insert(1, Entry::default());
+        l.sample(&sample(Some(10.0), Some(4.0), 1.0), 0.0);
+        l.sample(&sample(Some(2.0), Some(1.0), 1.0), 0.0);
+        let s = l.active.remove(&1).unwrap().share;
+        assert_eq!((s.gpu_j, s.cpu_j), (Some(12.0), Some(5.0)));
+        assert!(!s.shared && !s.cpu_estimated);
+        assert_eq!(s.joules(), Some(17.0));
+    }
+
+    /// Each sample is split evenly among the requests active over it when none reports its work, and every request that
+    /// met another is marked shared; the shares add up to what was drawn.
+    #[test]
+    fn a_sample_is_split_among_the_requests_active_over_it() {
+        let mut l = Ledger::default();
+        l.active.insert(1, Entry::default());
+        l.sample(&sample(Some(6.0), Some(2.0), 1.0), 0.0);
+        l.active.insert(2, Entry::default());
+        l.sample(&sample(Some(8.0), Some(4.0), 1.0), 0.0);
+        let a = l.active.remove(&1).unwrap().share;
+        l.sample(&sample(Some(3.0), Some(1.0), 1.0), 0.0);
+        let b = l.active.remove(&2).unwrap().share;
+        assert_eq!((a.gpu_j, a.cpu_j), (Some(10.0), Some(4.0)));
+        assert_eq!((b.gpu_j, b.cpu_j), (Some(7.0), Some(3.0)));
+        assert!(a.shared && b.shared);
+        assert_eq!(a.joules().unwrap() + b.joules().unwrap(), 24.0);
+    }
+
+    /// Without RAPL the CPU part is the configured TDP over the sample, split like the rest
+    /// and marked estimated; with no TDP it is not reported. Without a GPU counter the GPU
+    /// part is not reported.
+    /// Requests that report their work share each sample by the tokens each computed over it.
+    #[test]
+    fn a_sample_is_shared_by_the_work_done_over_it() {
+        use crate::request_metrics::RequestProbe;
+        let (long, short) = (
+            Arc::new(RequestProbe::default()),
+            Arc::new(RequestProbe::default()),
+        );
+        let mut l = Ledger::default();
+        for (id, p) in [(1, &long), (2, &short)] {
+            l.active.insert(
+                id,
+                Entry {
+                    probe: Some(p.clone()),
+                    ..Entry::default()
+                },
+            );
+        }
+        long.note_prefill(300, 300);
+        short.note_decoded(100);
+        l.sample(&sample(Some(40.0), Some(8.0), 1.0), 0.0);
+        let a = l.active.remove(&1).unwrap().share;
+        let b = l.active.remove(&2).unwrap().share;
+        assert_eq!((a.gpu_j, a.cpu_j), (Some(30.0), Some(6.0)));
+        assert_eq!((b.gpu_j, b.cpu_j), (Some(10.0), Some(2.0)));
+        assert!(a.shared && b.shared);
+    }
+
+    #[test]
+    fn an_unread_domain_is_estimated_or_left_out() {
+        let mut l = Ledger::default();
+        l.active.insert(1, Entry::default());
+        l.active.insert(2, Entry::default());
+        l.sample(&sample(None, None, 2.0), 50.0);
+        let s = l.active.remove(&1).unwrap().share;
+        assert_eq!((s.gpu_j, s.cpu_j), (None, Some(50.0)));
+        assert!(s.cpu_estimated && s.shared);
+        let mut l = Ledger::default();
+        l.active.insert(1, Entry::default());
+        l.sample(&sample(None, None, 2.0), 0.0);
+        let s = l.active.remove(&1).unwrap().share;
+        assert_eq!((s.gpu_j, s.cpu_j, s.joules()), (None, None, None));
+        assert!(s.cpu_estimated);
+    }
+
+    /// A metered request leaves the shared meter when it ends or is dropped, so a later
+    /// request alone is not marked shared.
+    #[test]
+    fn a_dropped_request_leaves_the_meter() {
+        let dropped = RequestEnergy::open(None);
+        drop(dropped);
+        let alone = RequestEnergy::open(None);
+        let id = alone.id;
+        assert!(!meters().ledger.active.contains_key(&(id - 1)));
+        let share = alone.close();
+        assert!(!meters().ledger.active.contains_key(&id));
+        assert!(share.duration_s >= 0.0);
     }
 }

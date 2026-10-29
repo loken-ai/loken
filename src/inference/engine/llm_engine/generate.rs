@@ -196,9 +196,11 @@ impl LlmEngine {
         // Owned: the meter is fed from inside the blocking closure, which cannot borrow self.
         let metered_model = self.config.model_id.clone();
         let prefill_peer = self.config.prefill_peer.clone();
+        let probe = params.probe.clone();
 
         let arrived = std::time::Instant::now();
         let inner_result = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
             let mut guard = model_state.blocking_lock();
             // Requests to one model take it in turn: the wait for it is the request's queue.
             let queue_s = arrived.elapsed().as_secs_f64();
@@ -793,6 +795,7 @@ impl LlmEngine {
             while !ends.contains(&next_token)
                 && generated.len() < max_tokens
                 && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::request_metrics::note_decoded(generated.len());
                 let step_start = std::time::Instant::now();
                 generated.push(next_token);
                 recent_tokens.push(next_token);
@@ -2081,15 +2084,24 @@ impl LlmEngine {
             };
             crate::distributed::rate_meter::record_generation(
                 &metered_model, prefill_tok_s, decode_tok_s, eval_count);
-            crate::request_metrics::record(
+            crate::request_metrics::record_outcome(
                 &metered_model,
-                &crate::request_metrics::RequestFigures {
-                    queue_s,
-                    prefill_s: prompt_eval_duration as f64 / 1e9,
-                    decode_s: eval_duration as f64 / 1e9,
-                    prompt_tokens: prompt_tokens.len() as u64,
-                    cached_prompt_tokens: cached_tokens as u64,
-                    generated_tokens: eval_count,
+                probe.as_deref(),
+                crate::request_metrics::RequestOutcome {
+                    figures: crate::request_metrics::RequestFigures {
+                        queue_s,
+                        prefill_s: prompt_eval_duration as f64 / 1e9,
+                        decode_s: eval_duration as f64 / 1e9,
+                        prompt_tokens: prompt_tokens.len() as u64,
+                        cached_prompt_tokens: cached_tokens as u64,
+                        generated_tokens: eval_count,
+                    },
+                    drafted: spec_drafted + pld_stats_drafted,
+                    accepted: spec_accepted + pld_stats_accepted,
+                    kv: crate::request_metrics::KvPlace::of(
+                        state.model.kv_len(),
+                        state.model.kv_capacity(),
+                    ),
                 },
             );
             // The acceptance rate is the only number that says whether speculation is

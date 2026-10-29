@@ -447,6 +447,8 @@ pub struct GenerationParams {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The token rules, stop tokens and prompt cut a request adds to the knobs above.
     pub rules: RequestRules,
+    /// Hears the prompt's reading and the request's own figures, when the handler reports them.
+    pub probe: Option<std::sync::Arc<crate::request_metrics::RequestProbe>>,
 }
 
 /// Which end of a prompt a cut to `truncate_prompt_tokens` keeps.

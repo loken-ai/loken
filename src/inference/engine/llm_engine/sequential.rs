@@ -113,6 +113,7 @@ fn decode_sequential(
     let decode_start = std::time::Instant::now();
 
     while generated.len() < max_tokens {
+        crate::request_metrics::note_decoded(generated.len());
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             finish = FinishReason::Disconnect;
             break;
@@ -209,17 +210,32 @@ fn decode_sequential(
     })
 }
 
-/// The figures of a finished sequential generation, for the request metrics.
-fn record_figures(model_id: &str, queue_s: f64, r: &GenerationResult) {
-    crate::request_metrics::record(
+/// The figures of a finished sequential generation, for the request metrics and the request's
+/// probe. This path does not speculate.
+fn record_figures(
+    model_id: &str,
+    queue_s: f64,
+    r: &GenerationResult,
+    state: &LoadedModelState,
+    probe: Option<&crate::request_metrics::RequestProbe>,
+) {
+    crate::request_metrics::record_outcome(
         model_id,
-        &crate::request_metrics::RequestFigures {
-            queue_s,
-            prefill_s: r.prompt_eval_duration as f64 / 1e9,
-            decode_s: r.eval_duration as f64 / 1e9,
-            prompt_tokens: r.prompt_eval_count,
-            cached_prompt_tokens: 0,
-            generated_tokens: r.eval_count,
+        probe,
+        crate::request_metrics::RequestOutcome {
+            figures: crate::request_metrics::RequestFigures {
+                queue_s,
+                prefill_s: r.prompt_eval_duration as f64 / 1e9,
+                decode_s: r.eval_duration as f64 / 1e9,
+                prompt_tokens: r.prompt_eval_count,
+                cached_prompt_tokens: 0,
+                generated_tokens: r.eval_count,
+            },
+            kv: crate::request_metrics::KvPlace::of(
+                state.model.kv_len(),
+                state.model.kv_capacity(),
+            ),
+            ..Default::default()
         },
     );
 }
@@ -235,8 +251,10 @@ impl LlmEngine {
         let sessions = self.sessions.clone();
         let config = self.config.clone();
         let cancel = params.cancel.clone().unwrap_or_default();
+        let probe = params.probe.clone();
         let arrived = std::time::Instant::now();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
             let mut guard = model_state.blocking_lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let state = guard
@@ -256,7 +274,7 @@ impl LlmEngine {
                 },
             )?;
             result.logprobs = logprobs;
-            record_figures(&config.model_id, queue_s, &result);
+            record_figures(&config.model_id, queue_s, &result, state, probe.as_deref());
             Ok(result)
         })
         .await;
@@ -284,9 +302,11 @@ impl LlmEngine {
         let logprob_queue = self.logprob_queue.clone();
         let stats_slot = self.stream_stats_slot();
         let cancel = params.cancel.clone().unwrap_or_default();
+        let probe = params.probe.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
         let arrived = std::time::Instant::now();
         std::thread::spawn(move || {
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
             let mut guard = model_state.blocking_lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let Some(state) = guard.as_mut() else {
@@ -311,7 +331,7 @@ impl LlmEngine {
             );
             match run {
                 Ok(r) => {
-                    record_figures(&config.model_id, queue_s, &r);
+                    record_figures(&config.model_id, queue_s, &r, state, probe.as_deref());
                     if let Ok(mut slot) = stats_slot.lock() {
                         *slot = Some(StreamStats {
                             eval_count: r.eval_count,

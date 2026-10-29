@@ -91,6 +91,7 @@ Smaller, by priority:
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
 | Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Done |
+| Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Partial |
 | Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Done |
 | Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |

@@ -34,7 +34,7 @@ Every route but `/health` and `/ping` demands a key when `[server] require_auth`
 
 | Route | What it does |
 |---|---|
-| `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`, and vLLM's extensions (below). Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. A stop sequence is not part of the text. |
+| `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`, and vLLM's extensions (below). Returns `reasoning_content` apart from `content`, `finish_reason`, and in `usage` the reasoning tokens, the speculation's `accepted_prediction_tokens` and `rejected_prediction_tokens`, and the [`loken` object](#per-request-figures). A stop sequence is not part of the text. |
 | `POST /v1/chat/completions/batch` | vLLM's batch of conversations: `messages` is a list of conversations, each answered as its own chat completion, one choice per conversation. No `stream`, `tools` or `n` above 1. |
 | `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, an array of prompts, `logit_bias`, `response_format`, and vLLM's extensions (below). `prompt_embeds` sends the prompt as embedding rows of the model's width instead of text, in one of the forms under [Prompt embeddings](#prompt-embeddings); not served while the model batches concurrent requests. |
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. `input_image` (`image_url` as a base64 data URL, or `file_id` of an upload) and `input_audio` (`data`, `format`) parts are ingested as the `image_url` and `input_audio` parts of a chat completion; another part type answers 400 naming it. |
@@ -214,7 +214,7 @@ cap's key and the value it carried, before the image is decoded.
 
 | Route | What it does |
 |---|---|
-| `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking`, `output_format`, `top_k`, `seed`, `stop_sequences`. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts in `usage`. Streams as the official event stream, with `error` events. |
+| `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking`, `output_format`, `top_k`, `seed`, `stop_sequences`. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts and the [`loken` object](#per-request-figures) in `usage`. Streams as the official event stream, with `error` events. |
 | `POST /v1/messages/count_tokens` | Count the prompt with the model's own tokenizer. |
 | `POST /v1/messages/batches`, `GET /v1/messages/batches/{id}` | Batches in the Messages API's shape. `/cancel` stops one; `/results` serves its JSONL. |
 
@@ -223,6 +223,62 @@ comes back in the `request-id` header. An image block with a URL source
 (`{"type": "image", "source": {"type": "url", "url": ...}}`) is fetched from a host in
 `image_fetch_hosts` and held to the media caps; a host outside it is answered 400 naming the host.
 A part the server cannot take, such as a document block, is refused with the reason.
+
+## Per-request figures
+
+A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figures in a `loken`
+object inside its final usage:
+
+| Route | Where |
+|---|---|
+| `/v1/chat/completions` | `usage` of a whole answer. The usage chunk of a stream, sent when `stream_options.include_usage` is set. |
+| `/v1/messages` | `usage` of a whole answer. `usage` of the `message_delta` event of a stream. |
+
+```json
+"loken": {
+  "queue_ms": 1.2, "prefill_ms": 840.5, "decode_ms": 2210.0,
+  "energy": {"joules": 95.3, "gpu_joules": 80.1, "cpu_joules": 15.2, "estimated": false, "share": "work"},
+  "kv": {"used_tokens": 1830, "capacity_tokens": 32768}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `queue_ms` | From the request's arrival at the model to the start of its prompt. |
+| `prefill_ms` | Reading the prompt, to the first token. |
+| `decode_ms` | Writing the answer after the first token. |
+| `energy.joules` | The domains read, summed. |
+| `energy.gpu_joules` | From the GPU energy counter. Absent when no counter is read. |
+| `energy.cpu_joules` | CPU package and DRAM. Read from RAPL, or the configured `cpu_tdp_w` over the time when RAPL is not readable. `null` when neither reads it. |
+| `energy.estimated` | `true` when the CPU part is not read from RAPL. |
+| `energy.share` | `alone` when no other request was active during the request. `work` when others were. |
+| `kv.used_tokens` | The request's sequence in the KV cache when it ended. |
+| `kv.capacity_tokens` | The tokens the cache of the loaded model holds. |
+
+The share rule: the energy meter is read at every start and end of a request. Each reading
+between two of them is split among the requests active over it by the tokens each computed
+over it, its prompt read and its answer generated. A reading over which no request computed a
+token is split evenly. A request's energy is the sum of its parts.
+
+A field loken does not measure is left out. `energy` is absent when `[energy] enabled` is off or no domain is read.
+`kv` is absent when the backend does not report its cache. An answer that gathers several
+generations (`n` above 1, a beam search) carries no `loken` object.
+
+`completion_tokens_details.accepted_prediction_tokens` counts the drafted tokens the model kept
+and `rejected_prediction_tokens` the ones it refused. Both stay at zero on a model served by
+continuous batching, whose worker does not report its speculation.
+
+A streamed answer whose prompt is still being read after 250 ms reports the reading as an SSE
+comment line about every 250 ms until the first token, on both routes:
+
+```
+: loken-prefill {"done": 2048, "total": 8192}
+```
+
+`done` is the prompt tokens read so far and `total` the tokens to read, the cached prefix left
+out. A prompt read in under 250 ms sends no comment line. Neither does a model served by
+continuous batching, whose worker reads several prompts at once. A client that follows the SSE
+specification ignores comment lines.
 
 ## Server, models and cluster
 

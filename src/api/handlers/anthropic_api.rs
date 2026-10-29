@@ -201,8 +201,12 @@ pub(crate) async fn anthropic_messages_at(
         let _admitted = admission;
         let mut params = params;
         let _cancel = engine.cancel_guard(&mut params);
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        params.probe = Some(probe.clone());
+        let energy = crate::energy_report::begin_with(Some(probe.clone()));
         match engine.generate(&prompt, params).await {
             Ok(result) => {
+                let energy = crate::energy_report::end_share(energy, "text", "[/v1/messages]");
                 let (thinking, answer) =
                     crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
                 let (text, calls) = if tools_active {
@@ -217,7 +221,7 @@ pub(crate) async fn anthropic_messages_at(
                 let (stop_kind, stop_seq) = result.finish_reason.anthropic();
                 let hit_max = stop_kind == "max_tokens" && calls.is_empty();
                 let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-                let body = anthropic::build_response(
+                let mut body = anthropic::build_response(
                     &id,
                     &model_for_resp,
                     thinking.as_deref(),
@@ -231,6 +235,11 @@ pub(crate) async fn anthropic_messages_at(
                     hit_max,
                     stop_seq,
                 );
+                body["usage"]["loken"] = crate::api::request_figures::LokenUsage::new(
+                    probe.outcome().as_ref(),
+                    energy.as_ref(),
+                )
+                .to_json();
                 (StatusCode::OK, Json(body)).into_response()
             }
             Err(e) => anthropic_error_response(
@@ -246,8 +255,25 @@ pub(crate) async fn anthropic_messages_at(
             .map(|n| n as i32)
             .unwrap_or_else(|| estimate_token_count(&prompt) as i32);
         let engine_for_stats = engine.clone();
-        match engine.generate_stream(&prompt, params).await {
-            Ok(mut rx) => {
+        // The request's own figures come back through the probe; its energy is metered from
+        // here to the end of its answer.
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        let energy = crate::energy_report::begin_with(Some(probe.clone()));
+        let start = {
+            let (engine, prompt) = (engine.clone(), prompt.clone());
+            let params = GenerationParams {
+                probe: Some(probe.clone()),
+                ..params
+            };
+            Box::pin(async move {
+                engine
+                    .generate_stream(&prompt, params)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        };
+        match crate::api::request_figures::open_stream(start).await {
+            Ok(opening) => {
                 let model_clone = model_for_resp.clone();
                 let event_stream = async_stream::stream! {
                     let _admitted = admission;
@@ -260,6 +286,37 @@ pub(crate) async fn anthropic_messages_at(
                     yield Ok(Event::default()
                         .event("ping")
                         .data(anthropic::sse::ping().to_string()));
+                    // A prompt still being read reports its reading as comment lines.
+                    let mut rx = match opening {
+                        crate::api::request_figures::Opening::Open(rx) => rx,
+                        crate::api::request_figures::Opening::Reading(start) => {
+                            let mut reading = Box::pin(crate::api::request_figures::read_prompt(
+                                start,
+                                probe.clone(),
+                            ));
+                            let mut opened = None;
+                            while let Some(r) = futures::StreamExt::next(&mut reading).await {
+                                match r {
+                                    crate::api::request_figures::Reading::Progress { done, total } => {
+                                        yield Ok(Event::default().comment(
+                                            crate::api::request_figures::prefill_comment(done, total),
+                                        ));
+                                    }
+                                    crate::api::request_figures::Reading::Started(r) => opened = Some(r),
+                                }
+                            }
+                            match opened {
+                                Some(Ok(rx)) => rx,
+                                Some(Err(e)) => {
+                                    yield Ok(Event::default()
+                                        .event("error")
+                                        .data(anthropic::sse::error("api_error", &format!("generate_stream: {e}")).to_string()));
+                                    return;
+                                }
+                                None => return,
+                            }
+                        }
+                    };
                     let mut scanner = if tools_active {
                         Some(crate::api::tool_calls::StreamToolScanner::new(tool_format))
                     } else {
@@ -417,6 +474,7 @@ pub(crate) async fn anthropic_messages_at(
                     }
 
                     let stats = engine_for_stats.take_last_stream_stats();
+                    let energy = crate::energy_report::end_share(energy, "text", "[/v1/messages]");
                     // What the engine counted; the chunk count and the prompt estimate only
                     // where it published nothing.
                     let (stop_seq, hit_max, usage) = match stats.as_ref() {
@@ -442,14 +500,20 @@ pub(crate) async fn anthropic_messages_at(
                             },
                         ),
                     };
+                    let mut delta = anthropic::sse::message_delta(
+                        used_tools,
+                        hit_max,
+                        stop_seq.as_deref(),
+                        usage,
+                    );
+                    delta["usage"]["loken"] = crate::api::request_figures::LokenUsage::new(
+                        probe.outcome().as_ref(),
+                        energy.as_ref(),
+                    )
+                    .to_json();
                     yield Ok(Event::default()
                         .event("message_delta")
-                        .data(anthropic::sse::message_delta(
-                            used_tools,
-                            hit_max,
-                            stop_seq.as_deref(),
-                            usage,
-                        ).to_string()));
+                        .data(delta.to_string()));
                     yield Ok(Event::default()
                         .event("message_stop")
                         .data(anthropic::sse::message_stop().to_string()));
