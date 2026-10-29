@@ -39,6 +39,78 @@ pub struct Card {
     pub perf_gflops: u64,
 }
 
+/// The disk a file lives on: what a read of it can reach at best is set by the drive and by the
+/// link it sits on.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Disk {
+    /// The block device, `nvme1n1` for instance.
+    pub device: String,
+    pub model: String,
+    /// The bus link the drive negotiated, `16.0 GT/s PCIe x4` for instance; empty when the sysfs
+    /// tree does not say.
+    pub link: String,
+    /// A spinning drive.
+    pub rotational: bool,
+}
+
+impl Disk {
+    /// The disk holding `path`, read from the kernel's block device tree.
+    pub fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(path).ok()?.dev();
+        let (major, minor) = ((dev >> 8) & 0xfff, (dev & 0xff) | ((dev >> 12) & 0xfff00));
+        let node = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+        // A partition's node sits inside its disk's.
+        let disk = if node.join("partition").exists() {
+            node.parent()?.to_path_buf()
+        } else {
+            node
+        };
+        let read = |p: std::path::PathBuf| {
+            std::fs::read_to_string(p)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let device = disk.file_name()?.to_string_lossy().into_owned();
+        // An NVMe drive's controller is `device`, and the PCI function it sits on is its parent.
+        let pci = std::fs::canonicalize(disk.join("device/device")).ok();
+        let link = pci
+            .map(|p| {
+                let (speed, width) = (
+                    read(p.join("current_link_speed")),
+                    read(p.join("current_link_width")),
+                );
+                if speed.is_empty() {
+                    String::new()
+                } else {
+                    format!("{speed} x{width}")
+                }
+            })
+            .unwrap_or_default();
+        let model = [disk.join("device/model"), disk.join("device/device/model")]
+            .into_iter()
+            .map(read)
+            .find(|m| !m.is_empty())
+            .unwrap_or_default();
+        Some(Self {
+            device,
+            model,
+            link,
+            rotational: read(disk.join("queue/rotational")) == "1",
+        })
+    }
+
+    /// One line for a table.
+    pub fn describe(&self) -> String {
+        let kind = if self.rotational {
+            "rotational"
+        } else {
+            "solid state"
+        };
+        format!("{} {} ({kind}) {}", self.device, self.model, self.link)
+    }
+}
+
 /// The machine that ran.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Machine {
@@ -197,6 +269,10 @@ pub struct Counters {
 pub struct Record {
     pub build: Build,
     pub machine: Machine,
+    /// The disk of the model file, whose speed bounds the reads of the experts a host keeps out of
+    /// memory.
+    #[serde(default)]
+    pub disk: Option<Disk>,
     pub controls: ControlsRecord,
     pub model: ModelRecord,
     pub timing: Timing,
@@ -215,6 +291,9 @@ impl Record {
         use std::fmt::Write;
         let mut s = String::new();
         let tokens = self.controls.tokens.max(1) as f64;
+        if let Some(d) = &self.disk {
+            let _ = writeln!(s, "disk of the file: {}", d.describe());
+        }
         let _ = writeln!(
             s,
             "layer bench: {} layers [{}, {}) of {}, {} tokens after {} warm, placement {}, page cache {}",
@@ -338,8 +417,20 @@ impl PageCache {
 mod tests {
     use super::*;
 
+    /// A path on this machine is placed on a disk, and the disk's line starts with its device.
+    #[test]
+    fn a_file_is_placed_on_a_disk() {
+        let Some(d) = Disk::of(&std::env::temp_dir()) else {
+            eprintln!("no block device tree for the temp directory; not covered by this run");
+            return;
+        };
+        assert!(!d.device.is_empty());
+        assert!(d.describe().starts_with(&d.device));
+    }
+
     fn record() -> Record {
         Record {
+            disk: None,
             build: Build {
                 version: "0.5.0-dev+gabc".into(),
                 commit: "abc".into(),

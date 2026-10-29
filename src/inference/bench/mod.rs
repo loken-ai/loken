@@ -190,6 +190,7 @@ pub fn run(controls: &Controls) -> Result<report::Record, String> {
     Ok(report::Record {
         build: report::Build::this(),
         machine: report::Machine::this(),
+        disk: report::Disk::of(&controls.file),
         controls: report::ControlsRecord::from(controls),
         model,
         timing: report::Timing::of(ms),

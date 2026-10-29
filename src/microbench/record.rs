@@ -54,6 +54,9 @@ pub struct Record {
     pub card: Option<CardRecord>,
     pub options: Options,
     pub shapes: Shapes,
+    /// The disk of the file the shapes came from; the ceiling of every read bench.
+    #[serde(default)]
+    pub disk: Option<crate::inference::bench::report::Disk>,
     pub rows: Vec<Row>,
 }
 
@@ -72,6 +75,10 @@ impl Record {
             card,
             options: options.clone(),
             shapes: shapes.clone(),
+            disk: shapes
+                .file
+                .as_deref()
+                .and_then(crate::inference::bench::report::Disk::of),
             rows: measured.into_iter().map(Row::from).collect(),
         }
     }
@@ -92,6 +99,9 @@ impl Record {
             self.bench, self.build.version, self.build.commit, self.machine.host
         ));
         out.push_str(&format!("shapes: {}\n", self.shapes.describe()));
+        if let Some(d) = &self.disk {
+            out.push_str(&format!("disk of the file: {}\n", d.describe()));
+        }
         out.push_str(&format!(
             "{} s per variant, median and p10..p90 of the time per call, outliers above q3 + 1.5 iqr\n\n",
             self.options.seconds
