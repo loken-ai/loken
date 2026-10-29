@@ -174,6 +174,7 @@ fn stage<S: WeightSource + ?Sized>(g: &S, s: usize, cfg: &DsparkConfig) -> Resul
         resident_override: Default::default(),
         observer: std::sync::RwLock::new(None),
         offload: std::sync::RwLock::new(None),
+        scripted: Default::default(),
     };
     Ok(DsparkStage {
         attn: attn(g, s, cfg)?,

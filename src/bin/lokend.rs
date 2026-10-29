@@ -56,6 +56,57 @@ enum Commands {
         #[arg(long)]
         cpu: bool,
     },
+
+    /// Replay decode steps through a few layers of a model file, placed as a served model is,
+    /// and report where a token's time goes: a developer's measurement, no server involved
+    LayerBench {
+        /// The model file; the parts of a split file are found beside it
+        file: std::path::PathBuf,
+
+        /// The layers to hold, `from..to` (the end excluded) or one index
+        #[arg(long)]
+        layers: String,
+
+        /// Decode steps timed
+        #[arg(long, default_value_t = 32)]
+        tokens: usize,
+
+        /// Decode steps run before the timed ones
+        #[arg(long, default_value_t = 4)]
+        warm: usize,
+
+        /// Where the layers go: auto (as served), host (no card), cards (no host tier)
+        #[arg(long, default_value = "auto")]
+        placement: loken::inference::bench::Placement,
+
+        /// The page cache of the held layers' experts when the steps start: warm or cold
+        #[arg(long, default_value = "warm")]
+        page_cache: loken::inference::bench::PageCache,
+
+        /// The expert read-ahead depth, in layers; without it the model's own controller
+        #[arg(long)]
+        readahead: Option<usize>,
+
+        /// Routed experts per held layer the cards keep; without it the share a served layer gets
+        #[arg(long)]
+        card_experts: Option<usize>,
+
+        /// The share of a token's experts its read-ahead guess names, 0 to 1
+        #[arg(long, default_value_t = 1.0)]
+        guess_hit: f64,
+
+        /// The seed of the synthetic stream and of the routing drawn
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+
+        /// An expert profile whose counts give the routing heat, in place of the file's prior
+        #[arg(long)]
+        expert_profile: Option<std::path::PathBuf>,
+
+        /// Write the JSON record here
+        #[arg(long)]
+        json: Option<std::path::PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -108,6 +159,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     match cli.command {
+        Commands::LayerBench {
+            file,
+            layers,
+            tokens,
+            warm,
+            placement,
+            page_cache,
+            readahead,
+            card_experts,
+            guess_hit,
+            seed,
+            expert_profile,
+            json,
+        } => {
+            use loken::inference::bench;
+            let layers = bench::parse_layers(&layers).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+            let controls = bench::Controls {
+                file,
+                layers,
+                tokens,
+                warm,
+                placement,
+                page_cache,
+                readahead,
+                card_experts,
+                guess_hit,
+                seed,
+                expert_profile,
+                json,
+            };
+            let record = bench::run(&controls).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+            print!("{}", record.table());
+            if let Some(path) = &controls.json {
+                std::fs::write(path, record.to_json())
+                    .unwrap_or_else(|e| eprintln!("error: {}: {e}", path.display()));
+                println!("record written to {}", path.display());
+            }
+            return Ok(());
+        }
         Commands::Serve {
             port,
             models_dir,
@@ -724,7 +820,10 @@ mod tests {
             verbose,
             keep_alive,
             ..
-        } = cli.command;
+        } = cli.command
+        else {
+            panic!("not the serve command");
+        };
         assert_eq!(port, Some(9000));
         assert_eq!(models_dir.as_deref(), Some("/tmp/models"));
         assert!(verbose);
@@ -737,7 +836,66 @@ mod tests {
 
         let cli = Cli::parse_from(args);
 
-        let Commands::Serve { keep_alive, .. } = cli.command;
+        let Commands::Serve { keep_alive, .. } = cli.command else {
+            panic!("not the serve command");
+        };
         assert_eq!(keep_alive, Some("10m".to_string()));
+    }
+
+    /// The layer bench's controls parse with their defaults and their overrides.
+    #[test]
+    fn layer_bench_arguments_parse() {
+        let cli = Cli::parse_from(["lokend", "layer-bench", "m.gguf", "--layers", "10..13"]);
+        let Commands::LayerBench {
+            layers,
+            tokens,
+            warm,
+            placement,
+            page_cache,
+            readahead,
+            guess_hit,
+            ..
+        } = cli.command
+        else {
+            panic!("not the layer bench");
+        };
+        assert_eq!(layers, "10..13");
+        assert_eq!((tokens, warm), (32, 4));
+        assert_eq!(placement, loken::inference::bench::Placement::Auto);
+        assert_eq!(page_cache, loken::inference::bench::PageCache::Warm);
+        assert_eq!(readahead, None);
+        assert_eq!(guess_hit, 1.0);
+        let cli = Cli::parse_from([
+            "lokend",
+            "layer-bench",
+            "m.gguf",
+            "--layers",
+            "7",
+            "--placement",
+            "cards",
+            "--page-cache",
+            "cold",
+            "--readahead",
+            "2",
+            "--card-experts",
+            "40",
+            "--tokens",
+            "8",
+        ]);
+        let Commands::LayerBench {
+            placement,
+            page_cache,
+            readahead,
+            card_experts,
+            tokens,
+            ..
+        } = cli.command
+        else {
+            panic!("not the layer bench");
+        };
+        assert_eq!(placement, loken::inference::bench::Placement::Cards);
+        assert_eq!(page_cache, loken::inference::bench::PageCache::Cold);
+        assert_eq!((readahead, card_experts, tokens), (Some(2), Some(40), 8));
+        assert!(Cli::try_parse_from(["lokend", "layer-bench", "m.gguf", "--layers", "1", "--placement", "gpu"]).is_err());
     }
 }

@@ -28,6 +28,7 @@ pub mod model_facts;
 pub use engine::llm_engine;
 
 pub use engine::{InferenceEngine, LlmEngine};
+pub mod bench;
 pub mod cache;
 pub mod codec;
 pub mod kernel;

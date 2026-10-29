@@ -1336,6 +1336,12 @@ struct PipelineHead {
     seq: u32,
 }
 
+/// Room each card keeps free for a prompt this wide to run its stream, attention and experts
+/// there, in tokens: the widest prompt chunk the prefill ladder starts from. With less, the
+/// experts that fill the cards leave a prompt's steps to decline, and they fall to the host for
+/// the rest of the request. A wider prompt runs its widest steps in chunks.
+pub(crate) const PREFILL_TRANSIENT_TOKENS: usize = 2048;
+
 impl DeepseekV41Backend {
     /// The backend with no draft.
     pub(crate) fn new(
@@ -1354,11 +1360,6 @@ impl DeepseekV41Backend {
         dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark>,
     ) -> Self {
         use crate::inference::offload::streamed::Streamed;
-        // Room each card keeps free for a prompt this wide to run its stream, attention and
-        // experts there. With less, the experts that fill the cards leave a prompt's steps to
-        // decline, and they fall to the host for the rest of the request. A wider prompt runs its
-        // widest steps in chunks.
-        const PREFILL_TRANSIENT_TOKENS: usize = 2048; // the widest prompt chunk the prefill ladder starts from
         let state = model.new_decode_state();
         // The engine opens the card placement through the generic streamed-model seam: the model
         // states its resident footprint, routing and experts, and no architecture is named here.

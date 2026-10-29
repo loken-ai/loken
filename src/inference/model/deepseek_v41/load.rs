@@ -115,6 +115,7 @@ pub fn load_moe<S: WeightSource + ?Sized>(
         resident_override: Default::default(),
         observer: std::sync::RwLock::new(None),
         offload: std::sync::RwLock::new(None),
+        scripted: Default::default(),
     })
 }
 

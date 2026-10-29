@@ -42,6 +42,16 @@ impl Truncation {
     }
 }
 
+/// Routes imposed on the gate one decoded token at a time: what each token routes to, and what
+/// its read-ahead guess names, each taken in place of the gate's own choice while an entry is
+/// left. The weights stay the gate's scores of the chosen. A measurement whose input stands in
+/// for a real stream keeps the model's routing this way. Empty: the gate decides.
+#[derive(Default)]
+pub struct ScriptedRoutes {
+    pub routes: std::collections::VecDeque<Vec<usize>>,
+    pub guesses: std::collections::VecDeque<Vec<usize>>,
+}
+
 /// A full MoE block: gate, routed experts, and the shared expert.
 pub struct Moe {
     pub gate_weight: Tensor, // [n_routed, dim]
@@ -79,9 +89,51 @@ pub struct Moe {
     pub observer: std::sync::RwLock<Option<std::sync::Arc<ExpertObserver>>>,
     /// Where routed experts run when not on the CPU; `None` keeps them here.
     pub offload: std::sync::RwLock<Option<std::sync::Arc<ExpertOffload>>>,
+    /// Routes and guesses imposed on the decode, consumed one token at a time; empty in service.
+    pub scripted: std::sync::Mutex<ScriptedRoutes>,
 }
 
 impl Moe {
+    /// Queue `routes` and `guesses` for the decoded tokens to come, in order: each token takes the
+    /// next of each. An entry names `n_activated` distinct experts below `n_routed`; one that does
+    /// not is refused whole, and the queues stay as they were.
+    pub fn script_routes(&self, routes: Vec<Vec<usize>>, guesses: Vec<Vec<usize>>) -> Result<()> {
+        for entry in routes.iter().chain(guesses.iter()) {
+            let distinct: std::collections::HashSet<usize> = entry.iter().copied().collect();
+            if entry.len() != self.n_activated
+                || distinct.len() != entry.len()
+                || entry.iter().any(|&e| e >= self.n_routed)
+            {
+                return Err(crate::tensor::Error::msg(format!(
+                    "a scripted route names {} experts, {} distinct, of {}: {} are routed to at once",
+                    entry.len(),
+                    distinct.len(),
+                    self.n_routed,
+                    self.n_activated
+                )));
+            }
+        }
+        let mut s = self.scripted.lock().unwrap();
+        s.routes.extend(routes);
+        s.guesses.extend(guesses);
+        Ok(())
+    }
+
+    /// The gate's weights of `chosen` for one token's gate row, as `select` weighs its own choice.
+    fn weigh(&self, row: &[f32], chosen: Vec<usize>) -> (Vec<usize>, Vec<f32>) {
+        let mut w: Vec<f32> = chosen
+            .iter()
+            .map(|&e| Self::softplus(row[e] / self.gate_temp).sqrt())
+            .collect();
+        if self.norm_topk && self.n_activated > 1 {
+            let s: f32 = w.iter().sum::<f32>() + 1e-20;
+            for wi in w.iter_mut() {
+                *wi /= s;
+            }
+        }
+        (chosen, w)
+    }
+
     /// The router's gate and bias, in bytes: read whole for every token, as the attention is.
     pub fn gate_bytes(&self) -> usize {
         (self.gate_weight.elem_count() + self.gate_bias.elem_count()) * std::mem::size_of::<f32>()
@@ -268,6 +320,13 @@ impl Moe {
         let raw = crate::inference::offload::linear(x, &self.gate_weight)?.to_vec2::<f32>()?;
         let bias = self.gate_bias.flatten_all()?.to_vec1::<f32>()?;
         let (chosen, _) = self.select(&raw[0], &bias);
+        let chosen = self
+            .scripted
+            .lock()
+            .unwrap()
+            .guesses
+            .pop_front()
+            .unwrap_or(chosen);
         let on_card = self.on_card_probe();
         for &e in &chosen {
             self.experts.advise(e, self.n_activated, &on_card);
@@ -306,9 +365,17 @@ impl Moe {
         let mut routing: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         // Each token's choice is its own: made across the cores, taken in token order below.
         let truncation = *self.truncation.read().unwrap();
+        // A scripted route stands in for one token's choice; a batch is never scripted.
+        let scripted = if n == 1 {
+            self.scripted.lock().unwrap().routes.pop_front()
+        } else {
+            None
+        };
         let picks: Vec<(Vec<usize>, Vec<f32>)> = {
             use rayon::prelude::*;
-            if truncation.active() {
+            if let Some(chosen) = scripted {
+                vec![self.weigh(&raw[0], chosen)]
+            } else if truncation.active() {
                 let resident = self.residency();
                 raw.par_iter()
                     .map(|row| self.select_lossy(row, &bias, truncation, &resident))
@@ -744,6 +811,7 @@ mod tests {
             resident_override: Default::default(),
             observer: std::sync::RwLock::new(None),
             offload: std::sync::RwLock::new(None),
+            scripted: Default::default(),
         }
     }
 

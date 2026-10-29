@@ -355,6 +355,25 @@ impl DeepseekV41Model {
         cfg: &DeepseekV41Config,
         from: usize,
     ) -> Result<Self> {
+        Self::load_layers(g, cfg, from, cfg.n_layers)
+    }
+
+    /// Load only the layers `[from, to)`: `load_range` cut at the top as well, for a measurement
+    /// that holds a few layers of the stack. The layers outside the range are never fetched and
+    /// never run; the embedding, the final norm and the output projection are loaded whatever the
+    /// range. An empty or out-of-stack range is refused.
+    pub fn load_layers<S: WeightSource + ?Sized>(
+        g: &S,
+        cfg: &DeepseekV41Config,
+        from: usize,
+        to: usize,
+    ) -> Result<Self> {
+        if from >= to || to > cfg.n_layers {
+            return Err(Error::msg(format!(
+                "layers [{from}, {to}) are not within the {} of the stack",
+                cfg.n_layers
+            )));
+        }
         let embed = g.dense_f32("embed.weight")?;
         let norm = g.dense_f32("norm.weight")?;
         // The head is its own tensor when present, otherwise tied to the embedding.
@@ -366,7 +385,7 @@ impl DeepseekV41Model {
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         let mut engrams = Vec::with_capacity(cfg.n_layers);
         for layer in 0..cfg.n_layers {
-            if layer < from {
+            if layer < from || layer >= to {
                 // Outside this node's range: never fetched, never run.
                 blocks.push(None);
                 engrams.push(None);
@@ -948,15 +967,30 @@ impl DeepseekV41Model {
             .unwrap_or(Ok(0))
     }
 
-    /// The bytes of the always-read path as stored: every layer's attention projections and
-    /// shared expert, the head, the engram projections. What the page cache must hold beside
-    /// the routed experts for a token to run without re-reading it.
-    pub fn resident_path_bytes(&self) -> usize {
+    /// The held layers' share of the always-read path: their attention projections, shared
+    /// experts and gates, without the head and the engram projections.
+    pub fn resident_layer_bytes(&self) -> usize {
         self.blocks
             .iter()
             .flatten()
             .map(|b| b.attn.bytes() + b.moe.shared.bytes() + b.moe.gate_bytes())
             .sum::<usize>()
+    }
+
+    /// Per held layer, the routed experts a card holds now and the slots of the host tier.
+    pub fn expert_tiers(&self) -> Vec<(usize, usize)> {
+        self.blocks
+            .iter()
+            .flatten()
+            .map(|b| (b.moe.cards_hold().len(), b.moe.experts.capacity()))
+            .collect()
+    }
+
+    /// The bytes of the always-read path as stored: every layer's attention projections and
+    /// shared expert, the head, the engram projections. What the page cache must hold beside
+    /// the routed experts for a token to run without re-reading it.
+    pub fn resident_path_bytes(&self) -> usize {
+        self.resident_layer_bytes()
             + self.output.bytes()
             + self
                 .engrams
@@ -1380,18 +1414,64 @@ impl DeepseekV41Model {
     /// logits, which is what the self-consistency gate checks.
     pub fn forward_decode(&self, token: u32, state: &mut DecodeState) -> Result<Tensor> {
         let started = std::time::Instant::now();
+        let n = self.blocks.len();
+        let logits = match self.forward_decode_range(DecodeRangeIn::Token(token), 0, n, state)? {
+            DecodeRangeOut::Logits(l) => l,
+            DecodeRangeOut::Boundary(_) => {
+                return Err(Error::msg(
+                    "a decode over the whole stack yielded no logits",
+                ))
+            }
+        };
+        if self.readahead_pin.is_none() {
+            self.readahead
+                .note_token(started.elapsed().as_nanos() as u64);
+        }
+        Ok(logits)
+    }
+
+    /// Hold the read-ahead depth at `depth` (or hand it back to the controller with `None`).
+    pub fn pin_readahead(&mut self, depth: Option<usize>) {
+        self.readahead_pin = depth;
+    }
+
+    /// Queue the routes and read-ahead guesses layer `layer` takes for the decoded tokens to
+    /// come, in place of its gate's; see `Moe::script_routes`. A layer not held is refused.
+    pub fn script_routes(
+        &self,
+        layer: usize,
+        routes: Vec<Vec<usize>>,
+        guesses: Vec<Vec<usize>>,
+    ) -> Result<()> {
+        self.block(layer)?.moe.script_routes(routes, guesses)
+    }
+
+    /// The layers held: the first and one past the last.
+    pub fn held_layers(&self) -> Option<(usize, usize)> {
+        let first = self.blocks.iter().position(Option::is_some)?;
+        let last = self.blocks.iter().rposition(Option::is_some)?;
+        Some((first, last + 1))
+    }
+
+    /// Run layers `[from, to)` of a decode. This is `forward_decode` split at a layer boundary, so
+    /// a pipeline can place one contiguous run of layers on each node: `from == 0` embeds the token
+    /// and starts the residual; `to == n_layers` finishes with the final norm and head and advances
+    /// the position; an interior range returns the boundary the next range resumes from - the
+    /// residual stream, its collapse weights, the band state that flows down within a token, and the
+    /// engram recent this token pushed. Each range advances only its own layers' caches
+    /// (`state.layers[from..to]`), which on a cluster is exactly the layers that node holds. The
+    /// whole stack as one range is `forward_decode` itself: the expert read-ahead and the deferral
+    /// of host experts run within every range as they do there.
+    pub fn forward_decode_range(
+        &self,
+        input: DecodeRangeIn,
+        from: usize,
+        to: usize,
+        state: &mut DecodeState,
+    ) -> Result<DecodeRangeOut> {
         let depth = self.readahead_pin.unwrap_or_else(|| self.readahead.value());
         let pos = state.pos;
         let (dim, hc) = (self.dim, self.hc_mult);
-
-        let row =
-            crate::inference::offload::stage("embed", || self.embed.narrow(0, token as usize, 1))?;
-        let h = row.reshape((1, 1, dim))?;
-        let mut x = h
-            .unsqueeze(2)?
-            .broadcast_as((1, 1, hc, dim))?
-            .contiguous()?;
-
         let n = pos + 1;
         let (cos0, sin0) = rope_table(self.rope_head_dim, n, 0, self.rope_theta, self.rope_factor)?;
         let (cosb, sinb) = rope_table(
@@ -1402,30 +1482,43 @@ impl DeepseekV41Model {
             self.rope_factor,
         )?;
 
-        let mut pre_mix: Vec<Vec<f32>> = vec![{
-            let mut v = vec![0f32; hc];
-            v[0] = 1.0;
-            v
-        }];
+        // Node 0 embeds the token and pushes the engram recent once; a later range resumes from the
+        // boundary the previous one produced.
+        let (mut x, mut pre_mix, mut shared, recent) = match input {
+            DecodeRangeIn::Token(token) => {
+                let row = crate::inference::offload::stage("embed", || {
+                    self.embed.narrow(0, token as usize, 1)
+                })?;
+                let x = row
+                    .reshape((1, 1, dim))?
+                    .unsqueeze(2)?
+                    .broadcast_as((1, 1, hc, dim))?
+                    .contiguous()?;
+                let pre_mix = vec![{
+                    let mut v = vec![0f32; hc];
+                    v[0] = 1.0;
+                    v
+                }];
+                // The engram hash reads this token and the few before it, recorded once per step.
+                let recent = self
+                    .engram_cfg
+                    .as_ref()
+                    .map(|ecfg| state.engram.push(ecfg, token));
+                (x, pre_mix, SharedAttn::default(), recent)
+            }
+            DecodeRangeIn::Resume(b) => (b.x, b.pre_mix, b.shared, b.recent),
+        };
 
-        // The engram hash reads this token and the few before it, recorded once per step.
-        let recent = self
-            .engram_cfg
-            .as_ref()
-            .map(|ecfg| state.engram.push(ecfg, token));
-        let mut shared = SharedAttn::default();
         // The DSpark draft reads the attention input (the hidden mean-pooled over the
         // hyper-connection copies) of its target layers; captured here, read after the decode.
         let cap = state.capture_layers.clone();
-        if !cap.is_empty() {
+        if from == 0 && !cap.is_empty() {
             state.captured = vec![Vec::new(); cap.len()];
         }
         let defer = self.deferred_experts();
         let mut pending: Option<(usize, super::moe::DeferredExperts, Vec<f32>)> = None;
-        for (i, block) in self.blocks.iter().enumerate() {
-            let Some(block) = block.as_ref() else {
-                continue;
-            };
+        for i in from..to {
+            let block = self.block(i)?;
             if let (Some(engram), Some(ecfg), Some(recent)) =
                 (&self.engrams[i], &self.engram_cfg, &recent)
             {
@@ -1493,124 +1586,9 @@ impl DeepseekV41Model {
             x = nx;
             pre_mix = npm;
         }
-        // Nothing stays running past the token: the head reads the stream whole.
+        // Nothing stays running past the range: the head, or the next range, reads the stream whole.
         if let Some((layer, job, post)) = pending.take() {
             x = self.block(layer)?.add_deferred(&x, job, &post)?;
-        }
-
-        let h = hc_pre(&x, &pre_mix)?;
-        let h = crate::inference::offload::stage("final norm", || {
-            rms_norm(&h, &self.norm, self.rms_eps)
-        })?;
-        let logits =
-            crate::inference::offload::stage("head", || self.output.apply(&h.reshape((1, dim))?))?;
-        state.pos += 1;
-        if self.readahead_pin.is_none() {
-            self.readahead
-                .note_token(started.elapsed().as_nanos() as u64);
-        }
-        Ok(logits)
-    }
-
-    /// Hold the read-ahead depth at `depth` (or hand it back to the controller with `None`).
-    pub fn pin_readahead(&mut self, depth: Option<usize>) {
-        self.readahead_pin = depth;
-    }
-
-    /// Run layers `[from, to)` of a decode. This is `forward_decode` split at a layer boundary, so
-    /// a pipeline can place one contiguous run of layers on each node: `from == 0` embeds the token
-    /// and starts the residual; `to == n_layers` finishes with the final norm and head and advances
-    /// the position; an interior range returns the boundary the next range resumes from - the
-    /// residual stream, its collapse weights, the band state that flows down within a token, and the
-    /// engram recent this token pushed. Each range advances only its own layers' caches
-    /// (`state.layers[from..to]`), which on a cluster is exactly the layers that node holds. The
-    /// split is bit-for-bit `forward_decode`: the same per-layer block, only the loop is cut.
-    pub fn forward_decode_range(
-        &self,
-        input: DecodeRangeIn,
-        from: usize,
-        to: usize,
-        state: &mut DecodeState,
-    ) -> Result<DecodeRangeOut> {
-        let pos = state.pos;
-        let (dim, hc) = (self.dim, self.hc_mult);
-        let n = pos + 1;
-        let (cos0, sin0) = rope_table(self.rope_head_dim, n, 0, self.rope_theta, self.rope_factor)?;
-        let (cosb, sinb) = rope_table(
-            self.rope_head_dim,
-            n,
-            self.original_seq_len,
-            self.compress_rope_theta,
-            self.rope_factor,
-        )?;
-
-        // Node 0 embeds the token and pushes the engram recent once; a later range resumes from the
-        // boundary the previous one produced.
-        let (mut x, mut pre_mix, mut shared, recent) = match input {
-            DecodeRangeIn::Token(token) => {
-                let row = crate::inference::offload::stage("embed", || {
-                    self.embed.narrow(0, token as usize, 1)
-                })?;
-                let x = row
-                    .reshape((1, 1, dim))?
-                    .unsqueeze(2)?
-                    .broadcast_as((1, 1, hc, dim))?
-                    .contiguous()?;
-                let pre_mix = vec![{
-                    let mut v = vec![0f32; hc];
-                    v[0] = 1.0;
-                    v
-                }];
-                let recent = self
-                    .engram_cfg
-                    .as_ref()
-                    .map(|ecfg| state.engram.push(ecfg, token));
-                (x, pre_mix, SharedAttn::default(), recent)
-            }
-            DecodeRangeIn::Resume(b) => (b.x, b.pre_mix, b.shared, b.recent),
-        };
-
-        let cap = state.capture_layers.clone();
-        if from == 0 && !cap.is_empty() {
-            state.captured = vec![Vec::new(); cap.len()];
-        }
-        for i in from..to {
-            if let (Some(engram), Some(ecfg), Some(recent)) =
-                (&self.engrams[i], &self.engram_cfg, &recent)
-            {
-                let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
-                x = engram.forward(&x, &[ecfg.hash(which, recent)])?;
-            }
-            if let Some(ci) = cap.iter().position(|&l| l == i) {
-                let v = x.reshape((hc, dim))?.to_vec2::<f32>()?;
-                let mut m = vec![0f32; dim];
-                for row in &v {
-                    for (j, &val) in row.iter().enumerate() {
-                        m[j] += val;
-                    }
-                }
-                let inv = 1.0 / hc as f32;
-                for val in m.iter_mut() {
-                    *val *= inv;
-                }
-                state.captured[ci] = m;
-            }
-            let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
-                (&cos0, &sin0)
-            } else {
-                (&cosb, &sinb)
-            };
-            let (nx, npm) = self.block(i)?.forward_decode(
-                &x,
-                &pre_mix,
-                cos,
-                sin,
-                pos,
-                &mut state.layers[i],
-                &mut shared,
-            )?;
-            x = nx;
-            pre_mix = npm;
         }
 
         if to >= self.blocks.len() {
@@ -1632,7 +1610,6 @@ impl DeepseekV41Model {
             }))
         }
     }
-
     /// Decode one token by running the stack in `segments` (half-open layer ranges that must
     /// partition the layers in order), each a `forward_decode_range`, the boundary handed from one
     /// to the next. This is the single-process rehearsal of the pipeline a cluster runs with each
@@ -2370,7 +2347,7 @@ impl crate::inference::offload::streamed::StreamedModel for DeepseekV41Model {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
     use crate::tensor::quantized::gguf_file::{open_mapped, Value};
@@ -2389,7 +2366,7 @@ mod tests {
     const MIX: usize = 24;
     const INH: usize = 4;
     const IHD: usize = 64;
-    pub(super) const VOCAB: usize = 48;
+    pub(crate) const VOCAB: usize = 48;
 
     fn f32e(name: String, dims: Vec<usize>) -> GgufEntry {
         let n: usize = dims.iter().product();
@@ -2584,7 +2561,7 @@ mod tests {
 
     /// The same metadata for a chosen band layout: the compress ratios, and the kv and index
     /// source layers when the layout names them (an empty list leaves them to be derived).
-    pub(super) fn real_md_layout(
+    pub(crate) fn real_md_layout(
         ratios: &[u32],
         kv_src: &[u32],
         index_src: &[u32],
@@ -2654,7 +2631,7 @@ mod tests {
     }
 
     /// The tensors of a model whose layers are band layers where `bands` says.
-    pub(super) fn real_entries_for(bands: &[bool]) -> Vec<GgufEntry> {
+    pub(crate) fn real_entries_for(bands: &[bool]) -> Vec<GgufEntry> {
         let mut entries = vec![
             f32e("token_embd".into(), vec![VOCAB, DIM]),
             f32e("output_norm".into(), vec![DIM]),

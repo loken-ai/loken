@@ -49,3 +49,4 @@ Read in this order.
 | [`guides/drafter.md`](guides/drafter.md) | Speed up a model that spills to the host with a drafter |
 | [`guides/kv-memory.md`](guides/kv-memory.md) | Keep conversations in memory between requests |
 | [`guides/cluster.md`](guides/cluster.md) | Two machines |
+| [`guides/layer-bench.md`](guides/layer-bench.md) | Measure a decode on a few layers of a large model |
