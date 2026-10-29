@@ -859,6 +859,12 @@ impl DeepseekV41Model {
         &self.ratios
     }
 
+    /// Bytes of one token's residual as the blocks carry it: `hc_mult` copies of the hidden
+    /// state, in f32.
+    pub fn residual_bytes_per_token(&self) -> usize {
+        self.hc_mult * self.dim * std::mem::size_of::<f32>()
+    }
+
     pub fn n_layers(&self) -> usize {
         self.blocks.len()
     }
@@ -2515,6 +2521,7 @@ mod tests {
         cfg.rms_eps = 1e-20;
 
         let model = DeepseekV41Model::load(&g, &cfg).unwrap();
+        assert_eq!(model.residual_bytes_per_token(), cfg.hc_mult * DIM * 4);
         let tokens: Vec<u32> = vec![1, 5, 3, 0, 7, 2, 9, 4]; // s divisible by ratio 2
         let logits = model.forward_prefill(&tokens).unwrap();
         assert_eq!(logits.dims(), &[tokens.len(), VOCAB]);

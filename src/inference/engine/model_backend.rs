@@ -2983,6 +2983,14 @@ impl ModelBackend for DeepseekV41Backend {
         }
     }
 
+    /// The widest FFN's activation, and the residual's copies a token keeps live on the card
+    /// in and out of each block's mix.
+    fn prefill_shape(&self) -> PrefillShape {
+        let mut shape = PrefillShape::from_widest_ffn(self.widest_ffn);
+        shape.bytes_per_token += 2 * self.model.residual_bytes_per_token();
+        shape
+    }
+
     fn widest_ffn(&self) -> usize {
         self.widest_ffn
     }
