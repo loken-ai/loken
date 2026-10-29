@@ -50,3 +50,4 @@ Read in this order.
 | [`guides/kv-memory.md`](guides/kv-memory.md) | Keep conversations in memory between requests |
 | [`guides/cluster.md`](guides/cluster.md) | Two machines |
 | [`guides/layer-bench.md`](guides/layer-bench.md) | Measure a decode on a few layers of a large model |
+| [`guides/microbench.md`](guides/microbench.md) | Time one mechanism at a model's shapes, its variants side by side |

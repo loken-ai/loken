@@ -177,6 +177,9 @@ vulkan = ["dep:ash", "dep:naga"]
 # the `cpu` feature exists so downstream Cargo.toml can request
 # the explicit CPU-only mode without depending on Cargo defaults.
 cpu = []
+# The microbenches of `benches/microbench.rs`: one mechanism each at a model's shapes, with the
+# library module that drives them. A developer's feature; no release build enables it.
+microbench = []
 # Build the one-off dev validator / parity / microbench binaries (see the
 # [[bin]] section below). Off by default so ~100 dev bins do not compile on
 # every build; some have pre-existing breakage and must not block releases.
@@ -200,6 +203,15 @@ path = "src/bin/lokend.rs"
 [[bin]]
 name = "loken"
 path = "src/bin/loken.rs"
+
+# The microbenches: `cargo bench --features cuda,microbench --bench microbench -- <name>`.
+# Their own command line, so no harness runs them, and only with the feature that compiles the
+# module they drive.
+[[bench]]
+name = "microbench"
+path = "benches/microbench.rs"
+harness = false
+required-features = ["microbench"]
 
 # What a runner builds the tests with: the dev optimisation level, since the suite has tests
 # that crawl unoptimised, and line tables only, since nobody attaches a debugger to a runner.

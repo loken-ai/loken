@@ -75,6 +75,9 @@ pub mod energy;
 pub mod energy_report;
 pub mod gpu;
 pub mod inference;
+// The microbenches' library side, driven by benches/microbench.rs; a developer's feature.
+#[cfg(feature = "microbench")]
+pub mod microbench;
 mod notice_gate;
 pub mod privacy;
 pub mod request_metrics;
