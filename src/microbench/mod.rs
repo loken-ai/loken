@@ -13,6 +13,7 @@ pub mod shapes;
 pub mod stats;
 
 #[cfg(feature = "gpu")]
+pub mod cache_policy;
 pub mod card;
 #[cfg(feature = "gpu")]
 pub mod crossing;
@@ -98,6 +99,28 @@ pub struct Options {
     #[arg(long, default_value_t = 1.0)]
     pub seconds: f64,
 
+    /// An expert profile, the routing counts per layer a served model writes: the heat
+    /// `cache-policy` draws its routing from
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
+
+    /// The hottest experts per layer the cards hold, which a host tier never serves
+    /// (`cache-policy`)
+    #[arg(long, default_value_t = 58)]
+    pub card_slots: usize,
+
+    /// Slots per layer the host tier is tried with (`cache-policy`)
+    #[arg(long, value_delimiter = ',', default_values_t = vec![94, 130, 170])]
+    pub slots: Vec<usize>,
+
+    /// Tokens routed per variant (`cache-policy`)
+    #[arg(long, default_value_t = 20000)]
+    pub tokens: usize,
+
+    /// The rate the disk reads experts at, in GB/s, to turn misses into time (`cache-policy`)
+    #[arg(long, default_value_t = 6.0)]
+    pub disk_gbs: f64,
+
     /// Write the JSON record here
     #[arg(long)]
     pub json: Option<PathBuf>,
@@ -155,6 +178,12 @@ pub fn benches() -> Vec<Bench> {
             run: expert_upload::run,
         });
     }
+    all.push(Bench {
+        name: "cache-policy",
+        about: "the experts a host tier misses per token, for a policy and a size, on a routing drawn from an expert profile",
+        needs_card: false,
+        run: cache_policy::run,
+    });
     all.push(Bench {
         name: "expert-read",
         about: "one routed expert read from disk with its pages dropped first: faults, advice, populate, direct reads",

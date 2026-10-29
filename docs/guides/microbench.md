@@ -88,6 +88,20 @@ It answers how a missing expert is best read. Its variants:
 - A buffered read.
 - A direct read into an aligned buffer, which bypasses the page cache.
 
+`cache-policy` replays a routing through the policies of a host tier and counts the experts each
+misses, which the disk then has to read. It needs `--profile`, the routing counts a served model
+writes, and an expert size from `--shapes-from` or `--projection-bytes`. It touches no model, no
+disk and no card. Its variants are the slots per layer in `--slots`, each under three policies:
+
+- Static: the slots hold the experts the profile counts most and never change.
+- Recency: the least recently routed expert makes room.
+- Frequency: the least often routed expert makes room.
+
+The experts the cards hold (`--card-slots`, the hottest of each layer) are never asked of the tier.
+The routing is drawn for each token from the counts alone, so it carries the heat of the experts and
+no order: a recency policy is judged without the locality a real answer adds. The time per token is
+the misses read at `--disk-gbs`.
+
 ## Read the report
 
 The heading names the bench, the build, the host and the card, then the shapes and where they
