@@ -124,6 +124,7 @@ pub(crate) async fn ollama_list_models(
                             .map(format_parameter_count)
                             .unwrap_or_else(|| estimate_parameter_size(m.size, format_str)),
                         quantization_level: quant,
+                        running_format: None,
                     };
                     {
                         let mut om = OllamaModel::new(m.id.clone(), m.size, m.downloaded_at)
@@ -891,6 +892,7 @@ fn show_hub_model(
                 .map(format_parameter_count)
                 .unwrap_or_else(|| "unknown".to_string()),
             quantization_level: gguf_quant,
+            running_format: None,
         }),
         model_info,
         capabilities: Some(caps),
@@ -1074,6 +1076,7 @@ pub(crate) async fn ollama_show_model(
                         .or_else(|| declared_params.map(format_parameter_count))
                         .unwrap_or(parameter_size),
                     quantization_level: field("file_type").or(gguf_quant),
+                    running_format: None,
                 }),
                 model_info,
                 capabilities,

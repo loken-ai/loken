@@ -9,28 +9,24 @@ use super::*;
 #[derive(Debug, Clone)]
 pub enum QMatMul {
     QTensor(Arc<QTensor>),
+    /// An F32 weight.
     Tensor(Tensor),
+    /// An F16 weight held as stored, on the host or a card.
     TensorF16(Tensor),
-    /// A BF16 weight held as stored on a card.
+    /// A BF16 weight held as stored, on the host or a card.
     Bf16(Tensor),
 }
 
 impl QMatMul {
+    /// A float weight is held in its stored format on the device it was read to; a block
+    /// format keeps its blocks for the quantised kernels.
     pub fn from_arc(qt: Arc<QTensor>) -> Result<Self> {
-        // Mirror the fork: dense float "quantized" tensors dequantize to
-        // a plain weight (the QTensor kernel path is for block quants).
+        let dev = qt.device().clone();
         match qt.dtype() {
-            GgmlDType::BF16 if qt.device().is_cuda() => Self::bf16_onto(&qt, qt.device()),
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {
-                let t = qt.dequantize(qt.device())?;
-                let t = if qt.device().is_cpu() && t.dtype() == crate::tensor::DType::BF16 {
-                    // CONVERSION: the host's dense product reads F32 and F16 weights, not BF16.
-                    t.to_dtype(crate::tensor::DType::F32)?
-                } else {
-                    t
-                };
-                Ok(Self::Tensor(t))
-            }
+            GgmlDType::BF16 => Self::bf16_onto(&qt, &dev),
+            GgmlDType::F16 => Self::f16_onto(&qt, &dev),
+            // CONVERSION: none of value: the decode of F32 blocks is the F32 tensor itself.
+            GgmlDType::F32 => Ok(Self::Tensor(qt.dequantize(&dev)?)),
             _ => Ok(Self::QTensor(qt)),
         }
     }
@@ -66,17 +62,49 @@ impl QMatMul {
         }
     }
 
-    /// The BF16 weight `qt` held as stored on the card `dev`: its bits decoded on the host and
-    /// placed once.
+    /// The BF16 weight `qt` held as stored on `dev`: its bits decoded on the host and placed
+    /// once. A counting device counts it at two bytes a weight.
     pub fn bf16_onto(qt: &QTensor, dev: &Device) -> Result<Self> {
+        if dev.is_dry() {
+            return Ok(Self::Bf16(Tensor::dry(
+                dev,
+                crate::tensor::DType::BF16,
+                qt.shape().clone(),
+            )?));
+        }
         // CONVERSION: none of value: the host decode of BF16 blocks is the BF16 tensor itself.
         Ok(Self::Bf16(qt.dequantize(&Device::Cpu)?.to_device(dev)?))
+    }
+
+    /// The F16 weight `qt` held as stored on `dev`, as [`Self::bf16_onto`] holds a BF16 one.
+    pub fn f16_onto(qt: &QTensor, dev: &Device) -> Result<Self> {
+        if dev.is_dry() {
+            return Ok(Self::TensorF16(Tensor::dry(
+                dev,
+                crate::tensor::DType::F16,
+                qt.shape().clone(),
+            )?));
+        }
+        // CONVERSION: none of value: the host decode of F16 blocks is the F16 tensor itself.
+        Ok(Self::TensorF16(
+            qt.dequantize(&Device::Cpu)?.to_device(dev)?,
+        ))
+    }
+
+    /// The stored float format this projection holds its weight in, `None` for block formats.
+    pub fn float_format(&self) -> Option<GgmlDType> {
+        match self {
+            Self::QTensor(_) => None,
+            Self::Tensor(_) => Some(GgmlDType::F32),
+            Self::TensorF16(_) => Some(GgmlDType::F16),
+            Self::Bf16(_) => Some(GgmlDType::BF16),
+        }
     }
 
     /// The BF16 weight a card holds, when this projection is one.
     pub fn bf16(&self) -> Option<&Tensor> {
         match self {
-            Self::Bf16(w) => Some(w),
+            Self::Bf16(w) if w.device().runs_as_card() => Some(w),
             _ => None,
         }
     }
@@ -117,6 +145,25 @@ impl QMatMul {
         y.reshape(odims)?.to_dtype(out_dtype)
     }
 
+    /// `x @ w^T` on the host for a weight held as stored in F16 or BF16: the activation read as
+    /// F32, the weight widened row by row inside the product, summed in F32.
+    fn host_half(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let k = *dims
+            .last()
+            .ok_or_else(|| Error::msg("QMatMul: rank-0 input"))?;
+        let rows = x.elem_count() / k;
+        let x2 = x.to_dtype(crate::tensor::DType::F32)?.reshape((rows, k))?;
+        // A weight held as a view of a larger storage takes the F32 product of its widened copy.
+        let y = match x2.matmul_t_half_f32(w)? {
+            Some(y) => y,
+            None => x2.matmul_t(&w.to_dtype(crate::tensor::DType::F32)?)?,
+        };
+        let mut odims = dims;
+        *odims.last_mut().unwrap() = w.dims()[0];
+        y.reshape(odims)?.to_dtype(x.dtype())
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(qt) => {
@@ -132,8 +179,29 @@ impl QMatMul {
             // decoded token, 59% of AWQ GPU time), and matmul_t
             // never read it.
             Self::Tensor(w) => Self::dense_matmul_t(x, w, x.dtype()),
+            Self::TensorF16(w) if w.device().is_cpu() => Self::host_half(x, w),
+            Self::Bf16(w) if w.device().is_cpu() => Self::host_half(x, w),
             Self::TensorF16(w) => {
+                // One row takes the F16-weight product summed in F32; more, the library's F16
+                // product with the activation rounded to F16, summed in F32 where the card
+                // offers it.
+                let k = *x
+                    .dims()
+                    .last()
+                    .ok_or_else(|| Error::msg("QMatMul: rank-0 input"))?;
+                let mut odims = x.dims().to_vec();
+                *odims.last_mut().unwrap() = w.dims()[0];
+                if x.elem_count() == k {
+                    let row = x.to_dtype(crate::tensor::DType::F32)?.reshape((1, k))?;
+                    if let Some(y) = row.gemv_f16w(w, None)? {
+                        return y.reshape(odims)?.to_dtype(x.dtype());
+                    }
+                }
                 let xf = x.to_dtype(crate::tensor::DType::F16)?;
+                let rows = xf.reshape((x.elem_count() / k, k))?;
+                if let Some(y) = rows.matmul_t_f16_f32(w)? {
+                    return y.reshape(odims)?.to_dtype(x.dtype());
+                }
                 Self::dense_matmul_t(&xf, w, x.dtype())
             }
             Self::Bf16(w) => {

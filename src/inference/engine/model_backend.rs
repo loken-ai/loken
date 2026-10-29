@@ -259,6 +259,12 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
+    /// The formats the per-layer projections run in, by their GGUF names joined with `+`, when
+    /// the backend knows them.
+    fn running_format(&self) -> Option<String> {
+        None
+    }
+
     /// Why this backend can serve nothing more, when it cannot: the nodes it depended on are
     /// gone. A caller that finds a reason unloads the model so the next request loads it afresh.
     fn unusable(&self) -> Option<String> {
@@ -1886,6 +1892,10 @@ impl GenericBackend {
 }
 
 impl ModelBackend for GenericBackend {
+    fn running_format(&self) -> Option<String> {
+        self.0.running_format()
+    }
+
     fn reclaim_prefill_room(&mut self, need: u64) -> bool {
         self.reclaim_for_chunk(need)
     }

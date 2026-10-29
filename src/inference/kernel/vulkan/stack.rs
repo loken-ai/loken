@@ -132,7 +132,12 @@ pub struct LayerTensors<'a> {
 pub fn runs_format(dtype: GgmlDType) -> bool {
     matches!(
         dtype,
-        GgmlDType::Q4K | GgmlDType::Q6K | GgmlDType::Q8_0 | GgmlDType::F16
+        GgmlDType::Q4K
+            | GgmlDType::Q6K
+            | GgmlDType::Q8_0
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::F32
     )
 }
 
@@ -167,6 +172,9 @@ impl Matrix {
             match t.dtype {
                 GgmlDType::Q4K => ("mv_q4k", Some("mm_q4k"), Cow::Borrowed(&t.bytes)),
                 GgmlDType::F16 => ("mv_f16", Some("mm_f16"), Cow::Borrowed(&t.bytes)),
+                // BF16 and F32 run the mat-vec at every token count: they have no mat-mat.
+                GgmlDType::BF16 => ("mv_bf16", None, Cow::Borrowed(&t.bytes)),
+                GgmlDType::F32 => ("mv_f32", None, Cow::Borrowed(&t.bytes)),
                 GgmlDType::Q6K => (
                     "mv_q6k",
                     Some("mm_q6k"),
@@ -794,7 +802,8 @@ impl VulkanStack {
 
     /// Whether any of `ws` reads the f32 copy of the activations.
     fn wants_f32(ws: &[&Matrix]) -> bool {
-        ws.iter().any(|w| w.kernel == "mv_f16")
+        ws.iter()
+            .any(|w| matches!(w.kernel, "mv_f16" | "mv_bf16" | "mv_f32"))
     }
 
     /// The dispatches of a step of `tokens` rows through layers `[from, to)`.
@@ -1410,17 +1419,35 @@ pub(super) fn matvec_probe(
         all.iter().flat_map(|v| v.to_le_bytes()).collect()
     };
     let quant = words([tokens as u32, m.cols as u32, 0, 0, 1, 0, 0, 0]);
-    let mv = words([rows, m.cols as u32, tokens as u32, 0, 0, 0, 0, rows]);
+    let mv = |count: usize, first: usize| {
+        words([
+            rows,
+            m.cols as u32,
+            count as u32,
+            first as u32,
+            0,
+            0,
+            0,
+            rows,
+        ])
+    };
     let quant_pipe = ctx.pipeline("quant")?;
-    let (pipeline, groups) = match mat_mat_for(&m, tokens) {
-        Some((k, tile)) => (
+    // The mat-mat takes every token in one dispatch; the mat-vec takes them in batches of
+    // `MV_TOKENS`, as the stack dispatches it.
+    let dispatches: Vec<(vk::Pipeline, Vec<u8>, [u32; 3])> = match mat_mat_for(&m, tokens) {
+        Some((k, tile)) => vec![(
             ctx.pipeline(k)?,
+            mv(tokens, 0),
             [rows.div_ceil(tile.0), (tokens as u32).div_ceil(tile.1), 1],
-        ),
-        None => (
-            ctx.pipeline(m.kernel)?,
-            matvec_groups(m.kernel, rows, ctx.workgroup),
-        ),
+        )],
+        None => {
+            let pipeline = ctx.pipeline(m.kernel)?;
+            let groups = matvec_groups(m.kernel, rows, ctx.workgroup);
+            (0..tokens)
+                .step_by(MV_TOKENS)
+                .map(|first| (pipeline, mv((tokens - first).min(MV_TOKENS), first), groups))
+                .collect()
+        }
     };
     ctx.submit_once(|cmd| unsafe {
         let run = |pipe: vk::Pipeline, set: vk::DescriptorSet, imm: &[u8], g: [u32; 3]| {
@@ -1461,7 +1488,9 @@ pub(super) fn matvec_probe(
             vk::AccessFlags::SHADER_READ,
             vk::PipelineStageFlags::COMPUTE_SHADER,
         );
-        run(pipeline, sets[1], &mv, groups);
+        for (pipeline, imm, groups) in &dispatches {
+            run(*pipeline, sets[1], imm, *groups);
+        }
         barrier(
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,

@@ -147,6 +147,7 @@ pub(crate) async fn ollama_ps(
             families: None,
             parameter_size,
             quantization_level: None,
+            running_format: entry.engine.running_format().await,
         };
 
         debug!(
@@ -209,6 +210,7 @@ pub(crate) async fn ollama_ps(
                 families: None,
                 parameter_size,
                 quantization_level: None,
+                running_format: None,
             },
             expires_at: "never".to_string(),
             size_vram: img_vram,
@@ -236,6 +238,7 @@ pub(crate) async fn ollama_ps(
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,
+                running_format: None,
             },
             expires_at: "never".to_string(),
             size_vram: asr_info.resident_bytes,
@@ -262,6 +265,7 @@ pub(crate) async fn ollama_ps(
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,
+                running_format: None,
             },
             expires_at: "never".to_string(),
             size_vram: tts_vram,

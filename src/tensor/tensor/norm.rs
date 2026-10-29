@@ -851,6 +851,41 @@ impl Tensor {
         self.matmul(&rhs.transpose(rank - 2, rank - 1)?)
     }
 
+    /// `self @ w^T` on the host for F32 activations `[rows, k]` and a weight `[n, k]` held as
+    /// stored in F16 or BF16: `[rows, n]` F32, summed in F32. Each weight row is widened once
+    /// per call and dotted with every activation row, so the weight is read once whatever the
+    /// rows. `None` where the operands are not that.
+    pub fn matmul_t_half_f32(&self, w: &Self) -> Result<Option<Self>> {
+        let (xd, wd) = (self.dims(), w.dims());
+        if xd.len() != 2 || wd.len() != 2 || xd[1] != wd[1] || self.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        if !self.device().is_cpu() || !w.device().is_cpu() {
+            return Ok(None);
+        }
+        let (rows, k, n) = (xd[0], xd[1], wd[0]);
+        // A storage holding exactly the tensor is the tensor, read from its first element.
+        let a = self.contiguous()?;
+        let a = a.f32_data()?;
+        if a.len() != rows * k {
+            return Ok(None);
+        }
+        let mut out = vec![0f32; rows * n];
+        match w.storage().as_ref() {
+            Storage::Cpu(CpuStorage::F16(b)) if b.len() == n * k => {
+                gemm_nt_half_f32(a, b, rows, k, n, &mut out)
+            }
+            Storage::Cpu(CpuStorage::BF16(b)) if b.len() == n * k => {
+                gemm_nt_half_f32(a, b, rows, k, n, &mut out)
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(Self::from_packed(
+            Arc::new(Storage::Cpu(CpuStorage::F32(out))),
+            Shape::from(vec![rows, n]),
+        )))
+    }
+
     /// Standard-normal tensor matching `self`'s shape/device (Box-Muller
     /// over the process RNG; generated host-side, uploaded once - the VAE
     /// encode-path reparameterization sample).

@@ -34,8 +34,9 @@ fn check(dtype: GgmlDType, tokens: usize, coop: bool) {
         .to_vec1::<f32>()
         .unwrap();
     let x = values(tokens * cols, 11);
-    // The kernels read int8 blocks of 32 for every format but F16, as the quantiser makes them.
-    let seen = if dtype == GgmlDType::F16 {
+    // The kernels read int8 blocks of 32 for every format but the floats, as the quantiser makes
+    // them.
+    let seen = if matches!(dtype, GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32) {
         x.clone()
     } else {
         x.chunks(if cols % 128 == 0 { 128 } else { 32 })
@@ -102,6 +103,26 @@ fn matvec_q8_0() {
 #[test]
 fn matvec_f16() {
     check(GgmlDType::F16, 3, false);
+}
+
+#[test]
+fn matvec_bf16() {
+    check(GgmlDType::BF16, 3, false);
+}
+
+#[test]
+fn many_tokens_bf16() {
+    check(GgmlDType::BF16, 40, false);
+}
+
+#[test]
+fn matvec_f32() {
+    check(GgmlDType::F32, 3, false);
+}
+
+#[test]
+fn many_tokens_f32() {
+    check(GgmlDType::F32, 40, false);
 }
 
 #[test]

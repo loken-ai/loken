@@ -105,6 +105,8 @@ Smaller, by priority:
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
 | Model directories on several disks | Models | Several model directories, on several disks, form one catalogue, and a model being pulled lands on the directory that holds it and reads it fastest, judged on its size, the free space and the measured speed of each disk. | Partial |
 | Serving without custom settings | API | A client gets the window, the cache format and the priority a request needs without any loken header or option: the server derives them from the request and the machine. | Done |
+| Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family; it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
+| One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Planned |
 
 ## 0.6.0
 

@@ -151,6 +151,28 @@ shards of a Llama, Mistral or Qwen text model is served through the same generic
 file. Shapes come from the configuration, the tensors are read in their stored width, and a
 long-context rope declared there is turned into the frequency table a GGUF file would carry.
 
+The projections of a float checkpoint run in their stored format when the placement fits it, on
+the host and on every card family. The layers a card takes fit as stored. The layers the host
+keeps are weighed against the memory it can give. A checkpoint that does not fit is rebuilt once
+at load in the widest format that does:
+
+| Rung | Projections | Feed-forward output |
+|---|---|---|
+| 1 | as stored (`F32`, `F16`, `BF16`) | as stored |
+| 2 | `Q8_0` | `Q8_0` |
+| 3 | `Q4_K` | `Q6_K` |
+
+The load log says which rung runs, and `/api/ps` reports it as `details.running_format`. A GGUF
+file with block projections rebuilds its stray float matrices in `Q8_0`, or in `Q4_K` when its
+stack spills to the host. On a Vulkan device a `BF16` or `F32` matrix runs the mat-vec kernel
+at every token count: only `F16` has a mat-mat kernel there. The OpenCL kernels do not read
+`BF16`.
+
+The expert stacks of a mixture-of-experts checkpoint follow the kernels instead. A stack runs as
+stored where a kernel of its device reads that format. On the host that includes `F32`, through
+the dense expert product, which copies the stack on each call and is slow for a large one.
+`F16` and `BF16` stacks are rebuilt in `Q8_0`.
+
 Embeddings and reranking: BERT-shaped encoders (`nomic`, `bge` and the like) answer
 `/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`. A CLIP
 or SigLIP checkpoint directory embeds texts and images in one space on `/v1/embeddings` and

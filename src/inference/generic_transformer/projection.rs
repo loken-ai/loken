@@ -748,11 +748,36 @@ impl QMatMul {
             QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::QTensor(t)) => t.device().clone(),
             QMatMulKind::Gguf(
                 crate::tensor::quantized::QMatMul::Tensor(t)
+                | crate::tensor::quantized::QMatMul::TensorF16(t)
                 | crate::tensor::quantized::QMatMul::Bf16(t),
             ) => t.device().clone(),
             QMatMulKind::Awq(w) => w.qweight.device().clone(),
-            _ => Device::Cpu,
         }
+    }
+
+    /// The format the weight runs in, by its GGUF name: the stored float format, the block
+    /// format, or the packed int4 of an AWQ checkpoint.
+    pub fn format_name(&self) -> &'static str {
+        match &self.inner {
+            QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::QTensor(q)) => {
+                q.dtype().gguf_name()
+            }
+            QMatMulKind::Gguf(inner) => inner.float_format().map_or("f32", |f| f.gguf_name()),
+            QMatMulKind::Awq(_) => "awq_int4",
+        }
+    }
+
+    /// The formats a set of projections run in, distinct, in the order first met, joined with
+    /// `+`: `None` for an empty set.
+    pub fn formats_of<'a>(projections: impl IntoIterator<Item = &'a QMatMul>) -> Option<String> {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for p in projections {
+            let f = p.format_name();
+            if !seen.contains(&f) {
+                seen.push(f);
+            }
+        }
+        (!seen.is_empty()).then(|| seen.join("+"))
     }
 
     /// `silu(gate . x) * (up . x)` for one row `x` `[1, k]` on a card, in the one launch the
@@ -956,6 +981,25 @@ impl Module for Mlp {
     }
 }
 
+impl super::GenericHeteroTransformer {
+    /// The formats the per-layer projections run in, as [`QMatMul::formats_of`] names them: the
+    /// attention's and, in a layer that has one, the dense feed-forward's.
+    pub fn running_format(&self) -> Option<String> {
+        QMatMul::formats_of(self.layers.iter().flat_map(|l| {
+            let attention = [
+                l.attn_q.as_ref(),
+                l.attn_k.as_ref(),
+                l.attn_v.as_ref(),
+                l.attn_qkv.as_ref(),
+                Some(&l.attn_output),
+            ];
+            let ffn = [l.ffn_gate.as_ref(), Some(&l.ffn_up), Some(&l.ffn_down)];
+            let ffn = ffn.into_iter().filter(|_| l.has_ffn);
+            attention.into_iter().chain(ffn).flatten()
+        }))
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "gpu")]
 mod marlin_parity {
@@ -1102,6 +1146,39 @@ mod marlin_parity {
                 eprintln!("K={k} N={n}, {rows} rows: the INT4 GEMM agrees with the host");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+
+    fn held_as(dtype: GgmlDType) -> QMatMul {
+        let (n, k) = (8usize, 256usize);
+        let w = Tensor::from_vec_f32(
+            (0..n * k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect(),
+            vec![n, k],
+        )
+        .expect("weight");
+        QMatMul::from_qtensor(QTensor::quantize(&w, dtype).expect("quantize")).expect("matmul")
+    }
+
+    /// A projection is named by the format its weight is held in, and a set of them by its
+    /// distinct formats in the order first met.
+    #[test]
+    fn a_set_of_projections_is_named_by_its_distinct_formats() {
+        let bf16 = held_as(GgmlDType::BF16);
+        let (q4, q6) = (held_as(GgmlDType::Q4K), held_as(GgmlDType::Q6K));
+        assert_eq!(bf16.format_name(), "bf16");
+        assert_eq!(held_as(GgmlDType::F16).format_name(), "f16");
+        assert_eq!(held_as(GgmlDType::F32).format_name(), "f32");
+        assert_eq!(QMatMul::formats_of([&bf16, &bf16]).as_deref(), Some("bf16"));
+        assert_eq!(
+            QMatMul::formats_of([&q4, &q6, &q4]).as_deref(),
+            Some("q4_K+q6_K")
+        );
+        assert_eq!(QMatMul::formats_of(Vec::<&QMatMul>::new()), None);
     }
 }
 

@@ -12,6 +12,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: take vLLM's request fields and serve its extra routes.
 - Models: embed texts and images in one space with CLIP and SigLIP checkpoints, on the embeddings routes.
 - Config: list several model directories, on several disks, as one catalogue read in the order listed.
+- Models: serve a float checkpoint in its stored format when it fits.
 - API: answer use_beam_search with the n best beams, scored as transformers does.
 - Serving: log the pace of batched steps once a second.
 - Vision: read the Qwen3.5 vision tower from a separate projector file.

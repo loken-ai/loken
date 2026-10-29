@@ -689,6 +689,11 @@ pub struct OllamaModelDetails {
     /// null when the checkpoint does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization_level: Option<String>,
+    /// The formats the loaded model's per-layer projections run in, GGUF names joined with `+`:
+    /// "bf16" for a checkpoint served as stored, "q8_0" or "q4_K+q6_K" for one rebuilt to fit.
+    /// Sent by `/api/ps` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_format: Option<String>,
 }
 
 /// Ollama list models response (GET /api/tags)

@@ -18,7 +18,9 @@ pub(super) const MM_TOKENS: u32 = 8 * MM_TT;
 /// and the format's loads are narrow enough to want the extra requests in flight.
 pub(super) fn lanes_per_row(kernel: &str) -> u32 {
     match kernel {
-        "mv_q4k" | "mv_f16" | "mx_q4k" | "mx_f16" => 32,
+        "mv_q4k" | "mv_f16" | "mv_bf16" | "mv_f32" | "mx_q4k" | "mx_f16" | "mx_bf16" | "mx_f32" => {
+            32
+        }
         _ => 16,
     }
 }
@@ -391,6 +393,38 @@ const F16_ITEM: (&str, &str, &str) = (
             let x0 = xf[xi];
             let x1 = xf[xi + 1u];
             acc[t] = acc[t] + dot(w0, x0.xy) + dot(w1, x0.zw) + dot(w2, x1.xy) + dot(w3, x1.zw);
+        }
+"#,
+);
+
+/// BF16, as stored: eight values a vector, each widened exactly by moving its 16 bits to the top
+/// of an f32, read against the f32 activations. An item is a vector.
+const BF16_ITEM: (&str, &str, &str) = (
+    "vec4<u32>",
+    "k / 8u",
+    r#"
+        let wv = w[row * (k / 8u) + it];
+        let w0 = vec2<f32>(bitcast<f32>(wv.x << 16u), bitcast<f32>(wv.x & 0xffff0000u));
+        let w1 = vec2<f32>(bitcast<f32>(wv.y << 16u), bitcast<f32>(wv.y & 0xffff0000u));
+        let w2 = vec2<f32>(bitcast<f32>(wv.z << 16u), bitcast<f32>(wv.z & 0xffff0000u));
+        let w3 = vec2<f32>(bitcast<f32>(wv.w << 16u), bitcast<f32>(wv.w & 0xffff0000u));
+        for (var t = 0u; t < nt; t = t + 1u) {
+            let xi = (tb + t) * (k / 4u) + it * 2u;
+            let x0 = xf[xi];
+            let x1 = xf[xi + 1u];
+            acc[t] = acc[t] + dot(w0, x0.xy) + dot(w1, x0.zw) + dot(w2, x1.xy) + dot(w3, x1.zw);
+        }
+"#,
+);
+
+/// F32, as stored: four values a vector, read against the f32 activations. An item is a vector.
+const F32_ITEM: (&str, &str, &str) = (
+    "vec4<f32>",
+    "k / 4u",
+    r#"
+        let wv = w[row * (k / 4u) + it];
+        for (var t = 0u; t < nt; t = t + 1u) {
+            acc[t] = acc[t] + dot(wv, xf[(tb + t) * (k / 4u) + it]);
         }
 "#,
 );
@@ -1229,6 +1263,8 @@ pub(super) fn expert_kernel(mv: &str) -> &'static str {
         "mv_q4k" => "mx_q4k",
         "mv_q6k" => "mx_q6k",
         "mv_q8_0" => "mx_q8_0",
+        "mv_bf16" => "mx_bf16",
+        "mv_f32" => "mx_f32",
         _ => "mx_f16",
     }
 }
@@ -1316,6 +1352,8 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
         "mv_q6k" | "mx_q6k" => matvec(Q6K_ITEM),
         "mv_q8_0" | "mx_q8_0" => matvec(Q8_0_ITEM),
         "mv_f16" | "mx_f16" => matvec(F16_ITEM),
+        "mv_bf16" | "mx_bf16" => matvec(BF16_ITEM),
+        "mv_f32" | "mx_f32" => matvec(F32_ITEM),
         "moe_combine" => MOE_COMBINE.to_string(),
         "mm_q4k" => matmat(Q4K_LOAD),
         "mm_q6k" => matmat(Q6K_LOAD),

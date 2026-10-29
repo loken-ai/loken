@@ -875,6 +875,13 @@ impl LlmEngine {
         ))
     }
 
+    /// The formats the loaded model's per-layer projections run in, `None` with no model loaded
+    /// or a model that does not say.
+    pub async fn running_format(&self) -> Option<String> {
+        let guard = self.model_state.lock().await;
+        guard.as_ref()?.model.running_format()
+    }
+
     /// The loaded model's tokens for `text` and each token's text: the special tokens added
     /// as a prompt is read when `special`, none otherwise. `None` with no model loaded.
     pub async fn tokenize(

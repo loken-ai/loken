@@ -17,34 +17,28 @@ const FFN: usize = 512;
 const VOCAB: usize = 64;
 const BLOCKS: usize = 2;
 
-/// Every conversion a dense host load performs: `(class, stored, resident, reason)`.
-/// A stored format a class keeps does not appear. The reason is what the loader's ledger
-/// records for the same change.
-const DECLARED: &[(&str, &str, &str, &str)] = &[
-    (
-        "projection",
-        "f32",
-        "q8_0",
-        "float projection rebuilt as a block format for the block-quant kernels and fused projections",
-    ),
-    (
-        "projection",
-        "f16",
-        "q8_0",
-        "float projection rebuilt as a block format for the block-quant kernels and fused projections",
-    ),
-    (
-        "projection",
-        "bf16",
-        "q8_0",
-        "float projection rebuilt as a block format for the block-quant kernels and fused projections",
-    ),
-    (
-        "output",
-        "bf16",
-        "f32",
-        "the host's dense product reads F32 and F16 weights, not BF16",
-    ),
+/// Every conversion a dense host load that fits performs: `(class, stored, resident, reason)`.
+/// A stored format a class keeps does not appear: a float checkpoint that fits keeps its
+/// projections and its output head as stored. The reason is what the loader's ledger records
+/// for the same change.
+const DECLARED: &[(&str, &str, &str, &str)] = &[];
+
+/// The reason the ledger records for a float projection rebuilt to fit.
+const REQUANT_REASON: &str =
+    "float projection rebuilt as a block format for the block-quant kernels and fused projections";
+
+/// Every conversion a load performs on a float checkpoint that does not fit as stored:
+/// `(class, stored, resident)`, each recorded with [`REQUANT_REASON`].
+const REQUANTISED: &[(&str, &str, &str)] = &[
+    ("projection", "f32", "q8_0"),
+    ("projection", "f16", "q8_0"),
+    ("projection", "bf16", "q8_0"),
+    ("projection", "f32", "q4_K"),
+    ("projection", "f16", "q4_K"),
+    ("projection", "bf16", "q4_K"),
+    ("projection", "f32", "q6_K"),
+    ("projection", "f16", "q6_K"),
+    ("projection", "bf16", "q6_K"),
 ];
 
 /// The formats the loader accepts for a weight, by the name GGUF spells them with.
@@ -229,6 +223,7 @@ fn a_load_keeps_every_class_in_its_stored_format_unless_declared() {
             crate::tensor::quantized::QMatMul::QTensor(q) if q.dtype() == dtype => {}
             crate::tensor::quantized::QMatMul::Tensor(t)
             | crate::tensor::quantized::QMatMul::TensorF16(t)
+            | crate::tensor::quantized::QMatMul::Bf16(t)
                 if t.dtype().as_str() == stored || head_declared(t.dtype().as_str()) => {}
             other => problems.push(format!(
                 "{stored}: the output head is resident as {other:?}"
@@ -254,19 +249,83 @@ fn a_load_keeps_every_class_in_its_stored_format_unless_declared() {
 }
 
 #[test]
-fn a_declared_conversion_is_in_the_ledger() {
-    let dir = std::env::temp_dir().join(format!("loken-conv-ledger-{}", std::process::id()));
+fn a_float_checkpoint_that_fits_is_served_as_stored() {
+    let dir = std::env::temp_dir().join(format!("loken-conv-stored-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("f16.gguf");
-    write_dense(&path, GgmlDType::F16).unwrap();
-    let _m = load(&path).unwrap();
-    let entries = crate::tensor::conversion::entries();
-    let _ = std::fs::remove_dir_all(&dir);
-    for (class, from, to, why) in DECLARED.iter().filter(|d| d.1 == "f16") {
+    // The logits of a prefill of four tokens and of one decoded after them.
+    let run = |m: &mut GenericHeteroTransformer| -> Vec<f32> {
+        let prompt = Tensor::new(&[3u32, 17, 42, 5][..], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let next = Tensor::new(&[9u32][..], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let mut out = Vec::new();
+        for (ids, pos) in [(prompt, 0), (next, 4)] {
+            let logits = m.forward(&ids, pos).unwrap();
+            let logits = logits.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+            out.extend(logits.to_vec1::<f32>().unwrap());
+        }
+        out
+    };
+    let mut reference: Option<Vec<f32>> = None;
+    for dtype in [GgmlDType::F32, GgmlDType::F16, GgmlDType::BF16] {
+        let path = dir.join(format!("{}.gguf", dtype.gguf_name()));
+        write_dense(&path, dtype).unwrap();
+        let mut m = load(&path).unwrap();
+        assert_eq!(
+            m.running_format().as_deref(),
+            Some(dtype.gguf_name()),
+            "{} checkpoint",
+            dtype.gguf_name()
+        );
+        let got = run(&mut m);
         assert!(
-            entries
-                .iter()
-                .any(|e| e.class == *class && e.from == *from && e.to == *to && e.reason == *why),
+            got.iter().all(|v| v.is_finite()),
+            "{dtype:?}: a logit is not finite"
+        );
+        match &reference {
+            None => reference = Some(got),
+            Some(want) => {
+                // The half formats round each weight to 11 or 8 significant bits.
+                let scale = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let err = got
+                    .iter()
+                    .zip(want)
+                    .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
+                assert!(
+                    err <= scale * 0.05,
+                    "{dtype:?}: logits off by {err} of {scale} from the f32 checkpoint"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_requantised_projection_is_in_the_ledger() {
+    let w = Tensor::from_vec(values(4 * HIDDEN, 3, 0.1), (4, HIDDEN), &Device::Cpu).unwrap();
+    for (class, from, to) in REQUANTISED {
+        let stored = STORED_FORMATS
+            .into_iter()
+            .find(|d| d.gguf_name() == *from)
+            .unwrap();
+        let target = STORED_FORMATS
+            .into_iter()
+            .find(|d| d.gguf_name() == *to)
+            .unwrap();
+        let qt = QTensor::quantize(&w, stored).unwrap();
+        let out = super::loader::requant_float_weight(qt, target, &Device::Cpu, class).unwrap();
+        assert_eq!(out.dtype(), target);
+        let entries = crate::tensor::conversion::entries();
+        assert!(
+            entries.iter().any(|e| e.class == *class
+                && e.from == *from
+                && e.to == *to
+                && e.reason == REQUANT_REASON),
             "no ledger entry for {class} {from}->{to}"
         );
     }
@@ -338,6 +397,7 @@ fn a_host_expert_stack_is_used_as_the_file_stores_it_when_a_dot_kernel_reads_it(
         GgmlDType::Q5K,
         GgmlDType::Q6K,
         GgmlDType::MxFp4,
+        GgmlDType::F32,
     ] {
         assert!(
             moe_stack_served_as_stored(dtype, false),

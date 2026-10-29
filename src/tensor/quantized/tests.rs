@@ -518,6 +518,60 @@ fn q5_0_gpu_mmvq_matches_oracle() {
 /// of an f64 reference matmul over the dequantized weights. Synthetic
 /// weights, no model store needed.
 #[cfg(target_arch = "x86_64")]
+/// A float weight read on the host is held in its stored format, and its projection equals
+/// the F32 product over the widened weight, for one activation row and for several.
+#[test]
+fn a_host_float_weight_is_held_as_stored() {
+    use crate::tensor::{DType, Tensor};
+    let (n, k) = (12usize, 96usize);
+    let w = Tensor::from_vec_f32(
+        (0..n * k)
+            .map(|i| ((i % 113) as f32) * 0.018 - 0.99)
+            .collect(),
+        vec![n, k],
+    )
+    .unwrap();
+    for (stored, held) in [
+        (GgmlDType::F32, DType::F32),
+        (GgmlDType::F16, DType::F16),
+        (GgmlDType::BF16, DType::BF16),
+    ] {
+        let qt = QTensor::quantize(&w, stored).unwrap();
+        let wide = qt
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let qm = QMatMul::from_arc(std::sync::Arc::new(qt)).unwrap();
+        assert_eq!(qm.float_format(), Some(stored));
+        match &qm {
+            QMatMul::Tensor(t) | QMatMul::TensorF16(t) | QMatMul::Bf16(t) => {
+                assert_eq!(t.dtype(), held, "{stored:?}");
+                assert!(t.device().is_cpu(), "{stored:?}");
+            }
+            QMatMul::QTensor(_) => panic!("{stored:?} is held as blocks"),
+        }
+        for rows in [1usize, 4] {
+            let x = Tensor::from_vec_f32(
+                (0..rows * k)
+                    .map(|i| ((i % 71) as f32) * 0.027 - 0.95)
+                    .collect(),
+                vec![rows, k],
+            )
+            .unwrap();
+            let got = qm.forward(&x).unwrap();
+            assert_eq!(got.dtype(), DType::F32);
+            let want = x.matmul_t(&wide).unwrap().to_vec_f32();
+            for (g, w) in got.to_vec_f32().iter().zip(&want) {
+                assert!(
+                    (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                    "{stored:?}: {g} against {w}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn cpu_qmatmul_vec_dot_matches_oracle() {
     if !crate::cpu::hardware_has_avx2() {

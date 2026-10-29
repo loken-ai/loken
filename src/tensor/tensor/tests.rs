@@ -91,6 +91,37 @@ fn gemm_f16w_matches_upcast_path() -> Result<()> {
     Ok(())
 }
 
+/// The host product over a weight held as stored in F16 or BF16 equals the F32 product over
+/// the widened weight, for one activation row and for several, with a row length that is not
+/// a whole number of the dot's lanes. Operands the product does not read return `None`.
+#[test]
+fn matmul_t_half_f32_matches_the_widened_product() -> Result<()> {
+    let (k, n) = (203usize, 37usize);
+    let mk = |len: usize, s: f32| -> Vec<f32> { (0..len).map(|i| (i as f32 * s).sin()).collect() };
+    for half in [DType::F16, DType::BF16] {
+        let w = Tensor::from_vec_f32(mk(n * k, 0.11), (n, k))?.to_dtype(half)?;
+        let wide = w.to_dtype(DType::F32)?;
+        for rows in [1usize, 5] {
+            let x = Tensor::from_vec_f32(mk(rows * k, 0.37), (rows, k))?;
+            let got = x
+                .matmul_t_half_f32(&w)?
+                .expect("host F32 rows over a half weight");
+            assert_eq!(got.dims(), &[rows, n]);
+            let want = x.matmul_t(&wide)?;
+            for (g, w) in got.to_vec_f32().iter().zip(want.to_vec_f32()) {
+                assert!(
+                    (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                    "{half:?}: {g} against {w}"
+                );
+            }
+        }
+        let x = Tensor::from_vec_f32(mk(k, 0.37), (1, k))?;
+        assert!(x.to_dtype(DType::F16)?.matmul_t_half_f32(&w)?.is_none());
+        assert!(x.matmul_t_half_f32(&wide)?.is_none());
+    }
+    Ok(())
+}
+
 #[test]
 fn cos_get_on_dim_contiguous() -> Result<()> {
     let t = Tensor::from_vec_f32(

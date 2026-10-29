@@ -718,7 +718,7 @@ fn alibi_slopes(n_head: usize, max_bias: f32) -> Vec<f32> {
         .collect()
 }
 
-fn requant_float_weight(
+pub(super) fn requant_float_weight(
     qt: QTensor,
     target: crate::tensor::quantized::GgmlDType,
     device: &Device,
@@ -743,8 +743,8 @@ fn requant_float_weight(
 }
 
 /// Whether the expert kernels of a device read a stack of `dtype` as the file stores it: the
-/// card kernels on a card, the host dot kernels on the host. A stack for which this is false
-/// is rebuilt in a format they read.
+/// card kernels on a card, the host dot kernels and the dense F32 product on the host. A stack
+/// for which this is false is rebuilt in a format they read.
 pub(crate) fn moe_stack_served_as_stored(
     dtype: crate::tensor::quantized::GgmlDType,
     on_card: bool,
@@ -752,7 +752,9 @@ pub(crate) fn moe_stack_served_as_stored(
     if on_card {
         crate::inference::moe_cuda::gemm::expert_kernels_serve(dtype)
     } else {
-        crate::inference::moe_cpu::cpu_qmatmul_supported(dtype)
+        // A host F32 stack is read as stored by the dense expert product: the weights are exact.
+        dtype == crate::tensor::quantized::GgmlDType::F32
+            || crate::inference::moe_cpu::cpu_qmatmul_supported(dtype)
     }
 }
 
@@ -1168,33 +1170,134 @@ fn tp_share_config(
     share
 }
 
-/// The block format float projections are rebuilt in. Eight bits keep a small model's answers;
-/// four bits halve what a large one takes. The plan decides: a stack kept on one kind of memory
-/// holds the checkpoint as it is, so eight bits fit; a stack split between cards and the host
-/// had to spill, so it takes four. A stack on the host alone is checked against `spare`, the
-/// memory the host can give. The rule reads the plan and the file, never the backend.
+/// The weights of a checkpoint as the format rule weighs them: its per-layer float projections
+/// apart from everything else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CheckpointWeights {
+    /// The format the projections are stored in; `None` when one of them is a block format.
+    float: Option<crate::tensor::quantized::GgmlDType>,
+    /// Bytes of the per-layer projections as stored.
+    projection_bytes: u64,
+    /// Elements of the per-layer projections, the feed-forward's output projection apart.
+    projection_elems: u64,
+    /// Elements of the feed-forward's output projections.
+    down_elems: u64,
+    /// Bytes of every other tensor as stored.
+    other_bytes: u64,
+}
+
+impl CheckpointWeights {
+    /// The weights of the file `content`. A per-layer projection is a matrix under `blk.`.
+    fn of(content: &gguf_file::Content) -> Self {
+        let mut w = Self::default();
+        let mut block = false;
+        for (name, info) in &content.tensor_infos {
+            let bytes = info.size_in_bytes() as u64;
+            let dims = info.shape.dims();
+            if !name.starts_with("blk.") || dims.len() != 2 {
+                w.other_bytes += bytes;
+                continue;
+            }
+            let dtype = info.ggml_dtype;
+            if is_float_format(dtype) {
+                // The widest of the stored float formats names the checkpoint's.
+                w.float = Some(match w.float {
+                    Some(f) if f.type_size() >= dtype.type_size() => f,
+                    _ => dtype,
+                });
+            } else {
+                block = true;
+            }
+            w.projection_bytes += bytes;
+            let elems = info.shape.elem_count() as u64;
+            if name.contains("ffn_down") {
+                w.down_elems += elems;
+            } else {
+                w.projection_elems += elems;
+            }
+        }
+        if block {
+            w.float = None;
+        }
+        w
+    }
+
+    /// Bytes of the checkpoint with its projections in `format`, as stored when `None`.
+    fn bytes_in(&self, format: Option<crate::tensor::quantized::GgmlDType>) -> u64 {
+        let at = |dtype: crate::tensor::quantized::GgmlDType, elems: u64| {
+            elems * dtype.type_size() as u64 / dtype.block_size() as u64
+        };
+        let projections = match format {
+            None => self.projection_bytes,
+            Some(f) => at(f, self.projection_elems) + at(ffn_down_format(f), self.down_elems),
+        };
+        self.other_bytes + projections
+    }
+}
+
+/// Whether `dtype` is one of the float formats a projection is served in as stored.
+fn is_float_format(dtype: crate::tensor::quantized::GgmlDType) -> bool {
+    use crate::tensor::quantized::GgmlDType;
+    matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+}
+
+/// The block formats a float checkpoint is rebuilt in when it does not fit as stored, widest
+/// first: eight bits keep a small model's answers, four bits halve what a large one takes.
+const REQUANT_LADDER: [crate::tensor::quantized::GgmlDType; 2] = [
+    crate::tensor::quantized::GgmlDType::Q8_0,
+    crate::tensor::quantized::GgmlDType::Q4K,
+];
+
+/// The format float projections run in. A float checkpoint keeps its stored format when the
+/// plan fits with it, and is otherwise rebuilt in the widest format of [`REQUANT_LADDER`] that
+/// fits, the narrowest when none does. The plan sized every layer at its stored bytes, so the
+/// layers it gives cards fit as stored; the layers it keeps on the host are checked against
+/// `spare`, the memory the host can give, in proportion to their share of the stack.
+///
+/// A checkpoint with a block-format projection keeps the rule of block files for its stray
+/// float matrices: eight bits where its stack stays on one kind of memory and fits, four where
+/// it spills. The rule reads the plan and the file, never the backend.
 fn float_projection_format(
     plan: &HeteroPlan,
-    stored: u64,
+    weights: &CheckpointWeights,
     spare: u64,
 ) -> crate::tensor::quantized::GgmlDType {
     use crate::tensor::quantized::GgmlDType;
     let on_host = |s: &crate::inference::place::layer_executor::HeteroSegment| {
         matches!(s.kind, DeviceKind::Cpu)
     };
-    let hosted = plan.segments.iter().any(on_host);
-    let carded = plan.segments.iter().any(|s| !on_host(s));
-    match (hosted, carded) {
-        (true, true) => GgmlDType::Q4K,
-        (false, true) => GgmlDType::Q8_0,
-        _ if stored <= spare => GgmlDType::Q8_0,
-        _ => GgmlDType::Q4K,
+    let Some(stored) = weights.float else {
+        let hosted = plan.segments.iter().any(on_host);
+        let carded = plan.segments.iter().any(|s| !on_host(s));
+        return match (hosted, carded) {
+            (true, true) => GgmlDType::Q4K,
+            (false, true) => GgmlDType::Q8_0,
+            _ if weights.bytes_in(None) <= spare => GgmlDType::Q8_0,
+            _ => GgmlDType::Q4K,
+        };
+    };
+    let total = plan.total_layers.max(1) as u128;
+    let host_layers: u128 = plan
+        .segments
+        .iter()
+        .filter(|s| on_host(s))
+        .map(|s| s.num_layers() as u128)
+        .sum();
+    let fits = |format: Option<GgmlDType>| {
+        weights.bytes_in(format) as u128 * host_layers / total <= spare as u128
+    };
+    if fits(None) {
+        return stored;
     }
+    REQUANT_LADDER
+        .into_iter()
+        .find(|&f| fits(Some(f)))
+        .unwrap_or(REQUANT_LADDER[REQUANT_LADDER.len() - 1])
 }
 
-/// The block format the feed-forward's output projection takes when float weights are rebuilt
-/// in `base`. In four bits it stays in six, as the K-quant mixes of llama.cpp do: its error
-/// reaches the residual stream directly, and no other weight is fused with it.
+/// The format the feed-forward's output projection takes when float weights run in `base`. In
+/// four bits it stays in six, as the K-quant mixes of llama.cpp do: its error reaches the
+/// residual stream directly, and no other weight is fused with it.
 fn ffn_down_format(
     base: crate::tensor::quantized::GgmlDType,
 ) -> crate::tensor::quantized::GgmlDType {
@@ -1293,17 +1396,13 @@ fn build_generic_layer(
         }
     };
 
-    // The block format float projections are requantised to: the model's choice, unless a float
-    // weight's rows are not whole blocks of it, in which case the layer's float weights all take
-    // Q8_0 so the byte-concat fusions below still see one format.
+    // The format float projections run in: the model's choice, unless it is a block format whose
+    // blocks a float weight's rows do not fill, in which case the layer's float weights all take
+    // Q8_0 so the byte-concat fusions below still see one format. A float choice keeps every
+    // float projection in its stored format.
     let requant_dtype = {
         use crate::tensor::quantized::GgmlDType;
-        let is_float = |qt: &QTensor| {
-            matches!(
-                qt.dtype(),
-                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-            )
-        };
+        let is_float = |qt: &QTensor| is_float_format(qt.dtype());
         let whole_q4k_rows = [
             raw.attn_q.as_ref(),
             raw.attn_k.as_ref(),
@@ -1349,17 +1448,10 @@ fn build_generic_layer(
         let Some(qt) = qt else {
             return Ok(None);
         };
-        let dtype = qt.dtype();
-        let needs_requant = matches!(
-            dtype,
-            crate::tensor::quantized::GgmlDType::F32
-                | crate::tensor::quantized::GgmlDType::F16
-                | crate::tensor::quantized::GgmlDType::BF16
-        );
-        // Requant F16/BF16/F32 weights to the block format on BOTH cuda and cpu. On GPU
-        // it enables the QKV/FFN byte-concat fusions; on CPU the block kernels read about
-        // a quarter of the bytes of a dense F32 GEMM. The host's numerics match the card's.
-        // The byte-concat *fusion* stays GPU-only.
+        let needs_requant = is_float_format(qt.dtype()) && !is_float_format(requant_dtype);
+        // A float weight takes the block format the placement chose, on a card and on the host
+        // alike, so the QKV and FFN byte-concat fusions see one format. A float choice keeps it
+        // as stored.
         if needs_requant {
             // One block format for every per-layer weight, so that the QKV and FFN
             // gate+up fusions apply.
@@ -1376,14 +1468,7 @@ fn build_generic_layer(
     //
     // Helper: requant a QTensor to the block format if it's F16/F32/BF16 (returns QTensor).
     let requant_qt = |qt: QTensor| -> Result<QTensor> {
-        let dtype = qt.dtype();
-        let needs = matches!(
-            dtype,
-            crate::tensor::quantized::GgmlDType::F32
-                | crate::tensor::quantized::GgmlDType::F16
-                | crate::tensor::quantized::GgmlDType::BF16
-        );
-        if needs {
+        if is_float_format(qt.dtype()) && !is_float_format(requant_dtype) {
             requant_float_weight(qt, requant_dtype, device, "projection")
         } else {
             Ok(qt)
@@ -3329,15 +3414,24 @@ impl GenericHeteroTransformer {
                 cfg.max_q8_seq_len = fit;
             }
         }
+        let weights = CheckpointWeights::of(content);
         cfg.flags.float_format = float_projection_format(
             plan,
-            content
-                .tensor_infos
-                .values()
-                .map(|info| info.size_in_bytes() as u64)
-                .sum(),
+            &weights,
             crate::inference::place::layer_executor::host_spill_budget_bytes(),
         );
+        if let Some(stored) = weights.float {
+            let run = cfg.flags.float_format;
+            match run == stored {
+                true => info!("float projections run as stored: {}", stored.gguf_name()),
+                false => info!(
+                    "float projections run as {} (feed-forward output {}): stored {} does not fit",
+                    run.gguf_name(),
+                    ffn_down_format(run).gguf_name(),
+                    stored.gguf_name()
+                ),
+            }
+        }
         let config = Arc::new(cfg);
         let flags = Arc::new(config.flags.clone());
         let n_layers = config.n_layers;
@@ -5433,10 +5527,11 @@ mod split_tests {
         assert_eq!(ffn_down_format(GgmlDType::Q8_0), GgmlDType::Q8_0);
     }
 
-    /// Float projections are rebuilt in eight bits where the stack stays on one kind of memory
-    /// and the checkpoint fits it, and in four bits where the stack spills.
+    /// A float checkpoint keeps its stored format where the plan fits it, and is rebuilt in the
+    /// widest block format that fits where it does not. A checkpoint with block projections
+    /// keeps the rule of block files.
     #[test]
-    fn float_projections_take_eight_bits_where_the_checkpoint_fits() {
+    fn a_float_checkpoint_runs_as_stored_where_it_fits() {
         use crate::inference::place::layer_executor::HeteroSegment;
         use crate::tensor::quantized::GgmlDType;
         let seg = |kind, start, end| HeteroSegment {
@@ -5457,10 +5552,72 @@ mod split_tests {
             seg(DeviceKind::Cpu, 2, 4),
         ]);
         let host = plan(vec![seg(DeviceKind::Cpu, 0, 4)]);
-        assert_eq!(float_projection_format(&cards, 1 << 40, 0), GgmlDType::Q8_0);
-        assert_eq!(float_projection_format(&split, 1, 1 << 40), GgmlDType::Q4K);
-        assert_eq!(float_projection_format(&host, 100, 200), GgmlDType::Q8_0);
-        assert_eq!(float_projection_format(&host, 300, 200), GgmlDType::Q4K);
+        // 1024 elements of projections, 256 of them the feed-forward's output: 2 KiB in BF16.
+        let bf16 = CheckpointWeights {
+            float: Some(GgmlDType::BF16),
+            projection_bytes: 2048,
+            projection_elems: 768,
+            down_elems: 256,
+            other_bytes: 0,
+        };
+        let q8 = bf16.bytes_in(Some(GgmlDType::Q8_0));
+        let q4 = bf16.bytes_in(Some(GgmlDType::Q4K));
+        assert_eq!(bf16.bytes_in(None), 2048);
+        assert_eq!(q8, 1024 / 32 * 34);
+        assert_eq!(q4, 768 / 256 * 144 + 256 / 256 * 210);
+        // Cards hold what the plan gave them as stored.
+        assert_eq!(float_projection_format(&cards, &bf16, 0), GgmlDType::BF16);
+        // The host holds its share of the stack, half of it in the split plan.
+        assert_eq!(float_projection_format(&host, &bf16, 2048), GgmlDType::BF16);
+        assert_eq!(float_projection_format(&split, &bf16, 1024), GgmlDType::BF16);
+        assert_eq!(float_projection_format(&host, &bf16, q8), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&split, &bf16, q8 / 2), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&host, &bf16, q4), GgmlDType::Q4K);
+        // Nothing fits: the narrowest rung.
+        assert_eq!(float_projection_format(&host, &bf16, 1), GgmlDType::Q4K);
+        // A block checkpoint's stray float matrices.
+        let block = CheckpointWeights {
+            float: None,
+            other_bytes: 100,
+            ..bf16
+        };
+        assert_eq!(float_projection_format(&cards, &block, 0), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&split, &block, u64::MAX), GgmlDType::Q4K);
+        assert_eq!(float_projection_format(&host, &block, 1 << 20), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&host, &block, 2000), GgmlDType::Q4K);
+    }
+
+    /// The legacy rule for block files, kept for their stray float matrices.
+    #[test]
+    fn stray_float_matrices_of_a_block_file_take_eight_bits_where_the_file_fits() {
+        use crate::inference::place::layer_executor::HeteroSegment;
+        use crate::tensor::quantized::GgmlDType;
+        let seg = |kind, start, end| HeteroSegment {
+            kind,
+            layer_start: start,
+            layer_end: end,
+            free_memory_bytes: 0,
+        };
+        let plan = |segments| HeteroPlan {
+            segments,
+            tp_cards: None,
+            total_layers: 4,
+            host_experts_from: None,
+        };
+        let cards = plan(vec![seg(DeviceKind::Cuda(0), 0, 4)]);
+        let split = plan(vec![
+            seg(DeviceKind::Cuda(0), 0, 2),
+            seg(DeviceKind::Cpu, 2, 4),
+        ]);
+        let host = plan(vec![seg(DeviceKind::Cpu, 0, 4)]);
+        let file = |bytes| CheckpointWeights {
+            other_bytes: bytes,
+            ..CheckpointWeights::default()
+        };
+        assert_eq!(float_projection_format(&cards, &file(1 << 40), 0), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&split, &file(1), 1 << 40), GgmlDType::Q4K);
+        assert_eq!(float_projection_format(&host, &file(100), 200), GgmlDType::Q8_0);
+        assert_eq!(float_projection_format(&host, &file(300), 200), GgmlDType::Q4K);
     }
 
     #[test]

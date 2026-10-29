@@ -16,7 +16,7 @@ Every route but `/health` and `/ping` demands a key when `[server] require_auth`
 | `GET /api/version` | The Ollama API level served, with the crate version beside it. |
 | `GET /api/tags` | The models on this machine, with the architecture, quantisation and parameter count each header declares, read once before the port opens and again only for a file that changed. In a cluster, the models the peers hold follow, each under `node`; a request naming one is forwarded there. |
 | `POST /api/show` | A model's details, with the Modelfile synthesised from its own blobs. `verbose` adds the vocabulary arrays. |
-| `GET /api/ps` | The models resident in memory. |
+| `GET /api/ps` | The models resident in memory. `details.running_format` names the formats a language model's per-layer projections run in, joined with `+`: `bf16` for a checkpoint served as stored, `q8_0` or `q4_K+q6_K` for one rebuilt to fit. |
 | `POST /api/pull` | Fetch a model. Streams progress unless `stream: false`. |
 | `POST /api/push` | Refused: nothing is pushed to a registry. |
 | `POST /api/create` | Build a model from blobs uploaded through `/api/blobs`, with template, system, parameters, license and messages as layers of their own. Streams NDJSON. |

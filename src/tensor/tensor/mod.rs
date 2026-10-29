@@ -977,6 +977,63 @@ pub(super) fn gemm_f16w_f32_cpu(
     }
 }
 
+/// Lanes of the F32 accumulators a dot product of [`gemm_nt_half_f32`] keeps.
+const HALF_DOT_LANES: usize = 8;
+
+/// `a @ b^T` for F32 `a` `[m, k]` and a half-precision `b` `[n, k]` (F16 or BF16) into `out`
+/// `[m, n]`, summed in F32. The columns are sharded across the GEMV pool; a chunk widens each
+/// of its weight rows once, exactly, and dots it with every row of `a`. A result does not
+/// depend on the rows beside it.
+pub(super) fn gemm_nt_half_f32<H: Sync>(
+    a: &[f32],
+    b: &[H],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) where
+    [H]: half::slice::HalfFloatSliceExt,
+{
+    use half::slice::HalfFloatSliceExt;
+    if m == 0 || n == 0 {
+        return;
+    }
+    let pool = crate::tensor::quant_cpu::gemv_pool::pool();
+    let (chunk_cols, n_chunks) = crate::tensor::quant_cpu::gemv_grid(1, n, pool.threads);
+    struct MutPtr(*mut f32);
+    unsafe impl Send for MutPtr {}
+    unsafe impl Sync for MutPtr {}
+    let out_ptr = MutPtr(out.as_mut_ptr());
+    pool.run(n_chunks, &|chunk| {
+        let out_ptr = &out_ptr;
+        let col0 = chunk * chunk_cols;
+        let col1 = (col0 + chunk_cols).min(n);
+        let mut row = vec![0f32; k];
+        for col in col0..col1 {
+            b[col * k..][..k].convert_to_f32_slice(&mut row);
+            for r in 0..m {
+                let x = &a[r * k..][..k];
+                let mut acc = [0f32; HALF_DOT_LANES];
+                let xs = x.chunks_exact(HALF_DOT_LANES);
+                let ws = row.chunks_exact(HALF_DOT_LANES);
+                let tail: f32 = xs
+                    .remainder()
+                    .iter()
+                    .zip(ws.remainder())
+                    .map(|(p, q)| p * q)
+                    .sum();
+                for (xv, wv) in xs.zip(ws) {
+                    for ((s, p), q) in acc.iter_mut().zip(xv).zip(wv) {
+                        *s += p * q;
+                    }
+                }
+                // SAFETY: chunks address disjoint column ranges of `out`.
+                unsafe { *out_ptr.0.add(r * n + col) = acc.iter().sum::<f32>() + tail };
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests;
 
