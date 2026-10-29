@@ -28,6 +28,8 @@ pub mod model_facts;
 pub use engine::llm_engine;
 
 pub use engine::{InferenceEngine, LlmEngine};
+// The layer bench and the pieces the microbenches share; a developer's feature.
+#[cfg(feature = "microbench")]
 pub mod bench;
 pub mod cache;
 pub mod codec;

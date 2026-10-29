@@ -13,6 +13,7 @@
 //! serves, and another streamed or resident model adds an implementation and a line in
 //! [`subject::open`].
 
+pub mod args;
 pub mod counters;
 pub mod deepseek;
 pub mod report;

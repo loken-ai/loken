@@ -7,12 +7,12 @@ of the whole file for every hypothesis. The layer bench holds a few layers of th
 places them as the server places the whole, replays decode steps through them and reports the
 same stage profile the server keeps, with the counters a hypothesis needs.
 
-The bench is a subcommand of the daemon's binary. It starts no server and loads no other model.
+The bench is a cargo bench behind the `microbench` feature, so no release build carries it. It starts no server and loads no other model.
 
 ## Run
 
 ```sh
-lokend layer-bench /models/large.gguf --layers 10..13 --tokens 64 --json results/layers-10-13.json
+cargo bench --features cuda,microbench --bench layerbench -- /models/large.gguf --layers 10..13 --tokens 64 --json results/layers-10-13.json
 ```
 
 The arguments:

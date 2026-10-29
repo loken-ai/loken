@@ -213,6 +213,14 @@ path = "benches/microbench.rs"
 harness = false
 required-features = ["microbench"]
 
+# The layer bench: decode steps through a few layers of a model file. Same feature, same command
+# line convention.
+[[bench]]
+name = "layerbench"
+path = "benches/layerbench.rs"
+harness = false
+required-features = ["microbench"]
+
 # What a runner builds the tests with: the dev optimisation level, since the suite has tests
 # that crawl unoptimised, and line tables only, since nobody attaches a debugger to a runner.
 [profile.ci]
