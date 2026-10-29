@@ -28,6 +28,12 @@ Read in this order.
 | [`learn/README.md`](learn/README.md) | The series: ten lessons, ten minutes each, one exercise per lesson |
 | [`learn/slides.html`](learn/slides.html) | The same series as a deck |
 
+## Maps
+
+| Map | What it shows |
+|---|---|
+| [`ANATOMY.md`](ANATOMY.md) | The modules of lokend drawn on a body, with the HeteroPlan levels each reads |
+
 ## Guides
 
 | Guide | Task |
