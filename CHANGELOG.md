@@ -27,6 +27,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Experts: keep more of them in host memory, sized while serving, with read-ahead taken only when it runs faster.
+- Experts: read only the experts a prompt routes to, and run them on the cards.
 - Experts: copy a decode's experts to the cards beside the token, not inside it.
 - API: leave the stop sequence out of the text returned by every route unless asked to keep it.
 - Serving: decode and prefill more requests in one batch, sharing the cache and fusing the attention.

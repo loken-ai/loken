@@ -602,8 +602,11 @@ impl DeepseekV41Model {
         }
         let engram_start = state.engram.clone();
         // A prompt this wide routes to nearly every expert of every layer, so each layer is read
-        // in while the one before it computes, instead of faulting in under its own MoE.
-        let reads_whole_layers = self.routes_whole_layers(tokens.len());
+        // in while the one before it computes, instead of faulting in under its own MoE. Not
+        // when the cards run the prompt's experts: each layer then reads only the experts the
+        // prompt routes to, by its own plan, once the router has named them.
+        let reads_whole_layers =
+            self.routes_whole_layers(tokens.len()) && !self.cards_take_prompt(tokens.len());
         if reads_whole_layers {
             if let Some(b) = self.blocks.iter().flatten().next() {
                 b.prefetch_layer();
@@ -743,6 +746,24 @@ impl DeepseekV41Model {
         };
         let (k, e) = (b.moe.n_activated as f64, b.moe.n_routed as f64);
         e > 0.0 && 1.0 - (1.0 - k / e).powf(tokens as f64) > 0.5
+    }
+
+    /// Whether the cards run the routed experts of a prompt of `tokens` rows (see
+    /// `Moe::prompt_plan`): the experts' offload has a layer path for a prompt and a card has
+    /// the room for the rows now. The whole-layer read-ahead then stays off.
+    fn cards_take_prompt(&self, tokens: usize) -> bool {
+        if tokens <= crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS {
+            return false;
+        }
+        let Some(b) = self.blocks.iter().flatten().next() else {
+            return false;
+        };
+        let Some(off) = b.moe.offload.read().unwrap().clone() else {
+            return false;
+        };
+        off.device
+            .as_ref()
+            .is_some_and(|d| (d.room)(tokens * self.dim * std::mem::size_of::<f32>()))
     }
 
     /// The engram ids a decode holds after `tokens`: the last `max_ngram` of them, compressed.
@@ -1016,14 +1037,13 @@ impl DeepseekV41Model {
     }
 
     /// Size the kept expert tier to the host memory left once the page cache can hold, beside
-    /// it, the always-read path, one token's worth of routed experts, and one layer's whole
-    /// set of experts - what a prompt's prefill streams through while the kept ones must stay.
+    /// it, the always-read path and one token's worth of routed experts. A prompt reads only
+    /// the experts it routes to, so no whole layer is set aside for it.
     /// Without that room the kept tier fills the memory exactly, every miss read evicts a kept
     /// expert, and the misses sustain themselves. Applied to every layer; returns the slots.
     pub fn size_expert_cache_to_memory(&self, cfg: &DeepseekV41Config) -> Result<usize> {
         let expert_bytes = self.expert_bytes()? as u64;
         let per_token = expert_bytes * (cfg.n_activated_experts * cfg.n_layers) as u64;
-        let per_layer = expert_bytes * cfg.n_routed_experts as u64;
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         // A hard free-memory headroom the kept tier never sizes into. The tier keeps its experts
@@ -1031,7 +1051,7 @@ impl DeepseekV41Model {
         // cache, but a co-process or a prefill's allocation burst can outrun the kernel's reclaim
         // and OOM the host. One eighth of total RAM keeps enough genuinely free for a burst.
         let headroom = sys.total_memory() / 8;
-        let reserve = self.resident_path_bytes() as u64 + per_token + per_layer + headroom;
+        let reserve = self.resident_path_bytes() as u64 + per_token + headroom;
         let budget = sys.available_memory().saturating_sub(reserve);
         let slots = if expert_bytes == 0 || cfg.n_layers == 0 {
             0
@@ -3896,6 +3916,7 @@ mod oracle_gate {
         // Every expert is the host's: the cards decline all of them.
         model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
             host_expert_ns: Default::default(),
+            prompt_host_row_ns: Default::default(),
             lanes: 1,
             device: None,
             timings: std::sync::Arc::new(Default::default()),

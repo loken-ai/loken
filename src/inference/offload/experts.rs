@@ -228,12 +228,36 @@ pub struct DeviceLayer {
             + Send
             + Sync,
     >,
+    /// `run` for an expert of a prompt's plan (see `offload::prompt_experts`): from the card's
+    /// copy where it keeps the expert, else from a copy made for this layer in memory the card
+    /// has free, which takes no kept expert's place and stays only where the room for it is
+    /// free. `None` where the card has no room and the host runs it.
+    #[allow(clippy::type_complexity)]
+    pub prompt: Box<
+        dyn Fn(
+                usize,
+                &Arc<dyn std::any::Any + Send + Sync>,
+                &Expert,
+                &[u32],
+                f32,
+            ) -> Option<Result<Vec<f32>>>
+            + Send
+            + Sync,
+    >,
+    /// Whether a card has `bytes` free now for a layer's context.
+    pub room: Box<dyn Fn(usize) -> bool + Send + Sync>,
+    /// Nanoseconds a copy to the card lane `lane` runs on takes per KiB, measured on its copies;
+    /// 0 until one was measured.
+    pub copy_ns_per_kib: Box<dyn Fn(usize) -> u64 + Send + Sync>,
 }
 
 pub struct ExpertOffload {
     /// Nanoseconds the host takes for one routed expert of a decode, smoothed over the blocks
     /// that ran some there: what a use on a card saves.
     pub host_expert_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// Nanoseconds the host takes for one row of a prompt's routed expert, smoothed over the
+    /// layers that ran some there; 0 until one did. What a copy to a card is weighed against.
+    pub prompt_host_row_ns: Arc<std::sync::atomic::AtomicU64>,
     /// A prompt's experts held on the cards' side (see `DeviceLayer`), where the offload has it.
     pub device: Option<DeviceLayer>,
     pub lanes: usize,

@@ -265,9 +265,14 @@ What the offload derives for itself, from measurement, and logs:
 | Reader threads | The smallest count that reaches the device's read rate, from a probe at load. |
 | Sightings before a card takes an expert | The measured upload cost against what a use saves. |
 | Experts kept per layer | What the host memory allows. |
+| Where a prompt's expert runs | The measured time of a copy to the card per byte against the measured time of a host row, per expert of the layer. |
 
-During a prompt's prefill, the experts of the next layer are read from the file into one of two
-page-locked slabs while the dense work of the current layer runs.
+During a prompt's prefill, each layer reads only the experts the prompt routes to, once its
+router has named them. The cards' copies are read from the file into a page-locked slab in runs
+of adjacent experts, around the page cache, while the cards run the experts they keep and the
+host runs its own. A copy made for the layer is let go after it unless the card has the room
+free to keep it. It never takes a kept expert's place. When no card has room for the prompt's
+rows, the whole next layer is read ahead into the slab while the current layer runs.
 
 ### Expert cache of a mixture held in the file's mapping
 

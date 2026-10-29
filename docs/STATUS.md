@@ -73,7 +73,7 @@ from the file as routing asks for them. Its runs are on the
 
 | Piece | State |
 |---|---|
-| Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards; a layer's experts are read into page-locked slabs ahead and sent on a copy stream. See the benchmark rows of the model |
+| Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards. Each layer reads only the experts the prompt routes to, in runs, into a page-locked slab, and sends them on a copy stream. See the benchmark rows of the model |
 | Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [`CONFIGURATION.md`](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Decode-state cache | In host memory unless `state_cache_dir` puts it on disk. A stored prefix always pays; a short remainder still reads nearly every expert, which bounds how little it costs |
 | `quality` | `exact` unless `fidelity = "fast"`. The other levels change the output. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |

@@ -7,7 +7,8 @@
 //! thread and the call, so a model served elsewhere in the process keeps its own path.
 //!
 //! `projection` and `experts` are what any model hands over; `store` keeps a working set of
-//! routed experts in the page cache; `room` is what a card may hold beside its own work;
+//! routed experts in the page cache; `prompt_experts` splits a prompt layer's experts between
+//! the cards and the host; `room` is what a card may hold beside its own work;
 //! `cuda` is the card behind the trait; `streamed` opens the placement from what a model
 //! declares, under the engine's own switches.
 
@@ -18,6 +19,7 @@ pub mod cuda;
 pub mod experts;
 pub mod moe_dispatch;
 pub mod projection;
+pub mod prompt_experts;
 pub mod readahead;
 pub mod room;
 pub mod store;

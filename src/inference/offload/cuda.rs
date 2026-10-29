@@ -10,11 +10,11 @@ use super::projection::Projection;
 use super::room::Room;
 use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
-    expert_tables, gpu_expert_layer_rows, gpu_expert_row, gpu_expert_rows_grouped,
-    gpu_expert_rows_grouped_multi, gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear,
-    gpu_index_scores, gpu_layer_begin, gpu_matmul_kept, gpu_prefill_attention, gpu_quant_linear,
-    gpu_sparse_attn, CudaDevice, ExpertFormat, ExpertTables, ExpertWeight, HcStreamDev,
-    LayerBuffers, PrefillAttention, QuantWeight, QUANT_LINEAR_TILE_BYTES,
+    expert_tables, gpu_expert_layer_rows, gpu_expert_layer_rows_held, gpu_expert_row,
+    gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_expert_tokens, gpu_fp4_linear,
+    gpu_fp8_linear, gpu_index_scores, gpu_layer_begin, gpu_matmul_kept, gpu_prefill_attention,
+    gpu_quant_linear, gpu_sparse_attn, CudaDevice, ExpertFormat, ExpertTables, ExpertWeight,
+    HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::gpu_runtime::driver::CudaSlice;
 use crate::tensor::ops::rms_norm;
@@ -201,6 +201,9 @@ pub struct Card {
     admission: Arc<Admission>,
     /// Nanoseconds the host takes for one expert, smoothed; set when the card joins an offload.
     host_expert_ns: OnceLock<Arc<AtomicU64>>,
+    /// Nanoseconds the card's copy engine takes per KiB of a prompt expert's copy, smoothed over
+    /// the copies made; 0 until one was timed. What a prompt weighs against the host's row.
+    copy_ns_per_kib: AtomicU64,
 }
 
 /// Copies the experts a card's decodes asked it to keep, one after the other, on a stream of
@@ -301,6 +304,7 @@ impl Card {
             said: AtomicBool::new(false),
             admission: Arc::new(Admission::new(protect as usize)),
             host_expert_ns: OnceLock::new(),
+            copy_ns_per_kib: AtomicU64::new(0),
         }
     }
 
@@ -500,6 +504,27 @@ impl Card {
         if self.declined.load(Ordering::Relaxed) && !made_room && !self.has_free(need) {
             return None;
         }
+        self.outcome(what, run)
+    }
+
+    /// `attempt` for a step that takes no room from the kept experts: a card that was short of
+    /// memory runs it only when it has `need` bytes free, and one that fails for want of memory
+    /// is declined for the host to run. Nothing is evicted for it.
+    fn attempt_held<T>(
+        &self,
+        what: &str,
+        need: usize,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Option<Result<T>> {
+        if self.declined.load(Ordering::Relaxed) && !self.has_free(need) {
+            return None;
+        }
+        self.outcome(what, run)
+    }
+
+    /// `run` as a step of this card: its answer, or `None` when the card declined it for want
+    /// of memory, which the host then runs.
+    fn outcome<T>(&self, what: &str, run: impl FnOnce() -> Result<T>) -> Option<Result<T>> {
         // The driver panics on some allocations it cannot make rather than erring; a step that
         // panics is a step the card declined, and the host runs it.
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
@@ -1105,6 +1130,113 @@ impl Card {
         self.attempt("an expert's rows of a layer", need, || {
             gpu_expert_layer_rows(&self.dev, weights, tables, (inter, dim), layer, toks, limit)
         })
+    }
+
+    /// One expert of a prompt's plan over its rows `toks` of the layer (see
+    /// `offload::prompt_experts`): from the weights this card keeps for it, else from a copy made
+    /// for this layer in memory the card has free. The copy takes no kept expert's place, and
+    /// stays on the card after the layer only where the room for it is free. `None` where the
+    /// card has no room or the weights are not in a format the exact kernels read.
+    fn prompt_expert(
+        &self,
+        layer: &LayerBuffers,
+        e: &Expert,
+        toks: &[u32],
+        limit: f32,
+    ) -> Option<Result<Vec<f32>>> {
+        let (inter, dim) = (e.w1.dims()[0], e.w1.dims()[1]);
+        let staged = [
+            quant_blocks_any(&e.w1).ok()?,
+            quant_blocks_any(&e.w3).ok()?,
+            quant_blocks_any(&e.w2).ok()?,
+        ];
+        let (format, weights) = self.expert_weights(e, &staged)?;
+        let kept = matches!(weights[0], ExpertWeight::Card(_));
+        let tables = self.tables_for(format)?;
+        let copy = if kept { 0 } else { e.bytes() };
+        let need = copy + toks.len() * (2 * inter + dim) * F32;
+        let ran = self.attempt_held("a prompt expert's rows", need, || {
+            gpu_expert_layer_rows_held(&self.dev, weights, tables, (inter, dim), layer, toks, limit)
+        })?;
+        let (out, held, copied) = match ran {
+            Ok(v) => v,
+            Err(err) => return Some(Err(err)),
+        };
+        if let Some((bytes, ns)) = copied {
+            self.note_copy(bytes, ns);
+        }
+        if !kept {
+            self.keep_if_room(e, held, toks.len() as u64);
+        }
+        Some(Ok(out))
+    }
+
+    /// A copy of `bytes` took `ns` on the card's copy engine: smoothed into the cost per KiB,
+    /// which the first copy sets whole.
+    fn note_copy(&self, bytes: usize, ns: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let per = ns.saturating_mul(super::prompt_experts::KIB as u64) / bytes as u64;
+        let old = self.copy_ns_per_kib.load(Ordering::Relaxed);
+        let next = if old == 0 {
+            per
+        } else {
+            old - old / super::admission::SMOOTHING + per / super::admission::SMOOTHING
+        };
+        self.copy_ns_per_kib.store(next, Ordering::Relaxed);
+    }
+
+    /// Keep `weights`, the three weights of `e` sent for a prompt's layer and read by `rows` of
+    /// its tokens, when the accounting has a place for them and the card has memory free beyond
+    /// its working room and its reserve with them in it. Nothing is evicted for them: without
+    /// the room they go with the layer.
+    fn keep_if_room(&self, e: &Expert, weights: [Arc<CudaSlice<u8>>; 3], rows: u64) {
+        let Some((_, gate)) = expert_gate(e) else {
+            return;
+        };
+        let key = (gate.as_ptr() as usize, gate.len());
+        let total: usize = weights.iter().map(|w| w.len()).sum();
+        {
+            let tier = self.tier();
+            if tier.kept.contains_key(&key) || tier.pending.contains(&key) {
+                return;
+            }
+        }
+        if !self.take_room(total, false) {
+            return;
+        }
+        // The weights are on the card already: what is free now is what they leave.
+        let leaves = self.free_now().is_some_and(|free| {
+            self.room
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .leaves(free, 0)
+        });
+        if !leaves {
+            self.give_room(total);
+            return;
+        }
+        let mut tier = self.tier();
+        if tier.kept.contains_key(&key) {
+            drop(tier);
+            self.give_room(total);
+            return;
+        }
+        let used = tier.clock;
+        let [gate_d, up_d, down_d] = weights;
+        tier.kept.insert(
+            key,
+            ExpertOnCard {
+                gate: gate_d,
+                up: up_d,
+                down: down_d,
+                used,
+                freq: rows,
+                admitted_freq: rows,
+                bytes: total,
+            },
+        );
     }
 
     /// `xs` rows through `m`, a weight kept on this card.
@@ -1726,8 +1858,10 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let multi_cards = cards.clone();
     let multi_timings = timings.clone();
     let (begin_cards, run_cards) = (cards.clone(), cards.clone());
+    let (prompt_cards, room_cards, cost_cards) = (cards.clone(), cards.clone(), cards.clone());
     ExpertOffload {
         host_expert_ns,
+        prompt_host_row_ns: Arc::new(AtomicU64::new(0)),
         device: Some(super::experts::DeviceLayer {
             begin: Box::new(move |x, dim| {
                 let layers: Vec<Option<LayerBuffers>> =
@@ -1742,6 +1876,17 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
                 let c = lane % run_cards.len();
                 let layer = layers.get(c)?.as_ref()?;
                 run_cards[c].layer_expert(layer, expert, toks, limit)
+            }),
+            prompt: Box::new(move |lane, ctx, expert, toks, limit| {
+                let layers = ctx.downcast_ref::<Vec<Option<LayerBuffers>>>()?;
+                let c = lane % prompt_cards.len();
+                let layer = layers.get(c)?.as_ref()?;
+                prompt_cards[c].prompt_expert(layer, expert, toks, limit)
+            }),
+            room: Box::new(move |bytes| room_cards.iter().any(|c| c.has_free(bytes))),
+            copy_ns_per_kib: Box::new(move |lane| {
+                let c = lane % cost_cards.len();
+                cost_cards[c].copy_ns_per_kib.load(Ordering::Relaxed)
             }),
         }),
         lanes: cards.len() * LANES_PER_CARD,

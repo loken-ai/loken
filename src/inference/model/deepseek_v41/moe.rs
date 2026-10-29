@@ -10,6 +10,8 @@
 
 use crate::inference::offload::experts::{Expert, ExpertOffload};
 pub use crate::inference::offload::moe_dispatch::DeferredExperts;
+use crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS;
+use crate::inference::offload::prompt_experts::{PromptExpert, PromptPlan};
 use crate::inference::offload::store::ExpertSet;
 use crate::tensor::{Device, Result, Tensor};
 use std::sync::Arc;
@@ -514,6 +516,13 @@ impl Moe {
                 );
             }
         }
+        // Which of the batch's experts the host's memory holds before the batch is admitted:
+        // what a prompt's plan copies from memory rather than from the file.
+        let kept_before: Vec<bool> = if n > VERIFY_BATCH_MAX_ROWS {
+            uses.iter().map(|&(e, _, _)| self.experts.is_kept(e)).collect()
+        } else {
+            Vec::new()
+        };
         self.experts.prefetch(&uses, n as u64)?;
         let active: Vec<usize> = uses.iter().map(|&(e, _, _)| e).collect();
         {
@@ -532,15 +541,29 @@ impl Moe {
             .collect::<Result<_>>()?;
         // A card that holds an expert runs it from its own copy, and one a layer's read-ahead
         // stages is read there: only the others are read in through the mapping, asked for
-        // from several threads so that their reads reach the disk together.
+        // from several threads so that their reads reach the disk together. A prompt's layer
+        // reads by its plan instead: the cards' copies from the file around the page cache.
         let on_card = self.on_card_probe();
-        {
-            use rayon::prelude::*;
-            active_refs.par_iter().for_each(|r| {
-                if !on_card(r) && !r.prestaged() {
-                    r.will_need();
-                }
-            });
+        let observer = self.observer.read().unwrap().clone();
+        let prompt = self.prompt_plan(
+            n,
+            &active,
+            &active_refs,
+            &assign,
+            &kept_before,
+            &on_card,
+            observer.is_some(),
+        );
+        match &prompt {
+            Some(plan) => self.read_prompt_plan(plan, &active_refs),
+            None => {
+                use rayon::prelude::*;
+                active_refs.par_iter().for_each(|r| {
+                    if !on_card(r) && !r.prestaged() {
+                        r.will_need();
+                    }
+                });
+            }
         }
 
         crate::inference::offload::prof_record(
@@ -573,7 +596,6 @@ impl Moe {
             })
         };
         let xv: Vec<&[f32]> = flat.chunks(self.dim).collect();
-        let observer = self.observer.read().unwrap().clone();
         if let Some(obs) = &observer {
             obs(None, flat, &[], &[]);
         }
@@ -613,9 +635,24 @@ impl Moe {
                 );
                 let dispatched = std::time::Instant::now();
                 // The routed experts of this block, resident ones on the cards and the misses on the
-                // cores at once; run on the host from its mapping when no card placement is set.
-                let routed = if let Some(off) = &offload {
-                    crate::inference::offload::moe_dispatch::run_routed(
+                // cores at once; a prompt's by its plan over the layer's context; run on the host
+                // from its mapping when no card placement is set.
+                let routed = match (&offload, &prompt, &layer_dev) {
+                    (Some(off), Some(plan), Some((hooks, ctx))) => {
+                        crate::inference::offload::prompt_experts::run_prompt(
+                            off,
+                            hooks,
+                            ctx,
+                            &active,
+                            &active_refs,
+                            &assign,
+                            &xv,
+                            self.dim,
+                            self.swiglu_limit,
+                            plan,
+                        )
+                    }
+                    (Some(off), _, _) => crate::inference::offload::moe_dispatch::run_routed(
                         off,
                         &active,
                         &active_refs,
@@ -629,13 +666,12 @@ impl Moe {
                         layer_dev.as_ref().map(|(hooks, ctx)| {
                             crate::inference::offload::moe_dispatch::DevRun { hooks, ctx }
                         }),
-                    )
-                } else {
-                    (
+                    ),
+                    (None, _, _) => (
                         (0..active.len()).map(|_| None).collect(),
                         (0..active.len()).map(|_| None).collect(),
                         None,
-                    )
+                    ),
                 };
                 crate::inference::offload::prof_record(
                     "moe dispatch",
@@ -787,6 +823,86 @@ impl Moe {
             );
         }
         Ok((y, deferred))
+    }
+
+    /// How a prompt layer's active experts split between the cards and the host, and the file
+    /// spans the cards' copies are read from (see `offload::prompt_experts`): `None` for a batch
+    /// the cards' layer path does not take, which runs as before. `kept_before[i]` says whether
+    /// `active[i]` was in the host's memory before the batch was admitted. The host's row is
+    /// costed at what a prompt measured, else at what the decode measured for one expert.
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_plan(
+        &self,
+        n: usize,
+        active: &[usize],
+        active_refs: &[Arc<Expert>],
+        assign: &[Vec<(usize, f32)>],
+        kept_before: &[bool],
+        on_card: &dyn Fn(&Expert) -> bool,
+        observed: bool,
+    ) -> Option<PromptPlan> {
+        if n <= VERIFY_BATCH_MAX_ROWS || observed || kept_before.len() != active.len() {
+            return None;
+        }
+        let offload = self.offload.read().unwrap().clone()?;
+        let device = offload.device.as_ref()?;
+        let lanes = offload.lanes.max(1);
+        use std::sync::atomic::Ordering::Relaxed;
+        let host_row_ns = match offload.prompt_host_row_ns.load(Relaxed) {
+            0 => offload.host_expert_ns.load(Relaxed),
+            ns => ns,
+        };
+        let in_memory = |r: &Expert| -> bool {
+            #[cfg(target_os = "linux")]
+            {
+                let (resident, pages) = r.resident_pages();
+                resident == pages
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = r;
+                true
+            }
+        };
+        let experts: Vec<PromptExpert> = active
+            .iter()
+            .zip(active_refs)
+            .zip(kept_before)
+            .map(|((&e, r), &kept)| PromptExpert {
+                rows: assign[e].len(),
+                bytes: r.bytes(),
+                held: on_card(r),
+                resident: kept && in_memory(r),
+                storage: match [&r.w1, &r.w3, &r.w2].map(|p| p.storage_span()) {
+                    [Some(a), Some(b), Some(c)] => Some([a, b, c]),
+                    _ => None,
+                },
+                copy_ns_per_kib: (device.copy_ns_per_kib)(e % lanes),
+            })
+            .collect();
+        Some(crate::inference::offload::prompt_experts::plan(
+            &experts,
+            host_row_ns,
+        ))
+    }
+
+    /// Start the reads of a prompt layer's plan, waiting for none: the host's experts into the
+    /// page cache, the cards' copies from the file into page-locked memory in the plan's runs,
+    /// around the page cache. A layer whose experts a read-ahead already staged whole reads
+    /// nothing more.
+    fn read_prompt_plan(&self, plan: &PromptPlan, active_refs: &[Arc<Expert>]) {
+        {
+            use rayon::prelude::*;
+            plan.on_host
+                .par_iter()
+                .for_each(|&i| active_refs[i].will_need());
+        }
+        #[cfg(feature = "gpu")]
+        if !plan.spans.is_empty() && !plan.copied.iter().any(|&i| active_refs[i].prestaged()) {
+            crate::tensor::cuda::prestage_weights(plan.spans.clone(), self.n_activated * 2);
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = plan.spans.len();
     }
 
     /// Wait for the experts `forward_with` left running and return their weighted sum
@@ -1045,6 +1161,7 @@ mod tests {
         let counter = ran.clone();
         *moe.offload.write().unwrap() = Some(Arc::new(ExpertOffload {
             host_expert_ns: Default::default(),
+            prompt_host_row_ns: Default::default(),
             lanes: 3,
             device: None,
             timings: Arc::new(Default::default()),
@@ -1145,6 +1262,7 @@ mod tests {
     fn toy_cards() -> Arc<ExpertOffload> {
         Arc::new(ExpertOffload {
             host_expert_ns: Default::default(),
+            prompt_host_row_ns: Default::default(),
             lanes: 1,
             device: None,
             timings: Arc::new(Default::default()),
@@ -1206,30 +1324,45 @@ mod tests {
         let plain = out(&moe, &x);
         let tokens: Vec<Vec<f32>> = (0..TOKENS).map(|t| out(&moe, &token(t))).collect();
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (in_layer, in_block) = (ran.clone(), ran.clone());
+        let (in_layer, in_prompt_layer, in_block) = (ran.clone(), ran.clone(), ran.clone());
+        // A held expert over its rows of the layer's context, counted; the others declined.
+        let layer_rows = move |counter: &std::sync::atomic::AtomicUsize,
+                               ctx: &Arc<dyn std::any::Any + Send + Sync>,
+                               expert: &Expert,
+                               toks: &[u32],
+                               limit: f32|
+              -> Option<Result<Vec<f32>>> {
+            if !held(expert) {
+                return None;
+            }
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let xin = ctx.downcast_ref::<Vec<f32>>()?;
+            let rows: Vec<f32> = toks
+                .iter()
+                .flat_map(|&t| {
+                    xin[t as usize * DIM..(t as usize + 1) * DIM]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            Some(run_rows(expert, rows, limit))
+        };
         *moe.offload.write().unwrap() = Some(Arc::new(ExpertOffload {
             host_expert_ns: Default::default(),
+            prompt_host_row_ns: Default::default(),
             lanes: 2,
             device: Some(DeviceLayer {
                 begin: Box::new(|x, _dim| {
                     Some(Arc::new(x.to_vec()) as Arc<dyn std::any::Any + Send + Sync>)
                 }),
                 run: Box::new(move |_lane, ctx, expert, toks, limit| {
-                    if !held(expert) {
-                        return None;
-                    }
-                    in_layer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let xin = ctx.downcast_ref::<Vec<f32>>()?;
-                    let rows: Vec<f32> = toks
-                        .iter()
-                        .flat_map(|&t| {
-                            xin[t as usize * DIM..(t as usize + 1) * DIM]
-                                .iter()
-                                .copied()
-                        })
-                        .collect();
-                    Some(run_rows(expert, rows, limit))
+                    layer_rows(&in_layer, ctx, expert, toks, limit)
                 }),
+                prompt: Box::new(move |_lane, ctx, expert, toks, limit| {
+                    layer_rows(&in_prompt_layer, ctx, expert, toks, limit)
+                }),
+                room: Box::new(|_| false),
+                copy_ns_per_kib: Box::new(|_| 0),
             }),
             timings: Arc::new(Default::default()),
             warm: None,
@@ -1264,6 +1397,139 @@ mod tests {
         assert!(
             ran.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "no decoded expert ran on the cards"
+        );
+    }
+
+    /// A prompt's routed experts split by its plan between the cards' layer and the host give the
+    /// host's output bit for bit. With a copy costed above any expert's rows, the experts the
+    /// cards keep alone reach them; with the copy's cost unmeasured, every expert does; an expert
+    /// a card declines runs on the host either way.
+    #[test]
+    fn a_prompts_plan_splits_the_experts_and_changes_nothing() {
+        use crate::inference::offload::experts::DeviceLayer;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+        // The cards keep every other expert, told apart by its handle.
+        let experts = experts_arc();
+        let kept: Arc<Vec<usize>> = Arc::new(
+            experts
+                .iter()
+                .step_by(2)
+                .map(|e| Arc::as_ptr(e) as usize)
+                .collect(),
+        );
+        let held = move |e: &Expert| kept.contains(&(e as *const Expert as usize));
+        let moe = build_moe(ExpertSet::Resident(experts));
+        let x = input();
+        let out = |moe: &Moe, x: &Tensor| -> Vec<f32> {
+            moe.forward(x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let plain = out(&moe, &x);
+        let on_cards = Arc::new(AtomicUsize::new(0));
+        let copied = Arc::new(AtomicUsize::new(0));
+        let declined = Arc::new(AtomicUsize::new(0));
+        let copy_cost = Arc::new(AtomicU64::new(0));
+        let (cards_seen, copies_seen, declines_seen, cost) = (
+            on_cards.clone(),
+            copied.clone(),
+            declined.clone(),
+            copy_cost.clone(),
+        );
+        let calls = AtomicUsize::new(0);
+        let held_too = held.clone();
+        *moe.offload.write().unwrap() = Some(Arc::new(ExpertOffload {
+            // The decode's figure stands in for the host's row until a prompt measures one.
+            host_expert_ns: Arc::new(AtomicU64::new(1000)),
+            prompt_host_row_ns: Default::default(),
+            lanes: 2,
+            device: Some(DeviceLayer {
+                begin: Box::new(|x, _dim| {
+                    Some(Arc::new(x.to_vec()) as Arc<dyn std::any::Any + Send + Sync>)
+                }),
+                run: Box::new(|_, _, _, _, _| None),
+                prompt: Box::new(move |_lane, ctx, expert, toks, limit| {
+                    // Every third expert asked of the card is declined.
+                    if calls.fetch_add(1, Relaxed) % 3 == 2 {
+                        declines_seen.fetch_add(1, Relaxed);
+                        return None;
+                    }
+                    cards_seen.fetch_add(1, Relaxed);
+                    if !held_too(expert) {
+                        copies_seen.fetch_add(1, Relaxed);
+                    }
+                    let xin = ctx.downcast_ref::<Vec<f32>>()?;
+                    let rows: Vec<f32> = toks
+                        .iter()
+                        .flat_map(|&t| {
+                            xin[t as usize * DIM..(t as usize + 1) * DIM]
+                                .iter()
+                                .copied()
+                        })
+                        .collect();
+                    let xe = Tensor::from_vec(rows, (toks.len(), DIM), &Device::Cpu).ok()?;
+                    Some(
+                        expert
+                            .forward(&xe, limit)
+                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>()),
+                    )
+                }),
+                room: Box::new(|_| true),
+                copy_ns_per_kib: Box::new(move |_| cost.load(Relaxed)),
+            }),
+            timings: Arc::new(Default::default()),
+            warm: None,
+            run: Box::new(|_, _, _, _, _| None),
+            run_batch: None,
+            on_card: Some(Box::new(held)),
+            run_multi: None,
+        }));
+        // A copy dearer than every row of the batch: the kept experts alone reach the cards.
+        copy_cost.store(1 << 40, Relaxed);
+        assert_eq!(plain, out(&moe, &x), "a prompt with the copies kept back");
+        assert!(
+            on_cards.load(Relaxed) > 0,
+            "no kept expert ran on the cards"
+        );
+        assert_eq!(
+            copied.load(Relaxed),
+            0,
+            "an expert was copied against its cost"
+        );
+        assert!(
+            moe.offload
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .prompt_host_row_ns
+                .load(Relaxed)
+                > 0,
+            "the host's rows went unmeasured"
+        );
+        // An unmeasured copy goes to the cards on sight, as an upload is admitted untimed.
+        copy_cost.store(0, Relaxed);
+        on_cards.store(0, Relaxed);
+        declined.store(0, Relaxed);
+        assert_eq!(plain, out(&moe, &x), "a prompt with every expert copied");
+        assert!(
+            copied.load(Relaxed) > 0,
+            "no expert was copied to the cards"
+        );
+        let active: std::collections::HashSet<usize> = moe
+            .last_routing
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t.iter().map(|&(e, _)| e))
+            .collect();
+        assert_eq!(
+            on_cards.load(Relaxed) + declined.load(Relaxed),
+            active.len(),
+            "every expert reached the cards or was declined"
         );
     }
 

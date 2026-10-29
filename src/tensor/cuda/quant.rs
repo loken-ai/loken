@@ -1398,8 +1398,9 @@ struct SlabInner {
     ctx: usize,
     /// Bumped when the slab is refilled: readers of an earlier fill stop, and its entries vanish.
     generation: u64,
-    /// Source address of a weight to its place in the slab and whether it has arrived.
-    entries: std::collections::HashMap<usize, (usize, usize, bool)>,
+    /// Source address of a span to its place in the slab, its length and whether it has
+    /// arrived. A weight inside a span is found by the span that starts at or before it.
+    entries: std::collections::BTreeMap<usize, (usize, usize, bool)>,
     /// Reader threads still running on this slab.
     active: usize,
 }
@@ -1409,10 +1410,10 @@ struct Slab {
     cv: std::sync::Condvar,
 }
 
-fn slabs() -> &'static [Slab; 2] {
-    static S: std::sync::OnceLock<[Slab; 2]> = std::sync::OnceLock::new();
-    S.get_or_init(|| {
-        let one = || Slab {
+impl Slab {
+    /// A slab with no memory and no spans.
+    fn empty() -> Self {
+        Slab {
             inner: std::sync::Mutex::new(SlabInner {
                 ptr: 0,
                 cap: 0,
@@ -1422,9 +1423,34 @@ fn slabs() -> &'static [Slab; 2] {
                 active: 0,
             }),
             cv: std::sync::Condvar::new(),
-        };
-        [one(), one()]
-    })
+        }
+    }
+
+    /// Whether this slab has taken the weight at `addr`, `len` bytes, read or not.
+    fn holds(&self, addr: usize, len: usize) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        slab_entry(&g, addr, len).is_some()
+    }
+
+    /// The page-locked address of the weight at `addr`, `len` bytes, once this slab has read it
+    /// in; waits for a read that has begun. `None` when no span of this slab covers it.
+    fn staged(&self, addr: usize, len: usize) -> Option<usize> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match slab_entry(&g, addr, len) {
+                Some((at, true)) => return Some(g.ptr + at),
+                Some((_, false)) => {
+                    g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                None => return None,
+            }
+        }
+    }
+}
+
+fn slabs() -> &'static [Slab; 2] {
+    static S: std::sync::OnceLock<[Slab; 2]> = std::sync::OnceLock::new();
+    S.get_or_init(|| [Slab::empty(), Slab::empty()])
 }
 
 static SLAB_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1433,26 +1459,33 @@ static SLAB_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// on `readers` threads this call does not wait for, in the order given and as many as the host's
 /// free memory allows a quarter of. Answers whether the slab took them; `false` leaves the reads
 /// to whoever asks for the weights.
-/// The file of `f` opened again for direct I/O, kept per file: `None` where it cannot be.
+/// The file of `f` opened again for direct I/O, kept per descriptor while the descriptor names
+/// the same file (a number closed and reused for another file gets a handle of its own): `None`
+/// where it cannot be.
 #[cfg(target_os = "linux")]
 fn direct_file(f: &std::fs::File) -> Option<std::sync::Arc<std::fs::File>> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    type Opened = std::collections::HashMap<i32, Option<std::sync::Arc<std::fs::File>>>;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    type Handle = ((u64, u64), Option<std::sync::Arc<std::fs::File>>);
+    type Opened = std::collections::HashMap<i32, Handle>;
     static OPENED: std::sync::Mutex<Option<Opened>> = std::sync::Mutex::new(None);
     let fd = f.as_raw_fd();
+    let identity = f.metadata().ok().map(|m| (m.dev(), m.ino()))?;
     let mut g = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(Default::default)
-        .entry(fd)
-        .or_insert_with(|| {
-            std::fs::OpenOptions::new()
+    let opened = g.get_or_insert_with(Default::default);
+    match opened.get(&fd) {
+        Some((id, handle)) if *id == identity => handle.clone(),
+        _ => {
+            let handle = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECT)
                 .open(format!("/proc/self/fd/{fd}"))
                 .ok()
-                .map(std::sync::Arc::new)
-        })
-        .clone()
+                .map(std::sync::Arc::new);
+            opened.insert(fd, (identity, handle.clone()));
+            handle
+        }
+    }
 }
 
 /// Read at least `need` bytes of `f` from `off` into `buf` with direct I/O; `off`, `buf`'s
@@ -1483,19 +1516,30 @@ fn read_direct(f: &std::fs::File, buf: &mut [u8], off: u64, need: usize) -> bool
 /// Whether a slab has taken the weight at `addr`, `len` bytes, read or not: its bytes are, or
 /// are about to be, in page-locked memory, and a read of the mapping would read them again.
 pub fn is_prestaged(addr: usize, len: usize) -> bool {
-    slabs().iter().any(|slab| {
-        let g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.entries.get(&addr).is_some_and(|&(_, l, _)| l == len)
-    })
+    slabs().iter().any(|slab| slab.holds(addr, len))
+}
+
+/// The place in the slab of the weight at `addr`, `len` bytes, and whether it has arrived: the
+/// weight lies within one span the slab took, at the same offset from the span's place as from
+/// its source. `None` when no span of the slab covers it whole.
+fn slab_entry(g: &SlabInner, addr: usize, len: usize) -> Option<(usize, bool)> {
+    let (&start, &(at, span, done)) = g.entries.range(..=addr).next_back()?;
+    (addr + len <= start + span).then_some((at + (addr - start), done))
 }
 
 pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
+    if spans.is_empty() {
+        return false;
+    }
+    let turn = SLAB_TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2;
+    fill_slab(&slabs()[turn], spans, readers)
+}
+
+/// `prestage_weights` into `slab`: its spans before are let go, their readers stopped.
+fn fill_slab(slab: &'static Slab, spans: Vec<(usize, usize)>, readers: usize) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
-        if spans.is_empty() {
-            return false;
-        }
         // PLACEMENT-EXEMPT: sizes a host staging area, not a device placement. What the kernel
         // calls available counts the page cache it can give back, which free pages do not.
         let avail = std::fs::read_to_string("/proc/meminfo")
@@ -1527,8 +1571,6 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
         if chosen.is_empty() {
             return false;
         }
-        let turn = SLAB_TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2;
-        let slab = &slabs()[turn];
         let generation = {
             let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
             // Readers of the fill before stop at their next weight; wait for them, since the
@@ -1571,7 +1613,6 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
         for _ in 0..readers.max(1) {
             let (chosen, next) = (chosen.clone(), next.clone());
             std::thread::spawn(move || {
-                let slab = &slabs()[turn];
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(&(addr, len, at)) = chosen.get(i) else {
@@ -1621,7 +1662,7 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = (spans, readers);
+        let _ = (slab, spans, readers);
         false
     }
 }
@@ -1630,27 +1671,11 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
 /// waits for a read that has begun. `None` when no slab holds it.
 fn staged_weight(addr: usize, len: usize) -> Option<usize> {
     let started = std::time::Instant::now();
-    let found = staged_weight_wait(addr, len);
+    let found = slabs().iter().find_map(|slab| slab.staged(addr, len));
     if found.is_some() {
         crate::inference::offload::prof_record("slab wait", started.elapsed().as_nanos() as u64);
     }
     found
-}
-
-fn staged_weight_wait(addr: usize, len: usize) -> Option<usize> {
-    for slab in slabs() {
-        let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            match g.entries.get(&addr) {
-                Some(&(at, l, true)) if l == len => return Some(g.ptr + at),
-                Some(&(_, l, false)) if l == len => {
-                    g = slab.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                }
-                _ => break,
-            }
-        }
-    }
-    None
 }
 
 /// Staging buffers in use by one expert's products. Dropping them waits for the card's stream,
@@ -1661,14 +1686,19 @@ struct Staging<'a> {
     /// compute stream waits for each one's event before it reads the weight.
     copy: std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     held: Vec<Pinned>,
-    /// One per upload, recorded behind its copy: waited on instead of the whole stream, which
-    /// other threads' work shares.
-    copied: Vec<crate::tensor::gpu_runtime::driver::CudaEvent>,
+    /// One per upload: the events before and behind its copy and its bytes. The one behind is
+    /// waited on instead of the whole stream, which other threads' work shares; the pair times
+    /// the copy.
+    copied: Vec<(
+        crate::tensor::gpu_runtime::driver::CudaEvent,
+        crate::tensor::gpu_runtime::driver::CudaEvent,
+        usize,
+    )>,
 }
 
 impl Drop for Staging<'_> {
     fn drop(&mut self) {
-        for e in &self.copied {
+        for (_, e, _) in &self.copied {
             let _ = e.synchronize();
         }
         PINNED
@@ -1766,6 +1796,10 @@ impl<'a> Staging<'a> {
         copy.context()
             .bind_to_thread()
             .map_err(|e| Error(format!("staged upload: bind context: {e:?}")))?;
+        let timed = Some(crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let started = copy
+            .record_event(timed)
+            .map_err(|e| Error(format!("staged upload: record: {e:?}")))?;
         use crate::tensor::gpu_runtime::driver::DevicePtr;
         let (dptr, guard) = dst.device_ptr(stream);
         let r = unsafe {
@@ -1781,13 +1815,27 @@ impl<'a> Staging<'a> {
             return Err(Error(format!("staged upload: {r:?}")));
         }
         let done = copy
-            .record_event(None)
+            .record_event(timed)
             .map_err(|e| Error(format!("staged upload: record: {e:?}")))?;
         stream
             .wait(&done)
             .map_err(|e| Error(format!("staged upload: wait: {e:?}")))?;
-        self.copied.push(done);
+        self.copied.push((started, done, len));
         Ok(dst)
+    }
+
+    /// The bytes the uploads sent and the nanoseconds the card's copy engine spent on them,
+    /// once they are done; `None` when nothing was sent or the card keeps no time.
+    fn copy_time(&self) -> Option<(usize, u64)> {
+        let mut bytes = 0usize;
+        let mut ns = 0u64;
+        for (started, done, len) in &self.copied {
+            done.synchronize().ok()?;
+            let ms = started.elapsed_ms(done).ok()?;
+            bytes += len;
+            ns += (ms as f64 * 1e6) as u64;
+        }
+        (bytes > 0).then_some((bytes, ns))
     }
 }
 
@@ -1901,6 +1949,27 @@ pub fn gpu_expert_layer_rows(
     toks: &[u32],
     limit: f32,
 ) -> Result<Vec<f32>> {
+    gpu_expert_layer_rows_held(dev, weights, tables, (inter, dim), layer, toks, limit)
+        .map(|(out, _, _)| out)
+}
+
+/// `gpu_expert_layer_rows`, also answering the expert's three weights on the card, for a caller
+/// that may keep them, and the bytes its uploads sent with the nanoseconds the card's copy
+/// engine spent on them (`None` when the weights were on the card already).
+#[allow(clippy::type_complexity)]
+pub fn gpu_expert_layer_rows_held(
+    dev: &CudaDevice,
+    weights: [ExpertWeight; 3],
+    tables: &ExpertTables,
+    (inter, dim): (usize, usize),
+    layer: &LayerBuffers,
+    toks: &[u32],
+    limit: f32,
+) -> Result<(
+    Vec<f32>,
+    [std::sync::Arc<CudaSlice<u8>>; 3],
+    Option<(usize, u64)>,
+)> {
     if dim != layer.dim || toks.is_empty() || toks.iter().any(|&t| t as usize >= layer.n) {
         return Err(Error(format!(
             "expert rows: {} rows of {dim} against a layer of {} rows of {}",
@@ -1935,7 +2004,8 @@ pub fn gpu_expert_layer_rows(
         "expert card wait",
         sync_started.elapsed().as_nanos() as u64,
     );
-    Ok(out)
+    let copied = staging.copy_time();
+    Ok((out, [g, u, d], copied))
 }
 
 /// A quantised weight [rows, inp] as it lies in the file, `dtype` its format.
@@ -5038,6 +5108,84 @@ mod iq2_xxs_gpu_tests {
                 );
             }
         }
+    }
+
+    /// A weight that lies inside a span a read-ahead staged is found in the slab at its offset,
+    /// with the file's bytes; one that no span covers whole is not. Into a slab of the test's
+    /// own, filled by the same code as the process's two.
+    #[test]
+    fn a_weight_inside_a_staged_span_is_found_in_the_slab() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the slab is NOT covered by this run");
+            return;
+        };
+        // The slab's page-locked memory belongs to the context current on this thread.
+        dev.context().bind_to_thread().unwrap();
+        let slab: &'static Slab = Box::leak(Box::new(Slab::empty()));
+        let page = crate::tensor::mapped::page_size().unwrap_or(4096);
+        let path = std::env::temp_dir().join(format!(
+            "loken-slab-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes: Vec<u8> = (0..8 * page).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::sync::Arc::new(std::fs::File::open(&path).unwrap());
+        // Safety: the file is written above and read only, through this mapping, until it
+        // is removed at the end.
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&*file) }.unwrap());
+        crate::tensor::mapped::register_file(&map, &file);
+        let base = map.as_ptr() as usize;
+        // Two spans, pages 1 to 3 and page 5: page 4 and both ends are left out.
+        assert!(
+            fill_slab(
+                slab,
+                vec![(base + page, 3 * page), (base + 5 * page, page)],
+                2
+            ),
+            "the slab took nothing"
+        );
+        let at = slab
+            .staged(base + page + 100, 1000)
+            .expect("a weight inside the first span");
+        // Safety: the slab holds the span the weight lies in until its refill.
+        let got = unsafe { std::slice::from_raw_parts(at as *const u8, 1000) };
+        assert_eq!(got, &bytes[page + 100..page + 1100]);
+        let at = slab
+            .staged(base + 5 * page, page)
+            .expect("the second span whole");
+        let got = unsafe { std::slice::from_raw_parts(at as *const u8, page) };
+        assert_eq!(got, &bytes[5 * page..6 * page]);
+        assert!(
+            !slab.holds(base + 4 * page, 16),
+            "the gap between the spans"
+        );
+        assert!(
+            !slab.holds(base + 3 * page, 2 * page),
+            "a weight past the end of a span"
+        );
+        assert!(!slab.holds(base, page), "a weight before the first span");
+        // The readers are done once every span has arrived; the slab's memory goes back.
+        {
+            let mut g = slab.inner.lock().unwrap();
+            while g.active > 0 {
+                g = slab.cv.wait(g).unwrap();
+            }
+            let _ = unsafe {
+                crate::tensor::gpu_runtime::driver::result::free_host(
+                    g.ptr as *mut std::ffi::c_void,
+                )
+            };
+            g.ptr = 0;
+            g.cap = 0;
+            g.entries.clear();
+        }
+        drop(map);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A GGUF-quantised linear on the card equals the CPU's dequantisation times the input, for each
