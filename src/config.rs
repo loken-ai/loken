@@ -135,12 +135,18 @@ pub struct InferenceConfigToml {
     /// card, so a context no single card holds is served whole. Off unless set.
     #[serde(default)]
     pub context_parallel: bool,
-    /// Whether drafts (a model's own draft head, prompt lookup) are verified in recorded
-    /// windows, the head guessing only where they are. Off unless set: a window is checked
-    /// against the plain step at each recording, and a request whose windows are given up
-    /// decodes plainly.
+    /// How closely the output follows the published model, against speed and memory:
+    /// `reference`, `balanced` (the default) or `fast`. It chooses the weight format of float
+    /// checkpoints, the cache format, the shifted context, and the value of
+    /// `recorded_drafts`, `quality` and `expert_variants` where those are left unset.
     #[serde(default)]
-    pub recorded_drafts: bool,
+    pub fidelity: crate::inference::engine::llm_engine::Fidelity,
+    /// Whether drafts (a model's own draft head, prompt lookup) are verified in recorded
+    /// windows, the head guessing only where they are. Unset, `fidelity` decides: on at `fast`
+    /// only. A window is checked against the plain step at each recording, and a request whose
+    /// windows are given up decodes plainly.
+    #[serde(default)]
+    pub recorded_drafts: Option<bool>,
     /// A directory the model's probes write the tensors of a prompt's first rows to, for a
     /// comparison against a reference; none unless set.
     #[serde(default)]
@@ -186,18 +192,20 @@ pub struct InferenceConfigToml {
     /// Seconds a fetch of an image given by URL may take, connection to last byte.
     #[serde(default = "default_image_fetch_timeout_secs")]
     pub image_fetch_timeout_secs: u64,
-    /// For a streamed model: how much exactness the output may give up for speed. `exact` (the
-    /// default) keeps it identical to the full model; `balanced` accepts differences no larger
-    /// than the model's own run-to-run noise; `fast` accepts a small multiple of that. The
-    /// engine measures the noise and the cost of each way of giving up experts at load.
+    /// For a streamed model: how much exactness the output may give up for speed. `exact` keeps
+    /// it identical to the full model; `balanced` accepts differences no larger than the
+    /// model's own run-to-run noise; `fast` accepts a small multiple of that. Unset, `fidelity`
+    /// decides: `fast` at `fast`, `exact` otherwise. The engine measures the noise and the cost
+    /// of each way of giving up experts at load.
     #[serde(default)]
-    pub quality: crate::inference::engine::llm_engine::QualityLevel,
+    pub quality: Option<crate::inference::engine::llm_engine::QualityLevel>,
     /// For a model whose manifest names further files of its checkpoint: which file each routed
-    /// expert is read from. `plan` (the default) reads the experts kept on the cards from the
-    /// most precise file and those the host computes from the smallest;
-    /// `smallest` and `largest` read every expert from that one file.
+    /// expert is read from. `plan` reads the experts kept on the cards from the most precise
+    /// file and those the host computes from the smallest; `smallest` and `largest` read every
+    /// expert from that one file. Unset, `fidelity` decides: `largest` at `reference`, `plan`
+    /// at `balanced`, `smallest` at `fast`.
     #[serde(default)]
-    pub expert_variants: crate::inference::place::expert_variants::VariantChoice,
+    pub expert_variants: Option<crate::inference::place::expert_variants::VariantChoice>,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
@@ -430,6 +438,7 @@ impl Config {
     /// Convert to InferenceConfig
     pub fn to_inference_config(&self) -> InferenceConfig {
         let toml_config = &self.inference;
+        let fidelity = toml_config.fidelity;
 
         InferenceConfig {
             model_id: toml_config.model_id.clone(),
@@ -440,7 +449,9 @@ impl Config {
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             prefill_peer: toml_config.prefill_peer.clone(),
             context_parallel: toml_config.context_parallel,
-            recorded_drafts: toml_config.recorded_drafts,
+            recorded_drafts: toml_config
+                .recorded_drafts
+                .unwrap_or(fidelity.recorded_drafts()),
             probe_dump_dir: toml_config.probe_dump_dir.clone(),
             expert_profile: toml_config.expert_profile.clone(),
             expert_profile_save: toml_config.expert_profile_save.clone(),
@@ -458,8 +469,11 @@ impl Config {
                 fetch_hosts: toml_config.image_fetch_hosts.clone(),
                 fetch_timeout_secs: toml_config.image_fetch_timeout_secs,
             },
-            quality: toml_config.quality,
-            expert_variants: toml_config.expert_variants,
+            quality: toml_config.quality.unwrap_or(fidelity.quality()),
+            expert_variants: toml_config
+                .expert_variants
+                .unwrap_or(fidelity.expert_variants()),
+            fidelity,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
             disable_arc_layers: false,
@@ -699,17 +713,67 @@ mod tests {
         };
         assert_eq!(
             read("balanced").unwrap().inference.quality,
-            QualityLevel::Balanced
+            Some(QualityLevel::Balanced)
         );
-        assert_eq!(read("fast").unwrap().inference.quality, QualityLevel::Fast);
+        assert_eq!(
+            read("fast").unwrap().inference.quality,
+            Some(QualityLevel::Fast)
+        );
         assert_eq!(
             read("exact").unwrap().inference.quality,
-            QualityLevel::Exact
+            Some(QualityLevel::Exact)
         );
         let none: Config = toml::from_str("[inference]\nmodel_id = \"m\"\n").unwrap();
-        assert_eq!(none.inference.quality, QualityLevel::Exact);
+        assert_eq!(none.inference.quality, None);
+        assert_eq!(none.to_inference_config().quality, QualityLevel::Exact);
         let err = read("quick").unwrap_err().to_string();
         for name in ["exact", "balanced", "fast"] {
+            assert!(err.contains(name), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_fidelity_level_sets_what_the_file_leaves_unset() {
+        use crate::inference::engine::llm_engine::{Fidelity, QualityLevel};
+        use crate::inference::place::expert_variants::VariantChoice;
+        let read = |body: &str| -> Result<Config, toml::de::Error> {
+            toml::from_str(&format!("[inference]\nmodel_id = \"m\"\n{body}"))
+        };
+        let resolved = |body: &str| read(body).unwrap().to_inference_config();
+
+        // No key is `balanced`, and `balanced` is today's behaviour.
+        let default = resolved("");
+        assert_eq!(default.fidelity, Fidelity::Balanced);
+        assert!(!default.recorded_drafts);
+        assert_eq!(default.quality, QualityLevel::Exact);
+        assert_eq!(default.expert_variants, VariantChoice::Plan);
+
+        let reference = resolved("fidelity = \"reference\"\n");
+        assert_eq!(reference.fidelity, Fidelity::Reference);
+        assert!(!reference.recorded_drafts);
+        assert_eq!(reference.quality, QualityLevel::Exact);
+        assert_eq!(reference.expert_variants, VariantChoice::Largest);
+
+        let fast = resolved("fidelity = \"fast\"\n");
+        assert_eq!(fast.fidelity, Fidelity::Fast);
+        assert!(fast.recorded_drafts);
+        assert_eq!(fast.quality, QualityLevel::Fast);
+        assert_eq!(fast.expert_variants, VariantChoice::Smallest);
+
+        // A knob set explicitly keeps its value whatever the level.
+        let pinned = resolved(
+            "fidelity = \"fast\"\nrecorded_drafts = false\nquality = \"exact\"\n\
+             expert_variants = \"plan\"\n",
+        );
+        assert!(!pinned.recorded_drafts);
+        assert_eq!(pinned.quality, QualityLevel::Exact);
+        assert_eq!(pinned.expert_variants, VariantChoice::Plan);
+        let pinned = resolved("fidelity = \"reference\"\nrecorded_drafts = true\n");
+        assert!(pinned.recorded_drafts);
+
+        // Any other level is a startup error that names the three.
+        let err = read("fidelity = \"exact\"\n").unwrap_err().to_string();
+        for name in ["reference", "balanced", "fast"] {
             assert!(err.contains(name), "{err}");
         }
     }

@@ -53,7 +53,14 @@ model_id = "qwen3:0.6b"
 # state_cache_dir = "/var/lib/loken/state"
 # state_cache_budget_gb = 0         # 0 = derived from the directory's free space
 
-# Models whose routed experts stream from disk: `exact` keeps every output identical.
+# How closely the output follows the published model, against speed and memory. `reference`
+# serves float weights as stored with a full-width cache and no context shift. `balanced`
+# requantises float weights to fit, takes a Q8 cache and shifts the context. `fast` adds
+# four-bit float weights and recorded drafts. See docs/CONFIGURATION.md for the table.
+# fidelity = "balanced"             # reference, balanced or fast
+
+# Models whose routed experts stream from disk: `exact` keeps every output identical. Unset,
+# `fidelity` decides: fast at `fast`, exact otherwise.
 # quality = "exact"                 # exact, balanced (within the model's own noise) or fast
 
 # Files, moderation and the URLs handed out.

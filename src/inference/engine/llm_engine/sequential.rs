@@ -53,11 +53,13 @@ fn decode_sequential(
         config.context_length,
         params.context_length,
     );
-    let prompt_tokens = clamp_prompt_to_window(
+    let prompt_tokens = prompt_in_window(
         request_prompt_tokens(&params, encoding.get_ids()),
         kv_window,
         params.max_tokens.unwrap_or(0),
-    );
+        None,
+    )
+    .map_err(|e| anyhow!(e))?;
     let ResolvedGenParams {
         max_tokens,
         temperature,

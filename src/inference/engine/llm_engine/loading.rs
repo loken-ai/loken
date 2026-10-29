@@ -22,6 +22,20 @@ pub(crate) fn kv_cache_bytes(kv_quant: KvQuant, native_bytes: u64, elems: u64) -
     }
 }
 
+/// The cache format a model is served with. A quantised format the kernels do not serve for
+/// the head shape falls back to the native width. `Off` is raised to Q8 where they do serve it
+/// and the level quantises the cache: half the bytes per token read at each decode step, and
+/// the device-position kernels a captured decode graph needs. The `reference` level keeps the
+/// full-width cache the published model computes with.
+pub(crate) fn kv_cache_format(asked: KvQuant, kernels_serve: bool, fidelity: Fidelity) -> KvQuant {
+    match asked {
+        KvQuant::Off if kernels_serve && fidelity.quantizes_cache() => KvQuant::Q8,
+        KvQuant::Off => KvQuant::Off,
+        _ if !kernels_serve => KvQuant::Off,
+        quantised => quantised,
+    }
+}
+
 /// The dimensions of a language model a placement is priced from, read from its GGUF header.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModelDims {
@@ -306,6 +320,8 @@ impl LlmEngine {
         let expert_profile = self.config.expert_profile.clone();
         let layer_share = self.config.layer_share;
         let quality = self.config.quality;
+        let fidelity = self.config.fidelity;
+        crate::inference::generic_transformer::set_float_weights(fidelity.float_weights());
         let state_cache = self.state_cache.clone();
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
@@ -665,25 +681,25 @@ impl LlmEngine {
             if kv_quant_supported {
                 crate::inference::quantized_cuda::prewarm_shape(head_dim, n_q_per_kv);
             }
-            // The KV precision follows what the quantised kernels can serve.
-            let kv_quant = if !kv_quant_supported && !matches!(kv_quant, KvQuant::Off) {
-                warn!(
-                    "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={}. Auto-downgrading kv_quant to Off for {}.",
-                    head_dim, n_q_per_kv, &model_id_clone
-                );
-                KvQuant::Off
-            } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off) {
-                // Every model the quantised kernels serve takes a Q8 cache: half the bytes
-                // per token read at each decode step, reference-grade accuracy (Q8_0 KV
-                // perplexity sits within the F16 error bars), and the device-position
-                // kernels a captured decode graph needs. The models kept off it are decided
-                // above by what they are - a head shape the kernels do not cover, capped
-                // attention scores, attention sinks, a cache precision the architecture's
-                // facts rule out - not by a list of names.
-                info!("Auto-promoting kv_quant Off -> Q8 for arch={arch}");
-                KvQuant::Q8
-            } else {
-                kv_quant
+            // The KV precision follows what the quantised kernels can serve and the fidelity
+            // level. The models kept off a quantised cache are decided above by what they
+            // are (a head shape the kernels do not cover, capped attention scores, attention
+            // sinks, a cache precision the architecture's facts rule out), not by a list of
+            // names.
+            let kv_quant = {
+                let chosen = kv_cache_format(kv_quant, kv_quant_supported, fidelity);
+                if chosen != kv_quant && matches!(chosen, KvQuant::Off) {
+                    warn!(
+                        "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={}. Auto-downgrading kv_quant to Off for {}.",
+                        head_dim, n_q_per_kv, &model_id_clone
+                    );
+                } else if chosen != kv_quant {
+                    info!(
+                        "Auto-promoting kv_quant Off -> {chosen:?} for arch={arch} (fidelity={})",
+                        fidelity.name()
+                    );
+                }
+                chosen
             };
 
             // --- 3. Build tokenizer ---
@@ -807,11 +823,12 @@ impl LlmEngine {
 
             debug!("✓ Using device: {:?}", device);
 
-            // Enable reduced precision GEMM on CUDA for better throughput
+            // Float GEMMs on CUDA reduce in TF32 and fast BF16, except at the `reference` level,
+            // which keeps IEEE F32 reductions.
             #[cfg(feature = "gpu")]
             if matches!(device, Device::Cuda(_)) {
-                crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
-                debug!("✓ Enabled reduced precision GEMM (TF32/FP16/BF16) for quantized inference");
+                crate::tensor::cuda_ext::set_gemm_reduced_precision(fidelity.reduces_gemm());
+                debug!("reduced precision GEMM (TF32/BF16): {}", fidelity.reduces_gemm());
             }
 
             // --- 5. Load model weights based on architecture ---
@@ -846,7 +863,9 @@ impl LlmEngine {
                     info!("Vision model loaded (Moondream v2) on {:?}", built_on.location());
                     #[cfg(feature = "gpu")]
                     if built_on.is_cuda() {
-                        crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
+                        crate::tensor::cuda_ext::set_gemm_reduced_precision(
+                            fidelity.reduces_gemm(),
+                        );
                     }
                     device = built_on;
                     Box::new(MoondreamBackend(model))
@@ -1797,6 +1816,44 @@ mod kv_bytes_tests {
     fn an_unquantised_cache_is_priced_at_its_native_width() {
         assert_eq!(kv_cache_bytes(KvQuant::Off, 2, 100), 200);
         assert_eq!(kv_cache_bytes(KvQuant::Off, 4, 100), 400);
+    }
+}
+
+#[cfg(test)]
+mod cache_format_tests {
+    use super::*;
+
+    /// A model the quantised kernels serve takes a Q8 cache at `balanced` and `fast`, and
+    /// keeps its native width at `reference`.
+    #[test]
+    fn the_level_decides_the_cache_of_a_served_head_shape() {
+        assert_eq!(
+            kv_cache_format(KvQuant::Off, true, Fidelity::Reference),
+            KvQuant::Off
+        );
+        for level in [Fidelity::Balanced, Fidelity::Fast] {
+            assert_eq!(kv_cache_format(KvQuant::Off, true, level), KvQuant::Q8);
+        }
+    }
+
+    /// A head shape the kernels do not serve keeps the native width at every level, and a
+    /// quantised format asked for it falls back to the native width.
+    #[test]
+    fn an_unserved_head_shape_keeps_the_native_width() {
+        for level in [Fidelity::Reference, Fidelity::Balanced, Fidelity::Fast] {
+            assert_eq!(kv_cache_format(KvQuant::Off, false, level), KvQuant::Off);
+            assert_eq!(kv_cache_format(KvQuant::Q8, false, level), KvQuant::Off);
+            assert_eq!(kv_cache_format(KvQuant::Q4, false, level), KvQuant::Off);
+        }
+    }
+
+    /// A quantised format asked for a served head shape is kept, whatever the level.
+    #[test]
+    fn a_quantised_format_asked_for_is_kept_where_served() {
+        for level in [Fidelity::Reference, Fidelity::Balanced, Fidelity::Fast] {
+            assert_eq!(kv_cache_format(KvQuant::Q8, true, level), KvQuant::Q8);
+            assert_eq!(kv_cache_format(KvQuant::Q4, true, level), KvQuant::Q4);
+        }
     }
 }
 

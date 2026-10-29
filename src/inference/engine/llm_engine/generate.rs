@@ -276,16 +276,15 @@ impl LlmEngine {
                 .filter(|_| audio_split.is_some())
                 .and_then(|c| c.embeds.dim(1).ok())
                 .map_or(0, |n| n.saturating_sub(1));
-            let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
-                (Some(a), _) => a.tokens.clone(),
-                (None, Some(sent)) => clamp_qwen35_prompt_to_window(
+            let prompt_tokens: Vec<u32> = match &audio_split {
+                Some(a) => a.tokens.clone(),
+                None => prompt_in_window(
                     request_prompt_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
-                    params.max_tokens.unwrap_or(0), sent),
-                (None, None) => clamp_prompt_to_window(
-                    request_prompt_tokens(&params, encoding.get_ids()),
-                    kv_window - vision_extra,
-                    params.max_tokens.unwrap_or(0)),
+                    params.max_tokens.unwrap_or(0),
+                    qwen35_sentinel,
+                )
+                .map_err(|e| anyhow!(e))?,
             };
 
             // Request-start graph hygiene: the graphs kept from the last request stay, with
@@ -339,6 +338,7 @@ impl LlmEngine {
                     disabled,
                     kv_disk.as_deref(),
                     &|t| added.contains_key(&t),
+                    config.fidelity.shifts_context(),
                 )
             };
 

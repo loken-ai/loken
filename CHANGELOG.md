@@ -21,6 +21,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: stream the reading of a long prompt as comment lines.
 - Models: convert DeepSeek V4.1 and its draft into files ollama and llama.cpp load.
 - Docs: explain how lokend works in 7 pages, and map its code for contributors.
+- Config: choose fidelity to the published model or speed with one setting.
 
 ### Changed
 

@@ -216,6 +216,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Log loaded configuration
             info!("✅ Configuration loaded:");
             info!("   • Model: {}", inference_config.model_id);
+            info!(
+                "   • Fidelity: {} ({}; recorded_drafts={}, quality={:?}, expert_variants={:?})",
+                inference_config.fidelity.name(),
+                inference_config.fidelity.summary(),
+                inference_config.recorded_drafts,
+                inference_config.quality,
+                inference_config.expert_variants
+            );
             info!("");
 
             // Initialize NVML and detect GPUs

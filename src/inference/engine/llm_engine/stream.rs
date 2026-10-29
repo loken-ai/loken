@@ -453,19 +453,21 @@ impl LlmEngine {
                     .and_then(|c| c.embeds.dim(1).ok())
                     .map_or(0, |n| n.saturating_sub(1));
                 audio_positions = audio_extra;
-                let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
-                    (Some(a), _) => a.tokens.clone(),
-                    (None, Some(sent)) => clamp_qwen35_prompt_to_window(
+                let windowed = match &audio_split {
+                    Some(a) => Ok(a.tokens.clone()),
+                    None => prompt_in_window(
                         request_prompt_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
                         params.max_tokens.unwrap_or(0),
-                        sent,
+                        qwen35_sentinel,
                     ),
-                    (None, None) => clamp_prompt_to_window(
-                        request_prompt_tokens(&params, encoding.get_ids()),
-                        kv_window - vision_extra,
-                        params.max_tokens.unwrap_or(0),
-                    ),
+                };
+                let prompt_tokens: Vec<u32> = match windowed {
+                    Ok(tokens) => tokens,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
                 };
 
                 // Token ids decode back to the prompt, so only the count is logged.
@@ -667,6 +669,7 @@ impl LlmEngine {
                         false,
                         kv_disk.as_deref(),
                         &|t| added.contains_key(&t),
+                        config.fidelity.shifts_context(),
                     )
                 } else {
                     let sess_guard = sessions.blocking_lock();

@@ -18,6 +18,129 @@ pub enum QualityLevel {
     Fast,
 }
 
+/// Every trade between fidelity to the published model and speed or memory, chosen by one
+/// level. A knob the configuration sets explicitly wins over the level's value for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fidelity {
+    /// What the published model computes in float, within float rounding: weights as stored,
+    /// a full-width cache, no shifted context.
+    Reference,
+    /// Eight-bit weights where the model fits, four where it spills, a Q8 cache and a shifted
+    /// context.
+    #[default]
+    Balanced,
+    /// Four-bit weights, recorded drafts, and the streamed experts' measured shortcuts.
+    Fast,
+}
+
+/// The format float projections are held in at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatWeights {
+    /// As the file stores them: F16 on a card for a BF16 checkpoint, F32 on the host.
+    AsStored,
+    /// Eight bits where the plan keeps the stack on one kind of memory, four where it spills.
+    ByPlan,
+    /// Four bits everywhere.
+    FourBit,
+}
+
+impl Fidelity {
+    pub fn name(self) -> &'static str {
+        match self {
+            Fidelity::Reference => "reference",
+            Fidelity::Balanced => "balanced",
+            Fidelity::Fast => "fast",
+        }
+    }
+
+    /// The choices the level makes on its own, for the start-up log.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Fidelity::Reference => {
+                "float weights as stored, full-width cache, IEEE F32 GEMM, no context shift"
+            }
+            Fidelity::Balanced => {
+                "float weights in 8 bits on one kind of memory and 4 when split, Q8 cache where \
+                 served, TF32 GEMM, context shift"
+            }
+            Fidelity::Fast => {
+                "float weights in 4 bits, Q8 cache where served, TF32 GEMM, context shift"
+            }
+        }
+    }
+
+    pub fn float_weights(self) -> FloatWeights {
+        match self {
+            Fidelity::Reference => FloatWeights::AsStored,
+            Fidelity::Balanced => FloatWeights::ByPlan,
+            Fidelity::Fast => FloatWeights::FourBit,
+        }
+    }
+
+    /// Whether a model whose head shape the quantised kernels serve takes a Q8 cache.
+    pub fn quantizes_cache(self) -> bool {
+        self != Fidelity::Reference
+    }
+
+    /// Whether float GEMMs on a card reduce in TF32 and fast BF16 rather than in IEEE F32.
+    pub fn reduces_gemm(self) -> bool {
+        self != Fidelity::Reference
+    }
+
+    /// Whether a conversation past the window keeps its resident tail, re-phased.
+    pub fn shifts_context(self) -> bool {
+        self != Fidelity::Reference
+    }
+
+    /// `recorded_drafts` when the configuration leaves it unset.
+    pub fn recorded_drafts(self) -> bool {
+        self == Fidelity::Fast
+    }
+
+    /// `quality` when the configuration leaves it unset.
+    pub fn quality(self) -> QualityLevel {
+        match self {
+            Fidelity::Fast => QualityLevel::Fast,
+            _ => QualityLevel::Exact,
+        }
+    }
+
+    /// `expert_variants` when the configuration leaves it unset.
+    pub fn expert_variants(self) -> crate::inference::place::expert_variants::VariantChoice {
+        use crate::inference::place::expert_variants::VariantChoice;
+        match self {
+            Fidelity::Reference => VariantChoice::Largest,
+            Fidelity::Balanced => VariantChoice::Plan,
+            Fidelity::Fast => VariantChoice::Smallest,
+        }
+    }
+}
+
+/// The prompt as the window admits it, at every fidelity level. A prompt longer than the
+/// window is refused: cut, it could lose its system prompt or its tool instructions and still
+/// read as a plausible answer. A prompt that fits but leaves too little room for the answer
+/// keeps its first token and its tail, through the image sentinel when there is one. A window
+/// of 0 is unbounded.
+pub(super) fn prompt_in_window(
+    tokens: Vec<u32>,
+    kv_window: usize,
+    want_gen: usize,
+    sentinel: Option<u32>,
+) -> Result<Vec<u32>, String> {
+    if kv_window > 0 && tokens.len() > kv_window {
+        return Err(format!(
+            "the prompt is {} tokens and the context window is {kv_window}; shorten the \
+             conversation or load the model with a larger num_ctx",
+            tokens.len()
+        ));
+    }
+    Ok(match sentinel {
+        Some(s) => clamp_qwen35_prompt_to_window(tokens, kv_window, want_gen, s),
+        None => clamp_prompt_to_window(tokens, kv_window, want_gen),
+    })
+}
+
 /// Check whether an error indicates a CUDA out-of-memory condition. Used to
 /// distinguish recoverable load failures (retry via split) from real errors,
 /// and recoverable runtime allocation failures (retry with a smaller prefill
@@ -220,6 +343,10 @@ pub struct InferenceConfig {
     /// Which of a model's files each routed expert is read from, when its manifest names more
     /// than one.
     pub expert_variants: crate::inference::place::expert_variants::VariantChoice,
+    /// The level that chooses the weight format, the cache format and the shifted context.
+    /// `recorded_drafts`, `quality` and `expert_variants` above are already resolved against
+    /// it.
+    pub fidelity: Fidelity,
     /// Progress callback
     pub progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     /// Models directory (for finding model files)
@@ -299,6 +426,7 @@ impl Default for InferenceConfig {
             media_limits: crate::api::media_limits::MediaLimits::default(),
             quality: QualityLevel::Exact,
             expert_variants: Default::default(),
+            fidelity: Fidelity::Balanced,
             progress_callback: None,
             models_dir: None,
             disable_arc_layers: false,
@@ -711,6 +839,92 @@ mod rule_tests {
         let mut p = GenerationParams::default();
         p.rules.ignore_eos = true;
         assert!(p.with_default_stops(&stops).stop_sequences.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fidelity_tests {
+    use super::*;
+
+    /// `reference` keeps every choice at the published model's computation, `fast` takes the
+    /// four-bit weights, and `balanced` is the behaviour with no level set.
+    #[test]
+    fn each_level_maps_its_choices() {
+        let r = Fidelity::Reference;
+        assert_eq!(r.float_weights(), FloatWeights::AsStored);
+        assert!(!r.quantizes_cache());
+        assert!(!r.reduces_gemm());
+        assert!(!r.shifts_context());
+        for level in [Fidelity::Balanced, Fidelity::Fast] {
+            assert!(level.quantizes_cache());
+            assert!(level.reduces_gemm());
+            assert!(level.shifts_context());
+        }
+        assert_eq!(Fidelity::Balanced.float_weights(), FloatWeights::ByPlan);
+        assert_eq!(Fidelity::Fast.float_weights(), FloatWeights::FourBit);
+        assert_eq!(Fidelity::default(), Fidelity::Balanced);
+        assert_eq!(
+            InferenceConfig::default().fidelity,
+            Fidelity::default(),
+            "the engine's default level is the configuration's"
+        );
+    }
+
+    /// A prompt that fits with room for the answer is kept whole.
+    #[test]
+    fn a_prompt_in_the_window_is_kept_whole() {
+        let tokens: Vec<u32> = (0..10).collect();
+        assert_eq!(
+            prompt_in_window(tokens.clone(), 64, 4, None).unwrap(),
+            tokens
+        );
+    }
+
+    /// A prompt longer than the window is refused, with the sentinel and without, whatever
+    /// the level: the window rule does not read `fidelity`.
+    #[test]
+    fn a_prompt_past_the_window_is_refused() {
+        let window = 64;
+        let tokens: Vec<u32> = (0..window as u32 * 2).collect();
+        let err = prompt_in_window(tokens.clone(), window, 4, None).unwrap_err();
+        assert!(err.contains(&tokens.len().to_string()), "{err}");
+        assert!(err.contains(&window.to_string()), "{err}");
+        let one_over: Vec<u32> = (0..window as u32 + 1).collect();
+        assert!(prompt_in_window(one_over, window, 4, None).is_err());
+        let mut with_sentinel = vec![1, 2, 9_999];
+        with_sentinel.extend(tokens.iter().copied());
+        assert!(prompt_in_window(with_sentinel, window, 4, Some(9_999)).is_err());
+    }
+
+    /// A prompt that fits but leaves too little room for the answer keeps its first token
+    /// and its tail, through the image sentinel when it carries one.
+    #[test]
+    fn a_tight_prompt_keeps_its_first_token_and_its_tail() {
+        let window = 64;
+        let tokens: Vec<u32> = (0..window as u32).collect();
+        let kept = prompt_in_window(tokens.clone(), window, 4, None).unwrap();
+        assert_eq!(kept, clamp_prompt_to_window(tokens.clone(), window, 4));
+        assert!(kept.len() < window);
+        assert_eq!(kept[0], tokens[0]);
+        assert_eq!(kept.last(), tokens.last());
+
+        let sentinel = 9_999;
+        let mut tokens: Vec<u32> = vec![1, 2, sentinel];
+        tokens.extend(100..100 + window as u32 - 3);
+        let kept = prompt_in_window(tokens.clone(), window, 4, Some(sentinel)).unwrap();
+        assert!(kept.len() < window);
+        assert_eq!(&kept[..3], &[1, 2, sentinel]);
+        assert_eq!(kept.last(), tokens.last());
+    }
+
+    /// A window of 0 is unbounded: nothing is refused.
+    #[test]
+    fn an_unbounded_window_refuses_nothing() {
+        let tokens: Vec<u32> = (0..1000).collect();
+        assert_eq!(
+            prompt_in_window(tokens.clone(), 0, 4, None).unwrap(),
+            tokens
+        );
     }
 }
 

@@ -70,6 +70,38 @@ read from fixed paths under the store (`boogu/`, `wan/`, `flux-kontext-q4km.gguf
 |---|---|---|
 | `model_id` | required | The model loaded when a request names none. `loken list` prints the tags on this machine. |
 
+### Fidelity to the published model
+
+| Key | Default | What it does |
+|---|---|---|
+| `fidelity` | `balanced` | How closely the output follows the published model, against speed and memory: `reference`, `balanced` or `fast`. Any other value is a startup error. The server logs the level and what it chose at start. |
+| `recorded_drafts` | by `fidelity` | Drafts (the model's own draft head, prompt lookup) verified in recorded windows, the head guessing only where they are. A window is checked against the plain step when it is recorded. |
+
+What each level chooses:
+
+| Choice | `reference` | `balanced` | `fast` |
+|---|---|---|---|
+| Float projections of an F32, F16 or BF16 checkpoint | As stored (BF16 held as F16 on a card) | Q8_0 when the stack sits on one kind of memory, Q4_K (Q6_K for the feed-forward output) when it is split between cards and host | Q4_K (Q6_K for the feed-forward output) |
+| KV cache format | Full width | Q8 for a model the quantised kernels serve | Q8 for a model the quantised kernels serve |
+| Float GEMMs on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 | TF32 and fast BF16 |
+| Context shift | Off | On | On |
+| `recorded_drafts` when unset | `false` | `false` | `true` |
+| `quality` when unset | `exact` | `exact` | `fast` |
+| `expert_variants` when unset | `largest` | `plan` | `smallest` |
+
+`recorded_drafts`, `quality` and `expert_variants` set in the file keep their value at every level.
+A quantised checkpoint (Q4_K, Q8_0 and the like) is read as stored at every level. Its products
+quantise the activation to eight bits, as llama.cpp does.
+
+Not chosen by the level, the same at all three:
+
+| Choice | Why |
+|---|---|
+| Prompt lookup and a drafter attached to a model that spills | Every draft is verified by the target's own sampler, and a short verify runs the decode step's numerics row by row. |
+| A prompt longer than the window | Refused with an error on every route. Cut, it could lose its system prompt or its tool instructions and still read as a plausible answer. |
+| Batched serving of overlapping requests | It runs the residual stream in F16 on the cards. No level turns it off yet. |
+| Approximate kernels (fast exp, fused attention in F16 with F32 sums) | Built into the kernels, within float rounding of their precise forms. |
+
 ### Decided by loken
 
 Nothing below is configured; a key of that name in an older `config.toml` loads and is reported as no longer read.
@@ -83,12 +115,12 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | Card a model loads on | The fastest card that holds it, from the probe. |
 | Memory each card offers | The measured free memory; the load keeps its own runtime reserve and backs off after an out-of-memory. |
 | Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
-| KV cache format | Q8 for every model whose head shape the quantised kernels serve, Q4 for qwen3moe; full width for a head shape they do not cover, capped attention scores (Gemma2) and gemma4. |
+| KV cache format | Q8 for every model whose head shape the quantised kernels serve, at `balanced` and `fast`. Full width at `reference`, and for a head shape they do not cover, capped attention scores (Gemma2), attention sinks and gemma4. |
 | Conversation snapshots | Each finished sequence is copied aside, a quantised cache in its packed form, so a later request on it resumes from its own KV; how many are kept is bounded by the free device memory, leaving the cache its working window and the next prefill the memory it sizes its chunk from, and a copy that would not fit is not taken. |
 | Batched serving | A model serves requests one at a time until they overlap several times in a row, then batches them in its paged worker (cards only); as many lone arrivals in a row take it back to serial decode, the faster path for one stream. |
 | Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target; the draft length is learned from measured acceptance and cycle time, a cycle that recorded a verify window or the drafter's step counting its acceptance alone. The drafter's decode step is recorded where the model allows it and kept between requests while nothing it reads has moved. A model held on the cards gets no drafter. `POST /api/draft/attach` still attaches one by hand. |
 | Resident models | As many language models stay loaded as the cards hold; the least recently used is unloaded only when an incoming model would otherwise be pushed off the cards. |
-| Context shift | Once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
+| Context shift | At `balanced` and `fast`, once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
 
 ### Copies of a model
 
@@ -211,8 +243,8 @@ engine measures the rest. `expert_variants` applies only to a model served from 
 
 | Key | Default | What it does |
 |---|---|---|
-| `expert_variants` | `plan` | For a model whose manifest names further files of its checkpoint ([`MODELS.md`](MODELS.md)): which file each routed expert is read from. `plan`: the experts the cards keep, hottest first, from the most precise file while the cards have room for them; those the host tier keeps or reads from disk, from the smallest. `smallest` and `largest`: every expert from that file, which answers as that file alone does. |
-| `quality` | `exact` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold: a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
+| `expert_variants` | by `fidelity` | For a model whose manifest names further files of its checkpoint ([`MODELS.md`](MODELS.md)): which file each routed expert is read from. `plan`: the experts the cards keep, hottest first, from the most precise file while the cards have room for them; those the host tier keeps or reads from disk, from the smallest. `smallest` and `largest`: every expert from that file, which answers as that file alone does. |
+| `quality` | by `fidelity` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold: a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
 
 At load the engine runs a bundled text teacher-forced on the card path and on the host path to
 measure the noise, then once under each candidate way of giving up experts, and applies the

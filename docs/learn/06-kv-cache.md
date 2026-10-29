@@ -47,7 +47,7 @@ Two rules follow:
 | `src/inference/cache/kv_disk.rs` | The disk tier: blocks, the chained hash, one manifest per sequence, writes off the request path. |
 | `src/inference/cache/turboquant/mod.rs` | A 3-bit cache written as a host reference so that the measurement deciding whether to write the kernel exists first. Read `measure` before the rest. |
 | `src/inference/engine/llm_engine/load.rs` (`kv_reuse_start`) | What a new prompt reuses: the resident prefix, a snapshot that covers more of it, a disk sequence that covers more still, each rounded down to a prefill chunk. |
-| `src/inference/engine/llm_engine/params.rs` | The keys: `kv_disk_dir` and its budget; snapshots and the shift past the window need none. The guide is [`../guides/kv-memory.md`](../guides/kv-memory.md). |
+| `src/inference/engine/llm_engine/params.rs` | The keys: `kv_disk_dir` and its budget. Snapshots need none. `fidelity` turns the shift past the window off at `reference`. The guide is [`../guides/kv-memory.md`](../guides/kv-memory.md). |
 
 ## What was measured
 

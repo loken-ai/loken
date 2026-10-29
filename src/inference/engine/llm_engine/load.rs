@@ -1206,6 +1206,7 @@ pub(crate) fn kv_reuse_start(
     disabled: bool,
     disk: Option<&crate::inference::cache::kv_disk::KvDiskStore>,
     turn_marker: &dyn Fn(u32) -> bool,
+    shift: bool,
 ) -> usize {
     let mut reuse = if disabled || !model.capabilities().trim_kv {
         None
@@ -1324,11 +1325,11 @@ pub(crate) fn kv_reuse_start(
     // is that first token alone, and every turn re-prefills the whole window. The tail
     // is still resident, at positions `discard` further on: shift it down and prefill
     // only what is new. The shifted keys are re-phased, not recomputed, so the result
-    // is not the cold run's bit for bit; the option says the caller accepts that, and
+    // is not the cold run's bit for bit; `shift` says the caller accepts that, and
     // with it the chunk grid below: a shifted tail is kept whole, since rounding it to
     // a grid that can exceed the window would keep nothing.
     let mut shifted: Option<usize> = None;
-    if model.capabilities().shift_kv && reuse.is_some_and(|c| c < chunk) {
+    if shift && model.capabilities().shift_kv && reuse.is_some_and(|c| c < chunk) {
         let mut g = sessions.blocking_lock();
         if let Some(s) = g.get_mut(GLOBAL_PROMPT_CACHE_KEY) {
             if let Some((discard, reused)) = shift_reuse_plan(

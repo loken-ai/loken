@@ -51,6 +51,7 @@ mod dense;
 mod dense_layouts;
 mod draft_head;
 pub use draft_head::set_probe_dir;
+pub use loader::set_float_weights;
 mod context_parallel;
 #[cfg(test)]
 mod conversation_tests;

@@ -23,9 +23,11 @@ by a later request or a later run of the daemon. Writing happens off the request
 
 ## Past the window
 
-Automatic. Once a conversation outgrows the context, the resident tail is kept and
-re-phased instead of re-prefilled. The re-phased keys are not the cold run's bit for bit.
-Refused on Q4 caches, sliding-window layers and recurrent hybrids, which prefill cold.
+Automatic at `fidelity = "balanced"` (the default) and `"fast"`. Once a conversation outgrows
+the context, the resident tail is kept and re-phased instead of re-prefilled. The re-phased keys
+are not the cold run's bit for bit. Refused on Q4 caches, sliding-window layers and recurrent
+hybrids, which prefill cold. At `fidelity = "reference"` the tail is re-prefilled cold. A prompt
+longer than the window is refused at every level.
 
 ## What to expect
 
