@@ -11,6 +11,9 @@
 //!   reads one run of the file;
 //! - the engram tables, read a row at a time.
 //!
+//! A completed file is loken's own layout: llama.cpp reads the file `convert` writes, whose
+//! experts are stacks and whose draft is a companion file, not this one.
+//!
 //! Every tensor starts on the largest block the device reads, so no read straddles a block it
 //! does not need; every expert unit and engram table starts on the device's preferred I/O size.
 //! A stack of experts is carried as its experts' slices: the bytes are the source's, only their
@@ -20,7 +23,10 @@ use super::convert::{bytes_per, draft_expert_format, written_format};
 use super::dspark::{expert_prefix, tensor_names, DsparkConfig};
 use super::safetensors_source::SafeTensorsSource;
 use super::source::{expert_unit_name, WeightSource, EXPERT_STACKS};
-use crate::tensor::gguf_write::{encode_value, GgufStreamWriter, Placement, PlannedEntry};
+use crate::inference::load::model_dirs::ensure_room;
+use crate::tensor::gguf_write::{
+    encode_value, planned_len, GgufStreamWriter, Placement, PlannedEntry,
+};
 use crate::tensor::quantized::gguf_file::{layout, MappedGguf};
 use crate::tensor::quantized::GgmlDType;
 use crate::tensor::{Error, Result};
@@ -137,7 +143,7 @@ fn unit_of(name: &str) -> Option<(usize, &'static str, usize)> {
 }
 
 fn is_engram_table(name: &str) -> bool {
-    name.contains("engram_embd")
+    name.contains("engram_embd") || name == super::source::ENGRAM_TABLE
 }
 
 /// A layer's experts in the order its hot list ranks them, the others after it by id.
@@ -146,8 +152,12 @@ fn hot_order(
     layer: usize,
     n: usize,
 ) -> Vec<usize> {
+    let arch = md
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok().cloned())
+        .unwrap_or_else(|| super::ARCH.to_string());
     let listed: Vec<usize> = md
-        .get(&format!("{}.hot_experts.{layer}", super::ARCH))
+        .get(&format!("{arch}.hot_experts.{layer}"))
         .and_then(|v| v.to_vec().ok())
         .map(|a| {
             a.iter()
@@ -516,6 +526,67 @@ pub fn complete(
     writer.finish_with_digest()
 }
 
+/// The draft's file before a byte of it is written: its keys and its tensors, where each starts.
+struct DraftPlan {
+    metadata: Vec<(String, crate::tensor::quantized::gguf_file::Value)>,
+    items: Vec<Item>,
+    entries: Vec<PlannedEntry>,
+    placement: Placement,
+}
+
+impl DraftPlan {
+    fn new(
+        ckpt: &SafeTensorsSource,
+        dir: &Path,
+        layout: Layout,
+        format: GgmlDType,
+    ) -> Result<Self> {
+        let cfg = DsparkConfig::from_config_json(dir)?;
+        let (dense, experts) = draft_items(ckpt, &cfg, format, layout)?;
+        let mut metadata = vec![(
+            "general.architecture".to_string(),
+            crate::tensor::quantized::gguf_file::Value::String(super::ARCH.to_string()),
+        )];
+        metadata.extend(cfg.to_metadata());
+        let items: Vec<Item> = dense.into_iter().chain(experts).collect();
+        let entries: Vec<PlannedEntry> = items
+            .iter()
+            .map(|it| PlannedEntry {
+                name: it.entry.name.clone(),
+                dims: it.entry.dims.clone(),
+                dtype: it.entry.dtype,
+                byte_len: it.entry.byte_len,
+            })
+            .collect();
+        let placement = Placement {
+            alignment: layout.alignment,
+            starts: items.iter().map(|it| it.start).collect(),
+        };
+        Ok(Self {
+            metadata,
+            items,
+            entries,
+            placement,
+        })
+    }
+
+    /// The bytes of the file written at `out`.
+    fn file_bytes(&self, out: &Path) -> Result<u64> {
+        planned_len(out, &self.metadata, &self.entries, &self.placement)
+    }
+}
+
+/// The bytes [`write_draft`] writes for the same arguments.
+pub fn draft_bytes_planned(
+    ckpt: &SafeTensorsSource,
+    dir: &Path,
+    out: &Path,
+    layout: Layout,
+    format: GgmlDType,
+) -> Result<u64> {
+    DraftPlan::new(ckpt, dir, layout, format)?.file_bytes(out)
+}
+
 /// Write the draft alone, from the released checkpoint in `dir`, as a file of its own to keep
 /// beside a model that carries none: the architecture key, the draft's metadata, and its tensors
 /// laid out as `complete` lays them, each in `format` where its rows tile into that format's
@@ -528,27 +599,16 @@ pub fn write_draft(
     format: GgmlDType,
     progress: &(dyn Fn(usize, usize, &str) + Sync),
 ) -> Result<String> {
-    let cfg = DsparkConfig::from_config_json(dir)?;
-    let (dense, experts) = draft_items(ckpt, &cfg, format, layout)?;
-    let mut metadata = vec![(
-        "general.architecture".to_string(),
-        crate::tensor::quantized::gguf_file::Value::String(super::ARCH.to_string()),
-    )];
-    metadata.extend(cfg.to_metadata());
-    let items: Vec<Item> = dense.into_iter().chain(experts).collect();
-    let entries: Vec<PlannedEntry> = items
-        .iter()
-        .map(|it| PlannedEntry {
-            name: it.entry.name.clone(),
-            dims: it.entry.dims.clone(),
-            dtype: it.entry.dtype,
-            byte_len: it.entry.byte_len,
-        })
-        .collect();
-    let placement = Placement {
-        alignment: layout.alignment,
-        starts: items.iter().map(|it| it.start).collect(),
-    };
+    let draft = DraftPlan::new(ckpt, dir, layout, format)?;
+    let need = draft.file_bytes(out)?;
+    let room = out.parent().unwrap_or(Path::new("."));
+    ensure_room("the draft", room, need).map_err(Error::msg)?;
+    let DraftPlan {
+        metadata,
+        items,
+        entries,
+        placement,
+    } = draft;
     let mut writer = GgufStreamWriter::create_placed(out, &metadata, &entries, &placement)?;
     let total = items.len();
     let batch = rayon::current_num_threads().max(1);

@@ -2505,6 +2505,31 @@ pub fn from_float_bytes(dtype: GgmlDType, xs: &[f32]) -> Result<Vec<u8>> {
     })
 }
 
+/// `xs` encoded in `dtype` on every core: whole blocks a task, a few hundred of them, so the pool's
+/// overhead stays small. F32 is written as its little-endian bytes. The bytes are those
+/// [`from_float_bytes`] gives.
+pub fn from_float_bytes_parallel(dtype: GgmlDType, xs: &[f32]) -> Result<Vec<u8>> {
+    use rayon::prelude::*;
+    if dtype == GgmlDType::F32 {
+        let mut bytes = vec![0u8; xs.len() * 4];
+        bytes
+            .par_chunks_mut(4 << 16)
+            .zip(xs.par_chunks(1 << 16))
+            .for_each(|(out, v)| {
+                for (o, x) in out.chunks_exact_mut(4).zip(v) {
+                    o.copy_from_slice(&x.to_le_bytes());
+                }
+            });
+        return Ok(bytes);
+    }
+    let chunk = dtype.block_size() * 256;
+    let parts = xs
+        .par_chunks(chunk)
+        .map(|c| from_float_bytes(dtype, c))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parts.concat())
+}
+
 #[cfg(test)]
 mod q8_1_dequantize_test {
     use super::*;

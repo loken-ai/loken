@@ -71,6 +71,18 @@ the first file at the same shape, format and bytes; a table read row by row (the
 is compared on evenly spread spans. Tensors only the further file carries are ignored. The
 DeepSeek V4.1 route reads this layout.
 
+`loken convert` writes a DeepSeek V4.1 file in llama.cpp's `deepseek41` layout, which llama.cpp
+and the engines vendoring it load. The file carries llama.cpp's keys and tensor names, and
+llama.cpp's vocabulary arrays beside the checkpoint's own `tokenizer.json`. The engram tables
+are one `per_layer_token_embd` table in Q8_0: ggml has no fp8 type, and Q8_0 holds the
+released values in about the same bytes. Each engram layer's query and key weights are stored
+as their product. The routed experts
+keep the formats asked for. The checkpoint's DSpark draft is stored apart, as
+`<name>:<tag>-dspark`, a companion the loader finds beside the model. A partial conversion of
+layers `0:N` is a model of N + 1 layers that llama.cpp loads as such. The route still reads the
+files loken wrote before, under `deepseek_v41` and its own names; a file `--complete` lays out is
+loken's own and not llama.cpp's.
+
 ```json
 {"layers": [
   {"mediaType": "application/vnd.ollama.image.model", "digest": "sha256:<iq2 file>", "size": 374255419392},

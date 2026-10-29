@@ -274,67 +274,7 @@ impl GgufStreamWriter {
         placement: &Placement,
     ) -> Result<Self> {
         let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", path.display()));
-        let alignment = placement.alignment;
-        if alignment == 0 || !alignment.is_multiple_of(DEFAULT_ALIGNMENT) {
-            return Err(Error(format!(
-                "gguf write {}: alignment {alignment} is not a multiple of {DEFAULT_ALIGNMENT}",
-                path.display()
-            )));
-        }
-        if !placement.starts.is_empty() && placement.starts.len() != entries.len() {
-            return Err(Error(format!(
-                "gguf write {}: {} starts for {} tensors",
-                path.display(),
-                placement.starts.len(),
-                entries.len()
-            )));
-        }
-        let mut metadata = metadata.to_vec();
-        match metadata
-            .iter()
-            .find(|(k, _)| k == layout::ALIGNMENT_KEY)
-            .map(|(_, v)| v.to_u64())
-        {
-            Some(Ok(declared)) if declared == alignment => {}
-            Some(_) => {
-                return Err(Error(format!(
-                    "gguf write {}: the metadata declares an alignment other than {alignment}",
-                    path.display()
-                )))
-            }
-            None if alignment != DEFAULT_ALIGNMENT => metadata.push((
-                layout::ALIGNMENT_KEY.to_string(),
-                Value::U32(alignment as u32),
-            )),
-            None => {}
-        }
-        // Offsets are fixed-width, so the header's length does not depend on them: measured with
-        // placeholders, then written with the real ones.
-        let zeros = vec![0u64; entries.len()];
-        let header_len = stream_header(&metadata, entries, &zeros, 0).len() as u64;
-        let data_start = layout::align_up(header_len, alignment);
-        let mut starts = Vec::with_capacity(entries.len());
-        let mut end = data_start;
-        for (i, e) in entries.iter().enumerate() {
-            let a = placement
-                .starts
-                .get(i)
-                .copied()
-                .unwrap_or(alignment)
-                .max(alignment);
-            if a % alignment != 0 {
-                return Err(Error(format!(
-                    "gguf write {}: tensor {} starts on {a}, not a multiple of {alignment}",
-                    path.display(),
-                    e.name
-                )));
-            }
-            let start = layout::align_up(end, a);
-            starts.push(start);
-            end = start + e.byte_len;
-        }
-        let mut header = stream_header(&metadata, entries, &starts, data_start);
-        header.resize(data_start as usize, 0);
+        let (header, starts) = planned_layout(path, metadata, entries, placement)?;
         let tmp = path.with_extension("gguf.partial");
         let f = std::fs::File::create(&tmp).map_err(io_err)?;
         let mut writer = Self {
@@ -344,14 +284,106 @@ impl GgufStreamWriter {
             digest: sha2::Digest::new(),
             planned: entries.iter().map(|e| e.byte_len).collect(),
             starts,
-            alignment,
+            alignment: placement.alignment,
             next: 0,
             pos: 0,
         };
         writer.put(&header)?;
         Ok(writer)
     }
+}
 
+/// The bytes of the file `create_placed` writes for `metadata`, `entries` and `placement`, the
+/// padding after its last tensor included.
+pub fn planned_len(
+    path: &Path,
+    metadata: &[(String, Value)],
+    entries: &[PlannedEntry],
+    placement: &Placement,
+) -> Result<u64> {
+    let (header, starts) = planned_layout(path, metadata, entries, placement)?;
+    let end = starts
+        .iter()
+        .zip(entries)
+        .map(|(s, e)| s + e.byte_len)
+        .max()
+        .unwrap_or(header.len() as u64);
+    Ok(layout::align_up(end, placement.alignment))
+}
+
+/// The header of a streamed file, padded to where its data starts, and the absolute file
+/// position each planned tensor starts at.
+fn planned_layout(
+    path: &Path,
+    metadata: &[(String, Value)],
+    entries: &[PlannedEntry],
+    placement: &Placement,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let alignment = placement.alignment;
+    if alignment == 0 || !alignment.is_multiple_of(DEFAULT_ALIGNMENT) {
+        return Err(Error(format!(
+            "gguf write {}: alignment {alignment} is not a multiple of {DEFAULT_ALIGNMENT}",
+            path.display()
+        )));
+    }
+    if !placement.starts.is_empty() && placement.starts.len() != entries.len() {
+        return Err(Error(format!(
+            "gguf write {}: {} starts for {} tensors",
+            path.display(),
+            placement.starts.len(),
+            entries.len()
+        )));
+    }
+    let mut metadata = metadata.to_vec();
+    match metadata
+        .iter()
+        .find(|(k, _)| k == layout::ALIGNMENT_KEY)
+        .map(|(_, v)| v.to_u64())
+    {
+        Some(Ok(declared)) if declared == alignment => {}
+        Some(_) => {
+            return Err(Error(format!(
+                "gguf write {}: the metadata declares an alignment other than {alignment}",
+                path.display()
+            )))
+        }
+        None if alignment != DEFAULT_ALIGNMENT => metadata.push((
+            layout::ALIGNMENT_KEY.to_string(),
+            Value::U32(alignment as u32),
+        )),
+        None => {}
+    }
+    // Offsets are fixed-width, so the header's length does not depend on them: measured with
+    // placeholders, then written with the real ones.
+    let zeros = vec![0u64; entries.len()];
+    let header_len = stream_header(&metadata, entries, &zeros, 0).len() as u64;
+    let data_start = layout::align_up(header_len, alignment);
+    let mut starts = Vec::with_capacity(entries.len());
+    let mut end = data_start;
+    for (i, e) in entries.iter().enumerate() {
+        let a = placement
+            .starts
+            .get(i)
+            .copied()
+            .unwrap_or(alignment)
+            .max(alignment);
+        if a % alignment != 0 {
+            return Err(Error(format!(
+                "gguf write {}: tensor {} starts on {a}, not a multiple of {alignment}",
+                path.display(),
+                e.name
+            )));
+        }
+        let start = layout::align_up(end, a);
+        starts.push(start);
+        end = start + e.byte_len;
+    }
+    let mut header = stream_header(&metadata, entries, &starts, data_start);
+    header.resize(data_start as usize, 0);
+    Ok((header, starts))
+}
+
+impl GgufStreamWriter {
     /// Bytes out to the file and into the digest.
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         sha2::Digest::update(&mut self.digest, bytes);

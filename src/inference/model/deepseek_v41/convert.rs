@@ -6,21 +6,24 @@
 //! they saw, each block's error carried onto the columns after it; the path every token reads at a
 //! higher precision; the engram tables exactly as released, beside the hash that indexes them.
 //!
-//! Every name and key is the one this module's own reader looks for, so the file loads here
-//! without translation. The file is streamed tensor by tensor: nothing larger than one expert
-//! stack is held.
+//! Every name and key is llama.cpp's (`mainline`), so the file loads there and here alike: the
+//! engram tables as one table in `mainline::ENGRAM_TABLE_FORMAT`, each engram layer's query and key
+//! weights as their product, the draft left to a companion file. The file is streamed tensor by
+//! tensor: nothing larger than one expert stack is held. Its size is known before the first byte,
+//! and a disk that cannot hold it is refused then.
 
-use super::dspark::{expert_prefix, tensor_names, DsparkConfig};
-use super::engram::EngramConfig;
+use super::engram::{qk_weight, EngramConfig};
+use super::mainline;
 use super::model::DeepseekV41Model;
 use super::safetensors_source::SafeTensorsSource;
-use super::source::{gguf_names, WeightSource};
+use super::source::{llamacpp_name, WeightSource, ENGRAM_TABLE};
 use super::DeepseekV41Config;
 use crate::inference::load::calibrated::{quantize_projection_on, Kernels, Recipe, Records};
 use crate::inference::load::calibration::Calibration;
 use crate::inference::load::compensate::stage::{self, time, Stage};
 use crate::inference::load::compensate::{Calibration as Moment, Factor};
-use crate::tensor::gguf_write::{GgufStreamWriter, PlannedEntry};
+use crate::inference::load::model_dirs::ensure_room;
+use crate::tensor::gguf_write::{planned_len, GgufStreamWriter, Placement, PlannedEntry};
 use crate::tensor::quantized::gguf_file::Value;
 use crate::tensor::quantized::GgmlDType;
 use crate::tensor::{Error, Result};
@@ -217,10 +220,13 @@ pub fn calibrate(
 enum Source {
     /// Dequantised and written in `dtype`.
     Dense(String),
-    /// The shard's own bytes, untouched.
-    Verbatim(String),
     /// One layer's routed experts: `w1`, `w2` or `w3`.
     Experts(usize, &'static str),
+    /// One engram layer's query and key weights multiplied, f32.
+    Gate(usize),
+    /// Every engram layer's table by its reference name, in `mainline::ENGRAM_TABLE_FORMAT`, one
+    /// after the other.
+    Table(Vec<String>),
 }
 
 /// The keys this module's reader looks for, from the checkpoint's own configuration.
@@ -347,119 +353,33 @@ pub fn tokenizer_metadata(files: &TokenizerFiles) -> Vec<(String, Value)> {
     ]
 }
 
-/// The checkpoint's own configuration, as the file will carry it. The draft's keys are added
-/// beside it with the draft's tensors, by `DsparkConfig::to_metadata`.
-fn metadata(
-    cfg: &serde_json::Value,
-    engram: Option<&EngramConfig>,
+/// The file's keys, in llama.cpp's layout: the configuration of its first `n_layers` layers, the
+/// context the checkpoint declares, and the tokenizer both as the checkpoint ships it and as
+/// llama.cpp's vocabulary arrays. `engram_rows` holds each engram table's rows, as
+/// [`mainline::metadata`] takes them.
+fn file_metadata(
+    src: &SafeTensorsSource,
+    cfg: &DeepseekV41Config,
+    n_layers: usize,
+    engram_rows: &[usize],
     tokenizer: Option<&TokenizerFiles>,
-) -> Vec<(String, Value)> {
-    let arch = super::ARCH;
-    let mut md = vec![
-        (
-            "general.architecture".to_string(),
-            Value::String(arch.to_string()),
-        ),
-        (
-            "general.name".to_string(),
-            Value::String("DeepSeek-V4.1-Flash".into()),
-        ),
-    ];
-    let key = |k: &str| format!("{arch}.{k}");
-    let u = |v: &str| cfg.get(v).and_then(|x| x.as_u64());
-    let f = |v: &str| cfg.get(v).and_then(|x| x.as_f64());
-    for (k, v) in [
-        ("block_count", "n_layers"),
-        ("embedding_length", "dim"),
-        ("vocab_size", "vocab_size"),
-        ("attention.head_count", "n_heads"),
-        ("attention.key_length", "head_dim"),
-        ("rope.dimension_count", "rope_head_dim"),
-        ("attention.q_lora_rank", "q_lora_rank"),
-        ("attention.o_lora_rank", "o_lora_rank"),
-        ("attention.o_groups", "o_groups"),
-        ("attention.sliding_window", "window_size"),
-        ("expert_count", "n_routed_experts"),
-        ("expert_shared_count", "n_shared_experts"),
-        ("expert_used_count", "n_activated_experts"),
-        ("expert_feed_forward_length", "moe_inter_dim"),
-        ("indexer.head_count", "index_n_heads"),
-        ("indexer.key_length", "index_head_dim"),
-        ("indexer.top_k", "index_topk"),
-        ("hyper_connection.count", "hc_mult"),
-        ("hyper_connection.sinkhorn_iterations", "hc_sinkhorn_iters"),
-        ("attention.candidate_source_layer", "candidate_source_layer"),
-        ("attention.candidate_topk_blocks", "candidate_topk_blocks"),
-        ("attention.candidate_block_size", "candidate_block_size"),
-        ("rope.scaling.original_context_length", "original_seq_len"),
-    ] {
-        if let Some(x) = u(v) {
-            md.push((key(k), Value::U32(x as u32)));
-        }
-    }
-    md.push((key("attention.head_count_kv"), Value::U32(1)));
-    for (k, v) in [
-        ("attention.layer_norm_rms_epsilon", "norm_eps"),
-        ("expert_weights_scale", "route_scale"),
-        ("expert_swiglu_limit", "swiglu_limit"),
-        ("hyper_connection.epsilon", "hc_eps"),
-        ("rope.freq_base", "rope_theta"),
-        ("rope.scaling.factor", "rope_factor"),
-        ("attention.compress_rope_freq_base", "compress_rope_theta"),
-    ] {
-        if let Some(x) = f(v) {
-            md.push((key(k), Value::F32(x as f32)));
-        }
-    }
-    if let Some(s) = cfg.get("score_func").and_then(|x| x.as_str()) {
-        md.push((key("expert_scoring_func"), Value::String(s.to_string())));
-    }
-    let arr = |xs: &[u64]| Value::Array(xs.iter().map(|&x| Value::U32(x as u32)).collect());
-    let arr64 = |xs: &[u64]| Value::Array(xs.iter().map(|&x| Value::U64(x)).collect());
-    let list = |v: &str| -> Option<Vec<u64>> {
-        cfg.get(v)?.as_array()?.iter().map(|x| x.as_u64()).collect()
-    };
-    for (k, v) in [
-        ("attention.compress_ratios", "compress_ratios"),
-        ("attention.kv_source_layers", "kv_source_layers"),
-        ("attention.index_source_layers", "index_source_layers"),
-    ] {
-        if let Some(xs) = list(v) {
-            md.push((key(k), arr(&xs)));
-        }
-    }
-    // A table is unusable without the hash that indexed it: the file carries that hash whole.
-    if let Some(e) = engram {
-        let pad = u("engram_pad_id").unwrap_or(0);
-        md.push((key("engram.head_count"), Value::U32(e.n_heads as u32)));
-        md.push((key("engram.key_length"), Value::U32(e.head_dim as u32)));
-        md.push((key("engram.max_ngram_size"), Value::U32(e.max_ngram as u32)));
-        md.push((key("engram.pad_id"), Value::U32(pad as u32)));
-        md.push((
-            key("engram.layer_ids"),
-            arr64(&e.layer_ids.iter().map(|&x| x as u64).collect::<Vec<_>>()),
-        ));
-        md.push((
-            key("engram.multipliers"),
-            arr64(
-                &e.multipliers
-                    .iter()
-                    .flatten()
-                    .map(|&x| x as u64)
-                    .collect::<Vec<_>>(),
-            ),
-        ));
-        md.push((key("engram.primes"), arr64(&e.primes.concat())));
-        md.push((key("engram.offsets"), arr64(&e.offsets.concat())));
-        md.push((
-            key("engram.token_map"),
-            arr64(&e.token_map.iter().map(|&x| x as u64).collect::<Vec<_>>()),
-        ));
-    }
+) -> Result<Vec<(String, Value)>> {
+    let hf = src.config.get("text_config").unwrap_or(&src.config);
+    let context_length = hf
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .map_or_else(|| mainline::trained_context(cfg), |v| v as usize);
+    let mut keys = Vec::new();
     if let Some(files) = tokenizer {
-        md.extend(tokenizer_metadata(files));
+        keys.extend(tokenizer_metadata(files));
+        keys.extend(mainline::vocab_metadata(&files.json, cfg.vocab_size)?);
     }
-    md
+    let extras = mainline::Extras {
+        name: "DeepSeek-V4.1-Flash".into(),
+        context_length,
+        tokenizer: keys,
+    };
+    mainline::metadata(cfg, n_layers, engram_rows, &extras)
 }
 
 /// The format a tensor outside the routed experts is written in: a large matrix whose rows tile
@@ -570,31 +490,6 @@ fn quantize_on_device(
         factor,
         Some(&kernels),
     )
-}
-
-/// `values` in `dtype` without a record: f32 as its bytes, a block format's blocks encoded across the
-/// rayon pool, each block alone as the format's plain encoder takes it.
-fn encode_plain(dtype: GgmlDType, values: &[f32]) -> Result<Vec<u8>> {
-    use rayon::prelude::*;
-    if dtype == GgmlDType::F32 {
-        let mut bytes = vec![0u8; values.len() * 4];
-        bytes
-            .par_chunks_mut(4 << 16)
-            .zip(values.par_chunks(1 << 16))
-            .for_each(|(out, v)| {
-                for (o, x) in out.chunks_exact_mut(4).zip(v) {
-                    o.copy_from_slice(&x.to_le_bytes());
-                }
-            });
-        return Ok(bytes);
-    }
-    // Whole blocks a task, a few hundred of them, so the pool's overhead stays small.
-    let chunk = dtype.block_size() * 256;
-    let parts = values
-        .par_chunks(chunk)
-        .map(|c| crate::tensor::quant_cpu::from_float_bytes(dtype, c))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(parts.concat())
 }
 
 /// What quantising a layer's expert stacks reads: the checkpoint, the calibration, and the cards.
@@ -937,7 +832,9 @@ impl Stacks<'_> {
 /// Write the file. `records` is a calibration read back with `calibration::read`. `layers` limits the
 /// blocks written, for a partial file that checks a recipe on its first layers before the whole
 /// model is spent on it. `tokenizer` is the checkpoint's `tokenizer.json`, carried whole so the file
-/// serves without a sidecar. Returns the SHA-256 of the file, hashed as it was written.
+/// serves without a sidecar. `after` counts the bytes the caller writes beside the file once it is
+/// done: the file is refused before its first byte when its disk cannot hold both. Returns the
+/// SHA-256 of the file, hashed as it was written.
 #[allow(clippy::too_many_arguments)]
 pub fn convert(
     src: &SafeTensorsSource,
@@ -948,12 +845,13 @@ pub fn convert(
     recipe: Recipe,
     layers: std::ops::Range<usize>,
     tokenizer: Option<&TokenizerFiles>,
+    after: u64,
     progress: &dyn Fn(usize, usize, &str),
 ) -> Result<String> {
     let mut plan: Vec<(PlannedEntry, Source)> = Vec::new();
     let dense =
         |name: &str, shape: &[usize], plan: &mut Vec<(PlannedEntry, Source)>| -> Result<()> {
-            let Some(target) = gguf_names(name).into_iter().next().filter(|n| n != name) else {
+            let Some(target) = llamacpp_name(name) else {
                 return Ok(());
             };
             let elems: usize = shape.iter().product();
@@ -978,34 +876,52 @@ pub fn convert(
     }
     let mut names: Vec<String> = src.names().into_iter().map(str::to_string).collect();
     names.sort();
-    for layer in layers.start..layers.end.min(cfg.n_layers) {
+    // The file holds its first `n_layers` layers, which llama.cpp loads as a model of that many.
+    let n_layers = layers.end.min(cfg.n_layers);
+    let below: Vec<usize> = mainline::engram_layers(cfg, n_layers)
+        .into_iter()
+        .filter_map(|i| cfg.engram.as_ref().map(|e| e.layer_ids[i]))
+        .collect();
+    // The offsets the keys declare count the rows of every engram layer below `n_layers`.
+    let engram_rows = below
+        .iter()
+        .map(|l| {
+            let name = format!("layers.{l}.engram.embed.weight");
+            src.shape(&name)
+                .map(|s| s[0])
+                .ok_or_else(|| Error::msg(format!("no tensor {name}")))
+        })
+        .collect::<Result<Vec<usize>>>()?;
+    let engram_layers: Vec<usize> = below.into_iter().filter(|l| layers.contains(l)).collect();
+    let mut tables: Vec<String> = Vec::new();
+    for layer in layers.start..n_layers {
         let prefix = format!("layers.{layer}.");
         for name in names.iter().filter(|n| n.starts_with(&prefix)) {
             if name.contains(".ffn.experts.") || name.ends_with(".scale") {
                 continue;
             }
+            // An engram layer's tables go into the one table; its query and key weights into
+            // its gate. A configuration without the hash leaves the engram out.
+            if name.contains(".engram.") && !engram_layers.contains(&layer) {
+                continue;
+            }
             if name.ends_with("engram.embed.weight") {
-                let target = gguf_names(name).remove(0);
-                let (_, shape, _) = src.raw(name)?;
-                let scale = format!("{}.scale", name.strip_suffix(".weight").unwrap_or(name));
-                let (_, sshape, _) = src.raw(&scale)?;
+                tables.push(name.clone());
+                continue;
+            }
+            if name.ends_with("engram.q_weight") {
+                let dims = src
+                    .shape(name)
+                    .ok_or_else(|| Error::msg(format!("no tensor {name}")))?;
+                let elems: usize = dims.iter().product();
                 plan.push((
                     PlannedEntry {
-                        name: target.clone(),
-                        dims: shape.clone(),
-                        dtype: GgmlDType::I8,
-                        byte_len: shape.iter().product::<usize>() as u64,
+                        name: format!("blk.{layer}.engram_gate.weight"),
+                        dims,
+                        dtype: GgmlDType::F32,
+                        byte_len: bytes_per(GgmlDType::F32, elems),
                     },
-                    Source::Verbatim(name.clone()),
-                ));
-                plan.push((
-                    PlannedEntry {
-                        name: format!("{target}.scale"),
-                        dims: sshape.clone(),
-                        dtype: GgmlDType::I8,
-                        byte_len: sshape.iter().product::<usize>() as u64,
-                    },
-                    Source::Verbatim(scale),
+                    Source::Gate(layer),
                 ));
                 continue;
             }
@@ -1026,7 +942,7 @@ pub fn convert(
             let elems: usize = dims.iter().product();
             plan.push((
                 PlannedEntry {
-                    name: format!("blk.{layer}.{stack}"),
+                    name: format!("blk.{layer}.{stack}.weight"),
                     dims,
                     dtype,
                     byte_len: bytes_per(dtype, elems),
@@ -1036,42 +952,28 @@ pub fn convert(
         }
     }
 
-    // The draft the checkpoint holds, under its own names: its always-read tensors as the
-    // backbone's are written, and its routed experts in the always-read format too, since the
-    // calibration record does not cover them.
-    let mut md = metadata(&src.inference_config, cfg.engram.as_ref(), tokenizer);
-    if src.shape("mtp.0.main_proj.weight").is_some() {
-        let draft = DsparkConfig::from_config_value(&src.config)?;
-        let mut names = tensor_names(draft.n_stages);
-        for s in 0..draft.n_stages {
-            for e in 0..draft.n_routed {
-                for w in ["w1", "w3", "w2"] {
-                    names.push(format!("{}.{e}.{w}.weight", expert_prefix(s)));
-                }
-            }
+    if let (Some(e), false) = (cfg.engram.as_ref(), tables.is_empty()) {
+        let mut rows = 0;
+        for t in &tables {
+            rows += src
+                .shape(t)
+                .map(|s| s[0])
+                .ok_or_else(|| Error::msg(format!("no tensor {t}")))?;
         }
-        for name in names {
-            let dims = src
-                .shape(&name)
-                .ok_or_else(|| Error::msg(format!("no tensor {name}")))?;
-            let dtype = if name.contains(".ffn.experts.") {
-                draft_expert_format(&dims, formats.always_read)
-            } else {
-                written_format(&dims, formats.always_read)
-            };
-            let elems: usize = dims.iter().product();
-            plan.push((
-                PlannedEntry {
-                    name: name.clone(),
-                    dims,
-                    dtype,
-                    byte_len: bytes_per(dtype, elems),
-                },
-                Source::Dense(name),
-            ));
-        }
-        md.extend(draft.to_metadata());
+        plan.push((
+            PlannedEntry {
+                name: ENGRAM_TABLE.into(),
+                dims: vec![rows, e.head_dim],
+                dtype: mainline::ENGRAM_TABLE_FORMAT,
+                byte_len: mainline::engram_table_bytes(rows, e.head_dim)?,
+            },
+            Source::Table(tables),
+        ));
     }
+
+    // The draft the checkpoint holds is not in this file: llama.cpp refuses a tensor it does not
+    // read. `complete::write_draft` writes it as a companion the loader finds beside the model.
+    let md = file_metadata(src, cfg, n_layers, &engram_rows, tokenizer)?;
 
     let entries: Vec<PlannedEntry> = plan
         .iter()
@@ -1082,6 +984,9 @@ pub fn convert(
             byte_len: e.byte_len,
         })
         .collect();
+    let need = planned_len(out, &md, &entries, &Placement::packed())? + after;
+    let room = out.parent().unwrap_or(Path::new("."));
+    ensure_room("the conversion", room, need).map_err(Error::msg)?;
     let writer = GgufStreamWriter::create(out, &md, &entries)?;
     let total = plan.len();
     // Opened once for the whole file: a context costs seconds and holds memory on the card.
@@ -1109,7 +1014,6 @@ pub fn convert(
             for piece in pieces {
                 time(Stage::Write, || match piece {
                     Piece::Bytes(b) => writer.append(&b),
-                    Piece::Mapped(b) => writer.append(b.as_slice()),
                     Piece::Stream(parts) => writer.append_parts(parts),
                     Piece::Parts(parts) => writer.append_parts(parts),
                 })?;
@@ -1125,9 +1029,11 @@ pub fn convert(
                 let Source::Dense(name) = source else {
                     continue;
                 };
-                let bytes = src
-                    .values(name)
-                    .and_then(|v| time(Stage::HostEncode, || encode_plain(entry.dtype, &v)));
+                let bytes = src.values(name).and_then(|v| {
+                    time(Stage::HostEncode, || {
+                        crate::tensor::quant_cpu::from_float_bytes_parallel(entry.dtype, &v)
+                    })
+                });
                 if encoded.send(bytes).is_err() {
                     return;
                 }
@@ -1146,11 +1052,32 @@ pub fn convert(
                             .map_err(|_| Error::msg("convert: the host encoder stopped"))??;
                         to_writer.send(Piece::Bytes(bytes)).map_err(|_| stopped())?;
                     }
-                    Source::Verbatim(name) => {
-                        let (_, _, bytes) = src.raw(name)?;
+                    Source::Gate(layer) => {
+                        let gate = qk_weight(src, &format!("layers.{layer}.engram"))?;
+                        let bytes = gate
+                            .iter()
+                            .flatten()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect();
+                        to_writer.send(Piece::Bytes(bytes)).map_err(|_| stopped())?;
+                    }
+                    Source::Table(names) => {
+                        // A run of rows at a time, the writer taking each as it comes.
+                        let (parts, stream) = std::sync::mpsc::channel();
                         to_writer
-                            .send(Piece::Mapped(bytes))
+                            .send(Piece::Stream(stream))
                             .map_err(|_| stopped())?;
+                        for name in names {
+                            let table = src.engram_table(name)?;
+                            table.advise_sequential();
+                            let rows = table.n_rows();
+                            for start in (0..rows).step_by(mainline::TABLE_ROWS_PER_PIECE) {
+                                let end = (start + mainline::TABLE_ROWS_PER_PIECE).min(rows);
+                                let piece =
+                                    table.encode_rows(start..end, mainline::ENGRAM_TABLE_FORMAT);
+                                parts.send(piece).map_err(|_| stopped())?;
+                            }
+                        }
                     }
                     Source::Experts(layer, w) => {
                         let (layer, w) = (*layer, *w);
@@ -1226,7 +1153,6 @@ pub fn convert(
 /// What the file writer is handed, in plan order: one tensor's bytes, whole or in pieces.
 enum Piece {
     Bytes(Vec<u8>),
-    Mapped(crate::tensor::mapped::MappedBytes),
     /// Pieces still being produced, ending when their sender is dropped.
     Stream(std::sync::mpsc::Receiver<Result<Vec<u8>>>),
     Parts(Vec<Result<Vec<u8>>>),

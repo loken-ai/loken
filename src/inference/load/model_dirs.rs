@@ -83,6 +83,29 @@ pub fn free_bytes(dir: &Path) -> Option<u64> {
     Some(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
+/// Refuse a write of `need` bytes when `free`, the free bytes where it goes, holds fewer, naming
+/// both sizes. An unknown free space lets the write go ahead.
+pub fn fits(what: &str, need: u64, free: Option<u64>) -> Result<(), String> {
+    const GB: f64 = 1e9;
+    match free {
+        Some(free) if free < need => Err(format!(
+            "{what} takes {need} bytes ({:.1} GB) and the disk has {free} bytes ({:.1} GB) free",
+            need as f64 / GB,
+            free as f64 / GB
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// [`fits`] for a write of `need` bytes into `dir`.
+pub fn ensure_room(what: &str, dir: &Path, need: u64) -> Result<(), String> {
+    fits(
+        &format!("{what} in {}", dir.display()),
+        need,
+        free_bytes(dir),
+    )
+}
+
 /// What a pull destination is chosen from: each directory's free space and what
 /// `holding(dir)` says of the model there: `(bytes held, holds the model)`.
 pub fn facts(dirs: &[PathBuf], holding: impl Fn(&Path) -> (u64, bool)) -> Vec<DirFacts> {
@@ -205,6 +228,23 @@ pub(crate) mod tests {
     fn free_space_is_read_where_a_directory_will_be() {
         let d = scratch("free").join("not-yet").join("created");
         assert!(free_bytes(&d).is_some_and(|f| f > 0));
+    }
+
+    /// A write larger than the free space is refused with both sizes; one that fits, or whose
+    /// free space is unknown, goes ahead.
+    #[test]
+    fn a_write_the_disk_cannot_hold_is_refused() {
+        let said = fits("the file", 400_000_000_000, Some(203_000_000_000)).unwrap_err();
+        assert!(said.contains("400000000000 bytes (400.0 GB)"), "{said}");
+        assert!(
+            said.contains("203000000000 bytes (203.0 GB) free"),
+            "{said}"
+        );
+        assert!(fits("the file", 10, Some(10)).is_ok());
+        assert!(fits("the file", 10, None).is_ok());
+        let d = scratch("room");
+        assert!(ensure_room("the file", &d, u64::MAX).is_err());
+        assert!(ensure_room("the file", &d, 1).is_ok());
     }
 
     #[test]

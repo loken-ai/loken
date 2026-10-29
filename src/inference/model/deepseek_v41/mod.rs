@@ -26,6 +26,7 @@ pub mod engram;
 pub mod engram_hash;
 pub mod hyper_connections;
 pub mod load;
+pub mod mainline;
 pub mod model;
 pub mod moe;
 pub mod packed;
@@ -320,11 +321,6 @@ impl DeepseekV41Config {
                 .unwrap_or(d)
         };
         let opt_f = |keys: &[&str], d: f32| g(keys).and_then(|v| v.to_f32().ok()).unwrap_or(d);
-        let opt_s = |keys: &[&str], d: &str| {
-            g(keys)
-                .and_then(|v| v.to_string().ok().cloned())
-                .unwrap_or_else(|| d.to_string())
-        };
         let opt_b = |keys: &[&str], d: bool| match g(keys) {
             Some(Value::Bool(b)) => *b,
             Some(v) => v.to_u32().map(|x| x != 0).unwrap_or(d),
@@ -398,7 +394,10 @@ impl DeepseekV41Config {
                 .filter(|&l| has(l, "attn_compressor_kv", "attn_compressor_kv.weight"))
                 .collect();
         }
-        let mut index_source_layers = arr_u(&["attention.index_source_layers"]);
+        let mut index_source_layers = arr_u(&[
+            "attention.index_source_layers",
+            "attention.indexer.source_layers",
+        ]);
         if index_source_layers.is_empty() {
             index_source_layers = (0..n_layers)
                 .filter(|&l| has(l, "indexer.attn_q_b", "attn_indexer_q_b.weight"))
@@ -416,12 +415,25 @@ impl DeepseekV41Config {
         };
         let swiglu_limit = swiglu_limits.first().copied().unwrap_or(0.0);
 
-        let candidate_source_layer =
-            match g(&["attention.candidate_source_layer"]).and_then(|v| v.to_u32().ok()) {
-                Some(v) => v as i64,
-                None if llamacpp => release::CANDIDATE_SOURCE_LAYER,
-                None => -1,
-            };
+        // Written signed by llama.cpp's `deepseek41` converter.
+        let candidate_source_layer = match g(&[
+            "attention.candidate_source_layer",
+            "attention.indexer.candidate_source_layer",
+        ])
+        .and_then(|v| v.to_i64().ok())
+        {
+            Some(v) => v,
+            None if llamacpp => release::CANDIDATE_SOURCE_LAYER,
+            None => -1,
+        };
+        let score_func = match g(&["expert_scoring_func"]) {
+            Some(v) => v.to_string().ok().cloned(),
+            None => g(&["expert_gating_func"])
+                .and_then(|v| v.to_u32().ok())
+                .and_then(mainline::scoring_func)
+                .map(str::to_string),
+        }
+        .unwrap_or_else(|| "sqrtsoftplus".to_string());
         let vocab_size = match opt_u(&["vocab_size"], 0) {
             0 => dims(&["token_embd", "token_embd.weight"])
                 .map(|d| d[0])
@@ -446,7 +458,7 @@ impl DeepseekV41Config {
             n_shared_experts: opt_u(&["expert_shared_count"], 0),
             n_activated_experts: opt_u(&["expert_used_count"], 0),
             moe_inter_dim: opt_u(&["feed_forward_length", "expert_feed_forward_length"], 0),
-            score_func: opt_s(&["expert_scoring_func"], "sqrtsoftplus"),
+            score_func,
             route_scale: opt_f(&["expert_weights_scale"], 1.0),
             gate_temp: opt_f(&["expert_gate_temp"], 1.0),
             swiglu_limit,
@@ -485,7 +497,10 @@ impl DeepseekV41Config {
             ),
             candidate_source_layer,
             candidate_topk_blocks: opt_u(
-                &["attention.candidate_topk_blocks"],
+                &[
+                    "attention.candidate_topk_blocks",
+                    "attention.indexer.candidate_top_k_blocks",
+                ],
                 if llamacpp {
                     release::CANDIDATE_TOPK_BLOCKS
                 } else {
@@ -493,7 +508,10 @@ impl DeepseekV41Config {
                 },
             ),
             candidate_block_size: opt_u(
-                &["attention.candidate_block_size"],
+                &[
+                    "attention.candidate_block_size",
+                    "attention.indexer.candidate_block_size",
+                ],
                 if llamacpp {
                     release::CANDIDATE_BLOCK_SIZE
                 } else {

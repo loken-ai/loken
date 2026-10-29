@@ -355,6 +355,7 @@ pub(crate) async fn convert_model(
     let blobs = manager.ollama().blobs_dir();
     std::fs::create_dir_all(&blobs).map_err(|e| ApiError::Internal(format!("blobs dir: {e}")))?;
     let work = work_file(&blobs, "convert");
+    let draft_work = work_file(&blobs, "draft");
     let first = format!("converting {} into '{}'", request.model, request.name);
     let name = request.name.clone();
     Ok(detached(request.stream, first, move |progress| {
@@ -376,6 +377,16 @@ pub(crate) async fn convert_model(
                 started.elapsed().as_secs_f64()
             );
             let tokenizer = convert::TokenizerFiles::read(&dir).map_err(|e| e.to_string())?;
+            // The draft is written after the model, on the same disk: the model's room covers it.
+            use crate::inference::model::deepseek_v41::complete;
+            let layout = complete::Layout::for_paths(&[blobs.as_path()]);
+            let has_draft = src.shape("mtp.0.main_proj.weight").is_some();
+            let draft_bytes = if has_draft {
+                complete::draft_bytes_planned(&src, &dir, &draft_work, layout, formats.always_read)
+                    .map_err(|e| e.to_string())?
+            } else {
+                0
+            };
             let digest = convert::convert(
                 &src,
                 &cfg,
@@ -385,19 +396,48 @@ pub(crate) async fn convert_model(
                 recipe,
                 layers,
                 Some(&tokenizer),
+                draft_bytes,
                 &|done, total, _name| progress(done, total, "converting tensors"),
             )
             .map_err(|e| e.to_string())?;
             progress(0, 0, "writing manifest");
-            ollama::store_gguf_with_digest(manager.ollama(), &work, &digest, &name, [None; 4])
+            ollama::store_gguf_with_digest(manager.ollama(), &work, &digest, &name, [None; 4])?;
+            // The draft is a companion of its own, which the loader finds beside the model.
+            if has_draft {
+                let digest = complete::write_draft(
+                    &src,
+                    &dir,
+                    &draft_work,
+                    layout,
+                    formats.always_read,
+                    &|done, total, _name| progress(done, total, "writing the draft"),
+                )
+                .map_err(|e| e.to_string())?;
+                ollama::store_gguf_with_digest(
+                    manager.ollama(),
+                    &draft_work,
+                    &digest,
+                    &draft_name(&name),
+                    [None; 4],
+                )?;
+            }
+            Ok(())
         };
         let outcome = run();
         if outcome.is_err() {
-            let _ = std::fs::remove_file(&work);
-            let _ = std::fs::remove_file(work.with_extension("gguf.partial"));
+            for w in [&work, &draft_work] {
+                let _ = std::fs::remove_file(w);
+                let _ = std::fs::remove_file(w.with_extension("gguf.partial"));
+            }
         }
         outcome.map(|()| "success".to_string())
     }))
+}
+
+/// The name a conversion's draft companion is stored under: the model's tag with `-dspark`.
+fn draft_name(name: &str) -> String {
+    let (model, tag) = name.split_once(':').unwrap_or((name, "latest"));
+    format!("{model}:{tag}-dspark")
 }
 
 #[cfg(test)]
@@ -423,5 +463,12 @@ mod tests {
         )
         .unwrap();
         assert!(c.calibration.is_none() && c.complete.as_deref() == Some("dsv41:iq2"));
+    }
+
+    /// The draft companion takes the model's tag with a suffix, `latest` when it names none.
+    #[test]
+    fn the_draft_is_named_after_the_model() {
+        assert_eq!(draft_name("dsv41:iq2"), "dsv41:iq2-dspark");
+        assert_eq!(draft_name("dsv41"), "dsv41:latest-dspark");
     }
 }

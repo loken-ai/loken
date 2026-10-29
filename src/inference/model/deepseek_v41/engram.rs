@@ -20,8 +20,8 @@ use crate::tensor::blockscaled::dequant::{e4m3_to_f32, e8m0_to_f32};
 use crate::tensor::mapped::MappedBytes;
 use crate::tensor::quant_view::rows_view;
 use crate::tensor::quantized::gguf_file::Value;
-use crate::tensor::quantized::QTensor;
 use crate::tensor::quantized::BLOCK_ALIGN;
+use crate::tensor::quantized::{GgmlDType, QTensor};
 use crate::tensor::{Device, Error, Result, Tensor};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -56,11 +56,56 @@ pub struct EngramConfig {
     pub offsets: Vec<Vec<u64>>,
 }
 
+/// The metadata keys of one engram layout, each under the architecture prefix.
+pub struct EngramKeys {
+    pub layer_ids: &'static str,
+    pub n_heads: &'static str,
+    pub head_dim: &'static str,
+    pub max_ngram: &'static str,
+    pub multipliers: &'static str,
+    pub primes: &'static str,
+    pub offsets: &'static str,
+    pub token_map: &'static str,
+    pub pad_id: &'static str,
+}
+
+/// loken's own layout: each layer's table apart, its offsets from that table's first row.
+const OWN_KEYS: EngramKeys = EngramKeys {
+    layer_ids: "engram.layer_ids",
+    n_heads: "engram.head_count",
+    head_dim: "engram.key_length",
+    max_ngram: "engram.max_ngram_size",
+    multipliers: "engram.multipliers",
+    primes: "engram.primes",
+    offsets: "engram.offsets",
+    token_map: "engram.token_map",
+    pad_id: "engram.pad_id",
+};
+
+/// llama.cpp's layout (`deepseek41`): one table for every layer, its offsets from that table's
+/// first row.
+pub const LLAMACPP_KEYS: EngramKeys = EngramKeys {
+    layer_ids: "ple.layers",
+    n_heads: "ple.heads_per_ngram",
+    head_dim: "embedding_length_per_layer_input",
+    max_ngram: "ple.ngram_size",
+    multipliers: "ple.layer_multipliers",
+    primes: "ple.head_vocab_sizes",
+    offsets: "ple.head_offsets",
+    token_map: "engram.token_map",
+    pad_id: "engram.pad_token_id",
+};
+
 impl EngramConfig {
-    /// Read the layout from the metadata under `{arch}.engram.*`; `None` when the file has no
-    /// engram layers or omits any of the hash parameters.
+    /// Read the layout from the metadata, under loken's `{arch}.engram.*` keys or llama.cpp's
+    /// `{arch}.ple.*` ones; `None` when the file has no engram layers or omits any of the hash
+    /// parameters.
     pub fn read(md: &HashMap<String, Value>, arch: &str) -> Option<Self> {
-        let g = |k: &str| md.get(&format!("{arch}.engram.{k}"));
+        Self::read_keys(md, arch, &OWN_KEYS).or_else(|| Self::read_keys(md, arch, &LLAMACPP_KEYS))
+    }
+
+    fn read_keys(md: &HashMap<String, Value>, arch: &str, keys: &EngramKeys) -> Option<Self> {
+        let g = |k: &str| md.get(&format!("{arch}.{k}"));
         let u = |k: &str| g(k).and_then(|v| v.to_u32().ok()).map(|v| v as usize);
         let arr_u64 = |k: &str| -> Option<Vec<u64>> {
             g(k)?
@@ -70,7 +115,7 @@ impl EngramConfig {
                 .map(|v| v.to_u64().ok())
                 .collect()
         };
-        let layer_ids: Vec<usize> = arr_u64("layer_ids")?
+        let layer_ids: Vec<usize> = arr_u64(keys.layer_ids)?
             .into_iter()
             .map(|v| v as usize)
             .collect();
@@ -78,27 +123,27 @@ impl EngramConfig {
             return None;
         }
         let (n_heads, head_dim, max_ngram) =
-            (u("head_count")?, u("key_length")?, u("max_ngram_size")?);
+            (u(keys.n_heads)?, u(keys.head_dim)?, u(keys.max_ngram)?);
         let n_cols = (max_ngram.checked_sub(1)?) * n_heads;
         let n = layer_ids.len();
         let split = |v: Vec<u64>, per: usize| -> Option<Vec<Vec<u64>>> {
             (v.len() == n * per).then(|| v.chunks(per).map(|c| c.to_vec()).collect())
         };
         // Written unsigned; each is bounded so that id * multiplier fits a signed 64-bit product.
-        let multipliers: Vec<i64> = arr_u64("multipliers")?
+        let multipliers: Vec<i64> = arr_u64(keys.multipliers)?
             .into_iter()
             .map(i64::try_from)
             .collect::<std::result::Result<_, _>>()
             .ok()?;
         let multipliers = (multipliers.len() == n * max_ngram)
             .then(|| multipliers.chunks(max_ngram).map(|c| c.to_vec()).collect())?;
-        let primes = split(arr_u64("primes")?, n_cols)?;
-        let offsets = split(arr_u64("offsets")?, n_cols)?;
-        let token_map: Vec<u32> = arr_u64("token_map")?
+        let primes = split(arr_u64(keys.primes)?, n_cols)?;
+        let offsets = split(arr_u64(keys.offsets)?, n_cols)?;
+        let token_map: Vec<u32> = arr_u64(keys.token_map)?
             .into_iter()
             .map(|v| v as u32)
             .collect();
-        let pad = u("pad_id")?;
+        let pad = u(keys.pad_id)?;
         let pad_id = *token_map.get(pad)?;
         Some(Self {
             layer_ids,
@@ -222,7 +267,8 @@ pub enum EngramTable {
 }
 
 impl EngramTable {
-    fn row(&self, r: u64) -> Result<Vec<f32>> {
+    /// Row `r`, decoded.
+    pub(super) fn row(&self, r: u64) -> Result<Vec<f32>> {
         let r = r as usize;
         match self {
             Self::Streamed(t) => {
@@ -239,6 +285,8 @@ impl EngramTable {
                     .dequantize(&Device::Cpu)?
                     .narrow(0, r - start, 1)?
                     .flatten_all()?
+                    // CONVERSION: a BF16 table decodes to BF16 on the host; its row is read as F32.
+                    .to_dtype(crate::tensor::DType::F32)?
                     .to_vec1::<f32>()
             }
             Self::Fp8Rows {
@@ -257,8 +305,29 @@ impl EngramTable {
                     .map(|(j, &b)| e4m3_to_f32(b) * e8m0_to_f32(sc[j / block]))
                     .collect())
             }
-            Self::Resident(t) => t.narrow(0, r, 1)?.flatten_all()?.to_vec1::<f32>(),
+            Self::Resident(t) => t
+                .narrow(0, r, 1)?
+                .flatten_all()?
+                .to_dtype(crate::tensor::DType::F32)?
+                .to_vec1::<f32>(),
         }
+    }
+
+    /// Rows `rows` encoded in `dtype`: decoded and encoded on every core, through the host
+    /// encoder every dense tensor of a conversion takes.
+    pub(super) fn encode_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        dtype: GgmlDType,
+    ) -> Result<Vec<u8>> {
+        use rayon::prelude::*;
+        let values = rows
+            .into_par_iter()
+            .map(|r| self.row(r as u64))
+            .collect::<Result<Vec<_>>>()?
+            .concat();
+        // CONVERSION: a table is written in the format the target file holds it in.
+        crate::tensor::quant_cpu::from_float_bytes_parallel(dtype, &values)
     }
 
     /// Start reading rows `ids` in, where the table is mapped.
@@ -289,6 +358,14 @@ impl EngramTable {
         }
     }
 
+    /// Ask the kernel to read this table in order, as a conversion copies it whole.
+    pub fn advise_sequential(&self) {
+        if let Self::Fp8Rows { bytes, scales, .. } = self {
+            bytes.advise_sequential();
+            scales.advise_sequential();
+        }
+    }
+
     pub fn n_rows(&self) -> usize {
         match self {
             Self::Streamed(t) => t.shape().dims()[0],
@@ -296,6 +373,25 @@ impl EngramTable {
             Self::Resident(t) => t.dims()[0],
         }
     }
+}
+
+/// The product of an engram layer's query and key weights, `[hc_mult, dim]`: the file's when it
+/// carries the product, else computed from the two.
+pub fn qk_weight<S: WeightSource + ?Sized>(g: &S, prefix: &str) -> Result<Vec<Vec<f32>>> {
+    let gate = format!("{prefix}.gate.weight");
+    if g.shape(&gate).is_some() {
+        return g.dense_f32(&gate)?.to_vec2::<f32>();
+    }
+    let q = g
+        .dense_f32(&format!("{prefix}.q_weight"))?
+        .to_vec2::<f32>()?;
+    let k = g
+        .dense_f32(&format!("{prefix}.k_weight"))?
+        .to_vec2::<f32>()?;
+    Ok(q.iter()
+        .zip(&k)
+        .map(|(qr, kr)| qr.iter().zip(kr).map(|(a, b)| a * b).collect())
+        .collect())
 }
 
 /// One engram layer's weights.
@@ -321,13 +417,7 @@ impl Engram {
     ) -> Result<Self> {
         let p = format!("layers.{layer}.engram");
         let table = g.engram_table(&format!("{p}.embed.weight"))?;
-        let q = g.dense_f32(&format!("{p}.q_weight"))?.to_vec2::<f32>()?;
-        let k = g.dense_f32(&format!("{p}.k_weight"))?.to_vec2::<f32>()?;
-        let qk_weight = q
-            .iter()
-            .zip(&k)
-            .map(|(qr, kr)| qr.iter().zip(kr).map(|(a, b)| a * b).collect())
-            .collect();
+        let qk_weight = qk_weight(g, &p)?;
         Ok(Self {
             table,
             wkv: projection(g, &format!("{p}.wkv.weight"))?,

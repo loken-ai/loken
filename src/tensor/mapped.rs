@@ -206,15 +206,21 @@ impl MappedBytes {
         }
     }
 
-    /// Tell the kernel these bytes will not be read again soon: the range is unmapped from
-    /// this process and dropped from the page cache, so what is read next does not evict
-    /// something worth keeping. A later read faults the bytes back in from the file.
     /// Tell the kernel these bytes are read at random: read-ahead around a row nobody asked for
     /// pulls megabytes per lookup and evicts what the model is using.
     pub fn advise_random(&self) {
         advise_bytes(self.as_slice(), libc::MADV_RANDOM, true);
     }
 
+    /// Tell the kernel these bytes are read once, in order: read-ahead runs well ahead of the
+    /// reader.
+    pub fn advise_sequential(&self) {
+        advise_bytes(self.as_slice(), libc::MADV_SEQUENTIAL, true);
+    }
+
+    /// Tell the kernel these bytes will not be read again soon: the range is unmapped from
+    /// this process and dropped from the page cache, so what is read next does not evict
+    /// something worth keeping. A later read faults the bytes back in from the file.
     pub fn dont_need(&self) {
         // Safety: the mapping is read-only over a file that is not written while served, so
         // discarding its pages loses nothing; they are read back from the file on demand.

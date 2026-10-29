@@ -17,6 +17,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Vision: answer about a video clip sent as a video_url part.
 - API: report each chat answer's times, energy share, cache place and drafts.
 - API: stream the reading of a long prompt as comment lines.
+- Models: convert DeepSeek V4.1 and its draft into files ollama and llama.cpp load.
 
 ### Changed
 

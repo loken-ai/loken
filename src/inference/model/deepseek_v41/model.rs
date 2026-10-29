@@ -2803,11 +2803,106 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// A file in loken's own layout, re-laid in llama.cpp's, carries every key llama.cpp's
+    /// `deepseek41` loader requires and exactly the tensors it creates, the engram tables as one
+    /// table holding the source's blocks and the gate as the query and key product, and
+    /// loads here to exactly the logits of the file it came from.
+    #[test]
+    fn relaid_in_llamacpp_layout_loads_to_the_same_logits() {
+        use super::super::mainline;
+        use super::super::source::ENGRAM_TABLE;
+        use crate::tensor::quantized::GgmlDType;
+        let table_format = mainline::ENGRAM_TABLE_FORMAT;
+        let head_dim = table_format.block_size();
+        let (emd, mut eentries) = engram_md_and_entries_of(1, head_dim);
+        // The table in the format the re-laid file holds it in.
+        let mut table = Vec::new();
+        for e in eentries
+            .iter_mut()
+            .filter(|e| e.name.ends_with("engram_embd"))
+        {
+            let values: Vec<f32> = e
+                .data
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            e.data = crate::tensor::quant_cpu::from_float_bytes(table_format, &values).unwrap();
+            e.dtype = table_format;
+            table = e.data.clone();
+        }
+        let vocab: serde_json::Map<String, serde_json::Value> = (0..VOCAB)
+            .map(|i| (format!("t{i}"), serde_json::json!(i)))
+            .collect();
+        let json = serde_json::json!({ "model": { "vocab": vocab, "merges": [] } }).to_string();
+        let mut md = real_md(3);
+        md.extend(emd);
+        md.push((
+            super::super::convert::TOKENIZER_KEY.into(),
+            Value::String(json),
+        ));
+        let mut entries = real_entries();
+        entries.extend(eentries);
+        let tokens: Vec<u32> = vec![1, 5, 3, 0, 7, 2, 9, 4, 3, 3];
+        let logits = |g: &crate::tensor::quantized::gguf_file::MappedGguf| {
+            let cfg = DeepseekV41Config::from_gguf(&g.content).unwrap();
+            DeepseekV41Model::load(g, &cfg)
+                .unwrap()
+                .forward_prefill(&tokens)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+
+        let own = tmp("own.gguf");
+        write_gguf_with_metadata(&own, &md, &entries).unwrap();
+        let g = open_mapped(&own).unwrap();
+        let _ = std::fs::remove_file(&own);
+        let want = logits(&g);
+        let relaid = tmp("relaid.gguf");
+        mainline::relayout(&g, &relaid, &|_, _, _| {}).unwrap();
+        let h = open_mapped(&relaid).unwrap();
+        let _ = std::fs::remove_file(&relaid);
+
+        let md = &h.content.metadata;
+        assert_eq!(
+            md["general.architecture"].to_string().unwrap(),
+            mainline::ARCH
+        );
+        for k in mainline::REQUIRED_KEYS.iter().chain(mainline::ENGRAM_KEYS) {
+            assert!(md.contains_key(*k), "llama.cpp requires {k}");
+        }
+        let cfg = DeepseekV41Config::from_gguf(&h.content).unwrap();
+        let mut got: Vec<&String> = h.content.tensor_infos.keys().collect();
+        got.sort();
+        let mut expected = mainline::tensor_names(&cfg, cfg.n_layers);
+        expected.sort();
+        assert_eq!(got, expected.iter().collect::<Vec<_>>());
+        let info = &h.content.tensor_infos[ENGRAM_TABLE];
+        assert_eq!(info.shape.dims(), &[48, head_dim]);
+        assert_eq!(info.ggml_dtype, table_format);
+        let start = (h.content.tensor_data_offset + info.offset) as usize;
+        assert_eq!(
+            &h.mmap[start..start + info.size_in_bytes()],
+            table.as_slice()
+        );
+        assert_eq!(logits(&h), want);
+    }
+
     /// The engram keys and tensors of one layer, for a toy hash layout: 2 heads, 3-gram, a
-    /// 4-column table of 48 rows whose bucket ranges are consecutive primes.
+    /// table of 48 rows of 8 values whose bucket ranges are consecutive primes.
     fn engram_md_and_entries(layer: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
+        engram_md_and_entries_of(layer, 8)
+    }
+
+    /// [`engram_md_and_entries`] with rows of `head_dim` values.
+    fn engram_md_and_entries_of(
+        layer: usize,
+        head_dim: usize,
+    ) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
         const EH: usize = 2;
-        const EHD: usize = 8;
+        let ehd = head_dim;
         const NGRAM: usize = 3;
         let primes = [7u64, 11, 13, 17];
         let offsets = [0u64, 7, 18, 31];
@@ -2828,7 +2923,7 @@ mod tests {
                 Value::Array(vec![Value::I32(layer as i32)]),
             ),
             ("deepseek4.engram.head_count".into(), Value::U32(EH as u32)),
-            ("deepseek4.engram.key_length".into(), Value::U32(EHD as u32)),
+            ("deepseek4.engram.key_length".into(), Value::U32(ehd as u32)),
             (
                 "deepseek4.engram.max_ngram_size".into(),
                 Value::U32(NGRAM as u32),
@@ -2841,12 +2936,12 @@ mod tests {
         ];
         let p = format!("blk.{layer}");
         let entries = vec![
-            f32e(format!("{p}.engram_embd"), vec![rows, EHD]),
+            f32e(format!("{p}.engram_embd"), vec![rows, ehd]),
             f32e(format!("{p}.engram_q"), vec![HC, DIM]),
             f32e(format!("{p}.engram_k"), vec![HC, DIM]),
             f32e(
                 format!("{p}.engram_wkv"),
-                vec![DIM * (HC + 1), (NGRAM - 1) * EH * EHD],
+                vec![DIM * (HC + 1), (NGRAM - 1) * EH * ehd],
             ),
         ];
         (md, entries)

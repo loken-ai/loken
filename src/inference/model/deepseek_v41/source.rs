@@ -95,8 +95,86 @@ fn gguf_block_names(rest: &str) -> Option<(&'static str, &'static str, &'static 
         "engram.wkv.weight" => ("engram_wkv", ".weight", "engram_wkv.weight"),
         "engram.q_weight" => ("engram_q", ".weight", "engram_q.weight"),
         "engram.k_weight" => ("engram_k", ".weight", "engram_k.weight"),
+        // The query and key weights multiplied together: not a checkpoint tensor, a file's.
+        "engram.gate.weight" => ("engram_gate", ".weight", "engram_gate.weight"),
         _ => return None,
     })
+}
+
+/// Every reference name below `layers.N.` that [`gguf_block_names`] spells, the routed experts
+/// and the engram table aside.
+pub const BLOCK_TENSORS: &[&str] = &[
+    "attn_norm.weight",
+    "ffn_norm.weight",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_attn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "hc_ffn_base",
+    "attn.wq_a.weight",
+    "attn.q_norm.weight",
+    "attn.wq_b.weight",
+    "attn.wkv.weight",
+    "attn.kv_norm.weight",
+    "attn.attn_sink",
+    "attn.wo_a.weight",
+    "attn.wo_b.weight",
+    "attn.compressor.norm.weight",
+    "attn.compressor.wkv.weight",
+    "attn.compressor.wgate.weight",
+    "attn.indexer.wq_b.weight",
+    "attn.indexer.weights_proj.weight",
+    "attn.indexer.wk.weight",
+    "attn.indexer.k_norm.weight",
+    "ffn.gate.weight",
+    "ffn.gate.bias",
+    "ffn.shared_experts.w1.weight",
+    "ffn.shared_experts.w2.weight",
+    "ffn.shared_experts.w3.weight",
+    "engram.wkv.weight",
+    "engram.q_weight",
+    "engram.k_weight",
+    "engram.gate.weight",
+];
+
+/// The one table llama.cpp's layout holds every engram layer's rows in, layer after layer; the
+/// bucket offsets the file declares index it whole.
+pub const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
+
+/// llama.cpp's spelling of a block tensor whose name there is not the bare converter name.
+fn llamacpp_block_name(rest: &str) -> Option<&'static str> {
+    Some(match rest {
+        "engram.wkv.weight" => "engram_kv.weight",
+        _ => return None,
+    })
+}
+
+/// The name llama.cpp's `deepseek41` loader reads a reference tensor under, `None` for a tensor
+/// it has no place for. Every engram table maps to [`ENGRAM_TABLE`]; an engram layer's query and
+/// key weights have no name there, only their product, `engram.gate.weight`.
+pub fn llamacpp_name(name: &str) -> Option<String> {
+    match name {
+        "embed.weight" => return Some("token_embd.weight".into()),
+        "norm.weight" => return Some("output_norm.weight".into()),
+        "head.weight" => return Some("output.weight".into()),
+        _ => {}
+    }
+    let (l, rest) = layer_of(name)?;
+    if matches!(rest, "engram.q_weight" | "engram.k_weight") {
+        return None;
+    }
+    if let Some((_, w)) = expert_of(rest) {
+        return gguf_expert_stack(w).map(|s| format!("blk.{l}.{s}.weight"));
+    }
+    if rest == "engram.embed.weight" {
+        return Some(ENGRAM_TABLE.into());
+    }
+    if let Some(n) = llamacpp_block_name(rest) {
+        return Some(format!("blk.{l}.{n}"));
+    }
+    let (bare, suffix, _) = gguf_block_names(rest)?;
+    Some(format!("blk.{l}.{bare}{suffix}"))
 }
 
 /// The GGUF stack a routed expert's projection sits in.
@@ -201,11 +279,20 @@ pub fn gguf_names(name: &str) -> Vec<String> {
         };
     }
     match gguf_block_names(rest) {
-        Some((bare, suffix, legacy)) => vec![
-            format!("blk.{l}.{bare}"),
-            format!("blk.{l}.{bare}{suffix}"),
-            format!("blk.{l}.{legacy}"),
-        ],
+        Some((bare, suffix, legacy)) => {
+            let mut names = vec![
+                format!("blk.{l}.{bare}"),
+                format!("blk.{l}.{bare}{suffix}"),
+                format!("blk.{l}.{legacy}"),
+            ];
+            if let Some(n) = llamacpp_block_name(rest) {
+                names.push(format!("blk.{l}.{n}"));
+            }
+            if rest == "engram.embed.weight" {
+                names.push(ENGRAM_TABLE.to_string());
+            }
+            names
+        }
         None => vec![name.to_string()],
     }
 }
