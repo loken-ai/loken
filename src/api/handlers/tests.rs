@@ -741,6 +741,50 @@ fn a_repository_without_weights_is_not_advertised() {
     assert!(super::holds_weights(&entry("ollama", &[])));
 }
 
+/// A released checkpoint the loader serves in place through its model's own source is listed,
+/// as the loader routes it: a cache repository whose shard index names the DeepSeek V4.1
+/// hyper-connection mix, safetensors and no GGUF.
+#[test]
+fn a_checkpoint_a_model_source_serves_is_advertised() {
+    use crate::inference::load::model_manager::ModelMetadata;
+    let hf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-scratch")
+        .join(format!("catalogue-checkpoint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&hf);
+    let repo = hf.join("hub").join("models--test--released-checkpoint");
+    let rev = "0123456789abcdef0123456789abcdef01234567";
+    let snapshot = repo.join("snapshots").join(rev);
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(repo.join("refs")).unwrap();
+    std::fs::write(repo.join("refs").join("main"), rev).unwrap();
+    std::fs::write(
+        snapshot.join("config.json"),
+        r#"{"architectures": ["TestForCausalLM"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        snapshot.join("model.safetensors.index.json"),
+        r#"{"weight_map": {"layers.0.hc_attn_fn": "model-00001.safetensors"}}"#,
+    )
+    .unwrap();
+    let entry = ModelMetadata {
+        id: "test/released-checkpoint".into(),
+        name: "test/released-checkpoint".into(),
+        size: 0,
+        downloaded_at: String::new(),
+        files: vec!["config.json".into(), "model-00001.safetensors".into()],
+        source: "huggingface".into(),
+        digest: String::new(),
+    };
+    let path = crate::inference::load::huggingface_manager::HuggingFaceManager::new(hf.clone())
+        .get_model_path(&entry.id)
+        .expect("the repository resolves");
+    assert!(crate::inference::model::deepseek_v41::claims_checkpoint_dir(&path));
+    assert!(super::text_loader_can_open(&hf.to_string_lossy(), &entry));
+    let _ = std::fs::remove_dir_all(&hf);
+}
+
 /// The catalogue must not advertise a causal language model the text loader cannot open.
 /// A plain safetensors checkpoint of one was listed and failed at load with "model file
 /// not found"; an AWQ checkpoint loads; a model that is not a causal LM belongs to another
