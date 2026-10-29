@@ -22,6 +22,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Experts: copy a decode's experts to the cards beside the token, not inside it.
 - API: leave the stop sequence out of the text returned by every route unless asked to keep it.
 - Serving: decode and prefill more requests in one batch, sharing the cache and fusing the attention.
 - Inference: run the host attention of a long prompt over tiles of keys and rows.

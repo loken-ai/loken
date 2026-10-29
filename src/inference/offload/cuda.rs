@@ -89,6 +89,17 @@ struct ExpertTier {
     /// long tail a decode routes to once or twice on the host.
     seen: HashMap<ExpertKeys, u32>,
     clock: u64,
+    /// Experts whose copy to the card is queued or running: their room is taken, they are not
+    /// kept yet, and a second request for one queues nothing more.
+    pending: std::collections::HashSet<ExpertKeys>,
+}
+
+/// An expert a decode asked the card to keep, on its way to the card.
+struct PendingUpload {
+    key: ExpertKeys,
+    expert: Expert,
+    freq: u64,
+    bytes: usize,
 }
 
 /// A projection's blocks, when it is quantised.
@@ -160,7 +171,10 @@ pub struct Card {
     dense: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<QMatMul>>>,
     /// The same weights transposed as a prompt's product reads them, by their storage.
     dense_t: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<CudaSlice<f32>>>>,
-    experts: Mutex<ExpertTier>,
+    experts: Arc<Mutex<ExpertTier>>,
+    /// The queue of the thread that copies a decode's admitted experts to the card, started on
+    /// first use; `None` when the thread could not be started.
+    uploads: OnceLock<Option<std::sync::mpsc::SyncSender<PendingUpload>>>,
     /// The clock ticks one expert block spans a token - the model's layer count. An expert used
     /// within this many ticks is this token's working set and is never evicted, so a decode
     /// adapts the card toward its own hot experts across tokens without trading out, at every
@@ -178,9 +192,89 @@ pub struct Card {
     said: AtomicBool,
     /// How many sightings an expert needs before it is taken on, from the measured cost of an
     /// upload against what a use saves.
-    admission: Admission,
+    admission: Arc<Admission>,
     /// Nanoseconds the host takes for one expert, smoothed; set when the card joins an offload.
     host_expert_ns: OnceLock<Arc<AtomicU64>>,
+}
+
+/// Copies the experts a card's decodes asked it to keep, one after the other, on a stream of
+/// their own so that the copies overlap the card's compute. An expert is kept once its copy is
+/// done; one whose copy failed gives its room back and stays on the host.
+fn upload_worker(
+    dev: &CudaDevice,
+    tier: &Mutex<ExpertTier>,
+    admission: &Admission,
+    room: &Mutex<Room>,
+    rx: std::sync::mpsc::Receiver<PendingUpload>,
+) {
+    if dev.context().bind_to_thread().is_err() {
+        return;
+    }
+    let Ok(copy) = dev.context().new_stream() else {
+        return;
+    };
+    while let Ok(job) = rx.recv() {
+        let started = std::time::Instant::now();
+        let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send_expert(dev, &copy, &job.expert)
+        }))
+        .ok()
+        .flatten();
+        let ns = started.elapsed().as_nanos() as u64;
+        super::prof_record("card expert upload", ns);
+        let mut t = tier.lock().unwrap_or_else(|e| e.into_inner());
+        t.pending.remove(&job.key);
+        match sent {
+            Some((gate, up, down)) if !t.kept.contains_key(&job.key) => {
+                admission.note_upload(ns);
+                let used = t.clock;
+                t.kept.insert(
+                    job.key,
+                    ExpertOnCard {
+                        gate: Arc::new(gate),
+                        up: Arc::new(up),
+                        down: Arc::new(down),
+                        used,
+                        freq: job.freq,
+                        admitted_freq: job.freq,
+                        bytes: job.bytes,
+                    },
+                );
+            }
+            _ => room
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .give(job.bytes),
+        }
+    }
+}
+
+/// `e`'s three quantised weights copied to the card on `copy`. The memory is allocated on the
+/// card's own stream, so that its release stays ordered after the kernels that read it; the copy
+/// waits for the allocation and the call returns once the copy is done.
+fn send_expert(
+    dev: &CudaDevice,
+    copy: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+    e: &Expert,
+) -> Option<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>)> {
+    let (_, gate) = expert_gate(e)?;
+    let up = quant_blocks_any(&e.w3).ok()?;
+    let down = quant_blocks_any(&e.w2).ok()?;
+    let srcs = [gate.as_ref(), up.as_ref(), down.as_ref()];
+    let main = dev.stream();
+    let mut dsts = Vec::with_capacity(srcs.len());
+    for src in srcs {
+        // Safety: written by the copy below before any kernel reads it.
+        dsts.push(unsafe { main.alloc::<u8>(src.len()) }.ok()?);
+    }
+    let ready = main.record_event(None).ok()?;
+    copy.wait(&ready).ok()?;
+    for (src, dst) in srcs.into_iter().zip(dsts.iter_mut()) {
+        copy.memcpy_htod(src, dst).ok()?;
+    }
+    copy.synchronize().ok()?;
+    let mut it = dsts.into_iter();
+    Some((it.next()?, it.next()?, it.next()?))
 }
 
 impl Card {
@@ -192,12 +286,13 @@ impl Card {
             resident: Mutex::new(HashMap::new()),
             dense: Mutex::new(HashMap::new()),
             dense_t: Mutex::new(HashMap::new()),
-            experts: Mutex::new(ExpertTier::default()),
+            experts: Arc::new(Mutex::new(ExpertTier::default())),
+            uploads: OnceLock::new(),
             protect: protect.max(1),
             tables: Default::default(),
             declined: AtomicBool::new(false),
             said: AtomicBool::new(false),
-            admission: Admission::new(protect as usize),
+            admission: Arc::new(Admission::new(protect as usize)),
             host_expert_ns: OnceLock::new(),
         }
     }
@@ -461,6 +556,9 @@ impl Card {
             if tier.kept.contains_key(&key) {
                 return Some(key);
             }
+            if tier.pending.contains(&key) {
+                return None;
+            }
             let c = tier.seen.entry(key).or_insert(0);
             *c += 1;
             *c
@@ -508,6 +606,12 @@ impl Card {
             self.give_room(total);
             return None;
         }
+        // A decode's expert goes over on the card's copy stream, off this token's path: the token
+        // runs it on the host, and a later one finds it on the card once the copy is done. The
+        // prior's and a prompt's are sent here and now, for the decode that follows to find.
+        if !proven {
+            return self.upload_later(e, key, n as u64, total);
+        }
         // Sent outside the tier's lock, and a driver that panics on the allocation rather than
         // erring is a card that declined: the room goes back and the host runs the expert.
         let stream = self.dev.stream();
@@ -519,10 +623,8 @@ impl Card {
                 stream.clone_htod(down.as_ref()).ok()?,
             ))
         }));
-        super::prof_record(
-            "card expert upload",
-            upload_started.elapsed().as_nanos() as u64,
-        );
+        let upload_ns = upload_started.elapsed().as_nanos() as u64;
+        super::prof_record("card expert upload", upload_ns);
         let Ok(Some((gate_d, up_d, down_d))) = sent else {
             self.give_room(total);
             self.decline(
@@ -531,6 +633,7 @@ impl Card {
             );
             return None;
         };
+        self.admission.note_upload(upload_ns);
         let mut tier = self.tier();
         if tier.kept.contains_key(&key) {
             // Another lane sent it meanwhile: one copy is kept, this one's room goes back.
@@ -556,6 +659,65 @@ impl Card {
             },
         );
         Some(key)
+    }
+
+    /// Queue `e` (key `key`, seen `freq` times, `bytes` long, its room taken) for the copy thread.
+    /// Always `None`: the caller runs the expert on the host this time. The room goes back when
+    /// the expert cannot be queued.
+    fn upload_later(
+        &self,
+        e: &Expert,
+        key: ExpertKeys,
+        freq: u64,
+        bytes: usize,
+    ) -> Option<ExpertKeys> {
+        let job = PendingUpload {
+            key,
+            expert: Expert {
+                w1: e.w1.clone(),
+                w2: e.w2.clone(),
+                w3: e.w3.clone(),
+            },
+            freq,
+            bytes,
+        };
+        let queued = match self.uploader() {
+            Some(tx) if self.tier().pending.insert(key) => {
+                let sent = tx.try_send(job).is_ok();
+                if !sent {
+                    self.tier().pending.remove(&key);
+                }
+                sent
+            }
+            _ => false,
+        };
+        if !queued {
+            self.give_room(bytes);
+        }
+        None
+    }
+
+    /// The copy thread's queue, the thread started on the first call. The queue holds one
+    /// token's worth of requests, one per layer: a request that finds it full is dropped and
+    /// made again at a later sighting.
+    fn uploader(&self) -> Option<&std::sync::mpsc::SyncSender<PendingUpload>> {
+        self.uploads
+            .get_or_init(|| {
+                let (tx, rx) =
+                    std::sync::mpsc::sync_channel::<PendingUpload>(self.protect as usize);
+                let (dev, tier, admission, room) = (
+                    self.dev.clone(),
+                    self.experts.clone(),
+                    self.admission.clone(),
+                    self.room,
+                );
+                std::thread::Builder::new()
+                    .name(format!("card {} uploads", self.ordinal))
+                    .spawn(move || upload_worker(&dev, &tier, &admission, room, rx))
+                    .ok()
+                    .map(|_| tx)
+            })
+            .as_ref()
     }
 
     /// Free at least `need` bytes by dropping the LEAST-FREQUENTLY-routed kept experts (never one
