@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Added
 
 - Metrics: publish each request's queue, prefill, decode and cache figures.
+- Serving: batch the image and speech requests queued behind a running one.
 - API: take a completion's prompt as embeddings, in loken's checksummed format or as torch.save tensors.
 - API: take vLLM's request fields and serve its extra routes.
 - Models: embed texts and images in one space with CLIP and SigLIP checkpoints, on the embeddings routes.

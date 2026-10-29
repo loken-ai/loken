@@ -9,6 +9,7 @@ pub mod cancel;
 pub mod continuous_batch;
 pub mod continuous_serve;
 pub mod eagle;
+pub mod gather;
 pub mod pipeline;
 pub mod pipeline_segment;
 pub mod pipeline_serve;

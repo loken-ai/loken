@@ -200,6 +200,22 @@ models as unknown.
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. `POST /api/video/plan` says what a clip of a given length will cost before rendering it. |
 | `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | `image` | Renders in flight, and cancelling one. |
 
+### Requests that share a pass
+
+| Route | Grouped when | Shared pass |
+|---|---|---|
+| `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | the audio windows of every clip run through the encoder as one batch, and each clip decodes on its own windows |
+| `POST /v1/images/generations` (an SDXL checkpoint) | not streamed, `n` 1, no `control_image`, no `regions`, and the same model, `size`, step count, `sampler`, `scheduler` and `loras` | the group takes the media gate once and its renders denoise as one batch, with the prompt, `negative_prompt`, `guidance` and `seed` of each request |
+
+A request that finds no group of its kind running starts at once. Requests that arrive while a
+group runs queue behind it, and the queue runs as the next group when it ends. A group holds as
+many requests as the roomiest card has free memory for, one request's scratch each, and the rest
+of the queue waits for the group after. With no card a group holds every queued request. Each request
+keeps its own seed and no row of a batch reads another row, so a request answers what it answers
+alone, up to the rounding of a larger matrix product on a card. A request that fails on its own,
+a clip the server cannot read for one, fails alone and its companions answer. An image batch
+that fails as a whole renders each request alone.
+
 A streamed render on any of these routes sends events with `status`, `phase`, `phase_label`, `step`, `total` and `elapsed_ms`, and every event carries `node`: the name of the node that renders, so a client behind a hand-over sees where its work is, or null when the server runs alone.
 
 ### Media input limits

@@ -65,6 +65,75 @@ const CLIP_CONTEXT_TOKENS: usize = 77;
 const TEXT_PREFIX: &str = "conditioner.";
 const CLIP_CONTEXT_DIM: usize = 1280;
 
+/// One request of a batch render: what it conditions on, how hard it is guided, the
+/// seed its noise is drawn from, and the token that stops it.
+pub struct SdxlRow<'a> {
+    pub prompt: &'a str,
+    pub negative: &'a str,
+    pub guidance: f32,
+    pub seed: u64,
+    pub cancel: Option<&'a crate::inference::serve::cancel::CancelToken>,
+}
+
+/// The conditional prediction of every row and, under guidance, the unconditional one,
+/// each stacked in row order on the host.
+type Predictions = (Vec<f32>, Option<Vec<f32>>);
+
+/// Tensors of one row each, stacked along the batch axis in row order.
+fn stack_rows(rows: &[Tensor]) -> Result<Tensor> {
+    match rows {
+        [one] => Ok(one.clone()),
+        _ => Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0),
+    }
+}
+
+/// The sampling loop over latents that share one sigma ladder, one per row.
+///
+/// `predict` takes the scaled latents of every row, stacked, and the sigma they sit at,
+/// and answers [`Predictions`]; it is asked for the unconditional branch when any row is
+/// guided. Each row is guided at its own scale and keeps its own solver history, so a
+/// row's latent depends on its own inputs alone. `stopped` is polled before every step.
+fn sample_rows(
+    mut xs: Vec<Vec<f32>>,
+    guidance: &[f32],
+    sigmas: &[f32],
+    sampler: SamplerKind,
+    mut predict: impl FnMut(&[f32], f32, bool) -> Result<Predictions>,
+    mut stopped: impl FnMut() -> Result<()>,
+    on_step: crate::inference::sample::StepSink,
+) -> Result<Vec<Vec<f32>>> {
+    let guided = guidance.iter().any(|g| *g > 1.0);
+    let plane = xs.first().map_or(0, Vec::len);
+    let mut solvers: Vec<DpmPP2M> = xs.iter().map(|_| DpmPP2M::new()).collect();
+    let total_steps = sigmas.len() - 1;
+    on_step(0, total_steps);
+    for i in 0..total_steps {
+        stopped()?;
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        // The model is fed the SCALED latent and the timestep matching sigma.
+        let scale = input_scale(sigma);
+        let scaled: Vec<f32> = xs.iter().flatten().map(|v| v * scale).collect();
+        let (eps_c, eps_u) = predict(&scaled, sigma, guided)?;
+        for (r, x) in xs.iter_mut().enumerate() {
+            let span = r * plane..(r + 1) * plane;
+            let eps = match (&eps_u, guidance[r] > 1.0) {
+                (Some(eps_u), true) => cfg(&eps_c[span.clone()], &eps_u[span], guidance[r]),
+                _ => eps_c[span].to_vec(),
+            };
+            let d = denoised(x.as_slice(), &eps, sigma);
+            *x = match sampler {
+                SamplerKind::Euler => euler_step(x.as_slice(), &d, sigma, sigma_next),
+                SamplerKind::DpmPP2M => {
+                    let prev = if i == 0 { None } else { Some(sigmas[i - 1]) };
+                    solvers[r].step(x.as_slice(), &d, prev, sigma, sigma_next)
+                }
+            };
+        }
+        on_step(i + 1, total_steps);
+    }
+    Ok(xs)
+}
+
 /// Resident bytes of the part of a single-file checkpoint under `prefix`, from the
 /// safetensors header alone - no tensor data is read.
 ///
@@ -529,7 +598,24 @@ impl SdxlPipeline {
         )
     }
 
-    /// The one sampling loop, from noise or from an image.
+    /// Generate one image per row, all rows denoised together as one batch through the
+    /// UNet. Returns interleaved RGB8 of `width * height` per row, in row order.
+    ///
+    /// The rows share the size, the step count, the solver and the sigma curve; each keeps
+    /// its own prompt, negative prompt, guidance and seed, and gets the image it gets alone.
+    /// A batch renders from noise and without a control image.
+    pub fn generate_batch(
+        &self,
+        rows: &[SdxlRow<'_>],
+        width: usize,
+        height: usize,
+        steps: usize,
+        on_step: crate::inference::sample::StepSink,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.render_rows(rows, width, height, steps, None, on_step)
+    }
+
+    /// The one sampling loop, from noise or from an image, for one request.
     fn render(
         &self,
         prompt: &str,
@@ -543,12 +629,60 @@ impl SdxlPipeline {
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
         on_step: crate::inference::sample::StepSink,
     ) -> Result<Vec<u8>> {
+        let row = SdxlRow {
+            prompt,
+            negative,
+            guidance,
+            seed,
+            cancel,
+        };
+        self.render_rows(&[row], width, height, steps, init, on_step)?
+            .pop()
+            .ok_or_else(|| crate::tensor::Error("sdxl: the render produced no image".into()))
+    }
+
+    /// The ControlNet's residuals for one guidance branch, `None` without a control image.
+    fn control_residuals(
+        &self,
+        xin: &Tensor,
+        t: f32,
+        ctx: &Tensor,
+        label: &Tensor,
+    ) -> Result<Option<crate::inference::model::sdxl::controlnet::ControlResiduals>> {
+        match (&self.controlnet, &self.control) {
+            (Some(net), Some((img, scale))) => Ok(Some(net.forward(
+                &xin.to_device(&self.control_device)?,
+                t,
+                &ctx.to_device(&self.control_device)?,
+                &label.to_device(&self.control_device)?,
+                img,
+                *scale,
+            )?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The sampling loop over every row at once. `init` is only taken with a single row.
+    fn render_rows(
+        &self,
+        rows: &[SdxlRow<'_>],
+        width: usize,
+        height: usize,
+        steps: usize,
+        init: Option<(&[u8], f32)>,
+        on_step: crate::inference::sample::StepSink,
+    ) -> Result<Vec<Vec<u8>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if rows.len() > 1 && (init.is_some() || self.control.is_some()) {
+            return Err(crate::tensor::Error(
+                "sdxl: a batch renders from noise, without a control image".into(),
+            ));
+        }
         let (sampler, scheduler) = (self.sampler, self.scheduler);
         let (lw, lh) = (width / 8, height / 8);
 
-        // Conditioning: both towers, for the prompt and the negative prompt.
-        let (ctx_c, pooled_c) = self.text.encode(&self.tokenize(prompt)?)?;
-        let (ctx_u, pooled_u) = self.text.encode(&self.tokenize(negative)?)?;
         // SDXL's micro-conditioning: the size the image claims to be, the crop it
         // claims to come from, and the size it targets.
         let sizes = [
@@ -559,11 +693,23 @@ impl SdxlPipeline {
             height as f32,
             width as f32,
         ];
-        let label_c = self.unet.label_vector(&pooled_c, sizes)?;
-        let label_u = self.unet.label_vector(&pooled_u, sizes)?;
+        // Conditioning: both towers, for each row's prompt and negative prompt, stacked
+        // in row order.
+        let mut ctx_c = Vec::with_capacity(rows.len());
+        let mut ctx_u = Vec::with_capacity(rows.len());
+        let mut label_c = Vec::with_capacity(rows.len());
+        let mut label_u = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (c, pooled_c) = self.text.encode(&self.tokenize(row.prompt)?)?;
+            let (u, pooled_u) = self.text.encode(&self.tokenize(row.negative)?)?;
+            label_c.push(self.unet.label_vector(&pooled_c, sizes)?);
+            label_u.push(self.unet.label_vector(&pooled_u, sizes)?);
+            ctx_c.push(c);
+            ctx_u.push(u);
+        }
+        let (ctx_c, ctx_u) = (stack_rows(&ctx_c)?, stack_rows(&ctx_u)?);
+        let (label_c, label_u) = (stack_rows(&label_c)?, stack_rows(&label_u)?);
 
-        // A seeded draw, so the same request returns the same image.
-        crate::tensor::rng::set_global_seed(seed);
         let full = match scheduler {
             SchedulerKind::Normal => self.schedule.sigma_ladder(steps),
             SchedulerKind::Karras => karras_sigmas(
@@ -590,99 +736,82 @@ impl SdxlPipeline {
             None => 0,
         };
         let sigmas = &full[start..];
-        let mut solver = DpmPP2M::new();
-        let noise = {
-            let z = Tensor::zeros_on(vec![1, LATENT_CHANNELS, lh, lw], DType::F32, &Device::Cpu)?;
-            z.randn_like()?
-        };
-        let mut x: Vec<f32> = match init {
-            // x_t = x_0 + sigma * noise, the convention this ladder is written in.
-            Some((rgb, _)) => {
-                let latent = self.encode_image(rgb, width, height)?;
-                let noised = noise.affine(sigmas[0], 0.0)?.to_vec_f32();
-                latent.iter().zip(&noised).map(|(a, b)| a + b).collect()
-            }
-            None => noise.affine(sigmas[0], 0.0)?.to_vec_f32(),
-        };
+        let mut xs = Vec::with_capacity(rows.len());
+        for row in rows {
+            // A seeded draw per row, so the same request returns the same image, alone or
+            // beside others.
+            crate::tensor::rng::set_global_seed(row.seed);
+            let noise = {
+                let z =
+                    Tensor::zeros_on(vec![1, LATENT_CHANNELS, lh, lw], DType::F32, &Device::Cpu)?;
+                z.randn_like()?
+            };
+            xs.push(match init {
+                // x_t = x_0 + sigma * noise, the convention this ladder is written in.
+                Some((rgb, _)) => {
+                    let latent = self.encode_image(rgb, width, height)?;
+                    let noised = noise.affine(sigmas[0], 0.0)?.to_vec_f32();
+                    latent.iter().zip(&noised).map(|(a, b)| a + b).collect()
+                }
+                None => noise.affine(sigmas[0], 0.0)?.to_vec_f32(),
+            });
+        }
         crate::tensor::rng::clear_global_seed();
 
-        let total_steps = sigmas.len() - 1;
-        on_step(0, total_steps);
-        for i in 0..total_steps {
-            if let Some(c) = cancel {
-                c.bail()?;
-            }
-            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
-            // The model is fed the SCALED latent and the timestep matching sigma.
-            let scaled: Vec<f32> = x.iter().map(|v| v * input_scale(sigma)).collect();
-            // The sampler works in F32 on the host; the UNet meets it in its own
-            // dtype, and hands the prediction back to the host as F32.
-            let xin = Tensor::from_vec_f32(scaled, vec![1, LATENT_CHANNELS, lh, lw])?
+        let n = rows.len();
+        let guidance: Vec<f32> = rows.iter().map(|r| r.guidance).collect();
+        // The sampler works in F32 on the host; the UNet meets it in its own dtype, and
+        // hands the prediction back to the host as F32.
+        let to_host = |eps: Tensor| -> Result<Vec<f32>> {
+            Ok(eps
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .to_vec_f32())
+        };
+        let predict = |scaled: &[f32], sigma: f32, guided: bool| -> Result<Predictions> {
+            let xin = Tensor::from_vec_f32(scaled.to_vec(), vec![n, LATENT_CHANNELS, lh, lw])?
                 .to_device(&self.device)?
                 .to_dtype(self.unet.dtype())?;
             let t = self.schedule.timestep_for(sigma);
-
             // The residuals depend on the latent AND the conditioning, so they are
             // recomputed per step and per guidance branch - the same rule the UNet
             // itself follows. Skipped entirely without a control image.
-            let res_c = match (&self.controlnet, &self.control) {
-                (Some(net), Some((img, scale))) => Some(net.forward(
-                    &xin.to_device(&self.control_device)?,
-                    t,
-                    &ctx_c.to_device(&self.control_device)?,
-                    &label_c.to_device(&self.control_device)?,
-                    img,
-                    *scale,
-                )?),
-                _ => None,
-            };
-            let res_u = match (guidance > 1.0, &self.controlnet, &self.control) {
-                (true, Some(net), Some((img, scale))) => Some(net.forward(
-                    &xin.to_device(&self.control_device)?,
-                    t,
-                    &ctx_u.to_device(&self.control_device)?,
-                    &label_u.to_device(&self.control_device)?,
-                    img,
-                    *scale,
-                )?),
-                _ => None,
-            };
+            let res_c = self.control_residuals(&xin, t, &ctx_c, &label_c)?;
             let eps_c = self
                 .unet
                 .forward_controlled(&xin, t, &ctx_c, &label_c, res_c.as_ref())?;
-            let eps = if guidance > 1.0 {
-                let eps_u =
-                    self.unet
-                        .forward_controlled(&xin, t, &ctx_u, &label_u, res_u.as_ref())?;
-                cfg(
-                    &eps_c
-                        .to_dtype(DType::F32)?
-                        .to_device(&Device::Cpu)?
-                        .to_vec_f32(),
-                    &eps_u
-                        .to_dtype(DType::F32)?
-                        .to_device(&Device::Cpu)?
-                        .to_vec_f32(),
-                    guidance,
-                )
+            let eps_u = if guided {
+                let res_u = self.control_residuals(&xin, t, &ctx_u, &label_u)?;
+                Some(to_host(self.unet.forward_controlled(
+                    &xin,
+                    t,
+                    &ctx_u,
+                    &label_u,
+                    res_u.as_ref(),
+                )?)?)
             } else {
-                eps_c
-                    .to_dtype(DType::F32)?
-                    .to_device(&Device::Cpu)?
-                    .to_vec_f32()
+                None
             };
-            let d = denoised(&x, &eps, sigma);
-            x = match sampler {
-                SamplerKind::Euler => euler_step(&x, &d, sigma, sigma_next),
-                SamplerKind::DpmPP2M => {
-                    let prev = if i == 0 { None } else { Some(sigmas[i - 1]) };
-                    solver.step(&x, &d, prev, sigma, sigma_next)
-                }
-            };
-            on_step(i + 1, total_steps);
-        }
+            Ok((to_host(eps_c)?, eps_u))
+        };
+        // The batch stops when every request in it has stopped; a row whose request went
+        // away runs on with the others and its image is not read.
+        let stopped = || -> Result<()> {
+            match rows.iter().map(|r| r.cancel).collect::<Option<Vec<_>>>() {
+                Some(tokens) if tokens.iter().all(|c| c.is_cancelled()) => tokens[0].bail(),
+                _ => Ok(()),
+            }
+        };
+        let xs = sample_rows(xs, &guidance, sigmas, sampler, predict, stopped, on_step)?;
 
-        // Decode. The VAE applies the SDXL scaling itself.
+        xs.into_iter()
+            .map(|x| self.decode_latent(x, width, height))
+            .collect()
+    }
+
+    /// Decode one latent to interleaved RGB8. The VAE applies the SDXL scaling itself.
+    fn decode_latent(&self, x: Vec<f32>, width: usize, height: usize) -> Result<Vec<u8>> {
+        let (lw, lh) = (width / 8, height / 8);
         let lat = Tensor::from_vec_f32(x, vec![1, LATENT_CHANNELS, lh, lw])?;
         // The VAE stays F32 whatever the denoiser runs in, so the latent converts here.
         let lat = lat.to_dtype(DType::F32)?;
@@ -722,6 +851,105 @@ mod tests {
     /// Same negative the engine conditions SDXL against.
     const SDXL_NEGATIVE_FOR_TEST: &str =
         "blurry, low quality, distorted, deformed, watermark, text";
+
+    /// A stand-in denoiser that reads each row's latent as a whole: its prediction for a
+    /// value depends on that value and on the mean of its own row, so a row read at the
+    /// wrong offset, or mixed with its neighbour, changes the answer.
+    fn row_denoiser(
+        plane: usize,
+    ) -> impl FnMut(&[f32], f32, bool) -> crate::tensor::Result<Predictions> {
+        move |scaled: &[f32], sigma: f32, guided: bool| {
+            let branch = |bias: f32| -> Vec<f32> {
+                scaled
+                    .chunks(plane)
+                    .flat_map(|row| {
+                        let mean = row.iter().sum::<f32>() / row.len() as f32;
+                        row.iter()
+                            .map(move |v| (v * 0.3 + mean * 0.05 + bias * sigma).sin())
+                    })
+                    .collect()
+            };
+            Ok((branch(0.1), guided.then(|| branch(-0.2))))
+        }
+    }
+
+    /// A latent of `plane` values, distinct per `seed`.
+    fn latent(seed: usize, plane: usize) -> Vec<f32> {
+        (0..plane)
+            .map(|i| (((i * 37 + seed * 101) % 89) as f32) * 0.05 - 2.2)
+            .collect()
+    }
+
+    /// Two rows sampled together come out exactly as each comes out alone: the split of
+    /// the stacked prediction, the guidance per row and the solver history per row.
+    #[test]
+    fn a_batch_samples_each_row_as_it_samples_alone() {
+        let plane = LATENT_CHANNELS * 4 * 4;
+        let sigmas = Schedule::new().sigma_ladder(6);
+        let never = || -> crate::tensor::Result<()> { Ok(()) };
+        for sampler in [SamplerKind::DpmPP2M, SamplerKind::Euler] {
+            let rows = [(latent(1, plane), 7.0f32), (latent(2, plane), 1.0)];
+            let alone: Vec<Vec<f32>> = rows
+                .iter()
+                .map(|(x, g)| {
+                    sample_rows(
+                        vec![x.clone()],
+                        &[*g],
+                        &sigmas,
+                        sampler,
+                        row_denoiser(plane),
+                        never,
+                        &crate::inference::sample::no_progress,
+                    )
+                    .expect("alone")
+                    .remove(0)
+                })
+                .collect();
+            let together = sample_rows(
+                rows.iter().map(|(x, _)| x.clone()).collect(),
+                &rows.iter().map(|(_, g)| *g).collect::<Vec<_>>(),
+                &sigmas,
+                sampler,
+                row_denoiser(plane),
+                never,
+                &crate::inference::sample::no_progress,
+            )
+            .expect("together");
+            assert_eq!(together, alone, "a row's latent moved in the batch");
+            assert_ne!(together[0], together[1], "the rows must stay distinct");
+        }
+    }
+
+    /// A batch stops only when every request in it has stopped.
+    #[test]
+    fn a_batch_runs_until_every_request_has_stopped() {
+        let plane = LATENT_CHANNELS;
+        let sigmas = Schedule::new().sigma_ladder(4);
+        let steps = std::cell::Cell::new(0usize);
+        let counted = |_: usize, _: usize| steps.set(steps.get() + 1);
+        let polls = std::cell::Cell::new(0usize);
+        // Stops on the third poll, as a batch whose last request goes away there would.
+        let stopped = || -> crate::tensor::Result<()> {
+            polls.set(polls.get() + 1);
+            if polls.get() >= 3 {
+                Err(crate::tensor::Error("cancelled".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let out = sample_rows(
+            vec![latent(1, plane), latent(2, plane)],
+            &[7.0, 7.0],
+            &sigmas,
+            SamplerKind::DpmPP2M,
+            row_denoiser(plane),
+            stopped,
+            &counted,
+        );
+        assert!(out.is_err());
+        // The opening report and the two steps that ran before the stop.
+        assert_eq!(steps.get(), 3);
+    }
 
     /// THE end-to-end gate: a real checkpoint, a real prompt, a real PNG.
     ///

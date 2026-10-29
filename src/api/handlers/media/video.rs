@@ -941,9 +941,22 @@ pub(crate) async fn images_generations(
     {
         return relayed;
     }
+    // One plain render of a family that denoises in batches runs as one group with the
+    // renders of its key queued behind the running one, and the group takes the gate and
+    // loads the model once for all of them (see `render_gathered`): this request takes
+    // neither here.
+    let gathered = !req.stream.unwrap_or(false)
+        && req.n.unwrap_or(1) == 1
+        && req.control_image.is_none()
+        && crate::api::assist::request_conditioner().is_none()
+        && super::gathers_renders(&state, &model_name);
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock_for(&model_name, "image").await;
+    let _media_guard = if gathered {
+        None
+    } else {
+        Some(state.media_lock_for(&model_name, "image").await)
+    };
 
     let default_steps: usize = defaults.steps;
     let default_guidance: f64 = defaults.guidance;
@@ -999,7 +1012,7 @@ pub(crate) async fn images_generations(
     // makes the load invisible: no part of the response body exists until this returns, so
     // the minute spent reading a checkpoint reaches the client as a minute of silence.
     let will_stream = req.stream.unwrap_or(false);
-    if !will_stream {
+    if !will_stream && !gathered {
         if let Err(e) = ensure_image_model_loaded(&state, &model_name, geom).await {
             return err_resp(http_status_for_load_error(&e), e);
         }
@@ -1339,11 +1352,24 @@ pub(crate) async fn images_generations(
         };
         // Cooperative cancellation: a client that disconnects drops this future and the
         // render bails at its next step instead of running on as an orphan.
-        let _res = guarded_render(
-            &render_cancel,
-            generate_image_resilient(&state, &model_name, geom, &req.prompt, params),
-        )
-        .await;
+        let _res = if gathered {
+            guarded_render(
+                &render_cancel,
+                render_gathered(&state, &model_name, geom, &req.prompt, params),
+            )
+            .await
+        } else {
+            guarded_render(
+                &render_cancel,
+                generate_image_resilient(&state, &model_name, geom, &req.prompt, params),
+            )
+            .await
+        };
+        if let Err(e) = &_res {
+            if let Some(load) = e.downcast_ref::<GatheredLoadFailed>() {
+                return err_resp(http_status_for_load_error(&load.0), load.0.clone());
+            }
+        }
         match _res {
             Ok(rendered) => {
                 let b64 = match (conditioner.as_ref(), prepared.as_ref()) {

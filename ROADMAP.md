@@ -94,7 +94,7 @@ Smaller, by priority:
 | Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Partial |
 | Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Done |
-| Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Planned |
+| Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Started |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
 | Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds; the Responses API's previous response names the conversation. | Done |

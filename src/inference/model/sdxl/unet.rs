@@ -966,7 +966,8 @@ impl SdxlUnet {
 
     /// One denoise step: predict the noise in `x` at timestep `t`.
     ///
-    /// `x`: `[1, 4, h/8, w/8]`, `ctx`: `[1, 77, 2048]`, `label`: `[1, 2816]`.
+    /// `x`: `[b, 4, h/8, w/8]`, `ctx`: `[b, 77, 2048]`, `label`: `[b, 2816]`, every row
+    /// at the same timestep.
     pub fn forward(&self, x: &Tensor, t: f32, ctx: &Tensor, label: &Tensor) -> Result<Tensor> {
         self.forward_controlled(x, t, ctx, label, None)
     }
@@ -998,7 +999,8 @@ impl SdxlUnet {
         let y = self
             .label_2
             .forward(&self.label_1.forward(&label)?.silu()?)?;
-        let emb = emb.add(&y)?;
+        // One timestep for the whole batch, one label per row.
+        let emb = y.broadcast_add(&emb)?;
 
         let mut h = self
             .conv_in
@@ -1283,6 +1285,98 @@ mod tests {
                 "output block {i} channel pairing"
             );
         }
+    }
+
+    /// Two rows through a residual block and a spatial transformer come out as each comes
+    /// out alone: the group norms, the embedding broadcast, the convolutions and both
+    /// attentions of one row never read another row.
+    #[test]
+    fn a_batch_of_rows_runs_through_the_blocks_as_each_row_alone() {
+        use crate::tensor::DType;
+        let (dim, side) = (HEAD_DIM, 4usize);
+        let filled = |seed: usize, dims: &[usize], scale: f32| -> Tensor {
+            let n: usize = dims.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|i| ((((i * 31 + seed * 17) % 83) as f32) / 41.0 - 1.0) * scale)
+                .collect();
+            Tensor::from_vec_f32(v, dims.to_vec()).unwrap()
+        };
+        let mut weights = std::collections::HashMap::new();
+        // Every tensor gets its own seed, and a projection's scale follows its fan-in.
+        let mut put = |name: &str, dims: &[usize]| {
+            let fan_in: usize = dims[1..].iter().product::<usize>().max(1);
+            let scale = 1.0 / (fan_in as f32).sqrt();
+            weights.insert(name.to_string(), filled(weights.len() + 1, dims, scale));
+        };
+        for norm in ["res.in_layers.0", "res.out_layers.0", "attn.norm"] {
+            put(&format!("{norm}.weight"), &[dim]);
+            put(&format!("{norm}.bias"), &[dim]);
+        }
+        for conv in ["res.in_layers.2", "res.out_layers.3"] {
+            put(&format!("{conv}.weight"), &[dim, dim, 3, 3]);
+            put(&format!("{conv}.bias"), &[dim]);
+        }
+        put("res.emb_layers.1.weight", &[dim, EMB_DIM]);
+        put("res.emb_layers.1.bias", &[dim]);
+        let block = "attn.transformer_blocks.0";
+        for norm in ["norm1", "norm2", "norm3"] {
+            put(&format!("{block}.{norm}.weight"), &[dim]);
+            put(&format!("{block}.{norm}.bias"), &[dim]);
+        }
+        for (attn, kv_dim) in [("attn1", dim), ("attn2", CONTEXT_DIM)] {
+            put(&format!("{block}.{attn}.to_q.weight"), &[dim, dim]);
+            put(&format!("{block}.{attn}.to_k.weight"), &[dim, kv_dim]);
+            put(&format!("{block}.{attn}.to_v.weight"), &[dim, kv_dim]);
+            put(&format!("{block}.{attn}.to_out.0.weight"), &[dim, dim]);
+            put(&format!("{block}.{attn}.to_out.0.bias"), &[dim]);
+        }
+        put(&format!("{block}.ff.net.0.proj.weight"), &[8 * dim, dim]);
+        put(&format!("{block}.ff.net.0.proj.bias"), &[8 * dim]);
+        put(&format!("{block}.ff.net.2.weight"), &[dim, 4 * dim]);
+        put(&format!("{block}.ff.net.2.bias"), &[dim]);
+        for proj in ["attn.proj_in", "attn.proj_out"] {
+            put(&format!("{proj}.weight"), &[dim, dim]);
+            put(&format!("{proj}.bias"), &[dim]);
+        }
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu);
+        let res = ResBlock::new(dim, dim, &vb.pp("res")).expect("residual block");
+        let attn = SpatialTransformer::new(dim, 1, &vb.pp("attn")).expect("transformer");
+
+        let rows = [
+            (
+                filled(101, &[1, dim, side, side], 1.0),
+                filled(102, &[1, EMB_DIM], 1.0),
+                filled(103, &[1, 77, CONTEXT_DIM], 1.0),
+            ),
+            (
+                filled(104, &[1, dim, side, side], 1.0),
+                filled(105, &[1, EMB_DIM], 1.0),
+                filled(106, &[1, 77, CONTEXT_DIM], 1.0),
+            ),
+        ];
+        let run = |x: &Tensor, emb: &Tensor, ctx: &Tensor| -> Vec<f32> {
+            let h = res.forward(x, emb).expect("residual block forward");
+            let h = attn.forward(&h, ctx).expect("transformer forward");
+            h.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let alone: Vec<Vec<f32>> = rows.iter().map(|(x, e, c)| run(x, e, c)).collect();
+        let stacked = |pair: [&Tensor; 2]| Tensor::cat(&pair, 0).unwrap();
+        let both = run(
+            &stacked([&rows[0].0, &rows[1].0]),
+            &stacked([&rows[0].1, &rows[1].1]),
+            &stacked([&rows[0].2, &rows[1].2]),
+        );
+        let plane = dim * side * side;
+        assert_eq!(both.len(), 2 * plane);
+        for (row, want) in alone.iter().enumerate() {
+            let got = &both[row * plane..(row + 1) * plane];
+            let gap = got
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(gap < 1e-4, "row {row} moved by {gap} in the batch");
+        }
+        assert_ne!(alone[0], alone[1], "the rows must stay distinct");
     }
 
     /// THE gate: load the whole UNet from a real checkpoint and run one forward.

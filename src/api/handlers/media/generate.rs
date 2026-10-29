@@ -133,6 +133,146 @@ pub(super) async fn generate_image_resilient(
     .await
 }
 
+/// A render's answer as the gather hands it back.
+pub(crate) type ImageAnswer = Result<
+    crate::inference::engine::image_engine::RenderedImage,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+/// Renders gathered by their batch key; each job is a prompt and its parameters.
+pub(crate) type ImageGather = crate::inference::serve::gather::Gather<
+    crate::inference::engine::image_engine::ImageBatchKey,
+    (String, ImageGenParams),
+    ImageAnswer,
+>;
+
+/// The model load a gathered render waited on failed; carries the load's message.
+#[derive(Debug)]
+pub(crate) struct GatheredLoadFailed(pub(crate) String);
+
+impl std::fmt::Display for GatheredLoadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GatheredLoadFailed {}
+
+/// Whether renders of `model_name` are gathered: the family denoises several requests as
+/// one batch.
+pub(crate) fn gathers_renders(state: &APIServer, model_name: &str) -> bool {
+    matches!(
+        image_loader(&state.huggingface_models_dir, model_name),
+        Ok(ImageFamily::Sdxl)
+    )
+}
+
+/// The card memory one more render of this geometry takes beside the others of a batch.
+fn image_row_bytes(
+    state: &APIServer,
+    model_name: &str,
+    geom: crate::inference::place::runtime_demand::RequestGeometry,
+) -> u64 {
+    image_loader(&state.huggingface_models_dir, model_name)
+        .map(|loader| family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom))
+        .unwrap_or(0)
+}
+
+/// Render at once when no render of this batch key runs, or as one group with the renders
+/// of the key queued behind the running one, as many at once as the roomiest card takes.
+/// The group takes the media gate and makes sure of the model once for all of it, so the
+/// caller holds neither.
+///
+/// A render with no batch key (a source image, a mask, a control image, regions) takes
+/// the gate and renders alone.
+pub(crate) async fn render_gathered(
+    state: &APIServer,
+    model_name: &str,
+    geom: crate::inference::place::runtime_demand::RequestGeometry,
+    prompt: &str,
+    params: ImageGenParams,
+) -> ImageAnswer {
+    let job = (prompt.to_string(), params);
+    let Some(key) = crate::inference::engine::image_engine::ImageBatchKey::of(model_name, &job.1)
+    else {
+        return render_group(state.clone(), model_name.to_string(), geom, vec![job])
+            .await
+            .pop()
+            .unwrap_or_else(|| Err("the render ended without an image".into()));
+    };
+    let cap = crate::inference::serve::gather::rows_that_fit(
+        image_row_bytes(state, model_name, geom),
+        usize::MAX,
+    );
+    let runner = state.clone();
+    let model = model_name.to_string();
+    state
+        .image_gather
+        .submit(key, job, cap, move |jobs| async move {
+            render_group(runner, model, geom, jobs).await
+        })
+        .await
+        .unwrap_or_else(|| Err("the batch this render joined ended without its image".into()))
+}
+
+/// One gate pass for a gathered group: load, then render it in batches of as many renders
+/// as the roomiest card takes, answers in job order.
+async fn render_group(
+    state: APIServer,
+    model_name: String,
+    geom: crate::inference::place::runtime_demand::RequestGeometry,
+    jobs: Vec<(String, ImageGenParams)>,
+) -> Vec<ImageAnswer> {
+    let _media_guard = state.media_lock_for(&model_name, "image").await;
+    if let Err(e) = ensure_image_model_loaded(&state, &model_name, geom).await {
+        return jobs
+            .iter()
+            .map(|_| Err(GatheredLoadFailed(e.clone()).into()))
+            .collect();
+    }
+    let per_row = image_row_bytes(&state, &model_name, geom);
+    let mut answers = Vec::with_capacity(jobs.len());
+    let mut rest = jobs;
+    while !rest.is_empty() {
+        let take = crate::inference::serve::gather::rows_that_fit(per_row, rest.len());
+        let tail = rest.split_off(take);
+        let batch = std::mem::replace(&mut rest, tail);
+        answers.extend(render_batch(&state, &model_name, geom, batch, per_row).await);
+    }
+    answers
+}
+
+/// Several renders as one batch through the denoiser; each alone, through the recovery
+/// ladder, when there is one render, when the resident family does not batch, or when the
+/// batch fails.
+async fn render_batch(
+    state: &APIServer,
+    model_name: &str,
+    geom: crate::inference::place::runtime_demand::RequestGeometry,
+    batch: Vec<(String, ImageGenParams)>,
+    per_row: u64,
+) -> Vec<ImageAnswer> {
+    if batch.len() > 1 {
+        let _demand = crate::inference::place::recover::hold_scratch(
+            "media",
+            per_row.saturating_mul(batch.len() as u64),
+        );
+        match state.image_engine.generate_batch(batch.clone()).await {
+            Ok(Some(images)) => return images.into_iter().map(Ok).collect(),
+            Ok(None) => {}
+            Err(e) => warn!(
+                "image: a batch of {} renders failed ({e}); rendering each alone",
+                batch.len()
+            ),
+        }
+    }
+    let mut answers = Vec::with_capacity(batch.len());
+    for (prompt, params) in batch {
+        answers.push(generate_image_resilient(state, model_name, geom, &prompt, params).await);
+    }
+    answers
+}
+
 /// Drops the resident image model and loads it again at the pressure in force, for a
 /// render that ran out of card memory.
 pub(super) async fn replan_image(

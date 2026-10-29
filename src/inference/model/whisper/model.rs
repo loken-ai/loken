@@ -399,6 +399,77 @@ mod tests {
         map
     }
 
+    /// Two clips through the audio tower together come out as each comes out alone: the
+    /// convolutions, the positions and the attention of one row never read another row.
+    #[test]
+    fn the_audio_tower_batched_matches_each_clip_alone() {
+        let (n_mels, frames, n_state, n_head) = (8usize, 12usize, 16usize, 4usize);
+        let cfg = Config {
+            num_mel_bins: n_mels,
+            max_source_positions: frames / 2,
+            d_model: n_state,
+            encoder_attention_heads: n_head,
+            encoder_layers: 1,
+            vocab_size: 1,
+            max_target_positions: 1,
+            decoder_attention_heads: n_head,
+            decoder_layers: 1,
+            suppress_tokens: Vec::new(),
+        };
+        let filled = |seed: usize, dims: &[usize]| -> Tensor {
+            let n: usize = dims.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i * 23 + seed * 11) % 47) as f32) * 0.013 - 0.3)
+                .collect();
+            Tensor::from_vec_f32(v, dims.to_vec()).unwrap()
+        };
+        let mut weights: HashMap<String, Tensor> = block_weights(n_state, false)
+            .into_iter()
+            .map(|(k, v)| (format!("layers.0.{k}"), v))
+            .collect();
+        weights.insert("conv1.weight".into(), filled(1, &[n_state, n_mels, 3]));
+        weights.insert("conv1.bias".into(), filled(2, &[n_state]));
+        weights.insert("conv2.weight".into(), filled(3, &[n_state, n_state, 3]));
+        weights.insert("conv2.bias".into(), filled(4, &[n_state]));
+        weights.insert("layer_norm.weight".into(), filled(5, &[n_state]));
+        weights.insert("layer_norm.bias".into(), filled(6, &[n_state]));
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu);
+        let mut tower = AudioEncoder::load(vb, &cfg).unwrap();
+
+        let (a, b) = (
+            filled(7, &[1, n_mels, frames]),
+            filled(8, &[1, n_mels, frames]),
+        );
+        let alone = [
+            tower.forward(&a, true).unwrap(),
+            tower.forward(&b, true).unwrap(),
+        ];
+        let both = tower
+            .forward(&Tensor::cat(&[&a, &b], 0).unwrap(), true)
+            .unwrap();
+        assert_eq!(both.dims(), &[2, frames / 2, n_state]);
+        for (row, alone) in alone.iter().enumerate() {
+            let got = both
+                .narrow(0, row, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let want = alone.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let gap = got
+                .iter()
+                .zip(&want)
+                .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(gap < 1e-5, "clip {row} moved by {gap} in the batch");
+        }
+        let (first, second) = (
+            alone[0].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            alone[1].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        assert_ne!(first, second, "the two clips must encode apart");
+    }
+
     /// A decoder block fed one token at a time answers what it answers fed the whole prefix.
     ///
     /// This is the wiring rather than the arithmetic: that the self attention is the one that

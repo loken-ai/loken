@@ -116,6 +116,46 @@ pub struct RenderedImage {
     pub seed: u64,
 }
 
+/// What renders must share to run as one batch through the denoiser: the checkpoint, the
+/// size, the step count, the solver, the sigma curve and the adapter set. Prompts,
+/// negative prompts, guidance and seeds stay per render.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImageBatchKey {
+    model: String,
+    width: usize,
+    height: usize,
+    num_steps: usize,
+    sampler: Option<String>,
+    scheduler: Option<String>,
+    /// Each adapter's path and the bits of its strength.
+    loras: Vec<(String, u32)>,
+}
+
+impl ImageBatchKey {
+    /// The key of a render of `model` with `params`; `None` for a render that runs alone:
+    /// one with a source image, a mask, a control image or regions of its own.
+    pub fn of(model: &str, params: &ImageGenParams) -> Option<Self> {
+        let alone = params.input_image.is_some()
+            || params.kontext
+            || params.mask.is_some()
+            || params.control_image.is_some()
+            || !params.regions.is_empty();
+        (!alone).then(|| Self {
+            model: model.to_string(),
+            width: params.width,
+            height: params.height,
+            num_steps: params.num_steps,
+            sampler: params.sampler.clone(),
+            scheduler: params.scheduler.clone(),
+            loras: params
+                .loras
+                .iter()
+                .map(|(path, strength)| (path.clone(), strength.to_bits()))
+                .collect(),
+        })
+    }
+}
+
 /// Progress event during image generation
 #[derive(Debug, Clone)]
 pub enum ImageStreamEvent {
@@ -148,3 +188,74 @@ pub const FLUX_PATCH: usize = 2;
 /// The text conditioning is padded to a fixed length and rides in the same sequence
 /// as the image tokens, so it is part of what the attention is sized for.
 pub const FLUX_TEXT_TOKENS: usize = 256;
+
+#[cfg(test)]
+mod batch_key_tests {
+    use super::*;
+
+    #[test]
+    fn renders_that_differ_only_per_row_share_a_key() {
+        let a = ImageGenParams {
+            width: 1024,
+            height: 768,
+            num_steps: 20,
+            ..Default::default()
+        };
+        let b = ImageGenParams {
+            seed: Some(7),
+            guidance: 9.0,
+            negative_prompt: Some("blurry".into()),
+            ..a.clone()
+        };
+        assert_eq!(ImageBatchKey::of("m", &a), ImageBatchKey::of("m", &b));
+        assert!(ImageBatchKey::of("m", &a).is_some());
+    }
+
+    #[test]
+    fn size_steps_solver_adapters_and_model_split_the_key() {
+        let base = ImageGenParams::default();
+        let key = ImageBatchKey::of("m", &base);
+        for other in [
+            ImageGenParams {
+                width: base.width * 2,
+                ..base.clone()
+            },
+            ImageGenParams {
+                num_steps: base.num_steps + 1,
+                ..base.clone()
+            },
+            ImageGenParams {
+                sampler: Some("euler".into()),
+                ..base.clone()
+            },
+            ImageGenParams {
+                loras: vec![("a.safetensors".into(), 0.5)],
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(ImageBatchKey::of("m", &other), key);
+        }
+        assert_ne!(ImageBatchKey::of("n", &base), key);
+    }
+
+    #[test]
+    fn a_render_from_a_source_or_a_control_image_runs_alone() {
+        let base = ImageGenParams::default();
+        for alone in [
+            ImageGenParams {
+                input_image: Some("aGk=".into()),
+                ..base.clone()
+            },
+            ImageGenParams {
+                control_image: Some(vec![1, 2, 3]),
+                ..base.clone()
+            },
+            ImageGenParams {
+                regions: vec![("cat".into(), 0.0, 0.0, 0.5, 0.5, 1.0)],
+                ..base.clone()
+            },
+        ] {
+            assert_eq!(ImageBatchKey::of("m", &alone), None);
+        }
+    }
+}

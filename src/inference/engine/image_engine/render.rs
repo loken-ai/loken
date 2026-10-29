@@ -51,6 +51,47 @@ impl ImageEngine {
             .map_err(boxed_engine_error)
     }
 
+    /// Render several requests as one batch through the denoiser, one image per request
+    /// in request order, each from its own seed.
+    ///
+    /// The requests share a size, a step count, a solver, a sigma curve and an adapter
+    /// set, and none carries a source image, a mask or a control image (see
+    /// [`ImageBatchKey`]). `None` when the resident family does not render in batches or a
+    /// request asks for something it refuses; the caller then renders each alone, which
+    /// also answers the refusal.
+    pub async fn generate_batch(
+        &self,
+        mut jobs: Vec<(String, ImageGenParams)>,
+    ) -> Result<Option<Vec<RenderedImage>>, Box<dyn std::error::Error + Send + Sync>> {
+        let seeds: Vec<u64> = jobs.iter_mut().map(|(_, p)| p.resolve_seed()).collect();
+        let model_state = self.model_state.clone();
+        let presence = self.presence_cell();
+        let result =
+            tokio::task::spawn_blocking(move || -> AnyResult<Option<Vec<RenderedImage>>> {
+                let mut guard = model_state.blocking_lock();
+                let state = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("Image model not loaded"))?;
+                super::remember(&presence, state);
+                if jobs.iter().any(|(_, p)| {
+                    MediaCapabilities::of(&state.model)
+                        .refuse_unsupported(family_of_model(&state.model), p)
+                        .is_err()
+                }) {
+                    return Ok(None);
+                }
+                let _precision = crate::inference::media::precision::GemmPrecision::pin(
+                    family_wants_reduced_precision(&state.model),
+                );
+                let LoadedImageModel::Sdxl(pipe) = &mut state.model else {
+                    return Ok(None);
+                };
+                render_sdxl_batch(pipe, &jobs, &seeds).map(Some)
+            })
+            .await?;
+        result.map_err(boxed_engine_error)
+    }
+
     /// Generate an image with streaming progress updates.
     ///
     /// A request with no seed renders from a fresh one; a caller that echoes the seed
@@ -196,6 +237,75 @@ fn render_on(
         ),
         LoadedImageModel::Sdxl(pipe) => render_sdxl(pipe, prompt, params, seed, on_step),
     }
+}
+
+/// SDXL, several requests denoised as one batch. The adapters, the solver and the decode
+/// tiling are set once from the first request, which [`ImageBatchKey`] makes them share.
+fn render_sdxl_batch(
+    pipe: &mut crate::inference::model::sdxl::pipeline::SdxlPipeline,
+    jobs: &[(String, ImageGenParams)],
+    seeds: &[u64],
+) -> AnyResult<Vec<RenderedImage>> {
+    use crate::inference::model::sdxl::pipeline::SdxlRow;
+    use crate::inference::model::sdxl::sampling::{SamplerKind, SchedulerKind};
+    let Some((_, first)) = jobs.first() else {
+        return Ok(Vec::new());
+    };
+    pipe.set_loras(&first.loras)
+        .map_err(|e| anyhow!("lora: {e}"))?;
+    pipe.set_control(None, first.control_scale)
+        .map_err(|e| anyhow!("control image: {e}"))?;
+    pipe.set_sampling(
+        first
+            .sampler
+            .as_deref()
+            .map(SamplerKind::parse)
+            .unwrap_or_default(),
+        first
+            .scheduler
+            .as_deref()
+            .map(SchedulerKind::parse)
+            .unwrap_or_default(),
+    );
+    let tile = super::vae_decode_tile(pipe.vae_device(), first.width, first.height);
+    pipe.set_vae_tile(tile.map(|t| (t, VAE_TILE_OVERLAP)));
+    let rows: Vec<SdxlRow<'_>> = jobs
+        .iter()
+        .zip(seeds)
+        .map(|((prompt, params), seed)| SdxlRow {
+            prompt,
+            negative: negative_of(params),
+            guidance: params.guidance as f32,
+            seed: *seed,
+            cancel: Some(&params.cancel),
+        })
+        .collect();
+    info!(
+        "sdxl: {} requests in one batch at {}x{}, {} steps",
+        rows.len(),
+        first.width,
+        first.height,
+        first.num_steps
+    );
+    let images = pipe
+        .generate_batch(
+            &rows,
+            first.width,
+            first.height,
+            first.num_steps,
+            &crate::inference::sample::no_progress,
+        )
+        .map_err(|e| anyhow!("sdxl batch: {e}"))?;
+    images
+        .into_iter()
+        .zip(seeds)
+        .map(|(rgb, seed)| {
+            Ok(RenderedImage {
+                png_base64: rgb_to_png_base64(rgb, first.width, first.height)?,
+                seed: *seed,
+            })
+        })
+        .collect()
 }
 
 /// SDXL: attach this request's adapters, control image and solver, then sample.

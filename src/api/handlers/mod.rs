@@ -442,6 +442,12 @@ pub struct APIServer {
     /// inside a worker). LLM generations are NOT gated here - they compete for VRAM
     /// through the reclaim protocol instead, so chat stays responsive during a render.
     media_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Image renders that share an
+    /// [`ImageBatchKey`](crate::inference::engine::image_engine::ImageBatchKey), queued behind
+    /// the one running: the group takes the media gate once and renders as one batch through
+    /// the denoiser.
+    #[cfg(feature = "image")]
+    image_gather: media::ImageGather,
     /// The media jobs running now, by name and kind: what a listing shows as rendering
     /// and what the cluster counts as busy, since none of them crosses the request gate.
     media_jobs: Arc<std::sync::Mutex<MediaJobs>>,
@@ -1529,6 +1535,8 @@ impl APIServer {
             loading: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             declared_contexts: Arc::default(),
             media_gate: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "image")]
+            image_gather: Default::default(),
             media_jobs: Arc::new(std::sync::Mutex::new(MediaJobs::default())),
             // Defaults to off; `configure_auth` applies the config at startup.
             auth: Arc::new(AuthGate::new(false, &[], &[], 0, 10)),
