@@ -1,5 +1,8 @@
 # Documentation
 
+The same documents, with the map of lokend, are served at
+<https://loken-ai.github.io/loken/>.
+
 Read in this order.
 
 1. The [feature matrix](../README.md#what-it-does) in the README: each capability, its route,
