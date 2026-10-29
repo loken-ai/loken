@@ -25,6 +25,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod decode;
+pub use decode::CardsDecode;
+
 const F32: usize = std::mem::size_of::<f32>();
 
 /// Rope the last `rd` elements of each row of `x` [n, hd] on the device, interleaved (GPT-J) as the
@@ -171,6 +174,9 @@ pub struct Card {
     dense: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<QMatMul>>>,
     /// The same weights transposed as a prompt's product reads them, by their storage.
     dense_t: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<CudaSlice<f32>>>>,
+    /// The dense values a decode's kernels read as they are - norms, sinks, biases, the
+    /// hyper-connection projections - as device tensors, by their storage.
+    tensors: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<Tensor>>>,
     experts: Arc<Mutex<ExpertTier>>,
     /// The queue of the thread that copies a decode's admitted experts to the card, started on
     /// first use; `None` when the thread could not be started.
@@ -286,6 +292,7 @@ impl Card {
             resident: Mutex::new(HashMap::new()),
             dense: Mutex::new(HashMap::new()),
             dense_t: Mutex::new(HashMap::new()),
+            tensors: Mutex::new(HashMap::new()),
             experts: Arc::new(Mutex::new(ExpertTier::default())),
             uploads: OnceLock::new(),
             protect: protect.max(1),
@@ -1600,6 +1607,16 @@ impl Card {
 }
 
 impl Offload for Cards {
+    /// On the first card with room for the stream; the layers then run where their weights are.
+    fn decode_stream(
+        &self,
+        x: &[f32],
+        hc: usize,
+        d: usize,
+    ) -> Option<Box<dyn super::DecodeStream>> {
+        CardsDecode::open(&self.0, x, hc, d).map(|s| Box::new(s) as Box<dyn super::DecodeStream>)
+    }
+
     /// On the fastest card that has the room, as the placement ranks them.
     fn prefill_attention(&self, a: &super::PrefillAttn) -> Option<Result<Vec<f32>>> {
         self.0.iter().find_map(|c| c.prefill_attention(a))

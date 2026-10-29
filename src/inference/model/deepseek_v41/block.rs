@@ -114,6 +114,114 @@ impl LayerAttn {
             LayerAttn::Band(a) => a.forward_decode(x, cos, sin, pos, cache, shared),
         }
     }
+
+    pub fn window_size(&self) -> usize {
+        match self {
+            LayerAttn::Ratio0(a) => a.window_size,
+            LayerAttn::Band(a) => a.window_size,
+        }
+    }
+
+    /// Whether the layer pools compressed rows for the layers below.
+    pub fn is_kv_source(&self) -> bool {
+        matches!(self, LayerAttn::Band(a) if a.compressor.is_some())
+    }
+
+    /// Whether the layer chooses the compressed slots for the layers below.
+    pub fn is_index_source(&self) -> bool {
+        matches!(self, LayerAttn::Band(a) if a.indexer.is_some())
+    }
+
+    /// Whether the layer takes part in the two-level candidate pre-filter, which a card does
+    /// not run.
+    pub fn uses_candidates(&self) -> bool {
+        matches!(self, LayerAttn::Band(a)
+            if a.indexer.as_ref().is_some_and(|i| i.is_candidate_source || i.uses_candidates))
+    }
+
+    /// The layer's attention as a card runs it for the token at `pos`, collapsed and normed with
+    /// `norm`; `index_source` is the layer whose top-k a reader takes.
+    pub fn decode_dev<'a>(
+        &'a self,
+        norm: &'a Tensor,
+        cos: &'a Tensor,
+        sin: &'a Tensor,
+        pos: usize,
+        index_source: Option<usize>,
+    ) -> crate::inference::offload::DecodeAttn<'a> {
+        use crate::inference::offload::{CompressorDev, DecodeAttn, IndexerDev};
+        match self {
+            LayerAttn::Ratio0(a) => DecodeAttn {
+                norm,
+                wq_a: &a.wq_a,
+                q_norm: &a.q_norm,
+                wq_b: &a.wq_b,
+                wkv: &a.wkv,
+                kv_norm: &a.kv_norm,
+                wo_a: &a.wo_a,
+                wo_b: &a.wo_b,
+                sink: &a.attn_sink,
+                compressor: None,
+                indexer: None,
+                cos,
+                sin,
+                pos,
+                index_source,
+                n_heads: a.n_heads,
+                head_dim: a.head_dim,
+                rope_head_dim: a.rope_head_dim,
+                o_groups: a.o_groups,
+                o_lora: a.o_lora_rank,
+                dim: norm.elem_count(),
+                window: a.window_size,
+                ratio: 0,
+                index_topk: 0,
+                eps: a.eps,
+                scale: (a.head_dim as f32).powf(-0.5),
+            },
+            LayerAttn::Band(a) => DecodeAttn {
+                norm,
+                wq_a: &a.wq_a,
+                q_norm: &a.q_norm,
+                wq_b: &a.wq_b,
+                wkv: &a.wkv,
+                kv_norm: &a.kv_norm,
+                wo_a: &a.wo_a,
+                wo_b: &a.wo_b,
+                sink: &a.attn_sink,
+                compressor: a.compressor.as_ref().map(|c| CompressorDev {
+                    norm: &c.norm,
+                    wkv: &c.wkv,
+                    wgate: c.wgate.as_ref(),
+                }),
+                indexer: a.indexer.as_ref().map(|i| IndexerDev {
+                    wq_b: &i.wq_b,
+                    weights_proj: &i.weights_proj,
+                    wk: i.wk.as_ref(),
+                    k_norm: i.k_norm.as_ref(),
+                    n_heads: i.n_heads,
+                    head_dim: i.index_head_dim,
+                    topk: i.index_topk,
+                    eps: i.eps,
+                }),
+                cos,
+                sin,
+                pos,
+                index_source,
+                n_heads: a.n_heads,
+                head_dim: a.head_dim,
+                rope_head_dim: a.rope_head_dim,
+                o_groups: a.o_groups,
+                o_lora: a.o_lora_rank,
+                dim: norm.elem_count(),
+                window: a.window_size,
+                ratio: a.ratio.max(1),
+                index_topk: a.index_topk,
+                eps: a.eps,
+                scale: (a.head_dim as f32).powf(-0.5),
+            },
+        }
+    }
 }
 
 /// Where a prefill's stream stands after a layer run against a card that holds it.
@@ -412,6 +520,114 @@ impl Block {
     ) -> Result<(Tensor, Vec<Vec<f32>>)> {
         let (x, am_pre) = self.forward_decode_attn(x, pre_mix, cos, sin, pos, cache, shared)?;
         self.forward_prefill_ffn(&x, &am_pre)
+    }
+
+    /// A sublayer's hyper-connection weights as a card reads them.
+    fn hc_dev<'a>(&'a self, w: &'a HcWeights) -> crate::inference::offload::HcDev<'a> {
+        crate::inference::offload::HcDev {
+            func: &w.func,
+            scale: &w.scale,
+            base: &w.base,
+            iters: self.hc_sinkhorn_iters,
+            norm_eps: self.norm_eps,
+            hc_eps: self.hc_eps,
+        }
+    }
+
+    /// The router and, when `with_shared`, the shared expert as a card runs them.
+    fn router_dev(&self, with_shared: bool) -> crate::inference::offload::DecodeRouter<'_> {
+        let m = &self.moe;
+        crate::inference::offload::DecodeRouter {
+            norm: &self.ffn_norm,
+            gate: &m.gate_weight,
+            bias: &m.gate_bias,
+            n_routed: m.n_routed,
+            n_activated: m.n_activated,
+            gate_temp: m.gate_temp,
+            route_scale: m.route_scale,
+            norm_topk: m.norm_topk,
+            eps: self.norm_eps,
+            shared: (with_shared && m.has_shared).then_some((
+                &m.shared.w1,
+                &m.shared.w3,
+                &m.shared.w2,
+                m.swiglu_limit,
+            )),
+        }
+    }
+
+    /// The attention half of a decode whose stream `ds` holds on a card: the mixes, the
+    /// collapse, the block with its caches and the update, all there. `cache` is this layer's
+    /// host state, its card copy taken out as `dev`; `source` is the kv-source's for a reader
+    /// and `index_source` the layer whose top-k a reader takes. `Err` leaves the stream as it
+    /// was, for the host to run the layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_attn_dev(
+        &self,
+        ds: &mut dyn crate::inference::offload::DecodeStream,
+        layer: usize,
+        cos: &Tensor,
+        sin: &Tensor,
+        pos: usize,
+        dev: &mut crate::inference::offload::DevCache,
+        cache: &AttnCache,
+        source: Option<(&crate::inference::offload::DevCache, &AttnCache)>,
+        index_source: Option<usize>,
+    ) -> Result<()> {
+        use crate::inference::offload::{stage, HostCache};
+        if self.attn.uses_candidates() {
+            return Err(crate::tensor::Error::msg(
+                "the candidate pre-filter runs on the host",
+            ));
+        }
+        let a = self
+            .attn
+            .decode_dev(&self.attn_norm, cos, sin, pos, index_source);
+        let hc = self.hc_dev(&self.hc_attn);
+        let src = source.map(|(d, h)| (d, h as &dyn HostCache));
+        stage("attention on the card", || {
+            ds.attention(layer, &hc, &a, dev, cache, src)
+        })
+    }
+
+    /// The FFN half of a decode whose stream `ds` holds on a card: the mixes, the collapse, the
+    /// router and the shared expert there, the routed experts where they are, their sum folded
+    /// in there. The rows the attention appended reach `cache`, an index-source's top-k reaches
+    /// `shared`, and `ahead`'s experts are advised from the card's guess. Up to `defer` host
+    /// experts may be left running, as `forward_decode_ffn_deferring` leaves them. `Err` once
+    /// the crossing has happened leaves the host to finish from the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_ffn_dev(
+        &self,
+        ds: &mut dyn crate::inference::offload::DecodeStream,
+        dev: &mut crate::inference::offload::DevCache,
+        cache: &mut AttnCache,
+        ahead: Option<&Block>,
+        defer: usize,
+        shared: &mut SharedAttn,
+    ) -> Result<Option<(super::moe::DeferredExperts, Vec<f32>)>> {
+        use crate::inference::offload::stage;
+        let r = self.router_dev(true);
+        let hc = self.hc_dev(&self.hc_ffn);
+        let ahead_r = ahead.map(|b| (b.hc_dev(&b.hc_attn), b.router_dev(false)));
+        let crossing = stage("moe route on the card", || {
+            ds.moe_route(&hc, &r, ahead_r.as_ref().map(|(h, r)| (h, r)), dev)
+        })?;
+        if let Some(a) = &crossing.append {
+            cache.apply(a, self.attn.window_size());
+            if let Some(t) = &a.topk {
+                shared.topk_idxs = Some(t.clone());
+            }
+        }
+        if let (Some(b), false) = (ahead, crossing.predicted.is_empty()) {
+            b.moe.advise(&crossing.predicted);
+        }
+        let (routed, deferred) = stage("moe", || {
+            self.moe
+                .forward_routed(&crossing.xin, &crossing.routing, defer)
+        })?;
+        stage("hc post on the card", || ds.moe_finish(&routed))?;
+        Ok(deferred.map(|d| (d, crossing.post)))
     }
 
     /// The attention half of `forward_decode`: the stream after ring-aware attention, and the

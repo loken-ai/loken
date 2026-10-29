@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Added
 
 - Microbench: time a decode through a few layers and the mechanisms of a model at its shapes.
+- Inference: run a decode layer whole on the card that keeps its weights, routed experts apart.
 - Metrics: publish each request's queue, prefill, decode and cache figures.
 - Serving: batch the image and speech requests queued behind a running one.
 - API: take a completion's prompt as embeddings, in loken's checksummed format or as torch.save tensors.

@@ -232,7 +232,200 @@ pub struct PrefillAttn<'a> {
     pub groups: usize,
 }
 
+/// A card's copy of one layer's attention rows (its window, compressed rows, index keys and the
+/// rows of the group filling), owned by the layer's host cache. Cloning the cache leaves the copy
+/// behind: a card rebuilds its own from the host rows when it next runs the layer.
+#[derive(Default)]
+pub struct DevCache(pub Option<Box<dyn std::any::Any + Send>>);
+
+impl Clone for DevCache {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+/// What a layer's host attention cache holds, read by a card to check its own copy against and
+/// to rebuild it. The window is the rope'd, fp8 rows oldest first; the compressed rows and index
+/// keys are flat, one row per completed group; the group rows are the raw inputs of the group
+/// still filling.
+pub trait HostCache {
+    fn window_rows(&self) -> usize;
+    fn window_flat(&self) -> Vec<f32>;
+    fn last_window_row(&self) -> Option<&[f32]>;
+    fn groups(&self) -> usize;
+    fn compressed(&self) -> &[f32];
+    fn index_keys(&self) -> &[f32];
+    fn group_rows(&self) -> usize;
+    fn group_flat(&self) -> Vec<f32>;
+    fn last_group_row(&self) -> Option<&[f32]>;
+}
+
+/// The rows one token's attention on a card appends to a layer's cache, read back for the host
+/// copy: the window row always; the raw row of the group filling for a kv-source; the compressed
+/// row and, when the layer owns them, the index key when that row completed a group.
+#[derive(Clone, Default, Debug)]
+pub struct CacheAppend {
+    pub window_row: Vec<f32>,
+    pub group_row: Option<Vec<f32>>,
+    pub comp_row: Option<Vec<f32>>,
+    pub index_row: Option<Vec<f32>>,
+    /// The compressed slots an index-source chose for the token, for the readers below it.
+    pub topk: Option<Vec<i32>>,
+}
+
+/// The hyper-connection weights of one sublayer as a card reads them.
+pub struct HcDev<'a> {
+    pub func: &'a crate::tensor::Tensor,
+    pub scale: &'a crate::tensor::Tensor,
+    pub base: &'a crate::tensor::Tensor,
+    pub iters: usize,
+    pub norm_eps: f32,
+    pub hc_eps: f32,
+}
+
+/// A kv-source's compressor: `wkv` and `wgate` [head_dim, dim], `norm` [head_dim].
+pub struct CompressorDev<'a> {
+    pub norm: &'a crate::tensor::Tensor,
+    pub wkv: &'a crate::tensor::Tensor,
+    pub wgate: Option<&'a crate::tensor::Tensor>,
+}
+
+/// An index-source's indexer: queries from the shared query latent, head weights from the layer
+/// input, keys of its own (`wk`, `k_norm`) when it owns them.
+pub struct IndexerDev<'a> {
+    pub wq_b: &'a Projection,
+    pub weights_proj: &'a crate::tensor::Tensor,
+    pub wk: Option<&'a crate::tensor::Tensor>,
+    pub k_norm: Option<&'a crate::tensor::Tensor>,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub topk: usize,
+    pub eps: f32,
+}
+
+/// One layer's attention for a decode on a card: the base block of every layer, the compressor
+/// of a kv-source, the indexer of an index-source. `cos`/`sin` are the full rope tables of the
+/// layer's kind; the card takes the rows of `pos` and of the groups it completes.
+pub struct DecodeAttn<'a> {
+    pub norm: &'a crate::tensor::Tensor,
+    pub wq_a: &'a Projection,
+    pub q_norm: &'a crate::tensor::Tensor,
+    pub wq_b: &'a Projection,
+    pub wkv: &'a Projection,
+    pub kv_norm: &'a crate::tensor::Tensor,
+    pub wo_a: &'a Projection,
+    pub wo_b: &'a Projection,
+    pub sink: &'a crate::tensor::Tensor,
+    pub compressor: Option<CompressorDev<'a>>,
+    pub indexer: Option<IndexerDev<'a>>,
+    pub cos: &'a crate::tensor::Tensor,
+    pub sin: &'a crate::tensor::Tensor,
+    pub pos: usize,
+    /// The layer whose top-k a reader takes, this token.
+    pub index_source: Option<usize>,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub rope_head_dim: usize,
+    pub o_groups: usize,
+    pub o_lora: usize,
+    pub dim: usize,
+    pub window: usize,
+    /// The compress ratio (0 for a window-only layer) and the compressed slots a band layer
+    /// attends to beside its window.
+    pub ratio: usize,
+    pub index_topk: usize,
+    pub eps: f32,
+    pub scale: f32,
+}
+
+/// A layer's router and shared expert for a decode on a card: the gate [n_routed, dim] and its
+/// selection bias, the FFN norm, and the shared expert's three projections.
+pub struct DecodeRouter<'a> {
+    pub norm: &'a crate::tensor::Tensor,
+    pub gate: &'a crate::tensor::Tensor,
+    pub bias: &'a crate::tensor::Tensor,
+    pub n_routed: usize,
+    pub n_activated: usize,
+    pub gate_temp: f32,
+    pub route_scale: f32,
+    pub norm_topk: bool,
+    pub eps: f32,
+    pub shared: Option<(&'a Projection, &'a Projection, &'a Projection, f32)>,
+}
+
+/// What crosses to the host at a layer's MoE: the FFN input row, the token's routing, the
+/// coefficients the host would need to finish the layer itself, the rows the attention
+/// appended, and the experts a read-ahead predicted.
+#[derive(Default, Debug)]
+pub struct Crossing {
+    pub xin: Vec<f32>,
+    pub routing: Vec<(usize, f32)>,
+    pub post: Vec<f32>,
+    pub comb: Vec<f32>,
+    pub append: Option<CacheAppend>,
+    pub predicted: Vec<usize>,
+}
+
+/// A decode token's residual stream kept on a card, with every step of a layer but the routed
+/// experts the host holds run there. Per layer, the host sees the MoE input and the routing go
+/// out and sends the routed experts' sum back. A step that fails leaves the stream as it was,
+/// readable with `rows` and `pre`, and the host finishes the layer.
+pub trait DecodeStream: Send {
+    /// The attention sublayer of layer `layer`, whole: the mixes, the collapse and norm, the
+    /// block with its caches on the card, the update of the stream. `cache` is this layer's
+    /// card copy and `host` the rows it must agree with; `source` is the kv-source's for a
+    /// reader. `Err` when a card cannot run it, the stream untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &mut self,
+        layer: usize,
+        hc: &HcDev,
+        attn: &DecodeAttn,
+        cache: &mut DevCache,
+        host: &dyn HostCache,
+        source: Option<(&DevCache, &dyn HostCache)>,
+    ) -> Result<()>;
+
+    /// The FFN sublayer up to its crossing: the mixes with `hc`, the collapse and norm, the
+    /// router and its top-k, with `ahead`'s mixes and router run on the stream too for a
+    /// read-ahead when given. The rows the attention appended to `cache` come back in the same
+    /// download. The shared expert starts on the card as the crossing returns.
+    fn moe_route(
+        &mut self,
+        hc: &HcDev,
+        r: &DecodeRouter,
+        ahead: Option<(&HcDev, &DecodeRouter)>,
+        cache: &mut DevCache,
+    ) -> Result<Crossing>;
+
+    /// The FFN sublayer from the routed experts' sum `routed` [d] on: added to the shared
+    /// expert's output, the stream updated.
+    fn moe_finish(&mut self, routed: &[f32]) -> Result<()>;
+
+    /// Add `delta` [d] to every copy of the stream, copy c scaled by `post[c]`: a deferred share.
+    fn add(&mut self, delta: &[f32], post: &[f32]) -> Result<()>;
+
+    /// The rows the last attention appended to `cache` and not yet read back, for a host that
+    /// finishes the layer.
+    fn take_append(&mut self, cache: &mut DevCache) -> Result<Option<CacheAppend>>;
+
+    /// The collapse weights the next sublayer input is taken with.
+    fn pre(&mut self) -> Result<Vec<f32>>;
+
+    /// The stream, `[hc, d]`.
+    fn rows(&mut self) -> Result<Vec<f32>>;
+
+    /// Replace the stream and its collapse weights.
+    fn replace(&mut self, x: &[f32], pre: &[f32]) -> Result<()>;
+}
+
 pub trait Offload: Send + Sync {
+    /// Hold a decode token's stream `x` [hc, d] on a card (see `DecodeStream`). `None` when no
+    /// card has room or the offload keeps no stream.
+    fn decode_stream(&self, _x: &[f32], _hc: usize, _d: usize) -> Option<Box<dyn DecodeStream>> {
+        None
+    }
+
     /// A prompt's attention from the query latent on - queries from the latent, rotated, sparse
     /// attention with the sink, rotated back, the grouped output projection - run whole where the
     /// weights and keys are, `[n, dim]`. `None` to run it step by step here.

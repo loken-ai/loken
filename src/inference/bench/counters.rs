@@ -7,7 +7,7 @@
 //! on the card's stream. A step the card declines runs on the host and moves nothing.
 
 use crate::inference::offload::projection::Projection;
-use crate::inference::offload::{AttnBlock, HcStream, Offload, PrefillAttn};
+use crate::inference::offload::{AttnBlock, DecodeStream, HcStream, Offload, PrefillAttn};
 use crate::tensor::Result;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -103,6 +103,13 @@ impl Offload for Counting {
             out,
             r.as_ref().map_or(0, back_bytes),
         );
+        r
+    }
+
+    fn decode_stream(&self, x: &[f32], hc: usize, d: usize) -> Option<Box<dyn DecodeStream>> {
+        let r = self.inner.as_ref().and_then(|o| o.decode_stream(x, hc, d));
+        self.crossings
+            .note("decode stream", r.is_some(), f32_bytes(x), 0);
         r
     }
 

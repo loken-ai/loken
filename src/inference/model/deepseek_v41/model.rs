@@ -65,6 +65,21 @@ pub(crate) fn rope_table(
 /// times the three windows of a round, so a round is a fifth of the time.
 const READAHEAD_EXPLOIT_WINDOWS: usize = 12;
 
+/// Where a decode's token stands after a layer that was to run on a card.
+enum DevStep {
+    /// The layer ran on the card; the stream is still there.
+    Done,
+    /// The card ran the attention and the host finished the FFN from the stream, which it now
+    /// holds: the stream, its collapse weights, and the experts left running.
+    Host(
+        Tensor,
+        Vec<Vec<f32>>,
+        Option<(super::moe::DeferredExperts, Vec<f32>)>,
+    ),
+    /// The card could not run the attention: the host holds the stream and runs the layer.
+    ToHost(Tensor, Vec<Vec<f32>>),
+}
+
 pub struct DeepseekV41Model {
     embed: Tensor,      // [vocab, dim]
     output: Projection, // [vocab, dim]
@@ -1430,6 +1445,137 @@ impl DeepseekV41Model {
         Ok(logits)
     }
 
+    /// One layer of a decode whose stream `ds` holds on a card (see `Block::forward_decode_attn_dev`
+    /// and `forward_decode_ffn_dev`): both halves there, the experts the layer above left running
+    /// added between them. A half the card cannot run leaves the stream to the host.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decode_layer_dev(
+        &self,
+        ds: &mut dyn crate::inference::offload::DecodeStream,
+        i: usize,
+        block: &Block,
+        cos: &Tensor,
+        sin: &Tensor,
+        pos: usize,
+        state: &mut DecodeState,
+        shared: &mut SharedAttn,
+        sources: (Option<usize>, Option<usize>),
+        ahead: Option<&Block>,
+        defer: usize,
+        pending: &mut Option<(usize, super::moe::DeferredExperts, Vec<f32>)>,
+    ) -> Result<DevStep> {
+        use crate::inference::offload::stage;
+        let (hc, dim) = (self.hc_mult, self.dim);
+        let to_host =
+            |ds: &mut dyn crate::inference::offload::DecodeStream| -> Result<(Tensor, Vec<Vec<f32>>)> {
+                let pre = ds.pre()?;
+                let x = Tensor::from_vec(ds.rows()?, (1, 1, hc, dim), &Device::Cpu)?;
+                Ok((x, vec![pre]))
+            };
+        let (kv_src, idx_src) = sources;
+        let mut devc = std::mem::take(&mut state.layers[i].dev);
+        let attended = {
+            let host = &state.layers[i];
+            let source = kv_src.map(|s| (&state.layers[s].dev, &state.layers[s]));
+            block.forward_decode_attn_dev(ds, i, cos, sin, pos, &mut devc, host, source, idx_src)
+        };
+        state.layers[i].dev = devc;
+        if let Err(e) = attended {
+            tracing::debug!(
+                "layer {i}: the card does not run the attention ({e}); the host runs the layer"
+            );
+            let (x, pm) = to_host(ds)?;
+            return Ok(DevStep::ToHost(x, pm));
+        }
+        // The host finishes the FFN half from the stream: the rows the card's attention
+        // appended reach the host cache first, then a share left over is added.
+        let host_ffn = |ds: &mut dyn crate::inference::offload::DecodeStream,
+                        state: &mut DecodeState,
+                        shared: &mut SharedAttn,
+                        extra: Option<(Vec<f32>, Vec<f32>)>|
+         -> Result<DevStep> {
+            let mut devc = std::mem::take(&mut state.layers[i].dev);
+            let taken = ds.take_append(&mut devc);
+            state.layers[i].dev = devc;
+            if let Some(a) = taken? {
+                state.layers[i].apply(&a, block.attn.window_size());
+                if let Some(t) = &a.topk {
+                    shared.topk_idxs = Some(t.clone());
+                }
+            }
+            let (mut x, pm) = to_host(ds)?;
+            if let Some((post, delta)) = extra {
+                x = super::hyper_connections::hc_add(&x, &post, &delta)?;
+            }
+            let (nx, npm, left) = block.forward_decode_ffn_deferring(&x, &pm, defer)?;
+            Ok(DevStep::Host(nx, npm, left))
+        };
+        if let Some((layer, job, post)) = pending.take() {
+            let delta = stage("moe deferred wait", || {
+                self.block(layer)?.moe.finish_deferred(job)
+            })?;
+            if let Err(e) = ds.add(&delta, &post) {
+                tracing::debug!("layer {i}: the card does not add a deferred share ({e})");
+                return host_ffn(ds, state, shared, Some((post, delta)));
+            }
+        }
+        let mut devc = std::mem::take(&mut state.layers[i].dev);
+        let ffn =
+            block.forward_decode_ffn_dev(ds, &mut devc, &mut state.layers[i], ahead, defer, shared);
+        state.layers[i].dev = devc;
+        match ffn {
+            Ok(left) => {
+                *pending = left.map(|(j, p)| (i, j, p));
+                Ok(DevStep::Done)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "layer {i}: the card does not run the FFN ({e}); the host finishes it"
+                );
+                host_ffn(ds, state, shared, None)
+            }
+        }
+    }
+
+    /// Give a reader on the host the rows of a kv-source that ran on a card this token: the
+    /// source's host copy, as the source itself publishes when it runs on the host.
+    fn publish_sources(
+        &self,
+        shared: &mut SharedAttn,
+        state: &DecodeState,
+        kv_source: Option<usize>,
+        index_source: Option<usize>,
+    ) -> Result<()> {
+        let _ = index_source;
+        let Some(s) = kv_source else {
+            return Ok(());
+        };
+        let Some(Some(b)) = self.blocks.get(s) else {
+            return Ok(());
+        };
+        let super::block::LayerAttn::Band(a) = &b.attn else {
+            return Ok(());
+        };
+        let c = &state.layers[s];
+        if shared.compress_kv.is_none() {
+            shared.compress_kv = Some(Tensor::from_vec(
+                c.comp_kv.clone(),
+                (1, c.n_groups, a.head_dim),
+                &Device::Cpu,
+            )?);
+        }
+        if let Some(ix) = &a.indexer {
+            if ix.owns_k && shared.index_k.is_none() {
+                shared.index_k = Some(Tensor::from_vec(
+                    c.index_k.clone(),
+                    (1, c.n_groups, ix.index_head_dim),
+                    &Device::Cpu,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
     /// Hold the read-ahead depth at `depth` (or hand it back to the controller with `None`).
     pub fn pin_readahead(&mut self, depth: Option<usize>) {
         self.readahead_pin = depth;
@@ -1484,6 +1630,7 @@ impl DeepseekV41Model {
 
         // Node 0 embeds the token and pushes the engram recent once; a later range resumes from the
         // boundary the previous one produced.
+        let resumed = matches!(input, DecodeRangeIn::Resume(_));
         let (mut x, mut pre_mix, mut shared, recent) = match input {
             DecodeRangeIn::Token(token) => {
                 let row = crate::inference::offload::stage("embed", || {
@@ -1517,13 +1664,37 @@ impl DeepseekV41Model {
         }
         let defer = self.deferred_experts();
         let mut pending: Option<(usize, super::moe::DeferredExperts, Vec<f32>)> = None;
+        // The stream on a card for this range, when the offload holds one: it goes up from the
+        // token's embedding or from the boundary, every layer runs there until a step the card
+        // cannot do, and the host finishes the range from the stream as it stands.
+        let mut dev: Option<Box<dyn crate::inference::offload::DecodeStream>> =
+            crate::inference::offload::current().and_then(|off| {
+                let flat = x.flatten_all().ok()?.to_vec1::<f32>().ok()?;
+                let mut ds = off.decode_stream(&flat, hc, dim)?;
+                if resumed {
+                    ds.replace(&flat, pre_mix.first()?).ok()?;
+                }
+                Some(ds)
+            });
+        // The latest kv-source and index-source of this range: what a reader below them takes.
+        let (mut kv_source, mut index_source): (Option<usize>, Option<usize>) = (None, None);
         for i in from..to {
             let block = self.block(i)?;
+            let on_host_now = self.engrams[i].is_some() || cap.contains(&i);
+            if let (Some(ds), true) = (dev.as_deref_mut(), on_host_now) {
+                // An engram's rows and a capture read the stream on the host.
+                let rows = ds.rows()?;
+                x = Tensor::from_vec(rows, (1, 1, hc, dim), &Device::Cpu)?;
+            }
             if let (Some(engram), Some(ecfg), Some(recent)) =
                 (&self.engrams[i], &self.engram_cfg, &recent)
             {
                 let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
                 x = engram.forward(&x, &[ecfg.hash(which, recent)])?;
+                if let Some(ds) = dev.as_deref_mut() {
+                    let pre = ds.pre()?;
+                    ds.replace(&x.flatten_all()?.to_vec1::<f32>()?, &pre)?;
+                }
             }
             if let Some(ci) = cap.iter().position(|&l| l == i) {
                 // Mean over the hyper-connection copies: x is [1, 1, hc, dim].
@@ -1540,18 +1711,70 @@ impl DeepseekV41Model {
                 }
                 state.captured[ci] = m;
             }
-            if depth > 0 {
-                if let Some(Some(ahead)) = self.blocks.get(i + depth) {
-                    crate::inference::offload::stage("expert read-ahead", || {
-                        ahead.advise_experts(&x)
-                    })?;
-                }
-            }
             let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
                 (&cos0, &sin0)
             } else {
                 (&cosb, &sinb)
             };
+            let ahead = (depth > 0)
+                .then(|| self.blocks.get(i + depth).and_then(|b| b.as_ref()))
+                .flatten();
+            if let Some(ds) = dev.as_deref_mut() {
+                let ran = self.forward_decode_layer_dev(
+                    ds,
+                    i,
+                    block,
+                    cos,
+                    sin,
+                    pos,
+                    state,
+                    &mut shared,
+                    (kv_source, index_source),
+                    ahead,
+                    defer,
+                    &mut pending,
+                )?;
+                match ran {
+                    DevStep::Done => {
+                        if block.attn.is_kv_source() {
+                            kv_source = Some(i);
+                        }
+                        if block.attn.is_index_source() {
+                            index_source = Some(i);
+                        }
+                        continue;
+                    }
+                    DevStep::Host(nx, npm, left) => {
+                        x = nx;
+                        pre_mix = npm;
+                        dev = None;
+                        pending = left.map(|(job, post)| (i, job, post));
+                        if block.attn.is_kv_source() {
+                            kv_source = Some(i);
+                        }
+                        if block.attn.is_index_source() {
+                            index_source = Some(i);
+                        }
+                        continue;
+                    }
+                    DevStep::ToHost(nx, npm) => {
+                        x = nx;
+                        pre_mix = npm;
+                        dev = None;
+                    }
+                }
+            }
+            if let Some(ahead) = ahead {
+                crate::inference::offload::stage("expert read-ahead", || ahead.advise_experts(&x))?;
+            }
+            // A reader whose source ran on a card reads the source's rows from its host copy.
+            self.publish_sources(&mut shared, state, kv_source, index_source)?;
+            if block.attn.is_kv_source() {
+                kv_source = Some(i);
+            }
+            if block.attn.is_index_source() {
+                index_source = Some(i);
+            }
             if defer == 0 {
                 let (nx, npm) = block.forward_decode(
                     &x,
@@ -1586,7 +1809,18 @@ impl DeepseekV41Model {
             x = nx;
             pre_mix = npm;
         }
-        // Nothing stays running past the range: the head, or the next range, reads the stream whole.
+        // Nothing stays running past the range: the head, or the next range, reads the stream
+        // whole, which comes down from the card with its collapse weights.
+        if let Some(ds) = dev.as_deref_mut() {
+            if let Some((layer, job, post)) = pending.take() {
+                let delta = crate::inference::offload::stage("moe deferred wait", || {
+                    self.block(layer)?.moe.finish_deferred(job)
+                })?;
+                ds.add(&delta, &post)?;
+            }
+            pre_mix = vec![ds.pre()?];
+            x = Tensor::from_vec(ds.rows()?, (1, 1, hc, dim), &Device::Cpu)?;
+        }
         if let Some((layer, job, post)) = pending.take() {
             x = self.block(layer)?.add_deferred(&x, job, &post)?;
         }
@@ -4786,6 +5020,238 @@ mod oracle_gate {
                 }
             }
         }
+    }
+
+    /// A decode whose stream stays on a card for every layer - the mixes, the attention with its
+    /// window, compressed rows and index keys kept there, the router, the shared expert and the
+    /// update - gives the CPU's logits token after token: from a fresh state past the window and
+    /// through many groups, after a prefill, after a rewind, and after a token the host ran in
+    /// between, on both layouts.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_decode_with_the_stream_on_a_card_matches_the_cpu() {
+        use crate::inference::offload::cuda::{Card, Cards};
+        use crate::inference::offload::{
+            room, stage_prof_enable, stage_prof_snapshot, with_offload,
+        };
+        let Ok(dev) = crate::tensor::cuda::CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card decode is NOT covered by this run");
+            return;
+        };
+        let (_, total) = crate::tensor::cuda_ext::mem_get_info(&Device::Cuda(dev.clone())).unwrap();
+        let room = room::open(dev.ordinal(), total, 0);
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let cards: std::sync::Arc<dyn crate::inference::offload::Offload> =
+            std::sync::Arc::new(Cards(vec![std::sync::Arc::new(Card::new(dev, room, 1))]));
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        stage_prof_enable(true);
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, _) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens: Vec<u32> = (0..70)
+                .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+                .collect();
+            let step = |cpu: &mut DecodeState, card: &mut DecodeState, t: u32, what: &str| {
+                let a = vecf_of(&model.forward_decode(t, cpu).unwrap());
+                let b = vecf_of(
+                    &with_offload(cards.clone(), || model.forward_decode(t, card)).unwrap(),
+                );
+                assert!(
+                    rel(&b, &a) < 1e-3,
+                    "{ratios:?} {what} at {}: rel {}",
+                    cpu.pos,
+                    rel(&b, &a)
+                );
+                assert_eq!(argmax(&b), argmax(&a), "{ratios:?} {what} at {}", cpu.pos);
+            };
+            // From a fresh state: the window fills and wraps, the groups accumulate.
+            let (mut cpu, mut card) = (model.new_decode_state(), model.new_decode_state());
+            for &t in &tokens {
+                step(&mut cpu, &mut card, t, "from scratch");
+            }
+            // After a prefill: the card copies start from the host rows.
+            let mut cpu = model.new_decode_state();
+            model.prefill_into(&tokens[..45], &mut cpu).unwrap();
+            let mut card = cpu.clone();
+            for &t in &tokens[45..] {
+                step(&mut cpu, &mut card, t, "after a prefill");
+            }
+            // After a rewind: the card copies are ahead of the host rows and are rebuilt.
+            let (mark_cpu, mark_card) = (cpu.checkpoint(), card.checkpoint());
+            for &t in &tokens[..6] {
+                step(&mut cpu, &mut card, t, "before a rewind");
+            }
+            cpu.rewind(&mark_cpu);
+            card.rewind(&mark_card);
+            for &t in &tokens[10..16] {
+                step(&mut cpu, &mut card, t, "after a rewind");
+            }
+            // After a token the host ran on the card's state: the host rows moved without the
+            // card, which sees it and rebuilds.
+            let t = tokens[20];
+            let a = vecf_of(&model.forward_decode(t, &mut cpu).unwrap());
+            let b = vecf_of(&model.forward_decode(t, &mut card).unwrap());
+            assert!(
+                rel(&b, &a) < 1e-5,
+                "{ratios:?} a host token on the card's state"
+            );
+            for &t in &tokens[21..27] {
+                step(&mut cpu, &mut card, t, "after a host token");
+            }
+        }
+        let prof = stage_prof_snapshot();
+        stage_prof_enable(false);
+        let on_card = |name: &str| prof.iter().find(|s| s.0 == name).map_or(0, |s| s.2);
+        assert!(
+            on_card("attention on the card") > 0 && on_card("moe route on the card") > 0,
+            "the decode did not run on the card: {prof:?}"
+        );
+    }
+
+    /// One layer of a decode on a card - a kv-source and index-source band layer at a group
+    /// boundary - leaves the stream, its collapse weights, the layer's cache rows and the top-k
+    /// the host path leaves, from the same stream and state.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn one_decode_layer_on_a_card_matches_the_host() {
+        use crate::inference::offload::cuda::{Card, Cards};
+        use crate::inference::offload::{room, with_offload, DevCache, Offload};
+        let Ok(dev) = crate::tensor::cuda::CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card layer is NOT covered by this run");
+            return;
+        };
+        let (_, total) = crate::tensor::cuda_ext::mem_get_info(&Device::Cuda(dev.clone())).unwrap();
+        let room = room::open(dev.ordinal(), total, 0);
+        let cards: std::sync::Arc<dyn Offload> =
+            std::sync::Arc::new(Cards(vec![std::sync::Arc::new(Card::new(dev, room, 1))]));
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let (hc, dim) = (model.hc_mult, model.dim);
+        let layer = 1usize;
+        let block = model.block(layer).unwrap();
+        let mut state = model.new_decode_state();
+        // An odd count of tokens: the layer's next token completes a group.
+        model.prefill_into(&tokens[..21], &mut state).unwrap();
+        let pos = state.pos;
+        let (cos, sin) = rope_table(
+            model.rope_head_dim,
+            pos + 1,
+            model.original_seq_len,
+            model.compress_rope_theta,
+            model.rope_factor,
+        )
+        .unwrap();
+        let x: Vec<f32> = (0..hc * dim)
+            .map(|i| ((i as f32) * 0.173).sin() * 1.5)
+            .collect();
+        let pre: Vec<f32> = (0..hc).map(|c| 0.1 + 0.3 * c as f32).collect();
+        let xt = Tensor::from_vec(x.clone(), (1, 1, hc, dim), &Device::Cpu).unwrap();
+        // The host.
+        let mut host_cache = state.layers[layer].clone();
+        let mut host_shared = SharedAttn::default();
+        let (hx, hpre) = block
+            .forward_decode(
+                &xt,
+                std::slice::from_ref(&pre),
+                &cos,
+                &sin,
+                pos,
+                &mut host_cache,
+                &mut host_shared,
+            )
+            .unwrap();
+        // The card, the same steps through the stream.
+        let mut card_cache = state.layers[layer].clone();
+        let mut card_shared = SharedAttn::default();
+        let (cx, cpre) = with_offload(cards.clone(), || {
+            let mut ds = cards.decode_stream(&x, hc, dim).unwrap();
+            ds.replace(&x, &pre).unwrap();
+            let mut devc = DevCache::default();
+            block
+                .forward_decode_attn_dev(
+                    ds.as_mut(),
+                    layer,
+                    &cos,
+                    &sin,
+                    pos,
+                    &mut devc,
+                    &card_cache,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let left = block
+                .forward_decode_ffn_dev(
+                    ds.as_mut(),
+                    &mut devc,
+                    &mut card_cache,
+                    None,
+                    0,
+                    &mut card_shared,
+                )
+                .unwrap();
+            assert!(left.is_none());
+            (ds.rows().unwrap(), ds.pre().unwrap())
+        });
+        let hx = vecf_of(&hx);
+        let range = hx.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = cx
+            .iter()
+            .zip(&hx)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst <= 1e-3 * range.max(1.0),
+            "stream: worst {worst} of {range}"
+        );
+        for (c, h) in cpre.iter().zip(&hpre[0]) {
+            assert!((c - h).abs() <= 1e-4, "pre {c} vs {h}");
+        }
+        // Cache rows are quantised from values the card and the host compute to rounding: a
+        // block's scale may differ in its last bit, and a value on a rounding boundary may move
+        // by one grid step on one side only, so the rows agree to rounding.
+        let rows_agree = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got.len(), want.len(), "{what}: length");
+            let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-2 * range.max(1.0),
+                "{what}: worst {worst} of {range}"
+            );
+        };
+        assert_eq!(card_cache.win.len(), host_cache.win.len());
+        assert_eq!(card_cache.n_groups, host_cache.n_groups);
+        assert_eq!(card_cache.n_groups, state.layers[layer].n_groups + 1);
+        assert_eq!(card_cache.group_x.len(), host_cache.group_x.len());
+        rows_agree(
+            card_cache.win.back().unwrap(),
+            host_cache.win.back().unwrap(),
+            "window row",
+        );
+        rows_agree(&card_cache.comp_kv, &host_cache.comp_kv, "compressed rows");
+        rows_agree(&card_cache.index_k, &host_cache.index_k, "index keys");
+        let sorted = |v: &Option<Vec<i32>>| {
+            let mut s = v.clone().unwrap();
+            s.sort_unstable();
+            s
+        };
+        assert_eq!(
+            sorted(&card_shared.topk_idxs),
+            sorted(&host_shared.topk_idxs)
+        );
     }
 
     /// Unit 2, decode: token-at-a-time decode from a fresh cache reproduces prefill's per-position

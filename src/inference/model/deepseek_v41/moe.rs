@@ -320,19 +320,79 @@ impl Moe {
         let raw = crate::inference::offload::linear(x, &self.gate_weight)?.to_vec2::<f32>()?;
         let bias = self.gate_bias.flatten_all()?.to_vec1::<f32>()?;
         let (chosen, _) = self.select(&raw[0], &bias);
+        Ok(self.advise(&chosen))
+    }
+
+    /// Start reading the experts a token is expected to route to: `chosen`, or the guess a
+    /// scripted routing sets in its place, as `predict_and_advise` does from a guess made
+    /// elsewhere (a card's router over its stream). Returns the experts it read ahead.
+    pub fn advise(&self, chosen: &[usize]) -> Vec<usize> {
+        if matches!(self.experts, ExpertSet::Resident(_)) {
+            return Vec::new();
+        }
         let chosen = self
             .scripted
             .lock()
             .unwrap()
             .guesses
             .pop_front()
-            .unwrap_or(chosen);
+            .unwrap_or_else(|| chosen.to_vec());
         let on_card = self.on_card_probe();
         for &e in &chosen {
             self.experts.advise(e, self.n_activated, &on_card);
         }
         *self.predicted.lock().unwrap() = chosen.clone();
-        Ok(chosen)
+        chosen
+    }
+
+    /// The routed experts' weighted sum for one decoding token's row `x` [dim] already routed
+    /// to `routing` (expert, weight with the route scale), `[dim]`, without the shared expert:
+    /// the host's share of a layer whose router and shared expert ran on a card. Up to `defer`
+    /// of the host's experts may be left running, as `forward_with` leaves them.
+    pub fn forward_routed(
+        &self,
+        x: &[f32],
+        routing: &[(usize, f32)],
+        defer: usize,
+    ) -> Result<(Vec<f32>, Option<DeferredExperts>)> {
+        if x.len() != self.dim {
+            return Err(crate::tensor::Error::msg(format!(
+                "a routed row of {} values for {}",
+                x.len(),
+                self.dim
+            )));
+        }
+        let x2 = Tensor::from_vec(x.to_vec(), (1, self.dim), &Device::Cpu)?;
+        // A scripted route stands in for the card's choice, weighed by the gate row as the
+        // host path weighs its own.
+        let scripted = self.scripted.lock().unwrap().routes.pop_front();
+        let routing: Vec<(usize, f32)> = match scripted {
+            Some(chosen) => {
+                let raw =
+                    crate::inference::offload::linear(&x2, &self.gate_weight)?.to_vec2::<f32>()?;
+                let (chosen, w) = self.weigh(&raw[0], chosen);
+                chosen
+                    .into_iter()
+                    .zip(w)
+                    .map(|(e, wi)| (e, wi * self.route_scale))
+                    .collect()
+            }
+            None => routing.to_vec(),
+        };
+        let routing = routing.as_slice();
+        let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.n_routed];
+        for &(e, w) in routing {
+            if e >= self.n_routed {
+                return Err(crate::tensor::Error::msg(format!(
+                    "routed to expert {e} of {}",
+                    self.n_routed
+                )));
+            }
+            assign[e].push((0, w));
+        }
+        let (mut y, deferred) =
+            self.run_routed(&x2, x, assign, vec![routing.to_vec()], 1, defer, false)?;
+        Ok((y.pop().unwrap_or_default(), deferred))
     }
 
     /// `x` is [b, s, dim]; returns [b, s, dim].
@@ -396,13 +456,35 @@ impl Moe {
                     .collect(),
             );
         }
-        *self.last_routing.lock().unwrap() = routing;
         if crate::inference::offload::current().is_some() {
             crate::inference::offload::prof_record(
                 "moe routing",
                 gate_started.elapsed().as_nanos() as u64,
             );
         }
+        let (y, deferred) = self.run_routed(&x2, &flat, assign, routing, n, defer, true)?;
+        let flat: Vec<f32> = y.into_iter().flatten().collect();
+        Ok((
+            Tensor::from_vec(flat, (n, self.dim), &Device::Cpu)?.reshape(dims)?,
+            deferred,
+        ))
+    }
+
+    /// The experts of `x2` [n, dim] (`flat` its values) run as `assign` and `routing` say, the
+    /// shared expert among them when `with_shared`: each token's weighted sum, `[n][dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_routed(
+        &self,
+        x2: &Tensor,
+        flat: &[f32],
+        assign: Vec<Vec<(usize, f32)>>,
+        routing: Vec<Vec<(usize, f32)>>,
+        n: usize,
+        defer: usize,
+        with_shared: bool,
+    ) -> Result<(Vec<Vec<f32>>, Option<DeferredExperts>)> {
+        use crate::inference::offload::stage;
+        *self.last_routing.lock().unwrap() = routing;
 
         // The routed experts this batch needs are known from the top-k before any of them runs, so
         // a streamed set prefetches that working set before the compute loop reads it.
@@ -468,7 +550,7 @@ impl Moe {
         // Every token passes through the shared expert; routed experts add on top, each run over
         // the rows of the tokens that selected it and nothing else.
         let shared_fn = || -> Result<Vec<Vec<f32>>> {
-            Ok(if self.has_shared {
+            Ok(if self.has_shared && with_shared {
                 stage("moe shared expert", || {
                     // On a card the shared expert's three products and SwiGLU stay on the device, so
                     // the activation crosses once instead of once per projection; the host path serves
@@ -478,15 +560,13 @@ impl Moe {
                             &self.shared.w1,
                             &self.shared.w3,
                             &self.shared.w2,
-                            &flat,
+                            flat,
                             self.swiglu_limit,
                         ) {
                             return Ok(res?.chunks(self.dim).map(|c| c.to_vec()).collect());
                         }
                     }
-                    self.shared
-                        .forward(&x2, self.swiglu_limit)?
-                        .to_vec2::<f32>()
+                    self.shared.forward(x2, self.swiglu_limit)?.to_vec2::<f32>()
                 })?
             } else {
                 vec![vec![0f32; self.dim]; n]
@@ -495,7 +575,7 @@ impl Moe {
         let xv: Vec<&[f32]> = flat.chunks(self.dim).collect();
         let observer = self.observer.read().unwrap().clone();
         if let Some(obs) = &observer {
-            obs(None, &flat, &[], &[]);
+            obs(None, flat, &[], &[]);
         }
         let offload = self.offload.read().unwrap().clone();
         let rows_of = |e: usize| -> Vec<f32> {
@@ -523,7 +603,7 @@ impl Moe {
                     {
                         off.device
                             .as_ref()
-                            .and_then(|d| (d.begin)(&flat, self.dim).map(|ctx| (d, ctx)))
+                            .and_then(|d| (d.begin)(flat, self.dim).map(|ctx| (d, ctx)))
                     }
                     _ => None,
                 };
@@ -706,11 +786,7 @@ impl Moe {
                 gather_started.elapsed().as_nanos() as u64,
             );
         }
-        let flat: Vec<f32> = y.into_iter().flatten().collect();
-        Ok((
-            Tensor::from_vec(flat, (n, self.dim), &Device::Cpu)?.reshape(dims)?,
-            deferred,
-        ))
+        Ok((y, deferred))
     }
 
     /// Wait for the experts `forward_with` left running and return their weighted sum

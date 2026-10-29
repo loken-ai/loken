@@ -32,6 +32,67 @@ pub struct AttnCache {
     /// Prefill scratch, output: the window at each of `grid` that the prefill passed, as the
     /// snapshot format's window section (see `snapshot::window_section`).
     pub at_grid: Vec<Vec<u8>>,
+    /// A card's copy of the rows above, when a decode keeps them there. A clone of the cache
+    /// starts without one: the card rebuilds it from the rows when it next runs the layer.
+    pub dev: crate::inference::offload::DevCache,
+}
+
+impl crate::inference::offload::HostCache for AttnCache {
+    fn window_rows(&self) -> usize {
+        self.win.len()
+    }
+
+    fn window_flat(&self) -> Vec<f32> {
+        self.win.iter().flatten().copied().collect()
+    }
+
+    fn last_window_row(&self) -> Option<&[f32]> {
+        self.win.back().map(Vec::as_slice)
+    }
+
+    fn groups(&self) -> usize {
+        self.n_groups
+    }
+
+    fn compressed(&self) -> &[f32] {
+        &self.comp_kv
+    }
+
+    fn index_keys(&self) -> &[f32] {
+        &self.index_k
+    }
+
+    fn group_rows(&self) -> usize {
+        self.group_x.len()
+    }
+
+    fn group_flat(&self) -> Vec<f32> {
+        self.group_x.iter().flatten().copied().collect()
+    }
+
+    fn last_group_row(&self) -> Option<&[f32]> {
+        self.group_x.last().map(Vec::as_slice)
+    }
+}
+
+impl AttnCache {
+    /// Append what a token's attention on a card produced for this layer: its window row, and
+    /// for a kv-source the raw row it buffers and, when that completed a group, the group's
+    /// compressed row and index key. The same rows in the same order as the host path appends.
+    pub fn apply(&mut self, a: &crate::inference::offload::CacheAppend, window: usize) {
+        super::attention::push_window(self, &a.window_row, window);
+        if let Some(row) = &a.group_row {
+            self.group_x.push(row.clone());
+        }
+        if let Some(row) = &a.comp_row {
+            self.comp_kv.extend_from_slice(row);
+            if let Some(k) = &a.index_row {
+                self.index_k.extend_from_slice(k);
+            }
+            self.group_x.clear();
+            self.n_groups += 1;
+        }
+    }
 }
 
 /// The whole model's decode state: one cache per layer, the recent ids the engram hash reads,

@@ -3109,3 +3109,262 @@ extern "C" __global__ void fp4_to_columns(
     const float v = (nib & 8) ? -mag : mag;
     out[i] = v * scale[(size_t) r * (cols / block) + c / block];
 }
+
+// ---- A decode token's attention state on the card: rounding, pooling, gathering, selection -------
+
+// e4m3fn rounding of `a`, finite and within [-448, 448]: ties to even, subnormal steps of 2^-9.
+__device__ static float dec_e4m3_round(float a) {
+    if (a == 0.0f) return 0.0f;
+    const float mag = fabsf(a);
+    float step;
+    if (mag < 0.015625f) {
+        step = 0.001953125f;
+    } else {
+        int e;
+        frexpf(mag, &e);
+        step = ldexpf(1.0f, e - 4);
+    }
+    return copysignf(fminf(rintf(mag / step) * step, 448.0f), a);
+}
+
+// The nearest e2m1 grid magnitude to `m` (>= 0), the first grid point winning a tie.
+__device__ static float dec_e2m1_round(float m) {
+    const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float best = grid[0], bestd = fabsf(m - grid[0]);
+    for (int i = 1; i < 8; ++i) {
+        const float d = fabsf(m - grid[i]);
+        if (d < bestd) { bestd = d; best = grid[i]; }
+    }
+    return best;
+}
+
+// The smallest power of two at or above `x` (x > 0), as the host computes it.
+__device__ static float dec_pow2_ceil(float x) {
+    return exp2f(ceilf(log2f(x)));
+}
+
+// Block-wise fp8 (e4m3) round trip of `x` in place: `block` consecutive values share the
+// power-of-two scale that puts the block's largest magnitude at or below 448. One thread per block
+// of values, the host's operations in the host's order.
+extern "C" __global__ void fp8_round_f32(float * __restrict__ x, const long total, const long block) {
+    const long b = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b * block >= total) return;
+    float * seg = x + b * block;
+    float amax = 0.0f;
+    for (long i = 0; i < block; ++i) amax = fmaxf(amax, fabsf(seg[i]));
+    const float scale = dec_pow2_ceil(fmaxf(amax / 448.0f, 1e-30f));
+    for (long i = 0; i < block; ++i) {
+        const float c = fminf(fmaxf(seg[i] / scale, -448.0f), 448.0f);
+        seg[i] = dec_e4m3_round(c) * scale;
+    }
+}
+
+// Block-wise fp4 (e2m1) round trip of `x` in place: `block` consecutive values share the scale
+// that puts the block's largest magnitude at 6, rounded up to a power of two when `pow2` is set.
+extern "C" __global__ void fp4_round_f32(
+        float * __restrict__ x, const long total, const long block, const int pow2) {
+    const long b = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b * block >= total) return;
+    float * seg = x + b * block;
+    float amax = 0.0f;
+    for (long i = 0; i < block; ++i) amax = fmaxf(amax, fabsf(seg[i]));
+    float scale = fmaxf(amax / 6.0f, 1e-30f);
+    if (pow2) scale = dec_pow2_ceil(scale);
+    for (long i = 0; i < block; ++i) {
+        const float s = fminf(fmaxf(seg[i] / scale, -6.0f), 6.0f);
+        seg[i] = copysignf(dec_e2m1_round(fabsf(s)), s) * scale;
+    }
+}
+
+// `ratio` tokens' latents `kv` [ratio, hd] pooled into one row by a softmax over the tokens of
+// their gate scores `score` [ratio, hd], per channel: one thread per channel.
+extern "C" __global__ void compress_pool_f32(
+        const float * __restrict__ kv, const float * __restrict__ score, float * __restrict__ out,
+        const long ratio, const long hd) {
+    const long c = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= hd) return;
+    float mx = -INFINITY;
+    for (long r = 0; r < ratio; ++r) mx = fmaxf(mx, score[r * hd + c]);
+    float den = 0.0f, acc = 0.0f;
+    for (long r = 0; r < ratio; ++r) {
+        const float w = expf(score[r * hd + c] - mx);
+        den += w;
+        acc += w * kv[r * hd + c];
+    }
+    out[c] = acc / den;
+}
+
+// One query's keys gathered from the window ring and the compressed rows: slot `s` below `w` is
+// ring row (start + s) % cap, from `w` on compressed row s - w, a negative slot a row of zeros.
+// The output is [topk, d], one value per thread.
+extern "C" __global__ void gather_ring_f32(
+        const float * __restrict__ ring, const long start, const long cap, const long w,
+        const float * __restrict__ comp, const int * __restrict__ idxs, float * __restrict__ out,
+        const long topk, const long d) {
+    const long i = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= topk * d) return;
+    const long slot = i / d, t = i % d;
+    const int s = idxs[slot];
+    float v = 0.0f;
+    if (s >= 0) v = s < w ? ring[((start + s) % cap) * d + t] : comp[(s - w) * d + t];
+    out[i] = v;
+}
+
+// The stream `x` [hc, d] with `delta` [d] added to every copy, copy c scaled by `post[c]`.
+extern "C" __global__ void hc_add_f32(
+        float * __restrict__ x, const float * __restrict__ delta, const float * __restrict__ post,
+        const long d, const int hc) {
+    const long i = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long) hc * d) return;
+    x[i] += post[i / d] * delta[i % d];
+}
+
+// A float's order key: unsigned integers in the order of the floats they come from.
+__device__ static unsigned int dec_order_key(float f) {
+    const unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// Sum of `v` over the block, valid in every thread. `scratch` holds one int per warp.
+__device__ static int dec_block_sum_int(int v, int * scratch) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __syncthreads();
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    int total = 0;
+    for (int w = 0; w < (int) (blockDim.x + 31) / 32; ++w) total += scratch[w];
+    __syncthreads();
+    return total;
+}
+
+// Exclusive prefix sum of `v` over the block; `scratch` holds one int per thread.
+__device__ static int dec_block_scan(int v, int * scratch) {
+    scratch[threadIdx.x] = v;
+    __syncthreads();
+    for (int off = 1; off < (int) blockDim.x; off <<= 1) {
+        const int t = threadIdx.x >= (unsigned) off ? scratch[threadIdx.x - off] : 0;
+        __syncthreads();
+        scratch[threadIdx.x] += t;
+        __syncthreads();
+    }
+    return scratch[threadIdx.x] - v;
+}
+
+// The `k` largest of `scores[0 .. reach)`, the set a descending stable sort keeps (ties to the
+// lower index), as slots `index + offset` in `out` [k] and the same as floats in `outf`, -1 past
+// the ones found. One block: the k-th largest key is found by a binary search over the key space
+// with a count per step, then the keys above it and enough of the keys equal to it are written.
+extern "C" __global__ void topk_select_f32(
+        const float * __restrict__ scores, const long reach, const long k, const long offset,
+        int * __restrict__ out, float * __restrict__ outf) {
+    __shared__ int warps[32];
+    __shared__ int scan[1024];
+    const int T = blockDim.x;
+    const long want = k < reach ? k : reach;
+    const long per = (reach + T - 1) / T;
+    const long lo_i = (long) threadIdx.x * per;
+    const long hi_i = lo_i + per < reach ? lo_i + per : reach;
+    unsigned int lo = 0u, hi = 0xFFFFFFFFu;
+    if (want > 0) {
+        // The upper midpoint, computed without overflowing at the top of the key space.
+        while (lo < hi) {
+            const unsigned int mid = lo + ((hi - lo) >> 1) + 1u;
+            int c = 0;
+            for (long i = lo_i; i < hi_i; ++i) c += dec_order_key(scores[i]) >= mid;
+            const int total = dec_block_sum_int(c, warps);
+            if ((long) total >= want) lo = mid; else hi = mid - 1u;
+        }
+    }
+    const unsigned int thr = lo;
+    int above = 0, equal = 0;
+    if (want > 0) {
+        for (long i = lo_i; i < hi_i; ++i) {
+            const unsigned int key = dec_order_key(scores[i]);
+            above += key > thr;
+            equal += key == thr;
+        }
+    }
+    const int at = dec_block_scan(above, scan);
+    const int n_above = dec_block_sum_int(above, warps);
+    const int at_eq = dec_block_scan(equal, scan);
+    if (want > 0) {
+        int wa = at, we = n_above + at_eq;
+        for (long i = lo_i; i < hi_i; ++i) {
+            const unsigned int key = dec_order_key(scores[i]);
+            if (key > thr) {
+                out[wa] = (int) (i + offset);
+                outf[wa] = (float) (i + offset);
+                ++wa;
+            } else if (key == thr && we < (int) want) {
+                out[we] = (int) (i + offset);
+                outf[we] = (float) (i + offset);
+                ++we;
+            }
+        }
+    }
+    for (long i = want + threadIdx.x; i < k; i += T) {
+        out[i] = -1;
+        outf[i] = -1.0f;
+    }
+}
+
+// A token's routed experts from its gate logits `z` [n]: scores sqrt(softplus(z / temp)), the `k`
+// largest of score + bias taken in turn (ties to the lower expert), their weights the unbiased
+// scores, normalised over the chosen when `norm_topk` is set, times `route_scale`. `out` [2k]
+// holds the chosen experts as floats, then their weights. One block, the keys in shared memory.
+extern "C" __global__ void router_select_f32(
+        const float * __restrict__ z, const float * __restrict__ bias, const long n, const long k,
+        const float temp, const int norm_topk, const float route_scale, float * __restrict__ out) {
+    extern __shared__ float key[];
+    __shared__ float best_v[32];
+    __shared__ int best_i[32];
+    __shared__ int pick;
+    const int T = blockDim.x;
+    for (long e = threadIdx.x; e < n; e += T) {
+        const float s = z[e] / temp;
+        const float sp = s > 20.0f ? s : log1pf(expf(s));
+        key[e] = sqrtf(sp) + bias[e];
+    }
+    __syncthreads();
+    for (long slot = 0; slot < k; ++slot) {
+        float v = -INFINITY;
+        int bi = -1;
+        for (long e = threadIdx.x; e < n; e += T) {
+            if (key[e] > v) { v = key[e]; bi = (int) e; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, v, off);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (ov > v || (ov == v && oi >= 0 && (bi < 0 || oi < bi))) { v = ov; bi = oi; }
+        }
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        if (lane == 0) { best_v[warp] = v; best_i[warp] = bi; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float bv = -INFINITY;
+            int bb = -1;
+            for (int w = 0; w < (T + 31) / 32; ++w) {
+                const bool better = best_v[w] > bv
+                    || (best_v[w] == bv && best_i[w] >= 0 && (bb < 0 || best_i[w] < bb));
+                if (better) { bv = best_v[w]; bb = best_i[w]; }
+            }
+            pick = bb;
+            out[slot] = (float) bb;
+            const float s = z[bb] / temp;
+            out[k + slot] = sqrtf(s > 20.0f ? s : log1pf(expf(s)));
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) key[pick] = -INFINITY;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        if (norm_topk && k > 1) {
+            float sum = 0.0f;
+            for (long slot = 0; slot < k; ++slot) sum += out[k + slot];
+            sum += 1e-20f;
+            for (long slot = 0; slot < k; ++slot) out[k + slot] /= sum;
+        }
+        for (long slot = 0; slot < k; ++slot) out[k + slot] *= route_scale;
+    }
+}

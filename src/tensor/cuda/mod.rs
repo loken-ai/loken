@@ -47,6 +47,8 @@ mod gemm;
 pub use gemm::*;
 mod quant;
 pub use quant::*;
+mod decode_stream;
+pub use decode_stream::*;
 mod correct;
 pub mod prequant;
 pub use correct::*;
