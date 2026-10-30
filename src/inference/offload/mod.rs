@@ -24,6 +24,7 @@ pub mod readahead;
 pub mod room;
 pub mod store;
 pub mod streamed;
+pub mod tier_tune;
 pub mod tuner;
 pub mod weight_cache;
 pub mod weight_stream;

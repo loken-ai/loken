@@ -2810,6 +2810,10 @@ impl ModelBackend for DeepseekV41Backend {
         self.restored
     }
 
+    fn rerank_hot_experts(&self) {
+        self.model.retune_expert_cache();
+    }
+
     /// The prompt in one pass: the prefill runs each layer once over all of it and bounds its own
     /// memory, and the state cache sees the whole prompt to restore and store against.
     fn forward_prefill_chunked(

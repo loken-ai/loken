@@ -102,6 +102,9 @@ pub struct DeepseekV41Model {
     /// has by then; 0 reads none ahead. Moved by the decode's own timing; timing only, the gate
     /// still decides the routing.
     readahead: crate::inference::offload::tuner::Tuner,
+    /// The kept tier's size over the requests: grown while the host has room and its memory
+    /// stalls do not rise; empty until the tier is first sized.
+    tier_tune: std::sync::Mutex<Option<crate::inference::offload::tier_tune::TierTune>>,
     /// A depth held fixed in place of the controller's: for a test of the read-ahead itself.
     readahead_pin: Option<usize>,
     /// The share of a token's routed experts whose host compute may finish a layer late; 0 keeps
@@ -448,6 +451,7 @@ impl DeepseekV41Model {
             routing_seed: std::sync::Mutex::new(Vec::new()),
             // Starts one layer ahead (the nearest stream that stands in for the layer's own) and
             // may go as deep as the stack; a window is as many tokens as the stack has layers.
+            tier_tune: std::sync::Mutex::new(None),
             readahead: crate::inference::offload::tuner::Tuner::new(
                 "expert read-ahead depth",
                 1,
@@ -1069,7 +1073,29 @@ impl DeepseekV41Model {
         self.host_tier_bytes
             .store(budget, std::sync::atomic::Ordering::Relaxed);
         self.set_expert_cache(slots);
+        *self.tier_tune.lock().unwrap() =
+            Some(crate::inference::offload::tier_tune::TierTune::new(
+                slots,
+                cfg.n_routed_experts,
+                self.resident_path_bytes() as u64 + per_token,
+                expert_bytes * cfg.n_layers as u64,
+            ));
         Ok(slots)
+    }
+
+    /// At a request's end: move the kept tier's size by what the host reports of its memory.
+    pub fn retune_expert_cache(&self) {
+        let mut guard = self.tier_tune.lock().unwrap();
+        let Some(tune) = guard.as_mut() else { return };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let before = tune.slots;
+        if let Some(slots) = tune.look(sys.available_memory()) {
+            if slots != before {
+                tracing::info!("expert host tier: {before} to {slots} slots/layer");
+                self.set_expert_cache(slots);
+            }
+        }
     }
 
     /// Pick between the files the routed experts are stored in by `choice`, the experts ranked
