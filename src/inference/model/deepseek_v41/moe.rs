@@ -524,11 +524,24 @@ impl Moe {
         // Which of the batch's experts the host's memory holds before the batch is admitted:
         // what a prompt's plan copies from memory rather than from the file.
         let kept_before: Vec<bool> = if n > VERIFY_BATCH_MAX_ROWS {
-            uses.iter().map(|&(e, _, _)| self.experts.is_kept(e)).collect()
+            uses.iter()
+                .map(|&(e, _, _)| self.experts.is_kept(e))
+                .collect()
         } else {
             Vec::new()
         };
-        stage("moe expert admit", || self.experts.prefetch(&uses, n as u64))?;
+        // Which of a decoded token's experts the tier did not hold before this admission: the
+        // ones whose pages may still be on the disk.
+        let cold: Vec<bool> = if n == 1 {
+            uses.iter()
+                .map(|&(e, _, _)| !self.experts.is_kept(e))
+                .collect()
+        } else {
+            vec![false; uses.len()]
+        };
+        stage("moe expert admit", || {
+            self.experts.prefetch(&uses, n as u64)
+        })?;
         let active: Vec<usize> = uses.iter().map(|&(e, _, _)| e).collect();
         {
             let layer = self as *const Moe as usize;
@@ -670,6 +683,7 @@ impl Moe {
                         self.swiglu_limit,
                         observer.is_some(),
                         defer,
+                        &cold,
                         layer_dev.as_ref().map(|(hooks, ctx)| {
                             crate::inference::offload::moe_dispatch::DevRun { hooks, ctx }
                         }),

@@ -104,9 +104,11 @@ pub(crate) struct DevRun<'a> {
 /// Run the `active` experts of one block: resident ones on the cards, the misses on the cores at
 /// the same instant. `assign[e]` is expert `e`'s `(token, weight)` rows; `xv[t]` is token `t`'s
 /// row; `active_refs[i]` is the handle for `active[i]`; `n` is the batch width; `observed` is true
-/// when a calibration wants each expert's rows, which forces the per-expert path. A decode that
-/// runs its misses beside the cards may hand up to `defer` of the host's experts, lightest routing
-/// weight first, to a job that outlives the call; the caller finds them in the third answer.
+/// when a calibration wants each expert's rows, which forces the per-expert path; `cold[i]` is
+/// true when `active[i]` was not in the host tier before the block was admitted. A decode that
+/// runs its misses beside the cards may hand up to `defer` of the host's experts, lightest
+/// routing weight first, to a job that outlives the call; the caller finds them in the third
+/// answer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_routed(
     off: &ExpertOffload,
@@ -119,6 +121,7 @@ pub(crate) fn run_routed(
     swiglu_limit: f32,
     observed: bool,
     defer: usize,
+    cold: &[bool],
     dev: Option<DevRun>,
 ) -> Routed {
     let ref_of: HashMap<usize, Arc<Expert>> = active
@@ -156,6 +159,10 @@ pub(crate) fn run_routed(
             let mut cpu_pos: Vec<usize> = (0..active.len())
                 .filter(|&i| !is_on(&active_refs[i]))
                 .collect();
+            // The experts the tier held run first, so the reads of the others, asked for before
+            // the compute began, go on beside that work. Each output keeps its own position, so
+            // the sum is taken in the order it always was.
+            cpu_pos.sort_by_key(|&i| cold.get(i).copied().unwrap_or(false));
             // The lightest of the host's experts leave for the deferred job: their share of the
             // layer's output is the smallest, and the stream takes it a layer late.
             let weight_of = |i: usize| assign[active[i]].first().map_or(0.0, |&(_, w)| w);
