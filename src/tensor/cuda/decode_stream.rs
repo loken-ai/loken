@@ -748,6 +748,35 @@ pub fn topk_select(
     Ok((out, outf))
 }
 
+/// `swiglu(g, u)` for each value of a layer's gate and up products, the gate clamped from above
+/// and the up value on both sides when `limit` is positive.
+pub fn swiglu_limit(
+    dev: &CudaDevice,
+    g: &CudaView<'_, f32>,
+    u: &CudaView<'_, f32>,
+    limit: f32,
+) -> Result<CudaSlice<f32>> {
+    let n = g.len();
+    if u.len() < n {
+        return Err(Error(format!(
+            "swiglu: {} gate and {} up values",
+            n,
+            u.len()
+        )));
+    }
+    let out = alloc_f32(dev, "swiglu", n)?;
+    let func = dev.quantized_fn("swiglu_limit_f32")?;
+    let n_i = n as i64;
+    let mut b = dev.stream().launch_builder(&func);
+    b.arg(g);
+    b.arg(u);
+    b.arg(&out);
+    b.arg(&n_i);
+    b.arg(&limit);
+    unsafe { b.launch(grid_for(n)) }.map_err(|e| launch_err("swiglu_limit_f32", e))?;
+    Ok(out)
+}
+
 /// The candidate blocks of one query's index `scores`, over the `reach` reachable positions: 1.0
 /// where a position lies in a kept block, 0.0 elsewhere, one value for each score.
 pub fn candidate_mask(
@@ -1018,6 +1047,39 @@ mod tests {
             assert_eq!(got_sorted, want_sorted, "g {g} reach {reach} k {k}");
             assert!(got[k.min(reach)..].iter().all(|&v| v == -1));
             assert_eq!(gotf.iter().map(|&v| v as i32).collect::<Vec<_>>(), got);
+        }
+    }
+
+    /// The card's SwiGLU gives the host's value, with the clamp and without it.
+    #[test]
+    fn the_card_applies_the_hosts_swiglu() {
+        use crate::inference::offload::experts::swiglu;
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card SwiGLU is NOT covered by this run");
+            return;
+        };
+        let g = wave(2304, 0.173, 9.0);
+        let u = wave(2304, 0.071, 11.0);
+        for limit in [0.0f32, 7.0, 3.5] {
+            let gd = upload_f32(&dev, "g", &g).unwrap();
+            let ud = upload_f32(&dev, "u", &u).unwrap();
+            let h =
+                swiglu_limit(&dev, &gd.slice(0..g.len()), &ud.slice(0..u.len()), limit).unwrap();
+            let got = download(&dev, &h);
+            let want: Vec<f32> = g
+                .iter()
+                .zip(&u)
+                .map(|(&g, &u)| swiglu(g, u, limit))
+                .collect();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                .fold(0f32, f32::max);
+            assert!(
+                worst < 1e-6,
+                "limit {limit}: worst relative difference {worst}"
+            );
         }
     }
 

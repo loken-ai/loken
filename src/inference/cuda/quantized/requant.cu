@@ -2207,6 +2207,14 @@ __device__ static float cx_swiglu(float g, float u, const float limit) {
     return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, cx_exp(-g))), u);
 }
 
+// h[i] = swiglu(g[i], u[i]) over a layer's gate and up products, one thread to a value.
+extern "C" __global__ void swiglu_limit_f32(
+        const float * __restrict__ g, const float * __restrict__ u, float * __restrict__ h,
+        const long n, const float limit) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i < n) h[i] = cx_swiglu(g[i], u[i], limit);
+}
+
 // The 32 signed weights of an IQ2_XXS sub-block, four to an int in the order the activations run.
 __device__ static void cx_iq2xxs_sub(
         const unsigned char * q, const unsigned char * grid, const unsigned char * signs,

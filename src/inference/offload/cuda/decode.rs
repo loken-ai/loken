@@ -12,9 +12,9 @@ use crate::inference::offload::{
     CacheAppend, Crossing, DecodeAttn, DecodeRouter, DecodeStream, DevCache, HcDev, HostCache,
 };
 use crate::tensor::cuda::{
-    alloc_i32, apply_candidate_mask, candidate_mask, compress_pool, copy_f32, fp4_round, fp8_round, gather_ring, index_scores_dev,
-    pack_download, rope_rows, router_select, sparse_attention_dev, topk_select, upload_f32,
-    upload_i32, DecodeStreamDev, GrowDev, RingDev,
+    alloc_i32, apply_candidate_mask, candidate_mask, compress_pool, copy_f32, fp4_round, fp8_round,
+    gather_ring, index_scores_dev, pack_download, rope_rows, router_select, sparse_attention_dev,
+    swiglu_limit, topk_select, upload_f32, upload_i32, DecodeStreamDev, GrowDev, RingDev,
 };
 use crate::tensor::cuda_ext::{f32_slice_of, tensor_from_f32_slice, TensorCudaSlice};
 use crate::tensor::gpu_runtime::driver::CudaView;
@@ -748,15 +748,12 @@ impl Card {
                 Some((m1, m3, m2, limit)) => {
                     let g = m1.forward(&xin_t)?;
                     let u = m3.forward(&xin_t)?;
-                    let h = if *limit > 0.0 {
-                        let hi = Tensor::full(*limit, 1, &dev)?;
-                        let lo = Tensor::full(-*limit, 1, &dev)?;
-                        let g = g.broadcast_minimum(&hi)?;
-                        let u = u.broadcast_maximum(&lo)?.broadcast_minimum(&hi)?;
-                        g.silu()?.mul(&u)?
-                    } else {
-                        g.silu()?.mul(&u)?
-                    };
+                    let n = g.elem_count();
+                    let h = tensor_of(
+                        &dev,
+                        swiglu_limit(cd, &dview(&g)?.view()?, &dview(&u)?.view()?, *limit)?,
+                        (1, n),
+                    )?;
                     Some(m2.forward(&h)?)
                 }
                 None => None,
