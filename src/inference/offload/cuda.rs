@@ -236,6 +236,7 @@ fn upload_worker(
         match sent {
             Some((gate, up, down)) if !t.kept.contains_key(&job.key) => {
                 admission.note_upload(ns);
+                job.expert.dont_need();
                 let used = t.clock;
                 t.kept.insert(
                     job.key,
@@ -657,6 +658,11 @@ impl Card {
         }));
         let upload_ns = upload_started.elapsed().as_nanos() as u64;
         super::prof_record("card expert upload", upload_ns);
+        // The card holds its copy now: the host pages the copy was read through serve nothing
+        // while the card keeps the expert, and would take the room of experts the host needs.
+        if matches!(sent, Ok(Some(_))) {
+            e.dont_need();
+        }
         let Ok(Some((gate_d, up_d, down_d))) = sent else {
             self.give_room(total);
             self.decline(

@@ -416,10 +416,11 @@ impl ExpertStore {
             .copied()
     }
 
+    /// Let expert `id` go from the tier. Its pages stay where the kernel keeps them: memory
+    /// still free serves a later request for it, and the kernel takes them back when it needs
+    /// the room.
     fn evict(&self, g: &mut CacheInner, id: usize) {
-        if let Some(e) = g.kept.remove(&id) {
-            let loader = self.loader.clone();
-            drop_later(Box::new(move || loader.release(&e)));
+        if g.kept.remove(&id).is_some() {
             g.stats.evictions += 1;
         }
     }
