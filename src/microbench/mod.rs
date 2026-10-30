@@ -20,6 +20,7 @@ pub mod crossing;
 pub mod expert_read;
 #[cfg(feature = "gpu")]
 pub mod expert_upload;
+pub mod host_expert;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -136,6 +137,14 @@ pub struct Options {
     #[arg(long, default_value_t = 6.0)]
     pub disk_gbs: f64,
 
+    /// The format of an expert's gate and up weights, for `host-expert`
+    #[arg(long, default_value = "iq2_xxs")]
+    pub gate_format: String,
+
+    /// The format of an expert's down weights, for `host-expert`
+    #[arg(long, default_value = "q2_k")]
+    pub down_format: String,
+
     /// Write the JSON record here
     #[arg(long)]
     pub json: Option<PathBuf>,
@@ -193,6 +202,12 @@ pub fn benches() -> Vec<Bench> {
             run: expert_upload::run,
         });
     }
+    all.push(Bench {
+        name: "host-expert",
+        about: "one routed expert computed on the host cores from memory: the floor of a miss once its pages are there",
+        needs_card: false,
+        run: host_expert::run,
+    });
     all.push(Bench {
         name: "cache-policy",
         about: "the experts a host tier misses per token, for a policy and a size, on a routing drawn from an expert profile",

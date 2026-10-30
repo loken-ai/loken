@@ -269,6 +269,67 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
             Ok(())
         },
     )?);
+    // Pages already in the page cache but not mapped by this process: touching them costs a
+    // minor fault per page. Prepared outside the timed part: read once, then the mapping alone
+    // dropped, which leaves the cached pages where they are.
+    let zap = |spans: &[Span]| {
+        for &(off, len) in spans {
+            let lo = off / page * page;
+            let hi = (off + len).div_ceil(page) * page;
+            // Safety: advice on a read-only file mapping this function owns.
+            unsafe {
+                libc::madvise(
+                    map.as_ptr().add(lo) as *mut libc::c_void,
+                    hi - lo,
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    };
+    let mut next = 1000usize;
+    let mut cached_variant =
+        |variant: &str, zapped: bool, body: &mut dyn FnMut(&[Span])| -> Vec<f64> {
+            let _ = variant;
+            run_for(target, || {
+                let spans = plan.spans(next);
+                next += 1;
+                for &(off, len) in &spans {
+                    touch(&map[off..off + len], page);
+                }
+                if zapped {
+                    zap(&spans);
+                }
+                let t = Instant::now();
+                body(&spans);
+                t.elapsed().as_secs_f64() * 1e6
+            })
+        };
+    for (name, zapped, populate) in [
+        ("pages cached and mapped, touch", false, false),
+        ("pages cached, mapping dropped, touch", true, false),
+        (
+            "pages cached, mapping dropped, populate then touch",
+            true,
+            true,
+        ),
+    ] {
+        let samples = cached_variant(name, zapped, &mut |spans| {
+            if populate {
+                for &(off, len) in spans {
+                    mapped::advise_span(map.as_ptr() as usize + off, len, 22, false);
+                }
+            }
+            for &(off, len) in spans {
+                touch(&map[off..off + len], page);
+            }
+        });
+        rows.push(Measured {
+            variant: name.to_string(),
+            bytes,
+            samples_us: samples,
+            note: Some("the pages were in the page cache before the call".to_string()),
+        });
+    }
     // The whole file marked for sequential reads, as the reference engines mark it before
     // mapping: the kernel then reads a larger window ahead of every fault. Set once; the variants
     // after this one run under it.
