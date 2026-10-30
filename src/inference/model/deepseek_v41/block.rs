@@ -203,6 +203,10 @@ impl LayerAttn {
                     head_dim: i.index_head_dim,
                     topk: i.index_topk,
                     eps: i.eps,
+                    is_candidate_source: i.is_candidate_source,
+                    uses_candidates: i.uses_candidates,
+                    candidate_block_size: i.candidate_block_size,
+                    candidate_topk_blocks: i.candidate_topk_blocks,
                 }),
                 cos,
                 sin,
@@ -575,11 +579,6 @@ impl Block {
         index_source: Option<usize>,
     ) -> Result<()> {
         use crate::inference::offload::{stage, HostCache};
-        if self.attn.uses_candidates() {
-            return Err(crate::tensor::Error::msg(
-                "the candidate pre-filter runs on the host",
-            ));
-        }
         let a = self
             .attn
             .decode_dev(&self.attn_norm, cos, sin, pos, index_source);

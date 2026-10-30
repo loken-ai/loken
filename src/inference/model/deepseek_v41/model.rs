@@ -1530,6 +1530,10 @@ impl DeepseekV41Model {
             tracing::debug!(
                 "layer {i}: the card does not run the attention ({e}); the host runs the layer"
             );
+            // A reader of the candidate blocks takes the mask the source published on the card.
+            if block.attn.uses_candidates() && shared.candidates.is_none() {
+                shared.candidates = Some(ds.candidates()?.unwrap_or_default());
+            }
             let (x, pm) = to_host(ds)?;
             return Ok(DevStep::ToHost(x, pm));
         }

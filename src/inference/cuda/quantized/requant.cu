@@ -3336,6 +3336,76 @@ __device__ static int dec_block_scan(int v, int * scratch) {
     return scratch[threadIdx.x] - v;
 }
 
+// The candidate blocks of one query's index scores, level one of the two-level pre-filter: each
+// block of `block_size` positions is scored by its best position below `reach`, the block holding
+// the newest reachable position is pinned, and the `topk_blocks` best blocks (ties to the lower
+// block) that are not -inf are kept. `mask` [width] is 1 in a kept block and 0 elsewhere.
+// `bscore` and `chosen` [blocks] are scratch. One block of threads, a multiple of 32.
+extern "C" __global__ void candidate_blocks_f32(
+        const float * __restrict__ scores, const long width, const long reach,
+        const long block_size, const long topk_blocks,
+        float * __restrict__ bscore, float * __restrict__ chosen, float * __restrict__ mask) {
+    __shared__ float rv[32];
+    __shared__ long ri[32];
+    __shared__ long picked;
+    const long nb = (width + block_size - 1) / block_size;
+    for (long j = threadIdx.x; j < nb; j += blockDim.x) {
+        float m = -INFINITY;
+        const long end = (j + 1) * block_size < width ? (j + 1) * block_size : width;
+        for (long p = j * block_size; p < end; ++p) {
+            const float v = p < reach ? scores[p] : -INFINITY;
+            m = fmaxf(m, v);
+        }
+        bscore[j] = m;
+        chosen[j] = 0.0f;
+    }
+    __syncthreads();
+    const long last = reach > 0 ? (reach - 1) / block_size : 0;
+    if (threadIdx.x == 0 && last < nb) bscore[last] = INFINITY;
+    __syncthreads();
+    const long k = topk_blocks < nb ? topk_blocks : nb;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, warps = blockDim.x / 32;
+    for (long it = 0; it < k; ++it) {
+        float bv = -INFINITY;
+        long bi = -1;
+        for (long j = threadIdx.x; j < nb; j += blockDim.x) {
+            if (chosen[j] == 0.0f && bscore[j] > bv) { bv = bscore[j]; bi = j; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const long oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { rv[warp] = bv; ri[warp] = bi; }
+        __syncthreads();
+        if (warp == 0) {
+            bv = lane < warps ? rv[lane] : -INFINITY;
+            bi = lane < warps ? ri[lane] : -1;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+                const long oi = __shfl_down_sync(0xffffffffu, bi, off);
+                if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+            }
+            if (lane == 0) {
+                picked = bi;
+                if (bi >= 0) chosen[bi] = 1.0f;
+            }
+        }
+        __syncthreads();
+        if (picked < 0) break;
+        __syncthreads();
+    }
+    __syncthreads();
+    for (long p = threadIdx.x; p < width; p += blockDim.x) mask[p] = chosen[p / block_size];
+}
+
+// Level two's mask step for one query: every score outside a candidate block set to -inf.
+extern "C" __global__ void apply_candidate_mask_f32(
+        float * __restrict__ scores, const float * __restrict__ mask, const long width) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i < width && mask[i] == 0.0f) scores[i] = -INFINITY;
+}
+
 // The `k` largest of `scores[0 .. reach)`, the set a descending stable sort keeps (ties to the
 // lower index), as slots `index + offset` in `out` [k] and the same as floats in `outf`, -1 past
 // the ones found. One block: the k-th largest key is found by a binary search over the key space

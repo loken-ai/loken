@@ -12,7 +12,7 @@ use crate::inference::offload::{
     CacheAppend, Crossing, DecodeAttn, DecodeRouter, DecodeStream, DevCache, HcDev, HostCache,
 };
 use crate::tensor::cuda::{
-    alloc_i32, compress_pool, copy_f32, fp4_round, fp8_round, gather_ring, index_scores_dev,
+    alloc_i32, apply_candidate_mask, candidate_mask, compress_pool, copy_f32, fp4_round, fp8_round, gather_ring, index_scores_dev,
     pack_download, rope_rows, router_select, sparse_attention_dev, topk_select, upload_f32,
     upload_i32, DecodeStreamDev, GrowDev, RingDev,
 };
@@ -273,6 +273,7 @@ impl Card {
         s: &mut DecodeStreamDev,
         rope: &mut HashMap<(TensorId, usize), RopeRows>,
         topk_in: Option<&(usize, usize, Arc<CudaSlice<i32>>)>,
+        candidates: &mut Option<(usize, Arc<CudaSlice<f32>>)>,
         hc: &HcDev,
         a: &DecodeAttn,
         cache: &mut DevCache,
@@ -499,7 +500,7 @@ impl Card {
                             upload_f32(cd, "top-k", &vec![-1f32; ix.topk])?,
                         )
                     } else {
-                        let scores = index_scores_dev(
+                        let mut scores = index_scores_dev(
                             cd,
                             &iqs,
                             &keys,
@@ -509,6 +510,29 @@ impl Card {
                             scale,
                             a.pos,
                         )?;
+                        // The two-level candidate pre-filter: a source publishes the blocks its
+                        // scores keep, a reader scores only inside them.
+                        if ix.is_candidate_source {
+                            let mask = candidate_mask(
+                                cd,
+                                &scores,
+                                clen,
+                                ix.candidate_block_size,
+                                ix.candidate_topk_blocks,
+                            )?;
+                            *candidates = Some((self.ordinal, Arc::new(mask)));
+                        } else if ix.uses_candidates {
+                            match candidates {
+                                Some((ord, mask)) if *ord == self.ordinal && mask.len() >= gtot => {
+                                    apply_candidate_mask(cd, &mut scores, mask)?
+                                }
+                                _ => {
+                                    return Err(Error::msg(
+                                        "the candidate mask is not on this card",
+                                    ))
+                                }
+                            }
+                        }
                         topk_select(cd, &scores, clen, ix.topk, w)?
                     };
                     pending.topk = Some(floats);
@@ -855,6 +879,8 @@ pub struct CardsDecode {
     rope: HashMap<(TensorId, usize), RopeRows>,
     /// The top-k the last index-source published this token: its card, its layer, the slots.
     topk: Option<(usize, usize, Arc<CudaSlice<i32>>)>,
+    /// The candidate mask the last candidate source published this token: its card, the flags.
+    candidates: Option<(usize, Arc<CudaSlice<f32>>)>,
     /// The shared expert's output of the FFN in flight, awaiting the routed sum.
     shared_out: Option<Option<Tensor>>,
 }
@@ -873,6 +899,7 @@ impl CardsDecode {
                     s,
                     rope: HashMap::new(),
                     topk: None,
+                    candidates: None,
                     shared_out: None,
                 });
             }
@@ -931,6 +958,7 @@ impl DecodeStream for CardsDecode {
                 &mut self.s,
                 &mut self.rope,
                 topk_in,
+                &mut self.candidates,
                 hc,
                 attn,
                 cache,
@@ -964,6 +992,23 @@ impl DecodeStream for CardsDecode {
             .ok_or_else(|| Error::msg("the card cannot keep the layer's router"))??;
         self.shared_out = Some(shared);
         Ok(crossing)
+    }
+
+    fn candidates(&mut self) -> Result<Option<Vec<bool>>> {
+        let Some((ordinal, mask)) = &self.candidates else {
+            return Ok(None);
+        };
+        let card = self
+            .cards
+            .iter()
+            .find(|c| c.ordinal == *ordinal)
+            .ok_or_else(|| Error::msg("the candidate mask's card is gone"))?;
+        let flags = card
+            .dev
+            .stream()
+            .clone_dtoh(mask.as_ref())
+            .map_err(|e| Error(format!("candidate mask download: {e}")))?;
+        Ok(Some(flags.into_iter().map(|f| f != 0.0).collect()))
     }
 
     fn moe_finish(&mut self, routed: &[f32]) -> Result<()> {

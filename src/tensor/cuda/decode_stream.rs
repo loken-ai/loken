@@ -748,6 +748,69 @@ pub fn topk_select(
     Ok((out, outf))
 }
 
+/// The candidate blocks of one query's index `scores`, over the `reach` reachable positions: 1.0
+/// where a position lies in a kept block, 0.0 elsewhere, one value for each score.
+pub fn candidate_mask(
+    dev: &CudaDevice,
+    scores: &CudaSlice<f32>,
+    reach: usize,
+    block_size: usize,
+    topk_blocks: usize,
+) -> Result<CudaSlice<f32>> {
+    let width = scores.len();
+    if block_size == 0 || reach > width {
+        return Err(Error(format!(
+            "candidate blocks: {reach} reachable of {width} scores in blocks of {block_size}"
+        )));
+    }
+    let blocks = width.div_ceil(block_size).max(1);
+    let bscore = alloc_f32(dev, "candidate block scores", blocks)?;
+    let chosen = alloc_f32(dev, "candidate blocks chosen", blocks)?;
+    let mask = alloc_f32(dev, "candidate mask", width.max(1))?;
+    let func = dev.quantized_fn("candidate_blocks_f32")?;
+    let (width_i, reach_i, bs_i, k_i) = (
+        width as i64,
+        reach as i64,
+        block_size as i64,
+        topk_blocks as i64,
+    );
+    let mut b = dev.stream().launch_builder(&func);
+    b.arg(scores);
+    b.arg(&width_i);
+    b.arg(&reach_i);
+    b.arg(&bs_i);
+    b.arg(&k_i);
+    b.arg(&bscore);
+    b.arg(&chosen);
+    b.arg(&mask);
+    unsafe { b.launch(one_block(256, 0)) }.map_err(|e| launch_err("candidate_blocks_f32", e))?;
+    Ok(mask)
+}
+
+/// `scores` with every position outside the candidate blocks of `mask` set to -inf.
+pub fn apply_candidate_mask(
+    dev: &CudaDevice,
+    scores: &mut CudaSlice<f32>,
+    mask: &CudaSlice<f32>,
+) -> Result<()> {
+    let width = scores.len();
+    if mask.len() < width {
+        return Err(Error(format!(
+            "candidate mask: {} values for {width} scores",
+            mask.len()
+        )));
+    }
+    let func = dev.quantized_fn("apply_candidate_mask_f32")?;
+    let width_i = width as i64;
+    let mut b = dev.stream().launch_builder(&func);
+    b.arg(scores);
+    b.arg(mask);
+    b.arg(&width_i);
+    unsafe { b.launch(grid_for(width)) }
+        .map(|_| ())
+        .map_err(|e| launch_err("apply_candidate_mask_f32", e))
+}
+
 /// A token's routed experts from its gate logits `z` [n] and the selection bias: `[2k]`, the
 /// chosen experts as floats then their weights (see the kernel).
 #[allow(clippy::too_many_arguments)]
@@ -955,6 +1018,53 @@ mod tests {
             assert_eq!(got_sorted, want_sorted, "g {g} reach {reach} k {k}");
             assert!(got[k.min(reach)..].iter().all(|&v| v == -1));
             assert_eq!(gotf.iter().map(|&v| v as i32).collect::<Vec<_>>(), got);
+        }
+    }
+
+    /// The card keeps the candidate blocks the host keeps, and a reader's scores outside them
+    /// become -inf, for scores with ties and a reach short of the width.
+    #[test]
+    fn the_card_keeps_the_hosts_candidate_blocks() {
+        use crate::inference::model::deepseek_v41::candidates::{
+            apply_candidate_mask as host_apply, select_candidate_blocks,
+        };
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card candidate blocks are NOT covered by this run");
+            return;
+        };
+        for (width, reach, block, keep) in [
+            (5000usize, 4321usize, 64usize, 16usize),
+            (700, 700, 32, 8),
+            (100, 37, 16, 4),
+            (50, 50, 64, 3),
+            (9, 0, 4, 2),
+        ] {
+            // Ties: every third score repeats; positions past the reach are -inf.
+            let scores: Vec<f32> = (0..width)
+                .map(|i| {
+                    if i < reach {
+                        ((i / 3) as f32 * 0.731).sin()
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect();
+            let want = select_candidate_blocks(&scores, 1, width, &[reach], keep, block);
+            let sd = upload_f32(&dev, "s", &scores).unwrap();
+            let mask = candidate_mask(&dev, &sd, reach, block, keep).unwrap();
+            let got: Vec<bool> = download(&dev, &mask).iter().map(|&f| f != 0.0).collect();
+            assert_eq!(
+                got, want,
+                "width {width} reach {reach} block {block} keep {keep}"
+            );
+            let reader: Vec<f32> = wave(width, 0.37, 2.0);
+            let mut rd = upload_f32(&dev, "r", &reader).unwrap();
+            apply_candidate_mask(&dev, &mut rd, &mask).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&download(&dev, &rd)),
+                bits(&host_apply(&reader, &want))
+            );
         }
     }
 

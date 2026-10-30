@@ -304,6 +304,12 @@ pub struct IndexerDev<'a> {
     pub head_dim: usize,
     pub topk: usize,
     pub eps: f32,
+    /// The layer publishes the candidate blocks of its scores for the readers below it.
+    pub is_candidate_source: bool,
+    /// The layer restricts its scores to the blocks a candidate source published.
+    pub uses_candidates: bool,
+    pub candidate_block_size: usize,
+    pub candidate_topk_blocks: usize,
 }
 
 /// One layer's attention for a decode on a card: the base block of every layer, the compressor
@@ -411,6 +417,12 @@ pub trait DecodeStream: Send {
     /// The rows the last attention appended to `cache` and not yet read back, for a host that
     /// finishes the layer.
     fn take_append(&mut self, cache: &mut DevCache) -> Result<Option<CacheAppend>>;
+
+    /// The candidate mask the last candidate source published this token, one flag per score,
+    /// for a host that runs a reader of it; `None` when none was published.
+    fn candidates(&mut self) -> Result<Option<Vec<bool>>> {
+        Ok(None)
+    }
 
     /// The collapse weights the next sublayer input is taken with.
     fn pre(&mut self) -> Result<Vec<f32>>;
