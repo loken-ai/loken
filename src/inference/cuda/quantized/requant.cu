@@ -3136,6 +3136,36 @@ extern "C" __global__ void index_scores_f32(
     out[idx] = acc;
 }
 
+// Index scores of one decoded token, a block for each compressed position and a thread for each
+// head: the same products and the same sum over the heads, in head order, as `index_scores_f32`
+// gives a single query. Launched with `nh * 4` bytes of shared memory and at most 1024 threads.
+extern "C" __global__ void index_scores_heads_f32(
+        const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ w,
+        float * __restrict__ out, const long nh, const long ihd, const long g,
+        const long ratio, const long q_off, const float scale) {
+    extern __shared__ float contrib[];
+    const long t = blockIdx.x;
+    long reach = (q_off + 1) / ratio;
+    if (reach > g) reach = g;
+    if (t >= reach) {
+        if (threadIdx.x == 0) out[t] = -INFINITY;
+        return;
+    }
+    const float * kk = k + t * ihd;
+    for (long hh = threadIdx.x; hh < nh; hh += blockDim.x) {
+        const float * qq = q + hh * ihd;
+        float dot = 0.0f;
+        for (long c = 0; c < ihd; c++) dot += qq[c] * kk[c];
+        contrib[hh] = fmaxf(dot, 0.0f) * w[hh] * scale;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float acc = 0.0f;
+        for (long hh = 0; hh < nh; hh++) acc += contrib[hh];
+        out[t] = acc;
+    }
+}
+
 // The keys of each query of a chunk gathered: row `k` of query `i` is `kv[idxs[(start + i) * topk + k]]`,
 // zeros for an empty slot. The output is [count, topk, d].
 extern "C" __global__ void gather_slots_f32(

@@ -693,15 +693,8 @@ pub fn index_scores_dev(
     if g == 0 {
         return Ok(out);
     }
-    let func = dev.quantized_fn("index_scores_f32")?;
-    let dims = [
-        1i64,
-        nh as i64,
-        ihd as i64,
-        g as i64,
-        ratio as i64,
-        pos as i64,
-    ];
+    let func = dev.quantized_fn("index_scores_heads_f32")?;
+    let dims = [nh as i64, ihd as i64, g as i64, ratio as i64, pos as i64];
     let mut b = dev.stream().launch_builder(&func);
     b.arg(q);
     b.arg(k);
@@ -711,7 +704,12 @@ pub fn index_scores_dev(
         b.arg(v);
     }
     b.arg(&scale);
-    unsafe { b.launch(grid_for(g)) }.map_err(|e| launch_err("index_scores_f32", e))?;
+    let cfg = LaunchConfig {
+        grid_dim: (g as u32, 1, 1),
+        block_dim: ((nh.clamp(1, 1024)) as u32, 1, 1),
+        shared_mem_bytes: (nh * std::mem::size_of::<f32>()) as u32,
+    };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("index_scores_heads_f32", e))?;
     Ok(out)
 }
 
@@ -1080,6 +1078,62 @@ mod tests {
                 worst < 1e-6,
                 "limit {limit}: worst relative difference {worst}"
             );
+        }
+    }
+
+    /// The card's index scores of a decoded token are the host's: the sum over the heads of
+    /// relu(q . k) * weight * scale for the reachable positions, -inf past them.
+    #[test]
+    fn the_card_scores_the_index_as_the_host_does() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card index scores are NOT covered by this run");
+            return;
+        };
+        for (nh, ihd, g, ratio, pos) in [
+            (64usize, 128usize, 25usize, 4usize, 99usize),
+            (8, 32, 40, 2, 30),
+        ] {
+            let q = wave(nh * ihd, 0.173, 1.5);
+            let k = wave(g * ihd, 0.071, 1.2);
+            let w = wave(nh, 0.9, 0.5);
+            let scale = (ihd as f32).powf(-0.5) * (nh as f32).powf(-0.5);
+            let qd = upload_f32(&dev, "q", &q).unwrap();
+            let kd = upload_f32(&dev, "k", &k).unwrap();
+            let wd = upload_f32(&dev, "w", &w).unwrap();
+            let got = download(
+                &dev,
+                &index_scores_dev(
+                    &dev,
+                    &qd,
+                    &kd.slice(0..k.len()),
+                    &wd.slice(0..w.len()),
+                    (nh, ihd, g),
+                    ratio,
+                    scale,
+                    pos,
+                )
+                .unwrap(),
+            );
+            let reach = ((pos + 1) / ratio).min(g);
+            for t in 0..g {
+                if t >= reach {
+                    assert_eq!(got[t], f32::NEG_INFINITY, "position {t} is out of reach");
+                    continue;
+                }
+                let mut acc = 0f32;
+                for h in 0..nh {
+                    let mut dot = 0f32;
+                    for c in 0..ihd {
+                        dot += q[h * ihd + c] * k[t * ihd + c];
+                    }
+                    acc += dot.max(0.0) * w[h] * scale;
+                }
+                assert!(
+                    (got[t] - acc).abs() <= 1e-5 * acc.abs().max(1.0),
+                    "position {t}: card {} host {acc}",
+                    got[t]
+                );
+            }
         }
     }
 
