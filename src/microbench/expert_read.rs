@@ -269,6 +269,42 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
             Ok(())
         },
     )?);
+    // The whole file marked for sequential reads, as the reference engines mark it before
+    // mapping: the kernel then reads a larger window ahead of every fault. Set once; the variants
+    // after this one run under it.
+    // Safety: advice on a read-only mapping this function owns.
+    let marked = unsafe {
+        libc::madvise(
+            map.as_ptr() as *mut libc::c_void,
+            map.len(),
+            libc::MADV_SEQUENTIAL,
+        )
+    } == 0;
+    if marked {
+        rows.push(measure(
+            "touch, 1 thread, file marked sequential".to_string(),
+            &mut |spans| {
+                for &(off, len) in spans {
+                    touch(&map[off..off + len], page);
+                }
+                Ok(())
+            },
+        )?);
+        rows.push(measure(
+            format!("touch, {threads} threads, file marked sequential"),
+            &mut |spans| {
+                touch_threads(&map, spans, page, threads);
+                Ok(())
+            },
+        )?);
+        rows.push(measure(
+            "touch, 16 threads, file marked sequential".to_string(),
+            &mut |spans| {
+                touch_threads(&map, spans, page, 16);
+                Ok(())
+            },
+        )?);
+    }
     rows.push(measure(
         "willneed per projection, then touch it".to_string(),
         &mut |spans| {
