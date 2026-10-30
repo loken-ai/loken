@@ -724,10 +724,7 @@ mod tests {
             verbose,
             keep_alive,
             ..
-        } = cli.command
-        else {
-            panic!("not the serve command");
-        };
+        } = cli.command;
         assert_eq!(port, Some(9000));
         assert_eq!(models_dir.as_deref(), Some("/tmp/models"));
         assert!(verbose);
@@ -740,9 +737,7 @@ mod tests {
 
         let cli = Cli::parse_from(args);
 
-        let Commands::Serve { keep_alive, .. } = cli.command else {
-            panic!("not the serve command");
-        };
+        let Commands::Serve { keep_alive, .. } = cli.command;
         assert_eq!(keep_alive, Some("10m".to_string()));
     }
 }
