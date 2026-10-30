@@ -280,6 +280,15 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
         },
     )?);
     rows.push(measure(
+        "willneed on every projection, the advice calls alone".to_string(),
+        &mut |spans| {
+            for &s in spans {
+                range(s)?.will_need();
+            }
+            Ok(())
+        },
+    )?);
+    rows.push(measure(
         "willneed over the whole expert, then touch".to_string(),
         &mut |spans| {
             for &s in spans {
