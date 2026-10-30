@@ -176,7 +176,11 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
     };
     for &slots in &cx.options.slots {
         for policy in [Policy::Static, Policy::Recency, Policy::Frequency] {
-            for &hit in &hits {
+            for (&hit, &block) in hits
+                .iter()
+                .flat_map(|h| cx.options.block.iter().map(move |b| (h, b)))
+            {
+                let block = block.max(1);
                 let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
                 let mut tiers: Vec<Tier> = layers
                     .iter()
@@ -184,41 +188,61 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
                     .collect();
                 let (mut samples, mut in_block, mut routed, mut missed, mut wasted) =
                     (Vec::new(), 0u64, 0u64, 0u64, 0u64);
-                for t in 0..tokens {
-                    for (l, (weights, on_cards, _)) in layers.iter().enumerate() {
-                        let chosen = draw(weights, &mut rng);
-                        // The read-ahead reads what it names that no card and no tier holds,
-                        // and reads for nothing what the token then does not route to.
-                        for e in guess(&chosen, hit, weights, &mut rng) {
-                            if !on_cards.contains(&e)
-                                && !tiers[l].kept.contains(&e)
-                                && !chosen.contains(&e)
-                            {
-                                wasted += 1;
-                                in_block += 1;
+                // A block of `block` tokens is verified together: an expert it misses is read
+                // once for the whole block, and the block yields its first token and as many
+                // drafts as the acceptance keeps.
+                let emitted = 1.0
+                    + (1..block)
+                        .map(|i| cx.options.accept.powi(i as i32))
+                        .sum::<f64>();
+                let mut blocks = 0u64;
+                let mut t = 0usize;
+                while t < tokens {
+                    let mut read_in_block: HashSet<(usize, usize)> = HashSet::new();
+                    for b in 0..block {
+                        for (l, (weights, on_cards, _)) in layers.iter().enumerate() {
+                            let chosen = draw(weights, &mut rng);
+                            // The read-ahead reads what it names that no card and no tier holds,
+                            // and reads for nothing what the token then does not route to.
+                            if block == 1 {
+                                for e in guess(&chosen, hit, weights, &mut rng) {
+                                    if !on_cards.contains(&e)
+                                        && !tiers[l].kept.contains(&e)
+                                        && !chosen.contains(&e)
+                                    {
+                                        wasted += 1;
+                                        in_block += 1;
+                                    }
+                                }
                             }
-                        }
-                        for e in chosen {
-                            if on_cards.contains(&e) {
-                                continue;
-                            }
-                            routed += 1;
-                            if !tiers[l].route(e, t as u64) {
-                                in_block += 1;
-                                missed += 1;
+                            for e in chosen {
+                                if on_cards.contains(&e) {
+                                    continue;
+                                }
+                                routed += 1;
+                                if !tiers[l].route(e, (t + b) as u64)
+                                    && read_in_block.insert((l, e))
+                                {
+                                    in_block += 1;
+                                    missed += 1;
+                                }
                             }
                         }
                     }
-                    if (t + 1) % BLOCK == 0 {
-                        let bytes = in_block as f64 * expert_bytes as f64 / BLOCK as f64;
+                    blocks += 1;
+                    t += block;
+                    if blocks % (BLOCK as u64 / block as u64).max(1) == 0 {
+                        let bytes = in_block as f64 * expert_bytes as f64
+                            / (BLOCK as f64 / block as f64 * emitted);
                         samples.push(bytes / disk * 1e6);
                         in_block = 0;
                     }
                 }
-                let per_token = (missed + wasted) as f64 * expert_bytes as f64 / tokens as f64;
-                let waste = wasted as f64 * expert_bytes as f64 / tokens as f64;
+                let tokens_out = blocks as f64 * emitted;
+                let per_token = (missed + wasted) as f64 * expert_bytes as f64 / tokens_out;
+                let waste = wasted as f64 * expert_bytes as f64 / tokens_out;
                 rows.push(Measured {
-                    variant: format!("{slots} slots, {}, guess hit {hit}", policy.name()),
+                    variant: format!("{slots} slots, {}, guess hit {hit}, block {block}", policy.name()),
                     bytes: Some(per_token as u64),
                     samples_us: samples,
                     note: Some(format!(

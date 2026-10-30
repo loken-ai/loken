@@ -70,6 +70,25 @@ pub fn read_report() -> (u64, u64) {
     )
 }
 
+static ROUTED_AGAIN: AtomicU64 = AtomicU64::new(0);
+static ROUTED_DECODED: AtomicU64 = AtomicU64::new(0);
+
+/// Note how many of the experts a decoded token routed to `now` the previous token of the same
+/// layer had routed to as well: what a block of tokens verified together can read once.
+pub fn note_repeat(previous: &[usize], now: &[usize]) {
+    let again = now.iter().filter(|e| previous.contains(e)).count();
+    ROUTED_AGAIN.fetch_add(again as u64, Ordering::Relaxed);
+    ROUTED_DECODED.fetch_add(now.len() as u64, Ordering::Relaxed);
+}
+
+/// `(experts also routed by the layer's previous token, experts routed)` since start.
+pub fn repeat_report() -> (u64, u64) {
+    (
+        ROUTED_AGAIN.load(Ordering::Relaxed),
+        ROUTED_DECODED.load(Ordering::Relaxed),
+    )
+}
+
 static PREDICTED_USED: AtomicU64 = AtomicU64::new(0);
 static ACTUAL_ROUTED: AtomicU64 = AtomicU64::new(0);
 static ACTUAL_UNKEPT: AtomicU64 = AtomicU64::new(0);

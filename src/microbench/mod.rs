@@ -118,6 +118,16 @@ pub struct Options {
     #[arg(long, value_delimiter = ',', default_values_t = vec![1.0])]
     pub guess_hit: Vec<f64>,
 
+    /// Tokens verified together, a draft's block: the experts the block routes to are read once
+    /// for all of it, one variant for each size (`cache-policy`)
+    #[arg(long, value_delimiter = ',', default_values_t = vec![1])]
+    pub block: Vec<usize>,
+
+    /// The share of a draft token the verification accepts after the one before it was
+    /// accepted (`cache-policy`)
+    #[arg(long, default_value_t = 0.8)]
+    pub accept: f64,
+
     /// Tokens routed per variant (`cache-policy`)
     #[arg(long, default_value_t = 20000)]
     pub tokens: usize,

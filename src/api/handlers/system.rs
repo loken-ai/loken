@@ -434,7 +434,9 @@ pub(crate) async fn stage_performance_endpoint(
     let (routed, named, unkept, unkept_named) =
         crate::inference::offload::store::prediction_report();
     let (read_compute, read_ahead) = crate::inference::offload::store::read_report();
+    let (again, decoded) = crate::inference::offload::store::repeat_report();
     let prediction = serde_json::json!({
+        "routed_again": again, "decoded_routed": decoded,
         "read_for_compute": read_compute, "read_for_ahead": read_ahead,
         "routed": routed, "named": named, "unkept": unkept, "unkept_named": unkept_named,
     });
