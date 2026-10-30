@@ -200,9 +200,24 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
             .map_err(|e| format!("{e:?}"))
     };
 
+    // The sectors the disk under the file has read, which count what the kernel reads beyond the
+    // bytes a variant asks for.
+    let device = crate::inference::bench::report::Disk::of(&path).map(|d| d.device);
+    let sectors = || -> Option<u64> {
+        let device = device.as_deref()?;
+        std::fs::read_to_string("/proc/diskstats")
+            .ok()?
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>())
+            .find(|f| f.get(2) == Some(&device))?
+            .get(5)?
+            .parse()
+            .ok()
+    };
     let mut call = 0usize;
     let mut measure = |variant: String, body: &mut dyn FnMut(&[Span]) -> Result<(), String>| {
         let mut failed = None;
+        let before = sectors();
         let samples = run_for(target, || {
             let spans = plan.spans(call);
             call += 1;
@@ -220,13 +235,22 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
             }
             t.elapsed().as_secs_f64() * 1e6
         });
+        let read = before.zip(sectors()).map(|(b, a)| (a - b) * 512);
+        let note = read.zip(bytes).map(|(read, expert)| {
+            let per_call = read as f64 / samples.len().max(1) as f64;
+            format!(
+                "the disk read {:.1} MB per call, {:.2} times the expert",
+                per_call / 1e6,
+                per_call / expert as f64
+            )
+        });
         match failed {
             Some(e) => Err(format!("{variant}: {e}")),
             None => Ok(Measured {
                 variant,
                 bytes,
                 samples_us: samples,
-                note: None,
+                note,
             }),
         }
     };

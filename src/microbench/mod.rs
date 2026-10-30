@@ -113,6 +113,11 @@ pub struct Options {
     #[arg(long, value_delimiter = ',', default_values_t = vec![94, 130, 170])]
     pub slots: Vec<usize>,
 
+    /// The share of a token's experts the read-ahead guess names, one variant for each
+    /// (`cache-policy`)
+    #[arg(long, value_delimiter = ',', default_values_t = vec![1.0])]
+    pub guess_hit: Vec<f64>,
+
     /// Tokens routed per variant (`cache-policy`)
     #[arg(long, default_value_t = 20000)]
     pub tokens: usize,
