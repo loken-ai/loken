@@ -1527,6 +1527,20 @@ fn slab_entry(g: &SlabInner, addr: usize, len: usize) -> Option<(usize, bool)> {
     (addr + len <= start + span).then_some((at + (addr - start), done))
 }
 
+/// A launch of one warp for each of `total` items, eight warps to a block.
+pub fn warp_cfg(total: usize) -> LaunchConfig {
+    const WARPS: usize = 8;
+    LaunchConfig {
+        grid_dim: (total.div_ceil(WARPS).max(1) as u32, 1, 1),
+        block_dim: (WARPS as u32 * 32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Threads of a block of `hc_mixes_f32`: a warp for each of the mixed dot products, the most the
+/// hardware allows a block to hold.
+pub const HC_MIXES_THREADS: u32 = 1024;
+
 pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
     if spans.is_empty() {
         return false;
@@ -2277,7 +2291,7 @@ pub fn gpu_prefill_attention_with(
         sm.arg(&h_i);
         sm.arg(&topk_i);
         sm.arg(&a.scale);
-        unsafe { sm.launch(cfg(count * h)) }
+        unsafe { sm.launch(warp_cfg(count * h)) }
             .map_err(|e| Error(format!("sink_softmax_f32 launch: {e}")))?;
         let o = matmul_f32(dev, &logits, &keys, count, h, topk, hd)?;
         // The output rotated back, then the grouped projection.
@@ -2429,7 +2443,7 @@ impl HcStreamDev {
         let func_k = dev.quantized_fn("hc_mixes_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (n as u32, 1, 1),
-            block_dim: (256, 1, 1),
+            block_dim: (HC_MIXES_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let (flat_i, hc_i, mix_i, it_i) = (flat as i64, hc as i32, mix_hc as i32, iters as i32);
@@ -2641,7 +2655,7 @@ pub fn gpu_sparse_attn(
         sm.arg(&h_i);
         sm.arg(&topk_i);
         sm.arg(&scale);
-        unsafe { sm.launch(cfg(count * h)) }
+        unsafe { sm.launch(warp_cfg(count * h)) }
             .map_err(|e| Error(format!("sink_softmax_f32 launch: {e}")))?;
         // [count, h, topk] @ [count, topk, d] -> [count, h, d]
         let out = matmul_f32(dev, &logits, &keys, count, h, topk, d)?;

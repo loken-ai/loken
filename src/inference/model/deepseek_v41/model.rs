@@ -1520,11 +1520,11 @@ impl DeepseekV41Model {
             };
         let (kv_src, idx_src) = sources;
         let mut devc = std::mem::take(&mut state.layers[i].dev);
-        let attended = {
+        let attended = stage("layer attention half", || {
             let host = &state.layers[i];
             let source = kv_src.map(|s| (&state.layers[s].dev, &state.layers[s]));
             block.forward_decode_attn_dev(ds, i, cos, sin, pos, &mut devc, host, source, idx_src)
-        };
+        });
         state.layers[i].dev = devc;
         if let Err(e) = attended {
             tracing::debug!(
@@ -1566,8 +1566,9 @@ impl DeepseekV41Model {
             }
         }
         let mut devc = std::mem::take(&mut state.layers[i].dev);
-        let ffn =
-            block.forward_decode_ffn_dev(ds, &mut devc, &mut state.layers[i], ahead, defer, shared);
+        let ffn = stage("layer ffn half", || {
+            block.forward_decode_ffn_dev(ds, &mut devc, &mut state.layers[i], ahead, defer, shared)
+        });
         state.layers[i].dev = devc;
         match ffn {
             Ok(left) => {

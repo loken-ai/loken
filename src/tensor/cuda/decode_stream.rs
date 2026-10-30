@@ -351,11 +351,24 @@ fn launch_mixes(
         )));
     }
     let stream = dev.stream();
-    let k = dev.quantized_fn("hc_mixes_f32")?;
+    let dots = dev.quantized_fn("hc_mixed_dots_f32")?;
+    let gates = dev.quantized_fn("hc_mixed_gates_f32")?;
+    let mut mixed = alloc_f32(dev, "decode stream mixed", mix_hc + 1)?;
     let (flat_i, hc_i, mix_i, it_i) = (flat as i64, hc as i32, mix_hc as i32, iters as i32);
-    let mut b = stream.launch_builder(&k);
+    let mut b = stream.launch_builder(&dots);
     b.arg(x);
     b.arg(func);
+    b.arg(&mut mixed);
+    b.arg(&flat_i);
+    b.arg(&mix_i);
+    let cfg = LaunchConfig {
+        grid_dim: (mix_hc as u32 + 1, 1, 1),
+        block_dim: (THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { b.launch(cfg) }.map_err(|e| launch_err("hc_mixed_dots_f32", e))?;
+    let mut b = stream.launch_builder(&gates);
+    b.arg(&mixed);
     b.arg(scale);
     b.arg(base);
     b.arg(pre);
@@ -367,9 +380,9 @@ fn launch_mixes(
     b.arg(&it_i);
     b.arg(&norm_eps);
     b.arg(&hc_eps);
-    unsafe { b.launch(one_block(THREADS, 0)) }
+    unsafe { b.launch(one_block(32, 0)) }
         .map(|_| ())
-        .map_err(|e| launch_err("hc_mixes_f32", e))
+        .map_err(|e| launch_err("hc_mixed_gates_f32", e))
 }
 
 /// A sliding window of `d`-wide rows on the device: the last `cap` rows appended, oldest first
@@ -855,7 +868,7 @@ pub fn sparse_attention_dev(
     b.arg(&h_i);
     b.arg(&topk_i);
     b.arg(&scale);
-    unsafe { b.launch(grid_for(h)) }.map_err(|e| launch_err("sink_softmax_f32", e))?;
+    unsafe { b.launch(super::warp_cfg(h)) }.map_err(|e| launch_err("sink_softmax_f32", e))?;
     matmul_f32(dev, &logits, keys, 1, h, topk, d)
 }
 

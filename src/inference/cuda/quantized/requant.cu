@@ -2888,30 +2888,18 @@ __device__ static float hc_block_sum(float v, float * scratch) {
     return total;
 }
 
-// A token's coefficients: the stream's statistic and the projection of its flattened hc*d values
-// onto `fn` [mix_hc, flat], then the pre and post gates and the Sinkhorn-normalised comb matrix.
-// One block per token; the projection is read as dot products, the rest runs in thread 0.
-extern "C" __global__ void hc_mixes_f32(
-        const float * __restrict__ x, const float * __restrict__ fn,
-        const float * __restrict__ scale, const float * __restrict__ base,
-        float * __restrict__ pre, float * __restrict__ post, float * __restrict__ comb,
-        const long flat, const int hc, const int mix_hc, const int iters,
-        const float norm_eps, const float hc_eps) {
-    __shared__ float scratch[32];
-    __shared__ float mixed[(2 + HC_MAX) * HC_MAX + 1];
-    const long t = blockIdx.x;
-    const float * row = x + t * flat;
-    for (int m = 0; m <= mix_hc; ++m) {
-        const float * w = m < mix_hc ? fn + (long) m * flat : row;
-        float acc = 0.0f;
-        for (long j = threadIdx.x; j < flat; j += blockDim.x) acc += row[j] * w[j];
-        const float total = hc_block_sum(acc, scratch);
-        if (threadIdx.x == 0) mixed[m] = total;
-    }
-    __syncthreads();
-    if (threadIdx.x != 0) return;
+// The coefficients of a token from its mixed values: the gates and the Sinkhorn-normalised comb
+// matrix. `N` is the number of hyper-connection copies when it is known at compile time, so the
+// loops unroll and the matrix lives in registers; 0 reads it from `hc_rt`.
+template <int N>
+__device__ static void hc_epilogue(
+        const float * mixed, const float * scale, const float * base,
+        float * pre, float * post, float * comb, const long t, const long flat, const int hc_rt,
+        const int mix_hc, const int iters, const float norm_eps, const float hc_eps) {
+    const int hc = N == 0 ? hc_rt : N;
+    constexpr int M = N == 0 ? HC_MAX : N;
     const float rsq = 1.0f / sqrtf(mixed[mix_hc] / (float) flat + norm_eps);
-    float cm[HC_MAX][HC_MAX];
+    float cm[M][M];
     for (int c = 0; c < hc; ++c) {
         const float a = mixed[c] * rsq * scale[0] + base[c];
         pre[t * hc + c] = 1.0f / (1.0f + expf(-a)) + hc_eps;
@@ -2946,6 +2934,97 @@ extern "C" __global__ void hc_mixes_f32(
     }
     for (int i = 0; i < hc; ++i)
         for (int j = 0; j < hc; ++j) comb[t * hc * hc + i * hc + j] = cm[i][j];
+}
+
+// A token's coefficients: the stream's statistic and the projection of its flattened hc*d values
+// onto `fn` [mix_hc, flat], then the pre and post gates and the Sinkhorn-normalised comb matrix.
+// One block per token. Each dot product of the projection is read by a warp of its own, so the
+// products advance together, whatever the number of warps the block holds; the rest runs in
+// thread 0. Launched with a multiple of 32 threads.
+extern "C" __global__ void __launch_bounds__(1024) hc_mixes_f32(
+        const float * __restrict__ x, const float * __restrict__ fn,
+        const float * __restrict__ scale, const float * __restrict__ base,
+        float * __restrict__ pre, float * __restrict__ post, float * __restrict__ comb,
+        const long flat, const int hc, const int mix_hc, const int iters,
+        const float norm_eps, const float hc_eps) {
+    __shared__ float mixed[(2 + HC_MAX) * HC_MAX + 1];
+    const long t = blockIdx.x;
+    const float * row = x + t * flat;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
+    for (int m = warp; m <= mix_hc; m += warps) {
+        const float * w = m < mix_hc ? fn + (long) m * flat : row;
+        float acc = 0.0f;
+        if ((flat & 3) == 0) {
+            // Eight 16-byte loads in flight per lane: the products wait on memory, not on the
+            // arithmetic.
+            const float4 * r4 = (const float4 *) row;
+            const float4 * w4 = (const float4 *) w;
+            const long n4 = flat / 4;
+            float a[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            long j = lane;
+            for (; j + 224 < n4; j += 256) {
+                #pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const float4 p = r4[j + 32 * u], q = w4[j + 32 * u];
+                    a[u] += p.x * q.x + p.y * q.y + p.z * q.z + p.w * q.w;
+                }
+            }
+            for (; j < n4; j += 32) {
+                const float4 p = r4[j], q = w4[j];
+                a[0] += p.x * q.x + p.y * q.y + p.z * q.z + p.w * q.w;
+            }
+            acc = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
+        } else {
+            for (long j = lane; j < flat; j += 32) acc += row[j] * w[j];
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) mixed[m] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    if (hc == 4) hc_epilogue<4>(mixed, scale, base, pre, post, comb, t, flat, hc, mix_hc, iters, norm_eps, hc_eps);
+    else hc_epilogue<0>(mixed, scale, base, pre, post, comb, t, flat, hc, mix_hc, iters, norm_eps, hc_eps);
+}
+
+// The mixed values of one token's stream, one block for each of the `mix_hc + 1` dot products
+// (the last is the stream against itself), so a decode's single token spreads over as many
+// multiprocessors as there are products. `mixed` is [n, mix_hc + 1]. Grid (mix_hc + 1, n).
+extern "C" __global__ void hc_mixed_dots_f32(
+        const float * __restrict__ x, const float * __restrict__ fn,
+        float * __restrict__ mixed, const long flat, const int mix_hc) {
+    __shared__ float scratch[32];
+    const int m = blockIdx.x;
+    const long t = blockIdx.y;
+    const float * row = x + t * flat;
+    const float * w = m < mix_hc ? fn + (long) m * flat : row;
+    float acc = 0.0f;
+    if ((flat & 3) == 0) {
+        const float4 * r4 = (const float4 *) row;
+        const float4 * w4 = (const float4 *) w;
+        for (long j = threadIdx.x; j < flat / 4; j += blockDim.x) {
+            const float4 p = r4[j], q = w4[j];
+            acc += p.x * q.x + p.y * q.y + p.z * q.z + p.w * q.w;
+        }
+    } else {
+        for (long j = threadIdx.x; j < flat; j += blockDim.x) acc += row[j] * w[j];
+    }
+    const float total = hc_block_sum(acc, scratch);
+    if (threadIdx.x == 0) mixed[t * (mix_hc + 1) + m] = total;
+}
+
+// The gates and the Sinkhorn-normalised comb matrix from the mixed values of `hc_mixed_dots_f32`.
+// One thread per token.
+extern "C" __global__ void hc_mixed_gates_f32(
+        const float * __restrict__ mixed,
+        const float * __restrict__ scale, const float * __restrict__ base,
+        float * __restrict__ pre, float * __restrict__ post, float * __restrict__ comb,
+        const long flat, const int hc, const int mix_hc, const int iters,
+        const float norm_eps, const float hc_eps) {
+    const long t = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const float * m = mixed + t * (mix_hc + 1);
+    if (hc == 4) hc_epilogue<4>(m, scale, base, pre, post, comb, t, flat, hc, mix_hc, iters, norm_eps, hc_eps);
+    else hc_epilogue<0>(m, scale, base, pre, post, comb, t, flat, hc, mix_hc, iters, norm_eps, hc_eps);
 }
 
 // The stream collapsed by `pre` [n, hc] into one row per token and RMS-normalised by `w` [d]:
@@ -3067,21 +3146,25 @@ extern "C" __global__ void gather_slots_f32(
 }
 
 // Logits [count, h, topk] turned in place into attention weights: scaled, softmaxed with the head's
-// sink logit, empty slots weighing nothing.
+// sink logit, empty slots weighing nothing. One warp per (token, head), its lanes sharing the
+// slots; launched with a multiple of 32 threads.
 extern "C" __global__ void sink_softmax_f32(
         float * __restrict__ logits, const float * __restrict__ sink, const int * __restrict__ idxs,
         const long start, const long count, const long h, const long topk, const float scale) {
-    const long idx = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    const long warps = (long) blockDim.x / 32;
+    const long idx = (long) blockIdx.x * warps + (long) (threadIdx.x / 32);
+    const int lane = threadIdx.x % 32;
     if (idx >= count * h) return;
     const long i = idx / h, hi = idx % h;
     const int * slots = idxs + (start + i) * topk;
     float * l = logits + idx * topk;
     float m = sink[hi];
-    for (long k = 0; k < topk; k++) {
+    for (long k = lane; k < topk; k += 32) {
         if (slots[k] >= 0) m = fmaxf(m, l[k] * scale);
     }
-    float denom = exp(sink[hi] - m);
-    for (long k = 0; k < topk; k++) {
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+    float denom = 0.0f;
+    for (long k = lane; k < topk; k += 32) {
         if (slots[k] >= 0) {
             l[k] = exp(l[k] * scale - m);
             denom += l[k];
@@ -3089,7 +3172,9 @@ extern "C" __global__ void sink_softmax_f32(
             l[k] = 0.0f;
         }
     }
-    for (long k = 0; k < topk; k++) l[k] /= denom;
+    for (int off = 16; off > 0; off >>= 1) denom += __shfl_xor_sync(0xffffffffu, denom, off);
+    denom += exp(sink[hi] - m);
+    for (long k = lane; k < topk; k += 32) l[k] /= denom;
 }
 
 // Block-scaled fp4 weight to f32 in column order: `packed` is [rows, cols/2] e2m1 (element 2j in
