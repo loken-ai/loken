@@ -528,7 +528,7 @@ impl Moe {
         } else {
             Vec::new()
         };
-        self.experts.prefetch(&uses, n as u64)?;
+        stage("moe expert admit", || self.experts.prefetch(&uses, n as u64))?;
         let active: Vec<usize> = uses.iter().map(|&(e, _, _)| e).collect();
         {
             let layer = self as *const Moe as usize;
@@ -540,10 +540,12 @@ impl Moe {
         // compute of another instead of each faulting in alone. Built once and kept: the
         // residency read, the block and the host all take these same handles, where fetching
         // afresh at each re-sliced the mmap three times over for one expert.
-        let active_refs: Vec<Arc<Expert>> = active
-            .iter()
-            .map(|&e| self.experts.fetch(e))
-            .collect::<Result<_>>()?;
+        let active_refs: Vec<Arc<Expert>> = stage("moe expert handles", || {
+            active
+                .iter()
+                .map(|&e| self.experts.fetch(e))
+                .collect::<Result<_>>()
+        })?;
         // A card that holds an expert runs it from its own copy, and one a layer's read-ahead
         // stages is read there: only the others are read in through the mapping, asked for
         // from several threads so that their reads reach the disk together. A prompt's layer
@@ -561,14 +563,14 @@ impl Moe {
         );
         match &prompt {
             Some(plan) => self.read_prompt_plan(plan, &active_refs),
-            None => {
+            None => stage("moe expert advice", || {
                 use rayon::prelude::*;
                 active_refs.par_iter().for_each(|r| {
                     if !on_card(r) && !r.prestaged() {
                         r.will_need();
                     }
                 });
-            }
+            }),
         }
 
         crate::inference::offload::prof_record(
