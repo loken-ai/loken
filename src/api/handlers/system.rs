@@ -433,7 +433,9 @@ pub(crate) async fn stage_performance_endpoint(
         .collect();
     let (routed, named, unkept, unkept_named) =
         crate::inference::offload::store::prediction_report();
+    let (read_compute, read_ahead) = crate::inference::offload::store::read_report();
     let prediction = serde_json::json!({
+        "read_for_compute": read_compute, "read_for_ahead": read_ahead,
         "routed": routed, "named": named, "unkept": unkept, "unkept_named": unkept_named,
     });
     let (sums, calls) = stages::snapshot();

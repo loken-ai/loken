@@ -40,6 +40,36 @@ pub fn hitmiss_report() -> (u64, u64) {
     )
 }
 
+/// Who asked for an expert's bytes to be read from disk.
+#[derive(Clone, Copy)]
+pub enum ReadFor {
+    /// The step computing the expert, which waits for them.
+    Compute,
+    /// A read-ahead: a guess of the next layer's routing, or a prompt's whole layer.
+    Ahead,
+}
+
+static READ_FOR_COMPUTE: AtomicU64 = AtomicU64::new(0);
+static READ_FOR_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Note that `bytes` of an expert were missing from memory when `who` asked for them.
+pub fn note_read(who: ReadFor, bytes: u64) {
+    match who {
+        ReadFor::Compute => &READ_FOR_COMPUTE,
+        ReadFor::Ahead => &READ_FOR_AHEAD,
+    }
+    .fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `(bytes asked by the computing step, bytes asked by a read-ahead)` that were missing from
+/// memory when asked, since start.
+pub fn read_report() -> (u64, u64) {
+    (
+        READ_FOR_COMPUTE.load(Ordering::Relaxed),
+        READ_FOR_AHEAD.load(Ordering::Relaxed),
+    )
+}
+
 static PREDICTED_USED: AtomicU64 = AtomicU64::new(0);
 static ACTUAL_ROUTED: AtomicU64 = AtomicU64::new(0);
 static ACTUAL_UNKEPT: AtomicU64 = AtomicU64::new(0);

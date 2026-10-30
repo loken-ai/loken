@@ -110,6 +110,14 @@ impl Expert {
     /// Read the three projections into memory now, returning once they are there: the blocking
     /// form of `will_need`, for a thread whose job is to wait on the read.
     pub fn populate(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            let (resident, pages) = self.resident_pages();
+            super::store::note_read(
+                super::store::ReadFor::Ahead,
+                ((pages - resident) * crate::tensor::mapped::page_size().unwrap_or(4096)) as u64,
+            );
+        }
         #[cfg(unix)]
         {
             // MADV_POPULATE_READ: fault the range in as a read would, without mapping it for a
@@ -153,6 +161,10 @@ impl Expert {
             if resident == pages {
                 return;
             }
+            super::store::note_read(
+                super::store::ReadFor::Compute,
+                ((pages - resident) * crate::tensor::mapped::page_size().unwrap_or(4096)) as u64,
+            );
         }
         #[cfg(unix)]
         if let Some((start, len)) = self.storage_unit() {
