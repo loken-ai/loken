@@ -37,6 +37,8 @@ The arguments after `--`:
 | `--inter` | The expert's feed-forward length, without a file. | 2048 |
 | `--weight-bits` | Bits per stored weight, without a file. 4.5 for q4_k, 8.5 for q8_0. | 4.5 |
 | `--projection-bytes` | The bytes of each projection, one value or three, in place of the two above. | derived |
+| `--gate-format` | The format of an expert's gate and up weights, for `host-expert`. | iq2_xxs |
+| `--down-format` | The format of an expert's down weights, for `host-expert`. | q2_k |
 | `--pack` | Rows the packed variants of `crossing` move in one copy. | 8 |
 | `--file` | The file `expert-read` reads. | the shapes file |
 | `--offset` | Where the first expert read starts, when the file is not the shapes file. | 0 |
@@ -87,6 +89,19 @@ It answers how a missing expert is best read. Its variants:
 - A populating advice.
 - A buffered read.
 - A direct read into an aligned buffer, which bypasses the page cache.
+
+`host-expert` computes routed experts on the host cores. It answers what a missing expert costs once its
+pages are in memory, and what the decode's host path adds to the bare products. It runs at the
+dimensions of the shapes file, or of `--hidden` and `--inter`, in the formats `--gate-format` and
+`--down-format`. It touches no disk and no card. Its variants:
+
+- One expert, the same weights every call, so they stay in the caches.
+- 4 experts per call out of 96 distinct ones, far more than the caches hold, so the weights come
+  from memory. Each runs through the thread pool in 3 regions, one thread per expert, and one
+  after the other on one thread.
+- The same 4 experts on weights in the page cache of a mapped file, where a served model keeps them.
+- 4 and 6 experts per call through the function a decode calls for its host experts, on experts
+  built as the store builds them.
 
 `cache-policy` replays a routing through the policies of a host tier and counts the experts each
 misses, which the disk then has to read. It needs `--profile`, the routing counts a served model
