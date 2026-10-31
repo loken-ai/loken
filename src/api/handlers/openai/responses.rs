@@ -378,6 +378,18 @@ fn chat_body(
     if stream {
         chat["stream_options"] = json!({"include_usage": true});
     }
+    // Log probabilities are asked for by `top_logprobs` or by the `include` list.
+    let top = req.get("top_logprobs").and_then(Value::as_u64);
+    let included = req
+        .get("include")
+        .and_then(Value::as_array)
+        .is_some_and(|l| l.iter().any(|v| v == "message.output_text.logprobs"));
+    if top.is_some() || included {
+        chat["logprobs"] = json!(true);
+        if let Some(n) = top {
+            chat["top_logprobs"] = json!(n);
+        }
+    }
     if let Some(t) = tools {
         chat["tools"] = Value::Array(t);
     }
@@ -447,7 +459,12 @@ pub(crate) async fn openai_responses_at(
         } else {
             ("completed", None)
         };
-        let output = output_items(&message);
+        let mut output = output_items(&message);
+        if let Some(lp) = choice.pointer("/logprobs/content").filter(|l| !l.is_null()) {
+            for item in output.iter_mut().filter(|i| i["type"] == "message") {
+                item["content"][0]["logprobs"] = lp.clone();
+            }
+        }
         let body = response_object(
             &id,
             created,
@@ -486,6 +503,7 @@ pub(crate) async fn openai_responses_at(
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut failure: Option<Value> = None;
         let mut finished = false;
+        let mut logprobs: Vec<Value> = Vec::new();
         'frames: while let Some(chunk) = frames.next().await {
             let Ok(bytes) = chunk else { break };
             buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -539,7 +557,12 @@ pub(crate) async fn openai_responses_at(
                             msg_id = Some(mid);
                         }
                         text.push_str(c);
-                        yield Ok::<_, axum::Error>(event("response.output_text.delta", json!({"item_id": msg_id.clone(), "output_index": output.len(), "content_index": 0, "delta": c}), &mut seq));
+                        let mut delta_event = json!({"item_id": msg_id.clone(), "output_index": output.len(), "content_index": 0, "delta": c});
+                        if let Some(l) = choice.pointer("/logprobs/content").and_then(Value::as_array) {
+                            logprobs.extend(l.iter().cloned());
+                            delta_event["logprobs"] = Value::Array(l.clone());
+                        }
+                        yield Ok::<_, axum::Error>(event("response.output_text.delta", delta_event, &mut seq));
                     }
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -557,9 +580,15 @@ pub(crate) async fn openai_responses_at(
             }
         }
         if let Some(mid) = msg_id.clone() {
-            yield Ok::<_, axum::Error>(event("response.output_text.done", json!({"item_id": mid, "output_index": output.len(), "content_index": 0, "text": text}), &mut seq));
-            yield Ok::<_, axum::Error>(event("response.content_part.done", json!({"item_id": mid, "output_index": output.len(), "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}}), &mut seq));
-            let item = json!({"type": "message", "id": mid, "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]});
+            let mut part = json!({"type": "output_text", "text": text, "annotations": []});
+            let mut done = json!({"item_id": mid, "output_index": output.len(), "content_index": 0, "text": text});
+            if !logprobs.is_empty() {
+                part["logprobs"] = Value::Array(logprobs.clone());
+                done["logprobs"] = Value::Array(logprobs.clone());
+            }
+            yield Ok::<_, axum::Error>(event("response.output_text.done", done, &mut seq));
+            yield Ok::<_, axum::Error>(event("response.content_part.done", json!({"item_id": mid, "output_index": output.len(), "content_index": 0, "part": part.clone()}), &mut seq));
+            let item = json!({"type": "message", "id": mid, "status": "completed", "role": "assistant", "content": [part]});
             yield Ok::<_, axum::Error>(event("response.output_item.done", json!({"output_index": output.len(), "item": item}), &mut seq));
             output.push(item);
         }
