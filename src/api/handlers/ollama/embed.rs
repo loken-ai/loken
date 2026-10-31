@@ -453,12 +453,13 @@ pub(crate) async fn ollama_embed(
     // spaces and over-estimates for code).
     let prompt_eval_count: u64 = inputs.iter().map(|s| estimate_token_count(s)).sum();
 
-    // `dimensions` keeps the leading coordinates, as OpenAI's `dimensions` does.
+    // `dimensions` keeps the leading coordinates.
+    // It scales them to unit length.
     let embeddings: Vec<Vec<f32>> = match request.dimensions {
         Some(d) if d > 0 => embeddings
             .into_iter()
             .map(|mut v| {
-                v.truncate(d);
+                super::super::shorten_embedding(&mut v, d);
                 v
             })
             .collect(),

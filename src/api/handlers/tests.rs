@@ -54,6 +54,24 @@ fn cors_narrows_once_the_api_is_credentialed() {
 }
 use super::*;
 
+/// A shortened embedding keeps its leading coordinates at unit length.
+/// A size that does not shorten leaves it as it was.
+#[test]
+fn a_shortened_embedding_is_scaled_back_to_unit_length() {
+    let mut v = vec![0.5f32; 4];
+    shorten_embedding(&mut v, 2);
+    assert_eq!(v.len(), 2);
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-6, "norm {norm}");
+    let mut same = vec![0.5f32; 4];
+    shorten_embedding(&mut same, 4);
+    shorten_embedding(&mut same, 0);
+    assert_eq!(same, vec![0.5f32; 4]);
+    let mut zero = vec![0.0f32; 4];
+    shorten_embedding(&mut zero, 2);
+    assert_eq!(zero, vec![0.0f32; 2], "a zero vector stays zero");
+}
+
 #[test]
 fn available_endpoints_list_includes_critical_routes() {
     // Pins the discoverability hint surfaced in 404 envelopes to

@@ -100,6 +100,25 @@ pub(crate) use system::*;
 // `parse_keep_alive` is re-exported `pub` from api/mod.rs.
 pub use model_manager::parse_keep_alive;
 
+/// Keeps the first `dims` coordinates of an embedding.
+/// Scales them back to unit length.
+pub(crate) fn shorten_embedding(embedding: &mut Vec<f32>, dims: usize) {
+    if dims == 0 || dims >= embedding.len() {
+        return;
+    }
+    embedding.truncate(dims);
+    let norm = embedding
+        .iter()
+        .map(|v| (*v as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        for v in embedding.iter_mut() {
+            *v = (*v as f64 / norm) as f32;
+        }
+    }
+}
+
 /// Normalize model ID for Ollama models (append :latest if no tag)
 /// - "llama3" -> "llama3:latest"
 /// - "llama3:8b" -> "llama3:8b" (already has tag)

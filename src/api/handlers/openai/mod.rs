@@ -2480,9 +2480,7 @@ pub(crate) async fn openai_embeddings(
         match embedded {
             Ok(mut embedding) => {
                 if let Some(d) = dims_req {
-                    if d < embedding.len() {
-                        embedding.truncate(d);
-                    }
+                    super::shorten_embedding(&mut embedding, d);
                 }
                 if emb_dim == 0 {
                     emb_dim = embedding.len();
