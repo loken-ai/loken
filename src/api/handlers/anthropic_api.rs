@@ -208,8 +208,13 @@ pub(crate) async fn anthropic_messages_at(
         match engine.generate(&prompt, params).await {
             Ok(result) => {
                 let energy = crate::energy_report::end_share(energy, "text", "[/v1/messages]");
+                let text = crate::api::handlers::openai::vllm::strip_stop(
+                    result.text.clone(),
+                    &result.finish_reason,
+                    false,
+                );
                 let (thinking, answer) =
-                    crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
+                    crate::api::thinking::split_thinking_opened(thinking_opened, &text);
                 let (text, calls) = if tools_active {
                     let mut parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &answer);
                     if single_tool_call {
@@ -256,6 +261,7 @@ pub(crate) async fn anthropic_messages_at(
             .map(|n| n as i32)
             .unwrap_or_else(|| estimate_token_count(&prompt) as i32);
         let engine_for_stats = engine.clone();
+        let stops = params.stop_sequences.clone();
         // The request's own figures come back through the probe; its energy is metered from
         // here to the end of its answer.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
@@ -332,6 +338,9 @@ pub(crate) async fn anthropic_messages_at(
                     let mut output_tokens = 0i32;
                     let mut segments: Vec<crate::api::thinking::Segment> = Vec::new();
                     let mut ended = false;
+                    let mut holdback =
+                        crate::api::handlers::openai::vllm::StopHoldback::new(&stops, false);
+                    let mut stats = None;
                     loop {
                         if segments.is_empty() {
                             if ended {
@@ -340,7 +349,7 @@ pub(crate) async fn anthropic_messages_at(
                             match rx.recv().await {
                                 Some(Ok(tok)) => {
                                     output_tokens += 1;
-                                    segments = splitter.push(&tok);
+                                    segments = splitter.push(&holdback.push(&tok));
                                     segments.reverse();
                                 }
                                 Some(Err(e)) => {
@@ -353,7 +362,13 @@ pub(crate) async fn anthropic_messages_at(
                                 }
                                 None => {
                                     ended = true;
-                                    segments = splitter.finish();
+                                    stats = engine_for_stats.take_last_stream_stats();
+                                    // The text held back for a stop sequence goes out first.
+                                    // The stop sequence itself is left out.
+                                    let held =
+                                        holdback.finish(stats.as_ref().map(|s| &s.finish_reason));
+                                    segments = splitter.push(&held);
+                                    segments.extend(splitter.finish());
                                     segments.reverse();
                                 }
                             }
@@ -474,7 +489,6 @@ pub(crate) async fn anthropic_messages_at(
                         idx += 1;
                     }
 
-                    let stats = engine_for_stats.take_last_stream_stats();
                     let energy = crate::energy_report::end_share(energy, "text", "[/v1/messages]");
                     // What the engine counted; the chunk count and the prompt estimate only
                     // where it published nothing.
