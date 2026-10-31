@@ -485,6 +485,7 @@ pub(crate) async fn openai_responses_at(
         let mut buf = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut failure: Option<Value> = None;
+        let mut finished = false;
         'frames: while let Some(chunk) = frames.next().await {
             let Ok(bytes) = chunk else { break };
             buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -494,6 +495,7 @@ pub(crate) async fn openai_responses_at(
                 let Some(data) = line.strip_prefix("data:") else { continue };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    finished = true;
                     break 'frames;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
@@ -581,7 +583,15 @@ pub(crate) async fn openai_responses_at(
             yield Ok::<_, axum::Error>(event("response.failed", json!({"response": failed}), &mut seq));
             return;
         }
-        let (status, incomplete) = if finish == "length" { ("incomplete", Some("max_output_tokens")) } else { ("completed", None) };
+        // A stream that ends without its final marker was cut upstream.
+        // What arrived is reported as incomplete.
+        let (status, incomplete) = if finish == "length" {
+            ("incomplete", Some("max_output_tokens"))
+        } else if !finished {
+            ("incomplete", Some("interrupted"))
+        } else {
+            ("completed", None)
+        };
         let final_obj = response_object(&id, created, &req_for_stream, &model, status, output, usage_object(if usage.is_null() { None } else { Some(&usage) }), incomplete);
         if keep {
             let mut convo = history.clone();
