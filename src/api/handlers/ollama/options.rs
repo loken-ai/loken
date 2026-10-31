@@ -149,12 +149,16 @@ pub(crate) async fn ollama_chat(
                 )));
             }
         }
-        // Empty content is allowed only on assistant turns that carry
-        // tool_calls (the OpenAI/Ollama agentic round-trip shape) - every
-        // other role still needs text.
-        if m.content.is_empty()
-            && !(m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| !t.is_empty()))
-        {
+        // Empty content is allowed on an assistant turn that carries tool_calls.
+        // It is allowed on a tool result.
+        // It is allowed on a turn that carries images, audio or video.
+        // Every other turn needs text.
+        let carries_media = m.images.as_ref().is_some_and(|v| !v.is_empty())
+            || m.audios.as_ref().is_some_and(|v| !v.is_empty())
+            || m.videos.as_ref().is_some_and(|v| !v.is_empty());
+        let invokes_tools =
+            m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+        if m.content.is_empty() && !(invokes_tools || carries_media || m.role == "tool") {
             return Err(ApiError::Validation(format!(
                 "messages[{i}].content must not be empty"
             )));

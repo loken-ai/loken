@@ -41,6 +41,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Delete: unload a model after releasing the table of loaded models.
+- Chat: accept a turn with media or a tool result and no text.
 - Responses: report a stream cut upstream as incomplete.
 - Streams: end a failed OpenAI stream with an error frame, not as text.
 - API: stop listing 2 multi-device routes that do not exist.

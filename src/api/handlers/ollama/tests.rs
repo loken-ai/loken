@@ -603,6 +603,38 @@ async fn a_failed_preload_is_an_error_not_a_load() {
     );
 }
 
+/// A turn with no text is accepted when it carries media or is a tool result.
+/// It is refused when it carries nothing.
+#[tokio::test]
+async fn a_turn_with_no_text_needs_media_or_a_tool_result() {
+    let ask = |message: Message| async move {
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let request = OllamaChatRequest::new("no-such-model".to_string(), vec![message]);
+        ollama_chat(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            OllamaJson(request),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:?}"))
+        .unwrap_or_default()
+    };
+    let refused = "content must not be empty";
+    assert!(ask(Message::new("user".to_string(), String::new()))
+        .await
+        .contains(refused));
+    let mut with_image = Message::new("user".to_string(), String::new());
+    with_image.images = Some(vec!["AAAA".to_string()]);
+    assert!(!ask(with_image).await.contains(refused));
+    assert!(!ask(Message::new("tool".to_string(), String::new()))
+        .await
+        .contains(refused));
+}
+
 #[test]
 fn classify_pull_error_routes_404_keywords_to_notfound() {
     // 404 in the body of an upstream response.
