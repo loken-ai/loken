@@ -582,6 +582,27 @@ async fn generate_sends_a_prompt_as_given_to_a_package_without_a_template() {
     let _ = std::fs::remove_dir_all(&packaged);
 }
 
+/// A preload of a model that cannot be loaded is answered with an error.
+#[tokio::test]
+async fn a_failed_preload_is_an_error_not_a_load() {
+    let state = APIServer::new(
+        "/nonexistent-ollama-models".to_string(),
+        "/nonexistent-hf-models".to_string(),
+    );
+    let mut request = OllamaChatRequest::new("no-such-model".to_string(), Vec::new());
+    request.keep_alive = Some("5m".to_string());
+    let result = ollama_chat(
+        axum::extract::State(state),
+        axum::http::HeaderMap::new(),
+        OllamaJson(request),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a model that is not there cannot answer a load"
+    );
+}
+
 #[test]
 fn classify_pull_error_routes_404_keywords_to_notfound() {
     // 404 in the body of an upstream response.

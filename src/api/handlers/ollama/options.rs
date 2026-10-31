@@ -184,7 +184,10 @@ pub(crate) async fn ollama_chat(
         } else if keep_alive_minutes > 0 {
             // LOAD - model load via the dedup'd loader (per-model lock,
             // re-check after acquire, no double-engine on race).
-            let _ = state.ensure_loaded(&model_name, keep_alive_minutes).await;
+            state
+                .ensure_loaded(&model_name, keep_alive_minutes)
+                .await
+                .map_err(|e| ApiError::Internal(format!("load {model_name}: {e}")))?;
 
             // Return load response
             let mut response = OllamaChatResponse::new(
