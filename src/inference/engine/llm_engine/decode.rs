@@ -46,6 +46,24 @@ fn penalise_recent(logits: &mut [f32], recent_tokens: &[u32], penalty: f32, last
     }
 }
 
+/// The distinct tokens of the last `repeat_last_n` that a repeat penalty acts on.
+/// None when the penalty is 1.0.
+#[cfg(feature = "gpu")]
+fn penalty_ids(recent_tokens: &[u32], repeat_penalty: f32, repeat_last_n: usize) -> Vec<u32> {
+    if repeat_penalty == 1.0 {
+        return Vec::new();
+    }
+    let start = recent_tokens.len().saturating_sub(repeat_last_n);
+    let window = &recent_tokens[start..];
+    let mut unique: Vec<u32> = Vec::with_capacity(window.len());
+    for &t in window {
+        if !unique.contains(&t) {
+            unique.push(t);
+        }
+    }
+    unique
+}
+
 /// Token sampling for a row that may live on a card.
 ///
 /// A greedy draw with no bias or log-probabilities runs as one fused penalty + argmax kernel
@@ -97,18 +115,7 @@ pub(crate) fn gpu_sample(
     // Fused repeat penalty + argmax in a single CUDA kernel (1 launch vs 6+)
     #[cfg(feature = "gpu")]
     if logits.device().is_cuda() {
-        let start = recent_tokens.len().saturating_sub(repeat_last_n);
-        let window = &recent_tokens[start..];
-        // Dedup with a fixed-size stack buffer instead of HashSet - for a
-        // typical repeat_last_n of 64 the quadratic scan is faster than
-        // HashSet alloc + hashing. Pre-allocates a Vec of capacity=window.len
-        // so the only allocation is the final result; HashSet adds an extra.
-        let mut unique: Vec<u32> = Vec::with_capacity(window.len());
-        for &t in window {
-            if !unique.contains(&t) {
-                unique.push(t);
-            }
-        }
+        let unique = penalty_ids(recent_tokens, repeat_penalty, repeat_last_n);
         return crate::inference::kernel::fused::fused_penalty_argmax(
             logits,
             &unique,
@@ -154,14 +161,7 @@ pub(super) fn gpu_sample_returning_tensor(
         return Ok((tok, None));
     }
 
-    let start = recent_tokens.len().saturating_sub(repeat_last_n);
-    let window = &recent_tokens[start..];
-    let mut unique: Vec<u32> = Vec::with_capacity(window.len());
-    for &t in window {
-        if !unique.contains(&t) {
-            unique.push(t);
-        }
-    }
+    let unique = penalty_ids(recent_tokens, repeat_penalty, repeat_last_n);
     let (tok, dev_slice) = crate::inference::kernel::fused::fused_penalty_argmax_u32_with_device(
         logits,
         &unique,
@@ -1387,5 +1387,40 @@ mod kept_graphs_tests {
         let mut kept = RecordedAt::kept((1, 5));
         kept.note(None);
         assert_eq!(kept.keepable(Some((1, 5))), None);
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod penalty_ids_tests {
+    use super::penalty_ids;
+
+    /// A penalty of 1.0 names no token.
+    /// Any other penalty names the distinct tokens of the window.
+    #[test]
+    fn a_penalty_of_one_names_no_token() {
+        assert!(penalty_ids(&[1, 2, 3], 1.0, 64).is_empty());
+        assert_eq!(penalty_ids(&[1, 2, 2, 3, 1], 1.3, 64), vec![1, 2, 3]);
+        assert_eq!(penalty_ids(&[1, 2, 2, 3, 1], 1.3, 2), vec![3, 1]);
+    }
+
+    /// On the card, a penalty of 1.0 picks the same token with or without a list.
+    #[test]
+    fn a_penalty_of_one_picks_the_same_token_with_or_without_a_list() {
+        use crate::tensor::{cuda::CudaDevice, Device, Tensor};
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the GPU kernels are NOT covered by this run");
+            return;
+        };
+        let logits: Vec<f32> = (0..4096)
+            .map(|i| (((i * 7919) % 1013) as f32) * 0.01 - 5.0)
+            .collect();
+        let t = Tensor::from_vec_f32(logits, vec![4096])
+            .unwrap()
+            .to_device(&Device::Cuda(dev))
+            .unwrap();
+        let with =
+            crate::inference::kernel::fused::fused_penalty_argmax(&t, &[3, 7, 11], 1.0).unwrap();
+        let without = crate::inference::kernel::fused::fused_penalty_argmax(&t, &[], 1.0).unwrap();
+        assert_eq!(with, without);
     }
 }

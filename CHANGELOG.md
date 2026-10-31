@@ -42,6 +42,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 - Delete: unload a model after releasing the table of loaded models.
 - Chat: return one log probability per token, streamed or not, and on the Responses route.
+- Sampling: build and upload no repeat penalty list when the penalty is 1.0.
 - Matmul: dequantise on the card for one call when its workspace is short, keeping no copy.
 - Sessions: keep no token list for each session id, and count the resident conversation.
 - Loaded models: list them without holding the table through each engine's wait.
