@@ -4,9 +4,7 @@
 
 # loken
 
-A local inference server for language **and** generative-media models, written in Rust. One
-process serves chat, images, audio, speech, transcription and video, over an
-OpenAI-compatible API, an Ollama-compatible one and the Messages API.
+A local inference server for language and generative-media models, written in Rust. One process serves chat, images, audio, speech, transcription and video over an OpenAI-compatible API, an Ollama-compatible API and the Messages API.
 
 ```sh
 cp config.toml.example config.toml   # the daemon reads this from its working directory
@@ -15,112 +13,56 @@ cargo build --release                # target/release/{lokend,loken}
 ./target/release/loken  list         # and the client that talks to it
 ```
 
-It speaks the OpenAI API, so anything that already talks to one works unchanged:
+Any OpenAI client works unchanged:
 
 ```sh
 curl -s localhost:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen3:1.7b",
-  "messages": [{"role": "user", "content": "Say hello in six words."}]
+  "messages": [{"role": "user", "content": "Say hello in 6 words."}]
 }'
 ```
 
-**Inference never leaves the machine.** No account, no API key, no hosted fallback. What does
-reach the network: fetching a model you asked for, and a cluster node announcing itself if you
-configure one.
+Inference stays on the machine. loken needs no account and no API key, and has no hosted fallback. It reaches the network to fetch a model you asked for, and to announce a cluster node you configured.
 
 ## What it does
 
-| Capability | Route | Configuration | State |
-|---|---|---|---|
-| Chat and completion, streamed or whole | `/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`, `/v1/messages` | `model_id` | Measured against ollama, [STATUS](docs/STATUS.md#decode-rate-vs-ollama) |
-| Responses API | `/v1/responses` | | Runs |
-| Coding agents on the daemon | `loken launch claude`, `loken launch cline` | | Runs, [guide](docs/guides/agents.md) |
-| Tools, JSON schema, grammar-constrained output | the chat routes, `tool_choice`, `response_format` | | Runs |
-| Reasoning apart from the answer, Harmony included | the chat routes, `think`, `reasoning_effort` | | Runs |
-| Vision and speech in a chat turn | the chat routes, image and audio content | | Runs |
-| Log-probabilities, logit bias, seeds | the chat and completion routes | | Runs |
-| Embeddings and reranking | `/v1/embeddings`, `/api/embed`, `/v1/rerank` | | Runs |
-| Placement across cards and the host | automatic | | Measured, [STATUS](docs/STATUS.md#placement-measured-separately) |
-| Expert spilling for mixtures that do not fit, streamed from disk when the file exceeds the host | automatic | | Measured, [STATUS](docs/STATUS.md#large-mixtures-streamed-from-disk) |
-| Continuous batching | automatic, when requests overlap | | Runs, cards only |
-| Speculative decoding | automatic for a model that spills to the host, `/api/draft/attach` | | Measured on one pair, [guide](docs/guides/drafter.md) |
-| KV reuse across conversations, on disk, past the window | automatic | `kv_disk_dir` | Runs, [guide](docs/guides/kv-memory.md) |
-| Decode-state cache for the large mixture and recurrent hybrids | automatic, in memory, on disk once set | `state_cache_dir` | Runs, [CONFIG](docs/CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
-| Lossy expert routing for speed, within the model's own noise | automatic once set | `quality` | DeepSeek V4.1 only, off by default, [CONFIG](docs/CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
-| Files, batches, message batches | `/v1/files`, `/v1/batches`, `/v1/messages/batches` | `files_dir` | Runs |
-| Moderation with a classifier | `/v1/moderations` | `moderation_model` | Runs, 5 families |
-| Images, edits, variations, adapters | `/v1/images/*`, `/v1/loras` | `lora_dir` | Judged partially, [STATUS](docs/STATUS.md#judged-partially) |
-| Video | `/v1/video/generations` | | Runs |
-| Transcription and translation | `/v1/audio/transcriptions`, `/v1/audio/translations` | | Runs |
-| Speech, music, sound effects, separation | `/v1/audio/speech`, `/v1/audio/generations`, `/v1/audio/separate` | | Runs |
-| Energy per request | every answer | `[energy]` | Measured |
-| Replicated serving across machines | `/api/cluster/*` | `[cluster]` | Runs at one node, unmeasured at 2 |
-| Sharding one model across machines | automatic at load | `[cluster]` | DeepSeek V4.1 only, unmeasured at 2 nodes |
-| Scrape endpoint | `/metrics` | feature `metrics` | Runs |
-| Authentication and rate limit | every route | `require_auth`, `api_keys`, `rate_limit_per_minute` | Runs, off by default |
+- Chat, completion, embeddings and reranking, with tools, JSON schema and grammar-constrained output.
+- Images, video, transcription, speech, music and sound effects.
+- Placement of a model across cards and the host, with experts streamed from disk when a mixture does not fit.
+- Continuous batching, speculative decoding and KV reuse across conversations.
+- Coding agents served by the daemon: `loken launch claude`, `loken launch cline`.
+- Replicated serving and sharding across machines.
+- Energy reported per request.
 
-Each media family is a Cargo feature, `image`, `audio`, `video`, `midi`, or `media` for all. A
-family that is not compiled reports its models as unknown rather than dispatching to something
-absent. The families served are in [`docs/MODELS.md`](docs/MODELS.md). One page per task is in
-[`docs/guides/`](docs/guides/).
+[`docs/start/overview.md`](docs/start/overview.md) holds the full table: each capability, its route, its configuration key and its state.
 
-## Where it is careful
+## Expose it on a network
 
-- **Placement is measured.** The forward is walked without allocating, each card is asked what
-  it holds, and one rule decides for every family. Weights are charged at what the pool keeps,
-  not what the files weigh.
-- **Out of memory is a bug, not a condition.** What does not fit spreads across cards. Only what
-  no card holds reaches the host.
-- **Energy is reported beside speed**, per request.
-
-## Building
-
-The default build wants a CUDA toolkit and OpenCL headers. Without them, build the host path:
-
-```sh
-cargo build --release --no-default-features --features cpu
-```
-
-Toolchains, features, the daemon's flags and what to do when a build or a load fails are in
-[`docs/BUILDING.md`](docs/BUILDING.md).
-
-## Running it on a network
-
-The server **has no authentication and no rate limit unless you configure them**, and its API
-can delete models. Turn both on in `config.toml` before it listens on anything but localhost:
-`require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]`.
+The server has no authentication and no rate limit unless you configure them, and its API can delete models. Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` in `config.toml` before it listens on anything but localhost.
 
 ## Documentation
 
-[`docs/README.md`](docs/README.md) says what to read in which order. The short list:
+| Page | Read it to |
+|---|---|
+| [`docs/start/install.md`](docs/start/install.md) | Build and install loken |
+| [`docs/guides/`](docs/guides/) | Do one task, with the smallest configuration and one request |
+| [`docs/learn/`](docs/learn/) | Learn the fundamentals of inference in 10 lessons |
+| [`docs/API.md`](docs/API.md) | Look up a route on the 3 surfaces |
+| [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Look up a key of `config.toml` and its default |
+| [`docs/STATUS.md`](docs/STATUS.md) | See what is measured, what is slower, and what has never run |
+| [`ROADMAP.md`](ROADMAP.md) | See the next work |
 
-- [`docs/guides/`](docs/guides/): one page per task, with the configuration and one request
-- [`docs/learn/`](docs/learn/): the fundamentals of inference in 10 lessons, as experimented here
-- [`docs/MODELS.md`](docs/MODELS.md): the families served and how a request names them
-- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md): every key of `config.toml` and its default
-- [`docs/API.md`](docs/API.md): every route on the 3 surfaces
-- [`docs/STATUS.md`](docs/STATUS.md): **what is measured, what is known to be slower, what is
-  written but not wired, and what has never run.** Read this one before deciding whether the
-  engine suits you
-- [benchmarks](https://github.com/loken-ai/benchmarks): the bench campaign, and the measurements against other engines
-  published at https://loken-ai.github.io/benchmarks/, including the cells where this engine loses
-- [`docs/CLUSTER.md`](docs/CLUSTER.md): spreading work across more than one machine
-- [`ROADMAP.md`](ROADMAP.md): what the next releases bring, and the state of each feature
+[`docs/README.md`](docs/README.md) indexes every page.
 
 ## Contributing and reporting
 
-[`CONTRIBUTING.md`](CONTRIBUTING.md), what a change should bring with it.
-[`SECURITY.md`](SECURITY.md), reporting a vulnerability, and what the unauthenticated default
-assumes.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): what a change brings with it.
+- [`SECURITY.md`](SECURITY.md): reporting a vulnerability, and what the unauthenticated default assumes.
 
 ## History
 
-The git history was rewritten before publication. The project began as experiments early in
-2026. What is published starts on 2026-08-30 with the tree as it stood then, laid out as
-chapters, and carries the work from that point on. The earlier commits are not part of this
-repository.
+The git history was rewritten before publication. The project began as experiments early in 2026. The published history starts on 2026-08-30 with the tree as it stood then, laid out as chapters, and carries the work from that point on. The earlier commits are not part of this repository.
 
 ## Licence
 
-MIT OR Apache-2.0, at your option. Third-party attributions are in [`NOTICE.md`](NOTICE.md).
-Model weights are not distributed here and carry their own terms.
+MIT OR Apache-2.0, at your option. [`NOTICE.md`](NOTICE.md) holds the third-party attributions. Model weights are not distributed here and carry their own terms.

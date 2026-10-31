@@ -1,29 +1,26 @@
 # Roadmap
 
-What the next releases bring, feature by feature. [`CHANGELOG.md`](CHANGELOG.md) lists what is
-done. [`docs/STATUS.md`](docs/STATUS.md) says what is measured. A feature is done when
-what its "Done when" column says is true and measured. Until then it stays here with its state.
+The next work, by version. [`CHANGELOG.md`](CHANGELOG.md) lists what shipped. [`docs/STATUS.md`](docs/STATUS.md) says what is measured.
 
-A state is one word: Done, Partial (what is left is a feature of a later version), Started,
-Planned, or Waiting (for the hardware to measure it on).
+A row stays until its `Done when` is true and measured.
+
+| State | Meaning |
+|---|---|
+| Started | Work is under way |
+| Partial | Part shipped, the rest is open |
+| Planned | Not started |
+| Waiting | Needs hardware to measure on |
 
 ## 0.3.0
 
+Run 1 model across several cards and machines.
+
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| One model across several machines, cut by layer | Cluster | A model too big for one machine runs across several, faster than on the best machine alone. | Done |
-| Tensor parallelism in the generic path | Parallelism | A model runs split across any number of cards, MoE models included. | Done |
 | Expert parallelism | Parallelism | A MoE model's experts are spread across cards when that is faster. | Partial |
-| Pipeline parallelism across machines | Cluster | A chain of any number of machines serves one model, with speculative decoding still working. | Done |
-| Data parallelism | Parallelism | Several copies of a model share the incoming requests. | Done |
-| Context parallelism | Parallelism | A long context's attention is split across cards. | Done |
 | Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Partial |
-| CUDA on the published cudarc crate | Backends | loken builds on the published cudarc crate, with no patched fork, and graphs still work. | Done |
-| A Linux binary | Packaging | One Linux archive runs on the CPU anywhere, a second one adds the CUDA libraries. | Done |
-| CPU kernels chosen at run time | CPU | One binary picks AVX2 or AVX-512 on the machine it runs on. | Done |
-| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on one and 2 cards. | Partial |
+| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on 1 and 2 cards. | Partial |
 | A coding agent on large models | Agents | lokode finishes a multi-step task on Qwen3.8 and DeepSeek V4.1. | Done |
-| A faster test suite | Tests | The tests a change must pass run in a fraction of the old time. | Done |
 
 ## 0.4.0
 
@@ -31,39 +28,15 @@ Major, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| One binary for NVIDIA and AMD cards | Backends | One binary uses NVIDIA and AMD cards at the same time, and one model can run across both. | Done |
-| Everything CUDA runs, on AMD | Backends | Every CUDA test passes on an AMD card, the NVIDIA-only kernels ported. | Done |
-| A Vulkan backend | Backends | One model of each family runs through Vulkan on an NVIDIA, an AMD and an Intel card and answers as the host does, in decode and in prompt reading. | Done |
-| Backends measured | Backends | Each backend is measured against the reference engine on the same card. | Done |
 | Coding agents beyond lokode | Agents | opencode, Claude Code and Cline finish the lokode task on Qwen3.8 and DeepSeek V4.1. | Done |
-| Forecasting models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Done |
-| Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
-| Load every format a model ships in | Models | Every model loads from each format its publisher ships, GGUF and safetensors in the Hugging Face and the native layouts, through the same placement as the others, checked by one loading test per architecture. | Done |
-| Mistral Timestral forecasts | Models | The 4 Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Done |
-
-Smaller, by priority:
-
-| Feature | Category | Done when | State |
-|---|---|---|---|
-| AVX-512 host kernels for the IQ formats | CPU | IQ2_S, IQ3_XXS and IQ4_NL experts run faster with AVX-512 than with AVX2 on the same machine. | Done |
-| The OpenCL path brought back | Backends | A language model and an image model run through OpenCL on an Intel GPU and answer as the CPU does. | Done |
-| A routing profile kept per model | Performance | After a restart, a model's expert cache is already warm, with no setting needed. | Done |
-| Audio input proven on real checkpoints | Audio | Voxtral and Ultravox transcribe a 20-clip set as well as the reference implementation. | Done |
-| Ultravox on its own | Audio | An Ultravox checkpoint answers audio with no extra GGUF beside it. | Done |
-| Media input limits | API | A request with too many images, pixels or audio seconds gets a 400 that names the limit. | Done |
-| Images by URL on the Messages API | API | The Messages API reads an image from a URL on an allowed host. | Done |
-| Multimodal parts on the Responses API | API | The Responses API reads images and audio as chat completions does. | Done |
-| Generated audio as mp3 and flac | Audio | Generated audio comes back as wav, mp3 or flac, as asked. | Done |
-| MIDI at the tempo asked | Music | A MIDI render has the tempo the request asks for. | Done |
-| Audio models in half precision | Audio | Stable Audio, EzAudio and ACE-Step keep their weights in F16, and Stable Audio fits in 2.5 GB. | Done |
 
 ## 0.4.x
 
-What finishes or speeds up what 0.4.0 ships working, released as 0.4.1, 0.4.2 and so on:
+Patch releases that finish or speed up what 0.4.0 ships:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for one model of each family. | Planned |
+| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Planned |
 | Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Planned |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
@@ -78,8 +51,8 @@ Major, by priority:
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Started |
 | Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Started |
 | DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Planned |
-| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10 % of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
-| Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
+| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10% of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
+| Qwen3.8 IQ1_M on 1 card at the reference | Performance | Qwen3.8 IQ1_M on 1 card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
 | Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
 
 Smaller, by priority:
@@ -87,26 +60,47 @@ Smaller, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
-| Image and text embeddings | API | A CLIP or SigLIP model turns texts and images into vectors on the embeddings route, as the original code does. | Done |
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
-| Per-request metrics | Operations | The metrics endpoint shows queue, prefill, decode and cache figures for each request. | Done |
 | Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Partial |
-| Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Done |
-| Concurrent media requests | Serving | 2 image or speech requests on one card finish sooner together than one after the other. | Started |
-| Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
+| Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |
+| Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
-| Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds, the Responses API's previous response names the conversation. | Done |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Planned |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
-| Model directories on several disks | Models | Several model directories, on several disks, form one catalogue, and a model being pulled lands on the directory that holds it and reads it fastest, judged on its size, the free space and the measured speed of each disk. | Partial |
-| Serving without custom settings | API | A client gets the window, the cache format and the priority a request needs without any loken header or option: the server derives them from the request and the machine. | Done |
 | Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
 | One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
+| Speculation sized by expert cost | Speculation | The draft length accounts for the experts a draft adds that are not in memory, and a streamed model decodes faster with it than with the length chosen by acceptance alone. | Planned |
+| Routing toward resident experts | Performance | At the fast level the router favours experts already in memory, and the answers stay inside the bounds of the quality harness. | Planned |
+| Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
+| Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
+| Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
+| Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Planned |
+| Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Planned |
+| Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the highest rate that still meets a first-token time and a per-token time the user sets. | Planned |
+| Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Planned |
+| Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Planned |
+| Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a signature so that a copy cannot change under the same name. | Planned |
+
+Fixes, by priority:
+
+| Feature | Category | Done when | State |
+|---|---|---|---|
+| Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Started |
+| A missing token count stays missing | Bench | An iteration with no token count is left out of the totals and says so, instead of counting 0. | Partial |
+| Same first-token time on every engine | Bench | The bench starts the first-token time at the first text of the stream on every engine. | Done |
+| Failures visible in concurrent cells | Bench | A failed request in a cell with concurrent requests is recorded in the errors of the cell. | Done |
+| Streams that cannot hang | Bench | The measuring client times out a silent stream and refuses an https address instead of connecting in plain text. | Done |
+| A cut stream is reported as cut | API | A Responses stream whose upstream ends without its final marker ends as incomplete, not as completed. | Started |
+| Warm-up failures visible | Bench | A failed warm-up request is reported for every modality. | Done |
+| Measured settings recorded | Bench | The image size, seed, duration, voice, keep-alive and client timeout of a cell are options, and the record holds them. | Partial |
+| A memory fallback that does not stay | Performance | A matrix product that runs out of card memory falls back for that call only, and the fallback copy is not kept. | Started |
+| Sampling without per-token allocation | Performance | A sampled token allocates no buffer on the card, and uploads no penalty list when the penalty is off. | Partial |
+| Honest back-pressure | API | A refused request carries a Retry-After computed from the queue and the measured rate, and a request waiting on a model load reports the load as it goes. | Partial |
 
 ## 0.6.0
 
@@ -133,6 +127,34 @@ Smaller, by priority:
 | Longer sound | Audio | A long sound renders in one piece, with no audible seam. | Planned |
 | Another music family | Music | One more open music family renders through the music route. | Planned |
 | Audio speed published | Performance | The benchmarks show each music and sound family's speed on a named card. | Planned |
+| Placement preview | API | `loken fit` and a plan route tell, for a model file, the layers per device, the host share and the context that fits, from the code a real load runs. | Planned |
+| Authenticated cluster | Cluster | Nodes sign their announcements and their peer calls with a shared secret, and a node without it is refused. | Planned |
+| Model copy between nodes | Cluster | A node fetches a model file from a peer that holds it, checks its digest and resumes after a cut. | Planned |
+| Host tier for the KV cache | Serving | The KV of a long context lives in host memory, a working set stays on the card, and the pages a query selects are fetched, so a long context is no longer bounded by card memory. | Planned |
+| Suffix drafting across requests | Speculation | A draft index built from earlier answers of the same model, kept in memory and cleared on unload, drafts faster than prompt lookup alone on repeated agent work. | Planned |
+| Tree drafting | Speculation | The verification pass checks a tree of candidates, and the width of the tree follows the cost of the experts it adds. | Planned |
+| Chunked pipeline prefill | Cluster | The chunks of a prompt cross a cut pipeline one behind the other, so every stage works at once, and a long prompt reaches its first token sooner than with each chunk waiting for the whole chain. | Planned |
+| Several sequences through a cut pipeline | Cluster | A pipeline across machines serves several sequences at once, each with its own KV on every stage, and keeps speculative verification working. | Planned |
+| Disk-streamed layers in the cut plan | Cluster | A node whose share of layers does not fit in its memory streams them from disk while the other stages work, and the cut plan counts that stream as capacity. | Planned |
+| Cut boundary sized by the link | Cluster | The activations that cross a cut are sent in the narrowest form the link needs, chosen from the link speed loken measured, and answers stay inside the bounds of the quality harness. | Planned |
+| Load-driven re-cut | Cluster | A cut pipeline moves layers between nodes when the load or the speed of a node changes, without dropping the requests in flight. | Planned |
+| Peer memory as an expert tier | Cluster | The memory of a peer holds experts for a node whose own memory is short, fetched over the link, and a model decodes faster than with those experts read from disk. | Planned |
+| Encoder on its own card or node | Serving | The vision or audio encoder of a model runs on a card or a node other than the one that decodes, and a request that carries media decodes sooner than with both on 1 card. | Planned |
+| Weight types NVFP4, IQ1 and ternary | Models | A GGUF file that holds an NVFP4, an IQ1 or a ternary tensor loads and answers as the reference implementation does. | Planned |
+| Block cache for diffusion transformers | Performance | An image or video model reuses the output of its blocks from one step to the next, renders faster than with whole steps skipped, and the quality score does not fall. | Planned |
+| Multi-vector embeddings | API | The embeddings and rerank routes return one vector for each token and score a query against a document by late interaction, for text and for page images. | Planned |
+| Embeddings as integers and bits | API | The embeddings routes return a vector as int8 or as binary on request, and a client ranks with them as well as with the float vector. | Planned |
+| Word timestamps and long recordings | Audio | The transcription route returns the time of each word, and a recording of any length is read in windows cut at silences. | Planned |
+| Several vision embeddings cached | Serving | The embeddings of several images are kept between requests, and a conversation that comes back to an image does not read it again. | Planned |
+
+Fixes, by priority:
+
+| Feature | Category | Done when | State |
+|---|---|---|---|
+| Cluster polling in parallel | Operations | lokpit asks all nodes at the same time, so a slow node delays only its own reading, and a failed endpoint marks the node as degraded. | Planned |
+| Each tensor parsed once | Performance | Loading a safetensors checkpoint parses the header of each file once. | Planned |
+| The disk cache lock held briefly | Performance | Saving a prompt to the disk cache never delays a lookup. | Planned |
+| lokpit export serves | Operations | `lokpit export` serves on the address it is given, or the option is removed. | Planned |
 
 ## 0.7.0
 
@@ -149,7 +171,7 @@ Smaller, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | Open decision models | Models | Clef 27B, Clef-flash 9B, Clef-omni 30B, Perplexity's Decider, Liquid's d1-3B and d1-omni-600M each match their reference on a fixed set on the decision route, and read the images, audio or video they were trained on. Closed ones (Jev, Microsoft, OpenAI, Liquid d1-ultra) are not served. | Planned |
-| System One extraction models | Models | Once its weights are published, Clairic returns numbers with an 80 % range, typed values and extracts with their positions in one pass, matching the reference on a fixed set. | Planned |
+| System One extraction models | Models | Once its weights are published, Clairic returns numbers with an 80% range, typed values and extracts with their positions in one pass, matching the reference on a fixed set. | Planned |
 | Streamed speech | Audio | Speech starts playing before a tenth of its render time, in opus, flac, aac, wav or mp3. | Planned |
 | Audio from a chat turn | Audio | A chat completion can answer with text and audio. | Planned |
 | Streamed music | Music | Streamed music starts within a fifth of its render time. | Planned |
@@ -178,6 +200,19 @@ Smaller, by priority:
 | Tabular models | Models | loken predicts rows of a table and beats a simple baseline on a fixed data set. | Planned |
 | Energy-aware placement | Operations | On request, the placement saves watts at some cost in speed, both measured. | Planned |
 | Quotas per key | Operations | Each API key has a token and request budget that loken enforces, names the models, tools and media it may use, and every request leaves a record of the key, model and tools. | Planned |
+| Scopes per key | Operations | A key is limited to inference or to administration, may expire, and the key list reloads without a restart. | Planned |
+| Traces and metrics export | Operations | loken exports traces and the standard generation metrics, follows an incoming trace across cluster hops, and carries no prompt text. | Planned |
+| Cost and carbon ledger | Operations | loken keeps counters per key and model of requests, tokens and energy, and prices the energy with a tariff the user sets. | Planned |
+| Warm prefixes | Serving | A client names a prefix that loken loads into the cache tiers and keeps against eviction, within the memory budget. | Planned |
+| Tool loop on the server | Tools | loken runs a bounded loop of tool calls itself and returns the final answer. | Planned |
+| Model digest allowlist | Operations | A configuration lists the model digests that may load, and any other file is refused. | Planned |
+| Cluster history and alerts | Operations | lokpit records snapshots, replays them, and calls a command when a finding appears or clears. | Planned |
+| Side-by-side answers | Client | lokraft sends one prompt to 2 models or 2 fidelity levels and shows both answers with their speed and energy. | Planned |
+| KV reuse outside the prefix | Serving | A chunk of text seen before is reused at another position with a share of its tokens recomputed, and the answers stay close to a cold read. | Planned |
+| Attention and feed-forward on different nodes | Cluster | The attention of a layer and its feed-forward run on different machines, and a model too large for the best machine decodes faster than with its layers cut. | Planned |
+| Multi-path placement | Cluster | A model is placed over a cluster by the speed of its links and the memory of its nodes, with a layer served by more than one path, and decodes faster than with 1 path. | Planned |
+| Visual token pruning | Performance | A request can drop the image tokens that matter least to its question, and a vision model answers faster with the answer inside the bounds of the quality harness. | Planned |
+| Sampling recipe carried by an adapter | Models | A few-step adapter brings the sampler and the step count it needs, and a render uses them without a setting. | Planned |
 
 ## 0.9.0
 
@@ -197,10 +232,10 @@ Smaller, by priority:
 
 ## Waiting for hardware
 
-Features that cannot be measured on the machines at hand. Each moves into a version once a machine
-to measure it on is available.
+Features that no available machine can measure. Each moves into a version when a machine to measure it on is available.
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| A backend for Apple silicon | Backends | One model of each family runs through Metal on an Apple Silicon Mac. | Waiting |
-| A native backend for Intel GPUs | Backends | One model of each family runs through Intel's Level Zero, with the matrix engines of an Arc card, faster than through Vulkan and OpenCL on the same card. | Waiting |
+| A backend for Apple silicon | Backends | 1 model of each family runs through Metal on an Apple Silicon Mac. | Waiting |
+| A native backend for Intel GPUs | Backends | 1 model of each family runs through Intel's Level Zero, with the matrix engines of an Arc card, faster than through Vulkan and OpenCL on the same card. | Waiting |
+| Disk reads straight to the card | Performance | Experts stream from the SSD to a card without passing through host memory, faster and with fewer joules per byte than the current read. | Waiting |

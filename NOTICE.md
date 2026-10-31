@@ -1,11 +1,8 @@
 # Third-Party Notices
 
-`loken` is licensed under the terms of **MIT OR Apache-2.0** (see
-[`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE)).
+`loken` is licensed under **MIT OR Apache-2.0**. See [`LICENSE-MIT`](https://github.com/loken-ai/loken/blob/main/LICENSE-MIT) and [`LICENSE-APACHE`](https://github.com/loken-ai/loken/blob/main/LICENSE-APACHE).
 
-It builds on, vendors, or links against the third-party works listed below. Each remains
-under its own license. This file collects the required notices. The authoritative license for
-any crate dependency is the one shipped in its own source tree (resolved in `Cargo.lock`).
+`loken` builds on, vendors or links against the third-party works listed here. Each keeps its own license, and this file collects the required notices. The authoritative license of a crate dependency is the one shipped in its source tree, resolved in `Cargo.lock`.
 
 ## Dependency
 
@@ -29,25 +26,26 @@ their credits, in the [benchmarks](https://github.com/loken-ai/benchmarks) repos
 
 ## Borrowed code, measured
 
-Each row states what a file still shares, verbatim, with the upstream it names. Figures come
-from `scripts/provenance/manifest.tsv`, measured against real checkouts. `src/notice_gate.rs`
-holds the table to them: at or above 30% a file must have a row, below 10% a row must go, and
-between the 2 is a judgement call. The goal is an empty table.
+Each row states what a file still shares, verbatim, with the upstream it names.
+The figures come from `scripts/provenance/manifest.tsv`, measured against real checkouts.
+`src/notice_gate.rs` holds the table to them:
 
-2 caveats. A snippet scanner sees reformatted copies our line-for-line measure cannot, so the
-larger of the 2 figures is what is recorded. And the largest range left in `mmq_gguf.cuh` is
-the GGUF k-quant bit specification (masks, shifts and strides any correct reader reproduces).
-So 2 restructurings left the arithmetic identical and the share slightly higher. Convergent
-design over a published format, not residual copying. The IQ2_XXS row is the same case in one
-file: every matched line is the format's codebook, the point grid, the sign patterns and the
-mask a reader of that format holds byte for byte, and the dequantiser around them is ours.
+- At or above 30%, a file must have a row.
+- Below 10%, a row must go.
+- Between the 2, a row is a judgement call.
 
-**Chain of title.** The `cuda/mmq_gguf/` and `cuda/moe/` kernels reached this tree through
-candle, whose own copies are llama.cpp's, candle matches `ggml/src/ggml-cuda` at 100%, 94%, 63%
-and 55% across those files. Those are candle's shares, not ours. They establish that llama.cpp
-(MIT) governs the kernels even where candle is the immediate upstream. `cuda/marlin/` descends
-from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin) via vLLM. Files under the listing
-threshold that remain ports carry their attribution inline.
+The goal is an empty table.
+
+2 caveats:
+
+- A snippet scanner sees reformatted copies that the line-for-line measure cannot, so the larger of the 2 figures is recorded.
+- The largest range left in `mmq_gguf.cuh` is the GGUF k-quant bit specification: masks, shifts and strides that any correct reader reproduces. 2 restructurings left the arithmetic identical and the share slightly higher. This is convergent design over a published format, not residual copying.
+
+The IQ2_XXS row is the same case in one file. Every matched line is the format's codebook, the point grid, the sign patterns and the mask that a reader of that format holds byte for byte. The dequantiser around them is ours.
+
+**Chain of title.** The `cuda/mmq_gguf/` and `cuda/moe/` kernels reached this tree through candle, whose own copies are llama.cpp's. Candle matches `ggml/src/ggml-cuda` at 100%, 94%, 63% and 55% across those files. Those are candle's shares, not ours. They establish that llama.cpp (MIT) governs the kernels even where candle is the immediate upstream.
+`cuda/marlin/` descends from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin) via vLLM.
+Files under the listing threshold that remain ports carry their attribution inline.
 
 | Path | Share | Lines | Immediate upstream | License |
 |------|-------|-------|--------------------|---------|
@@ -57,10 +55,7 @@ threshold that remain ports carry their attribution inline.
 
 ## Algorithms followed
 
-The IQ3_XXS encoder in `src/tensor/quant_cpu/format/iq3_xxs.rs` follows the search of
-`quantize_row_iq3_xxs_impl` in [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-`ggml/src/ggml-quants.c` (MIT): the scale candidates, the weighting by importance and the
-nearest-point fallback for patterns off the grid. The code is written for loken.
+The IQ3_XXS encoder in `src/tensor/quant_cpu/format/iq3_xxs.rs` follows the search of `quantize_row_iq3_xxs_impl` in [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `ggml/src/ggml-quants.c` (MIT). It follows the scale candidates, the weighting by importance and the nearest-point fallback for patterns off the grid. The code is written for loken.
 
 The encoders below follow the same file's searches in the same way, written for loken:
 
@@ -72,25 +67,19 @@ The encoders below follow the same file's searches in the same way, written for 
 | `src/tensor/quant_cpu/format/iq4_nl.rs`, `iq4_xs.rs` | `quantize_row_iq4_nl_impl`, `quantize_iq4_xs` |
 | `src/tensor/quant_cpu/format/legacy_guided.rs` | the importance weighting of `quantize_row_q4_0_impl` and its kin |
 
-The card kernels for these formats in `src/inference/cuda/quantized/requant.cu` run the same
-searches as the host encoders above.
+The card kernels for these formats in `src/inference/cuda/quantized/requant.cu` run the same searches as the host encoders above.
 
-Model *weights* are not distributed with this repository. Downloading and using any model is
-subject to that model's own license and terms of use. The references each model
-implementation was written against, architecture attribution, not borrowed code, are listed
-in [`docs/REFERENCES.md`](docs/REFERENCES.md).
+## Model weights
+
+Model *weights* are not distributed with this repository. Downloading and using a model is subject to that model's own license and terms of use.
+The references each model implementation was written against are architecture attribution, not borrowed code. They are listed in [`docs/REFERENCES.md`](https://github.com/loken-ai/loken/blob/main/docs/REFERENCES.md).
 
 ## Notable dependencies and their licenses
 
-Permissive (MIT / Apache-2.0 / BSD), among others: `tokio`, `axum`, `serde`, `reqwest`,
-`tokenizers`, `hf-hub`, `nvml-wrapper`, `opencl3`, `llguidance`, `toktrie_hf_tokenizers`,
-`image`, `rayon`, `half`, `safetensors`, `bytemuck`.
+Permissive (MIT, Apache-2.0, BSD), among others: `tokio`, `axum`, `serde`, `reqwest`, `tokenizers`, `hf-hub`, `nvml-wrapper`, `opencl3`, `llguidance`, `toktrie_hf_tokenizers`, `image`, `rayon`, `half`, `safetensors`, `bytemuck`.
 
 Weak copyleft (file-level), used unmodified as a dependency:
 
-- **`symphonia`** (audio decoding: MP3/FLAC/OGG/AAC): **MPL-2.0**. Compatible with this
-  project's license. It requires that modifications to the symphonia source files themselves
-  remain under MPL-2.0. `loken` does not modify symphonia, so no additional obligation
-  applies beyond this notice.
+- **`symphonia`** (audio decoding: MP3, FLAC, OGG, AAC): **MPL-2.0**. Compatible with this project's license. It requires that modifications to the symphonia source files themselves remain under MPL-2.0. `loken` does not modify symphonia, so no additional obligation applies beyond this notice.
 
-For the complete, version-pinned dependency license set: `cargo license`.
+`cargo license` lists the complete, version-pinned dependency license set.

@@ -1,53 +1,36 @@
 # Documentation
 
-The same documents, with the map of lokend, are served at
-<https://loken-ai.github.io/loken/>.
+The same pages are served at <https://loken-ai.github.io/loken/>.
 
-Read in this order.
-
-1. The [feature matrix](../README.md#what-it-does) in the README: each capability, its route,
-   its configuration key and its state.
-2. [`guides/`](guides/): one page per task, each with the smallest configuration, one request
-   and what to expect.
-3. [`learn/`](learn/): the fundamentals of inference in 10 lessons, each with what this
-   tree does about it, what was measured, and one thing to run.
-4. [`MODELS.md`](MODELS.md): the families served, the stores they are read from, how a request
-   names them.
-5. [`CONFIGURATION.md`](CONFIGURATION.md): every key of `config.toml` and its default.
-6. [`API.md`](API.md): every route on the 3 surfaces.
-7. [`BUILDING.md`](BUILDING.md): the toolchains, the builds without CUDA, the daemon's flags,
-   troubleshooting.
-8. [`STATUS.md`](STATUS.md): what is measured, what is slower, what is written and wired to
-   nothing. Read it before relying on a feature.
-9. The [benchmarks](https://github.com/loken-ai/benchmarks) repository: the campaign, the measurements and the protocol behind
-   them, published at https://loken-ai.github.io/benchmarks/.
-10. [`CLUSTER.md`](CLUSTER.md): serving from more than one machine.
-11. [`REFERENCES.md`](REFERENCES.md): the papers and implementations this work draws on.
-
-## Learn
-
-| Lesson | Question |
+| Page | Read it to |
 |---|---|
-| [`learn/README.md`](learn/README.md) | The series: 10 lessons, 10 minutes each, one exercise per lesson |
-| [`learn/slides.html`](learn/slides.html) | The same series as a deck |
-
-## Maps
-
-| Map | What it shows |
-|---|---|
-| [`ANATOMY.md`](ANATOMY.md) | The modules of lokend drawn on a body, with the HeteroPlan levels each reads |
-
-## Guides
-
-| Guide | Task |
-|---|---|
+| [`start/overview.md`](start/overview.md) | See what loken serves and in which state |
+| [`start/install.md`](start/install.md) | Build the 2 binaries |
+| [`start/first-run.md`](start/first-run.md) | Start the daemon, pull a model and get an answer |
+| [`start/choose-a-model.md`](start/choose-a-model.md) | Pick a family, a size and a quantisation that fit your memory |
+| [`start/concepts.md`](start/concepts.md) | Learn the terms of the guides and how a request reaches a model |
 | [`guides/openai-sdk.md`](guides/openai-sdk.md) | Serve a chat model to an OpenAI client |
 | [`guides/ollama-clients.md`](guides/ollama-clients.md) | Point an Ollama client at loken |
 | [`guides/agents.md`](guides/agents.md) | Run Claude Code or Cline on loken |
+| [`guides/embeddings.md`](guides/embeddings.md) | Embed texts and images |
 | [`guides/images.md`](guides/images.md) | Generate an image |
 | [`guides/speech.md`](guides/speech.md) | Transcribe and synthesise speech |
 | [`guides/drafter.md`](guides/drafter.md) | Speed up a model that spills to the host with a drafter |
 | [`guides/kv-memory.md`](guides/kv-memory.md) | Keep conversations in memory between requests |
-| [`guides/cluster.md`](guides/cluster.md) | 2 machines |
-| [`guides/layer-bench.md`](guides/layer-bench.md) | Measure a decode on a few layers of a large model |
-| [`guides/microbench.md`](guides/microbench.md) | Time one mechanism at a model's shapes, its variants side by side |
+| [`operate/cluster.md`](operate/cluster.md) | Serve from 2 machines |
+| [`operate/network.md`](operate/network.md) | Expose loken on a network with a key and a rate limit |
+| [`operate/troubleshooting.md`](operate/troubleshooting.md) | Find the cause of a failure by its message |
+| [`learn/README.md`](learn/README.md) | Follow the series of 10 lessons, one exercise each |
+| [`MODELS.md`](MODELS.md) | Find the families served, their stores, and how a request names them |
+| [`CONFIGURATION.md`](CONFIGURATION.md) | Look up a key of `config.toml` and its default |
+| [`API.md`](API.md) | Look up a route on the 3 surfaces |
+| [`BUILDING.md`](BUILDING.md) | Pick a toolchain, build without CUDA, read the daemon's flags, fix a failed build |
+| [`CLUSTER.md`](CLUSTER.md) | Look up the `[cluster]` keys, the routes and how a request is routed |
+| [`STATUS.md`](STATUS.md) | See what is measured, what is slower, and what has never run |
+| [`ARCHITECTURES.md`](ARCHITECTURES.md) | List the architectures the loader accepts and the formats of each |
+| [`ANATOMY.md`](ANATOMY.md) | See the modules of lokend drawn on a body, with the plan levels each reads |
+| [`REFERENCES.md`](REFERENCES.md) | Find the papers and implementations each model was written against |
+| [`dev/layer-bench.md`](dev/layer-bench.md) | Measure a decode on a few layers of a large model |
+| [`dev/microbench.md`](dev/microbench.md) | Time one mechanism at a model's shapes, variants side by side |
+
+The [benchmarks](https://github.com/loken-ai/benchmarks) repository holds the campaign, its method and its results, published at <https://loken-ai.github.io/benchmarks/>.
