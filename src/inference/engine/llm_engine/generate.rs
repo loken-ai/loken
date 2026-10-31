@@ -1922,6 +1922,7 @@ impl LlmEngine {
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                             &mut logits_processor,
                         )?;
+                        record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                         if head_on {
                             head_tokens.clear();
                             head_tokens.push(next_token);
@@ -2157,7 +2158,13 @@ impl LlmEngine {
                 eval_duration,
                 cached_prompt_tokens: cached_tokens as u64,
                 finish_reason,
-                logprobs: logprob_acc,
+                // One entry per token written.
+                // The draw that ended the generation is not a token written.
+                logprobs: {
+                    let mut written = logprob_acc;
+                    written.truncate(generated.len());
+                    written
+                },
             })
         }).await
             .map_err(|e| format!("spawn_blocking error: {e}").into());
