@@ -547,10 +547,12 @@ impl ExpertStore {
     }
 
     /// Called once `expert` (id `id`) has been computed: one that is not kept is dropped from
-    /// the page cache now, so its bytes do not stay in the way of the kept ones.
+    /// the page cache now while the host's memory is short, so its bytes do not stay in the way
+    /// of the kept ones, and stays there otherwise.
     pub fn release(&self, id: usize, expert: &Expert) {
         let kept = self.inner.lock().unwrap().kept.contains_key(&id);
-        if !kept && self.capacity.load(Ordering::Relaxed) > 0 {
+        if !kept && self.capacity.load(Ordering::Relaxed) > 0 && super::tier_tune::memory_stalled()
+        {
             let loader = self.loader.clone();
             let e = Expert {
                 w1: expert.w1.clone(),
@@ -566,7 +568,7 @@ impl ExpertStore {
     /// each one read; those pages were never asked for, so no release ever dropped them, and
     /// they grew to evict the kept experts of the layers read before.
     pub fn sweep(&self) -> Result<()> {
-        if self.capacity.load(Ordering::Relaxed) == 0 {
+        if self.capacity.load(Ordering::Relaxed) == 0 || !super::tier_tune::memory_stalled() {
             return Ok(());
         }
         let kept: Vec<usize> = self.inner.lock().unwrap().kept.keys().copied().collect();

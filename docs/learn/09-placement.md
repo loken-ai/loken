@@ -31,7 +31,7 @@ the trip beats serving it locally.
 | `src/inference/place/placement_invariants.rs` | The fleet rule as tests: the cards decide, not the budgets; no placement decides on a name or an index; every hot component can span n cards. |
 | `src/inference/place/layer_executor.rs` | The host budget as a share of the machine, not a constant. |
 | `src/inference/offload/streamed.rs`, `room.rs`, `cuda.rs` | The streamed placement for a model larger than the cards and host together: the weights every token reads and as many routed experts as the room allows, kept on the cards fastest first, under the same switches as every other placement. |
-| `src/inference/offload/store.rs` | The hot tier over streamed experts: views into the mapping, least-recently-routed eviction, cold experts dropped from the page cache once they have run. |
+| `src/inference/offload/store.rs` | The hot tier over streamed experts: views into the mapping, least-recently-routed eviction, cold experts dropped from the page cache once they have run while the host's memory is short, and left there otherwise. |
 | `src/distributed/routing.rs` | Which node answers, by predicted completion rather than by load. [`../CLUSTER.md`](../CLUSTER.md) has the cost model. |
 
 ## What was measured

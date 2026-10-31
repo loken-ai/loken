@@ -4,7 +4,25 @@
 //! growth, and falls back one step when they have. The kernel's own count of the time tasks wait
 //! for memory is the signal, so no share of the memory is set aside by a rule of thumb.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// Whether tasks waited for memory during the last interval the tier was looked at. Pages of
+/// experts the tier does not keep are dropped from the page cache only while it is true: with the
+/// host's memory not short, they stay for the next use, and the kernel takes them back itself
+/// when it needs the room. True until a look says otherwise, and where the system reports no
+/// memory stalls.
+static MEMORY_STALLED: AtomicBool = AtomicBool::new(true);
+
+/// See [`MEMORY_STALLED`].
+pub fn memory_stalled() -> bool {
+    MEMORY_STALLED.load(Ordering::Relaxed)
+}
+
+/// Whether a stall share means the host's memory is short: tasks waited for it at all.
+fn memory_short(stall: f64) -> bool {
+    stall > 0.0
+}
 
 /// What the next size of the tier is.
 ///
@@ -46,6 +64,11 @@ pub struct TierTune {
 
 impl TierTune {
     pub fn new(slots: usize, ceiling: usize, need: u64, step_bytes: u64) -> Self {
+        // A system that reports memory stalls starts with the pages kept: the first look says
+        // whether that was right.
+        if stall_total_us().is_some() {
+            MEMORY_STALLED.store(false, Ordering::Relaxed);
+        }
         Self {
             slots,
             ceiling,
@@ -66,6 +89,7 @@ impl TierTune {
         };
         let wall = now.duration_since(at).as_micros().max(1) as f64;
         let stall = total.saturating_sub(was) as f64 / wall;
+        MEMORY_STALLED.store(memory_short(stall), Ordering::Relaxed);
         let next = next_slots(
             self.slots,
             self.ceiling,
@@ -124,6 +148,24 @@ mod tests {
             100
         );
         assert_eq!(next_slots(1, 384, 0.5, Some(0.0), 20 * GB, 8 * GB, GB), 1);
+    }
+
+    /// Where the system reports memory stalls, a tuner starts with the pages of unkept experts
+    /// left in the cache, and the first look sets the flag from the stalls it measures.
+    #[test]
+    fn pages_stay_until_memory_is_short() {
+        if !std::path::Path::new("/proc/pressure/memory").exists() {
+            return;
+        }
+        let _tune = TierTune::new(10, 384, 0, GB);
+        assert!(!memory_stalled());
+    }
+
+    /// Any wait for memory in an interval makes it short, and none leaves it not short.
+    #[test]
+    fn memory_is_short_when_tasks_waited_for_it() {
+        assert!(!memory_short(0.0));
+        assert!(memory_short(0.0001));
     }
 
     /// The pressure report of this machine, where there is one, parses.
