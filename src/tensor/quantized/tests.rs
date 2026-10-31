@@ -1919,3 +1919,68 @@ fn the_bf16_gemm_sums_in_f32_on_every_card() {
     }
     assert!(!failed, "a card's BF16 product does not sum in F32");
 }
+
+/// The matmul that dequantises on the card for one call agrees with the host.
+/// The host multiplies the dequantised weight.
+/// This holds for the formats the card dequantises in F32.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_transient_dequantised_matmul_agrees_with_the_host() {
+    use crate::tensor::{cuda::CudaDevice, quant_cpu, Device, Tensor};
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the GPU kernels are NOT covered by this run");
+        return;
+    };
+    let device = Device::Cuda(dev);
+    let (n, k, rows) = (96usize, 512usize, 5usize);
+    let wf: Vec<f32> = (0..n * k)
+        .map(|i| {
+            let h = (i as u32)
+                .wrapping_mul(2_246_822_519)
+                .wrapping_add(374_761_393);
+            ((h >> 8) as f32 / (1 << 24) as f32 - 0.5) * 2.0
+        })
+        .collect();
+    let x: Vec<f32> = (0..rows * k)
+        .map(|i| (((i * 37 + i / 32) % 255) as f32 - 127.0) * 0.01)
+        .collect();
+    for dtype in [
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+    ] {
+        let bytes = quant_cpu::from_float_bytes(dtype, &wf).unwrap();
+        let qt = QHostTensor::from_bytes(&bytes, dtype, vec![n, k]).unwrap();
+        let w = qt.dequantize_f32().unwrap();
+        let qm = QKernelMatMul::from_qtensor_on(std::sync::Arc::new(qt), &device).unwrap();
+        let t = Tensor::from_vec_f32(x.clone(), vec![rows, k])
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+        let y = qm
+            .forward_dequant_transient(&t)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{dtype:?}: the card dequantises this format"))
+            .to_vec_f32();
+        assert_eq!(y.len(), rows * n, "{dtype:?}: wrong output length");
+        for r in 0..rows {
+            let reference: Vec<f64> = (0..n)
+                .map(|o| {
+                    (0..k)
+                        .map(|j| x[r * k + j] as f64 * w[o * k + j] as f64)
+                        .sum()
+                })
+                .collect();
+            let scale = reference.iter().fold(0f64, |m, v| m.max(v.abs()));
+            for o in 0..n {
+                let got = y[r * n + o] as f64;
+                assert!(
+                    (got - reference[o]).abs() <= 4e-3 * scale,
+                    "{dtype:?} row {r} col {o}: {got} against {} (row scale {scale})",
+                    reference[o]
+                );
+            }
+        }
+    }
+}

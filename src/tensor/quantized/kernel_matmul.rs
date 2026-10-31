@@ -536,6 +536,40 @@ impl QKernelMatMul {
         y.to_dtype(crate::tensor::DType::F32).map(Some)
     }
 
+    /// `x [.., k] @ W^T` in F32 over a copy of the weight dequantised on its card.
+    /// The copy lives for this call only.
+    /// The output follows the dtype of the activation.
+    /// `None` for a weight [`Self::dequant_f32_gpu`] does not serve.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn forward_dequant_transient(
+        &self,
+        x: &crate::tensor::Tensor,
+    ) -> Result<Option<crate::tensor::Tensor>> {
+        let crate::tensor::Device::Cuda(qdev) = &self.device else {
+            return Ok(None);
+        };
+        let Some(w) = self.dequant_f32_gpu()? else {
+            return Ok(None);
+        };
+        let wt = crate::tensor::Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(w),
+            qdev.clone(),
+            vec![self.n, self.k],
+        )?;
+        let xf = if x.dtype() == crate::tensor::DType::F32 {
+            x.clone()
+        } else {
+            x.to_dtype(crate::tensor::DType::F32)?
+        };
+        let y = xf.matmul_t(&wt)?;
+        match x.dtype() {
+            crate::tensor::DType::F16 | crate::tensor::DType::BF16 => {
+                y.to_dtype(x.dtype()).map(Some)
+            }
+            _ => Ok(Some(y)),
+        }
+    }
+
     /// Attach a low-rank correction on top of the quantised weight.
     pub fn add_lora(&mut self, delta: crate::tensor::lora::LoraDelta) -> Result<()> {
         let (din, r) = delta.down.shape().dims2()?;
@@ -1380,6 +1414,12 @@ impl QKernelMatMul {
                                 "mmq unavailable ({e}); this matmul takes the dequantised \
                                  path instead of failing"
                             );
+                            // The weight is dequantised on the card for this call only.
+                            // No copy of it is kept.
+                            #[cfg(feature = "gpu")]
+                            if let Some(y) = self.forward_dequant_transient(x)? {
+                                return Ok(y);
+                            }
                         }
                         Err(e) => return Err(e),
                     }
@@ -1409,6 +1449,12 @@ impl QKernelMatMul {
                                 "mmq unavailable ({e}); this matmul takes the dequantised \
                                  path instead of failing"
                             );
+                            // The weight is dequantised on the card for this call only.
+                            // No copy of it is kept.
+                            #[cfg(feature = "gpu")]
+                            if let Some(y) = self.forward_dequant_transient(x)? {
+                                return Ok(y);
+                            }
                         }
                         Err(e) => return Err(e),
                     }
