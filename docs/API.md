@@ -230,7 +230,7 @@ cap's key and the value it carried, before the image is decoded.
 
 | Route | What it does |
 |---|---|
-| `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking`, `output_format`, `top_k`, `seed`, `stop_sequences`. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts and the [`loken` object](#per-request-figures) in `usage`. Streams as the official event stream, with `error` events. |
+| `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking`, `output_format`, `top_k`, `seed`, `stop_sequences`. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts and the [`loken` object](#per-request-figures) in `usage`. Streams as the official event stream, with `error` events. `max_tokens` is required, as in the Anthropic API. |
 | `POST /v1/messages/count_tokens` | Count the prompt with the model's own tokenizer. |
 | `POST /v1/messages/batches`, `GET /v1/messages/batches/{id}` | Batches in the Messages API's shape. `/cancel` stops one; `/results` serves its JSONL. |
 

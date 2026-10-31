@@ -82,8 +82,7 @@ pub struct AnthropicTool {
 pub struct AnthropicMessagesRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
-    /// Anthropic requires `max_tokens`; default defensively if a client
-    /// omits it rather than 422'ing.
+    /// The cap on the answer. The route refuses a request without it.
     #[serde(default)]
     pub max_tokens: Option<usize>,
     #[serde(default)]

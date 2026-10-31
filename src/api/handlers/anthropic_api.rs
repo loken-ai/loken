@@ -58,6 +58,14 @@ pub(crate) async fn anthropic_messages_at(
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_api_error(e);
     }
+    // A request without max_tokens is refused.
+    if req.max_tokens.is_none() {
+        return anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "max_tokens: Field required".to_string(),
+        );
+    }
     if let Some(why) = req.unsupported_input() {
         return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
     }
@@ -686,6 +694,26 @@ mod tests {
                 "model": "some-model",
                 "max_tokens": 16,
                 "messages": messages
+            }))
+            .unwrap();
+        let state = APIServer::new(String::new(), String::new());
+        let resp = anthropic_messages_at(
+            state,
+            axum::http::HeaderMap::new(),
+            req,
+            crate::api::gate::Priority::Interactive,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A request without `max_tokens` is refused.
+    #[tokio::test]
+    async fn a_request_without_max_tokens_is_refused() {
+        let req: crate::api::anthropic::AnthropicMessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "some-model",
+                "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
         let state = APIServer::new(String::new(), String::new());
