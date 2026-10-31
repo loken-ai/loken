@@ -726,7 +726,6 @@ impl LlmEngine {
                 }
             };
 
-            super::gguf::lead_with_template_bos(&mut tokenizer, &content);
             debug!("✓ Tokenizer loaded");
 
             // --- 4. The cards the placement offers this model ---

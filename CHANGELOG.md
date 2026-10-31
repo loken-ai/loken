@@ -28,6 +28,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Tokenizer: follow the file's add_bos_token on a bare prompt, as the reference does.
 - Experts: keep more of them in host memory, sized while serving, with read-ahead taken only when it runs faster.
 - Experts: read only the experts a prompt routes to, and run them on the cards.
 - Experts: copy a decode's experts to the cards beside the token, not inside it.

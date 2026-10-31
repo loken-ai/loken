@@ -599,13 +599,12 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         Some(gguf_file::Value::Bool(b)) => *b,
         _ => default_add_bos,
     };
-    // A model whose chat template opens every conversation with the BOS, or an architecture
-    // whose converters declare `add_bos_token = false` although the model needs one, gets a BOS
-    // on a bare continuation too. A prompt the template rendered already carries it, and
-    // `encode_prompt` keeps it single. The override is logged rather than silent.
-    let forced_bos = !declared_bos
-        && (facts.forces_bos
-            || template_opens_with_bos(content, gguf_bos_text(content).as_deref()));
+    // An architecture known to need a BOS gets one on a bare continuation.
+    // This holds when its converters declare `add_bos_token = false`.
+    // A prompt the template rendered already carries it.
+    // `encode_prompt` keeps it single.
+    // The override is logged.
+    let forced_bos = !declared_bos && facts.forces_bos;
     if forced_bos {
         info!(
             "🔖 {arch} declares add_bos_token=false and needs one regardless - adding it, as \
@@ -674,84 +673,6 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
     }
 
     Ok(tokenizer)
-}
-
-/// Make a tokenizer read whole from a file or a sidecar lead every sequence with the BOS when
-/// the file's chat template opens with it and the tokenizer does not add it: a bare
-/// continuation then reaches the model as the template's conversations do. What the
-/// tokenizer already does after encoding is kept, the BOS added after it.
-pub fn lead_with_template_bos(tokenizer: &mut Tokenizer, content: &gguf_file::Content) {
-    let Some(gguf_file::Value::U32(bos_id)) = content.metadata.get("tokenizer.ggml.bos_token_id")
-    else {
-        return;
-    };
-    let Some(bos) = tokenizer.id_to_token(*bos_id) else {
-        return;
-    };
-    if !template_opens_with_bos(content, Some(&bos)) {
-        return;
-    }
-    if tokenizer
-        .encode("a", true)
-        .is_ok_and(|e| e.get_ids().first() == Some(bos_id))
-    {
-        return;
-    }
-    use tokenizers::processors::template::TemplateProcessing;
-    use tokenizers::processors::PostProcessorWrapper;
-    let Ok(template) = TemplateProcessing::builder()
-        .try_single(format!("{bos}:0 $A:0"))
-        .and_then(|b| b.try_pair(format!("{bos}:0 $A:0 $B:1")))
-        .map(|b| b.special_tokens(vec![(bos.clone(), *bos_id)]).build())
-    else {
-        return;
-    };
-    let Ok(template) = template else {
-        return;
-    };
-    let post =
-        match tokenizer.get_post_processor().cloned() {
-            Some(existing) => PostProcessorWrapper::Sequence(
-                tokenizers::processors::sequence::Sequence::new(vec![existing, template.into()]),
-            ),
-            None => template.into(),
-        };
-    tokenizer.with_post_processor(Some(post));
-    info!("🔖 the chat template opens with {bos}: a bare prompt is given it too");
-}
-
-/// Whether the file's chat template writes the BOS before anything else: a literal of the
-/// BOS token's text `bos`, or the template's `bos_token` variable.
-fn template_opens_with_bos(content: &gguf_file::Content, bos: Option<&str>) -> bool {
-    let Some(gguf_file::Value::String(template)) = content.metadata.get("tokenizer.chat_template")
-    else {
-        return false;
-    };
-    let opening = template
-        .trim_start()
-        .trim_start_matches("{{-")
-        .trim_start_matches("{{")
-        .trim_start();
-    opening.starts_with("bos_token")
-        || bos.is_some_and(|b| {
-            opening.starts_with(&format!("'{b}'")) || opening.starts_with(&format!("\"{b}\""))
-        })
-}
-
-/// The text of the file's BOS token, read from its vocabulary.
-fn gguf_bos_text(content: &gguf_file::Content) -> Option<String> {
-    match (
-        content.metadata.get("tokenizer.ggml.bos_token_id"),
-        content.metadata.get("tokenizer.ggml.tokens"),
-    ) {
-        (Some(gguf_file::Value::U32(id)), Some(gguf_file::Value::Array(tokens))) => {
-            match tokens.get(*id as usize) {
-                Some(gguf_file::Value::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
 }
 
 /// Build sampling strategy from explicit parameters
@@ -1174,23 +1095,6 @@ mod opening_bos_tests {
             tensor_data_offset: 0,
             mmap_owner: None,
         }
-    }
-
-    /// A template that writes the BOS first, as a literal or through `bos_token`, opens with
-    /// it; one that writes it later or not at all does not.
-    #[test]
-    fn a_template_opens_with_the_bos_only_when_it_writes_it_first() {
-        let bos = Some("<｜begin▁of▁sentence｜>");
-        let opens = |t: &str| template_opens_with_bos(&content(t), bos);
-        assert!(opens(
-            "{{ '<｜begin▁of▁sentence｜>' }}{% for m in messages %}{% endfor %}"
-        ));
-        assert!(opens("{{- bos_token }}{% for m in messages %}{% endfor %}"));
-        assert!(!opens(
-            "{% for m in messages %}<｜User｜>{{ m.content }}{% endfor %}"
-        ));
-        assert!(!opens("{% if x %}{{ bos_token }}{% endif %}"));
-        assert_eq!(gguf_bos_text(&content("")).as_deref(), bos);
     }
 }
 
