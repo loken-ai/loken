@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// per region via config (`carbon_intensity`). World average ≈ 480, coal-heavy ≈ 800.
 pub const DEFAULT_CARBON_INTENSITY: f64 = 50.0;
 
-/// Default water footprint of electricity generation (liters / kWh) - the water
-/// consumed (cooling, evaporation) to produce the energy. Highly grid-dependent;
-/// ~1.8 L/kWh is a representative figure. Override via config (`water_l_per_kwh`).
+/// Default water footprint of electricity generation (liters / kWh).
+/// The water consumed (cooling, evaporation) to produce the energy.
+/// Highly grid-dependent.
 pub const DEFAULT_WATER_L_PER_KWH: f64 = 1.8;
 
 // -- reference appliance constants (generic, documented; not machine-specific) --

@@ -37,7 +37,7 @@ Any client written for the OpenAI API, the Ollama API or the Messages API works 
 | Speculative decoding | automatic for a model that spills to the host, `/api/draft/attach` | Measured on 1 pair, [guide](../guides/drafter.md) |
 | KV reuse across conversations, on disk, past the window | automatic, `kv_disk_dir` | Runs, [guide](../guides/kv-memory.md) |
 | Decode-state cache for the large mixture and recurrent hybrids | automatic in memory, on disk once `state_cache_dir` is set | Runs, [configuration](../CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
-| Lossy expert routing for speed, within the model's own noise | `quality` | DeepSeek V4.1 only, off by default, [configuration](../CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
+| Lossy expert routing for speed, within the model's own noise | `fidelity = "fast"` | DeepSeek V4.1 only, off by default, [configuration](../CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Files, batches, message batches | `/v1/files`, `/v1/batches`, `/v1/messages/batches`, `files_dir` | Runs |
 | Moderation with a classifier | `/v1/moderations`, `moderation_model` | Runs, 5 families |
 | Images, edits, variations, adapters | `/v1/images/*`, `/v1/loras`, `lora_dir` | Judged partially, [images](../guides/images.md) |

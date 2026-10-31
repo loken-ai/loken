@@ -237,7 +237,7 @@ Every event carries `node`, the name of the node that renders, or null when the 
 
 ### Media input limits
 
-Every chat route holds a request to `max_images` images, `max_image_pixels` pixels per image and `max_audio_seconds` seconds of audio.
+Every chat route holds a request to a number of images, a number of pixels per image and a number of seconds of audio, which follow the decoder's allocation budget.
 The chat routes are `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses` and `/v1/messages`.
 The keys sit under `[inference]`, see [CONFIGURATION.md](CONFIGURATION.md#media-input).
 A request past 1 of them is answered 400 with the cap's key and the value it carried, before the image is decoded.
@@ -295,7 +295,7 @@ A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figur
 | `decode_ms` | Writing the answer after the first token. |
 | `energy.joules` | The domains read, summed. |
 | `energy.gpu_joules` | From the GPU energy counter. Absent when no counter is read. |
-| `energy.cpu_joules` | CPU package and DRAM. Read from RAPL, or the configured `cpu_tdp_w` over the time when RAPL is not readable. `null` when neither reads it. |
+| `energy.cpu_joules` | CPU package and DRAM. Read from RAPL. `null` when RAPL is not readable. |
 | `energy.estimated` | `true` when the CPU part is not read from RAPL. |
 | `energy.share` | `alone` when no other request was active during the request, `work` when others were. |
 | `kv.used_tokens` | The request's sequence in the KV cache when it ended. |

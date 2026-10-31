@@ -16,7 +16,6 @@ The snapshot tier needs no configuration. The disk tier needs a directory:
 ```toml
 [inference]
 kv_disk_dir = "/var/lib/loken/kv"
-kv_disk_budget_gb = 20
 ```
 
 Keys are described in [the configuration page](../CONFIGURATION.md#kv-reuse-across-requests).

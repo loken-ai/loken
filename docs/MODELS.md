@@ -94,7 +94,7 @@ The heat is the model's routing profile in `profiles/` of the store, else the ro
 | Cards, while they have room | The file that stores it in the most bytes | A card computes an expert at the same speed whatever its format |
 | Host tier, or read from disk | The file that stores it in the fewest bytes | The host's cores read every byte of an expert at each use |
 
-`expert_variants` in [Configuration](CONFIGURATION.md) forces 1 file for every expert.
+`fidelity` in [Configuration](CONFIGURATION.md) chooses the file: the largest at `reference`, the smallest at `fast`.
 
 A further file is refused at load, with what differs, unless it matches the first file on all of these:
 

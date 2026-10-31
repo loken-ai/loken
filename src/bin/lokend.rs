@@ -159,14 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ollama_models_dir: None,
                         huggingface_models_dir: None,
                         energy: None,
-                        cpu: None,
                     }
                 }
             };
             let port = port.unwrap_or_else(|| config.server().port);
 
-            // The kernels dispatch on this, and weights are repacked for it at load.
-            config.apply_cpu_level();
             info!(
                 "CPU kernels: {} (hardware: {}; SIMD: {})",
                 loken::cpu::cpu_level().name(),
@@ -194,22 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // request measures + reports energy (systematic, awareness-oriented).
             let energy_settings = config.energy_settings();
             loken::energy_report::init_settings(energy_settings.clone());
-            if energy_settings.enabled {
-                info!(
-                    "⚡ Energy reporting: ENABLED (carbon intensity {:.0} gCO₂/kWh{})",
-                    energy_settings.carbon_intensity,
-                    if energy_settings.cpu_tdp_w > 0.0 {
-                        format!(
-                            ", CPU estimate {:.0} W when RAPL unavailable",
-                            energy_settings.cpu_tdp_w
-                        )
-                    } else {
-                        String::new()
-                    }
-                );
-            } else {
-                info!("⚡ Energy reporting: disabled ([energy] enabled=false in config)");
-            }
+            info!(
+                "⚡ Energy reporting: ENABLED (carbon intensity {:.0} gCO₂/kWh)",
+                energy_settings.carbon_intensity
+            );
 
             let inference_config = config.to_inference_config();
 

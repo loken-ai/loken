@@ -109,8 +109,6 @@ A CUDA build also serves without a card: `lokend serve --cpu` places every layer
 A CPU without them is refused at start, with a message that names what is missing.
 
 The daemon chooses the quantized kernels at start from what the CPU has, and logs the level.
-`[cpu] level` in `config.toml` caps it.
-`generic` selects the scalar reference code.
 
 To let the compiler use the build host's whole instruction set outside the kernels, build with `RUSTFLAGS="-C target-cpu=native"`.
 That binary does not run on other hosts.

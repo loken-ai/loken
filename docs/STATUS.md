@@ -110,7 +110,7 @@ The other engines could not run it.
 | Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards. Each layer reads only the experts the prompt routes to, in runs, into a page-locked slab, and sends them on a copy stream. See the benchmark rows of the model |
 | Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [Configuration](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Decode-state cache | In host memory, or on disk when `state_cache_dir` is set. A stored prefix always pays. A short remainder still reads nearly every expert, which bounds how little it costs |
-| `quality` | `exact` unless `fidelity = "fast"`. The other levels change the output. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
+| Exactness of streamed experts | `exact` unless `fidelity = "fast"`. The other levels change the output. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
 | Sharding across nodes | Unmeasured at 2 nodes, see [The cluster](#the-cluster) |
 <!-- site: end -->
 

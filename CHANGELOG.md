@@ -81,6 +81,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Removed
 
 - API: derive window, cache format and priority instead of loken headers and options.
+- Config: stop reading 18 keys and the [cpu] table, which loken decides itself.
 
 ## [0.4.2] - 2026-10-28
 

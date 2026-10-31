@@ -18,7 +18,6 @@ The messages are quoted as the daemon prints them, and `...` stands for text tha
 | `Address already in use` | Another process listens on the port. | Run `lokend serve --port <other>`, or stop the other process. |
 | `Failed to load config.toml: config.toml not found in CWD, exe dir, or user config dir. Using defaults.` | No `config.toml` in the working directory, beside the executable or in the user configuration directory. | Copy `config.toml.example` to `config.toml` in the working directory. |
 | `Failed to load config.toml: Failed to parse config file: ...` | `config.toml` is not valid TOML, or a key has the wrong type. The daemon runs on defaults. | Fix the line the message names. |
-| `[cpu] level is not generic, avx2 or avx512; ignored` | `[cpu] level` holds another value. | Use `generic`, `avx2` or `avx512`. |
 | `CUDA libraries not found: ...` | The CUDA runtime libraries are not on the library path. The daemon places every layer on the host. | Install the CUDA runtime, or ignore the message on a machine without a card. |
 | `nvcc not found at ...; set CUDA_PATH` at build time | The build cannot find the CUDA toolkit. | Set `CUDA_PATH` to the toolkit, or build without CUDA ([Building](../BUILDING.md)). |
 

@@ -77,8 +77,6 @@ These are looked up in the first Hugging Face directory only.
 | Key | Default | What it does |
 |---|---|---|
 | `fidelity` | `balanced` | How closely the output follows the published model, against speed and memory: `reference`, `balanced` or `fast`. Any other value is a startup error. The server logs the level and what it chose at start. |
-| `recorded_drafts` | by `fidelity` | Verify drafts (the model's own draft head, prompt lookup) in recorded windows, the head guessing only where they are. A window is checked against the plain step when it is recorded. |
-| `probe_dump_dir` | unset | Directory where the model's probes write the tensors of a prompt's first rows, as little-endian f32 files named by tensor, for comparison against a reference. Nothing is written when unset. |
 
 What each level chooses:
 
@@ -89,12 +87,12 @@ What each level chooses:
 | KV cache format | Full width | Q8 for a model the quantised kernels serve | Q8 for a model the quantised kernels serve |
 | Float GEMMs on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 | TF32 and fast BF16 |
 | Context shift | Off | On | On |
-| `recorded_drafts` when unset | `false` | `false` | `true` |
-| `quality` when unset | `exact` | `exact` | `fast` |
-| `expert_variants` when unset | `largest` | `plan` | `smallest` |
+| Drafts verified in recorded windows | No | No | Yes |
+| Exactness the experts streamed from disk may give up | `exact` | `exact` | `fast` |
+| File each expert is read from, for a model served from several files | `largest` | `plan` | `smallest` |
 <!-- site: end -->
 
-`recorded_drafts`, `quality` and `expert_variants` set in the file keep their value at every level.
+The level decides these choices alone. The file names none of them.
 A quantised checkpoint (Q4_K, Q8_0 and the like) is read as stored at every level.
 Its products quantise the activation to 8 bits, as llama.cpp does.
 
@@ -140,8 +138,6 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 | Key | Default | What it does |
 |---|---|---|
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots. Holds token blocks shared between sequences by prefix, and 1 manifest per sequence. Survives a restart. |
-| `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
-| `kv_lease_secs` | `1800` | Seconds a conversation's kept state stays after its last turn. Past it, the state is dropped and the next turn reads its prompt again. `0` keeps a state until the memory is needed. |
 
 The next turn of a conversation keeps the rows it shares with the turn before, up to the last turn marker of the chat template.
 It reads only the answer and the new turn: a conversation of 7000 tokens reads 30 at its second turn.
@@ -225,7 +221,6 @@ Keep the directory where the prompts could live, and leave the key unset where n
 | Key | Default | What it does |
 |---|---|---|
 | `state_cache_dir` | none | Directory of the cache. None keeps it in host memory. |
-| `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, or in memory the host memory a component may take, less room for 1 more state of the largest size written. Least recently used goes first. In each family of states sharing a first block, the one restored most goes last, the longest among equals. |
 
 The cache works out these quantities from what the model, the disk and the engine report, and logs when they change:
 
@@ -262,13 +257,16 @@ A restore always leaves at least 1 token to prefill, to produce the logits.
 
 ### Streamed mixtures (DeepSeek V4.1)
 
-`quality` applies to a model whose routed experts stream from disk. It is the only knob: the engine measures the rest.
-`expert_variants` applies only to a model served from several files.
+The `fidelity` level decides both choices of a model whose routed experts stream from disk. The file names neither.
 
-| Key | Default | What it does |
-|---|---|---|
-| `expert_variants` | by `fidelity` | For a model whose manifest names further files of its checkpoint ([MODELS.md](MODELS.md)): which file each routed expert is read from. `plan` reads the experts the cards keep, hottest first, from the most precise file while the cards have room, and those the host tier keeps or reads from disk from the smallest. `smallest` and `largest` read every expert from that file, which answers as that file alone does. |
-| `quality` | by `fidelity` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold, because a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, 3 times that noise. Any other value is a startup error. |
+The exactness the output may give up for speed follows the level.
+At `reference` and `balanced`, the output is identical to the full model, the same tokens whichever experts the cards hold, because a routed expert on a card gives the bits the host gives.
+At `fast`, the output differs by small, measured amounts, 3 times the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's.
+
+For a model whose manifest names further files of its checkpoint ([MODELS.md](MODELS.md)), the level also chooses the file each routed expert is read from.
+`reference` reads every expert from the largest file.
+`balanced` reads the experts the cards keep, hottest first, from the most precise file while the cards have room, and those the host tier keeps or reads from disk from the smallest.
+`fast` reads every expert from the smallest file.
 
 At load, the engine runs a bundled text teacher-forced on the card path and on the host path to measure the noise.
 It then runs the text once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the level's budget.
@@ -303,8 +301,6 @@ The load sizes the cache on each layer's card.
 
 | Key | Default | What it does |
 |---|---|---|
-| `expert_profile` | `profiles/` of the model store | A routing profile written by `expert_profile_save`. At the load it fills the slots the prefill does not borrow with the most routed experts, and gives every expert the heat its count earns. A DeepSeek V4.1 model ranks its experts by that heat for the cards it warms and the file each expert is read from. A missing file is skipped. With neither key set, each model reads its own profile from `profiles/` of the model store, named after the model id. |
-| `expert_profile_save` | `profiles/` of the model store | Where the routing counts are written after each request: those of the profile read at the load plus the decodes since, halved together when one would pass the 32-bit limit. With neither key set, each model writes its own profile where it reads it. |
 
 | Quantity | Derived from |
 |---|---|
@@ -327,34 +323,22 @@ The load sizes the cache on each layer's card.
 
 ### Media input
 
-Every chat route holds a request to these caps before its media reach the model.
-A request past 1 is answered 400 naming the key and the value it carried.
+Every chat route holds a request to caps before its media reach the model.
+The caps follow the decoder's allocation budget: a request past 1 is answered 400 naming the cap and the value it carried.
+The only key is the list of hosts an image may be fetched from.
 
 <!-- site: widget table id=config-media-input -->
 | Key | Default | What it does |
 |---|---|---|
-| `max_images` | `16`, the most 1 message carries | Images 1 request hands the vision encoder. |
-| `max_image_pixels` | `134217728`, the decoder's 512 MiB budget at RGBA8 | Pixels (width times height) an image may declare in its header, checked before it is decoded. An image fetched by URL may also be at most 4 bytes per allowed pixel. |
-| `max_audio_seconds` | `1398`, the same budget for a stereo clip at 48 kHz in f32 | Seconds of audio in a clip, read from the container's header where it states them and from the decoded frames otherwise. |
 | `image_fetch_hosts` | none | Hosts, or `host:port` pairs, an image given by URL on the Messages API or `/v1/embeddings` is fetched from. Redirects are followed only to them. Empty fetches nothing. |
-| `image_fetch_timeout_secs` | `30` | Seconds a fetch of an image by URL may take, connection to last byte. |
 <!-- site: end -->
-
-## `[cpu]`
-
-| Key | Default | What it does |
-|---|---|---|
-| `level` | the best the CPU has | Highest SIMD level the host kernels may use: `generic` (scalar reference code), `avx2` or `avx512`. It only lowers the level, never raises it above what the CPU supports. Use it to compare paths, or on hosts where a wider level measures slower. |
 
 ## `[energy]`
 
 <!-- site: widget table id=config-energy -->
 | Key | Default | What it does |
 |---|---|---|
-| `enabled` | `true` | Measure and report energy on every request, from the card's own counter. |
 | `carbon_intensity` | `50` | Grid intensity in gCO2eq per kWh, for the CO2 estimate. |
-| `cpu_tdp_w` | `0` | Package TDP used to estimate host energy when RAPL is unreadable. `0` reports measured domains only. |
-| `water_l_per_kwh` | `1.8` | Water footprint of generation, in litres per kWh. |
 <!-- site: end -->
 
 ## `[cluster]`

@@ -49,7 +49,7 @@ The reused prefix is rounded down to a prefill chunk.
 
 | Setting | Effect |
 |---|---|
-| `kv_disk_dir` | Turns the disk tier on. Set a size budget with `kv_disk_budget_gb`. |
+| `kv_disk_dir` | Turns the disk tier on. The tier holds what its disk allows. |
 | Snapshots | No key. They are automatic. |
 | `fidelity = "reference"` | Turns off the shift past the window. |
 

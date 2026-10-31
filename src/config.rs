@@ -68,31 +68,14 @@ fn default_replicas() -> usize {
     1
 }
 
+/// Seconds a conversation's kept state stays after its last turn.
+pub const DEFAULT_KV_LEASE_SECS: u64 = 1800;
+
 /// The model served when the configuration names none.
 pub const DEFAULT_MODEL_ID: &str = "ollama:qwen3:0.6b";
 
 fn default_model_id() -> String {
     DEFAULT_MODEL_ID.to_string()
-}
-
-fn default_max_images() -> usize {
-    crate::api::media_limits::DEFAULT_MAX_IMAGES
-}
-
-fn default_max_image_pixels() -> u64 {
-    crate::api::media_limits::default_max_image_pixels()
-}
-
-fn default_max_audio_seconds() -> f64 {
-    crate::api::media_limits::default_max_audio_seconds()
-}
-
-fn default_image_fetch_timeout_secs() -> u64 {
-    crate::api::media_limits::DEFAULT_FETCH_TIMEOUT_SECS
-}
-
-fn default_kv_lease_secs() -> u64 {
-    1800
 }
 
 impl Default for InferenceConfigToml {
@@ -120,13 +103,6 @@ pub struct InferenceConfigToml {
     /// Empty offers the ones no other runtime of the build drives.
     #[serde(default)]
     pub vulkan_devices: Vec<String>,
-    #[serde(default)]
-    pub kv_disk_budget_gb: f64,
-    /// Seconds a conversation's kept state stays after its last turn; past it the state is
-    /// dropped and the next turn reads its prompt again. 0 keeps a state until the memory is
-    /// needed.
-    #[serde(default = "default_kv_lease_secs")]
-    pub kv_lease_secs: u64,
     /// The instance that reads this one's long prompts: it hands back their KV cache and this
     /// one decodes. Both serve the same model. None reads every prompt here.
     #[serde(default)]
@@ -141,71 +117,21 @@ pub struct InferenceConfigToml {
     /// `recorded_drafts`, `quality` and `expert_variants` where those are left unset.
     #[serde(default)]
     pub fidelity: crate::inference::engine::llm_engine::Fidelity,
-    /// Whether drafts (a model's own draft head, prompt lookup) are verified in recorded
-    /// windows, the head guessing only where they are. Unset, `fidelity` decides: on at `fast`
-    /// only. A window is checked against the plain step at each recording, and a request whose
-    /// windows are given up decodes plainly.
-    #[serde(default)]
-    pub recorded_drafts: Option<bool>,
-    /// A directory the model's probes write the tensors of a prompt's first rows to, for a
-    /// comparison against a reference; none unless set.
-    #[serde(default)]
-    pub probe_dump_dir: Option<String>,
-    /// A routing profile (`expert_profile_save` of an earlier run) that fills the expert
-    /// caches at the load, before any prompt has routed. With neither key set, each model
-    /// reads and writes its own in `profiles/` of the model store.
-    #[serde(default)]
-    pub expert_profile: Option<String>,
-    /// Where the routing counts of the decodes, added to those of the profile read at the
-    /// load, are written after each request, for a later run's `expert_profile`.
-    #[serde(default)]
-    pub expert_profile_save: Option<String>,
     /// Directory of the on-disk cache of DeepSeek V4.1 decode states, which lets a prompt that
     /// begins with a prefix seen before skip prefilling it. Off unless set. The files hold
     /// state derived from prompts (KV tensors and hidden rows, no text), so they are as private
     /// as the prompts.
     #[serde(default)]
     pub state_cache_dir: Option<String>,
-    /// Bytes the decode-state cache may hold, in GiB; 0 derives the limit from the free space
-    /// of the cache directory's filesystem.
-    #[serde(default)]
-    pub state_cache_budget_gb: f64,
     #[serde(default)]
     pub files_dir: Option<String>,
     #[serde(default)]
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
-    /// Images one request hands the vision encoder; past it the request is refused.
-    #[serde(default = "default_max_images")]
-    pub max_images: usize,
-    /// Pixels one image may declare in its header; past it the request is refused before
-    /// the image is decoded.
-    #[serde(default = "default_max_image_pixels")]
-    pub max_image_pixels: u64,
-    /// Seconds of audio one request hands the speech tower; past it the request is refused.
-    #[serde(default = "default_max_audio_seconds")]
-    pub max_audio_seconds: f64,
     /// Hosts an image given by URL may be fetched from. Empty fetches nothing.
     #[serde(default)]
     pub image_fetch_hosts: Vec<String>,
-    /// Seconds a fetch of an image given by URL may take, connection to last byte.
-    #[serde(default = "default_image_fetch_timeout_secs")]
-    pub image_fetch_timeout_secs: u64,
-    /// For a streamed model: how much exactness the output may give up for speed. `exact` keeps
-    /// it identical to the full model; `balanced` accepts differences no larger than the
-    /// model's own run-to-run noise; `fast` accepts a small multiple of that. Unset, `fidelity`
-    /// decides: `fast` at `fast`, `exact` otherwise. The engine measures the noise and the cost
-    /// of each way of giving up experts at load.
-    #[serde(default)]
-    pub quality: Option<crate::inference::engine::llm_engine::QualityLevel>,
-    /// For a model whose manifest names further files of its checkpoint: which file each routed
-    /// expert is read from. `plan` reads the experts kept on the cards from the most precise
-    /// file and those the host computes from the smallest; `smallest` and `largest` read every
-    /// expert from that one file. Unset, `fidelity` decides: `largest` at `reference`, `plan`
-    /// at `balanced`, `smallest` at `fast`.
-    #[serde(default)]
-    pub expert_variants: Option<crate::inference::place::expert_variants::VariantChoice>,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
@@ -216,24 +142,8 @@ pub struct InferenceConfigToml {
 /// defaults so existing config.toml files keep working unchanged.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct EnergyConfig {
-    /// Measure + report energy on every request. Default: true (systematic).
-    pub enabled: Option<bool>,
     /// Grid carbon intensity (gCO₂eq / kWh) for the CO₂ estimate. Default: France ~50.
     pub carbon_intensity: Option<f64>,
-    /// CPU package TDP (W) used to estimate CPU energy when RAPL is unreadable
-    /// (root-only kernels). Default: 0 = no estimate (report measured domains only).
-    pub cpu_tdp_w: Option<f64>,
-    /// Water footprint of electricity generation (liters / kWh). Default: ~1.8.
-    pub water_l_per_kwh: Option<f64>,
-}
-
-/// CPU configuration (`[cpu]` section).
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
-pub struct CpuConfig {
-    /// Highest SIMD level the CPU kernels may use: `generic` (the scalar reference code), `avx2` or
-    /// `avx512`. Absent, the best level the CPU has. It never raises the level above what the CPU
-    /// supports.
-    pub level: Option<String>,
 }
 
 /// Root configuration structure
@@ -251,8 +161,6 @@ pub struct Config {
     pub lora_dir: Option<String>,
     #[serde(default)]
     pub energy: Option<EnergyConfig>,
-    #[serde(default)]
-    pub cpu: Option<CpuConfig>,
     /// Clustering policy. Absent = this node runs alone, and every cluster path is skipped.
     #[serde(default)]
     pub cluster: Option<ClusterConfigToml>,
@@ -341,38 +249,14 @@ fn default_min_speedup() -> f64 {
 }
 
 impl Config {
-    /// Apply `[cpu] level` to the kernel dispatch. Call before any model is loaded. An
-    /// unknown name is reported and leaves the level at what the CPU supports.
-    pub fn apply_cpu_level(&self) {
-        let cap = self
-            .cpu
-            .as_ref()
-            .and_then(|c| c.level.as_deref())
-            .and_then(|name| {
-                let level = crate::cpu::CpuLevel::parse(name);
-                if level.is_none() {
-                    tracing::warn!(
-                        level = name,
-                        "[cpu] level is not generic, avx2 or avx512; ignored"
-                    );
-                }
-                level
-            });
-        crate::cpu::set_level_cap(cap);
-    }
-
     /// Resolve the energy-reporting settings (defaults applied).
     pub fn energy_settings(&self) -> crate::energy_report::EnergySettings {
         let e = self.energy.clone().unwrap_or_default();
         crate::energy_report::EnergySettings {
-            enabled: e.enabled.unwrap_or(true),
             carbon_intensity: e
                 .carbon_intensity
                 .unwrap_or(crate::energy_report::DEFAULT_CARBON_INTENSITY),
-            cpu_tdp_w: e.cpu_tdp_w.unwrap_or(0.0),
-            water_l_per_kwh: e
-                .water_l_per_kwh
-                .unwrap_or(crate::energy_report::DEFAULT_WATER_L_PER_KWH),
+            ..Default::default()
         }
     }
 }
@@ -449,30 +333,25 @@ impl Config {
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             prefill_peer: toml_config.prefill_peer.clone(),
             context_parallel: toml_config.context_parallel,
-            recorded_drafts: toml_config
-                .recorded_drafts
-                .unwrap_or(fidelity.recorded_drafts()),
-            probe_dump_dir: toml_config.probe_dump_dir.clone(),
-            expert_profile: toml_config.expert_profile.clone(),
-            expert_profile_save: toml_config.expert_profile_save.clone(),
-            kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
-            kv_lease_secs: toml_config.kv_lease_secs,
+            recorded_drafts: fidelity.recorded_drafts(),
+            probe_dump_dir: None,
+            expert_profile: None,
+            expert_profile_save: None,
+            // No fixed budget. The store holds what its disk allows.
+            kv_disk_budget_gb: 0.0,
+            kv_lease_secs: DEFAULT_KV_LEASE_SECS,
             state_cache_dir: toml_config.state_cache_dir.clone(),
-            state_cache_budget_gb: toml_config.state_cache_budget_gb,
+            // The limit is derived from the free space of the cache directory's filesystem.
+            state_cache_budget_gb: 0.0,
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
             media_limits: crate::api::media_limits::MediaLimits {
-                max_images: toml_config.max_images,
-                max_image_pixels: toml_config.max_image_pixels,
-                max_audio_seconds: toml_config.max_audio_seconds,
                 fetch_hosts: toml_config.image_fetch_hosts.clone(),
-                fetch_timeout_secs: toml_config.image_fetch_timeout_secs,
+                ..Default::default()
             },
-            quality: toml_config.quality.unwrap_or(fidelity.quality()),
-            expert_variants: toml_config
-                .expert_variants
-                .unwrap_or(fidelity.expert_variants()),
+            quality: fidelity.quality(),
+            expert_variants: fidelity.expert_variants(),
             fidelity,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
@@ -588,7 +467,6 @@ impl Config {
             huggingface_models_dir: None,
             lora_dir: None,
             energy: None,
-            cpu: None,
             cluster: None,
         })
     }
@@ -704,36 +582,30 @@ mod tests {
     }
 
     #[test]
-    fn the_quality_policy_is_read_strictly() {
-        use crate::inference::engine::llm_engine::QualityLevel;
-        let read = |v: &str| -> Result<Config, toml::de::Error> {
-            toml::from_str(&format!(
-                "[inference]\nmodel_id = \"m\"\nquality = \"{v}\"\n"
-            ))
-        };
+    fn keys_that_loken_decides_load_and_are_held_aside() {
+        let config: Config = toml::from_str(
+            "[inference]\nmodel_id = \"m\"\nquality = \"fast\"\nkv_lease_secs = 5\nmax_images = 2\n",
+        )
+        .unwrap();
+        let held: Vec<&str> = config
+            .inference
+            .obsolete
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(held, ["kv_lease_secs", "max_images", "quality"]);
+        // The fidelity and the engine decide these values.
+        let resolved = config.to_inference_config();
+        assert_eq!(resolved.quality, resolved.fidelity.quality());
+        assert_eq!(resolved.kv_lease_secs, DEFAULT_KV_LEASE_SECS);
         assert_eq!(
-            read("balanced").unwrap().inference.quality,
-            Some(QualityLevel::Balanced)
+            resolved.media_limits.max_images,
+            crate::api::media_limits::DEFAULT_MAX_IMAGES
         );
-        assert_eq!(
-            read("fast").unwrap().inference.quality,
-            Some(QualityLevel::Fast)
-        );
-        assert_eq!(
-            read("exact").unwrap().inference.quality,
-            Some(QualityLevel::Exact)
-        );
-        let none: Config = toml::from_str("[inference]\nmodel_id = \"m\"\n").unwrap();
-        assert_eq!(none.inference.quality, None);
-        assert_eq!(none.to_inference_config().quality, QualityLevel::Exact);
-        let err = read("quick").unwrap_err().to_string();
-        for name in ["exact", "balanced", "fast"] {
-            assert!(err.contains(name), "{err}");
-        }
     }
 
     #[test]
-    fn the_fidelity_level_sets_what_the_file_leaves_unset() {
+    fn the_fidelity_level_sets_the_drafts_the_quality_and_the_expert_files() {
         use crate::inference::engine::llm_engine::{Fidelity, QualityLevel};
         use crate::inference::place::expert_variants::VariantChoice;
         let read = |body: &str| -> Result<Config, toml::de::Error> {
@@ -760,16 +632,14 @@ mod tests {
         assert_eq!(fast.quality, QualityLevel::Fast);
         assert_eq!(fast.expert_variants, VariantChoice::Smallest);
 
-        // A knob set explicitly keeps its value whatever the level.
-        let pinned = resolved(
+        // The level decides these values. The file does not.
+        let ignored = resolved(
             "fidelity = \"fast\"\nrecorded_drafts = false\nquality = \"exact\"\n\
              expert_variants = \"plan\"\n",
         );
-        assert!(!pinned.recorded_drafts);
-        assert_eq!(pinned.quality, QualityLevel::Exact);
-        assert_eq!(pinned.expert_variants, VariantChoice::Plan);
-        let pinned = resolved("fidelity = \"reference\"\nrecorded_drafts = true\n");
-        assert!(pinned.recorded_drafts);
+        assert!(ignored.recorded_drafts);
+        assert_eq!(ignored.quality, QualityLevel::Fast);
+        assert_eq!(ignored.expert_variants, VariantChoice::Smallest);
 
         // Any other level is a startup error that names the three.
         let err = read("fidelity = \"exact\"\n").unwrap_err().to_string();

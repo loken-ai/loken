@@ -200,12 +200,11 @@ Smaller, by priority:
 | Tabular models | Models | loken predicts rows of a table and beats a simple baseline on a fixed data set. | Planned |
 | Energy-aware placement | Operations | On request, the placement saves watts at some cost in speed, both measured. | Planned |
 | Quotas per key | Operations | Each API key has a token and request budget that loken enforces, names the models, tools and media it may use, and every request leaves a record of the key, model and tools. | Planned |
-| Scopes per key | Operations | A key is limited to inference or to administration, may expire, and the key list reloads without a restart. | Planned |
+| Scopes per key | Operations | A key is limited to inference or to administration. | Planned |
 | Traces and metrics export | Operations | loken exports traces and the standard generation metrics, follows an incoming trace across cluster hops, and carries no prompt text. | Planned |
 | Cost and carbon ledger | Operations | loken keeps counters per key and model of requests, tokens and energy, and prices the energy with a tariff the user sets. | Planned |
 | Warm prefixes | Serving | A client names a prefix that loken loads into the cache tiers and keeps against eviction, within the memory budget. | Planned |
 | Tool loop on the server | Tools | loken runs a bounded loop of tool calls itself and returns the final answer. | Planned |
-| Model digest allowlist | Operations | A configuration lists the model digests that may load, and any other file is refused. | Planned |
 | Cluster history and alerts | Operations | lokpit records snapshots, replays them, and calls a command when a finding appears or clears. | Planned |
 | Side-by-side answers | Client | lokraft sends one prompt to 2 models or 2 fidelity levels and shows both answers with their speed and energy. | Planned |
 | KV reuse outside the prefix | Serving | A chunk of text seen before is reused at another position with a share of its tokens recomputed, and the answers stay close to a cold read. | Planned |
