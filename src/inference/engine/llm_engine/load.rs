@@ -1767,3 +1767,40 @@ mod packed_projection_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod session_count_tests {
+    use super::*;
+    use crate::inference::engine::llm_engine::LlmEngine;
+
+    /// The count is the conversations resident in the KV cache.
+    /// It is 0 with nothing resident and 1 once the resident entry names tokens.
+    #[tokio::test]
+    async fn the_session_count_is_the_resident_conversation() {
+        let engine = LlmEngine::with_config(Default::default());
+        assert_eq!(engine.session_count().await, 0);
+        let resident = |tokens: Vec<u32>| SessionState {
+            kv_len: tokens.len(),
+            tokens,
+            model_name: "m".to_string(),
+            image_hash: None,
+            image_prefix_len: 0,
+        };
+        engine
+            .sessions
+            .lock()
+            .await
+            .insert(GLOBAL_PROMPT_CACHE_KEY.to_string(), resident(Vec::new()));
+        assert_eq!(
+            engine.session_count().await,
+            0,
+            "an empty entry holds nothing"
+        );
+        engine
+            .sessions
+            .lock()
+            .await
+            .insert(GLOBAL_PROMPT_CACHE_KEY.to_string(), resident(vec![1, 2, 3]));
+        assert_eq!(engine.session_count().await, 1);
+    }
+}

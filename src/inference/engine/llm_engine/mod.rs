@@ -726,12 +726,11 @@ impl LlmEngine {
         Ok(report)
     }
 
-    /// How many sessions hold a KV cache on this engine right now.
-    ///
-    /// What "busy" means for a node: a session is a conversation whose prefix is resident, so
-    /// this is the state a router would lose by sending the next turn elsewhere.
+    /// How many conversations have their prefix resident in the KV cache right now.
+    /// One KV is resident, so the count is 0 or 1.
+    /// It is the state a router would lose by sending the next turn elsewhere.
     pub async fn session_count(&self) -> usize {
-        self.sessions.lock().await.len()
+        usize::from(self.holds_a_conversation().await)
     }
 
     /// Whether a conversation's prefix is resident in the key-value cache right now.

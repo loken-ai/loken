@@ -3217,18 +3217,6 @@ impl LlmEngine {
                         }
                     };
                     let mut sess_guard = sessions.blocking_lock();
-                    if let Some(sid) = session_id.as_ref() {
-                        sess_guard.insert(
-                            sid.clone(),
-                            SessionState {
-                                tokens: full.clone(),
-                                model_name: model_name.clone(),
-                                kv_len: pos,
-                                image_hash,
-                                image_prefix_len,
-                            },
-                        );
-                    }
                     {
                         // Mirror the resident KV for sessionless prefix reuse.
                         sess_guard.insert(
