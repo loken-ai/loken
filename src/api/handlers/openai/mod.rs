@@ -623,16 +623,13 @@ pub(crate) async fn chat_completion_at(
                                 Some(Ok(rx)) => rx,
                                 Some(Err(e)) => {
                                     error!("Generation error (OpenAI chat completion stream-init): {e}");
-                                    let mut err_chunk = ChatCompletionChunk::new_delta_at(
-                                        &completion_id,
-                                        &model_name_clone,
-                                        created_at,
-                                        0,
-                                        ChunkDelta::content(format!("[Error: generate_stream: {e}]")),
-                                        Some("stop".to_string()),
-                                    );
-                                    err_chunk.service_tier = service_tier.clone();
-                                    yield Ok(Event::default().data(to_json_string!(&err_chunk)));
+                                    yield Ok(Event::default().data(
+                                        openai_error_body(
+                                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                            format!("generate_stream: {e}"),
+                                        )
+                                        .to_string(),
+                                    ));
                                     yield Ok(Event::default().data("[DONE]"));
                                     return;
                                 }
@@ -715,22 +712,15 @@ pub(crate) async fn chat_completion_at(
                                 }
                             }
                             Err(e) => {
-                                // Surface the error as the terminal
-                                // chunk: include the message in
-                                // content + close out with the
-                                // OpenAI-spec finish_reason for failed
-                                // generation. Single terminal chunk,
-                                // no duplicate stop after this.
-                                let mut err_chunk = ChatCompletionChunk::new_delta_at(
-                                    &completion_id,
-                                    &model_name_clone,
-                                    created_at,
-                                    0,
-                                    ChunkDelta::content(format!("[Error: {}]", e)),
-                                    Some("stop".to_string()),
-                                );
-                                err_chunk.service_tier = service_tier.clone();
-                                yield Ok(Event::default().data(to_json_string!(&err_chunk)));
+                                // The failure ends the stream with an error frame.
+                                // No finish chunk follows it.
+                                yield Ok(Event::default().data(
+                                    openai_error_body(
+                                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        e.to_string(),
+                                    )
+                                    .to_string(),
+                                ));
                                 errored = true;
                                 break;
                             }
@@ -1570,19 +1560,13 @@ pub(crate) async fn text_completions_at(
                         yield Ok::<_, axum::Error>(Event::default().data(chunk.to_string()));
                     }
                     Err(e) => {
-                        let err_chunk = serde_json::json!({
-                            "id": cid,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": mn,
-                            "choices": [{
-                                "text": format!("[Error: {e}]"),
-                                "index": 0,
-                                "logprobs": serde_json::Value::Null,
-                                "finish_reason": "stop",
-                            }],
-                        });
-                        yield Ok(Event::default().data(err_chunk.to_string()));
+                        yield Ok(Event::default().data(
+                            openai_error_body(
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                e.to_string(),
+                            )
+                            .to_string(),
+                        ));
                         errored = true;
                         break;
                     }

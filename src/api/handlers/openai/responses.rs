@@ -484,6 +484,7 @@ pub(crate) async fn openai_responses_at(
         let mut usage = Value::Null;
         let mut buf = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
+        let mut failure: Option<Value> = None;
         'frames: while let Some(chunk) = frames.next().await {
             let Ok(bytes) = chunk else { break };
             buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -496,6 +497,10 @@ pub(crate) async fn openai_responses_at(
                     break 'frames;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+                if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                    failure = Some(err.clone());
+                    break 'frames;
+                }
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     usage = u.clone();
                 }
@@ -568,6 +573,13 @@ pub(crate) async fn openai_responses_at(
             done["status"] = json!("completed");
             yield Ok::<_, axum::Error>(event("response.output_item.done", json!({"output_index": output.len(), "item": done}), &mut seq));
             output.push(done);
+        }
+        if let Some(err) = failure {
+            let message = err.get("message").and_then(Value::as_str).unwrap_or("the generation failed");
+            let mut failed = response_object(&id, created, &req_for_stream, &model, "failed", output, usage_object(None), None);
+            failed["error"] = json!({"code": "server_error", "message": message});
+            yield Ok::<_, axum::Error>(event("response.failed", json!({"response": failed}), &mut seq));
+            return;
         }
         let (status, incomplete) = if finish == "length" { ("incomplete", Some("max_output_tokens")) } else { ("completed", None) };
         let final_obj = response_object(&id, created, &req_for_stream, &model, status, output, usage_object(if usage.is_null() { None } else { Some(&usage) }), incomplete);
