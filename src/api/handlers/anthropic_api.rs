@@ -58,6 +58,15 @@ pub(crate) async fn anthropic_messages_at(
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_api_error(e);
     }
+    if let Some(why) = req.unsupported_input() {
+        return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
+    }
+    // The sampling bounds are checked before an image is fetched.
+    // They are checked before the request is relayed.
+    let sampling = super::sampling::SamplingRequest::from_anthropic(&req);
+    if let Err(e) = sampling.validate() {
+        return anthropic_api_error(e);
+    }
     // Images by URL are fetched here, so a relayed request carries them as base64.
     if let Err(why) = req
         .inline_url_images(&state.default_inference_config.media_limits)
@@ -106,14 +115,6 @@ pub(crate) async fn anthropic_messages_at(
         {
             return relayed;
         }
-    }
-    if let Some(why) = req.unsupported_input() {
-        return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
-    }
-    // The same sampling bounds as every other route.
-    let sampling = super::sampling::SamplingRequest::from_anthropic(&req);
-    if let Err(e) = sampling.validate() {
-        return anthropic_api_error(e);
     }
 
     if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
@@ -619,4 +620,41 @@ pub(crate) async fn list_models_by_dialect(
         "last_id": last,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request out of bounds is refused before its images are fetched.
+    #[tokio::test]
+    async fn a_request_out_of_bounds_is_refused_before_its_images_are_fetched() {
+        let req: crate::api::anthropic::AnthropicMessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "some-model",
+                "max_tokens": 16,
+                "temperature": 9.0,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "http://203.0.113.1/a.png"}},
+                    {"type": "text", "text": "hi"}
+                ]}]
+            }))
+            .unwrap();
+        let state = APIServer::new(String::new(), String::new());
+        let resp = anthropic_messages_at(
+            state,
+            axum::http::HeaderMap::new(),
+            req,
+            crate::api::gate::Priority::Interactive,
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("temperature"),
+            "refused for its bounds: {text}"
+        );
+    }
 }
