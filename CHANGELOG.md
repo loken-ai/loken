@@ -40,6 +40,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Delete: unload a model after releasing the table of loaded models.
 - Chat: answer a failed preload with an error, not as a load.
 - Generate: send the prompt as given to a package that has no template layer.
 - ROCm: run the hardware 8-bit dot product on RDNA3 and RDNA4 cards.

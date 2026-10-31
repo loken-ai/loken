@@ -814,21 +814,27 @@ pub(crate) async fn ollama_delete_model(
 
     // Remove from loaded engines if present and unload
     info!("   Checking if model is loaded...");
-    {
+    // The entry leaves the table under the lock.
+    // The unload runs after the lock is released.
+    let removed = {
         let mut engines = state.engines.write().await;
-        if let Some(pos) = engines.iter().position(|e| e.model_id == model_name) {
-            info!("   Model is loaded, unloading...");
-            let entry = engines.remove(pos);
-            // Cancel expiration timer
-            if let Some(handle) = &entry.expire_handle {
-                handle.abort();
-            }
-            // Unload the engine
-            let _ = entry.unload_all().await;
-            info!("   Model unloaded from memory");
-        } else {
-            info!("   Model not currently loaded");
+        engines
+            .iter()
+            .position(|e| e.model_id == model_name)
+            .map(|pos| engines.remove(pos))
+    };
+    if let Some(entry) = removed {
+        info!("   Model is loaded, unloading...");
+        // Cancel expiration timer
+        if let Some(handle) = &entry.expire_handle {
+            handle.abort();
         }
+        match entry.unload_all().await {
+            Ok(()) => info!("   Model unloaded from memory"),
+            Err(e) => warn!("   Model {model_name} unload failed: {e}"),
+        }
+    } else {
+        info!("   Model not currently loaded");
     }
 
     // through ApiError::Internal so any future real deletion failures
