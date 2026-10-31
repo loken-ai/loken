@@ -1,7 +1,7 @@
 //! The microbenches' command line. Run as
 //! `cargo bench --features cuda,microbench --bench microbench -- <name> [options]`, and
 //! `-- list` to name the benches. One mechanism per bench, its variants side by side, no model
-//! loaded and no server started. See docs/guides/microbench.md.
+//! loaded and no server started. See docs/dev/microbench.md.
 
 use clap::Parser;
 use loken::microbench::{benches, run, Options};

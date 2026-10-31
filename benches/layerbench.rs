@@ -1,7 +1,7 @@
 //! The layer bench: replay decode steps through a few layers of a model file, placed as a served
 //! model is, and report where a token's time goes. Run as
 //! `cargo bench --features cuda,microbench --bench layerbench -- <file> --layers <range> [options]`.
-//! See docs/guides/layer-bench.md.
+//! See docs/dev/layer-bench.md.
 
 use clap::Parser;
 use loken::inference::bench::{args::Args, parse_layers, run, Controls};

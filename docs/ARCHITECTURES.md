@@ -1,43 +1,77 @@
 # Architectures
 
-Every architecture the loader accepts, the formats it reads, and the test that loads it.
+This page lists every architecture the loader accepts, the formats it reads, and the tests that load it.
 
-The loader decides from tensors and metadata. The key `general.architecture` selects the row of
-`src/inference/model_facts.rs`. A checkpoint's `architectures[0]` selects a GGUF tag in
-`src/inference/load/awq_loader.rs`. This table lists the keys of the first and the classes of the second.
+## Selection
 
-Each test lives in `src/inference/generic_transformer/loading_tests.rs`. It writes a tiny synthetic
-checkpoint of the architecture in the format, loads it through `GenericWeights::build` (the call
-the server makes) on a host-only `HeteroPlan`, runs a forward pass of 5 tokens, and asserts finite,
-non-constant logits of the vocabulary's size. A safetensors test writes the weights of the
-architecture's GGUF recipe in the publisher's tensor names and layout (fused or split projections,
-the publisher's rotary row order, stacked or per-expert tensors, shifted norms), and asserts that
-its logits equal those of the same weights loaded from the GGUF file, so a wrong permutation or
-split fails. `every_architecture_has_a_loading_test` fails when the facts table holds an
-architecture without a test, and when an architecture whose publisher ships safetensors has no
-safetensors test or no row here saying so.
+The loader decides from tensors and metadata:
 
-`src/inference/generic_transformer/hf_reference_tests.rs` checks the layout against the reference
-implementation. `scripts/hf_vectors.py` builds a tiny random model from each class of the Hugging Face
-`transformers` library, saves it with the library's `save_pretrained` as float32 safetensors under
-`tests/vectors/hf/<folder>`, and records the logits of the last position of a 6-token prompt and of
-the next 4 greedy tokens, run in float32 on the CPU. The test loads each folder through the same
-entry point on a host-only plan, feeds the reference's ids back in turn, and asserts a cosine of at
-least 0.998 with the reference's logits at every step and the same argmax wherever the 2 top
-reference logits are further apart than twice the measured rounding error (float weights are rebuilt
-in 8 bits). Every hybrid keeps one block of each kind. A seed is kept only when its routing decisions
-and its logits stay clear of that rounding. `every_reference_folder_has_a_test` fails when a folder
-and the list of tests differ. A composite release whose vendor also ships a native layout gets
-`params.json` and `consolidated.safetensors` of the same weights beside it, checked by the library's
-own converter of that layout. Its native tests assert the reference's logits and those of the
-composite.
+- `general.architecture` selects a row of `src/inference/model_facts.rs`.
+- A checkpoint's `architectures[0]` selects a GGUF tag through the class table in `src/inference/load/hf_config.rs`. AWQ checkpoints are read by `src/inference/load/awq_loader.rs`.
 
-The `Publisher safetensors` column names the `architectures[0]` classes of the publisher's
-`config.json` the loader reads (the class table in `src/inference/load/hf_config.rs`), `read as`
-when the class loads under another architecture's tag, and `none:` with the reason when the publisher
-ships no checkpoint the loader can read. The `Verified` column says how the safetensors layout is
-checked: `reference` (the folders whose logits it matches), `synthetic` (equality with the GGUF
-recipe), `real checkpoint` (a published checkpoint checked by hand).
+The table below lists the keys of the first and the classes of the second.
+
+## Tests
+
+Each loading test lives in `src/inference/generic_transformer/loading_tests.rs`.
+A test writes a tiny synthetic checkpoint of the architecture in the format.
+It loads the checkpoint through `GenericWeights::build`, the call the server makes, on a host-only `HeteroPlan`.
+It runs a forward pass of 5 tokens and asserts finite, non-constant logits of the vocabulary's size.
+
+A safetensors test also writes the weights of the architecture's GGUF recipe in the publisher's tensor names and layout:
+
+- fused or split projections
+- the publisher's rotary row order
+- stacked or per-expert tensors
+- shifted norms
+
+It asserts that its logits equal those of the same weights loaded from the GGUF file.
+A wrong permutation or split fails.
+
+`every_architecture_has_a_loading_test` fails in 2 cases:
+
+- The facts table holds an architecture without a test.
+- An architecture whose publisher ships safetensors has no safetensors test or no row here saying so.
+
+### Reference tests
+
+`src/inference/generic_transformer/hf_reference_tests.rs` checks the layout against the reference implementation.
+
+`scripts/hf_vectors.py` builds the vectors:
+
+1. It builds a tiny random model from each class of the Hugging Face `transformers` library.
+2. It saves the model with `save_pretrained` as float32 safetensors under `tests/vectors/hf/<folder>`.
+3. It records, in float32 on the CPU, the logits of the last position of a 6-token prompt and of the next 4 greedy tokens.
+
+The test loads each folder through the same entry point on a host-only plan and feeds the reference's ids back in turn.
+At every step it asserts:
+
+- a cosine of at least 0.998 with the reference's logits
+- the same argmax wherever the 2 top reference logits are further apart than twice the measured rounding error (float weights are rebuilt in 8 bits)
+
+Every hybrid keeps 1 block of each kind.
+A seed is kept only when its routing decisions and its logits stay clear of that rounding.
+`every_reference_folder_has_a_test` fails when the folders and the list of tests differ.
+
+A composite release whose vendor also ships a native layout gets `params.json` and `consolidated.safetensors` of the same weights beside it.
+The library's own converter of that layout checks them.
+The native tests assert the reference's logits and those of the composite.
+
+## Architecture table
+
+The `Publisher safetensors` column lists:
+
+- the `architectures[0]` classes of the publisher's `config.json` that the loader reads (the class table in `src/inference/load/hf_config.rs`)
+- `read as` when the class loads under another architecture's tag
+- `none:` and the reason when the publisher ships no checkpoint the loader can read
+
+The `Verified` column says how the safetensors layout is checked:
+
+| Value | Meaning |
+|---|---|
+| `reference` | its logits match the named reference folders |
+| `synthetic` | its logits equal the GGUF recipe |
+| `real checkpoint` | a published checkpoint, checked by hand |
 
 | Architecture | Publisher safetensors | Formats read | Test names | Verified |
 |---|---|---|---|---|
@@ -87,103 +121,207 @@ recipe), `real checkpoint` (a published checkpoint checked by hand).
 
 ## Notes
 
-- Formats are GGUF (one file. A split set reads through the same tensor path, covered once in `loader.rs`), dense safetensors in the framework's layout (F32, F16, BF16. MXFP4 blocks for the experts of `gptoss`), AWQ safetensors, and the vendor's native layout (`params.json` and `consolidated*.safetensors`), dense or with routed experts.
-- A checkpoint's `architectures[0]` selects a row of the class table in `src/inference/load/hf_config.rs`: the architecture tag, the tensor layout (`src/inference/generic_transformer/dense_layouts.rs`), and the conventions the class fixes. The layouts are data: a rule per part of a block says whether a stored tensor is read in place, reshaped, shifted by one (norm scales stored less one), split by head, stacked from per-expert tensors, halved, transposed or repacked (MXFP4). The config keys are read under the names each publisher uses (`hf_config.rs`). Widths that the tensors state (the dense and the expert feed-forward, the short convolution, which blocks attend) are read from the tensors.
-- Rotary rows: a class pairs lanes as the framework's rotation does (lane `i` with `i + n/2`) unless its row says adjacent. A GGUF converter reorders the rows of the tags whose GGUF files pair adjacent lanes. The checkpoint's rows are not reordered, the loader's pairing follows the class.
-- A fused attention projection whose rows are grouped by key-value head (`InternLM2ForCausalLM`. `FalconForCausalLM` of a grouped decoder, `GPTBigCodeForCausalLM` without a shared head) is split into query, key and value rows when read. The others are read in place.
-- The recipes write the tensor set each architecture's GGUF carries: fused or split projections, biases, QK norms, post norms, routed experts with shared experts, short convolution, Mamba2 and delta-rule blocks. Every recipe is written in F32. `tiny_model::write_quant` exercises K-quant weights for one architecture.
-- `qwen4exp` loads the seeded toy file `tests/vectors/qwen4exp/toy.gguf`, since its wide residual, indexer and n-gram features are not part of a recipe. `wide_tests.rs` checks that model against the reference.
-- A test checks the file says what the recipe meant (each block's mixer) and that a file missing a tensor of its block is refused (`a_file_missing_a_tensor_of_its_block_is_refused`). `a_wrong_layout_is_caught` loads checkpoints laid out wrongly (rows left in the file's pairing, a fused projection read in the wrong order, norms not shifted) and asserts their logits differ.
-- The synthetic tests check that a model loads and runs, and that a publisher's checkpoint equals its GGUF recipe. The reference tests check that it answers as the reference does. `mpt` positions come from ALiBi (`attention.max_alibi_bias`), which only the unfused host attention adds to the scores: the load offers such a model no card, Vulkan or OpenCL device and logs why, and a card's attention refuses such a layer (`an_alibi_model_stays_off_the_cards`, run with a card).
-- A query scale by position (`llama_4_scaling_beta`, `attention.temperature_scale` and `attention.temperature_length`) is not applied: the context stops at the length before which the scale is one, and the load logs it.
-- Not read, as from a GGUF file: LongRoPE factors (`phi3`), the linear rope scaling of the global layers (`gemma3`), `clip_qkv` (`dbrx`), the per-head query and key norms of the 12B `stablelm`. The reference vectors hold none of these. The grouped `falcon` decoder's 2 input norms are not mapped, so such a checkpoint is refused for a missing tensor. A quantised checkpoint other than AWQ of the llama, mistral and qwen families is refused.
-- Architectures with their own model code (image, speech, video, forecasting, DeepSeek V4.1) are not read by the generic transformer and are not in this table.
+### Formats
+
+The loader reads:
+
+- GGUF, 1 file. A split set reads through the same tensor path, covered once in `loader.rs`.
+- Dense safetensors in the framework's layout: F32, F16, BF16, and MXFP4 blocks for the experts of `gptoss`.
+- AWQ safetensors.
+- The vendor's native layout (`params.json` and `consolidated*.safetensors`), dense or with routed experts.
+
+### Layout rules
+
+A checkpoint's `architectures[0]` selects a row of the class table in `src/inference/load/hf_config.rs`.
+The row fixes the architecture tag, the tensor layout (`src/inference/generic_transformer/dense_layouts.rs`) and the conventions of the class.
+
+The layouts are data.
+A rule per part of a block says how a stored tensor is read:
+
+- in place
+- reshaped
+- shifted by 1 (norm scales stored less 1)
+- split by head
+- stacked from per-expert tensors
+- halved
+- transposed
+- repacked (MXFP4)
+
+`hf_config.rs` reads the config keys under the names each publisher uses.
+The tensors state some widths, and the loader reads those from the tensors: the dense and the expert feed-forward, the short convolution, and which blocks attend.
+
+### Rotary rows
+
+A class pairs lanes as the framework's rotation does (lane `i` with `i + n/2`), unless its row says adjacent.
+A GGUF converter reorders the rows of the tags whose GGUF files pair adjacent lanes.
+The loader leaves the checkpoint's rows in place and pairs lanes by class.
+
+### Fused attention projections
+
+A fused attention projection whose rows are grouped by key-value head is split into query, key and value rows when read.
+This applies to:
+
+- `InternLM2ForCausalLM`
+- `FalconForCausalLM` of a grouped decoder
+- `GPTBigCodeForCausalLM` without a shared head
+
+The loader reads the other projections in place.
+
+### Recipes
+
+The recipes write the tensor set each architecture's GGUF carries:
+
+- fused or split projections
+- biases, QK norms and post norms
+- routed experts with shared experts
+- short convolution
+- Mamba2 and delta-rule blocks
+
+Every recipe is written in F32.
+`tiny_model::write_quant` exercises K-quant weights for 1 architecture.
+
+`qwen4exp` loads the seeded toy file `tests/vectors/qwen4exp/toy.gguf`, because its wide residual, indexer and n-gram features are not part of a recipe.
+`wide_tests.rs` checks that model against the reference.
+
+### What the tests check
+
+| Test | Checks |
+|---|---|
+| Synthetic loading tests | A model loads and runs, and a publisher's checkpoint equals its GGUF recipe. |
+| Reference tests | A model answers as the reference does. |
+| `a_file_missing_a_tensor_of_its_block_is_refused` | The file says what the recipe meant (each block's mixer), and a file missing a tensor of its block is refused. |
+| `a_wrong_layout_is_caught` | Checkpoints laid out wrongly (rows left in the file's pairing, a fused projection read in the wrong order, norms not shifted) produce different logits. |
+
+### ALiBi
+
+`mpt` positions come from ALiBi (`attention.max_alibi_bias`).
+Only the unfused host attention adds ALiBi to the scores.
+The load offers such a model no card, Vulkan or OpenCL device, and logs why.
+A card's attention refuses such a layer.
+`an_alibi_model_stays_off_the_cards` checks this and runs with a card.
+
+### Query scale by position
+
+The loader does not apply a query scale by position (`llama_4_scaling_beta`, `attention.temperature_scale` and `attention.temperature_length`).
+The context stops at the length before which the scale is 1, and the load logs it.
+
+### Not read
+
+The loader does not read these, as from a GGUF file:
+
+- LongRoPE factors (`phi3`)
+- the linear rope scaling of the global layers (`gemma3`)
+- `clip_qkv` (`dbrx`)
+- the per-head query and key norms of the 12B `stablelm`
+
+The reference vectors hold none of these.
+
+The loader does not map the 2 input norms of the grouped `falcon` decoder, so it refuses such a checkpoint for a missing tensor.
+It refuses a quantised checkpoint other than AWQ of the llama, mistral and qwen families.
+
+Architectures with their own model code (image, speech, video, forecasting, DeepSeek V4.1) are outside this table.
+The generic transformer does not read them.
+
+## Embeddings towers
+
+A text-image checkpoint is served as such when it holds:
+
+- `tokenizer.json`
+- `preprocessor_config.json`
+- a `text_config` and a `vision_config`
+- the tensors of 1 of 2 layouts
+
+`src/inference/model/clip/pair.rs` makes the check.
+
+| Layout | Tensors | Text vector | Image vector |
+|---|---|---|---|
+| CLIP | `text_projection`, `visual_projection` | Causal tower, read at the end-of-text token, projected. | Class token through `post_layernorm`, projected. |
+| SigLIP | `text_model.head`, `vision_model.head` | Bidirectional tower over a row padded to the position table, read at its last position through the head. | Attention-pool head. |
+
+- Heads, norm epsilon and activation come from the tower configs, with the defaults of `transformers` for what a config leaves out.
+- A text longer than the position table is cut, keeping the end-of-text token.
+- Images are resized, cropped, rescaled and normalised as `preprocessor_config.json` states, with the Pillow resampling filter of the same number (`src/inference/model/clip/preprocess.rs`).
+- The model runs on the host in f32.
+
+## Drafter verification
+
+A verify step runs several rows at once (`src/inference/generic_transformer/verify_window.rs`).
+On a card, its kernels can settle a near-tie between 2 tokens the other way than a 1-row step does.
 
 ## Where the lessons live in the code
 
-The lessons in `learn/` describe behaviour. This section lists, lesson by lesson, the source files that carry it and the checks that verify it.
+Each lesson in `learn/` describes a behaviour.
+The tables below list the source files that carry it.
 
 ### Lesson 1: Tokens
 
-File table removed from "In loken":
+[Lesson](learn/01-tokens.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/engine/llm_engine/gguf.rs` | Builds the tokenizer from GGUF metadata (`tokenizer.ggml.model`, `.tokens`, `.merges`, `.token_type`, `.pre`). Synthesises merges for a SentencePiece vocabulary that ships none. |
-| `src/inference/token/sentencepiece.rs` | The unigram tokenizer from scratch: `ModelProto` wire format, Viterbi segmentation, the space meta-symbol, byte fallback. |
-| `src/api/handlers/prompt_format.rs` | Renders the checkpoint's `tokenizer.chat_template` through a Jinja engine. |
-| `src/api/thinking.rs` | Splits reasoning from the answer (`<think>`, Harmony channels, the `thought` variant), surviving a chunk boundary mid-stream. `SPLIT_MARKERS` are registered as ordinary text so a decoder that drops special tokens keeps them. |
-| `src/api/tool_calls.rs` | Reads a tool call out of the raw token stream, on every family's spelling. |
-
-Checks removed: none. The "Try it" curl exercises stay.
+| `src/inference/engine/llm_engine/gguf.rs` | Builds the tokenizer from the GGUF keys `tokenizer.ggml.model`, `.tokens`, `.merges`, `.token_type`, `.pre`. Synthesises merges for a SentencePiece vocabulary that ships none. |
+| `src/inference/token/sentencepiece.rs` | Unigram tokenizer: `ModelProto` wire format, Viterbi segmentation, space meta-symbol, byte fallback. |
+| `src/api/handlers/prompt_format.rs` | Renders `tokenizer.chat_template` through a Jinja engine. |
+| `src/api/thinking.rs` | Splits reasoning from the answer (`<think>`, Harmony channels, the `thought` variant) across chunk boundaries. Registers `SPLIT_MARKERS` as ordinary text, so a decoder that drops special tokens keeps them. |
+| `src/api/tool_calls.rs` | Reads a tool call out of the raw token stream, in every family's spelling. |
 
 ### Lesson 2: What a model file holds
 
-File table removed from "In loken":
+[Lesson](learn/02-model-file.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/tensor/quantized/gguf_file.rs` | The one statement of the container: `mod layout` holds the magic, the field order, the dimension reversal, the value-type ids and the alignment rule, so the reader and the writer cannot disagree. `read_facts` reads what a catalogue lists and stops at the first `tokenizer.*` key. |
-| `src/tensor/quantized/gguf_source.rs` | A checkpoint split into parts, presented as one source. |
-| `src/tensor/safetensors_io.rs` | The safetensors reader: header, then views over the mapping. |
-| `src/tensor/quant_view.rs` | A typed view into blocks owned by a parent tensor or by a mapped file, so a layer can be read in place. |
-| `src/inference/cache/qvb.rs` | The parsed checkpoint kept on the host between model swaps, so switching back does not re-read gigabytes. |
-| `src/api/handlers/catalogue.rs` | What `/api/tags` and `/v1/models` list, and the header facts they are built from. |
+| `src/tensor/quantized/gguf_file.rs` | States the container once in `mod layout`: magic, field order, dimension reversal, value-type ids, alignment rule. Reader and writer share it. `read_facts` reads what a catalogue lists and stops at the first `tokenizer.*` key. |
+| `src/tensor/quantized/gguf_source.rs` | Presents a checkpoint split into parts as 1 source. |
+| `src/tensor/safetensors_io.rs` | Safetensors reader: header, then views over the mapping. |
+| `src/tensor/quant_view.rs` | Typed view into blocks owned by a parent tensor or a mapped file. A layer is read in place. |
+| `src/inference/cache/qvb.rs` | Keeps the parsed checkpoint on the host between model swaps. |
+| `src/api/handlers/catalogue.rs` | Lists models on `/api/tags` and `/v1/models` from the header facts. |
 
-Document links removed from the text:
-
-- How a request names a model, and which stores are searched, is in `../MODELS.md`.
-- Load time costs ("A 24 GB checkpoint over a USB disk: 52 s reading, 6 s uploading to the cards") were sourced from `../STATUS.md#costs`, which also records what a spilled model used to hold twice in host memory, and what the loader still uploads twice.
-
-Checks removed: none.
+- [`MODELS.md`](MODELS.md) says how a request names a model and which stores are searched.
+- [`STATUS.md`](STATUS.md#costs) holds the load-time costs and what the loader still uploads twice.
 
 ### Lesson 3: Fewer bits per weight, and what it costs
 
-File table removed from "In loken":
+[Lesson](learn/03-quantisation.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/tensor/quant_cpu/format/q4_0.rs`, `q4_k.rs`, `iq2_xxs.rs` | One file per format, holding layout, dequantiser and quantiser together, because a sub-block count changed in one and not the others is a silent defect. Start with `q4_0.rs`: the bias that makes an unsigned nibble signed, and why the 2 nibbles of a byte are not neighbours. |
-| `src/tensor/quant_cpu/scale.rs` | The scale searches: signed, with offset, and the second stage that quantises the scales themselves. |
-| `src/tensor/quant_cpu/avx/mod.rs` | The AVX2 dot products: the 4-step shape every kernel follows and the unsigned-by-signed constraint of the multiply-add. |
-| `src/tensor/quantized/kernel_matmul.rs` | Which matmul serves a call: mat-vec for decode, tiled for prefill, a repack when the format has one, each able to decline, and the dequantised matmul at the end that never does. |
-| `src/tensor/oracle_parity.rs` | Every dequantiser pinned against ggml's scalar output, since a format compared only with itself proves nothing. |
-| `src/inference/load/requantize.rs`, `calibration.rs`, `compensate.rs` | Re-quantising per tensor rather than per model, the importance record, the error carried into later columns. |
-| `src/tensor/blockscaled/` | fp8, fp4 and bf16 with the checkpoint's block scales, read in place by any model that ships them. |
-| `cuda/marlin/DESIGN.md`, `cuda/README.md` | The 4-bit tensor-core GEMM explained as a design, and which kernels are built by nvcc against which are compiled at run time. |
-| `src/inference/load/awq.rs` | Why a second 4-bit format is worth carrying, in bytes a weight. |
-
-Checks removed from "Try it":
+| `src/tensor/quant_cpu/format/q4_0.rs`, `q4_k.rs`, `iq2_xxs.rs` | 1 file per format, with layout, dequantiser and quantiser together. A sub-block count changed in only 1 of them is a silent defect. Read `q4_0.rs` first. |
+| `src/tensor/quant_cpu/scale.rs` | Scale searches: signed, with offset, and the second stage that quantises the scales. |
+| `src/tensor/quant_cpu/avx/mod.rs` | AVX2 dot products: the 4-step shape of every kernel and the unsigned-by-signed constraint of the multiply-add. |
+| `src/tensor/quantized/kernel_matmul.rs` | Picks the matmul for a call: mat-vec for decode, tiled for prefill, a repack when the format has one. Each can decline. The dequantised matmul at the end never does. |
+| `src/tensor/oracle_parity.rs` | Pins every dequantiser against the scalar output of ggml. |
+| `src/inference/load/requantize.rs`, `calibration.rs`, `compensate.rs` | Re-quantises per tensor, records importance, carries the error into later columns. |
+| `src/tensor/blockscaled/` | fp8, fp4 and bf16 with the checkpoint's block scales, read in place. |
+| `cuda/marlin/DESIGN.md`, `cuda/README.md` | The 4-bit tensor-core GEMM design, and which kernels `nvcc` builds and which NVRTC compiles at run time. |
+| `src/inference/load/awq.rs` | The second 4-bit format, in bytes per weight. |
 
 ```sh
 cargo test --lib oracle_parity
 ```
 
-- Expected: 14 tests, one per format plus `every_format_reconstructs_about_as_well_as_ggml` and the importance-matrix one, all passing.
-- It verifies every dequantiser against ggml's scalar output.
-- Reading `src/tensor/quant_cpu/format/q4_0.rs` confirms the arithmetic: 32 values, a 16-bit scale, 4 bits each, 18 bytes, 4.5 bits a weight.
-- `q8_0.rs` gives 34 bytes for 32, 8.5 bits a weight.
+- It runs 14 tests: 1 per format, `every_format_reconstructs_about_as_well_as_ggml`, and the importance-matrix test.
+- It checks every dequantiser against the scalar output of ggml.
+- `q4_0.rs` shows the arithmetic: 32 values, a 16-bit scale, 4 bits each, 18 bytes, 4.5 bits per weight.
+- `q8_0.rs` gives 34 bytes for 32 values, 8.5 bits per weight.
 
 ### Lesson 4: One layer, then 40 of them
 
-File table removed from "In loken":
+[Lesson](learn/04-forward-pass.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/generic_transformer/mod.rs` | One layer struct for every `blk.{i}.*` decoder: the optional pieces (split or fused QKV, q/k norms, post-attention norms, a mixture) are detected from the checkpoint's tensors, so Qwen2/3, Gemma, Phi and the others share the code. |
+| `src/inference/generic_transformer/mod.rs` | 1 layer struct for every `blk.{i}.*` decoder. It detects the optional pieces from the tensors: split or fused QKV, q/k norms, post-attention norms, a mixture. |
 | `src/inference/generic_transformer/layer_attn.rs`, `layer_ffn.rs` | The 2 sub-layers, with the sliding-window variant and the fused paths. |
-| `src/inference/model/rope.rs` | The rotary table, and YaRN: high-frequency dimensions kept, low-frequency ones interpolated, so a model trained at one length answers past it. |
-| `src/tensor/ops/attention.rs` | The attention op itself: scaled dot product, the grouped-query repeat, the 2 rotary pairings, the fused prefill. |
-| `src/inference/fused_moe.rs` | The router and the batched expert projections it feeds. |
-| `src/inference/model/deepseek_v41/attention.rs` | Latent attention with a single shared key head, an fp8 round trip and a learned attention sink. The `model/` directory holds one such directory per family. |
-| `src/inference/engine/model_backend.rs` | The trait each architecture implements, which replaced a match over every variant. |
+| `src/inference/model/rope.rs` | Rotary table and YaRN: high-frequency dimensions kept, low-frequency ones interpolated. |
+| `src/tensor/ops/attention.rs` | Attention op: scaled dot product, grouped-query repeat, the 2 rotary pairings, fused prefill. |
+| `src/inference/generic_transformer/moe_weights.rs` | Routes a mixture and runs the batched expert projections. |
+| `src/inference/model/deepseek_v41/attention.rs` | Latent attention with 1 shared key head, an fp8 round trip and a learned attention sink. `src/inference/model/` holds 1 directory per family. |
+| `src/inference/engine/model_backend.rs` | The trait each architecture implements. |
 
-Other references removed:
-
-- The papers behind each family are listed in `../REFERENCES.md`.
-- The DeepSeek V4.1 port was gated against the authors' own `model.py`. Each phase of the reference dumps its inputs and outputs into `tests/vectors/`, and a test replays the phase on the same inputs.
-
-Checks removed from "Try it":
+- [`REFERENCES.md`](REFERENCES.md) lists the papers behind each family.
+- The DeepSeek V4.1 port is gated against the authors' `model.py`. Each phase of the reference dumps its inputs and outputs into `tests/vectors/`, and a test replays the phase on the same inputs.
 
 ```sh
 ls tests/vectors/
@@ -192,115 +330,102 @@ cargo test --lib the_selected_attention_matches_the_reference_block
 cargo test --lib deepseek_v41::moe
 ```
 
-- `the_rope_frequencies_are_the_references` checks the rotary frequencies against the reference's `inv_freq`.
-- `the_selected_attention_matches_the_reference_block` checks an attention block against the reference's block output.
-- Exercise: find the tolerance the second test asserts against the scale of the output, divide it by 10 and run again. The assertion names the measured difference, which is what a parity test is for.
-- `deepseek_v41::moe` runs the streamed experts against the resident ones.
+| Test | Checks |
+|---|---|
+| `the_rope_frequencies_are_the_references` | Rotary frequencies against the reference's `inv_freq`. |
+| `the_selected_attention_matches_the_reference_block` | An attention block against the reference's block output. |
+| `deepseek_v41::moe` | The streamed experts against the resident ones. |
+
+Exercise: divide the tolerance of the second test by 10 and run it again.
+The assertion names the measured difference.
 
 ### Lesson 5: 2 regimes, one model
 
-File table removed from "In loken":
+[Lesson](learn/05-prefill-and-decode.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/engine/model_backend.rs` | The prefill chunk, derived from the free VRAM and the widest feed-forward rather than a constant, and the chunked prefill with its out-of-memory ladder. |
-| `src/inference/serve/scheduler.rs` | The iteration-level scheduler: a plan per step (who prefills, who decodes, with their block tables), a prefill token budget, preemption that never half-allocates. Pure bookkeeping, tested without a card. |
-| `src/inference/serve/continuous_serve.rs` | The worker thread that owns the model and the paged cache and is the only caller of the forward. |
-| `src/inference/serve/batched_forward.rs` | The batched forward as an f32 specification, and the batch-invariance contract a real backend has to meet. |
-| `src/inference/kernel/cpu_decode_exec.rs` | The host decode path with a preallocated arena, so a token on the host allocates nothing. |
-| `src/inference/place/layer_perf.rs`, `src/api/handlers/system.rs` | The per-layer and per-stage timers behind `/api/layer_perf` and `/api/stage_perf`. Off by default because each stage costs a device synchronisation. |
+| `src/inference/engine/model_backend.rs` | Derives the prefill chunk from the free VRAM and the widest feed-forward. Runs the chunked prefill with its out-of-memory ladder. |
+| `src/inference/serve/scheduler.rs` | Iteration-level scheduler. Plans each step: who prefills, who decodes, their block tables. Applies a prefill token budget. Preempts without half-allocating. Pure bookkeeping, tested without a card. |
+| `src/inference/serve/continuous_serve.rs` | Worker thread that owns the model and the paged cache. The only caller of the forward. |
+| `src/inference/serve/batched_forward.rs` | The batched forward as an f32 specification, and the batch-invariance contract a backend meets. |
+| `src/inference/kernel/cpu_decode_exec.rs` | Host decode path with a preallocated arena. A token on the host allocates nothing. |
+| `src/inference/place/layer_perf.rs`, `src/api/handlers/system.rs` | Per-layer and per-stage timers behind `/api/layer_perf` and `/api/stage_perf`. Off by default, because each stage costs a device synchronisation. |
 
-Other references removed: the 70B host-placement figure was sourced from `../STATUS.md#placement-measured-separately`.
-
-Checks removed: none. The stage timer exercise stays.
+The 70B host-placement figure comes from [`STATUS.md`](STATUS.md#placement-measured-separately).
 
 ### Lesson 6: What the model remembers between tokens
 
-The removed table, verbatim:
+[Lesson](learn/06-kv-cache.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/cache/mod.rs` | Everything that remembers between tokens: the index of this directory. |
-| `src/inference/cache/paged_kv.rs`, `paged_attention.rs` | The block allocator and block tables, pure bookkeeping tested without a card, and the attention that reads through them. |
-| `src/inference/cache/q4_kv.rs`, `q8_kv.rs` | The quantised caches: why a per-token 4-bit key failed and the per-channel scheme that replaced it, and the 8-bit layout that appends one row per step with one copy. |
-| `src/inference/cache/kv_disk.rs` | The disk tier: blocks, the chained hash, one manifest per sequence, writes off the request path. |
-| `src/inference/cache/turboquant/mod.rs` | A 3-bit cache written as a host reference so that the measurement deciding whether to write the kernel exists first. Read `measure` before the rest. |
-| `src/inference/engine/llm_engine/load.rs` (`kv_reuse_start`) | What a new prompt reuses: the resident prefix, a snapshot that covers more of it, a disk sequence that covers more still, each rounded down to a prefill chunk. |
-| `src/inference/engine/llm_engine/params.rs` | The keys: `kv_disk_dir` and its budget. Snapshots need none. `fidelity` turns the shift past the window off at `reference`. The guide is [`../guides/kv-memory.md`](guides/kv-memory.md). |
+| `src/inference/cache/mod.rs` | Index of everything that remembers between tokens. |
+| `src/inference/cache/paged_kv.rs`, `paged_attention.rs` | Block allocator and block tables, tested without a card. The attention that reads through them. |
+| `src/inference/cache/q4_kv.rs`, `q8_kv.rs` | Quantised caches. A per-token 4-bit key failed and a per-channel scheme replaced it. The 8-bit layout appends 1 row per step with 1 copy. |
+| `src/inference/cache/kv_disk.rs` | Disk tier: blocks, chained hash, 1 manifest per sequence, writes off the request path. |
+| `src/inference/cache/turboquant/mod.rs` | 3-bit cache as a host reference. The measurement that decides whether to write the kernel comes first: read `measure.rs` before the rest. |
+| `src/inference/engine/llm_engine/load.rs` (`kv_reuse_start`) | What a new prompt reuses: the resident prefix, a snapshot that covers more, a disk sequence that covers more still. Each is rounded down to a prefill chunk. |
+| `src/inference/engine/llm_engine/params.rs` | Keys `kv_disk_dir` (and its budget) and `fidelity`. Snapshots need no key. `fidelity = reference` turns the shift past the window off. |
 
-Removed reference in the Try it text: the prefill chunk size comes from `adaptive_prefill_chunk` in `src/inference/engine/model_backend.rs`.
-
-Removed checks: none.
+- The prefill chunk size comes from `adaptive_prefill_chunk` in `src/inference/engine/model_backend.rs`.
+- [`guides/kv-memory.md`](guides/kv-memory.md) is the user guide.
 
 ### Lesson 7: From logits to a token
 
-The removed table, verbatim:
+[Lesson](learn/07-sampling.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/sample/token_sampling.rs` | The 2 steps: which tokens are candidates, then one draw. The draw is host-side, so the logits come back from the device once per token. |
-| `src/inference/engine/llm_engine/gguf.rs` (`build_sampling_from`) and `sampling_tests.rs` | How a request's `temperature`, `top_k`, `top_p` and the model's own defaults combine. The tests read as the specification (a `top_p` without a `top_k` is nucleus sampling over the whole vocabulary). |
-| `src/inference/engine/decode_step.rs` | The per-step order: penalty, then sampling, on the shared decode path. |
-| `cuda/sampling.cu` | The device-side sampler used when the draw can stay on the card. |
-| `src/inference/engine/llm_engine/mod.rs` | The grammar parser factory: a JSON schema or a Lark grammar becomes a per-token mask through llguidance. `response_format` on the OpenAI surface and `format` on the Ollama one reach it. |
-| `src/distributed/replay.rs` | Resuming a generation on another node with the same tokens, which holds only if sampling depends on position and seed alone. |
+| `src/inference/sample/token_sampling.rs` | 2 steps: pick the candidates, then draw 1. The draw runs on the host, so the logits return from the device once per token. |
+| `src/inference/engine/llm_engine/gguf.rs` (`build_sampling_from`), `sampling_tests.rs` | Combines a request's `temperature`, `top_k`, `top_p` with the model's defaults. The tests are the specification: a `top_p` without a `top_k` is nucleus sampling over the whole vocabulary. |
+| `src/inference/engine/decode_step.rs` | Per-step order on the shared decode path: penalty, then sampling. |
+| `cuda/sampling.cu` | Device-side sampler for draws that can stay on the card. |
+| `src/inference/engine/llm_engine/mod.rs` | Grammar parser factory. A JSON schema or a Lark grammar becomes a per-token mask through llguidance. `response_format` (OpenAI) and `format` (Ollama) reach it. |
+| `src/distributed/replay.rs` | Resumes a generation on another node with the same tokens. This holds only if sampling depends on position and seed alone. |
 | `scripts/determinism.py` | Runs a prompt repeatedly and diffs the answers. |
 
-Removed reference in the measured section: the comment above `kv_reuse_start` in `src/inference/engine/llm_engine/load.rs` states the chunk boundary rule.
-
-Removed checks: none. The `scripts/determinism.py` runner was only listed, never run in an exercise.
+The comment above `kv_reuse_start` in `src/inference/engine/llm_engine/load.rs` states the chunk boundary rule.
 
 ### Lesson 8: More than one token per weight read
 
-The removed table, verbatim:
+[Lesson](learn/08-speculative-decoding.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/serve/eagle.rs` | The EAGLE-1 head on the native substrate: one decoder layer over the target's feature and the next token's embedding, reusing the target's embedding table and output head. The module comment is a complete account of the method. |
+| `src/inference/serve/eagle.rs` | EAGLE-1 head: 1 decoder layer over the target's feature and the next token's embedding. Reuses the target's embedding table and output head. The module comment describes the method in full. |
 | `src/inference/serve/prompt_lookup.rs` | Prompt-lookup drafting from a rolling buffer of prompt and generated tokens. |
-| `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model and verifying in one target pass. The comment states the greedy restriction and what temperature would need. |
-| `src/inference/serve/speculative_config.rs` | Whether drafting is worth it, decided from measured device timings rather than assumed. |
-| `src/inference/serve/spec_kv_cache.rs` | A cache that can drop the rejected tail. |
+| `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model, verified in 1 target pass. The comment states the greedy restriction and what temperature would need. |
+| `src/inference/serve/speculative_config.rs` | Decides from measured device timings whether drafting pays. |
+| `src/inference/serve/spec_kv_cache.rs` | Cache that drops the rejected tail. |
 
-Removed reference in the measured section: the EAGLE figure of 1.71 to 1.82 times was "the module's, dated by it", from the `eagle.rs` module comment.
-
-Removed checks: none.
+The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment, dated there.
 
 ### Lesson 9: Fitting a model on the machine you have
 
-The removed table, verbatim:
+[Lesson](learn/09-placement.md)
 
-| File | What it decides |
+| File | Role |
 |---|---|
-| `src/inference/place/plan.rs` | The heterogeneous plan every block stack uses: pack the fastest card first, spill card to card to host, never out of memory. |
-| `src/inference/place/vram_manager.rs` | The one place placement reads a card's state from: pools trimmed before the probe, a reclaim registry for idle media residents, headroom for a hot component before it loads. |
-| `src/tensor/dry.rs`, `src/tensor/heap.rs`, `src/inference/place/dry_plan.rs` | The circularity break: measure a request's peak by running the forward on a device that allocates nothing, then replay the allocator's chunk and hole behaviour on top of it. |
-| `src/inference/place/placement_invariants.rs` | The fleet rule as tests: the cards decide, not the budgets. No placement decides on a name or an index. Every hot component can span n cards. |
-| `src/inference/place/layer_executor.rs` | The host budget as a share of the machine, not a constant. |
-| `src/inference/offload/streamed.rs`, `room.rs`, `cuda.rs` | The streamed placement for a model larger than the cards and host together: the weights every token reads and as many routed experts as the room allows, kept on the cards fastest first, under the same switches as every other placement. |
-| `src/inference/offload/store.rs` | The hot tier over streamed experts: views into the mapping, least-recently-routed eviction, cold experts dropped from the page cache once they have run while the host's memory is short, and left there otherwise. |
-| `src/distributed/routing.rs` | Which node answers, by predicted completion rather than by load. [`CLUSTER.md`](CLUSTER.md) has the cost model. |
-
-Removed checks: none. The invariants in `placement_invariants.rs` are tests (the cards decide, not the budgets, no decision on a name or an index, every hot component can span n cards), but the lesson gave no command to run them.
+| `src/inference/place/plan.rs` | Heterogeneous plan of every block stack: pack the fastest card first, spill card to card to host, never run out of memory. |
+| `src/inference/place/vram_manager.rs` | The one place placement reads card state from. Trims pools before the probe, keeps a reclaim registry for idle media residents, reserves headroom for a hot component before it loads. |
+| `src/tensor/dry.rs`, `src/tensor/heap.rs`, `src/inference/place/dry_plan.rs` | Break the circularity. They measure a request's peak by running the forward on a device that allocates nothing, then replay the allocator's chunk and hole behaviour on it. |
+| `src/inference/place/placement_invariants.rs` | The fleet rule as tests. The cards decide, not the budgets. No placement decides on a name or an index. Every hot component can span n cards. |
+| `src/inference/place/layer_executor.rs` | Sets the host budget as a share of the machine. |
+| `src/inference/offload/streamed.rs`, `room.rs`, `cuda.rs` | Streamed placement for a model larger than the cards and host together. Keeps the weights every token reads and as many routed experts as the room allows on the cards, fastest first. |
+| `src/inference/offload/store.rs` | Hot tier over streamed experts: views into the mapping, least-recently-routed eviction. Drops cold experts from the page cache after they run, while the host's memory is short. |
+| `src/distributed/routing.rs` | Picks the node that answers by predicted completion. [`CLUSTER.md`](CLUSTER.md) describes the routing. |
 
 ### Lesson 10: Measuring an engine without fooling yourself
 
-The removed table, verbatim:
+[Lesson](learn/10-measuring.md)
 
-| File | What it decides |
+| Resource | Role |
 |---|---|
-| [Method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md) | The protocol: the cell, the prompts, which cards each engine may use, what a cell that publishes no rate means, the `Tokens` column beside the rate. |
-| [Rate columns](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#the-rate-columns) | Why prefill is prompt tokens over the client's time to first token, why decode is the client's span, and why both are medians. Cold and warm figures: [cold and warm](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#cold-and-warm). |
-| [`scripts/bench`](https://github.com/loken-ai/benchmarks/blob/main/scripts/bench) in the benchmarks repository | The harness: starts the releases named in its settings, stamps the build into every row, files each run. |
-| [Benchmarks site](https://loken-ai.github.io/benchmarks/) | The runs of every machine, one page per hardware, rebuilt from the records so that no page is typed. |
-| `scripts/determinism.py` | The same prompt repeated, and a diff of the answers. |
-| `src/inference/place/layer_perf.rs`, `src/energy.rs` | The per-layer timers of lesson 5, and the joules: host RAPL and card NVML summed over the request window. |
-| [lokprof](https://github.com/loken-ai/lokprof) | The bench tool: drives each engine through its own API, separates prefill from decode, records energy beside speed, makes the engines comparable before comparing them. |
-
-Removed wording in Try it: lokprof "is not in this tree", and a `cargo build` running in another terminal (now "a build").
-
-Removed checks: none.
-
-## README
-
-Removed: "Lessons 3 and 4 run a `cargo test`", "shows where it lives in this tree", and the path `../img/learn-*.svg` of the diagrams.
+| [Method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md) | The protocol: the cell, the prompts, the cards each engine may use, what a cell without a published rate means, the `Tokens` column. |
+| [Rate columns](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#the-rate-columns) | Prefill is prompt tokens over the client's time to first token. Decode is the client's span. Both are medians. [Cold and warm](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#cold-and-warm) figures are separate. |
+| [`scripts/bench`](https://github.com/loken-ai/benchmarks/blob/main/scripts/bench) (benchmarks repository) | Harness: starts the releases named in its settings, stamps the build into every row, files each run. |
+| [Benchmarks site](https://loken-ai.github.io/benchmarks/) | The runs of every machine, 1 page per hardware, rebuilt from the records. |
+| `scripts/determinism.py` | Repeats a prompt and diffs the answers. |
+| `src/inference/place/layer_perf.rs`, `src/energy.rs` | Per-layer timers (lesson 5) and joules: host RAPL and card NVML summed over the request window. |
+| [lokprof](https://github.com/loken-ai/lokprof) | Bench tool: drives each engine through its own API, separates prefill from decode, records energy beside speed. |
