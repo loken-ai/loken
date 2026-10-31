@@ -8,9 +8,9 @@ Issues and pull requests welcome. A few things first.
   which card, which model, what else was running. the [benchmarks](https://github.com/loken-ai/benchmarks)
   repository has the protocol and the harness.
 - **A test that can fail.** Kernel and arithmetic changes want a reference computed a *different*
-  way - a host reference, not a second GPU path - and seen to go red. Defects have shipped here
-  because a kernel had no such test; one produced wrong answers for two days.
-- **A derived tolerance.** Say what rounding steps the two paths differ by and size the bound
+  way, a host reference, not a second GPU path, and seen to go red. Defects have shipped here
+  because a kernel had no such test. One produced wrong answers for 2 days.
+- **A derived tolerance.** Say what rounding steps the 2 paths differ by and size the bound
   from that. A tolerance picked to make a test pass will pass when the code is wrong.
 
 ## Build
@@ -19,15 +19,15 @@ CUDA toolkit and OpenCL headers, or `cargo build --release --no-default-features
 for neither. Tested against CUDA 13.3. `cp config.toml.example config.toml` before running the
 daemon.
 
-The CI runs the host's suite; the card tests run where you are. `cargo test --lib --profile gate`
+The CI runs the host's suite. The card tests run where you are. `cargo test --lib --profile gate`
 before opening a PR: the release build's code, rebuilt in place, so a change recompiles the units
 that hold it. Tests marked `#[ignore]` need model weights on disk or several cards -
 `config.test.toml.example` says how to point them at your weights.
 
 ## Style
 
-Comments say what the code does and what invariant it holds - not how it was found, not what it
-replaced. Commit messages: two paragraphs at most.
+Comments say what the code does and what invariant it holds, not how it was found, not what it
+replaced. Commit messages: 2 paragraphs at most.
 
 Porting an architecture: take it from the architecture and the checkpoint's tensor names. Copied
 code is measured and listed in `NOTICE.md`, and that table should be empty.
@@ -35,5 +35,5 @@ code is measured and listed in `NOTICE.md`, and that table should be empty.
 ## Reporting
 
 Model, prompt, hardware, and what you expected. If the output is wrong rather than slow, say
-whether it is wrong the same way each time - consistent and random need different
+whether it is wrong the same way each time, consistent and random need different
 investigations.

@@ -36,7 +36,7 @@ The arguments after `--`:
 | `--element-bytes` | Bytes per element of a row. | 4 |
 | `--inter` | The expert's feed-forward length, without a file. | 2048 |
 | `--weight-bits` | Bits per stored weight, without a file. 4.5 for q4_k, 8.5 for q8_0. | 4.5 |
-| `--projection-bytes` | The bytes of each projection, one value or three, in place of the two above. | derived |
+| `--projection-bytes` | The bytes of each projection, one value or 3, in place of the 2 above. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, for `host-expert`. | iq2_xxs |
 | `--down-format` | The format of an expert's down weights, for `host-expert`. | q2_k |
 | `--pack` | Rows the packed variants of `crossing` move in one copy. | 8 |
@@ -48,7 +48,7 @@ The arguments after `--`:
 | `--json` | Where the JSON record is written. | none |
 
 With `--shapes-from`, the row is the file's hidden size times its hyper-connection multiple.
-The expert is the layer's three routed projections, cut from a stacked tensor or taken from
+The expert is the layer's 3 routed projections, cut from a stacked tensor or taken from
 one tensor per expert, with the offset of every expert's copy in the file. Without a file, the
 options give the row and the projections' bytes.
 
@@ -66,8 +66,8 @@ crossing costs, the unit behind a layer's count of crossings. Its variants:
 - `--pack` rows in separate copies, against the same rows packed in one copy each way.
 - A stream synchronisation and an event wait with nothing queued.
 
-`expert-upload` copies one routed expert's three projections host to card. It answers the
-cost of a synchronous upload inside a token and what overlap buys. Its variants cross three
+`expert-upload` copies one routed expert's 3 projections host to card. It answers the
+cost of a synchronous upload inside a token and what overlap buys. Its variants cross 3
 choices:
 
 - The compute stream, a copy stream, or a copy stream ordered after an event recorded on the
@@ -106,7 +106,7 @@ dimensions of the shapes file, or of `--hidden` and `--inter`, in the formats `-
 `cache-policy` replays a routing through the policies of a host tier and counts the experts each
 misses, which the disk then has to read. It needs `--profile`, the routing counts a served model
 writes, and an expert size from `--shapes-from` or `--projection-bytes`. It touches no model, no
-disk and no card. Its variants are the slots per layer in `--slots`, each under three policies:
+disk and no card. Its variants are the slots per layer in `--slots`, each under 3 policies:
 
 - Static: the slots hold the experts the profile counts most and never change.
 - Recency: the least recently routed expert makes room.
@@ -129,7 +129,7 @@ far above its median has a stall worth a look. The bandwidth is the bytes one ca
 the median call. A variant that could not run says why in place of its figures.
 
 The JSON record carries the build, the machine, the card, the options as parsed, the shapes
-as resolved and every row's summary. Two records with the same options compare two commits.
+as resolved and every row's summary. 2 records with the same options compare 2 commits.
 
 Run a card bench on a card that serves nothing else. Run `expert-read` while no model is being
 read from the same disk.

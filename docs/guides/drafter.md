@@ -21,14 +21,17 @@ drafter attached to a model that fits the cards, it is dropped.
 ## By hand
 
 `POST /api/draft/attach` with `target` and `draft` attaches a drafter to a loaded model after
-the same vocabulary check, on the fastest card unless the request's `device_index` names one;
+the same vocabulary check, on the fastest card unless the request's `device_index` names one.
 `/api/draft/detach` removes it and `/api/draft/status` lists the pairs and their current draft
 length. A drafter that finds no room on a card is refused for a target held on the cards, since
-on the host it would cost the target more than it saves. These endpoints are loken's own; the Ollama API has none.
+on the host it would cost the target more than it saves.
+These endpoints are loken's own.
+The Ollama API has none.
 
 ## What to expect
 
 The answer is the target's answer, since the target verifies every draft with the request's
 own sampling. A verify runs several rows at once, and on a card its kernels can settle a
-near-tie between two tokens the other way than a one-row step does. The gain depends on how many drafts the target accepts; a drafter
-of the same family accepts more. Measured in [`../STATUS.md`](../STATUS.md).
+near-tie between 2 tokens the other way than a one-row step does.
+The gain depends on how many drafts the target accepts.
+A drafter of the same family accepts more. Measured in [`../STATUS.md`](../STATUS.md).

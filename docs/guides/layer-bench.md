@@ -75,11 +75,11 @@ the major page faults, and the bytes read from disk by the process, over the tim
 
 The JSON record carries the build (version and commit), the machine (host, processor, memory,
 cards), the controls, the model as held and placed, the time of every token, the stages and the
-counters. Two records with the same controls compare two commits.
+counters. 2 records with the same controls compare 2 commits.
 
-## Compare two commits
+## Compare 2 commits
 
-Build each commit, run the same command with `--json` on each, and read the two records side
+Build each commit, run the same command with `--json` on each, and read the 2 records side
 by side. The seed fixes the routing and the stream, so the experts read are the same on both.
 Run the warm page cache before the cold one when both are wanted: a cold run leaves the experts
 it read in memory.

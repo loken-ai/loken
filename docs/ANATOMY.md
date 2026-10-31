@@ -30,19 +30,19 @@ Steps 3 to 6 repeat for every token.
 | Pipeline split (`shifted`) | one node's share of a stack that goes on elsewhere | Layer stack and placement, Generation loop, Cluster |
 | Placement ladder (`ladder`) | the Demand placed rung after rung until it holds | Layer stack and placement, Generation loop, KV and state, Requests and responses, Experts and streaming, Models and formats, Media generation |
 
-A layer split across two cards:
+A layer split across 2 cards:
 
 1. The token climbs layers 0 to 4 on the host.
-2. Layers 5 to 16 are split across two CUDA cards. Card 1 gets a copy of the token.
+2. Layers 5 to 16 are split across 2 CUDA cards. Card 1 gets a copy of the token.
 3. Each card computes its share of the attention heads. A card's share follows its read rate.
-4. The two partial outputs are summed onto both cards.
+4. The 2 partial outputs are summed onto both cards.
 5. Each card computes its share of the feed-forward.
 6. The partial outputs are summed again. Both cards hold the output of the layer and go on to the next one.
 7. Card 0 hands the token to the ROCm card, which runs layers 17 to 23. The output head on that card draws the next token.
 
 Steps 3 to 6 repeat for every split layer.
 
-The sums cross the link between two cards of one machine, twice per layer. Between machines each sum would be a network round trip. The cluster splits the stack by layers instead.
+The sums cross the link between 2 cards of 1 machine, twice per layer. Between machines each sum would be a network round trip. The cluster splits the stack by layers instead.
 
 ## Requests, input and KV
 

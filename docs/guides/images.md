@@ -26,14 +26,17 @@ curl -s localhost:11435/v1/images/generations -H 'Content-Type: application/json
 The picture comes back base64 under `data[0].b64_json`. `response_format: "url"` stores it as
 a file and answers a URL on the request's `Host`, or on `public_url` when configured. `n`,
 `seed`, `num_steps`, `guidance`, `negative_prompt`, `loras`, `sampler` and `scheduler` are
-read; `stream: true` sends per-step progress as events.
+read.
+`stream: true` sends per-step progress as events.
 
 Edits and variations take the source image as multipart on `/v1/images/edits` and
-`/v1/images/variations`; adapters are named through `GET /v1/loras` and resolved inside
+`/v1/images/variations`.
+Adapters are named through `GET /v1/loras` and resolved inside
 `lora_dir`, never by path.
 
 ## What to expect
 
-The placement measures what each card holds before loading; a family that does not fit spreads
+The placement measures what each card holds before loading.
+A family that does not fit spreads
 across cards and, only when no card holds a piece, reaches the host. `GET /v1/renders` shows
 what is in flight, and `POST /v1/renders/{id}/cancel` stops one.

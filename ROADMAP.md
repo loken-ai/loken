@@ -1,8 +1,8 @@
 # Roadmap
 
 What the next releases bring, feature by feature. [`CHANGELOG.md`](CHANGELOG.md) lists what is
-done; [`docs/STATUS.md`](docs/STATUS.md) says what is measured. A feature is done when
-what its "Done when" column says is true and measured; until then it stays here with its state.
+done. [`docs/STATUS.md`](docs/STATUS.md) says what is measured. A feature is done when
+what its "Done when" column says is true and measured. Until then it stays here with its state.
 
 A state is one word: Done, Partial (what is left is a feature of a later version), Started,
 Planned, or Waiting (for the hardware to measure it on).
@@ -19,9 +19,9 @@ Planned, or Waiting (for the hardware to measure it on).
 | Context parallelism | Parallelism | A long context's attention is split across cards. | Done |
 | Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Partial |
 | CUDA on the published cudarc crate | Backends | loken builds on the published cudarc crate, with no patched fork, and graphs still work. | Done |
-| A Linux binary | Packaging | One Linux archive runs on the CPU anywhere; a second one adds the CUDA libraries. | Done |
+| A Linux binary | Packaging | One Linux archive runs on the CPU anywhere, a second one adds the CUDA libraries. | Done |
 | CPU kernels chosen at run time | CPU | One binary picks AVX2 or AVX-512 on the machine it runs on. | Done |
-| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on one and two cards. | Partial |
+| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on one and 2 cards. | Partial |
 | A coding agent on large models | Agents | lokode finishes a multi-step task on Qwen3.8 and DeepSeek V4.1. | Done |
 | A faster test suite | Tests | The tests a change must pass run in a fraction of the old time. | Done |
 
@@ -39,7 +39,7 @@ Major, by priority:
 | Forecasting models | Models | loken forecasts time series and beats naive forecasts on a fixed set. | Done |
 | Write every format loken reads | Models | Every GGUF weight format loken reads, it also writes, with each expert's importance where the format uses one, and each within 2 % of the reference quantiser's error. | Done |
 | Load every format a model ships in | Models | Every model loads from each format its publisher ships, GGUF and safetensors in the Hugging Face and the native layouts, through the same placement as the others, checked by one loading test per architecture. | Done |
-| Mistral Timestral forecasts | Models | The four Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Done |
+| Mistral Timestral forecasts | Models | The 4 Timestral checkpoints answer on the forecast route with their 21 quantiles and covariates, matching Mistral's library on a fixed set. | Done |
 
 Smaller, by priority:
 
@@ -76,9 +76,9 @@ Major, by priority:
 |---|---|---|---|
 | Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Started |
-| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Planned |
-| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on two 16 GB cards and the host | Planned |
-| Experts chosen across quantised files | Performance | One model served from two GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10 % of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
+| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Started |
+| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Planned |
+| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10 % of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
 | Qwen3.8 IQ1_M on one card at the reference | Performance | Qwen3.8 IQ1_M on one card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
 | Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
 
@@ -94,10 +94,10 @@ Smaller, by priority:
 | Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Partial |
 | Prompt embeddings | API | A request can send embeddings instead of tokens and gets the same answer. | Done |
-| Concurrent media requests | Serving | Two image or speech requests on one card finish sooner together than one after the other. | Started |
+| Concurrent media requests | Serving | 2 image or speech requests on one card finish sooner together than one after the other. | Started |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on one card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
-| Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds; the Responses API's previous response names the conversation. | Done |
+| Conversation KV kept between turns | Serving | The next turn of a conversation reads only the tokens it adds, the previous answer included, for as long as a lease set in the configuration holds, the Responses API's previous response names the conversation. | Done |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Planned |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
@@ -105,7 +105,7 @@ Smaller, by priority:
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
 | Model directories on several disks | Models | Several model directories, on several disks, form one catalogue, and a model being pulled lands on the directory that holds it and reads it fastest, judged on its size, the free space and the measured speed of each disk. | Partial |
 | Serving without custom settings | API | A client gets the window, the cache format and the priority a request needs without any loken header or option: the server derives them from the request and the machine. | Done |
-| Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family; it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
+| Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
 | One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
 
 ## 0.6.0
@@ -197,7 +197,7 @@ Smaller, by priority:
 
 ## Waiting for hardware
 
-Features that cannot be measured on the machines at hand; each moves into a version once a machine
+Features that cannot be measured on the machines at hand. Each moves into a version once a machine
 to measure it on is available.
 
 | Feature | Category | Done when | State |

@@ -1,7 +1,7 @@
 # Keep conversations in memory between requests
 
 A request that continues the previous one reuses the resident KV and prefills only its new
-tokens. Two more tiers extend that to several conversations and across a restart.
+tokens. 2 more tiers extend that to several conversations and across a restart.
 
 ## Snapshots
 
@@ -31,6 +31,6 @@ longer than the window is refused at every level.
 
 ## What to expect
 
-`prompt_eval_count` counts the tokens actually prefilled, so a served prefix shows there; the
-Messages API reports the cache counts in `usage`. Snapshots cost one KV each where the layers
+`prompt_eval_count` counts the tokens actually prefilled, so a served prefix shows there.
+The Messages API reports the cache counts in `usage`. Snapshots cost one KV each where the layers
 live, and a quantised cache restores on its own grid: Q8 exactly, Q4 within a step.

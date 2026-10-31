@@ -13,12 +13,12 @@ target disagrees with is replaced by the target's choice, and everything after i
 dropped. What survives is exactly what the target would have generated on its own, token for
 token under greedy decoding, so the output is unchanged.
 
-The gain is accepted drafts per pass; the cost is drafting plus a verification pass slightly
-heavier than a plain step. Three sources of drafts:
+The gain is accepted drafts per pass. The cost is drafting plus a verification pass slightly
+heavier than a plain step. 3 sources of drafts:
 
-- a **separate small model** of the same family, with the same vocabulary;
+- a **separate small model** of the same family, with the same vocabulary.
 - a **trained head** on the target's own last hidden state (EAGLE), a few percent of a layer,
-  with acceptance rates near ninety percent;
+  with acceptance rates near 90%.
 - the **prompt itself**: an n-gram that already occurred is continued the way it continued
   before, which costs nothing and works on repetitive text such as code.
 
@@ -32,7 +32,7 @@ that fits a card, verification costs about what drafting saves.
 |---|---|
 | `src/inference/serve/eagle.rs` | The EAGLE-1 head on the native substrate: one decoder layer over the target's feature and the next token's embedding, reusing the target's embedding table and output head. The module comment is a complete account of the method. |
 | `src/inference/serve/prompt_lookup.rs` | Prompt-lookup drafting from a rolling buffer of prompt and generated tokens. |
-| `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model and verifying in one target pass; the comment states the greedy restriction and what temperature would need. |
+| `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model and verifying in one target pass. The comment states the greedy restriction and what temperature would need. |
 | `src/inference/serve/speculative_config.rs` | Whether drafting is worth it, decided from measured device timings rather than assumed. |
 | `src/inference/serve/spec_kv_cache.rs` | A cache that can drop the rejected tail. |
 
@@ -53,17 +53,17 @@ tokens a second on the pair above, and a drafter attached to a model that fits t
 dropped by the same rule.
 
 **The head, when it was built.** The EAGLE head reached 1.71 to 1.82 times the plain rate on
-deepcoder, held out, on an earlier substrate; the figure is the module's, dated by it, and
+deepcoder, held out, on an earlier substrate. The figure is the module's, dated by it, and
 not re-measured on the native one.
 
 ## Try it
 
-This exercise needs a target that spills, which is a 70B on two 16 GB cards. loken gives it a
+This exercise needs a target that spills, which is a 70B on a pair of 16 GB cards. loken gives it a
 drafter on its own: the smallest model in the store sharing its vocabulary, here llama3.2:1b.
 The log says so at load (`deepseek-r1:70b spills to the host: llama3.2:1b drafts for it`).
 
-Run one prompt of a few hundred generated tokens, then `GET /api/draft/status`: it lists the
+Run one prompt of hundreds of generated tokens, then `GET /api/draft/status`: it lists the
 pair and the draft length learned so far. The first request explores the lengths, plain
-decoding included; compare `eval_count / eval_duration` on the first reply and on a later
+decoding included. Compare `eval_count / eval_duration` on the first reply and on a later
 one. To see plain decoding for the same prompt, `POST /api/draft/detach` with
 `{"target":"deepseek-r1:70b"}` and run it again: the `response` text is the same.

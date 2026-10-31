@@ -4,7 +4,8 @@
 (a Qwen3-Embedding or BERT-shaped checkpoint, or a chat model as a fallback). A CLIP or SigLIP
 checkpoint embeds images as well, in the same space as its texts: a caption and its picture
 land near each other, so one cosine ranks images against a text or texts against an image.
-Every vector is L2-normalised; the cosine is the dot product.
+Every vector is L2-normalised.
+The cosine is the dot product.
 
 ## Find the model
 
@@ -15,7 +16,7 @@ the models directory itself, and `huggingface_models_dir`
 ([configuration](../CONFIGURATION.md)). The first snapshot holding safetensors and a
 `config.json` is taken, and it is served as a text-image model when it also holds
 `tokenizer.json`, `preprocessor_config.json`, a `text_config` and a `vision_config`, and the
-tensors of one of the two layouts:
+tensors of one of the 2 layouts:
 
 | Layout | Tensors | Text vector | Image vector |
 |---|---|---|---|
@@ -67,5 +68,6 @@ model asked for an image answers 400.
 
 ## Encodings
 
-`float` is a JSON array; `base64` is the little-endian f32 bytes, base64-encoded.
+`float` is a JSON array.
+`base64` is the little-endian f32 bytes, base64-encoded.
 `dimensions` (`output_dimension` on `/v2/embed`) keeps the first coordinates of each vector.

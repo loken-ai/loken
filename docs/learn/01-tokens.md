@@ -4,13 +4,13 @@ A model reads a row of ints and writes one int at a time. Text becomes ints goin
 become text coming out. Both translations fail silently: no crash, no slowdown, just plausible
 nonsense.
 
-That is the whole risk. The rest of this page is where each half lives in loken and the five
+That is the whole risk. The rest of this page is where each half lives in loken and the 5
 times it actually broke.
 
 ## The idea
 
-- **Tokenizer**: a fixed vocabulary (~150k strings; qwen3 has 151 936) and a rule for cutting
-  text into it. Byte-pair merges up from bytes; a SentencePiece unigram picks the
+- **Tokenizer**: a fixed vocabulary (~150k strings, 151 936 for qwen3) and a rule for cutting
+  text into it. Byte-pair merges up from bytes. A SentencePiece unigram picks the
   highest-scoring split. Both ship in the checkpoint. Wrong tokenizer, wrong output, every
   kernel innocent.
 - **Special tokens**: entries that mark a turn or a reasoning block and stand for no text.
@@ -18,7 +18,7 @@ times it actually broke.
 - **Chat template**: a Jinja program in the checkpoint that folds messages into the one
   string shape the model trained on. Render it slightly off and answers trail away.
 - **The return split**: ids back to text, then split into answer, reasoning (`<think>`, a
-  Harmony `analysis` channel), and any tool call. Not arithmetic; fails with no kernel
+  Harmony `analysis` channel), and any tool call. Not arithmetic. It fails with no kernel
   complaining.
 
 Rough sizes: an English word is ~1.3 tokens, source code ~2.
@@ -35,27 +35,27 @@ Rough sizes: an English word is ~1.3 tokens, source code ~2.
 
 ## What was measured
 
-Four defects, none in the arithmetic, on months-old models the same week (2026-09-12). Each
+4 defects, none in the arithmetic, on months-old models the same week (2026-09-12). Each
 sat between the model's tokens and the client's JSON, and none moved a token rate, so no speed
 or coherence check could see it.
 
 | Defect | Reach | Cause |
 |---|---|---|
-| a bare `thought` at the head of every answer | gemma4 31b and 26b, both surfaces | the channel tags `<\|channel>...<channel\|>` were dropped as special at decode; the channel name between them survived |
-| reasoning delivered as the answer, `thinking` empty | 19 of the 44 models scanned | drop-special-tokens keyed on one spelling, gpt-oss's `<\|channel\|>`; `<think>` is a control token and fell with the rest |
+| a bare `thought` at the head of every answer | gemma4 31b and 26b, both surfaces | the channel tags `<\|channel>...<channel\|>` were dropped as special at decode, and the channel name between them survived |
+| reasoning delivered as the answer, `thinking` empty | 19 of the 44 models scanned | drop-special-tokens keyed on one spelling, gpt-oss's `<\|channel\|>`. `<think>` is a control token and fell with the rest |
 | the template failed to render, a fallback rendered instead | falcon3, granite3-moe, granite3.1-dense, llama3.2 | `tojson(indent=4)` on a filter that took no named argument |
-| a tool call lost | qwen3 (emitted inside the reasoning block), granite (an array where an object was expected) | `enable_thinking` never set when rendering; a valid JSON array short-circuited to nothing |
+| a tool call lost | qwen3 (emitted inside the reasoning block), granite (an array where an object was expected) | `enable_thinking` never set when rendering, and a valid JSON array short-circuited to nothing |
 
 A fifth surfaced when a guard added since (2026-09-13) began rendering every stored template
 with and without a tool: smollm3's `{% generation %}` tags, unknown to the Jinja engine, are
 now stripped before parsing.
 
 Dead end: patching gemma4 through the prompt fixes 31b and 26b and breaks `gemma4:latest`,
-which then reasons without stopping. Four tags, three architectures; test all four.
+which then reasons without stopping. 4 tags, 3 architectures. Test all 4.
 
 ## Try it
 
-A reasoning model splits its answer in two:
+A reasoning model splits its answer in 2 parts:
 
 ```sh
 curl -s localhost:11435/api/chat -d '{"model":"qwen3:0.6b","stream":false,

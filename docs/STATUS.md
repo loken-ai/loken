@@ -12,10 +12,10 @@ of the [benchmarks](https://github.com/loken-ai/benchmarks) repository, publishe
 https://loken-ai.github.io/benchmarks/. How a cell is measured is in its
 [method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md). The figures quoted below
 come from the campaign of 2026-10-03 on the machine named above: both cards available to every
-engine, idle machine, greedy, streamed, short prompt, 4096 ctx, median of three iterations.
+engine, idle machine, greedy, streamed, short prompt, 4096 ctx, median of 3 iterations.
 
-Two mixtures lost in that campaign. They came from a harness that had moved into its own repository and
-started the engine without its configuration; measured configured on 2026-09-02, olmoe is
+2 mixtures lost in that campaign. They came from a harness that had moved into its own repository and
+started the engine without its configuration. Measured configured on 2026-09-02, olmoe is
 +17.4% and granite3-moe +0.2%. The mixtures that do lose are the ones too large for the cards.
 A layer was placed whole, so a spilled mixture ran attention on the host for the sake of expert
 weights that are 97% of its bytes and read a few at a time. Spilling the experts and keeping
@@ -24,9 +24,9 @@ qwen3-coder-next from 10.7 to 30.8 against 26-28. A mixture that already fits is
 
 ## Placement, measured separately
 
-Given both cards, ollama splits models that fit on one; this engine keeps them on the fast
+Given both cards, ollama splits models that fit on one. This engine keeps them on the fast
 card, and pays nothing for having the second one present. Measured 2026-09-03, olmoe: 464 tok/s
-on card 0 alone, 462 with both cards visible, 252 on card 1 alone - the placer picks the fast
+on card 0 alone, 462 with both cards visible, 252 on card 1 alone, the placer picks the fast
 card, and the 390-against-496 penalty an earlier revision of this page reported is gone.
 
 For a model that fits on neither card the limit is the bus. deepseek-r1:70b at Q4_K_M holds
@@ -39,7 +39,7 @@ proposes tokens and the 70B verifies them. The 2026-09 row with a llama3.2:1b dr
 (`deepseek-r1:70b-ffnq3`, `-ffnq3d2`, `-q3ks`) are among the measured runs.
 
 A checkpoint that ships split is read as one model across its parts. unsloth/Qwen3-235B-A22B-GGUF,
-a mixture of 235B parameters, runs on the two cards and the host at 7.0 tok/s prefill and
+a mixture of 235B parameters, runs on the 2 cards and the host at 7.0 tok/s prefill and
 4.7 tok/s decode (4096 ctx, short prompt, streamed).
 
 ## Context shift
@@ -69,15 +69,15 @@ holds no positions to shift.
 
 DeepSeek V4.1 is served from its own GGUF, which may be split, with the routed experts read
 from the file as routing asks for them. Its runs are on the
-[benchmarks site](https://loken-ai.github.io/benchmarks/); the other engines could not run it.
+[benchmarks site](https://loken-ai.github.io/benchmarks/). The other engines could not run it.
 
 | Piece | State |
 |---|---|
 | Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards. Each layer reads only the experts the prompt routes to, in runs, into a page-locked slab, and sends them on a copy stream. See the benchmark rows of the model |
 | Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [`CONFIGURATION.md`](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
-| Decode-state cache | In host memory unless `state_cache_dir` puts it on disk. A stored prefix always pays; a short remainder still reads nearly every expert, which bounds how little it costs |
+| Decode-state cache | In host memory unless `state_cache_dir` puts it on disk. A stored prefix always pays, a short remainder still reads nearly every expert, which bounds how little it costs |
 | `quality` | `exact` unless `fidelity = "fast"`. The other levels change the output. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
-| Sharding across nodes | Unmeasured at two nodes, see below |
+| Sharding across nodes | Unmeasured at 2 nodes, see below |
 
 A transformer with recurrent layers (a convolution, state-space or delta-rule mixer beside
 attention) cannot trim its state back to a shorter prefix, so the cache stores the states its prefill passes and
@@ -138,34 +138,34 @@ a block, and is not shipped.
 
 ## Forecasting
 
-The forecast route serves Chronos-2 and the four Timestral checkpoints. On the fixed set of the
-Timestral gate (eight series with their held-out continuation), the mean MASE of the median
+The forecast route serves Chronos-2 and the 4 Timestral checkpoints. On the fixed set of the
+Timestral gate (8 series with their held-out continuation), the mean MASE of the median
 forecast is 0.85 for Chronos-2 and between 1.15 and 1.29 for the Timestral checkpoints, against
-2.71 for the seasonal naive forecast. Two tests fail when a model stops beating it:
+2.71 for the seasonal naive forecast. 2 tests fail when a model stops beating it:
 `chronos2_beats_seasonal_naive` and `checkpoints_match_the_reference_and_beat_seasonal_naive`.
 
 ## The qwen4exp family
 
-Three files of the architecture load through the generic route on the two-card machine: a
-160-expert Q4_K_M (28.4 GB), a 256-expert IQ1_M in two parts (58.4 GB) and a 512-expert
-UD-Q4_K_XL in four (111 GB). Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchmarks/); none is
+3 files of the architecture load through the generic route on the 2-card machine: a
+160-expert Q4_K_M (28.4 GB), a 256-expert IQ1_M in 2 parts (58.4 GB) and a 512-expert
+UD-Q4_K_XL in 4 (111 GB). Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchmarks/). None is
 quoted here.
 
 | What | State |
 |---|---|
 | Card against host numerics | The card paths agree with the host to a cosine of 0.9997 per layer on the 160-expert file |
 | Low-bit expert formats | Run on the card in decode and prefill, judged against the host decoder |
-| Expert cache | Hot experts held on each layer's card; a missing expert is copied into the card's transit room or computed on the host, split by measured rates; a wide batch streams a layer's experts through two buffers when that costs less than its rows. A card with room for all its experts holds them and runs its layers as loaded ones |
-| 256 experts, decode | On a 4.0k token prompt one card decodes 21 to 23 tok/s and two cards 30 to 33; on 14k tokens 20 and 28 to 30. Before the cache plan used the second card: 16 to 17 on 4.0k and 12 on 14k |
+| Expert cache | Hot experts held on each layer's card, a missing expert is copied into the card's transit room or computed on the host, split by measured rates, a wide batch streams a layer's experts through 2 buffers when that costs less than its rows. A card with room for all its experts holds them and runs its layers as loaded ones |
+| 256 experts, decode | On a 4.0k token prompt one card decodes 21 to 23 tok/s and 2 cards 30 to 33, on 14k tokens 20 and 28 to 30. Before the cache plan used the second card: 16 to 17 on 4.0k and 12 on 14k |
 | Decode graph | Captured for files without an n-gram table or indexed attention. The others, and every file under the cache plan, decode eagerly |
 | 160 experts, one card | Measured on 3.2k and 12.9k token prompts |
-| 160 experts, two cards | Measured on a 4.5k token prompt |
-| 256 experts, one card | Answers a 72-token prompt coherently; 3.2k tokens prefill, the first request then ends after one token and a second fails out of memory |
-| 256 experts, two cards | Measured on a 72-token prompt before the cache plan; the 3.2k-token prompt fails as on one card |
+| 160 experts, 2 cards | Measured on a 4.5k token prompt |
+| 256 experts, one card | Answers a 72-token prompt coherently, 3.2k tokens prefill, the first request then ends after one token and a second fails out of memory |
+| 256 experts, 2 cards | Measured on a 72-token prompt before the cache plan, the 3.2k-token prompt fails as on one card |
 | 512 experts | Loads. Not measured on either envelope |
 
 Quality, as the mean negative log-likelihood per token of held-out texts from this repository
-(code, 1500 tokens; docs, 2200 tokens), chunk 512, two cards, scored by the quality harness:
+(code, 1500 tokens. Docs, 2200 tokens), chunk 512, 2 cards, scored by the quality harness:
 
 | File | Code | Docs |
 |---|---:|---:|
@@ -174,7 +174,7 @@ Quality, as the mean negative log-likelihood per token of held-out texts from th
 | 512 experts, UD-Q4_K_XL | 1.03 | 1.76 |
 
 For the 160-expert file the placements differ by at most 0.01 nat: host only 2.176 and 3.359,
-two cards 2.181 and 3.370. Host against cards, top-1 agreement is 0.94 and 0.92 at a mean KL of
+2 cards 2.181 and 3.370. Host against cards, top-1 agreement is 0.94 and 0.92 at a mean KL of
 0.017 and 0.021. One run per cell.
 
 Limits:
@@ -182,15 +182,15 @@ Limits:
 - **Out of memory in prefill.** The 256-expert file on a 3.2k token prompt fails with a card
   reported nearly full (27 to 59 MB free) while the chunk accounting counted several GB free.
   The engine halves the chunk and the request ends with one token or an error. The cause is not
-  found; a 2.7k token prompt completes.
+  found. A 2.7k token prompt completes.
 - **Prefill is compute-bound** in the delta-rule projections, convolution, scan and the wide
   mixers. The expert copy is hidden behind it.
 - **The first 128 decoded tokens run while the expert cache learns**, so a decode rate over
   fewer tokens understates the steady state.
 - **The 512-expert file** holds 77 GB of experts against 56 GB of host memory in the scope
-  measured, which is untried. Only three quarters of the memory the kernel still has free is
-  page-locked; the rest copies through the driver's staging at a lower rate.
-- **Two cards** under the cache plan cut the layers by link: the card on the slower link (x4 here)
+  measured, which is untried. Only 3 quarters of the memory the kernel still has free is
+  page-locked. The rest copies through the driver's staging at a lower rate.
+- **2 cards** under the cache plan cut the layers by link: the card on the slower link (x4 here)
   holds the layers it can hold whole, the other the rest with a cache. The decode of a card
   with a cache is bound by the host launching its kernels one by one, since the decode graph
   is off for these files.
@@ -201,32 +201,32 @@ Limits:
 ## Costs
 
 - **~870 MiB per load, any model.** CUDA contexts, cuBLAS workspace, preloaded module images.
-  Fixed, not proportional - 893 and 867 MiB on models differing 2x in weights. The placement
+  Fixed, not proportional, 893 and 867 MiB on models differing 2x in weights. The placement
   planner does not know about it.
 - **First answer after load is slower.** A mixture pays ~0.5 s if a request arrives before the
-  background repack finishes - when it fits. A spilled one pays far more: qwen3next decodes its
+  background repack finishes, when it fits. A spilled one pays far more: qwen3next decodes its
   first request at 2.0 tok/s and the next at 34.7. The benchmark table takes the median over
-  its iterations, so that cost no longer reaches a published rate; a user's first answer still
+  its iterations, so that cost no longer reaches a published rate. A user's first answer still
   pays it.
 - **A spilled model was double-held in host RAM.** The file was prefetched whole before
   placement, so the 28 GB already on the cards stayed cached beside the 14 GB the host actually
   reads, and a 64 GB box swapped 16 GB during the decode being timed. The advice now follows
-  the plan - DontNeed for what the cards hold, WillNeed for what the host reads - and each
+  the plan, DontNeed for what the cards hold, WillNeed for what the host reads, and each
   layer's pages are dropped the moment it lands on a card, because waiting for the end of the
   load was already too late: the cache had reached 44 GB and 12-15 GB of the process had gone
   to zram, and the same cell then decoded anywhere between 1.5 and 2.2 tok/s from one run to
-  the next. Dropped per layer, the cell measures 2.25 three times. Those figures predate two
+  the next. Dropped per layer, the cell measures 2.25 3 times. Those figures predate 2
   changes: a weight the loader built (fused q/k/v and gate/up, a rebuilt float projection) and
   now sits on a card keeps no host copy, and the token tables stay as the file stores them
   instead of widening to F32. The load logs one ledger line with every conversion it made, its
   bytes before and after, and warns when the cards grow by more than the file. The load still
-  reads the pages of host layers once their repack exists; no figure here measures the peak
+  reads the pages of host layers once their repack exists. No figure here measures the peak
   after the changes.
 - **Load time is your disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
 ## The cluster
 
-Two halves live in [`CLUSTER.md`](CLUSTER.md), and only one of them runs.
+2 halves live in [`CLUSTER.md`](CLUSTER.md), and only one of them runs.
 
 **Replicated serving runs.** Any node is an entry point and an entry point holds nothing: a
 client talks to whichever node it knows, that node forwards the whole HTTP request to the best
@@ -236,80 +236,80 @@ and `/api/cluster/prefix` report it. No consensus protocol: routing to a dead no
 retry, not a corruption.
 
 A hand-over is priced on rates each node measures from its own completed generations, never
-from hardware nameplates - what a card could do is not what this build achieves on this model
+from hardware nameplates, what a card could do is not what this build achieves on this model
 at this quantisation.
 
-**Sharding runs for DeepSeek V4.1, unmeasured at two nodes.** At load, each node measures its
+**Sharding runs for DeepSeek V4.1, unmeasured at 2 nodes.** At load, each node measures its
 own profile, the planner compares a split against local serving, and when a split pays the head
-forms a pipeline of any length over the binary data plane. A three-node loopback chain decodes
+forms a pipeline of any length over the binary data plane. A 3-node loopback chain decodes
 bit-identically to one node.
 
-**Sharding runs for dense generic transformers, measured at two nodes on one machine.** Each
+**Sharding runs for dense generic transformers, measured at 2 nodes on one machine.** Each
 clustered node times a layer on its cards and on its host and publishes it with the bytes its
 cards carry of the model. The node that loads the model second plans the cut from those and the
 gossip round trip, asks the other node to reload its layers through its own placement ladder,
 reloads its own the same way, and sends the boundary of every prefill chunk and decode step over
-the binary frames; each node keeps the KV cache of its layers. On two loopback servers, one card
+the binary frames. Each node keeps the KV cache of its layers. On 2 loopback servers, one card
 each, DeepSeek R1 32B (19.9 GB, 64 layers, does not fit one 16 GB card): prefill 1170 tok/s and
 decode 26 tok/s at 2k tokens, 1060 and 21 at 6k, against 43 and 3.3 for one card with 21 layers
-on the host, and 711 and 27 for the two cards of one node as tensor-parallel. Greedy output
-matches the one-card node for 64 tokens on two prompts and for a 6k prompt with its
-continuation; the one-card node itself varies between runs past about 25 tokens. A two-way and a
-four-way split are bit-identical to one part on the host in the tests. Refused, with the reason:
+on the host, and 711 and 27 for the 2 cards of one node as tensor-parallel. Greedy output
+matches the one-card node for 64 tokens on 2 prompts and for a 6k prompt with its
+continuation. The one-card node itself varies between runs past about 25 tokens. A 2-way and a
+4-way split are bit-identical to one part on the host in the tests. Refused, with the reason:
 models whose layers take per-layer inputs, share KV, keep a recurrent state, hold experts in
-host memory, or carry an adapter or an image tower; verify batches. The tail node gives up its
+host memory, or carry an adapter or an image tower. Verify batches. The tail node gives up its
 own copy of the model while it serves a segment. The crossing is priced by the gossip round
 trip alone, not by the logits that come back. The link-cost matrix, the tiered KV, the resume
 path and the layer scheduler are still reached by nothing: `distributed::wiring_gate` records
 the state of every module in that directory.
 
-**One defect found, and its fix unverified at two nodes.** A node published a capacity derived
+**One defect found, and its fix unverified at 2 nodes.** A node published a capacity derived
 from one generation's decode rate multiplied by its lane count, while its generations serialise
-behind the model lock. Two comparable machines therefore priced each other an order of
+behind the model lock. 2 comparable machines therefore priced each other an order of
 magnitude apart, and the cluster handed over a few requests where it should have split the work
 roughly in half. The meter now publishes what a window of real completions produced. The second
-machine left the bench before the fix could be measured, so **the two-node gain is currently
-unmeasured** - the correction is judged by trace replay, not by a cluster.
+machine left the bench before the fix could be measured, so **the 2-node gain is currently
+unmeasured**, the correction is judged by trace replay, not by a cluster.
 
 **Open.** A peer that has never answered is priced from a floor rather than from its catalogue,
 so a cold node looks worse than an idle one that holds nothing. And a replica set keyed on a
-placeholder digest - what models cached from Hugging Face carry - groups every such model into
+placeholder digest, what models cached from Hugging Face carry, groups every such model into
 one set.
 
 ## Written, wired to nothing
 
-- **Layer scheduler** (`src/distributed/layer_scheduler.rs`) - one caller: itself, since the
+- **Layer scheduler** (`src/distributed/layer_scheduler.rs`): one caller: itself, since the
   engine that used to build a plan by hand was removed. Judged over 21 placement and 119 naming
-  cases, with two perturbations proving the judge can fail.
-- **Reserve pass** (`src/tensor/dry.rs`) - runs the forward on a device that allocates nothing,
+  cases, with 2 perturbations proving the judge can fail.
+- **Reserve pass** (`src/tensor/dry.rs`): runs the forward on a device that allocates nothing,
   to replace the per-model formulas. Called by the Z-Image, FLUX and other image loaders. Every
   language-model placement is still budgeted by formula.
 
 ## Shipped as source, never compiled
 
-The CUDA kernels carry AMD arms - MFMA on CDNA, WMMA on RDNA3+ - guarded and complete. There is
+The CUDA kernels carry AMD arms, MFMA on CDNA, WMMA on RDNA3+, guarded and complete. There is
 no hipcc build here, so none has been through a compiler. Treat AMD as source, not support.
 
 ## Next
 
-A Vulkan backend. One generic compute backend reaches AMD, Intel and NVIDIA; HIP reaches one
+A Vulkan backend. One generic compute backend reaches AMD, Intel and NVIDIA. HIP reaches one
 vendor and a subset of its cards.
 
 ## Judged partially
 
-- **Mat-vec core** - checked against an independent reference for 2 formats of 10. The production
+- **Mat-vec core**: checked against an independent reference for 2 formats of 10. The production
   entry point does not reach the core.
 - **Z-Image bends its schedule twice.** `new` derives timesteps from bent sigmas,
   `set_timesteps` from the pre-bend ramp. At 9 steps: `[1.0, 0.960129, 0.913349, ...]` against
   `[1.0, 0.96, 0.913043, ...]` for one bend. Only a render says which the checkpoint expects.
-- **Image parity is a hash**, one prompt and seed per family - and not a property of the code
-  alone. The placer reads free VRAM at load, and four runs of one binary gave four hashes. Run it
+- **Image parity is a hash**, one prompt and seed per family, and not a property of the code
+  alone. The placer reads free VRAM at load, and 4 runs of one binary gave 4 hashes. Run it
   on a quiet machine.
 
 ## Measured and refused
 
 A 3-bit KV cache through a randomised Hadamard rotation. The rotation is orthogonal and does
-spread outliers (excess kurtosis 35.7 -> -0.6); against f16 it delivers what it promises. Against
+spread outliers (excess kurtosis from 35.7 to -0.6). Against f16 it delivers what it promises. Against
 the Q4_0 cache already here it does not: token-axis grouping removes the outliers first, so
 rotating changes the error by under 0.5%, and Q4_0 is 2.6x more accurate for one more bit. The
 harness stays, wired to nothing.
@@ -324,9 +324,9 @@ largest matched range is the GGUF k-quant bit specification, which any correct r
 The 870 MiB nobody budgets, and the reserve pass reaching language models. Each has a
 measurement waiting. olmoe's deficit is closed: it was the harness, not the engine.
 
-granite3-moe:1b loses 1-5% streamed and wins 7-20% not streamed, on six runs across three
-days. At ~3 ms a token the stream's per-token cost - the chunk, its JSON, the client's read
-loop - is the same order as the token, and that is where the gap lives, not in the kernels.
+granite3-moe:1b loses 1-5% streamed and wins 7-20% not streamed, on 6 runs across 3
+days. At ~3 ms a token the stream's per-token cost, the chunk, its JSON, the client's read
+loop, is the same order as the token, and that is where the gap lives, not in the kernels.
 
 One speculative loop, with the draft length learned from the cycles. deepseek-r1:70b spilling
 to the host, drafted for by llama3.2:1b, greedy: 1.49 tok/s alone, 2.72 drafted, same text.

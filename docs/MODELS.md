@@ -12,12 +12,12 @@ What loken can load, where it looks for the files, and how a request names them.
 
 `loken pull <name> --source ollama|huggingface` fetches into the matching store: an Ollama
 tag whole, a Hugging Face repository's safetensors, GGUF, bin and JSON files. A `.pth` archive a
-media family needs is placed in the store by hand. `loken list` prints what both stores hold;
+media family needs is placed in the store by hand. `loken list` prints what both stores hold.
 `loken delete` removes a model. A request that names a model not yet
 loaded loads it, and a model stays resident for the keep-alive the daemon was started with.
 
 Quantisations are read as the file carries them. On the cards the block formats run through
-their own kernels; on the host they need AVX2 (see [`BUILDING.md`](BUILDING.md)).
+their own kernels. On the host they need AVX2 (see [`BUILDING.md`](BUILDING.md)).
 
 | Tensor formats a GGUF may carry | |
 |---|---|
@@ -29,7 +29,7 @@ their own kernels; on the host they need AVX2 (see [`BUILDING.md`](BUILDING.md))
 
 The codebook formats run on a card for the experts, in decode and prefill, and on the host
 through integer dot products that need AVX2. A dense projection stored in a codebook format is
-requantised once at load to Q8_0 for a card; the experts keep their format.
+requantised once at load to Q8_0 for a card. The experts keep their format.
 
 A file that stores a tensor in another format is refused with the format's id. Token and
 per-layer embedding tables stay as stored and a lookup decodes the rows it needs. A load that
@@ -38,36 +38,36 @@ after.
 
 `loken pull owner/repo:SELECTOR` keeps the GGUF files of a repository whose directory, or
 dash-delimited file-name token, equals SELECTOR (case-insensitive), with the repository's
-configuration files; without a selector every file is pulled. Each file is checked against its
+configuration files. Without a selector every file is pulled. Each file is checked against its
 listed size and its sha256.
 
 A pull follows the daemon's streamed progress and stops when no frame arrives for a multiple of
-the longest gap seen (eight times). A repository
-holding a model GGUF and its `mmproj` resolves to the model file; the projector is its companion.
+the longest gap seen (8 times). A repository
+holding a model GGUF and its `mmproj` resolves to the model file. The projector is its companion.
 
 A GGUF split into parts by `gguf-split` is read as one model on the generic route: the first
 part's metadata, the union of the parts' tensor directories, each tensor read from the part
 that holds it. It is named by its first part, and a part whose siblings are missing is refused.
 A set is placed layer by layer, never tensor-parallel. A family's vision tower reads from the
-first part only; a set whose `v.*` tensors sit in another part is served as text, and the log
+first part only. A set whose `v.*` tensors sit in another part is served as text, and the log
 says why.
 
 A mixture model may be served from several GGUF files of one checkpoint, each quantising the
 routed experts to its own format. Its Ollama manifest names the first file as its model layer, as
 any model does, and each further file as a layer of media type
-`application/vnd.loken.image.model.variant`; the tag is listed by `/api/tags` like any other.
+`application/vnd.loken.image.model.variant`. The tag is listed by `/api/tags` like any other.
 Every tensor is read from the first file except the routed experts, which the placement reads
 expert by expert from one file or another. The placement fills the cards, then the host tier,
 in routing-heat order: the experts the cards keep come from the file that stores them in the
 most bytes, while the cards have room for them, since a card computes an expert at the same speed
-whatever its format; those the host tier keeps or reads from disk come from the file that stores
+whatever its format. Those the host tier keeps or reads from disk come from the file that stores
 them in the fewest, since the host's cores read every byte of an expert at each use. The
 heat is the model's routing profile in `profiles/` of the store, else the routing prior the file
 records. `expert_variants` in [`CONFIGURATION.md`](CONFIGURATION.md) forces one file for every
 expert. A further file is refused at load, with what differs, unless it carries the same
 `general.architecture` and `tokenizer.*` metadata, the same routed experts (layer, projection
 and expert) at the same shapes, whether stacked or one tensor each, and every other tensor of
-the first file at the same shape, format and bytes; a table read row by row (the engram tables)
+the first file at the same shape, format and bytes. A table read row by row (the engram tables)
 is compared on evenly spread spans. Tensors only the further file carries are ignored. The
 DeepSeek V4.1 route reads this layout.
 
@@ -80,7 +80,7 @@ as their product. The routed experts
 keep the formats asked for. The checkpoint's DSpark draft is stored apart, as
 `<name>:<tag>-dspark`, a companion the loader finds beside the model. A partial conversion of
 layers `0:N` is a model of N + 1 layers that llama.cpp loads as such. The route still reads the
-files loken wrote before, under `deepseek_v41` and its own names; a file `--complete` lays out is
+files loken wrote before, under `deepseek_v41` and its own names. A file `--complete` lays out is
 loken's own and not llama.cpp's.
 
 ```json
@@ -115,20 +115,20 @@ rather than a port. The architectures that table names:
 | OLMo | `olmo2`, `olmoe` |
 | Others | `gptoss`, `lfm2`, `lfm2moe`, `nemotron_h_moe`, `smollm3`, `starcoder`, `starcoder2`, `glm4`, `chatglm`, `ernie4_5`, `dbrx` |
 
-Mixtures route their experts on the card, and spill experts alone when the model does not fit;
-the recurrent hybrids (`lfm2moe`, `nemotron_h_moe`, `qwen3next`) carry their state-space blocks
+Mixtures route their experts on the card, and spill experts alone when the model does not fit.
+The recurrent hybrids (`lfm2moe`, `nemotron_h_moe`, `qwen3next`) carry their state-space blocks
 beside attention. Reasoning models return their thinking apart from the answer on every
-surface; gpt-oss speaks Harmony and is read as such.
+surface. Gpt-oss speaks Harmony and is read as such.
 
 DeepSeek V4.1 has a loader of its own, chosen by what the file or the checkpoint directory
 contains (hyper-connection tensors), not by name. Its routed experts stay in the file, which may
-be split, and are read as routing asks for them; the always-read weights and the busiest experts
+be split, and are read as routing asks for them. The always-read weights and the busiest experts
 sit on the cards. A routing prior the file lacks is borrowed from a companion GGUF beside it,
 found by the metadata it declares. Sharding across machines runs for this model only, see
 [`CLUSTER.md`](CLUSTER.md).
 
 Vision: `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`). Images travel
-base64 in the request on all three surfaces.
+base64 in the request on all 3 surfaces.
 
 Speech in: `voxtral` and `ultravox` take audio in a chat turn. A model whose files carry a speech
 tower lists `audio` among its capabilities. The tower is either the `mmproj*.gguf` beside a text
@@ -136,7 +136,7 @@ GGUF (`clip.projector_type` names the family), or a checkpoint directory whose `
 declares an `audio_config`: Ultravox ships only the tower and the projector, and names its text
 model by `text_model_id`, which is looked up in the hub cache by id, else by name under any owner.
 Its safetensors are served through the dense checkpoint route below, so no GGUF is needed. Pulling
-the checkpoint pulls that text model too when the cache holds no copy of it; a gated id needs a
+the checkpoint pulls that text model too when the cache holds no copy of it. A gated id needs a
 token, or a copy pulled under another owner.
 The tower is placed after the text model, on a card the text model does not use when there is one.
 A clip arrives base64 as an `input_audio` part of `/v1/chat/completions` or in `audios` of an
@@ -174,7 +174,7 @@ the dense expert product, which copies the stack on each call and is slow for a 
 `F16` and `BF16` stacks are rebuilt in `Q8_0`.
 
 Embeddings and reranking: BERT-shaped encoders (`nomic`, `bge` and the like) answer
-`/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`. A CLIP
+`/v1/embeddings` and `/api/embed`. A Qwen3-Reranker checkpoint answers `/v1/rerank`. A CLIP
 or SigLIP checkpoint directory embeds texts and images in one space on `/v1/embeddings` and
 `/v2/embed` ([guide](guides/embeddings.md)).
 
@@ -186,7 +186,7 @@ loader of its own. What the file declares and the loader reads:
 | Element | Read from the file |
 |---|---|
 | Wide residual (hyper-connections) | The stream count and the low-rank width, with the mixers that replace the layer norms and the output mixer. Mixers and tables stored in BF16 or a block format are read as stored |
-| Layer pattern | One indexed-attention layer after every `full_attention_interval` layers, the others delta-rule (three delta-rule layers, then one attention layer, in the files measured) |
+| Layer pattern | One indexed-attention layer after every `full_attention_interval` layers, the others delta-rule (3 delta-rule layers, then one attention layer, in the files measured) |
 | Indexed attention | The indexer's head count, key length and top-k, and the per-layer compress ratio |
 | Experts | Routed and used counts, expert width, a shared expert with a scalar gate. 160, 256 and 512 routed experts have been loaded |
 | N-gram table | One table at the layer `ple.layers` names, 16 heads over bigrams and trigrams. It is read by row from the mapping and never staged on a card |
@@ -200,14 +200,14 @@ The files measured, all loading through the generic route:
 | UD-Q4_K_XL | 512 | 4 | 111 GB |
 
 The experts stay in the file's mapping. A card holds a cache of the hot ones per layer and the
-rest run on the host beside it; a wide prompt batch streams the layer's experts to the card
-through two buffers when that costs less than running its rows one by one. Host memory is
+rest run on the host beside it. A wide prompt batch streams the layer's experts to the card
+through 2 buffers when that costs less than running its rows one by one. Host memory is
 admitted against the bytes the process owns. Limits and measurements are in
 [`STATUS.md`](STATUS.md#the-qwen4exp-family).
 
 ## Image
 
-The `model` of an image request names the family by substring; the loader then reads that
+The `model` of an image request names the family by substring. The loader then reads that
 family's files from the Hugging Face store.
 
 | Family | `model` contains | Files |
@@ -239,7 +239,7 @@ of one render per family and depends on the placement, see [`STATUS.md`](STATUS.
 | Sound effects | EzAudio | `ezaudio` |
 | Separation | Mel-Band RoFormer | `/v1/audio/separate` |
 
-The OpenAI voice names (`alloy`, `echo`, `fable`, `onyx` and the rest) are accepted and mapped;
+The OpenAI voice names (`alloy`, `echo`, `fable`, `onyx` and the rest) are accepted and mapped.
 `GET /v1/audio/voices` lists what the resident model offers.
 
 ## Time series
@@ -256,7 +256,7 @@ A Timestral forecast reads the last 32,768 points and answers 21 quantile levels
 A horizon longer than one block is decoded block by block, each block's median read back as
 context. The forecast is averaged with the reflected forecast of the negated series, and
 clipped at zero when the context never goes below it. A categorical covariate is encoded by
-the mean of the series over each category. The four checkpoints match the reference library
+the mean of the series over each category. The 4 checkpoints match the reference library
 within 5e-4 of the largest quantile on the fixed set under `tests/vectors/timestral`.
 
 ## What a request may not ask for

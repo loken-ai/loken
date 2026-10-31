@@ -76,6 +76,7 @@ read from fixed paths under the store (`boogu/`, `wan/`, `flux-kontext-q4km.gguf
 |---|---|---|
 | `fidelity` | `balanced` | How closely the output follows the published model, against speed and memory: `reference`, `balanced` or `fast`. Any other value is a startup error. The server logs the level and what it chose at start. |
 | `recorded_drafts` | by `fidelity` | Drafts (the model's own draft head, prompt lookup) verified in recorded windows, the head guessing only where they are. A window is checked against the plain step when it is recorded. |
+| `probe_dump_dir` | unset | A directory the model's probes write the tensors of a prompt's first rows to, as little-endian f32 files named by tensor, for a comparison against a reference. Nothing is written when unset. |
 
 What each level chooses:
 
@@ -91,9 +92,9 @@ What each level chooses:
 
 `recorded_drafts`, `quality` and `expert_variants` set in the file keep their value at every level.
 A quantised checkpoint (Q4_K, Q8_0 and the like) is read as stored at every level. Its products
-quantise the activation to eight bits, as llama.cpp does.
+quantise the activation to 8 bits, as llama.cpp does.
 
-Not chosen by the level, the same at all three:
+Not chosen by the level, the same at all 3:
 
 | Choice | Why |
 |---|---|
@@ -104,22 +105,22 @@ Not chosen by the level, the same at all three:
 
 ### Decided by loken
 
-Nothing below is configured; a key of that name in an older `config.toml` loads and is reported as no longer read.
+Nothing below is configured. A key of that name in an older `config.toml` loads and is reported as no longer read.
 
 | Decision | Where it comes from |
 |---|---|
 | Sampling (`temperature`, `top_p`, `top_k`, repetition penalty, stop sequences) | The request, else the model's own recommendation (the `params` layer of an Ollama manifest, `generation_config.json` of a checkpoint), else the Ollama API defaults. |
 | Seed | The request's, else a fresh one per request. |
 | Generation length | The request's cap, else the end of the context window. |
-| Context window | The request's `num_ctx`, else what the checkpoint declares; a quantised cache grows into it on demand, an F16 cache is sized by the placement plan. |
+| Context window | The request's `num_ctx`, else what the checkpoint declares, a quantised cache grows into it on demand, an F16 cache is sized by the placement plan. |
 | Card a model loads on | The fastest card that holds it, from the probe. |
-| Memory each card offers | The measured free memory; the load keeps its own runtime reserve and backs off after an out-of-memory. |
+| Memory each card offers | The measured free memory, the load keeps its own runtime reserve and backs off after an out-of-memory. |
 | Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
 | KV cache format | Q8 for every model whose head shape the quantised kernels serve, at `balanced` and `fast`. Full width at `reference`, and for a head shape they do not cover, capped attention scores (Gemma2), attention sinks and gemma4. |
-| Conversation snapshots | Each finished sequence is copied aside, a quantised cache in its packed form, so a later request on it resumes from its own KV; how many are kept is bounded by the free device memory, leaving the cache its working window and the next prefill the memory it sizes its chunk from, and a copy that would not fit is not taken. |
-| Batched serving | A model serves requests one at a time until they overlap several times in a row, then batches them in its paged worker (cards only); as many lone arrivals in a row take it back to serial decode, the faster path for one stream. |
-| Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target; the draft length is learned from measured acceptance and cycle time, a cycle that recorded a verify window or the drafter's step counting its acceptance alone. The drafter's decode step is recorded where the model allows it and kept between requests while nothing it reads has moved. A model held on the cards gets no drafter. `POST /api/draft/attach` still attaches one by hand. |
-| Resident models | As many language models stay loaded as the cards hold; the least recently used is unloaded only when an incoming model would otherwise be pushed off the cards. |
+| Conversation snapshots | Each finished sequence is copied aside, a quantised cache in its packed form, so a later request on it resumes from its own KV. How many are kept is bounded by the free device memory, leaving the cache its working window and the next prefill the memory it sizes its chunk from, and a copy that would not fit is not taken. |
+| Batched serving | A model serves requests one at a time until they overlap several times in a row, then batches them in its paged worker (cards only). As many lone arrivals in a row take it back to serial decode, the faster path for one stream. |
+| Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target, the draft length is learned from measured acceptance and cycle time, a cycle that recorded a verify window or the drafter's step counting its acceptance alone. The drafter's decode step is recorded where the model allows it and kept between requests while nothing it reads has moved. A model held on the cards gets no drafter. `POST /api/draft/attach` still attaches one by hand. |
+| Resident models | As many language models stay loaded as the cards hold, the least recently used is unloaded only when an incoming model would otherwise be pushed off the cards. |
 | Context shift | At `balanced` and `fast`, once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
 
 ### Copies of a model
@@ -135,9 +136,9 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
 | `vulkan_devices` | none | The Vulkan devices placement may give layers to, by index or by a part of their name. Empty offers those no other runtime of the build drives. Needs the `vulkan` feature. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
-| `kv_lease_secs` | `1800` | Seconds a conversation's kept state stays after its last turn; past it the state is dropped and the next turn reads its prompt again. `0` keeps a state until the memory is needed. |
+| `kv_lease_secs` | `1800` | Seconds a conversation's kept state stays after its last turn, past it the state is dropped and the next turn reads its prompt again. `0` keeps a state until the memory is needed. |
 
-The next turn of a conversation keeps the rows of what it shares with the turn before, up to the last turn marker of the chat template, and reads only the answer and the new turn: a conversation of seven thousand tokens reads thirty at its second turn, and a short one reads the few it adds. Several conversations are kept side by side, each restored when its turn comes, for as long as the lease holds. The usage of a reply names the tokens a kept state served (`cached_tokens`), on the chat route and on the Responses route, where `previous_response_id` names the conversation. A prompt with no turn marker keeps what a cold read of it would have produced, in whole blocks.
+The next turn of a conversation keeps the rows of what it shares with the turn before, up to the last turn marker of the chat template, and reads only the answer and the new turn: a conversation of 7000 tokens reads 30 at its second turn, and a short one reads the few it adds. Several conversations are kept side by side, each restored when its turn comes, for as long as the lease holds. The usage of a reply names the tokens a kept state served (`cached_tokens`), on the chat route and on the Responses route, where `previous_response_id` names the conversation. A prompt with no turn marker keeps what a cold read of it would have produced, in whole blocks.
 
 ### Prompts read by another instance
 
@@ -149,7 +150,7 @@ never leaves. A model with recurrent or windowed layers hands over its whole dec
 of rows: every recurrent state, the windowed layers' rows, the global layers' rows and the logits
 to resume from, checked against this instance's layer kinds and row geometry before it is read.
 A model with a split layer, a cache cut over the cards, or a peer that cannot answer reads the
-prompt here. The rows travel as f32, about four times the cache's own size.
+prompt here. The rows travel as f32, about 4 times the cache's own size.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -160,9 +161,9 @@ prompt here. The rows travel as f32, about four times the cache's own size.
 With `context_parallel` set, the cache of each attention layer is cut into ranges of positions,
 one on each card the machine shows: the layer's own card first, then the others. Before its
 prefill a request reserves the positions it needs, each card's room past the work of a prefill
-shared by the layers; a decode past them grows a range a working window at a time. A query attends to every range on the range's card and the
+shared by the layers. A decode past them grows a range a working window at a time. A query attends to every range on the range's card and the
 parts are combined on the layer's card, so a context no single card holds is served whole. The
-ranges hold F16 rows; the layers so cut run outside the recorded decode step, and their prefixes
+ranges hold F16 rows. The layers so cut run outside the recorded decode step, and their prefixes
 are not kept as snapshots. Layers with a sliding window, attention sinks, indexed attention, a
 cache other layers share, or split across cards keep their own cache.
 
@@ -173,13 +174,13 @@ cache other layers share, or split across cards keep their own cache.
 ### Decode-state cache (DeepSeek V4.1 and recurrent hybrids)
 
 In host memory for the life of the process, or on disk when `state_cache_dir` is set. A DeepSeek
-V4.1 prompt costs one pass over the routed experts, read from disk; this cache stores the model's
+V4.1 prompt costs one pass over the routed experts, read from disk. This cache stores the model's
 decode state after a prompt and after each finished turn, so a later prompt that begins with the
 same tokens restores it and prefills only the rest.
 
 Every file a cache keeps on disk (the state cache, the KV disk tier, the expert routing profile)
 has the same format: a 20-byte header that names the kind of file and its version, then a binary
-body. A body is stored compressed when that makes it clearly smaller, and read back whole; a
+body. A body is stored compressed when that makes it clearly smaller, and read back whole. A
 store in memory is never compressed. A file of another kind, another version or cut short is
 refused, and the cache rebuilds what it lost. Files hold floating-point state and token ids, no
 text, but they are not encrypted.
@@ -187,7 +188,7 @@ text, but they are not encrypted.
 The same keys open the same store for a generic-route model that carries a recurrent state beside
 its KV (a convolution, state-space or delta-rule mixer interleaved with attention). Such a state
 cannot be cut back to a shorter prefix, so no prefix of an earlier prompt can be reused by trimming
-and every turn re-prefills; with the store open, each state the prefill passes is kept and a later
+and every turn re-prefills. With the store open, each state the prefill passes is kept and a later
 prompt restores the longest one it extends. A dense model keeps its disk tier (`kv_disk`) and is
 unchanged.
 
@@ -199,24 +200,24 @@ could live, and leave the key unset where nothing about an exchange may reach th
 
 | Key | Default | What it does |
 |---|---|---|
-| `state_cache_dir` | none | Directory of the cache; none keeps it in host memory. |
-| `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, or in memory the host memory a component may take, less room for one more state of the largest size written. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
+| `state_cache_dir` | none | Directory of the cache, none keeps it in host memory. |
+| `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, or in memory the host memory a component may take, less room for one more state of the largest size written. Least recently used first, in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
 
 What the cache works out for itself, from what the model, the disk and the engine report, and logs when it changes:
 
 | Quantity | Derived from |
 |---|---|
-| Block size | The bytes a token adds to the blocks, the model's granule, and the directory's per-file cost and write throughput, measured once on the directory with synced probe files; kept in `geometry.json` so a restart finds the chain it wrote. |
+| Block size | The bytes a token adds to the blocks, the model's granule, and the directory's per-file cost and write throughput, measured once on the directory with synced probe files, kept in `geometry.json` so a restart finds the chain it wrote. |
 | Spacing of kept states | The measured write throughput, the size of a manifest and the measured prefill time per token: a state is kept no closer than the disk can finish writing it within the prefill of the tokens in between. It is the prefill's own chunk until both are measured, and a multiple of the block size and of the chunk. |
-| Whether to restore | A stored state is read only while its measured read-and-decode cost per byte, times its bytes, is below the measured prefill time of the tokens it covers; tried while either is unmeasured. |
-| Writes | One at a time, queued behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state; otherwise skipped with a log line. |
+| Whether to restore | A stored state is read only while its measured read-and-decode cost per byte, times its bytes, is below the measured prefill time of the tokens it covers, tried while either is unmeasured. |
+| Writes | One at a time, queued behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state, otherwise skipped with a log line. |
 
 A DeepSeek V4.1 state costs about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the
 model keeps them) and about 1.1 KB per token of compressed KV, stored once in block files that every
 snapshot of a conversation shares. A prompt restores the longest stored prefix and prefills the rest
-in one layer-major pass onto it, so a stored prefix always pays. A pass over a few hundred tokens still
+in one layer-major pass onto it, so a stored prefix always pays. A pass over a few 100 tokens still
 routes to nearly every expert of every layer and so reads about as many expert bytes as a whole prompt:
-a remainder of 250 tokens costs a little over half a cold 2000-token prompt. The batch worker and the serial path use the cache; a pipelined model does not, because half of its state is on
+a remainder of 250 tokens costs a little over half a cold 2000-token prompt. The batch worker and the serial path use the cache. A pipelined model does not, because half of its state is on
 the tail node.
 
 A state is also keyed by the model files (length, modification time and header),
@@ -225,7 +226,7 @@ with a log line.
 
 For a recurrent hybrid a stored state is a manifest and blocks. The manifest holds every recurrent
 mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole
-block; its size depends on the model and not on the prompt. Blocks hold the global layers' rows for
+block. Its size depends on the model and not on the prompt. Blocks hold the global layers' rows for
 one block size of tokens (derived, see above), once per shared prefix, as f16 where every value is exactly an f16
 and as f32 otherwise, so a restore returns the stored bits. States are kept at multiples of the
 largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least
@@ -243,8 +244,8 @@ engine measures the rest. `expert_variants` applies only to a model served from 
 
 | Key | Default | What it does |
 |---|---|---|
-| `expert_variants` | by `fidelity` | For a model whose manifest names further files of its checkpoint ([`MODELS.md`](MODELS.md)): which file each routed expert is read from. `plan`: the experts the cards keep, hottest first, from the most precise file while the cards have room for them; those the host tier keeps or reads from disk, from the smallest. `smallest` and `largest`: every expert from that file, which answers as that file alone does. |
-| `quality` | by `fidelity` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold: a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
+| `expert_variants` | by `fidelity` | For a model whose manifest names further files of its checkpoint ([`MODELS.md`](MODELS.md)): which file each routed expert is read from. `plan`: the experts the cards keep, hottest first, from the most precise file while the cards have room for them, those the host tier keeps or reads from disk, from the smallest. `smallest` and `largest`: every expert from that file, which answers as that file alone does. |
+| `quality` | by `fidelity` | How much exactness the output may give up for speed. `exact`: identical to the full model, the same tokens whichever experts the cards hold: a routed expert on a card gives the bits the host gives. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, 3 times that noise. Any other value is a startup error. |
 
 At load the engine runs a bundled text teacher-forced on the card path and on the host path to
 measure the noise, then once under each candidate way of giving up experts, and applies the
@@ -277,11 +278,11 @@ rows, the whole next layer is read ahead into the slab while the current layer r
 ### Expert cache of a mixture held in the file's mapping
 
 A mixture too large for the cards keeps its routed experts in the file's mapping, and the cache
-on each layer's card is sized by the load. Two keys carry what a run learned to the next one:
+on each layer's card is sized by the load. 2 keys carry what a run learned to the next one:
 
 | Key | Default | What it does |
 |---|---|---|
-| `expert_profile` | `profiles/` of the model store | A routing profile written by `expert_profile_save`; at the load it fills the slots the prefill does not borrow with the most routed experts, and gives every expert the heat its count earns; a DeepSeek V4.1 model ranks its experts by it for the cards it warms and the file each expert is read from. A missing file is skipped. With neither key set, each model reads its own profile from `profiles/` of the model store, named after the model id. |
+| `expert_profile` | `profiles/` of the model store | A routing profile written by `expert_profile_save`, at the load it fills the slots the prefill does not borrow with the most routed experts, and gives every expert the heat its count earns, a DeepSeek V4.1 model ranks its experts by it for the cards it warms and the file each expert is read from. A missing file is skipped. With neither key set, each model reads its own profile from `profiles/` of the model store, named after the model id. |
 | `expert_profile_save` | `profiles/` of the model store | Where the routing counts are written after each request: those of the profile read at the load plus the decodes since, halved together when one would pass the 32-bit limit. With neither key set, each model writes its own profile where it reads it. |
 
 
@@ -291,10 +292,10 @@ on each layer's card is sized by the load. Two keys carry what a run learned to 
 | Which card holds which layers | Cards on equal links are cut in proportion to their room beside the output head. On unequal links, read from the driver as the generation and width of each card's PCIe link, the slower card holds the layers it can hold whole, every expert on the card, and the card on the fastest link takes the rest |
 | Where a missing expert runs | On the card, copied into a transit room and run with the cached ones, or on the host. The split is the one at which both finish together, from the time a copy and a host computation have each taken on the layer. A transited expert hotter than the coldest slot not in use stays in that slot |
 | Which expert a slot holds | Counts of each expert's use, scaled down every few tens of tokens through a layer, so the cache follows the text in hand. A missing expert replaces the coldest slot not in use only when its count is higher by a margin |
-| Bytes page-locked for copies to the cards | Three quarters of the memory the kernel still has free, within the cap of the process's control group |
-| How long a recorded token waits on the host | 64 times the longest request the card's tier worker has answered, or the longest a layer's widest request takes at the measured paces of a host product and a copy. A request left unanswered that long while the worker does not move releases the card, logs the layer and the worker's step at error level, and fails the request; the layers serve again once the worker answers |
+| Bytes page-locked for copies to the cards | 3 quarters of the memory the kernel still has free, within the cap of the process's control group |
+| How long a recorded token waits on the host | 64 times the longest request the card's tier worker has answered, or the longest a layer's widest request takes at the measured paces of a host product and a copy. A request left unanswered that long while the worker does not move releases the card, logs the layer and the worker's step at error level, and fails the request, the layers serve again once the worker answers |
 | A wide batch streams a layer's experts | Only when copying what the card does not hold, at the host-to-card rate measured, takes less than running the rows through the cache at the pace tokens have decoded |
-| Host memory admitted for a spill | The bytes the process owns; pages viewed in place from the mapping are not counted, and the log gives the bytes read from the mapping with a warning when they exceed the host's memory |
+| Host memory admitted for a spill | The bytes the process owns, pages viewed in place from the mapping are not counted, and the log gives the bytes read from the mapping with a warning when they exceed the host's memory |
 
 ### Files, moderation and URLs
 
@@ -312,9 +313,9 @@ is answered 400 naming the key and the value it carried.
 | Key | Default | What it does |
 |---|---|---|
 | `max_images` | 16, the most one message carries | Images one request hands the vision encoder. |
-| `max_image_pixels` | 134217728, the decoder's 512 MiB budget at RGBA8 | Pixels (width times height) an image may declare in its header, checked before it is decoded. An image fetched by URL may also be at most four bytes per allowed pixel. |
+| `max_image_pixels` | 134217728, the decoder's 512 MiB budget at RGBA8 | Pixels (width times height) an image may declare in its header, checked before it is decoded. An image fetched by URL may also be at most 4 bytes per allowed pixel. |
 | `max_audio_seconds` | 1398, the same budget for a stereo clip at 48 kHz in f32 | Seconds of the audio clip, read from the container's header where it states them and from the decoded frames otherwise. |
-| `image_fetch_hosts` | none | Hosts, or `host:port` pairs, an image given by URL on the Messages API or `/v1/embeddings` is fetched from; redirects are followed only to them. Empty fetches nothing. |
+| `image_fetch_hosts` | none | Hosts, or `host:port` pairs, an image given by URL on the Messages API or `/v1/embeddings` is fetched from, redirects are followed only to them. Empty fetches nothing. |
 | `image_fetch_timeout_secs` | 30 | Seconds a fetch of an image by URL may take, connection to last byte. |
 
 ## `[cpu]`
@@ -335,7 +336,7 @@ is answered 400 naming the key and the value it carried.
 ## `[cluster]`
 
 Absent, the node runs alone and every cluster path is skipped. `docs/CLUSTER.md` explains the
-model; the keys are:
+model. The keys are:
 
 | Key | Default | What it does |
 |---|---|---|
@@ -351,7 +352,7 @@ model; the keys are:
 | Setting | Default | What it does |
 |---|---|---|
 | `LOKEN_API_KEY` | unset | Read by `loken launch`: the key handed to the agent when the daemon requires one. |
-| `OLLAMA_MODELS`, `OLLAMA_KEEP_ALIVE` | | The Ollama store, overriding `ollama_models_dir`; the keep-alive of a loaded model. |
+| `OLLAMA_MODELS`, `OLLAMA_KEEP_ALIVE` | | The Ollama store, overriding `ollama_models_dir`, the keep-alive of a loaded model. |
 | `HF_TOKEN` | unset | Sent when a pull fetches from Hugging Face. |
 
 ## Build features

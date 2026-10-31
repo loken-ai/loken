@@ -32,7 +32,8 @@ reasoning model returns its thinking under `reasoning_content`, apart from `cont
 
 ## With an SDK
 
-Point the client at the daemon; the key is anything until `require_auth` is on.
+Point the client at the daemon.
+The key is anything until `require_auth` is on.
 
 ```python
 from openai import OpenAI
@@ -43,7 +44,8 @@ print(r.choices[0].message.content)
 ```
 
 Streaming, tools, `response_format`, `n`, `logprobs` and `logit_bias` work as the API documents
-them; `/v1/responses` serves the Responses API the newer SDKs default to. The routes and what
+them.
+`/v1/responses` serves the Responses API the newer SDKs default to. The routes and what
 each takes are in [`../API.md`](../API.md#openai-surface).
 
 ## What to expect

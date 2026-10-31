@@ -43,25 +43,25 @@ configure one.
 | Placement across cards and the host | automatic | | Measured, [STATUS](docs/STATUS.md#placement-measured-separately) |
 | Expert spilling for mixtures that do not fit, streamed from disk when the file exceeds the host | automatic | | Measured, [STATUS](docs/STATUS.md#large-mixtures-streamed-from-disk) |
 | Continuous batching | automatic, when requests overlap | | Runs, cards only |
-| Speculative decoding | automatic for a model that spills to the host; `/api/draft/attach` | | Measured on one pair, [guide](docs/guides/drafter.md) |
+| Speculative decoding | automatic for a model that spills to the host, `/api/draft/attach` | | Measured on one pair, [guide](docs/guides/drafter.md) |
 | KV reuse across conversations, on disk, past the window | automatic | `kv_disk_dir` | Runs, [guide](docs/guides/kv-memory.md) |
-| Decode-state cache for the large mixture and recurrent hybrids | automatic, in memory; on disk once set | `state_cache_dir` | Runs, [CONFIG](docs/CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
+| Decode-state cache for the large mixture and recurrent hybrids | automatic, in memory, on disk once set | `state_cache_dir` | Runs, [CONFIG](docs/CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
 | Lossy expert routing for speed, within the model's own noise | automatic once set | `quality` | DeepSeek V4.1 only, off by default, [CONFIG](docs/CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Files, batches, message batches | `/v1/files`, `/v1/batches`, `/v1/messages/batches` | `files_dir` | Runs |
-| Moderation with a classifier | `/v1/moderations` | `moderation_model` | Runs, five families |
+| Moderation with a classifier | `/v1/moderations` | `moderation_model` | Runs, 5 families |
 | Images, edits, variations, adapters | `/v1/images/*`, `/v1/loras` | `lora_dir` | Judged partially, [STATUS](docs/STATUS.md#judged-partially) |
 | Video | `/v1/video/generations` | | Runs |
 | Transcription and translation | `/v1/audio/transcriptions`, `/v1/audio/translations` | | Runs |
 | Speech, music, sound effects, separation | `/v1/audio/speech`, `/v1/audio/generations`, `/v1/audio/separate` | | Runs |
 | Energy per request | every answer | `[energy]` | Measured |
-| Replicated serving across machines | `/api/cluster/*` | `[cluster]` | Runs at one node, unmeasured at two |
-| Sharding one model across machines | automatic at load | `[cluster]` | DeepSeek V4.1 only, unmeasured at two nodes |
+| Replicated serving across machines | `/api/cluster/*` | `[cluster]` | Runs at one node, unmeasured at 2 |
+| Sharding one model across machines | automatic at load | `[cluster]` | DeepSeek V4.1 only, unmeasured at 2 nodes |
 | Scrape endpoint | `/metrics` | feature `metrics` | Runs |
 | Authentication and rate limit | every route | `require_auth`, `api_keys`, `rate_limit_per_minute` | Runs, off by default |
 
-Each media family is a Cargo feature - `image`, `audio`, `video`, `midi`, or `media` for all. A
+Each media family is a Cargo feature, `image`, `audio`, `video`, `midi`, or `media` for all. A
 family that is not compiled reports its models as unknown rather than dispatching to something
-absent. The families served are in [`docs/MODELS.md`](docs/MODELS.md); one page per task is in
+absent. The families served are in [`docs/MODELS.md`](docs/MODELS.md). One page per task is in
 [`docs/guides/`](docs/guides/).
 
 ## Where it is careful
@@ -69,13 +69,13 @@ absent. The families served are in [`docs/MODELS.md`](docs/MODELS.md); one page 
 - **Placement is measured.** The forward is walked without allocating, each card is asked what
   it holds, and one rule decides for every family. Weights are charged at what the pool keeps,
   not what the files weigh.
-- **Out of memory is a bug, not a condition.** What does not fit spreads across cards; only what
+- **Out of memory is a bug, not a condition.** What does not fit spreads across cards. Only what
   no card holds reaches the host.
 - **Energy is reported beside speed**, per request.
 
 ## Building
 
-The default build wants a CUDA toolkit and OpenCL headers; without them, build the host path:
+The default build wants a CUDA toolkit and OpenCL headers. Without them, build the host path:
 
 ```sh
 cargo build --release --no-default-features --features cpu
@@ -94,29 +94,29 @@ can delete models. Turn both on in `config.toml` before it listens on anything b
 
 [`docs/README.md`](docs/README.md) says what to read in which order. The short list:
 
-- [`docs/guides/`](docs/guides/) - one page per task, with the configuration and one request
-- [`docs/learn/`](docs/learn/) - the fundamentals of inference in ten lessons, as experimented here
-- [`docs/MODELS.md`](docs/MODELS.md) - the families served and how a request names them
-- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) - every key of `config.toml` and its default
-- [`docs/API.md`](docs/API.md) - every route on the three surfaces
-- [`docs/STATUS.md`](docs/STATUS.md) - **what is measured, what is known to be slower, what is
+- [`docs/guides/`](docs/guides/): one page per task, with the configuration and one request
+- [`docs/learn/`](docs/learn/): the fundamentals of inference in 10 lessons, as experimented here
+- [`docs/MODELS.md`](docs/MODELS.md): the families served and how a request names them
+- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md): every key of `config.toml` and its default
+- [`docs/API.md`](docs/API.md): every route on the 3 surfaces
+- [`docs/STATUS.md`](docs/STATUS.md): **what is measured, what is known to be slower, what is
   written but not wired, and what has never run.** Read this one before deciding whether the
   engine suits you
-- [benchmarks](https://github.com/loken-ai/benchmarks) - the bench campaign, and the measurements against other engines
+- [benchmarks](https://github.com/loken-ai/benchmarks): the bench campaign, and the measurements against other engines
   published at https://loken-ai.github.io/benchmarks/, including the cells where this engine loses
-- [`docs/CLUSTER.md`](docs/CLUSTER.md) - spreading work across more than one machine
-- [`ROADMAP.md`](ROADMAP.md) - what the next releases bring, and the state of each feature
+- [`docs/CLUSTER.md`](docs/CLUSTER.md): spreading work across more than one machine
+- [`ROADMAP.md`](ROADMAP.md): what the next releases bring, and the state of each feature
 
 ## Contributing and reporting
 
-[`CONTRIBUTING.md`](CONTRIBUTING.md) - what a change should bring with it.
-[`SECURITY.md`](SECURITY.md) - reporting a vulnerability, and what the unauthenticated default
+[`CONTRIBUTING.md`](CONTRIBUTING.md), what a change should bring with it.
+[`SECURITY.md`](SECURITY.md), reporting a vulnerability, and what the unauthenticated default
 assumes.
 
 ## History
 
 The git history was rewritten before publication. The project began as experiments early in
-2026; what is published starts on 2026-08-30 with the tree as it stood then, laid out as
+2026. What is published starts on 2026-08-30 with the tree as it stood then, laid out as
 chapters, and carries the work from that point on. The earlier commits are not part of this
 repository.
 

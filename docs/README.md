@@ -9,12 +9,12 @@ Read in this order.
    its configuration key and its state.
 2. [`guides/`](guides/): one page per task, each with the smallest configuration, one request
    and what to expect.
-3. [`learn/`](learn/): the fundamentals of inference in ten lessons, each with what this
+3. [`learn/`](learn/): the fundamentals of inference in 10 lessons, each with what this
    tree does about it, what was measured, and one thing to run.
 4. [`MODELS.md`](MODELS.md): the families served, the stores they are read from, how a request
    names them.
 5. [`CONFIGURATION.md`](CONFIGURATION.md): every key of `config.toml` and its default.
-6. [`API.md`](API.md): every route on the three surfaces.
+6. [`API.md`](API.md): every route on the 3 surfaces.
 7. [`BUILDING.md`](BUILDING.md): the toolchains, the builds without CUDA, the daemon's flags,
    troubleshooting.
 8. [`STATUS.md`](STATUS.md): what is measured, what is slower, what is written and wired to
@@ -28,7 +28,7 @@ Read in this order.
 
 | Lesson | Question |
 |---|---|
-| [`learn/README.md`](learn/README.md) | The series: ten lessons, ten minutes each, one exercise per lesson |
+| [`learn/README.md`](learn/README.md) | The series: 10 lessons, 10 minutes each, one exercise per lesson |
 | [`learn/slides.html`](learn/slides.html) | The same series as a deck |
 
 ## Maps
@@ -48,6 +48,6 @@ Read in this order.
 | [`guides/speech.md`](guides/speech.md) | Transcribe and synthesise speech |
 | [`guides/drafter.md`](guides/drafter.md) | Speed up a model that spills to the host with a drafter |
 | [`guides/kv-memory.md`](guides/kv-memory.md) | Keep conversations in memory between requests |
-| [`guides/cluster.md`](guides/cluster.md) | Two machines |
+| [`guides/cluster.md`](guides/cluster.md) | 2 machines |
 | [`guides/layer-bench.md`](guides/layer-bench.md) | Measure a decode on a few layers of a large model |
 | [`guides/microbench.md`](guides/microbench.md) | Time one mechanism at a model's shapes, its variants side by side |

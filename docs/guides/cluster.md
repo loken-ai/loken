@@ -1,4 +1,4 @@
-# Two machines
+# 2 machines
 
 Every node runs the same daemon and any node is an entry point: a request arrives anywhere, the
 node forwards it whole to the best holder and relays the stream back.
@@ -10,18 +10,18 @@ node forwards it whole to the best holder and relays the stream back.
   music, speech, transcription and translation, embeddings, reranking, and each turn of the
   conversation route.
 - A node without the weights, or without a card that holds the model whole, hands the request to
-  the least loaded peer that has them and whose cards admit the demand; an upload travels as it
+  the least loaded peer that has them and whose cards admit the demand. An upload travels as it
   arrived.
 - Each node publishes what each of its cards admits as a whole load, so a hand-over never sends a
   render to a smaller card.
 - Each family asks with its own demand: an image family's hot component and scratch, the music
   model with its cache and reserve, a video denoiser at the requested frames, a voice or a
   transcription model loaded whole.
-- A node that keeps a request reclaims an idle resident before it loads; a request no peer can
+- A node that keeps a request reclaims an idle resident before it loads. A request no peer can
   take runs here, split across the cards when they hold it together, spilling to the host when
   they do not, and the loaded-models listing says which.
 
-Each node needs a `[cluster]` block; the rest is discovered.
+Each node needs a `[cluster]` block. The rest is discovered.
 
 ```toml
 [cluster]
@@ -30,7 +30,7 @@ advertise = "http://192.0.2.10:11435"
 ```
 
 `advertise` is the address peers reach this node at, and the one field that cannot be derived.
-Nodes on one network hear each other by multicast; across subnets, list the others in `join`.
+Nodes on one network hear each other by multicast. Across subnets, list the others in `join`.
 Turn `require_auth` on before a node listens beyond localhost.
 
 ## Check it
@@ -39,7 +39,7 @@ Turn `require_auth` on before a node listens beyond localhost.
 curl -s localhost:11435/api/cluster/peers
 ```
 
-lists who this node sees, with liveness and the measured round trip; `/api/cluster/state` is
+lists who this node sees, with liveness and the measured round trip. `/api/cluster/state` is
 what it publishes about itself. `/api/tags` on any node lists the whole cluster's models, the
 ones held elsewhere under the node that holds them, so a client sees one catalogue whichever
 node it talks to.

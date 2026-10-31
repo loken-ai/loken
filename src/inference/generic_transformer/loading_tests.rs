@@ -3143,7 +3143,7 @@ const NO_SAFETENSORS: [(&str, &str); 2] = [
     ),
     (
         "qwen4exp",
-        "no transformers class and no published checkpoint; read from GGUF only",
+        "no transformers class and no published checkpoint, read from GGUF only",
     ),
 ];
 

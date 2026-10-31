@@ -1,11 +1,12 @@
-# The fundamentals of inference, in ten lessons
+# The fundamentals of inference, in 10 lessons
 
-Ten lessons for a developer who has never opened an inference engine. Each takes about ten
+10 lessons for a developer who has never opened an inference engine. Each takes about 10
 minutes, states one fundamental, shows where it lives in this tree, reports what was
 measured about it here, and ends with one request or command to run against a local daemon.
 
-Prerequisites: a running `lokend` with a small model (the exercises use `qwen3:0.6b`; see
+Prerequisites: a running `lokend` with a small model, `qwen3:0.6b` in the exercises (see
 [`../BUILDING.md`](../BUILDING.md)), `curl` and `python3`. Lessons 3 and 4 run a `cargo test`.
+Lesson 10 needs [`lokprof`](https://github.com/loken-ai/lokprof).
 
 | Lesson | Question |
 |---|---|
@@ -22,12 +23,12 @@ Prerequisites: a running `lokend` with a small model (the exercises use `qwen3:0
 
 [`slides.html`](slides.html) is the same series as a deck, one file, to open in a browser.
 
-The thread through the ten: every defect reported in these pages was invisible to the
+The thread through the 10: every defect reported in these pages was invisible to the
 measurement in place when it happened. A coherence gate that read 120 characters, a prompt
 counted in words, a token rate, a sweep under eviction, a verification against a cache that
 already carried the defect.
 
-Every figure carries a date and the machine it came from; the machine is the one
+Every figure carries a date and the machine it came from. The machine is the one
 [`../STATUS.md`](../STATUS.md) describes unless a lesson says otherwise. The figures in
-[benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's; the ones here are the
+the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's. The ones here are the
 experiments'. The diagrams are hand-written SVG in `../img/learn-*.svg`.
