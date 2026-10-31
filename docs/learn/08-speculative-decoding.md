@@ -1,65 +1,116 @@
 # More than one token per weight read
 
-Decode reads the whole model to produce one token and leaves the arithmetic units mostly
-idle. Speculative decoding spends that idle arithmetic on checking several guessed tokens in
-the pass that would have produced one.
+Decode reads the whole model to produce 1 token and leaves most arithmetic units idle.
+Speculative decoding uses them to check several guessed tokens in the pass that would have produced 1.
 
 ## The idea
 
-A cheap **drafter** proposes k tokens. The target model runs one forward over the prompt
-plus those k tokens, which costs about one decode step in bytes since the weights are read
-once, and yields the target's own prediction at each of the k positions. The first draft the
-target disagrees with is replaced by the target's choice, and everything after it is
-dropped. What survives is exactly what the target would have generated on its own, token for
-token under greedy decoding, so the output is unchanged.
+A cheap **drafter** proposes k tokens. The target model runs 1 forward over the prompt plus those k tokens.
+That pass reads the weights once, so it costs about 1 decode step in bytes.
+It yields the target's own prediction at each of the k positions.
 
-The gain is accepted drafts per pass. The cost is drafting plus a verification pass slightly
-heavier than a plain step. 3 sources of drafts:
+The target keeps the drafts it agrees with.
+It replaces the first draft it disagrees with by its own choice and drops everything after.
+Under greedy decoding the output is token for token what the target generates alone.
 
-- a **separate small model** of the same family, with the same vocabulary.
-- a **trained head** on the target's own last hidden state (EAGLE), a few percent of a layer,
-  with acceptance rates near 90%.
-- the **prompt itself**: an n-gram that already occurred is continued the way it continued
-  before, which costs nothing and works on repetitive text such as code.
+The gain is the number of drafts accepted per pass.
+The cost is drafting plus a verification pass slightly heavier than a plain step.
 
-It pays where verification is far cheaper per token than generation: a model that
-spills to the host crosses the bus once for k tokens instead of once per token. On a model
-that fits a card, verification costs about what drafting saves.
+A drafter comes from 1 of 3 sources:
+
+- A **separate small model** of the same family, with the same vocabulary.
+- A **trained head** on the target's last hidden state (EAGLE). It is a few percent of a layer and accepts near 90% of its drafts.
+- The **prompt itself**. An n-gram that already occurred is continued as it was before. It costs nothing and suits repetitive text such as code.
+
+Drafting pays where verification is far cheaper per token than generation.
+A model that spills to the host crosses the bus once for k tokens instead of once per token.
+On a model that fits a card, verification costs about what drafting saves.
 
 ## What loken does
 
-loken drafts in 3 ways: a separate small model with the same vocabulary, an EAGLE head on the target's own hidden state, and prompt lookup over a rolling buffer of the prompt and the generated tokens.
+loken drafts with a separate small model, an EAGLE head, or prompt lookup over a rolling buffer of the prompt and the generated tokens.
 
-It decides whether drafting is worth it from measured timings, not from an assumption. Rejected drafts are dropped from the cache. Drafting with a separate model verifies greedy decoding only.
+It decides whether drafting pays from measured timings.
+It drops rejected drafts from the cache.
+Drafting with a separate model is verified for greedy decoding only.
 
-How loken picks a drafter, and the attach route, are in [`../guides/drafter.md`](../guides/drafter.md).
+[Pick and attach a drafter](../guides/drafter.md) covers the choice of drafter and the attach route.
 
 ## What was measured
 
-**One pair, on a spilled target (2026-09-03, desktop node).** deepseek-r1:70b at Q4_K_M, 26
-of its 80 layers on the host, with llama3.2:1b drafting: 2.21 tokens a second at 41.0 J a
-token against 1.49 and 51.8 alone, the same answer token for token, with 18% of drafts
-accepted. A better-matched drafter would accept more
-([`../STATUS.md`](../STATUS.md#placement-measured-separately)).
+| Case | Date | Result |
+|---|---|---|
+| deepseek-r1:70b at Q4_K_M, 26 of 80 layers on the host, drafted by llama3.2:1b | 2026-09-03, desktop node | 2.21 tokens/s at 41.0 J/token, against 1.49 tokens/s at 51.8 J/token alone. Same answer token for token, 18% of drafts accepted. |
+| Same target, one loop with a learned draft length | 2026-09-27 | 2.79 to 2.85 tokens/s |
+| EAGLE head on deepcoder, held out, earlier implementation | not re-measured | 1.71 to 1.82 times the plain rate |
 
-**One loop, a learned length (2026-09-27).** The drafter loken picks for that same target, and
-one attached by hand, drive a single loop. The draft length comes from measured acceptance
-per position and measured cycle time, plain decoding being one of the lengths: 2.79 to 2.85
-tokens a second on the pair above, and a drafter attached to a model that fits the cards is
-dropped by the same rule.
+<!-- site: widget chart type=bar id=speculative-rate -->
+| Variant | Tokens per second |
+|---|---|
+| Plain | 1.49 |
+| llama3.2:1b drafting | 2.21 |
+| Learned draft length | 2.85 |
+<!-- site: end -->
 
-**The head, when it was built.** The EAGLE head reached 1.71 to 1.82 times the plain rate on
-deepcoder, held out, on an earlier substrate. The figure is dated at its measurement and
-not re-measured on the current implementation.
+The 18% acceptance leaves room: a better-matched drafter accepts more ([status](../STATUS.md#placement-measured-separately)).
+
+The learned draft length comes from measured acceptance per position and measured cycle time.
+Plain decoding is one of the candidate lengths.
+The loop drives both the drafter loken picks and one attached by hand.
+A drafter attached to a model that fits the cards is dropped by the same rule.
 
 ## Try it
 
-This exercise needs a target that spills, which is a 70B on a pair of 16 GB cards. loken gives it a
-drafter on its own: the smallest model in the store sharing its vocabulary, here llama3.2:1b.
-The log says so at load (`deepseek-r1:70b spills to the host: llama3.2:1b drafts for it`).
+You need a target that spills, such as a 70B on 2 cards of 16 GB.
+loken gives it the smallest model in the store that shares its vocabulary, here llama3.2:1b.
+The load log says so: `deepseek-r1:70b spills to the host: llama3.2:1b drafts for it`.
 
-Run one prompt of hundreds of generated tokens, then `GET /api/draft/status`: it lists the
-pair and the draft length learned so far. The first request explores the lengths, plain
-decoding included. Compare `eval_count / eval_duration` on the first reply and on a later
-one. To see plain decoding for the same prompt, `POST /api/draft/detach` with
-`{"target":"deepseek-r1:70b"}` and run it again: the `response` text is the same.
+<!-- site: widget steps id=speculative-try -->
+1. Send 1 prompt that generates hundreds of tokens.
+2. Request `GET /api/draft/status`. It lists the pair and the draft length learned so far. The first request explores the lengths, plain decoding included.
+3. Compare `eval_count / eval_duration` on the first reply and on a later one.
+4. Send `POST /api/draft/detach` with `{"target":"deepseek-r1:70b"}` and run the prompt again. The `response` text is the same, at the plain rate.
+<!-- site: end -->
+
+## Check yourself
+
+<!-- site: widget quiz answer=2 id=speculative-quiz-1 -->
+What does the target do with a draft it disagrees with?
+
+1. It keeps it and flags the output.
+2. It replaces it with its own choice and drops every later draft.
+3. It reruns the draft with a lower temperature.
+
+The first disagreement is replaced and what follows is dropped, so the output equals the target's own.
+<!-- site: end -->
+
+<!-- site: widget quiz answer=1 id=speculative-quiz-2 -->
+Where does speculative decoding pay most?
+
+1. On a model that spills to the host.
+2. On a model that fits a card.
+3. On a model with a short prompt.
+
+Verification crosses the bus once for k tokens instead of once per token.
+On a model that fits a card, verification costs about what drafting saves.
+<!-- site: end -->
+
+<!-- site: widget quiz answer=3 id=speculative-quiz-3 -->
+What does loken use to decide whether drafting pays?
+
+1. A fixed draft length.
+2. The size of the drafter.
+3. Measured acceptance and cycle times.
+
+Plain decoding is one of the lengths it compares.
+<!-- site: end -->
+
+<!-- site: widget flashcards id=speculative-terms -->
+| Term | Meaning |
+|---|---|
+| Drafter | A cheap source of k guessed tokens. |
+| Target | The model whose output is kept. It verifies the drafts in 1 forward. |
+| Acceptance | The share of drafts the target agrees with. |
+| EAGLE | A trained head on the target's last hidden state that drafts tokens. |
+| Prompt lookup | Drafts taken from an n-gram that already occurred in the prompt or output. |
+<!-- site: end -->

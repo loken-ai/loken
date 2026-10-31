@@ -1,33 +1,53 @@
-# The fundamentals of inference, in 10 lessons
+# Course: how inference works
 
-10 lessons for a developer who has never opened an inference engine. Each takes about 10
-minutes, states one fundamental, shows what loken does about it, reports what was
-measured about it here, and ends with one request or command to run against a local daemon.
+10 lessons for a developer who has never opened an inference engine.
+Each lesson takes about 10 minutes.
 
-Prerequisites: a running `lokend` with a small model, `qwen3:0.6b` in the exercises (see
-[`../BUILDING.md`](../BUILDING.md)), `curl` and `python3`. Lesson 10 needs [`lokprof`](https://github.com/loken-ai/lokprof).
+Each lesson states 1 fundamental, shows what loken does about it, reports what was measured, and ends with a request or command to run against a local daemon.
+
+## Prerequisites
+
+<!-- site: widget checklist id=learn-prereq -->
+- [ ] A running `lokend` serving a small model, `qwen3:0.6b` in the exercises (see [BUILDING](../BUILDING.md))
+- [ ] `curl`
+- [ ] `python3`
+- [ ] [`lokprof`](https://github.com/loken-ai/lokprof), for lesson 10 only
+<!-- site: end -->
+
+## Lessons
 
 | Lesson | Question |
 |---|---|
-| [`01-tokens.md`](01-tokens.md) | How does text become ids, and ids become the JSON a client reads? |
-| [`02-model-file.md`](02-model-file.md) | What is in a checkpoint, and why does the catalogue read a few kilobytes of it? |
-| [`03-quantisation.md`](03-quantisation.md) | How are bits traded for bytes, and how is the trade judged? |
-| [`04-forward-pass.md`](04-forward-pass.md) | What does one layer read, compute and keep? |
-| [`05-prefill-and-decode.md`](05-prefill-and-decode.md) | Why is the prompt bound by arithmetic and the answer by bytes? |
-| [`06-kv-cache.md`](06-kv-cache.md) | What is kept between tokens, and between requests? |
-| [`07-sampling.md`](07-sampling.md) | How does a row of logits become one token, and when is that deterministic? |
-| [`08-speculative-decoding.md`](08-speculative-decoding.md) | How can a decode step commit more than one token? |
-| [`09-placement.md`](09-placement.md) | Where does each part of a model live, and what does a wrong choice cost? |
-| [`10-measuring.md`](10-measuring.md) | How is a rate taken so that it means something? |
+| [Tokens](01-tokens.md) | How does text become ids, and ids become the JSON a client reads? |
+| [What a model file holds](02-model-file.md) | What is in a checkpoint, and why does the catalogue read a few kilobytes of it? |
+| [Fewer bits per weight](03-quantisation.md) | How are bits traded for bytes, and how is the trade judged? |
+| [One layer, then 40 of them](04-forward-pass.md) | What does one layer read, compute and keep? |
+| [Prefill and decode](05-prefill-and-decode.md) | Why is the prompt bound by arithmetic and the answer by bytes? |
+| [The KV cache](06-kv-cache.md) | What is kept between tokens, and between requests? |
+| [Sampling](07-sampling.md) | How does a row of logits become 1 token, and when is that deterministic? |
+| [Speculative decoding](08-speculative-decoding.md) | How can a decode step commit more than 1 token? |
+| [Placement](09-placement.md) | Where does each part of a model live, and what does a wrong choice cost? |
+| [Measuring](10-measuring.md) | How is a rate taken so that it means something? |
 
-[`slides.html`](slides.html) is the same series as a deck, one file, to open in a browser.
+## Progress
 
-The thread through the 10: every defect reported in these pages was invisible to the
-measurement in place when it happened. A coherence gate that read 120 characters, a prompt
-counted in words, a token rate, a sweep under eviction, a verification against a cache that
-already carried the defect.
+<!-- site: widget progress id=learn-progress -->
+The progress of the reader appears here.
+<!-- site: end -->
 
-Every figure carries a date and the machine it came from. The machine is the one
-[`../STATUS.md`](../STATUS.md) describes unless a lesson says otherwise. The figures in
-the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's. The ones here are the
-experiments'. The diagrams are hand-written SVG.
+## Common thread
+
+Every defect reported in the lessons was invisible to the measurement in place when it happened:
+
+- a coherence gate that read 120 characters
+- a prompt counted in words
+- a token rate
+- a sweep under eviction
+- a verification against a cache that already carried the defect
+
+## About the figures
+
+- Every figure carries a date and the machine it came from.
+- The machine is the one [STATUS](../STATUS.md) describes, unless a lesson says otherwise.
+- The figures in the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's. The ones in the lessons are the experiments'.
+- The diagrams are hand-written SVG.
