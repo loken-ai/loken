@@ -336,7 +336,9 @@ impl KvDiskStore {
             window_blob,
         };
         let path = self.manifest_path(&manifest);
-        std::fs::write(&path, manifest.encode()).with_context(|| path.display().to_string())?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, manifest.encode()).with_context(|| tmp.display().to_string())?;
+        std::fs::rename(&tmp, &path).with_context(|| path.display().to_string())?;
         {
             let mut g = self
                 .index
