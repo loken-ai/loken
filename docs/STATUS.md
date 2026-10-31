@@ -4,39 +4,34 @@ What is measured, what is slower, what has never run. Revised 2026-11-01.
 
 Every figure comes from 1 machine: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux, CUDA 13.3, models on a USB disk reading at 460 MB/s.
 
-## Decode rate vs ollama
+## Decode rate
 
-The [benchmarks](https://github.com/loken-ai/benchmarks) repository holds the decode rates against ollama and vLLM, per card, per backend and per context size.
-[Its site](https://loken-ai.github.io/benchmarks/) publishes them.
+The [benchmarks](https://github.com/loken-ai/benchmarks) repository measures the decode rate per card, per backend and per context size.
+[Its site](https://loken-ai.github.io/benchmarks/) publishes the results.
 How a cell is measured is in its [method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md).
 
-The figures quoted below come from the campaign of 2026-10-03 on the machine named above:
+The figures below come from the campaign of 2026-10-03 on the machine named above:
 
-- Both cards available to every engine.
+- Both cards available.
 - Idle machine.
 - Greedy, streamed, short prompt, 4096 ctx.
 - Median of 3 iterations.
 
-2 mixtures lost in that campaign.
-Their harness had moved into its own repository and started the engine without its configuration.
-Measured configured on 2026-09-02, olmoe is +17.4% and granite3-moe +0.2%.
-
-The mixtures that do lose are the ones too large for the cards.
+A mixture too large for the cards decodes slower than one that fits.
 The placement used to place a layer whole.
 A spilled mixture then ran attention on the host for the sake of expert weights, which are 97% of its bytes and are read a few at a time.
 Spilling only the experts and keeping everything else on the cards changed the rates:
 
-| Model | Before | After | ollama |
-|---|---:|---:|---:|
-| qwen3next | 15.6 tok/s | 34.7 tok/s | 33 tok/s |
-| qwen3-coder-next | 10.7 tok/s | 30.8 tok/s | 26 to 28 tok/s |
+| Model | Before | After |
+|---|---:|---:|
+| qwen3next | 15.6 tok/s | 34.7 tok/s |
+| qwen3-coder-next | 10.7 tok/s | 30.8 tok/s |
 
 A mixture that already fits is untouched.
 
 ## Placement, measured separately
 
-Given both cards, ollama splits models that fit on 1 card.
-loken keeps them on the fast card and pays nothing for the second card being present.
+A model that fits on 1 card stays on the fast card, and the second card being present costs nothing.
 Measured 2026-09-03 on olmoe:
 
 | Setting | Rate |
@@ -46,17 +41,16 @@ Measured 2026-09-03 on olmoe:
 | Card 1 alone | 252 tok/s |
 
 The placer picks the fast card.
-An earlier revision of this page reported a 390 against 496 penalty, and it is gone.
 
 A model that fits on neither card is limited by the bus.
 deepseek-r1:70b at Q4_K_M holds 26 of its 80 layers on the host.
 The host reads each of them in full per token at ~36 GB/s, this machine's DRAM ceiling.
 
-| Run | loken | ollama |
-|---|---:|---:|
-| 2026-09, host path unaided | 1.6 tok/s | 1.5 tok/s |
-| 2026-10-03 campaign | 3.1 tok/s | 1.6 tok/s |
-| 2026-09, `llama3.2:1b` drafter | 2.0 tok/s | |
+| Run | Rate |
+|---|---:|
+| 2026-09, host path unaided | 1.6 tok/s |
+| 2026-10-03 campaign | 3.1 tok/s |
+| 2026-09, `llama3.2:1b` drafter | 2.0 tok/s |
 
 In the 2026-10-03 campaign, loken picks the drafter itself for a model that spills.
 The drafter proposes tokens and the 70B verifies them.
@@ -70,7 +64,7 @@ unsloth/Qwen3-235B-A22B-GGUF, a mixture of 235B parameters, runs on the 2 cards 
 ## Context shift
 
 A prompt longer than the window is refused on every route.
-ollama would cut it, and a cut prompt can lose its system prompt or its tool instructions and still read as a plausible answer.
+A cut prompt can lose its system prompt or its tool instructions and still read as a plausible answer.
 
 Before refusing, loken reloads the model with a wider window when the model and the request's `num_ctx` allow it.
 

@@ -1,6 +1,6 @@
 # Run a coding agent on loken
 
-`loken launch` starts Claude Code or Cline with the daemon as the model provider, as `ollama launch` does. Nothing leaves the machine.
+`loken launch` starts Claude Code or Cline with the daemon as the model provider. Nothing leaves the machine.
 
 ## Before you start
 

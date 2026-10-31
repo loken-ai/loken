@@ -42,12 +42,7 @@ Across nodes, a request goes to the node with the best predicted completion, not
 Dates: 2026-09-02/03.
 Placing a layer whole ran a spilled mixture's attention on the host to save expert weights.
 Those weights are 97% of the layer's bytes and are read a few at a time.
-Spilling only the experts changed the rate as follows:
-
-| Model | Layer spilled | Experts spilled | ollama |
-|---|---|---|---|
-| qwen3next | 15.6 tokens/s | 34.7 tokens/s | 33 |
-| qwen3-coder-next | 10.7 tokens/s | 30.8 tokens/s | 26 to 28 |
+Spilling only the experts changed the rate, in tokens per second:
 
 <!-- site: widget chart type=bar id=placement-spill -->
 | Model | Layer spilled | Experts spilled |
@@ -58,7 +53,7 @@ Spilling only the experts changed the rate as follows:
 
 A mixture that already fits is untouched.
 The planner cannot see 2 costs: about 870 MiB per loaded model whatever its size, and a spilled model held twice in host memory until the page advice followed the plan.
-See [decode rate against ollama](../STATUS.md#decode-rate-vs-ollama).
+See the [decode rate](../STATUS.md#decode-rate).
 
 ### A 552B mixture on a USB disk
 
