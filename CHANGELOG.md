@@ -41,6 +41,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Delete: unload a model after releasing the table of loaded models.
+- API: stop listing 2 multi-device routes that do not exist.
 - Messages: refuse a request without max_tokens, hold it to the usual bounds and check them before fetching images.
 - KV disk cache: write a manifest through a temporary file.
 - Chat: answer a failed preload with an error, not as a load.

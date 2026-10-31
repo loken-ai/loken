@@ -3301,8 +3301,6 @@ fn available_endpoints_list() -> serde_json::Value {
         "GET /api/distributed/devices",
         "GET /api/distributed/stats",
         "GET /api/distributed/recommend",
-        "POST /api/multi-device/plan",
-        "POST /api/multi-device/configure",
         "GET /api/multi-device/status",
         // OpenAI-style
         "GET /v1/models",
