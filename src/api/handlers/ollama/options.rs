@@ -394,6 +394,7 @@ pub(crate) async fn ollama_chat(
                 let start_time = std::time::Instant::now();
                 let prompt_clone = prompt.clone();
                 let engine_for_stats = engine.clone();
+                let stops = params.stop_sequences.clone();
                 let stream = async_stream::stream! {
                     let _admitted = admission;
                     let mut accumulated_text = String::new();
@@ -407,12 +408,15 @@ pub(crate) async fn ollama_chat(
                     let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut thought = false;
                     let mut thinking_ns: Option<u64> = None;
+                    let mut holdback =
+                        crate::api::handlers::openai::vllm::StopHoldback::new(&stops, false);
 
                     while let Some(result) = rx.recv().await {
                         match result {
                             Ok(chunk) => {
-                                accumulated_text.push_str(&chunk);
                                 chunk_count += 1;
+                                let chunk = holdback.push(&chunk);
+                                accumulated_text.push_str(&chunk);
                                 for seg in splitter.push(&chunk) {
                                     let message = match seg {
                                         crate::api::thinking::Segment::Thinking(t) => {
@@ -466,7 +470,17 @@ pub(crate) async fn ollama_chat(
                     // Skipped on error so SDK clients don't see two
                     // terminal markers (`error` + `done`) on one stream.
                     if !errored {
-                        for seg in splitter.finish() {
+                        let stats = engine_for_stats.take_last_stream_stats();
+                        // The text held back for a stop sequence goes out first.
+                        // The stop sequence itself is left out.
+                        let held = holdback.finish(stats.as_ref().map(|s| &s.finish_reason));
+                        accumulated_text.push_str(&held);
+                        let end: Vec<_> = splitter
+                            .push(&held)
+                            .into_iter()
+                            .chain(splitter.finish())
+                            .collect();
+                        for seg in end {
                             let message = match seg {
                                 crate::api::thinking::Segment::Thinking(t) => {
                                     serde_json::json!({"role": "assistant", "content": "", "thinking": t})
@@ -493,7 +507,6 @@ pub(crate) async fn ollama_chat(
                             yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
                         }
                         let wall_total_ns = start_time.elapsed().as_nanos() as u64;
-                        let stats = engine_for_stats.take_last_stream_stats();
                         let (
                             eval_count, eval_duration, prompt_eval_count,
                             prompt_eval_duration, total_duration, done_from_engine,
@@ -611,8 +624,13 @@ pub(crate) async fn ollama_chat(
                 // Tool calling: lift markers out of the output into
                 // structured tool_calls (Ollama surfaces these on
                 // message.tool_calls). Plain answers pass through.
+                let text = crate::api::handlers::openai::vllm::strip_stop(
+                    result.text.clone(),
+                    &result.finish_reason,
+                    false,
+                );
                 let (chat_thinking, chat_body) =
-                    crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
+                    crate::api::thinking::split_thinking_opened(thinking_opened, &text);
                 let (msg, _tool_called) = if tools_active {
                     let parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &chat_body);
                     if parsed.calls.is_empty() {
@@ -1092,6 +1110,7 @@ pub(crate) async fn ollama_generate(
                 // compute-only stats after consuming all chunks
                 // (bench-fairness fix - eval_duration matches Ollama).
                 let engine_for_stats = engine.clone();
+                let stops = params.stop_sequences.clone();
                 let stream = async_stream::stream! {
                     let _admitted = admission; // released when the stream ends
                     let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
@@ -1100,11 +1119,14 @@ pub(crate) async fn ollama_generate(
                     let mut accumulated_text = String::new();
                     let mut chunk_count: usize = 0;
                     let mut errored = false;
+                    let mut holdback =
+                        crate::api::handlers::openai::vllm::StopHoldback::new(&stops, false);
                     while let Some(result) = rx.recv().await {
                         match result {
                             Ok(chunk) => {
-                                accumulated_text.push_str(&chunk);
                                 chunk_count += 1;
+                                let chunk = holdback.push(&chunk);
+                                accumulated_text.push_str(&chunk);
                                 for seg in splitter.push(&chunk) {
                                     let (response, thinking) = match seg {
                                         crate::api::thinking::Segment::Thinking(t) => {
@@ -1156,7 +1178,17 @@ pub(crate) async fn ollama_generate(
                     // skipped on error to avoid emitting two terminal
                     // markers on the same stream (mirrors /api/chat).
                     if !errored {
-                        for seg in splitter.finish() {
+                        let stats = engine_for_stats.take_last_stream_stats();
+                        // The text held back for a stop sequence goes out first.
+                        // The stop sequence itself is left out.
+                        let held = holdback.finish(stats.as_ref().map(|s| &s.finish_reason));
+                        accumulated_text.push_str(&held);
+                        let end: Vec<_> = splitter
+                            .push(&held)
+                            .into_iter()
+                            .chain(splitter.finish())
+                            .collect();
+                        for seg in end {
                             let (response, thinking) = match seg {
                                 crate::api::thinking::Segment::Thinking(t) => (String::new(), Some(t)),
                                 crate::api::thinking::Segment::Content(c) => (c, None),
@@ -1184,7 +1216,6 @@ pub(crate) async fn ollama_generate(
                         // it observed, which includes the HTTP yield - so the same work
                         // reads as slower for reasons that have nothing to do with the
                         // engine. Every Ollama-compatible client expects these fields.
-                        let stats = engine_for_stats.take_last_stream_stats();
                         let (done_from_engine, context_tokens) = match stats.as_ref() {
                             Some(s) => (Some(s.finish_reason.ollama()), s.context_tokens.clone()),
                             None => (None, Vec::new()),
@@ -1257,8 +1288,13 @@ pub(crate) async fn ollama_generate(
                 crate::energy_report::end(energy, "text", "[/api/generate]");
                 let total_duration = start.elapsed().as_nanos() as u64;
 
+                let text = crate::api::handlers::openai::vllm::strip_stop(
+                    result.text.clone(),
+                    &result.finish_reason,
+                    false,
+                );
                 let (thinking, answer) =
-                    crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
+                    crate::api::thinking::split_thinking_opened(thinking_opened, &text);
                 let mut response = OllamaGenerateResponse::new(model_name, answer);
                 if !result.logprobs.is_empty() {
                     response.logprobs = Some(ollama_logprobs(&result.logprobs));
