@@ -1,25 +1,34 @@
-# Which CUDA source lives where
+# CUDA sources
 
-Two compilation models, and the directory a `.cu` sits in says which one it belongs to.
+2 compilation models exist. The directory of a `.cu` file says which one applies.
 
-**`cuda/**` - compiled at build time by `nvcc`.** `build.rs` turns each of these into an
-object and links it; the kernels are reached from Rust through `extern "C"` launchers. They
-carry real SASS for every architecture in `portable_gencodes()`, so a card gets machine code
-rather than something the driver has to compile on the way in.
+| Directory | Compiled | By | Reached through |
+|---|---|---|---|
+| `cuda/` | at build time | `nvcc`, driven by `build.rs` | `extern "C"` launchers called from Rust |
+| `src/inference/cuda/` | at run time | NVRTC | the source text, embedded with `include_str!` and handed to the driver on first use |
 
-**`src/inference/cuda/*.cu` - compiled at run time by NVRTC.** These are `include_str!`-ed
-into the binary and handed to the driver as text on first use. They live under `src/` because
-that is what they are: Rust source data, with paths resolved relative to the `.rs` file that
-embeds them. They cost nothing to build and are the right home for a kernel whose shape
-depends on values only known once a model is loaded.
+## `cuda/`
 
-## The one file in both
+`build.rs` turns each file into an object and links it.
+Each kernel carries SASS for every architecture in `portable_gencodes()`.
+A card gets machine code, and the driver compiles nothing on load.
 
-`cuda/moe/gguf.cuh` is compiled by `nvcc` for the MoE kernels *and* prepended to the mat-vec
-NVRTC unit by `src/inference/quantized_cuda/mod.rs`. It states the GGUF block layouts and
-their dot products, which both models need and neither should restate.
+## `src/inference/cuda/`
 
-That dual use is why it carries
+These files are Rust source data.
+Each path resolves relative to the `.rs` file that embeds it, so they live under `src/`.
+They cost nothing to build.
+They suit a kernel whose shape depends on values known only once a model is loaded.
+
+## The file in both
+
+`cuda/moe/gguf.cuh` is compiled by `nvcc` for the MoE kernels.
+`src/inference/quantized_cuda/mod.rs` also prepends it to the mat-vec NVRTC unit.
+It states the GGUF block layouts and their dot products, so neither model restates them.
+
+NVRTC compiles from a string with no system headers.
+The loader prepends `src/inference/cuda/nvrtc_compat.h`, which defines the same types.
+The header therefore guards its include:
 
 ```c
 #ifndef __CUDACC_RTC__
@@ -27,11 +36,8 @@ That dual use is why it carries
 #endif
 ```
 
- -  NVRTC compiles from a string with no system headers, and the loader prepends its own
-`nvrtc_compat.h` defining the same types, so including `<stdint.h>` there is a hard error.
+## Add a file
 
-## Adding a file
-
-`notice_gate.rs` fails the test suite for any `.cu`/`.cuh` under `cuda/` with no row in
-`NOTICE.md`. This is where verbatim vendored code has historically arrived, so a new file
-states what it is - measured against its upstream, not remembered.
+`src/notice_gate.rs` fails the test suite when a CUDA file has no row in `scripts/provenance/manifest.tsv`.
+Run the measurement and commit the regenerated manifest, see `scripts/provenance/README.md`.
+A file measured at or above the gate's `MUST_LIST` share also needs a row in `NOTICE.md`.
