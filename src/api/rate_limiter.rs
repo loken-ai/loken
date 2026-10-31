@@ -68,6 +68,17 @@ impl TokenBucket {
             false
         }
     }
+
+    /// The wait until `tokens` are there.
+    /// `None` for a bucket that never refills.
+    fn wait_for(&self, tokens: f64) -> Option<Duration> {
+        if self.refill_rate <= 0.0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            ((tokens - self.tokens) / self.refill_rate).max(0.0),
+        ))
+    }
 }
 
 /// A bucket per client, evicted when it has been idle long enough that forgetting it changes
@@ -94,12 +105,20 @@ impl RateLimiter {
     }
 
     /// True if the request may proceed.
+    #[cfg(test)]
+    async fn check_rate_limit(&self, client_id: &str) -> bool {
+        self.admit(client_id).await.is_ok()
+    }
+
+    /// `Ok` when the request may proceed.
+    /// `Err` holds the wait until the client has a token again.
+    /// The wait is `None` when its bucket never refills.
     ///
     /// The sweep is here and not on a timer because a timer is a task to spawn, own and shut
     /// down, and this map only grows when this function is called. Without it a server facing
     /// many distinct clients accumulated a bucket per client for the process's life - the
     /// eviction was written, and nothing ever called it.
-    pub async fn check_rate_limit(&self, client_id: &str) -> bool {
+    pub async fn admit(&self, client_id: &str) -> Result<(), Option<Duration>> {
         let mut buckets = self.buckets.write().await;
 
         if buckets.len() > SWEEP_ABOVE {
@@ -110,7 +129,11 @@ impl RateLimiter {
             TokenBucket::new(self.config.burst_capacity, self.config.refill_rate)
         });
 
-        bucket.try_consume(1.0)
+        if bucket.try_consume(1.0) {
+            Ok(())
+        } else {
+            Err(bucket.wait_for(1.0))
+        }
     }
 
     #[cfg(test)]
@@ -140,6 +163,31 @@ mod tests {
             !limiter.check_rate_limit("client").await,
             "the burst is spent; the next call must wait for a refill"
         );
+    }
+
+    /// A refused request is told the wait until its client has a token again.
+    #[tokio::test]
+    async fn a_refusal_says_how_long_to_wait() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            burst_capacity: 1,
+            refill_rate: 0.5,
+        });
+        assert!(limiter.admit("client").await.is_ok());
+        let wait = limiter
+            .admit("client")
+            .await
+            .unwrap_err()
+            .expect("it refills");
+        assert!(
+            wait > Duration::from_millis(1500) && wait <= Duration::from_secs(2),
+            "1 token at 0.5 per second is about 2 seconds: {wait:?}"
+        );
+        let never = RateLimiter::new(RateLimitConfig {
+            burst_capacity: 1,
+            refill_rate: 0.0,
+        });
+        assert!(never.admit("client").await.is_ok());
+        assert_eq!(never.admit("client").await.unwrap_err(), None);
     }
 
     #[tokio::test]

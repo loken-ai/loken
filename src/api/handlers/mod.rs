@@ -1078,22 +1078,31 @@ async fn throttled(
     if is_health_path(req.uri().path()) {
         return next.run(req).await;
     }
-    if limiter.check_rate_limit(client).await {
-        return next.run(req).await;
-    }
-    // 429 with Retry-After: a client that is told to back off can, and one that is
-    // simply refused will hammer.
+    let wait = match limiter.admit(client).await {
+        Ok(()) => return next.run(req).await,
+        Err(wait) => wait,
+    };
+    // The refusal carries Retry-After.
+    // The wait is the time until the bucket has a token, in whole seconds, at least 1.
+    // A bucket that never refills names none.
     let dialect = Dialect::of(&req);
-    (
+    let mut response = (
         axum::http::StatusCode::TOO_MANY_REQUESTS,
-        [(axum::http::header::RETRY_AFTER, "1")],
         axum::Json(dialect.error_body(
             "rate_limit_error",
             "too_many_requests",
             "rate limit exceeded",
         )),
     )
-        .into_response()
+        .into_response();
+    if let Some(wait) = wait {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+    }
+    response
 }
 
 /// Reject requests without a valid API key when authentication is required.
