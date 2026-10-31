@@ -1,37 +1,83 @@
 # Speed up a model that spills to the host with a drafter
 
-A model too large for the cards keeps part of its layers on the host, and every token reads
-those layers over the bus. A small drafter proposes several tokens at once, the large model
-verifies them in one pass, and the bus is crossed once for several tokens. It pays only there:
-on a model that fits, verification costs about what drafting saves.
+A small drafter model proposes several tokens, and the large model verifies them in one pass, so a model that spills to the host crosses the bus once for several tokens.
 
-## Automatic
+## Before you start
 
-When a model is predicted to spill, loken looks in the store for the smallest model with the
-same ordinary vocabulary (same pieces at the same ids, the added control tokens aside, and no
-more logit rows than the target's, so a vocabulary padded to a different size still drafts), loads
-it on the fastest card before the target, and places the target around it. If the target ends
-up on the cards after all, or the vocabularies differ, the drafter is released.
+<!-- site: widget checklist id=drafter-prereq -->
+- [ ] The target model is too large for the cards, so part of its layers sit on the host.
+- [ ] A smaller model with the same ordinary vocabulary is in the store.
+- [ ] For the manual route, the target is loaded.
+<!-- site: end -->
 
-The number of tokens drafted per cycle is learned: loken measures how often each draft position
-is accepted and what a cycle of each length costs, and drafts the length that commits the most
-tokens per second. Plain decoding is one of the lengths: when drafting stops paying, as with a
-drafter attached to a model that fits the cards, it is dropped.
+A model that fits the cards gains nothing: verification costs about what drafting saves.
 
-## By hand
+## Smallest configuration
 
-`POST /api/draft/attach` with `target` and `draft` attaches a drafter to a loaded model after
-the same vocabulary check, on the fastest card unless the request's `device_index` names one.
-`/api/draft/detach` removes it and `/api/draft/status` lists the pairs and their current draft
-length. A drafter that finds no room on a card is refused for a target held on the cards, since
-on the host it would cost the target more than it saves.
-These endpoints are loken's own.
-The Ollama API has none.
+None. loken attaches a drafter by itself when a model is predicted to spill.
 
-## What to expect
+## Attach a drafter
 
-The answer is the target's answer, since the target verifies every draft with the request's
-own sampling. A verify runs several rows at once, and on a card its kernels can settle a
-near-tie between 2 tokens the other way than a one-row step does.
-The gain depends on how many drafts the target accepts.
-A drafter of the same family accepts more. Measured in [`../STATUS.md`](../STATUS.md).
+<!-- site: widget steps id=drafter-attach -->
+1. Load the target model.
+2. Attach the drafter.
+
+   ```sh
+   curl -s localhost:11435/api/draft/attach -H 'Content-Type: application/json' -d '{"target": "TARGET", "draft": "DRAFT"}'
+   ```
+
+3. List the pairs.
+
+   ```sh
+   curl -s localhost:11435/api/draft/status
+   ```
+
+4. Detach it when you no longer need it.
+
+   ```sh
+   curl -s localhost:11435/api/draft/detach -H 'Content-Type: application/json' -d '{"target": "TARGET"}'
+   ```
+<!-- site: end -->
+
+| Field | Route | Effect |
+|---|---|---|
+| `target` | attach, detach | The loaded model to speed up. |
+| `draft` | attach | The drafter model. |
+| `device_index` | attach | The card for the drafter. Default: the fastest card. |
+
+These routes are loken's own. The Ollama API has none.
+
+## Expected result
+
+```json
+{"target": "TARGET", "draft": "DRAFT", "target_vocab": N, "draft_vocab": N, "tokenizer_fp_match": true, "status": "attached"}
+```
+
+`/api/draft/status` answers `{"pairs": [{"target": ..., "draft": ..., "draft_length": ...}]}`.
+The answers keep the target's quality, because the target verifies every draft with the request's own sampling.
+The gain grows with the share of drafts the target accepts, and a drafter of the same family accepts more.
+The measured gains are in [Status](../STATUS.md).
+
+## Automatic attach
+
+When a model is predicted to spill, loken picks the smallest model of the store with the same ordinary vocabulary.
+It loads that model on the fastest card before the target and places the target around it.
+It releases the drafter when the target ends up on the cards, or when the vocabularies differ.
+
+loken learns the number of tokens drafted per cycle.
+It measures how often each draft position is accepted and what a cycle of each length costs, then drafts the length that commits the most tokens per second.
+Plain decoding is one of the lengths, so a drafter that stops paying is dropped.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| 404 `Target model 'x' not loaded` | The target is not resident. | Load it with a request first. |
+| 400 `Tokenizer fingerprint mismatch` | The drafter has another ordinary vocabulary, or more logit rows than the target. | Choose a drafter of the same family. |
+| 400 `No card has room for the draft` | The target is held on the cards and the drafter would run on the host. | Free a card, or skip the drafter. |
+| 500 `Draft load failed` | The drafter did not load. | Read the message that follows. |
+
+## Next
+
+- [Measured gains](../STATUS.md)
+- [API routes](../API.md)

@@ -1,19 +1,33 @@
 # Generate an image
 
-Needs a build with the `image` feature, which the default build has.
+`POST /v1/images/generations` renders a picture from a prompt and returns it as a URL or as base64.
 
-## Files
+## Before you start
 
-The `model` of a request names the family by substring, and the loader reads that family's
-files from the Hugging Face store. For Z-Image:
+<!-- site: widget checklist id=images-prereq -->
+- [ ] The build has the `image` feature, which the default build has.
+- [ ] `lokend` is running.
+- [ ] The model files are in the Hugging Face store.
+<!-- site: end -->
+
+The `model` of a request names the family by substring, and the loader reads that family's files from the Hugging Face store.
+The families and their files are in [the image models](../MODELS.md#image). For Z-Image:
 
 ```sh
 loken pull Tongyi-MAI/Z-Image-Turbo --source huggingface
 ```
 
-The families and their files are listed in [`../MODELS.md`](../MODELS.md#image).
+## Smallest configuration
 
-## One request
+None. A request with no `model` renders with `z-image-turbo`.
+These keys apply to specific cases:
+
+| Key | Effect |
+|---|---|
+| `public_url` | The origin of the URLs the server hands out. Set it behind a proxy. |
+| `lora_dir` | Where adapters live. |
+
+## Run it
 
 ```sh
 curl -s localhost:11435/v1/images/generations -H 'Content-Type: application/json' -d '{
@@ -23,20 +37,48 @@ curl -s localhost:11435/v1/images/generations -H 'Content-Type: application/json
 }'
 ```
 
-The picture comes back base64 under `data[0].b64_json`. `response_format: "url"` stores it as
-a file and answers a URL on the request's `Host`, or on `public_url` when configured. `n`,
-`seed`, `num_steps`, `guidance`, `negative_prompt`, `loras`, `sampler` and `scheduler` are
-read.
-`stream: true` sends per-step progress as events.
+Add `"response_format": "b64_json"` to get the picture inline.
 
-Edits and variations take the source image as multipart on `/v1/images/edits` and
-`/v1/images/variations`.
-Adapters are named through `GET /v1/loras` and resolved inside
-`lora_dir`, never by path.
+## Expected result
 
-## What to expect
+Without `response_format`, or with `url`, the picture is stored as a file and the answer holds `data[0].url`, built on the `Host` of the request or on `public_url`.
+With `b64_json`, the picture comes back base64 under `data[0].b64_json`.
+The answer also holds `created` and `render_ms`.
+
+```json
+{"created": 1700000000, "data": [{"url": "http://localhost:11435/v1/files/FILE_ID/content"}], "render_ms": 9000}
+```
+
+## Options
+
+| Field | Effect |
+|---|---|
+| `size` | `WIDTHxHEIGHT`, each side a multiple of 16. |
+| `n` | 1 to 10 pictures. |
+| `seed`, `num_steps`, `guidance`, `negative_prompt`, `sampler`, `scheduler` | Read by the renderer. |
+| `loras` | Adapters, named through `GET /v1/loras` and resolved inside `lora_dir`, never by path. |
+| `output_format` | `png`, `jpeg` or `webp`. |
+| `stream: true` | Sends per-step progress as events. |
+
+`POST /v1/images/edits` and `POST /v1/images/variations` take the source image as multipart.
+
+## Placement
 
 The placement measures what each card holds before loading.
-A family that does not fit spreads
-across cards and, only when no card holds a piece, reaches the host. `GET /v1/renders` shows
-what is in flight, and `POST /v1/renders/{id}/cancel` stops one.
+A family that does not fit spreads across cards, and reaches the host only when no card holds a piece.
+`GET /v1/renders` lists the renders in flight. `POST /v1/renders/{id}/cancel` stops one.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| 400 `prompt must not be empty` | The prompt is blank. | Send a prompt. |
+| 400 `size ... must be a multiple of 16 (VAE stride)` | A side of `size` is not a multiple of 16. | Use a size such as `1024x1024`. |
+| 400 `n must be <= 10` or `n must be >= 1` | `n` is out of range. | Send 1 to 10. |
+| 400 `response_format '...' not supported; use 'url' or 'b64_json'` | `response_format` has another value. | Send `url` or `b64_json`. |
+| 400 `num_steps must be <= ...` or `num_steps must be >= 1` | `num_steps` is out of range. | Send a smaller value. |
+
+## Next
+
+- [Image families and their files](../MODELS.md#image)
+- [Routes and fields](../API.md)
