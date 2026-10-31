@@ -2108,6 +2108,7 @@ impl APIServer {
         let weights = model_blob
             .map(|b| chat_prompt::path_chat_format(&b))
             .unwrap_or_default();
+        let bare_package = packaged.is_none();
         let template = match weights.template {
             Some(j) if j.contains("{%") => Some(j),
             other => packaged.or(other),
@@ -2115,6 +2116,7 @@ impl APIServer {
         Some(chat_prompt::ChatFormat {
             template,
             vocabulary: weights.vocabulary,
+            bare_package,
         })
     }
 

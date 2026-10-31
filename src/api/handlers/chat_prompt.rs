@@ -34,6 +34,9 @@ pub(crate) use super::prompt_format::TemplateOptions;
 pub(crate) struct ChatFormat {
     pub template: Option<String>,
     pub vocabulary: String,
+    /// True for an Ollama package with no template layer.
+    /// `/api/generate` sends its prompt as given for such a package.
+    pub bare_package: bool,
 }
 
 impl ChatFormat {
@@ -80,6 +83,7 @@ fn gguf_chat_format(path: &std::path::Path) -> ChatFormat {
     ChatFormat {
         template: text("tokenizer.chat_template").cloned(),
         vocabulary: vocabulary_markers(tokens),
+        bare_package: false,
     }
 }
 
@@ -159,6 +163,7 @@ fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
             true => String::new(),
             false => vocabulary_markers(tokens),
         },
+        bare_package: false,
     }
 }
 
@@ -746,6 +751,7 @@ mod tests {
                     .to_string(),
             ),
             vocabulary: "[INST][SYSTEM_PROMPT][TOOL_CALLS]".to_string(),
+            bare_package: false,
         };
         let mut clip = user("Transcribe this audio", None);
         clip.audios = Some(vec!["AAAA".to_string()]);

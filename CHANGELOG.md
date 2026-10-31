@@ -39,6 +39,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Generate: send the prompt as given to a package that has no template layer.
 - ROCm: run the hardware 8-bit dot product on RDNA3 and RDNA4 cards.
 - Serving: honour stop sequences on the grammar path.
 - CUDA: run the kernels on a driver older than the bundled NVRTC.

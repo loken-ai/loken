@@ -24,7 +24,7 @@ Every route but `/health` and `/ping` demands a key when `[server] require_auth`
 | `POST /api/copy` | Copy a manifest under a new name, blobs shared. |
 | `DELETE /api/delete` | Remove a manifest and every blob no manifest names. |
 | `POST /api/chat` | Chat. Takes `tools`, `tool_choice`, `think`, `format`, `logprobs`, `top_logprobs`, images, and `audios` (base64 clips) on a user message for a model with the `audio` capability. Returns `thinking` apart from `content`, `done_reason`, and the engine's timings. |
-| `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix`, returns `context`. |
+| `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix`, returns `context`. A package with no template layer gets the prompt as given, as in Ollama. |
 | `POST /api/embed` | Embeddings. Honours `dimensions` and `truncate`. |
 | `POST /api/embeddings` | The legacy one-prompt shape. |
 

@@ -733,6 +733,13 @@ pub(crate) async fn generate_prompt(
         || request.prompt.is_empty()
     {
         request.prompt.clone()
+    } else if request
+        .template
+        .as_deref()
+        .is_none_or(|t| t.trim().is_empty())
+        && state.chat_format_for(model_name).await.bare_package
+    {
+        bare_package_prompt(request.system.as_deref(), &request.prompt)
     } else {
         templated_prompt(
             state,
@@ -754,6 +761,16 @@ pub(crate) async fn generate_prompt(
         template.as_deref(),
     );
     prompt
+}
+
+/// The prompt sent for a package with no template layer.
+/// The system text and a blank line come first when there is a system text.
+/// The prompt goes out alone otherwise.
+fn bare_package_prompt(system: Option<&str>, prompt: &str) -> String {
+    match system.filter(|s| !s.is_empty()) {
+        Some(s) => format!("{s}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
 }
 
 /// The one exchange `/api/generate` renders: an optional system turn and the prompt.

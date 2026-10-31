@@ -516,6 +516,72 @@ async fn keep_alive_zero_does_not_claim_an_unload_it_did_not_do() {
     );
 }
 
+/// A store holding one package.
+/// Its manifest names a model blob and, when `template` is given, a template layer.
+fn store_with_package(name: &str, template: Option<&str>) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "loken-package-{name}-{}-{}",
+        std::process::id(),
+        template.is_some()
+    ));
+    let manifest_dir = root.join("manifests/registry.ollama.ai/library").join(name);
+    let blobs = root.join("blobs");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join("sha256-aaaa"), b"not a gguf").unwrap();
+    let mut layers = vec![serde_json::json!({
+        "mediaType": "application/vnd.ollama.image.model", "digest": "sha256:aaaa", "size": 10
+    })];
+    if let Some(t) = template {
+        std::fs::write(blobs.join("sha256-bbbb"), t).unwrap();
+        layers.push(serde_json::json!({
+            "mediaType": "application/vnd.ollama.image.template", "digest": "sha256:bbbb", "size": 1
+        }));
+    }
+    std::fs::write(
+        manifest_dir.join("latest"),
+        serde_json::json!({"schemaVersion": 2, "layers": layers}).to_string(),
+    )
+    .unwrap();
+    root
+}
+
+/// A package with no template layer is sent the prompt as given.
+/// The system text and a blank line come first when there is a system text.
+/// A package with a template layer is still rendered in its template.
+/// A request template and `raw` are still honoured.
+#[tokio::test]
+async fn generate_sends_a_prompt_as_given_to_a_package_without_a_template() {
+    let bare = store_with_package("bare", None);
+    let state = APIServer::new(
+        bare.to_string_lossy().to_string(),
+        "/nonexistent-hf-models".to_string(),
+    );
+    let request =
+        OllamaGenerateRequest::new("bare".to_string(), "Moby Dick, chapter one".to_string());
+    assert_eq!(
+        generate_prompt(&state, "bare", &request).await,
+        "Moby Dick, chapter one"
+    );
+    let mut with_system = request.clone();
+    with_system.system = Some("You are Ishmael.".to_string());
+    assert_eq!(
+        generate_prompt(&state, "bare", &with_system).await,
+        "You are Ishmael.\n\nMoby Dick, chapter one"
+    );
+    let packaged = store_with_package("packaged", Some("{{ .Prompt }} [END]"));
+    let state = APIServer::new(
+        packaged.to_string_lossy().to_string(),
+        "/nonexistent-hf-models".to_string(),
+    );
+    assert!(
+        !state.chat_format_for("packaged").await.bare_package,
+        "a package with a template layer is not bare"
+    );
+    let _ = std::fs::remove_dir_all(&bare);
+    let _ = std::fs::remove_dir_all(&packaged);
+}
+
 #[test]
 fn classify_pull_error_routes_404_keywords_to_notfound() {
     // 404 in the body of an upstream response.
