@@ -2943,6 +2943,8 @@ impl LlmEngine {
                         }
 
                         next_token = new_next_token;
+                        // The log probability is kept with the draw it belongs to.
+                        record_logprobs(&stream_tokenizer, &mut logits_processor, &mut logprob_buf);
                         pos = new_pos;
                         next_token_dev = new_next_dev;
                     }
