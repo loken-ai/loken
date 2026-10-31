@@ -14,7 +14,7 @@
 .t{fill:#e6edf3}.s,.h{fill:#8b949e}.a,.p{stroke:#8b949e}}
 </style>
 <defs><marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#57606a"/></marker></defs>
-<text class="h" x="20" y="24">ONE DECODER LAYER: WHAT IT READS, WHAT IT KEEPS</text>
+<text class="h" x="20" y="14">ONE DECODER LAYER: WHAT IT READS, WHAT IT KEEPS</text>
 
 <text class="t" x="20" y="120">x in</text>
 <text class="s" x="20" y="138">one vector</text>
@@ -43,7 +43,7 @@
 <circle class="b" cx="470" cy="115" r="12"/>
 <text class="t" x="470" y="120" text-anchor="middle">+</text>
 <path class="p" d="M90,115 L90,40 L470,40 L470,103"/>
-<text class="s" x="280" y="34" text-anchor="middle">residual: x is added back, the layer only writes a correction</text>
+<text class="s" x="280" y="35" text-anchor="middle">residual: x is added back, the layer only writes a correction</text>
 
 <line class="a" x1="482" y1="115" x2="518" y2="115"/>
 <rect class="b" x="520" y="95" width="70" height="40" rx="6"/>
@@ -69,6 +69,6 @@
 <line class="a" x1="842" y1="115" x2="878" y2="115"/>
 <text class="t" x="852" y="140">x out</text>
 
-<text class="s" x="20" y="300">Weights are read once per pass whatever the number of tokens in it; the KV cache grows by one row per token.</text>
-<text class="s" x="20" y="318">Forty of these in a row, then a final norm and the output projection to one logit per vocabulary entry.</text>
+<text class="s" x="20" y="300">Weights are read once per pass whatever the number of tokens in it. The KV cache grows by 1 row per token.</text>
+<text class="s" x="20" y="318">40 of these in a row, then a final norm and the output projection to 1 logit per vocabulary entry.</text>
 </svg>

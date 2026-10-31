@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" viewBox="0 0 900 300" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="290" viewBox="0 0 900 290" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>
 .b{fill:#f6f8fa;stroke:#8c959f;stroke-width:1.2}
 .y{fill:#fff8c5;stroke:#9a6700;stroke-width:1.2}
@@ -18,38 +18,41 @@
 </defs>
 <text class="h" x="20" y="24">WHERE A CONVERSATION'S KV LIVES</text>
 
-<rect class="y" x="20" y="50" width="200" height="90" rx="6"/>
+<rect class="y" x="20" y="50" width="200" height="106" rx="6"/>
 <text class="t" x="120" y="74" text-anchor="middle">resident KV</text>
-<text class="s" x="120" y="94" text-anchor="middle">on the cards, one per model</text>
-<text class="s" x="120" y="110" text-anchor="middle">F16, Q8 or Q4 per token</text>
-<text class="s" x="120" y="126" text-anchor="middle">the conversation being served</text>
+<text class="s" x="120" y="94" text-anchor="middle">on the cards</text>
+<text class="s" x="120" y="110" text-anchor="middle">1 per model</text>
+<text class="s" x="120" y="126" text-anchor="middle">F16, Q8 or Q4 per token</text>
+<text class="s" x="120" y="142" text-anchor="middle">the conversation being served</text>
 
-<line class="a2" x1="220" y1="95" x2="258" y2="95"/>
+<line class="a2" x1="220" y1="103" x2="258" y2="103"/>
 
-<rect class="b" x="260" y="50" width="200" height="90" rx="6"/>
+<rect class="b" x="260" y="50" width="200" height="106" rx="6"/>
 <text class="t" x="360" y="74" text-anchor="middle">snapshots</text>
-<text class="s" x="360" y="94" text-anchor="middle">kv_snapshots copies, keyed by tokens</text>
-<text class="s" x="360" y="110" text-anchor="middle">where the layers live, within a budget</text>
-<text class="s" x="360" y="126" text-anchor="middle">other conversations, this run</text>
+<text class="s" x="360" y="94" text-anchor="middle">copies keyed by their tokens</text>
+<text class="s" x="360" y="110" text-anchor="middle">kept where the layers live</text>
+<text class="s" x="360" y="126" text-anchor="middle">within a budget</text>
+<text class="s" x="360" y="142" text-anchor="middle">other conversations, this run</text>
 
-<line class="a2" x1="460" y1="95" x2="498" y2="95"/>
+<line class="a2" x1="460" y1="103" x2="498" y2="103"/>
 
-<rect class="b" x="500" y="50" width="200" height="90" rx="6"/>
+<rect class="b" x="500" y="50" width="200" height="106" rx="6"/>
 <text class="t" x="600" y="74" text-anchor="middle">disk blocks</text>
-<text class="s" x="600" y="94" text-anchor="middle">kv_disk_dir, hash chained over tokens</text>
-<text class="s" x="600" y="110" text-anchor="middle">a shared prefix shares its blocks</text>
-<text class="s" x="600" y="126" text-anchor="middle">survives a restart</text>
+<text class="s" x="600" y="94" text-anchor="middle">under kv_disk_dir</text>
+<text class="s" x="600" y="110" text-anchor="middle">hash chained over the tokens</text>
+<text class="s" x="600" y="126" text-anchor="middle">a shared prefix shares blocks</text>
+<text class="s" x="600" y="142" text-anchor="middle">survives a restart</text>
 
-<line class="a2" x1="700" y1="95" x2="738" y2="95"/>
+<line class="a2" x1="700" y1="103" x2="738" y2="103"/>
 
-<rect class="c" x="740" y="50" width="140" height="90" rx="6"/>
+<rect class="c" x="740" y="50" width="140" height="106" rx="6"/>
 <text class="t" x="810" y="74" text-anchor="middle">a peer</text>
 <text class="s" x="810" y="94" text-anchor="middle">the node that holds</text>
 <text class="s" x="810" y="110" text-anchor="middle">the prefix prices its</text>
 <text class="s" x="810" y="126" text-anchor="middle">request lower</text>
 
-<text class="t" x="20" y="185">A request prefills only what none of these hold.</text>
-<text class="s" x="20" y="208">prompt_eval_count says how many tokens were computed; a served prefix does not appear in it.</text>
-<text class="s" x="20" y="228">A second conversation on the same model evicts the resident KV: without a snapshot, the next turn of the first one prefills from zero.</text>
-<text class="s" x="20" y="248">A window too small for the conversation is slower than a large one: compaction rewrites the history, and a rewritten prefix matches nothing.</text>
+<text class="t" x="20" y="200">A request prefills only what none of these hold.</text>
+<text class="s" x="20" y="223">prompt_eval_count counts the tokens computed. A served prefix does not appear in it.</text>
+<text class="s" x="20" y="243">A second conversation on the same model evicts the resident KV. Without a snapshot, the next turn of the first prefills from zero.</text>
+<text class="s" x="20" y="263">A window too small for the conversation is slower than a large one. Compaction rewrites the history, and a rewritten prefix matches nothing.</text>
 </svg>
