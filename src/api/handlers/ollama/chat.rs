@@ -15,26 +15,35 @@ pub(crate) async fn list_loaded_models(
     // DEBUG, not INFO - the GUI Hardware tab polls this every 2s.
     debug!("Listing loaded models with topology");
 
-    let engines = state.engines.read().await;
+    // The table is read for the names and the handles only.
+    // Each question below waits on the state of its engine.
+    // The table is free while it waits.
+    let held: Vec<_> = {
+        let engines = state.engines.read().await;
+        engines
+            .iter()
+            .map(|e| (e.model_id.clone(), e.engine.clone()))
+            .collect()
+    };
     let mut loaded_models = Vec::new();
 
-    for entry in engines.iter() {
-        let device_name = entry.engine.get_device_name().await;
-        let model_size = entry.engine.get_model_size().await;
+    for (model_id, engine) in held {
+        let device_name = engine.get_device_name().await;
+        let model_size = engine.get_model_size().await;
         // The window this engine serves, not the server-wide default. A client that
         // sizes its prompts on the listing was being told the default configured for
         // whatever model the file names, whatever model it asked about.
-        let context_length = entry.engine.context_window().await;
+        let context_length = engine.context_window().await;
 
         // Build layer distribution from the actual loaded model state
-        let layer_dist_info = entry.engine.get_layer_distribution().await;
+        let layer_dist_info = engine.get_layer_distribution().await;
         let (num_layers, layer_distribution) = match layer_dist_info {
             Some((total, distributions)) => (Some(total as u32), Some(distributions)),
             None => (None, None),
         };
 
         loaded_models.push(LoadedModelInfo {
-            model: entry.model_id.clone(),
+            model: model_id,
             status: "loaded".to_string(),
             device: Some(device_name),
             size_bytes: Some(model_size),

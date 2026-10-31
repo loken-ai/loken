@@ -42,6 +42,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 - Delete: unload a model after releasing the table of loaded models.
 - Chat: return one log probability per token, streamed or not, and on the Responses route.
+- Loaded models: list them without holding the table through each engine's wait.
 - Rate limit: tell a refused client how long to wait in Retry-After.
 - Chat: accept a turn with media or a tool result and no text.
 - Responses: report a stream cut upstream as incomplete.
