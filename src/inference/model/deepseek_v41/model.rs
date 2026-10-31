@@ -449,12 +449,14 @@ impl DeepseekV41Model {
             host_tier_bytes: std::sync::atomic::AtomicU64::new(0),
             variant_policy: std::sync::OnceLock::new(),
             routing_seed: std::sync::Mutex::new(Vec::new()),
-            // Starts one layer ahead (the nearest stream that stands in for the layer's own) and
-            // may go as deep as the stack; a window is as many tokens as the stack has layers.
+            // Starts with no read-ahead, which costs the card a router pass for each layer ahead,
+            // and takes one layer ahead (the nearest stream that stands in for the layer's own),
+            // or deeper, when a trial window runs faster; a window is as many tokens as the
+            // stack has layers.
             tier_tune: std::sync::Mutex::new(None),
             readahead: crate::inference::offload::tuner::Tuner::new(
                 "expert read-ahead depth",
-                1,
+                0,
                 cfg.n_layers.saturating_sub(1),
                 cfg.n_layers,
                 READAHEAD_EXPLOIT_WINDOWS,
