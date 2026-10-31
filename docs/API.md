@@ -240,6 +240,17 @@ comes back in the `request-id` header. An image block with a URL source
 `image_fetch_hosts` and held to the media caps; a host outside it is answered 400 naming the host.
 A part the server cannot take, such as a document block, is refused with the reason.
 
+## How a request ends
+
+These hold on every chat route.
+
+- The stop sequence an answer ends on is left out of the text. `include_stop_str_in_output` keeps it on the OpenAI routes.
+- `logprobs` carry one entry for each token written, in a streamed answer and in a whole one. The token that ended the answer is not one.
+- A generation that fails while streaming ends an OpenAI stream with a `{"error": ...}` frame and no finish chunk. The Responses route turns that frame into a `response.failed` event.
+- A Responses stream whose source ends without its final marker ends as `response.incomplete`.
+- A request refused by the rate limit carries `Retry-After`: the seconds until the client has a token again. A client whose allowance never refills gets none.
+- A request with too many messages, a role that is not one, or too many characters in all is refused with a 400. The Messages route applies the same bounds and requires `max_tokens`.
+
 ## Per-request figures
 
 A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figures in a `loken`
