@@ -27,6 +27,50 @@ const REPEAT_LAST_N_MAX: i64 = MAX_TOKENS_CAP;
 /// so the bound is the one the image routes put on their `n`.
 pub(crate) const N_MAX: u64 = 16;
 
+/// The most messages a conversation may hold.
+const CONVERSATION_MAX_MESSAGES: usize = 4096;
+
+/// The most characters the messages of a conversation may hold together.
+const CONVERSATION_MAX_CHARS: usize = 1024 * 1024;
+
+/// The roles a message of a conversation may have.
+const CONVERSATION_ROLES: [&str; 6] = [
+    "system",
+    "user",
+    "assistant",
+    "tool",
+    "function",
+    "developer",
+];
+
+/// Refuses a conversation outside the bounds every chat route holds.
+/// It holds at least 1 message and at most [`CONVERSATION_MAX_MESSAGES`].
+/// Each message has a known role.
+/// The messages hold at most [`CONVERSATION_MAX_CHARS`] characters together.
+pub(crate) fn check_conversation(messages: &[Message]) -> Result<(), ApiError> {
+    if messages.is_empty() || messages.len() > CONVERSATION_MAX_MESSAGES {
+        return Err(ApiError::Validation(format!(
+            "messages length must be in [1, {CONVERSATION_MAX_MESSAGES}]"
+        )));
+    }
+    for (i, m) in messages.iter().enumerate() {
+        if !CONVERSATION_ROLES.contains(&m.role.as_str()) {
+            return Err(ApiError::Validation(format!(
+                "messages[{i}].role '{}' not allowed; use {}",
+                m.role,
+                CONVERSATION_ROLES.join("|")
+            )));
+        }
+    }
+    let total: usize = messages.iter().map(|m| m.content.chars().count()).sum();
+    if total > CONVERSATION_MAX_CHARS {
+        return Err(ApiError::Validation(format!(
+            "aggregate `messages[*].content` is {total} chars; cap at {CONVERSATION_MAX_CHARS}. Trim history client-side."
+        )));
+    }
+    Ok(())
+}
+
 /// The completions an OpenAI request asks for, 1 when `n` is absent.
 pub(crate) fn completions_asked(n: Option<u64>) -> Result<usize, ApiError> {
     match n.unwrap_or(1) {
@@ -378,6 +422,32 @@ impl SamplingRequest {
 
 #[cfg(test)]
 mod tests {
+    fn conversation(n: usize, role: &str, text: &str) -> Vec<Message> {
+        (0..n)
+            .map(|_| Message::new(role.to_string(), text.to_string()))
+            .collect()
+    }
+
+    /// A conversation is held to the count, role and size bounds of every chat route.
+    #[test]
+    fn a_conversation_is_held_to_its_bounds() {
+        assert!(check_conversation(&conversation(3, "user", "hi")).is_ok());
+        assert!(check_conversation(&[]).is_err(), "no message");
+        assert!(
+            check_conversation(&conversation(CONVERSATION_MAX_MESSAGES + 1, "user", "x")).is_err(),
+            "too many messages"
+        );
+        assert!(
+            check_conversation(&conversation(1, "asistant", "hi")).is_err(),
+            "a role that is not one"
+        );
+        let long = "x".repeat(CONVERSATION_MAX_CHARS + 1);
+        assert!(
+            check_conversation(&conversation(1, "user", &long)).is_err(),
+            "too many characters"
+        );
+    }
+
     use super::*;
 
     fn err_of(s: SamplingRequest) -> String {

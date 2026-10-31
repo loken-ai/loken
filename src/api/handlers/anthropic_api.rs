@@ -67,6 +67,9 @@ pub(crate) async fn anthropic_messages_at(
     if let Err(e) = sampling.validate() {
         return anthropic_api_error(e);
     }
+    if let Err(e) = super::sampling::check_conversation(&req.clone().into_internal().0) {
+        return anthropic_api_error(e);
+    }
     // Images by URL are fetched here, so a relayed request carries them as base64.
     if let Err(why) = req
         .inline_url_images(&state.default_inference_config.media_limits)
@@ -670,5 +673,29 @@ mod tests {
             text.contains("temperature"),
             "refused for its bounds: {text}"
         );
+    }
+
+    /// A conversation with too many messages is refused with a 400.
+    #[tokio::test]
+    async fn a_conversation_of_too_many_messages_is_refused() {
+        let messages: Vec<_> = (0..5000)
+            .map(|_| serde_json::json!({"role": "user", "content": "hi"}))
+            .collect();
+        let req: crate::api::anthropic::AnthropicMessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "some-model",
+                "max_tokens": 16,
+                "messages": messages
+            }))
+            .unwrap();
+        let state = APIServer::new(String::new(), String::new());
+        let resp = anthropic_messages_at(
+            state,
+            axum::http::HeaderMap::new(),
+            req,
+            crate::api::gate::Priority::Interactive,
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 }
