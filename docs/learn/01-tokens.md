@@ -4,7 +4,7 @@ A model reads a row of ints and writes one int at a time. Text becomes ints goin
 become text coming out. Both translations fail silently: no crash, no slowdown, just plausible
 nonsense.
 
-That is the whole risk. The rest of this page is where each half lives in loken and the 5
+That is the whole risk. The rest of this page is what loken does for each half and the 5
 times it actually broke.
 
 ## The idea
@@ -23,15 +23,15 @@ times it actually broke.
 
 Rough sizes: an English word is ~1.3 tokens, source code ~2.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/engine/llm_engine/gguf.rs` | Builds the tokenizer from GGUF metadata (`tokenizer.ggml.model`, `.tokens`, `.merges`, `.token_type`, `.pre`). Synthesises merges for a SentencePiece vocabulary that ships none. |
-| `src/inference/token/sentencepiece.rs` | The unigram tokenizer from scratch: `ModelProto` wire format, Viterbi segmentation, the space meta-symbol, byte fallback. |
-| `src/api/handlers/prompt_format.rs` | Renders the checkpoint's `tokenizer.chat_template` through a Jinja engine. |
-| `src/api/thinking.rs` | Splits reasoning from the answer (`<think>`, Harmony channels, the `thought` variant), surviving a chunk boundary mid-stream. `SPLIT_MARKERS` are registered as ordinary text so a decoder that drops special tokens keeps them. |
-| `src/api/tool_calls.rs` | Reads a tool call out of the raw token stream, on every family's spelling. |
+- **Tokenizer**: built from the checkpoint's own metadata, for byte-pair and SentencePiece
+  vocabularies alike. A SentencePiece vocabulary that ships no merges gets them synthesised.
+- **Chat template**: the template stored in the checkpoint is rendered as written, with the
+  tools and the reasoning switch the request carries.
+- **Return split**: the output is split into `thinking`, `content` and `tool_calls`, on every
+  family's spelling of those markers. The split also holds when a marker straddles 2 streamed
+  chunks. Markers survive a decoder that drops special tokens.
 
 ## What was measured
 

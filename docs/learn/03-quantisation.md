@@ -33,19 +33,16 @@ wrong.
   far the model's output moves (KL divergence and top-1 agreement against the unquantised
   model on held-out text). The second is the one that counts.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/tensor/quant_cpu/format/q4_0.rs`, `q4_k.rs`, `iq2_xxs.rs` | One file per format, holding layout, dequantiser and quantiser together, because a sub-block count changed in one and not the others is a silent defect. Start with `q4_0.rs`: the bias that makes an unsigned nibble signed, and why the 2 nibbles of a byte are not neighbours. |
-| `src/tensor/quant_cpu/scale.rs` | The scale searches: signed, with offset, and the second stage that quantises the scales themselves. |
-| `src/tensor/quant_cpu/avx/mod.rs` | The AVX2 dot products: the 4-step shape every kernel follows and the unsigned-by-signed constraint of the multiply-add. |
-| `src/tensor/quantized/kernel_matmul.rs` | Which matmul serves a call: mat-vec for decode, tiled for prefill, a repack when the format has one, each able to decline, and the dequantised matmul at the end that never does. |
-| `src/tensor/oracle_parity.rs` | Every dequantiser pinned against ggml's scalar output, since a format compared only with itself proves nothing. |
-| `src/inference/load/requantize.rs`, `calibration.rs`, `compensate.rs` | Re-quantising per tensor rather than per model, the importance record, the error carried into later columns. |
-| `src/tensor/blockscaled/` | fp8, fp4 and bf16 with the checkpoint's block scales, read in place by any model that ships them. |
-| `cuda/marlin/DESIGN.md`, `cuda/README.md` | The 4-bit tensor-core GEMM explained as a design, and which kernels are built by nvcc against which are compiled at run time. |
-| `src/inference/load/awq.rs` | Why a second 4-bit format is worth carrying, in bytes a weight. |
+- **Formats**: reads the legacy, k-quant and IQ families, the fp8, fp4 and bf16 checkpoints with
+  their own block scales, and a second 4-bit format. Every format is checked against the
+  reference implementation's output.
+- **Matmul**: each call takes the fastest path that accepts it, a mat-vec for decode, a tiled
+  one for prefill, a repacked one when the format has it. Falling back to dequantise and
+  multiply always works.
+- **Re-quantising**: `/api/create` with `quantize` re-quantises per tensor, with calibration
+  and error compensation. `"keep"` with `tensor_types` rules leaves the other tensors alone.
 
 ## What was measured
 
@@ -79,16 +76,8 @@ derivative.
 
 ## Try it
 
-Every format against ggml:
-
-```sh
-cargo test --lib oracle_parity
-```
-
-Expected: 14 tests, one per format plus `every_format_reconstructs_about_as_well_as_ggml`
-and the importance-matrix one, all passing. Then open `src/tensor/quant_cpu/format/q4_0.rs`
-and check the arithmetic: 32 values, a 16-bit scale, 4 bits each, 18 bytes, 4.5 bits a
-weight. `q8_0.rs` gives 34 bytes for 32, 8.5.
+Check the arithmetic of 2 formats: Q4_0 is 32 values at 4 bits plus a 16-bit scale, 18 bytes,
+4.5 bits a weight. Q8_0 is 32 values at 8 bits plus the scale, 34 bytes, 8.5 bits a weight.
 
 A re-quantisation of the whole model at 3 bits:
 

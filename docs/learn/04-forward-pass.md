@@ -37,28 +37,24 @@ vocabulary entry. Lesson 7 turns that row into a token.
 What a layer reads: its weights, once per pass, whatever the number of tokens in the pass.
 What it keeps: the key and value of every token it has seen, lesson 6.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/generic_transformer/mod.rs` | One layer struct for every `blk.{i}.*` decoder: the optional pieces (split or fused QKV, q/k norms, post-attention norms, a mixture) are detected from the checkpoint's tensors, so Qwen2/3, Gemma, Phi and the others share the code. |
-| `src/inference/generic_transformer/layer_attn.rs`, `layer_ffn.rs` | The 2 sub-layers, with the sliding-window variant and the fused paths. |
-| `src/inference/model/rope.rs` | The rotary table, and YaRN: high-frequency dimensions kept, low-frequency ones interpolated, so a model trained at one length answers past it. |
-| `src/tensor/ops/attention.rs` | The attention op itself: scaled dot product, the grouped-query repeat, the 2 rotary pairings, the fused prefill. |
-| `src/inference/fused_moe.rs` | The router and the batched expert projections it feeds. |
-| `src/inference/model/deepseek_v41/attention.rs` | Latent attention with a single shared key head, an fp8 round trip and a learned attention sink. The `model/` directory holds one such directory per family. |
-| `src/inference/engine/model_backend.rs` | The trait each architecture implements, which replaced a match over every variant. |
-
-The papers behind each family are listed in [`../REFERENCES.md`](../REFERENCES.md).
+- **Architectures**: one decoder implementation serves the dense families (Qwen2 and 3, Gemma,
+  Phi and the others). It adapts to the checkpoint: split or fused QKV, q and k norms, extra
+  norms, sliding-window layers, a mixture of experts.
+- **Positions**: RoPE, with YaRN scaling so a model answers past its trained length.
+- **Attention variants**: grouped-query, and latent attention for DeepSeek.
+- **Mixtures**: a router picks the top experts per token and only those are read.
+- **Ports**: a family with its own design, such as DeepSeek V4.1, has a dedicated port.
 
 ## What was measured
 
 **Judging a port without running the original (2026-09-12 to 14).** The DeepSeek V4.1 port
-was gated against the authors' own `model.py`, unmodified, run on the CPU: their kernel
-module was shadowed on the import path by a pure-torch one, which works because their
-linear layer dispatches on the weight's dtype and bf16 never reaches a compiled kernel.
-Each phase of the reference dumps its inputs and outputs into `tests/vectors/`, and a test
-here replays the phase on the same inputs. The gates: attention within 1.3e-2 relative L2,
+was gated against the authors' own reference implementation, unmodified, run on the CPU: their
+kernel module was replaced by a pure-torch one, which works because their linear layer
+dispatches on the weight's dtype and bf16 never reaches a compiled kernel.
+Each phase of the reference dumps its inputs and outputs, and the port replays the phase on
+the same inputs. The gates: attention within 1.3e-2 relative L2,
 the mixture within 3.8e-3, the hyper-connections under 5e-3, the fp8 and fp4 dequantisers
 bit-exact.
 
@@ -78,16 +74,16 @@ tokens over a per-token threshold, and the pre-routing stages gated tightly on t
 
 ## Try it
 
-The vectors are in the tree:
+Read the shape of a model from its metadata:
 
 ```sh
-ls tests/vectors/
-cargo test --lib the_rope_frequencies_are_the_references
-cargo test --lib the_selected_attention_matches_the_reference_block
+curl -s localhost:11435/api/show -d '{"model":"qwen3:0.6b"}' | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['model_info']
+for k in ('block_count', 'embedding_length', 'attention.head_count',
+          'attention.head_count_kv', 'feed_forward_length'):
+    print(k, d.get('qwen3.' + k))"
 ```
 
-Expected: both pass. The first checks the rotary frequencies against the reference's
-`inv_freq`. The second checks an attention block against the reference's block output.
-Open the second, find the tolerance it asserts against the scale of the output, divide it by
-10 and run again: the assertion names the measured difference, which is what a parity test is
-for. `cargo test --lib deepseek_v41::moe` runs the streamed experts against the resident ones.
+Expected: 28 blocks, a width of 1024, 16 query heads against 8 key and value heads, so 2
+query heads share each key head. Repeat on a mixture model and look for the expert count keys.

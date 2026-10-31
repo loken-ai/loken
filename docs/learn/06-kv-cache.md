@@ -37,17 +37,13 @@ designs:
 - **A window too small** is slower than a large one: compaction rewrites the history from
   near its start, and a rewritten prefix matches nothing that is held.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/cache/mod.rs` | Everything that remembers between tokens: the index of this directory. |
-| `src/inference/cache/paged_kv.rs`, `paged_attention.rs` | The block allocator and block tables, pure bookkeeping tested without a card, and the attention that reads through them. |
-| `src/inference/cache/q4_kv.rs`, `q8_kv.rs` | The quantised caches: why a per-token 4-bit key failed and the per-channel scheme that replaced it, and the 8-bit layout that appends one row per step with one copy. |
-| `src/inference/cache/kv_disk.rs` | The disk tier: blocks, the chained hash, one manifest per sequence, writes off the request path. |
-| `src/inference/cache/turboquant/mod.rs` | A 3-bit cache written as a host reference so that the measurement deciding whether to write the kernel exists first. Read `measure` before the rest. |
-| `src/inference/engine/llm_engine/load.rs` (`kv_reuse_start`) | What a new prompt reuses: the resident prefix, a snapshot that covers more of it, a disk sequence that covers more still, each rounded down to a prefill chunk. |
-| `src/inference/engine/llm_engine/params.rs` | The keys: `kv_disk_dir` and its budget. Snapshots need none. `fidelity` turns the shift past the window off at `reference`. The guide is [`../guides/kv-memory.md`](../guides/kv-memory.md). |
+loken keeps one live cache per model, paged into fixed blocks, at F16, 8 bits or 4 bits with a per-channel key scale. It keeps a snapshot of a finished conversation so that an alternated one comes back without a full prefill.
+
+A new prompt reuses the longest prefix it finds, in this order: the resident cache, a snapshot that covers more, a disk sequence that covers more still. The reused prefix is rounded down to a prefill chunk.
+
+The disk tier is on when `kv_disk_dir` is set, with a size budget. Snapshots need no key. `fidelity` set to `reference` turns off the shift past the window. The guide is [`../guides/kv-memory.md`](../guides/kv-memory.md).
 
 ## What was measured
 
@@ -79,8 +75,7 @@ which is why the agent's default window is the large one.
 ## Try it
 
 The reused prefix is rounded down to a prefill chunk, and on a small model with a free card
-the chunk is 2 048 tokens (`adaptive_prefill_chunk` in
-`src/inference/engine/model_backend.rs`), so the conversation has to be longer than that to
+the chunk is 2 048 tokens, so the conversation has to be longer than that to
 show anything. Send a first turn of about
 4 400 tokens on conversation A, then its second turn, then a first turn of another
 conversation B, then A's second turn again, each with `"options":{"num_ctx":8192}`, and read

@@ -21,18 +21,15 @@ the trip beats serving it locally.
 
 ![2 ways to spill a mixture](../img/learn-placement.svg)
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/place/plan.rs` | The heterogeneous plan every block stack uses: pack the fastest card first, spill card to card to host, never out of memory. |
-| `src/inference/place/vram_manager.rs` | The one place placement reads a card's state from: pools trimmed before the probe, a reclaim registry for idle media residents, headroom for a hot component before it loads. |
-| `src/tensor/dry.rs`, `src/tensor/heap.rs`, `src/inference/place/dry_plan.rs` | The circularity break: measure a request's peak by running the forward on a device that allocates nothing, then replay the allocator's chunk and hole behaviour on top of it. |
-| `src/inference/place/placement_invariants.rs` | The fleet rule as tests: the cards decide, not the budgets. No placement decides on a name or an index. Every hot component can span n cards. |
-| `src/inference/place/layer_executor.rs` | The host budget as a share of the machine, not a constant. |
-| `src/inference/offload/streamed.rs`, `room.rs`, `cuda.rs` | The streamed placement for a model larger than the cards and host together: the weights every token reads and as many routed experts as the room allows, kept on the cards fastest first, under the same switches as every other placement. |
-| `src/inference/offload/store.rs` | The hot tier over streamed experts: views into the mapping, least-recently-routed eviction, cold experts dropped from the page cache once they have run while the host's memory is short, and left there otherwise. |
-| `src/distributed/routing.rs` | Which node answers, by predicted completion rather than by load. [`../CLUSTER.md`](../CLUSTER.md) has the cost model. |
+loken packs the fastest card first, spills from card to card and then to the host, and does not run out of memory. The host budget is a share of the machine, not a constant. No placement decides on a card's name or index, and every hot component can span n cards.
+
+It reads a card's state from one place and measures a request's peak by running the forward on a device that allocates nothing, then replays the allocator's behaviour on top of it.
+
+A model larger than the cards and the host together is streamed. The weights every token reads and as many routed experts as the room allows stay on the cards, fastest first. The other experts are read from disk, with a hot tier evicting the least recently routed.
+
+Across nodes, a request goes to the node with the best predicted completion, not the lowest load. [`../CLUSTER.md`](../CLUSTER.md) has the cost model.
 
 ## What was measured
 

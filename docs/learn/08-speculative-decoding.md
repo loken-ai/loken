@@ -26,15 +26,11 @@ It pays where verification is far cheaper per token than generation: a model tha
 spills to the host crosses the bus once for k tokens instead of once per token. On a model
 that fits a card, verification costs about what drafting saves.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/serve/eagle.rs` | The EAGLE-1 head on the native substrate: one decoder layer over the target's feature and the next token's embedding, reusing the target's embedding table and output head. The module comment is a complete account of the method. |
-| `src/inference/serve/prompt_lookup.rs` | Prompt-lookup drafting from a rolling buffer of prompt and generated tokens. |
-| `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model and verifying in one target pass. The comment states the greedy restriction and what temperature would need. |
-| `src/inference/serve/speculative_config.rs` | Whether drafting is worth it, decided from measured device timings rather than assumed. |
-| `src/inference/serve/spec_kv_cache.rs` | A cache that can drop the rejected tail. |
+loken drafts in 3 ways: a separate small model with the same vocabulary, an EAGLE head on the target's own hidden state, and prompt lookup over a rolling buffer of the prompt and the generated tokens.
+
+It decides whether drafting is worth it from measured timings, not from an assumption. Rejected drafts are dropped from the cache. Drafting with a separate model verifies greedy decoding only.
 
 How loken picks a drafter, and the attach route, are in [`../guides/drafter.md`](../guides/drafter.md).
 
@@ -53,8 +49,8 @@ tokens a second on the pair above, and a drafter attached to a model that fits t
 dropped by the same rule.
 
 **The head, when it was built.** The EAGLE head reached 1.71 to 1.82 times the plain rate on
-deepcoder, held out, on an earlier substrate. The figure is the module's, dated by it, and
-not re-measured on the native one.
+deepcoder, held out, on an earlier substrate. The figure is dated at its measurement and
+not re-measured on the current implementation.
 
 ## Try it
 

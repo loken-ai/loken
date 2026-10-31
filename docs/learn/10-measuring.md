@@ -27,17 +27,16 @@ The discipline that came out of 9 months of this:
 - Let nothing else run.
 - Treat a log line as a smell, not as a test.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| [Method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md) | The protocol: the cell, the prompts, which cards each engine may use, what a cell that publishes no rate means, the `Tokens` column beside the rate. |
-| [Rate columns](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#the-rate-columns) | Why prefill is prompt tokens over the client's time to first token, why decode is the client's span, and why both are medians. Cold and warm figures: [cold and warm](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#cold-and-warm). |
-| [`scripts/bench`](https://github.com/loken-ai/benchmarks/blob/main/scripts/bench) in the benchmarks repository | The harness: starts the releases named in its settings, stamps the build into every row, files each run. |
-| [Benchmarks site](https://loken-ai.github.io/benchmarks/) | The runs of every machine, one page per hardware, rebuilt from the records so that no page is typed. |
-| `scripts/determinism.py` | The same prompt repeated, and a diff of the answers. |
-| `src/inference/place/layer_perf.rs`, `src/energy.rs` | The per-layer timers of lesson 5, and the joules: host RAPL and card NVML summed over the request window. |
-| [lokprof](https://github.com/loken-ai/lokprof) | The bench tool: drives each engine through its own API, separates prefill from decode, records energy beside speed, makes the engines comparable before comparing them. |
+loken reports the joules of a request, summed from the host and the cards over the request window, and the time spent in each layer.
+
+The measurement side is the protocol and its tools:
+
+- The [method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md) states the cell, the prompts, which cards each engine may use, what a cell that publishes no rate means, and the `Tokens` column beside the rate.
+- The [rate columns](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#the-rate-columns) explain why prefill is prompt tokens over the client's time to first token, why decode is the client's span, and why both are medians. [Cold and warm](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#cold-and-warm) figures are kept apart.
+- The [benchmarks site](https://loken-ai.github.io/benchmarks/) shows the runs of every machine, one page per hardware, rebuilt from the records.
+- [lokprof](https://github.com/loken-ai/lokprof) drives each engine through its own API, separates prefill from decode, and records energy beside speed.
 
 ## What was measured
 
@@ -86,8 +85,8 @@ submission is quarantined until reproduced.
 
 One cell with the bench tool, against the daemon, 3 iterations.
 
-Prerequisite: [`lokprof`](https://github.com/loken-ai/lokprof), the bench tool, which is not in
-this tree. Build it once and call the binary it produces:
+Prerequisite: [`lokprof`](https://github.com/loken-ai/lokprof), the bench tool. Build it once
+and call the binary it produces:
 
 ```sh
 git clone https://github.com/loken-ai/lokprof
@@ -106,5 +105,5 @@ with its spread over `n=3`, 128 tokens generated on every iteration, 0.39 J a to
 card, and a coherence gate that reads `PASS` above a preview of the answer's first 120
 characters. Read 3 things: the rates are medians and the spread is printed beside them,
 the token count says how many steps the decode rate averages over, and the preview is the
-whole of what the gate judged. Then run the cell again with a `cargo build` in another
+whole of what the gate judged. Then run the cell again with a build running in another
 terminal and compare.

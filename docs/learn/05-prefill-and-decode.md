@@ -30,19 +30,17 @@ Orders of magnitude on this machine: qwen3:0.6b prefills 1 782 tokens in 50 ms a
 at about 730 tokens a second on an RTX 5070 Ti. Its 522 MB read at that rate is well under
 the card's bandwidth, the rest being fixed per-step costs (launches, the sampling round
 trip), which is what capturing a decode step as one CUDA graph reduces. A 70B at Q4 with 26
-of 80 layers on the host decodes at 1.5 tokens a second, pinned to the host's 36 GB/s
-([`../STATUS.md`](../STATUS.md#placement-measured-separately)).
+of 80 layers on the host decodes at 1.5 tokens a second, pinned to the host's 36 GB/s.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/engine/model_backend.rs` | The prefill chunk, derived from the free VRAM and the widest feed-forward rather than a constant, and the chunked prefill with its out-of-memory ladder. |
-| `src/inference/serve/scheduler.rs` | The iteration-level scheduler: a plan per step (who prefills, who decodes, with their block tables), a prefill token budget, preemption that never half-allocates. Pure bookkeeping, tested without a card. |
-| `src/inference/serve/continuous_serve.rs` | The worker thread that owns the model and the paged cache and is the only caller of the forward. |
-| `src/inference/serve/batched_forward.rs` | The batched forward as an f32 specification, and the batch-invariance contract a real backend has to meet. |
-| `src/inference/kernel/cpu_decode_exec.rs` | The host decode path with a preallocated arena, so a token on the host allocates nothing. |
-| `src/inference/place/layer_perf.rs`, `src/api/handlers/system.rs` | The per-layer and per-stage timers behind `/api/layer_perf` and `/api/stage_perf`. Off by default because each stage costs a device synchronisation. |
+- **Prefill chunk**: derived from the free VRAM and the widest feed-forward, not a constant. An
+  out-of-memory error in a chunk retries with a smaller one.
+- **Scheduler**: at every step it plans who prefills and who decodes, under a prefill token
+  budget. Under pressure it preempts a sequence without leaving it half allocated.
+- **Decode on the host**: a token served from the host allocates nothing.
+- **Timers**: `/api/layer_perf` and `/api/stage_perf` report the per-layer and per-stage
+  times. They are off by default because each stage costs a device synchronisation.
 
 ## What was measured
 

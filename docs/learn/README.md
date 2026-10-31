@@ -1,12 +1,11 @@
 # The fundamentals of inference, in 10 lessons
 
 10 lessons for a developer who has never opened an inference engine. Each takes about 10
-minutes, states one fundamental, shows where it lives in this tree, reports what was
+minutes, states one fundamental, shows what loken does about it, reports what was
 measured about it here, and ends with one request or command to run against a local daemon.
 
 Prerequisites: a running `lokend` with a small model, `qwen3:0.6b` in the exercises (see
-[`../BUILDING.md`](../BUILDING.md)), `curl` and `python3`. Lessons 3 and 4 run a `cargo test`.
-Lesson 10 needs [`lokprof`](https://github.com/loken-ai/lokprof).
+[`../BUILDING.md`](../BUILDING.md)), `curl` and `python3`. Lesson 10 needs [`lokprof`](https://github.com/loken-ai/lokprof).
 
 | Lesson | Question |
 |---|---|
@@ -31,4 +30,4 @@ already carried the defect.
 Every figure carries a date and the machine it came from. The machine is the one
 [`../STATUS.md`](../STATUS.md) describes unless a lesson says otherwise. The figures in
 the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's. The ones here are the
-experiments'. The diagrams are hand-written SVG in `../img/learn-*.svg`.
+experiments'. The diagrams are hand-written SVG.

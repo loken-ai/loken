@@ -21,17 +21,15 @@ of the same prompt agree.
   lesson's cache reuse and a batched kernel can both change. A seed fixes the draw, not the
   logits.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/inference/sample/token_sampling.rs` | The 2 steps: which tokens are candidates, then one draw. The draw is host-side, so the logits come back from the device once per token. |
-| `src/inference/engine/llm_engine/gguf.rs` (`build_sampling_from`) and `sampling_tests.rs` | How a request's `temperature`, `top_k`, `top_p` and the model's own defaults combine. The tests read as the specification (a `top_p` without a `top_k` is nucleus sampling over the whole vocabulary). |
-| `src/inference/engine/decode_step.rs` | The per-step order: penalty, then sampling, on the shared decode path. |
-| `cuda/sampling.cu` | The device-side sampler used when the draw can stay on the card. |
-| `src/inference/engine/llm_engine/mod.rs` | The grammar parser factory: a JSON schema or a Lark grammar becomes a per-token mask through llguidance. `response_format` on the OpenAI surface and `format` on the Ollama one reach it. |
-| `src/distributed/replay.rs` | Resuming a generation on another node with the same tokens, which holds only if sampling depends on position and seed alone. |
-| `scripts/determinism.py` | Runs a prompt repeatedly and diffs the answers. |
+loken takes `temperature`, `top_k`, `top_p` and the other sampling options from the request. A value the request omits falls back to the model's own default, listed by `/api/show` under `parameters`. A `top_p` without a `top_k` is nucleus sampling over the whole vocabulary.
+
+The repetition penalty applies first, then the candidates are cut, then one draw is made. The draw runs on the card when it can stay there.
+
+A JSON schema or a Lark grammar becomes a per-token mask. `response_format` on the OpenAI routes and `format` on the Ollama routes reach it.
+
+A generation resumed on another node with the same tokens gives the same continuation, because sampling depends on position and seed alone.
 
 ## What was measured
 
@@ -45,8 +43,7 @@ on a greedy decode that should have produced the same text 3 times.
 A warm run re-prefills the tail from the reused prefix. Off a chunk boundary the tail runs
 matrix shapes the cold run never used at those positions, and the reassociated arithmetic
 flips a greedy choice wherever the 2 best candidates are close. The reused prefix is
-therefore rounded down to a chunk boundary (the comment above `kv_reuse_start` in
-`src/inference/engine/llm_engine/load.rs` states the rule), and
+therefore rounded down to a chunk boundary, and
 [`../STATUS.md`](../STATUS.md#context-shift) keeps the window shift off by default for the
 same reason: a re-phased key is not the cold key, bit for bit.
 

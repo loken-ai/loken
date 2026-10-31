@@ -26,19 +26,16 @@ Orders of magnitude on qwen3:0.6b: 751 632 384 parameters, 28 layers, an embeddi
 1024, a trained context of 40 960 tokens, and 522 MB resident at Q4_K_M, which is 5.6 bits
 a parameter once the embedding and the output matrix are counted.
 
-## In loken
+## What loken does
 
-| File | What it decides |
-|---|---|
-| `src/tensor/quantized/gguf_file.rs` | The one statement of the container: `mod layout` holds the magic, the field order, the dimension reversal, the value-type ids and the alignment rule, so the reader and the writer cannot disagree. `read_facts` reads what a catalogue lists and stops at the first `tokenizer.*` key. |
-| `src/tensor/quantized/gguf_source.rs` | A checkpoint split into parts, presented as one source. |
-| `src/tensor/safetensors_io.rs` | The safetensors reader: header, then views over the mapping. |
-| `src/tensor/quant_view.rs` | A typed view into blocks owned by a parent tensor or by a mapped file, so a layer can be read in place. |
-| `src/inference/cache/qvb.rs` | The parsed checkpoint kept on the host between model swaps, so switching back does not re-read gigabytes. |
-| `src/api/handlers/catalogue.rs` | What `/api/tags` and `/v1/models` list, and the header facts they are built from. |
-
-How a request names a model, and which stores are searched, is in
-[`../MODELS.md`](../MODELS.md).
+- **Formats**: reads GGUF (a checkpoint split in parts counts as one) and safetensors
+  (one file or many, with an index).
+- **Memory mapping**: a tensor is read in place from the mapping. A layer served from the host
+  needs no copy.
+- **Catalogue**: `/api/tags` and `/v1/models` list from the header facts, read up to the first
+  `tokenizer.*` key. `/api/show` reads the whole header on demand.
+- **Model swaps**: the parsed checkpoint stays on the host between swaps, so switching back
+  does not re-read gigabytes.
 
 ## What was measured
 
@@ -52,8 +49,7 @@ that cache before it binds its port. `/api/show` still reads the whole header, o
 demand.
 
 **Load time is the disk.** A 24 GB checkpoint over a USB disk: 52 s reading, 6 s uploading to
-the cards ([`../STATUS.md`](../STATUS.md#costs)). The same page records what a spilled model
-used to hold twice in host memory, and what the loader still uploads twice.
+the cards. The loader still uploads some tensors twice.
 
 ## Try it
 
