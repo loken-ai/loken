@@ -18,6 +18,8 @@ Both translations fail silently, with plausible nonsense and no crash or slowdow
 - **Return split**: the step that turns ids back into text, then splits it into the answer, the reasoning (`<think>`, a Harmony `analysis` channel) and any tool call.
   It is not arithmetic, so no kernel reports its failures.
 
+![One request, from text to JSON](../img/learn-pipeline.svg)
+
 An English word is about 1.3 tokens.
 Source code is about 2.
 

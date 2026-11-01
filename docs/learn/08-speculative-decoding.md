@@ -7,12 +7,26 @@ Speculative decoding uses them to check several guessed tokens in the pass that 
 
 A cheap **drafter** proposes k tokens.  
 The target model runs 1 forward over the prompt plus those k tokens.
+That pass reads the weights once and costs about 1 decode step in bytes.
+It yields the target's own token at each position.
 
-The forward pass reads the weights once, so it costs about 1 decode step in bytes.
-It yields the target's own prediction at each of the k positions.
+```mermaid
+flowchart TD
+    D["drafter proposes k tokens"] --> V["target: 1 forward, weights read once"]
+    V --> P["the target's own token at each position"]
+    P --> C{"every draft matches?"}
+    C -- yes --> B["keep the k drafts, add the target's next token"]
+    C -- no --> K["keep the drafts before the first mismatch"]
+    K --> R["take the target's token at the mismatch"]
+    R --> X["drop every later draft and its cache rows"]
+    B --> L["learn k from acceptance and cycle time"]
+    X --> L
+    L --> D
+```
 
 The target keeps the drafts it agrees with.  
-It replaces the first draft it disagrees with by its own choice and drops everything after.
+It replaces the first draft it disagrees with by its own token and drops everything after.
+When every draft matches, the pass also yields the target's token after the last one.
 Under greedy decoding the output is token for token what the target generates alone.
 
 The gain is the number of drafts accepted per pass.  
@@ -37,7 +51,8 @@ loken drafts with a separate small model, an EAGLE head, or prompt lookup over a
 
 loken decides whether drafting pays from measured timings.  
 It drops rejected drafts from the cache.  
-Drafting with a separate model is verified for greedy decoding only.
+The target draws its own token at each position with the request's sampling, so drafting runs at any temperature.
+Token-for-token parity with the target alone is measured under greedy decoding only.
 
 [Pick and attach a drafter](../guides/drafter.md) covers the choice of drafter and the attach route.
 

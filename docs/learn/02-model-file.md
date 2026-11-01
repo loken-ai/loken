@@ -5,7 +5,7 @@ The container lets a server read the entries without reading the tensors, so the
 
 ## The idea
 
-- **GGUF**: a magic, a version and 2 counts (metadata pairs, tensors).  
+- **GGUF**: a magic, a version and 2 counts (tensors, then metadata pairs).  
   Then the metadata, key by key: architecture name, layer count, trained context length, head counts, rotary base and the whole tokenizer (vocabulary, merges, scores, token types, chat template).  
   Then 1 descriptor per tensor: name, dimensions, element type, offset.
   Dimensions are stored innermost first, so a reader reverses them.  
@@ -21,6 +21,18 @@ The container lets a server read the entries without reading the tensors, so the
   The operating system pages bytes in on first touch and keeps them in its page cache while memory allows.  
   A model loaded on a card is read from the mapping once and uploaded.  
   A layer left on the host is read from the mapping on every token.
+
+```mermaid
+flowchart LR
+    H["header: magic, version, 2 counts"] --> G["general and model keys"]
+    G --> T["the whole tokenizer"]
+    T --> D["1 descriptor per tensor, end of header"]
+    D --> P["payload, aligned to general.alignment"]
+    CAT["catalogue"] -. "stops at the first tokenizer key" .-> T
+    SHOW["/api/show"] -. "reads the whole header" .-> D
+    P --> CARD["layer on a card: read once, uploaded"]
+    P --> HOST["layer on the host: read every token"]
+```
 
 qwen3:0.6b in numbers:
 
@@ -39,7 +51,7 @@ qwen3:0.6b in numbers:
 |---|---|
 | Formats | Reads GGUF (a checkpoint split in parts counts as 1) and safetensors (1 file, or many with an index). |
 | Memory mapping | Reads a tensor in place from the mapping. A layer served from the host needs no copy. |
-| Catalogue | `/api/tags` and `/v1/models` list from the header facts, read up to the first `tokenizer.*` key. `/api/show` reads the whole header on demand. |
+| Catalogue | `/api/tags` and `/v1/models` list from the header facts. The read stops at the first `tokenizer.*` key once `general.parameter_count` is read. A file without that key is read on to its tensor descriptors, and its parameters are counted from their shapes. `/api/show` reads the whole header on demand. |
 | Model swaps | Keeps the parsed checkpoint on the host, so switching back does not re-read gigabytes. |
 
 ## What was measured

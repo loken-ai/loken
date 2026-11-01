@@ -8,7 +8,7 @@ It decides whether 2 runs of the same prompt agree.
 | Step | What it does |
 |---|---|
 | **Logits** | The row of numbers, 1 per vocabulary entry. A softmax turns them into probabilities. |
-| **Temperature** | Divides the logits first. Below 1 it sharpens the distribution. At 0 it takes the maximum, which is **greedy** decoding. |
+| **Temperature** | Divides the logits before the softmax. Below 1 it sharpens the distribution. At 0 it takes the maximum, which is **greedy** decoding. |
 | **Top-k** | Keeps the k largest entries. |
 | **Top-p** | Keeps the smallest set whose probabilities sum to p. |
 | **Min-p** | Keeps every entry above a fraction of the largest. |
@@ -34,7 +34,9 @@ A seed fixes the draw, not the logits.
 - loken takes `temperature`, `top_k`, `top_p` and the other sampling options from the request.
 - A value the request omits falls back to the model's own default, listed by `/api/show` under `parameters`.
 - A `top_p` without a `top_k` is nucleus sampling over the whole vocabulary.
-- The repetition penalty applies first, then the candidates are cut, then one draw is made.
+- The repetition penalty applies first.
+- A grammar mask and the token rules follow, min-p among them, then the logit bias.
+- Temperature, top-k and top-p cut the candidates, then one draw is made.
 - The draw runs on the card when it can stay there.
 - A JSON schema or a Lark grammar becomes a per-token mask. `response_format` on the OpenAI routes and `format` on the Ollama routes reach it.
 - A generation resumed on another node with the same tokens gives the same continuation, because sampling depends on position and seed alone.
@@ -52,14 +54,15 @@ A rate over a different length is a different measurement.
 The 96 was the mean of 3 iterations that ran 128, 80 and 80 tokens.  
 A greedy decode should have produced the same text 3 times.
 
-### Reuse only on a chunk boundary
+### Reuse on a chunk boundary
 
 - A cold run prefills in fixed chunks from position 0.
 - A warm run re-prefills the tail from the reused prefix.
 - Off a chunk boundary, the tail runs matrix shapes that the cold run never used at those positions.
 - The reassociated arithmetic flips a greedy choice wherever the 2 best candidates are close.
 
-The reused prefix is therefore rounded down to a chunk boundary.
+A reused prefix with no turn marker is therefore rounded down to a chunk boundary.
+The next turn of a conversation keeps the rows before its last turn marker instead ([lesson 6](06-kv-cache.md)).
 
 The window shift has the same cause: a re-phased key is not the cold key, bit for bit.  
 `fidelity = "reference"` turns the shift off ([Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#context-shift)).
@@ -106,7 +109,7 @@ What does `temperature` 0 do?
 2. It disables the softmax
 3. It cuts the candidates to the 0 largest
 
-Temperature divides the logits first. At 0 the draw is a maximum.
+Temperature divides the logits before the softmax. At 0 the draw is a maximum.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=3 id=sampling-quiz-2 -->
@@ -120,7 +123,7 @@ A seed fixes the draw, not the logits. The same logits need the same arithmetic 
 <!-- site: end -->
 
 <!-- site: widget quiz answer=2 id=sampling-quiz-3 -->
-Why is the reused prefix rounded down to a chunk boundary?
+Why is a reused prefix with no turn marker rounded down to a chunk boundary?
 
 1. To save memory
 2. Off a boundary, the tail runs matrix shapes the cold run never used, and the reassociated arithmetic can flip a greedy choice

@@ -40,7 +40,8 @@ A new prompt reuses the longest prefix it finds, searched in this order:
 2. A snapshot that covers more.
 3. A disk sequence that covers more still.
 
-The reused prefix is rounded down to a prefill chunk.
+The rows kept end before the last turn marker of the shared prefix, so the next turn of a conversation reads only its new tokens.
+Where the prefix holds no turn marker, or where the chunk grid keeps more, the kept prefix is rounded down to a prefill chunk.
 
 | Setting | Effect |
 |---|---|
@@ -110,8 +111,6 @@ The agent's default window is the large one.
 
 ## Try it
 
-On a small model with a free card the chunk is 2 048 tokens, so the conversation must be longer than that to show anything.
-
 <!-- site: widget steps id=kv-cache-steps -->
 1. Send a first turn of about 4 400 tokens on conversation A.
 2. Send the second turn of A.
@@ -122,24 +121,19 @@ On a small model with a free card the chunk is 2 048 tokens, so the conversation
 
 Send every request with `"options":{"num_ctx":8192}`.
 
-Observed on qwen3:0.6b, RTX 5070 Ti:
+The cold turns, observed on qwen3:0.6b, RTX 5070 Ti:
 
 | Turn | `prompt_eval_count` | `prompt_eval_duration` |
 |---|---|---|
 | A, first turn, cold | 4422 | 592 ms |
-| A, second turn | 381 | 24 ms |
 | B, first turn, cold | 4522 | 472 ms |
-| A, second turn again | 381 | 26 ms |
 
-The second turn computed 381 tokens.
-2 chunks of the 4 477 shared tokens were reused, and the remainder was recomputed.  
-The last turn came from a snapshot, and the daemon's log says so:
+On each second turn of A, `prompt_eval_count` counts only the tokens from the last turn marker shared with the cache onward.  
+The last turn comes from a snapshot, and the daemon's log says so:
 
 ```
 kv snapshot restored: 4477 tokens shared with the prompt, 4506 resident
 ```
-
-With turns shorter than a chunk nothing is reused, and the counts show it.
 
 ## Check yourself
 
@@ -166,15 +160,16 @@ A snapshot lets an alternated conversation come back without a full prefill.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=3 id=kv-cache-quiz-3 -->
-A new prompt shares 4 477 tokens with the resident cache, and a chunk is 2 048 tokens.  
-How many tokens are reused?
+A new prompt shares 4 477 tokens with the resident cache.
+The last turn marker among them comes after the first 4 419 tokens, and a chunk is 2 048 tokens.  
+How many rows are kept?
 
 1. 4 477
-2. 2 048
-3. 4 096
+2. 4 096
+3. 4 419
 
-The reused prefix is rounded down to a prefill chunk, here 2 chunks.
-Turns shorter than a chunk reuse nothing.
+The rows kept end before the last shared turn marker.
+The chunk grid would keep 4 096, which is fewer.
 <!-- site: end -->
 
 <!-- site: widget flashcards id=kv-cache-terms -->
@@ -185,5 +180,6 @@ Turns shorter than a chunk reuse nothing.
 | Snapshot | A copy of the resident cache set aside under its tokens. |
 | Disk tier | Token blocks written to disk, keyed by a hash chained over the tokens. Set with `kv_disk_dir`. |
 | Sliding window | A layer that attends only to the last n positions. |
+| Turn marker | A special token of the chat template. The next turn keeps the rows before the last one it shares. |
 | Shift past the window | Keeping a conversation's tail and re-phasing its positions. Off at `fidelity = "reference"`. |
 <!-- site: end -->

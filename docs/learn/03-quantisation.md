@@ -10,7 +10,8 @@ Quantisation trades precision for bytes.
   Block quantisation stores a group of consecutive weights as small integers plus 1 scale.
   The block's values are divided by the scale, rounded and packed.
 - **k-quants** nest the idea.
-  Q4_K holds 256 values in 8 sub-blocks, each with its own 6-bit scale and minimum under 1 16-bit super-scale.
+  Q4_K holds 256 values in 8 sub-blocks, each with its own 6-bit scale and minimum.
+  2 16-bit super-scales sit above them: 1 for the scales, 1 for the minimums.
   That is 144 bytes for 256 values, 4.5 bits a weight, a better fit than Q4_0.
 - **Codebooks**: below 3 bits a plain grid loses too much.
   IQ2_XXS stores an index into a fixed codebook of 8-value patterns instead, at 2.06 bits a weight.
@@ -40,6 +41,18 @@ Quantisation trades precision for bytes.
 | Q4_K | 256 values, 8 sub-blocks | 144 | 4.5 |
 | Q6_K | 256 values, 16 sub-blocks | 210 | 6.56 |
 | IQ2_XXS | 256 values as indexes into a codebook of 8-value patterns | 66 | 2.06 |
+
+The 2 ways a matmul uses a block:
+
+```mermaid
+flowchart LR
+    W["weight block: small integers, 1 scale"] --> DQ["way 1: dequantise to float"]
+    DQ --> FM["float multiply, twice the bytes moved"]
+    W --> ID["way 2: integer dot products"]
+    X["activation"] --> Q8["quantise to 8 bits per block"]
+    Q8 --> ID
+    ID --> SC["apply the 2 scales once at the end"]
+```
 
 ## What loken does
 
@@ -150,7 +163,7 @@ How do you re-quantise only the feed-forward tensors?
 | Term | Meaning |
 |---|---|
 | Block quantisation | A group of consecutive weights stored as small integers plus 1 scale. |
-| k-quant | A format that nests sub-blocks, each with its own scale, under 1 super-scale. |
+| k-quant | A format that nests sub-blocks, each with its own scale, under 16-bit super-scales. |
 | Calibration | Asking a corpus which weights matter, to weight the quantiser's error. |
 | Error compensation | Carrying the rounding error of 1 block into the columns quantised after it. |
 | KL divergence | The distance between the quantised and the unquantised model's output distributions. |
