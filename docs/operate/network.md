@@ -1,12 +1,9 @@
 # Expose loken on a network
 
-This page turns on authentication and a rate limit, and picks the address the daemon listens on.
-
 ## Before you start
 
 The default is safe for one person on one machine: `host` is `127.0.0.1`, no key is demanded and no rate limit applies.
-The API can pull models, copy them and delete them from disk.
-Whoever reaches the port can do that.
+The API can pull, copy and delete models on disk. Whoever reaches the port can do that.
 
 <!-- site: widget checklist id=operate-network-before -->
 - [ ] `lokend` runs and answers on `localhost`.
@@ -33,7 +30,7 @@ rate_limit_per_minute = 120
 | `rate_limit_per_minute` | `0` | Requests per minute per client. `0` is unlimited. |
 | `rate_limit_burst` | `10` | Requests that may arrive back to back before the per-minute rate applies. |
 
-Every key is in [Configuration](../CONFIGURATION.md#server).
+All keys: [Configuration](../CONFIGURATION.md#server).
 
 ## Run it
 
@@ -116,8 +113,6 @@ Discovery uses multicast announcements on UDP port 41999. Any host on the segmen
 [Run 2 machines](cluster.md) covers the cluster itself.
 
 ## Troubleshooting
-
-Every row comes from the status codes and log lines of the daemon.
 
 | Symptom | Cause | Fix |
 |---|---|---|

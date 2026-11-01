@@ -1,15 +1,14 @@
 # What a model file holds
 
 A checkpoint is hundreds of tensors and hundreds of metadata entries in a container.
-The container lets a server read the entries without reading the tensors.
-The catalogue therefore never opens more than a few kilobytes of a file.
+The container lets a server read the entries without reading the tensors, so the catalogue opens only a few kilobytes of a file.
 
 ## The idea
 
 - **GGUF**: a magic, a version and 2 counts (metadata pairs, tensors). Then the metadata, key by key: architecture name, layer count, trained context length, head counts, rotary base and the whole tokenizer (vocabulary, merges, scores, token types, chat template). Then 1 descriptor per tensor: name, dimensions, element type, offset. Dimensions are stored innermost first, so a reader reverses them. Then the payload, 1 tensor after another, aligned to `general.alignment` (32 by default).
 - **Element type**: how many bytes a weight takes. F16 takes 2 bytes. The block formats of [lesson 3](03-quantisation.md) take between 2 and 8 bits. `general.file_type` names the mix a file was packed with. Q4_K_M, for instance, packs most matrices at 4.5 bits and a few at 6.5.
 - **safetensors**: the same idea with a JSON header of names, dtypes, shapes and offsets, then the bytes. Hugging Face checkpoints ship in this format, as 1 file or many with an index.
-- **Memory-mapped**: nothing is copied at open, and a tensor is a view at an offset. The operating system pages bytes in on first touch and keeps them in its page cache while memory allows. A model loaded on a card was read from the mapping and uploaded. A layer left on the host is read from the mapping on every token.
+- **Memory-mapped**: nothing is copied at open, and a tensor is a view at an offset. The operating system pages bytes in on first touch and keeps them in its page cache while memory allows. A model loaded on a card is read from the mapping once and uploaded. A layer left on the host is read from the mapping on every token.
 
 qwen3:0.6b in numbers:
 
@@ -42,8 +41,7 @@ A GGUF puts the general keys first and the tokenizer arrays after them.
 A read that stops at the first `tokenizer.*` key gets the architecture, the file type and the parameter count in under 8 KB a file.
 That read takes 2 ms for the 44 files.
 
-The facts are cached by path, size and modification time.
-The daemon warms that cache before it binds its port.
+The facts are cached by path, size and modification time, and the daemon warms the cache before it binds its port.
 `/api/show` still reads the whole header, once, on demand.
 
 **Load time is the disk.**

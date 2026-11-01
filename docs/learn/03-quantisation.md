@@ -6,10 +6,10 @@ Quantisation trades precision for bytes.
 ## The idea
 
 - **Block quantisation**: a trained weight is a float, 2 bytes in 16 bits. A 70B model then costs 140 GB, more than a pair of consumer cards holds. Block quantisation stores a group of consecutive weights as small integers plus 1 scale. The block's values are divided by the scale, rounded and packed.
-- **k-quants** nest the idea. Q4_K holds 256 values in 8 sub-blocks, each with its own 6-bit scale and minimum under 1 16-bit super-scale. That is 144 bytes for 256 values, 4.5 bits a weight, with a better fit than Q4_0.
+- **k-quants** nest the idea. Q4_K holds 256 values in 8 sub-blocks, each with its own 6-bit scale and minimum under 1 16-bit super-scale. That is 144 bytes for 256 values, 4.5 bits a weight, a better fit than Q4_0.
 - **Codebooks**: below 3 bits a plain grid loses too much. IQ2_XXS stores an index into a fixed codebook of 8-value patterns instead, at 2.06 bits a weight.
 - **Native scales**: checkpoints trained in fp8 or fp4 ship their own block scales, 1 per 32 by 32 tile. A reader applies them and does not recompute them.
-- **The scale**: the decision inside every format. The obvious choice is the block's extreme value over the largest level. It is right only when the extreme is worth as much as the rest, which is rare. Every quantiser here starts from that answer and searches for one that loses less.
+- **The scale**: the decision inside every format. The obvious choice is the block's extreme value over the largest level. It is right only when the extreme is worth as much as the rest, which is rare. Every quantiser here searches for a scale that loses less.
 - **Calibration** asks a corpus which weights matter, so the search weights its error by an importance value per column.
 - **Error compensation** carries the rounding error of 1 block into the columns quantised after it, as GPTQ does.
 - **The matmul** uses a block in 1 of 2 ways. Dequantising to float and multiplying is simple and moves twice the bytes. Multiplying in the quantised domain quantises the activation to 8 bits per block too, takes integer dot products and applies the 2 scales once at the end. The integer dot product is a SIMD multiply-add of unsigned by signed bytes on AVX2, and an integer tensor-core instruction on a card. The second way makes a 4-bit model fast.
@@ -35,7 +35,7 @@ Quantisation trades precision for bytes.
 
 **Re-quantising on the card (2026-09-13, desktop node).**
 The `/api/create` route was rebuilt as a detached job that streams its progress and survives a client disconnect.
-The speed came from parallelism. The per-tensor work had been single-threaded.
+The speed came from parallelism: the per-tensor work had been single-threaded.
 
 Card kernels exist for q8_0, q4_K, q3_K and q2_K.
 Their contract is equivalent quality and a reproducible result, not a bit-identical one.

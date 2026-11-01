@@ -1,6 +1,6 @@
 # Architectures
 
-This page lists every architecture the loader accepts, the formats it reads, and the tests that load it.
+Every architecture the loader accepts, the formats it reads, and the tests that load it.
 
 ## Selection
 
@@ -8,8 +8,6 @@ The loader decides from tensors and metadata:
 
 - `general.architecture` selects a row of `src/inference/model_facts.rs`.
 - A checkpoint's `architectures[0]` selects a GGUF tag through the class table in `src/inference/load/hf_config.rs`. AWQ checkpoints are read by `src/inference/load/awq_loader.rs`.
-
-The table below lists the keys of the first and the classes of the second.
 
 ## Tests
 
@@ -219,8 +217,7 @@ The reference vectors hold none of these.
 The loader does not map the 2 input norms of the grouped `falcon` decoder, so it refuses such a checkpoint for a missing tensor.
 It refuses a quantised checkpoint other than AWQ of the llama, mistral and qwen families.
 
-Architectures with their own model code (image, speech, video, forecasting, DeepSeek V4.1) are outside this table.
-The generic transformer does not read them.
+Architectures with their own model code (image, speech, video, forecasting, DeepSeek V4.1) are outside this table, and the generic transformer does not read them.
 
 ## Embeddings towers
 
@@ -250,8 +247,7 @@ On a card, its kernels can settle a near-tie between 2 tokens the other way than
 
 ## Where the lessons live in the code
 
-Each lesson in `learn/` describes a behaviour.
-The tables below list the source files that carry it.
+Each lesson in `learn/` describes a behaviour, and the tables below list the source files that carry it.
 
 ### Lesson 1: Tokens
 

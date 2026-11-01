@@ -18,8 +18,6 @@ The snapshot tier needs no configuration. The disk tier needs a directory:
 kv_disk_dir = "/var/lib/loken/kv"
 ```
 
-Keys are described in [the configuration page](../CONFIGURATION.md#kv-reuse-across-requests).
-
 ## Tiers
 
 | Tier | Switch | What it does |

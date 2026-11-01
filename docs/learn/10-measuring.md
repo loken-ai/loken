@@ -1,7 +1,6 @@
 # Measuring an engine without fooling yourself
 
 A rate is a ratio, and both halves can be wrong.
-This lesson shows how the rates in the earlier lessons are taken, and which defects each measurement in place could not see.
 
 ## The idea
 
@@ -177,7 +176,6 @@ Why does a mean over 3 iterations mislead when the first one loaded the model?
 2. The cold load drags the mean below the steady rate.
 3. The median is always lower.
 
-The mean published 11.4 tokens/s for a model that decodes at 15.2.
 The median ignores the cold iteration, and cold and warm are reported apart.
 <!-- site: end -->
 
@@ -188,7 +186,6 @@ Whose clock times a rate in the benchmarks?
 2. The tokenizer's.
 3. The client's, the same way for every engine.
 
-Engine-reported prefill rates reversed the verdict on 3 cells of 4.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=1 id=measuring-quiz-3 -->
@@ -198,7 +195,6 @@ What should a 3-model load error in a sweep make you do?
 2. Report a deep defect.
 3. Raise the iteration count.
 
-All 3 errors were contention, and each model loaded when retested alone.
 <!-- site: end -->
 
 <!-- site: widget flashcards id=measuring-terms -->

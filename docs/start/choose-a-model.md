@@ -11,7 +11,7 @@ Pick a family for the task, then a size and quantisation that fit your memory.
 
 ## Families
 
-A request names the model as in [Concepts](concepts.md#model-stores-and-names). The table lists what is served. [Models](../MODELS.md) has the full architecture lists.
+A request names the model as in [Concepts](concepts.md#model-stores-and-names). [Models](../MODELS.md) has the full architecture lists.
 
 <!-- site: widget table id=choose-model-families -->
 | Task | Family | Request names it as | Notes |

@@ -7,9 +7,8 @@ It runs its variants side by side in one process, so one run settles one hypothe
 Mechanisms of this size cost a few microseconds to a few milliseconds each: a row crossing the bus, an expert uploaded to a card, an expert read from the disk.
 Measuring one on a served model costs a load of the whole file per hypothesis.
 
-The benches are a bench target of the crate, `benches/microbench.rs`.
-The `microbench` feature builds it.
-No release build enables the feature, so nothing of it reaches the daemon.
+The benches are the bench target `benches/microbench.rs`, built by the `microbench` feature.
+No release build enables it, so nothing reaches the daemon.
 
 ## Run
 
@@ -23,7 +22,7 @@ cargo bench --features cuda,microbench --bench microbench -- expert-read --shape
 A ROCm build takes `rocm` in place of `cuda`.
 A build without a GPU runtime omits `crossing` and `expert-upload`.
 
-The arguments after `--`:
+Arguments after `--`:
 
 | Argument | What it sets | Default |
 |---|---|---|
@@ -66,7 +65,7 @@ Without a file, `--hidden`, `--hc`, `--element-bytes` and `--inter` or `--projec
 ### crossing
 
 `crossing` moves one activation row from the host to the card and back.
-It measures the cost of 1 host-card crossing, the unit behind a layer's count of crossings.
+It measures 1 host-card crossing, the unit behind a layer's count of crossings.
 Its variants:
 
 - 1 copy each way from pageable memory with a stream synchronisation, as a decode step crosses.
@@ -78,7 +77,7 @@ Its variants:
 ### expert-upload
 
 `expert-upload` copies the 3 projections of one routed expert from the host to the card.
-It measures the cost of a synchronous upload inside a token and what overlap buys.
+It measures a synchronous upload inside a token and what overlap buys.
 Its variants cross 3 choices:
 
 - The compute stream, a copy stream, or a copy stream ordered after an event recorded on the compute stream, which is how the uploader orders its allocation.
@@ -129,13 +128,13 @@ Its variants are the slots per layer in `--slots`, each under 3 policies:
 - Frequency: the least often routed expert makes room.
 
 The cards hold the `--card-slots` hottest experts of each layer, and the tier is never asked for them.
-The routing is drawn for each token from the counts alone.
-It carries the heat of the experts and no order, so a recency policy is judged without the locality a real answer adds.
+Each token's routing is drawn from the counts alone.
+It carries heat and no order, so a recency policy is judged without the locality a real answer adds.
 The time per token is the misses read at `--disk-gbs`.
 
 ## Report
 
-The heading names the bench, the build, the host and the card, then the shapes and where they came from.
+The heading names the bench, the build, the host, the card, and the shapes with their source.
 
 Each variant gets 1 line:
 

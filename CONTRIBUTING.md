@@ -23,7 +23,7 @@ Copy `config.toml.example` to `config.toml` before running the daemon. CUDA 13.3
 
 ## Test
 
-Run `cargo test --lib --profile gate` before opening a pull request. The `gate` profile rebuilds the release code in place, so a change recompiles only the units that hold it.
+Run `cargo test --lib --profile gate` before opening a pull request.
 
 | Where | What runs |
 |---|---|
@@ -42,4 +42,4 @@ Tests marked `#[ignore]` need model weights on disk or several cards. `config.te
 ## Reporting a problem
 
 Give the model, the prompt, the hardware and the expected output.
-For a wrong output, say whether it is wrong the same way each time. A consistent error and a random one need different investigations.
+For a wrong output, say whether it is wrong the same way each time.

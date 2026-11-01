@@ -1,14 +1,12 @@
 # One layer, then 40 of them
 
-A transformer is 1 block repeated.
-The whole model applies that block 28 or 92 times.
-What is read per token and what is kept between tokens follow from it.
+A transformer is 1 block applied 28 or 92 times.
 
 ## The idea
 
 An id becomes a vector by a table lookup, the **embedding**, of width `d` (1024 on qwen3:0.6b).
-From then on every token is 1 such vector, and a layer is a function from a vector to a corrected vector.
-The correction is added to the input, the **residual**, so a layer only learns what to change.
+A layer is a function from a vector to a corrected vector.
+The correction, the **residual**, is added to the input, so a layer only learns what to change.
 
 ![One decoder layer](../img/learn-layer.svg)
 
@@ -46,9 +44,9 @@ After the last layer, a final norm and the output projection give 1 **logit** pe
 **Judging a port without running the original (2026-09-12 to 14).**
 The DeepSeek V4.1 port was gated against the authors' own reference implementation, unmodified, run on the CPU.
 Their kernel module was replaced by a pure-torch one.
-That works because their linear layer dispatches on the weight's dtype, and bf16 never reaches a compiled kernel.
+Their linear layer dispatches on the weight's dtype, so bf16 never reaches a compiled kernel.
 
-Each phase of the reference dumps its inputs and outputs, and the port replays the phase on the same inputs.
+The reference dumps each phase's inputs and outputs, and the port replays the phase on them.
 
 | Stage | Gate |
 |---|---|
@@ -111,7 +109,7 @@ What does a layer add to its input?
 2. A correction, the residual.
 3. The next token.
 
-A layer is a function from a vector to a corrected vector, so it only learns what to change.
+A layer only learns what to change.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=1 id=forward-pass-quiz-2 -->

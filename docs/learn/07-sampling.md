@@ -1,8 +1,7 @@
 # From logits to a token
 
-The model's output is a row of numbers, 1 per vocabulary entry.
-A sampling policy turns that row into the next id.
-The policy is chosen per request, and it decides whether 2 runs of the same prompt agree.
+A sampling policy, chosen per request, turns the logit row into the next id.
+It decides whether 2 runs of the same prompt agree.
 
 ## The idea
 
@@ -24,8 +23,7 @@ A JSON schema compiles to such a grammar.
 Every other logit is removed before the draw.
 
 **Determinism** is a property of the whole path.
-Greedy decoding on the same logits gives the same token.
-The same logits require the same arithmetic in the same order.
+Greedy decoding on the same logits gives the same token, and the same logits require the same arithmetic in the same order.
 Cache reuse ([lesson 6](06-kv-cache.md)) and a batched kernel can both change that order.
 A seed fixes the draw, not the logits.
 
@@ -61,8 +59,7 @@ A greedy decode should have produced the same text 3 times.
 
 The reused prefix is therefore rounded down to a chunk boundary.
 
-The same reason applies to the window shift.
-A re-phased key is not the cold key, bit for bit.
+The window shift has the same cause: a re-phased key is not the cold key, bit for bit.
 `fidelity = "reference"` turns the shift off ([Status](../STATUS.md#context-shift)).
 
 ## Try it

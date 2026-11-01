@@ -90,7 +90,6 @@ Little-endian throughout:
 
 A payload whose length is not exactly 28 bytes plus the values is refused as truncated or padded.
 A payload whose CRC-32 does not match, header included, is refused as corrupted.
-Half precision takes half the bytes of f32.
 A 256 MiB request body carries about 24,000 rows of width 4096 in float16 or bfloat16, and 12,000 in float32.
 
 ```python
@@ -180,8 +179,7 @@ These answer 400: `stream`, `prompt_embeds`, `best_of` above `n`, a structured o
 A model whose KV cache cannot be cut back to a shorter sequence answers 500.
 That covers a recurrent or sliding-window layer, and a backend other than the generic transformer.
 
-vLLM's own beam search differs from transformers'.
-It divides by the prompt and generated length without the end token.
+vLLM's own beam search divides by the prompt and generated length without the end token.
 It finishes every end token among a beam's best `2n` candidates.
 It always runs to `max_tokens`.
 
@@ -197,7 +195,6 @@ It always runs to `max_tokens`.
 ### Media
 
 A route in the Feature column exists when its Cargo feature is compiled.
-A family that is not compiled reports its models as unknown.
 
 <!-- site: widget table id=api-media -->
 | Route | Feature | What it does |
@@ -237,7 +234,7 @@ Every event carries `node`, the name of the node that renders, or null when the 
 
 ### Media input limits
 
-Every chat route holds a request to a number of images, a number of pixels per image and a number of seconds of audio, which follow the decoder's allocation budget.
+Every chat route caps the images per request, the pixels per image and the seconds of audio.
 The chat routes are `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses` and `/v1/messages`.
 The keys sit under `[inference]`, see [CONFIGURATION.md](CONFIGURATION.md#media-input).
 A request past 1 of them is answered 400 with the cap's key and the value it carried, before the image is decoded.
@@ -260,8 +257,6 @@ A host outside the list is answered 400 naming the host.
 A part the server cannot take, such as a document block, is refused with the reason.
 
 ## How a request ends
-
-These hold on every chat route.
 
 - The stop sequence an answer ends on is left out of the text. `include_stop_str_in_output` keeps it on the OpenAI routes.
 - `logprobs` carry 1 entry per token written, in a streamed answer and in a whole one. The token that ended the answer is not 1.
@@ -344,7 +339,7 @@ A client that follows the SSE specification ignores comment lines.
 | `POST /api/layers/swap` | Attach or detach adapters on a loaded model without reloading it. The body is the set the model should end up with. |
 | `POST /api/draft/attach`, `POST /api/draft/detach`, `GET /api/draft/status` | Speculative decoding for the resident model, after a tokenizer compatibility check. |
 | `GET /api/inflight` | Requests in flight and queued, by priority. A completion with a `suffix` is an editor filling in the middle and goes first. The lines of the batch APIs yield the cards to whoever is waiting. The rest is interactive. |
-| `GET /api/layer_perf`, `GET /api/stage_perf` | Where a decode step's time goes, per layer and per stage. Both record only while measurement is on. `?enable=1` on either switches it on and zeroes the counters, `?enable=0` switches it off, and each reply says whether it is on. It is off by default because it costs a device synchronisation per stage. A layer's figure is what issuing it costs the calling thread, which tells a layer on a card from one on the host. A streamed decode also times each token's iteration and its parts (`token: prepare`, `token: launch`, `token: sample`, `token: stream`) under `offload_stages`. |
+| `GET /api/layer_perf`, `GET /api/stage_perf` | Where a decode step's time goes, per layer and per stage. Both record only while measurement is on. `?enable=1` on either switches it on and zeroes the counters, `?enable=0` switches it off, and each reply says whether it is on. It is off by default because it costs a device synchronisation per stage. A layer's figure is what issuing it costs the calling thread. A streamed decode also times each token's iteration and its parts (`token: prepare`, `token: launch`, `token: sample`, `token: stream`) under `offload_stages`. |
 | `GET /api/distributed/devices` | The compute devices and their state. |
 | `GET /api/distributed/stats`, `GET /api/distributed/recommend` | What this node runs with, and the largest model in the catalogue that fits what is free. |
 | `GET /api/multi-device/status` | How the resident model is spread across devices. |

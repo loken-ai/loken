@@ -14,8 +14,6 @@ Disk sits below the host, another order of magnitude slower.
 Past the host, the metric is bytes read per token.
 It depends on which experts a token needs, how many the last token needed too, what the page cache kept, and whether reading overlaps computing.
 
-Across machines, forward a request only when the peer's predicted completion plus the trip beats serving it locally.
-
 ![2 ways to spill a mixture](../img/learn-placement.svg)
 
 ## What loken does
@@ -41,7 +39,6 @@ Across nodes, a request goes to the node with the best predicted completion, not
 
 Dates: 2026-09-02/03.
 Placing a layer whole ran a spilled mixture's attention on the host to save expert weights.
-Those weights are 97% of the layer's bytes and are read a few at a time.
 Spilling only the experts changed the rate, in tokens per second:
 
 <!-- site: widget chart type=bar id=placement-spill -->
@@ -88,7 +85,6 @@ Date: 2026-09-13.
 Setup: 50 concurrent requests on qwen3:0.6b, a desktop (RTX 5070 Ti) and a laptop (8 GB card).
 The desktop served 554 locally and forwarded 0.
 
-This is expected.
 The router forwards only when the peer lowers the predicted completion, and the fast card drains its queue faster than a hop to a slower one.
 The laptop's value is holding a model the desktop does not.
 See [the cluster](../STATUS.md#the-cluster).
@@ -116,8 +112,6 @@ For a spilled mixture, what does loken spill?
 2. The whole layer, attention included.
 3. Only the attention.
 
-Experts hold about 97% of the bytes and a token touches a few.
-Attention then stays on the card.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=3 id=placement-quiz-2 -->
@@ -127,7 +121,6 @@ Why did the desktop forward 0 of 554 requests to the laptop?
 2. The router balances by lowest load.
 3. The peer never lowered the predicted completion.
 
-The router forwards only when the peer's predicted completion plus the trip beats local serving.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=2 id=placement-quiz-3 -->

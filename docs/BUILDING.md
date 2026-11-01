@@ -2,7 +2,7 @@
 
 Build `lokend` and `loken` from source.
 A release archive needs no build, see [Install](start/install.md).
-The first start and the first request are in [First run](start/first-run.md).
+First start: [First run](start/first-run.md).
 
 ```sh
 cargo build --release   # target/release/{lokend,loken}
@@ -27,10 +27,9 @@ The feature table is in [Configuration](CONFIGURATION.md#build-features).
 
 The default features are `cuda`, `opencl` and `media`.
 The build needs a **CUDA toolkit** and **OpenCL headers**.
-It is built and tested against **CUDA 13.3**, and no older toolkit has been tried.
+It is built and tested against **CUDA 13.3**. No older toolkit has been tried.
 
-The kernels are compiled for a fixed list of architectures from Turing to Blackwell.
-The list is not probed against the toolkit.
+The kernels are compiled for a fixed list of architectures from Turing to Blackwell, not probed against the toolkit.
 A toolkit that does not know `sm_120a` fails the build.
 
 | Variable | Effect |
@@ -49,7 +48,7 @@ The kernels are compiled for the AMD targets from CDNA (gfx908) to RDNA4 (gfx120
 `LOKEN_ROCM_ARCHS` narrows the list.
 
 The server opens the HIP runtime, hipBLAS, hipRTC and RCCL when it starts.
-The binary therefore starts on a machine without them, and lists no AMD card.
+The binary therefore starts on a machine without them and lists no AMD card.
 
 These operations run on AMD's matrix instructions, on CDNA and from RDNA3 on:
 
@@ -68,8 +67,7 @@ cargo build --release --features cuda,rocm
 
 The build needs both toolkits.
 It lists the NVIDIA cards through CUDA, then the AMD cards through HIP, as 1 set of card numbers.
-The placement plan, the ladder and the probes see every card.
-A model can be split across a GeForce and a Radeon.
+The placement plan, the ladder and the probes see every card, so a model can be split across a GeForce and a Radeon.
 
 | Behaviour | Detail |
 |---|---|
@@ -84,7 +82,6 @@ A model can be split across a GeForce and a Radeon.
 cargo build --release --features vulkan
 ```
 
-The build needs nothing beyond the crates.
 The server opens the Vulkan loader when it starts, and compiles the kernels for the device when it opens.
 
 Placement offers the Vulkan GPUs that no other runtime of the build drives.
@@ -108,7 +105,7 @@ A CUDA build also serves without a card: `lokend serve --cpu` places every layer
 `.cargo/config.toml` builds for x86-64-v3 (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE), not for the host CPU.
 A CPU without them is refused at start, with a message that names what is missing.
 
-The daemon chooses the quantized kernels at start from what the CPU has, and logs the level.
+The daemon picks the quantized kernels at start from what the CPU has, and logs the level.
 
 To let the compiler use the build host's whole instruction set outside the kernels, build with `RUSTFLAGS="-C target-cpu=native"`.
 That binary does not run on other hosts.

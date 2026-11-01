@@ -1,8 +1,7 @@
 # What the model remembers between tokens
 
-Attention lets a token read every earlier one.
 Without a cache, every step would recompute the keys and values of every earlier token.
-The KV cache stores them instead.
+The KV cache stores them.
 
 ## The idea
 
@@ -12,10 +11,8 @@ A 4 096-token window takes 460 MB, close to the weights.
 On a larger model the cache dominates memory.
 Grouped-query and latent attention exist to shrink its per-token bytes.
 
-The cache is also state.
 The next turn of a conversation is the same prompt plus a little.
 A server that keeps the cache prefills only the little.
-6 designs follow:
 
 | Design | What it does |
 |---|---|
@@ -27,8 +24,6 @@ A server that keeps the cache prefills only the little.
 | Reuse past the window | When a conversation outgrows the window, the tail is kept and its positions are re-phased. The window is not prefilled again. |
 
 ![Where a conversation's KV lives](../img/learn-kv-tiers.svg)
-
-2 rules follow:
 
 - **One live cache per model.** 2 conversations served in alternation evict each other, unless a snapshot holds the other.
 - **A window too small is slower than a large one.** Compaction rewrites the history from near its start, and a rewritten prefix matches nothing that is held.
@@ -53,7 +48,7 @@ The reused prefix is rounded down to a prefill chunk.
 | Snapshots | No key. They are automatic. |
 | `fidelity = "reference"` | Turns off the shift past the window. |
 
-The guide is [the KV memory guide](../guides/kv-memory.md).
+See [the KV memory guide](../guides/kv-memory.md).
 
 ## What was measured
 
@@ -108,11 +103,10 @@ The same question at 2 windows, on the same day:
 | 32 768 tokens | 301 s | 250 ms |
 | 131 072 tokens | 24 s | 60 s |
 
-The agent's default window is therefore the large one.
+The agent's default window is the large one.
 
 ## Try it
 
-The reused prefix is rounded down to a prefill chunk.
 On a small model with a free card the chunk is 2 048 tokens, so the conversation must be longer than that to show anything.
 
 <!-- site: widget steps id=kv-cache-steps -->

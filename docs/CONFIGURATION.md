@@ -31,8 +31,8 @@ ollama_models_dir = ["/mnt/nvme/ollama", "/mnt/hdd/ollama"]
 huggingface_models_dir = ["/mnt/nvme/huggingface", "/mnt/hdd/huggingface"]
 ```
 
-The directories of a key form 1 catalogue: model listings and every load see the models of all of them.
-List order is the order of preference. Put the fastest disk first.
+The directories of a key form 1 catalogue: listings and loads see the models of all of them.
+List order is the order of preference, so put the fastest disk first.
 
 | Case | What happens |
 |---|---|
@@ -139,24 +139,31 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 |---|---|---|
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots. Holds token blocks shared between sequences by prefix, and 1 manifest per sequence. Survives a restart. |
 
-The next turn of a conversation keeps the rows it shares with the turn before, up to the last turn marker of the chat template.
-It reads only the answer and the new turn: a conversation of 7000 tokens reads 30 at its second turn.
-Several conversations are kept side by side, each restored when its turn comes, as long as the lease holds.
-The usage of a reply names the tokens a kept state served (`cached_tokens`), on the chat route and on the Responses route, where `previous_response_id` names the conversation.
-A prompt with no turn marker keeps what a cold read of it would have produced, in whole blocks.
+The next turn of a conversation keeps the rows it shares with the turn before, up to the last turn marker of the chat template:
+
+- It reads only the answer and the new turn: a conversation of 7000 tokens reads 30 at its second turn.
+- Several conversations are kept side by side, each restored when its turn comes, as long as the lease holds.
+- The usage of a reply names the tokens a kept state served (`cached_tokens`), on the chat route and on the Responses route, where `previous_response_id` names the conversation.
+- A prompt with no turn marker keeps what a cold read of it would have produced, in whole blocks.
 
 ### Prompts read by another instance
 
-An instance with `prefill_peer` set has its long prompts read by that peer, which serves the same model.
-The peer prefills the prompt and answers its KV cache over `/api/cluster/prefill`.
-This instance imports it as a snapshot and decodes.
-The prefix reuse restores it in whole prefill chunks and reads the rest of the prompt here, so a prompt within a chunk of what the cache holds never leaves.
+An instance with `prefill_peer` set has its long prompts read by that peer, which serves the same model:
+
+1. The peer prefills the prompt and answers its KV cache over `/api/cluster/prefill`.
+2. This instance imports it as a snapshot and decodes.
+3. The prefix reuse restores it in whole prefill chunks and reads the rest of the prompt here, so a prompt within a chunk of what the cache holds never leaves.
 
 A model with recurrent or windowed layers hands over its whole decode state instead of rows.
 That state holds every recurrent state, the windowed layers' rows, the global layers' rows and the logits to resume from.
 It is checked against this instance's layer kinds and row geometry before it is read.
 
-The prompt is read here when the model has a split layer, when the cache is cut over the cards, or when the peer cannot answer.
+The prompt is read here when:
+
+- the model has a split layer
+- the cache is cut over the cards
+- the peer cannot answer
+
 The rows travel as f32, about 4 times the cache's own size.
 
 | Key | Default | What it does |
@@ -166,9 +173,10 @@ The rows travel as f32, about 4 times the cache's own size.
 ### A context cut over the cards
 
 With `context_parallel` set, the cache of each attention layer is cut into ranges of positions, 1 on each card the machine shows: the layer's own card first, then the others.
-Before its prefill, a request reserves the positions it needs, each card's room past the work of a prefill shared by the layers.
-A decode past them grows a range a working window at a time.
-A query attends to every range on the range's card, and the parts are combined on the layer's card, so a context no single card holds is served whole.
+
+- Before its prefill, a request reserves the positions it needs, each card's room past the work of a prefill shared by the layers.
+- A decode past them grows a range a working window at a time.
+- A query attends to every range on the range's card, and the parts are combined on the layer's card, so a context no single card holds is served whole.
 
 The ranges hold F16 rows.
 The layers so cut run outside the recorded decode step, and their prefixes are not kept as snapshots.
@@ -201,11 +209,12 @@ A DeepSeek V4.1 prompt costs 1 pass over the routed experts, read from disk.
 The cache stores the model's decode state after a prompt and after each finished turn.
 A later prompt that begins with the same tokens restores it and prefills only the rest.
 
-Every file a cache keeps on disk (the state cache, the KV disk tier, the expert routing profile) has the same format: a 20-byte header naming the kind of file and its version, then a binary body.
-A body is stored compressed when that makes it clearly smaller, and read back whole.
-A store in memory is never compressed.
-A file of another kind, another version or cut short is refused, and the cache rebuilds what it lost.
-Files hold floating-point state and token ids, no text, and are not encrypted.
+Every file a cache keeps on disk (the state cache, the KV disk tier, the expert routing profile) has the same format:
+
+- A 20-byte header names the kind of file and its version, then comes a binary body.
+- A body is stored compressed when that makes it clearly smaller, and read back whole. A store in memory is never compressed.
+- A file of another kind, another version or cut short is refused, and the cache rebuilds what it lost.
+- Files hold floating-point state and token ids, no text, and are not encrypted.
 
 The same keys open the same store for a generic-route model that carries a recurrent state beside its KV (a convolution, state-space or delta-rule mixer interleaved with attention).
 Such a state cannot be cut back to a shorter prefix, so trimming never reuses an earlier prompt and every turn re-prefills.
@@ -231,8 +240,11 @@ The cache works out these quantities from what the model, the disk and the engin
 | Whether to restore | A stored state is read only while its measured read-and-decode cost per byte, times its bytes, is below the measured prefill time of the tokens it covers. It is tried while either is unmeasured. |
 | Writes | 1 at a time. A write queues behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state. Otherwise it is skipped with a log line. |
 
-A DeepSeek V4.1 state costs about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the model keeps them).
-It also costs about 1.1 KB per token of compressed KV, stored once in block files that every snapshot of a conversation shares.
+A DeepSeek V4.1 state costs:
+
+- about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the model keeps them)
+- about 1.1 KB per token of compressed KV, stored once in block files that every snapshot of a conversation shares
+
 A prompt restores the longest stored prefix and prefills the rest in 1 layer-major pass onto it, so a stored prefix always pays.
 A pass over a few 100 tokens still routes to nearly every expert of every layer, so it reads about as many expert bytes as a whole prompt.
 A remainder of 250 tokens costs a little over half a cold 2000-token prompt.
@@ -242,13 +254,12 @@ A pipelined model does not, because half of its state is on the tail node.
 A state is keyed by the model files (length, modification time and header), so a different file starts from nothing.
 A damaged, truncated or foreign file is ignored with a log line.
 
-For a recurrent hybrid, a stored state is a manifest and blocks.
-The manifest holds every recurrent mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole block.
-Its size depends on the model, not on the prompt.
-Blocks hold the global layers' rows for 1 block size of tokens (derived, see above), once per shared prefix.
-A block is stored as f16 where every value is exactly an f16, and as f32 otherwise, so a restore returns the stored bits.
-States are kept at multiples of the largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least 1 block.
-A state is keyed by the file, `kv_quant`, the layer kinds, the row geometry and which layers run on a card, so another placement or KV format starts from nothing.
+For a recurrent hybrid, a stored state is a manifest and blocks:
+
+- The manifest holds every recurrent mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole block. Its size depends on the model, not on the prompt.
+- Blocks hold the global layers' rows for 1 block size of tokens (derived, see above), once per shared prefix. A block is stored as f16 where every value is exactly an f16, and as f32 otherwise, so a restore returns the stored bits.
+- States are kept at multiples of the largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least 1 block.
+- A state is keyed by the file, `kv_quant`, the layer kinds, the row geometry and which layers run on a card, so another placement or KV format starts from nothing.
 
 A restore removes the prefill of the covered tokens: the recurrent state and the global KV are read from disk instead of recomputed.
 The gain grows with the covered length and with how slow a prefill is on the machine and placement in use.
@@ -259,14 +270,11 @@ A restore always leaves at least 1 token to prefill, to produce the logits.
 
 The `fidelity` level decides both choices of a model whose routed experts stream from disk. The file names neither.
 
-The exactness the output may give up for speed follows the level.
 At `reference` and `balanced`, the output is identical to the full model, the same tokens whichever experts the cards hold, because a routed expert on a card gives the bits the host gives.
 At `fast`, the output differs by small, measured amounts, 3 times the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's.
 
 For a model whose manifest names further files of its checkpoint ([MODELS.md](MODELS.md)), the level also chooses the file each routed expert is read from.
-`reference` reads every expert from the largest file.
 `balanced` reads the experts the cards keep, hottest first, from the most precise file while the cards have room, and those the host tier keeps or reads from disk from the smallest.
-`fast` reads every expert from the smallest file.
 
 At load, the engine runs a bundled text teacher-forced on the card path and on the host path to measure the noise.
 It then runs the text once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the level's budget.
@@ -287,21 +295,17 @@ The offload derives these quantities from measurement and logs them:
 | Experts kept per layer | What the host memory allows. |
 | Where a prompt's expert runs | The measured time of a copy to the card per byte against the measured time of a host row, per expert of the layer. |
 
-During a prompt's prefill, each layer reads only the experts the prompt routes to, once its router has named them.
-The cards' copies are read from the file into a page-locked slab in runs of adjacent experts, around the page cache.
-Meanwhile the cards run the experts they keep and the host runs its own.
-A copy made for the layer is let go after it unless the card has the room free to keep it. It never takes a kept expert's place.
-When no card has room for the prompt's rows, the whole next layer is read ahead into the slab while the current layer runs.
+During a prompt's prefill, each layer reads only the experts the prompt routes to, once its router has named them:
+
+- The cards' copies are read from the file into a page-locked slab in runs of adjacent experts, around the page cache.
+- Meanwhile the cards run the experts they keep and the host runs its own.
+- A copy made for the layer is let go after it unless the card has the room free to keep it. It never takes a kept expert's place.
+- When no card has room for the prompt's rows, the whole next layer is read ahead into the slab while the current layer runs.
 
 ### Expert cache of a mixture held in the file's mapping
 
 A mixture too large for the cards keeps its routed experts in the file's mapping.
 The load sizes the cache on each layer's card.
-2 keys carry what a run learned to the next one:
-
-| Key | Default | What it does |
-|---|---|---|
-
 | Quantity | Derived from |
 |---|---|
 | Experts a layer's cache holds | The budget the plan gave the card, less what the load took of it, the room for copies and the working memory of a chunk, divided by the bytes of 1 more expert in every layer the card holds. When the budget covers every expert of every layer, they are all on the card and the layers run as loaded ones, with no cache. |
@@ -325,7 +329,6 @@ The load sizes the cache on each layer's card.
 
 Every chat route holds a request to caps before its media reach the model.
 The caps follow the decoder's allocation budget: a request past 1 is answered 400 naming the cap and the value it carried.
-The only key is the list of hosts an image may be fetched from.
 
 <!-- site: widget table id=config-media-input -->
 | Key | Default | What it does |

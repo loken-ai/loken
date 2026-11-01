@@ -61,7 +61,7 @@ The server has no authentication and no rate limit unless you configure them, an
 
 ## History
 
-The git history was rewritten before publication. The project began as experiments early in 2026. The published history starts on 2026-08-30 with the tree as it stood then, laid out as chapters, and carries the work from that point on. The earlier commits are not part of this repository.
+The git history was rewritten before publication. The project began as experiments early in 2026. The published history starts on 2026-08-30 with the tree as it stood then, laid out as chapters, and carries the work from that point on.
 
 ## Licence
 

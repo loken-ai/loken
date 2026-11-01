@@ -16,7 +16,7 @@ curl -s localhost:11435/v1/chat/completions -H 'Content-Type: application/json' 
 }'
 ```
 
-Any client written for the OpenAI API, the Ollama API or the Messages API works unchanged. [Install](install.md) covers the binaries, and [First run](first-run.md) covers the first model.
+Any OpenAI, Ollama or Messages client works unchanged.
 
 ## What it does
 
@@ -59,7 +59,7 @@ Each media family is a build feature: `image`, `audio`, `video`, `midi`, or `med
 - **Out of memory is a bug.** What does not fit spreads across cards. Only what no card holds reaches the host.
 - **Energy is reported beside speed**, for each request.
 
-[Status](../STATUS.md) lists what is measured, what is slower than other engines, and what has never run. Read it before deciding whether loken suits you.
+[Status](../STATUS.md) lists what is measured, what is slower than other engines, and what has never run.
 
 ## Before you expose it
 

@@ -10,7 +10,7 @@
 - [ ] The model files are in the Hugging Face store.
 <!-- site: end -->
 
-The `model` of a request names the family by substring, and the loader reads that family's files from the Hugging Face store.
+The `model` of a request names the family by substring.
 The families and their files are in [the image models](../MODELS.md#image). For Z-Image:
 
 ```sh

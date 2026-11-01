@@ -7,8 +7,7 @@ Every figure comes from 1 machine: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux
 ## Decode rate
 
 The [benchmarks](https://github.com/loken-ai/benchmarks) repository measures the decode rate per card, per backend and per context size.
-[Its site](https://loken-ai.github.io/benchmarks/) publishes the results.
-How a cell is measured is in its [method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md).
+[Its site](https://loken-ai.github.io/benchmarks/) publishes the results, and its [method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md) says how a cell is measured.
 
 The figures below come from the campaign of 2026-10-03 on the machine named above:
 
@@ -19,7 +18,8 @@ The figures below come from the campaign of 2026-10-03 on the machine named abov
 
 A mixture too large for the cards decodes slower than one that fits.
 The placement used to place a layer whole.
-A spilled mixture then ran attention on the host for the sake of expert weights, which are 97% of its bytes and are read a few at a time.
+A spilled mixture then ran attention on the host to make room for expert weights.
+The experts are 97% of its bytes and are read a few at a time.
 Spilling only the experts and keeping everything else on the cards changed the rates:
 
 | Model | Before | After |
@@ -211,7 +211,6 @@ On that set, the mean MASE of the median forecast is:
 - A 512-expert UD-Q4_K_XL in 4 parts (111 GB).
 
 Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchmarks/).
-This page quotes none.
 
 <!-- site: widget table id=status-qwen4exp-state -->
 | What | State |
@@ -252,25 +251,40 @@ Each cell is 1 run.
 
 Limits:
 
-- **Out of memory in prefill.** The 256-expert file on a 3.2k token prompt fails with a card reported nearly full (27 to 59 MB free), while the chunk accounting counted several GB free. The engine halves the chunk, and the request ends with 1 token or an error. The cause is unknown. A 2.7k token prompt completes.
+- **Out of memory in prefill.** The 256-expert file on a 3.2k token prompt fails.
+  The card reports itself nearly full (27 to 59 MB free), while the chunk accounting counted several GB free.
+  The engine halves the chunk, and the request ends with 1 token or an error.
+  The cause is unknown. A 2.7k token prompt completes.
 - **Prefill is compute-bound** in the delta-rule projections, convolution, scan and the wide mixers. The expert copy is hidden behind it.
 - **The first 128 decoded tokens run while the expert cache learns.** A decode rate over fewer tokens understates the steady state.
-- **The 512-expert file** holds 77 GB of experts against 56 GB of host memory in the scope measured, and that case is untried. Only 3 quarters of the memory the kernel still has free is page-locked. The rest copies through the driver's staging at a lower rate.
-- **2 cards** under the cache plan cut the layers by link. The card on the slower link (x4 here) holds the layers it can hold whole, and the other card holds the rest with a cache. The decode of a card with a cache is bound by the host launching its kernels 1 by 1, since the decode graph is off for these files.
+- **The 512-expert file** holds 77 GB of experts against 56 GB of host memory in the scope measured, and that case is untried.
+  Only 3 quarters of the memory the kernel still has free is page-locked.
+  The rest copies through the driver's staging at a lower rate.
+- **2 cards** under the cache plan cut the layers by link.
+  The card on the slower link (x4 here) holds the layers it can hold whole.
+  The other card holds the rest with a cache.
+  The decode of a card with a cache is bound by the host launching its kernels 1 by 1, since the decode graph is off for these files.
 - **Multi-token prediction** runs as a draft head that `loken draft-head` writes beside the model from the checkpoint's `mtp.*` tensors. The decode drafts with it only when `fidelity = "fast"` is set and the decode graph is recorded.
 - A test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and passes alone.
 
 ## Costs
 
-- **~870 MiB per load, any model.** CUDA contexts, cuBLAS workspace and preloaded module images take it. It is fixed, not proportional: 893 and 867 MiB on models that differ 2x in weights. The placement planner does not know about it.
-- **The first answer after a load is slower.** A mixture pays ~0.5 s when a request arrives before the background repack finishes, if it fits. A spilled mixture pays far more: qwen3next decodes its first request at 2.0 tok/s and the next at 34.7. The benchmark table takes the median over its iterations, so that cost no longer reaches a published rate. A user's first answer still pays it.
+- **~870 MiB per load, any model.** CUDA contexts, cuBLAS workspace and preloaded module images take it.
+  It is fixed: 893 and 867 MiB on models that differ 2x in weights.
+  The placement planner does not know about it.
+- **The first answer after a load is slower.**
+  A mixture that fits pays ~0.5 s when a request arrives before the background repack finishes.
+  A spilled mixture pays far more: qwen3next decodes its first request at 2.0 tok/s and the next at 34.7.
+  The benchmark table takes the median over its iterations, so that cost no longer reaches a published rate.
+  A user's first answer still pays it.
 - **Load time is the disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
 ### Host memory of a spilled model
 
 A spilled model used to be held twice in host RAM.
 The file was prefetched whole before placement.
-The 28 GB already on the cards stayed cached beside the 14 GB the host reads, and a 64 GB box swapped 16 GB during the decode being timed.
+The 28 GB already on the cards stayed cached beside the 14 GB the host reads.
+A 64 GB box swapped 16 GB during the decode being timed.
 
 The advice now follows the plan: `DontNeed` for what the cards hold, `WillNeed` for what the host reads.
 Each layer's pages are dropped the moment the layer lands on a card.
@@ -386,7 +400,9 @@ Treat AMD as source, not support.
 ## Judged partially
 
 - **Mat-vec core:** checked against an independent reference for 2 formats of 10. The production entry point does not reach the core.
-- **Z-Image bends its schedule twice.** `new` derives timesteps from bent sigmas, and `set_timesteps` from the pre-bend ramp. At 9 steps the first gives `[1.0, 0.960129, 0.913349, ...]` and the second `[1.0, 0.96, 0.913043, ...]`, for 1 bend. Only a render says which the checkpoint expects.
+- **Z-Image bends its schedule twice.** `new` derives timesteps from bent sigmas, and `set_timesteps` from the pre-bend ramp.
+  At 9 steps the first gives `[1.0, 0.960129, 0.913349, ...]` and the second `[1.0, 0.96, 0.913043, ...]`, for 1 bend.
+  Only a render says which the checkpoint expects.
 - **Image parity is a hash**, one prompt and seed per family, and a property of the placement as well as the code. The placer reads free VRAM at load, and 4 runs of 1 binary gave 4 hashes. Run it on a quiet machine.
 
 ## Measured and refused
@@ -409,5 +425,7 @@ Its largest matched range is the GGUF k-quant bit specification, which any corre
 
 - The 870 MiB per load is unbudgeted, and the reserve pass does not reach language models.
 - olmoe's deficit is closed. The harness caused it, not the engine.
-- granite3-moe:1b loses 1 to 5% streamed and wins 7 to 20% not streamed, over 6 runs across 3 days. At ~3 ms a token, the stream's per-token cost is of the same order as the token. That cost is the chunk, its JSON and the client's read loop. The gap lives there, not in the kernels.
+- granite3-moe:1b loses 1 to 5% streamed and wins 7 to 20% not streamed, over 6 runs across 3 days.
+  At ~3 ms a token, the stream's per-token cost is of the same order as the token.
+  That cost is the chunk, its JSON and the client's read loop. The gap lives there, not in the kernels.
 - 1 speculative loop learns its draft length from the cycles. On deepseek-r1:70b spilling to the host, drafted for by llama3.2:1b, greedy, it decodes 1.49 tok/s alone and 2.72 drafted, with the same text.

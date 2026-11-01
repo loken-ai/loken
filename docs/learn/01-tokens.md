@@ -2,11 +2,11 @@
 
 A model reads a row of ints and writes 1 int at a time.
 Text becomes ints going in, and ints become text coming out.
-Both translations fail silently: no crash, no slowdown, only plausible nonsense.
+Both translations fail silently, with plausible nonsense and no crash or slowdown.
 
 ## The idea
 
-- **Tokenizer**: a fixed vocabulary of about 150k strings (151 936 for qwen3) and a rule for cutting text into it. Byte-pair encoding merges up from bytes. A SentencePiece unigram picks the highest-scoring split. Both ship in the checkpoint. A wrong tokenizer gives wrong output while every kernel stays correct.
+- **Tokenizer**: a fixed vocabulary of about 150k strings (151 936 for qwen3) and a rule for cutting text into it. Byte-pair encoding merges up from bytes. A SentencePiece unigram picks the highest-scoring split. Both ship in the checkpoint. A wrong tokenizer gives wrong output with every kernel correct.
 - **Special tokens**: entries that mark a turn or a reasoning block and stand for no text. Whether they are shown or hidden is a setting, not a property of the model.
 - **Chat template**: a Jinja program in the checkpoint that folds the messages into the 1 string shape the model trained on. A template rendered slightly off makes answers trail away.
 - **Return split**: the step that turns ids back into text, then splits it into the answer, the reasoning (`<think>`, a Harmony `analysis` channel) and any tool call. It is not arithmetic, so no kernel reports its failures.
@@ -25,7 +25,7 @@ An English word is about 1.3 tokens. Source code is about 2.
 
 4 defects found the same week (2026-09-12), on models months old.
 None was in the arithmetic.
-Each sat between the model's tokens and the client's JSON, and none moved a token rate, so no speed or coherence check could see it.
+Each sat between the model's tokens and the client's JSON and moved no token rate, so no speed or coherence check saw it.
 
 | Defect | Reach | Cause |
 |---|---|---|
@@ -38,7 +38,7 @@ A fifth surfaced on 2026-09-13, when a guard began rendering every stored templa
 smollm3's `{% generation %}` tags are unknown to the Jinja engine, so they are now stripped before parsing.
 
 Patching gemma4 through the prompt fixes 31b and 26b and breaks `gemma4:latest`, which then reasons without stopping.
-The 4 tags span 3 architectures, so test all 4.
+The 4 tags span 3 architectures: test all 4.
 
 ## Try it
 

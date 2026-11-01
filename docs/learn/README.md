@@ -2,8 +2,7 @@
 
 10 lessons for a developer who has never opened an inference engine.
 Each lesson takes about 10 minutes.
-
-Each lesson states 1 fundamental, shows what loken does about it, reports what was measured, and ends with a request or command to run against a local daemon.
+It states 1 fundamental, shows what loken does about it, reports what was measured, and ends with a request or command to run against a local daemon.
 
 ## Prerequisites
 

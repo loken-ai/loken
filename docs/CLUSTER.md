@@ -1,6 +1,5 @@
 # Cluster internals
 
-This page documents the `[cluster]` keys, the routes under `/api/cluster`, the way a request is routed, the way a cut is planned and the wire between nodes.
 To set up 2 machines, read [Run 2 machines](operate/cluster.md).
 [Status](STATUS.md#the-cluster) says what has been measured.
 
@@ -16,7 +15,7 @@ A forwarded request is the original HTTP request. The response is the stream the
 
 ## The `[cluster]` keys
 
-An absent `[cluster]` section leaves the node alone. No cluster path runs.
+Without a `[cluster]` section no cluster path runs.
 
 | Key | Default | Effect |
 |---|---|---|
@@ -29,7 +28,7 @@ An absent `[cluster]` section leaves the node alone. No cluster path runs.
 
 ## Routes
 
-A route under `/api/cluster` answers behind the same authentication as every other route.
+Routes under `/api/cluster` sit behind the same authentication as every other route.
 Peers send no key, so a node with `require_auth` on refuses their polls.
 
 | Route | Request | Answer |
@@ -58,7 +57,7 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 
 ## Routing a request
 
-A node decides in this order. Each verdict that keeps the request logs `cluster: serving locally: <reason>`.
+A node decides in this order. A verdict that keeps the request logs `cluster: serving locally: <reason>`.
 
 1. `join` is empty: serve locally, `single node`.
 2. The request carries the forwarded marker: serve locally, `already forwarded once - a second hop would risk a loop`. A request moves at most once.
@@ -79,7 +78,7 @@ At load, a clustered node measures itself and plans the split.
 2. It publishes the figures in `/api/cluster/state`. A peer that lacks them for the model is asked on `/api/cluster/measure`.
 3. The node that loads the model becomes the head. It collects the profiles of the alive nodes that have a cost for the model, and the measured round trips between nodes.
 4. The planner picks which node runs which contiguous run of layers. It minimises the predicted time of 1 token: the compute of each used node plus the crossing of each boundary.
-5. A boundary costs the measured round trip between the 2 nodes. Capacity is a hard limit. A plan that overflows a node is never returned.
+5. A boundary costs the measured round trip between the 2 nodes. Capacity is a hard limit: a plan never overflows a node.
 6. A node that would only slow the pipeline gets no layers. With up to a small number of nodes, the planner tries every order. Beyond that, it orders nodes by speed.
 7. When 1 node is fastest, the head logs `single node is fastest; not splitting` and serves alone.
 

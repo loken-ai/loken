@@ -1,7 +1,5 @@
 # Concepts
 
-The terms used across the guides, and how a request reaches a model.
-
 ## Daemon and client
 
 `lokend` is the daemon. It owns the models, the memory and the port, and answers every request. `loken` is the client. It sends commands to the daemon: `pull`, `list`, `ps`, `delete`, `chat`.

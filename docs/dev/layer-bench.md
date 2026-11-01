@@ -7,7 +7,7 @@ It reports the stage profile the server keeps, with the counters a hypothesis ne
 Time lost in a served decode shows at the scale of 1 layer: an expert uploaded on the compute stream, a read advised 1 projection at a time, an activation crossing the bus once per projection.
 Finding it on the whole model costs a build and a load of the whole file per hypothesis.
 
-The bench is `benches/layerbench.rs`, behind the `microbench` feature, so no release build carries it.
+The bench is `benches/layerbench.rs`, behind the `microbench` feature. No release build carries it.
 It starts no server and loads no other model.
 
 ## Run
@@ -15,8 +15,6 @@ It starts no server and loads no other model.
 ```sh
 cargo bench --features cuda,microbench --bench layerbench -- /models/large.gguf --layers 10..13 --tokens 64 --json results/layers-10-13.json
 ```
-
-The arguments:
 
 | Argument | What it sets | Default |
 |---|---|---|
@@ -65,7 +63,7 @@ The gate takes them in place of its own choice, and its weights stay the gate's.
 The read-ahead guess of the next layer is scripted the same way.
 `--guess-hit` sets how many of the token's experts it names.
 
-The read-ahead, the host tier, the card lanes and the deferral of host experts run as they do in service.
+The read-ahead, the host tier, the card lanes and the deferral of host experts run as in service.
 
 ## Report
 

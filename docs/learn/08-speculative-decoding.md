@@ -81,7 +81,6 @@ What does the target do with a draft it disagrees with?
 2. It replaces it with its own choice and drops every later draft.
 3. It reruns the draft with a lower temperature.
 
-The first disagreement is replaced and what follows is dropped, so the output equals the target's own.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=1 id=speculative-quiz-2 -->
@@ -92,7 +91,6 @@ Where does speculative decoding pay most?
 3. On a model with a short prompt.
 
 Verification crosses the bus once for k tokens instead of once per token.
-On a model that fits a card, verification costs about what drafting saves.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=3 id=speculative-quiz-3 -->

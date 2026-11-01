@@ -2,20 +2,17 @@
 
 A request runs the same layers in 2 regimes: once over the whole prompt, then once per generated token.
 Prefill is bound by arithmetic. Decode is bound by bytes.
-An inference server arranges for each regime to hit its bound.
 
 ## The idea
 
 ![Prefill against decode](../img/learn-prefill-decode.svg)
 
 - **Prefill** takes the n prompt tokens through every layer in one pass.
-  Each projection multiplies a matrix of n rows, so every weight byte read serves n tokens.
-  The arithmetic per byte is high, and the card's multiply speed bounds the pass.
+  Each projection multiplies n rows, so every weight byte read serves n tokens and the card's multiply speed bounds the pass.
   Attention adds a term that grows with n squared, because every token scores against every earlier one.
-  At long prompts that term takes most of the time.
+  At long prompts it takes most of the time.
 - **Decode** generates 1 token per pass.
   Each projection multiplies 1 row, so every weight byte read serves 1 token.
-  The speed at which bytes arrive bounds the pass.
   The token rate is close to memory bandwidth divided by model bytes.
   A model on a card reads at the card's rate.
   A layer on the host reads at the host's rate, an order of magnitude slower.
@@ -26,7 +23,6 @@ An inference server arranges for each regime to hit its bound.
 - **Scheduler**: a decode step reads the weights anyway, so several sequences can share the read.
   At every step the scheduler decides which requests prefill and which decode.
   It admits new requests when cache blocks free up, and preempts under pressure.
-  The card stays busy while a slow request finishes.
 
 Orders of magnitude on an RTX 5070 Ti:
 
@@ -54,15 +50,14 @@ Capturing a decode step as one CUDA graph reduces them.
 ### Where a long prefill's time goes
 
 Setup: 2026-09-11, RTX 5070 Ti and 5060 Ti, qwen3-coder 30b-a3b, chunk 512, Q4 KV.
-Prefill time was fitted on 3 prompts of real source, non-streamed and cache-busted.
-The 2-term fit is accurate to about 1%.
+Prefill time was fitted on 3 prompts of real source, non-streamed and cache-busted, to about 1%.
 
 | Build | prefill(n) in ms |
 |---|---|
 | before | `1.369 n + 1.655e-4 n^2` |
 | after | `1.372 n + 2.048e-5 n^2` |
 
-The linear term did not move. The quadratic term is 8 times cheaper.
+The quadratic term is 8 times cheaper, the linear term unchanged.
 A full 131 072-token cold prefill went from 50.4 to 8.9 minutes.
 
 3 changes made the difference:
@@ -83,7 +78,7 @@ At 44 363 tokens attention takes 43%, being the quadratic half of the cost.
 
 ### 3 leads measured and rejected
 
-Same day, same setup.
+Same day and setup.
 
 | Lead | Result |
 |---|---|
@@ -95,12 +90,10 @@ Same day, same setup.
 
 Until 2026-09-11, the log line of a streamed request reported a word-count estimate of the prompt, not the tokenizer's count.
 On source code the estimate is nearly half the real count.
-Every streamed measurement therefore read as twice as slow per token as it was.
+Every streamed measurement read as twice as slow per token.
 The usage chunk was always right, and the fit above used it.
 
 ## Try it
-
-Switch the stage timers on, run 1 prompt of hundreds of tokens, read the table, switch the timers off.
 
 <!-- site: widget steps id=prefill-decode-steps -->
 1. Switch the timers on.
@@ -141,7 +134,7 @@ Observed with a 715-token prompt on qwen3:0.6b:
 | Norms and residual adds | the rest |
 
 The `prompt_eval_duration` of the reply is a little higher while the timers are on.
-That is the synchronisation, and the reason the timers are off by default.
+That is the synchronisation.
 A mixture fills the `router`, `gate_up` and `down` rows instead.
 
 ## Check yourself

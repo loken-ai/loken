@@ -43,7 +43,7 @@ ROCm needs `hipcc` on the `PATH` or under `ROCM_PATH`. The feature table and the
 
 The binaries are `target/release/lokend` and `target/release/loken`.
 
-loken publishes no prebuilt archive and no package. A build from source is the only way to get the binaries.
+loken publishes no prebuilt archive and no package.
 
 ## Add a configuration
 

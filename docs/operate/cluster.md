@@ -21,7 +21,7 @@ flowchart LR
 
 ## Smallest configuration
 
-Each machine needs a `[cluster]` block. Everything else is measured at run time.
+Each machine needs a `[cluster]` block. The rest is measured at run time.
 
 <!-- site: widget tabs group=machine id=operate-cluster-config -->
 ### Machine A
@@ -82,7 +82,7 @@ On a fresh node, the first request pays a one-off compilation of the CUDA kernel
 
 ## Expected result
 
-The peers answer lists both machines, each with `alive` and the measured `rtt_ms`. For example:
+The peers answer lists both machines, each with `alive` and the measured `rtt_ms`:
 
 ```json
 {"clustered": true, "peers": [
@@ -111,15 +111,13 @@ That runs for DeepSeek V4.1 and for dense transformers. [Status](../STATUS.md#th
 
 ## Troubleshooting
 
-Every row below comes from the log lines and status codes of the daemon.
-
 | Symptom | Cause | Fix |
 |---|---|---|
 | `/api/cluster/peers` answers `{"clustered": false, "peers": []}` | The `[cluster]` section is absent from `config.toml`. | Add the block and restart. |
 | The peers list holds only this machine | The other machine is unreachable, runs another `name`, or answers `401`. | Open the port between the machines, give both the same `name`, turn `require_auth` off. |
 | The log says `cluster: no multicast discovery (...); seeds only` | The network offers no multicast. | List the peers in `join`. |
 | The log says `cluster: serving locally: single node` | `join` is empty on this node. | Put the address of 1 peer in `join`. |
-| The log says `cluster: serving locally: no local price for this model yet` | The node has not completed a request for this model, so it has no measured rate to compare. | Nothing. The first request stays local and becomes the measurement. |
+| The log says `cluster: serving locally: no local price for this model yet` | The node has no measured rate for this model. | Nothing. The first request stays local and becomes the measurement. |
 | The log says `cluster: serving locally: peer ... is only 1.10x faster, below the 1.15x a hand-over has to earn` | The peer is not faster than `min_speedup` requires. | Lower `min_speedup`, or accept that this machine serves it. |
 | The log says `cluster: hand-over to ... failed (...) - serving here instead` | The peer did not answer the forwarded request. | The request was served locally. Check the peer and its address in `advertise`. |
 | A stream ends early and the log says `cluster: the peer serving this request stopped before finishing it` | The peer died mid-generation. | The node closes the stream. Send the request again. |

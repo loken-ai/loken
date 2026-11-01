@@ -69,8 +69,6 @@ The window is the one the checkpoint declares. Cline also prints the files it wr
 
 ## Choosing a model
 
-The floor is a model that follows tool calls and a context of at least 32k tokens.
-The model loads with the window its checkpoint declares, and `loken launch` bounds the session by it.
 Claude Code speaks the Messages API and Cline the Ollama API.
 Any chat model the daemon serves works with both. On a cluster, the request goes to the node that holds it.
 

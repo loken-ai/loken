@@ -1,6 +1,6 @@
 # Point an Ollama client at loken
 
-An Ollama client talks to loken by changing the address, because loken serves the Ollama API on its own port.
+An Ollama client talks to loken by changing the address.
 
 ## Before you start
 

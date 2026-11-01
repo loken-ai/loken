@@ -1,7 +1,5 @@
 # Models
 
-The model families loken loads, the stores it reads, and how a request names a model.
-
 ## Formats and stores
 
 <!-- site: widget table id=models-stores -->
@@ -55,7 +53,6 @@ Each file is checked against its listed size and its sha256.
 A pull follows the daemon's streamed progress.
 It stops when no frame arrives for 8 times the longest gap seen.
 A repository that holds a model GGUF and its `mmproj` resolves to the model file.
-The projector is its companion.
 
 ### Split GGUF
 
@@ -73,7 +70,7 @@ Each tensor is read from the part that holds it.
 ### Mixture variants
 
 A mixture model may be served from several GGUF files of 1 checkpoint, each quantising the routed experts to its own format.
-Its Ollama manifest names the first file as its model layer, as any model does.
+Its Ollama manifest names the first file as its model layer.
 Each further file is a layer of media type `application/vnd.loken.image.model.variant`.
 `/api/tags` lists the tag like any other.
 
@@ -134,7 +131,7 @@ A model without the companion decodes without a head.
 `loken draft-head <repo> <out.gguf>` writes the companion from the checkpoint's `mtp.*` tensors.
 It fetches them by range requests and keeps them as released: the checkpoint's names, shapes and bytes.
 The file carries `general.architecture` and `general.name` and nothing else.
-This layout is loken's own, and no GGUF specification names it.
+This layout is loken's own.
 
 At load, the loader:
 
@@ -145,8 +142,7 @@ At load, the loader:
 
 ## Language models
 
-1 generic transformer reads its shape from the checkpoint, so a family is a row in a table.
-The architectures that table names:
+1 generic transformer reads its shape from the checkpoint, so a family is a row.
 
 <!-- site: widget table id=models-architectures -->
 | Line | Architectures as the GGUF header declares them |
@@ -245,8 +241,7 @@ On the host that includes `F32`, through the dense expert product, which copies 
 
 ## The qwen4exp family
 
-The architecture is read from the file by the generic transformer.
-A model of this family has no loader of its own.
+The generic transformer reads the architecture from the file.
 
 <!-- site: widget table id=models-qwen4exp-elements -->
 | Element | Read from the file |
@@ -339,4 +334,3 @@ The 4 checkpoints match the reference library within 5e-4 of the largest quantil
 
 A family that is not compiled reports its models as unknown.
 A media request for a family the build lacks is refused with the feature to enable.
-No other family serves it.
