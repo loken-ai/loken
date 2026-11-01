@@ -69,7 +69,7 @@ fn reclaimers() -> &'static Mutex<HashMap<&'static str, Reclaimer>> {
 /// believe. The difference is the degrade ladder: after an exhaustion the same card must
 /// look smaller, or the next attempt plans exactly the placement that just failed.
 pub fn probe_under_pressure(reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
-    if vram_force_cpu() || crate::gpu::force_cpu() {
+    if vram_force_cpu() || !crate::gpu::cards_allowed() {
         // The ladder has escalated past every split worth trying, or the server runs on the
         // host only: no card is offered, so every network lands on the host.
         return Vec::new();

@@ -11,23 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-/// Process-global CPU-only switch. Set once by the `--cpu` serve flag BEFORE any
-/// GPU manager is constructed; makes GPU detection report zero devices so the
-/// placement falls through to the exact CPU path the no-cuda build uses (no CUDA
-/// context is ever created). This is a CLI-driven flag, not an env var.
-static FORCE_CPU: AtomicBool = AtomicBool::new(false);
-
-/// Force CPU-only operation (no GPU placement). Call before constructing any
-/// `GPUManagerImpl`.
-pub fn set_force_cpu(v: bool) {
-    FORCE_CPU.store(v, Ordering::SeqCst);
-}
-
-/// Whether `--cpu` forced CPU-only operation.
-pub fn force_cpu() -> bool {
-    FORCE_CPU.load(Ordering::SeqCst)
-}
-
 /// GPU manager implementation with NVML support
 pub struct GPUManagerImpl {
     devices: Arc<Mutex<Vec<Device>>>,
@@ -46,15 +29,11 @@ impl Clone for GPUManagerImpl {
 impl GPUManagerImpl {
     /// Create a new GPU manager - detects GPUs once at initialization
     pub fn new() -> Self {
-        // CPU-only mode (--cpu / force_cpu): do NOT initialize NVML. On this driver
-        // nvmlInit dlopen's libcuda and spawns a CUDA driver thread that lives for
-        // the whole process; that thread periodically wakes and preempts a GEMV
-        // worker on the otherwise-saturated core set, adding run-to-run jitter and
-        // ~8% throughput loss to CPU decode vs a build that never links/inits CUDA.
-        // With no GPU in use there is nothing to monitor, so skip it entirely - this
-        // makes the CUDA binary run with --cpu match the pure-CPU build.
-        let nvml = if force_cpu() {
-            info!("--cpu: skipping NVML init (no GPU monitoring in CPU-only mode)");
+        // NVML is not initialised when cuda is not an allowed backend.
+        // Its init loads the CUDA driver, which starts a thread that stays for the process.
+        // With no card in use there is nothing to monitor.
+        let nvml = if !super::backends::allows(super::backends::Backend::Cuda) {
+            info!("cuda is not an allowed backend: skipping NVML init");
             None
         } else if cfg!(all(feature = "gpu", not(feature = "cuda"))) {
             // NVML lists NVIDIA cards, which this runtime does not drive.
@@ -86,8 +65,8 @@ impl GPUManagerImpl {
 
     /// Detect NVIDIA GPUs once at initialization (not in a loop)
     fn detect_nvidia_gpus_once(nvml: &Option<Arc<nvml_wrapper::Nvml>>) -> Vec<Device> {
-        if force_cpu() {
-            info!("--cpu: GPU placement disabled - running CPU-only (no GPU devices reported)");
+        if !super::backends::allows(super::backends::Backend::Cuda) {
+            info!("cuda is not an allowed backend: no NVIDIA card reported");
             return Vec::new();
         }
         let nvml_arc = match nvml {

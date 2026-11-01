@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+pub mod backends;
 mod device;
 mod manager;
 
@@ -12,12 +13,11 @@ pub use device::Device;
 pub use manager::GPUManagerImpl;
 
 // Re-export helper functions for live NVML queries
+pub use backends::cards_allowed;
 pub use manager::{
     get_live_clock_info, get_live_fan_info, get_live_power_info, get_live_temperature,
     get_live_utilization,
 };
-// `--cpu` force-CPU switch (set before any GPUManagerImpl is constructed).
-pub use manager::{force_cpu, set_force_cpu};
 
 /// GPU memory information
 #[derive(Debug, Clone)]

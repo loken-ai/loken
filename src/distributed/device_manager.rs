@@ -331,10 +331,9 @@ impl DeviceManager {
     /// Detect NVIDIA CUDA devices
     #[cfg(feature = "gpu")]
     fn detect_cuda_devices(&mut self) -> Result<()> {
-        // `--cpu`: skip CUDA enumeration entirely so only the CPU device is
-        // registered and the placement plan keeps every layer on the CPU.
-        if crate::gpu::force_cpu() {
-            info!("--cpu: skipping CUDA device detection (CPU-only placement)");
+        // No allowed backend drives a card: only the CPU device is registered.
+        if !crate::gpu::cards_allowed() {
+            info!("no allowed backend drives a card: skipping card detection");
             return Ok(());
         }
 

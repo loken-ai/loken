@@ -312,9 +312,9 @@ impl LlmEngine {
 
         let device_index = self.config.device_index;
         let disable_arc_layers = self.config.disable_arc_layers;
-        // `--cpu` serve flag forces the same all-CPU placement as the
-        // disable_cuda config (empty cuda_devices -> every layer on CPU).
-        let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
+        // No allowed backend drives a card: every layer goes to the host or to the
+        // Vulkan and OpenCL devices.
+        let disable_cuda = self.config.disable_cuda || !crate::gpu::cards_allowed();
         let vulkan_devices = self.config.vulkan_devices.clone();
         let kv_quant = self.config.kv_quant;
         let expert_profile = self.config.expert_profile.clone();
@@ -1335,18 +1335,23 @@ impl LlmEngine {
                                 std::collections::HashMap::new();
                             // The Vulkan devices take the layers a rung leaves on the host
                             // before the host does.
-                            let vulkan = if crate::gpu::force_cpu() || host_only.is_some() {
+                            let vulkan = if host_only.is_some() {
                                 Vec::new()
                             } else {
-                                let mut offered = crate::inference::place::ladder::vulkan_devices(
-                                    &vulkan_devices,
-                                    runtime_reserve_bytes,
-                                );
+                                let mut offered = Vec::new();
+                                if crate::gpu::backends::allows(crate::gpu::backends::Backend::Vulkan) {
+                                    offered = crate::inference::place::ladder::vulkan_devices(
+                                        &vulkan_devices,
+                                        runtime_reserve_bytes,
+                                    );
+                                }
                                 // The OpenCL GPUs no CUDA card stands for take their share
                                 // after them.
-                                offered.extend(crate::inference::place::ladder::accelerators(
-                                    runtime_reserve_bytes,
-                                ));
+                                if crate::gpu::backends::allows(crate::gpu::backends::Backend::OpenCl) {
+                                    offered.extend(crate::inference::place::ladder::accelerators(
+                                        runtime_reserve_bytes,
+                                    ));
+                                }
                                 offered
                             };
                             let model = crate::inference::place::ladder::load_planned(

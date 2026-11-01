@@ -51,10 +51,12 @@ enum Commands {
         #[arg(long, value_name = "DURATION")]
         keep_alive: Option<String>,
 
-        /// Run CPU-only: ignore all GPUs and place every layer on the CPU.
-        /// Lets one cuda-built binary serve either GPU or CPU without a rebuild.
-        #[arg(long)]
-        cpu: bool,
+        /// Backends to compute on, comma separated: cuda, rocm, vulkan, opencl, cpu.
+        /// A backend left out is not probed and receives no layer.
+        /// Without the option every backend the machine offers is used.
+        /// `cpu` alone serves on the host only.
+        #[arg(long, value_name = "LIST")]
+        backends: Option<String>,
     },
 }
 
@@ -113,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             models_dir,
             verbose,
             keep_alive,
-            cpu,
+            backends,
         } => {
             if verbose {
                 warn!("Verbose logging enabled");
@@ -121,9 +123,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Must be set before ANY GPUManagerImpl is constructed so detection
             // reports zero GPUs and placement uses the CPU path.
-            if cpu {
-                loken::gpu::set_force_cpu(true);
-                info!("🖥️  --cpu: GPU disabled, serving on CPU only");
+            if let Some(list) = backends {
+                let backends = match loken::gpu::backends::parse(&list) {
+                    Ok(backends) => backends,
+                    Err(why) => {
+                        eprintln!("error: --backends: {why}");
+                        std::process::exit(2);
+                    }
+                };
+                loken::gpu::backends::set_allowed(&backends);
+                let names: Vec<_> = backends.iter().map(|b| b.name()).collect();
+                info!("--backends: computing on {}", names.join(", "));
             }
 
             info!("Starting lokend");

@@ -101,7 +101,7 @@ cargo build --release --no-default-features --features cpu        # language mod
 cargo build --release --no-default-features --features cpu,media  # and every media family
 ```
 
-A CUDA build also serves without a card: `lokend serve --cpu` places every layer and every tower on the host.
+A CUDA build also serves without a card: `lokend serve --backends cpu` places every layer and every tower on the host.
 
 ## CPU level
 
@@ -131,7 +131,7 @@ The other IQ formats, the fp4 chunk dot, the argmax and the decode GEMVs of the 
 ## Daemon options
 
 ```
-lokend serve [--port PORT] [--models-dir DIR] [--keep-alive DURATION] [--cpu] [--verbose]
+lokend serve [--port PORT] [--models-dir DIR] [--keep-alive DURATION] [--backends LIST] [--verbose]
 ```
 
 | Option | Effect |
@@ -139,7 +139,7 @@ lokend serve [--port PORT] [--models-dir DIR] [--keep-alive DURATION] [--cpu] [-
 | `--port` | Overrides `[server] port` of `config.toml`. The port is 11435 when neither names one |
 | `--models-dir` | Names the Ollama store |
 | `--keep-alive` | Sets how long a model stays resident after its last request. `-1` keeps it for ever. `OLLAMA_KEEP_ALIVE` is read too |
-| `--cpu` | Places every layer and every tower on the host |
+| `--backends` | Names the backends to compute on, among `cuda`, `rocm`, `vulkan`, `opencl` and `cpu`. A backend left out is not probed and receives no layer. `cpu` alone places every layer and every tower on the host. Without the option every backend the machine offers is used |
 | `--verbose` | Logs more |
 
 `config.toml` holds everything else.  

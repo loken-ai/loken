@@ -103,7 +103,7 @@ impl Streamed {
         use super::room;
         use crate::inference::place::vram_manager;
         use crate::tensor::cuda::CudaDevice;
-        if crate::gpu::force_cpu() || vram_manager::vram_force_cpu() {
+        if !crate::gpu::cards_allowed() || vram_manager::vram_force_cpu() {
             return None;
         }
         // Fastest first, as the placement reads the cards.

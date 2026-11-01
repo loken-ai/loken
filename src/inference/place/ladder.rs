@@ -721,9 +721,59 @@ fn beside_host(
     }
 }
 
+/// Whether a plan leaves layers or experts on the host.
+pub fn uses_host(plan: &HeteroPlan) -> bool {
+    plan.host_experts_from.is_some()
+        || plan
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, DeviceKind::Cpu))
+}
+
+/// Whether the allowed backends forbid `plan`: it keeps work on the host and the host is not
+/// one of them.
+fn host_refused(plan: &HeteroPlan) -> bool {
+    refuses(
+        crate::gpu::backends::allows(crate::gpu::backends::Backend::Cpu),
+        plan,
+    )
+}
+
+fn refuses(host_allowed: bool, plan: &HeteroPlan) -> bool {
+    !host_allowed && uses_host(plan)
+}
+
+/// An error a placement can raise itself, when no plan is allowed to be built.
+pub trait Refusal {
+    fn refusal(message: String) -> Self;
+}
+
+impl Refusal for String {
+    fn refusal(message: String) -> Self {
+        message
+    }
+}
+
+impl Refusal for crate::tensor::Error {
+    fn refusal(message: String) -> Self {
+        crate::tensor::Error::msg(message)
+    }
+}
+
+impl Refusal for anyhow::Error {
+    fn refusal(message: String) -> Self {
+        anyhow::anyhow!(message)
+    }
+}
+
+/// What a refused plan reports. It reads as a memory shortage, so the ladder goes on to the
+/// next rung, which may fit the cards alone.
+const HOST_REFUSED: &str =
+    "out of memory: the model does not fit the allowed backends, and the host is not one of them";
+
 /// Build `what` on the plan its demand asks for, and on the next rung each time a build
 /// runs out of card memory. `cards` are ranked fastest first with the bytes each offers.
-pub fn load_placed<T, E: std::fmt::Display>(
+pub fn load_placed<T, E: std::fmt::Display + Refusal>(
     what: &str,
     demand: &Demand,
     cards: &[(usize, u64)],
@@ -743,7 +793,7 @@ pub fn load_placed<T, E: std::fmt::Display>(
 
 /// [`load_placed`] from a first plan the planner made for this component, with
 /// `accelerators` taking the blocks each rung leaves on the host before the host does.
-pub fn load_planned<T, E: std::fmt::Display>(
+pub fn load_planned<T, E: std::fmt::Display + Refusal>(
     what: &str,
     first_plan: HeteroPlan,
     demand: &Demand,
@@ -753,9 +803,13 @@ pub fn load_planned<T, E: std::fmt::Display>(
     mut build: impl FnMut(&HeteroPlan) -> Result<T, E>,
 ) -> Result<T, E> {
     let first_plan = beside_host(first_plan, demand, accelerators);
-    let first = match build(&first_plan) {
-        Ok(m) => return Ok(m),
-        Err(e) => e,
+    let first = if host_refused(&first_plan) {
+        E::refusal(HOST_REFUSED.to_string())
+    } else {
+        match build(&first_plan) {
+            Ok(m) => return Ok(m),
+            Err(e) => e,
+        }
     };
     if cancelled() {
         return Err(first);
@@ -771,7 +825,7 @@ pub fn load_planned<T, E: std::fmt::Display>(
         if !last_oom && name != "the host" {
             continue;
         }
-        if tried.iter().any(|t| super::dry_plan::same_plan(t, &plan)) {
+        if tried.iter().any(|t| super::dry_plan::same_plan(t, &plan)) || host_refused(&plan) {
             continue;
         }
         tried.push(plan.clone());
@@ -924,7 +978,7 @@ pub fn run_whole_on<T, E: std::fmt::Display>(
 /// again at each shrinking share of the cards the host-assisted rung offers, the host taking
 /// what no card holds, and last on the host alone. Any other failure goes straight to the
 /// host, and if that fails too the first error is returned. A cancelled load stops.
-pub fn load_stages<T, E: std::fmt::Display>(
+pub fn load_stages<T, E: std::fmt::Display + Refusal>(
     what: &str,
     weights: &[u64],
     reserve: u64,
@@ -1038,7 +1092,7 @@ pub fn on_one_card(plan: &HeteroPlan) -> bool {
 }
 
 /// Build `what` through the ladder on the cards as they are now. A cancelled load stops.
-pub fn load<T, E: std::fmt::Display>(
+pub fn load<T, E: std::fmt::Display + Refusal>(
     what: &str,
     demand: &Demand,
     build: impl FnMut(&HeteroPlan) -> Result<T, E>,
@@ -1059,7 +1113,7 @@ fn whole_demand(bytes: u64, reserve: u64) -> Demand {
 
 /// Build a component that runs whole on one device through the ladder: the fastest card
 /// that holds it, else the host.
-pub fn load_whole<T, E: std::fmt::Display>(
+pub fn load_whole<T, E: std::fmt::Display + Refusal>(
     what: &str,
     bytes: u64,
     reserve: u64,
@@ -1072,7 +1126,7 @@ pub fn load_whole<T, E: std::fmt::Display>(
 
 /// [`load_whole`] for a component that runs once per request: with more than one card it
 /// takes the slowest card that holds it, leaving the fastest to what runs every step.
-pub fn load_aside<T, E: std::fmt::Display>(
+pub fn load_aside<T, E: std::fmt::Display + Refusal>(
     what: &str,
     bytes: u64,
     reserve: u64,
@@ -1141,6 +1195,38 @@ pub(crate) fn release_pools() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_on(kinds: &[DeviceKind], host_experts_from: Option<usize>) -> HeteroPlan {
+        let segments = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| HeteroSegment {
+                kind: *kind,
+                layer_start: i,
+                layer_end: i + 1,
+                free_memory_bytes: 0,
+            })
+            .collect();
+        HeteroPlan {
+            segments,
+            tp_cards: None,
+            total_layers: kinds.len(),
+            host_experts_from,
+        }
+    }
+
+    /// A plan on the host is refused when the host is not an allowed backend.
+    /// A plan on cards, or any plan when the host is allowed, is not.
+    #[test]
+    fn a_plan_on_the_host_is_refused_without_the_host() {
+        let cards = plan_on(&[DeviceKind::Cuda(0), DeviceKind::Vulkan(0)], None);
+        let host = plan_on(&[DeviceKind::Cuda(0), DeviceKind::Cpu], None);
+        let experts = plan_on(&[DeviceKind::Cuda(0)], Some(0));
+        assert!(!refuses(false, &cards));
+        assert!(refuses(false, &host));
+        assert!(refuses(false, &experts));
+        assert!(!refuses(true, &host));
+    }
 
     const GB: u64 = 1 << 30;
 

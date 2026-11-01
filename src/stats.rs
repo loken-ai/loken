@@ -107,13 +107,13 @@ impl StatsMonitor {
         }
 
         // Get GPU stats directly from NVML for live updates.
-        // Skipped in CPU-only mode (--cpu / force_cpu): with no GPU in use the
+        // Skipped when cuda is not an allowed backend: with no GPU in use the
         // periodic NVML driver queries (util/temp/power/clock per device) are
         // pure overhead - and on a memory-bandwidth-bound CPU decode they hold
         // the driver lock long enough to periodically stall the GEMV worker
         // pool, costing ~8% throughput + adding run-to-run jitter (measured:
         // CPU decode 4.7->5.1 tok/s once gated). No GPU stats to report anyway.
-        if !crate::gpu::force_cpu() {
+        if crate::gpu::backends::allows(crate::gpu::backends::Backend::Cuda) {
             if let Some(ref gpu_manager) = self.gpu_manager {
                 let _ = gpu_manager.detect_gpus().await;
 

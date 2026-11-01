@@ -93,14 +93,20 @@ pub(crate) fn topology() -> &'static Topology {
     TOPOLOGY.get_or_init(|| {
         // The libraries an archive carries beside the executable are opened before the probes.
         let _ = crate::tensor::cuda::runtime::usable();
-        let cuda = if cuda_usable() && cudarc::driver::result::init().is_ok() {
+        let cuda = if crate::gpu::backends::allows(crate::gpu::backends::Backend::Cuda)
+            && cuda_usable()
+            && cudarc::driver::result::init().is_ok()
+        {
             cudarc::driver::result::device::get_count()
                 .unwrap_or(0)
                 .max(0) as usize
         } else {
             0
         };
-        let hip = if hip_usable() && super::hip::driver::result::init().is_ok() {
+        let hip = if crate::gpu::backends::allows(crate::gpu::backends::Backend::Rocm)
+            && hip_usable()
+            && super::hip::driver::result::init().is_ok()
+        {
             super::hip::driver::result::device::get_count()
                 .unwrap_or(0)
                 .max(0) as usize
