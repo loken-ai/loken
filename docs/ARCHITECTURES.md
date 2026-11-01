@@ -7,13 +7,15 @@ Every architecture the loader accepts, the formats it reads, and the tests that 
 The loader decides from tensors and metadata:
 
 - `general.architecture` selects a row of `src/inference/model_facts.rs`.
-- A checkpoint's `architectures[0]` selects a GGUF tag through the class table in `src/inference/load/hf_config.rs`. AWQ checkpoints are read by `src/inference/load/awq_loader.rs`.
+- A checkpoint's `architectures[0]` selects a GGUF tag through the class table in `src/inference/load/hf_config.rs`.
+  AWQ checkpoints are read by `src/inference/load/awq_loader.rs`.
 
 ## Tests
 
-Each loading test lives in `src/inference/generic_transformer/loading_tests.rs`.
+Each loading test lives in `src/inference/generic_transformer/loading_tests.rs`.  
 A test writes a tiny synthetic checkpoint of the architecture in the format.
-It loads the checkpoint through `GenericWeights::build`, the call the server makes, on a host-only `HeteroPlan`.
+
+The test loads the checkpoint through `GenericWeights::build`, the call the server makes, on a host-only `HeteroPlan`.
 It runs a forward pass of 5 tokens and asserts finite, non-constant logits of the vocabulary's size.
 
 A safetensors test also writes the weights of the architecture's GGUF recipe in the publisher's tensor names and layout:
@@ -41,13 +43,13 @@ A wrong permutation or split fails.
 2. It saves the model with `save_pretrained` as float32 safetensors under `tests/vectors/hf/<folder>`.
 3. It records, in float32 on the CPU, the logits of the last position of a 6-token prompt and of the next 4 greedy tokens.
 
-The test loads each folder through the same entry point on a host-only plan and feeds the reference's ids back in turn.
+The test loads each folder through the same entry point on a host-only plan and feeds the reference's ids back in turn.  
 At every step it asserts:
 
 - a cosine of at least 0.998 with the reference's logits
 - the same argmax wherever the 2 top reference logits are further apart than twice the measured rounding error (float weights are rebuilt in 8 bits)
 
-Every hybrid keeps 1 block of each kind.
+Every hybrid keeps 1 block of each kind.  
 A seed is kept only when its routing decisions and its logits stay clear of that rounding.
 `every_reference_folder_has_a_test` fails when the folders and the list of tests differ.
 
@@ -123,7 +125,8 @@ The `Verified` column says how the safetensors layout is checked:
 
 The loader reads:
 
-- GGUF, 1 file. A split set reads through the same tensor path, covered once in `loader.rs`.
+- GGUF, 1 file.
+  A split set reads through the same tensor path, covered once in `loader.rs`.
 - Dense safetensors in the framework's layout: F32, F16, BF16, and MXFP4 blocks for the experts of `gptoss`.
 - AWQ safetensors.
 - The vendor's native layout (`params.json` and `consolidated*.safetensors`), dense or with routed experts.
@@ -151,6 +154,7 @@ The tensors state some widths, and the loader reads those from the tensors: the 
 ### Rotary rows
 
 A class pairs lanes as the framework's rotation does (lane `i` with `i + n/2`), unless its row says adjacent.
+
 A GGUF converter reorders the rows of the tags whose GGUF files pair adjacent lanes.
 The loader leaves the checkpoint's rows in place and pairs lanes by class.
 
@@ -194,8 +198,10 @@ Every recipe is written in F32.
 
 `mpt` positions come from ALiBi (`attention.max_alibi_bias`).
 Only the unfused host attention adds ALiBi to the scores.
+
 The load offers such a model no card, Vulkan or OpenCL device, and logs why.
 A card's attention refuses such a layer.
+
 `an_alibi_model_stays_off_the_cards` checks this and runs with a card.
 
 ### Query scale by position
@@ -214,7 +220,7 @@ The loader does not read these, as from a GGUF file:
 
 The reference vectors hold none of these.
 
-The loader does not map the 2 input norms of the grouped `falcon` decoder, so it refuses such a checkpoint for a missing tensor.
+The loader does not map the 2 input norms of the grouped `falcon` decoder, so it refuses such a checkpoint for a missing tensor.  
 It refuses a quantised checkpoint other than AWQ of the llama, mistral and qwen families.
 
 Architectures with their own model code (image, speech, video, forecasting, DeepSeek V4.1) are outside this table, and the generic transformer does not read them.
@@ -317,7 +323,8 @@ cargo test --lib oracle_parity
 | `src/inference/engine/model_backend.rs` | The trait each architecture implements. |
 
 - [`REFERENCES.md`](REFERENCES.md) lists the papers behind each family.
-- The DeepSeek V4.1 port is gated against the authors' `model.py`. Each phase of the reference dumps its inputs and outputs into `tests/vectors/`, and a test replays the phase on the same inputs.
+- The DeepSeek V4.1 port is gated against the authors' `model.py`.
+  Each phase of the reference dumps its inputs and outputs into `tests/vectors/`, and a test replays the phase on the same inputs.
 
 ```sh
 ls tests/vectors/

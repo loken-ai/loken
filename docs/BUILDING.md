@@ -1,7 +1,7 @@
 # Building
 
-Build `lokend` and `loken` from source.
-A release archive needs no build, see [Install](start/install.md).
+Build `lokend` and `loken` from source.  
+A release archive needs no build, see [Install](start/install.md).  
 First start: [First run](start/first-run.md).
 
 ```sh
@@ -20,14 +20,16 @@ cargo build --release   # target/release/{lokend,loken}
 | Host only, with every media family | `cargo build --release --no-default-features --features cpu,media` | Nothing |
 
 `image`, `audio`, `video` and `midi` can each be added on their own.
-`metrics` adds the scrape endpoint.
+`metrics` adds the scrape endpoint.  
 The feature table is in [Configuration](CONFIGURATION.md#build-features).
 
 ## The default build
 
 The default features are `cuda`, `opencl` and `media`.
+
 The build needs a **CUDA toolkit** and **OpenCL headers**.
-It is built and tested against **CUDA 13.3**. No older toolkit has been tried.
+It is built and tested against **CUDA 13.3**.
+No older toolkit has been tried.
 
 The kernels are compiled for a fixed list of architectures from Turing to Blackwell, not probed against the toolkit.
 A toolkit that does not know `sm_120a` fails the build.
@@ -43,7 +45,7 @@ A toolkit that does not know `sm_120a` fails the build.
 cargo build --release --no-default-features --features rocm,cpu
 ```
 
-The build needs ROCm's `hipcc` on the `PATH` or under `ROCM_PATH`.
+The build needs ROCm's `hipcc` on the `PATH` or under `ROCM_PATH`.  
 The kernels are compiled for the AMD targets from CDNA (gfx908) to RDNA4 (gfx1201).
 `LOKEN_ROCM_ARCHS` narrows the list.
 
@@ -67,6 +69,7 @@ cargo build --release --features cuda,rocm
 
 The build needs both toolkits.
 It lists the NVIDIA cards through CUDA, then the AMD cards through HIP, as 1 set of card numbers.
+
 The placement plan, the ladder and the probes see every card, so a model can be split across a GeForce and a Radeon.
 
 | Behaviour | Detail |
@@ -84,7 +87,7 @@ cargo build --release --features vulkan
 
 The server opens the Vulkan loader when it starts, and compiles the kernels for the device when it opens.
 
-Placement offers the Vulkan GPUs that no other runtime of the build drives.
+Placement offers the Vulkan GPUs that no other runtime of the build drives.  
 They come after the CUDA or HIP cards and before the host.
 The `vulkan_devices` setting names others.
 
@@ -139,7 +142,7 @@ lokend serve [--port PORT] [--models-dir DIR] [--keep-alive DURATION] [--cpu] [-
 | `--cpu` | Places every layer and every tower on the host |
 | `--verbose` | Logs more |
 
-`config.toml` holds everything else.
+`config.toml` holds everything else.  
 The daemon finds it in the working directory, beside the executable, or in the user configuration directory.
 
 ## Troubleshooting

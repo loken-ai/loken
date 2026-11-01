@@ -2,7 +2,8 @@
 
 1 process serves 3 APIs: Ollama under `/api`, OpenAI under `/v1`, Messages under `/v1/messages`.
 A client written for any of them works unchanged.
-Bodies are read as JSON whatever `Content-Type` says.
+
+Bodies are read as JSON whatever `Content-Type` says.  
 Each API answers a malformed body in its own error envelope.
 
 With `[server] require_auth` on, every route needs a key, as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
@@ -59,7 +60,9 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 ### Prompt embeddings
 
 `prompt_embeds` on `/v1/completions` takes a base64 string, an array of base64 strings, or an array of rows of numbers.
+
 An array of strings gives 1 prompt each and is answered as an array of prompts.
+
 The first bytes of a base64 payload select its form:
 
 | Form | First bytes | Width | Dtypes |
@@ -69,7 +72,7 @@ The first bytes of a base64 payload select its form:
 | bare little-endian f32, as `/v1/embeddings` returns them | anything else | the model's | float32 |
 
 Every form is refused with a 400 naming the fault in 2 cases.
-Before a value is converted, when the rows are not the model's width or fill the served context window.
+Before a value is converted, when the rows are not the model's width or fill the served context window.  
 After, when a value is not finite.
 
 #### loken's format
@@ -88,8 +91,9 @@ Little-endian throughout:
 | 24 | rows x width x dtype size | values, row after row |
 | end, 4 | 4 | CRC-32 of every byte before it (zlib's `crc32`) |
 
-A payload whose length is not exactly 28 bytes plus the values is refused as truncated or padded.
+A payload whose length is not exactly 28 bytes plus the values is refused as truncated or padded.  
 A payload whose CRC-32 does not match, header included, is refused as corrupted.
+
 A 256 MiB request body carries about 24,000 rows of width 4096 in float16 or bfloat16, and 12,000 in float32.
 
 ```python
@@ -109,10 +113,12 @@ bfloat16 is the top half of each float32: `(rows.astype("<f4").view("<u4") >> 16
 
 The payload is the archive `torch.save(tensor, buffer)` writes, base64-encoded.
 The tensor has shape `(tokens, hidden_size)` or `(1, tokens, hidden_size)`, any strides and storage offset, on any device.
+
 The server reads it without running the pickle.
 It accepts only the opcodes, the globals and the persistent references of 1 plain tensor.
 The accepted globals are `torch._utils._rebuild_tensor_v2`, `collections.OrderedDict`, `torch.FloatStorage`, `HalfStorage`, `BFloat16Storage` and `DoubleStorage`.
-Every entry used is checked against its CRC-32.
+
+Every entry used is checked against its CRC-32.  
 Anything else is refused: compressed or big-endian archives, torch's legacy format, sparse and quantized tensors, and tensors carrying attributes or hooks.
 
 ### vLLM's extensions
@@ -154,6 +160,7 @@ These fields decode 1 token per step, without prompt-lookup drafts, captured gra
 - a structured output
 
 These answer 400: `prompt_logprobs`, a request `chat_template`, and `continue_final_message` with `add_generation_prompt: true`.
+
 These are accepted without effect: `priority`, `request_id`, `spaces_between_special_tokens`, `add_special_tokens`, `stream_interval` and the disaggregation fields.
 
 #### Beam search
@@ -161,25 +168,28 @@ These are accepted without effect: `priority`, `request_id`, `spaces_between_spe
 `use_beam_search: true` scores and stops as transformers' `generate(num_beams=n, length_penalty=..., early_stopping=...)` does:
 
 - Each step ranks every continuation of the running beams by cumulative log-probability, read from the raw logits.
-- Of the first `n`, those ending on an end token finish, and on the last step all of them finish. The others keep running.
+- Of the first `n`, those ending on an end token finish, and on the last step all of them finish.
+  The others keep running.
 - A finished beam scores its cumulative log-probability over its generated length, the end token counted, raised to `length_penalty` (default 1).
 - `early_stopping: false` (default) stops once `n` beams are finished and the best running one cannot beat the worst of them at its current length.
 - `early_stopping: true` stops once `n` are finished.
 - `early_stopping: "never"` scores the running beam at `max_tokens` when `length_penalty` is positive.
 - Ties rank the earlier beam first, then the lower token id.
 
-The choices are the beams, best first.
+The choices are the beams, best first.  
 The text leaves out the end token.
 `logprobs` carry every generated token, the end token included, so they sum to the beam's cumulative log-probability.
+
 The model's end tokens and `stop_token_ids` end a beam.
-`ignore_eos` runs every beam to `max_tokens`.
+`ignore_eos` runs every beam to `max_tokens`.  
 Temperature, sampling knobs, penalties, stop sequences and token rules are not read.
 
 These answer 400: `stream`, `prompt_embeds`, `best_of` above `n`, a structured output and a required tool call.
+
 A model whose KV cache cannot be cut back to a shorter sequence answers 500.
 That covers a recurrent or sliding-window layer, and a backend other than the generic transformer.
 
-vLLM's own beam search divides by the prompt and generated length without the end token.
+vLLM's own beam search divides by the prompt and generated length without the end token.  
 It finishes every end token among a beam's best `2n` candidates.
 It always runs to `max_tokens`.
 
@@ -219,13 +229,16 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | The audio windows of every clip run through the encoder as 1 batch. Each clip decodes on its own windows. |
 | `POST /v1/images/generations` (an SDXL checkpoint) | not streamed, `n` 1, no `control_image`, no `regions`, and the same model, `size`, step count, `sampler`, `scheduler` and `loras` | The group takes the media gate once. Its renders denoise as 1 batch, with the prompt, `negative_prompt`, `guidance` and `seed` of each request. |
 
-A request that finds no group of its kind running starts at once.
+A request that finds no group of its kind running starts at once.  
 Requests that arrive while a group runs queue behind it, and the queue runs as the next group when it ends.
+
 A group holds as many requests as the roomiest card has free memory for, 1 request's scratch each.
 The rest of the queue waits for the group after.
 With no card, a group holds every queued request.
+
 Each request keeps its own seed and no row of a batch reads another row.
 A request answers what it answers alone, up to the rounding of a larger matrix product on a card.
+
 A request that fails on its own, such as a clip the server cannot read, fails alone and its companions answer.
 An image batch that fails as a whole renders each request alone.
 
@@ -236,6 +249,7 @@ Every event carries `node`, the name of the node that renders, or null when the 
 
 Every chat route caps the images per request, the pixels per image and the seconds of audio.
 The chat routes are `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses` and `/v1/messages`.
+
 The keys sit under `[inference]`, see [CONFIGURATION.md](CONFIGURATION.md#media-input).
 A request past 1 of them is answered 400 with the cap's key and the value it carried, before the image is decoded.
 
@@ -252,18 +266,25 @@ A request past 1 of them is answered 400 with the cap's key and the value it car
 
 A 401, 429 or 404 under `/v1/messages` carries the Messages API envelope.
 The request id comes back in the `request-id` header.
+
 An image block with a URL source, `{"type": "image", "source": {"type": "url", "url": ...}}`, is fetched from a host in `image_fetch_hosts` and held to the media caps.
 A host outside the list is answered 400 naming the host.
+
 A part the server cannot take, such as a document block, is refused with the reason.
 
 ## How a request ends
 
-- The stop sequence an answer ends on is left out of the text. `include_stop_str_in_output` keeps it on the OpenAI routes.
-- `logprobs` carry 1 entry per token written, in a streamed answer and in a whole one. The token that ended the answer is not 1.
-- A generation that fails while streaming ends an OpenAI stream with a `{"error": ...}` frame and no finish chunk. The Responses route turns that frame into a `response.failed` event.
+- The stop sequence an answer ends on is left out of the text.
+  `include_stop_str_in_output` keeps it on the OpenAI routes.
+- `logprobs` carry 1 entry per token written, in a streamed answer and in a whole one.
+  The token that ended the answer is not 1.
+- A generation that fails while streaming ends an OpenAI stream with a `{"error": ...}` frame and no finish chunk.
+  The Responses route turns that frame into a `response.failed` event.
 - A Responses stream whose source ends without its final marker ends as `response.incomplete`.
-- A request refused by the rate limit carries `Retry-After`: the seconds until the client has a token again. A client whose allowance never refills gets none.
-- A request with too many messages, an unknown role or too many characters in all is refused with a 400. The Messages route applies the same bounds.
+- A request refused by the rate limit carries `Retry-After`: the seconds until the client has a token again.
+  A client whose allowance never refills gets none.
+- A request with too many messages, an unknown role or too many characters in all is refused with a 400.
+  The Messages route applies the same bounds.
 
 ## Per-request figures
 
@@ -299,12 +320,14 @@ A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figur
 
 The energy meter is read at every start and end of a request.
 Each reading between 2 of them is split among the requests active over it, by the tokens each computed over it (prompt read and answer generated).
-A reading over which no request computed a token is split evenly.
+
+A reading over which no request computed a token is split evenly.  
 A request's energy is the sum of its parts.
 
 A field loken does not measure is left out.
-`energy` is absent when `[energy] enabled` is off or no domain is read.
+`energy` is absent when `[energy] enabled` is off or no domain is read.  
 `kv` is absent when the backend does not report its cache.
+
 An answer that gathers several generations (`n` above 1, a beam search) carries no `loken` object.
 
 `completion_tokens_details.accepted_prediction_tokens` counts the drafted tokens the model kept, and `rejected_prediction_tokens` the ones it refused.
@@ -317,8 +340,10 @@ A streamed answer whose prompt is still being read after 250 ms reports the read
 ```
 
 `done` is the prompt tokens read so far and `total` the tokens to read, the cached prefix left out.
+
 A prompt read in under 250 ms sends no comment line.
 Neither does a model served by continuous batching, whose worker reads several prompts at once.
+
 A client that follows the SSE specification ignores comment lines.
 
 ## Server, models and cluster

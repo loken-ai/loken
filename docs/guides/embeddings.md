@@ -3,20 +3,25 @@
 Post texts, or images with a CLIP or SigLIP model, to `/v1/embeddings` and get 1 L2-normalised vector per item.
 
 An embedding model is a Qwen3-Embedding or BERT-shaped checkpoint, or a chat model as a fallback.
-A CLIP or SigLIP checkpoint embeds images as well, in the same space as its texts. A caption and its picture land near each other, so the cosine ranks images against a text or texts against an image.
+
+A CLIP or SigLIP checkpoint embeds images as well, in the same space as its texts.
+A caption and its picture land near each other, so the cosine ranks images against a text or texts against an image.  
 The cosine is the dot product.
 
 ## Before you start
 
 <!-- site: widget checklist id=embeddings-prereq -->
-- [ ] An embedding model is in the store. A CLIP or SigLIP checkpoint is found by its Hugging Face repository id, for example `openai/clip-vit-large-patch14`, under `huggingface_models_dir` ([configuration](../CONFIGURATION.md)).
-- [ ] For images by URL, `image_fetch_hosts` lists the hosts to fetch from. A base64 data URL needs no host.
+- [ ] An embedding model is in the store.
+  A CLIP or SigLIP checkpoint is found by its Hugging Face repository id, for example `openai/clip-vit-large-patch14`, under `huggingface_models_dir` ([configuration](../CONFIGURATION.md)).
+- [ ] For images by URL, `image_fetch_hosts` lists the hosts to fetch from.
+  A base64 data URL needs no host.
 - [ ] For an image model, the checkpoint folder holds safetensors, `config.json`, `tokenizer.json` and `preprocessor_config.json`.
 <!-- site: end -->
 
 ## Smallest configuration
 
-Texts and data URLs need none. Images by URL need:
+Texts and data URLs need none.  
+Images by URL need:
 
 ```toml
 [inference]
@@ -39,7 +44,9 @@ curl localhost:11435/v1/embeddings -d '{
 
 ### vLLM
 
-1 conversation per vector. Its single part is an `image_url`: a base64 data URL, or an http(s) URL from a host listed in `image_fetch_hosts`. `messages` holds 1 conversation, or a list of them for several vectors.
+1 conversation per vector.
+Its single part is an `image_url`: a base64 data URL, or an http(s) URL from a host listed in `image_fetch_hosts`.  
+`messages` holds 1 conversation, or a list of them for several vectors.
 
 ```sh
 curl localhost:11435/v1/embeddings -d '{
@@ -52,7 +59,9 @@ curl localhost:11435/v1/embeddings -d '{
 
 ### Cohere
 
-`images` holds data URIs. `inputs` holds `content` lists. `texts` holds strings.
+`images` holds data URIs.  
+`inputs` holds `content` lists.  
+`texts` holds strings.
 
 ```sh
 curl localhost:11435/v2/embed -d '{
@@ -72,7 +81,8 @@ curl localhost:11435/v2/embed -d '{
 
 ## Expected result
 
-1 vector per item, in the order sent. The OpenAI form answers one `data` entry per vector with its `embedding`.
+1 vector per item, in the order sent.
+The OpenAI form answers one `data` entry per vector with its `embedding`.
 
 ## Troubleshooting
 

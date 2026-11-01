@@ -16,12 +16,12 @@
 | `loken list` | Prints what both stores hold |
 | `loken delete` | Removes a model |
 
-A `.pth` archive that a media family needs is placed in the store by hand.
-A request that names a model not yet loaded loads it.
+A `.pth` archive that a media family needs is placed in the store by hand.  
+A request that names a model not yet loaded loads it.  
 A model stays resident for the keep-alive the daemon was started with.
 
 Quantisations are read as the file carries them.
-On a card, the block formats run through their own kernels.
+On a card, the block formats run through their own kernels.  
 On the host, they need AVX2 (see [Building](BUILDING.md)).
 
 <!-- site: widget table id=models-tensor-formats -->
@@ -34,20 +34,24 @@ On the host, they need AVX2 (see [Building](BUILDING.md)).
 | Others | `MXFP4` |
 <!-- site: end -->
 
-The codebook formats run on a card for the experts, in decode and prefill.
+The codebook formats run on a card for the experts, in decode and prefill.  
 On the host, they run through integer dot products that need AVX2.
+
 A dense projection stored in a codebook format is requantised once at load to `Q8_0` for a card.
 The experts keep their format.
 
 A file that stores a tensor in another format is refused with the format's id.
-Token and per-layer embedding tables stay as stored, and a lookup decodes the rows it needs.
+
+Token and per-layer embedding tables stay as stored, and a lookup decodes the rows it needs.  
 A load that rebuilds a weight in another representation logs 1 ledger line with the bytes before and after.
 
 ### Pull a selection
 
 `loken pull owner/repo:SELECTOR` keeps the GGUF files of a repository whose directory, or dash-delimited file-name token, equals `SELECTOR` (case-insensitive).
 It also keeps the repository's configuration files.
+
 Without a selector, every file is pulled.
+
 Each file is checked against its listed size and its sha256.
 
 A pull follows the daemon's streamed progress.
@@ -57,7 +61,7 @@ A repository that holds a model GGUF and its `mmproj` resolves to the model file
 ### Split GGUF
 
 A GGUF split into parts by `gguf-split` is read as 1 model on the generic route.
-The loader takes the first part's metadata and the union of the parts' tensor directories.
+The loader takes the first part's metadata and the union of the parts' tensor directories.  
 Each tensor is read from the part that holds it.
 
 | Rule | Detail |
@@ -70,7 +74,8 @@ Each tensor is read from the part that holds it.
 ### Mixture variants
 
 A mixture model may be served from several GGUF files of 1 checkpoint, each quantising the routed experts to its own format.
-Its Ollama manifest names the first file as its model layer.
+
+The mixture model's Ollama manifest names the first file as its model layer.  
 Each further file is a layer of media type `application/vnd.loken.image.model.variant`.
 `/api/tags` lists the tag like any other.
 
@@ -83,7 +88,8 @@ Each further file is a layer of media type `application/vnd.loken.image.model.va
 
 Every tensor is read from the first file, except the routed experts.
 The placement reads the routed experts expert by expert, from 1 file or another.
-It fills the cards, then the host tier, in routing-heat order.
+
+The placement fills the cards, then the host tier, in routing-heat order.
 The heat is the model's routing profile in `profiles/` of the store, else the routing prior the file records.
 
 | Tier | File an expert comes from | Reason |
@@ -99,14 +105,13 @@ A further file is refused at load, with what differs, unless it matches the firs
 - The routed experts (layer, projection and expert), at the same shapes, stacked or 1 tensor each.
 - Every other tensor of the first file, at the same shape, format and bytes.
 
-A table read row by row (the engram tables) is compared on evenly spread spans.
+A table read row by row (the engram tables) is compared on evenly spread spans.  
 Tensors that only the further file carries are ignored.
 The DeepSeek V4.1 route reads this layout.
 
 ### Convert DeepSeek V4.1
 
-`loken convert` writes a DeepSeek V4.1 file in llama.cpp's `deepseek41` layout.
-llama.cpp and the engines that vendor it load that file.
+`loken convert` writes a DeepSeek V4.1 file in llama.cpp's `deepseek41` layout. llama.cpp and the engines that vendor it load that file.
 
 | Element | Content |
 |---|---|
@@ -118,18 +123,21 @@ llama.cpp and the engines that vendor it load that file.
 | DSpark draft | Stored apart as `<name>:<tag>-dspark`, a companion the loader finds beside the model |
 
 A partial conversion of layers `0:N` is a model of N + 1 layers that llama.cpp loads as such.
-The route still reads the files loken wrote before, under `deepseek_v41` and its own names.
+
+The route still reads the files loken wrote before, under `deepseek_v41` and its own names.  
 A file that `--complete` lays out is loken's own layout, not llama.cpp's.
 
 ### Draft head
 
 A checkpoint may ship a draft head that the served file leaves out: the multi-token-prediction layer of the wide-residual family.
 The loader reads it from a companion file, `<stem>.mtp.gguf`, beside the model.
+
 The stem is that of a split's parts.
 A model without the companion decodes without a head.
 
 `loken draft-head <repo> <out.gguf>` writes the companion from the checkpoint's `mtp.*` tensors.
 It fetches them by range requests and keeps them as released: the checkpoint's names, shapes and bytes.
+
 The file carries `general.architecture` and `general.name` and nothing else.
 This layout is loken's own.
 
@@ -158,17 +166,22 @@ At load, the loader:
 
 Mixtures route their experts on the card.
 When the model does not fit, only the experts spill.
+
 The recurrent hybrids (`lfm2moe`, `nemotron_h_moe`, `qwen3next`) carry their state-space blocks beside attention.
-Reasoning models return their thinking apart from the answer on every surface.
+
+Reasoning models return their thinking apart from the answer on every surface.  
 `gptoss` speaks Harmony and is read as such.
 
 ### DeepSeek V4.1
 
 DeepSeek V4.1 has its own loader.
 The file or the checkpoint directory selects it by its hyper-connection tensors, not by name.
+
 The routed experts stay in the file, which may be split, and are read as routing asks for them.
 The always-read weights and the busiest experts sit on the cards.
+
 A routing prior that the file lacks is borrowed from a companion GGUF beside it, found by the metadata it declares.
+
 Sharding across machines runs for this model only, see [Cluster](CLUSTER.md).
 
 ### Vision and speech in
@@ -181,18 +194,23 @@ Sharding across machines runs for this model only, see [Cluster](CLUSTER.md).
 A model whose files carry a speech tower lists `audio` among its capabilities.
 The tower comes from one of 2 sources:
 
-- The `mmproj*.gguf` beside a text GGUF. `clip.projector_type` names the family.
+- The `mmproj*.gguf` beside a text GGUF.
+  `clip.projector_type` names the family.
 - A checkpoint directory whose `config.json` declares an `audio_config`.
 
 Ultravox ships only the tower and the projector.
+
 It names its text model by `text_model_id`, which the loader looks up in the hub cache by id, else by name under any owner.
-Its safetensors are served through the dense checkpoint route below, so no GGUF is needed.
-Pulling the checkpoint pulls that text model too when the cache holds no copy of it.
+
+Ultravox's safetensors are served through the dense checkpoint route below, so no GGUF is needed.
+Pulling the checkpoint pulls that text model too when the cache holds no copy of it.  
 A gated id needs a token, or a copy pulled under another owner.
 
 The tower is placed after the text model, on a card the text model does not use when there is one.
+
 A clip arrives base64 as an `input_audio` part of `/v1/chat/completions`, or in `audios` of an `/api/chat` message.
 Any container the server decodes is accepted.
+
 The clip is mixed down and resampled to the tower's rate.
 Clips over 30 s are encoded window by window.
 
@@ -203,12 +221,14 @@ A request that carries a clip is not served from the prompt cache and takes no g
 ### Dense checkpoints
 
 A directory of `config.json`, a tokenizer and F32, F16 or BF16 safetensors shards of a Llama, Mistral or Qwen text model is served through the generic route, as a GGUF file is.
-Shapes come from the configuration.
+
+Shapes come from the configuration.  
 Tensors are read in their stored width.
 A long-context rope declared there becomes the frequency table that a GGUF file would carry.
 
 The projections of a float checkpoint run in their stored format when the placement fits it, on the host and on every card family.
 The layers a card takes fit as stored.
+
 The layers the host keeps are weighed against the memory it can give.
 A checkpoint that does not fit is rebuilt once at load, in the widest format that does:
 
@@ -218,7 +238,7 @@ A checkpoint that does not fit is rebuilt once at load, in the widest format tha
 | 2 | `Q8_0` | `Q8_0` |
 | 3 | `Q4_K` | `Q6_K` |
 
-The load log says which rung runs, and `/api/ps` reports it as `details.running_format`.
+The load log says which rung runs, and `/api/ps` reports it as `details.running_format`.  
 A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, or in `Q4_K` when its stack spills to the host.
 
 | Backend | Float matrix behaviour |
@@ -228,6 +248,7 @@ A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, 
 
 The expert stacks of a mixture-of-experts checkpoint follow the kernels instead.
 A stack runs as stored where a kernel of its device reads that format.
+
 On the host that includes `F32`, through the dense expert product, which copies the stack on each call and is slow for a large one.
 `F16` and `BF16` stacks are rebuilt in `Q8_0`.
 
@@ -264,9 +285,12 @@ The files measured all load through the generic route:
 <!-- site: end -->
 
 The experts stay in the file's mapping.
+
 A card holds a cache of the hot ones per layer, and the rest run on the host beside it.
+
 A wide prompt batch streams the layer's experts to the card through 2 buffers when that costs less than running its rows 1 by 1.
 Host memory is admitted against the bytes the process owns.
+
 Limits and measurements are in [Status](STATUS.md#the-qwen4exp-family).
 
 ## Image
@@ -291,7 +315,7 @@ The hash depends on the placement, see [Status](STATUS.md).
 
 ## Video
 
-`wan` produces clips conditioned on text or on an image, with the umT5 encoder the family ships.
+`wan` produces clips conditioned on text or on an image, with the umT5 encoder the family ships.  
 `POST /api/video/plan` returns what a clip of a given length costs before rendering it.
 
 ## Audio
@@ -325,9 +349,12 @@ Its configuration says which network it is.
 
 A Timestral forecast reads the last 32,768 points and answers 21 quantile levels, 0.01 to 0.99.
 A horizon longer than 1 block is decoded block by block, each block's median read back as context.
-The forecast is averaged with the reflected forecast of the negated series.
-It is clipped at zero when the context never goes below it.
+
+The forecast is averaged with the reflected forecast of the negated series.  
+The forecast is clipped at zero when the context never goes below it.
+
 A categorical covariate is encoded by the mean of the series over each category.
+
 The 4 checkpoints match the reference library within 5e-4 of the largest quantile on the fixed set of the Timestral gate.
 
 ## What a request may not ask for

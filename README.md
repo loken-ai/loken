@@ -4,7 +4,8 @@
 
 # loken
 
-A local inference server for language and generative-media models, written in Rust. One process serves chat, images, audio, speech, transcription and video over an OpenAI-compatible API, an Ollama-compatible API and the Messages API.
+A local inference server for language and generative-media models, written in Rust.  
+One process serves chat, images, audio, speech, transcription and video over an OpenAI-compatible API, an Ollama-compatible API and the Messages API.
 
 ```sh
 cp config.toml.example config.toml   # the daemon reads this from its working directory
@@ -22,7 +23,8 @@ curl -s localhost:11435/v1/chat/completions -H 'Content-Type: application/json' 
 }'
 ```
 
-Inference stays on the machine. loken needs no account and no API key, and has no hosted fallback. It reaches the network to fetch a model you asked for, and to announce a cluster node you configured.
+Inference stays on the machine. loken needs no account and no API key, and has no hosted fallback.
+It reaches the network to fetch a model you asked for, and to announce a cluster node you configured.
 
 ## What it does
 
@@ -38,7 +40,8 @@ Inference stays on the machine. loken needs no account and no API key, and has n
 
 ## Expose it on a network
 
-The server has no authentication and no rate limit unless you configure them, and its API can delete models. Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` in `config.toml` before it listens on anything but localhost.
+The server has no authentication and no rate limit unless you configure them, and its API can delete models.  
+Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` in `config.toml` before it listens on anything but localhost.
 
 ## Documentation
 
@@ -61,8 +64,12 @@ The server has no authentication and no rate limit unless you configure them, an
 
 ## History
 
-The git history was rewritten before publication. The project began as experiments early in 2026. The published history starts on 2026-08-30 with the tree as it stood then, laid out as chapters, and carries the work from that point on.
+The git history was rewritten before publication.  
+The project began as experiments early in 2026.
+The published history starts on 2026-08-30 with the tree as it stood then, laid out as chapters, and carries the work from that point on.
 
 ## Licence
 
-MIT OR Apache-2.0, at your option. [`NOTICE.md`](NOTICE.md) holds the third-party attributions. Model weights are not distributed here and carry their own terms.
+MIT OR Apache-2.0, at your option.  
+[`NOTICE.md`](NOTICE.md) holds the third-party attributions.  
+Model weights are not distributed here and carry their own terms.

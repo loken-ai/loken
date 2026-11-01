@@ -8,7 +8,8 @@ loken builds from source into 2 binaries, `lokend` (the daemon) and `loken` (the
 - [ ] A Rust toolchain with `cargo`, and the repository checked out.
 - [ ] For the default build: a CUDA toolkit and OpenCL headers.
 - [ ] For the CPU build: nothing beyond the toolchain.
-- [ ] A CPU with AVX2, FMA, BMI1/2, F16C, LZCNT and MOVBE. Older CPUs are refused at start with a message naming what is missing.
+- [ ] A CPU with AVX2, FMA, BMI1/2, F16C, LZCNT and MOVBE.
+  Older CPUs are refused at start with a message naming what is missing.
 <!-- site: end -->
 
 ## Build
@@ -20,7 +21,9 @@ loken builds from source into 2 binaries, `lokend` (the daemon) and `loken` (the
 cargo build --release
 ```
 
-The default features are `cuda`, `opencl` and `media`. The build looks for the toolkit through `CUDA_PATH` or `CUDA_HOME`. Without a toolkit it fails with `nvcc not found at ...; set CUDA_PATH`.
+The default features are `cuda`, `opencl` and `media`.  
+The build looks for the toolkit through `CUDA_PATH` or `CUDA_HOME`.
+Without a toolkit it fails with `nvcc not found at ...; set CUDA_PATH`.
 
 ### Without CUDA
 
@@ -28,7 +31,8 @@ The default features are `cuda`, `opencl` and `media`. The build looks for the t
 cargo build --release --no-default-features --features cpu
 ```
 
-Language models run on the host. Add `media` for every media family: `--features cpu,media`.
+Language models run on the host.  
+Add `media` for every media family: `--features cpu,media`.
 
 ### AMD, NVIDIA and Vulkan
 
@@ -38,7 +42,8 @@ cargo build --release --features cuda,rocm
 cargo build --release --features vulkan
 ```
 
-ROCm needs `hipcc` on the `PATH` or under `ROCM_PATH`. The feature table and the per-vendor requirements are in [Building](../BUILDING.md).
+ROCm needs `hipcc` on the `PATH` or under `ROCM_PATH`.  
+The feature table and the per-vendor requirements are in [Building](../BUILDING.md).
 <!-- site: end -->
 
 The binaries are `target/release/lokend` and `target/release/loken`.
@@ -57,7 +62,8 @@ The daemon reads `config.toml` from the first of these places:
 2. The directory of the executable.
 3. The user configuration directory, `~/.config/loken/config.toml` on Linux.
 
-Without a file the daemon runs on its defaults. Every key is in [Configuration](../CONFIGURATION.md).
+Without a file the daemon runs on its defaults.  
+Every key is in [Configuration](../CONFIGURATION.md).
 
 ## Verify
 

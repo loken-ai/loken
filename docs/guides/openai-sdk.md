@@ -38,7 +38,8 @@ model_id = "qwen3:0.6b"
    ```
 <!-- site: end -->
 
-Send a chat completion. The API key is any string until `require_auth` is on.
+Send a chat completion.
+The API key is any string until `require_auth` is on.
 
 <!-- site: widget tabs group=client id=openai-sdk-client -->
 ### curl
@@ -63,10 +64,11 @@ print(r.choices[0].message.content)
 
 ## Expected result
 
-The answer has the OpenAI shape: `choices[0].message.content`, `finish_reason` and `usage`.
+The answer has the OpenAI shape: `choices[0].message.content`, `finish_reason` and `usage`.  
 A reasoning model returns its thinking under `reasoning_content`, apart from `content`.
 
-The first request loads the model. `GET /api/ps` lists what is resident.
+The first request loads the model.
+`GET /api/ps` lists what is resident.  
 Every answer on the Ollama surface carries the engine's timings (`eval_count`, `eval_duration`) for the decode rate.
 
 ## Supported features

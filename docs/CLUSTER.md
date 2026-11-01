@@ -1,17 +1,21 @@
 # Cluster internals
 
-To set up 2 machines, read [Run 2 machines](operate/cluster.md).
+To set up 2 machines, read [Run 2 machines](operate/cluster.md).  
 [Status](STATUS.md#the-cluster) says what has been measured.
 
 ## Principle
 
 The cluster measures what it needs.
 A node times its own layers and its own completed requests, and publishes them.
+
 Every link is priced by the round trip of the state poll.
 No operator gives a speed, a bandwidth or a topology.
 
-Any node accepts any request. A node without the weights forwards it.
-A forwarded request is the original HTTP request. The response is the stream the peer sends, relayed unchanged.
+Any node accepts any request.
+A node without the weights forwards it.
+
+A forwarded request is the original HTTP request.  
+The response is the stream the peer sends, relayed unchanged.
 
 ## The `[cluster]` keys
 
@@ -40,7 +44,7 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 | `POST /api/cluster/prefill` | `model`, `prompt` | `application/octet-stream`: the KV cache after reading the prompt, which the asking node imports and decodes from. |
 | `POST /api/pipeline/tail` | `model`, `from`, `to`, `next`, `context` | `port`: the wire port. The node serves layers `[from, to)` and relays to `next`, a `host:port`, unless it holds the last segment. |
 
-`measure`, `prefill` and `pipeline/tail` are calls between nodes.
+`measure`, `prefill` and `pipeline/tail` are calls between nodes.  
 `GET /api/tags` lists the models of the peers beside the local ones, each under `node`.
 
 ## Discovery and membership
@@ -57,17 +61,22 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 
 ## Routing a request
 
-A node decides in this order. A verdict that keeps the request logs `cluster: serving locally: <reason>`.
+A node decides in this order.  
+A verdict that keeps the request logs `cluster: serving locally: <reason>`.
 
 1. `join` is empty: serve locally, `single node`.
-2. The request carries the forwarded marker: serve locally, `already forwarded once - a second hop would risk a loop`. A request moves at most once.
-3. A request that yields (batch priority) goes to the nearest alive peer that can serve it. With no peer and a conversation resident, the node answers `409`.
+2. The request carries the forwarded marker: serve locally, `already forwarded once - a second hop would risk a loop`.
+   A request moves at most once.
+3. A request that yields (batch priority) goes to the nearest alive peer that can serve it.
+   With no peer and a conversation resident, the node answers `409`.
 4. A node that has no measured rate for the model, and can serve it, serves it first, `no local price for this model yet`.
-5. Every candidate gets a predicted completion time, round trip included. The inputs are the rates the node measured for that model, its load and lanes, the prefix tokens it reports on `/api/cluster/prefix`, and the cost of loading the model when it is not resident.
-6. The lowest estimate wins. A peer that failed a hand-over is out for 10 gossip intervals.
+5. Every candidate gets a predicted completion time, round trip included.
+   The inputs are the rates the node measured for that model, its load and lanes, the prefix tokens it reports on `/api/cluster/prefix`, and the cost of loading the model when it is not resident.
+6. The lowest estimate wins.
+   A peer that failed a hand-over is out for 10 gossip intervals.
 7. The best peer must beat the local estimate by `min_speedup`, unless this node cannot serve the model at all.
 
-A hand-over that fails before the peer answers falls back to local serving.
+A hand-over that fails before the peer answers falls back to local serving.  
 When the peer stops mid-stream, the relay appends the closing chunk of the API format so the client sees an end.
 
 ## Planning a cut
@@ -75,11 +84,17 @@ When the peer stops mid-stream, the relay appends the closing chunk of the API f
 At load, a clustered node measures itself and plans the split.
 
 1. The node times a layer on its cards (`layer_ms`), the cost of a layer on its host (`miss_ms`), and the bytes its cards can carry for the model.
-2. It publishes the figures in `/api/cluster/state`. A peer that lacks them for the model is asked on `/api/cluster/measure`.
-3. The node that loads the model becomes the head. It collects the profiles of the alive nodes that have a cost for the model, and the measured round trips between nodes.
-4. The planner picks which node runs which contiguous run of layers. It minimises the predicted time of 1 token: the compute of each used node plus the crossing of each boundary.
-5. A boundary costs the measured round trip between the 2 nodes. Capacity is a hard limit: a plan never overflows a node.
-6. A node that would only slow the pipeline gets no layers. With up to a small number of nodes, the planner tries every order. Beyond that, it orders nodes by speed.
+2. It publishes the figures in `/api/cluster/state`.
+   A peer that lacks them for the model is asked on `/api/cluster/measure`.
+3. The node that loads the model becomes the head.
+   It collects the profiles of the alive nodes that have a cost for the model, and the measured round trips between nodes.
+4. The planner picks which node runs which contiguous run of layers.
+   It minimises the predicted time of 1 token: the compute of each used node plus the crossing of each boundary.
+5. A boundary costs the measured round trip between the 2 nodes.  
+   Capacity is a hard limit: a plan never overflows a node.
+6. A node that would only slow the pipeline gets no layers.  
+   With up to a small number of nodes, the planner tries every order.
+   Beyond that, it orders nodes by speed.
 7. When 1 node is fastest, the head logs `single node is fastest; not splitting` and serves alone.
 
 | Model | Cost of a node's run of layers |
@@ -88,14 +103,16 @@ At load, a clustered node measures itself and plans the split.
 | Dense transformer | Each layer at `layer_ms` on a card, or `miss_ms` on the host. The stack starts on the node that holds the request. |
 
 When a split pays, the head calls `/api/pipeline/tail` on every later segment, the last first, then connects its own model to the first tail.
-The tail reloads its layers through its own placement ladder and needs the model file locally.
+
+The tail reloads its layers through its own placement ladder and needs the model file locally.  
 A failure logs `pipeline not formed (...); one node`, and the head serves alone.
 
 A split is refused for models whose layers read state outside themselves: per-layer inputs, shared KV, recurrent state, experts held in host memory, an adapter or an image tower.
 
 ## The wire between nodes
 
-Control traffic is HTTP and JSON. Activations travel on a persistent TCP connection in binary frames.
+Control traffic is HTTP and JSON.  
+Activations travel on a persistent TCP connection in binary frames.
 A tail opens its wire port on every interface at a port the system assigns, and returns it from `/api/pipeline/tail`.
 
 A frame is little endian:
@@ -114,7 +131,8 @@ A frame is little endian:
 
 A frame whose shape and length disagree, or whose length passes the cap, is refused before any allocation.
 
-A multiplexed link carries many requests on 1 connection. A reply is routed by its request id, and a bound on requests in flight makes a fast sender wait.
+A multiplexed link carries many requests on 1 connection.
+A reply is routed by its request id, and a bound on requests in flight makes a fast sender wait.
 
 Pipeline frames:
 
@@ -125,4 +143,5 @@ Pipeline frames:
 | Cut | Length to cut the KV caches back to | One `Q8` byte for the operation. The answer is an empty `Q8` frame. |
 | Failure | none | A non-empty `Q8` answer holding the message. |
 
-A prefill chunk and a decode step are the same frame. Each segment keeps the KV cache of its own layers.
+A prefill chunk and a decode step are the same frame.  
+Each segment keeps the KV cache of its own layers.

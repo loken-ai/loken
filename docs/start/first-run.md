@@ -12,19 +12,22 @@ Start the daemon, pull a model and get one answer back.
 ## Run it
 
 <!-- site: widget steps id=first-run-steps -->
-1. Start the daemon. It listens on port 11435, set by `[server] port` or `--port`.
+1. Start the daemon.
+   It listens on port 11435, set by `[server] port` or `--port`.
 
    ```sh
    lokend serve
    ```
 
-2. Check it is up from another terminal. `/health` answers without a key.
+2. Check it is up from another terminal.
+   `/health` answers without a key.
 
    ```sh
    curl -s localhost:11435/health
    ```
 
-3. Pull a model. A name without `/` comes from the Ollama registry, one with `/` from Hugging Face.
+3. Pull a model.
+   A name without `/` comes from the Ollama registry, one with `/` from Hugging Face.
 
    ```sh
    loken pull qwen3:0.6b
@@ -36,7 +39,8 @@ Start the daemon, pull a model and get one answer back.
    loken list
    ```
 
-5. Send 1 request. The first one loads the model.
+5. Send 1 request.
+   The first one loads the model.
 
    ```sh
    loken chat --model qwen3:0.6b "Say hello in 6 words."
@@ -59,7 +63,8 @@ Assistant: <the answer>
 ```
 <!-- site: end -->
 
-`/health` also reports `version`, `uptime_seconds` and the engines loaded. `loken ps` lists the models resident in memory.
+`/health` also reports `version`, `uptime_seconds` and the engines loaded.  
+`loken ps` lists the models resident in memory.
 
 An OpenAI client reaches the same model at `http://localhost:11435/v1`, see [Serve a chat model to an OpenAI client](../guides/openai-sdk.md).
 

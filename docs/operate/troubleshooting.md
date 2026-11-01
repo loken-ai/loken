@@ -1,12 +1,13 @@
 # Troubleshoot
 
-Each table maps a message of the daemon, `lokend`, to its cause and fix.
+Each table maps a message of the daemon, `lokend`, to its cause and fix.  
 Messages are quoted as printed, and `...` stands for varying text.
 
 ## Before you start
 
 <!-- site: widget checklist id=operate-troubleshoot-prereq -->
-- [ ] You can read the output of `lokend serve`. Add `--verbose` for more lines.
+- [ ] You can read the output of `lokend serve`.
+  Add `--verbose` for more lines.
 - [ ] You know the name of the model and the address of the daemon, `localhost:11435` by default.
 <!-- site: end -->
 

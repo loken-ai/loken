@@ -5,14 +5,16 @@ Send audio to `/v1/audio/transcriptions` to get text, or text to `/v1/audio/spee
 ## Before you start
 
 <!-- site: widget checklist id=speech-prereq -->
-- [ ] The server runs a build with the `audio` feature, which the default build has. Without it these routes answer 404.
+- [ ] The server runs a build with the `audio` feature, which the default build has.
+  Without it these routes answer 404.
 - [ ] The audio clip is a WAV, MP3, FLAC or OGG file.
 - [ ] The model is listed in [the models page](../MODELS.md#audio), or named by its repository.
 <!-- site: end -->
 
 ## Smallest configuration
 
-None. Both routes load the model on the first request that names it.
+None.
+Both routes load the model on the first request that names it.
 
 ## Transcribe
 
@@ -24,11 +26,12 @@ None. Both routes load the model on the first request that names it.
    ```
 
 2. Read the `text` of the answer.
-3. Add `language`, `prompt`, `temperature` or `response_format` to steer it. `response_format` is `json`, `text`, `verbose_json`, `srt` or `vtt`.
+3. Add `language`, `prompt`, `temperature` or `response_format` to steer it.
+   `response_format` is `json`, `text`, `verbose_json`, `srt` or `vtt`.
 <!-- site: end -->
 
 `whisper-1` resolves to `openai/whisper-small`.
-A larger Whisper, a distil or a faster-whisper checkpoint is named by its repository.
+A larger Whisper, a distil or a faster-whisper checkpoint is named by its repository.  
 `/v1/audio/translations` takes the same form and answers in English.
 
 ## Synthesise
@@ -44,7 +47,8 @@ A larger Whisper, a distil or a faster-whisper checkpoint is named by its reposi
    }' -o out.wav
    ```
 
-2. Set `response_format` to `mp3` for an encoded output. The default is `wav`, and `pcm` is also accepted.
+2. Set `response_format` to `mp3` for an encoded output.
+   The default is `wav`, and `pcm` is also accepted.
 3. Set `stream` to `true` to receive the audio as 1 chunk per sentence.
 <!-- site: end -->
 

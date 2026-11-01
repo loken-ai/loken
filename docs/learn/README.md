@@ -2,7 +2,8 @@
 
 10 lessons for a developer who has never opened an inference engine.
 Each lesson takes about 10 minutes.
-It states 1 fundamental, shows what loken does about it, reports what was measured, and ends with a request or command to run against a local daemon.
+
+Each lesson states 1 fundamental, shows what loken does about it, reports what was measured, and ends with a request or command to run against a local daemon.
 
 ## Prerequisites
 
@@ -48,5 +49,6 @@ Every defect reported in the lessons was invisible to the measurement in place w
 
 - Every figure carries a date and the machine it came from.
 - The machine is the one [STATUS](../STATUS.md) describes, unless a lesson says otherwise.
-- The figures in the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's. The ones in the lessons are the experiments'.
+- The figures in the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's.  
+  The ones in the lessons are the experiments'.
 - The diagrams are hand-written SVG.

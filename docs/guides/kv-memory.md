@@ -1,6 +1,7 @@
 # Keep conversations in memory between requests
 
-A request that continues the previous one reuses the resident KV cache and prefills only its new tokens. 2 more tiers extend that to several conversations and across a restart.
+A request that continues the previous one reuses the resident KV cache and prefills only its new tokens.  
+2 more tiers extend that to several conversations and across a restart.
 
 ## Before you start
 
@@ -11,7 +12,8 @@ A request that continues the previous one reuses the resident KV cache and prefi
 
 ## Smallest configuration
 
-The snapshot tier needs no configuration. The disk tier needs a directory:
+The snapshot tier needs no configuration.  
+The disk tier needs a directory:
 
 ```toml
 [inference]
@@ -28,7 +30,8 @@ kv_disk_dir = "/var/lib/loken/kv"
 
 Past the window applies at `fidelity = "balanced"` (the default) and `"fast"`.
 The re-phased keys differ from a cold run's in the last bits.
-Q4 caches, sliding-window layers and recurrent hybrids prefill cold.
+
+Q4 caches, sliding-window layers and recurrent hybrids prefill cold.  
 At `fidelity = "reference"` the tail is re-prefilled cold.
 
 ## Run it
@@ -53,9 +56,11 @@ At `fidelity = "reference"` the tail is re-prefilled cold.
 
 ## Expected result
 
-`prompt_eval_count` counts the tokens actually prefilled. The second request shows only its new tokens.
+`prompt_eval_count` counts the tokens actually prefilled.
+The second request shows only its new tokens.  
 The Messages API reports the cache counts in `usage`.
-A snapshot costs 1 KV, held where the layers live.
+
+A snapshot costs 1 KV, held where the layers live.  
 A quantised cache restores on its own grid: Q8 exactly, Q4 within a step.
 
 ## Troubleshooting

@@ -2,8 +2,9 @@
 
 ## Before you start
 
-The default is safe for one person on one machine: `host` is `127.0.0.1`, no key is demanded and no rate limit applies.
-The API can pull, copy and delete models on disk. Whoever reaches the port can do that.
+The default is safe for one person on one machine: `host` is `127.0.0.1`, no key is demanded and no rate limit applies.  
+The API can pull, copy and delete models on disk.
+Whoever reaches the port can do that.
 
 <!-- site: widget checklist id=operate-network-before -->
 - [ ] `lokend` runs and answers on `localhost`.
@@ -49,7 +50,8 @@ API authentication ON (1 key(s), 0 allowed browser origin(s))
 Rate limit: 120 requests/minute per client, burst 10
 ```
 
-A request without a valid key gets `401`, in the error format of the surface it called. On `/v1`:
+A request without a valid key gets `401`, in the error format of the surface it called.  
+On `/v1`:
 
 ```json
 {"error": {"message": "missing or invalid API key", "type": "invalid_request_error", "code": "unauthorized"}}
@@ -84,7 +86,8 @@ A caller with a valid key, or any caller when `require_auth` is off, can:
 | Upload files, up to the body limits | `/v1/files`, `/v1/batches` |
 | Fetch images by URL from the hosts in `image_fetch_hosts` | the Messages API and `/v1/embeddings` |
 
-A key grants all of it. There is no read-only key.
+A key grants all of it.
+There is no read-only key.  
 Share a key only with callers you would trust to delete models.
 
 ## Check before you expose it
@@ -97,19 +100,26 @@ Share a key only with callers you would trust to delete models.
 - [ ] The daemon logs `API authentication ON` and `Rate limit: ...` at start.
 - [ ] A request without a key returns `401` from another machine.
 - [ ] The firewall allows the API port from the networks that need it and from no other.
-- [ ] A reverse proxy terminates TLS when the traffic crosses a network you do not control. The daemon speaks plain HTTP.
+- [ ] A reverse proxy terminates TLS when the traffic crosses a network you do not control.
+  The daemon speaks plain HTTP.
 - [ ] `image_fetch_hosts` stays empty or names only hosts you trust.
 - [ ] The key is stored in a secret store, and each client reads it from there.
 <!-- site: end -->
 
 ## Cluster nodes
 
-Cluster nodes poll each other on `/api/cluster/state` without a key. A node with `require_auth` on refuses the poll with `401`, so peers cannot join it.
+Cluster nodes poll each other on `/api/cluster/state` without a key.
+A node with `require_auth` on refuses the poll with `401`, so peers cannot join it.  
 Restrict the port with a firewall to the addresses of the cluster nodes instead.
 
-A node that takes part in a pipeline split also opens a binary port on every interface, at a port number the system picks. Allow all traffic between the cluster nodes.
+A node that takes part in a pipeline split also opens a binary port on every interface, at a port number the system picks.  
+Allow all traffic between the cluster nodes.
 
-Discovery uses multicast announcements on UDP port 41999. Any host on the segment can send one, and a node that hears it contacts the endpoint it names. Set `join` and block the port when the segment is not yours.
+Discovery uses multicast announcements on UDP port 41999.  
+Any host on the segment can send one, and a node that hears it contacts the endpoint it names.
+
+Set `join` and block the port when the segment is not yours.
+
 [Run 2 machines](cluster.md) covers the cluster itself.
 
 ## Troubleshooting

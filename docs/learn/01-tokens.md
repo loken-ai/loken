@@ -1,17 +1,25 @@
 # Tokens
 
-A model reads a row of ints and writes 1 int at a time.
+A model reads a row of ints and writes 1 int at a time.  
 Text becomes ints going in, and ints become text coming out.
 Both translations fail silently, with plausible nonsense and no crash or slowdown.
 
 ## The idea
 
-- **Tokenizer**: a fixed vocabulary of about 150k strings (151 936 for qwen3) and a rule for cutting text into it. Byte-pair encoding merges up from bytes. A SentencePiece unigram picks the highest-scoring split. Both ship in the checkpoint. A wrong tokenizer gives wrong output with every kernel correct.
-- **Special tokens**: entries that mark a turn or a reasoning block and stand for no text. Whether they are shown or hidden is a setting, not a property of the model.
-- **Chat template**: a Jinja program in the checkpoint that folds the messages into the 1 string shape the model trained on. A template rendered slightly off makes answers trail away.
-- **Return split**: the step that turns ids back into text, then splits it into the answer, the reasoning (`<think>`, a Harmony `analysis` channel) and any tool call. It is not arithmetic, so no kernel reports its failures.
+- **Tokenizer**: a fixed vocabulary of about 150k strings (151 936 for qwen3) and a rule for cutting text into it.
+  Byte-pair encoding merges up from bytes.
+  A SentencePiece unigram picks the highest-scoring split.  
+  Both ship in the checkpoint.
+  A wrong tokenizer gives wrong output with every kernel correct.
+- **Special tokens**: entries that mark a turn or a reasoning block and stand for no text.
+  Whether they are shown or hidden is a setting, not a property of the model.
+- **Chat template**: a Jinja program in the checkpoint that folds the messages into the 1 string shape the model trained on.
+  A template rendered slightly off makes answers trail away.
+- **Return split**: the step that turns ids back into text, then splits it into the answer, the reasoning (`<think>`, a Harmony `analysis` channel) and any tool call.
+  It is not arithmetic, so no kernel reports its failures.
 
-An English word is about 1.3 tokens. Source code is about 2.
+An English word is about 1.3 tokens.
+Source code is about 2.
 
 ## What loken does
 
@@ -23,7 +31,7 @@ An English word is about 1.3 tokens. Source code is about 2.
 
 ## What was measured
 
-4 defects found the same week (2026-09-12), on models months old.
+4 defects found the same week (2026-09-12), on models months old.  
 None was in the arithmetic.
 Each sat between the model's tokens and the client's JSON and moved no token rate, so no speed or coherence check saw it.
 
@@ -34,23 +42,25 @@ Each sat between the model's tokens and the client's JSON and moved no token rat
 | The template failed to render and a fallback rendered instead | falcon3, granite3-moe, granite3.1-dense, llama3.2 | `tojson(indent=4)` called a filter that took no named argument. |
 | A tool call lost | qwen3, granite | qwen3 emitted the call inside the reasoning block because `enable_thinking` was never set when rendering. granite returned an array where an object was expected, and a valid JSON array short-circuited to nothing. |
 
-A fifth surfaced on 2026-09-13, when a guard began rendering every stored template with and without a tool.
-smollm3's `{% generation %}` tags are unknown to the Jinja engine, so they are now stripped before parsing.
+A fifth surfaced on 2026-09-13, when a guard began rendering every stored template with and without a tool. smollm3's `{% generation %}` tags are unknown to the Jinja engine, so they are now stripped before parsing.
 
-Patching gemma4 through the prompt fixes 31b and 26b and breaks `gemma4:latest`, which then reasons without stopping.
+Patching gemma4 through the prompt fixes 31b and 26b and breaks `gemma4:latest`, which then reasons without stopping.  
 The 4 tags span 3 architectures: test all 4.
 
 ## Try it
 
 <!-- site: widget steps id=tokens-steps -->
-1. Ask a reasoning model a question. `message.thinking` holds the reasoning and `message.content` the answer. When streamed, the split happens per chunk.
+1. Ask a reasoning model a question.  
+   `message.thinking` holds the reasoning and `message.content` the answer.
+   When streamed, the split happens per chunk.
 
    ```sh
    curl -s localhost:11435/api/chat -d '{"model":"qwen3:0.6b","stream":false,
      "messages":[{"role":"user","content":"Say hello in six words."}]}'
    ```
 
-2. Add a tool. `content` goes empty.
+2. Add a tool.
+   `content` goes empty.
 
    ```sh
    curl -s localhost:11435/api/chat -d '{"model":"qwen3:0.6b","stream":false,

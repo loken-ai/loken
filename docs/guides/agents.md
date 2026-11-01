@@ -1,6 +1,7 @@
 # Run a coding agent on loken
 
-`loken launch` starts Claude Code or Cline with the daemon as the model provider. Nothing leaves the machine.
+`loken launch` starts Claude Code or Cline with the daemon as the model provider.
+Nothing leaves the machine.
 
 ## Before you start
 
@@ -13,7 +14,8 @@
 
 ## Smallest configuration
 
-None. `loken launch` writes what the agent reads.
+None.
+`loken launch` writes what the agent reads.  
 Without `--model`, the agent gets the one model loaded, or the one model held.
 
 ## Run it
@@ -48,7 +50,8 @@ loken launch claude -- -p "explain this repository"
 claude on qwen3:8b at http://localhost:11435, window 40960
 ```
 
-The window is the one the checkpoint declares. Cline also prints the files it wrote.
+The window is the one the checkpoint declares.  
+Cline also prints the files it wrote.
 
 ## What each agent gets
 
@@ -70,7 +73,8 @@ The window is the one the checkpoint declares. Cline also prints the files it wr
 ## Choosing a model
 
 Claude Code speaks the Messages API and Cline the Ollama API.
-Any chat model the daemon serves works with both. On a cluster, the request goes to the node that holds it.
+Any chat model the daemon serves works with both.  
+On a cluster, the request goes to the node that holds it.
 
 ## Troubleshooting
 

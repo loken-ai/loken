@@ -45,7 +45,8 @@ None. loken attaches a drafter by itself when a model is predicted to spill.
 | `draft` | attach | The drafter model. |
 | `device_index` | attach | The card for the drafter. Default: the fastest card. |
 
-These routes are loken's own. The Ollama API has none.
+These routes are loken's own.
+The Ollama API has none.
 
 ## Expected result
 
@@ -54,18 +55,21 @@ These routes are loken's own. The Ollama API has none.
 ```
 
 `/api/draft/status` answers `{"pairs": [{"target": ..., "draft": ..., "draft_length": ...}]}`.
+
 The answers keep the target's quality, because the target verifies every draft with the request's own sampling.
-The gain grows with the share of drafts the target accepts, and a drafter of the same family accepts more.
+The gain grows with the share of drafts the target accepts, and a drafter of the same family accepts more.  
 The measured gains are in [Status](../STATUS.md).
 
 ## Automatic attach
 
 When a model is predicted to spill, loken picks the smallest model of the store with the same ordinary vocabulary.
 It loads that model on the fastest card before the target and places the target around it.
-It releases the drafter when the target ends up on the cards, or when the vocabularies differ.
+
+loken releases the drafter when the target ends up on the cards, or when the vocabularies differ.
 
 loken learns the number of tokens drafted per cycle.
 It measures how often each draft position is accepted and what a cycle of each length costs, then drafts the length that commits the most tokens per second.
+
 Plain decoding is one of the lengths, so a drafter that stops paying is dropped.
 
 ## Troubleshooting

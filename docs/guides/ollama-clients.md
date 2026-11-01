@@ -7,7 +7,8 @@ An Ollama client talks to loken by changing the address.
 <!-- site: widget checklist id=ollama-clients-prereq -->
 - [ ] `lokend` is running.
 - [ ] An Ollama client is installed: the `ollama` command, or an application that speaks the Ollama API.
-- [ ] A model is in the store. `loken pull` and `ollama pull` fill the same layout, so a model pulled by either is served.
+- [ ] A model is in the store.
+  `loken pull` and `ollama pull` fill the same layout, so a model pulled by either is served.
 <!-- site: end -->
 
 ## Smallest configuration
@@ -47,7 +48,8 @@ loken pull qwen3:0.6b --source ollama
 
 ## Expected result
 
-`ollama list` prints the models of the store. `ollama run` answers in the terminal.
+`ollama list` prints the models of the store.  
+`ollama run` answers in the terminal.
 
 ## What matches
 
@@ -56,7 +58,7 @@ loken pull qwen3:0.6b --source ollama
 | `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`, `/api/show`, `/api/ps`, `/api/pull`, `/api/create`, `/api/copy`, `/api/delete` | Answer in Ollama's shapes, `keep_alive` included. |
 | `/api/version` | Names the API level served. |
 
-A model's template, system prompt and parameters come from its manifest.
+A model's template, system prompt and parameters come from its manifest.  
 `think` returns the reasoning apart from the answer.
 
 ## What differs

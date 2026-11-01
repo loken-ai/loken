@@ -11,7 +11,8 @@
 <!-- site: end -->
 
 The `model` of a request names the family by substring.
-The families and their files are in [the image models](../MODELS.md#image). For Z-Image:
+The families and their files are in [the image models](../MODELS.md#image).  
+For Z-Image:
 
 ```sh
 loken pull Tongyi-MAI/Z-Image-Turbo --source huggingface
@@ -19,7 +20,8 @@ loken pull Tongyi-MAI/Z-Image-Turbo --source huggingface
 
 ## Smallest configuration
 
-None. A request with no `model` renders with `z-image-turbo`.
+None.
+A request with no `model` renders with `z-image-turbo`.  
 These keys apply to specific cases:
 
 | Key | Effect |
@@ -42,7 +44,8 @@ Add `"response_format": "b64_json"` to get the picture inline.
 ## Expected result
 
 Without `response_format`, or with `url`, the picture is stored as a file and the answer holds `data[0].url`, built on the `Host` of the request or on `public_url`.
-With `b64_json`, the picture comes back base64 under `data[0].b64_json`.
+
+With `b64_json`, the picture comes back base64 under `data[0].b64_json`.  
 The answer also holds `created` and `render_ms`.
 
 ```json
@@ -66,7 +69,9 @@ The answer also holds `created` and `render_ms`.
 
 The placement measures what each card holds before loading.
 A family that does not fit spreads across cards, and reaches the host only when no card holds a piece.
-`GET /v1/renders` lists the renders in flight. `POST /v1/renders/{id}/cancel` stops one.
+
+`GET /v1/renders` lists the renders in flight.  
+`POST /v1/renders/{id}/cancel` stops one.
 
 ## Troubleshooting
 

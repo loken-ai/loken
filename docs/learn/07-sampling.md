@@ -1,6 +1,6 @@
 # From logits to a token
 
-A sampling policy, chosen per request, turns the logit row into the next id.
+A sampling policy, chosen per request, turns the logit row into the next id.  
 It decides whether 2 runs of the same prompt agree.
 
 ## The idea
@@ -19,12 +19,14 @@ It decides whether 2 runs of the same prompt agree.
 
 **Constrained decoding** is a mask on the row.
 A grammar says which tokens can continue a valid output at this position.
+
 A JSON schema compiles to such a grammar.
 Every other logit is removed before the draw.
 
 **Determinism** is a property of the whole path.
 Greedy decoding on the same logits gives the same token, and the same logits require the same arithmetic in the same order.
-Cache reuse ([lesson 6](06-kv-cache.md)) and a batched kernel can both change that order.
+
+Cache reuse ([lesson 6](06-kv-cache.md)) and a batched kernel can both change that order.  
 A seed fixes the draw, not the logits.
 
 ## What loken does
@@ -43,11 +45,11 @@ A seed fixes the draw, not the logits.
 
 Setup: 2026-09-12, desktop node, a campaign of 16 cells that published 2 comparisons.
 
-2 cells were blanked.
+2 cells were blanked.  
 On gemma4:31b, 1 engine averaged 96 tokens and the other 128.
 A rate over a different length is a different measurement.
 
-The 96 was the mean of 3 iterations that ran 128, 80 and 80 tokens.
+The 96 was the mean of 3 iterations that ran 128, 80 and 80 tokens.  
 A greedy decode should have produced the same text 3 times.
 
 ### Reuse only on a chunk boundary
@@ -59,7 +61,7 @@ A greedy decode should have produced the same text 3 times.
 
 The reused prefix is therefore rounded down to a chunk boundary.
 
-The window shift has the same cause: a re-phased key is not the cold key, bit for bit.
+The window shift has the same cause: a re-phased key is not the cold key, bit for bit.  
 `fidelity = "reference"` turns the shift off ([Status](../STATUS.md#context-shift)).
 
 ## Try it
@@ -76,7 +78,7 @@ The window shift has the same cause: a re-phased key is not the cold key, bit fo
 
    Expected: the same string twice, for example `Three colors are: **blue, red, and green**.`
 
-2. Drop `temperature` and run again.
+2. Drop `temperature` and run again.  
    The model's own default applies, and the 2 answers may differ.
    `/api/show` lists the default under `parameters`: 0.6 for qwen3.
 
@@ -90,8 +92,8 @@ The window shift has the same cause: a re-phased key is not the cold key, bit fo
        "required":["city","population"],"additionalProperties":false}}}}'
    ```
 
-4. Read `content`.
-   It is a JSON object with exactly 2 keys (observed: `Paris`, `1900000`).
+4. Read `content`.  
+   It is a JSON object with exactly 2 keys (observed: `Paris`, `1900000`).  
    `usage.completion_tokens` counts only what the mask let through.
 <!-- site: end -->
 

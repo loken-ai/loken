@@ -1,6 +1,7 @@
 # loken
 
-A local inference server for language and generative-media models. One process serves chat, images, audio, speech, transcription and video over an OpenAI-compatible API, an Ollama-compatible API and the Messages API.
+A local inference server for language and generative-media models.  
+One process serves chat, images, audio, speech, transcription and video over an OpenAI-compatible API, an Ollama-compatible API and the Messages API.
 
 > [!NOTE]
 > Inference stays on the machine. loken needs no account and no API key, and has no hosted fallback. It reaches the network to fetch a model you asked for, and to announce a cluster node you configured.
@@ -51,12 +52,16 @@ Any OpenAI, Ollama or Messages client works unchanged.
 | Authentication and rate limit | every route, `require_auth`, `api_keys`, `rate_limit_per_minute` | Runs, off by default |
 <!-- site: end -->
 
-Each media family is a build feature: `image`, `audio`, `video`, `midi`, or `media` for all. A family that is not built reports its models as unknown. [Models](../MODELS.md) lists the families served.
+Each media family is a build feature: `image`, `audio`, `video`, `midi`, or `media` for all.
+A family that is not built reports its models as unknown.  
+[Models](../MODELS.md) lists the families served.
 
 ## Where it is careful
 
-- **Placement is measured.** loken walks the forward pass without allocating, asks each card what it holds, and applies 1 rule to every family. Weights are charged at what the pool keeps, not at what the files weigh.
-- **Out of memory is a bug.** What does not fit spreads across cards. Only what no card holds reaches the host.
+- **Placement is measured.** loken walks the forward pass without allocating, asks each card what it holds, and applies 1 rule to every family.  
+  Weights are charged at what the pool keeps, not at what the files weigh.
+- **Out of memory is a bug.** What does not fit spreads across cards.  
+  Only what no card holds reaches the host.
 - **Energy is reported beside speed**, for each request.
 
 [Status](../STATUS.md) lists what is measured, what is slower than other engines, and what has never run.

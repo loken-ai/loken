@@ -11,7 +11,8 @@ Pick a family for the task, then a size and quantisation that fit your memory.
 
 ## Families
 
-A request names the model as in [Concepts](concepts.md#model-stores-and-names). [Models](../MODELS.md) has the full architecture lists.
+A request names the model as in [Concepts](concepts.md#model-stores-and-names).  
+[Models](../MODELS.md) has the full architecture lists.
 
 <!-- site: widget table id=choose-model-families -->
 | Task | Family | Request names it as | Notes |
@@ -35,11 +36,13 @@ A request names the model as in [Concepts](concepts.md#model-stores-and-names). 
 | Forecasting | Chronos-2, Timestral | `autogluon/chronos-2-small`, `mistralai/Timestral-5M` | `POST /v1/forecast` |
 <!-- site: end -->
 
-Image, video, audio and music families are build features. A family that is not built reports its models as unknown, see [Installation](install.md).
+Image, video, audio and music families are build features.
+A family that is not built reports its models as unknown, see [Installation](install.md).
 
 ## Size and memory
 
-The weights take parameters x bits per weight / 8 bytes. The bits per weight come from the file.
+The weights take parameters x bits per weight / 8 bytes.
+The bits per weight come from the file.
 
 <!-- site: widget table id=choose-model-bits -->
 | Format | Bits per weight | Weights of 8B parameters | Weights of 70B parameters |
@@ -51,7 +54,8 @@ The weights take parameters x bits per weight / 8 bytes. The bits per weight com
 | IQ2_XXS | 2.06 | 2.1 GB | 18 GB |
 <!-- site: end -->
 
-The bits per weight are those of [Fewer bits per weight](../learn/03-quantisation.md). The 2 size columns are that arithmetic, not measurements.
+The bits per weight are those of [Fewer bits per weight](../learn/03-quantisation.md).
+The 2 size columns are that arithmetic, not measurements.
 
 Add these to the weights:
 
@@ -70,7 +74,8 @@ Add these to the weights:
 | They fit on the cards and the host | The remainder spills to the host. Decode reads every host layer per token, so the host memory bandwidth bounds the rate |
 | A mixture larger than both | Only the experts spill, and are read from disk. The disk bounds the load and the rate |
 
-[Placement](../learn/09-placement.md) shows the measured cases. 2 examples from [Status](../STATUS.md):
+[Placement](../learn/09-placement.md) shows the measured cases.  
+2 examples from [Status](../STATUS.md):
 
 | Model | Result on 2 cards of 16 GB and the host |
 |---|---|
@@ -85,7 +90,8 @@ Add these to the weights:
 | Keep quality | Q8_0 or F16 when memory allows |
 | Run on the host | Any block format, which needs AVX2, see [Building](../BUILDING.md) |
 
-A file in a format loken does not read is refused with the format's id. [Models](../MODELS.md) lists the formats read.
+A file in a format loken does not read is refused with the format's id.
+[Models](../MODELS.md) lists the formats read.
 
 ## Run it
 
@@ -95,7 +101,8 @@ loken list
 loken ps
 ```
 
-`loken list` shows the model in the store. `loken ps` shows it after a first request loads it.
+`loken list` shows the model in the store.  
+`loken ps` shows it after a first request loads it.
 
 ## Next
 

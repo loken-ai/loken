@@ -1,6 +1,6 @@
 # References
 
-Each row names the reference a model implementation was validated against.
+Each row names the reference a model implementation was validated against.  
 This page attributes architectures, not code.
 A checkpoint dictates its tensor names, shapes and operation order, and an implementation that departs from them does not load.
 
@@ -43,6 +43,6 @@ The page will be corrected.
 | `inference/model/ultravox/` | projector and stacking factor per `ultravox_model.py` | [fixie-ai/ultravox](https://github.com/fixie-ai/ultravox) | MIT |
 | `inference/model/pixtral/`, `inference/model/voxtral/` | vision/audio towers read from the llama.cpp `mmproj` GGUF layout | [mistralai](https://huggingface.co/mistralai) via [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | Apache-2.0 (models), MIT (llama.cpp) |
 
-Model weights are not distributed with this repository.
+Model weights are not distributed with this repository.  
 Each model's license and terms of use govern its download and use.
 The FLUX.1 and Z-Image weights, for example, carry weight licenses distinct from the code license, some non-commercial.

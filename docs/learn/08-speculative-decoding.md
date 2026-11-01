@@ -1,37 +1,42 @@
 # More than one token per weight read
 
-Decode reads the whole model to produce 1 token and leaves most arithmetic units idle.
+Decode reads the whole model to produce 1 token and leaves most arithmetic units idle.  
 Speculative decoding uses them to check several guessed tokens in the pass that would have produced 1.
 
 ## The idea
 
-A cheap **drafter** proposes k tokens. The target model runs 1 forward over the prompt plus those k tokens.
-That pass reads the weights once, so it costs about 1 decode step in bytes.
+A cheap **drafter** proposes k tokens.  
+The target model runs 1 forward over the prompt plus those k tokens.
+
+The forward pass reads the weights once, so it costs about 1 decode step in bytes.
 It yields the target's own prediction at each of the k positions.
 
-The target keeps the drafts it agrees with.
+The target keeps the drafts it agrees with.  
 It replaces the first draft it disagrees with by its own choice and drops everything after.
 Under greedy decoding the output is token for token what the target generates alone.
 
-The gain is the number of drafts accepted per pass.
+The gain is the number of drafts accepted per pass.  
 The cost is drafting plus a verification pass slightly heavier than a plain step.
 
 A drafter comes from 1 of 3 sources:
 
 - A **separate small model** of the same family, with the same vocabulary.
-- A **trained head** on the target's last hidden state (EAGLE). It is a few percent of a layer and accepts near 90% of its drafts.
-- The **prompt itself**. An n-gram that already occurred is continued as it was before. It costs nothing and suits repetitive text such as code.
+- A **trained head** on the target's last hidden state (EAGLE).
+  It is a few percent of a layer and accepts near 90% of its drafts.
+- The **prompt itself**.
+  An n-gram that already occurred is continued as it was before.  
+  It costs nothing and suits repetitive text such as code.
 
 Drafting pays where verification is far cheaper per token than generation.
-A model that spills to the host crosses the bus once for k tokens instead of once per token.
+A model that spills to the host crosses the bus once for k tokens instead of once per token.  
 On a model that fits a card, verification costs about what drafting saves.
 
 ## What loken does
 
 loken drafts with a separate small model, an EAGLE head, or prompt lookup over a rolling buffer of the prompt and the generated tokens.
 
-It decides whether drafting pays from measured timings.
-It drops rejected drafts from the cache.
+It decides whether drafting pays from measured timings.  
+It drops rejected drafts from the cache.  
 Drafting with a separate model is verified for greedy decoding only.
 
 [Pick and attach a drafter](../guides/drafter.md) covers the choice of drafter and the attach route.
@@ -54,22 +59,27 @@ Drafting with a separate model is verified for greedy decoding only.
 
 The 18% acceptance leaves room: a better-matched drafter accepts more ([status](../STATUS.md#placement-measured-separately)).
 
-The learned draft length comes from measured acceptance per position and measured cycle time.
+The learned draft length comes from measured acceptance per position and measured cycle time.  
 Plain decoding is one of the candidate lengths.
-The loop drives both the drafter loken picks and one attached by hand.
+
+The loop drives both the drafter loken picks and one attached by hand.  
 A drafter attached to a model that fits the cards is dropped by the same rule.
 
 ## Try it
 
 You need a target that spills, such as a 70B on 2 cards of 16 GB.
-loken gives it the smallest model in the store that shares its vocabulary, here llama3.2:1b.
+
+loken gives the target the smallest model in the store that shares its vocabulary, here llama3.2:1b.  
 The load log says so: `deepseek-r1:70b spills to the host: llama3.2:1b drafts for it`.
 
 <!-- site: widget steps id=speculative-try -->
 1. Send 1 prompt that generates hundreds of tokens.
-2. Request `GET /api/draft/status`. It lists the pair and the draft length learned so far. The first request explores the lengths, plain decoding included.
+2. Request `GET /api/draft/status`.
+   It lists the pair and the draft length learned so far.  
+   The first request explores the lengths, plain decoding included.
 3. Compare `eval_count / eval_duration` on the first reply and on a later one.
-4. Send `POST /api/draft/detach` with `{"target":"deepseek-r1:70b"}` and run the prompt again. The `response` text is the same, at the plain rate.
+4. Send `POST /api/draft/detach` with `{"target":"deepseek-r1:70b"}` and run the prompt again.
+   The `response` text is the same, at the plain rate.
 <!-- site: end -->
 
 ## Check yourself

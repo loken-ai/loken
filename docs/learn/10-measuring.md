@@ -26,7 +26,8 @@ No rate says whether the output was good, or a loop the gate did not read far en
 The discipline that came out of 9 months of measuring:
 
 - Measure from the client, the same way for every engine.
-- Take the median. Report the first request apart from the later ones: cold and warm.
+- Take the median.
+  Report the first request apart from the later ones: cold and warm.
 - Publish the token count beside the rate.
 - Say which build, which machine, which day.
 - Profile a representative slice before a run of hours.
@@ -35,13 +36,15 @@ The discipline that came out of 9 months of measuring:
 
 ## What loken does
 
-loken reports the joules of a request, summed from the host and the cards over the request window.
+loken reports the joules of a request, summed from the host and the cards over the request window.  
 It also reports the time spent in each layer.
 
 The protocol and its tools do the rest:
 
 - The [method](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md) defines the cell, the prompts, the cards each engine may use, what a cell with no published rate means, and the `Tokens` column beside the rate.
-- The [rate columns](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#the-rate-columns) define prefill as prompt tokens over the client's time to first token, and decode as the client's span. Both are medians. [Cold and warm](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#cold-and-warm) figures stay apart.
+- The [rate columns](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#the-rate-columns) define prefill as prompt tokens over the client's time to first token, and decode as the client's span.
+  Both are medians.  
+  [Cold and warm](https://github.com/loken-ai/benchmarks/blob/main/docs/METHOD.md#cold-and-warm) figures stay apart.
 - The [benchmarks site](https://loken-ai.github.io/benchmarks/) shows the runs of every machine, 1 page per hardware, rebuilt from the records.
 - [lokprof](https://github.com/loken-ai/lokprof) drives each engine through its own API, separates prefill from decode, and records energy beside speed.
 
@@ -49,17 +52,19 @@ The protocol and its tools do the rest:
 
 ### The engines' own prefill rates
 
-Date: 2026-08.
-On a 15-token prompt, 1 engine reported 652 tokens/s where its own time to first token implied 35.
+Date: 2026-08.  
+On a 15-token prompt, 1 engine reported 652 tokens/s where its own time to first token implied 35.  
 Another reported 49 373 where its own implied 728.
-Side by side, those figures reversed the verdict on 3 cells of 4.
+
+Side by side, those figures reversed the verdict on 3 cells of 4.  
 Both columns now use the client's clock.
 
 ### Mean against median
 
-Date: 2026-09.
+Date: 2026-09.  
 A mixture too large to hold decoded at 3.8, 15.2 and 15.2 tokens/s over 3 iterations.
 The first iteration was the cold load.
+
 The published mean was 11.4 for a model that decodes at 15.2.
 
 | Quantity | Published | Steady state |
@@ -71,15 +76,17 @@ The energy figure flattered this engine: the first iteration's joules include lo
 
 ### A gate that read 120 characters
 
-Date: 2026-09-12.
+Date: 2026-09-12.  
 The coherence gate that blanks a looping answer judged a preview, the first 120 characters of an answer running past 500.
+
 One answer scored 0.139 distinct words over its full text and 0.870 over the preview, so the campaign blamed the wrong engine.
-A second, stricter gate written that day read the same preview and was retracted the same day.
+
+A second, stricter gate written that day read the same preview and was retracted the same day.  
 The 4 defects of lesson 1 lived below the same gate for months.
 
 ### A sweep under eviction
 
-Date: 2026-09-13.
+Date: 2026-09-13.  
 The sweep covered 65 models, with 1 question and 1 tool call each and 1 model resident at a time.
 
 | Outcome | Models |
@@ -91,12 +98,14 @@ The sweep covered 65 models, with 1 question and 1 tool call each and 1 model re
 
 All 3 load errors were contention.
 Retested cold and alone, each loaded and answered.
+
 A sweep is reliable for a deterministic defect and useless for a load error.
 
 ### Nothing compiles during a cell
 
-Date: 2026-09-03.
+Date: 2026-09-03.  
 The same 70B cell gave 2.15, then 1.64, then 1.58 tokens/s.
+
 From the second run, a build on 20 threads took half the DRAM bandwidth that the host layers were reading at.
 
 <!-- site: widget chart type=bar id=measuring-build -->
@@ -109,21 +118,23 @@ From the second run, a build on 20 threads took half the DRAM bandwidth that the
 
 ### Profile a slice first
 
-Date: 2026-09-17.
+Date: 2026-09-17.  
 9 machine-hours of full runs on the 552B mixture found bottlenecks that a 2-layer slice finds in minutes.
-On 4 layers and 4 096 tokens, 7 changes took 1 batched prefill from 78.7 s to 18.7 s.
-A stage timer measured each change.
+
+On 4 layers and 4 096 tokens, 7 changes took 1 batched prefill from 78.7 s to 18.7 s.  
+A stage timer measured each change.  
 The whole model then ran once to confirm.
 
 ### What a record identifies
 
-Date: 2026-09-12.
+Date: 2026-09-12.  
 A stored result named its engine by the binary's modification time and its model by a size and a quantisation label.
 Every digest read as zeros.
+
 The fairness protocol lived in shell, so a stranger's file looked like a protocol run.
 
-Records are now versioned and self-describing.
-They are compared only within an equivalence class: same schema, same protocol profile, same declared flags.
+Records are now versioned and self-describing.  
+They are compared only within an equivalence class: same schema, same protocol profile, same declared flags.  
 A submission is quarantined until reproduced.
 
 ## Try it

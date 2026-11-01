@@ -5,6 +5,7 @@ A transformer is 1 block applied 28 or 92 times.
 ## The idea
 
 An id becomes a vector by a table lookup, the **embedding**, of width `d` (1024 on qwen3:0.6b).
+
 A layer is a function from a vector to a corrected vector.
 The correction, the **residual**, is added to the input, so a layer only learns what to change.
 
@@ -13,15 +14,23 @@ The correction, the **residual**, is added to the input, so a layer only learns 
 A layer has 2 sub-layers, each behind a **norm**.
 RMSNorm divides the vector by its root-mean-square and scales it by a learned weight.
 
-- **Attention** lets a token read the others. 3 projections give each token a query, a key and a value. The query is scored against every earlier key. The scores go through a softmax, and the token's output is the values weighted by those scores, then 1 more projection.
-- **RoPE** rotates query and key by an angle that grows with the position, before the scoring. This is how the model knows distance.
+- **Attention** lets a token read the others.
+  3 projections give each token a query, a key and a value.  
+  The query is scored against every earlier key.  
+  The scores go through a softmax, and the token's output is the values weighted by those scores, then 1 more projection.
+- **RoPE** rotates query and key by an angle that grows with the position, before the scoring.
+  This is how the model knows distance.
 - **Heads** run attention in parallel on slices of the vector.
-- **Grouped-query attention** has several query heads share 1 key and value head, 16 against 8 on qwen3. It halves what is kept per token.
+- **Grouped-query attention** has several query heads share 1 key and value head, 16 against 8 on qwen3.
+  It halves what is kept per token.
 - **Latent attention** (DeepSeek) keeps 1 compressed vector per token and decompresses it when read.
-- **Feed-forward** is 2 matrices with a gate between them: `silu(x W_gate) * (x W_up)`, then `W_down`. It holds most of a dense model's bytes.
-- **Mixture of experts** replaces the feed-forward with many such blocks and a router. A small projection scores the experts, the top `k` run (8 of 128, say) and their outputs are summed with the router's weights. Only those experts' bytes are read for that token.
+- **Feed-forward** is 2 matrices with a gate between them: `silu(x W_gate) * (x W_up)`, then `W_down`.
+  It holds most of a dense model's bytes.
+- **Mixture of experts** replaces the feed-forward with many such blocks and a router.
+  A small projection scores the experts, the top `k` run (8 of 128, say) and their outputs are summed with the router's weights.
+  Only those experts' bytes are read for that token.
 
-After the last layer, a final norm and the output projection give 1 **logit** per vocabulary entry.
+After the last layer, a final norm and the output projection give 1 **logit** per vocabulary entry.  
 [Lesson 7](07-sampling.md) turns that row into a token.
 
 | | A layer |
@@ -41,10 +50,10 @@ After the last layer, a final norm and the output projection give 1 **logit** pe
 
 ## What was measured
 
-**Judging a port without running the original (2026-09-12 to 14).**
-The DeepSeek V4.1 port was gated against the authors' own reference implementation, unmodified, run on the CPU.
-Their kernel module was replaced by a pure-torch one.
-Their linear layer dispatches on the weight's dtype, so bf16 never reaches a compiled kernel.
+**Judging a port without running the original (2026-09-12 to 14).** The DeepSeek V4.1 port was gated against the authors' own reference implementation, unmodified, run on the CPU.
+
+The authors' kernel module was replaced by a pure-torch one.
+The authors' linear layer dispatches on the weight's dtype, so bf16 never reaches a compiled kernel.
 
 The reference dumps each phase's inputs and outputs, and the port replays the phase on them.
 
@@ -58,10 +67,10 @@ The reference dumps each phase's inputs and outputs, and the port replays the ph
 2 pitfalls gave finite, wrong output and no error:
 
 - Casting the reference's rotary table to fp32 drops the imaginary half, so RoPE applies half its rotation.
-- A lazily evaluated closure bound its loop variable late, so every expert came from the last layer. 1 layer matched, 2 layers gave cosine 0.92, and finding it took an hour.
+- A lazily evaluated closure bound its loop variable late, so every expert came from the last layer.
+  1 layer matched, 2 layers gave cosine 0.92, and finding it took an hour.
 
-**Gating a mixture is not gating a matrix (2026-09-13).**
-The router's top-k is a discrete choice.
+**Gating a mixture is not gating a matrix (2026-09-13).** The router's top-k is a discrete choice.
 Any precision gap between an f32 port and a bf16 reference flips the occasional borderline token to another expert.
 
 1 flipped token out of 64 moved the block's relative L2 from 1e-2 to 6e-2.
@@ -75,7 +84,7 @@ Every other token agreed and the cosine stayed at 0.998.
 | Block output | 0.058 |
 <!-- site: end -->
 
-A tight global threshold fails correct code, and a loose one hides real bugs.
+A tight global threshold fails correct code, and a loose one hides real bugs.  
 The gate that separates them has 3 parts:
 
 - the cosine over the whole tensor
@@ -96,7 +105,8 @@ The gate that separates them has 3 parts:
        print(k, d.get('qwen3.' + k))"
    ```
 
-2. Check the output: 28 blocks, a width of 1024, 16 query heads against 8 key and value heads. 2 query heads share each key head.
+2. Check the output: 28 blocks, a width of 1024, 16 query heads against 8 key and value heads.
+   2 query heads share each key head.
 3. Repeat on a mixture model and look for the expert count keys.
 <!-- site: end -->
 

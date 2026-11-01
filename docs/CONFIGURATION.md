@@ -8,13 +8,16 @@ The daemon reads `config.toml` from the first of these places:
 
 `config.toml.example` at the root of the repository is a working starting point.
 
-Every key is optional. A key left out takes the default shown.
+Every key is optional.
+A key left out takes the default shown.
 
 Logs carry lengths and counts, never a prompt, a message, a transcript or a generated text, at any level.
 
 A component that falls back to the host is admitted against the memory the host can give without swapping, minus a quarter kept as headroom.
 Past that, the request is refused with the figures instead of running in swap.
-A health probe or a model listing never waits on a load or a render. It reports what was last known.
+
+A health probe or a model listing never waits on a load or a render.
+It reports what was last known.
 
 ## Top level
 
@@ -31,7 +34,7 @@ ollama_models_dir = ["/mnt/nvme/ollama", "/mnt/hdd/ollama"]
 huggingface_models_dir = ["/mnt/nvme/huggingface", "/mnt/hdd/huggingface"]
 ```
 
-The directories of a key form 1 catalogue: listings and loads see the models of all of them.
+The directories of a key form 1 catalogue: listings and loads see the models of all of them.  
 List order is the order of preference, so put the fastest disk first.
 
 | Case | What happens |
@@ -43,10 +46,10 @@ List order is the order of preference, so put the fastest disk first.
 | A copy (`/api/copy`) | Stays in the directory of its source, beside the blobs it shares. |
 | A delete | Removes every copy. |
 
-A manifest and every blob it names stay in 1 directory.
+A manifest and every blob it names stay in 1 directory.  
 A Hugging Face repository stays whole in 1 directory.
 
-A single string reads as a list of 1.
+A single string reads as a list of 1.  
 Some media families read checkpoints from fixed paths under the store: `boogu/`, `wan/`, `flux-kontext-q4km.gguf` and `qwen-image-edit/`.
 These are looked up in the first Hugging Face directory only.
 
@@ -92,7 +95,9 @@ What each level chooses:
 | File each expert is read from, for a model served from several files | `largest` | `plan` | `smallest` |
 <!-- site: end -->
 
-The level decides these choices alone. The file names none of them.
+The level decides these choices alone.
+The file names none of them.
+
 A quantised checkpoint (Q4_K, Q8_0 and the like) is read as stored at every level.
 Its products quantise the activation to 8 bits, as llama.cpp does.
 
@@ -155,7 +160,8 @@ An instance with `prefill_peer` set has its long prompts read by that peer, whic
 3. The prefix reuse restores it in whole prefill chunks and reads the rest of the prompt here, so a prompt within a chunk of what the cache holds never leaves.
 
 A model with recurrent or windowed layers hands over its whole decode state instead of rows.
-That state holds every recurrent state, the windowed layers' rows, the global layers' rows and the logits to resume from.
+
+The decode state holds every recurrent state, the windowed layers' rows, the global layers' rows and the logits to resume from.
 It is checked against this instance's layer kinds and row geometry before it is read.
 
 The prompt is read here when:
@@ -180,6 +186,7 @@ With `context_parallel` set, the cache of each attention layer is cut into range
 
 The ranges hold F16 rows.
 The layers so cut run outside the recorded decode step, and their prefixes are not kept as snapshots.
+
 These layers keep their own cache: layers with a sliding window, attention sinks or indexed attention, layers sharing a cache with others, and layers split across cards.
 
 | Key | Default | What it does |
@@ -205,26 +212,34 @@ Both keys unset keep nothing on disk.
 ### Decode-state cache (DeepSeek V4.1 and recurrent hybrids)
 
 The cache lives in host memory for the life of the process, or on disk when `state_cache_dir` is set.
+
 A DeepSeek V4.1 prompt costs 1 pass over the routed experts, read from disk.
+
 The cache stores the model's decode state after a prompt and after each finished turn.
 A later prompt that begins with the same tokens restores it and prefills only the rest.
 
 Every file a cache keeps on disk (the state cache, the KV disk tier, the expert routing profile) has the same format:
 
 - A 20-byte header names the kind of file and its version, then comes a binary body.
-- A body is stored compressed when that makes it clearly smaller, and read back whole. A store in memory is never compressed.
+- A body is stored compressed when that makes it clearly smaller, and read back whole.
+  A store in memory is never compressed.
 - A file of another kind, another version or cut short is refused, and the cache rebuilds what it lost.
 - Files hold floating-point state and token ids, no text, and are not encrypted.
 
 The same keys open the same store for a generic-route model that carries a recurrent state beside its KV (a convolution, state-space or delta-rule mixer interleaved with attention).
-Such a state cannot be cut back to a shorter prefix, so trimming never reuses an earlier prompt and every turn re-prefills.
+
+The recurrent state cannot be cut back to a shorter prefix, so trimming never reuses an earlier prompt and every turn re-prefills.
 With the store open, each state the prefill passes is kept, and a later prompt restores the longest one it extends.
+
 A dense model keeps its disk tier (`kv_disk_dir`) and is unchanged.
 
 In memory, states are kept as the KV snapshots are: never written, gone with the process.
+
 On disk, the files hold state derived from prompts: KV tensors, hidden rows of the filling compression group and compressed token-class ids.
-They hold no text and no token ids, and names and keys are hashes.
+
+The files hold no text and no token ids, and names and keys are hashes.
 The state is as private as the prompt it came from.
+
 Keep the directory where the prompts could live, and leave the key unset where nothing about an exchange may reach the disk.
 
 | Key | Default | What it does |
@@ -246,9 +261,11 @@ A DeepSeek V4.1 state costs:
 - about 1.1 KB per token of compressed KV, stored once in block files that every snapshot of a conversation shares
 
 A prompt restores the longest stored prefix and prefills the rest in 1 layer-major pass onto it, so a stored prefix always pays.
+
 A pass over a few 100 tokens still routes to nearly every expert of every layer, so it reads about as many expert bytes as a whole prompt.
 A remainder of 250 tokens costs a little over half a cold 2000-token prompt.
-The batch worker and the serial path use the cache.
+
+The batch worker and the serial path use the cache.  
 A pipelined model does not, because half of its state is on the tail node.
 
 A state is keyed by the model files (length, modification time and header), so a different file starts from nothing.
@@ -256,33 +273,44 @@ A damaged, truncated or foreign file is ignored with a log line.
 
 For a recurrent hybrid, a stored state is a manifest and blocks:
 
-- The manifest holds every recurrent mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole block. Its size depends on the model, not on the prompt.
-- Blocks hold the global layers' rows for 1 block size of tokens (derived, see above), once per shared prefix. A block is stored as f16 where every value is exactly an f16, and as f32 otherwise, so a restore returns the stored bits.
+- The manifest holds every recurrent mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole block.
+  Its size depends on the model, not on the prompt.
+- Blocks hold the global layers' rows for 1 block size of tokens (derived, see above), once per shared prefix.
+  A block is stored as f16 where every value is exactly an f16, and as f32 otherwise, so a restore returns the stored bits.
 - States are kept at multiples of the largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least 1 block.
 - A state is keyed by the file, `kv_quant`, the layer kinds, the row geometry and which layers run on a card, so another placement or KV format starts from nothing.
 
 A restore removes the prefill of the covered tokens: the recurrent state and the global KV are read from disk instead of recomputed.
 The gain grows with the covered length and with how slow a prefill is on the machine and placement in use.
-The read speed of the cache directory against the state size bounds it.
+
+The read speed of the cache directory against the state size bounds the gain.
+
 A restore always leaves at least 1 token to prefill, to produce the logits.
 
 ### Streamed mixtures (DeepSeek V4.1)
 
-The `fidelity` level decides both choices of a model whose routed experts stream from disk. The file names neither.
+The `fidelity` level decides both choices of a model whose routed experts stream from disk.
+The file names neither.
 
 At `reference` and `balanced`, the output is identical to the full model, the same tokens whichever experts the cards hold, because a routed expert on a card gives the bits the host gives.
+
 At `fast`, the output differs by small, measured amounts, 3 times the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's.
 
 For a model whose manifest names further files of its checkpoint ([MODELS.md](MODELS.md)), the level also chooses the file each routed expert is read from.
+
 `balanced` reads the experts the cards keep, hottest first, from the most precise file while the cards have room, and those the host tier keeps or reads from disk from the smallest.
 
 At load, the engine runs a bundled text teacher-forced on the card path and on the host path to measure the noise.
-It then runs the text once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the level's budget.
+
+The engine then runs the text once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the level's budget.
+
 With no card and host to compare, `balanced` and `fast` run exact and say why in the log.
 
 The candidates derive from `K`, the number of experts a token routes to.
+
 Each candidate either keeps the `K-1` or `K-2` heaviest experts, or replaces a light expert that sits in no card tier when its weight share is under `0.5/K`, `0.75/K` or `1/K`.
-The measured table is cached per model file and plan, and the noise per model file, under `loken/` in the user cache directory, so a different level reuses them.
+
+The measured table is cached per model file and plan, and the noise per model file, under `loken/` in the user cache directory, so a different level reuses them.  
 A file with no tokenizer in its metadata runs exact.
 
 The offload derives these quantities from measurement and logs them:
@@ -299,13 +327,15 @@ During a prompt's prefill, each layer reads only the experts the prompt routes t
 
 - The cards' copies are read from the file into a page-locked slab in runs of adjacent experts, around the page cache.
 - Meanwhile the cards run the experts they keep and the host runs its own.
-- A copy made for the layer is let go after it unless the card has the room free to keep it. It never takes a kept expert's place.
+- A copy made for the layer is let go after it unless the card has the room free to keep it.
+  It never takes a kept expert's place.
 - When no card has room for the prompt's rows, the whole next layer is read ahead into the slab while the current layer runs.
 
 ### Expert cache of a mixture held in the file's mapping
 
-A mixture too large for the cards keeps its routed experts in the file's mapping.
+A mixture too large for the cards keeps its routed experts in the file's mapping.  
 The load sizes the cache on each layer's card.
+
 | Quantity | Derived from |
 |---|---|
 | Experts a layer's cache holds | The budget the plan gave the card, less what the load took of it, the room for copies and the working memory of a chunk, divided by the bytes of 1 more expert in every layer the card holds. When the budget covers every expert of every layer, they are all on the card and the layers run as loaded ones, with no cache. |
@@ -346,7 +376,7 @@ The caps follow the decoder's allocation budget: a request past 1 is answered 40
 
 ## `[cluster]`
 
-Without this table, the node runs alone and every cluster path is skipped.
+Without this table, the node runs alone and every cluster path is skipped.  
 See [CLUSTER.md](CLUSTER.md) for the model.
 
 <!-- site: widget table id=config-cluster -->

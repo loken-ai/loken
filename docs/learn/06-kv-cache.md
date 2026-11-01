@@ -5,10 +5,10 @@ The KV cache stores them.
 
 ## The idea
 
-Each layer stores 1 key row and 1 value row per key head, for every token seen.
-qwen3:0.6b stores 28 x 8 x 128 x 2 = 57 344 numbers per token, 112 KB at F16.
+Each layer stores 1 key row and 1 value row per key head, for every token seen. qwen3:0.6b stores 28 x 8 x 128 x 2 = 57 344 numbers per token, 112 KB at F16.
+
 A 4 096-token window takes 460 MB, close to the weights.
-On a larger model the cache dominates memory.
+On a larger model the cache dominates memory.  
 Grouped-query and latent attention exist to shrink its per-token bytes.
 
 The next turn of a conversation is the same prompt plus a little.
@@ -30,8 +30,8 @@ A server that keeps the cache prefills only the little.
 
 ## What loken does
 
-loken keeps 1 live cache per model, paged into fixed blocks.
-The cache is F16, 8 bits, or 4 bits with a per-channel key scale.
+loken keeps 1 live cache per model, paged into fixed blocks.  
+The cache is F16, 8 bits, or 4 bits with a per-channel key scale.  
 It keeps a snapshot of a finished conversation, so an alternated conversation comes back without a full prefill.
 
 A new prompt reuses the longest prefix it finds, searched in this order:
@@ -70,8 +70,9 @@ Tokens prefilled on an alternated turn:
 - llama3.2 at Q8: the output is bit-identical.
 - qwen3 at Q4: the output is within 1 quantisation step.
 
-The disk tier persists only prefix-uniform snapshots.
+The disk tier persists only prefix-uniform snapshots.  
 A sliding-window model's windowed layers go in a side blob.
+
 On gemma4, 1 248 of 3 296 tokens were re-prefilled after a restart.
 
 2 attempts were removed:
@@ -84,16 +85,18 @@ The disk holds the native dtype, and disk and memory hold the same values bit fo
 ### 3 bits, measured and refused
 
 A randomised Hadamard rotation spreads the outliers (excess kurtosis 35.7 to -0.6) and beats F16, as promised.
-Against the 4-bit cache, it does not.
-Per-channel grouping removes the outliers first, so rotating changes the error by under 0.5%.
+
+Against the 4-bit cache, the rotation does not.
+Per-channel grouping removes the outliers first, so rotating changes the error by under 0.5%.  
 Q4_0 is 2.6 times more accurate for 1 more bit ([Status](../STATUS.md#measured-and-refused)).
 
 ### One cache per model
 
-Date: 2026-09-11.
+Date: 2026-09-11.  
 An agent's speculative read ran at batch priority on the same model as its conversation.
 Every interactive step re-prefilled from nothing: 137 s, where a reuse costs 1.2 s.
-Work that yields now goes to a peer that can serve the model, or is declined.
+
+Work that yields now goes to a peer that can serve the model, or is declined.  
 The pricing cannot see this cost, because it falls on a different request than the one priced.
 
 The same question at 2 windows, on the same day:
@@ -129,7 +132,7 @@ Observed on qwen3:0.6b, RTX 5070 Ti:
 | A, second turn again | 381 | 26 ms |
 
 The second turn computed 381 tokens.
-2 chunks of the 4 477 shared tokens were reused, and the remainder was recomputed.
+2 chunks of the 4 477 shared tokens were reused, and the remainder was recomputed.  
 The last turn came from a snapshot, and the daemon's log says so:
 
 ```
@@ -151,23 +154,27 @@ A step computes only the new token's key and value vectors.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=1 id=kv-cache-quiz-2 -->
-2 conversations are served in alternation on one model, with no snapshot. What happens?
+2 conversations are served in alternation on one model, with no snapshot.  
+What happens?
 
 1. They evict each other from the single live cache
 2. Each keeps its own live cache
 3. The second one is refused
 
-loken keeps 1 live cache per model. A snapshot lets an alternated conversation come back without a full prefill.
+loken keeps 1 live cache per model.  
+A snapshot lets an alternated conversation come back without a full prefill.
 <!-- site: end -->
 
 <!-- site: widget quiz answer=3 id=kv-cache-quiz-3 -->
-A new prompt shares 4 477 tokens with the resident cache, and a chunk is 2 048 tokens. How many tokens are reused?
+A new prompt shares 4 477 tokens with the resident cache, and a chunk is 2 048 tokens.  
+How many tokens are reused?
 
 1. 4 477
 2. 2 048
 3. 4 096
 
-The reused prefix is rounded down to a prefill chunk, here 2 chunks. Turns shorter than a chunk reuse nothing.
+The reused prefix is rounded down to a prefill chunk, here 2 chunks.
+Turns shorter than a chunk reuse nothing.
 <!-- site: end -->
 
 <!-- site: widget flashcards id=kv-cache-terms -->

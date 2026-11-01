@@ -7,8 +7,10 @@ Any machine of the cluster accepts a request and serves it, or forwards it whole
 <!-- site: widget checklist id=operate-cluster-prereq -->
 - [ ] `lokend` is installed on both machines, with the model files of the models to serve ([Install](../start/install.md)).
 - [ ] Each machine reaches the other on the port of `[server]`, 11435 by default.
-- [ ] `[server] host` on both machines is an address the other can reach. The default `127.0.0.1` accepts local connections only.
-- [ ] `require_auth` is off on both machines. Peers poll `/api/cluster/state` without a key, and a node that demands one refuses the poll.
+- [ ] `[server] host` on both machines is an address the other can reach.
+  The default `127.0.0.1` accepts local connections only.
+- [ ] `require_auth` is off on both machines.
+  Peers poll `/api/cluster/state` without a key, and a node that demands one refuses the poll.
 <!-- site: end -->
 
 ```mermaid
@@ -21,7 +23,8 @@ flowchart LR
 
 ## Smallest configuration
 
-Each machine needs a `[cluster]` block. The rest is measured at run time.
+Each machine needs a `[cluster]` block.  
+The rest is measured at run time.
 
 <!-- site: widget tabs group=machine id=operate-cluster-config -->
 ### Machine A
@@ -92,6 +95,7 @@ The peers answer lists both machines, each with `alive` and the measured `rtt_ms
 ```
 
 The log of the node that took the request says what it chose: `forwarding to machine-b: ...` or `cluster: serving locally: ...`, with the reason.
+
 `GET /api/tags` on either machine lists the models of the whole cluster, those held elsewhere under the machine that holds them.
 
 ## What is forwarded
@@ -103,11 +107,15 @@ The log of the node that took the request says what it chose: `forwarding to mac
 | A request that only loads a model | A machine that has it. |
 
 A machine forwards only when the peer is at least `min_speedup` times faster.
+
 A request that no peer can take runs on the machine that received it, split across its cards when they hold the model together, spilled to the host when they do not.
-A request is forwarded once. The peer serves it whatever its own estimate says.
+
+A request is forwarded once.
+The peer serves it whatever its own estimate says.
 
 A model too large for any single machine is split across the machines by layers when the measured cost beats serving it alone.
-That runs for DeepSeek V4.1 and for dense transformers. [Status](../STATUS.md#the-cluster) says what has been measured.
+That runs for DeepSeek V4.1 and for dense transformers.  
+[Status](../STATUS.md#the-cluster) says what has been measured.
 
 ## Troubleshooting
 

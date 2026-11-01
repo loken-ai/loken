@@ -19,7 +19,8 @@ A kernel without such a test has shipped wrong answers for 2 days.
 | CUDA toolkit and OpenCL headers | `cargo build --release` |
 | Neither | `cargo build --release --no-default-features --features cpu` |
 
-Copy `config.toml.example` to `config.toml` before running the daemon. CUDA 13.3 is the tested toolkit.
+Copy `config.toml.example` to `config.toml` before running the daemon.  
+CUDA 13.3 is the tested toolkit.
 
 ## Test
 
@@ -30,16 +31,18 @@ Run `cargo test --lib --profile gate` before opening a pull request.
 | CI | The suite on the host |
 | Your machine | The card tests |
 
-Tests marked `#[ignore]` need model weights on disk or several cards. `config.test.toml.example` shows how to point them at your weights.
+Tests marked `#[ignore]` need model weights on disk or several cards.
+`config.test.toml.example` shows how to point them at your weights.
 
 ## Style
 
 - A comment says what the code does and what invariant it holds.
 - A commit message has 2 paragraphs at most.
 - A ported architecture comes from the architecture and the checkpoint's tensor names.
-- Copied code is measured and listed in `NOTICE.md`. The goal is an empty table.
+- Copied code is measured and listed in `NOTICE.md`.
+  The goal is an empty table.
 
 ## Reporting a problem
 
-Give the model, the prompt, the hardware and the expected output.
+Give the model, the prompt, the hardware and the expected output.  
 For a wrong output, say whether it is wrong the same way each time.

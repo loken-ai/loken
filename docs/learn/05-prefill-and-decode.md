@@ -1,6 +1,6 @@
 # 2 regimes, one model
 
-A request runs the same layers in 2 regimes: once over the whole prompt, then once per generated token.
+A request runs the same layers in 2 regimes: once over the whole prompt, then once per generated token.  
 Prefill is bound by arithmetic. Decode is bound by bytes.
 
 ## The idea
@@ -9,19 +9,21 @@ Prefill is bound by arithmetic. Decode is bound by bytes.
 
 - **Prefill** takes the n prompt tokens through every layer in one pass.
   Each projection multiplies n rows, so every weight byte read serves n tokens and the card's multiply speed bounds the pass.
+
   Attention adds a term that grows with n squared, because every token scores against every earlier one.
   At long prompts it takes most of the time.
 - **Decode** generates 1 token per pass.
   Each projection multiplies 1 row, so every weight byte read serves 1 token.
   The token rate is close to memory bandwidth divided by model bytes.
-  A model on a card reads at the card's rate.
-  A layer on the host reads at the host's rate, an order of magnitude slower.
+
+  A model on a card reads at the card's rate.  
+  A layer on the host reads at the host's rate, an order of magnitude slower.  
   A layer streamed from disk reads at the disk's rate, another order of magnitude slower.
 - **Chunks** cut prefill so that its activations fit beside the weights.
-  A chunk's peak memory scales with the chunk length times the widest feed-forward.
+  A chunk's peak memory scales with the chunk length times the widest feed-forward.  
   Chunks also let a long prompt yield to other requests.
 - **Scheduler**: a decode step reads the weights anyway, so several sequences can share the read.
-  At every step the scheduler decides which requests prefill and which decode.
+  At every step the scheduler decides which requests prefill and which decode.  
   It admits new requests when cache blocks free up, and preempts under pressure.
 
 Orders of magnitude on an RTX 5070 Ti:
@@ -49,7 +51,7 @@ Capturing a decode step as one CUDA graph reduces them.
 
 ### Where a long prefill's time goes
 
-Setup: 2026-09-11, RTX 5070 Ti and 5060 Ti, qwen3-coder 30b-a3b, chunk 512, Q4 KV.
+Setup: 2026-09-11, RTX 5070 Ti and 5060 Ti, qwen3-coder 30b-a3b, chunk 512, Q4 KV.  
 Prefill time was fitted on 3 prompts of real source, non-streamed and cache-busted, to about 1%.
 
 | Build | prefill(n) in ms |
@@ -91,6 +93,7 @@ Same day and setup.
 Until 2026-09-11, the log line of a streamed request reported a word-count estimate of the prompt, not the tokenizer's count.
 On source code the estimate is nearly half the real count.
 Every streamed measurement read as twice as slow per token.
+
 The usage chunk was always right, and the fit above used it.
 
 ## Try it
