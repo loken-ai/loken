@@ -136,7 +136,6 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 | Key | Default | What it does |
 |---|---|---|
 | `replicas` | `1` | Copies of a model served side by side, each whole on a card of its own, so concurrent requests run in parallel. A request goes to the least busy copy, or to the one that served the last request while it is free, so a conversation keeps its cache. A model that does not fit 1 card is served once whatever this says. A copy that cannot be placed whole on its card is dropped. A reload for a wider window or another cache format brings the model back as 1 copy until its next cold load. |
-| `vulkan_devices` | none | Vulkan devices placement may give layers to, by index or by a part of their name. Empty offers those no other runtime of the build drives. Needs the `vulkan` feature. |
 
 ### KV reuse across requests
 
@@ -406,7 +405,7 @@ See [CLUSTER.md](CLUSTER.md) for the model.
 | `cuda`, `opencl` | on | The device backends. |
 | `rocm` | off | AMD cards through HIP. Alone with `--no-default-features --features rocm,cpu`, or beside `cuda` with `--features cuda,rocm`, where 1 binary drives both vendors' cards. |
 | `image`, `audio`, `video`, `midi`, or `media` for all | on | The generative-media families and their routes. |
-| `vulkan` | off | Dense decoder layers on Vulkan GPUs: those no other runtime drives, or those `vulkan_devices` names. |
+| `vulkan` | off | Dense decoder layers on Vulkan GPUs that no other runtime of the build drives. A build with `vulkan` alone drives every GPU. |
 | `metrics` | off | `GET /metrics` in OpenMetrics, behind the same authentication as every other route. |
 | `cpu` | off | Language models on the host only. |
 <!-- site: end -->
