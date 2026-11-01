@@ -62,7 +62,7 @@ A greedy decode should have produced the same text 3 times.
 The reused prefix is therefore rounded down to a chunk boundary.
 
 The window shift has the same cause: a re-phased key is not the cold key, bit for bit.  
-`fidelity = "reference"` turns the shift off ([Status](../STATUS.md#context-shift)).
+`fidelity = "reference"` turns the shift off ([Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#context-shift)).
 
 ## Try it
 

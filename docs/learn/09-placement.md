@@ -57,7 +57,7 @@ Spilling only the experts changed the rate, in tokens per second:
 
 A mixture that already fits is untouched.  
 The planner cannot see 2 costs: about 870 MiB per loaded model whatever its size, and a spilled model held twice in host memory until the page advice followed the plan.
-See the [decode rate](../STATUS.md#decode-rate).
+See the [decode rate](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#decode-rate).
 
 ### A 552B mixture on a USB disk
 
@@ -96,7 +96,7 @@ The desktop served 554 locally and forwarded 0.
 
 The router forwards only when the peer lowers the predicted completion, and the fast card drains its queue faster than a hop to a slower one.  
 The laptop's value is holding a model the desktop does not.  
-See [the cluster](../STATUS.md#the-cluster).
+See [the cluster](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-cluster).
 
 ## Try it
 

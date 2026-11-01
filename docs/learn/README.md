@@ -8,7 +8,7 @@ Each lesson states 1 fundamental, shows what loken does about it, reports what w
 ## Prerequisites
 
 <!-- site: widget checklist id=learn-prereq -->
-- [ ] A running `lokend` serving a small model, `qwen3:0.6b` in the exercises (see [BUILDING](../BUILDING.md))
+- [ ] A running `lokend` serving a small model, `qwen3:0.6b` in the exercises (see [BUILDING](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md))
 - [ ] `curl`
 - [ ] `python3`
 - [ ] [`lokprof`](https://github.com/loken-ai/lokprof), for lesson 10 only
@@ -48,7 +48,7 @@ Every defect reported in the lessons was invisible to the measurement in place w
 ## About the figures
 
 - Every figure carries a date and the machine it came from.
-- The machine is the one [STATUS](../STATUS.md) describes, unless a lesson says otherwise.
+- The machine is the one [STATUS](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md) describes, unless a lesson says otherwise.
 - The figures in the [benchmarks](https://github.com/loken-ai/benchmarks) repository are the protocol's.  
   The ones in the lessons are the experiments'.
 - The diagrams are hand-written SVG.

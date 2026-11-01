@@ -22,7 +22,7 @@ A model stays resident for the keep-alive the daemon was started with.
 
 Quantisations are read as the file carries them.  
 On a card, the block formats run through their own kernels.  
-On the host, they need AVX2 (see [Building](BUILDING.md)).
+On the host, they need AVX2 (see [Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md)).
 
 <!-- site: widget table id=models-tensor-formats -->
 | Tensor formats a GGUF may carry | |
@@ -291,7 +291,7 @@ A card holds a cache of the hot ones per layer, and the rest run on the host bes
 A wide prompt batch streams the layer's experts to the card through 2 buffers when that costs less than running its rows 1 by 1.
 Host memory is admitted against the bytes the process owns.
 
-Limits and measurements are in [Status](STATUS.md#the-qwen4exp-family).
+Limits and measurements are in [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-qwen4exp-family).
 
 ## Image
 
@@ -311,7 +311,7 @@ A loader that lacks a file says which one it looked for.
 <!-- site: end -->
 
 Image parity across machines is a hash of 1 render per family.
-The hash depends on the placement, see [Status](STATUS.md).
+The hash depends on the placement, see [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md).
 
 ## Video
 

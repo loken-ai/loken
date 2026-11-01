@@ -88,7 +88,7 @@ A randomised Hadamard rotation spreads the outliers (excess kurtosis 35.7 to -0.
 
 Against the 4-bit cache, the rotation does not.
 Per-channel grouping removes the outliers first, so rotating changes the error by under 0.5%.  
-Q4_0 is 2.6 times more accurate for 1 more bit ([Status](../STATUS.md#measured-and-refused)).
+Q4_0 is 2.6 times more accurate for 1 more bit ([Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#measured-and-refused)).
 
 ### One cache per model
 

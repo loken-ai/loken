@@ -24,7 +24,7 @@ Any OpenAI, Ollama or Messages client works unchanged.
 <!-- site: widget table id=overview-capabilities -->
 | Capability | Interface | State |
 |---|---|---|
-| Chat and completion, streamed or whole | `/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`, `/v1/messages` | Measured, [decode rate](../STATUS.md#decode-rate) |
+| Chat and completion, streamed or whole | `/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`, `/v1/messages` | Measured, [decode rate](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#decode-rate) |
 | Responses API | `/v1/responses` | Runs |
 | Coding agents on the daemon | `loken launch claude`, `loken launch cline` | Runs, [guide](../guides/agents.md) |
 | Tools, JSON schema, grammar-constrained output | the chat routes, `tool_choice`, `response_format` | Runs |
@@ -32,8 +32,8 @@ Any OpenAI, Ollama or Messages client works unchanged.
 | Vision and speech in a chat turn | the chat routes, image and audio content | Runs |
 | Log-probabilities, logit bias, seeds | the chat and completion routes | Runs |
 | Embeddings and reranking | `/v1/embeddings`, `/api/embed`, `/v1/rerank` | Runs, [guide](../guides/embeddings.md) |
-| Placement across cards and the host | automatic | Measured, [placement](../STATUS.md#placement-measured-separately) |
-| Expert spilling for mixtures that do not fit, streamed from disk when the file exceeds the host | automatic | Measured, [large mixtures](../STATUS.md#large-mixtures-streamed-from-disk) |
+| Placement across cards and the host | automatic | Measured, [placement](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#placement-measured-separately) |
+| Expert spilling for mixtures that do not fit, streamed from disk when the file exceeds the host | automatic | Measured, [large mixtures](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#large-mixtures-streamed-from-disk) |
 | Continuous batching | automatic when requests overlap | Runs, cards only |
 | Speculative decoding | automatic for a model that spills to the host, `/api/draft/attach` | Measured on 1 pair, [guide](../guides/drafter.md) |
 | KV reuse across conversations, on disk, past the window | automatic, `kv_disk_dir` | Runs, [guide](../guides/kv-memory.md) |
@@ -64,7 +64,7 @@ A family that is not built reports its models as unknown.
   Only what no card holds reaches the host.
 - **Energy is reported beside speed**, for each request.
 
-[Status](../STATUS.md) lists what is measured, what is slower than other engines, and what has never run.
+[Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md) lists what is measured, what is slower than other engines, and what has never run.
 
 ## Before you expose it
 

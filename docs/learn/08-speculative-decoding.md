@@ -57,7 +57,7 @@ Drafting with a separate model is verified for greedy decoding only.
 | Learned draft length | 2.85 |
 <!-- site: end -->
 
-The 18% acceptance leaves room: a better-matched drafter accepts more ([status](../STATUS.md#placement-measured-separately)).
+The 18% acceptance leaves room: a better-matched drafter accepts more ([status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#placement-measured-separately)).
 
 The learned draft length comes from measured acceptance per position and measured cycle time.  
 Plain decoding is one of the candidate lengths.

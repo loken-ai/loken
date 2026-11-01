@@ -58,7 +58,7 @@ The Ollama API has none.
 
 The answers keep the target's quality, because the target verifies every draft with the request's own sampling.  
 The gain grows with the share of drafts the target accepts, and a drafter of the same family accepts more.
-The measured gains are in [Status](../STATUS.md).
+The measured gains are in [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md).
 
 ## Automatic attach
 
@@ -83,5 +83,5 @@ Plain decoding is one of the lengths, so a drafter that stops paying is dropped.
 
 ## Next
 
-- [Measured gains](../STATUS.md)
+- [Measured gains](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md)
 - [API routes](../API.md)

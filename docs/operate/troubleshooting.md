@@ -20,7 +20,7 @@ Messages are quoted as printed, and `...` stands for varying text.
 | `Failed to load config.toml: config.toml not found in CWD, exe dir, or user config dir. Using defaults.` | No `config.toml` in the working directory, beside the executable or in the user config directory. | Copy `config.toml.example` to `config.toml` in the working directory. |
 | `Failed to load config.toml: Failed to parse config file: ...` | `config.toml` is not valid TOML, or a key has the wrong type. The daemon runs on defaults. | Fix the line the message names. |
 | `CUDA libraries not found: ...` | The CUDA runtime is not on the library path. Every layer runs on the host. | Install the CUDA runtime, or ignore the message on a machine without a card. |
-| `nvcc not found at ...; set CUDA_PATH` at build time | The build cannot find the CUDA toolkit. | Set `CUDA_PATH` to the toolkit, or build without CUDA ([Building](../BUILDING.md)). |
+| `nvcc not found at ...; set CUDA_PATH` at build time | The build cannot find the CUDA toolkit. | Set `CUDA_PATH` to the toolkit, or build without CUDA ([Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md)). |
 
 ## A model will not load or does not fit
 

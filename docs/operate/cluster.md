@@ -115,7 +115,7 @@ The peer serves it whatever its own estimate says.
 
 A model too large for any single machine is split across the machines by layers when the measured cost beats serving it alone.
 That runs for DeepSeek V4.1 and for dense transformers.  
-[Status](../STATUS.md#the-cluster) says what has been measured.
+[Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-cluster) says what has been measured.
 
 ## Troubleshooting
 

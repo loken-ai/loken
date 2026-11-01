@@ -75,7 +75,7 @@ Add these to the weights:
 | A mixture larger than both | Only the experts spill, and are read from disk. The disk bounds the load and the rate |
 
 [Placement](../learn/09-placement.md) shows the measured cases.  
-2 examples from [Status](../STATUS.md):
+2 examples from [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md):
 
 | Model | Result on 2 cards of 16 GB and the host |
 |---|---|
@@ -88,7 +88,7 @@ Add these to the weights:
 |---|---|
 | Fit a model that is slightly too large | The next smaller format of the same model |
 | Keep quality | Q8_0 or F16 when memory allows |
-| Run on the host | Any block format, which needs AVX2, see [Building](../BUILDING.md) |
+| Run on the host | Any block format, which needs AVX2, see [Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md) |
 
 A file in a format loken does not read is refused with the format's id.
 [Models](../MODELS.md) lists the formats read.
@@ -107,5 +107,5 @@ loken ps
 ## Next
 
 - [First run](first-run.md)
-- [Models](../MODELS.md) and [Status](../STATUS.md)
+- [Models](../MODELS.md) and [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md)
 - [Placement](../learn/09-placement.md)

@@ -43,7 +43,7 @@ cargo build --release --features vulkan
 ```
 
 ROCm needs `hipcc` on the `PATH` or under `ROCM_PATH`.  
-The feature table and the per-vendor requirements are in [Building](../BUILDING.md).
+The feature table and the per-vendor requirements are in [Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md).
 <!-- site: end -->
 
 The binaries are `target/release/lokend` and `target/release/loken`.
@@ -84,5 +84,5 @@ Every key is in [Configuration](../CONFIGURATION.md).
 ## Next
 
 - [First run](first-run.md)
-- [Building](../BUILDING.md)
+- [Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md)
 - [Models](../MODELS.md)
