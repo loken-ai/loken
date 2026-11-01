@@ -17,7 +17,7 @@ Any machine of the cluster accepts a request and serves it, or forwards it whole
 flowchart LR
     C["client"] --> A["machine A"]
     A -- "forwards whole, relays the stream" --> B["machine B"]
-    A <-- "state poll every gossip interval" --> B
+    A -- "state poll every gossip interval, both ways" --- B
     A -. "multicast announcement" .- B
 ```
 
@@ -106,12 +106,29 @@ The log of the node that took the request says what it chose: `forwarding to mac
 | Image generation, edits and variations, video, sound and music, speech, transcription and translation, embeddings, reranking, and each turn of the conversation route | A machine that has the model and whose cards admit it whole. An upload travels as it arrived. |
 | A request that only loads a model | A machine that has it. |
 
-A machine forwards only when the peer is at least `min_speedup` times faster.
+A request of the first row goes through these tests on the machine that received it.
+Each end that serves the request here carries the reason its log line gives.
+
+```mermaid
+flowchart TD
+    R["request reaches a machine"] --> J{"join empty?"}
+    J -- yes --> L1["single node"]
+    J -- no --> F{"already forwarded once?"}
+    F -- yes --> L0["already forwarded once"]
+    F -- no --> P{"rate measured here for this model?"}
+    P -- no --> L2["no local price for this model yet"]
+    P -- yes --> B{"best peer min_speedup times faster?"}
+    B -- no --> L3["below the speedup a hand-over has to earn"]
+    B -- yes --> H["forwarding to the peer, stream relayed"]
+    H -- "peer does not answer" --> L4["hand-over failed, serving here instead"]
+```
+
+- A request is forwarded once, and the peer serves it whatever its own estimate says.
+- A machine without the model forwards it to the best peer, whatever the speedup.
+- A request of batch priority goes to the nearest peer that can serve the model, even a slower one.
+- [Troubleshooting](#troubleshooting) gives the fix for each reason, and 2 more local reasons.
 
 A request that no peer can take runs on the machine that received it, split across its cards when they hold the model together, spilled to the host when they do not.
-
-A request is forwarded once.
-The peer serves it whatever its own estimate says.
 
 A model too large for any single machine is split across the machines by layers when the measured cost beats serving it alone.
 That runs for DeepSeek V4.1 and for dense transformers.  
@@ -126,6 +143,8 @@ That runs for DeepSeek V4.1 and for dense transformers.
 | The log says `cluster: no multicast discovery (...); seeds only` | The network offers no multicast. | List the peers in `join`. |
 | The log says `cluster: serving locally: single node` | `join` is empty on this node. | Put the address of 1 peer in `join`. |
 | The log says `cluster: serving locally: no local price for this model yet` | The node has no measured rate for this model. | Nothing. The first request stays local and becomes the measurement. |
+| The log says `cluster: serving locally: no peer published anything usable` | No peer has published its state, or every peer is excluded. | Check `/api/cluster/peers`, then the `advertise` address of each peer. |
+| The log says `cluster: serving locally: no address known for ...` | The best peer has no address on record. | Read the `endpoint` of the peer in `/api/cluster/peers`, then set `join` or `advertise`. |
 | The log says `cluster: serving locally: peer ... is only 1.10x faster, below the 1.15x a hand-over has to earn` | The peer is not faster than `min_speedup` requires. | Lower `min_speedup`, or accept that this machine serves it. |
 | The log says `cluster: hand-over to ... failed (...) - serving here instead` | The peer did not answer the forwarded request. | The request was served locally. Check the peer and its address in `advertise`. |
 | A stream ends early and the log says `cluster: the peer serving this request stopped before finishing it` | The peer died mid-generation. | The node closes the stream. Send the request again. |

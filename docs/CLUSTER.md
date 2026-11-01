@@ -14,6 +14,8 @@ No operator gives a speed, a bandwidth or a topology.
 Any node accepts any request.
 A node without the weights forwards it.
 
+![A request enters at node B, which forwards it once to node A that holds the weights](img/cluster-topology.svg)
+
 A forwarded request is the original HTTP request.  
 The response is the stream the peer sends, relayed unchanged.
 
@@ -40,7 +42,7 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 | `GET /api/cluster/state` | none | What this node publishes: `node_id`, `models` resident, `serves` (what it could load), `load`, `busy`, `lanes`, `devices`, `cards` (bytes each card admits whole), measured rates, `prefix_blocks`, the cost of a layer per model, the bytes its cards carry per model, and the round trips it timed to its peers. |
 | `GET /api/cluster/peers` | none | `clustered` and `peers`. Each peer has `node_id`, `endpoint`, `alive`, `phi`, `rtt_ms`, `is_self` and `state`. |
 | `POST /api/cluster/prefix` | `model`, `prompt` | `cached_tokens`: how many tokens of the prompt this node holds in its prefix cache. A model that is not resident answers 0. |
-| `POST /api/cluster/measure` | `model` | `card_ms`, `host_ms`, `card_bytes`: what a layer of the model costs on this node. A head asks it of a peer that has no cost for the model yet. |
+| `POST /api/cluster/measure` | `model` | `card_ms`, `host_ms`, `card_bytes`: what a layer of the model costs on this node. A head that plans the cut of a dense model asks it of a peer that has no cost for the model yet. |
 | `POST /api/cluster/prefill` | `model`, `prompt` | `application/octet-stream`: the KV cache after reading the prompt, which the asking node imports and decodes from. |
 | `POST /api/pipeline/tail` | `model`, `from`, `to`, `next`, `context` | `port`: the wire port. The node serves layers `[from, to)` and relays to `next`, a `host:port`, unless it holds the last segment. |
 
@@ -64,11 +66,28 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 A node decides in this order.  
 A verdict that keeps the request logs `cluster: serving locally: <reason>`.
 
+```mermaid
+flowchart TD
+  A[Request arrives] --> B{join empty, or<br/>forwarded marker?}
+  B -->|yes| L1[Serve locally]
+  B -->|no| D{Batch priority:<br/>it yields?}
+  D -->|yes, a peer can serve| F[Forward to the<br/>nearest alive peer]
+  D -->|yes, no peer,<br/>conversation resident| X[Answer 409]
+  D -->|no, or no peer| E{No local rate yet<br/>and can serve?}
+  E -->|yes| L2[Serve locally]
+  E -->|no| G[Estimate completion for every<br/>candidate, failed peers out]
+  G --> H{Best peer beats local by<br/>min_speedup, or no local option?}
+  H -->|no| L3[Serve locally]
+  H -->|yes| P[Forward to the best peer]
+  P -->|fails before it answers| L3
+```
+
 1. `join` is empty: serve locally, `single node`.
 2. The request carries the forwarded marker: serve locally, `already forwarded once - a second hop would risk a loop`.
    A request moves at most once.
 3. A request that yields (batch priority) goes to the nearest alive peer that can serve it.
    With no peer and a conversation resident, the node answers `409`.
+   With no peer and no conversation resident, the request goes on to step 4.
 4. A node that has no measured rate for the model, and can serve it, serves it first, `no local price for this model yet`.
 5. Every candidate gets a predicted completion time, round trip included.
    The inputs are the rates the node measured for that model, its load and lanes, the prefix tokens it reports on `/api/cluster/prefix`, and the cost of loading the model when it is not resident.
@@ -76,18 +95,36 @@ A verdict that keeps the request logs `cluster: serving locally: <reason>`.
    A peer that failed a hand-over is out for 10 gossip intervals.
 7. The best peer must beat the local estimate by `min_speedup`, unless this node cannot serve the model at all.
 
-A hand-over that fails before the peer answers falls back to local serving.  
-When the peer stops mid-stream, the relay appends the closing chunk of the API format so the client sees an end.
+When a peer stops mid-stream, the relay appends the closing chunk of the API format so the client sees an end.
 
 ## Planning a cut
 
 At load, a clustered node measures itself and plans the split.
+The node that loads the model becomes the head.
 
-1. The node times a layer on its cards (`layer_ms`), the cost of a layer on its host (`miss_ms`), and the bytes its cards can carry for the model.
-2. It publishes the figures in `/api/cluster/state`.
-   A peer that lacks them for the model is asked on `/api/cluster/measure`.
-3. The node that loads the model becomes the head.
-   It collects the profiles of the alive nodes that have a cost for the model, and the measured round trips between nodes.
+```mermaid
+sequenceDiagram
+  participant H as Head
+  participant P as Peers
+  participant T1 as First tail
+  participant T2 as Last tail
+  Note over H: Times a layer<br/>on cards and on host
+  H->>P: POST /api/cluster/measure
+  Note over P: Dense model,<br/>no figures yet
+  P-->>H: Figures, in the state poll
+  Note over H: Plans runs of layers.<br/>A split pays: starts the tails
+  H->>T2: POST /api/pipeline/tail, last segment first
+  Note over T2: Reloads its layers<br/>from its own file
+  T2-->>H: Wire port
+  H->>T1: POST /api/pipeline/tail, next is the last tail
+  T1-->>H: Wire port
+  H->>T1: Connect, boundary frames on the wire
+```
+
+1. The head times a layer on its cards (`layer_ms`), the cost of a layer on its host (`miss_ms`), and the bytes its cards can carry for the model.
+2. Every node publishes these figures in `/api/cluster/state`.
+   For a dense model, the head asks a peer that lacks them on `/api/cluster/measure`.
+3. The head collects the profiles of the alive nodes that have a cost for the model, and the measured round trips between nodes.
 4. The planner picks which node runs which contiguous run of layers.
    It minimises the predicted time of 1 token: the compute of each used node plus the crossing of each boundary.
 5. A boundary costs the measured round trip between the 2 nodes.  

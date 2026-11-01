@@ -9,19 +9,18 @@ digraph cluster {
         fontcolor="#57606a", arrowsize=.7];
 
   client [label="client", shape=plaintext, fontcolor="#57606a"];
-  router [label="router\lSWIM gossip, phi-accrual detector,\land an eventually-consistent table\l",
-          color="#2da44e", fontcolor="#2da44e"];
 
-  a [label="node A\nTP=2"];
-  b [label="node B\nTP=2"];
-  c [label="node C\nCPU, full replica"];
+  a [label="node A\nholds the weights", color="#2da44e", fontcolor="#2da44e"];
+  b [label="node B\nno weights"];
+  c [label="node C\nholds the weights"];
 
-  client -> router [label=" any node is an entry point "];
-  router -> a;
-  router -> b;
-  router -> c;
+  client -> b [label=" any node accepts the request "];
+  b -> a [label=" forwards the request once,\l relays the stream \l", color="#2da44e", fontcolor="#2da44e"];
+  a -> c [dir=both, style=dashed, constraint=false, label=" state poll:\l its round trip prices the link \l"];
+  b -> c [dir=both, style=dashed, constraint=false];
 
   note [shape=plaintext, fontsize=9, fontcolor="#57606a",
-        label="A model is sharded across nodes only when no single node holds it,\land only where the measured link cost says it pays.\l"];
+        label="Each node decides alone from the rates, the load and the link prices it measured.\lNodes find each other by multicast announcements and join seeds.\lA phi-accrual detector evicts a silent node.\l"];
   c -> note [style=invis];
+  a -> note [style=invis];
 }
