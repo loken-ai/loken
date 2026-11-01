@@ -29,7 +29,7 @@ The host budget is a share of the machine.
 No placement depends on a card's name or index.  
 Every hot component can span n cards.
 
-It reads a card's state from 1 place.  
+loken reads a card's state from 1 place.  
 It measures a request's peak by running the forward on a device that allocates nothing, then replays the allocator's behaviour on top.
 
 A model larger than the cards and the host together is streamed.  

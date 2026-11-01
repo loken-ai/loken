@@ -45,7 +45,7 @@ None. loken attaches a drafter by itself when a model is predicted to spill.
 | `draft` | attach | The drafter model. |
 | `device_index` | attach | The card for the drafter. Default: the fastest card. |
 
-These routes are loken's own.
+The attach and detach routes are loken's own.
 The Ollama API has none.
 
 ## Expected result
@@ -56,8 +56,8 @@ The Ollama API has none.
 
 `/api/draft/status` answers `{"pairs": [{"target": ..., "draft": ..., "draft_length": ...}]}`.
 
-The answers keep the target's quality, because the target verifies every draft with the request's own sampling.
-The gain grows with the share of drafts the target accepts, and a drafter of the same family accepts more.  
+The answers keep the target's quality, because the target verifies every draft with the request's own sampling.  
+The gain grows with the share of drafts the target accepts, and a drafter of the same family accepts more.
 The measured gains are in [Status](../STATUS.md).
 
 ## Automatic attach

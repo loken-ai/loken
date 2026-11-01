@@ -17,10 +17,10 @@
 | `loken delete` | Removes a model |
 
 A `.pth` archive that a media family needs is placed in the store by hand.  
-A request that names a model not yet loaded loads it.  
+A request that names a model not yet loaded loads it.
 A model stays resident for the keep-alive the daemon was started with.
 
-Quantisations are read as the file carries them.
+Quantisations are read as the file carries them.  
 On a card, the block formats run through their own kernels.  
 On the host, they need AVX2 (see [Building](BUILDING.md)).
 
@@ -55,13 +55,13 @@ Without a selector, every file is pulled.
 Each file is checked against its listed size and its sha256.
 
 A pull follows the daemon's streamed progress.
-It stops when no frame arrives for 8 times the longest gap seen.
+It stops when no frame arrives for 8 times the longest gap seen.  
 A repository that holds a model GGUF and its `mmproj` resolves to the model file.
 
 ### Split GGUF
 
-A GGUF split into parts by `gguf-split` is read as 1 model on the generic route.
-The loader takes the first part's metadata and the union of the parts' tensor directories.  
+A GGUF split into parts by `gguf-split` is read as 1 model on the generic route.  
+The loader takes the first part's metadata and the union of the parts' tensor directories.
 Each tensor is read from the part that holds it.
 
 | Rule | Detail |
@@ -76,7 +76,7 @@ Each tensor is read from the part that holds it.
 A mixture model may be served from several GGUF files of 1 checkpoint, each quantising the routed experts to its own format.
 
 The mixture model's Ollama manifest names the first file as its model layer.  
-Each further file is a layer of media type `application/vnd.loken.image.model.variant`.
+Each further file is a layer of media type `application/vnd.loken.image.model.variant`.  
 `/api/tags` lists the tag like any other.
 
 ```json
@@ -106,7 +106,7 @@ A further file is refused at load, with what differs, unless it matches the firs
 - Every other tensor of the first file, at the same shape, format and bytes.
 
 A table read row by row (the engram tables) is compared on evenly spread spans.  
-Tensors that only the further file carries are ignored.
+Tensors that only the further file carries are ignored.  
 The DeepSeek V4.1 route reads this layout.
 
 ### Convert DeepSeek V4.1
@@ -200,7 +200,7 @@ The tower comes from one of 2 sources:
 
 Ultravox ships only the tower and the projector.
 
-It names its text model by `text_model_id`, which the loader looks up in the hub cache by id, else by name under any owner.
+Ultravox names its text model by `text_model_id`, which the loader looks up in the hub cache by id, else by name under any owner.
 
 Ultravox's safetensors are served through the dense checkpoint route below, so no GGUF is needed.
 Pulling the checkpoint pulls that text model too when the cache holds no copy of it.  
@@ -215,7 +215,7 @@ The clip is mixed down and resampled to the tower's rate.
 Clips over 30 s are encoded window by window.
 
 The clip's embeddings take the place of 1 marker in the prompt.
-The clip counts against the context window and in `prompt_tokens` and `prompt_eval_count`.
+The clip counts against the context window and in `prompt_tokens` and `prompt_eval_count`.  
 A request that carries a clip is not served from the prompt cache and takes no grammar.
 
 ### Dense checkpoints
@@ -223,7 +223,7 @@ A request that carries a clip is not served from the prompt cache and takes no g
 A directory of `config.json`, a tokenizer and F32, F16 or BF16 safetensors shards of a Llama, Mistral or Qwen text model is served through the generic route, as a GGUF file is.
 
 Shapes come from the configuration.  
-Tensors are read in their stored width.
+Tensors are read in their stored width.  
 A long-context rope declared there becomes the frequency table that a GGUF file would carry.
 
 The projections of a float checkpoint run in their stored format when the placement fits it, on the host and on every card family.
@@ -296,7 +296,7 @@ Limits and measurements are in [Status](STATUS.md#the-qwen4exp-family).
 ## Image
 
 The `model` of an image request names the family by substring.
-The loader then reads that family's files from the Hugging Face store.
+The loader then reads that family's files from the Hugging Face store.  
 A loader that lacks a file says which one it looked for.
 
 <!-- site: widget table id=models-image -->

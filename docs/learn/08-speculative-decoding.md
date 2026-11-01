@@ -35,7 +35,7 @@ On a model that fits a card, verification costs about what drafting saves.
 
 loken drafts with a separate small model, an EAGLE head, or prompt lookup over a rolling buffer of the prompt and the generated tokens.
 
-It decides whether drafting pays from measured timings.  
+loken decides whether drafting pays from measured timings.  
 It drops rejected drafts from the cache.  
 Drafting with a separate model is verified for greedy decoding only.
 

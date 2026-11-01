@@ -71,7 +71,7 @@ The first bytes of a base64 payload select its form:
 | `torch.save` of 1 tensor, as vLLM clients send it | `PK 03 04` | the tensor's last dimension | float32, float16, bfloat16, float64 |
 | bare little-endian f32, as `/v1/embeddings` returns them | anything else | the model's | float32 |
 
-Every form is refused with a 400 naming the fault in 2 cases.
+Every form is refused with a 400 naming the fault in 2 cases.  
 Before a value is converted, when the rows are not the model's width or fill the served context window.  
 After, when a value is not finite.
 
@@ -184,7 +184,7 @@ The model's end tokens and `stop_token_ids` end a beam.
 `ignore_eos` runs every beam to `max_tokens`.  
 Temperature, sampling knobs, penalties, stop sequences and token rules are not read.
 
-These answer 400: `stream`, `prompt_embeds`, `best_of` above `n`, a structured output and a required tool call.
+A beam search request answers 400 with `stream`, `prompt_embeds`, `best_of` above `n`, a structured output and a required tool call.
 
 A model whose KV cache cannot be cut back to a shorter sequence answers 500.
 That covers a recurrent or sliding-window layer, and a backend other than the generic transformer.
@@ -233,7 +233,7 @@ A request that finds no group of its kind running starts at once.
 Requests that arrive while a group runs queue behind it, and the queue runs as the next group when it ends.
 
 A group holds as many requests as the roomiest card has free memory for, 1 request's scratch each.
-The rest of the queue waits for the group after.
+The rest of the queue waits for the group after.  
 With no card, a group holds every queued request.
 
 Each request keeps its own seed and no row of a batch reads another row.
@@ -324,7 +324,7 @@ Each reading between 2 of them is split among the requests active over it, by th
 A reading over which no request computed a token is split evenly.  
 A request's energy is the sum of its parts.
 
-A field loken does not measure is left out.
+A field loken does not measure is left out.  
 `energy` is absent when `[energy] enabled` is off or no domain is read.  
 `kv` is absent when the backend does not report its cache.
 

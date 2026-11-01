@@ -4,7 +4,7 @@ Each row names the reference a model implementation was validated against.
 This page attributes architectures, not code.
 A checkpoint dictates its tensor names, shapes and operation order, and an implementation that departs from them does not load.
 
-The code in these modules is this project's.
+The code in these modules is this project's.  
 Borrowed code is code in files that still share measured body lines with an upstream.
 `NOTICE.md` lists it, driven by `scripts/provenance/manifest.tsv`.
 

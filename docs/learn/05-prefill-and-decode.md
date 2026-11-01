@@ -35,7 +35,7 @@ Orders of magnitude on an RTX 5070 Ti:
 | 70B at Q4, 26 of 80 layers on the host, decode | 1.5 tokens a second, pinned to the host's 36 GB/s |
 
 At 730 tokens a second the 522 MB of qwen3:0.6b weights stream well under the card's bandwidth.
-Fixed per-step costs take the rest: launches and the sampling round trip.
+Fixed per-step costs take the rest: launches and the sampling round trip.  
 Capturing a decode step as one CUDA graph reduces them.
 
 ## What loken does
@@ -137,7 +137,7 @@ Observed with a 715-token prompt on qwen3:0.6b:
 | Norms and residual adds | the rest |
 
 The `prompt_eval_duration` of the reply is a little higher while the timers are on.
-That is the synchronisation.
+That is the synchronisation.  
 A mixture fills the `router`, `gate_up` and `down` rows instead.
 
 ## Check yourself

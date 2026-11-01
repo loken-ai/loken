@@ -7,8 +7,8 @@ The container lets a server read the entries without reading the tensors, so the
 
 - **GGUF**: a magic, a version and 2 counts (metadata pairs, tensors).  
   Then the metadata, key by key: architecture name, layer count, trained context length, head counts, rotary base and the whole tokenizer (vocabulary, merges, scores, token types, chat template).  
-  Then 1 descriptor per tensor: name, dimensions, element type, offset.  
-  Dimensions are stored innermost first, so a reader reverses them.
+  Then 1 descriptor per tensor: name, dimensions, element type, offset.
+  Dimensions are stored innermost first, so a reader reverses them.  
   Then the payload, 1 tensor after another, aligned to `general.alignment` (32 by default).
 - **Element type**: how many bytes a weight takes.
   F16 takes 2 bytes.  
@@ -19,7 +19,7 @@ The container lets a server read the entries without reading the tensors, so the
   Hugging Face checkpoints ship in this format, as 1 file or many with an index.
 - **Memory-mapped**: nothing is copied at open, and a tensor is a view at an offset.
   The operating system pages bytes in on first touch and keeps them in its page cache while memory allows.  
-  A model loaded on a card is read from the mapping once and uploaded.
+  A model loaded on a card is read from the mapping once and uploaded.  
   A layer left on the host is read from the mapping on every token.
 
 qwen3:0.6b in numbers:
@@ -51,7 +51,7 @@ Listing them read all of it and took 11 s at every catalogue request.
 A GGUF puts the general keys first and the tokenizer arrays after them.
 A read that stops at the first `tokenizer.*` key gets the architecture, the file type and the parameter count in under 8 KB a file.
 
-That read takes 2 ms for the 44 files.
+The read that stops at the first `tokenizer.*` key takes 2 ms for the 44 files.
 
 The facts are cached by path, size and modification time, and the daemon warms the cache before it binds its port.  
 `/api/show` still reads the whole header, once, on demand.

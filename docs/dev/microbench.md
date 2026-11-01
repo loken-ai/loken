@@ -126,7 +126,7 @@ Its variants:
 `cache-policy` replays a routing through the policies of a host tier and counts the experts each policy misses.
 The disk then reads those experts.
 
-`cache-policy` needs `--profile`, the routing counts a served model writes, and an expert size from `--shapes-from` or `--projection-bytes`.  
+`cache-policy` needs `--profile`, the routing counts a served model writes, and an expert size from `--shapes-from` or `--projection-bytes`.
 It touches no model, no disk and no card.  
 Its variants are the slots per layer in `--slots`, each under 3 policies:
 

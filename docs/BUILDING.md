@@ -1,6 +1,6 @@
 # Building
 
-Build `lokend` and `loken` from source.  
+Build `lokend` and `loken` from source.
 A release archive needs no build, see [Install](start/install.md).  
 First start: [First run](start/first-run.md).
 
@@ -19,7 +19,7 @@ cargo build --release   # target/release/{lokend,loken}
 | Host only, language models | `cargo build --release --no-default-features --features cpu` | Nothing |
 | Host only, with every media family | `cargo build --release --no-default-features --features cpu,media` | Nothing |
 
-`image`, `audio`, `video` and `midi` can each be added on their own.
+`image`, `audio`, `video` and `midi` can each be added on their own.  
 `metrics` adds the scrape endpoint.  
 The feature table is in [Configuration](CONFIGURATION.md#build-features).
 
@@ -27,7 +27,7 @@ The feature table is in [Configuration](CONFIGURATION.md#build-features).
 
 The default features are `cuda`, `opencl` and `media`.
 
-The build needs a **CUDA toolkit** and **OpenCL headers**.
+The build needs a **CUDA toolkit** and **OpenCL headers**.  
 It is built and tested against **CUDA 13.3**.
 No older toolkit has been tried.
 
@@ -88,7 +88,7 @@ cargo build --release --features vulkan
 The server opens the Vulkan loader when it starts, and compiles the kernels for the device when it opens.
 
 Placement offers the Vulkan GPUs that no other runtime of the build drives.  
-They come after the CUDA or HIP cards and before the host.
+They come after the CUDA or HIP cards and before the host.  
 A build with `vulkan` alone has no other runtime, so every GPU is offered.
 
 The layers of a dense decoder in `Q4_K`, `Q6_K`, `Q8_0` or `F16` run on Vulkan, with the output head when the last layer does.

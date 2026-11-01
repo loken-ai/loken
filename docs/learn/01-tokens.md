@@ -7,7 +7,7 @@ Both translations fail silently, with plausible nonsense and no crash or slowdow
 ## The idea
 
 - **Tokenizer**: a fixed vocabulary of about 150k strings (151 936 for qwen3) and a rule for cutting text into it.
-  Byte-pair encoding merges up from bytes.
+  Byte-pair encoding merges up from bytes.  
   A SentencePiece unigram picks the highest-scoring split.  
   Both ship in the checkpoint.
   A wrong tokenizer gives wrong output with every kernel correct.

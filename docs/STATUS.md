@@ -133,7 +133,7 @@ It reports 3 figures:
 - Divergence over the exact run's top 20.
 - The log-probability given to the exact choice.
 
-It runs by hand on a real checkpoint.
+The quality harness runs by hand on a real checkpoint.
 
 ## Audio in
 
@@ -236,7 +236,7 @@ Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchma
 <!-- site: end -->
 
 Quality is the mean negative log-likelihood per token (nats) of held-out texts from this repository, scored by the quality harness.
-The code text holds 1500 tokens and the docs text 2200.
+The code text holds 1500 tokens and the docs text 2200.  
 The chunk is 512, on 2 cards.
 
 <!-- site: widget chart type=bar id=status-qwen4exp-nll -->
@@ -306,7 +306,7 @@ The same cell then decoded anywhere between 1.5 and 2.2 tok/s from 1 run to the 
 
 Dropped per layer, the cell measures 2.25 tok/s, 3 times.
 
-Those figures predate 2 changes:
+The decode figures of this cell predate 2 changes:
 
 - A weight the loader built (fused q/k/v and gate/up, a rebuilt float projection) and that now sits on a card keeps no host copy.
 - The token tables stay as the file stores them instead of widening to F32.
@@ -359,7 +359,7 @@ Sharding runs for dense generic transformers, measured at 2 nodes on one machine
 5. It sends the boundary of every prefill chunk and decode step over the binary frames.
 
 Each node keeps the KV cache of its layers.  
-The tail node gives up its own copy of the model while it serves a segment.
+The tail node gives up its own copy of the model while it serves a segment.  
 The gossip round trip alone prices the crossing, not the logits that come back.
 
 Measured on 2 loopback servers, 1 card each, with DeepSeek R1 32B (19.9 GB, 64 layers, does not fit 1 16 GB card):
@@ -398,7 +398,7 @@ Its generations serialise behind the model lock.
 2 comparable machines therefore priced each other an order of magnitude apart.
 The cluster handed over a few requests where it should have split the work roughly in half.
 
-The meter now publishes what a window of real completions produced.
+The meter now publishes what a window of real completions produced.  
 The 2nd machine left the bench before the fix could be measured, so **the 2-node gain is unmeasured**.
 Trace replay judges the correction, not a cluster.
 

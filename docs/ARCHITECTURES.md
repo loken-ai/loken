@@ -25,7 +25,7 @@ A safetensors test also writes the weights of the architecture's GGUF recipe in 
 - stacked or per-expert tensors
 - shifted norms
 
-It asserts that its logits equal those of the same weights loaded from the GGUF file.
+The safetensors test asserts that its logits equal those of the same weights loaded from the GGUF file.
 A wrong permutation or split fails.
 
 `every_architecture_has_a_loading_test` fails in 2 cases:
@@ -50,11 +50,11 @@ At every step it asserts:
 - the same argmax wherever the 2 top reference logits are further apart than twice the measured rounding error (float weights are rebuilt in 8 bits)
 
 Every hybrid keeps 1 block of each kind.  
-A seed is kept only when its routing decisions and its logits stay clear of that rounding.
+A seed is kept only when its routing decisions and its logits stay clear of that rounding.  
 `every_reference_folder_has_a_test` fails when the folders and the list of tests differ.
 
 A composite release whose vendor also ships a native layout gets `params.json` and `consolidated.safetensors` of the same weights beside it.
-The library's own converter of that layout checks them.
+The library's own converter of that layout checks them.  
 The native tests assert the reference's logits and those of the composite.
 
 ## Architecture table
@@ -303,8 +303,8 @@ Each lesson in `learn/` describes a behaviour, and the tables below list the sou
 cargo test --lib oracle_parity
 ```
 
-- It runs 14 tests: 1 per format, `every_format_reconstructs_about_as_well_as_ggml`, and the importance-matrix test.
-- It checks every dequantiser against the scalar output of ggml.
+- The command runs 14 tests: 1 per format, `every_format_reconstructs_about_as_well_as_ggml`, and the importance-matrix test.
+- The command checks every dequantiser against the scalar output of ggml.
 - `q4_0.rs` shows the arithmetic: 32 values, a 16-bit scale, 4 bits each, 18 bytes, 4.5 bits per weight.
 - `q8_0.rs` gives 34 bytes for 32 values, 8.5 bits per weight.
 
