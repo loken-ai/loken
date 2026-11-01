@@ -202,7 +202,7 @@ It writes and reads at the speed of its disk and measures nothing.
 The decode-state cache writes whole decode states, far larger than a block.
 It measures the write speed, the cost per file and the restore time of its disk.
 It writes a state only when the disk can drain it within the prefill time of the prompt it came from.
-It restores a state only when reading it costs less than prefilling the prompt again.
+It restores a state only when reading it costs less than prefilling the tokens it covers.
 It sizes its files from the cost per file.
 
 A machine with a fast disk and a large one can put each cache on the disk that suits it, the KV tier on the fast disk and the states on the large one.
@@ -215,7 +215,26 @@ The cache lives in host memory for the life of the process, or on disk when `sta
 A DeepSeek V4.1 prompt costs 1 pass over the routed experts, read from disk.
 
 The cache stores the model's decode state after a prompt and after each finished turn.
-A later prompt that begins with the same tokens restores it and prefills only the rest.
+A later prompt that begins with the same tokens restores a stored state and prefills only the rest:
+
+```mermaid
+flowchart TD
+  P[Prompt arrives] --> L[Longest stored state<br/>the prompt extends]
+  L -->|found| R{Reading it cheaper<br/>than its prefill?}
+  L -->|none| F[Prefill the whole prompt]
+  R -->|yes| S[Restore the state]
+  R -->|no| N[Next shorter stored state]
+  N -->|found| R
+  N -->|none left| F
+  S --> T[Prefill the rest]
+  F --> K[Keep the states the prefill<br/>passes and the one it ends in]
+  T --> K
+  K --> W{On disk: the queue drains<br/>within the prefill time?}
+  W -->|yes| Q[Queue the write]
+  W -->|no| X[Skip it, log a line]
+```
+
+A state whose read costs more than the prefill of its tokens is passed over for the next shorter one, with a log line.
 
 Every file a cache keeps on disk (the state cache, the KV disk tier, the expert routing profile) has the same format:
 
@@ -223,12 +242,15 @@ Every file a cache keeps on disk (the state cache, the KV disk tier, the expert 
 - A body is stored compressed when that makes it clearly smaller, and read back whole.
   A store in memory is never compressed.
 - A file of another kind, another version or cut short is refused, and the cache rebuilds what it lost.
-- Files hold floating-point state and token ids, no text, and are not encrypted.
+- Files hold no text and are not encrypted.
+- A manifest of the KV disk tier holds the token ids of its sequence.
+  A file of the state cache holds none.
 
 The same keys open the same store for a generic-route model that carries a recurrent state beside its KV (a convolution, state-space or delta-rule mixer interleaved with attention).
 
 The recurrent state cannot be cut back to a shorter prefix, so trimming never reuses an earlier prompt and every turn re-prefills.
-With the store open, each state the prefill passes is kept, and a later prompt restores the longest one it extends.
+With the store open, a hybrid restores and keeps states on the same path as DeepSeek V4.1.
+It keeps no state after a finished turn.
 
 A dense model keeps its disk tier (`kv_disk_dir`) and is unchanged.
 
@@ -236,7 +258,7 @@ In memory, states are kept as the KV snapshots are: never written, gone with the
 
 On disk, the files hold state derived from prompts: KV tensors, hidden rows of the filling compression group and compressed token-class ids.
 
-The files hold no text and no token ids, and names and keys are hashes.
+The state cache's files hold no text and no token ids, and names and keys are hashes.
 The state is as private as the prompt it came from.
 
 Keep the directory where the prompts could live, and leave the key unset where nothing about an exchange may reach the disk.
@@ -259,7 +281,8 @@ A DeepSeek V4.1 state costs:
 - about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the model keeps them)
 - about 1.1 KB per token of compressed KV, stored once in block files that every snapshot of a conversation shares
 
-A prompt restores the longest stored prefix and prefills the rest in 1 layer-major pass onto it, so a stored prefix always pays.
+A DeepSeek V4.1 prompt prefills the rest in 1 layer-major pass onto the restored state.
+A prompt stored whole with its logits is answered from them, with nothing to prefill.
 
 A pass over a few 100 tokens still routes to nearly every expert of every layer, so it reads about as many expert bytes as a whole prompt.
 A remainder of 250 tokens costs a little over half a cold 2000-token prompt.
@@ -276,7 +299,7 @@ For a recurrent hybrid, a stored state is a manifest and blocks:
   Its size depends on the model, not on the prompt.
 - Blocks hold the global layers' rows for 1 block size of tokens (derived, see above), once per shared prefix.
   A block is stored as f16 where every value is exactly an f16, and as f32 otherwise, so a restore returns the stored bits.
-- States are kept at multiples of the largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least 1 block.
+- States are kept at the derived spacing of kept states, and at the end of every prompt of at least 1 block.
 - A state is keyed by the file, `kv_quant`, the layer kinds, the row geometry and which layers run on a card, so another placement or KV format starts from nothing.
 
 A restore removes the prefill of the covered tokens: the recurrent state and the global KV are read from disk instead of recomputed.
@@ -284,7 +307,8 @@ The gain grows with the covered length and with how slow a prefill is on the mac
 
 The read speed of the cache directory against the state size bounds the gain.
 
-A restore always leaves at least 1 token to prefill, to produce the logits.
+A hybrid restore leaves at least 1 token to prefill, to produce the logits.
+A hybrid with a draft head leaves 2.
 
 ### Streamed mixtures (DeepSeek V4.1)
 
@@ -293,24 +317,34 @@ The file names neither.
 
 At `reference` and `balanced`, the output is identical to the full model, the same tokens whichever experts the cards hold, because a routed expert on a card gives the bits the host gives.
 
-At `fast`, the output differs by small, measured amounts, 3 times the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's.
+At `fast`, the output differs from the exact one by at most 3 times the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's.
 
-For a model whose manifest names further files of its checkpoint ([MODELS.md](MODELS.md)), the level also chooses the file each routed expert is read from.
+For a model whose manifest names further files of its checkpoint, the level also chooses the file each routed expert is read from, see [Mixture variants](MODELS.md#mixture-variants).
 
-`balanced` reads the experts the cards keep, hottest first, from the most precise file while the cards have room, and those the host tier keeps or reads from disk from the smallest.
+At load, the engine settles how far `fast` gives up exact routing:
 
-At load, the engine runs a bundled text teacher-forced on the card path and on the host path to measure the noise.
+```mermaid
+flowchart TD
+  A[Load a mixture whose<br/>experts stream from disk] --> B{fidelity is fast?}
+  B -->|no| E1[Exact routing]
+  B -->|yes| C{Card and host to compare,<br/>tokenizer in the file?}
+  C -->|no| E2[Exact routing]
+  C -->|yes| D[Run the bundled text<br/>on card and on host: the noise]
+  D --> G[Run the text under<br/>each candidate]
+  G --> H{A candidate within<br/>3 times the noise?}
+  H -->|no| E3[Exact routing]
+  H -->|yes| I[Apply the one that saves<br/>the most disk reads]
+```
 
-The engine then runs the text once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the level's budget.
-
-With no card and host to compare, `balanced` and `fast` run exact and say why in the log.
+The bundled text runs teacher-forced.
+With no card and host to compare, `fast` runs exact and says why in the log.
+When no candidate fits the budget, routing stays exact and the log says so.
 
 The candidates derive from `K`, the number of experts a token routes to.
-
 Each candidate either keeps the `K-1` or `K-2` heaviest experts, or replaces a light expert that sits in no card tier when its weight share is under `0.5/K`, `0.75/K` or `1/K`.
 
-The measured table is cached per model file and plan, and the noise per model file, under `loken/` in the user cache directory, so a different level reuses them.  
-A file with no tokenizer in its metadata runs exact.
+The measured table and the noise are cached per model file and plan, under `loken/` in the user cache directory.
+A later load of the same file and plan reuses them.
 
 The offload derives these quantities from measurement and logs them:
 

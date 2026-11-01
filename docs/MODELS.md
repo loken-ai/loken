@@ -91,13 +91,24 @@ The placement reads the routed experts expert by expert, from 1 file or another.
 
 The placement fills the cards, then the host tier, in routing-heat order.
 The heat is the model's routing profile in `profiles/` of the store, else the routing prior the file records.
+The `fidelity` level in [Configuration](CONFIGURATION.md) picks the file:
+
+```mermaid
+flowchart TD
+  A[Routed experts, hottest first:<br/>profile, else the file's prior] --> B{fidelity}
+  B -->|reference| L[Largest file<br/>for every expert]
+  B -->|balanced| C{Room left<br/>on a card?}
+  B -->|fast| S[Smallest file<br/>for every expert]
+  C -->|yes| P[Card keeps it,<br/>file with the most bytes]
+  C -->|no| H[Host tier or disk,<br/>file with the fewest bytes]
+```
+
+At `balanced`, each tier takes the file that suits its compute:
 
 | Tier | File an expert comes from | Reason |
 |---|---|---|
 | Cards, while they have room | The file that stores it in the most bytes | A card computes an expert at the same speed whatever its format |
 | Host tier, or read from disk | The file that stores it in the fewest bytes | The host's cores read every byte of an expert at each use |
-
-`fidelity` in [Configuration](CONFIGURATION.md) chooses the file: the largest at `reference`, the smallest at `fast`.
 
 A further file is refused at load, with what differs, unless it matches the first file on all of these:
 
@@ -182,7 +193,7 @@ The always-read weights and the busiest experts sit on the cards.
 
 A routing prior that the file lacks is borrowed from a companion GGUF beside it, found by the metadata it declares.
 
-Sharding across machines runs for this model only, see [Cluster](CLUSTER.md).
+Across machines, the model splits into runs of layers as a dense stack does, see [Cluster](CLUSTER.md#planning-a-cut).
 
 ### Vision and speech in
 

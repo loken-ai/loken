@@ -69,19 +69,33 @@ unsloth/Qwen3-235B-A22B-GGUF, a mixture of 235B parameters, runs on the 2 cards 
 A prompt longer than the window is refused on every route.
 A cut prompt can lose its system prompt or its tool instructions and still read as a plausible answer.
 
-Before refusing, loken reloads the model with a wider window when the model and the request's `num_ctx` allow it.
+```mermaid
+flowchart TD
+    P["prompt arrives"] --> W{"prompt and answer fit the window?"}
+    W -- yes --> N["served whole"]
+    W -- no --> R["reload, wider window if the checkpoint declares one"]
+    R --> L{"prompt longer than the window?"}
+    L -- yes --> X["refused on every route"]
+    L -- no --> F{"room left for the answer?"}
+    F -- yes --> N
+    F -- no --> C["keep the first token and the tail"]
+    C --> S{"cache can shift?"}
+    S -- no --> K["cold prefill of the whole window"]
+    S -- yes --> M["pull the tail keys down, re-phase them"]
+    M --> Q["prefill only the new tokens"]
+```
+
+A prompt that, with its answer budget, exceeds the window reloads the model with a wider window.
+The reload stops at the context length the checkpoint declares.
 
 A prompt that fits but leaves too little room for the answer keeps its first token and its tail.
-
 Once a conversation reaches that point, the prefix it shares with the resident KV is that first token alone.
 A cold run then re-prefills the whole window every turn.
 
-loken keeps the tail instead:
-
-- It pulls the resident keys down to their new positions.
-- It re-phases them in place.
-  The rotary phase of the shift is read off the layer's own table, so YaRN and factored frequencies need nothing special.
-- It prefills only the new tokens.
+loken keeps the tail instead and re-phases it in place.
+The rotary phase of the shift is read off the layer's own table, so YaRN and factored frequencies need nothing special.  
+The shift is tried only when the prefix shared with the resident KV is shorter than 1 prefill chunk.
+It needs the resident sequence to hold the tail of the prompt.
 
 Measured 2026-09-04, on the 2nd turn of a conversation 500 tokens past the window:
 
@@ -94,13 +108,16 @@ The answer is coherent both ways, and the text differs.
 A re-phased key is not the key a cold prefill would have produced, bit for bit.
 
 The shift runs by itself wherever the cache supports it.  
-It falls back to a cold prefill in 3 cases:
+It falls back to a cold prefill in these cases:
 
 | Case | Reason |
 |---|---|
 | Q4 KV cache | A block groups 32 positions of 1 channel |
 | Sliding-window layers | The buffer index stops being the position after a slide |
 | Recurrent hybrids | The state holds no positions to shift |
+| Learned position embeddings | A position learned for 1 slot cannot be given to another |
+| A backend that does not claim the shift, such as a pipeline head | A head cannot move the positions the later segments hold |
+| `fidelity = "reference"` | The shift is off |
 
 ## Large mixtures streamed from disk
 
@@ -344,7 +361,9 @@ Sharding runs for DeepSeek V4.1, unmeasured at 2 nodes.
 
 At load, each node measures its own profile.  
 The planner compares a split against local serving.
+It plans from the profiles its peers already published, and asks no peer to measure.
 When a split pays, the head forms a pipeline of any length over the binary data plane.
+Its frames cross the plane as drawn under [Sharding for dense transformers](#sharding-for-dense-transformers).
 
 A 3-node loopback chain decodes bit-identically to 1 node.
 
@@ -352,15 +371,30 @@ A 3-node loopback chain decodes bit-identically to 1 node.
 
 Sharding runs for dense generic transformers, measured at 2 nodes on one machine.
 
-1. Each clustered node times a layer on its cards and on its host.
-2. Each node publishes that time with the bytes its cards carry of the model.
-3. The node that loads the model 2nd plans the cut from those figures and the gossip round trip.
-4. It asks the other node to reload its layers through its own placement ladder, and reloads its own the same way.
-5. It sends the boundary of every prefill chunk and decode step over the binary frames.
+Any clustered node that loads a dense model plans the cut and becomes the head.
+The exchange with 1 peer:
 
-Each node keeps the KV cache of its layers.  
-The tail node gives up its own copy of the model while it serves a segment.  
-The gossip round trip alone prices the crossing, not the logits that come back.
+```mermaid
+sequenceDiagram
+    participant A as head, the node that loads
+    participant B as peer
+    Note over A: times a layer on its cards and its host
+    A->>B: measure your layers, if you published no cost
+    Note over B: times a layer on its cards and its host
+    B-->>A: gossip: layer time, card bytes of the model
+    Note over A: plans the cut from the figures and the round trip
+    A->>B: serve your layers
+    Note over B: drops its own copy, places its share by its ladder
+    Note over A: drops its own copy, places its share the same way
+    Note over A,B: then, every prefill chunk and decode step
+    A->>B: boundary over the binary frames
+    B-->>A: logits
+```
+
+- The head asks through `/api/cluster/measure`, then waits 2 gossip rounds for the costs.
+- A plan can chain more than 2 nodes.
+- Each node keeps the KV cache of its layers.
+- The gossip round trip alone prices the crossing, not the logits that come back.
 
 Measured on 2 loopback servers, 1 card each, with DeepSeek R1 32B (19.9 GB, 64 layers, does not fit 1 16 GB card):
 
@@ -380,13 +414,15 @@ In the tests, a 2-way and a 4-way split are bit-identical to 1 part on the host.
 
 Sharding refuses a model, with the reason, when its layers:
 
+- Run through Vulkan or OpenCL.
 - Take per-layer inputs.
 - Share KV.
+- Mix a wide residual stream outside the layers.
 - Keep a recurrent state.
 - Hold experts in host memory.
 - Carry an adapter or an image tower.
 
-Verify batches are refused too.
+A verify batch crosses the pipeline: the last segment answers with the logits of every position.
 
 The link-cost matrix, the tiered KV, the resume path and the layer scheduler are reached by no code path.
 

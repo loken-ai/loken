@@ -219,7 +219,20 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `GET /v1/loras` | `image` | The adapters this server can apply, by name. |
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. |
 | `POST /api/video/plan` | `video` | What a clip of a given length will cost, before rendering it. |
-| `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | none | Renders in flight, and cancelling 1. |
+| `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | none | Renders in flight of the calling key, and cancelling 1. See [Naming a render](#naming-a-render). |
+
+### Naming a render
+
+A render takes the `X-Request-Id` of its request as its identifier.
+The server answers with the same header on every response.
+Without a valid header the server gives the render an identifier of its own.
+A valid identifier has letters, digits, dot, underscore and dash, 64 characters at most.
+
+- A client that sends its own identifier stops the render with `POST /v1/renders/{id}/cancel`.
+- Reusing an identifier of the same key while its render runs cancels that render.
+- 2 keys can use the same identifier. Each reaches its own render.
+- These renders register: image generation, image edit and variation, music, sound effect, MIDI, transcription, separation, video and speech.
+
 <!-- site: end -->
 
 ### Requests that share a pass
@@ -229,8 +242,22 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | The audio windows of every clip run through the encoder as 1 batch. Each clip decodes on its own windows. |
 | `POST /v1/images/generations` (an SDXL checkpoint) | not streamed, `n` 1, no `control_image`, no `regions`, and the same model, `size`, step count, `sampler`, `scheduler` and `loras` | The group takes the media gate once. Its renders denoise as 1 batch, with the prompt, `negative_prompt`, `guidance` and `seed` of each request. |
 
-A request that finds no group of its kind running starts at once.  
-Requests that arrive while a group runs queue behind it, and the queue runs as the next group when it ends.
+A request starts at once when no group of its kind runs, and queues behind the group otherwise:
+
+```mermaid
+sequenceDiagram
+  participant R1 as Request 1
+  participant R2 as Request 2
+  participant R3 as Request 3
+  participant G as Group of its kind
+  R1->>G: No group running, starts at once
+  R2->>G: Arrives while it runs, queues
+  R3->>G: Arrives while it runs, queues
+  G-->>R1: Answer
+  Note over G: Queue runs<br/>as the next group
+  G-->>R2: Answer
+  G-->>R3: Answer
+```
 
 A group holds as many requests as the roomiest card has free memory for, 1 request's scratch each.
 The rest of the queue waits for the group after.  
@@ -250,8 +277,10 @@ Every event carries `node`, the name of the node that renders, or null when the 
 Every chat route caps the images per request, the pixels per image and the seconds of audio.
 The chat routes are `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses` and `/v1/messages`.
 
-The keys sit under `[inference]`, see [CONFIGURATION.md](CONFIGURATION.md#media-input).
-A request past 1 of them is answered 400 with the cap's key and the value it carried, before the image is decoded.
+The caps are built in and follow the decoder's allocation budget.
+No key sets them.
+A request past 1 of them is answered 400 naming the cap and the value it carried, before the image is decoded.
+`image_fetch_hosts`, under `[inference]`, names the hosts an image given by URL is fetched from, see [CONFIGURATION.md](CONFIGURATION.md#media-input).
 
 ## Messages API surface
 
@@ -285,6 +314,18 @@ A part the server cannot take, such as a document block, is refused with the rea
   A client whose allowance never refills gets none.
 - A request with too many messages, an unknown role or too many characters in all is refused with a 400.
   The Messages route applies the same bounds.
+
+## Whose cached prompt it is
+
+A cached prompt belongs to the API key that wrote it.
+Another key never finds it, so the time to a first token and the count of cached tokens tell a caller nothing about what others sent.
+
+- Covered: the prompt held in memory, the saved copies of the KV cache, the KV and decode-state caches on disk, and `POST /api/cluster/prefix`.
+- Covered: the renders in flight. `GET /v1/renders` lists those of the calling key, and `POST /v1/renders/{id}/cancel` stops only those.
+- Covered: a stored Responses object. Only its key reads it, continues it with `previous_response_id` or deletes it.
+- With `require_auth` off, or with no distinct key, every caller shares a scope and cached prompts are shared as before.
+- `cache_salt` still keeps a request out of the cache. It is not needed to keep keys apart.
+- Covered: uploaded files and batches. Only the key that made them lists, reads, deletes or cancels them.
 
 ## Per-request figures
 
@@ -325,7 +366,7 @@ A reading over which no request computed a token is split evenly.
 A request's energy is the sum of its parts.
 
 A field loken does not measure is left out.  
-`energy` is absent when `[energy] enabled` is off or no domain is read.  
+`energy` is absent when no domain is read.  
 `kv` is absent when the backend does not report its cache.
 
 An answer that gathers several generations (`n` above 1, a beam search) carries no `loken` object.
@@ -370,7 +411,7 @@ A client that follows the SSE specification ignores comment lines.
 | `GET /api/multi-device/status` | How the resident model is spread across devices. |
 | `GET /api/cluster/state`, `GET /api/cluster/peers` | What a node publishes about itself, and who it sees. |
 | `POST /api/pipeline/tail` | Run this node as 1 segment of a pipeline: layers `from` to `to` of `model`, relaying to `next`. Answers the wire port the upstream connects to. The head calls it, not an operator. |
-| `POST /api/cluster/measure` | Measure what a layer of `model` costs on this node and publish it. A head asks each peer before planning a cut. |
+| `POST /api/cluster/measure` | Measure what a layer of `model` costs on this node and publish it. A head asks a peer with no cost for the model before it plans the cut of a dense model. |
 | `POST /api/cluster/prefill` | Read a `prompt` for a peer serving the same model and answer its KV cache as `application/octet-stream`. |
 | `POST /api/cluster/prefix` | How much of a prompt this node already holds in its KV. |
 <!-- site: end -->

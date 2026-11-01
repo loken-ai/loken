@@ -31,7 +31,7 @@ kv_disk_dir = "/var/lib/loken/kv"
 Past the window applies at `fidelity = "balanced"` (the default) and `"fast"`.
 The re-phased keys differ from a cold run's in the last bits.
 
-Q4 caches, sliding-window layers and recurrent hybrids prefill cold.  
+Q4 caches, sliding-window layers, recurrent hybrids and learned position embeddings prefill cold.  
 At `fidelity = "reference"` the tail is re-prefilled cold.
 
 ## Run it
