@@ -24,6 +24,8 @@ Run 1 model across several cards and machines.
 
 ## 0.4.0
 
+Every backend and every format loken reads.
+
 Major, by priority:
 
 | Feature | Category | Done when | State |
@@ -42,6 +44,8 @@ Patch releases that finish or speed up what 0.4.0 ships:
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
 
 ## 0.5.0
+
+Decode fast when the experts do not fit on the card, and serve many requests at once.
 
 Major, by priority:
 
@@ -81,7 +85,7 @@ Smaller, by priority:
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
 | Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Planned |
 | Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Planned |
-| Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the highest rate that still meets a first-token time and a per-token time the user sets. | Planned |
+| Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the rate at which the queue of the engine starts to grow without bound. | Planned |
 | Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Planned |
 | Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Planned |
 | Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a signature so that a copy cannot change under the same name. | Planned |
@@ -91,18 +95,20 @@ Fixes, by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Started |
-| A missing token count stays missing | Bench | An iteration with no token count is left out of the totals and says so, instead of counting 0. | Partial |
+| A missing token count stays missing | Bench | An iteration with no token count is left out of the totals and says so, instead of counting 0. | Done |
 | Same first-token time on every engine | Bench | The bench starts the first-token time at the first text of the stream on every engine. | Done |
 | Failures visible in concurrent cells | Bench | A failed request in a cell with concurrent requests is recorded in the errors of the cell. | Done |
 | Streams that cannot hang | Bench | The measuring client times out a silent stream and refuses an https address instead of connecting in plain text. | Done |
 | A cut stream is reported as cut | API | A Responses stream whose upstream ends without its final marker ends as incomplete, not as completed. | Started |
 | Warm-up failures visible | Bench | A failed warm-up request is reported for every modality. | Done |
-| Measured settings recorded | Bench | The image size, seed, duration, voice, keep-alive and client timeout of a cell are options, and the record holds them. | Partial |
-| A memory fallback that does not stay | Performance | A matrix product that runs out of card memory falls back for that call only, and the fallback copy is not kept. | Started |
+| Measured settings recorded | Bench | The image size, seed, duration, voice and keep-alive of a cell appear in the record, and so does the request timeout. | Partial |
+| A memory fallback that does not stay | Performance | A matrix product that runs out of card memory falls back for that call only, and the fallback copy is not kept. | Done |
 | Sampling without per-token allocation | Performance | A sampled token allocates no buffer on the card, and uploads no penalty list when the penalty is off. | Partial |
 | Honest back-pressure | API | A refused request carries a Retry-After computed from the queue and the measured rate, and a request waiting on a model load reports the load as it goes. | Partial |
 
 ## 0.6.0
+
+A cluster that survives failures and can be trusted, more weight formats, and a plan before a load.
 
 Major, by priority:
 
@@ -113,6 +119,7 @@ Major, by priority:
 | A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an encrypted link. | Planned |
 | Tensor parallelism across machines | Cluster | A layer split across the cards of several machines runs faster than the layer cut alone. | Planned |
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
+| Mistral 4 Large | Models | The published Mistral 4 Large checkpoint loads and answers as the reference implementation does. | Planned |
 
 Smaller, by priority:
 
@@ -158,6 +165,8 @@ Fixes, by priority:
 
 ## 0.7.0
 
+Reach and hardening: Windows, packaging, typed answers, streamed audio, and exact decoding.
+
 Major, by priority:
 
 | Feature | Category | Done when | State |
@@ -181,8 +190,32 @@ Smaller, by priority:
 | Voice conversion | Audio | An OpenVoice model makes a recording sound like another speaker. | Planned |
 | Web search and fetch tools | Tools | A request can turn on web search and fetch, and each call is logged. | Planned |
 | A build with vision input alone | Packaging | A smaller build reads images in chat without the generation pipelines. | Planned |
+| A service profile | Packaging | A systemd unit with a dedicated user and access to the devices the node uses, and a container recipe, run loken on NVIDIA and AMD nodes. | Planned |
+| Signed releases | Packaging | Every release archive is signed and published with its checksums and a software bill of materials. | Planned |
+| Realtime voice session | Audio | A WebSocket session streams audio in and out with turn detection. | Planned |
+| Job callbacks | API | A render or video job calls a URL on an allowed host, or streams its events, when it ends. | Planned |
+| More samplers | API | typical_p, mirostat, XTC and DRY are accepted on every route that takes sampling options, and match the reference results. | Planned |
+| Deterministic mode | Decoding | At the reference level a sequence's tokens do not depend on the batch around it. | Planned |
+| FP4 cache measured | Quantisation | A 4-bit float KV cache is scored against the 4-bit cache already here, and kept only if it wins. | Planned |
+| Half-precision sums for split layers | Parallelism | Split layers sum their partial results in half precision, and a model split across cards decodes faster than with the sums in F32, inside the bounds of the quality harness. | Planned |
+| Tensor parallelism across NVIDIA and AMD cards | Parallelism | One layer split across an NVIDIA card and an AMD card runs, and faster than the layer cut alone. | Planned |
+| Wake a node on demand | Cluster | A node that sleeps is woken over the network when a model it holds is asked for, and sleeps again when it is idle. | Planned |
+| Per-tensor quantisation within a size | Quantisation | The converter picks the format of each tensor by its importance, and the file is smaller than with one format for all at the same quality score. | Planned |
+| Speaker labels | Audio | The transcription route says which speaker said each part. | Planned |
+| Transducer speech recognition | Audio | A transducer speech model transcribes through the existing ONNX executor as its reference does. | Planned |
+| 4-bit weights and activations | Quantisation | A diffusion model runs with 4-bit weights and activations plus a low-rank branch in 16 bits, inside the quality score of the 8-bit model. | Planned |
+| Lossless compressed BF16 weights | Quantisation | A BF16 checkpoint is stored entropy-coded, decoded on the card as it is read, and gives the same bits in less memory. | Planned |
+| Video diffusion with a wider VAE | Models | A video model whose VAE compresses 16 by 16 in space and 4 in time loads and renders as its reference does. | Planned |
+
+Fixes, by priority:
+
+| Feature | Category | Done when | State |
+|---|---|---|---|
+| lokraft starts or says why | Client | lokraft reports an error when its HTTP client cannot be built, and carries no unused items. | Planned |
 
 ## 0.8.0
+
+Agents and operations: tools, keys, traces, cost and what an operator can see.
 
 Major, by priority:
 
@@ -202,7 +235,7 @@ Smaller, by priority:
 | Quotas per key | Operations | Each API key has a token and request budget that loken enforces, names the models, tools and media it may use, and every request leaves a record of the key, model and tools. | Planned |
 | Scopes per key | Operations | A key is limited to inference or to administration. | Planned |
 | Traces and metrics export | Operations | loken exports traces and the standard generation metrics, follows an incoming trace across cluster hops, and carries no prompt text. | Planned |
-| Cost and carbon ledger | Operations | loken keeps counters per key and model of requests, tokens and energy, and prices the energy with a tariff the user sets. | Planned |
+| Cost and carbon ledger | Operations | loken keeps counters per key and model of requests, tokens and energy, with the carbon the configured carbon intensity gives. | Planned |
 | Warm prefixes | Serving | A client names a prefix that loken loads into the cache tiers and keeps against eviction, within the memory budget. | Planned |
 | Tool loop on the server | Tools | loken runs a bounded loop of tool calls itself and returns the final answer. | Planned |
 | Cluster history and alerts | Operations | lokpit records snapshots, replays them, and calls a command when a finding appears or clears. | Planned |
@@ -214,6 +247,8 @@ Smaller, by priority:
 | Sampling recipe carried by an adapter | Models | A few-step adapter brings the sampler and the step count it needs, and a render uses them without a setting. | Planned |
 
 ## 0.9.0
+
+Several model families answering together.
 
 Major, by priority:
 
