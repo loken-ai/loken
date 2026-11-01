@@ -247,8 +247,8 @@ Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchma
 | Decode graph | Captured for files without an n-gram table or indexed attention. The others, and every file under the cache plan, decode eagerly |
 | 160 experts, 1 card | Measured on 3.2k and 12.9k token prompts |
 | 160 experts, 2 cards | Measured on a 4.5k token prompt |
-| 256 experts, 1 card | Answers a 72-token prompt coherently. A 3.2k token prefill ends the first request after 1 token, and a second request fails out of memory |
-| 256 experts, 2 cards | Measured on a 72-token prompt before the cache plan. The 3.2k-token prompt fails as on 1 card |
+| 256 experts, 1 card | Answers a 72-token prompt coherently. Reads the 4.0k and 14k token prompts of the decode row |
+| 256 experts, 2 cards | Reads the 4.0k and 14k token prompts of the decode row |
 | 512 experts | Loads. Not measured on either envelope |
 <!-- site: end -->
 
@@ -276,11 +276,6 @@ Each cell is 1 run.
 
 Limits:
 
-- **Out of memory in prefill.** The 256-expert file on a 3.2k token prompt fails.
-  The card reports itself nearly full (27 to 59 MB free), while the chunk accounting counted several GB free.
-  The engine halves the chunk, and the request ends with 1 token or an error.
-  The cause is unknown.  
-  A 2.7k token prompt completes.
 - **Prefill is compute-bound** in the delta-rule projections, convolution, scan and the wide mixers.
   The expert copy is hidden behind it.
 - **The first 128 decoded tokens run while the expert cache learns.** A decode rate over fewer tokens understates the steady state.

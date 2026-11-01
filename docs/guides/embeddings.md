@@ -95,8 +95,3 @@ The OpenAI form answers one `data` entry per vector with its `embedding`.
 | 400 `exactly one of texts, images or inputs must be given` | `/v2/embed` got 0 or several of them. | Send 1 field. |
 | 400 `dimensions must be >= 1` | `dimensions` is below 1. | Raise it. |
 | 404 `Model 'x' not loaded` | The model is not in the store. | Pull it with `POST /api/pull`, or check the repository id. |
-
-## Next
-
-- [`/v1/embeddings` in the API reference](../API.md)
-- [Models](../MODELS.md)

@@ -38,12 +38,14 @@ At 730 tokens a second the 522 MB of qwen3:0.6b weights stream well under the ca
 Fixed per-step costs take the rest: launches and the sampling round trip.  
 Capturing a decode step as one CUDA graph reduces them.
 
+[The generation loop](../inside/generation.md) follows a long prompt through the chunks.
+
 ## What loken does
 
 | Part | Behavior |
 |---|---|
 | Prefill chunk | Derived from the free VRAM and the widest feed-forward, not a constant. An out-of-memory error in a chunk retries with a smaller one. |
-| Scheduler | Plans at every step who prefills and who decodes, under a prefill token budget. Under pressure it preempts a sequence without leaving it half allocated. |
+| Scheduler | Takes over from serial decode once requests have overlapped several times in a row. Plans at every step who prefills and who decodes, under a prefill token budget. Under pressure it preempts a sequence without leaving it half allocated. |
 | Decode on the host | A token served from the host allocates nothing. |
 | Timers | `/api/layer_perf` and `/api/stage_perf` report per-layer and per-stage times. They are off by default because each stage costs a device synchronisation. |
 

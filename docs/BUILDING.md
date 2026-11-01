@@ -76,7 +76,8 @@ The placement plan, the ladder and the probes see every card, so a model can be 
 |---|---|
 | Transfers between vendors | Through host memory, as between cards without peer access |
 | Runtime libraries | Opened at server start, the HIP runtime included. A machine with 1 vendor's stack lists only that vendor's cards |
-| Tensor-parallel group, replayed decode step | Stay on cards of 1 vendor |
+| Tensor-parallel group | Sums through NCCL among NVIDIA cards and RCCL among AMD cards. A group of both vendors moves its activations through host memory, and is chosen only over a plan that leaves layers on the host |
+| Replayed decode step | Stays on cards of 1 vendor |
 | Layer on an AMD card | Takes the kernels the ROCm build runs |
 
 ## Vulkan cards

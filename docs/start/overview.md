@@ -34,7 +34,7 @@ Any OpenAI, Ollama or Messages client works unchanged.
 | Embeddings and reranking | `/v1/embeddings`, `/api/embed`, `/v1/rerank` | Runs, [guide](../guides/embeddings.md) |
 | Placement across cards and the host | automatic | Measured, [placement](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#placement-measured-separately) |
 | Expert spilling for mixtures that do not fit, streamed from disk when the file exceeds the host | automatic | Measured, [large mixtures](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#large-mixtures-streamed-from-disk) |
-| Continuous batching | automatic when requests overlap | Runs, cards only |
+| Continuous batching | automatic once requests overlap several times in a row | Runs, cards only |
 | Speculative decoding | automatic for a model that spills to the host, `/api/draft/attach` | Measured on 1 pair, [guide](../guides/drafter.md) |
 | KV reuse across conversations, on disk, past the window | automatic, `kv_disk_dir` | Runs, [guide](../guides/kv-memory.md) |
 | Decode-state cache for the large mixture and recurrent hybrids | automatic in memory, on disk once `state_cache_dir` is set | Runs, [configuration](../CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
@@ -53,7 +53,6 @@ Any OpenAI, Ollama or Messages client works unchanged.
 <!-- site: end -->
 
 Each media family is a build feature: `image`, `audio`, `video`, `midi`, or `media` for all.
-A family that is not built reports its models as unknown.  
 [Models](../MODELS.md) lists the families served.
 
 ## Where it is careful
@@ -70,10 +69,3 @@ A family that is not built reports its models as unknown.
 
 > [!WARNING]
 > The server has no authentication and no rate limit until you configure them, and its API can delete models. Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` before it listens on anything but localhost.
-
-## Next
-
-- [Install](install.md) and [First run](first-run.md)
-- [Guides](../guides/openai-sdk.md): 1 page per task
-- [Learn](../learn/README.md): the fundamentals of inference in 10 lessons
-- [API](../API.md) and [Configuration](../CONFIGURATION.md)

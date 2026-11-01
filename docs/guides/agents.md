@@ -84,8 +84,3 @@ On a cluster, the request goes to the node that holds it.
 | `cannot ask the daemon what is loaded: ...` | The daemon is unreachable. | Start `lokend`. |
 | `claude is not installed. Install it with: ...` | The agent binary is not on the `PATH`. | Run the install command the message prints. Cline is `npm install -g cline`. |
 | 401 `missing or invalid API key` | The daemon requires a key. | Export a key from `api_keys` as `LOKEN_API_KEY`, then launch again. |
-
-## Next
-
-- [Messages API and Ollama API routes](../API.md)
-- [Environment variables, `LOKEN_API_KEY`](../CONFIGURATION.md)

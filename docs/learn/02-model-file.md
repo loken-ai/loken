@@ -52,7 +52,7 @@ qwen3:0.6b in numbers:
 | Formats | Reads GGUF (a checkpoint split in parts counts as 1) and safetensors (1 file, or many with an index). |
 | Memory mapping | Reads a tensor in place from the mapping. A layer served from the host needs no copy. |
 | Catalogue | `/api/tags` and `/v1/models` list from the header facts. The read stops at the first `tokenizer.*` key once `general.parameter_count` is read. A file without that key is read on to its tensor descriptors, and its parameters are counted from their shapes. `/api/show` reads the whole header on demand. |
-| Model swaps | Keeps the parsed checkpoint on the host, so switching back does not re-read gigabytes. |
+| Model swaps | Keeps the parsed checkpoint of an image, video or audio model on the host, so switching back does not re-read gigabytes. A language model is read again from its file. |
 
 ## What was measured
 

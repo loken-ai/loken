@@ -31,7 +31,8 @@ RMSNorm divides the vector by its root-mean-square and scales it by a learned we
   Only those experts' bytes are read for that token.
 
 After the last layer, a final norm and the output projection give 1 **logit** per vocabulary entry.  
-[Lesson 7](07-sampling.md) turns that row into a token.
+[Lesson 7](07-sampling.md) turns that row into a token.  
+[The map of lokend](../inside/map.md) draws the layer stack inside the daemon.
 
 | | A layer |
 |---|---|

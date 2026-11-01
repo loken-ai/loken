@@ -41,7 +41,8 @@ Messages are quoted as printed, and `...` stands for varying text.
 |---|---|---|
 | `alloc failed: out of memory` | A card ran out after the placement had spread the model. | Lower the `num_ctx` of the request, or pick a smaller quantisation. |
 | The log says `...: out of card memory; retrying at pressure level N` | A step ran out of card memory. The daemon frees its pools and retries. | No action when the request then succeeds. Lower `num_ctx` when it repeats. |
-| The log says `...: out of card memory; retrying at N` | A decode chunk or a capture buffer did not fit. The daemon halves its size and retries. | No action when the request then succeeds. |
+| The log says `...: out of card memory; retrying at N` | The decode chunk of an audio model did not fit. The daemon halves the chunk and retries. | No action when the request then succeeds. |
+| The log says `...prefill: out of memory at N (...); retrying at M` | A prompt chunk did not fit. The daemon halves the chunk and goes on from the chunk that failed. A model with recurrent layers, or whose cache cannot be cut back, reads the prompt again from where the reading began. | No action when the request then succeeds. |
 | `503` with `Model '...' exists but the machine has no room for it right now` | The load ran out of memory after every fallback of the placement. | Wait for other work to finish, or unload a model. |
 | The log says `...: not whole on one card, so served once` | `replicas` is above 1 and the model does not fit 1 card. | Lower `replicas` to 1, or use a smaller quantisation. |
 
@@ -52,7 +53,8 @@ Messages are quoted as printed, and `...` stands for varying text.
 | The first answer after a load is slow | The load, the repack of a mixture of experts, and on a fresh node the CUDA kernel compilation are paid once. | Send it again. |
 | The log says `...: placement failed (...); trying the host` | Layers run on the host. | Free card memory, shrink `num_ctx`, or use a smaller quantisation. |
 | `CUDA libraries not found: ...` | Every layer runs on the host. | Install the CUDA runtime. |
-| The log says `stays off tensor parallelism on N cards: ...` | Splitting layers across cards does not pay on this machine. | No action. The reason follows the colon. |
+| The log says `stays off tensor parallelism on N cards: ...` | A layer of the model cannot be split across N cards. | No action. The reason follows the colon. |
+| The log says `stays layer by layer on N cards: ...` | Splitting every layer is predicted slower than whole layers, for a token or for a prompt chunk. | No action. |
 | The daemon was started with `--cpu` | `--cpu` places every layer on the host. | Start without `--cpu`. |
 
 ## Requests refused
@@ -82,9 +84,3 @@ Authentication and rate limits: [Expose loken on a network](network.md).
 | The log says `cluster: hand-over to ... failed (...) - serving here instead` | The peer did not answer the forwarded request. | Check the peer. The failed peer is not chosen again until its penalty expires. |
 | The log says `cluster auto-tune ...: not enough measured nodes to plan a split` | Too few nodes published a cost for the model. | Load the model on each node, or wait for the next gossip rounds. |
 | The log says `cluster auto-tune ...: pipeline not formed (...); one node` | A tail node refused its share. | Read the reason. The tail needs the model file locally. |
-
-## Next
-
-- [Expose loken on a network](network.md)
-- [Run 2 machines](cluster.md)
-- [Configuration](../CONFIGURATION.md)

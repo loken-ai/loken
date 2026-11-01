@@ -78,8 +78,3 @@ The second command writes `out.wav` and prints nothing.
 | 413 `audio file too large` | The clip exceeds the size cap. | Compress it as MP3, FLAC or OGG, or cut it. |
 | 400 `response_format 'x' not supported` | Unknown format. | Use the formats listed above. |
 | 400 `voice 'x' is unknown` | `voice` is not a preset. | Pick a name from `GET /v1/audio/voices`, or pass `voice_description`. |
-
-## Next
-
-- [`POST /voice` and `POST /conversation`](../API.md#media): audio in, audio out through the chat model.
-- [Audio models](../MODELS.md#audio)

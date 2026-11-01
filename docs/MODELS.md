@@ -68,7 +68,7 @@ Each tensor is read from the part that holds it.
 |---|---|
 | Name | The first part names the set |
 | Missing part | A part whose siblings are missing is refused |
-| Placement | Layer by layer, never tensor-parallel |
+| Placement | Layer by layer. A set is never split tensor-parallel, even when it does not fit 1 card |
 | Vision tower | Read from the first part only. A set whose `v.*` tensors sit in another part is served as text, and the log says why |
 
 ### Mixture variants

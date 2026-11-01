@@ -35,8 +35,10 @@ The cost is drafting plus a verification pass slightly heavier than a plain step
 A drafter comes from 1 of 3 sources:
 
 - A **separate small model** of the same family, with the same vocabulary.
-- A **trained head** on the target's last hidden state (EAGLE).
-  It is a few percent of a layer and accepts near 90% of its drafts.
+- A **draft head** that reads the target's hidden state with the next token's embedding.
+  It is 1 more decoder layer, and it reuses the target's embedding table and output head.  
+  A checkpoint can ship one as its multi-token-prediction layer.
+  EAGLE trains one apart from the model.
 - The **prompt itself**.
   An n-gram that already occurred is continued as it was before.  
   It costs nothing and suits repetitive text such as code.
@@ -47,7 +49,8 @@ On a model that fits a card, verification costs about what drafting saves.
 
 ## What loken does
 
-loken drafts with a separate small model, an EAGLE head, or prompt lookup over a rolling buffer of the prompt and the generated tokens.
+loken drafts with a separate small model, or with prompt lookup over a rolling buffer of the prompt and the generated tokens.  
+Under `fidelity = "fast"`, it also drafts with the draft head a checkpoint ships.
 
 loken decides whether drafting pays from measured timings.  
 It drops rejected drafts from the cache.  

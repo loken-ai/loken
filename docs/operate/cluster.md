@@ -130,7 +130,7 @@ flowchart TD
 
 A request that no peer can take runs on the machine that received it, split across its cards when they hold the model together, spilled to the host when they do not.
 
-A model too large for any single machine is split across the machines by layers when the measured cost beats serving it alone.
+A model is cut across the machines by runs of layers whenever the measured cost beats serving it alone, even when 1 machine holds it.
 That runs for DeepSeek V4.1 and for dense transformers.  
 [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-cluster) says what has been measured.
 
@@ -149,9 +149,3 @@ That runs for DeepSeek V4.1 and for dense transformers.
 | The log says `cluster: hand-over to ... failed (...) - serving here instead` | The peer did not answer the forwarded request. | The request was served locally. Check the peer and its address in `advertise`. |
 | A stream ends early and the log says `cluster: the peer serving this request stopped before finishing it` | The peer died mid-generation. | The node closes the stream. Send the request again. |
 | `409` with `this node is holding a conversation and has nowhere to place work that yields` | A request of batch priority found no peer, and a conversation is resident. | Send the request without the batch priority, or add a peer. |
-
-## Next
-
-- [Expose loken on a network](network.md)
-- [Troubleshoot](troubleshooting.md)
-- [Cluster internals](../CLUSTER.md)

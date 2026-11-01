@@ -11,7 +11,8 @@ The listening address is the security boundary.
 Inside it there is none.
 
 Prompts never leave the machine.  
-The network is reached to fetch a model you asked for, and by cluster nodes announcing themselves when configured.
+The network is reached to fetch a model you asked for, and by cluster nodes announcing themselves when configured.  
+Logs carry lengths and counts, never a prompt or a generated text.
 
 ## Reporting
 

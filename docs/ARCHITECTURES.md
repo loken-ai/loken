@@ -277,7 +277,7 @@ Each lesson in `learn/` describes a behaviour, and the tables below list the sou
 | `src/tensor/quantized/gguf_source.rs` | Presents a checkpoint split into parts as 1 source. |
 | `src/tensor/safetensors_io.rs` | Safetensors reader: header, then views over the mapping. |
 | `src/tensor/quant_view.rs` | Typed view into blocks owned by a parent tensor or a mapped file. A layer is read in place. |
-| `src/inference/cache/qvb.rs` | Keeps the parsed checkpoint on the host between model swaps. |
+| `src/inference/cache/qvb.rs` | Keeps the parsed checkpoint of an image, video or audio model on the host between model swaps. |
 | `src/api/handlers/catalogue.rs` | Lists models on `/api/tags` and `/v1/models` from the header facts. |
 
 - [`MODELS.md`](MODELS.md) says how a request names a model and which stores are searched.
@@ -396,9 +396,10 @@ The comment above `kv_reuse_start` in `src/inference/engine/llm_engine/load.rs` 
 
 | File | Role |
 |---|---|
-| `src/inference/serve/eagle.rs` | EAGLE-1 head: 1 decoder layer over the target's feature and the next token's embedding. Reuses the target's embedding table and output head. The module comment describes the method in full. |
+| `src/inference/generic_transformer/draft_head.rs` | The draft head a checkpoint ships: 1 more layer of the model's own kind over the hidden state and the next token's embedding. The decode drafts with it under `fidelity = "fast"`. |
+| `src/inference/serve/eagle.rs` | EAGLE-1 head: 1 decoder layer over the target's feature and the next token's embedding. Reuses the target's embedding table and output head. No request path builds it. The module comment describes the method in full. |
 | `src/inference/serve/prompt_lookup.rs` | Prompt-lookup drafting from a rolling buffer of prompt and generated tokens. |
-| `src/inference/engine/llm_engine/spec.rs` | Drafting with a separate model, verified in 1 target pass. The comment states the greedy restriction and what temperature would need. |
+| `src/inference/engine/llm_engine/mod.rs` | `draft_k` drafts k tokens with a separate model. The target samples its own token at every position. |
 | `src/inference/serve/speculative_config.rs` | Decides from measured device timings whether drafting pays. |
 | `src/inference/serve/spec_kv_cache.rs` | Cache that drops the rejected tail. |
 
@@ -411,6 +412,7 @@ The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment
 | File | Role |
 |---|---|
 | `src/inference/place/plan.rs` | Heterogeneous plan of every block stack: pack the fastest card first, spill card to card to host, never run out of memory. |
+| `src/inference/place/tensor_parallel.rs` | Splits every layer across a group of cards, a mixture's experts by range, when the model does not fit 1 card and the measured reads, links and sums predict it faster. |
 | `src/inference/place/vram_manager.rs` | The one place placement reads card state from. Trims pools before the probe, keeps a reclaim registry for idle media residents, reserves headroom for a hot component before it loads. |
 | `src/tensor/dry.rs`, `src/tensor/heap.rs`, `src/inference/place/dry_plan.rs` | Break the circularity. They measure a request's peak by running the forward on a device that allocates nothing, then replay the allocator's chunk and hole behaviour on it. |
 | `src/inference/place/placement_invariants.rs` | The fleet rule as tests. The cards decide, not the budgets. No placement decides on a name or an index. Every hot component can span n cards. |

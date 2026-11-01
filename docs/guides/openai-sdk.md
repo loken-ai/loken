@@ -83,9 +83,3 @@ Every answer on the Ollama surface carries the engine's timings (`eval_count`, `
 | Symptom | Cause | Fix |
 |---|---|---|
 | 401 `missing or invalid API key` | `require_auth` is on and the request carries no accepted key, or `api_keys` is empty. | Add the key to `api_keys`. Send it as `Authorization: Bearer <key>` or `X-API-Key: <key>`. |
-
-## Next
-
-- [Routes and fields of the OpenAI surface](../API.md#openai-surface)
-- [Server keys, `require_auth` and `api_keys`](../CONFIGURATION.md)
-- [Point an Ollama client at loken](ollama-clients.md)

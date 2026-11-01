@@ -103,9 +103,3 @@ loken ps
 
 `loken list` shows the model in the store.  
 `loken ps` shows it after a first request loads it.
-
-## Next
-
-- [First run](first-run.md)
-- [Models](../MODELS.md) and [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md)
-- [Placement](../learn/09-placement.md)

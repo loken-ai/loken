@@ -32,6 +32,7 @@ Past the window applies at `fidelity = "balanced"` (the default) and `"fast"`.
 The re-phased keys differ from a cold run's in the last bits.
 
 Q4 caches, sliding-window layers, recurrent hybrids and learned position embeddings prefill cold.  
+A request with an image keeps no snapshot and writes nothing to disk.  
 At `fidelity = "reference"` the tail is re-prefilled cold.
 
 ## Run it
@@ -68,8 +69,3 @@ A quantised cache restores on its own grid: Q8 exactly, Q4 within a step.
 | Symptom | Cause | Fix |
 |---|---|---|
 | 400 `the prompt is N tokens and the model's context window is M` | The prompt is longer than the window. Past the window does not apply to a single prompt. | Shorten the conversation, or load the model with a larger `num_ctx`. |
-
-## Next
-
-- [Configuration](../CONFIGURATION.md#kv-reuse-across-requests)
-- [The KV cache lesson](../learn/06-kv-cache.md)

@@ -82,8 +82,3 @@ A family that does not fit spreads across cards, and reaches the host only when 
 | 400 `n must be <= 10` or `n must be >= 1` | `n` is out of range. | Send 1 to 10. |
 | 400 `response_format '...' not supported; use 'url' or 'b64_json'` | `response_format` has another value. | Send `url` or `b64_json`. |
 | 400 `num_steps must be <= ...` or `num_steps must be >= 1` | `num_steps` is out of range. | Send a smaller value. |
-
-## Next
-
-- [Image families and their files](../MODELS.md#image)
-- [Routes and fields](../API.md)

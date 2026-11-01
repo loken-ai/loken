@@ -152,11 +152,9 @@ The next turn of a conversation keeps the rows it shares with the turn before, u
 
 ### Prompts read by another instance
 
-An instance with `prefill_peer` set has its long prompts read by that peer, which serves the same model:
-
-1. The peer prefills the prompt and answers its KV cache over `/api/cluster/prefill`.
-2. This instance imports it as a snapshot and decodes.
-3. The prefix reuse restores it in whole prefill chunks and reads the rest of the prompt here, so a prompt within a chunk of what the cache holds never leaves.
+An instance with `prefill_peer` set has its long prompts read by that peer, which serves the same model.
+The peer answers with its KV cache over `/api/cluster/prefill`, and this instance imports it and decodes.  
+[Across machines](inside/nodes.md) draws the steps.
 
 A model with recurrent or windowed layers hands over its whole decode state instead of rows.
 
@@ -165,6 +163,8 @@ It is checked against this instance's layer kinds and row geometry before it is 
 
 The prompt is read here when:
 
+- the prompt adds less than 1 prefill chunk to what the cache holds
+- the request carries an image
 - the model has a split layer
 - the cache is cut over the cards
 - the peer cannot answer

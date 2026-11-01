@@ -1,7 +1,8 @@
 # Cluster internals
 
 To set up 2 machines, read [Run 2 machines](operate/cluster.md).  
-[Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-cluster) says what has been measured.
+[Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-cluster) says what has been measured.  
+[Across machines](inside/nodes.md) follows a request and a cut step by step.
 
 ## Principle
 

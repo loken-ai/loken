@@ -76,8 +76,3 @@ A model's template, system prompt and parameters come from its manifest.
 | 403 `loken does not support pushing models to a remote registry` | `/api/push` is refused. | Drop the push step. loken keeps models on the machine that holds them. |
 | 401 `missing or invalid API key` | `require_auth` is on. | Send an accepted key from `api_keys` as `Authorization: Bearer <key>`. |
 | 404 `Model '<name>' not found in remote registry` | `ollama pull` or `/api/pull` named a model the registry does not hold. | Check the name and tag. |
-
-## Next
-
-- [Routes and fields of the Ollama surface](../API.md#ollama-surface)
-- [Serve a chat model to an OpenAI client](openai-sdk.md)

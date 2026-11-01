@@ -80,9 +80,3 @@ Every key is in [Configuration](../CONFIGURATION.md).
 | `nvcc not found at ...; set CUDA_PATH` | The build cannot find the CUDA toolkit. | Set `CUDA_PATH` to it, or build without CUDA. |
 | `config.toml not found in CWD, exe dir, or user config dir` | No configuration file in the 3 places. | Copy `config.toml.example` next to the daemon. |
 | `Address already in use` | Another process holds the port. | `lokend serve --port <other>`, or stop that process. |
-
-## Next
-
-- [First run](first-run.md)
-- [Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md)
-- [Models](../MODELS.md)

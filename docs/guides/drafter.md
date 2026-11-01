@@ -80,8 +80,3 @@ Plain decoding is one of the lengths, so a drafter that stops paying is dropped.
 | 400 `Tokenizer fingerprint mismatch` | The drafter has another ordinary vocabulary, or more logit rows than the target. | Choose a drafter of the same family. |
 | 400 `No card has room for the draft` | The target is held on the cards and the drafter would run on the host. | Free a card, or skip the drafter. |
 | 500 `Draft load failed` | The drafter did not load. | Read the message that follows. |
-
-## Next
-
-- [Measured gains](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md)
-- [API routes](../API.md)

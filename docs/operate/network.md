@@ -132,9 +132,3 @@ Set `join` and block the port when the segment is not yours.
 | `429` for callers that share an address | Without `require_auth`, all callers share 1 bucket. | Turn on `require_auth`, so each key has its own bucket. |
 | The log says `The API is listening on ... and it is NOT authenticated` | `host` is not loopback. The daemon logs it whether `require_auth` is on or off. | Check that `require_auth` is on, or set `host` to `127.0.0.1`. |
 | A browser call fails on CORS after `require_auth` | The origin is not in `allowed_origins`. | Add the origin. |
-
-## Next
-
-- [Run 2 machines](cluster.md)
-- [Troubleshoot](troubleshooting.md)
-- [API reference](../API.md)

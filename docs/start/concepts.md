@@ -69,22 +69,17 @@ The daemon asks each card what it holds, fills the fastest card first, then spil
 
 For a mixture of experts, only the experts that do not fit leave the cards.
 
+A model that does not fit 1 card can instead have every layer split across a group of cards.
+Each card takes a share in proportion to its read rate.
+A mixture gives each card a range of its experts.  
+The daemon picks this split only when the model's layers allow it and its measurements predict it faster.
+
 Nothing is configured for this.
-The placement plan picks the card and the layers, see [Configuration](../CONFIGURATION.md#decided-by-loken).
-
-## What stays on the machine
-
-Inference runs on the machine. loken needs no account and no API key, and has no hosted fallback.
-
-The network is used to fetch a model you asked for, and by a cluster node you configured to announce itself.  
-Logs carry lengths and counts, never a prompt or a generated text.
-
-> [!WARNING]
-> The server has no authentication and no rate limit until `require_auth`, `api_keys` and `rate_limit_per_minute` are set under `[server]`.
+The placement plan picks the card and the layers, see [Configuration](../CONFIGURATION.md#decided-by-loken).  
+[Layers and placement](../inside/layers.md) draws the plan and its levels.
 
 ## Terms
 
-<!-- site: widget flashcards id=concepts-terms -->
 | Term | Meaning |
 |---|---|
 | `lokend` | The daemon: owns the models, the memory and the port |
@@ -97,9 +92,3 @@ Logs carry lengths and counts, never a prompt or a generated text.
 | Placement | The choice of card or host for each part of a model |
 | Spill | Placing on the host what no card holds |
 | Mixture | A model whose layers hold many experts, of which each token uses a few |
-<!-- site: end -->
-
-## Next
-
-- [Choose a model](choose-a-model.md)
-- [Install](install.md) and [First run](first-run.md)

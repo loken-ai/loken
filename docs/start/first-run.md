@@ -78,9 +78,3 @@ An OpenAI client reaches the same model at `http://localhost:11435/v1`, see [Ser
 | `Model '...' not found in remote registry` | The registry chosen by `--source` does not know the name. | Check the tag on that registry, or use the other source. |
 | 401 `missing or invalid API key` | `require_auth` is on. | Send `Authorization: Bearer <key>` or `X-API-Key` with a key from `api_keys`. |
 | `loken launch` fails to authenticate | The daemon needs a key. | Set `LOKEN_API_KEY` before `loken launch`. |
-
-## Next
-
-- [Serve a chat model to an OpenAI client](../guides/openai-sdk.md)
-- [Run a coding agent on loken](../guides/agents.md)
-- [Models](../MODELS.md)

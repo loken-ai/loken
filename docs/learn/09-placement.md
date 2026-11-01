@@ -25,6 +25,9 @@ It depends on which experts a token needs, how many the last token needed too, w
 loken packs the fastest card first, then spills from card to card, then to the host.  
 It does not run out of memory.
 
+A model that does not fit 1 card can instead have every layer split across a group of cards.
+loken picks that split when the layers allow it and measurements predict it faster.
+
 The host budget is a share of the machine.  
 No placement depends on a card's name or index.  
 Every hot component can span n cards.
@@ -39,6 +42,8 @@ The other experts are read from disk, through a hot tier that evicts the least r
 
 Across nodes, a request goes to the node with the best predicted completion, not the lowest load.  
 [The cluster page](../CLUSTER.md) describes how a request is routed.
+
+[Layers and placement](../inside/layers.md) and [Models and experts](../inside/weights.md) draw the plan and the expert slots.
 
 ## What was measured
 
