@@ -483,6 +483,78 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    fn key_paths(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    key_paths(v, &path, out);
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    /// The keys of the configuration file are the ones only a person can say.
+    /// loken decides everything else.
+    /// A key added here needs the owner's agreement first (CLAUDE.md, "Configuration").
+    /// This test fails on any addition on purpose.
+    #[test]
+    fn the_configuration_file_holds_only_the_keys_the_owner_agreed_to() {
+        let config = Config {
+            server: Some(ServerConfig::default()),
+            inference: InferenceConfigToml::default(),
+            ollama_models_dir: Some(DirList::one("d")),
+            huggingface_models_dir: Some(DirList::one("d")),
+            lora_dir: Some("d".to_string()),
+            energy: Some(EnergyConfig::default()),
+            cluster: Some(toml::from_str("").unwrap()),
+        };
+        let mut keys = Vec::new();
+        key_paths(&serde_json::to_value(&config).unwrap(), "", &mut keys);
+        keys.sort();
+        let mut agreed = vec![
+            "cluster.advertise",
+            "cluster.gossip_interval_ms",
+            "cluster.join",
+            "cluster.min_speedup",
+            "cluster.name",
+            "cluster.node_id",
+            "energy.carbon_intensity",
+            "huggingface_models_dir",
+            "inference.context_parallel",
+            "inference.files_dir",
+            "inference.fidelity",
+            "inference.image_fetch_hosts",
+            "inference.kv_disk_dir",
+            "inference.model_id",
+            "inference.moderation_model",
+            "inference.prefill_peer",
+            "inference.public_url",
+            "inference.replicas",
+            "inference.state_cache_dir",
+            "inference.vulkan_devices",
+            "lora_dir",
+            "ollama_models_dir",
+            "server.allowed_origins",
+            "server.api_keys",
+            "server.host",
+            "server.port",
+            "server.rate_limit_burst",
+            "server.rate_limit_per_minute",
+            "server.require_auth",
+        ];
+        agreed.sort();
+        assert_eq!(
+            keys, agreed,
+            "the configuration file gained or lost a key: ask the owner before changing it"
+        );
+    }
+
     use super::*;
 
     #[test]
