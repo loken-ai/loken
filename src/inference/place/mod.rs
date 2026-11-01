@@ -19,6 +19,7 @@ pub mod expert_variants;
 pub mod fit_report;
 #[cfg(all(test, feature = "image"))]
 mod geometry_invariants;
+pub mod heap;
 pub mod ladder;
 pub mod layer_executor;
 pub mod layer_perf;

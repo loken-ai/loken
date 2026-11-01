@@ -2988,6 +2988,7 @@ impl LlmEngine {
             }
             if let Some(s) = model_state.blocking_lock().as_ref() {
                 s.model.rerank_hot_experts();
+                crate::inference::place::heap::release_retained();
             }
             if let Some(path) = config.expert_profile_save.as_deref() {
                 let profile = model_state

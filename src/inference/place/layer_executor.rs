@@ -73,7 +73,7 @@ fn anonymous_bytes(stat: &str) -> Option<u64> {
 /// of an 8 GB machine, which is exactly what the flat figure did to a 16 GB one. Erring large is
 /// still right - a per-segment OOM in the loader is far cheaper than swapping the host - but a
 /// share errs large on its own, without a number chosen for a machine nobody measured.
-fn host_ram_safety_headroom_bytes() -> u64 {
+pub(crate) fn host_ram_safety_headroom_bytes() -> u64 {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
@@ -82,6 +82,12 @@ fn host_ram_safety_headroom_bytes() -> u64 {
         None => sys.total_memory(),
     };
     total / 4
+}
+
+/// The memory kept free for a burst: one eighth of the memory the process may take.
+/// The kept expert tier leaves the same share.
+pub(crate) fn host_burst_headroom_bytes() -> u64 {
+    host_ram_safety_headroom_bytes() / 2
 }
 
 /// What a component may take on the host right now without pushing the machine into

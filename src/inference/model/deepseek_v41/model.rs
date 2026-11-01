@@ -568,6 +568,8 @@ impl DeepseekV41Model {
         state.x = nx;
         state.pre_mix = npm;
         state.next += 1;
+        // The buffers this layer freed stay in the allocator only up to the host headroom.
+        crate::inference::place::heap::release_retained();
         Ok(())
     }
 
