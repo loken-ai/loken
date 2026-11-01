@@ -1,0 +1,147 @@
+# The scenes of the way into the head: a prompt with an image, and a second turn.
+
+to mid(b)
+  return (attr(b, "x") + 5.5, attr(b, "y") + 5)
+end
+
+scene vision
+  # An image in a chat.
+  # The way of an image through a model whose vision tower splices into the text:
+  let mouth = (512, 140)
+  let outside = (640, 140)
+  let neck = (500, 182)
+  let eyes = [(482, 106), (518, 106)]
+  let blocks = [shape("rect", {class: "box kvb", x: 474 + (i % 4) * 13, y: 60 + floor(i / 4) * 13, width: 11, height: 10, rx: 1.5}) for i in range(8)]
+  to fill(b, cls)
+    let d = dotAt(neck, 3, "kv")
+    travel(d, [(500, 120), mid(b)], 220)
+    remove d
+    add cls to b
+    light "kv" "glow"
+  end
+  # Step 0: A chat request with an image arrives.
+  # The template puts 1 image placeholder in the prompt, and the tokenizer turns the text into ids.
+  step 0
+  let p = dotAt(outside)
+  glide p to mouth over 900
+  light "requests" "speak"
+  # The prompt as the template and the tokenizer leave it: words, 1 image placeholder, then the
+  # question mark.
+  let tx = 520
+  to chip(w)
+    let t = label(tx, 156, w, class="ptok", size=8)
+    tx += textWidth(t) + 2.5
+    return t
+  end
+  let chips = [chip(w) for w in ["What", "is", "in"]]
+  let hole = shape("rect", {class: "box ph", x: tx, y: 151.5, width: 4, height: 5, rx: 0.8})
+  tx += 5.5
+  let mark = chip("?")
+  wait 1.1s
+  # Step 1: The vision tower turns the image into embeddings.
+  step 1
+  let imgs = [dotAt(mouth, 4, "img") for e in eyes]
+  glideAll([[d, eyes[i]] for [i, d] in enumerate(imgs)], 700)
+  light "senses" "held" on
+  compute imgs for 900 say "Encoding the image"
+  light "senses" "held" off
+  # Step 2: At prefill, the placeholder grows into a run of tokens, 1 per merged patch of the image.
+  # The embeddings take the place of that run.
+  step 2
+  # The placeholder grows into a run of 3 tokens and the embeddings take their place.
+  let x0 = attr(hole, "x")
+  let holes = [hole] + [shape("rect", {class: "box ph", x: x0 + i * 5.5, y: 151.5, width: 4, height: 5, rx: 0.8}) for i in [1, 2]]
+  setAttr(mark, "x", x0 + 3 * 5.5)
+  let embs = [dotAt(eyes[i % 2], 2.2, "img") for [i, h] in enumerate(holes)]
+  remove imgs
+  glideAll([[d, (attr(holes[i], "x") + 2, 154)] for [i, d] in enumerate(embs)], 700)
+  remove embs
+  add "on" to holes
+  wait 700
+  remove chips, holes, mark
+  # Step 3: The prompt is read through the layers, the image rows with the text rows.
+  step 3
+  glide p to neck over 500
+  swell p on
+  say "Reading the image rows with the text rows" busy
+  light "loop" "breathe"
+  for b in blocks[0:5]
+    fill(b, "on")
+  end
+  swell p off
+  remove p
+  wait 600
+end
+
+scene turn
+  # A conversation continued.
+  # The way of the next turn of a text conversation:
+  let mouth = (512, 140)
+  let outside = (640, 140)
+  let neck = (500, 182)
+  let disk = (432, 44)
+  let blocks = [shape("rect", {class: "box kvb", x: 474 + (i % 4) * 13, y: 60 + floor(i / 4) * 13, width: 11, height: 10, rx: 1.5}) for i in range(8)]
+  to fill(b, cls)
+    let d = dotAt(neck, 3, "kv")
+    travel(d, [(500, 120), mid(b)], 220)
+    remove d
+    add cls to b
+    light "kv" "glow"
+  end
+  # The resident KV after an answer: 4 full blocks and 1 block still filling.
+  let held = blocks[0:5]
+  add "on" to held
+  # Step 0: After an answer, the resident KV is copied aside as a snapshot, under its tokens.
+  step 0
+  let snap = [shape("rect", {class: "box kvb", x: 548 + i * 9, y: 66, width: 7, height: 7, rx: 1}) for [i, b] in enumerate(held)]
+  label(548, 61, "snapshot", size=7)
+  let copies = [dotAt(mid(b), 2.4, "small") for b in held]
+  glideAll([[d, (attr(snap[i], "x") + 3.5, 69.5)] for [i, d] in enumerate(copies)], 800)
+  remove copies
+  add "kept" to snap
+  light "kv" "glow"
+  wait 700
+  # Step 1: With `kv_disk_dir` set, a thread writes the full blocks of the cache to disk, off the
+  #   request path.
+  # Each block is named by a hash chained over its own tokens and those of the blocks before it.
+  step 1
+  shape("path", {class: "box", d: "M" + str(disk[0] - 13) + "," + str(disk[1] - 5) + " a13,4 0 0 0 26,0 a13,4 0 0 0 -26,0 v12 a13,4 0 0 0 26,0 v-12"})
+  label(disk[0], disk[1] + 20, "disk", anchor="middle")
+  let outs = [dotAt(mid(b), 2.6, "small") for b in held[0:4]]
+  glideAll([[d, disk] for d in outs], 900)
+  remove outs
+  for b in held
+    drop "on" from b
+    add "kept" to b
+  end
+  wait 600
+  # Step 2: The next turn repeats the conversation.
+  # The daemon finds the snapshot or the longest chain of blocks that the prompt shares.
+  step 2
+  let q = dotAt(outside)
+  glide q to mouth over 800
+  light "requests" "speak"
+  for b in held
+    drop "kept" from b
+    add "on" to b
+  end
+  light "kv" "glow"
+  wait 900
+  # Step 3: It keeps the rows up to the last turn marker of the template, or up to the last whole
+  #   prefill chunk when that keeps more.
+  step 3
+  drop "on" from held[4]
+  add "kept" to held[4]
+  wait 900
+  # Step 4: Only the answer and the new turn are read through the layers.
+  step 4
+  glide q to neck over 500
+  swell q on
+  say "Reading the answer and the new turn through the layers" busy
+  light "loop" "breathe"
+  drop "kept" from held[4]
+  fill(held[4], "on")
+  fill(blocks[5], "on")
+  swell q off
+  wait 600
+end

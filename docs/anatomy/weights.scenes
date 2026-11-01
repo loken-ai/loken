@@ -1,0 +1,133 @@
+# The scenes of the weights: a model loaded from the catalogue, and an expert the card lacks.
+
+to mid(b)
+  return (attr(b, "x") + 5, attr(b, "y") + 5)
+end
+
+scene load
+  # A model loaded through the plan.
+  let stomach = centre(select("#v-trunk [data-group=\"models\"] .t"))
+  let store = (500, 470)
+  # Step 0: The catalogue finds the model in the stores of the configuration, read as one.
+  # A model held by several stores is read from the first one listed.
+  step 0
+  let p = dotAt(store)
+  light "models" "churn" on
+  compute p for 500 say "Reading the catalogue"
+  glide p to stomach over 600
+  # Step 1: The placement plan reads what each card offers: its free memory, its read rate, its
+  #   compute rate and its link.
+  # It gives each run of layers to one device.
+  step 1
+  for r in ["dc", "dr", "dh"]
+    let run = [v for v in layers if v.run == r]
+    add "hot" to run
+    say "Measuring and placing on " + RUN_NAMES[r] busy
+    wait 600
+    drop "hot" from run
+  end
+  # Step 2: The loaders read each layer's weights into the device of its run.
+  step 2
+  for r in ["dc", "dr", "dh"]
+    say "Reading weights into " + RUN_NAMES[r]
+    for v in [x for x in layers if x.run == r]
+      let d = dotAt(stomach, 2.6, "small")
+      travel(d, [(500, max(v.y, 380)), (500, v.y)], 900)
+      remove d
+      add "hot" to v
+      later 400
+        drop "hot" from v
+      end
+    end
+  end
+  # Step 3: For an image, video or audio model, the parsed checkpoint stays in host memory while
+  #   memory allows.
+  # Loading that model again skips the disk.
+  step 3
+  add "kv" to p
+  compute p for 1200 say "Keeping the parsed checkpoint in host memory"
+  say "Loading that model again: no disk read, only the uploads"
+  for v in layers
+    let d = dotAt(stomach, 2.6, "small")
+    travel(d, [(500, max(v.y, 380)), (500, v.y)], 2400)
+    remove d
+    add "hot" to v
+    later 300
+      drop "hot" from v
+    end
+  end
+  light "models" "churn" off
+end
+
+scene experts
+  # A token through a mixture of experts.
+  let spot = [v for v in layers if v.run == "dc"][5]
+  let heart = centre(select("#v-trunk [data-group=\"experts\"] .t"))
+  let slots = [shape("rect", {class: "box slot", x: 546 + i * 13, y: 236, width: 10, height: 10, rx: 1.5}) for i in range(6)]
+  let room = shape("rect", {class: "box slot", x: 632, y: 236, width: 10, height: 10, rx: 1.5})
+  let hosts = [shape("rect", {class: "box host", x: 344 + i * 11.5, y: 420, width: 10, height: 10, rx: 1.5}) for i in range(9)]
+  label(546, 230, "slots on the card", size=8)
+  label(626, 258, "transit room", size=7)
+  label(344, 413, "experts in host memory", size=8)
+  let used = [slots[0], slots[2], slots[3]]
+  let miss = hosts[6]
+  let moved = hosts[2]
+  let aims = used + [room, miss]
+  # Step 0: A token reaches a mixture layer.
+  # The router picks its experts.
+  step 0
+  let p = dot(500, spot.y)
+  add "hot" to spot
+  glide p to heart over 600
+  light "experts" "beat" in ".t"
+  compute p for 400 say "The router scoring the experts"
+  let goes = [dotAt(heart, 3.2, "small") for a in aims]
+  glideAll([[d, mid(used[i])] for [i, d] in enumerate(goes[0:3])] + [[goes[3], heart], [goes[4], mid(miss)]], 800)
+  # Step 1: The experts that have a slot on the card run there.
+  step 1
+  add "on" to used
+  light "experts" "beat" in ".t"
+  light "backends" "flex" on
+  swell goes[0:3] on
+  say "Computing on the card" busy
+  wait 700
+  # Step 2: An expert without a slot runs in one of 2 places, split by the rates measured on the
+  #   layer.
+  # It is copied into the card's transit room and run with the others, or computed on the host cores
+  #   beside the card.
+  step 2
+  let copy = dotAt(mid(moved), 2.6, "small")
+  say "Copying an expert into the transit room"
+  travel(copy, [(612, 400), mid(room)], 320)
+  remove copy
+  glide goes[3] to mid(room) over 300
+  add "on" to room
+  add "on" to miss
+  light "experts" "beat" in ".t"
+  swell goes[3:] on
+  say "The card and the host cores computing together" busy
+  wait 1s
+  swell goes off
+  drop "on" from used + [room, miss]
+  light "backends" "flex" off
+  light "experts" "beat" in ".t"
+  # Step 3: The outputs of the experts are summed, each weighted by the router, and the token goes
+  #   on.
+  step 3
+  glideAll([[d, heart] for d in goes], 700)
+  remove goes
+  compute p for 400 say "Summing the outputs, each weighted by the router"
+  glide p to (500, spot.y) over 500
+  drop "hot" from spot
+  glide p to (500, layers[spot.n + 1].y) over 300
+  remove p
+  # Step 4: Every expert's use is counted.
+  # A worker copies an expert that the counts show hotter than the coldest slot the token leaves
+  #   unused into that slot, and never holds up a token.
+  step 4
+  let w = dotAt(mid(miss), 3.2, "small")
+  travel(w, [(612, 400), mid(slots[5])], 260)
+  remove w
+  add "fresh" to slots[5]
+  wait 1s
+end

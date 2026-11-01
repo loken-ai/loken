@@ -1,0 +1,298 @@
+# The scenes of the layer stack.
+# `layers` are the drawn layers from layer 0 up, `base` is the line under layer 0 and `top` is the
+# last layer.
+
+scene one
+  # A model on one card.
+  # Step 0: The cards are ordered by a timed compute rate, a pinned card first, and each one offers
+  #   its free memory.
+  step 0
+  let ranks = [label(528, base + 30 + dy, t, size=8) for [t, dy] in [("card A: 1st", 0), ("card B: 2nd", 13)]]
+  wait 1s
+  # Step 1: The demand adds the layers, the output head, the KV cache at the planned context and a
+  #   runtime reserve.
+  step 1
+  let parts = [label(472, base + 30 + i * 12, t, anchor="end", size=8) for [i, t] in enumerate(["layers", "head", "KV cache", "reserve"])]
+  wait 1.3s
+  # Step 2: The first card in that order that holds the whole demand receives every layer, the head
+  #   and the caches.
+  step 2
+  wave layers 30
+  remove parts, ranks[1]
+  wait 400ms
+  # Step 3: A token climbs every layer on that card.
+  step 3
+  light "loop" "breathe"
+  let p = dot(500, base)
+  move p via (500, top.y) speed 300 * z tracked
+  # Step 4: The output head on the same card gives the logits.
+  step 4
+  compute p for 700ms say "The output head on card A giving the logits"
+  emit at (512, top.y - 10) DEMO.answer[0]
+  light "requests" "speak"
+  wait 1.2s
+end
+
+scene runs
+  # Layers spread over 2 cards.
+  # Step 0: No card holds the whole model, and the cards together do.
+  step 0
+  let tags = [label(528, base + 30 + dy, t, size=8) for [t, dy] in [("card A", 0), ("card B", 13)]]
+  wait 1s
+  # Step 1: The cards are filled in rank order until every layer has a card.
+  step 1
+  plan([["pa", 16], ["pb", 8]])
+  wave layers 30
+  wait 500ms
+  # Step 2: When the model keeps a KV cache and every card has a measured speed, the same layers are
+  #   then shared out by that speed, within what each card holds.
+  step 2
+  plan([["pa", 14], ["pb", 10]])
+  add "hot" to layers[14:16]
+  wait 900ms
+  drop "hot" from layers[14:16]
+  # Step 3: The output head stays on the card of the last layer, and each layer keeps its KV cache
+  #   on its own card.
+  step 3
+  let head = label(528, top.y + 3, "head", size=8)
+  let kv = [shape("rect", {class: "box kvb on", x: 466, y: v.y - 3, width: 6, height: 6, rx: 1}) for v in [layers[2], layers[8], layers[16], layers[21]]]
+  wait 1.1s
+  # Step 4: A token climbs the run of card A, crosses once to card B and climbs the run of card B.
+  step 4
+  light "loop" "breathe"
+  let p = dot(500, base)
+  move p via (500, top.y) speed 300 * z tracked
+  compute p for 600ms say "The output head on card B giving the logits"
+  remove p
+  # Step 5: When the plan uses exactly 2 cards with no layer or expert on the host, card B reads
+  #   memory at least 1.1 times faster and holds the last layers with the head, the slower card A
+  #   takes the first layers if that cuts the token time by at least 3%.
+  step 5
+  retext(tags[0], "card A: slower, first layers")
+  retext(tags[1], "card B: faster, last layers")
+  wait 1.6s
+  remove head, kv
+  emit at (512, top.y - 10) DEMO.answer[0]
+  light "requests" "speak"
+  wait 1s
+end
+
+scene tail
+  # A dense model larger than the cards.
+  let host = [v for v in layers if data(v, "plan") == "ph"]
+  let cards = [v for v in layers if data(v, "plan") != "ph"]
+  # Step 0: A dense model is larger than the cards, even with blocks taken out of each card's
+  #   runtime reserve.
+  step 0
+  wave cards 30
+  wait 500ms
+  # Step 1: The last layers stay on the host, read in place from the file's mapping where their
+  #   format allows and advised to stay in the page cache.
+  step 1
+  let map = label(472, host[0].y + 3, "file mapping", anchor="end", size=8)
+  add "hot" to host
+  wait 1s
+  drop "hot" from host
+  # Step 2: Those layers keep their KV cache in host memory.
+  step 2
+  let kv = [shape("rect", {class: "box kvb on", x: 520, y: v.y - 2.5, width: 5, height: 5, rx: 1}) for v in host]
+  let kvt = label(528, host[-1].y + 3, "KV in host memory", size=7)
+  wait 1.1s
+  # Step 3: A token climbs the runs of the cards, then crosses to the host and climbs the host run.
+  step 3
+  light "loop" "breathe"
+  let p = dot(500, base)
+  move p via (500, top.y) speed 260 * z tracked
+  # Step 4: The vector crosses back to the last card for the output head.
+  step 4
+  let last = cards[-1]
+  move p via (512, (top.y + last.y) / 2), (500, last.y) speed 160 * z
+  compute p for 700ms say "The output head on card B giving the logits"
+  remove map, kvt, kv
+  emit at (512, last.y - 10) DEMO.answer[0]
+  light "requests" "speak"
+  wait 1.2s
+end
+
+to mid(b)
+  return (attr(b, "x") + 5, attr(b, "y") + 5)
+end
+
+scene spill
+  # A mixture whose experts leave the cards.
+  # Step 0: Every layer's attention, router, shared expert and KV cache go to a card.
+  step 0
+  wave layers 30
+  let kv = [shape("rect", {class: "box kvb on", x: 466, y: v.y - 3, width: 6, height: 6, rx: 1}) for v in [layers[3], layers[9], layers[15], layers[21]]]
+  wait 500ms
+  # Step 1: When the experts do not fit with the whole reserve and the card cache serves the file's
+  #   expert format, the routed experts of every layer stay in the file's mapping.
+  step 1
+  let hosts = [shape("rect", {class: "box host", x: 344 + i * 11.5, y: 420, width: 10, height: 10, rx: 1.5}) for i in range(9)]
+  label(344, 413, "experts in the file's mapping", size=8)
+  wait 1.1s
+  # Step 2: Each card keeps a cache of expert slots for its layers.
+  step 2
+  to slotRow(y, name)
+    label(546, y - 6, name, size=7)
+    return [shape("rect", {class: "box slot", x: 546 + i * 13, y: y, width: 10, height: 10, rx: 1.5}) for i in range(5)]
+  end
+  let slotsB = slotRow(232, "slots on card B")
+  let slotsA = slotRow(330, "slots on card A")
+  wait 1.1s
+  # Step 3: With at least 2 cards, a measured read rate and link for each, and room on the cards for
+  #   every expert, each layer takes its experts back, split across cards by id range where that is
+  #   predicted faster.
+  step 3
+  let goes = [(dotAt(mid(hosts[i % 9]), 2.6, "small"), b) for [i, b] in enumerate(slotsA + slotsB)]
+  glideAll([[d, mid(b)] for [d, b] in goes], 900)
+  for [d, b] in goes
+    remove d
+    add "on" to b
+  end
+  wait 900ms
+  # Step 4: When the card cache cannot serve the file's expert format, only the experts of the last
+  #   layers stay in host memory.
+  step 4
+  drop "on" from slotsA + slotsB
+  add "on" to hosts[6:]
+  wait 1.4s
+  remove kv
+  wait 600ms
+end
+
+scene split
+  # Every layer split across 2 cards.
+  let OUT = 40
+  let NEAR = 22
+  # Step 0: The model does not fit 1 card, and the split is predicted faster for 1 token and for a
+  #   prompt chunk, or the layers would otherwise reach the host.
+  step 0
+  let tags = [label(x, layers[0].y + 3, t, anchor=a) for [t, x, a] in [("card A", 500 - OUT - 14, "end"), ("card B", 500 + OUT + 14, "start")]]
+  let p = dot(500 - NEAR, layers[0].y + 14)
+  let q = dot(500 + NEAR, layers[0].y + 14)
+  compute p, q for 900 say "Predicting 1 token and 1 prompt chunk on the split"
+  # Step 1: Every layer is split across the 2 cards, each card's share following its read rate.
+  step 1
+  light "backends" "flex" on
+  wave layers 25
+  # Step 2: Each card holds its share of the heads and the feed-forward, or a range of a mixture's
+  #   experts with the router whole on every card.
+  step 2
+  row 0 str(layers[0].n)
+  glide p to (500 - NEAR, layers[0].y), q to (500 + NEAR, layers[0].y) over 500
+  wait 600
+  light "loop" "breathe"
+  for i in range(len(layers))
+    let v = layers[i]
+    let slow = i < 2
+    let t = 1 if slow else 0.12
+    row 0 str(v.n)
+    for e in tags
+      setAttr(e, "y", v.y + 3)
+    end
+    add "hot" to v
+    # Steps 3 and 4 play for every layer in turn.
+    # Step 3: Each card computes its share of the attention heads, then the 2 partial outputs are
+    #   summed onto both cards.
+    # Step 4: Each card computes its share of the feed-forward, then the outputs are summed again.
+    for st in [3, 4]
+      step st
+      glide p to (500 - OUT, v.y), q to (500 + OUT, v.y) over 380 * t
+      compute p, q for 600 * t
+      glide p to (500 - NEAR, v.y), q to (500 + NEAR, v.y) over 380 * t
+      let a = dot(500 - NEAR, v.y, 3.5, "small")
+      let b = dot(500 + NEAR, v.y, 3.5, "small")
+      say "Summing the attention onto both cards" if st == 3 else "Summing the feed-forward onto both cards"
+      glide a to (500 + NEAR, v.y), b to (500 - NEAR, v.y) over 450 * t
+      remove a, b
+      if slow
+        wait 250
+      end
+    end
+    drop "hot" from v
+    if i + 1 < len(layers)
+      let following = layers[i + 1]
+      glide p to (500 - NEAR, following.y), q to (500 + NEAR, following.y) over 300 * t
+    end
+  end
+  # Step 5: A layer that cannot be split runs whole on the first card.
+  step 5
+  remove q, tags[1]
+  glide p to (500, top.y) over 350
+  compute p for 700 say "A layer that cannot split, whole on card A"
+  # Step 6: After the last layer, the output head on the first card gives the logits.
+  step 6
+  glide p to (500, top.y - 8) over 300
+  compute p for 700 say "The output head on card A giving the logits"
+  light "backends" "flex" off
+  emit at (512, top.y - 10) DEMO.answer[0]
+  light "requests" "speak"
+  wait 1.2s
+end
+
+scene ladder
+  # The placement ladder.
+  let tag = none
+  to note(t)
+    if tag
+      remove tag
+    end
+    tag = label(528, base + 30, t, size=8)
+  end
+  to fail()
+    let middle = layers[floor(len(layers) / 2)]
+    let d = dot(500, middle.y, 4, "fail")
+    wait 700
+    remove d
+  end
+  # Step 0: The planned placement fails on the cards with an out-of-memory error.
+  step 0
+  note("the planned placement")
+  wave layers 25
+  fail()
+  # Step 1: Rung 2, `an even split over 2 cards`, shares the layers out by each card's compute
+  #   speed, whatever its free memory.
+  step 1
+  plan([["pa", 12], ["pb", 12]])
+  note("an even split over 2 cards")
+  wave layers 25
+  fail()
+  # Step 2: Rung 3, `the cards at 70% with the host`, then at 50%, 35% and 20%, offers that share of
+  #   each card's free memory and leaves the rest off the cards.
+  step 2
+  plan([["pa", 10], ["pb", 8], ["ph", 6]])
+  note("the cards at 70% with the host")
+  wave layers 25
+  wait 700
+  # Step 3: Rung 4, `the host`, puts every layer off the cards.
+  step 3
+  note("the host: not reached")
+  wait 1.3s
+  # Step 4: A failure that is not out of memory goes straight to the host rung, and a rung that
+  #   repeats a tried placement is skipped.
+  step 4
+  note("a repeated plan: skipped")
+  wait 1.3s
+  # Step 5: At request time, an out-of-memory error hands the pools back, evicts idle models one by
+  #   one, then reloads the model with a larger reserve on the cards.
+  step 5
+  remove tag
+  tag = none
+  let p = dot(500, base)
+  travel(p, [(500, layers[15].y)], 260 * z, true)
+  add "fail" to p
+  wait 600
+  remove p
+  plan([["pa", 8], ["pb", 6], ["ph", 10]])
+  note("a larger reserve on the cards")
+  wave layers 25
+  wait 600
+  # Step 6: An idle model moves whole to the fastest card it does not use that has room, and a model
+  #   already on 1 card moves only to a faster card.
+  step 6
+  plan([["pa", 24]])
+  note("idle, moved whole to the fastest card")
+  wave layers 25
+  wait 1.3s
+end

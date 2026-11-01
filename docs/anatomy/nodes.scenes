@@ -1,0 +1,307 @@
+# The scenes of 2 nodes serving one request: the request crosses to the other node, the layers
+# are shared between the nodes, and the cache of one node is restored on the other.
+# `R` holds the routes and the measures of the drawing and `N` is the number of answer tokens.
+
+to mini(pt, cls)
+  return shape("circle", {class: "pulse " + cls, r: 2.4, "data-r": 2.4, cx: pt[0], cy: pt[1]})
+end
+
+to lineOf(x, y, n)
+  return [(x + (i - (n - 1) / 2) * 5, y) for i in range(n)]
+end
+
+# The tokens `ds` follow one another along a route, a little apart.
+to train(ds, route, pace)
+  together for [i, d] in enumerate(ds)
+    kitWait(i * 70)
+    ride(d, route, pace)
+  end
+end
+
+# A band of prompt tokens up one node's stack, from its base to its top, in one pass.
+to band(toks, x, text)
+  glideAll([[d, lineOf(x, R.base, len(toks))[i]] for [i, d] in enumerate(toks)], 700)
+  for d in toks
+    drop "small" from d
+    setAttr(d, "r", 3.2)
+    add "busy" to d
+  end
+  let ref = shape("circle", {class: "apath", r: 0, "data-r": 0, "data-big": 0})
+  setBase(text)
+  glideAll([[d, lineOf(x, R.top, len(toks))[i]] for [i, d] in enumerate(toks)], 1500, follow(ref, x))
+  remove ref
+end
+
+to prompt(pt)
+  return [mini(lineOf(pt[0], pt[1] + 16, len(DEMO.tokens))[i], "small") for [i, w] in enumerate(DEMO.tokens)]
+end
+
+to closing()
+  wait 700
+  clearLayer()
+  now("Answer complete")
+  stopPlaying()
+  complete()
+end
+
+scene forward
+  # A request forwarded.
+  let p = cdot("", R.a_mouth)
+  # Step 0: A chat request reaches any machine of the cluster.
+  step 0
+  wait 800
+  # Step 1: That machine predicts the completion time of the request on itself and on each peer,
+  #   round trip included.
+  step 1
+  compute p for 600 say "Node A predicting its own completion time"
+  let probe = cdot("small", R.a_mouth)
+  ride(probe, "a_to_hands", 420)
+  ride(probe, "hands_to_b", 420)
+  ride(probe, "b_to_hands", 420)
+  ride(probe, "hands_to_a", 420)
+  remove probe
+  compute p for 600 say "Node A predicting the time on node B, round trip included"
+  # Step 2: A peer wins when it beats the local estimate by `min_speedup`, or when this machine
+  #   cannot serve the model.
+  step 2
+  wait 900
+  # Step 3: The request goes to the winner whole, and its stream comes back unchanged.
+  step 3
+  ride(p, "a_to_hands", 260)
+  ride(p, "hands_to_b", 260)
+  say "Node B decodes"
+  remove p
+  let toks = prompt(R.b_mouth)
+  kitWait(400)
+  band(toks, R.b_mouth[0], "Node B reading the prompt's tokens in one pass")
+  remove toks
+  let p2 = cdot("", (R.b_mouth[0], R.top))
+  ride(p2, "b_top_to_mouth", 200)
+  for n in range(N)
+    say "Relaying the token through node A"
+    let t = cdot("small", R.b_mouth)
+    start relay
+      ride(t, "b_to_hands", 420)
+      ride(t, "hands_to_a", 420)
+      remove t
+      emitToken(n)
+    end
+    if n < N - 1
+      say "Node B decodes"
+      ride(p2, "b_climb", 520)
+      ride(p2, "b_top_to_mouth", 400)
+    else
+      finish relay
+    end
+  end
+  closing()
+end
+
+scene pipeline
+  # A model cut across 2 machines.
+  let midX = (R.a_mouth[0] + R.b_mouth[0]) / 2
+  let aV = [v for v in layers if v.x < midX]
+  let bV = [v for v in layers if v.x >= midX]
+  let p = cdot("", R.a_mouth)
+  # Step 0: The machine that loads the model becomes the head.
+  # It times a layer on its cards and on its host.
+  step 0
+  remove p
+  let q = cdot("", (aV[0].x, aV[0].y))
+  compute q for 700 say "Node A timing a layer on its card"
+  let hostLayers = [v for v in aV if v.run == "dh"]
+  travel(q, [(hostLayers[0].x, hostLayers[0].y)], 160 * R.s, true)
+  compute q for 700 say "Node A timing a layer on its host"
+  remove q
+  # Step 1: Every machine publishes its own figures, and each poll between machines times their
+  #   round trip.
+  step 1
+  for i in range(2)
+    let a1 = cdot("small", R.a_mouth)
+    let b1 = cdot("small", R.b_mouth)
+    together
+      ride(a1, "a_to_hands", 420)
+      ride(a1, "hands_to_b", 420)
+    also
+      ride(b1, "b_to_hands", 420)
+      ride(b1, "hands_to_a", 420)
+    end
+    remove a1, b1
+  end
+  # Step 2: The planner gives each machine one contiguous run of layers.
+  # It minimises the predicted time of 1 token: the compute of each machine plus the crossing of
+  #   each boundary.
+  step 2
+  let planDot = cdot("", R.a_mouth)
+  compute planDot for 700 say "Minimising the predicted time of 1 token"
+  remove planDot
+  toggleClass("hot", aV, true)
+  say "Node A takes layers 0 to 23"
+  wait 900
+  toggleClass("hot", aV, false)
+  toggleClass("hot", bV, true)
+  say "Node B takes layers 24 to 47"
+  wait 900
+  toggleClass("hot", bV, false)
+  # Step 3: When the cut pays, each other machine reloads its own layers from its own copy of the
+  #   model file.
+  step 3
+  let store = (R.b_mouth[0], R.base + 96 * R.s)
+  for r in ["dc", "dr", "dh"]
+    together for [i, v] in enumerate([x for x in bV if x.run == r])
+      kitWait(i * 40)
+      let d = mini(store, "small")
+      travel(d, [(v.x, v.y)], 700 * R.s)
+      remove d
+      add "hot" to v
+      later 400
+        drop "hot" from v
+      end
+    end
+  end
+  let toks = prompt(R.a_mouth)
+  wait 400
+  # Step 4: For each token, the head runs its layers and sends the boundary activations to the next
+  #   machine.
+  # They travel in binary frames on a connection that stays open.
+  step 4
+  band(toks, R.a_mouth[0], "Node A reading the prompt's tokens in one pass")
+  for d in toks
+    drop "busy" from d
+    add "small" to d
+    setAttr(d, "r", 2.4)
+  end
+  say "The activations of every prompt token crossing to node B"
+  train(toks, "a_top_to_hands", 340)
+  # Step 5: The machine of the last layers answers with the logits, and the head draws the token.
+  step 5
+  band(toks, R.b_mouth[0], "Node B reading the prompt's tokens in one pass")
+  remove toks
+  to back()
+    say "Node B answering with the logits"
+    let l = cdot("small", (R.b_mouth[0], R.top))
+    ride(l, "b_top_to_hands", 420)
+    ride(l, "hands_to_a", 420)
+    remove l
+    let h = cdot("", R.a_mouth)
+    compute h for 450 say "Node A drawing the token"
+    remove h
+  end
+  back()
+  emitToken(0)
+  wait 400
+  for n in range(1, N)
+    step 4
+    let t = cdot("", R.a_mouth)
+    ride(t, "a_climb", 800)
+    ride(t, "a_top_to_hands", 800)
+    step 5
+    ride(t, "hands_to_b_base", 800)
+    remove t
+    back()
+    emitToken(n)
+    wait 120
+  end
+  closing()
+end
+
+scene prefill
+  # A prompt read by a peer.
+  # The prompt's tokens travel as a train, B reads them as one band, and the KV of every token
+  # crosses back, lands in A's cache as a snapshot and is restored in whole chunks.
+  let p = cdot("", R.a_mouth)
+  let ax = R.a_mouth[0]
+  let bx = R.b_mouth[0]
+  let P = 10
+  let CH = 4
+  let s = R.s
+  to slot(cx, i)
+    return shape("rect", {class: "box kvb", x: cx + s * (-27 + (i % 5) * 11), y: R.kv_y + s * 11 * floor(i / 5), width: 9 * s, height: 9 * s, rx: 1.5})
+  end
+  let aSlots = [slot(ax, i) for i in range(P + N - 1)]
+  let bSlots = [slot(bx, i) for i in range(P)]
+  to mid(b)
+    return (attr(b, "x") + 4.5 * s, attr(b, "y") + 4.5 * s)
+  end
+  remove p
+  let toks = [mini((ax + (i - (P - 1) / 2) * 5, R.a_mouth[1] + 16), "small") for i in range(P)]
+  # Step 0: A long prompt reaches a machine whose `prefill_peer` names another instance that serves
+  #   the same model.
+  step 0
+  wait 1000
+  # Step 1: The machine sends the prompt to that peer.
+  step 1
+  train(toks, "a_to_hands", 320)
+  train(toks, "hands_to_b", 320)
+  # Step 2: The peer reads the prompt through its layers and answers with its KV cache.
+  # A model whose recurrent or windowed layers support it hands over its whole decode state instead.
+  step 2
+  to lineAt(y)
+    return [(d, (bx + (i - (P - 1) / 2) * 5, y)) for [i, d] in enumerate(toks)]
+  end
+  glideAll(lineAt(R.base), 700)
+  for d in toks
+    drop "small" from d
+    setAttr(d, "r", 3.2)
+    add "busy" to d
+  end
+  let ref = shape("circle", {class: "apath", r: 0, "data-r": 0, "data-big": 0})
+  glideAll(lineAt(R.top), 1600, follow(ref, bx))
+  remove ref
+  say "Node B keeping the KV of every prompt token"
+  let kvB = []
+  for d in toks
+    let spot = pos(d)
+    remove d
+    kvB += [mini(spot, "kv")]
+  end
+  glideAll([[d, mid(bSlots[i])] for [i, d] in enumerate(kvB)], 700)
+  remove kvB
+  add "on" to bSlots
+  say "Node B answering with its KV cache"
+  let kvs = [mini(mid(b), "kv") for b in bSlots]
+  train(kvs, "b_top_to_hands", 340)
+  train(kvs, "hands_to_a_top", 340)
+  # Step 3: The machine checks the cache against its own cache shape and the prompt's tokens, then
+  #   imports it as a snapshot.
+  step 3
+  glideAll([[d, mid(aSlots[i])] for [i, d] in enumerate(kvs)], 600)
+  remove kvs
+  add "kept" to aSlots[0:P]
+  let chk = cdot("", (ax, R.top))
+  compute chk for 800 say "Checking the cache shape and the prompt's tokens"
+  remove chk
+  # Step 4: The prefix reuse restores the snapshot in whole prefill chunks.
+  # The rest of the prompt is read here, and the machine decodes.
+  step 4
+  say "Restoring the snapshot in whole prefill chunks"
+  for c in range(0, P - CH + 1, CH)
+    for b in aSlots[c:c + CH]
+      drop "kept" from b
+      add "on" to b
+    end
+    light "cluster" "glow"
+    wait 450
+  end
+  let whole = floor(P / CH) * CH
+  let rest = [mini(R.a_mouth, "small") for b in aSlots[whole:P]]
+  drop "kept" from aSlots[whole:P]
+  band(rest, ax, "Reading the rest of the prompt here")
+  glideAll([[d, mid(aSlots[whole + i])] for [i, d] in enumerate(rest)], 500)
+  remove rest
+  add "on" to aSlots[whole:P]
+  say "Node A decodes"
+  let q = cdot("", (ax, R.top))
+  for n in range(N)
+    if n == 0
+      ride(q, "a_top_to_mouth", 200)
+    else
+      ride(q, "a_climb", 520)
+      add "on" to aSlots[P + n - 1]
+      ride(q, "a_top_to_mouth", 400)
+    end
+    emitToken(n)
+    wait 100 if n else 300
+  end
+  closing()
+end

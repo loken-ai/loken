@@ -1,0 +1,164 @@
+# The scenes of the generation: a prompt read in chunks, and a draft checked in one pass.
+
+to mid(b)
+  return (attr(b, "x") + 4, attr(b, "y") + 4)
+end
+
+scene chunks
+  # A long prompt read in chunks.
+  let N = 24
+  let failAt = [v for v in layers if v.run == "dc"][4]
+  let slots = [shape("rect", {class: "box kvb", x: 366 + (i % 8) * 10, y: 152 + floor(i / 8) * 10, width: 8, height: 8, rx: 1.2}) for i in range(N)]
+  label(366, 145, "KV cache", size=8)
+  to place(i, size)
+    return (522 + i * 5 + floor(i / size) * 6, 150)
+  end
+  let toks = [dotAt(place(i, 8), 2.4, "small") for i in range(N)]
+  let ref = shape("circle", {class: "apath", r: 0, "data-r": 0, "data-big": 0})
+  let read = 0
+  row 0 "0 of " + str(N)
+  # Step 0: A long prompt arrives.
+  # Its chunk length comes from the free memory of the tightest card and the widest feed-forward of
+  #   the model.
+  step 0
+  wait 1200
+  # A chunk of tokens in a line at the height y.
+  to lineUp(chunk, y)
+    return [(d, (500 + (i - (len(chunk) - 1) / 2) * 5.5, y)) for [i, d] in enumerate(chunk)]
+  end
+  # One chunk up the stack: to the top, or to `stop` where the card runs out of memory.
+  to climb(chunk, stop)
+    # Step 1: Each chunk climbs the layers in one pass.
+    # Each of its tokens attends to the tokens before it.
+    step 1
+    light "loop" "breathe"
+    glideAll(lineUp(chunk, base), 600)
+    for d in chunk
+      drop "small" from d
+      setAttr(d, "r", 3 * z)
+      add "busy" to d
+    end
+    glideAll(lineUp(chunk, stop.y if stop else top.y), 900 if stop else 1200, follow(ref, 500))
+  end
+  to keep(chunk)
+    # Step 2: The chunk's tokens add their key and value to the cache.
+    step 2
+    let kvs = [dotAt(pos(d), 2, "kv") for d in chunk]
+    for d in chunk
+      setAttr(d, "opacity", 0)
+    end
+    glideAll([[d, mid(slots[read + i])] for [i, d] in enumerate(kvs)], 700)
+    remove kvs
+    add "on" to slots[read:read + len(chunk)]
+    light "kv" "glow"
+    read += len(chunk)
+    row 0 str(read) + " of " + str(N)
+  end
+  let first = toks[0:8]
+  climb(first)
+  keep(first)
+  remove first
+  let second = toks[8:16]
+  climb(second, failAt)
+  for d in second
+    drop "busy" from d
+    add "fail" to d
+  end
+  say "Out of memory on the CUDA card" busy
+  wait 900
+  # Step 3: A chunk that runs a card out of memory is halved.
+  # When the cache can be cut back and the model keeps no recurrent state, reading goes on from that
+  #   chunk and the tokens before it keep their cache.
+  # Otherwise the prompt is read again from where this reading began.
+  step 3
+  for d in second
+    drop "fail" from d
+    add "small" to d
+    setAttr(d, "r", data(d, "r"))
+  end
+  let rest = toks[8:]
+  glideAll([[d, place(i + 8, 4)] for [i, d] in enumerate(rest)], 900)
+  wait 500
+  for c in range(0, len(rest), 4)
+    let chunk = rest[c:c + 4]
+    climb(chunk)
+    keep(chunk)
+    if c + 4 < len(rest)
+      remove chunk
+    end
+  end
+  # Step 4: Only the last chunk's logits are kept.
+  # They give the first token.
+  step 4
+  let last = rest[-1]
+  remove rest[0:-1]
+  setAttr(last, "opacity", 1)
+  compute last for 800 say "The output head drawing the first token"
+  emit at (512, top.y - 10) DEMO.answer[0]
+  light "requests" "speak"
+  wait 1300
+end
+
+scene draft
+  # Tokens guessed ahead, then checked.
+  shape("rect", {class: "box dh", x: 512, y: 137, width: 22, height: 8, rx: 2})
+  label(538, 144, "draft head")
+  let words = []
+  # Step 0: The decode step climbs the layers and the output head draws a token.
+  step 0
+  row 0 DEMO.answer[0]
+  light "loop" "breathe"
+  let p = dot(500, layers[0].y + 14)
+  travel(p, [(500, top.y)], 520, true)
+  compute p for 500 say "The output head drawing a token"
+  # Step 1: The draft head guesses the next tokens.
+  # It is 1 more layer of the model's own kind, shipped with the checkpoint.
+  # It drafts only under `fidelity = "fast"`.
+  step 1
+  glide p to (523, 141) over 400
+  let guesses = ["capital", "is", "London"]
+  for i in range(len(guesses))
+    light "loop" "breathe"
+    compute p for 380
+    words += [label(560, 166 + i * 13, guesses[i], class="draft")]
+    wait 200
+  end
+  # Step 2: The loop learns how many tokens to guess from the measured acceptance and the cost of a
+  #   cycle.
+  step 2
+  row 1 "3 ahead"
+  label(538, 154, "3 ahead", size=7)
+  compute p for 700 say "Weighing the measured acceptance against the cost of a cycle"
+  # Step 3: The model checks every guess in one pass through the layers.
+  # When every layer and the head sit on 1 card, that pass is replayed as a recorded graph.
+  # A model with a wide residual stream replays it across several cards too.
+  step 3
+  remove p
+  to lineAt(y)
+    return [(500 + dx, y) for dx in [-6, 0, 6]]
+  end
+  let band = [dot(pt[0], pt[1], 3.4) for pt in lineAt(layers[0].y + 14)]
+  let ref = shape("circle", {class: "apath", r: 0, "data-r": 0, "data-big": 0})
+  add "busy" to band
+  light "loop" "breathe"
+  glideAll([[d, lineAt(top.y)[i]] for [i, d] in enumerate(band)], 1500, follow(ref, 500))
+  remove ref
+  compute band for 500 say "The output head scoring every guess at once"
+  # Step 4: The guesses the model agrees with are kept, with 1 token of its own.
+  # The KV cache and a recurrent state are cut back to the kept tokens.
+  step 4
+  add "kept" to words[0]
+  add "kept" to words[1]
+  add "cut" to words[2]
+  add "fail" to band[2]
+  wait 500
+  say "Cutting the KV cache back to the kept tokens"
+  glide band[2] to (506, layers[0].y + 14) over 700
+  remove band[2]
+  light "requests" "speak"
+  let own = label(560, 166 + 3 * 13, "Paris", class="draft")
+  add "kept" to own
+  row 0 join(DEMO.answer[0:4])
+  remove band
+  wait 1200
+end

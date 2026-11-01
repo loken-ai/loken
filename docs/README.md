@@ -20,6 +20,7 @@ The same pages are served at <https://loken-ai.github.io/loken/>.
 | [`operate/cluster.md`](operate/cluster.md) | Serve from 2 machines |
 | [`operate/network.md`](operate/network.md) | Expose loken on a network with a key and a rate limit |
 | [`operate/troubleshooting.md`](operate/troubleshooting.md) | Find the cause of a failure by its message |
+| [`inside/map.md`](inside/map.md) | See how lokend serves a request, part by part, one figure each |
 | [`learn/README.md`](learn/README.md) | Follow the series of 10 lessons, one exercise each |
 | [`MODELS.md`](MODELS.md) | Find the families served, their stores, and how a request names them |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Look up a key of `config.toml` and its default |
@@ -28,9 +29,9 @@ The same pages are served at <https://loken-ai.github.io/loken/>.
 | [`CLUSTER.md`](CLUSTER.md) | Look up the `[cluster]` keys, the routes and how a request is routed |
 | [`STATUS.md`](STATUS.md) | See what is measured, what is slower, and what has never run |
 | [`ARCHITECTURES.md`](ARCHITECTURES.md) | List the architectures the loader accepts and the formats of each |
-| [`ANATOMY.md`](ANATOMY.md) | See the modules of lokend drawn on a body, with the plan levels each reads |
 | [`REFERENCES.md`](REFERENCES.md) | Find the papers and implementations each model was written against |
 | [`dev/layer-bench.md`](dev/layer-bench.md) | Measure a decode on a few layers of a large model |
 | [`dev/microbench.md`](dev/microbench.md) | Time one mechanism at a model's shapes, variants side by side |
+| [`dev/code-map.md`](dev/code-map.md) | Find the code behind each part of lokend and the plan levels it reads |
 
 The [benchmarks](https://github.com/loken-ai/benchmarks) repository holds the campaign, its method and its results, published at <https://loken-ai.github.io/benchmarks/>.

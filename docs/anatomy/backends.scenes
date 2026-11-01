@@ -1,0 +1,65 @@
+# The scene of the backends: an image drawn by a card and decoded by the host.
+
+to target(i, j)
+  return 0.25 + 0.75 * max(0, 1 - hypot(i - 1.2, j - 1.5) / 2.6)
+end
+
+scene image
+  # An image generated.
+  let muscles = sortBy([c for c in [centre(e) for e in query("[data-group=\"backends\"] .t")] if c[0] > 500], 1)
+  let media = sortBy([centre(e) for e in query("[data-group=\"media\"] .t")], 0)
+  let throat = media[0]
+  let hand = media[-1]
+  let upper = muscles[0]
+  let fore = muscles[1]
+  let n = 4
+  let cell = 12
+  let x0 = hand[0] - 2 * cell
+  let y0 = hand[1] + 40
+  let cells = []
+  for j in range(n)
+    for i in range(n)
+      let c = shape("rect", {class: "cell", x: x0 + i * cell, y: y0 + j * cell, width: cell - 1, height: cell - 1})
+      style(c, "fillOpacity", fixed(0.2 + 0.8 * random(), 2))
+      cells += [(c, i, j)]
+    end
+  end
+  # Step 0: The images route takes the prompt.
+  step 0
+  let p = dotAt(throat)
+  wait 700
+  # Step 1: The text encoder reads the prompt.
+  step 1
+  travel(p, [(upper[0], upper[1] - 60), upper], 260)
+  light "backends" "flex" on
+  compute p for 800 say "Computing on a card"
+  # Step 2: The denoiser clears a latent image step by step.
+  # The placement plan puts it whole on a card that holds it, else spreads its blocks over the cards
+  #   and the host.
+  step 2
+  glide p to fore over 500
+  for s in range(1, 7)
+    compute p for 380 say "Computing on a card"
+    for [c, i, j] in cells
+      let now = num(style(c, "fillOpacity"))
+      let aim = target(i, j)
+      style(c, "fillOpacity", fixed(now + (aim - now) * s / 6, 2))
+    end
+    wait 140
+  end
+  # Step 3: The decoder turns the latent into pixels.
+  # It works tile by tile when the whole image does not fit the card.
+  # Boogu decodes every image larger than 1 tile in tiles.
+  step 3
+  light "backends" "flex" off
+  glide p to hand over 500
+  for [ti, tj] in [(0, 0), (1, 0), (0, 1), (1, 1)]
+    light "media" "draw" in "path.t"
+    compute p for 350 say "Decoding a tile"
+    add "px" to [c for [c, i, j] in cells if floor(i / 2) == ti and floor(j / 2) == tj]
+  end
+  # Step 4: The image leaves as a PNG, or re-encoded as JPEG or WebP when the request asks.
+  step 4
+  emit at (x0, y0 + n * cell + 16) "image.png"
+  wait 1500
+end
