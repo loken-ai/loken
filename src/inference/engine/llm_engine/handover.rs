@@ -17,9 +17,11 @@ impl LlmEngine {
             .map_err(|e| anyhow!("{e}"))?;
         let model_state = self.model_state.clone();
         let prompt = prompt.to_string();
+        let scope = crate::inference::engine::cache_scope::CacheScope::current();
         tokio::task::spawn_blocking(move || -> AnyResult<Vec<u8>> {
-            let guard = model_state.blocking_lock();
-            let state = guard.as_ref().ok_or_else(|| anyhow!("no model loaded"))?;
+            let mut guard = model_state.blocking_lock();
+            let state = guard.as_mut().ok_or_else(|| anyhow!("no model loaded"))?;
+            state.model.set_cache_scope(scope);
             let tokens = super::encode_prompt(&state.tokenizer, prompt.as_str())
                 .map_err(|e| anyhow!("tokenize: {e}"))?
                 .get_ids()

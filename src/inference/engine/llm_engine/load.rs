@@ -1083,6 +1083,19 @@ pub(crate) struct SessionState {
     /// next request dies on the shape - `cannot broadcast [191, 620] to
     /// [1, 16, 191, 617]`, the two lengths in plain sight.
     pub(super) kv_len: usize,
+    /// The caller whose prompt this entry holds. No other caller reuses it.
+    pub(super) scope: crate::inference::engine::cache_scope::CacheScope,
+}
+
+impl SessionState {
+    /// Whether this entry may serve a request for `model_name` made by `scope`.
+    pub(super) fn belongs_to(
+        &self,
+        model_name: &str,
+        scope: crate::inference::engine::cache_scope::CacheScope,
+    ) -> bool {
+        self.model_name == model_name && self.scope == scope
+    }
 }
 
 /// Longest prefix of `prompt` the resident cache can actually serve.
@@ -1149,6 +1162,7 @@ pub(crate) fn exact_repeat(
     state: &mut LoadedModelState,
     sessions: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionState>>>,
     prompt_tokens: &[u32],
+    scope: crate::inference::engine::cache_scope::CacheScope,
 ) -> Option<Tensor> {
     let n = prompt_tokens.len();
     let hit = n > 1
@@ -1162,7 +1176,7 @@ pub(crate) fn exact_repeat(
             .blocking_lock()
             .get(GLOBAL_PROMPT_CACHE_KEY)
             .is_some_and(|s| {
-                s.model_name == state.name
+                s.belongs_to(&state.name, scope)
                     && s.image_hash.is_none()
                     && s.kv_len >= n
                     && s.tokens.starts_with(prompt_tokens)
@@ -1207,13 +1221,15 @@ pub(crate) fn kv_reuse_start(
     disk: Option<&crate::inference::cache::kv_disk::KvDiskStore>,
     turn_marker: &dyn Fn(u32) -> bool,
     shift: bool,
+    scope: crate::inference::engine::cache_scope::CacheScope,
 ) -> usize {
+    model.set_cache_scope(scope);
     let mut reuse = if disabled || !model.capabilities().trim_kv {
         None
     } else {
         let g = sessions.blocking_lock();
         match g.get(GLOBAL_PROMPT_CACHE_KEY) {
-            Some(s) if s.model_name == model_name && s.image_hash.is_none() => {
+            Some(s) if s.belongs_to(model_name, scope) && s.image_hash.is_none() => {
                 Some(reusable_prefix(&s.tokens, prompt_tokens, s.kv_len))
             }
             _ => None,
@@ -1249,6 +1265,7 @@ pub(crate) fn kv_reuse_start(
                                 image_hash: None,
                                 image_prefix_len: 0,
                                 kv_len,
+                                scope,
                             },
                         );
                         tracing::info!(
@@ -1267,7 +1284,7 @@ pub(crate) fn kv_reuse_start(
     if let (Some(store), false) = (disk, disabled) {
         if let Some((n_layers, _, _)) = model.kv_layout() {
             let cur_keep = reuse.map(kept_of).unwrap_or(0);
-            let layout = kv_layout_id(model);
+            let layout = kv_layout_id(model) ^ scope.folded();
             if let Some((mi, covered)) = store.best(model_name, layout, prompt_tokens) {
                 // A windowed manifest's side blob describes one exact prefix length; reuse
                 // it only when the whole prefix matches, never a shorter shared run.
@@ -1307,6 +1324,7 @@ pub(crate) fn kv_reuse_start(
                                     image_hash: None,
                                     image_prefix_len: 0,
                                     kv_len,
+                                    scope,
                                 },
                             );
                             tracing::info!(
@@ -1391,10 +1409,11 @@ pub(crate) fn spawn_persist(
     model_state: std::sync::Arc<tokio::sync::Mutex<Option<LoadedModelState>>>,
     store: std::sync::Arc<crate::inference::cache::kv_disk::KvDiskStore>,
     tokens: Vec<u32>,
+    scope: crate::inference::engine::cache_scope::CacheScope,
 ) {
     let spawned = std::thread::Builder::new()
         .name("kv-disk-persist".to_string())
-        .spawn(move || persist_kv_snapshot(&model_state, &store, &tokens));
+        .spawn(move || persist_kv_snapshot(&model_state, &store, &tokens, scope));
     if let Err(e) = spawned {
         tracing::warn!("kv disk persist thread: {e}");
     }
@@ -1417,17 +1436,19 @@ fn persist_kv_snapshot(
     model_state: &tokio::sync::Mutex<Option<LoadedModelState>>,
     store: &crate::inference::cache::kv_disk::KvDiskStore,
     tokens: &[u32],
+    scope: crate::inference::engine::cache_scope::CacheScope,
 ) {
     // Under the lock: the snapshot's facts and the rows of the blocks still to write.
     let (model_name, layout, kv_len, kv_dtype, window, staged) = {
-        let g = model_state.blocking_lock();
-        let Some(state) = g.as_ref() else { return };
+        let mut g = model_state.blocking_lock();
+        let Some(state) = g.as_mut() else { return };
+        state.model.set_cache_scope(scope);
         let model = state.model.as_ref();
         let Some((index, kv_len)) = snapshot_index_for(model, tokens) else {
             return;
         };
         let covered = store.covered_len(tokens.len(), kv_len);
-        let layout = kv_layout_id(model);
+        let layout = kv_layout_id(model) ^ scope.folded();
         let window = match model.export_window_rows(index, covered) {
             Ok(w) => w,
             Err(e) => {
@@ -1773,6 +1794,30 @@ mod session_count_tests {
     use super::*;
     use crate::inference::engine::llm_engine::LlmEngine;
 
+    /// An entry serves the model and the caller that wrote it, and no other.
+    #[test]
+    fn an_entry_serves_the_caller_that_wrote_it() {
+        use crate::inference::engine::cache_scope::CacheScope;
+        let entry = SessionState {
+            tokens: vec![1, 2, 3],
+            model_name: "m".to_string(),
+            image_hash: None,
+            image_prefix_len: 0,
+            kv_len: 3,
+            scope: CacheScope::of_key("a"),
+        };
+        assert!(entry.belongs_to("m", CacheScope::of_key("a")));
+        assert!(
+            !entry.belongs_to("m", CacheScope::of_key("b")),
+            "another key"
+        );
+        assert!(!entry.belongs_to("m", CacheScope::COMMON), "no key");
+        assert!(
+            !entry.belongs_to("other", CacheScope::of_key("a")),
+            "another model"
+        );
+    }
+
     /// The count is the conversations resident in the KV cache.
     /// It is 0 with nothing resident and 1 once the resident entry names tokens.
     #[tokio::test]
@@ -1785,6 +1830,7 @@ mod session_count_tests {
             model_name: "m".to_string(),
             image_hash: None,
             image_prefix_len: 0,
+            scope: Default::default(),
         };
         engine
             .sessions

@@ -2408,11 +2408,12 @@ pub(super) fn tts_events_response(
         Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string()))
     };
 
+    let caller = crate::inference::engine::cache_scope::CacheScope::current();
     let stream = async_stream::stream! {
         // The registry entry lives with the STREAM, not with this call. Built in the
         // handler it would be dropped the moment the response was constructed, and the id
         // the first event carries would already name a render nobody could stop - measured.
-        let _reg = crate::inference::serve::cancel::registry::Entry::new(&render_id, &cancel);
+        let _reg = crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &cancel);
         yield ev(serde_json::json!({
             "status": "started",
             "model": model,

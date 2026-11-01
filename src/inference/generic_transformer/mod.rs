@@ -593,6 +593,8 @@ pub struct GenericHeteroTransformer {
     /// Resident sequences copied aside after a request (`snapshot_kv`), most recently
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,
+    /// The caller of the request being served, which the snapshots taken and looked up belong to.
+    cache_scope: crate::inference::engine::cache_scope::CacheScope,
     kv_snapshot_tick: u64,
     /// How long a snapshot is kept after it was last used; `None` keeps it until memory is needed.
     kv_lease: Option<std::time::Duration>,
@@ -651,6 +653,8 @@ pub struct KvSnapshot {
     /// Times a later prompt restored this conversation's snapshot, the lineage of the ones it
     /// replaced included: a conversation that came back is kept over one that never did.
     pub(crate) hits: u32,
+    /// The caller whose prompt this snapshot holds. No other caller reuses it.
+    pub(crate) scope: crate::inference::engine::cache_scope::CacheScope,
 }
 
 impl KvSnapshot {

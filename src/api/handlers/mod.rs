@@ -1158,7 +1158,11 @@ async fn require_api_key(
         .map(str::to_string);
     let dialect = Dialect::of(&req);
     match presented {
-        Some(key) if auth.accepts(&key) => throttled(&auth, &key, req, next).await,
+        Some(key) if auth.accepts(&key) => {
+            crate::inference::engine::cache_scope::CacheScope::of_key(&key)
+                .serve(throttled(&auth, &key, req, next))
+                .await
+        }
         _ => (
             axum::http::StatusCode::UNAUTHORIZED,
             axum::Json(dialect.error_body(

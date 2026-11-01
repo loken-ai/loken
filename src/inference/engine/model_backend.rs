@@ -658,6 +658,8 @@ pub(crate) trait ModelBackend: Send {
     fn kv_snapshot_dtype(&self, _index: usize) -> Option<u8> {
         None
     }
+    /// Makes `scope` the caller whose snapshots this model takes and looks up from now on.
+    fn set_cache_scope(&mut self, _scope: crate::inference::engine::cache_scope::CacheScope) {}
     fn best_kv_snapshot(&self, _prompt: &[u32]) -> Option<(usize, usize)> {
         None
     }
@@ -2266,6 +2268,9 @@ impl ModelBackend for GenericBackend {
     ) -> bool {
         self.0.attach_state_cache(store, identity)
     }
+    fn set_cache_scope(&mut self, scope: crate::inference::engine::cache_scope::CacheScope) {
+        self.0.set_cache_scope(scope);
+    }
     fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         self.0.best_kv_snapshot(prompt)
     }
@@ -3008,6 +3013,12 @@ impl ModelBackend for DeepseekV41Backend {
 
     fn widest_ffn(&self) -> usize {
         self.widest_ffn
+    }
+
+    fn set_cache_scope(&mut self, scope: crate::inference::engine::cache_scope::CacheScope) {
+        if let Some(cache) = self.state_cache.as_mut() {
+            cache.set_scope(scope);
+        }
     }
 
     fn expert_profile(

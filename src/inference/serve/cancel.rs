@@ -26,6 +26,11 @@ impl CancelToken {
         self.0.store(true, Ordering::Relaxed);
     }
 
+    /// Whether `other` is a handle on the same flag.
+    pub fn same(&self, other: &CancelToken) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
@@ -216,34 +221,45 @@ mod scoped_tests {
 /// cancel, rather than hoping the connection notices.
 pub mod registry {
     use super::CancelToken;
+    use crate::inference::engine::cache_scope::CacheScope;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    fn table() -> &'static Mutex<HashMap<String, CancelToken>> {
-        static T: OnceLock<Mutex<HashMap<String, CancelToken>>> = OnceLock::new();
+    /// An identifier belongs to the caller that registered it: 2 callers can use the same
+    /// string without touching each other's render.
+    type Key = (CacheScope, String);
+
+    fn table() -> &'static Mutex<HashMap<Key, CancelToken>> {
+        static T: OnceLock<Mutex<HashMap<Key, CancelToken>>> = OnceLock::new();
         T.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Publish `token` under `id` until [`forget`] runs. Replacing an existing id cancels
-    /// what was there: two renders cannot share an identifier, and silently losing the
-    /// first one's handle would leave it unstoppable.
-    pub fn register(id: &str, token: &CancelToken) {
+    /// Publish `token` under `id` for the caller `scope` until [`forget`] runs. Replacing an
+    /// existing id of the same caller cancels what was there: two renders cannot share an
+    /// identifier, and silently losing the first one's handle would leave it unstoppable.
+    pub fn register(scope: CacheScope, id: &str, token: &CancelToken) {
         let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = t.insert(id.to_string(), token.clone()) {
+        if let Some(old) = t.insert((scope, id.to_string()), token.clone()) {
             old.cancel();
         }
     }
 
-    /// Drop the entry. Always called when a render ends, however it ends.
-    pub fn forget(id: &str) {
-        table().lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    /// Drop the entry of `scope` if it still holds `token`. A render that was replaced under
+    /// its identifier leaves the newer entry alone.
+    pub fn forget(scope: CacheScope, id: &str, token: &CancelToken) {
+        let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
+        let key = (scope, id.to_string());
+        if t.get(&key).is_some_and(|held| held.same(token)) {
+            t.remove(&key);
+        }
     }
 
-    /// Cancel by id. False when nothing is registered under it - already finished, or never
-    /// existed; the caller cannot tell the difference and does not need to.
+    /// Cancel the render of the current caller under `id`. False when nothing is registered
+    /// under it for that caller - already finished, never existed, or another caller's; the
+    /// caller cannot tell the difference and does not need to.
     pub fn cancel(id: &str) -> bool {
         let t = table().lock().unwrap_or_else(|e| e.into_inner());
-        match t.get(id) {
+        match t.get(&(CacheScope::current(), id.to_string())) {
             Some(tok) => {
                 tok.cancel();
                 true
@@ -252,31 +268,43 @@ pub mod registry {
         }
     }
 
-    /// The identifiers currently in flight.
+    /// The identifiers of the current caller's renders in flight.
     pub fn in_flight() -> Vec<String> {
+        let scope = CacheScope::current();
         table()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
-            .cloned()
+            .filter(|(owner, _)| *owner == scope)
+            .map(|(_, id)| id.clone())
             .collect()
     }
 
     /// Ties an entry to a scope: registered on creation, removed on drop, so a render that
     /// ends by error or by panic does not leave a handle behind that would cancel whatever
     /// reuses the identifier next.
-    pub struct Entry(String);
+    pub struct Entry {
+        scope: CacheScope,
+        id: String,
+        token: CancelToken,
+    }
 
     impl Entry {
-        pub fn new(id: &str, token: &CancelToken) -> Self {
-            register(id, token);
-            Self(id.to_string())
+        /// The entry of the caller `scope`, taken where the request is handled: a stream is
+        /// polled outside the scope of its request.
+        pub fn new(scope: CacheScope, id: &str, token: &CancelToken) -> Self {
+            register(scope, id, token);
+            Self {
+                scope,
+                id: id.to_string(),
+                token: token.clone(),
+            }
         }
     }
 
     impl Drop for Entry {
         fn drop(&mut self) {
-            forget(&self.0);
+            forget(self.scope, &self.id, &self.token);
         }
     }
 
@@ -284,35 +312,66 @@ pub mod registry {
     mod tests {
         use super::*;
 
-        #[test]
-        fn an_entry_lives_and_dies_with_its_scope() {
+        #[tokio::test]
+        async fn an_entry_lives_and_dies_with_its_scope() {
             let tok = CancelToken::new();
-            {
-                let _e = Entry::new("render-a", &tok);
-                assert!(in_flight().contains(&"render-a".to_string()));
-                assert!(
-                    cancel("render-a"),
-                    "a registered render must be cancellable"
-                );
-                assert!(tok.is_cancelled());
-            }
-            assert!(!in_flight().contains(&"render-a".to_string()));
-            assert!(!cancel("render-a"), "an ended render is not cancellable");
+            let scope = CacheScope::of_key("a");
+            scope
+                .serve(async {
+                    {
+                        let _e = Entry::new(scope, "render-a", &tok);
+                        assert!(in_flight().contains(&"render-a".to_string()));
+                        assert!(
+                            cancel("render-a"),
+                            "a registered render must be cancellable"
+                        );
+                        assert!(tok.is_cancelled());
+                    }
+                    assert!(!in_flight().contains(&"render-a".to_string()));
+                    assert!(!cancel("render-a"), "an ended render is not cancellable");
+                })
+                .await;
         }
 
-        /// Reusing an identifier must not orphan the render already under it - that one
-        /// would then be unstoppable, which is the defect this whole registry exists for.
+        /// Reusing an identifier of the same caller must not orphan the render already under
+        /// it - that one would then be unstoppable, which is the defect this whole registry
+        /// exists for.
         #[test]
         fn reusing_an_id_cancels_what_was_there() {
+            let scope = CacheScope::of_key("b");
             let (first, second) = (CancelToken::new(), CancelToken::new());
-            let _a = Entry::new("render-b", &first);
-            register("render-b", &second);
+            let a = Entry::new(scope, "render-b", &first);
+            register(scope, "render-b", &second);
             assert!(
                 first.is_cancelled(),
                 "the displaced render must be cancelled"
             );
             assert!(!second.is_cancelled());
-            forget("render-b");
+            drop(a);
+            let held = table()
+                .lock()
+                .unwrap()
+                .contains_key(&(scope, "render-b".to_string()));
+            assert!(held, "the displaced entry must not remove the newer one");
+            forget(scope, "render-b", &second);
+        }
+
+        /// A caller sees, cancels and displaces only its own renders.
+        #[tokio::test]
+        async fn a_render_belongs_to_the_caller_that_registered_it() {
+            let (a, b) = (CacheScope::of_key("a"), CacheScope::of_key("b"));
+            let (ta, tb) = (CancelToken::new(), CancelToken::new());
+            let _ea = Entry::new(a, "render-c", &ta);
+            let _eb = Entry::new(b, "render-c", &tb);
+            assert!(
+                !ta.is_cancelled(),
+                "another caller's same id must not displace it"
+            );
+            assert!(b.serve(async { cancel("render-c") }).await);
+            assert!(tb.is_cancelled());
+            assert!(!ta.is_cancelled(), "b must not reach a's render");
+            assert!(b.serve(async { in_flight() }).await == vec!["render-c".to_string()]);
+            assert!(!CacheScope::COMMON.serve(async { cancel("render-c") }).await);
         }
     }
 }

@@ -96,6 +96,10 @@ impl LlmEngine {
         prompt: &str,
         params: GenerationParams,
     ) -> Result<GenerationResult, Box<dyn std::error::Error>> {
+        let params = GenerationParams {
+            cache_scope: crate::inference::engine::cache_scope::CacheScope::current(),
+            ..params
+        };
         crate::inference::place::recover::retry_on_oom(
             &self.config.model_id,
             || self.generate_once(prompt, params.clone()),
@@ -196,6 +200,7 @@ impl LlmEngine {
         // Owned: the meter is fed from inside the blocking closure, which cannot borrow self.
         let metered_model = self.config.model_id.clone();
         let prefill_peer = self.config.prefill_peer.clone();
+        let cache_scope = params.cache_scope;
         let probe = params.probe.clone();
 
         let arrived = std::time::Instant::now();
@@ -319,6 +324,7 @@ impl LlmEngine {
                     || audio_split.is_some();
                 let disabled = is_vision_req
                     || false;
+                state.model.set_cache_scope(cache_scope);
                 if let (Some(peer), false) = (prefill_peer.as_deref(), disabled) {
                     super::handover::pull_prompt_from_peer(
                         state.model.as_mut(),
@@ -339,6 +345,7 @@ impl LlmEngine {
                     kv_disk.as_deref(),
                     &|t| added.contains_key(&t),
                     config.fidelity.shifts_context(),
+                    cache_scope,
                 )
             };
 
@@ -497,6 +504,7 @@ impl LlmEngine {
                         }
                         Err(e) => return Err(e.into()),
                     };
+                    state.model.set_cache_scope(cache_scope);
                     state.model.snapshot_prefix(&prompt_tokens, &lg)?;
                     lg
                 };
@@ -2028,13 +2036,15 @@ impl LlmEngine {
                     image_hash: None,
                     image_prefix_len: 0,
                     kv_len: pos,
+                    scope: cache_scope,
                 });
                 drop(g);
+                state.model.set_cache_scope(cache_scope);
                 match state.model.snapshot_kv(full.clone(), pos) {
                     Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                     Ok(()) => {
                         if let Some(store) = kv_disk.clone() {
-                            spawn_persist(model_state.clone(), store, full.clone());
+                            spawn_persist(model_state.clone(), store, full.clone(), cache_scope);
                         }
                     }
                 }

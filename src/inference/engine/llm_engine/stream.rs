@@ -232,6 +232,10 @@ impl LlmEngine {
         params: GenerationParams,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
+        let params = GenerationParams {
+            cache_scope: crate::inference::engine::cache_scope::CacheScope::current(),
+            ..params
+        };
         let started = crate::inference::place::recover::retry_on_oom(
             &self.config.model_id,
             || async {
@@ -302,6 +306,7 @@ impl LlmEngine {
         let logprob_queue = self.logprob_queue.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
+        let cache_scope = params.cache_scope;
         let config = self.config.clone();
         let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
@@ -551,7 +556,7 @@ impl LlmEngine {
                     && qwen35_sentinel.is_none()
                     && session_id.is_none();
                 let mut exact_logits = if sessionless_text {
-                    exact_repeat(state, &sessions, &prompt_tokens)
+                    exact_repeat(state, &sessions, &prompt_tokens, cache_scope)
                 } else {
                     state.exact_prefill = None;
                     None
@@ -572,7 +577,7 @@ impl LlmEngine {
                         .iter()
                         .filter(|(sid, _)| sid.as_str() == GLOBAL_PROMPT_CACHE_KEY)
                     {
-                        if sess.model_name != state.name {
+                        if !sess.belongs_to(&state.name, cache_scope) {
                             continue;
                         }
                         if sess.image_hash != cur_image_hash {
@@ -647,9 +652,9 @@ impl LlmEngine {
                     // in-memory only - never persisted). The SAME proven trim logic as
                     // the session path guarantees greedy-identical output (keep only the
                     // common prefix; re-prefill the divergent suffix + leave the last
-                    // token on a full match). Disable for multi-tenant privacy
-                    // (cross-tenant timing side-channel) with
-                    // LOKEN_NO_GLOBAL_PROMPT_CACHE=1.
+                    // token on a full match).
+                    // The resident KV serves only the caller that wrote it.
+                    state.model.set_cache_scope(cache_scope);
                     if let Some(peer) = config.prefill_peer.as_deref() {
                         super::handover::pull_prompt_from_peer(
                             state.model.as_mut(),
@@ -670,6 +675,7 @@ impl LlmEngine {
                         kv_disk.as_deref(),
                         &|t| added.contains_key(&t),
                         config.fidelity.shifts_context(),
+                        cache_scope,
                     )
                 } else {
                     let sess_guard = sessions.blocking_lock();
@@ -684,7 +690,7 @@ impl LlmEngine {
                         .iter()
                         .filter(|(sid, _)| sid.as_str() == GLOBAL_PROMPT_CACHE_KEY)
                     {
-                        if sess.model_name != state.name {
+                        if !sess.belongs_to(&state.name, cache_scope) {
                             continue;
                         }
                         let t = &sess.tokens;
@@ -988,6 +994,7 @@ impl LlmEngine {
                                         // A prefill that began from a cached state read only the rest.
                                         reused_prompt_tokens =
                                             reused_prompt_tokens.max(state.model.prefix_covered());
+                                        state.model.set_cache_scope(cache_scope);
                                         if let Err(e) =
                                             state.model.snapshot_prefix(&prompt_tokens, &l)
                                         {
@@ -3184,9 +3191,8 @@ impl LlmEngine {
             // Snapshot the cache-representative token sequence so the next request
             // can skip redundant prefill: under the explicit session_id when present,
             // AND under GLOBAL_PROMPT_CACHE_KEY (mirroring the single resident KV) so a
-            // sessionless request can prefix-reuse it (ollama parity). In-memory only  -
-            // never persisted (see project_prompt_cache_privacy). The GLOBAL mirror is
-            // skipped when LOKEN_NO_GLOBAL_PROMPT_CACHE=1 (multi-tenant privacy).
+            // sessionless request can prefix-reuse it (ollama parity).
+            // The entry carries the scope of the caller that wrote it.
             {
                 let model_name = {
                     let g = model_state.blocking_lock();
@@ -3227,6 +3233,7 @@ impl LlmEngine {
                                 kv_len: pos,
                                 image_hash,
                                 image_prefix_len,
+                                scope: cache_scope,
                             },
                         );
                     }
@@ -3236,11 +3243,17 @@ impl LlmEngine {
                     if image_hash.is_none() {
                         let mut g = model_state.blocking_lock();
                         if let Some(s) = g.as_mut() {
+                            s.model.set_cache_scope(cache_scope);
                             match s.model.snapshot_kv(full.clone(), pos) {
                                 Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                                 Ok(()) => {
                                     if let Some(store) = kv_disk.clone() {
-                                        spawn_persist(model_state.clone(), store, full.clone());
+                                        spawn_persist(
+                                            model_state.clone(),
+                                            store,
+                                            full.clone(),
+                                            cache_scope,
+                                        );
                                     }
                                 }
                             }
@@ -3281,6 +3294,10 @@ impl LlmEngine {
             tracing::debug!("cluster prefix: no resident session to compare against");
             return Some(0);
         };
+        // The resident prompt answers only the caller that wrote it.
+        if s.scope != crate::inference::engine::cache_scope::CacheScope::current() {
+            return Some(0);
+        }
         // The session records the engine's own name for the model; a peer asks with the name
         // it was given. They are the same string today and a mismatch would silently answer
         // "nothing cached" forever, so it is logged rather than assumed.

@@ -26,6 +26,8 @@ use std::sync::Arc;
 pub struct StateCache {
     store: Arc<StateStore>,
     identity: Identity,
+    /// The caller whose states this cache reads and writes.
+    scope: crate::inference::engine::cache_scope::CacheScope,
     ratios: Vec<usize>,
     /// Tokens per block of this model's chain, settled in the store.
     block: usize,
@@ -77,12 +79,23 @@ impl StateCache {
         Some(Self {
             store,
             identity,
+            scope: Default::default(),
             block,
             last_stride: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // The ratios of the layers a state has: the model lists the draft's after them.
             ratios: model.compress_ratios()[..model.n_layers().min(model.compress_ratios().len())]
                 .to_vec(),
         })
+    }
+
+    /// Makes `scope` the caller whose states this cache reads and writes from now on.
+    pub fn set_scope(&mut self, scope: crate::inference::engine::cache_scope::CacheScope) {
+        self.scope = scope;
+    }
+
+    /// The identity states are keyed under: the model's, mixed with the caller's scope.
+    fn scoped_identity(&self) -> Identity {
+        self.scope.mixed_into(&self.identity)
     }
 
     fn layout(&self) -> BlockLayout<'_> {
@@ -96,7 +109,7 @@ impl StateCache {
     /// holds no logits cannot answer and is passed over; a file that cannot be read or decoded is
     /// logged and dropped.
     fn restore(&self, model: &DeepseekV41Model, ids: &[u32]) -> Option<Restored> {
-        let keys = self.store.keys(&self.identity, ids);
+        let keys = self.store.keys(&self.scoped_identity(), ids);
         for entry in self.store.candidates(&keys, ids.len()) {
             let bytes = self.store.entry_bytes(&entry);
             let m = self.store.tuning().get();
@@ -134,7 +147,12 @@ impl StateCache {
                     continue;
                 }
             };
-            match decode_split(&manifest, &blocks, &self.identity, model.n_layers()) {
+            match decode_split(
+                &manifest,
+                &blocks,
+                &self.scoped_identity(),
+                model.n_layers(),
+            ) {
                 Ok(snap) if snap.state.pos == entry.len => {
                     if entry.len == ids.len() && snap.logits.is_none() {
                         continue;
@@ -284,7 +302,7 @@ impl StateCache {
         if let Err(why) = block_shape(state, &layout) {
             tracing::info!("state cache: states are kept whole, not in blocks: {why}");
         }
-        let keys = self.store.keys(&self.identity, tokens);
+        let keys = self.store.keys(&self.scoped_identity(), tokens);
         let mut points = Vec::new();
         for (p, windows) in grid {
             let point = GridPoint {
@@ -292,15 +310,19 @@ impl StateCache {
                 windows: &windows,
                 engram: model.engram_after(&tokens[..p]),
             };
-            match encode_grid_manifest(state, &point, &self.identity, &layout) {
+            match encode_grid_manifest(state, &point, &self.scoped_identity(), &layout) {
                 Some((manifest, nb)) => points.push((p, manifest, nb)),
                 None => tracing::info!(
                     "state cache: no state kept at token {p}: the final state cannot be cut at that block boundary"
                 ),
             }
         }
-        let (manifest, nblocks) =
-            encode_manifest(state, logits.as_deref(), &self.identity, Some(&layout));
+        let (manifest, nblocks) = encode_manifest(
+            state,
+            logits.as_deref(),
+            &self.scoped_identity(),
+            Some(&layout),
+        );
         let top = points.iter().map(|x| x.2).max().unwrap_or(0).max(nblocks);
         let mut blocks: std::collections::HashMap<usize, Vec<u8>> = (0..top)
             .filter(|&b| !self.store.has_block(&keys, b))
@@ -310,7 +332,7 @@ impl StateCache {
         let tokens = tokens.to_vec();
         std::thread::spawn(move || {
             ticket.run(|| {
-                let keys = this.store.keys(&this.identity, &tokens);
+                let keys = this.store.keys(&this.scoped_identity(), &tokens);
                 // The states the prefill passed, at block boundaries, so any prompt that shares
                 // a prefix with this one restores at the last of them it shares.
                 let mut kept = 0;

@@ -1277,7 +1277,8 @@ impl HybridStateCache {
         if prompt.len() <= left {
             return 0;
         }
-        let keys = self.store.keys(&self.identity, prompt);
+        let identity = model.cache_scope.mixed_into(&self.identity);
+        let keys = self.store.keys(&identity, prompt);
         for entry in self.store.candidates(&keys, prompt.len() - left) {
             let bytes = self.store.entry_bytes(&entry);
             let m = self.store.tuning().get();
@@ -1318,7 +1319,8 @@ impl HybridStateCache {
 
     fn restore_entry(&self, model: &mut GenericHeteroTransformer, entry: &Entry) -> AnyResult<()> {
         let layout = &*self.layout;
-        let point = decode_manifest(&self.store.read(entry)?, &self.identity, layout)?;
+        let identity = model.cache_scope.mixed_into(&self.identity);
+        let point = decode_manifest(&self.store.read(entry)?, &identity, layout)?;
         if point.pos != entry.len || entry.blocks.len() != point.pos / layout.block_tokens {
             bail!("state cache: a manifest that does not match its name");
         }
@@ -1381,7 +1383,8 @@ impl HybridStateCache {
                 return;
             }
         };
-        let keys = self.store.keys(&self.identity, prompt);
+        let identity = model.cache_scope.mixed_into(&self.identity);
+        let keys = self.store.keys(&identity, prompt);
         let nblocks = prompt.len() / g;
         let first = self.store.first_missing_block(&keys, nblocks);
         let mut blocks = Vec::with_capacity(nblocks - first);
@@ -1405,11 +1408,11 @@ impl HybridStateCache {
         let tokens = prompt.to_vec();
         std::thread::spawn(move || {
             ticket.run(|| {
-                let keys = this.store.keys(&this.identity, &tokens);
+                let keys = this.store.keys(&identity, &tokens);
                 let mut points = grid;
                 points.push(end);
                 for p in points {
-                    let manifest = encode_manifest(&this.identity, &this.layout, &p);
+                    let manifest = encode_manifest(&identity, &this.layout, &p);
                     let mut lost = false;
                     let put = this.store.put(&keys, p.pos, &manifest, p.pos / g, |b| {
                         match b.checked_sub(first).and_then(|i| blocks.get(i)) {

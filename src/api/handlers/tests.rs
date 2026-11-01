@@ -72,6 +72,55 @@ fn a_shortened_embedding_is_scaled_back_to_unit_length() {
     assert_eq!(zero, vec![0.0f32; 2], "a zero vector stays zero");
 }
 
+/// The scope a request is served in follows its API key.
+/// 2 keys give 2 scopes.
+/// The same key gives the same scope twice.
+/// No authentication gives the common scope.
+#[tokio::test]
+async fn the_scope_of_a_request_follows_its_api_key() {
+    use crate::inference::engine::cache_scope::CacheScope;
+    use tower::ServiceExt;
+    let app = |required: bool| {
+        let keys = vec!["key-a".to_string(), "key-b".to_string()];
+        let auth = Arc::new(AuthGate::new(required, &keys, &[], 0, 10));
+        axum::Router::new()
+            .route(
+                "/probe",
+                axum::routing::get(|| async { format!("{:?}", CacheScope::current()) }),
+            )
+            .layer(axum::middleware::from_fn_with_state(auth, require_api_key))
+    };
+    let scope_of = |app: axum::Router, key: Option<&'static str>| async move {
+        let mut request = axum::http::Request::builder().uri("/probe");
+        if let Some(key) = key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let response = app
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 10)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    let a = scope_of(app(true), Some("key-a")).await;
+    let b = scope_of(app(true), Some("key-b")).await;
+    assert_eq!(
+        a,
+        scope_of(app(true), Some("key-a")).await,
+        "one key, one scope"
+    );
+    assert_ne!(a, b, "two keys, two scopes");
+    assert_eq!(a, format!("{:?}", CacheScope::of_key("key-a")));
+    let open = scope_of(app(false), None).await;
+    assert_eq!(
+        open,
+        format!("{:?}", CacheScope::COMMON),
+        "no authentication"
+    );
+}
+
 #[test]
 fn available_endpoints_list_includes_critical_routes() {
     // Pins the discoverability hint surfaced in 404 envelopes to

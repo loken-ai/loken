@@ -552,6 +552,9 @@ pub struct GenerationParams {
     /// new suffix gets prefilled. Set via Ollama option `session_id` or the
     /// OpenAI `user` field.
     pub session_id: Option<String>,
+    /// The caller whose cached prefixes this request may reuse and extend.
+    /// Set from the request being served, never by the caller.
+    pub cache_scope: crate::inference::engine::cache_scope::CacheScope,
     /// Bytes of the prompt that the next turn of its conversation renders the same: the
     /// prompt up to where the assistant's turn opens. A model that cannot rewind its state
     /// keeps the state at that point.

@@ -396,6 +396,7 @@ impl SamplingRequest {
             })
         });
         GenerationParams {
+            cache_scope: Default::default(),
             stable_prefix: None,
             prefix_tokens: None,
             // A negative cap is Ollama's "until EOS".

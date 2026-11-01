@@ -4,6 +4,7 @@
 //! conversation of each response so `previous_response_id` can continue it.
 
 use super::*;
+use crate::inference::engine::cache_scope::CacheScope;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -14,6 +15,8 @@ const STORE_CAPACITY: usize = 256;
 
 struct Stored {
     id: String,
+    /// The caller that made the response: no other caller reads, continues or deletes it.
+    scope: CacheScope,
     messages: Vec<Value>,
     response: Value,
 }
@@ -23,7 +26,7 @@ fn store() -> &'static Mutex<VecDeque<Stored>> {
     STORE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-fn store_response(id: &str, messages: Vec<Value>, response: Value) {
+fn store_response(scope: CacheScope, id: &str, messages: Vec<Value>, response: Value) {
     if let Ok(mut g) = store().lock() {
         g.retain(|s| s.id != id);
         if g.len() >= STORE_CAPACITY {
@@ -31,18 +34,19 @@ fn store_response(id: &str, messages: Vec<Value>, response: Value) {
         }
         g.push_back(Stored {
             id: id.to_string(),
+            scope,
             messages,
             response,
         });
     }
 }
 
-fn stored_messages(id: &str) -> Option<Vec<Value>> {
+fn stored_messages(scope: CacheScope, id: &str) -> Option<Vec<Value>> {
     store()
         .lock()
         .ok()?
         .iter()
-        .find(|s| s.id == id)
+        .find(|s| s.id == id && s.scope == scope)
         .map(|s| s.messages.clone())
 }
 
@@ -116,10 +120,10 @@ fn lower_content(content: &Value, file: FileBytes) -> Result<Value, String> {
 
 /// The chat messages a Responses request stands for; `file` reads the uploads a
 /// `file_id` names.
-fn lower_input(req: &Value, file: FileBytes) -> Result<Vec<Value>, String> {
+fn lower_input(req: &Value, file: FileBytes, scope: CacheScope) -> Result<Vec<Value>, String> {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(prev) = req.get("previous_response_id").and_then(Value::as_str) {
-        match stored_messages(prev) {
+        match stored_messages(scope, prev) {
             Some(m) => messages.extend(m),
             None => return Err(format!("previous_response_id '{prev}' is not known")),
         }
@@ -421,7 +425,8 @@ pub(crate) async fn openai_responses_at(
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::Validation("`model` is required".to_string()))?
         .to_string();
-    let messages = lower_input(&req, &|id| super::files::read_file_bytes(&state, id))
+    let scope = CacheScope::current();
+    let messages = lower_input(&req, &|id| super::files::read_file_bytes(&state, id), scope)
         .map_err(ApiError::Validation)?;
     if messages.is_empty() {
         return Err(ApiError::Validation("`input` is empty".to_string()));
@@ -478,7 +483,7 @@ pub(crate) async fn openai_responses_at(
         if keep {
             let mut convo = history;
             convo.push(message);
-            store_response(&id, convo, body.clone());
+            store_response(scope, &id, convo, body.clone());
         }
         return Ok(Json(body).into_response());
     }
@@ -629,7 +634,7 @@ pub(crate) async fn openai_responses_at(
                 assistant["tool_calls"] = Value::Array(tool_calls.clone());
             }
             convo.push(assistant);
-            store_response(&id, convo, final_obj.clone());
+            store_response(scope, &id, convo, final_obj.clone());
         }
         let kind = if status == "completed" { "response.completed" } else { "response.incomplete" };
         yield Ok::<_, axum::Error>(event(kind, json!({"response": final_obj}), &mut seq));
@@ -643,10 +648,11 @@ pub(crate) async fn openai_responses_at(
 pub(crate) async fn openai_get_response(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let found = store()
-        .lock()
-        .ok()
-        .and_then(|g| g.iter().find(|s| s.id == id).map(|s| s.response.clone()));
+    let found = store().lock().ok().and_then(|g| {
+        g.iter()
+            .find(|s| s.id == id && s.scope == CacheScope::current())
+            .map(|s| s.response.clone())
+    });
     match found {
         Some(r) => Json(r).into_response(),
         None => error(StatusCode::NOT_FOUND, format!("response '{id}' not found")),
@@ -661,7 +667,7 @@ pub(crate) async fn openai_delete_response(
         .lock()
         .map(|mut g| {
             let before = g.len();
-            g.retain(|s| s.id != id);
+            g.retain(|s| s.id != id || s.scope != CacheScope::current());
             before != g.len()
         })
         .unwrap_or(false);
@@ -682,7 +688,7 @@ mod tests {
 
     /// The messages chat completion ingests from a Responses request, as JSON.
     fn ingested_from_responses(req: &Value, file: FileBytes) -> Value {
-        let msgs = lower_input(req, file).unwrap();
+        let msgs = lower_input(req, file, CacheScope::COMMON).unwrap();
         let chat: ChatCompletionRequest =
             serde_json::from_value(chat_body(req, "m", &msgs, None, false)).unwrap();
         serde_json::to_value(&chat.messages).unwrap()
@@ -728,7 +734,9 @@ mod tests {
         let unknown = json!({"input": [{"role": "user", "content": [
             {"type": "input_image", "file_id": "file_2"}
         ]}]});
-        assert!(lower_input(&unknown, &file).unwrap_err().contains("file_2"));
+        assert!(lower_input(&unknown, &file, CacheScope::COMMON)
+            .unwrap_err()
+            .contains("file_2"));
     }
 
     #[test]
@@ -752,7 +760,7 @@ mod tests {
         let req = json!({"input": [{"role": "user", "content": [
             {"type": "input_video", "video_url": "x"}
         ]}]});
-        let e = lower_input(&req, &no_files).unwrap_err();
+        let e = lower_input(&req, &no_files, CacheScope::COMMON).unwrap_err();
         assert!(e.contains("'input_video'"), "{e}");
         let status = ApiError::Validation(e).into_response().status();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -769,7 +777,7 @@ mod tests {
             "stop": ["END"],
             "reasoning": {"effort": "minimal"}
         });
-        let msgs = lower_input(&req, &no_files).unwrap();
+        let msgs = lower_input(&req, &no_files, CacheScope::COMMON).unwrap();
         let whole = chat_body(&req, "m", &msgs, None, false);
         assert!(whole.get("stream_options").is_none());
         assert_eq!(whole["reasoning_effort"], "minimal");
@@ -779,6 +787,24 @@ mod tests {
         assert_eq!(parsed.reasoning_effort.as_deref(), Some("minimal"));
         let streamed = chat_body(&req, "m", &msgs, None, true);
         assert_eq!(streamed["stream_options"]["include_usage"], true);
+    }
+
+    /// A stored response is continued only by the caller that made it.
+    #[test]
+    fn a_stored_response_belongs_to_its_caller() {
+        let (a, b) = (CacheScope::of_key("a"), CacheScope::of_key("b"));
+        store_response(
+            a,
+            "resp_scoped",
+            vec![json!({"role": "user", "content": "hi"})],
+            json!({}),
+        );
+        assert!(stored_messages(a, "resp_scoped").is_some());
+        assert!(stored_messages(b, "resp_scoped").is_none(), "another key");
+        assert!(
+            stored_messages(CacheScope::COMMON, "resp_scoped").is_none(),
+            "no key"
+        );
     }
 
     #[test]
@@ -791,7 +817,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "c1", "output": "42"}
             ]
         });
-        let m = lower_input(&req, &no_files).unwrap();
+        let m = lower_input(&req, &no_files, CacheScope::COMMON).unwrap();
         assert_eq!(m.len(), 4);
         assert_eq!(m[0]["role"], "system");
         assert_eq!(m[1]["content"][0]["type"], "text");

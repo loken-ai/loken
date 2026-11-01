@@ -45,6 +45,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Embeddings: scale a vector cut to fewer dimensions back to unit length.
 - Sampling: build and upload no repeat penalty list when the penalty is 1.0.
 - Matmul: dequantise on the card for one call when its workspace is short, keeping no copy.
+- API: keep the prompt caches, stored responses, files, batches and renders of each API key to itself.
 - Sessions: keep no token list for each session id, and count the resident conversation.
 - Loaded models: list them without holding the table through each engine's wait.
 - Rate limit: tell a refused client how long to wait in Retry-After.

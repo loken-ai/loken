@@ -1914,13 +1914,22 @@ impl GenericHeteroTransformer {
             logits,
             used: std::time::Instant::now(),
             hits: 0,
+            scope: self.cache_scope,
         };
-        let existing: Vec<(&[u32], u64)> = self
-            .kv_snapshots
-            .iter()
-            .map(|s| (s.tokens.as_slice(), s.rank()))
+        // Only this caller's snapshots can be replaced by this one.
+        let own: Vec<usize> = (0..self.kv_snapshots.len())
+            .filter(|&i| self.kv_snapshots[i].scope == snap.scope)
             .collect();
-        match snapshot_slot(&existing, &snap.tokens, SNAPSHOT_COUNT_UNBOUNDED) {
+        let existing: Vec<(&[u32], u64)> = own
+            .iter()
+            .map(|&i| {
+                (
+                    self.kv_snapshots[i].tokens.as_slice(),
+                    self.kv_snapshots[i].rank(),
+                )
+            })
+            .collect();
+        match snapshot_slot(&existing, &snap.tokens, SNAPSHOT_COUNT_UNBOUNDED).map(|i| own[i]) {
             Some(i) => {
                 // The conversation goes on in the snapshot that replaces its earlier turn.
                 snap.hits = self.kv_snapshots[i].hits;
@@ -2088,6 +2097,7 @@ impl GenericHeteroTransformer {
             .kv_snapshots
             .iter()
             .enumerate()
+            .filter(|(_, s)| s.scope == self.cache_scope)
             .filter(|(_, s)| {
                 prompt.starts_with(&s.tokens)
                     && (s.logits.is_some() || (!logits_only && s.tokens.len() < prompt.len()))
@@ -2204,12 +2214,18 @@ impl GenericHeteroTransformer {
         self.decode_reserve = self.decode_reserve.max(bytes);
     }
 
+    /// Makes `scope` the caller whose snapshots are taken and looked up from now on.
+    pub fn set_cache_scope(&mut self, scope: crate::inference::engine::cache_scope::CacheScope) {
+        self.cache_scope = scope;
+    }
+
     /// The snapshot sharing the longest prefix with `prompt`, as `(index, common)`,
     /// `common` never past what the snapshot holds in its KV.
     pub fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         self.kv_snapshots
             .iter()
             .enumerate()
+            .filter(|(_, s)| s.scope == self.cache_scope)
             .filter(|(_, s)| s.logits.is_none())
             .map(|(i, s)| (i, common_prefix(&s.tokens, prompt).min(s.kv_len)))
             .filter(|(_, c)| *c > 0)
@@ -2247,6 +2263,7 @@ impl GenericHeteroTransformer {
         self.kv_snapshots
             .iter()
             .enumerate()
+            .filter(|(_, s)| s.scope == self.cache_scope)
             .filter(|(_, s)| {
                 s.kv_len > 0
                     && s.tokens.len() >= s.kv_len

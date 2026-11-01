@@ -593,7 +593,11 @@ pub(crate) async fn video_generations(
         // NOT a dependable signal - measured: a clip ran to completion for nobody after its
         // client had gone - so the client is given something it can act on instead.
         let render_id = next_render_id();
-        let reg = crate::inference::serve::cancel::registry::Entry::new(&render_id, &cancel);
+        let reg = crate::inference::serve::cancel::registry::Entry::new(
+            crate::inference::engine::cache_scope::CacheScope::current(),
+            &render_id,
+            &cancel,
+        );
         let id_for_event = render_id.clone();
         let energy = crate::energy_report::begin();
         // The job record follows the render: every count and every placed part lands in
@@ -749,7 +753,11 @@ pub(crate) async fn video_generations(
     // Registered for the same reason as the streaming route: this one has no early message
     // in which to hand the identifier back, so a caller finds it through GET /v1/renders.
     let render_id = next_render_id();
-    let _reg = crate::inference::serve::cancel::registry::Entry::new(&render_id, &cancel);
+    let _reg = crate::inference::serve::cancel::registry::Entry::new(
+        crate::inference::engine::cache_scope::CacheScope::current(),
+        &render_id,
+        &cancel,
+    );
     let _cg = crate::inference::serve::cancel::CancelGuard::new(cancel);
     let cond_plain = conditioner.clone();
     let prepared_plain = prepared.clone();

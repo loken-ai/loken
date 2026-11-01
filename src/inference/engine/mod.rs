@@ -19,6 +19,7 @@ pub trait InferenceEngine {
 pub mod audio_engine;
 #[cfg(feature = "image")]
 pub mod boogu_engine;
+pub mod cache_scope;
 pub(crate) mod decode_step;
 #[cfg(feature = "image")]
 pub mod flux2_engine;

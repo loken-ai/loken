@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::api::gate::Priority;
+use crate::inference::engine::cache_scope::CacheScope;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
@@ -60,9 +61,25 @@ pub(crate) fn store_file(
         "purpose": purpose,
         "status": "processed",
     });
-    std::fs::write(record_path(&dir, &id), record.to_string())
+    let mut kept = record.clone();
+    if let Some(owner) = CacheScope::current().owner_text() {
+        kept[OWNER_KEY] = json!(owner);
+    }
+    std::fs::write(record_path(&dir, &id), kept.to_string())
         .map_err(|e| ApiError::Internal(format!("files: {e}")))?;
     Ok(record)
+}
+
+/// The field of a stored record that names the caller that uploaded the file.
+const OWNER_KEY: &str = "loken_owner";
+
+/// The record as the caller sees it, or `None` when another caller owns the file.
+fn visible_record(mut record: Value) -> Option<Value> {
+    let owner = record
+        .as_object_mut()?
+        .remove(OWNER_KEY)
+        .and_then(|v| v.as_str().map(str::to_string));
+    (owner == CacheScope::current().owner_text()).then_some(record)
 }
 
 fn read_record(state: &APIServer, id: &str) -> Option<Value> {
@@ -70,7 +87,7 @@ fn read_record(state: &APIServer, id: &str) -> Option<Value> {
         return None;
     }
     let bytes = std::fs::read(record_path(&files_dir(state), id)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    visible_record(serde_json::from_slice(&bytes).ok()?)
 }
 
 pub(crate) fn read_file_bytes(state: &APIServer, id: &str) -> Option<Vec<u8>> {
@@ -122,7 +139,7 @@ pub(crate) async fn files_list(State(state): State<APIServer>) -> Json<Value> {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("json") {
                 if let Ok(Ok(v)) = std::fs::read(&p).map(|b| serde_json::from_slice::<Value>(&b)) {
-                    data.push(v);
+                    data.extend(visible_record(v));
                 }
             }
         }
@@ -209,6 +226,8 @@ pub(crate) async fn files_delete(
 
 #[derive(Clone)]
 struct Batch {
+    /// The caller that created the batch: no other caller lists, reads or cancels it.
+    scope: CacheScope,
     object: Value,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -248,7 +267,13 @@ fn batches() -> &'static Mutex<HashMap<String, Batch>> {
 }
 
 fn batch_get(id: &str) -> Option<Batch> {
-    batches().lock().ok()?.get(id).cloned()
+    let scope = CacheScope::current();
+    batches()
+        .lock()
+        .ok()?
+        .get(id)
+        .filter(|b| b.scope == scope)
+        .cloned()
 }
 
 fn batch_update(id: &str, f: impl FnOnce(&mut Value)) {
@@ -355,6 +380,7 @@ pub(crate) async fn batches_create(
         g.insert(
             id.clone(),
             Batch {
+                scope: CacheScope::current(),
                 object: object.clone(),
                 cancel: cancel.clone(),
             },
@@ -362,7 +388,7 @@ pub(crate) async fn batches_create(
     }
     let runner_state = state.clone();
     let runner_id = id.clone();
-    tokio::spawn(async move {
+    tokio::spawn(CacheScope::current().serve(async move {
         let mut out = String::new();
         let mut errs = String::new();
         let mut completed = 0usize;
@@ -431,7 +457,7 @@ pub(crate) async fn batches_create(
                 .and_then(|f| f.get("id").cloned())
                 .unwrap_or(Value::Null);
         });
-    });
+    }));
     Ok(Json(object))
 }
 
@@ -446,7 +472,12 @@ pub(crate) async fn batches_get(
 pub(crate) async fn batches_list() -> Json<Value> {
     let mut data: Vec<Value> = batches()
         .lock()
-        .map(|g| g.values().map(|b| b.object.clone()).collect())
+        .map(|g| {
+            g.values()
+                .filter(|b| b.scope == CacheScope::current())
+                .map(|b| b.object.clone())
+                .collect()
+        })
         .unwrap_or_default();
     data.sort_by_key(|v| -v.get("created_at").and_then(Value::as_i64).unwrap_or(0));
     Json(json!({"object": "list", "data": data, "has_more": false}))
@@ -503,6 +534,7 @@ pub(crate) async fn anthropic_batches_create(
         g.insert(
             id.clone(),
             Batch {
+                scope: CacheScope::current(),
                 object: object.clone(),
                 cancel: cancel.clone(),
             },
@@ -510,7 +542,7 @@ pub(crate) async fn anthropic_batches_create(
     }
     let runner_state = state.clone();
     let runner_id = id.clone();
-    tokio::spawn(async move {
+    tokio::spawn(CacheScope::current().serve(async move {
         let mut out = String::new();
         let (mut succeeded, mut errored, mut canceled) = (0usize, 0usize, 0usize);
         let total = requests.len();
@@ -576,7 +608,7 @@ pub(crate) async fn anthropic_batches_create(
                 o["results_file_id"] = f;
             }
         });
-    });
+    }));
     Json(object).into_response()
 }
 
@@ -598,6 +630,7 @@ pub(crate) async fn anthropic_batches_list() -> Json<Value> {
         .lock()
         .map(|g| {
             g.values()
+                .filter(|b| b.scope == CacheScope::current())
                 .filter(|b| b.object["type"] == "message_batch")
                 .map(|b| b.object.clone())
                 .collect()
@@ -737,5 +770,48 @@ pub(crate) fn with_style(prompt: String, style: Option<&str>) -> String {
         Some("vivid") => format!("{prompt}, vivid, dramatic lighting, saturated color"),
         Some("natural") => format!("{prompt}, natural, realistic, understated"),
         _ => prompt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file record is shown to the caller that uploaded it and to no other.
+    /// The owner never reaches the client.
+    #[tokio::test]
+    async fn a_file_record_is_visible_to_its_owner_only() {
+        let (a, b) = (CacheScope::of_key("a"), CacheScope::of_key("b"));
+        let record = json!({"id": "file_x", OWNER_KEY: a.owner_text().unwrap()});
+        let seen = a.serve(async { visible_record(record.clone()) }).await;
+        assert_eq!(seen, Some(json!({"id": "file_x"})));
+        assert!(b
+            .serve(async { visible_record(record.clone()) })
+            .await
+            .is_none());
+        assert!(visible_record(record).is_none(), "no key");
+        assert!(
+            visible_record(json!({"id": "file_y"})).is_some(),
+            "a record with no owner"
+        );
+    }
+
+    /// A batch is found, listed and cancelled only by the caller that created it.
+    #[tokio::test]
+    async fn a_batch_belongs_to_its_creator() {
+        let (a, b) = (CacheScope::of_key("a"), CacheScope::of_key("b"));
+        batches().lock().unwrap().insert(
+            "batch_scoped".to_string(),
+            Batch {
+                scope: a,
+                object: json!({"id": "batch_scoped"}),
+                cancel: Default::default(),
+            },
+        );
+        assert!(a.serve(async { batch_get("batch_scoped") }).await.is_some());
+        assert!(b.serve(async { batch_get("batch_scoped") }).await.is_none());
+        let listed = |s: CacheScope| async move { s.serve(batches_list()).await.0["data"].clone() };
+        assert_eq!(listed(a).await.as_array().map(Vec::len), Some(1));
+        assert_eq!(listed(b).await.as_array().map(Vec::len), Some(0));
     }
 }
