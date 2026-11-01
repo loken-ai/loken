@@ -62,12 +62,12 @@ impl ImageEngine {
     pub async fn generate_batch(
         &self,
         mut jobs: Vec<(String, ImageGenParams)>,
-    ) -> Result<Option<Vec<RenderedImage>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Vec<BatchedImage>>, Box<dyn std::error::Error + Send + Sync>> {
         let seeds: Vec<u64> = jobs.iter_mut().map(|(_, p)| p.resolve_seed()).collect();
         let model_state = self.model_state.clone();
         let presence = self.presence_cell();
         let result =
-            tokio::task::spawn_blocking(move || -> AnyResult<Option<Vec<RenderedImage>>> {
+            tokio::task::spawn_blocking(move || -> AnyResult<Option<Vec<BatchedImage>>> {
                 let mut guard = model_state.blocking_lock();
                 let state = guard
                     .as_mut()
@@ -241,11 +241,14 @@ fn render_on(
 
 /// SDXL, several requests denoised as one batch. The adapters, the solver and the decode
 /// tiling are set once from the first request, which [`ImageBatchKey`] makes them share.
+/// The answer to one row of a batch: its image, or why it has none.
+pub type BatchedImage = Result<RenderedImage, String>;
+
 fn render_sdxl_batch(
     pipe: &mut crate::inference::model::sdxl::pipeline::SdxlPipeline,
     jobs: &[(String, ImageGenParams)],
     seeds: &[u64],
-) -> AnyResult<Vec<RenderedImage>> {
+) -> AnyResult<Vec<BatchedImage>> {
     use crate::inference::model::sdxl::pipeline::SdxlRow;
     use crate::inference::model::sdxl::sampling::{SamplerKind, SchedulerKind};
     let Some((_, first)) = jobs.first() else {
@@ -299,11 +302,13 @@ fn render_sdxl_batch(
     images
         .into_iter()
         .zip(seeds)
-        .map(|(rgb, seed)| {
-            Ok(RenderedImage {
+        .map(|(rgb, seed)| match rgb {
+            // A row whose request went away left the pass; it is answered on its own.
+            None => Ok(Err("generation cancelled (client disconnected)".to_string())),
+            Some(rgb) => Ok(Ok(RenderedImage {
                 png_base64: rgb_to_png_base64(rgb, first.width, first.height)?,
                 seed: *seed,
-            })
+            })),
         })
         .collect()
 }

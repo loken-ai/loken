@@ -258,7 +258,12 @@ async fn render_batch(
             per_row.saturating_mul(batch.len() as u64),
         );
         match state.image_engine.generate_batch(batch.clone()).await {
-            Ok(Some(images)) => return images.into_iter().map(Ok).collect(),
+            Ok(Some(images)) => {
+                return images
+                    .into_iter()
+                    .map(|answer| answer.map_err(Into::into))
+                    .collect()
+            }
             Ok(None) => {}
             Err(e) => warn!(
                 "image: a batch of {} renders failed ({e}); rendering each alone",

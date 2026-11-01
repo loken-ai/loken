@@ -89,49 +89,72 @@ fn stack_rows(rows: &[Tensor]) -> Result<Tensor> {
 
 /// The sampling loop over latents that share one sigma ladder, one per row.
 ///
-/// `predict` takes the scaled latents of every row, stacked, and the sigma they sit at,
-/// and answers [`Predictions`]; it is asked for the unconditional branch when any row is
-/// guided. Each row is guided at its own scale and keeps its own solver history, so a
-/// row's latent depends on its own inputs alone. `stopped` is polled before every step.
+/// `predict` takes the scaled latents of the rows still running, stacked, the sigma they sit
+/// at, whether to answer the unconditional branch and the indices of those rows, and answers
+/// [`Predictions`]; it is asked for the unconditional branch when any running row is guided.
+/// Each row is guided at its own scale and keeps its own solver history, so a row's latent
+/// depends on its own inputs alone.
+///
+/// `gone` is asked before every step for each running row. A row whose request went away
+/// leaves the pass there: it is no longer computed, and its place in the answer is `None`.
+/// The loop ends with an error when no row is left.
 fn sample_rows(
-    mut xs: Vec<Vec<f32>>,
+    xs: Vec<Vec<f32>>,
     guidance: &[f32],
     sigmas: &[f32],
     sampler: SamplerKind,
-    mut predict: impl FnMut(&[f32], f32, bool) -> Result<Predictions>,
-    mut stopped: impl FnMut() -> Result<()>,
+    mut predict: impl FnMut(&[f32], f32, bool, &[usize]) -> Result<Predictions>,
+    mut gone: impl FnMut(usize) -> bool,
     on_step: crate::inference::sample::StepSink,
-) -> Result<Vec<Vec<f32>>> {
-    let guided = guidance.iter().any(|g| *g > 1.0);
+) -> Result<Vec<Option<Vec<f32>>>> {
     let plane = xs.first().map_or(0, Vec::len);
-    let mut solvers: Vec<DpmPP2M> = xs.iter().map(|_| DpmPP2M::new()).collect();
+    let total = xs.len();
+    let mut running: Vec<usize> = (0..total).collect();
+    let mut latents: Vec<Option<Vec<f32>>> = xs.into_iter().map(Some).collect();
+    let mut solvers: Vec<DpmPP2M> = (0..total).map(|_| DpmPP2M::new()).collect();
     let total_steps = sigmas.len() - 1;
     on_step(0, total_steps);
     for i in 0..total_steps {
-        stopped()?;
+        running.retain(|&r| {
+            let stays = !gone(r);
+            if !stays {
+                latents[r] = None;
+            }
+            stays
+        });
+        if running.is_empty() {
+            return Err(crate::tensor::Error(
+                "generation cancelled (client disconnected)".into(),
+            ));
+        }
+        let guided = running.iter().any(|&r| guidance[r] > 1.0);
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         // The model is fed the SCALED latent and the timestep matching sigma.
         let scale = input_scale(sigma);
-        let scaled: Vec<f32> = xs.iter().flatten().map(|v| v * scale).collect();
-        let (eps_c, eps_u) = predict(&scaled, sigma, guided)?;
-        for (r, x) in xs.iter_mut().enumerate() {
-            let span = r * plane..(r + 1) * plane;
+        let scaled: Vec<f32> = running
+            .iter()
+            .flat_map(|&r| latents[r].iter().flatten().map(|v| v * scale))
+            .collect();
+        let (eps_c, eps_u) = predict(&scaled, sigma, guided, &running)?;
+        for (slot, &r) in running.iter().enumerate() {
+            let span = slot * plane..(slot + 1) * plane;
             let eps = match (&eps_u, guidance[r] > 1.0) {
                 (Some(eps_u), true) => cfg(&eps_c[span.clone()], &eps_u[span], guidance[r]),
                 _ => eps_c[span].to_vec(),
             };
+            let x = latents[r].take().unwrap_or_default();
             let d = denoised(x.as_slice(), &eps, sigma);
-            *x = match sampler {
+            latents[r] = Some(match sampler {
                 SamplerKind::Euler => euler_step(x.as_slice(), &d, sigma, sigma_next),
                 SamplerKind::DpmPP2M => {
                     let prev = if i == 0 { None } else { Some(sigmas[i - 1]) };
                     solvers[r].step(x.as_slice(), &d, prev, sigma, sigma_next)
                 }
-            };
+            });
         }
         on_step(i + 1, total_steps);
     }
-    Ok(xs)
+    Ok(latents)
 }
 
 /// Resident bytes of the part of a single-file checkpoint under `prefix`, from the
@@ -611,7 +634,7 @@ impl SdxlPipeline {
         height: usize,
         steps: usize,
         on_step: crate::inference::sample::StepSink,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         self.render_rows(rows, width, height, steps, None, on_step)
     }
 
@@ -638,6 +661,7 @@ impl SdxlPipeline {
         };
         self.render_rows(&[row], width, height, steps, init, on_step)?
             .pop()
+            .flatten()
             .ok_or_else(|| crate::tensor::Error("sdxl: the render produced no image".into()))
     }
 
@@ -671,7 +695,7 @@ impl SdxlPipeline {
         steps: usize,
         init: Option<(&[u8], f32)>,
         on_step: crate::inference::sample::StepSink,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -707,8 +731,16 @@ impl SdxlPipeline {
             ctx_c.push(c);
             ctx_u.push(u);
         }
-        let (ctx_c, ctx_u) = (stack_rows(&ctx_c)?, stack_rows(&ctx_u)?);
-        let (label_c, label_u) = (stack_rows(&label_c)?, stack_rows(&label_u)?);
+        // The stack of every row, and the rows alone for the pass that loses some.
+        let (stack_ctx_c, stack_ctx_u) = (stack_rows(&ctx_c)?, stack_rows(&ctx_u)?);
+        let (stack_label_c, stack_label_u) = (stack_rows(&label_c)?, stack_rows(&label_u)?);
+        let kept_stack = |alone: &[Tensor], whole: &Tensor, running: &[usize]| -> Result<Tensor> {
+            if running.len() == alone.len() {
+                return Ok(whole.clone());
+            }
+            let chosen: Vec<Tensor> = running.iter().map(|&r| alone[r].clone()).collect();
+            stack_rows(&chosen)
+        };
 
         let full = match scheduler {
             SchedulerKind::Normal => self.schedule.sigma_ladder(steps),
@@ -768,44 +800,47 @@ impl SdxlPipeline {
                 .to_device(&Device::Cpu)?
                 .to_vec_f32())
         };
-        let predict = |scaled: &[f32], sigma: f32, guided: bool| -> Result<Predictions> {
-            let xin = Tensor::from_vec_f32(scaled.to_vec(), vec![n, LATENT_CHANNELS, lh, lw])?
+        let predict =
+            |scaled: &[f32], sigma: f32, guided: bool, running: &[usize]| -> Result<Predictions> {
+                let ctx_c = kept_stack(&ctx_c, &stack_ctx_c, running)?;
+                let ctx_u = kept_stack(&ctx_u, &stack_ctx_u, running)?;
+                let label_c = kept_stack(&label_c, &stack_label_c, running)?;
+                let label_u = kept_stack(&label_u, &stack_label_u, running)?;
+                let xin = Tensor::from_vec_f32(
+                    scaled.to_vec(),
+                    vec![running.len(), LATENT_CHANNELS, lh, lw],
+                )?
                 .to_device(&self.device)?
                 .to_dtype(self.unet.dtype())?;
-            let t = self.schedule.timestep_for(sigma);
-            // The residuals depend on the latent AND the conditioning, so they are
-            // recomputed per step and per guidance branch - the same rule the UNet
-            // itself follows. Skipped entirely without a control image.
-            let res_c = self.control_residuals(&xin, t, &ctx_c, &label_c)?;
-            let eps_c = self
-                .unet
-                .forward_controlled(&xin, t, &ctx_c, &label_c, res_c.as_ref())?;
-            let eps_u = if guided {
-                let res_u = self.control_residuals(&xin, t, &ctx_u, &label_u)?;
-                Some(to_host(self.unet.forward_controlled(
-                    &xin,
-                    t,
-                    &ctx_u,
-                    &label_u,
-                    res_u.as_ref(),
-                )?)?)
-            } else {
-                None
+                let t = self.schedule.timestep_for(sigma);
+                // The residuals depend on the latent AND the conditioning, so they are
+                // recomputed per step and per guidance branch - the same rule the UNet
+                // itself follows. Skipped entirely without a control image.
+                let res_c = self.control_residuals(&xin, t, &ctx_c, &label_c)?;
+                let eps_c =
+                    self.unet
+                        .forward_controlled(&xin, t, &ctx_c, &label_c, res_c.as_ref())?;
+                let eps_u = if guided {
+                    let res_u = self.control_residuals(&xin, t, &ctx_u, &label_u)?;
+                    Some(to_host(self.unet.forward_controlled(
+                        &xin,
+                        t,
+                        &ctx_u,
+                        &label_u,
+                        res_u.as_ref(),
+                    )?)?)
+                } else {
+                    None
+                };
+                Ok((to_host(eps_c)?, eps_u))
             };
-            Ok((to_host(eps_c)?, eps_u))
-        };
-        // The batch stops when every request in it has stopped; a row whose request went
-        // away runs on with the others and its image is not read.
-        let stopped = || -> Result<()> {
-            match rows.iter().map(|r| r.cancel).collect::<Option<Vec<_>>>() {
-                Some(tokens) if tokens.iter().all(|c| c.is_cancelled()) => tokens[0].bail(),
-                _ => Ok(()),
-            }
-        };
-        let xs = sample_rows(xs, &guidance, sigmas, sampler, predict, stopped, on_step)?;
+        // A row whose request went away leaves the pass at the next step, and the batch
+        // stops when no row is left.
+        let gone = |r: usize| rows[r].cancel.is_some_and(|c| c.is_cancelled());
+        let xs = sample_rows(xs, &guidance, sigmas, sampler, predict, gone, on_step)?;
 
         xs.into_iter()
-            .map(|x| self.decode_latent(x, width, height))
+            .map(|x| x.map(|x| self.decode_latent(x, width, height)).transpose())
             .collect()
     }
 
@@ -857,8 +892,8 @@ mod tests {
     /// wrong offset, or mixed with its neighbour, changes the answer.
     fn row_denoiser(
         plane: usize,
-    ) -> impl FnMut(&[f32], f32, bool) -> crate::tensor::Result<Predictions> {
-        move |scaled: &[f32], sigma: f32, guided: bool| {
+    ) -> impl FnMut(&[f32], f32, bool, &[usize]) -> crate::tensor::Result<Predictions> {
+        move |scaled: &[f32], sigma: f32, guided: bool, _running: &[usize]| {
             let branch = |bias: f32| -> Vec<f32> {
                 scaled
                     .chunks(plane)
@@ -886,7 +921,7 @@ mod tests {
     fn a_batch_samples_each_row_as_it_samples_alone() {
         let plane = LATENT_CHANNELS * 4 * 4;
         let sigmas = Schedule::new().sigma_ladder(6);
-        let never = || -> crate::tensor::Result<()> { Ok(()) };
+        let never = |_: usize| false;
         for sampler in [SamplerKind::DpmPP2M, SamplerKind::Euler] {
             let rows = [(latent(1, plane), 7.0f32), (latent(2, plane), 1.0)];
             let alone: Vec<Vec<f32>> = rows
@@ -903,6 +938,7 @@ mod tests {
                     )
                     .expect("alone")
                     .remove(0)
+                    .expect("a row that ran")
                 })
                 .collect();
             let together = sample_rows(
@@ -914,36 +950,72 @@ mod tests {
                 never,
                 &crate::inference::sample::no_progress,
             )
-            .expect("together");
+            .expect("together")
+            .into_iter()
+            .map(|x| x.expect("a row that ran"))
+            .collect::<Vec<_>>();
             assert_eq!(together, alone, "a row's latent moved in the batch");
             assert_ne!(together[0], together[1], "the rows must stay distinct");
         }
     }
 
-    /// A batch stops only when every request in it has stopped.
+    /// A row whose request goes away leaves the pass and is answered `None`.
+    /// The rows that stay come out exactly as they come out when no row leaves.
     #[test]
-    fn a_batch_runs_until_every_request_has_stopped() {
+    fn a_row_that_leaves_the_pass_does_not_move_the_others() {
+        let plane = LATENT_CHANNELS * 4 * 4;
+        let sigmas = Schedule::new().sigma_ladder(6);
+        let rows = [
+            (latent(1, plane), 7.0f32),
+            (latent(2, plane), 1.0),
+            (latent(3, plane), 5.0),
+        ];
+        let run = |gone: &dyn Fn(usize, usize) -> bool| {
+            let step = std::cell::Cell::new(0usize);
+            let seen = std::cell::RefCell::new(Vec::new());
+            let out = sample_rows(
+                rows.iter().map(|(x, _)| x.clone()).collect(),
+                &rows.iter().map(|(_, g)| *g).collect::<Vec<_>>(),
+                &sigmas,
+                SamplerKind::DpmPP2M,
+                |scaled: &[f32], sigma: f32, guided: bool, running: &[usize]| {
+                    seen.borrow_mut().push(running.to_vec());
+                    row_denoiser(plane)(scaled, sigma, guided, running)
+                },
+                |r| gone(r, step.get()),
+                &|done: usize, _| step.set(done),
+            )
+            .expect("a batch with rows left");
+            (out, seen.into_inner())
+        };
+        let (whole, _) = run(&|_, _| false);
+        let (out, seen) = run(&|r, step| r == 1 && step >= 2);
+        assert_eq!(out[0], whole[0], "a row moved when another one left");
+        assert_eq!(out[2], whole[2], "a row moved when another one left");
+        assert!(out[1].is_none(), "the row that left has no latent");
+        assert_eq!(seen[1], vec![0, 1, 2]);
+        assert_eq!(
+            seen[2],
+            vec![0, 2],
+            "the row that left is no longer computed"
+        );
+    }
+
+    /// The pass stops with an error when no row is left to compute.
+    #[test]
+    fn a_batch_stops_when_no_row_is_left() {
         let plane = LATENT_CHANNELS;
         let sigmas = Schedule::new().sigma_ladder(4);
         let steps = std::cell::Cell::new(0usize);
         let counted = |_: usize, _: usize| steps.set(steps.get() + 1);
-        let polls = std::cell::Cell::new(0usize);
-        // Stops on the third poll, as a batch whose last request goes away there would.
-        let stopped = || -> crate::tensor::Result<()> {
-            polls.set(polls.get() + 1);
-            if polls.get() >= 3 {
-                Err(crate::tensor::Error("cancelled".into()))
-            } else {
-                Ok(())
-            }
-        };
+        // Both requests go away before the third step.
         let out = sample_rows(
             vec![latent(1, plane), latent(2, plane)],
             &[7.0, 7.0],
             &sigmas,
             SamplerKind::DpmPP2M,
             row_denoiser(plane),
-            stopped,
+            |_| steps.get() >= 3,
             &counted,
         );
         assert!(out.is_err());
