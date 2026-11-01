@@ -103,6 +103,7 @@ pub(super) fn plain_transcription() -> AudioTranscribeParams {
         timestamps: false,
         collect_metrics: false,
         initial_prompt: None,
+        cancel: None,
     }
 }
 

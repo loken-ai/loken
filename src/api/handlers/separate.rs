@@ -162,7 +162,15 @@ pub(crate) async fn audio_separate(state: State<APIServer>, mut multipart: Multi
     // Decode, separate and mix down are all blocking compute.
     // One media job at a time: the separation takes a card for its windows.
     let _media_guard = state.media_lock_for(SEPARATION_MODEL, "separation").await;
+    let cancel = crate::inference::serve::cancel::CancelToken::new();
+    let guard = crate::inference::serve::cancel::CancelGuard::new(cancel.clone());
+    let _registered = crate::inference::serve::cancel::registry::Entry::new(
+        crate::inference::engine::cache_scope::CacheScope::current(),
+        &crate::api::request_id::render_id(),
+        &cancel,
+    );
     let done = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>, f32), String> {
+        let _stop = crate::inference::serve::cancel::scoped::publish(&cancel);
         let (left, right) = decode_to_stereo_44k(&bytes)?;
         let frames = left.len();
         let seconds = frames as f32 / SAMPLE_RATE as f32;
@@ -187,6 +195,7 @@ pub(crate) async fn audio_separate(state: State<APIServer>, mut multipart: Multi
         Ok((wav(&vocals), wav(&inst), seconds))
     })
     .await;
+    guard.disarm();
 
     let (vocals, inst, seconds) = match done {
         Ok(Ok(v)) => v,

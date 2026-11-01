@@ -408,6 +408,12 @@ async fn render_upload_batch(
     let bounces_before = crate::tensor::bounce::pressure_bounces();
     let mut data = Vec::with_capacity(form.n as usize);
     let mut failures: Vec<String> = Vec::new();
+    // Every image of the batch shares the token, so naming the request stops the batch.
+    let _registered = crate::inference::serve::cancel::registry::Entry::new(
+        crate::inference::engine::cache_scope::CacheScope::current(),
+        &crate::api::request_id::render_id(),
+        &base.cancel,
+    );
     for i in 0..form.n {
         let image_seed = job.seed.wrapping_add(u64::from(i));
         let params = ImageGenParams {

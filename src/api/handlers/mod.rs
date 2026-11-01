@@ -3022,6 +3022,9 @@ impl APIServer {
             // outer, Set inner - so on request flow Set runs first
             // (mints the ID), then Propagate snapshots it for the
             // response.
+            .layer(axum::middleware::from_fn(
+                crate::api::request_id::scope_request_id,
+            ))
             .layer(axum::middleware::from_fn(mirror_request_id))
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

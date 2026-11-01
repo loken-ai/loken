@@ -9,6 +9,7 @@ mod types;
 
 /// Optional collaborators for the media endpoints.
 pub mod assist;
+pub mod request_id;
 
 /// The model-resolution helpers the render CLI shares with the HTTP handlers, so that
 /// both agree on which family a name is, where its checkpoint lives, WHICH LOADER puts

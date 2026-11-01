@@ -592,7 +592,7 @@ pub(crate) async fn video_generations(
         // Publish it so the client can stop this render by name. Dropping the connection is
         // NOT a dependable signal - measured: a clip ran to completion for nobody after its
         // client had gone - so the client is given something it can act on instead.
-        let render_id = next_render_id();
+        let render_id = crate::api::request_id::render_id();
         let reg = crate::inference::serve::cancel::registry::Entry::new(
             crate::inference::engine::cache_scope::CacheScope::current(),
             &render_id,
@@ -752,7 +752,7 @@ pub(crate) async fn video_generations(
     let cancel_render = cancel.clone();
     // Registered for the same reason as the streaming route: this one has no early message
     // in which to hand the identifier back, so a caller finds it through GET /v1/renders.
-    let render_id = next_render_id();
+    let render_id = crate::api::request_id::render_id();
     let _reg = crate::inference::serve::cancel::registry::Entry::new(
         crate::inference::engine::cache_scope::CacheScope::current(),
         &render_id,
@@ -1075,6 +1075,8 @@ pub(crate) async fn images_generations(
         None => None,
     };
     let render_cancel = crate::inference::serve::cancel::CancelToken::new();
+    let caller = crate::inference::engine::cache_scope::CacheScope::current();
+    let render_id = crate::api::request_id::render_id();
     let sampler_name = req.sampler.clone();
     let lora_list = match parse_loras(req.loras.as_ref()) {
         Ok(v) => v,
@@ -1177,6 +1179,11 @@ pub(crate) async fn images_generations(
         let stream_state = state.0.clone();
 
         let stream = stream! {
+            let _registered = crate::inference::serve::cancel::registry::Entry::new(
+                caller,
+                &render_id,
+                &render_cancel,
+            );
             // Phase 0: get the model up, REPORTING. A cold checkpoint is the longest part
             // of a cold render and it used to happen before the response existed at all;
             // the loaders count every tensor they read (progress::scoped), and this is the
@@ -1351,6 +1358,11 @@ pub(crate) async fn images_generations(
         // above to either the caller's seed or a server-picked
         // random u64).
         let image_seed = base_params.seed.unwrap_or(0).wrapping_add(i as u64);
+        let _registered = crate::inference::serve::cancel::registry::Entry::new(
+            caller,
+            &render_id,
+            &render_cancel,
+        );
         let params = ImageGenParams {
             seed: Some(image_seed),
             sampler: sampler_name.clone(),

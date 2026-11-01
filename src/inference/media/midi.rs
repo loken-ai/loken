@@ -198,6 +198,8 @@ pub fn render_midi(
     let mut gen: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut pos = pp;
     while gen.len() < max_tokens {
+        // The render stops at the next token when its request is cancelled.
+        crate::inference::serve::cancel::scoped::bail().map_err(|e| e.to_string())?;
         gen.push(tokid);
         let l = model
             .forward(&Tensor::from_vec(vec![tokid], (1, 1), &dev)?, pos)

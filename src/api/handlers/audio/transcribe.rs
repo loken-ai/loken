@@ -20,10 +20,28 @@ pub(super) async fn decode_and_transcribe(
         return Err((StatusCode::BAD_REQUEST, "the audio is empty".to_string()));
     }
     validate_audio_input_size(bytes.len()).map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e))?;
+    let stopped = || {
+        params
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.is_cancelled())
+            .then(|| {
+                (
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                    "the transcription was cancelled".to_string(),
+                )
+            })
+    };
     let (samples, sr) = decode_audio_blocking(bytes, "audio").await?;
+    if let Some(answer) = stopped() {
+        return Err(answer);
+    }
     ensure_whisper_model_loaded(state, model_name)
         .await
         .map_err(|e| (http_status_for_load_error(&e), e))?;
+    if let Some(answer) = stopped() {
+        return Err(answer);
+    }
     state
         .audio_engine
         .transcribe(samples, sr, params)
@@ -83,6 +101,13 @@ async fn transcribe_with_audio_model(
         ..Default::default()
     };
     let _cancel = engine.cancel_guard(&mut params);
+    let _registered = params.cancel.clone().map(|flag| {
+        crate::inference::serve::cancel::registry::Entry::new(
+            crate::inference::engine::cache_scope::CacheScope::current(),
+            &crate::api::request_id::render_id(),
+            &crate::inference::serve::cancel::CancelToken::from_flag(flag),
+        )
+    });
     let out = engine
         .generate(&prompt, params)
         .await
@@ -300,6 +325,13 @@ pub(super) async fn audio_decode_endpoint(
         }
     }
     let collect_metrics = matches!(response_format.as_str(), "verbose_json" | "srt" | "vtt");
+    let cancel = crate::inference::serve::cancel::CancelToken::new();
+    let guard = crate::inference::serve::cancel::CancelGuard::new(cancel.clone());
+    let _registered = crate::inference::serve::cancel::registry::Entry::new(
+        crate::inference::engine::cache_scope::CacheScope::current(),
+        &crate::api::request_id::render_id(),
+        &cancel,
+    );
     let params = AudioTranscribeParams {
         language,
         temperature,
@@ -307,6 +339,7 @@ pub(super) async fn audio_decode_endpoint(
         timestamps: request_timestamps,
         collect_metrics,
         initial_prompt,
+        cancel: Some(cancel),
     };
     // The wall time goes out as `Server-Timing` (RFC 8673), for clients diagnosing a slow
     // transcription without server-side log access.
@@ -315,6 +348,7 @@ pub(super) async fn audio_decode_endpoint(
         Ok(r) => r,
         Err((code, e)) => return err_resp(code, e),
     };
+    guard.disarm();
     let transcribe_ms = transcribe_start.elapsed().as_secs_f64() * 1000.0;
     info!(
         "Audio {task:?}: duration={duration_s:.1}s lang={lang} transcribe={transcribe_ms:.0}ms",

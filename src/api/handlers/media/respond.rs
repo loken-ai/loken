@@ -546,12 +546,3 @@ mod preserve_tests {
         assert_eq!(out.get_pixel(32, 32), &image::Rgb([200, 100, 50]));
     }
 }
-
-/// A fresh identifier for a render in flight.
-///
-/// Monotonic within the process, which is all the registry needs: it exists so a client can
-/// name the work it started and stop it, not to be meaningful across restarts.
-pub(super) fn next_render_id() -> String {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    format!("r{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-}

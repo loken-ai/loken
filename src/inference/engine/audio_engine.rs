@@ -72,6 +72,9 @@ pub struct AudioTranscribeParams {
     /// way to bias vocabulary / continue a previous segment. Caller
     /// is responsible for length (we truncate at 220 tokens).
     pub initial_prompt: Option<String>,
+    /// Set by the request that can be cancelled: the transcription stops at its next window
+    /// and its next decoded token.
+    pub cancel: Option<crate::inference::serve::cancel::CancelToken>,
 }
 
 /// One whisper segment - a contiguous span of audio with start/end
@@ -546,7 +549,16 @@ fn transcribe_group_blocking(
     s: &mut WhisperModelState,
     jobs: &[(Vec<f32>, AudioTranscribeParams)],
 ) -> Vec<AnyResult<TranscribeResult>> {
-    let cut: Vec<AnyResult<MelWindows>> = jobs.iter().map(|(pcm, _)| mel_windows(s, pcm)).collect();
+    let cut: Vec<AnyResult<MelWindows>> = jobs
+        .iter()
+        .map(|(pcm, params)| {
+            // A cancelled job skips its spectrum; the others of the group go on.
+            if let Some(cancel) = &params.cancel {
+                cancel.bail().map_err(|e| anyhow!("{e}"))?;
+            }
+            mel_windows(s, pcm)
+        })
+        .collect();
     let all: Vec<&Tensor> = cut.iter().flatten().flat_map(|w| w.mels.iter()).collect();
     let per_pass = crate::inference::serve::gather::rows_that_fit(s.window_bytes, usize::MAX);
     let features = encode_in_passes(&all, per_pass, |pass| encode_pass(s, pass));
@@ -735,6 +747,9 @@ fn transcribe_windows(
     let mut first_chunk_no_speech: Option<f32> = None;
     let mut effective = params.clone();
     for (seek, audio_features) in windows.starts.iter().zip(features) {
+        if let Some(cancel) = &params.cancel {
+            cancel.bail().map_err(|e| anyhow!("{e}"))?;
+        }
         let chunk_offset_s = (*seek as f32) * 0.01; // 1 frame = 10 ms in whisper's mel
         let audio_features = audio_features.to_device(&s.device)?;
         let dec = decode_segment(s, &audio_features, &effective, chunk_offset_s)?;
@@ -985,6 +1000,9 @@ fn decode_segment(
     // sampled token - the cached K/V handle the prefix.
     s.model.decoder.restart_sequence();
     for i in 0..sample_len {
+        if let Some(cancel) = &params.cancel {
+            cancel.bail().map_err(|e| anyhow!("{e}"))?;
+        }
         let step_tokens: &[u32] = if i == 0 {
             tokens.as_slice()
         } else {

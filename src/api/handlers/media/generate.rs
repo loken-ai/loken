@@ -655,6 +655,8 @@ pub(crate) async fn handle_image_generation(
     };
 
     let start = std::time::Instant::now();
+    let caller = crate::inference::engine::cache_scope::CacheScope::current();
+    let render_id = crate::api::request_id::render_id();
 
     if request.stream {
         // Streaming mode: start SSE immediately and show loading + generation progress.
@@ -681,6 +683,11 @@ pub(crate) async fn handle_image_generation(
             // The media gate and the job record last as long as the render: the handler
             // returns with the response built, the stream is what renders.
             let _media_guard = _media_guard;
+            let _registered = crate::inference::serve::cancel::registry::Entry::new(
+                caller,
+                &render_id,
+                &params.cancel,
+            );
             // Phase 1: get the model up, REPORTING - the single family-aware entry point,
             // which also owns the unload-on-family-switch, the headroom protocol and the
             // load retry cascade this route never had.
@@ -836,6 +843,11 @@ pub(crate) async fn handle_image_generation(
             return Ok(Json(response).into_response());
         }
 
+        let _registered = crate::inference::serve::cancel::registry::Entry::new(
+            caller,
+            &render_id,
+            &params.cancel,
+        );
         let _cg = crate::inference::serve::cancel::CancelGuard::new(params.cancel.clone());
         let _res = generate_image_resilient(state, model_name, geom, &request.prompt, params).await;
         _cg.disarm();

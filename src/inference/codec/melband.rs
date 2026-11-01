@@ -545,6 +545,8 @@ impl MelBandRoformer {
         let (cos_t, sin_t) = self.rope_tables(&self.time_freqs, t)?;
         let (cos_f, sin_f) = self.rope_tables(&self.freq_freqs, NUM_BANDS)?;
         for (li, (time_block, freq_block)) in self.layers.iter().enumerate() {
+            // A cancelled request stops before the next block, not at the end of the chunk.
+            crate::inference::serve::cancel::scoped::bail()?;
             // time attention: batch = bands, seq = frames
             let xt = x.transpose(0, 1)?.contiguous()?; // [bands, t, dim]
             let xt = time_block.forward(&xt, &cos_t, &sin_t)?;
@@ -686,6 +688,8 @@ impl MelBandRoformer {
         let mut n_chunks = 0usize;
         let total_chunks = plen.div_ceil(step);
         while i < plen {
+            // A cancelled request stops before the next chunk.
+            crate::inference::serve::cancel::scoped::bail()?;
             let seg_len = chunk.min(plen - i);
             // chunk extraction + padding to full size (reflect when > chunk/2 remains)
             let mut part = vec![0f32; channels * chunk];

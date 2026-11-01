@@ -642,6 +642,9 @@ pub(crate) async fn audio_generations(
     // Counted where it runs, like a generation: a node speaking is not an idle node.
     let _inflight = crate::distributed::rate_meter::InFlight::enter();
     use axum::response::IntoResponse;
+    // The caller and the identifier its renders register under, read before any stream.
+    let caller = crate::inference::engine::cache_scope::CacheScope::current();
+    let render_id = crate::api::request_id::render_id();
     // The job goes to a node whose catalogue holds the model when this one's does not.
     {
         let requested = crate::api::handlers::catalogue::sound_entry(&body.0);
@@ -867,7 +870,15 @@ pub(crate) async fn audio_generations(
                 .as_deref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let cancel_midi = crate::inference::serve::cancel::CancelToken::new();
+            let guard_midi = crate::inference::serve::cancel::CancelGuard::new(cancel_midi.clone());
+            let _reg_midi = crate::inference::serve::cancel::registry::Entry::new(
+                caller,
+                &render_id,
+                &cancel_midi,
+            );
             let res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_midi);
                 crate::inference::media::midi::render_midi(
                     &prompt_m,
                     &midi_path,
@@ -881,6 +892,7 @@ pub(crate) async fn audio_generations(
                 .map_err(|e| e.to_string())
             })
             .await;
+            guard_midi.disarm();
             let mid = match res {
                 Ok(Ok(m)) => m,
                 Ok(Err(e)) => {
@@ -948,6 +960,7 @@ pub(crate) async fn audio_generations(
         // completion after the listener has gone.
         let cancel_m = crate::inference::serve::cancel::CancelToken::new();
         let guard_m = crate::inference::serve::cancel::CancelGuard::new(cancel_m.clone());
+        let reg_m = cancel_m.clone();
         let load_tx = tx.clone();
         // The job record follows the render: every count and every placed part lands in
         // it, which is what a listing of this node shows while the render runs.
@@ -990,6 +1003,7 @@ pub(crate) async fn audio_generations(
         let stream = async_stream::stream! {
             // Lives with the stream, not the handler call - see the stable-audio branch.
             let _cancel_guard = guard_m;
+            let _registered = crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &reg_m);
             // So does the media gate and the job record: the render runs on past the
             // handler, and both must last as long as it does.
             let _media_guard = _media_guard;
@@ -1066,6 +1080,7 @@ pub(crate) async fn audio_generations(
         // The render outlives the request unless the sampler can see the token.
         let cancel_s = crate::inference::serve::cancel::CancelToken::new();
         let guard_s = crate::inference::serve::cancel::CancelGuard::new(cancel_s.clone());
+        let reg_s = cancel_s.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, usize, usize)>(64);
         let energy = crate::energy_report::begin();
         let load_tx = tx.clone();
@@ -1104,6 +1119,7 @@ pub(crate) async fn audio_generations(
             // The guard must live as long as the STREAM, not the handler call: it
             // is what turns "the client stopped reading" into a stopped sampler.
             let _cancel_guard = guard_s;
+            let _registered = crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &reg_s);
             let _media_guard = _media_guard;
             yield Ok::<_, axum::Error>(Event::default().data(started_event(&model_s, node_s.as_deref())));
             while let Some((phase, step, total)) = rx.recv().await {
@@ -1150,6 +1166,7 @@ pub(crate) async fn audio_generations(
         // stream is dropped.
         let cancel_x = crate::inference::serve::cancel::CancelToken::new();
         let guard_x = crate::inference::serve::cancel::CancelGuard::new(cancel_x.clone());
+        let reg_x = cancel_x.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, String> {
             let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_x);
             crate::inference::model::ezaudio::pipeline::render_with_progress(
@@ -1171,6 +1188,7 @@ pub(crate) async fn audio_generations(
         let t0m = std::time::Instant::now();
         let stream = async_stream::stream! {
             let _cancel_guard = guard_x;
+            let _registered = crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &reg_x);
             yield Ok::<_, axum::Error>(Event::default().data(started_event(&model_s, node_s.as_deref())));
             while let Some((phase, step, total)) = rx.recv().await {
                 yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m, node_s.as_deref())));
@@ -1214,7 +1232,12 @@ pub(crate) async fn audio_generations(
         let record = _media_guard.reporter();
         let load_record = record.clone();
         let place_fn = record.placement_fn();
+        let cancel_j = crate::inference::serve::cancel::CancelToken::new();
+        let guard_j = crate::inference::serve::cancel::CancelGuard::new(cancel_j.clone());
+        let _registered_j =
+            crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &cancel_j);
         let res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_j);
             let mcfg: crate::inference::model::acestep::music::MusicConfig =
                 serde_json::from_value(cfg_json).map_err(|e| format!("bad config: {e}"))?;
             let _counts = crate::inference::serve::progress::scoped::publish(
@@ -1234,6 +1257,7 @@ pub(crate) async fn audio_generations(
             std::fs::read(&out_read).map_err(|e| format!("read rendered wav: {e}"))
         })
         .await;
+        guard_j.disarm();
         let wav = match res {
             Ok(Ok(w)) => w,
             Ok(Err(e)) => {
@@ -1273,6 +1297,8 @@ pub(crate) async fn audio_generations(
         let sao_init_s = sao_init.clone();
         let cancel_n = crate::inference::serve::cancel::CancelToken::new();
         let guard_n = crate::inference::serve::cancel::CancelGuard::new(cancel_n.clone());
+        let _registered_n =
+            crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &cancel_n);
         let rendered = tokio::task::spawn_blocking(move || {
             crate::inference::model::stable_audio::render_with_init(
                 &sao_prompt,
@@ -1318,6 +1344,8 @@ pub(crate) async fn audio_generations(
         let sfx_negative = negative_body.clone();
         let cancel_x = crate::inference::serve::cancel::CancelToken::new();
         let guard_x = crate::inference::serve::cancel::CancelGuard::new(cancel_x.clone());
+        let _registered_x =
+            crate::inference::serve::cancel::registry::Entry::new(caller, &render_id, &cancel_x);
         let rendered = tokio::task::spawn_blocking(move || {
             let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_x);
             crate::inference::model::ezaudio::pipeline::render(
@@ -2397,7 +2425,7 @@ pub(super) fn tts_events_response(
     use axum::response::sse::{Event, KeepAlive, Sse};
     use axum::response::IntoResponse;
 
-    let render_id = next_speech_id();
+    let render_id = crate::api::request_id::current().unwrap_or_else(next_speech_id);
     let cancel = crate::inference::serve::cancel::CancelToken::new();
     let id_for_event = render_id.clone();
     let t0 = std::time::Instant::now();

@@ -26,6 +26,11 @@ impl CancelToken {
         self.0.store(true, Ordering::Relaxed);
     }
 
+    /// The token of a flag a generation loop already reads.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     /// Whether `other` is a handle on the same flag.
     pub fn same(&self, other: &CancelToken) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -354,6 +359,16 @@ pub mod registry {
                 .contains_key(&(scope, "render-b".to_string()));
             assert!(held, "the displaced entry must not remove the newer one");
             forget(scope, "render-b", &second);
+        }
+
+        /// A render that reads a plain flag is stopped by cancelling the token made from it.
+        #[tokio::test]
+        async fn a_token_made_from_a_flag_sets_the_flag() {
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let scope = CacheScope::of_key("d");
+            let _entry = Entry::new(scope, "render-d", &CancelToken::from_flag(flag.clone()));
+            assert!(scope.serve(async { cancel("render-d") }).await);
+            assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         }
 
         /// A caller sees, cancels and displaces only its own renders.
