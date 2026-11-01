@@ -48,6 +48,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Matmul: dequantise on the card for one call when its workspace is short, keeping no copy.
 - API: keep the prompt caches, stored responses, files, batches and renders of each API key to itself.
 - Renders: stop a render by its X-Request-Id, a transcription or separation sooner, a cancelled SDXL row at once.
+- Offload: say what a card keeps and has free when it declines a step.
 - Sessions: keep no token list for each session id, and count the resident conversation.
 - Loaded models: list them without holding the table through each engine's wait.
 - Rate limit: tell a refused client how long to wait in Retry-After.

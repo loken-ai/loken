@@ -548,9 +548,19 @@ impl Card {
 
     fn decline(&self, what: &str, e: &Error) {
         if !self.declined.swap(true, Ordering::Relaxed) {
+            let (kept, kept_bytes) = {
+                let tier = self.tier();
+                (
+                    tier.kept.len(),
+                    tier.kept.values().map(|v| v.bytes).sum::<usize>(),
+                )
+            };
             tracing::warn!(
-                "card {}: no memory for {what} ({e}); the host runs what the card has no room for",
-                self.ordinal
+                "card {}: no memory for {what} ({e}); the host runs what the card has no room for. \
+                 The card keeps {kept} experts of {} MB and the driver reports {} MB free",
+                self.ordinal,
+                kept_bytes >> 20,
+                self.free_now().map_or(0, |free| free >> 20)
             );
         }
     }
