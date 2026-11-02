@@ -1225,4 +1225,170 @@ mod tests {
     fn a_dense_bf16_checkpoint_gives_the_reference_logits() {
         logits_match("bf16", 8e-2);
     }
+
+    /// The model and the prompt of the seeded toy checkpoint, on the CPU, as the logits tests
+    /// build them.
+    fn toy_model_and_ids(
+        dir: &str,
+    ) -> (
+        crate::inference::generic_transformer::GenericHeteroTransformer,
+        Vec<u32>,
+    ) {
+        use crate::inference::load::awq_loader as awql;
+        use crate::inference::place::layer_executor::HeteroPlan;
+        use crate::tensor::safetensors::MmapedSafetensors;
+        use crate::tensor::Device;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/vectors/dense_llama")
+            .join(dir);
+        let cfg = awql::parse_config_json(root.to_str().unwrap()).unwrap();
+        let shards = vec![root.join("model.safetensors").to_string_lossy().to_string()];
+        let header = awql::synth_gguf_content(&cfg, awql::AwqTensorPresence::default());
+        let ck = DenseCheckpoint::open(&header, &shards, &cfg).unwrap();
+        let plan = HeteroPlan::calculate_with_kv(cfg.n_layers, 1 << 20, &[], &[], 1.0, 0);
+        let model =
+            crate::inference::generic_transformer::GenericHeteroTransformer::from_dense_checkpoint(
+                &ck,
+                &HashMap::new(),
+                &plan,
+                crate::inference::engine::llm_engine::KvQuant::Off,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let vectors = unsafe { MmapedSafetensors::new(root.join("vectors.safetensors")) }.unwrap();
+        let ids = vectors
+            .load("ids", &Device::Cpu)
+            .unwrap()
+            .to_dtype(crate::tensor::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| *v as u32)
+            .collect();
+        (model, ids)
+    }
+
+    /// The paged slots of `len` positions in the blocks `blocks`.
+    fn slots_of(blocks: &[u32], len: usize, block_size: usize) -> Vec<usize> {
+        (0..len)
+            .map(|p| blocks[p / block_size] as usize * block_size + p % block_size)
+            .collect()
+    }
+
+    /// The batch decode of a sequence gives the logits it gives alone: the other sequences of
+    /// the batch, of other lengths, change none of its rows. Reports the largest difference as
+    /// a share of the logits' range.
+    #[test]
+    fn a_sequence_decodes_to_the_same_logits_alone_and_inside_a_batch() {
+        use crate::inference::cache::paged_kv::PagedKvStore;
+        let (model, ids) = toy_model_and_ids("f32");
+        assert!(model.cb_eligible(), "{:?}", model.cb_unsupported_reason());
+        let (n_kv, hd, n_layers, vocab) = model.paged_geometry();
+        let device = model.compute_device();
+        let (block_size, num_blocks) = (4usize, 32usize);
+        let stores = || -> Vec<PagedKvStore> {
+            (0..n_layers)
+                .map(|_| {
+                    PagedKvStore::new(
+                        num_blocks,
+                        block_size,
+                        n_kv,
+                        hd,
+                        crate::tensor::DType::F32,
+                        &device,
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        // Three sequences of different lengths, each from its own blocks.
+        let n = ids.len();
+        let prompts: Vec<Vec<u32>> = vec![
+            ids.clone(),
+            (0..n - 2).map(|i| ids[(i + 3) % n]).collect(),
+            (0..n - 1).map(|i| ids[(i + 5) % n]).collect(),
+        ];
+        let blocks: Vec<Vec<u32>> = (0..prompts.len())
+            .map(|s| {
+                (0..(n / block_size + 2) as u32)
+                    .map(|b| s as u32 * 8 + b)
+                    .collect()
+            })
+            .collect();
+        let slots: Vec<Vec<usize>> = prompts
+            .iter()
+            .zip(&blocks)
+            .map(|(p, b)| slots_of(b, p.len(), block_size))
+            .collect();
+        let argmax = |row: &[f32]| -> u32 {
+            row.iter()
+                .enumerate()
+                .fold(
+                    (0usize, f32::MIN),
+                    |m, (i, &v)| if v > m.1 { (i, v) } else { m },
+                )
+                .0 as u32
+        };
+        // Prefills the sequences `which`, together, and returns their next tokens.
+        let prefill = |stores: &mut Vec<PagedKvStore>, which: &[usize]| -> Vec<u32> {
+            let seqs: Vec<(&[u32], &[usize])> = which
+                .iter()
+                .map(|&s| (prompts[s].as_slice(), slots[s].as_slice()))
+                .collect();
+            let logits = model.paged_prefill_batch(&seqs, stores).unwrap();
+            let rows = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            (0..which.len())
+                .map(|r| argmax(&rows[r * vocab..(r + 1) * vocab]))
+                .collect()
+        };
+        // One decode step of the sequences `which`, each with its next token `next`.
+        let decode = |stores: &mut Vec<PagedKvStore>, which: &[usize], next: &[u32]| -> Vec<f32> {
+            let pos: Vec<usize> = which.iter().map(|&s| prompts[s].len()).collect();
+            let at: Vec<usize> = which
+                .iter()
+                .zip(&pos)
+                .map(|(&s, &p)| blocks[s][p / block_size] as usize * block_size + p % block_size)
+                .collect();
+            let tables: Vec<Vec<u32>> = which.iter().map(|&s| blocks[s].clone()).collect();
+            let ctx: Vec<usize> = pos.iter().map(|p| p + 1).collect();
+            model
+                .batched_paged_decode(next, &pos, &at, &tables, &ctx, stores)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+
+        let mut alone_stores = stores();
+        let first = prefill(&mut alone_stores, &[0]);
+        let alone = decode(&mut alone_stores, &[0], &first);
+
+        let mut batch_stores = stores();
+        let firsts = prefill(&mut batch_stores, &[0, 1, 2]);
+        assert_eq!(
+            firsts[0], first[0],
+            "the prefill of the batch changed the first token"
+        );
+        let batch = decode(&mut batch_stores, &[0, 1, 2], &firsts);
+
+        let scale = alone.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let worst = alone
+            .iter()
+            .zip(&batch[..vocab])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "batch invariance: largest logit difference {:.3e} of a range {scale:.3}",
+            worst / scale
+        );
+        assert!(
+            worst / scale <= 1e-4,
+            "a sequence's logits changed inside a batch by {} of their range",
+            worst / scale
+        );
+    }
 }
