@@ -502,10 +502,11 @@ impl BatchedModel for GhBatched {
             self.pace.decode_rows += dec.len() as u32;
             self.pace.decode += decode_start.elapsed();
         }
-        // -- prefills: the prompts without a cached prefix together in ONE forward, a
-        // prefix-cached prompt alone over its suffix --
+        // -- prefills: every prompt in ONE forward, the weights read once. A prompt whose prefix
+        // the cache holds computes only its suffix. --
         let prefill_start = std::time::Instant::now();
-        let mut whole = Vec::new();
+        let mut plain = Vec::new();
+        let mut cached = Vec::new();
         for (i, it) in items.iter().enumerate() {
             if !it.is_prefill {
                 continue;
@@ -513,25 +514,29 @@ impl BatchedModel for GhBatched {
             self.pace.prompts += 1;
             self.pace.prompt_tokens += it.tokens.len() as u32;
             if it.cached_len == 0 {
-                whole.push(i);
-                continue;
+                plain.push(i);
+            } else {
+                cached.push(i);
             }
-            let l = self.model.paged_prefill_seq_cached(
-                &it.tokens,
-                &it.slots,
-                it.cached_len,
-                &it.block_table,
-                &mut self.stores,
-            )?;
-            out[i] = sample_row(&l, 0, &it.sampling, &it.recent_tokens)?;
         }
-        if !whole.is_empty() {
-            let seqs: Vec<(&[u32], &[usize])> = whole
+        if !plain.is_empty() || !cached.is_empty() {
+            let plain_seqs: Vec<(&[u32], &[usize])> = plain
                 .iter()
                 .map(|&i| (items[i].tokens.as_slice(), items[i].slots.as_slice()))
                 .collect();
-            let l = self.model.paged_prefill_batch(&seqs, &mut self.stores)?;
-            for (row, &i) in whole.iter().enumerate() {
+            let cached_seqs: Vec<crate::inference::generic_transformer::CachedPrompt<'_>> = cached
+                .iter()
+                .map(|&i| crate::inference::generic_transformer::CachedPrompt {
+                    tokens: items[i].tokens.as_slice(),
+                    suffix_slots: items[i].slots.as_slice(),
+                    cached_len: items[i].cached_len,
+                    block_table: items[i].block_table.as_slice(),
+                })
+                .collect();
+            let l = self
+                .model
+                .paged_prefill_mixed(&plain_seqs, &cached_seqs, &mut self.stores)?;
+            for (row, &i) in plain.iter().chain(cached.iter()).enumerate() {
                 out[i] = sample_row(&l, row, &items[i].sampling, &items[i].recent_tokens)?;
             }
         }

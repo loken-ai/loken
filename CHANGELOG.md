@@ -31,6 +31,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Serving: read the prompts that hit the prefix cache together in 1 pass.
 - Server: replace --cpu by --backends, which names the backends to compute on.
 - Tokenizer: follow the file's add_bos_token on a bare prompt, as the reference does.
 - Experts: keep more of them in host memory, sized while serving, with read-ahead taken only when it runs faster.

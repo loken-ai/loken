@@ -35,6 +35,15 @@ fn note_if_non_finite(stage: &str, x: &Tensor) {
     }
 }
 
+/// A prompt whose first `cached_len` tokens the paged cache already holds: the prompt, the
+/// paged slots of the tokens after them, and the block table that addresses the prefix.
+pub struct CachedPrompt<'a> {
+    pub tokens: &'a [u32],
+    pub suffix_slots: &'a [usize],
+    pub cached_len: usize,
+    pub block_table: &'a [u32],
+}
+
 impl GenericHeteroTransformer {
     /// Read-only view of the layers, which is how anything outside this module reaches a
     /// layer's KV cache after a forward.
@@ -1524,9 +1533,27 @@ impl GenericHeteroTransformer {
         seqs: &[(&[u32], &[usize])],
         stores: &mut [crate::inference::cache::paged_kv::PagedKvStore],
     ) -> Result<Tensor> {
+        self.paged_prefill_mixed(seqs, &[], stores)
+    }
+
+    /// [`Self::paged_prefill_batch`] with prompts whose prefix the cache holds: every row of
+    /// every prompt goes through the layers in one forward, the weights read once. Returns the
+    /// logits of the last position of each prompt, the plain prompts first, then the cached ones.
+    pub fn paged_prefill_mixed(
+        &self,
+        plain: &[(&[u32], &[usize])],
+        cached: &[CachedPrompt<'_>],
+        stores: &mut [crate::inference::cache::paged_kv::PagedKvStore],
+    ) -> Result<Tensor> {
         use crate::tensor::Tensor;
         let c = &self.config;
-        let lens: Vec<usize> = seqs.iter().map(|(tokens, _)| tokens.len()).collect();
+        // The rows of the forward: the plain prompts whole, then the suffix of each prompt
+        // whose prefix the cache holds.
+        let lens: Vec<usize> = plain
+            .iter()
+            .map(|(tokens, _)| tokens.len())
+            .chain(cached.iter().map(|p| p.tokens.len() - p.cached_len))
+            .collect();
         let starts: Vec<usize> = lens
             .iter()
             .scan(0, |at, &n| {
@@ -1536,13 +1563,19 @@ impl GenericHeteroTransformer {
             })
             .collect();
         let t: usize = lens.iter().sum();
-        let tokens: Vec<u32> = seqs
+        let tokens: Vec<u32> = plain
             .iter()
             .flat_map(|(tokens, _)| tokens.iter().copied())
+            .chain(
+                cached
+                    .iter()
+                    .flat_map(|p| p.tokens[p.cached_len..].iter().copied()),
+            )
             .collect();
-        let slots: Vec<usize> = seqs
+        let slots: Vec<usize> = plain
             .iter()
             .flat_map(|(_, slots)| slots.iter().copied())
+            .chain(cached.iter().flat_map(|p| p.suffix_slots.iter().copied()))
             .collect();
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let scale = 1.0f32 / (hd as f32).sqrt();
@@ -1550,7 +1583,12 @@ impl GenericHeteroTransformer {
         let edev = self.embeddings.embeddings().device().clone();
         let dev = self.compute_device();
         let cdt = Self::residual_dtype(&dev);
-        let positions: Vec<usize> = lens.iter().flat_map(|&n| 0..n).collect();
+        let positions: Vec<usize> = plain
+            .iter()
+            .flat_map(|(tokens, _)| 0..tokens.len())
+            .chain(cached.iter().flat_map(|p| p.cached_len..p.tokens.len()))
+            .collect();
+        let plain_rows: usize = lens[..plain.len()].iter().sum();
 
         let ids = Tensor::from_vec(tokens, &[t, 1][..], &edev)?;
         let mut x = self
@@ -1626,10 +1664,51 @@ impl GenericHeteroTransformer {
                 &k_rot.reshape(&[t, nkv * hd][..])?,
                 &v_f.reshape(&[t, nkv * hd][..])?,
             )?;
-            let attn = crate::inference::cache::paged_attention::paged_prefill_attn_seqs(
-                &q_rot, &k_rot, &v_f, &lens, nh, nkv, hd, scale,
-            )?
-            .reshape(&[t, nh * hd][..])?;
+            let mut parts: Vec<Tensor> = Vec::new();
+            if !plain.is_empty() {
+                parts.push(
+                    crate::inference::cache::paged_attention::paged_prefill_attn_seqs(
+                        &q_rot.narrow(0, 0, plain_rows)?,
+                        &k_rot.narrow(0, 0, plain_rows)?,
+                        &v_f.narrow(0, 0, plain_rows)?,
+                        &lens[..plain.len()],
+                        nh,
+                        nkv,
+                        hd,
+                        scale,
+                    )?
+                    .reshape(&[plain_rows, nh * hd][..])?,
+                );
+            }
+            // A prompt whose prefix the cache holds attends over that prefix, gathered from the
+            // store, then over its own suffix.
+            let mut at = plain_rows;
+            for (cp, &n) in cached.iter().zip(&lens[plain.len()..]) {
+                let (pk, pv) = stores[li].gather_seq(cp.block_table, cp.cached_len)?;
+                let pk = pk.reshape(&[cp.cached_len, nkv, hd][..])?.to_dtype(cdt)?;
+                let pv = pv.reshape(&[cp.cached_len, nkv, hd][..])?.to_dtype(cdt)?;
+                let full_k = Tensor::cat(&[&pk, &k_rot.narrow(0, at, n)?], 0)?;
+                let full_v = Tensor::cat(&[&pv, &v_f.narrow(0, at, n)?], 0)?;
+                parts.push(
+                    crate::inference::cache::paged_attention::paged_prefill_attn_suffix(
+                        &q_rot.narrow(0, at, n)?,
+                        &full_k,
+                        &full_v,
+                        cp.cached_len,
+                        nh,
+                        nkv,
+                        hd,
+                        scale,
+                    )?
+                    .reshape(&[n, nh * hd][..])?,
+                );
+                at += n;
+            }
+            let attn = if parts.len() == 1 {
+                parts.remove(0)
+            } else {
+                Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)?
+            };
             let o = attn
                 .to_dtype(cdt)
                 .and_then(|a| layer.attn_output.forward(&a))?

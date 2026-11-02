@@ -63,6 +63,7 @@ pub mod expert_tier;
 pub mod expert_tier;
 mod graph;
 pub mod hetero;
+pub use hetero::CachedPrompt;
 #[cfg(test)]
 mod hf_reference_tests;
 pub mod hyper;

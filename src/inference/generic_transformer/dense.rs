@@ -1391,4 +1391,122 @@ mod tests {
             worst / scale
         );
     }
+
+    /// A prompt whose prefix the cache holds, prefilled beside other prompts in one forward,
+    /// gets the logits it gets prefilled alone over its suffix.
+    #[test]
+    fn a_prefix_cached_prompt_prefills_beside_others_as_it_does_alone() {
+        use crate::inference::cache::paged_kv::PagedKvStore;
+        use crate::inference::generic_transformer::CachedPrompt;
+        let (model, ids) = toy_model_and_ids("f32");
+        let (n_kv, hd, n_layers, vocab) = model.paged_geometry();
+        let device = model.compute_device();
+        let (block_size, num_blocks) = (4usize, 64usize);
+        let stores = || -> Vec<PagedKvStore> {
+            (0..n_layers)
+                .map(|_| {
+                    PagedKvStore::new(
+                        num_blocks,
+                        block_size,
+                        n_kv,
+                        hd,
+                        crate::tensor::DType::F32,
+                        &device,
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        let n = ids.len();
+        let prefix = (n / block_size) * block_size;
+        assert!(
+            prefix >= block_size && prefix < n,
+            "the toy prompt must hold a whole block"
+        );
+        // The first prompt fills the cache. The second shares its first blocks and has a suffix
+        // of its own. The third is a plain prompt.
+        let first = ids.clone();
+        let mut second: Vec<u32> = ids[..prefix].to_vec();
+        second.extend((0..5).map(|i| ids[(i + 2) % n]));
+        let third: Vec<u32> = (0..n - 3).map(|i| ids[(i + 4) % n]).collect();
+        let first_blocks: Vec<u32> = (0..(n / block_size + 1) as u32).collect();
+        let shared = prefix / block_size;
+        let mut second_blocks: Vec<u32> = first_blocks[..shared].to_vec();
+        second_blocks.extend([20u32, 21, 22]);
+        let third_blocks: Vec<u32> = (30u32..40).collect();
+        let slot = |blocks: &[u32], p: usize| {
+            blocks[p / block_size] as usize * block_size + p % block_size
+        };
+        let first_slots: Vec<usize> = (0..first.len()).map(|p| slot(&first_blocks, p)).collect();
+        let second_suffix: Vec<usize> = (prefix..second.len())
+            .map(|p| slot(&second_blocks, p))
+            .collect();
+        let third_slots: Vec<usize> = (0..third.len()).map(|p| slot(&third_blocks, p)).collect();
+        let rows = |t: &crate::tensor::Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // Alone: the cached prompt over its suffix, then the plain one.
+        let mut alone = stores();
+        model
+            .paged_prefill_batch(&[(first.as_slice(), first_slots.as_slice())], &mut alone)
+            .unwrap();
+        let cached_alone = rows(
+            &model
+                .paged_prefill_seq_cached(
+                    &second,
+                    &second_suffix,
+                    prefix,
+                    &second_blocks,
+                    &mut alone,
+                )
+                .unwrap(),
+        );
+        let plain_alone = rows(
+            &model
+                .paged_prefill_batch(&[(third.as_slice(), third_slots.as_slice())], &mut alone)
+                .unwrap(),
+        );
+
+        // Together: the plain prompt and the cached one in one forward.
+        let mut together = stores();
+        model
+            .paged_prefill_batch(&[(first.as_slice(), first_slots.as_slice())], &mut together)
+            .unwrap();
+        let mixed = rows(
+            &model
+                .paged_prefill_mixed(
+                    &[(third.as_slice(), third_slots.as_slice())],
+                    &[CachedPrompt {
+                        tokens: &second,
+                        suffix_slots: &second_suffix,
+                        cached_len: prefix,
+                        block_table: &second_blocks,
+                    }],
+                    &mut together,
+                )
+                .unwrap(),
+        );
+        let scale = cached_alone
+            .iter()
+            .chain(&plain_alone)
+            .map(|v| v.abs())
+            .fold(0f32, f32::max);
+        let worst = |want: &[f32], got: &[f32]| {
+            want.iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+                / scale
+        };
+        let plain_worst = worst(&plain_alone, &mixed[..vocab]);
+        let cached_worst = worst(&cached_alone, &mixed[vocab..2 * vocab]);
+        eprintln!("mixed prefill: plain {plain_worst:.2e}, cached {cached_worst:.2e} of the range");
+        assert!(
+            plain_worst <= 1e-4,
+            "the plain prompt changed by {plain_worst}"
+        );
+        assert!(
+            cached_worst <= 1e-4,
+            "the cached prompt changed by {cached_worst}"
+        );
+    }
 }
