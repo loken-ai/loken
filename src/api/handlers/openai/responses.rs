@@ -403,96 +403,37 @@ fn chat_body(
     chat
 }
 
-pub(crate) async fn openai_responses(
-    State(state): State<APIServer>,
-    headers: axum::http::HeaderMap,
-    OpenAIJson(req): OpenAIJson<Value>,
-) -> Result<Response, ApiError> {
-    let priority = crate::api::gate::Priority::of_request(&headers, false);
-    openai_responses_at(state, headers, req, priority).await
+/// What a streamed response needs besides the frames it is built from.
+struct ResponseRun {
+    id: String,
+    created: i64,
+    req_for_stream: Value,
+    model: String,
+    keep: bool,
+    history: Vec<Value>,
+    scope: CacheScope,
 }
 
-/// A response run at `priority`: the route's own, or the batch priority of a line of the
-/// batch API.
-pub(crate) async fn openai_responses_at(
-    state: APIServer,
-    headers: axum::http::HeaderMap,
-    req: Value,
-    priority: crate::api::gate::Priority,
-) -> Result<Response, ApiError> {
-    let model = req
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::Validation("`model` is required".to_string()))?
-        .to_string();
-    let scope = CacheScope::current();
-    let messages = lower_input(&req, &|id| super::files::read_file_bytes(&state, id), scope)
-        .map_err(ApiError::Validation)?;
-    if messages.is_empty() {
-        return Err(ApiError::Validation("`input` is empty".to_string()));
-    }
-    let tools = lower_tools(&req).map_err(ApiError::Validation)?;
-    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let keep = req.get("store").and_then(Value::as_bool).unwrap_or(true);
-    let chat = chat_body(&req, &model, &messages, tools, stream);
-    let chat_req: ChatCompletionRequest = serde_json::from_value(chat)
-        .map_err(|e| ApiError::Validation(format!("responses: {e}")))?;
-    let id = new_id("resp");
-    let created = chrono::Utc::now().timestamp();
-    let history = messages.clone();
-    let inner = super::chat_completion_at(state, headers, chat_req, priority).await?;
-    if !inner.status().is_success() {
-        return Ok(inner);
-    }
-    if !stream {
-        let bytes = axum::body::to_bytes(inner.into_body(), usize::MAX)
-            .await
-            .map_err(|e| ApiError::Internal(format!("responses: {e}")))?;
-        let completion: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| ApiError::Internal(format!("responses: {e}")))?;
-        let choice = completion
-            .pointer("/choices/0")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let message = choice.get("message").cloned().unwrap_or(Value::Null);
-        let finish = choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("stop");
-        let (status, incomplete) = if finish == "length" {
-            ("incomplete", Some("max_output_tokens"))
-        } else {
-            ("completed", None)
-        };
-        let mut output = output_items(&message);
-        if let Some(lp) = choice.pointer("/logprobs/content").filter(|l| !l.is_null()) {
-            for item in output.iter_mut().filter(|i| i["type"] == "message") {
-                item["content"][0]["logprobs"] = lp.clone();
-            }
-        }
-        let body = response_object(
-            &id,
-            created,
-            &req,
-            &model,
-            status,
-            output,
-            usage_object(completion.get("usage")),
-            incomplete,
-        );
-        if keep {
-            let mut convo = history;
-            convo.push(message);
-            store_response(scope, &id, convo, body.clone());
-        }
-        return Ok(Json(body).into_response());
-    }
-
-    // Streamed: the chat completion's SSE frames become Responses events.
+/// The Responses events of a chat completion's SSE frames.
+/// A stream that ends without its final marker ends as incomplete.
+fn responses_events<S>(
+    mut frames: S,
+    run: ResponseRun,
+) -> impl futures::Stream<Item = Result<Event, axum::Error>>
+where
+    S: futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
+{
     use futures::StreamExt;
-    let mut frames = inner.into_body().into_data_stream();
-    let req_for_stream = req.clone();
-    let events = async_stream::stream! {
+    let ResponseRun {
+        id,
+        created,
+        req_for_stream,
+        model,
+        keep,
+        history,
+        scope,
+    } = run;
+    async_stream::stream! {
         let mut seq = 0u64;
         let pending = response_object(&id, created, &req_for_stream, &model, "in_progress", vec![], usage_object(None), None);
         yield Ok::<_, axum::Error>(event("response.created", json!({"response": pending}), &mut seq));
@@ -638,7 +579,107 @@ pub(crate) async fn openai_responses_at(
         }
         let kind = if status == "completed" { "response.completed" } else { "response.incomplete" };
         yield Ok::<_, axum::Error>(event(kind, json!({"response": final_obj}), &mut seq));
-    };
+    }
+}
+
+pub(crate) async fn openai_responses(
+    State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
+    OpenAIJson(req): OpenAIJson<Value>,
+) -> Result<Response, ApiError> {
+    let priority = crate::api::gate::Priority::of_request(&headers, false);
+    openai_responses_at(state, headers, req, priority).await
+}
+
+/// A response run at `priority`: the route's own, or the batch priority of a line of the
+/// batch API.
+pub(crate) async fn openai_responses_at(
+    state: APIServer,
+    headers: axum::http::HeaderMap,
+    req: Value,
+    priority: crate::api::gate::Priority,
+) -> Result<Response, ApiError> {
+    let model = req
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::Validation("`model` is required".to_string()))?
+        .to_string();
+    let scope = CacheScope::current();
+    let messages = lower_input(&req, &|id| super::files::read_file_bytes(&state, id), scope)
+        .map_err(ApiError::Validation)?;
+    if messages.is_empty() {
+        return Err(ApiError::Validation("`input` is empty".to_string()));
+    }
+    let tools = lower_tools(&req).map_err(ApiError::Validation)?;
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let keep = req.get("store").and_then(Value::as_bool).unwrap_or(true);
+    let chat = chat_body(&req, &model, &messages, tools, stream);
+    let chat_req: ChatCompletionRequest = serde_json::from_value(chat)
+        .map_err(|e| ApiError::Validation(format!("responses: {e}")))?;
+    let id = new_id("resp");
+    let created = chrono::Utc::now().timestamp();
+    let history = messages.clone();
+    let inner = super::chat_completion_at(state, headers, chat_req, priority).await?;
+    if !inner.status().is_success() {
+        return Ok(inner);
+    }
+    if !stream {
+        let bytes = axum::body::to_bytes(inner.into_body(), usize::MAX)
+            .await
+            .map_err(|e| ApiError::Internal(format!("responses: {e}")))?;
+        let completion: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::Internal(format!("responses: {e}")))?;
+        let choice = completion
+            .pointer("/choices/0")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let message = choice.get("message").cloned().unwrap_or(Value::Null);
+        let finish = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop");
+        let (status, incomplete) = if finish == "length" {
+            ("incomplete", Some("max_output_tokens"))
+        } else {
+            ("completed", None)
+        };
+        let mut output = output_items(&message);
+        if let Some(lp) = choice.pointer("/logprobs/content").filter(|l| !l.is_null()) {
+            for item in output.iter_mut().filter(|i| i["type"] == "message") {
+                item["content"][0]["logprobs"] = lp.clone();
+            }
+        }
+        let body = response_object(
+            &id,
+            created,
+            &req,
+            &model,
+            status,
+            output,
+            usage_object(completion.get("usage")),
+            incomplete,
+        );
+        if keep {
+            let mut convo = history;
+            convo.push(message);
+            store_response(scope, &id, convo, body.clone());
+        }
+        return Ok(Json(body).into_response());
+    }
+
+    // Streamed: the chat completion's SSE frames become Responses events.
+    let events = responses_events(
+        inner.into_body().into_data_stream(),
+        ResponseRun {
+            id,
+            created,
+            req_for_stream: req.clone(),
+            model,
+            keep,
+            history,
+            scope,
+        },
+    );
     Ok(Sse::new(events)
         .keep_alive(KeepAlive::default())
         .into_response())
@@ -699,6 +740,69 @@ mod tests {
         let chat: ChatCompletionRequest =
             serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap();
         serde_json::to_value(&chat.messages).unwrap()
+    }
+
+    /// The Responses events made of the given SSE frames, each as the text it sends.
+    async fn events_of(frames: &[&str]) -> Vec<String> {
+        use futures::StreamExt;
+        let frames: Vec<Result<axum::body::Bytes, axum::Error>> = frames
+            .iter()
+            .map(|f| Ok(axum::body::Bytes::from(f.to_string())))
+            .collect();
+        let run = ResponseRun {
+            id: "resp_test".into(),
+            created: 0,
+            req_for_stream: json!({}),
+            model: "m".into(),
+            keep: false,
+            history: Vec::new(),
+            scope: CacheScope::COMMON,
+        };
+        responses_events(futures::stream::iter(frames), run)
+            .map(|e| format!("{:?}", e.unwrap()))
+            .collect()
+            .await
+    }
+
+    const TEXT: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+    const STOP: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    const LENGTH: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n";
+    const DONE: &str = "data: [DONE]\n\n";
+
+    #[tokio::test]
+    async fn a_stream_that_reaches_its_final_marker_ends_as_completed() {
+        let events = events_of(&[TEXT, STOP, DONE]).await;
+        let last = events.last().unwrap();
+        assert!(last.contains("response.completed"), "got: {last}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_before_its_final_marker_ends_as_incomplete() {
+        let events = events_of(&[TEXT]).await;
+        let last = events.last().unwrap();
+        assert!(last.contains("response.incomplete"), "got: {last}");
+        assert!(last.contains("interrupted"), "got: {last}");
+        assert!(!events.iter().any(|e| e.contains("response.completed")));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_hit_the_token_limit_says_so() {
+        let events = events_of(&[TEXT, LENGTH, DONE]).await;
+        let last = events.last().unwrap();
+        assert!(last.contains("response.incomplete"), "got: {last}");
+        assert!(last.contains("max_output_tokens"), "got: {last}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_carries_an_error_ends_as_failed() {
+        let error = "data: {\"error\":{\"message\":\"engine stopped\"}}\n\n";
+        let events = events_of(&[TEXT, error, DONE]).await;
+        let last = events.last().unwrap();
+        assert!(last.contains("response.failed"), "got: {last}");
+        assert!(last.contains("engine stopped"), "got: {last}");
+        assert!(!events.iter().any(|e| e.contains("response.completed")));
     }
 
     #[test]

@@ -94,12 +94,12 @@ Fixes, by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Started |
+| Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Partial |
 | A missing token count stays missing | Bench | An iteration with no token count is left out of the totals and says so, instead of counting 0. | Done |
 | Same first-token time on every engine | Bench | The bench starts the first-token time at the first text of the stream on every engine. | Done |
 | Failures visible in concurrent cells | Bench | A failed request in a cell with concurrent requests is recorded in the errors of the cell. | Done |
 | Streams that cannot hang | Bench | The measuring client times out a silent stream and refuses an https address instead of connecting in plain text. | Done |
-| A cut stream is reported as cut | API | A Responses stream whose upstream ends without its final marker ends as incomplete, not as completed. | Started |
+| A cut stream is reported as cut | API | A Responses stream whose upstream ends without its final marker ends as incomplete, not as completed. | Done |
 | Warm-up failures visible | Bench | A failed warm-up request is reported for every modality. | Done |
 | Measured settings recorded | Bench | The image size, seed, duration, voice and keep-alive of a cell appear in the record, and so does the request timeout. | Partial |
 | A memory fallback that does not stay | Performance | A matrix product that runs out of card memory falls back for that call only, and the fallback copy is not kept. | Done |
