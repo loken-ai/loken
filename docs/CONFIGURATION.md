@@ -219,19 +219,22 @@ A later prompt that begins with the same tokens restores a stored state and pref
 
 ```mermaid
 flowchart TD
-  P[Prompt arrives] --> L[Longest stored state<br/>the prompt extends]
+  P(["Prompt arrives"]) --> L[Longest stored state<br/>the prompt extends]
   L -->|found| R{Reading it cheaper<br/>than its prefill?}
   L -->|none| F[Prefill the whole prompt]
   R -->|yes| S[Restore the state]
   R -->|no| N[Next shorter stored state]
   N -->|found| R
   N -->|none left| F
-  S --> T[Prefill the rest]
+  S -->|unreadable or does not match| N
+  S --> U{Covers the whole prompt,<br/>with its logits?}
+  U -->|yes| Y(["Answer from the restored state"])
+  U -->|no| T[Prefill the rest]
   F --> K[Keep the states the prefill<br/>passes and the one it ends in]
   T --> K
   K --> W{On disk: the queue drains<br/>within the prefill time?}
-  W -->|yes| Q[Queue the write]
-  W -->|no| X[Skip it, log a line]
+  W -->|yes| Q(["Queue the write"])
+  W -->|no| X(["Skip it, log a line"])
 ```
 
 A state whose read costs more than the prefill of its tokens is passed over for the next shorter one, with a log line.
@@ -325,15 +328,16 @@ At load, the engine settles how far `fast` gives up exact routing:
 
 ```mermaid
 flowchart TD
-  A[Load a mixture whose<br/>experts stream from disk] --> B{fidelity is fast?}
-  B -->|no| E1[Exact routing]
+  A(["Load a mixture whose<br/>experts stream from disk"]) --> B{fidelity is fast?}
+  B -->|no| E1(["Exact routing"])
   B -->|yes| C{Card and host to compare,<br/>tokenizer in the file?}
-  C -->|no| E2[Exact routing]
+  C -->|no| E2(["Exact routing"])
   C -->|yes| D[Run the bundled text<br/>on card and on host: the noise]
+  D -->|calibration fails, warning| E3
   D --> G[Run the text under<br/>each candidate]
   G --> H{A candidate within<br/>3 times the noise?}
-  H -->|no| E3[Exact routing]
-  H -->|yes| I[Apply the one that saves<br/>the most disk reads]
+  H -->|no| E3(["Exact routing"])
+  H -->|yes| I(["Apply the one that saves<br/>the most disk reads"])
 ```
 
 The bundled text runs teacher-forced.

@@ -21,7 +21,9 @@ flowchart TD
     R --> X["drop every later draft and its cache rows"]
     B --> L["learn k from acceptance and cycle time"]
     X --> L
-    L --> D
+    L --> S{"end of sequence, token limit or stop sequence?"}
+    S -- no --> D
+    S -- yes --> Z(["generation ends"])
 ```
 
 The target keeps the drafts it agrees with.  

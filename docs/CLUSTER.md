@@ -69,17 +69,18 @@ A verdict that keeps the request logs `cluster: serving locally: <reason>`.
 
 ```mermaid
 flowchart TD
-  A[Request arrives] --> B{join empty, or<br/>forwarded marker?}
-  B -->|yes| L1[Serve locally]
+  A(["Request arrives"]) --> B{join empty, or<br/>forwarded marker?}
+  B -->|yes| L1(["Serve locally"])
   B -->|no| D{Batch priority:<br/>it yields?}
-  D -->|yes, a peer can serve| F[Forward to the<br/>nearest alive peer]
-  D -->|yes, no peer,<br/>conversation resident| X[Answer 409]
+  D -->|yes, a peer can serve| F(["Forward to the<br/>nearest alive peer"])
+  D -->|yes, no peer,<br/>conversation resident| X(["Answer 409"])
   D -->|no, or no peer| E{No local rate yet<br/>and can serve?}
-  E -->|yes| L2[Serve locally]
+  E -->|yes| L2(["Serve locally"])
   E -->|no| G[Estimate completion for every<br/>candidate, failed peers out]
   G --> H{Best peer beats local by<br/>min_speedup, or no local option?}
-  H -->|no| L3[Serve locally]
+  H -->|no| L3(["Serve locally"])
   H -->|yes| P[Forward to the best peer]
+  P -->|answers| Z(["Stream relayed"])
   P -->|fails before it answers| L3
 ```
 

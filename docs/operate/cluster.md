@@ -111,16 +111,22 @@ Each end that serves the request here carries the reason its log line gives.
 
 ```mermaid
 flowchart TD
-    R["request reaches a machine"] --> J{"join empty?"}
-    J -- yes --> L1["single node"]
+    R(["request reaches a machine"]) --> J{"join empty?"}
+    J -- yes --> L1(["single node"])
     J -- no --> F{"already forwarded once?"}
-    F -- yes --> L0["already forwarded once"]
-    F -- no --> P{"rate measured here for this model?"}
-    P -- no --> L2["no local price for this model yet"]
-    P -- yes --> B{"best peer min_speedup times faster?"}
-    B -- no --> L3["below the speedup a hand-over has to earn"]
+    F -- yes --> L0(["already forwarded once"])
+    F -- no --> Y{"batch priority?"}
+    Y -- "no, or no peer and no conversation resident" --> P{"rate measured here for this model?"}
+    Y -- "yes, a peer can serve" --> H
+    Y -- "yes, no peer, a conversation resident" --> N9(["409"])
+    P -- no --> L2(["no local price for this model yet"])
+    P -- yes --> C{"best estimate is a peer?"}
+    C -- no --> L5(["this node is the best estimate"])
+    C -- yes --> B{"best peer min_speedup times faster?"}
+    B -- no --> L3(["below the speedup a hand-over has to earn"])
     B -- yes --> H["forwarding to the peer, stream relayed"]
-    H -- "peer does not answer" --> L4["hand-over failed, serving here instead"]
+    H -- "peer answers" --> D(["stream relayed"])
+    H -- "peer does not answer" --> L4(["hand-over failed, serving here instead"])
 ```
 
 - A request is forwarded once, and the peer serves it whatever its own estimate says.

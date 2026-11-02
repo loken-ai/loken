@@ -95,12 +95,12 @@ The `fidelity` level in [Configuration](CONFIGURATION.md) picks the file:
 
 ```mermaid
 flowchart TD
-  A[Routed experts, hottest first:<br/>profile, else the file's prior] --> B{fidelity}
-  B -->|reference| L[Largest file<br/>for every expert]
+  A(["Routed experts, hottest first:<br/>profile, else the file's prior"]) --> B{fidelity}
+  B -->|reference| L(["Largest file<br/>for every expert"])
   B -->|balanced| C{Room left<br/>on a card?}
-  B -->|fast| S[Smallest file<br/>for every expert]
-  C -->|yes| P[Card keeps it,<br/>file with the most bytes]
-  C -->|no| H[Host tier or disk,<br/>file with the fewest bytes]
+  B -->|fast| S(["Smallest file<br/>for every expert"])
+  C -->|yes| P(["Card keeps it,<br/>file with the most bytes"])
+  C -->|no| H(["Host tier or disk,<br/>file with the fewest bytes"])
 ```
 
 At `balanced`, each tier takes the file that suits its compute:

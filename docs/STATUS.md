@@ -71,18 +71,19 @@ A cut prompt can lose its system prompt or its tool instructions and still read 
 
 ```mermaid
 flowchart TD
-    P["prompt arrives"] --> W{"prompt and answer fit the window?"}
-    W -- yes --> N["served whole"]
+    P(["prompt arrives"]) --> W{"prompt and answer fit the window?"}
+    W -- yes --> N(["served whole"])
     W -- no --> R["reload, wider window if the checkpoint declares one"]
     R --> L{"prompt longer than the window?"}
-    L -- yes --> X["refused on every route"]
+    L -- yes --> X(["refused on every route"])
     L -- no --> F{"room left for the answer?"}
     F -- yes --> N
     F -- no --> C["keep the first token and the tail"]
     C --> S{"cache can shift?"}
-    S -- no --> K["cold prefill of the whole window"]
+    S -- no --> K(["cold prefill of the whole window"])
     S -- yes --> M["pull the tail keys down, re-phase them"]
-    M --> Q["prefill only the new tokens"]
+    M -- "no plan, or the shift fails" --> K
+    M --> Q(["prefill only the new tokens"])
 ```
 
 A prompt that, with its answer budget, exceeds the window reloads the model with a wider window.

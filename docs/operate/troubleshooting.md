@@ -81,6 +81,7 @@ Authentication and rate limits: [Expose loken on a network](network.md).
 | The log says `cluster: serving locally: no peer published anything usable` | No usable node: no peer has published its state, or every peer is excluded. | Check `/api/cluster/peers`, then the `advertise` address of each peer. |
 | The log says `cluster: serving locally: no address known for ...` | The best peer has no address on record. | Read the `endpoint` of the peer in `/api/cluster/peers`, then set `join` or `advertise`. |
 | The log says `cluster: serving locally: peer ... is only ...x faster, below the ...x a hand-over has to earn` | The peer is not faster than `min_speedup` requires. | Lower `min_speedup`, or accept that this node serves the request. |
+| The log says `cluster: serving locally: this node is the best estimate` | No peer is predicted to finish the request before this node. | Nothing. |
 | The log says `cluster: hand-over to ... failed (...) - serving here instead` | The peer did not answer the forwarded request. | Check the peer. The failed peer is not chosen again until its penalty expires. |
 | The log says `cluster auto-tune ...: not enough measured nodes to plan a split` | Too few nodes published a cost for the model. | Load the model on each node, or wait for the next gossip rounds. |
 | The log says `cluster auto-tune ...: pipeline not formed (...); one node` | A tail node refused its share. | Read the reason. The tail needs the model file locally. |
