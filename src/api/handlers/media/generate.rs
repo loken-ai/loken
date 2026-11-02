@@ -200,10 +200,13 @@ pub(crate) async fn render_gathered(
             .pop()
             .unwrap_or_else(|| Err("the render ended without an image".into()));
     };
-    let cap = crate::inference::serve::gather::rows_that_fit(
-        image_row_bytes(state, model_name, geom),
-        usize::MAX,
-    );
+    // The rows a batch holds are counted when the batch is formed, once the render ahead of it
+    // has ended and its pooled memory is back with the driver, not while it still holds it.
+    let per_row = image_row_bytes(state, model_name, geom);
+    let cap = move || {
+        crate::inference::engine::llm_engine::trim_cuda_pools();
+        crate::inference::serve::gather::rows_that_fit(per_row, usize::MAX)
+    };
     let runner = state.clone();
     let model = model_name.to_string();
     state

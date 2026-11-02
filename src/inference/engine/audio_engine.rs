@@ -352,10 +352,13 @@ impl AudioEngine {
         // their audio windows go through it as one batch, as many at once as the roomiest
         // card takes.
         let model = self.loaded_name().await.unwrap_or_default();
-        let cap = crate::inference::serve::gather::rows_that_fit(
-            *self.window_bytes.lock().await,
-            usize::MAX,
-        );
+        // The rows a group holds are counted when the group is formed, once the one ahead has
+        // ended and its pooled memory is back with the driver.
+        let window_bytes = *self.window_bytes.lock().await;
+        let cap = move || {
+            crate::inference::engine::llm_engine::trim_cuda_pools();
+            crate::inference::serve::gather::rows_that_fit(window_bytes, usize::MAX)
+        };
         let state = self.model_state.clone();
         self.gather
             .submit(model, (samples, params), cap, move |jobs| async move {

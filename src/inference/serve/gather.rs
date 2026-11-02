@@ -3,9 +3,9 @@
 //! A request whose key has no group running starts at once, as a group of one, and its
 //! runner is a task of its own. Requests of that key that arrive while a group runs queue
 //! behind it. When the running group ends, its runner takes the queue whole as the next
-//! group, up to the cap the first queued request asked for, and the rest wait for the
-//! group after. A lone request never waits, and a group never holds more jobs than that
-//! cap.
+//! group, up to the cap the first queued request gives when the group is formed, and the
+//! rest wait for the group after. A lone request never waits, and a group never holds more
+//! jobs than that cap.
 //!
 //! Each answer goes back to the request that brought the job, so a request whose client
 //! goes away does not take its companions' answers with it.
@@ -21,12 +21,12 @@ use tokio::sync::oneshot;
 type Runner<J, R> = Box<dyn FnOnce(Vec<J>) -> Pin<Box<dyn Future<Output = Vec<R>> + Send>> + Send>;
 
 /// A request in a queue: its job, where its answer goes, how it runs a group and how
-/// many jobs a group it opens may hold.
+/// many jobs a group it opens may hold, asked when the group is formed.
 struct Member<J, R> {
     job: J,
     answer: oneshot::Sender<R>,
     run: Runner<J, R>,
-    cap: usize,
+    cap: Box<dyn Fn() -> usize + Send>,
 }
 
 /// The keys with a group running, each with the requests queued behind it.
@@ -65,8 +65,9 @@ where
     /// `run` takes the jobs in arrival order and answers one result per job, in the same
     /// order; the first job of a group runs it for the whole group. `None` when the
     /// runner ended without an answer for this job.
-    pub async fn submit<F, Fut>(&self, key: K, job: J, cap: usize, run: F) -> Option<R>
+    pub async fn submit<F, Fut, C>(&self, key: K, job: J, cap: C, run: F) -> Option<R>
     where
+        C: Fn() -> usize + Send + 'static,
         F: FnOnce(Vec<J>) -> Fut + Send + 'static,
         Fut: Future<Output = Vec<R>> + Send + 'static,
     {
@@ -75,7 +76,7 @@ where
             job,
             answer: tx,
             run: Box::new(move |jobs| Box::pin(run(jobs))),
-            cap: cap.max(1),
+            cap: Box::new(cap),
         };
         let opened = {
             let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,9 +132,10 @@ where
             if queue.is_empty() {
                 return;
             }
-            // The next group is the queue, up to the cap of the request that opens it;
-            // the rest stay for the group after.
-            let take = queue[0].cap.min(queue.len());
+            // The next group is the queue, up to the cap of the request that opens it, asked
+            // now that the group before has ended and released what it held; the rest stay
+            // for the group after.
+            let take = (queue[0].cap)().max(1).min(queue.len());
             queue.drain(..take).collect()
         };
     }
@@ -218,7 +220,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<Option<u32>> {
         let gather = gather.clone();
         let runner = held(calls.clone(), release.clone());
-        let ahead = tokio::spawn(async move { gather.submit("k", first, 4, runner).await });
+        let ahead = tokio::spawn(async move { gather.submit("k", first, || 4, runner).await });
         while calls.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
@@ -234,7 +236,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<Option<u32>> {
         let mine = gather.clone();
         let runner = doubling(calls.clone());
-        let handle = tokio::spawn(async move { mine.submit("k", job, cap, runner).await });
+        let handle = tokio::spawn(async move { mine.submit("k", job, move || cap, runner).await });
         while gather
             .queues
             .lock()
@@ -251,7 +253,7 @@ mod tests {
     async fn a_lone_job_runs_without_waiting() {
         let gather: Gather<&str, u32, u32> = Gather::default();
         let calls = Calls::default();
-        let mut request = Box::pin(gather.submit("k", 3, 4, doubling(calls.clone())));
+        let mut request = Box::pin(gather.submit("k", 3, || 4, doubling(calls.clone())));
         // The first poll registers the request and spawns its runner; one turn of the
         // scheduler is all the runner needs, since no timer stands between them.
         assert!(futures::poll!(request.as_mut()).is_pending());
@@ -288,8 +290,8 @@ mod tests {
         let gather: Gather<&str, u32, u32> = Gather::default();
         let calls = Calls::default();
         let (a, b) = tokio::join!(
-            gather.submit("one", 3, 4, doubling(calls.clone())),
-            gather.submit("two", 5, 4, doubling(calls.clone())),
+            gather.submit("one", 3, || 4, doubling(calls.clone())),
+            gather.submit("two", 5, || 4, doubling(calls.clone())),
         );
         assert_eq!((a, b), (Some(6), Some(10)));
         assert_eq!(calls.lock().unwrap().len(), 2);
@@ -316,6 +318,49 @@ mod tests {
             [vec![1], vec![2, 3], vec![4]],
             "two together, the third in the group after"
         );
+    }
+
+    /// The cap is asked when the group is formed, after the group ahead has ended, not when
+    /// the request was submitted: a cap that grows once the group ahead is gone lets the
+    /// requests that queued behind it run together.
+    #[tokio::test]
+    async fn the_cap_is_asked_when_the_group_forms() {
+        let gather: Gather<&str, u32, u32> = Gather::default();
+        let calls = Calls::default();
+        let release = Arc::new(Notify::new());
+        let ahead = group_ahead(&gather, &calls, 1, &release).await;
+        // 1 while the group ahead runs, 4 once it has ended.
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut waiting = Vec::new();
+        for job in [2u32, 3, 4] {
+            let (mine, runner, ended) = (gather.clone(), doubling(calls.clone()), ended.clone());
+            let cap = move || {
+                if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    4
+                } else {
+                    1
+                }
+            };
+            waiting.push(tokio::spawn(async move {
+                mine.submit("k", job, cap, runner).await
+            }));
+            while gather
+                .queues
+                .lock()
+                .unwrap()
+                .get("k")
+                .is_none_or(|q| !q.iter().any(|m| m.job == job))
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        release.notify_one();
+        assert_eq!(ahead.await.unwrap(), Some(2));
+        for (handle, want) in waiting.into_iter().zip([4, 6, 8]) {
+            assert_eq!(handle.await.unwrap(), Some(want));
+        }
+        assert_eq!(*calls.lock().unwrap(), [vec![1], vec![2, 3, 4]]);
     }
 
     #[tokio::test]
@@ -359,7 +404,7 @@ mod tests {
         let release = Arc::new(Notify::new());
         let ahead = {
             let (gather, runner) = (gather.clone(), runner(calls.clone(), Some(release.clone())));
-            tokio::spawn(async move { gather.submit("k", 1, 4, runner).await })
+            tokio::spawn(async move { gather.submit("k", 1, || 4, runner).await })
         };
         while *calls.lock().unwrap() == 0 {
             tokio::task::yield_now().await;
@@ -368,7 +413,7 @@ mod tests {
         for job in [3, 0, 5] {
             let (mine, runner) = (gather.clone(), runner(calls.clone(), None));
             behind.push(tokio::spawn(async move {
-                mine.submit("k", job, 4, runner).await
+                mine.submit("k", job, || 4, runner).await
             }));
             while gather
                 .queues
@@ -403,7 +448,7 @@ mod tests {
         let short = |jobs: Vec<u32>| std::future::ready(vec![jobs[0]]);
         let second = {
             let gather = gather.clone();
-            tokio::spawn(async move { gather.submit("k", 3, 4, short).await })
+            tokio::spawn(async move { gather.submit("k", 3, || 4, short).await })
         };
         while gather
             .queues
@@ -416,7 +461,7 @@ mod tests {
         }
         let third = {
             let gather = gather.clone();
-            tokio::spawn(async move { gather.submit("k", 5, 4, short).await })
+            tokio::spawn(async move { gather.submit("k", 5, || 4, short).await })
         };
         while gather
             .queues
