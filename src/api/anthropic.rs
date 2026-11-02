@@ -108,8 +108,7 @@ pub struct AnthropicMessagesRequest {
     #[serde(default)]
     pub seed: Option<u64>,
     /// `{type: "enabled", budget_tokens}`; absent or disabled, a reasoning model is told
-    /// not to think. The budget is not enforced: a local model's reasoning has no cap
-    /// of its own.
+    /// not to think. The budget closes the reasoning once it is spent.
     #[serde(default)]
     pub thinking: Option<Value>,
     /// Structured output: `{type: "json_schema", schema}` constrains the answer.
@@ -219,6 +218,17 @@ impl AnthropicMessagesRequest {
             .and_then(Value::as_str)
             == Some("enabled");
         (!on).then_some("disabled")
+    }
+
+    /// The tokens the reasoning may take, from `{type: "enabled", budget_tokens}`.
+    pub fn thinking_budget(&self) -> Option<usize> {
+        let t = self.thinking.as_ref()?;
+        if t.get("type").and_then(Value::as_str) != Some("enabled") {
+            return None;
+        }
+        t.get("budget_tokens")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
     }
 
     /// The schema a `{type: "json_schema", schema}` structured output constrains the

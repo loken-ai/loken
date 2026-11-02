@@ -31,6 +31,9 @@ pub struct StructuredOutputs {
 /// OpenAI's. Every one is optional; an absent one is vLLM's default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VllmFields {
+    /// Tokens the reasoning may take before the server closes it and generates the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_token_budget: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

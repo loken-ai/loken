@@ -159,6 +159,7 @@ pub(crate) async fn anthropic_messages_at(
         .unwrap_or(false);
     let tool_choice = req.tool_choice.clone();
     let thinking = req.thinking_preference();
+    let thinking_budget = req.thinking_budget();
     let output_grammar = req.output_schema().and_then(json_schema_grammar_str);
     let (messages, tools) = req.into_internal();
     let super::chat_prompt::PreparedPrompt {
@@ -220,7 +221,24 @@ pub(crate) async fn anthropic_messages_at(
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         params.probe = Some(probe.clone());
         let energy = crate::energy_report::begin_with(Some(probe.clone()));
-        match engine.generate(&prompt, params).await {
+        let generated = match thinking_budget {
+            Some(tokens) => {
+                crate::api::thinking_budget::generate(
+                    crate::api::thinking_budget::Budget {
+                        tokens,
+                        opened_by_prompt: thinking_opened,
+                    },
+                    params,
+                    |suffix, params| {
+                        let (engine, prompt) = (engine.clone(), format!("{prompt}{suffix}"));
+                        async move { engine.generate(&prompt, params).await }
+                    },
+                )
+                .await
+            }
+            None => engine.generate(&prompt, params).await,
+        };
+        match generated {
             Ok(result) => {
                 let energy = crate::energy_report::end_share(energy, "text", "[/v1/messages]");
                 let text = crate::api::handlers::openai::vllm::strip_stop(
@@ -285,7 +303,7 @@ pub(crate) async fn anthropic_messages_at(
             let (engine, prompt) = (engine.clone(), prompt.clone());
             let params = GenerationParams {
                 probe: Some(probe.clone()),
-                ..params
+                ..params.clone()
             };
             Box::pin(async move {
                 engine
@@ -338,6 +356,30 @@ pub(crate) async fn anthropic_messages_at(
                                 None => return,
                             }
                         }
+                    };
+                    let mut rx = match thinking_budget {
+                        Some(tokens) => crate::api::thinking_budget::limit(
+                            rx,
+                            crate::api::thinking_budget::Budget {
+                                tokens,
+                                opened_by_prompt: thinking_opened,
+                            },
+                            {
+                                let (engine, prompt, params) =
+                                    (engine.clone(), prompt.clone(), params.clone());
+                                move |c| async move {
+                                    let params = GenerationParams {
+                                        max_tokens: params.max_tokens.map(|m| m.saturating_sub(c.spent)),
+                                        ..params
+                                    };
+                                    engine
+                                        .generate_stream(&format!("{prompt}{}", c.suffix), params)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                }
+                            },
+                        ),
+                        None => rx,
                     };
                     let mut scanner = if tools_active {
                         Some(crate::api::tool_calls::StreamToolScanner::new(tool_format))

@@ -36,6 +36,7 @@ pub mod media_limits;
 /// The figures a chat answer reports about itself.
 pub(crate) mod request_figures;
 pub(crate) mod thinking;
+pub(crate) mod thinking_budget;
 pub(crate) mod tool_calls;
 
 // Production features. Internal to the crate - none of these

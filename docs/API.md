@@ -133,6 +133,7 @@ Anything else is refused: compressed or big-endian archives, torch's legacy form
 | `allowed_token_ids` | The only tokens that may be drawn. |
 | `bad_words` | Words never written. The last token of each is banned after the tokens before it, at the start of a text and after a space. |
 | `min_tokens` | Tokens written before an end token, a stop token or a stop sequence may end the answer. |
+| `thinking_token_budget` | Tokens the reasoning may take on a chat completion, streamed or whole. The server then closes the reasoning with `</think>` and writes the answer. |
 | `ignore_eos` | The model's end tokens and default stop sequences end nothing. The answer runs to `max_tokens`. |
 | `stop_token_ids` | Tokens that end the answer besides the model's own. |
 | `include_stop_str_in_output` | Keeps the stop sequence the answer ended on in the text. |
@@ -287,7 +288,7 @@ A request past 1 of them is answered 400 naming the cap and the value it carried
 <!-- site: widget table id=api-messages -->
 | Route | What it does |
 |---|---|
-| `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking`, `output_format`, `top_k`, `seed`, `stop_sequences`. `max_tokens` is required. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts and the [`loken` object](#per-request-figures) in `usage`. Streams as the official event stream, with `error` events. |
+| `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking` (its `budget_tokens` closes the reasoning once spent), `output_format`, `top_k`, `seed`, `stop_sequences`. `max_tokens` is required. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts and the [`loken` object](#per-request-figures) in `usage`. Streams as the official event stream, with `error` events. |
 | `POST /v1/messages/count_tokens` | Count the prompt with the model's own tokenizer. |
 | `POST /v1/messages/batches`, `GET /v1/messages/batches`, `GET /v1/messages/batches/{id}` | Batches in the Messages API's shape. |
 | `POST /v1/messages/batches/{id}/cancel`, `GET /v1/messages/batches/{id}/results` | Stop 1 batch, and serve its JSONL. |

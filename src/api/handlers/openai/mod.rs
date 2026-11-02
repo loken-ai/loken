@@ -556,6 +556,7 @@ pub(crate) async fn chat_completion_at(
         // Streaming response using SSE (OpenAI-compatible format)
         let engine_for_stats = engine.clone();
         let wants_logprobs = request.logprobs == Some(true);
+        let thinking_budget = request.vllm.thinking_token_budget;
         // Taken before the engine reads the prompt: the first message of a stream only comes
         // once the prefill is done, and a time to first token counted from after it is zero.
         let stream_started = std::time::Instant::now();
@@ -640,6 +641,30 @@ pub(crate) async fn chat_completion_at(
 
                     let mut token_count: i32 = 0;
                     let mut first_token_at: Option<std::time::Instant> = None;
+                    let mut rx = match thinking_budget {
+                        Some(tokens) => crate::api::thinking_budget::limit(
+                            rx,
+                            crate::api::thinking_budget::Budget {
+                                tokens,
+                                opened_by_prompt: thinking_opened,
+                            },
+                            {
+                                let (engine, prompt, params) =
+                                    (engine.clone(), prompt.clone(), params.clone());
+                                move |c| async move {
+                                    let params = GenerationParams {
+                                        max_tokens: params.max_tokens.map(|m| m.saturating_sub(c.spent)),
+                                        ..params
+                                    };
+                                    engine
+                                        .generate_stream(&format!("{prompt}{}", c.suffix), params)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                }
+                            },
+                        ),
+                        None => rx,
+                    };
                     let mut errored = false;
                     // When tools are active, route content through a scanner
                     // that streams natural text until a tool-call marker,
@@ -983,7 +1008,23 @@ pub(crate) async fn chat_completion_at(
         let energy = crate::energy_report::begin_with(Some(probe.clone()));
         let mut result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
         let (content, finish_reason, completion_tokens, prompt_tokens, cached_tokens) =
-            match engine.generate(&prompt, params).await {
+            match match request.vllm.thinking_token_budget {
+                Some(tokens) => {
+                    crate::api::thinking_budget::generate(
+                        crate::api::thinking_budget::Budget {
+                            tokens,
+                            opened_by_prompt: thinking_opened,
+                        },
+                        params,
+                        |suffix, params| {
+                            let (engine, prompt) = (engine.clone(), format!("{prompt}{suffix}"));
+                            async move { engine.generate(&prompt, params).await }
+                        },
+                    )
+                    .await
+                }
+                None => engine.generate(&prompt, params).await,
+            } {
                 Ok(result) => {
                     result_logprobs = result.logprobs.clone();
                     if ids_as_tokens {

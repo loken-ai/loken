@@ -83,7 +83,7 @@ Smaller, by priority:
 | Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
 | Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
-| Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Planned |
+| Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Done |
 | Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Done |
 | Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the rate at which the queue of the engine starts to grow without bound. | Planned |
 | Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Planned |
