@@ -13,6 +13,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: batch the image and speech requests queued behind a running one.
 - API: take a completion's prompt as embeddings, in loken's checksummed format or as torch.save tensors.
 - API: take vLLM's request fields and serve its extra routes.
+- API: tell a request refused for lack of a slot when to retry.
 - Models: embed texts and images in one space with CLIP and SigLIP checkpoints, on the embeddings routes.
 - Config: list several model directories, on several disks, as one catalogue read in the order listed.
 - Models: serve a float checkpoint in its stored format when it fits.

@@ -21,13 +21,17 @@ pub(crate) fn anthropic_error_response(
 /// carries there.
 pub(crate) fn anthropic_api_error(e: ApiError) -> Response {
     use axum::http::StatusCode;
+    let mut retry_after = None;
     let (status, kind, message) = match e {
         ApiError::Validation(m) => (StatusCode::BAD_REQUEST, "invalid_request_error", m),
         ApiError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found_error", m),
-        ApiError::Busy(m) => (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", m),
+        ApiError::Busy(m, wait) => {
+            retry_after = wait;
+            (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", m)
+        }
         ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error", m),
     };
-    anthropic_error_response(status, kind, message)
+    super::with_retry_after(anthropic_error_response(status, kind, message), retry_after)
 }
 
 /// Anthropic Messages API shim (`POST /v1/messages`). Translates the

@@ -33,10 +33,13 @@ impl LoadRequest {
 /// full right now.
 pub(crate) fn load_error(model_name: &str, e: &str) -> ApiError {
     if crate::inference::place::ladder::is_out_of_memory(e) {
-        return ApiError::Busy(format!(
-            "Model '{model_name}' exists but the machine has no room for it right now: {e}. \
-             Retry once the current work finishes."
-        ));
+        return ApiError::Busy(
+            format!(
+                "Model '{model_name}' exists but the machine has no room for it right now: {e}. \
+                 Retry once the current work finishes."
+            ),
+            None,
+        );
     }
     ApiError::NotFound(format!("Model '{model_name}' could not be loaded: {e}"))
 }
@@ -307,11 +310,11 @@ mod tests {
     fn a_full_machine_is_not_a_missing_model() {
         assert!(matches!(
             load_error("m", "cuda OOM in QCudaStorage upload on GPU0"),
-            ApiError::Busy(_)
+            ApiError::Busy(..)
         ));
         assert!(matches!(
             load_error("m", "CUDA error: out of memory"),
-            ApiError::Busy(_)
+            ApiError::Busy(..)
         ));
         assert!(matches!(
             load_error("m", "no such model on disk"),

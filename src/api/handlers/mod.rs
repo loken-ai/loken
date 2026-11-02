@@ -3276,15 +3276,20 @@ async fn acquire_gate(
             .find(|e| e.model_id == model)
             .and_then(|e| e.gate.clone())
     };
-    own.unwrap_or_else(|| state.request_gate.clone())
+    let gate = own.unwrap_or_else(|| state.request_gate.clone());
+    match gate
         .acquire_with_info_timeout(priority, model, endpoint, GATE_WAIT)
         .await
-        .ok_or_else(|| {
-            ApiError::Busy(format!(
+    {
+        Some(guard) => Ok(guard),
+        None => Err(ApiError::Busy(
+            format!(
                 "no inference slot became available within {}s ({endpoint}); retry later",
                 GATE_WAIT.as_secs()
-            ))
-        })
+            ),
+            gate.retry_after_secs().await,
+        )),
+    }
 }
 
 /// API error types
@@ -3297,7 +3302,9 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
     #[error("Server busy: {0}")]
-    Busy(String),
+    /// The server cannot take the request now. The seconds after which it can, when known,
+    /// go out as `Retry-After`.
+    Busy(String, Option<u64>),
 }
 
 /// Fallback 404 handler with logging
@@ -3463,11 +3470,15 @@ where
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut retry_after = None;
         let (status, error_message) = match self {
             ApiError::Validation(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            ApiError::Busy(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            ApiError::Busy(msg, wait) => {
+                retry_after = wait;
+                (StatusCode::SERVICE_UNAVAILABLE, msg)
+            }
         };
         // Every refusal and failure is in the server's log with its reason, not only in the
         // body the client may discard.
@@ -3478,8 +3489,20 @@ impl IntoResponse for ApiError {
         // failures consistently with their primary backend's.
         let body = Json(openai_error_body(status, error_message));
 
-        (status, body).into_response()
+        with_retry_after((status, body).into_response(), retry_after)
     }
+}
+
+/// `response` with the `Retry-After` header set to `seconds`, when there are some.
+pub(crate) fn with_retry_after(mut response: Response, seconds: Option<u64>) -> Response {
+    if let Some(value) =
+        seconds.and_then(|s| axum::http::HeaderValue::from_str(&s.to_string()).ok())
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// Validation helper. Strips the validator crate's verbose serialized

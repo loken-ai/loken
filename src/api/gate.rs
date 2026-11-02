@@ -88,6 +88,20 @@ struct GateState {
     // /api/inflight can report what's actually running and queued, not
     // just counts. Keyed by `req_id`. Removed on guard drop.
     tracked: HashMap<u64, TrackedRequest>,
+    // Requests that held a permit and ended, and the time they held it: the service time
+    // behind the wait a refused request is told.
+    served: u64,
+    held_ms: u64,
+}
+
+impl GateState {
+    /// Forgets a request that ended and counts the time it held its permit.
+    fn finish(&mut self, req_id: u64) {
+        if let Some(started) = self.tracked.remove(&req_id).and_then(|t| t.started_at_ms) {
+            self.served += 1;
+            self.held_ms += (now_unix_ms() - started).max(0) as u64;
+        }
+    }
 }
 
 /// Snapshot of one tracked request - what we expose for observability.
@@ -117,6 +131,18 @@ pub struct RequestGate {
     max_in_flight: usize,
     seq_counter: AtomicU64,
     req_id_counter: AtomicU64,
+}
+
+/// Seconds a request that queues behind `queued` others can expect to wait: each of them and
+/// itself holds a permit for the mean of the `served` requests that ended, `held_ms` in all,
+/// and `slots` permits run at once. Nothing until a request has ended. Never under 1.
+fn expected_wait_secs(served: u64, held_ms: u64, queued: usize, slots: usize) -> Option<u64> {
+    if served == 0 {
+        return None;
+    }
+    let mean_ms = held_ms as f64 / served as f64;
+    let secs = ((queued + 1) as f64 * mean_ms / slots as f64 / 1000.0).ceil();
+    Some((secs as u64).max(1))
 }
 
 fn now_unix_ms() -> i64 {
@@ -262,6 +288,14 @@ impl RequestGate {
         state.in_flight = state.in_flight.saturating_sub(1);
     }
 
+    /// Seconds after which a refused request can expect a permit: the requests ahead of it
+    /// and itself, each holding a permit for the mean time permits were held, over the
+    /// permits that run at once. Nothing until a request has ended.
+    pub async fn retry_after_secs(&self) -> Option<u64> {
+        let g = self.state.lock().await;
+        expected_wait_secs(g.served, g.held_ms, g.waiters.len(), self.max_in_flight)
+    }
+
     /// Snapshot of the current gate state for observability.
     /// How many requests may run at once. Published so a peer can read this node's load as a
     /// fraction of what it can actually take, rather than as a raw count that means nothing
@@ -327,13 +361,13 @@ impl Drop for RequestGuard {
         let gate = self.gate.clone();
         let req_id = self.req_id;
         if let Ok(mut g) = gate.state.try_lock() {
-            g.tracked.remove(&req_id);
+            g.finish(req_id);
             gate.release(&mut g);
             return;
         }
         tokio::spawn(async move {
             let mut g = gate.state.lock().await;
-            g.tracked.remove(&req_id);
+            g.finish(req_id);
             gate.release(&mut g);
         });
     }
@@ -364,6 +398,36 @@ mod tests {
         );
         assert_eq!(Priority::of_request(&h, false), Priority::Batch);
         assert_eq!(Priority::of_request(&h, true), Priority::Batch);
+    }
+
+    #[test]
+    fn the_wait_told_to_a_refused_request_follows_the_queue_and_the_measured_hold() {
+        // Nothing has ended yet: no rate to tell.
+        assert_eq!(expected_wait_secs(0, 0, 3, 2), None);
+        // 3 queued and itself, each holding 2 s, 2 permits at once: 4 s.
+        assert_eq!(expected_wait_secs(5, 10_000, 3, 2), Some(4));
+        // A short hold still tells 1 s, never 0.
+        assert_eq!(expected_wait_secs(4, 40, 0, 1), Some(1));
+        // The queue lengthens the wait.
+        assert!(expected_wait_secs(5, 10_000, 9, 2) > expected_wait_secs(5, 10_000, 3, 2));
+    }
+
+    #[tokio::test]
+    async fn a_gate_tells_nothing_until_a_request_has_ended() {
+        let gate = RequestGate::new(1);
+        assert_eq!(gate.retry_after_secs().await, None);
+        let guard = gate
+            .acquire_with_info_timeout(
+                Priority::Interactive,
+                "m".into(),
+                "/test",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(gate.retry_after_secs().await.is_some());
     }
 
     #[test]
