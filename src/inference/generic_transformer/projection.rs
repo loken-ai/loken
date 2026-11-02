@@ -193,9 +193,10 @@ impl AwqWeight {
         Ok(Some(layer))
     }
 
-    /// Marlin forward for any M: one f32->f16 activation convert, the Marlin
-    /// GEMM (M-looped in chunks of 32 inside the launcher), one f16->f32 output
-    /// convert (downstream consumers are f32, like the dp4a/GEMM paths).
+    /// Marlin forward for any M: the Marlin GEMM (M-looped in chunks of 32 inside the
+    /// launcher) over f16 activations. The output has the dtype of the input when that is
+    /// f16, so a layer that computes in f16 pays no conversion on either side. Any other
+    /// input dtype gets an f32 output, like the dp4a/GEMM paths.
     #[cfg(feature = "gpu")]
     fn forward_marlin(
         &self,
@@ -216,7 +217,12 @@ impl AwqWeight {
         let c = layer
             .forward_view(&ndev, &view, tokens)
             .map_err(|e| crate::tensor::Error::msg(format!("awq marlin: {}", e.0)))?;
-        let y = cuda_ext::tensor_from_f16_slice(c, (tokens, self.n), &dev)?.to_dtype(DType::F32)?;
+        let y = cuda_ext::tensor_from_f16_slice(c, (tokens, self.n), &dev)?;
+        let y = if xs.dtype() == DType::F16 {
+            y
+        } else {
+            y.to_dtype(DType::F32)?
+        };
         let y = self.add_bias(y)?;
         y.reshape(out_shape)
     }
@@ -1113,7 +1119,11 @@ mod marlin_parity {
                     .unwrap();
                 let x_cpu = Tensor::from_vec_f32(xv, vec![rows, k]).unwrap();
 
-                let got = on_gpu.forward(&x_gpu).unwrap().to_vec_f32();
+                let out = on_gpu.forward(&x_gpu).unwrap();
+                // An f16 input comes back as f16: a layer that computes in f16 pays no
+                // conversion on either side of the product.
+                assert_eq!(out.dtype(), x_gpu.dtype());
+                let got = out.to_vec_f32();
                 // The judge is the exact product with the unpacked weight: the host forward
                 // reads eight-bit blocks, which round both operands.
                 let want = match &on_cpu.inner {
