@@ -92,6 +92,8 @@ where
     let mut merged: Option<serde_json::Value> = None;
     let mut choices = Vec::new();
     let (mut prompt_tokens, mut completion_tokens) = (0i64, 0i64);
+    let (mut accepted, mut rejected) = (0i64, 0i64);
+    let mut figures = Vec::new();
     for i in 0..runs {
         let resp = run(i).await?;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -113,6 +115,13 @@ where
             prompt_tokens += count("prompt_tokens");
         }
         completion_tokens += count("completion_tokens");
+        accepted += count("completion_tokens_details/accepted_prediction_tokens");
+        rejected += count("completion_tokens_details/rejected_prediction_tokens");
+        if let Some(l) = v.pointer("/usage/loken").and_then(|l| {
+            serde_json::from_value::<crate::api::request_figures::LokenUsage>(l.clone()).ok()
+        }) {
+            figures.push(l);
+        }
         merged.get_or_insert(v);
     }
     if let Some(best) = best_of {
@@ -133,9 +142,19 @@ where
     out["usage"]["prompt_tokens"] = serde_json::json!(prompt_tokens);
     out["usage"]["completion_tokens"] = serde_json::json!(completion_tokens);
     out["usage"]["total_tokens"] = serde_json::json!(prompt_tokens + completion_tokens);
-    // The figures of one run do not describe the merged answer.
+    // The speculation and the figures of the runs are summed into the answer's.
+    if let Some(details) = out["usage"]["completion_tokens_details"].as_object_mut() {
+        details.insert("accepted_prediction_tokens".into(), accepted.into());
+        details.insert("rejected_prediction_tokens".into(), rejected.into());
+    }
     if let Some(usage) = out["usage"].as_object_mut() {
         usage.remove("loken");
+        if figures.len() == runs {
+            usage.insert(
+                "loken".into(),
+                crate::api::request_figures::LokenUsage::sum(&figures).to_json(),
+            );
+        }
     }
     Ok(Json(out).into_response())
 }
@@ -962,10 +981,14 @@ pub(crate) async fn chat_completion_at(
         let _cancel = engine.cancel_guard(&mut params);
         if let Some(search) = beam {
             vllm::check_beam_request(false, params.grammar.is_some())?;
+            let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+            params.probe = Some(probe.clone());
+            let energy = crate::energy_report::begin_with(Some(probe.clone()));
             let out = engine
                 .generate_beams(&prompt, params, search)
                 .await
                 .map_err(|e| ApiError::Internal(format!("beam search: {e}")))?;
+            let energy = crate::energy_report::end_share(energy, "text", "[/v1/chat/completions]");
             let mut completion_tokens = 0u64;
             let mut choices = Vec::with_capacity(out.beams.len());
             for (i, b) in out.beams.into_iter().enumerate() {
@@ -996,7 +1019,8 @@ pub(crate) async fn chat_completion_at(
                 format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                 model_name,
                 choices,
-                Usage::from_counts(out.prompt_eval_count, 0, completion_tokens),
+                Usage::from_counts(out.prompt_eval_count, 0, completion_tokens)
+                    .with_request(probe.outcome().as_ref(), energy.as_ref()),
             );
             if let Some(tier) = request.service_tier.as_deref() {
                 response.service_tier = tier.to_string();

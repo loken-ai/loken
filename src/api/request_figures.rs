@@ -95,6 +95,40 @@ impl LokenUsage {
         }
     }
 
+    /// The figures of generations run one after the other for one answer: times and energy
+    /// added, `work` when any run shared its energy, the cache place of the last run.
+    /// A figure no run measured stays absent.
+    pub fn sum(parts: &[LokenUsage]) -> Self {
+        fn add(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            }
+        }
+        let mut total = Self::default();
+        for p in parts {
+            total.queue_ms = add(total.queue_ms, p.queue_ms);
+            total.prefill_ms = add(total.prefill_ms, p.prefill_ms);
+            total.decode_ms = add(total.decode_ms, p.decode_ms);
+            total.energy = match (total.energy.take(), p.energy.as_ref()) {
+                (Some(a), Some(b)) => Some(LokenEnergy {
+                    joules: a.joules + b.joules,
+                    gpu_joules: add(a.gpu_joules, b.gpu_joules),
+                    cpu_joules: add(a.cpu_joules, b.cpu_joules),
+                    estimated: a.estimated || b.estimated,
+                    share: if a.share == ShareRule::Work || b.share == ShareRule::Work {
+                        ShareRule::Work
+                    } else {
+                        ShareRule::Alone
+                    },
+                }),
+                (a, b) => a.or_else(|| b.cloned()),
+            };
+            total.kv = p.kv.or(total.kv);
+        }
+        total
+    }
+
     /// The object as JSON, for the routes that build their usage as a value.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_default()
@@ -184,6 +218,44 @@ mod tests {
     use super::*;
     use crate::request_metrics::{KvPlace, RequestFigures};
     use futures::StreamExt;
+
+    /// Generations summed give one answer's figures: times and energy added, the last cache
+    /// place, and `work` as soon as one run shared its energy.
+    #[test]
+    fn runs_gathered_into_one_answer_add_up() {
+        let run = |q: f64, joules: f64, shared: bool, used: u64| LokenUsage {
+            queue_ms: Some(q),
+            prefill_ms: Some(10.0),
+            decode_ms: Some(20.0),
+            energy: Some(LokenEnergy {
+                joules,
+                gpu_joules: Some(joules),
+                cpu_joules: None,
+                estimated: false,
+                share: if shared {
+                    ShareRule::Work
+                } else {
+                    ShareRule::Alone
+                },
+            }),
+            kv: Some(LokenKv {
+                used_tokens: used,
+                capacity_tokens: 100,
+            }),
+        };
+        let sum = LokenUsage::sum(&[run(1.0, 2.0, false, 30), run(2.0, 3.0, true, 40)]);
+        assert_eq!(sum.queue_ms, Some(3.0));
+        assert_eq!(sum.prefill_ms, Some(20.0));
+        assert_eq!(sum.decode_ms, Some(40.0));
+        let e = sum.energy.unwrap();
+        assert_eq!(
+            (e.joules, e.gpu_joules, e.cpu_joules),
+            (5.0, Some(5.0), None)
+        );
+        assert_eq!(e.share, ShareRule::Work);
+        assert_eq!(sum.kv.unwrap().used_tokens, 40);
+        assert_eq!(LokenUsage::sum(&[]), LokenUsage::default());
+    }
 
     /// The object carries the times in milliseconds, the energy with its share rule and the
     /// cache place; a field not measured is absent, and an unread CPU part is `null`.

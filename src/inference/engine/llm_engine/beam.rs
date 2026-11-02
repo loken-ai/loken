@@ -547,9 +547,11 @@ impl LlmEngine {
         let sessions = self.sessions.clone();
         let config = self.config.clone();
         let cancel = params.cancel.clone().unwrap_or_default();
+        let probe = params.probe.clone();
         let prompt = prompt.to_string();
         let arrived = std::time::Instant::now();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<BeamOutcome> {
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
             let mut guard = model_state.blocking_lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let state = guard
@@ -557,15 +559,23 @@ impl LlmEngine {
                 .ok_or_else(|| anyhow!("Model not loaded. Load a model first."))?;
             sessions.blocking_lock().clear();
             let out = decode_beams(state, &config, &prompt, params, search, &cancel)?;
-            crate::request_metrics::record(
+            crate::request_metrics::record_outcome(
                 &config.model_id,
-                &crate::request_metrics::RequestFigures {
-                    queue_s,
-                    prefill_s: out.prompt_eval_duration as f64 / 1e9,
-                    decode_s: out.eval_duration as f64 / 1e9,
-                    prompt_tokens: out.prompt_eval_count,
-                    cached_prompt_tokens: 0,
-                    generated_tokens: out.forwards,
+                probe.as_deref(),
+                crate::request_metrics::RequestOutcome {
+                    figures: crate::request_metrics::RequestFigures {
+                        queue_s,
+                        prefill_s: out.prompt_eval_duration as f64 / 1e9,
+                        decode_s: out.eval_duration as f64 / 1e9,
+                        prompt_tokens: out.prompt_eval_count,
+                        cached_prompt_tokens: 0,
+                        generated_tokens: out.forwards,
+                    },
+                    kv: crate::request_metrics::KvPlace::of(
+                        state.model.kv_len(),
+                        state.model.kv_capacity(),
+                    ),
+                    ..Default::default()
                 },
             );
             Ok(out)

@@ -231,6 +231,59 @@ async fn runs_merge_into_one_response() {
     }
 }
 
+/// Runs gather into one answer that reports their figures added together, and none when a run
+/// reported none.
+#[tokio::test]
+async fn gathered_runs_report_summed_figures() {
+    let answer = |figures: Option<serde_json::Value>| -> Result<Response, ApiError> {
+        let mut usage = serde_json::json!({
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+            "completion_tokens_details": {
+                "accepted_prediction_tokens": 1, "rejected_prediction_tokens": 2
+            }
+        });
+        if let Some(f) = figures {
+            usage["loken"] = f;
+        }
+        Ok(Json(serde_json::json!({
+            "id": "x", "choices": [{"index": 0, "text": "t"}], "usage": usage
+        }))
+        .into_response())
+    };
+    let figures = serde_json::json!({"queue_ms": 1.0, "prefill_ms": 10.0, "decode_ms": 20.0});
+    let merged = |all: bool| {
+        let (a, b) = (figures.clone(), figures.clone());
+        async move {
+            let out = merge_runs(2, false, None, |i| {
+                let r = answer((all || i == 0).then(|| if i == 0 { a.clone() } else { b.clone() }));
+                async move { r }
+            })
+            .await
+            .unwrap();
+            let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+    let v = merged(true).await;
+    assert_eq!(v["usage"]["loken"]["prefill_ms"], 20.0);
+    assert_eq!(v["usage"]["loken"]["decode_ms"], 40.0);
+    assert_eq!(
+        v["usage"]["completion_tokens_details"]["accepted_prediction_tokens"],
+        2
+    );
+    assert_eq!(
+        v["usage"]["completion_tokens_details"]["rejected_prediction_tokens"],
+        4
+    );
+    let v = merged(false).await;
+    assert!(
+        v["usage"].get("loken").is_none(),
+        "a run without figures leaves none"
+    );
+}
+
 /// `best_of` keeps the choices with the highest mean token log-probability, reindexed, and the
 /// usage still counts every run.
 #[tokio::test]

@@ -10,6 +10,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Metrics: count the expert bytes missing from memory by asker, and the experts a token shares with the last.
 - Inference: run a decode layer whole on the card that keeps its weights, routed experts apart.
 - Metrics: publish each request's queue, prefill, decode and cache figures.
+- API: report a chat answer's own times, energy and cache place, also when it gathers several generations.
 - Serving: batch the image and speech requests queued behind a running one.
 - API: take a completion's prompt as embeddings, in loken's checksummed format or as torch.save tensors.
 - API: take vLLM's request fields and serve its extra routes.

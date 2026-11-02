@@ -371,7 +371,9 @@ A field loken does not measure is left out.
 `energy` is absent when no domain is read.  
 `kv` is absent when the backend does not report its cache.
 
-An answer that gathers several generations (`n` above 1, a beam search) carries no `loken` object.
+An answer that gathers several generations (`n` above 1) reports the sum of their figures.
+Times and energy are added, `share` is `work` when any generation shared its energy, and `kv` is the place after the last generation.
+A beam search reports 1 set of figures for the whole search, and `decode_ms` covers every beam.
 
 `completion_tokens_details.accepted_prediction_tokens` counts the drafted tokens the model kept, and `rejected_prediction_tokens` the ones it refused.
 Both stay at 0 on a model served by continuous batching, whose worker does not report its speculation.
