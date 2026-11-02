@@ -994,6 +994,94 @@ mod tests {
         }
     }
 
+    /// The settings of a real transformers beam search and what it answered, recorded by
+    /// `scripts/beam_golden.py` on a model without weights: the search here finishes the same
+    /// hypotheses in the same order with the same scores, and so does the port the other tests
+    /// compare it with.
+    #[test]
+    fn the_search_answers_what_transformers_answered_when_it_ran() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/beam_transformers.json"
+        )))
+        .unwrap();
+        let ints = |v: &serde_json::Value| -> Vec<u32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect()
+        };
+        let prompt = ints(&golden["prompt"]);
+        let vocab = golden["vocab"].as_u64().unwrap();
+        // The recorded model: integer arithmetic on the tokens so far.
+        let model = |generated: &[u32]| -> Vec<f64> {
+            let seq: Vec<u64> = prompt
+                .iter()
+                .chain(generated)
+                .map(|&t| u64::from(t))
+                .collect();
+            let (sum, n, last) = (
+                seq.iter().sum::<u64>(),
+                seq.len() as u64,
+                seq[seq.len() - 1],
+            );
+            let logits: Vec<f32> = (0..vocab)
+                .map(|v| {
+                    let k = (17 * (v + 1) + 5 * sum + 3 * n * v + 7 * last * v) % 29;
+                    k as f32 * 0.25 + v as f32 * 0.0123
+                })
+                .collect();
+            log_softmax(&logits)
+        };
+        let cases = golden["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for c in cases {
+            let early = match &c["early_stopping"] {
+                serde_json::Value::Bool(false) => EarlyStopping::Heuristic,
+                serde_json::Value::Bool(true) => EarlyStopping::Done,
+                _ => EarlyStopping::Never,
+            };
+            let ends = ints(&c["ends"]);
+            let max_new = c["max_new"].as_u64().unwrap() as usize;
+            let s = search(
+                c["width"].as_u64().unwrap() as usize,
+                c["length_penalty"].as_f64().unwrap(),
+                early,
+            );
+            let case = format!("{c}");
+            let want_tokens: Vec<Vec<u32>> = c["sequences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(&ints)
+                .collect();
+            let mut searcher = BeamSearcher::new(s, ends.clone(), max_new, 0);
+            let mut rows = vec![model(&[])];
+            while searcher.advance(&rows) {
+                rows = searcher
+                    .running()
+                    .iter()
+                    .map(|h| model(&h.tokens))
+                    .collect();
+            }
+            let got = searcher.best();
+            let ported = transformers_search(s, &ends, max_new, &model);
+            let got_tokens: Vec<Vec<u32>> =
+                got.iter().map(|f| f.hypothesis.tokens.clone()).collect();
+            let ported_tokens: Vec<Vec<u32>> = ported.iter().map(|p| p.0.clone()).collect();
+            assert_eq!(got_tokens, want_tokens, "search: {case}");
+            assert_eq!(ported_tokens, want_tokens, "port: {case}");
+            // Greedy decoding keeps no beam score.
+            if let Some(scores) = c["scores"].as_array() {
+                for (i, want) in scores.iter().enumerate() {
+                    let want = want.as_f64().unwrap();
+                    assert!((got[i].score - want).abs() < 1e-4, "score {i}: {case}");
+                }
+            }
+        }
+    }
+
     /// The first token alone ranks first, but only the second has a likely continuation: width
     /// 2 keeps the second, and the answer starts with it, as transformers' does.
     #[test]
@@ -1070,6 +1158,56 @@ mod tests {
                     row == &plain(beam),
                     "beam {beam:?} read other logits than its plain decode"
                 );
+            }
+        }
+        tiny_model::remove(&path);
+    }
+
+    /// The search driven by a real model's rows, through the replays on the one cache, finishes
+    /// the hypotheses transformers' search finishes when it reads each beam's logits by a plain
+    /// decode of that beam alone.
+    #[test]
+    fn the_search_over_a_model_answers_what_transformers_answers() {
+        use crate::inference::engine::model_backend::GenericBackend;
+        use crate::inference::generic_transformer::tiny_model;
+        const LAYERS: usize = 2;
+        const PROMPT: [u32; 5] = [1, 4, 2, 9, 3];
+        let ids = |t: &[u32]| Tensor::new(t, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+        let path = tiny_model::write_quant("beam-search", LAYERS);
+        let plain = |beam: &[u32]| -> Vec<f64> {
+            let mut m = GenericBackend(tiny_model::load_q8_kv(&path, LAYERS));
+            let mut logits = m.forward(&ids(&PROMPT), 0).unwrap();
+            for (i, &t) in beam.iter().enumerate() {
+                logits = m.forward(&ids(&[t]), PROMPT.len() + i).unwrap();
+            }
+            log_softmax(&host_row(&logits).unwrap())
+        };
+        let end_sets: [&[u32]; 2] = [&[], &[7, 5]];
+        for width in [1, 3] {
+            for es in [EarlyStopping::Heuristic, EarlyStopping::Never] {
+                for ends in end_sets {
+                    let s = search(width, 1.0, es);
+                    let max_new = 5;
+                    let mut m = GenericBackend(tiny_model::load_q8_kv(&path, LAYERS));
+                    let first = m.forward(&ids(&PROMPT), 0).unwrap();
+                    let mut searcher = BeamSearcher::new(s, ends.to_vec(), max_new, 0);
+                    let mut rows = vec![log_softmax(&host_row(&first).unwrap())];
+                    let (mut resident, mut forwards) = (Vec::new(), 0);
+                    while searcher.advance(&rows) {
+                        rows = beam_rows(
+                            &mut m,
+                            &Device::Cpu,
+                            PROMPT.len(),
+                            &mut resident,
+                            searcher.running(),
+                            &mut forwards,
+                        )
+                        .unwrap();
+                    }
+                    let case = format!("width {width}, {es:?}, ends {ends:?}");
+                    let want = transformers_search(s, ends, max_new, &plain);
+                    assert_same(&searcher.best(), &want, &case);
+                }
             }
         }
         tiny_model::remove(&path);
