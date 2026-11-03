@@ -17,6 +17,8 @@ pub struct Embedding {
     table: Tensor,
     /// The stored `[vocab, dim]` blocks, when the table is kept in the checkpoint's format.
     stored: Option<Arc<crate::tensor::quantized::QTensor>>,
+    /// Whether a lookup widens the rows of a half precision table to F32.
+    widen_rows: bool,
 }
 
 impl Embedding {
@@ -24,6 +26,17 @@ impl Embedding {
         Self {
             table,
             stored: None,
+            widen_rows: false,
+        }
+    }
+
+    /// A dense table kept in the dtype the checkpoint stores.
+    /// A lookup returns F32 rows, the widening of the rows asked for.
+    pub fn new_widening_rows(table: Tensor) -> Self {
+        Self {
+            table,
+            stored: None,
+            widen_rows: true,
         }
     }
 
@@ -47,6 +60,7 @@ impl Embedding {
         Ok(Self {
             table: anchor,
             stored: Some(qt),
+            widen_rows: false,
         })
     }
 
@@ -123,7 +137,10 @@ impl Embedding {
         if self.stored.is_some() {
             return Err(Error::msg("a stored embedding table stays on the host"));
         }
-        Ok(Self::new(self.table.to_device(dev)?))
+        Ok(Self {
+            table: self.table.to_device(dev)?,
+            ..self.clone()
+        })
     }
 
     /// Copy on `dev` converted to `dtype`.
@@ -146,6 +163,10 @@ impl Embedding {
                 self.stored_rows(qt, &host)?
             }
             None => self.table.index_select(&flat, 0)?,
+        };
+        let rows = match self.widen_rows && rows.dtype() != crate::tensor::DType::F32 {
+            true => rows.to_dtype(crate::tensor::DType::F32)?,
+            false => rows,
         };
         let dim = self.table.dim(super::D::Minus1)?;
         let mut odims = id_dims;

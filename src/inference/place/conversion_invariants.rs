@@ -111,7 +111,7 @@ fn counts() -> std::collections::BTreeMap<String, usize> {
 /// list only shrinks: annotate a site, or remove the conversion, and lower the count.
 /// Regenerate with `cargo test conversion_debt_listing -- --ignored --nocapture`.
 const CONVERSION_DEBT: &[(&str, usize)] = &[
-    ("inference/generic_transformer/loader.rs", 8),
+    ("inference/generic_transformer/loader.rs", 7),
     ("inference/model/acestep/dit/mod.rs", 1),
     ("inference/model/acestep/music.rs", 1),
     ("inference/model/acestep/vae.rs", 1),

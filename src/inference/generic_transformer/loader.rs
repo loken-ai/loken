@@ -5401,16 +5401,15 @@ impl GenericHeteroTransformer {
             layer_devs.push(dev_enum);
         }
 
-        // Embeddings (CPU - large vocab table). Loaded as F32.
-        let emb = st
-            .load("model.embed_tokens.weight", &Device::Cpu)?
-            .to_dtype(DType::F32)?;
+        // Embeddings (CPU - large vocab table), in the dtype the checkpoint stores.
+        // A lookup widens the rows it returns to F32.
+        let emb = st.load("model.embed_tokens.weight", &Device::Cpu)?;
         // The table also goes to each card that holds layers, as F16, when the card keeps as much
         // room as the table takes: a decoded token's row is then read there by one launch.
         #[cfg(feature = "gpu")]
         let embed_cards = {
             let mut cards = Vec::new();
-            // CONVERSION: the card's copy of the table is half precision, half the size of the f32 one on the host.
+            // CONVERSION: the card's copy of the table is half precision, whatever the checkpoint stores.
             let half = emb.to_dtype(DType::F16)?;
             let bytes = (half.elem_count() * 2) as u64;
             let mut seen = std::collections::HashSet::new();
@@ -5438,7 +5437,7 @@ impl GenericHeteroTransformer {
         };
         #[cfg(not(feature = "gpu"))]
         let embed_cards = Vec::new();
-        let embeddings = Embedding::new(emb);
+        let embeddings = Embedding::new_widening_rows(emb);
 
         // Final norm - CPU RmsNorm + a GPU copy for the GPU final-norm path.
         let norm_w = st

@@ -65,6 +65,35 @@ mod tests {
         }
     }
 
+    /// A half precision table widens only the rows a lookup returns, to the values the
+    /// widened whole table gives, and owns half the bytes of the F32 table.
+    #[test]
+    fn widening_rows_match_the_widened_table() {
+        use crate::tensor::DType;
+        let (v, d) = (7usize, 4usize);
+        let f32_table = Tensor::from_vec_f32(data(v * d, 5), vec![v, d]).unwrap();
+        let ids = Tensor::from_vec_u32(vec![6, 0, 3, 3], vec![2, 2]).unwrap();
+        for half in [DType::F16, DType::BF16] {
+            let stored = f32_table.to_dtype(half).unwrap();
+            let before = Embedding::new(stored.to_dtype(DType::F32).unwrap());
+            let after = Embedding::new_widening_rows(stored);
+            let want = before.forward(&ids).unwrap();
+            let got = after.forward(&ids).unwrap();
+            assert_eq!(got.dtype(), DType::F32);
+            assert_eq!(got.dims(), want.dims());
+            assert_eq!(got.to_vec_f32(), want.to_vec_f32(), "{half:?}");
+            assert_eq!(after.owned_bytes() * 2, before.owned_bytes());
+        }
+        let wide = Embedding::new_widening_rows(f32_table.clone());
+        assert_eq!(
+            wide.forward(&ids).unwrap().to_vec_f32(),
+            Embedding::new(f32_table)
+                .forward(&ids)
+                .unwrap()
+                .to_vec_f32()
+        );
+    }
+
     /// A stored table decodes the rows it is asked for to exactly what the dense table of the
     /// same blocks holds, and owns no bytes beyond the blocks.
     #[test]
