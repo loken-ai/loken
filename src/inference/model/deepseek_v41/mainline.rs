@@ -638,53 +638,74 @@ pub fn relayout(
     writer.finish_with_digest()
 }
 
-/// Every key llama.cpp's `deepseek41` loader reads without a default: the generic loader's,
-/// `llama_model_deepseek4::load_arch_hparams`', `llama_model_deepseek41::load_arch_hparams`', and
-/// the vocabulary's.
-pub const REQUIRED_KEYS: &[&str] = &[
+/// The keys llama.cpp's loader of this architecture reads without a default, as they follow the
+/// architecture's prefix: the generic loader's, the two architecture loaders' hyperparameters.
+const REQUIRED_ARCH_KEYS: &[&str] = &[
+    "context_length",
+    "embedding_length",
+    "block_count",
+    "attention.layer_norm_rms_epsilon",
+    "attention.q_lora_rank",
+    "attention.sliding_window",
+    "expert_feed_forward_length",
+    "expert_shared_count",
+    "expert_weights_scale",
+    "expert_weights_norm",
+    "swiglu_clamp_exp",
+    "attention.indexer.head_count",
+    "attention.indexer.key_length",
+    "attention.indexer.top_k",
+    "attention.output_group_count",
+    "attention.output_lora_rank",
+    "attention.compress_rope_freq_base",
+    "hyper_connection.count",
+    "hyper_connection.sinkhorn_iterations",
+    "hyper_connection.epsilon",
+    "hash_layer_count",
+    "attention.compress_ratios",
+    "expert_gating_func",
+    "attention.kv_source_layers",
+    "attention.indexer.source_layers",
+];
+
+/// The keys it reads without a default that carry no architecture prefix: the tag and the
+/// vocabulary's.
+const REQUIRED_GENERAL_KEYS: &[&str] = &[
     "general.architecture",
-    "deepseek41.context_length",
-    "deepseek41.embedding_length",
-    "deepseek41.block_count",
-    "deepseek41.attention.layer_norm_rms_epsilon",
-    "deepseek41.attention.q_lora_rank",
-    "deepseek41.attention.sliding_window",
-    "deepseek41.expert_feed_forward_length",
-    "deepseek41.expert_shared_count",
-    "deepseek41.expert_weights_scale",
-    "deepseek41.expert_weights_norm",
-    "deepseek41.swiglu_clamp_exp",
-    "deepseek41.attention.indexer.head_count",
-    "deepseek41.attention.indexer.key_length",
-    "deepseek41.attention.indexer.top_k",
-    "deepseek41.attention.output_group_count",
-    "deepseek41.attention.output_lora_rank",
-    "deepseek41.attention.compress_rope_freq_base",
-    "deepseek41.hyper_connection.count",
-    "deepseek41.hyper_connection.sinkhorn_iterations",
-    "deepseek41.hyper_connection.epsilon",
-    "deepseek41.hash_layer_count",
-    "deepseek41.attention.compress_ratios",
-    "deepseek41.expert_gating_func",
-    "deepseek41.attention.kv_source_layers",
-    "deepseek41.attention.indexer.source_layers",
     "tokenizer.ggml.model",
     "tokenizer.ggml.tokens",
     "tokenizer.ggml.merges",
 ];
 
-/// The keys an engram layer adds, read once `ple.layers` names one.
-pub const ENGRAM_KEYS: &[&str] = &[
-    "deepseek41.ple.layers",
-    "deepseek41.ple.ngram_size",
-    "deepseek41.ple.heads_per_ngram",
-    "deepseek41.embedding_length_per_layer_input",
-    "deepseek41.ple.layer_multipliers",
-    "deepseek41.ple.head_offsets",
-    "deepseek41.ple.head_vocab_sizes",
-    "deepseek41.engram.pad_token_id",
-    "deepseek41.engram.token_map",
+/// The keys an engram layer adds, read once `ple.layers` names one, after the prefix.
+const ENGRAM_ARCH_KEYS: &[&str] = &[
+    "ple.layers",
+    "ple.ngram_size",
+    "ple.heads_per_ngram",
+    "embedding_length_per_layer_input",
+    "ple.layer_multipliers",
+    "ple.head_offsets",
+    "ple.head_vocab_sizes",
+    "engram.pad_token_id",
+    "engram.token_map",
 ];
+
+/// Every key llama.cpp's loader reads without a default, whole.
+pub fn required_keys() -> Vec<String> {
+    REQUIRED_GENERAL_KEYS
+        .iter()
+        .map(|k| (*k).to_string())
+        .chain(REQUIRED_ARCH_KEYS.iter().map(|k| format!("{ARCH}.{k}")))
+        .collect()
+}
+
+/// The keys an engram layer adds, whole.
+pub fn engram_keys() -> Vec<String> {
+    ENGRAM_ARCH_KEYS
+        .iter()
+        .map(|k| format!("{ARCH}.{k}"))
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {

@@ -3143,8 +3143,11 @@ pub(crate) mod tests {
             md["general.architecture"].to_string().unwrap(),
             mainline::ARCH
         );
-        for k in mainline::REQUIRED_KEYS.iter().chain(mainline::ENGRAM_KEYS) {
-            assert!(md.contains_key(*k), "llama.cpp requires {k}");
+        for k in mainline::required_keys()
+            .iter()
+            .chain(&mainline::engram_keys())
+        {
+            assert!(md.contains_key(k), "llama.cpp requires {k}");
         }
         let cfg = DeepseekV41Config::from_gguf(&h.content).unwrap();
         let mut got: Vec<&String> = h.content.tensor_infos.keys().collect();
