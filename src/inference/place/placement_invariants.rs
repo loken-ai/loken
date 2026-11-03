@@ -70,7 +70,40 @@ pub(super) fn fleet_sources() -> Vec<std::path::PathBuf> {
 /// behaviour - so only production code is read; an item kept for tests alone above the
 /// module does not end it.
 pub(super) fn production(text: &str) -> &str {
-    text.split("#[cfg(test)]\nmod ").next().unwrap_or("")
+    // A cfg attribute that holds `test` and does not negate it: `test`, `all(test, ..)`.
+    let is_test_cfg = |line: &str| {
+        let t = line.trim();
+        t.starts_with("#[cfg(")
+            && !t.contains("not(")
+            && (t.contains("(test)") || t.contains("(test,") || t.contains(", test"))
+    };
+    let mut offset = 0;
+    let mut lines = text.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let start = offset;
+        offset += line.len();
+        if !is_test_cfg(line) {
+            continue;
+        }
+        // Attributes between the cfg and the module (a feature gate, say) do not end the test.
+        let mut rest = lines.clone();
+        let next = loop {
+            match rest.next() {
+                Some(l) if l.trim_start().starts_with("#[") => continue,
+                other => break other,
+            }
+        };
+        let declares_a_module = next.is_some_and(|l| {
+            let l = l.trim_start();
+            ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+                .iter()
+                .any(|head| l.starts_with(head))
+        });
+        if declares_a_module {
+            return &text[..start];
+        }
+    }
+    text
 }
 
 /// Whether a whole FILE is test code.
@@ -1307,6 +1340,23 @@ fn route_counts(text: &str, rel: &str) -> (usize, usize, usize) {
         counts.2 += usize::from(builds_a_card_by_number(code));
     }
     counts
+}
+
+#[test]
+fn production_ends_at_a_test_module_of_any_visibility() {
+    for head in ["mod tests {", "pub mod tests {", "pub(crate) mod tests {"] {
+        let text =
+            format!("fn live() {{}}\n#[cfg(test)]\n{head}\n    const DIM: usize = 256;\n}}\n");
+        assert_eq!(production(&text), "fn live() {}\n", "{head}");
+    }
+    let gated = "fn live() {}\n#[cfg(test)]\n#[cfg(feature = \"gpu\")]\nmod tests {\n    const DIM: usize = 256;\n}\n";
+    assert_eq!(production(gated), "fn live() {}\n");
+    let all = "fn live() {}\n#[cfg(all(test, feature = \"gpu\"))]\nmod shape_tests {\n}\n";
+    assert_eq!(production(all), "fn live() {}\n");
+    let negated = "#[cfg(not(test))]\nmod shipping {\n}\n";
+    assert_eq!(production(negated), negated);
+    let helper = "#[cfg(test)]\nfn only_for_tests() {}\nfn live() {}\n";
+    assert_eq!(production(helper), helper);
 }
 
 #[test]

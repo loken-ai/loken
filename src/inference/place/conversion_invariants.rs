@@ -123,7 +123,6 @@ const CONVERSION_DEBT: &[(&str, usize)] = &[
     ("inference/model/wan/dit/layers.rs", 1),
     ("inference/moe_cuda_cpu/mod.rs", 7),
     ("inference/offload/cuda.rs", 1),
-    ("tensor/quantized/matmul.rs", 1),
 ];
 
 #[test]

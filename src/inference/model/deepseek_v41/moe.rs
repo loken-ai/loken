@@ -392,6 +392,7 @@ impl Moe {
                     self.n_routed
                 )));
             }
+            // PLACEMENT-EXEMPT: (0, w) is the batch row of the one token and its weight, not a card.
             assign[e].push((0, w));
         }
         let (mut y, deferred) =
