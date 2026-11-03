@@ -688,7 +688,7 @@ pub(super) fn try_wrap_with_vision(
                     return Err(anyhow!("no card holds the tower"));
                 }
                 let mut file = std::fs::File::open(blob)?;
-                let content = crate::tensor::quantized::gguf_file::Content::read(&mut file)
+                let content = crate::tensor::quantized::gguf_file::read_mapped_file(&file)
                     .map_err(|e| anyhow!("{e}"))?;
                 crate::inference::model::qwen35::vision::Qwen35Vision::from_gguf(
                     &content,
