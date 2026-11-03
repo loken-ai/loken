@@ -11,64 +11,45 @@ A row stays until its `Done when` is true and measured.
 | Planned | Not started |
 | Waiting | Needs hardware to measure on |
 
-## 0.3.0
+## 0.5.0
 
-Run 1 model across several cards and machines.
+Decode fast when the experts do not fit on the card, and serve many requests at once.
+
+Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10% of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
 | Expert parallelism | Parallelism | A MoE model's experts are spread across cards when that is faster. | Partial |
 | Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Partial |
 | Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on 1 and 2 cards. | Partial |
-| A coding agent on large models | Agents | lokode finishes a multi-step task on Qwen3.8 and DeepSeek V4.1. | Done |
-
-## 0.4.0
-
-Every backend and every format loken reads.
-
-Major, by priority:
-
-| Feature | Category | Done when | State |
-|---|---|---|---|
-| Coding agents beyond lokode | Agents | opencode, Claude Code and Cline finish the lokode task on Qwen3.8 and DeepSeek V4.1. | Done |
-
-## 0.4.x
-
-Patch releases that finish or speed up what 0.4.0 ships:
-
-| Feature | Category | Done when | State |
-|---|---|---|---|
+| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
+| Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Started |
+| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Started |
+| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Planned |
+| Qwen3.8 IQ1_M on 1 card at the reference | Performance | Qwen3.8 IQ1_M on 1 card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
+| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
 | Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Planned |
 | Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Planned |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
 
-## 0.5.0
-
-Decode fast when the experts do not fit on the card, and serve many requests at once.
-
-Major, by priority:
+Smaller, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
-| Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Started |
-| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Started |
-| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Planned |
-| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10% of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
-| Qwen3.8 IQ1_M on 1 card at the reference | Performance | Qwen3.8 IQ1_M on 1 card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
-| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
-
-Smaller, by priority:
-
-| Feature | Category | Done when | State |
-|---|---|---|---|
-| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
-| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Planned |
-| Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
-| Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
 | Beam search | Decoding | Beam search gives the same result as the reference implementation. | Done |
+| Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Done |
+| Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Done |
+| Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the rate at which the queue of the engine starts to grow without bound. | Done |
+| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Partial |
+| Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
+| Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
+| Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a signature so that a copy cannot change under the same name. | Partial |
 | Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |
+| One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
+| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
+| Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Planned |
@@ -76,33 +57,27 @@ Smaller, by priority:
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Planned |
-| Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
-| One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
 | Speculation sized by expert cost | Speculation | The draft length accounts for the experts a draft adds that are not in memory, and a streamed model decodes faster with it than with the length chosen by acceptance alone. | Planned |
 | Routing toward resident experts | Performance | At the fast level the router favours experts already in memory, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
 | Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
-| Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Done |
-| Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Done |
-| Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the rate at which the queue of the engine starts to grow without bound. | Planned |
 | Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Planned |
 | Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Planned |
-| Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a signature so that a copy cannot change under the same name. | Planned |
 
-Fixes, by priority:
+Fixes, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Partial |
 | A missing token count stays missing | Bench | An iteration with no token count is left out of the totals and says so, instead of counting 0. | Done |
 | Same first-token time on every engine | Bench | The bench starts the first-token time at the first text of the stream on every engine. | Done |
 | Failures visible in concurrent cells | Bench | A failed request in a cell with concurrent requests is recorded in the errors of the cell. | Done |
 | Streams that cannot hang | Bench | The measuring client times out a silent stream and refuses an https address instead of connecting in plain text. | Done |
 | A cut stream is reported as cut | API | A Responses stream whose upstream ends without its final marker ends as incomplete, not as completed. | Done |
 | Warm-up failures visible | Bench | A failed warm-up request is reported for every modality. | Done |
-| Measured settings recorded | Bench | The image size, seed, duration, voice and keep-alive of a cell appear in the record, and so does the request timeout. | Partial |
+| Measured settings recorded | Bench | The image size, seed, duration, voice and keep-alive of a cell appear in the record, and so does the request timeout. | Done |
 | A memory fallback that does not stay | Performance | A matrix product that runs out of card memory falls back for that call only, and the fallback copy is not kept. | Done |
+| Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Partial |
 | Sampling without per-token allocation | Performance | A sampled token allocates no buffer on the card, and uploads no penalty list when the penalty is off. | Partial |
 | Honest back-pressure | API | A refused request carries a Retry-After computed from the queue and the measured rate, and a request waiting on a model load reports the load as it goes. | Partial |
 
@@ -110,7 +85,7 @@ Fixes, by priority:
 
 A cluster that survives failures and can be trusted, more weight formats, and a plan before a load.
 
-Major, by priority:
+Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -121,7 +96,7 @@ Major, by priority:
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
 | Mistral 4 Large | Models | The published Mistral 4 Large checkpoint loads and answers as the reference implementation does. | Planned |
 
-Smaller, by priority:
+Smaller, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -154,7 +129,7 @@ Smaller, by priority:
 | Word timestamps and long recordings | Audio | The transcription route returns the time of each word, and a recording of any length is read in windows cut at silences. | Planned |
 | Several vision embeddings cached | Serving | The embeddings of several images are kept between requests, and a conversation that comes back to an image does not read it again. | Planned |
 
-Fixes, by priority:
+Fixes, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -167,7 +142,7 @@ Fixes, by priority:
 
 Reach and hardening: Windows, packaging, typed answers, streamed audio, and exact decoding.
 
-Major, by priority:
+Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -175,7 +150,7 @@ Major, by priority:
 | Typed answers on the language route | API | A request with a schema always gets an answer that fits it, or an explicit error, never a malformed one. | Planned |
 | Quantisation from the command line | Quantisation | One command quantises a checkpoint, and its quality is scored against the original. | Planned |
 
-Smaller, by priority:
+Smaller, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -207,7 +182,7 @@ Smaller, by priority:
 | Lossless compressed BF16 weights | Quantisation | A BF16 checkpoint is stored entropy-coded, decoded on the card as it is read, and gives the same bits in less memory. | Planned |
 | Video diffusion with a wider VAE | Models | A video model whose VAE compresses 16 by 16 in space and 4 in time loads and renders as its reference does. | Planned |
 
-Fixes, by priority:
+Fixes, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -217,14 +192,14 @@ Fixes, by priority:
 
 Agents and operations: tools, keys, traces, cost and what an operator can see.
 
-Major, by priority:
+Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | Fine-tuning of adapters | Models | A text adapter trains on the local cards and is served right away, its quality measured. | Planned |
 | loken as a tool server | Tools | Agents can call loken's models and media pipelines as MCP tools. | Planned |
 
-Smaller, by priority:
+Smaller, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -250,7 +225,7 @@ Smaller, by priority:
 
 Several model families answering together.
 
-Major, by priority:
+Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
@@ -258,7 +233,7 @@ Major, by priority:
 | A supermodel from several families | Models | Models of different families choose each word together and beat each of them alone. | Planned |
 | A mixture of experts built from several families | Models | Models of different families join one trained mixture of experts that beats each of them alone. | Planned |
 
-Smaller, by priority:
+Smaller, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
