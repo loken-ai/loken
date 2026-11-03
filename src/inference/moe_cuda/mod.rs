@@ -362,6 +362,12 @@ cuda_launchers! {
     loken_tier_tell(counter: *mut u32, told: *mut u32);
     loken_embed_rows_iq4_xs(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
     loken_embed_rows_q8_0(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
+    loken_embed_rows_f16(
+        table: *const c_void, ids: *const u32, n: i32, dim: i32, vocab: i32, out: *mut f32);
+    loken_embed_rows_bf16(
+        table: *const c_void, ids: *const u32, n: i32, dim: i32, vocab: i32, out: *mut f32);
+    loken_embed_rows_f32(
+        table: *const c_void, ids: *const u32, n: i32, dim: i32, vocab: i32, out: *mut f32);
     loken_cast_init_f32_from_dtype(
         dst: *mut f32, src: *const c_void, n: i32, dtype: i32);
     loken_moe_gemm_gguf_down_reduce_two(
@@ -460,10 +466,22 @@ cuda_launchers! {
         normed_out: *mut f32, hidden: i32, eps: f32);
 }
 
+/// Whether card `index` keeps at least as much room as a table of `bytes` takes once it holds
+/// the table.
+pub fn embed_table_fits(index: usize, bytes: u64) -> bool {
+    crate::inference::place::room::card_rooms()
+        .iter()
+        .find(|c| c.index == index)
+        .is_some_and(|c| c.available >= bytes.saturating_mul(2))
+}
+
 /// Whether `dtype` has a card decoder behind `embed_rows_gguf`.
 pub fn embed_rows_decodes(dtype: crate::tensor::quantized::GgmlDType) -> bool {
     use crate::tensor::quantized::GgmlDType;
-    matches!(dtype, GgmlDType::Iq4Xs | GgmlDType::Q8_0)
+    matches!(
+        dtype,
+        GgmlDType::Iq4Xs | GgmlDType::Q8_0 | GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32
+    )
 }
 
 /// The rows `ids` (`[n]` U32 on the card) of the table `table` on the same card, decoded into
@@ -476,8 +494,30 @@ pub fn embed_rows_gguf(
 ) -> crate::tensor::Result<()> {
     use crate::tensor::quantized::GgmlDType;
     match table.dtype() {
-        GgmlDType::Iq4Xs => embed_rows_launch(table, ids, out, loken_embed_rows_iq4_xs),
-        GgmlDType::Q8_0 => embed_rows_launch(table, ids, out, loken_embed_rows_q8_0),
+        GgmlDType::Iq4Xs => embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+            loken_embed_rows_iq4_xs(t, i, n, d, o, s)
+        }),
+        GgmlDType::Q8_0 => embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+            loken_embed_rows_q8_0(t, i, n, d, o, s)
+        }),
+        GgmlDType::F16 => {
+            let vocab = table.shape().dims()[0] as i32;
+            embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+                loken_embed_rows_f16(t, i, n, d, vocab, o, s)
+            })
+        }
+        GgmlDType::BF16 => {
+            let vocab = table.shape().dims()[0] as i32;
+            embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+                loken_embed_rows_bf16(t, i, n, d, vocab, o, s)
+            })
+        }
+        GgmlDType::F32 => {
+            let vocab = table.shape().dims()[0] as i32;
+            embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+                loken_embed_rows_f32(t, i, n, d, vocab, o, s)
+            })
+        }
         other => crate::tensor::bail!("the embedding gather has no decoder for {other:?} tables"),
     }
 }
@@ -487,28 +527,25 @@ fn embed_rows_launch(
     table: &crate::tensor::quantized::QTensor,
     ids: &crate::tensor::Tensor,
     out: &crate::tensor::Tensor,
-    kernel: unsafe extern "C" fn(*const c_void, *const u32, i32, i32, *mut f32, i64),
+    kernel: impl Fn(*const c_void, *const u32, i32, i32, *mut f32, i64),
 ) -> crate::tensor::Result<()> {
     use crate::tensor::DType;
     let dims = table.shape().dims();
-    let (vocab, dim) = (dims[0], dims[1]);
+    let dim = dims[1];
     let n = ids.elem_count();
     if ids.dtype() != DType::U32 || out.dtype() != DType::F32 || out.elem_count() != n * dim {
         crate::tensor::bail!("the embedding gather takes U32 ids and an F32 row a token");
     }
     let dev = out.device().as_cuda_device()?;
     let stream = dev.cuda_stream().cu_stream() as i64;
-    let _ = vocab;
-    unsafe {
-        kernel(
-            table.device_ptr()? as *const c_void,
-            card_address::<u32>(ids)? as *const u32,
-            n as i32,
-            dim as i32,
-            card_address::<f32>(out)? as *mut f32,
-            stream,
-        );
-    }
+    kernel(
+        table.device_ptr()? as *const c_void,
+        card_address::<u32>(ids)? as *const u32,
+        n as i32,
+        dim as i32,
+        card_address::<f32>(out)? as *mut f32,
+        stream,
+    );
     Ok(())
 }
 

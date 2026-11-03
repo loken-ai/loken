@@ -573,3 +573,43 @@ fn sample_topk_draws_by_cumulative_share() {
     // Dividing the leader's logit by 3 puts it below the second.
     assert_eq!(draw(0.0, 1.0, &[4000], 3.0), 17);
 }
+
+/// The rows a float embedding table gathers on the card are the rows of the table, widened to
+/// f32, in the order of the ids and for a repeated id.
+#[test]
+fn a_float_embedding_table_gathers_its_rows_on_the_card() {
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    const VOCAB: usize = 50;
+    const DIM: usize = 40;
+    let values: Vec<f32> = (0..VOCAB * DIM)
+        .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+        .collect();
+    let host = Tensor::from_slice(&values, (VOCAB, DIM), &Device::Cpu).unwrap();
+    let ids_host = [3u32, 7, 3, 49, 0];
+    for (dtype, round) in [
+        (GgmlDType::F32, (|v: f32| v) as fn(f32) -> f32),
+        (GgmlDType::F16, |v| half::f16::from_f32(v).to_f32()),
+        (GgmlDType::BF16, |v| half::bf16::from_f32(v).to_f32()),
+    ] {
+        let table = QTensor::quantize_onto(&host, dtype, &dev).unwrap();
+        assert!(crate::inference::moe_cuda::embed_rows_decodes(dtype));
+        let ids = Tensor::from_vec(ids_host.to_vec(), &[ids_host.len()][..], &dev).unwrap();
+        let out = Tensor::zeros_on((1, ids_host.len(), DIM), DType::F32, &dev).unwrap();
+        crate::inference::moe_cuda::embed_rows_gguf(&table, &ids, &out).unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (r, &id) in ids_host.iter().enumerate() {
+            for d in 0..DIM {
+                let want = round(values[id as usize * DIM + d]);
+                assert_eq!(
+                    got[r * DIM + d],
+                    want,
+                    "{dtype:?} row {r} (id {id}) col {d}"
+                );
+            }
+        }
+    }
+}

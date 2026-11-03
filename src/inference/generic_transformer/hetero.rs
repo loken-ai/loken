@@ -820,6 +820,18 @@ impl GenericHeteroTransformer {
         use crate::tensor::DType;
         let edev = self.embeddings.embeddings().device().clone();
         let dev = self.compute_device();
+        // A table the card holds is read there: one launch, no host lookup and no upload of
+        // the rows.
+        #[cfg(feature = "gpu")]
+        if let Some(table) = self.embed_table_on(&dev) {
+            // Built on the card directly, as the other per-step indices are: a copy of a host
+            // tensor waits on the card.
+            let ids = Tensor::from_vec(tokens.to_vec(), &[tokens.len()][..], &dev)?;
+            return self
+                .embed_rows_of_ids(table, &ids)?
+                .reshape(&[tokens.len(), self.config.embedding_length][..])?
+                .to_dtype(DType::F16);
+        }
         let ids = Tensor::from_vec(tokens.to_vec(), &[tokens.len(), 1][..], &edev)?;
         let mut x = self
             .embeddings
@@ -1358,6 +1370,30 @@ impl GenericHeteroTransformer {
         fused_rmsnorm_f16(&x, &norm_w, self.output_norm.eps() as f32)
     }
 
+    /// The head of a batch decoded greedily: the logits in the half precision the card computes
+    /// them in, when the head is a float matmul on the card and has no bias, so the argmax reads
+    /// half the bytes and no widening pass runs. Any other head answers as `lm_head` does.
+    pub fn lm_head_greedy(&self, f: &Tensor) -> Result<Tensor> {
+        if self.output_bias.is_none() && self.output_proj_cuda_qmm.is_none() {
+            if let Some(proj) = self.output_proj_cuda.as_ref() {
+                let dev = self
+                    .output_proj_dev
+                    .clone()
+                    .unwrap_or_else(|| f.device().clone());
+                let f = if f.device().same_device(&dev) {
+                    f.clone()
+                } else {
+                    f.to_device(&dev)?
+                };
+                return f
+                    .to_dtype(crate::tensor::DType::F16)?
+                    .matmul_t(proj)?
+                    .to_dtype(crate::tensor::DType::F16);
+            }
+        }
+        self.lm_head(f)
+    }
+
     /// Apply the lm_head (output projection) to a final hidden `[b, hidden]` ->
     /// logits `[b, vocab]`. Kept out of `decode_layers_gpu` so the captured graph
     /// stays GPU-only even when output_proj lives on CPU.
@@ -1590,12 +1626,31 @@ impl GenericHeteroTransformer {
             .collect();
         let plain_rows: usize = lens[..plain.len()].iter().sum();
 
-        let ids = Tensor::from_vec(tokens, &[t, 1][..], &edev)?;
-        let mut x = self
-            .embeddings
-            .forward(&ids)?
-            .reshape(&[t, c.embedding_length][..])?
-            .to_dtype(cdt)?;
+        // A table the card holds is read there, one launch for every row of the forward.
+        #[cfg(feature = "gpu")]
+        let on_card = match self.embed_table_on(&dev) {
+            Some(table) => {
+                let ids = Tensor::from_vec(tokens.clone(), &[t][..], &dev)?;
+                Some(
+                    self.embed_rows_of_ids(table, &ids)?
+                        .reshape(&[t, c.embedding_length][..])?
+                        .to_dtype(cdt)?,
+                )
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "gpu"))]
+        let on_card: Option<Tensor> = None;
+        let mut x = match on_card {
+            Some(x) => x,
+            None => {
+                let ids = Tensor::from_vec(tokens, &[t, 1][..], &edev)?;
+                self.embeddings
+                    .forward(&ids)?
+                    .reshape(&[t, c.embedding_length][..])?
+                    .to_dtype(cdt)?
+            }
+        };
         if !x.device().same_device(&dev) {
             x = x.to_device(&dev)?;
         }
@@ -1603,6 +1658,8 @@ impl GenericHeteroTransformer {
             &positions, hd, base, &dev, cdt,
         )?;
 
+        let mut slot_index: std::collections::HashMap<usize, Tensor> =
+            std::collections::HashMap::new();
         note_if_non_finite("the embedding, before any layer", &x);
         for (li, layer) in self.layers.iter().enumerate() {
             let residual = x.clone();
@@ -1659,8 +1716,14 @@ impl GenericHeteroTransformer {
             )?;
             let v_f = v.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
             // persist all T positions' K/V for the subsequent decode phase
-            stores[li].write(
-                &slots,
+            // The scatter index depends on the slots and the row width: built once per width
+            // for the forward, not once per layer.
+            let feat = stores[li].feat();
+            if let std::collections::hash_map::Entry::Vacant(entry) = slot_index.entry(feat) {
+                entry.insert(stores[li].slot_index(&slots, &k_rot.device())?);
+            }
+            stores[li].write_indexed(
+                &slot_index[&feat],
                 &k_rot.reshape(&[t, nkv * hd][..])?,
                 &v_f.reshape(&[t, nkv * hd][..])?,
             )?;

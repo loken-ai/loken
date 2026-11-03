@@ -342,6 +342,9 @@ impl BatchedModel for GhBatched {
             // CUDA-graph decode is what delivers the throughput win (eager batching
             // alone roughly ties serial on big models); always on, with a safe eager
             // fallback latched via `graph_failed` on any capture/replay failure.
+            // Every row decodes greedily: the head may answer in half precision.
+            #[cfg(feature = "gpu")]
+            let greedy = dec.iter().all(|&i| items[i].sampling.temperature <= 0.0);
             #[cfg(feature = "gpu")]
             let graph_on = !self.graph_failed
                 && !self.model.compute_device().is_cpu()
@@ -354,7 +357,7 @@ impl BatchedModel for GhBatched {
                     // Try the captured-graph path; on ANY capture/replay failure
                     // fall back to the eager path (correct, just unaccelerated) so
                     // the flag can never break serving.
-                    match self.decode_graph(&toks, &pos, &slots, &bts, &ctx) {
+                    match self.decode_graph(&toks, &pos, &slots, &bts, &ctx, greedy) {
                         Ok(l) => l,
                         Err(e) => {
                             let msg = format!("{e}");
@@ -559,6 +562,7 @@ impl GhBatched {
         slots: &[usize],
         bts: &[Vec<u32>],
         ctx: &[usize],
+        greedy: bool,
     ) -> crate::tensor::Result<Tensor> {
         use crate::tensor::cuda_ext;
         let Self {
@@ -681,7 +685,11 @@ impl GhBatched {
                 let _ = cd.cuda_stream().synchronize();
             }
             // lm_head runs eager (may live on CPU); the graph produced the hidden.
-            return model.lm_head(&g.hidden);
+            return if greedy {
+                model.lm_head_greedy(&g.hidden)
+            } else {
+                model.lm_head(&g.hidden)
+            };
         }
 
         // capture: the just-built tensors become the persistent buffers. Keep the

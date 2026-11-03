@@ -104,7 +104,7 @@ const KERNELS_AMPERE_ONLY: [&str; 6] = [
 
 /// The kernel families every card serves, compiled per architecture.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-const KERNELS: [&str; 30] = [
+const KERNELS: [&str; 31] = [
     "cuda/fused_norm_f16.cu",
     "cuda/gptoss_flash_decode.cu",
     "cuda/flash_decode_f16.cu",
@@ -114,6 +114,7 @@ const KERNELS: [&str; 30] = [
     "cuda/moe/rms_qmatmul.cu",
     "cuda/moe/moe_gguf.cu",
     "cuda/moe/embed_rows_q8_0.cu",
+    "cuda/moe/embed_rows_float.cu",
     "cuda/moe/moe_mmq.cu",
     "cuda/moe/attn_post_qkv.cu",
     "cuda/moe/kv_residual_scatter.cu",

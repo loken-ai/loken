@@ -1233,14 +1233,27 @@ impl GenericHeteroTransformer {
         input_ids: &Tensor,
     ) -> Result<Tensor> {
         let dev = table.device().clone();
-        let n = input_ids.elem_count();
-        let dim = table.shape().dims()[1];
         let ids = input_ids
             .flatten_all()?
             .to_dtype(crate::tensor::DType::U32)?
             .to_device(&dev)?;
-        let out = Tensor::zeros_on((1, n, dim), crate::tensor::DType::F32, &dev)?;
-        crate::inference::moe_cuda::embed_rows_gguf(table, &ids, &out)?;
+        self.embed_rows_of_ids(table, &ids)
+    }
+
+    /// The rows of `ids` (`[n]` U32 on the card of `table`) decoded from the table, `[1, n, dim]`
+    /// F32.
+    #[cfg(feature = "gpu")]
+    pub(super) fn embed_rows_of_ids(
+        &self,
+        table: &crate::tensor::quantized::QTensor,
+        ids: &Tensor,
+    ) -> Result<Tensor> {
+        let dev = table.device().clone();
+        let n = ids.elem_count();
+        let dim = table.shape().dims()[1];
+        // Every element is written by the gather, so the buffer is not cleared first.
+        let out = unsafe { Tensor::empty((1, n, dim), crate::tensor::DType::F32, &dev)? };
+        crate::inference::moe_cuda::embed_rows_gguf(table, ids, &out)?;
         Ok(out)
     }
 

@@ -3503,6 +3503,12 @@ impl GenericHeteroTransformer {
                 if !seen.insert(idx) {
                     continue;
                 }
+                // A float table is large: it goes to a card that keeps at least as much
+                // room as the table takes.
+                #[cfg(feature = "gpu")]
+                if !crate::inference::moe_cuda::embed_table_fits(idx, emb_table_bytes) {
+                    continue;
+                }
                 let host = emb_qt.native_qtensor().clone();
                 match crate::tensor::quantized::QTensor::from_native(host, card) {
                     Ok(on_card) => embed_cards.push(Arc::new(on_card)),
@@ -5399,6 +5405,39 @@ impl GenericHeteroTransformer {
         let emb = st
             .load("model.embed_tokens.weight", &Device::Cpu)?
             .to_dtype(DType::F32)?;
+        // The table also goes to each card that holds layers, as F16, when the card keeps as much
+        // room as the table takes: a decoded token's row is then read there by one launch.
+        #[cfg(feature = "gpu")]
+        let embed_cards = {
+            let mut cards = Vec::new();
+            // CONVERSION: the card's copy of the table is half precision, half the size of the f32 one on the host.
+            let half = emb.to_dtype(DType::F16)?;
+            let bytes = (half.elem_count() * 2) as u64;
+            let mut seen = std::collections::HashSet::new();
+            for idx in layer_card.iter().flatten().copied() {
+                if !seen.insert(idx) {
+                    continue;
+                }
+                let Some(card) = cuda_devices.get(&idx) else {
+                    continue;
+                };
+                if !crate::inference::moe_cuda::embed_table_fits(idx, bytes) {
+                    continue;
+                }
+                // CONVERSION: the half precision table is stored as it is, for the gather on the card.
+                match crate::tensor::quantized::QTensor::quantize_onto(
+                    &half,
+                    crate::tensor::quantized::GgmlDType::F16,
+                    card,
+                ) {
+                    Ok(on_card) => cards.push(Arc::new(on_card)),
+                    Err(e) => warn!("the embedding table stays off card {idx}: {e}"),
+                }
+            }
+            cards
+        };
+        #[cfg(not(feature = "gpu"))]
+        let embed_cards = Vec::new();
         let embeddings = Embedding::new(emb);
 
         // Final norm - CPU RmsNorm + a GPU copy for the GPU final-norm path.
@@ -5419,7 +5458,7 @@ impl GenericHeteroTransformer {
             config,
             embeddings,
             position_embd: None,
-            embed_cards: Vec::new(),
+            embed_cards,
             layers,
             first_layer: 0,
             layer_devs,

@@ -595,6 +595,38 @@ impl PagedKvStore {
         &self.v
     }
 
+    /// The index tensor `[n, feat]` of a scatter into `slots`, row i holding `slots[i]`
+    /// (`scatter_set` wants indexes shaped like the source; the column dimension is identity).
+    /// It depends on the slots and the row width alone, so a forward over several layers builds
+    /// it once.
+    pub fn slot_index(
+        &self,
+        slots: &[usize],
+        device: &crate::tensor::Device,
+    ) -> crate::tensor::Result<crate::tensor::Tensor> {
+        let n = slots.len();
+        let mut idx = Vec::with_capacity(n * self.feat);
+        for &s in slots {
+            for _ in 0..self.feat {
+                idx.push(s as u32);
+            }
+        }
+        crate::tensor::Tensor::from_vec(idx, &[n, self.feat][..], device)
+    }
+
+    /// Scatter `n_tok` new tokens' K/V (each `[n_tok, feat]`) into the slots of `idx`, as built
+    /// by [`slot_index`].
+    pub fn write_indexed(
+        &self,
+        idx: &crate::tensor::Tensor,
+        k_new: &crate::tensor::Tensor,
+        v_new: &crate::tensor::Tensor,
+    ) -> crate::tensor::Result<()> {
+        self.k.scatter_set(idx, k_new, 0)?;
+        self.v.scatter_set(idx, v_new, 0)?;
+        Ok(())
+    }
+
     /// Scatter `n_tok` new tokens' K/V (each `[n_tok, feat]`) into `slots`.
     pub fn write(
         &self,
@@ -602,20 +634,9 @@ impl PagedKvStore {
         k_new: &crate::tensor::Tensor,
         v_new: &crate::tensor::Tensor,
     ) -> crate::tensor::Result<()> {
-        let n = slots.len();
-        debug_assert_eq!(k_new.dims(), &[n, self.feat]);
-        // index tensor [n, feat] with row i == slots[i] (scatter_set wants
-        // indexes shaped like source; the column dim is identity).
-        let mut idx = Vec::with_capacity(n * self.feat);
-        for &s in slots {
-            for _ in 0..self.feat {
-                idx.push(s as u32);
-            }
-        }
-        let idx = crate::tensor::Tensor::from_vec(idx, &[n, self.feat][..], &k_new.device())?;
-        self.k.scatter_set(&idx, k_new, 0)?;
-        self.v.scatter_set(&idx, v_new, 0)?;
-        Ok(())
+        debug_assert_eq!(k_new.dims(), &[slots.len(), self.feat]);
+        let idx = self.slot_index(slots, &k_new.device())?;
+        self.write_indexed(&idx, k_new, v_new)
     }
 
     /// Gather a sequence's first `len` tokens' K and V into contiguous
