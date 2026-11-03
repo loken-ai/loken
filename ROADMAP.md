@@ -52,7 +52,7 @@ Smaller, by state then by priority:
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
-| Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Planned |
+| Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Partial |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Planned |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Planned |
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Planned |

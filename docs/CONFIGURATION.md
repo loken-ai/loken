@@ -156,6 +156,11 @@ An instance with `prefill_peer` set has its long prompts read by that peer, whic
 The peer answers with its KV cache over `/api/cluster/prefill`, and this instance imports it and decodes.  
 [Across machines](inside/nodes.md) draws the steps.
 
+The instance asks the peer only while handing the whole prompt over is expected to take no longer than reading the tokens its cache lacks.
+Both speeds are measured by the instance itself, the first from its hand-overs and the second from its prefills.
+A peer never measured is asked once.
+A peer measured slow is asked again after the local prefill has run as long as its last hand-over took.
+
 A model with recurrent or windowed layers hands over its whole decode state instead of rows.
 
 The decode state holds every recurrent state, the windowed layers' rows, the global layers' rows and the logits to resume from.

@@ -150,6 +150,16 @@ impl LlmEngine {
                         cached_prompt_tokens,
                     }) => {
                         admitted = Some((at, cached_prompt_tokens));
+                        // The worker read the prompt beyond the cached share before it
+                        // sent this marker.
+                        if let Some(p) = probe.as_deref() {
+                            let read = super::handover_rate::tokens_read(
+                                prompt_len,
+                                cached_prompt_tokens,
+                                false,
+                            ) as u64;
+                            p.note_prefill(read, read);
+                        }
                         continue;
                     }
                     _ => break,
@@ -844,6 +854,8 @@ impl LlmEngine {
                 } else {
                     state.model.draft_head_capture(false);
                 }
+                let prefill_began = Instant::now();
+                let mut prefill_skipped = false;
                 let x = match Tensor::new(prefill_slice, &device).and_then(|t| t.unsqueeze(0)) {
                     Ok(t) => t,
                     Err(e) => {
@@ -979,10 +991,12 @@ impl LlmEngine {
                     // advanced, never rewound). A hit skips the prefill entirely;
                     // trim-capable variants take the default miss and prefill.
                     if let Some(l) = exact_logits.take() {
+                        prefill_skipped = true;
                         l
                     } else {
                         match state.model.try_restore_prefix(&prompt_tokens) {
                             Ok(Some(l)) => {
+                                prefill_skipped = true;
                                 // A state restored from an earlier turn is prompt not read again.
                                 reused_prompt_tokens =
                                     reused_prompt_tokens.max(state.model.prefix_covered());
@@ -1023,6 +1037,19 @@ impl LlmEngine {
                     }
                 };
                 debug!("STREAMING PREFILL: Forward pass complete");
+                if !is_vision {
+                    super::handover_rate::note_local_prefill(
+                        super::handover_rate::tokens_read(
+                            prompt_tokens.len(),
+                            reused_prompt_tokens,
+                            prefill_skipped,
+                        ),
+                        crate::inference::engine::model_backend::adaptive_prefill_chunk(
+                            state.model.prefill_shape(),
+                        ),
+                        prefill_began.elapsed().as_secs_f64(),
+                    );
+                }
                 // The first compute window is NOT opened here. Sampling the first token and
                 // reaching the loop happen before that token reaches the client, so charging
                 // them to decode made the published decode rate slower than the one a client

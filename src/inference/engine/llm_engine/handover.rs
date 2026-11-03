@@ -89,9 +89,9 @@ fn handover_of(
     }))
 }
 
-/// Has the instance at `peer` read `prompt` when its cache holds less of it than a prefill chunk
-/// short of the whole, and imports the rows it hands back as a snapshot that the prefix reuse
-/// then restores. Anything that goes wrong leaves the prompt to be read here.
+/// Has the instance at `peer` read `prompt` when the cache here is at least a prefill chunk short
+/// of the whole and handing the prompt over is measured to take no longer than reading the rest here.
+/// Imports what it hands back as a snapshot that the prefix reuse then restores. Anything that goes wrong leaves the prompt to be read here.
 pub(super) fn pull_prompt_from_peer(
     model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
     model_name: &str,
@@ -113,6 +113,9 @@ pub(super) fn pull_prompt_from_peer(
         model.best_kv_snapshot(prompt_tokens).map_or(0, |(_, c)| c)
     };
     if prompt_tokens.len() < held + chunk {
+        return;
+    }
+    if !super::handover_rate::peer_reads(peer, prompt_tokens.len(), prompt_tokens.len() - held) {
         return;
     }
     let started = std::time::Instant::now();
@@ -171,11 +174,14 @@ pub(super) fn pull_prompt_from_peer(
         model.import_kv_snapshot(handover.header.tokens, kv_len, handover.rows, dtype)
     };
     match imported {
-        Ok(()) => info!(
-            "prompt read by {peer}: {n} tokens, {:.1} MB handed over in {:.0} ms",
-            bytes.len() as f64 / 1e6,
-            started.elapsed().as_secs_f64() * 1e3
-        ),
+        Ok(()) => {
+            super::handover_rate::note_handover(peer, n, started.elapsed().as_secs_f64());
+            info!(
+                "prompt read by {peer}: {n} tokens, {:.1} MB handed over in {:.0} ms",
+                bytes.len() as f64 / 1e6,
+                started.elapsed().as_secs_f64() * 1e3
+            )
+        }
         Err(e) => warn!("prefill peer {peer}: import: {e}; the prompt is read here"),
     }
 }

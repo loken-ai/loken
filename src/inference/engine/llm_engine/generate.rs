@@ -440,6 +440,7 @@ impl LlmEngine {
             // continuing logical mRoPE position. Otherwise the moondream prepend
             // path (or plain text).
             let qwen35_items = std::mem::take(&mut state.qwen35_vision);
+            let mut prefill_skipped = false;
             let (vision_prefix_len, mut logits, qwen35_pos) = if let Some(ref a) = audio_split {
                 // The embeddings were encoded for this request; the sequence they make is as
                 // long as the prefill says, which is where decoding continues.
@@ -478,6 +479,7 @@ impl LlmEngine {
                     // Exact-prompt hit on a recurrent hybrid: the whole prefill is
                     // skipped. Variants that reuse via trim_kv never reach this  - 
                     // their `try_restore_prefix` is the default miss.
+                    prefill_skipped = true;
                     lg
                 } else {
                     // RESUMING IS AN OPTIMISATION; SERVING THE REQUEST IS NOT.
@@ -526,6 +528,19 @@ impl LlmEngine {
             };
             // The prefill ends when its logits are on the host: the card's queue is drained by then.
             let prompt_eval_duration = prefill_start.elapsed().as_nanos() as u64;
+            if vision_prefix_len.is_none() && audio_split.is_none() {
+                super::handover_rate::note_local_prefill(
+                    super::handover_rate::tokens_read(
+                        prompt_tokens.len(),
+                        cached_tokens,
+                        prefill_skipped,
+                    ),
+                    crate::inference::engine::model_backend::adaptive_prefill_chunk(
+                        state.model.prefill_shape(),
+                    ),
+                    prompt_eval_duration as f64 / 1e9,
+                );
+            }
             // Diagnostic: fingerprint prefill logits + KV cache state.
             // Goal: localize the cyclic-3 non-determinism to prefill vs. decode.
             // If iter 1's prefill-logits fingerprint matches iter 2's, prefill
