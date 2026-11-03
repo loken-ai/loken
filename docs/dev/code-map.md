@@ -93,7 +93,7 @@ The API surfaces and coding agents, templates and tokens, tool calls and reasoni
 | `forecast`<br>[`src/inference/engine/forecast_engine.rs`](../../src/inference/engine/forecast_engine.rs)<br>[`src/api/handlers/openai/forecast.rs`](../../src/api/handlers/openai/forecast.rs)<br>[`src/inference/model/chronos2`](../../src/inference/model/chronos2)<br>[`src/inference/model/timestral`](../../src/inference/model/timestral) | `ladder` | Time series quantile forecasts, loaded through the ladder on first request. | Time series forecasts on /v1/forecast |
 | `reasoning_split`<br>[`src/api/thinking.rs`](../../src/api/thinking.rs)<br>[`src/api/thinking_budget.rs`](../../src/api/thinking_budget.rs) |  | Separates a model's reasoning from its answer, and cuts the reasoning of a stream once it has spent its token budget. | Reasoning returned apart from the answer |
 | `tool_calls`<br>[`src/api/tool_calls.rs`](../../src/api/tool_calls.rs) |  | Reads tool calls out of the generated text. | Tool calling (function calling)<br>Parallel tool calls<br>tool_choice (auto/required/none/named) |
-| `stream_out`<br>[`src/inference/engine/llm_engine/stream.rs`](../../src/inference/engine/llm_engine/stream.rs) |  | Streams the answer as it is decoded. | Streaming responses |
+| `stream_out`<br>[`src/inference/engine/llm_engine/stream.rs`](../../src/inference/engine/llm_engine/stream.rs)<br>[`src/api/handlers/openai/chat_stream.rs`](../../src/api/handlers/openai/chat_stream.rs) |  | Streams the answer as it is decoded, and turns the tokens into chat completion SSE events. | Streaming responses |
 
 ## Vision and audio input
 
