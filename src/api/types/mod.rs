@@ -2097,6 +2097,18 @@ pub struct OllamaPsModel {
     pub size_vram: u64,
     /// Context length from config (not from GGUF metadata)
     pub context_length: i32,
+    /// How far the load of a model still loading has come. Omitted once it is loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loading: Option<OllamaPsLoading>,
+}
+
+/// The last count a model load reported: the `phase` it is in and `done` of `total` units read.
+/// A `total` of 0 is a phase with nothing to count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OllamaPsLoading {
+    pub phase: String,
+    pub done: usize,
+    pub total: usize,
 }
 
 /// Ollama ps response (GET /api/ps)

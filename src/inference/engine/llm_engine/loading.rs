@@ -228,6 +228,18 @@ pub fn configure_thread_pool() {
 }
 
 impl LlmEngine {
+    /// Counts of the next loads go to `report`.
+    pub fn report_loads_to(&self, report: crate::inference::serve::progress::SharedProgressFn) {
+        *self.load_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+    }
+
+    fn load_report(&self) -> Option<crate::inference::serve::progress::SharedProgressFn> {
+        self.load_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Loads the configured model. A model that will spill to the host has room held for a
     /// drafter while it is placed, and the drafter loads there only if the placed model can
     /// use it (see `plan_drafter`).
@@ -361,7 +373,11 @@ impl LlmEngine {
         }
 
         // Load model in blocking thread since GGUF parsing and weight loading are CPU-intensive
+        let load_report = self.load_report();
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
+            // The reporter belongs to this thread, the one that reads the weights, and is
+            // withdrawn when the closure returns, on an error as on success.
+            let _published = load_report.map(crate::inference::serve::progress::scoped::publish);
             crate::inference::place::device_probe::debug_vram_by_card("closure-start");
 
             // --- 0a. A checkpoint directory the deepseek_v41 source serves ---

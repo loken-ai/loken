@@ -261,6 +261,8 @@ pub struct LlmEngine {
     draft_length: Arc<std::sync::Mutex<crate::inference::engine::decode_step::DraftLength>>,
     /// What the prompt-lookup verifies of earlier requests cost against plain steps.
     pld_cost: Arc<std::sync::Mutex<crate::inference::engine::decode_step::PldCost>>,
+    /// Where a load reports what it has read, when the caller wants to see it.
+    load_report: Arc<std::sync::Mutex<Option<crate::inference::serve::progress::SharedProgressFn>>>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -281,6 +283,7 @@ impl InferenceEngine for LlmEngine {
             active: Arc::default(),
             batching: Arc::default(),
             drafter_choice: Arc::default(),
+            load_report: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }
@@ -338,6 +341,7 @@ impl LlmEngine {
             active: Arc::default(),
             batching: Arc::default(),
             drafter_choice: Arc::default(),
+            load_report: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }

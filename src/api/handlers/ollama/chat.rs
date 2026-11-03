@@ -165,11 +165,7 @@ pub(crate) async fn list_loaded_models(
     // Models whose load is in flight: absent from `engines` until it finishes, but a client
     // watching the cluster should see the load happening, not a gap, and least of all a big
     // model that reads as simply not there for the ten-plus seconds it takes to warm the cards.
-    let loading: Vec<String> = state
-        .loading
-        .lock()
-        .map(|set| set.iter().cloned().collect())
-        .unwrap_or_default();
+    let loading = state.loading.models();
     for model in loading {
         if !loaded_models.iter().any(|m| m.model == model) {
             loaded_models.push(LoadedModelInfo {

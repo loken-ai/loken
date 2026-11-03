@@ -165,7 +165,21 @@ pub(crate) async fn ollama_ps(
             expires_at,
             size_vram,
             context_length: context_length as i32,
+            loading: None,
         });
+    }
+
+    // Models still loading: not in `engines` yet, listed with the count their load last
+    // reported. Entries of loaded models never carry the field.
+    for model in state.loading.models() {
+        let Some(progress) = state.loading.progress(&model) else {
+            continue;
+        };
+        if models.iter().any(|m| m.name == model) {
+            continue;
+        }
+        let digest = model_by_id.get(&model).cloned().unwrap_or_default();
+        models.push(loading_ps_entry(&model, &digest, progress));
     }
 
     // Include image / audio (ASR) / TTS engines so the catalog
@@ -215,6 +229,7 @@ pub(crate) async fn ollama_ps(
             expires_at: "never".to_string(),
             size_vram: img_vram,
             context_length: 0,
+            loading: None,
         });
     }
 
@@ -243,6 +258,7 @@ pub(crate) async fn ollama_ps(
             expires_at: "never".to_string(),
             size_vram: asr_info.resident_bytes,
             context_length: 0,
+            loading: None,
         });
     }
 
@@ -270,6 +286,7 @@ pub(crate) async fn ollama_ps(
             expires_at: "never".to_string(),
             size_vram: tts_vram,
             context_length: 0,
+            loading: None,
         });
     }
 
@@ -1226,4 +1243,36 @@ pub(crate) fn store_gguf_with_digest(
     store
         .write_manifest(&name, &tag, &manifest)
         .map_err(|e| e.to_string())
+}
+
+/// The `/api/ps` entry of a model whose load is in flight: nothing is resident yet, so the
+/// sizes are 0 and only the name, the digest and the load count are known.
+pub(crate) fn loading_ps_entry(
+    model_id: &str,
+    digest: &str,
+    progress: LoadProgress,
+) -> OllamaPsModel {
+    let digest = digest.strip_prefix("sha256:").unwrap_or(digest).to_string();
+    OllamaPsModel {
+        name: model_id.to_string(),
+        model: model_id.to_string(),
+        size: 0,
+        digest,
+        details: OllamaModelDetails {
+            format: "gguf".to_string(),
+            family: String::new(),
+            families: None,
+            parameter_size: estimate_parameter_size(0, "gguf"),
+            quantization_level: None,
+            running_format: None,
+        },
+        expires_at: "never".to_string(),
+        size_vram: 0,
+        context_length: 0,
+        loading: Some(OllamaPsLoading {
+            phase: progress.phase,
+            done: progress.done,
+            total: progress.total,
+        }),
+    }
 }

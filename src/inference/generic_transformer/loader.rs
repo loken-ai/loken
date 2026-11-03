@@ -175,6 +175,83 @@ struct TensorSource<'a> {
     split: Option<&'a crate::tensor::quantized::gguf_source::SplitGguf>,
     /// The checkpoint that makes some of the tensors from stored ones.
     dense: Option<&'a super::dense::DenseCheckpoint>,
+    /// What the load has read, reported to the reporter published when this was built.
+    count: LoadCount,
+}
+
+/// The bytes a load has read of the bytes its files list, counted per tensor.
+///
+/// The reporter is held here, not looked up per read: a pool thread cannot see the
+/// thread-scoped one.
+/// A tensor read twice (a tied head) counts once.
+/// Without a published reporter nothing is counted.
+struct LoadCount {
+    report: Option<crate::inference::serve::progress::SharedProgressFn>,
+    total: usize,
+    done: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl LoadCount {
+    /// Counts nothing.
+    fn none() -> Self {
+        Self {
+            report: None,
+            total: 0,
+            done: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Counts against the sum of the sizes the headers of `parts` list.
+    fn of(parts: &[TensorPart<'_>]) -> Self {
+        let Some(report) = crate::inference::serve::progress::scoped::current() else {
+            return Self::none();
+        };
+        let total = parts
+            .iter()
+            .flat_map(|p| p.content.tensor_infos.values())
+            .map(|i| i.size_in_bytes())
+            .sum();
+        Self {
+            report: Some(report),
+            total,
+            ..Self::none()
+        }
+    }
+
+    /// `info`, the tensor `name`, has been read.
+    fn read(&self, name: &str, info: &gguf_file::TensorInfo) {
+        let Some(report) = &self.report else { return };
+        let first = self
+            .seen
+            .lock()
+            .map(|mut seen| seen.insert(name.to_string()))
+            .unwrap_or(false);
+        if first {
+            let size = info.size_in_bytes();
+            let done = self
+                .done
+                .fetch_add(size, std::sync::atomic::Ordering::Relaxed)
+                + size;
+            report(
+                crate::inference::serve::progress::phase::LOAD_MODEL,
+                done.min(self.total),
+                self.total,
+            );
+        }
+    }
+
+    /// The load is over: what the model never reads is not left pending.
+    fn finish(&self) {
+        if let Some(report) = &self.report {
+            report(
+                crate::inference::serve::progress::phase::LOAD_MODEL,
+                self.total,
+                self.total,
+            );
+        }
+    }
 }
 
 struct TensorPart<'a> {
@@ -244,17 +321,19 @@ fn quantised_as_read(
 impl<'a> TensorSource<'a> {
     /// One mapped file: every tensor is in it.
     fn one(content: &'a gguf_file::Content, bytes: &'a [u8]) -> Self {
+        let parts = vec![TensorPart {
+            content,
+            bytes,
+            owner: content.mmap_owner.clone(),
+        }];
         Self {
             hf_rows: false,
             adjacent_rope: false,
             split: None,
             dense: None,
             owner: HashMap::new(),
-            parts: vec![TensorPart {
-                content,
-                bytes,
-                owner: content.mmap_owner.clone(),
-            }],
+            count: LoadCount::of(&parts),
+            parts,
         }
     }
 
@@ -276,6 +355,7 @@ impl<'a> TensorSource<'a> {
             });
         }
         Self {
+            count: LoadCount::of(&parts),
             parts,
             owner,
             hf_rows: false,
@@ -311,6 +391,7 @@ impl<'a> TensorSource<'a> {
             owner: None,
         });
         Self {
+            count: LoadCount::of(&parts),
             parts,
             owner,
             hf_rows: true,
@@ -337,8 +418,27 @@ impl<'a> TensorSource<'a> {
         }
     }
 
-    /// `name` on `device`, `None` when no part carries it.
+    /// `name` on `device`, `None` when no part carries it. A tensor a header lists is counted
+    /// once read.
     fn read_opt(&self, name: &str, device: &Device) -> crate::tensor::Result<Option<QTensor>> {
+        let read = self.read_unreported(name, device)?;
+        if read.is_some() {
+            if let Some(info) = self
+                .part_of(name)
+                .and_then(|p| p.content.tensor_infos.get(name))
+            {
+                self.count.read(name, info);
+            }
+        }
+        Ok(read)
+    }
+
+    /// [`Self::read_opt`] without the count.
+    fn read_unreported(
+        &self,
+        name: &str,
+        device: &Device,
+    ) -> crate::tensor::Result<Option<QTensor>> {
         // A tensor made of stored ones is built here, one at a time, and read as a stored one.
         if let Some((dtype, dims, bytes)) = self
             .dense
@@ -5118,6 +5218,7 @@ impl GenericHeteroTransformer {
                 }
             });
         }
+        source.count.finish();
         Ok(model)
     }
 
@@ -6023,11 +6124,76 @@ mod host_layer_bytes_tests {
             adjacent_rope: false,
             split: None,
             dense: None,
+            count: LoadCount::none(),
         };
         let (owned, mapped) = part(None).host_layer_bytes(1);
         assert_eq!((owned, mapped), (total, 0));
         let pinned: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
         let (owned, mapped) = part(Some(pinned)).host_layer_bytes(1);
         assert_eq!(owned + mapped, total);
+    }
+}
+
+#[cfg(test)]
+mod load_progress_tests {
+    use super::*;
+    use crate::inference::serve::progress::{phase, scoped, SharedProgressFn};
+    use std::sync::{Arc, Mutex};
+
+    type Records = Arc<Mutex<Vec<(String, usize, usize)>>>;
+
+    fn recorder() -> (Records, SharedProgressFn) {
+        let got: Records = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let report: SharedProgressFn = Arc::new(move |p: &str, d: usize, t: usize| {
+            sink.lock().unwrap().push((p.to_string(), d, t));
+        });
+        (got, report)
+    }
+
+    /// A load inside a published reporter counts bytes against the sum of the sizes the file
+    /// lists, never past it, and ends on it.
+    #[test]
+    fn a_gguf_load_counts_its_bytes_up_to_the_file_total() {
+        let path = super::super::tiny_model::write("progress", 2);
+        let file_total: usize = {
+            let g = crate::tensor::quantized::gguf_file::open_mapped(&path).unwrap();
+            g.content
+                .tensor_infos
+                .values()
+                .map(|i| i.size_in_bytes())
+                .sum()
+        };
+        let (got, report) = recorder();
+        let model = scoped::with(report, || super::super::tiny_model::load(&path, 2));
+        drop(model);
+        super::super::tiny_model::remove(&path);
+        let got = got.lock().unwrap();
+        assert!(
+            got.len() > 2,
+            "counted per tensor, got {} records",
+            got.len()
+        );
+        assert!(got
+            .iter()
+            .all(|(p, _, t)| p == phase::LOAD_MODEL && *t == file_total));
+        assert!(got.iter().all(|(_, d, t)| d <= t));
+        assert_eq!(got.last().map(|(_, d, _)| *d), Some(file_total));
+    }
+
+    /// Outside a published reporter a source holds none and counts nothing.
+    #[test]
+    fn a_gguf_source_built_without_a_reporter_counts_nothing() {
+        let path = super::super::tiny_model::write("progress-none", 1);
+        let g = crate::tensor::quantized::gguf_file::open_mapped(&path).unwrap();
+        let bytes = g.mmap.clone();
+        let source = TensorSource::one(&g.content, &bytes[..]);
+        source.read("token_embd.weight", &Device::Cpu).unwrap();
+        assert!(source.count.report.is_none());
+        assert_eq!(
+            source.count.done.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        super::super::tiny_model::remove(&path);
     }
 }

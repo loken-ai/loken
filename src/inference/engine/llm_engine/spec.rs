@@ -28,6 +28,7 @@ impl LlmEngine {
             drafter_choice: self.drafter_choice.clone(),
             draft_length: self.draft_length.clone(),
             pld_cost: self.pld_cost.clone(),
+            load_report: self.load_report.clone(),
         }
     }
 }

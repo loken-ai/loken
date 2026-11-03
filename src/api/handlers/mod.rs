@@ -448,9 +448,9 @@ pub struct APIServer {
     loading_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Models whose load is in flight right now: inserted before `load_model` and cleared when
     /// it returns, so a client listing loaded models sees the load happening rather than a gap
-    /// where the model is neither absent nor present. A sync mutex, so the RAII guard that
-    /// clears it runs in `Drop`.
-    loading: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// where the model is neither absent nor present. Each record also holds the last count
+    /// the load reported.
+    loading: Arc<model_manager::LoadsInFlight>,
     /// The context length each checkpoint's header declares, read once per file.
     declared_contexts: Arc<model_manager::DeclaredContexts>,
     /// ONE media job at a time (image / video / audio generation, including its
@@ -1564,7 +1564,7 @@ impl APIServer {
             ),
             request_gate,
             loading_locks: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            loading: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            loading: Arc::default(),
             declared_contexts: Arc::default(),
             media_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(feature = "image")]
@@ -1733,22 +1733,8 @@ impl APIServer {
         }
         // Announce the load so a client listing models sees it in flight rather than a gap; the
         // guard clears it whichever way this function returns, error included.
-        struct LoadingGuard {
-            set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-            model_id: String,
-        }
-        impl Drop for LoadingGuard {
-            fn drop(&mut self) {
-                if let Ok(mut set) = self.set.lock() {
-                    set.remove(&self.model_id);
-                }
-            }
-        }
-        self.loading.lock().unwrap().insert(model_id.to_string());
-        let _loading = LoadingGuard {
-            set: self.loading.clone(),
-            model_id: model_id.to_string(),
-        };
+        let load_guard = self.loading.begin(model_id);
+        let load_report = load_guard.reporter();
         let mut config = self.config_for_model(model_id);
         if let Some(want) = window {
             let want = match self.declared_context(model_id) {
@@ -1803,8 +1789,10 @@ impl APIServer {
             model_id,
             || {
                 let config = config.clone();
+                let load_report = load_report.clone();
                 async move {
                     let engine = Arc::new(LlmEngine::with_config(config));
+                    engine.report_loads_to(load_report);
                     engine.load_model().await.map_err(|e| e.to_string())?;
                     Ok::<_, String>(engine)
                 }

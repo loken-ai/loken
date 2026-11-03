@@ -659,3 +659,29 @@ fn classify_pull_error_routes_404_keywords_to_notfound() {
         other => panic!("expected Internal, got {other:?}"),
     }
 }
+
+/// A model still loading is listed with the count its load last reported, and a loaded
+/// model's entry carries no `loading` field.
+#[test]
+fn ps_lists_a_loading_model_with_its_count() {
+    let entry = loading_ps_entry(
+        "m:1",
+        "sha256:abc",
+        LoadProgress {
+            phase: "load-model".to_string(),
+            done: 4,
+            total: 10,
+        },
+    );
+    let json = serde_json::to_value(&entry).unwrap();
+    assert_eq!(json["name"], "m:1");
+    assert_eq!(json["digest"], "abc");
+    assert_eq!(
+        json["loading"],
+        serde_json::json!({ "phase": "load-model", "done": 4, "total": 10 })
+    );
+    let mut loaded = entry;
+    loaded.loading = None;
+    let json = serde_json::to_value(&loaded).unwrap();
+    assert!(json.get("loading").is_none());
+}

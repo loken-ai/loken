@@ -251,6 +251,108 @@ pub(crate) fn get_default_keep_alive() -> i64 {
         .unwrap_or(DEFAULT_KEEP_ALIVE_MINUTES)
 }
 
+/// What a model load has read so far, as its reporter gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadProgress {
+    pub(crate) phase: String,
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+}
+
+/// The loads in flight, by model id.
+///
+/// A model has a record from `begin` until its guard drops, whichever way the load ends.
+/// The record holds the last count the load reported.
+///
+/// Each record carries the generation `begin` gave it.
+/// A reporter and a guard act only on the record of their own generation.
+#[derive(Default)]
+pub(crate) struct LoadsInFlight {
+    records: std::sync::Mutex<std::collections::HashMap<String, (u64, LoadProgress)>>,
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
+/// Holds the record of one load; dropping it clears the record.
+pub(crate) struct LoadGuard {
+    loads: Arc<LoadsInFlight>,
+    model_id: String,
+    generation: u64,
+}
+
+impl LoadsInFlight {
+    /// Opens the record of `model_id` at the start of its load, with nothing counted.
+    pub(crate) fn begin(self: &Arc<Self>, model_id: &str) -> LoadGuard {
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lock().insert(
+            model_id.to_string(),
+            (
+                generation,
+                LoadProgress {
+                    phase: crate::inference::serve::progress::phase::LOAD_MODEL.to_string(),
+                    done: 0,
+                    total: 0,
+                },
+            ),
+        );
+        LoadGuard {
+            loads: self.clone(),
+            model_id: model_id.to_string(),
+            generation,
+        }
+    }
+
+    /// The ids of the models loading now.
+    pub(crate) fn models(&self) -> Vec<String> {
+        self.lock().keys().cloned().collect()
+    }
+
+    /// The last count `model_id` reported, when it is loading.
+    pub(crate) fn progress(&self, model_id: &str) -> Option<LoadProgress> {
+        self.lock().get(model_id).map(|(_, p)| p.clone())
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, (u64, LoadProgress)>> {
+        self.records.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl LoadGuard {
+    /// A reporter that writes into the record of this guard's generation. Safe to call from any thread.
+    pub(crate) fn reporter(&self) -> crate::inference::serve::progress::SharedProgressFn {
+        let loads = self.loads.clone();
+        let model_id = self.model_id.clone();
+        let generation = self.generation;
+        Arc::new(move |phase: &str, done: usize, total: usize| {
+            if let Some((_, record)) = loads
+                .lock()
+                .get_mut(&model_id)
+                .filter(|(g, _)| *g == generation)
+            {
+                record.phase.clear();
+                record.phase.push_str(phase);
+                record.done = done;
+                record.total = total;
+            }
+        })
+    }
+}
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        let mut records = self.loads.lock();
+        if records
+            .get(&self.model_id)
+            .is_some_and(|(g, _)| *g == self.generation)
+        {
+            records.remove(&self.model_id);
+        }
+    }
+}
+
 /// Entry for a loaded model with expiration tracking
 pub(crate) struct LoadedModelEntry {
     /// Model ID
@@ -1375,5 +1477,117 @@ mod tests {
         let huge = i64::MAX.to_string();
         assert_eq!(parse_keep_alive(&format!("{huge}h")), Some(i64::MAX));
         assert_eq!(parse_keep_alive(&format!("{huge}s")), Some(i64::MAX / 60));
+    }
+
+    /// A record lives from `begin` to the drop of its guard, and holds the last count.
+    #[test]
+    fn a_load_record_follows_the_reports_and_clears_when_the_guard_drops() {
+        let loads: Arc<LoadsInFlight> = Arc::default();
+        assert_eq!(loads.progress("m"), None);
+        let guard = loads.begin("m");
+        assert_eq!(loads.models(), vec!["m".to_string()]);
+        assert_eq!(loads.progress("m").map(|p| (p.done, p.total)), Some((0, 0)));
+        let report = guard.reporter();
+        report("load-model", 3, 10);
+        report("load-model", 4, 10);
+        assert_eq!(
+            loads.progress("m"),
+            Some(LoadProgress {
+                phase: "load-model".to_string(),
+                done: 4,
+                total: 10
+            })
+        );
+        assert_eq!(loads.progress("other"), None);
+        drop(guard);
+        assert_eq!(loads.progress("m"), None);
+        assert!(loads.models().is_empty());
+        // A reporter that outlives its load writes nothing back.
+        report("load-model", 5, 10);
+        assert_eq!(loads.progress("m"), None);
+    }
+
+    /// A reporter or a guard from a dropped load touches nothing of a newer load of the same model.
+    #[test]
+    fn a_stale_reporter_and_guard_leave_the_new_record_alone() {
+        let loads: Arc<LoadsInFlight> = Arc::default();
+        let old = loads.begin("m");
+        let stale = old.reporter();
+        // The old load is cancelled from the outside while its thread keeps running.
+        drop(old);
+        let newer = loads.begin("m");
+        stale("load-model", 7, 9);
+        assert_eq!(loads.progress("m").map(|p| (p.done, p.total)), Some((0, 0)));
+        newer.reporter()("load-model", 2, 9);
+        stale("load-model", 8, 9);
+        assert_eq!(loads.progress("m").map(|p| (p.done, p.total)), Some((2, 9)));
+        drop(newer);
+        assert_eq!(loads.progress("m"), None);
+    }
+
+    /// A guard dropped after a newer `begin` of the same model keeps the newer record.
+    #[test]
+    fn a_late_guard_drop_keeps_the_new_record() {
+        let loads: Arc<LoadsInFlight> = Arc::default();
+        let old = loads.begin("m");
+        let newer = loads.begin("m");
+        drop(old);
+        assert!(loads.progress("m").is_some());
+        drop(newer);
+        assert_eq!(loads.progress("m"), None);
+    }
+
+    /// A load that fails or unwinds drops its guard, so the record never outlives it.
+    #[test]
+    fn a_load_record_clears_when_the_load_fails() {
+        let loads: Arc<LoadsInFlight> = Arc::default();
+        let run = |fail: bool| -> Result<(), String> {
+            let guard = loads.begin("m");
+            guard.reporter()("load-model", 1, 2);
+            if fail {
+                return Err("out of memory".to_string());
+            }
+            Ok(())
+        };
+        assert!(run(true).is_err());
+        assert_eq!(loads.progress("m"), None);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = loads.begin("m");
+            guard.reporter()("load-model", 1, 2);
+            panic!("loader panicked");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(loads.progress("m"), None);
+        assert!(run(false).is_ok());
+        assert_eq!(loads.progress("m"), None);
+    }
+
+    /// The reporter a load publishes on its blocking thread is the one the weight loaders
+    /// count into, and a pool thread given a clone explicitly reaches it too.
+    #[test]
+    fn a_reporter_published_on_the_loading_thread_reaches_the_record() {
+        use crate::inference::serve::progress::{phase, scoped};
+        let loads: Arc<LoadsInFlight> = Arc::default();
+        let guard = loads.begin("m");
+        let report = guard.reporter();
+        let seen = loads.clone();
+        std::thread::spawn(move || {
+            scoped::with(report, || {
+                scoped::note(phase::LOAD_MODEL, 2, 5);
+                let carried = scoped::current().expect("published");
+                std::thread::scope(|s| {
+                    s.spawn(|| scoped::note(phase::LOAD_MODEL, 9, 9));
+                    s.spawn(move || carried(phase::LOAD_MODEL, 3, 5));
+                });
+            });
+            assert!(scoped::current().is_none());
+        })
+        .join()
+        .unwrap();
+        // The thread without a clone published nothing, so only the carried count landed.
+        let got = seen.progress("m").expect("still loading");
+        assert_eq!(got.phase, phase::LOAD_MODEL);
+        assert_eq!((got.done, got.total), (3, 5));
+        drop(guard);
     }
 }
