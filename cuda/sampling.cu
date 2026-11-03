@@ -44,12 +44,74 @@ __global__ void loken_batched_argmax_kernel(const T* __restrict__ logits,
     }
     if (threadIdx.x == 0) out[row] = (unsigned int)sidx[0];
 }
+// The same argmax with 16-byte loads and 1024 threads per row, for rows whose width and base
+// pointer allow them. A thread visits its columns in ascending order and keeps the first
+// maximum, and the reduction prefers the lowest index, so the ties break as in the kernel above.
+#define ARGMAX_VEC_THREADS 1024
+__device__ __forceinline__ void loken_argmax_take(float v, int idx, float& lmax, int& lidx) {
+    if (v > lmax) { lmax = v; lidx = idx; }
+}
+__device__ __forceinline__ void loken_argmax_reduce(float lmax, int lidx, unsigned int* out, int row) {
+    __shared__ float smax[ARGMAX_VEC_THREADS];
+    __shared__ int   sidx[ARGMAX_VEC_THREADS];
+    smax[threadIdx.x] = lmax; sidx[threadIdx.x] = lidx;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            float ov = smax[threadIdx.x + s]; int oi = sidx[threadIdx.x + s];
+            if (ov > smax[threadIdx.x] || (ov == smax[threadIdx.x] && oi < sidx[threadIdx.x])) {
+                smax[threadIdx.x] = ov; sidx[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = (unsigned int)sidx[0];
+}
+__global__ void loken_batched_argmax_vec_f32_kernel(const float* __restrict__ logits,
+                                                    unsigned int* __restrict__ out, int vocab) {
+    const int row = blockIdx.x;
+    const float4* r = (const float4*)(logits + (size_t)row * vocab);
+    float lmax = -1e30f; int lidx = 0;
+    for (int k = threadIdx.x; k < (vocab >> 2); k += blockDim.x) {
+        const float4 v = r[k];
+        loken_argmax_take(v.x, 4 * k, lmax, lidx);
+        loken_argmax_take(v.y, 4 * k + 1, lmax, lidx);
+        loken_argmax_take(v.z, 4 * k + 2, lmax, lidx);
+        loken_argmax_take(v.w, 4 * k + 3, lmax, lidx);
+    }
+    loken_argmax_reduce(lmax, lidx, out, row);
+}
+__global__ void loken_batched_argmax_vec_f16_kernel(const __half* __restrict__ logits,
+                                                    unsigned int* __restrict__ out, int vocab) {
+    const int row = blockIdx.x;
+    const uint4* r = (const uint4*)(logits + (size_t)row * vocab);
+    float lmax = -1e30f; int lidx = 0;
+    for (int k = threadIdx.x; k < (vocab >> 3); k += blockDim.x) {
+        uint4 u = r[k];
+        const __half2* h = (const __half2*)&u;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __half22float2(h[j]);
+            loken_argmax_take(f.x, 8 * k + 2 * j, lmax, lidx);
+            loken_argmax_take(f.y, 8 * k + 2 * j + 1, lmax, lidx);
+        }
+    }
+    loken_argmax_reduce(lmax, lidx, out, row);
+}
 extern "C" void loken_batched_argmax_f16(const void* logits, unsigned int* out,
                                              int n_rows, int vocab, cudaStream_t stream) {
+    if ((vocab & 7) == 0 && (((size_t)logits) & 15) == 0) {
+        loken_batched_argmax_vec_f16_kernel<<<n_rows, ARGMAX_VEC_THREADS, 0, stream>>>((const __half*)logits, out, vocab);
+        return;
+    }
     loken_batched_argmax_kernel<__half><<<n_rows, 256, 0, stream>>>((const __half*)logits, out, vocab);
 }
 extern "C" void loken_batched_argmax_f32(const void* logits, unsigned int* out,
                                              int n_rows, int vocab, cudaStream_t stream) {
+    if ((vocab & 3) == 0 && (((size_t)logits) & 15) == 0) {
+        loken_batched_argmax_vec_f32_kernel<<<n_rows, ARGMAX_VEC_THREADS, 0, stream>>>((const float*)logits, out, vocab);
+        return;
+    }
     loken_batched_argmax_kernel<float><<<n_rows, 256, 0, stream>>>((const float*)logits, out, vocab);
 }
 

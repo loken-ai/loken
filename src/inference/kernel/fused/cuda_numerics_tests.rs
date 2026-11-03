@@ -613,3 +613,37 @@ fn a_float_embedding_table_gathers_its_rows_on_the_card() {
         }
     }
 }
+
+/// The batched greedy argmax picks the lowest index among equal maxima, for widths the 16-byte
+/// kernels serve and for one they do not, in f32 and in f16.
+#[test]
+fn batched_argmax_breaks_ties_to_the_lowest_index() {
+    use crate::tensor::DType;
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    for vocab in [4096usize, 4100, 4098] {
+        let rows = 5usize;
+        let mut data = vec![0.0f32; rows * vocab];
+        let mut want = Vec::new();
+        for row in 0..rows {
+            let r = &mut data[row * vocab..(row + 1) * vocab];
+            for (i, v) in r.iter_mut().enumerate() {
+                *v = ((i * 31 + row * 7) % 97) as f32 * 0.01;
+            }
+            // The maximum appears at 3 positions; the first one must win.
+            let first = (row * 391 + 13) % (vocab / 2);
+            for at in [first, first + vocab / 4, vocab - 1] {
+                r[at] = 5.0;
+            }
+            want.push(first as u32);
+        }
+        let logits = Tensor::from_slice(&data, (rows, vocab), &dev).unwrap();
+        let got = crate::inference::moe_cuda::batched_argmax(&logits).unwrap();
+        assert_eq!(got, want, "f32, vocab {vocab}");
+        let half = logits.to_dtype(DType::F16).unwrap();
+        let got = crate::inference::moe_cuda::batched_argmax(&half).unwrap();
+        assert_eq!(got, want, "f16, vocab {vocab}");
+    }
+}
