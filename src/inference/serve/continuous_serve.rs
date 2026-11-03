@@ -953,6 +953,32 @@ fn worker_loop(
         Ok(e) => e,
         Err(_) => return,
     };
+    // Tokens reach their clients from a thread of their own, in the order they were produced:
+    // waking a client from the step loop lets the woken threads take the core before the next
+    // step is launched.
+    let (emit_tx, emit_rx) = mpsc::channel::<Vec<(Sender<CbToken>, CbToken)>>();
+    let emitter = std::thread::Builder::new()
+        .name("cb-emit".into())
+        .spawn(move || {
+            for batch in emit_rx {
+                for (tx, token) in batch {
+                    let _ = tx.send(token);
+                }
+            }
+        })
+        .is_ok();
+    let emit = |batch: Vec<(Sender<CbToken>, CbToken)>| {
+        if batch.is_empty() {
+            return;
+        }
+        if emitter {
+            let _ = emit_tx.send(batch);
+        } else {
+            for (tx, token) in batch {
+                let _ = tx.send(token);
+            }
+        }
+    };
     let mut next_id: u64 = 0;
     // seq id -> (token sender, prompt length already streamed marker)
     let mut chans: HashMap<u64, Sender<CbToken>> = HashMap::new();
@@ -1019,27 +1045,34 @@ fn worker_loop(
                     "cb-worker step error #{fails} (recovering, aborting {} in-flight): {e}",
                     chans.len()
                 );
+                let mut batch = Vec::new();
                 for id in engine.abort_all() {
                     if let Some(tx) = chans.remove(&id) {
-                        let _ = tx.send(CbToken::Done(FinishReason::Stop));
+                        batch.push((tx, CbToken::Done(FinishReason::Stop)));
                     }
                 }
                 if fails >= 3 {
                     eprintln!("cb-worker: 3 consecutive step errors - stopping worker");
                     for (_, tx) in chans.drain() {
-                        let _ = tx.send(CbToken::Done(FinishReason::Stop));
+                        batch.push((tx, CbToken::Done(FinishReason::Stop)));
                     }
+                    emit(batch);
                     return;
                 }
+                emit(batch);
                 continue;
             }
         };
+        let mut batch = Vec::new();
         for (id, at, cached_prompt_tokens) in engine.take_admitted() {
             if let Some(tx) = chans.get(&id) {
-                let _ = tx.send(CbToken::Admitted {
-                    at,
-                    cached_prompt_tokens,
-                });
+                batch.push((
+                    tx.clone(),
+                    CbToken::Admitted {
+                        at,
+                        cached_prompt_tokens,
+                    },
+                ));
             }
         }
         for (id, tok) in emits {
@@ -1049,14 +1082,15 @@ fn worker_loop(
                     .iter()
                     .any(|d| d.id == id && d.reason == FinishReason::Eos);
                 if !ended {
-                    let _ = tx.send(CbToken::Tok(tok));
+                    batch.push((tx.clone(), CbToken::Tok(tok)));
                 }
             }
         }
         for d in done {
             if let Some(tx) = chans.remove(&d.id) {
-                let _ = tx.send(CbToken::Done(d.reason));
+                batch.push((tx, CbToken::Done(d.reason)));
             }
         }
+        emit(batch);
     }
 }
