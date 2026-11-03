@@ -574,6 +574,63 @@ fn sample_topk_draws_by_cumulative_share() {
     assert_eq!(draw(0.0, 1.0, &[4000], 3.0), 17);
 }
 
+/// The f16 fused residual add + rmsnorm against a host reference, for a width the 16-byte
+/// kernel serves and for one it does not. The kept sum is exact, the norm is within 1 ulp of f16.
+#[test]
+fn fused_add_rmsnorm_f16_matches_a_host_reference() {
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    for cols in [4096usize, 2056, 4100] {
+        let rows = 7usize;
+        let eps = 1e-6f32;
+        let xs: Vec<half::f16> = (0..rows * cols)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.0173).sin() * 3.0))
+            .collect();
+        let rs: Vec<half::f16> = (0..rows * cols)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.0071).cos() * 2.0))
+            .collect();
+        let ws: Vec<f32> = (0..cols).map(|i| 0.5 + (i % 13) as f32 * 0.05).collect();
+        let x = Tensor::from_slice(&xs, (rows, cols), &dev).unwrap();
+        let r = Tensor::from_slice(&rs, (rows, cols), &dev).unwrap();
+        let w = Tensor::from_slice(&ws, (cols,), &dev).unwrap();
+        let (sum, norm) = fused_add_rmsnorm_f16(&x, &r, &w, eps).unwrap();
+        let sum = sum.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+        let norm = norm.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+        let plain = fused_rmsnorm_f16(&x, &w, eps).unwrap();
+        let plain = plain.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+        for row in 0..rows {
+            let at = |v: usize| row * cols + v;
+            let kept: Vec<half::f16> = (0..cols)
+                .map(|v| half::f16::from_f32(xs[at(v)].to_f32() + rs[at(v)].to_f32()))
+                .collect();
+            assert!(
+                (0..cols).all(|v| sum[at(v)] == kept[v]),
+                "cols {cols}: kept sum"
+            );
+            let reference = |input: &dyn Fn(usize) -> f32| -> Vec<f32> {
+                let mean = (0..cols).map(|v| input(v) * input(v)).sum::<f32>() / cols as f32;
+                let denom = (mean + eps).sqrt();
+                (0..cols).map(|v| input(v) / denom * ws[v]).collect()
+            };
+            let with_res = reference(&|v| kept[v].to_f32());
+            let without = reference(&|v| xs[at(v)].to_f32());
+            for v in 0..cols {
+                let tol = |want: f32| want.abs() * 2f32.powi(-10) + 1e-4;
+                assert!(
+                    (norm[at(v)].to_f32() - with_res[v]).abs() <= tol(with_res[v]),
+                    "cols {cols} row {row} col {v}: add norm"
+                );
+                assert!(
+                    (plain[at(v)].to_f32() - without[v]).abs() <= tol(without[v]),
+                    "cols {cols} row {row} col {v}: plain norm"
+                );
+            }
+        }
+    }
+}
+
 /// The rows a float embedding table gathers on the card are the rows of the table, widened to
 /// f32, in the order of the ids and for a repeated id.
 #[test]

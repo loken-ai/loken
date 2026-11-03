@@ -65,12 +65,91 @@ extern "C" __global__ void loken_fused_rmsnorm_f16_kernel(
     }
 }
 
+// The same normalisation 8 columns per thread, for rows whose pointers and width allow
+// 16-byte accesses. The sum is rounded to f16 and the division is kept, as in the scalar kernel.
+extern "C" __global__ void loken_fused_rmsnorm_f16_vec_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ res,
+    const float*  __restrict__ weight,
+    __half* __restrict__ norm_out,
+    __half* __restrict__ sum_out,
+    int rows, int cols, float eps
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int nvec = cols >> 3;
+    const uint4* xv = (const uint4*)(x + (size_t)row * cols);
+    const uint4* rv = res ? (const uint4*)(res + (size_t)row * cols) : nullptr;
+    uint4* nv = (uint4*)(norm_out + (size_t)row * cols);
+    uint4* sv = sum_out ? (uint4*)(sum_out + (size_t)row * cols) : nullptr;
+    const float4* wv = (const float4*)weight;
+    extern __shared__ float4 cache4[];
+    float local = 0.0f;
+    for (int v = tid; v < nvec; v += blockDim.x) {
+        uint4 xu = xv[v];
+        uint4 ru;
+        if (rv) ru = rv[v];
+        const __half2* xh = (const __half2*)&xu;
+        const __half2* rh = (const __half2*)&ru;
+        uint4 su;
+        __half2* sh = (__half2*)&su;
+        float f[8];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float2 xf = __half22float2(xh[k]);
+            if (rv) {
+                const float2 rf = __half22float2(rh[k]);
+                sh[k] = __floats2half2_rn(xf.x + rf.x, xf.y + rf.y);
+                xf = __half22float2(sh[k]);
+            }
+            f[2 * k] = xf.x;
+            f[2 * k + 1] = xf.y;
+            local += xf.x * xf.x + xf.y * xf.y;
+        }
+        if (rv) sv[v] = su;
+        cache4[2 * v] = make_float4(f[0], f[1], f[2], f[3]);
+        cache4[2 * v + 1] = make_float4(f[4], f[5], f[6], f[7]);
+    }
+    local = ll_warp_sum(local);
+    __shared__ float wsum[32];
+    const int warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
+    if (lane == 0) wsum[warp] = local;
+    __syncthreads();
+    if (warp == 0) {
+        float t = (lane < nwarps) ? wsum[lane] : 0.0f;
+        t = ll_warp_sum(t);
+        if (lane == 0) wsum[0] = t;
+    }
+    __syncthreads();
+    const float denom = sqrtf(wsum[0] / (float)cols + eps);
+    for (int v = tid; v < nvec; v += blockDim.x) {
+        const float4 a = cache4[2 * v], b = cache4[2 * v + 1];
+        const float4 wa = wv[2 * v], wb = wv[2 * v + 1];
+        uint4 ou;
+        __half2* oh = (__half2*)&ou;
+        oh[0] = __floats2half2_rn(a.x / denom * wa.x, a.y / denom * wa.y);
+        oh[1] = __floats2half2_rn(a.z / denom * wa.z, a.w / denom * wa.w);
+        oh[2] = __floats2half2_rn(b.x / denom * wb.x, b.y / denom * wb.y);
+        oh[3] = __floats2half2_rn(b.z / denom * wb.z, b.w / denom * wb.w);
+        nv[v] = ou;
+    }
+}
+
 extern "C" void loken_fused_rmsnorm_f16(
     const void* x, const void* res, const float* weight,
     void* norm_out, void* sum_out, int rows, int cols, float eps, cudaStream_t stream
 ) {
     const int block = 256; // 8 warps; dynamic shmem caches the F32 input row
     const int shmem = cols * (int)sizeof(float); // <= ~12KB for these hidden sizes
+    const bool aligned = (cols & 7) == 0 &&
+        (((size_t)x | (size_t)res | (size_t)weight | (size_t)norm_out | (size_t)sum_out) & 15) == 0;
+    if (aligned) {
+        loken_fused_rmsnorm_f16_vec_kernel<<<rows, block, shmem, stream>>>(
+            (const __half*)x, (const __half*)res, weight,
+            (__half*)norm_out, (__half*)sum_out, rows, cols, eps);
+        return;
+    }
     loken_fused_rmsnorm_f16_kernel<<<rows, block, shmem, stream>>>(
         (const __half*)x, (const __half*)res, weight,
         (__half*)norm_out, (__half*)sum_out, rows, cols, eps);

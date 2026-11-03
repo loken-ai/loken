@@ -1239,9 +1239,21 @@ impl GenericHeteroTransformer {
         let c = &self.config;
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let scale = 1.0f32 / (hd as f32).sqrt();
-        use crate::inference::kernel::fused::fused_rmsnorm_f16;
+        use crate::inference::kernel::fused::{
+            fused_add_rmsnorm_f16, fused_rmsnorm_f16, silu_mul_f16,
+        };
         let cdt = DType::F16;
         let mut x = x.clone();
+        // The final norm's weight, resident on the compute device (see below).
+        let norm_w = self
+            .output_norm_cuda_weight
+            .as_ref()
+            .filter(|w| w.device().same_device(&x.device()))
+            .map(|w| Ok(w.clone()))
+            .unwrap_or_else(|| self.output_norm.weight().to_device(&x.device()))?;
+        // The norm of the stream that enters the next layer, made by the kernel that added the
+        // previous layer's output to the residual.
+        let mut next_norm: Option<Tensor> = None;
         for (li, layer) in self.layers.iter().enumerate() {
             // Time on the calling thread. A layer whose work is enqueued on a device
             // returns before that work is done, so this is what ISSUING the layer costs -
@@ -1251,7 +1263,12 @@ impl GenericHeteroTransformer {
             let residual = x.clone();
             // F16-native RmsNorm (no F32 cast kernel -> safe inside CUDA-graph capture,
             // and it dispatches on the device capture stream).
-            let hn = fused_rmsnorm_f16(&x, layer.attn_norm.weight(), layer.attn_norm.eps() as f32)?;
+            let hn = match next_norm.take() {
+                Some(h) => h,
+                None => {
+                    fused_rmsnorm_f16(&x, layer.attn_norm.weight(), layer.attn_norm.eps() as f32)?
+                }
+            };
             let (qd, kvd) = (nh * hd, nkv * hd);
             let (q, k, v) = if let Some(qkvw) = layer.attn_qkv.as_ref() {
                 let mut qkv = qkvw.forward(&hn)?;
@@ -1340,10 +1357,11 @@ impl GenericHeteroTransformer {
                 .to_dtype(cdt)
                 .and_then(|a| layer.attn_output.forward(&a))?
                 .to_dtype(cdt)?;
-            x = residual.broadcast_add(&o)?;
-            let residual2 = x.clone();
             let ffn_norm = layer.ffn_norm.as_ref().unwrap();
-            let hn2 = fused_rmsnorm_f16(&x, ffn_norm.weight(), ffn_norm.eps() as f32)?;
+            let (sum, hn2) =
+                fused_add_rmsnorm_f16(&o, &residual, ffn_norm.weight(), ffn_norm.eps() as f32)?;
+            x = sum;
+            let residual2 = x.clone();
             let (g, u) = if let Some(gate) = layer.ffn_gate.as_ref() {
                 (gate.forward(&hn2)?, layer.ffn_up.forward(&hn2)?)
             } else {
@@ -1356,28 +1374,32 @@ impl GenericHeteroTransformer {
             let act = if c.flags.use_gelu {
                 g.gelu()?.mul(&u)?
             } else {
-                g.silu()?.mul(&u)?
+                match silu_mul_f16(&g, &u)? {
+                    Some(a) => a,
+                    None => g.silu()?.mul(&u)?,
+                }
             };
-            let d = layer.ffn_down.forward(&act)?;
-            x = residual2.broadcast_add(&d)?;
+            let d = layer.ffn_down.forward(&act)?.to_dtype(cdt)?;
+            // The residual add and the norm that follows it: the next layer's attention norm,
+            // or the output norm after the last layer.
+            let (next_weight, next_eps) = match self.layers.get(li + 1) {
+                Some(next) => (next.attn_norm.weight().clone(), next.attn_norm.eps() as f32),
+                None => (norm_w.clone(), self.output_norm.eps() as f32),
+            };
+            let (sum, h) = fused_add_rmsnorm_f16(&d, &residual2, &next_weight, next_eps)?;
+            x = sum;
+            next_norm = Some(h);
             note_if_non_finite(&format!("layer {li}"), &x);
         }
-        // Return the final normalized hidden (GPU). The lm_head (output_proj) is
-        // applied OUTSIDE the captured region by `lm_head()` - it can live on CPU
-        // for big-vocab models, which would break a GPU-only capture.
-        // CRITICAL for CUDA-graph capture: output_norm.weight() often lives on CPU
-        // (placed with lm_head/embeddings for big-vocab models). fused_rmsnorm_f16
-        // SILENTLY no-ops on a CPU weight (the storage match fails -> no kernel, zero
-        // graph nodes -> hidden never written on replay). Use the GPU-resident copy
-        // (output_norm_cuda_weight, built at load) so the final norm is a real,
-        // capture-safe kernel on the compute device.
-        let norm_w = self
-            .output_norm_cuda_weight
-            .as_ref()
-            .filter(|w| w.device().same_device(&x.device()))
-            .map(|w| Ok(w.clone()))
-            .unwrap_or_else(|| self.output_norm.weight().to_device(&x.device()))?;
-        fused_rmsnorm_f16(&x, &norm_w, self.output_norm.eps() as f32)
+        // The final normalized hidden (GPU), made by the last layer's fused add. The lm_head
+        // (output_proj) is applied OUTSIDE the captured region by `lm_head()`: it can live on
+        // CPU for big-vocab models, which would break a GPU-only capture. The output norm's
+        // weight is the GPU-resident copy built at load, a real capture-safe kernel input on
+        // the compute device, where a CPU weight would make the kernel a silent no-op.
+        match next_norm {
+            Some(h) => Ok(h),
+            None => fused_rmsnorm_f16(&x, &norm_w, self.output_norm.eps() as f32),
+        }
     }
 
     /// The head of a batch decoded greedily: the logits in the half precision the card computes
@@ -1668,12 +1690,19 @@ impl GenericHeteroTransformer {
             &positions, hd, base, &dev, cdt,
         )?;
 
-        let mut slot_index: std::collections::HashMap<usize, Tensor> =
-            std::collections::HashMap::new();
+        let mut slot_index: Vec<(usize, Device, Tensor)> = Vec::new();
         note_if_non_finite("the embedding, before any layer", &x);
+        // On a card in half precision the residual add and the norm that follows it run as one
+        // kernel, the activation as another: the next layer's attention norm comes from the
+        // previous layer's fused add.
+        let fused = cdt == DType::F16 && x.device().is_cuda();
+        let mut next_norm: Option<Tensor> = None;
         for (li, layer) in self.layers.iter().enumerate() {
             let residual = x.clone();
-            let hn = layer.attn_norm.forward(&x)?.to_dtype(cdt)?;
+            let hn = match next_norm.take() {
+                Some(h) => h,
+                None => layer.attn_norm.forward(&x)?.to_dtype(cdt)?,
+            };
             let (qd, kvd) = (nh * hd, nkv * hd);
             let (q, k, v) = if let Some(qkvw) = layer.attn_qkv.as_ref() {
                 let mut qkv = qkvw.forward(&hn)?;
@@ -1726,14 +1755,22 @@ impl GenericHeteroTransformer {
             )?;
             let v_f = v.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
             // persist all T positions' K/V for the subsequent decode phase
-            // The scatter index depends on the slots and the row width: built once per width
-            // for the forward, not once per layer.
+            // The scatter index depends on the slots, the row width and the card: built once for
+            // each of them in the forward, not once per layer.
             let feat = stores[li].feat();
-            if let std::collections::hash_map::Entry::Vacant(entry) = slot_index.entry(feat) {
-                entry.insert(stores[li].slot_index(&slots, &k_rot.device())?);
-            }
+            let card = k_rot.device();
+            let at = match slot_index
+                .iter()
+                .position(|(f, d, _)| *f == feat && d.same_device(&card))
+            {
+                Some(at) => at,
+                None => {
+                    slot_index.push((feat, card.clone(), stores[li].slot_index(&slots, &card)?));
+                    slot_index.len() - 1
+                }
+            };
             stores[li].write_indexed(
-                &slot_index[&feat],
+                &slot_index[at].2,
                 &k_rot.reshape(&[t, nkv * hd][..])?,
                 &v_f.reshape(&[t, nkv * hd][..])?,
             )?;
@@ -1786,14 +1823,21 @@ impl GenericHeteroTransformer {
                 .to_dtype(cdt)
                 .and_then(|a| layer.attn_output.forward(&a))?
                 .to_dtype(cdt)?;
-            x = residual.broadcast_add(&o)?;
+            let ffn_norm = layer.ffn_norm.as_ref().unwrap();
+            let hn2 = if fused {
+                let (sum, norm) = crate::inference::kernel::fused::fused_add_rmsnorm_f16(
+                    &o,
+                    &residual,
+                    ffn_norm.weight(),
+                    ffn_norm.eps() as f32,
+                )?;
+                x = sum;
+                norm
+            } else {
+                x = residual.broadcast_add(&o)?;
+                ffn_norm.forward(&x)?.to_dtype(cdt)?
+            };
             let residual2 = x.clone();
-            let hn2 = layer
-                .ffn_norm
-                .as_ref()
-                .unwrap()
-                .forward(&x)?
-                .to_dtype(cdt)?;
             let (g, u) = if let Some(gate) = layer.ffn_gate.as_ref() {
                 (
                     gate.forward(&hn2)?.to_dtype(cdt)?,
@@ -1809,10 +1853,25 @@ impl GenericHeteroTransformer {
             let act = if c.flags.use_gelu {
                 g.gelu()?.mul(&u)?
             } else {
-                g.silu()?.mul(&u)?
+                match crate::inference::kernel::fused::silu_mul_f16(&g, &u)? {
+                    Some(a) => a,
+                    None => g.silu()?.mul(&u)?,
+                }
             };
             let d = layer.ffn_down.forward(&act)?.to_dtype(cdt)?;
-            x = residual2.broadcast_add(&d)?;
+            match self.layers.get(li + 1) {
+                Some(next) if fused => {
+                    let (sum, h) = crate::inference::kernel::fused::fused_add_rmsnorm_f16(
+                        &d,
+                        &residual2,
+                        next.attn_norm.weight(),
+                        next.attn_norm.eps() as f32,
+                    )?;
+                    x = sum;
+                    next_norm = Some(h);
+                }
+                _ => x = residual2.broadcast_add(&d)?,
+            }
             note_if_non_finite(&format!("layer {li}"), &x);
         }
         // logits for the last position of each sequence only

@@ -81,6 +81,30 @@ pub fn fused_shexp_out(
     Ok(Some(out))
 }
 
+/// Whether a block of the fused norm kernels can hold a row of `cols` values as F32 in dynamic
+/// shared memory, given the `max_bytes` a block may use.
+pub(crate) fn fits_shared(cols: usize, max_bytes: usize) -> bool {
+    cols.checked_mul(core::mem::size_of::<f32>())
+        .is_some_and(|need| need <= max_bytes && need <= i32::MAX as usize)
+}
+
+/// Whether the fused norm kernels can run on the card of `x` for rows of `cols` values.
+/// A failed query counts as no.
+fn fused_norm_fits(x: &Tensor, cols: usize) -> bool {
+    use crate::tensor::gpu_runtime::driver::{result, sys};
+    let Ok(dev) = x.device().as_cuda_device() else {
+        return false;
+    };
+    let cu_device = dev.cuda_stream().context().cu_device();
+    let max = unsafe {
+        result::device::get_attribute(
+            cu_device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+        )
+    };
+    max.is_ok_and(|m| fits_shared(cols, m.max(0) as usize))
+}
+
 /// nvcc-compiled F16 fused residual-add + RMSNorm (cuda/fused_norm_f16.cu). The
 /// NVRTC FUSED_CUDA_SRC path is F32-only, so this uses the build.rs/FFI route.
 /// x/residual [.., cols] F16; weight [cols] F32. Returns (sum, norm) both F16,
@@ -94,7 +118,8 @@ pub fn fused_add_rmsnorm_f16(
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
-    if !x.device().is_cuda() {
+    let cols = *x.dims().last().unwrap();
+    if !x.device().is_cuda() || !fused_norm_fits(x, cols) {
         let sum = (x + residual)?;
         let norm = crate::tensor::ops::rms_norm(&sum.to_dtype(DType::F32)?, weight, eps)?
             .to_dtype(x.dtype())?;
@@ -103,7 +128,6 @@ pub fn fused_add_rmsnorm_f16(
     let x = x.contiguous()?;
     let residual = residual.contiguous()?;
     let weight = weight.contiguous()?;
-    let cols = *x.dims().last().unwrap();
     let rows = (x.elem_count() / cols) as i32;
     let norm_out = unsafe { Tensor::empty(x.shape(), DType::F16, &x.device())? };
     let sum_out = unsafe { Tensor::empty(x.shape(), DType::F16, &x.device())? };
@@ -146,13 +170,13 @@ pub fn fused_rmsnorm_f16(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
-    if !x.device().is_cuda() {
+    let cols = *x.dims().last().unwrap();
+    if !x.device().is_cuda() || !fused_norm_fits(x, cols) {
         return crate::tensor::ops::rms_norm(&x.to_dtype(DType::F32)?, weight, eps)?
             .to_dtype(x.dtype());
     }
     let x = x.contiguous()?;
     let weight = weight.contiguous()?;
-    let cols = *x.dims().last().unwrap();
     let rows = (x.elem_count() / cols) as i32;
     let norm_out = unsafe { Tensor::empty(x.shape(), DType::F16, &x.device())? };
     let dev = x.device().as_cuda_device()?;
@@ -961,4 +985,33 @@ pub fn fused_mamba2_gate_gnorm(
     drop(nw_s);
     drop(o_s);
     Ok(out)
+}
+
+#[cfg(test)]
+mod fits_shared_tests {
+    use super::fits_shared;
+
+    #[test]
+    fn fits_shared_below_the_limit() {
+        assert!(fits_shared(1000, 49152));
+    }
+
+    #[test]
+    fn fits_shared_at_the_limit() {
+        assert!(fits_shared(12288, 49152));
+    }
+
+    #[test]
+    fn fits_shared_above_the_limit() {
+        assert!(!fits_shared(12289, 49152));
+        assert!(!fits_shared(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn fits_shared_cols_not_a_multiple_of_8() {
+        assert!(fits_shared(12287, 49152));
+        assert!(!fits_shared(12289 + 3, 49152));
+        assert!(fits_shared(5, 20));
+        assert!(!fits_shared(5, 19));
+    }
 }
