@@ -318,7 +318,11 @@ static __device__ __forceinline__ void attn_output_q4_inner_dev_pos(
 }
 
 #define ATTN_OUTPUT_Q4_DEV_POS_KERNEL(NAME, HD, NQ)                            \
-extern "C" __global__ void NAME(                                               \
+/* Launched at ATTN_OUTPUT_WARPS x 32 threads. Without the bound the compiler  \
+   is free to spend more than 64 registers per thread on an arch it targets     \
+   natively, and a 1024-thread block then fails to LAUNCH - out of resources,   \
+   at run time, on exactly the cards compiled for most precisely. */            \
+extern "C" __global__ void __launch_bounds__(ATTN_OUTPUT_WARPS * 32) NAME(  \
     const void  * __restrict__ V_blob,                                         \
     const float * __restrict__ probs,                                          \
     float       * __restrict__ out,                                            \

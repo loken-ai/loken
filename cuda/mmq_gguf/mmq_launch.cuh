@@ -145,9 +145,11 @@ static void mmq_launch_tile(float *tmp_fixup, const mmq_args &args, cudaStream_t
 /// output is one tile across, since past that the extra width buys nothing and costs
 /// occupancy. Tensor-core tiles are laid out in groups of sixteen rather than eight, so a
 /// width that is not a multiple of the granularity cannot be built at all.
+///
+/// Returns the width launched, or 0 when none fits and nothing ran.
 template <ggml_type type>
-static void mmq_launch(float *tmp_fixup, const mmq_args &args, cudaStream_t stream, const int cc,
-                       const int nsm, const size_t smpbo, const int warp_size_host) {
+static int mmq_launch(float *tmp_fixup, const mmq_args &args, cudaStream_t stream, const int cc,
+                      const int nsm, const size_t smpbo, const int warp_size_host) {
     const int mmq_x_max = mmq_x_max_host(cc);
     const int mmq_y = mmq_rows_per_tile(cc);
     const int nwarps = 256 / warp_size_host;
@@ -176,18 +178,19 @@ static void mmq_launch(float *tmp_fixup, const mmq_args &args, cudaStream_t stre
         break;
         MMQ_TILE_WIDTHS(MMQ_DISPATCH_WIDTH)
 #undef MMQ_DISPATCH_WIDTH
-        // Nothing fitted: the caller keeps its result buffer untouched and falls back.
         default:
-            break;
+            return 0;
     }
+    return best;
 }
 
 /// The C entry point for one format - what `build.rs` links and Rust declares.
 ///
 /// The shape arguments describe a plain 2-D matmul; the channel and sample strides the kernel
 /// also understands are the batched form, which this path leaves at one channel, one sample.
+/// Returns the width launched, or 0 when none fits and nothing ran.
 #define MMQ_ENTRY_POINT(ggml_type_name, suffix)                                               \
-    extern "C" void launch_mmq_gguf_##suffix(                                                 \
+    extern "C" int launch_mmq_gguf_##suffix(                                                  \
         void *tmp_fixup_ptr, const void *x, const void *y_q8_1_mmq, void *dst,                \
         int64_t ncols_x, int64_t nrows_x, int64_t ncols_y, int64_t stride_row_x,              \
         int64_t stride_col_dst, int cc, int nsm, int64_t smpbo, int warp_size_host,           \
@@ -199,8 +202,9 @@ static void mmq_launch(float *tmp_fixup, const mmq_args &args, cudaStream_t stre
             (const char *) x, ggml_type_name, (const int *) y_q8_1_mmq, (float *) dst,       \
             ncols_x, nrows_x, ncols_y, stride_row_x, ncols_y, nrows_x,                        \
             1, 1, 0, 0, 0, 1, 1, 0, 0, 0, use_stream_k, ncols_y};                             \
-        mmq_launch<ggml_type_name>((float *) tmp_fixup_ptr, args, (cudaStream_t) stream, cc,  \
-                                   nsm, smpbo, warp_size_host);                               \
+        return mmq_launch<ggml_type_name>((float *) tmp_fixup_ptr, args,                      \
+                                          (cudaStream_t) stream, cc, nsm, smpbo,              \
+                                          warp_size_host);                                    \
     }
 
 /// Launch the expert-batched matmul at one tile width.

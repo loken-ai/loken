@@ -130,6 +130,8 @@ macro_rules! mmq_formats {
         /// The pointer type the dispatch below holds a tile kernel in - the same call the
         /// declarations under it make, said once.
         #[cfg(feature = "gpu")]
+        ///
+        /// It returns the tile width launched, or 0 when none fits and nothing ran.
         type MmqMatmulLauncher = unsafe extern "C" fn(
             tmp_fixup: *mut std::ffi::c_void,
             x: *const std::ffi::c_void,
@@ -145,7 +147,7 @@ macro_rules! mmq_formats {
             smpbo: i64,
             warp_size: i32,
             stream: *mut std::ffi::c_void,
-        );
+        ) -> i32;
 
         /// The pointer type the expert-batched tile kernels are held in.
         #[cfg(feature = "gpu")]
@@ -223,7 +225,7 @@ macro_rules! mmq_formats {
                         smpbo: i64,
                         warp_size: i32,
                         stream: *mut std::ffi::c_void,
-                    );
+                    ) -> i32;
                 )+
             }
         }

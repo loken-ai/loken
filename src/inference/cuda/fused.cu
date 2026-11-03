@@ -127,7 +127,7 @@ extern "C" __global__ void rope_neox_f32(
     if (row >= n_rows) return;
     int half = d / 2;
     int sidx = row % seq;
-    int xoff = row * d;
+    const long long xoff = (long long)row * d;
     int coff = sidx * half;
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float c = cos[coff + j], s = sin[coff + j];
@@ -145,7 +145,7 @@ extern "C" __global__ void rope_interleaved_f32(
     if (row >= n_rows) return;
     int half = d / 2;
     int sidx = row % seq;
-    int xoff = row * d;
+    const long long xoff = (long long)row * d;
     int coff = sidx * half;
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float c = cos[coff + j], s = sin[coff + j];
@@ -169,10 +169,10 @@ extern "C" __global__ void fused_gptoss_mask_f32(
     const int input_pos,
     const int window           // 0 = full causal; >0 = sliding window
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= seq * kv) return;
-    int i = idx / kv;
-    int j = idx % kv;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)seq * kv) return;
+    int i = (int)(idx / kv);
+    int j = (int)(idx % kv);
     int qpos = input_pos + i;
     bool masked = (j > qpos) || (window > 0 && (qpos - j) >= window);
     out[idx] = masked ? __int_as_float(0xff800000) : 0.0f; // -inf bit pattern
@@ -410,13 +410,13 @@ extern "C" __global__ void fused_split_gelu_mul_f32(
     const int M,
     const int N
 ) {
-    const int total = M * N;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)M * N;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    const int r = idx / N;
-    const int c = idx - r * N;
+    const int r = (int)(idx / N);
+    const int c = (int)(idx - (long long)r * N);
     const int two_n = N << 1;
-    const int gu_row = r * two_n;
+    const long long gu_row = (long long)r * two_n;
     const float g = gu[gu_row + c];
     const float u = gu[gu_row + N + c];
     // gelu(tanh-approx)
@@ -436,13 +436,13 @@ extern "C" __global__ void fused_split_silu_mul_f32(
     const int M,
     const int N
 ) {
-    const int total = M * N;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)M * N;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
-    const int r = idx / N;
-    const int c = idx - r * N;
+    const int r = (int)(idx / N);
+    const int c = (int)(idx - (long long)r * N);
     const int two_n = N << 1;
-    const int gu_row = r * two_n;
+    const long long gu_row = (long long)r * two_n;
     const float g = gu[gu_row + c];
     const float u = gu[gu_row + N + c];
     const float silu_g = g / (1.0f + expf(-g));
@@ -473,7 +473,7 @@ extern "C" __global__ void fused_gemma4_post_add_norm_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
 
     // Reduction 1: sum(attn_out²) -> rms_post
     float sum_a2 = 0.0f;
@@ -521,7 +521,7 @@ extern "C" __global__ void fused_add_rmsnorm_dual_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
 
     float thread_sum = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
@@ -559,7 +559,7 @@ extern "C" __global__ void fused_add_rmsnorm_dual_wide_f32(
     int row = blockIdx.x;
     extern __shared__ float ssum_ardw[];   // [cols] staged sum
     __shared__ float stree_ardw[256];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float val = x[offset + i] + residual[offset + i];
         ssum_ardw[i] = val;
@@ -610,7 +610,7 @@ extern "C" __global__ void fused_dual_rmsnorm_add_f32(
     extern __shared__ float sdata[];           // 2 x blockDim.x: [a^2 | b^2]
     float* s_a = sdata;
     float* s_b = sdata + blockDim.x;
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
 
     float sum_a2 = 0.0f;
     float sum_b2 = 0.0f;
@@ -656,7 +656,7 @@ extern "C" __global__ void fused_rmsnorm_then_add_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata_rta[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
 
     float thread_sum = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
@@ -688,7 +688,7 @@ extern "C" __global__ void fused_rmsnorm_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata_rn[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
     float thread_sum = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float v = x[offset + i];
@@ -724,7 +724,7 @@ extern "C" __global__ void fused_rmsnorm_wide_f32(
     int row = blockIdx.x;
     extern __shared__ float srow_rnw[];    // [cols] staged row
     __shared__ float stree_rnw[256];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         srow_rnw[i] = x[offset + i];
     }
@@ -768,7 +768,7 @@ extern "C" __global__ void fused_layernorm_f32(
     extern __shared__ float sdata_ln[];
     float* ssum = sdata_ln;
     float* ssq = sdata_ln + blockDim.x;
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
     float tsum = 0.0f, tsq = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float v = x[offset + i];
@@ -832,7 +832,7 @@ extern "C" __global__ void fused_softmax_lastdim_bf16(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata_bf[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
     float tmax = __int_as_float(0xff800000); // -inf
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         tmax = fmaxf(tmax, bf16_to_f32(x[offset + i]));
@@ -869,7 +869,7 @@ extern "C" __global__ void fused_softmax_lastdim_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata_sm[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
     float tmax = __int_as_float(0xff800000); // -inf (NVRTC has no <math.h> INFINITY)
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         tmax = fmaxf(tmax, x[offset + i]);
@@ -922,7 +922,7 @@ extern "C" __global__ void fused_rmsnorm_add_scale_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata_ras[];
-    int offset = row * cols;
+    const long long offset = (long long)row * cols;
 
     float thread_sum = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
@@ -1454,6 +1454,8 @@ extern "C" __global__ void fused_attn_decode_f32_hd512(
         }
         __syncthreads();
         const float m_tile_max = warp_red[0];
+        // Every warp has read the tile max before warp_red is reused.
+        __syncthreads();
 
         // Online merge: m_new = max(m_running, m_tile_max).
         const float m_new = fmaxf(m_running, m_tile_max);
@@ -1606,6 +1608,8 @@ extern "C" __global__ void fused_attn_decode_f32_hd512_splitk_partial(
         }
         __syncthreads();
         const float m_tile_max = warp_red[0];
+        // Every warp has read the tile max before warp_red is reused.
+        __syncthreads();
 
         const float m_new = fmaxf(m_running, m_tile_max);
         const float alpha = __expf(m_running - m_new);
@@ -1703,7 +1707,7 @@ extern "C" __global__ void fused_softmax_sinks_f32(
 ) {
     int row = blockIdx.x;
     extern __shared__ float sdata_sm[];
-    int offset = row * kv;
+    const long long offset = (long long)row * kv;
     int head = (row / q) % n_head;
     float sink = sinks[head];
 

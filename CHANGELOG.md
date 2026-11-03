@@ -90,6 +90,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Models: list a released checkpoint that loken serves in place.
 - DeepSeek V4.1: size a prompt's chunk for the residual copies each token keeps.
 - API: end a chat stream on an engine error with the error alone.
+- Kernels: refuse the inputs and launches that failed without an error.
 
 ### Removed
 

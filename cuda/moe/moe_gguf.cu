@@ -44,6 +44,9 @@ static std::mutex g_y_q8_1_lock;
 
 // The buffer, held for as long as the caller needs it.
 //
+// The pointer is null when the card could not grow the buffer. A caller that gets null
+// launches nothing.
+//
 // One stream is not one caller: several host threads submit to the same stream, and they all
 // stage into these same bytes. So the quantise and the matmul that reads what it wrote have to
 // reach the stream as a pair - if another thread's pair lands between them, the matmul reads
@@ -86,14 +89,29 @@ static y_q8_1_reservation get_y_q8_1_scratch(size_t needed, cudaStream_t stream)
         // it after a wider call moved on. Doubling bounds how many are left behind. A stream
         // that is being captured gets a plain allocation: a stream-ordered one would be a node
         // of the graph, its memory the graph's, while the slot keeps it for every later call.
-        const size_t bytes = needed > 2 * slot->bytes ? needed : 2 * slot->bytes;
+        const size_t doubled = needed > 2 * slot->bytes ? needed : 2 * slot->bytes;
         cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing(stream, &capturing);
-        if (capturing == cudaStreamCaptureStatusNone) {
-            cudaMallocAsync(&slot->ptr, bytes, stream);
-        } else {
-            cudaMalloc(&slot->ptr, bytes);
+        void* grown = nullptr;
+        size_t bytes = 0;
+        // The doubled size first, then exactly what the call needs.
+        for (const size_t want : {doubled, needed}) {
+            const cudaError_t status = capturing == cudaStreamCaptureStatusNone
+                                           ? cudaMallocAsync(&grown, want, stream)
+                                           : cudaMalloc(&grown, want);
+            if (status == cudaSuccess) {
+                bytes = want;
+                break;
+            }
+            cudaGetLastError();
+            grown = nullptr;
         }
+        if (grown == nullptr) {
+            // The slot keeps its buffer and its size.
+            // The caller gets a null pointer.
+            return {std::move(held), nullptr};
+        }
+        slot->ptr = grown;
         slot->bytes = bytes;
     }
     return {std::move(held), slot->ptr};
@@ -111,6 +129,7 @@ static y_q8_1_reservation stage_activation(const float* inputs, int rows, int si
     const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const size_t bytes = (size_t)rows * (k_padded / QK8_1) * sizeof(block_q8_1);
     y_q8_1_reservation staged = get_y_q8_1_scratch(bytes, stream);
+    if (staged.ptr == nullptr) return staged;
     quantize_q8_1<<<grid, block, 0, stream>>>(inputs, staged, size_k, k_padded);
     return staged;
 }
@@ -447,7 +466,7 @@ __global__ void loken_moe_gemm_gguf_kernel(
         <<<shape.grid, shape.block, shared_bytes, stream>>>( \
             weights, y_q8_1, sorted_token_ids, expert_ids, topk_weights, outputs, dims);
 
-extern "C" void loken_moe_gemm_gguf(
+extern "C" int loken_moe_gemm_gguf(
     const float* inputs, const void* weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids, const float* topk_weights,
     float* outputs,
@@ -462,6 +481,7 @@ extern "C" void loken_moe_gemm_gguf(
     // Held until the GEMM below is on the stream - see `y_q8_1_reservation`.
     const y_q8_1_reservation y_q8_1 =
         stage_activation(inputs, act_rows, size_k, kx_padded, stream);
+    if (y_q8_1.ptr == nullptr) return 1;
 
     // ROWS_PER_WARP > 1 doubles the per-block shared-memory cost (each warp now caches that
     // many weight rows). On Blackwell the shared-mem-per-block ceiling clamps blocks-resident-
@@ -480,6 +500,7 @@ extern "C" void loken_moe_gemm_gguf(
 #undef MOE_CASE
         default: break;
     }
+    return 0;
 }
 
 // ------------------------------------------------------------
@@ -724,7 +745,7 @@ extern "C" void loken_moe_sum_topk(const float* pairs, float* outputs, int token
 
 // `add_after`, when given, is joined to each token's folded row and `outputs` is written
 // whole; without it `outputs` must be pre-filled and receives the fold added onto it.
-static void down_reduce_impl(
+static int down_reduce_impl(
     const float* inputs,            // [M*topk, K] f32
     const void*  weights,           // [num_experts, N, K] quantized
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -749,6 +770,7 @@ static void down_reduce_impl(
     // The pairs' rows go to the caller's buffer when it gives one, and the sum is the caller's.
     const y_q8_1_reservation y_q8_1 =
         get_y_q8_1_scratch(act_bytes + (pair_rows != nullptr ? 0 : pair_bytes), stream);
+    if (y_q8_1.ptr == nullptr) return 1;
     {
         const dim3 grid(ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE), size_m, 1);
         const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
@@ -778,7 +800,7 @@ static void down_reduce_impl(
 #undef MOE_CASE
         default: break;
     }
-    if (pair_rows != nullptr) return;
+    if (pair_rows != nullptr) return 0;
     if (add_after) {
         const int threads = 256;
         const int blocks = ceil_div((size_m / topk) * size_n, threads);
@@ -787,11 +809,12 @@ static void down_reduce_impl(
     } else {
         loken_moe_sum_topk(pairs, reduced, size_m / topk, topk, size_n, stream);
     }
+    return 0;
 }
 
 /// `loken_moe_gemm_gguf_down_reduce_two` up to the pairs' rows: `pair_rows` `[size_m, size_n]`
 /// takes each routed pair's weighted row, and the caller sums a token's `topk` of them.
-extern "C" void loken_moe_gemm_gguf_down_pairs_two(
+extern "C" int loken_moe_gemm_gguf_down_pairs_two(
     const float* inputs, const void* weights, const void* alt_weights, int alt_from,
     const void* const* alt_at,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -800,14 +823,14 @@ extern "C" void loken_moe_gemm_gguf_down_pairs_two(
     int quant_type,
     cudaStream_t stream
 ) {
-    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, nullptr,
+    return down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, nullptr,
         num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr,
         alt_weights, alt_from, stream, nullptr, pair_rows, alt_at);
 }
 
 /// `loken_moe_gemm_gguf_down_pairs_two` over the first `*live` pairs, `live` read on the card;
 /// the idle pairs' rows are zero.
-extern "C" void loken_moe_gemm_gguf_down_pairs_live(
+extern "C" int loken_moe_gemm_gguf_down_pairs_live(
     const float* inputs, const void* weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
     const float* topk_weights, float* pair_rows,
@@ -815,12 +838,12 @@ extern "C" void loken_moe_gemm_gguf_down_pairs_live(
     int quant_type, const unsigned int* live,
     cudaStream_t stream
 ) {
-    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, nullptr,
+    return down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, nullptr,
         num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr,
         nullptr, 0, stream, live, pair_rows);
 }
 
-extern "C" void loken_moe_gemm_gguf_down_reduce(
+extern "C" int loken_moe_gemm_gguf_down_reduce(
     const float* inputs, const void* weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
     const float* topk_weights, float* outputs,
@@ -828,14 +851,14 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
     int quant_type, const float* down_bias, const float* add_after,
     cudaStream_t stream
 ) {
-    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, outputs,
+    return down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, outputs,
         num_experts, topk, size_m, size_n, size_k, quant_type, down_bias, add_after,
         nullptr, 0, stream);
 }
 
 /// [`loken_moe_gemm_gguf_down_reduce`] over `num_experts` slots, those from `alt_from` on read
 /// from the `alt_weights` tensor (slot `expert - alt_from` of it).
-extern "C" void loken_moe_gemm_gguf_down_reduce_two(
+extern "C" int loken_moe_gemm_gguf_down_reduce_two(
     const float* inputs, const void* weights, const void* alt_weights, int alt_from,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
     const float* topk_weights, float* outputs,
@@ -843,7 +866,7 @@ extern "C" void loken_moe_gemm_gguf_down_reduce_two(
     int quant_type, const float* down_bias, const float* add_after,
     cudaStream_t stream
 ) {
-    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, outputs,
+    return down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, outputs,
         num_experts, topk, size_m, size_n, size_k, quant_type, down_bias, add_after,
         alt_weights, alt_from, stream);
 }
@@ -980,7 +1003,7 @@ __global__ void loken_moe_gemm_gguf_gate_up_swiglu_oai_kernel(
         <<<shape.grid, shape.block, 0, stream>>>( \
             gate_weights, up_weights, y_q8_1, sorted_token_ids, expert_ids, outputs, dims);
 
-static void gate_up_silu_mul_impl(
+static int gate_up_silu_mul_impl(
     const float* inputs,
     const void* gate_weights, const void* up_weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -995,6 +1018,7 @@ static void gate_up_silu_mul_impl(
     // Held until the GEMM below is on the stream - see `y_q8_1_reservation`.
     const y_q8_1_reservation y_q8_1 =
         stage_activation(inputs, size_m / topk, size_k, kx_padded, stream);
+    if (y_q8_1.ptr == nullptr) return 1;
 
     // Without shared-mem barriers we can use smaller blocks to spread
     // work across more SMs. For typical MoE intermediate sizes (768) at
@@ -1012,9 +1036,10 @@ static void gate_up_silu_mul_impl(
 #undef MOE_CASE
         default: break;
     }
+    return 0;
 }
 
-extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul(
+extern "C" int loken_moe_gemm_gguf_gate_up_silu_mul(
     const float* inputs,
     const void* gate_weights, const void* up_weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -1023,14 +1048,14 @@ extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul(
     int quant_type,
     cudaStream_t stream
 ) {
-    gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
+    return gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
         num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr, 0, stream);
 }
 
 /// [`loken_moe_gemm_gguf_gate_up_silu_mul`] over `num_experts` slots, those from `alt_from` on
 /// read from the `alt_gate` and `alt_up` tensors (slot `expert - alt_from` of them).
 /// `loken_moe_gemm_gguf_gate_up_silu_mul` over the first `*live` pairs, `live` read on the card.
-extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_live(
+extern "C" int loken_moe_gemm_gguf_gate_up_silu_mul_live(
     const float* inputs,
     const void* gate_weights, const void* up_weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -1039,11 +1064,11 @@ extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_live(
     int quant_type, const unsigned int* live,
     cudaStream_t stream
 ) {
-    gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
+    return gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
         num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr, 0, stream, live);
 }
 
-extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_two(
+extern "C" int loken_moe_gemm_gguf_gate_up_silu_mul_two(
     const float* inputs,
     const void* gate_weights, const void* up_weights,
     const void* alt_gate, const void* alt_up, int alt_from, const void* const* alt_at,
@@ -1053,7 +1078,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_two(
     int quant_type,
     cudaStream_t stream
 ) {
-    gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
+    return gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
         num_experts, topk, size_m, size_n, size_k, quant_type, alt_gate, alt_up, alt_from, stream,
         nullptr, alt_at);
 }
@@ -1066,7 +1091,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_two(
 
 // Fused gate+up GEMM with the gpt-oss OAI clamped-SwiGLU epilogue + optional
 // per-expert biases.
-extern "C" void loken_moe_gemm_gguf_gate_up_swiglu_oai(
+extern "C" int loken_moe_gemm_gguf_gate_up_swiglu_oai(
     const float* inputs,
     const void* gate_weights, const void* up_weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -1081,6 +1106,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_swiglu_oai(
     // Held until the GEMM below is on the stream - see `y_q8_1_reservation`.
     const y_q8_1_reservation y_q8_1 =
         stage_activation(inputs, size_m / topk, size_k, kx_padded, stream);
+    if (y_q8_1.ptr == nullptr) return 1;
 
     const int nWraps = 2;
     constexpr int ROWS_PER_WARP = 1;
@@ -1094,6 +1120,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_swiglu_oai(
 #undef MOE_CASE
         default: break;
     }
+    return 0;
 }
 
 // ------------------------------------------------------------
@@ -1170,7 +1197,7 @@ __global__ void loken_moe_gemm_gguf_gate_up_gelu_mul_concat_kernel(
         <<<shape.grid, shape.block, 0, stream>>>( \
             gate_up_weights, y_q8_1, sorted_token_ids, expert_ids, outputs, dims);
 
-extern "C" void loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
+extern "C" int loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
     const float* inputs,
     const void* gate_up_weights,                 // [num_experts, 2*size_n, size_k]
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -1186,6 +1213,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
     // Held until the GEMM below is on the stream - see `y_q8_1_reservation`.
     const y_q8_1_reservation y_q8_1 =
         stage_activation(inputs, size_m / topk, size_k, kx_padded, stream);
+    if (y_q8_1.ptr == nullptr) return 1;
 
     const int nWraps = 2;
     constexpr int ROWS_PER_WARP = 1;
@@ -1199,6 +1227,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
 #undef MOE_CASE
         default: break;
     }
+    return 0;
 }
 
 // ------------------------------------------------------------
@@ -1207,17 +1236,24 @@ extern "C" void loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
 namespace loken_moe {
 
 /// Row `ids[r]` of an iq4_xs table of `dim` values a row, decoded to `out[r]`: one block a row,
-/// a thread a run of thirty-two values.
+/// a thread a run of thirty-two values. An id at or past `vocab` writes zeros for its row.
 __global__ void loken_embed_rows_iq4_xs_kernel(
-    const void * __restrict__ table, const uint32_t * __restrict__ ids, int n, int dim,
+    const void * __restrict__ table, const uint32_t * __restrict__ ids, int n, int dim, int vocab,
     float * __restrict__ out) {
     const int r = blockIdx.x;
     if (r >= n) return;
     const int blocks = dim / QK_K;
-    const block_iq4_xs * row = (const block_iq4_xs *) table + (size_t) ids[r] * blocks;
+    const uint32_t id = ids[r];
+    const bool ok = id < (uint32_t) vocab;
+    const block_iq4_xs * row = (const block_iq4_xs *) table + (size_t) (ok ? id : 0) * blocks;
     for (int run = threadIdx.x; run < blocks * (QK_K / 32); run += blockDim.x) {
         float y[32];
-        iq4_xs_run(&row[run / (QK_K / 32)], run % (QK_K / 32), y);
+        if (ok) {
+            iq4_xs_run(&row[run / (QK_K / 32)], run % (QK_K / 32), y);
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) y[j] = 0.0f;
+        }
         float * o = out + (size_t) r * dim + (size_t) run * 32;
         #pragma unroll
         for (int j = 0; j < 32; ++j) o[j] = y[j];
@@ -1227,7 +1263,7 @@ __global__ void loken_embed_rows_iq4_xs_kernel(
 } // namespace loken_moe
 
 extern "C" void loken_embed_rows_iq4_xs(
-    const void * table, const uint32_t * ids, int n, int dim, float * out, cudaStream_t stream) {
+    const void * table, const uint32_t * ids, int n, int dim, int vocab, float * out, cudaStream_t stream) {
     if (n <= 0) return;
-    loken_moe::loken_embed_rows_iq4_xs_kernel<<<n, 128, 0, stream>>>(table, ids, n, dim, out);
+    loken_moe::loken_embed_rows_iq4_xs_kernel<<<n, 128, 0, stream>>>(table, ids, n, dim, vocab, out);
 }

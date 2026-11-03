@@ -71,6 +71,6 @@ crate::tensor::gpu_runtime::aot_kernels! {
             size_k: i32,
             quant_type: i32,
             stream: i64,
-        );
+        ) -> i32;
     }
 }

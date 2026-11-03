@@ -523,19 +523,23 @@ extern "C" void loken_moe_q4k_imma_m8_gate_up(const void* gate_up_w, const void*
 
 // One row per routed pair, folded into the tokens in slot order afterwards, as the CUDA
 // launcher does: the same sum on every run. The rows are a stream-ordered allocation.
-extern "C" void loken_moe_q4k_imma_m8_down(const void* down_w, const void* inputs_q81,
-                                           const int32_t* sorted_token_ids,
-                                           const int32_t* expert_ids, const float* topk_weights,
-                                           float* dst_f32, int num_experts, int topk, int size_m,
-                                           int hidden, int K, hipStream_t stream) {
+extern "C" int loken_moe_q4k_imma_m8_down(const void* down_w, const void* inputs_q81,
+                                          const int32_t* sorted_token_ids,
+                                          const int32_t* expert_ids, const float* topk_weights,
+                                          float* dst_f32, int num_experts, int topk, int size_m,
+                                          int hidden, int K, hipStream_t stream) {
     using namespace loken_imma_amd;
-    if (size_m <= 0 || hidden <= 0 || K <= 0) return;
+    if (size_m <= 0 || hidden <= 0 || K <= 0) return 0;
     float* pairs = nullptr;
     const size_t pair_bytes = (size_t) size_m * hidden * sizeof(float);
-    if (hipMallocAsync(reinterpret_cast<void**>(&pairs), pair_bytes, stream) != hipSuccess) return;
+    if (hipMallocAsync(reinterpret_cast<void**>(&pairs), pair_bytes, stream) != hipSuccess) {
+        (void) hipGetLastError();
+        return 1;
+    }
     (void) hipMemsetAsync(pairs, 0, pair_bytes, stream);
     launch_moe<false>(down_w, inputs_q81, sorted_token_ids, expert_ids, topk_weights, pairs,
                       num_experts, topk, size_m, hidden, K, stream);
     loken_moe_sum_topk(pairs, dst_f32, size_m / topk, topk, hidden, stream);
     (void) hipFreeAsync(pairs, stream);
+    return 0;
 }

@@ -235,7 +235,7 @@ extern "C" __global__ void loken_moe_q4k_imma_m8_down_kernel(
 extern "C" void loken_moe_sum_topk(const float* pairs, float* outputs, int tokens, int topk,
                                    int cols, cudaStream_t stream);
 
-extern "C" void loken_moe_q4k_imma_m8_down(
+extern "C" int loken_moe_q4k_imma_m8_down(
     const void * down_w,
     const void * inputs_q81,
     const int32_t * sorted_token_ids,
@@ -249,7 +249,7 @@ extern "C" void loken_moe_q4k_imma_m8_down(
     int K,
     cudaStream_t stream
 ) {
-    if (size_m <= 0 || hidden <= 0 || K <= 0) return;
+    if (size_m <= 0 || hidden <= 0 || K <= 0) return 0;
     using namespace loken_moe_q4k_imma_m8_down_ns;
     dim3 grid((hidden + IDN_M - 1) / IDN_M,
               (size_m + IDN_N - 1) / IDN_N,
@@ -260,7 +260,10 @@ extern "C" void loken_moe_q4k_imma_m8_down(
     // rows are a stream-ordered allocation.
     float* pairs = nullptr;
     const size_t pair_bytes = (size_t)size_m * hidden * sizeof(float);
-    cudaMallocAsync(&pairs, pair_bytes, stream);
+    if (cudaMallocAsync(&pairs, pair_bytes, stream) != cudaSuccess) {
+        cudaGetLastError();
+        return 1;
+    }
     cudaMemsetAsync(pairs, 0, pair_bytes, stream);
     loken_moe_q4k_imma_m8_down_kernel<<<grid, blk, 0, stream>>>(
         down_w, inputs_q81, sorted_token_ids, expert_ids, topk_weights,
@@ -268,4 +271,5 @@ extern "C" void loken_moe_q4k_imma_m8_down(
     );
     loken_moe_sum_topk(pairs, dst_f32, size_m / topk, topk, hidden, stream);
     cudaFreeAsync(pairs, stream);
+    return 0;
 }

@@ -619,6 +619,9 @@ impl OpenClStack {
         sin: &[f32],
         half: usize,
     ) -> Result<Self> {
+        if !heads_grouped(spec.n_head, spec.n_kv) {
+            bail!("{} heads in {} groups", spec.n_head, spec.n_kv);
+        }
         let ids = super::opencl::enumerate_opencl_devices();
         let id = *ids
             .get(device)
@@ -1358,9 +1361,23 @@ fn probe_grid_barrier(device: cl_device_id) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether the `n_head` query heads split evenly over `n_kv` key/value heads.
+fn heads_grouped(n_head: usize, n_kv: usize) -> bool {
+    n_kv != 0 && n_head.is_multiple_of(n_kv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heads_grouped_needs_an_even_split() {
+        assert!(heads_grouped(8, 8));
+        assert!(heads_grouped(8, 2));
+        assert!(!heads_grouped(8, 3));
+        assert!(!heads_grouped(8, 0));
+        assert!(!heads_grouped(2, 8));
+    }
 
     /// The rate the device reads a large buffer at, and the host reads memory at: the bound
     /// on a decode step, which reads each weight once.

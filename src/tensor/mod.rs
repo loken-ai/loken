@@ -196,6 +196,74 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A count as the 32-bit signed argument a kernel takes, or an error naming the count.
+#[cfg(any(test, feature = "gpu"))]
+pub(crate) fn kernel_int(n: usize) -> Result<i32> {
+    i32::try_from(n).map_err(|_| Error(format!("count {n} does not fit a 32-bit kernel argument")))
+}
+
+/// Errors unless `have >= need` for the buffer or slice `what`.
+#[cfg(any(test, feature = "gpu"))]
+pub(crate) fn require_len(what: &str, have: usize, need: usize) -> Result<()> {
+    match have >= need {
+        true => Ok(()),
+        false => Err(Error(format!(
+            "{what}: length {have} is below the {need} required"
+        ))),
+    }
+}
+
+/// Errors unless `len` is a multiple of `unit` for the operation `what`.
+#[cfg(any(test, feature = "gpu"))]
+pub(crate) fn require_multiple(what: &str, len: usize, unit: usize) -> Result<()> {
+    match len.is_multiple_of(unit) {
+        true => Ok(()),
+        false => Err(Error(format!(
+            "{what}: length {len} is not a multiple of {unit}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod kernel_arg_tests {
+    use super::{kernel_int, require_len, require_multiple};
+
+    #[test]
+    fn kernel_int_accepts_up_to_i32_max() {
+        assert_eq!(kernel_int(0).unwrap(), 0);
+        assert_eq!(kernel_int(i32::MAX as usize).unwrap(), i32::MAX);
+    }
+
+    #[test]
+    fn kernel_int_names_a_count_past_i32_max() {
+        let n = i32::MAX as usize + 1;
+        let e = kernel_int(n).unwrap_err().to_string();
+        assert!(e.contains(&n.to_string()), "{e}");
+    }
+
+    #[test]
+    fn require_len_checks_the_lower_bound() {
+        assert!(require_len("buf", 8, 8).is_ok());
+        assert!(require_len("buf", 9, 8).is_ok());
+        let e = require_len("buf", 7, 8).unwrap_err().to_string();
+        assert!(
+            e.contains("buf") && e.contains('7') && e.contains('8'),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn require_multiple_names_the_operation_and_length() {
+        assert!(require_multiple("op", 512, 256).is_ok());
+        assert!(require_multiple("op", 0, 256).is_ok());
+        let e = require_multiple("op", 300, 256).unwrap_err().to_string();
+        assert!(
+            e.contains("op") && e.contains("300") && e.contains("256"),
+            "{e}"
+        );
+    }
+}
+
 #[macro_export]
 macro_rules! tensor_bail {
     ($($arg:tt)*) => {

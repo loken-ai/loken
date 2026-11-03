@@ -276,13 +276,18 @@ __global__ void __launch_bounds__(expander_threads<typename fmt::block_t>::value
     }
 }
 
-static void expert_offsets_on_stream(const int32_t* expert_ids, int size_m, int32_t* offsets,
+// False, with `offsets` untouched, when the counts could not be allocated.
+static bool expert_offsets_on_stream(const int32_t* expert_ids, int size_m, int32_t* offsets,
                                      int num_experts, hipStream_t stream) {
     int32_t* counts = nullptr;
-    (void) hipMallocAsync(reinterpret_cast<void**>(&counts), num_experts * sizeof(int32_t),
-                          stream);
+    if (hipMallocAsync(reinterpret_cast<void**>(&counts), num_experts * sizeof(int32_t),
+                       stream) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
     calculate_expert_offsets(expert_ids, size_m, counts, offsets, num_experts, stream);
     (void) hipFreeAsync(counts, stream);
+    return true;
 }
 
 template <typename act_t>
@@ -314,18 +319,23 @@ static void launch_prefill(dim3 grid, hipStream_t stream, const void* input,
 
 }  // namespace loken_moe_wmma_amd
 
-extern "C" void loken_moe_gemm_gguf_prefill(const void* input, const uint8_t* weights,
-                                            const int32_t* sorted_token_ids,
-                                            const int32_t* expert_ids, const float* topk_weights,
-                                            float* output, int num_experts, int topk, int size_m,
-                                            int size_n, int size_k, int input_dtype,
-                                            int gguf_type, hipStream_t stream) {
+extern "C" int loken_moe_gemm_gguf_prefill(const void* input, const uint8_t* weights,
+                                           const int32_t* sorted_token_ids,
+                                           const int32_t* expert_ids, const float* topk_weights,
+                                           float* output, int num_experts, int topk, int size_m,
+                                           int size_n, int size_k, int input_dtype,
+                                           int gguf_type, hipStream_t stream) {
     using namespace loken_moe_wmma_amd;
     int32_t* expert_offsets = nullptr;
     if (hipMallocAsync(reinterpret_cast<void**>(&expert_offsets),
-                       (num_experts + 1) * sizeof(int32_t), stream) != hipSuccess)
-        return;
-    expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream);
+                       (num_experts + 1) * sizeof(int32_t), stream) != hipSuccess) {
+        (void) hipGetLastError();
+        return 1;
+    }
+    if (!expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream)) {
+        (void) hipFreeAsync(expert_offsets, stream);
+        return 1;
+    }
     const dim3 grid(num_experts, ceil_div(size_n, N_BLK), 1);
     if (input_dtype == 0) {
         launch_prefill<__half>(grid, stream, input, weights, sorted_token_ids, expert_offsets,
@@ -337,11 +347,14 @@ extern "C" void loken_moe_gemm_gguf_prefill(const void* input, const uint8_t* we
                                        size_m, size_n, size_k, gguf_type);
     }
     (void) hipFreeAsync(expert_offsets, stream);
+    return 0;
 }
 
-extern "C" void loken_moe_expert_offsets(const int32_t* expert_ids, int size_m,
-                                         int32_t* expert_offsets, int num_experts,
-                                         hipStream_t stream) {
-    loken_moe_wmma_amd::expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts,
-                                                 stream);
+extern "C" int loken_moe_expert_offsets(const int32_t* expert_ids, int size_m,
+                                        int32_t* expert_offsets, int num_experts,
+                                        hipStream_t stream) {
+    return loken_moe_wmma_amd::expert_offsets_on_stream(expert_ids, size_m, expert_offsets,
+                                                        num_experts, stream)
+               ? 0
+               : 1;
 }

@@ -5,6 +5,7 @@
 use super::*;
 use crate::tensor::gpu_runtime::driver::CudaView;
 use crate::tensor::quantized::GgmlDType;
+use crate::tensor::{kernel_int, require_len, require_multiple};
 
 /// F32 activations -> q8_1 blocks (row padded to MATRIX_ROW_PADDING=512),
 /// the input format every mmvq GEMV kernel consumes.
@@ -84,6 +85,7 @@ pub(super) fn quantize_q8_1_rows_view_t<T: crate::tensor::gpu_runtime::driver::D
 ) -> Result<CudaSlice<u8>> {
     use crate::tensor::quantized::MATRIX_ROW_PADDING;
     const QUANT_BLOCK: usize = 256;
+    require_len("q8_1 quantize", x.len(), rows * k)?;
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     let bytes = rows * (k_padded / 32 * 36); // block_q8_1 = 32 i8 + 2 f16
     let func = dev.mmvq_fn(kernel)?;
@@ -97,7 +99,7 @@ pub(super) fn quantize_q8_1_rows_view_t<T: crate::tensor::gpu_runtime::driver::D
         block_dim: (QUANT_BLOCK as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (k_i, kp_i) = (k as i32, k_padded as i32);
+    let (k_i, kp_i) = (kernel_int(k)?, kernel_int(k_padded)?);
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -116,6 +118,7 @@ pub(super) fn quantize_q8_1_rows_t<T: crate::tensor::gpu_runtime::driver::Device
 ) -> Result<CudaSlice<u8>> {
     use crate::tensor::quantized::MATRIX_ROW_PADDING;
     const QUANT_BLOCK: usize = 256;
+    require_len("q8_1 quantize", x.len(), rows * k)?;
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     let bytes = rows * (k_padded / 32 * 36); // block_q8_1 = 32 i8 + 2 f16
     let stream = dev.stream();
@@ -137,7 +140,7 @@ pub(super) fn quantize_q8_1_rows_t<T: crate::tensor::gpu_runtime::driver::Device
         block_dim: (QUANT_BLOCK as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (k_i, kp_i) = (k as i32, k_padded as i32);
+    let (k_i, kp_i) = (kernel_int(k)?, kernel_int(k_padded)?);
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -180,6 +183,22 @@ pub fn mmvq_f32(
     mmvq_t::<f32>(dev, tag, "f32", weight_blob, q8_1, k, n, b_size, smallk)
 }
 
+/// Bytes of one 256-value super-block of the K-quant that dequantiser `kernel` decodes.
+fn kquant_block_bytes(kernel: &str) -> Option<usize> {
+    let dtype = [
+        ("q2_K", GgmlDType::Q2K),
+        ("q3_K", GgmlDType::Q3K),
+        ("q4_K", GgmlDType::Q4K),
+        ("q5_K", GgmlDType::Q5K),
+        ("q6_K", GgmlDType::Q6K),
+        ("q8_K", GgmlDType::Q8K),
+    ]
+    .into_iter()
+    .find(|(tag, _)| kernel.contains(tag))?
+    .1;
+    Some(dtype.type_size())
+}
+
 /// Dequantize a whole K-quant weight blob -> a dense F32 device buffer, using the ggml
 /// `dequantize_block_{q4_K,q5_K,q6_K}_f32` kernels (one CUDA block per 256-elem super-block).
 /// `kernel` = the kernel name, `threads` = its block size (q4_K:32, q5_K/q6_K:64), `total` = n.k.
@@ -192,10 +211,14 @@ pub fn dequantize_kquant_f32(
     total: usize,
     threads: u32,
 ) -> Result<CudaSlice<f32>> {
+    require_multiple(kernel, total, 256)?;
+    let nb = total / 256; // QK_K super-blocks
+    let type_size = kquant_block_bytes(kernel)
+        .ok_or_else(|| Error(format!("{kernel}: not a K-quant dequantiser")))?;
+    require_len(kernel, weight_blob.len(), nb * type_size)?;
     let func = dev.quantized_fn(kernel)?;
     let stream = dev.stream();
     let dst = with_oom_retry(dev, "dequant", || unsafe { stream.alloc::<f32>(total) })?;
-    let nb = total / 256; // QK_K super-blocks
     let cfg = LaunchConfig {
         grid_dim: (nb as u32, 1, 1),
         block_dim: (threads, 1, 1),
@@ -225,6 +248,7 @@ enum DequantGrid {
 pub struct DequantBf16 {
     func: CudaFunction,
     name: &'static str,
+    dtype: GgmlDType,
     threads: u32,
     grid: DequantGrid,
 }
@@ -244,6 +268,7 @@ impl DequantBf16 {
         Some(Self {
             func,
             name,
+            dtype,
             threads,
             grid,
         })
@@ -265,6 +290,12 @@ impl DequantBf16 {
                 dst.len()
             )));
         }
+        require_multiple(self.name, total, self.dtype.block_size())?;
+        require_len(
+            self.name,
+            weight_blob.len(),
+            total / self.dtype.block_size() * self.dtype.type_size(),
+        )?;
         let blocks = match self.grid {
             DequantGrid::Superblock => total / 256,
             DequantGrid::Block32 => total.div_ceil(256),
@@ -274,7 +305,7 @@ impl DequantBf16 {
             block_dim: (self.threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        let nb32 = (total / 32) as i32;
+        let nb32 = kernel_int(total / 32)?;
         let stream = dev.stream();
         let mut b = stream.launch_builder(&self.func);
         b.arg(weight_blob);
@@ -419,12 +450,7 @@ pub(crate) fn dequant_scratch_state(
 /// warp per block. Values match the CPU quantiser to f32 rounding, and the kernel is deterministic
 /// so the same input yields the same bytes every run - what the requant digest needs.
 pub fn gpu_quantize_q8_0(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
-    debug_assert_eq!(
-        f32s.len() % 32,
-        0,
-        "q8_0 quantize: {} not a multiple of 32",
-        f32s.len()
-    );
+    require_multiple("gpu_quantize_q8_0", f32s.len(), 32)?;
     let nblocks = f32s.len() / 32;
     let bytes = nblocks * 34; // sizeof(block_q8_0) = f16 + 32 i8
     let stream = dev.stream();
@@ -438,7 +464,7 @@ pub fn gpu_quantize_q8_0(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = nblocks as i32;
+    let n_i = kernel_int(nblocks)?;
     let mut b = stream.launch_builder(&func);
     b.arg(&x);
     b.arg(&out);
@@ -457,12 +483,7 @@ pub fn gpu_quantize_q8_0(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
 /// bits, and every value is levelled against the rounded scale. Quality-equivalent to the CPU
 /// quantiser and deterministic, so the digest stays stable.
 pub fn gpu_quantize_q4_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
-    debug_assert_eq!(
-        f32s.len() % 256,
-        0,
-        "q4_K quantize: {} not a multiple of 256",
-        f32s.len()
-    );
+    require_multiple("gpu_quantize_q4_k", f32s.len(), 256)?;
     let nblocks = f32s.len() / 256;
     let bytes = nblocks * 144; // sizeof(block_q4_K) = half2 + 12 + 128
     let stream = dev.stream();
@@ -476,7 +497,7 @@ pub fn gpu_quantize_q4_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = nblocks as i32;
+    let n_i = kernel_int(nblocks)?;
     let mut b = stream.launch_builder(&func);
     b.arg(&x);
     b.arg(&out);
@@ -494,12 +515,7 @@ pub fn gpu_quantize_q4_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
 /// and refinement of the CPU encoder, the sixteen scales are quantised to six signed bits, and
 /// every value's three-bit code is split into hmask and qs. Quality-equivalent, deterministic.
 pub fn gpu_quantize_q3_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
-    debug_assert_eq!(
-        f32s.len() % 256,
-        0,
-        "q3_K quantize: {} not a multiple of 256",
-        f32s.len()
-    );
+    require_multiple("gpu_quantize_q3_k", f32s.len(), 256)?;
     let nblocks = f32s.len() / 256;
     let bytes = nblocks * 110; // sizeof(block_q3_K) = 32 + 64 + 12 + 2
     let stream = dev.stream();
@@ -513,7 +529,7 @@ pub fn gpu_quantize_q3_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = nblocks as i32;
+    let n_i = kernel_int(nblocks)?;
     let mut b = stream.launch_builder(&func);
     b.arg(&x);
     b.arg(&out);
@@ -531,12 +547,7 @@ pub fn gpu_quantize_q3_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
 /// as the CPU encoder at nmax 3, scales and mins quantised to four bits, codes two bits packed four
 /// to a byte. Quality-equivalent, deterministic.
 pub fn gpu_quantize_q2_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
-    debug_assert_eq!(
-        f32s.len() % 256,
-        0,
-        "q2_K quantize: {} not a multiple of 256",
-        f32s.len()
-    );
+    require_multiple("gpu_quantize_q2_k", f32s.len(), 256)?;
     let nblocks = f32s.len() / 256;
     let bytes = nblocks * 84; // sizeof(block_q2_K) = 16 + 64 + 2 + 2
     let stream = dev.stream();
@@ -550,7 +561,7 @@ pub fn gpu_quantize_q2_k(dev: &CudaDevice, f32s: &[f32]) -> Result<Vec<u8>> {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = nblocks as i32;
+    let n_i = kernel_int(nblocks)?;
     let mut b = stream.launch_builder(&func);
     b.arg(&x);
     b.arg(&out);
@@ -725,7 +736,7 @@ pub fn gpu_mmv_iq2_xxs(
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (ki, ni) = (inp as i32, out as i32);
+    let (ki, ni) = (kernel_int(inp)?, kernel_int(out)?);
     let mut b = stream.launch_builder(&func);
     b.arg(blocks);
     b.arg(tables.0);
@@ -875,12 +886,15 @@ pub fn gpu_experts_exact(
         while end < n && end - start < EXACT_TILE && gate_ptrs[instances[end].0] == gate_ptrs[e] {
             end += 1;
         }
-        tiles.extend([e as i32, start as i32, (end - start) as i32]);
+        tiles.extend([e as i32, kernel_int(start)?, kernel_int(end - start)?]);
         widest = widest.max(end - start);
         start = end;
     }
     let ntiles = tiles.len() / 3;
-    let rows: Vec<i32> = instances.iter().map(|&(_, r)| r as i32).collect();
+    let rows = instances
+        .iter()
+        .map(|&(_, r)| kernel_int(r))
+        .collect::<Result<Vec<i32>>>()?;
     let up_err = |e| alloc_err("exact experts upload", e);
     let gate_arr = stream.clone_htod(&gate_ptrs).map_err(up_err)?;
     let up_arr = stream.clone_htod(&up_ptrs).map_err(up_err)?;
@@ -897,7 +911,7 @@ pub fn gpu_experts_exact(
     let y = with_oom_retry(dev, "exact experts y", || unsafe {
         stream.alloc::<f32>(n * dim)
     })?;
-    let (dim_i, inter_i, tt_i) = (dim as i32, inter as i32, widest as i32);
+    let (dim_i, inter_i, tt_i) = (kernel_int(dim)?, kernel_int(inter)?, widest as i32);
     let (sbs, sbs2) = (dim / 256, inter / 256);
     let (hname, dname) = tables.format.kernels();
     // The IQ2_XXS kernels stage their sub-block terms in shared memory; the IQ3_XXS ones keep
@@ -2762,7 +2776,7 @@ pub fn gpu_quantize_q2_k_guided(
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, per_row) = (nblocks as i32, (n_per_row / 256) as i32);
+    let (n_i, per_row) = (kernel_int(nblocks)?, kernel_int(n_per_row / 256)?);
     let (block_step, value_step, no) = (256i64, 1i64, 0i32);
     let unused = with_oom_retry(dev, "requant_q2_k_guided", || unsafe {
         stream.alloc::<f32>(1)
@@ -2824,7 +2838,7 @@ pub fn gpu_quantize_iq2_xxs(
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, per_row, has) = (nblocks as i32, (n_per_row / 256) as i32, has_imp);
+    let (n_i, per_row, has) = (kernel_int(nblocks)?, kernel_int(n_per_row / 256)?, has_imp);
     let (block_step, value_step, no) = (256i64, 1i64, 0i32);
     let unused = with_oom_retry(dev, "requant_iq2_xxs", || unsafe { stream.alloc::<f32>(1) })?;
     let mut b = stream.launch_builder(&func);
@@ -2880,7 +2894,7 @@ pub fn gpu_quantize_q3_k_guided(
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, per_row) = (nblocks as i32, (n_per_row / 256) as i32);
+    let (n_i, per_row) = (kernel_int(nblocks)?, kernel_int(n_per_row / 256)?);
     let (block_step, value_step, no) = (256i64, 1i64, 0i32);
     let unused = with_oom_retry(dev, "requant_q3_k_guided", || unsafe {
         stream.alloc::<f32>(1)
@@ -2944,7 +2958,7 @@ pub fn gpu_quantize_iq3_xxs(
         block_dim: (IQ3_XXS_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, per_row, has) = (nblocks as i32, (n_per_row / 256) as i32, has_imp);
+    let (n_i, per_row, has) = (kernel_int(nblocks)?, kernel_int(n_per_row / 256)?, has_imp);
     let (block_step, value_step, no) = (256i64, 1i64, 0i32);
     let unused = with_oom_retry(dev, "requant_iq3_xxs", || unsafe { stream.alloc::<f32>(1) })?;
     let mut b = stream.launch_builder(&func);
@@ -3076,8 +3090,8 @@ pub fn gpu_quantize_exact(
         shared_mem_bytes: 0,
     };
     let (n_i, per_row, has) = (
-        spans as i32,
-        (n_per_row / 256) as i32,
+        kernel_int(spans)?,
+        kernel_int(n_per_row / 256)?,
         importance.is_some() as i32,
     );
     let (block_step, value_step, no) = (256i64, 1i64, 0i32);
@@ -3167,7 +3181,7 @@ fn dequantize_q8_0_view(
     let dst = with_oom_retry(dev, "dequant q8_0", || unsafe {
         stream.alloc::<f32>(total)
     })?;
-    let nb32 = (total / 32) as i32;
+    let nb32 = kernel_int(total / 32)?;
     let grid = total.div_ceil(256) as u32;
     let cfg = LaunchConfig {
         grid_dim: (grid, 1, 1),
@@ -3315,8 +3329,13 @@ pub fn mmvq_f32_dual(
     let mut dst0 = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<f32>(n0) })?;
     let mut dst1 = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<f32>(n1) })?;
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
-    let stride_col_y = (k_padded / 32) as i32;
-    let (k_i, n0_i, n1_i, blocks0) = (k as i32, n0 as i32, n1 as i32, n0 as i32);
+    let stride_col_y = kernel_int(k_padded / 32)?;
+    let (k_i, n0_i, n1_i, blocks0) = (
+        kernel_int(k)?,
+        kernel_int(n0)?,
+        kernel_int(n1)?,
+        kernel_int(n0)?,
+    );
     let cfg = LaunchConfig {
         grid_dim: ((n0 + n1) as u32, 1, 1),
         block_dim: (32, 4, 1),
@@ -3501,8 +3520,9 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
     let func = dev.mmvq_fn(&kernel)?;
     let stream = dev.stream();
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
-    let stride_col_y = (k_padded / 32) as i32;
-    let stride_col_dst = n as i32;
+    require_len("mmvq q8_1 input", q8_1.len(), b_size * (k_padded / 32 * 36))?;
+    let stride_col_y = kernel_int(k_padded / 32)?;
+    let stride_col_dst = kernel_int(n)?;
     // Launch geometry mirrors the fork's C launchers exactly:
     // plain: rows_per_block = b<=1 ? 1 : 2, nwarps = b<=4 ? 4 : 2;
     // smallk: four rows to each group of `smallk_warps` warps, nwarps = 4.
@@ -3538,7 +3558,7 @@ fn launch_mmvq<T: crate::tensor::gpu_runtime::driver::DeviceRepr>(
         block_dim: (32, nwarps, 1),
         shared_mem_bytes: 0,
     };
-    let (k_i, n_i) = (k as i32, n as i32);
+    let (k_i, n_i) = (kernel_int(k)?, kernel_int(n)?);
     let mut b = stream.launch_builder(&func);
     b.arg(weight_blob);
     b.arg(q8_1);
@@ -3568,7 +3588,7 @@ pub fn cast_f32_to_f16(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -3590,7 +3610,7 @@ pub fn cast_f16_to_f32(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);

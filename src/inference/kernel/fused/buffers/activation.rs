@@ -88,9 +88,19 @@ pub(crate) fn fits_shared(cols: usize, max_bytes: usize) -> bool {
         .is_some_and(|need| need <= max_bytes && need <= i32::MAX as usize)
 }
 
+/// F32 slots the RMS-norm + Q8_1 quantize kernels add to the row in dynamic shared memory:
+/// the warp partial sums and the alignment pad, 96 bytes.
+const RMS_QUANTIZE_EXTRA_F32: usize = 24;
+
+/// Row width, in F32 slots, of the dynamic shared memory the RMS-norm + Q8_1 quantize kernels
+/// request for rows of `hidden` values.
+pub(crate) fn rms_quantize_shared_cols(hidden: usize) -> usize {
+    hidden.saturating_add(RMS_QUANTIZE_EXTRA_F32)
+}
+
 /// Whether the fused norm kernels can run on the card of `x` for rows of `cols` values.
 /// A failed query counts as no.
-fn fused_norm_fits(x: &Tensor, cols: usize) -> bool {
+pub(crate) fn fused_norm_fits(x: &Tensor, cols: usize) -> bool {
     use crate::tensor::gpu_runtime::driver::{result, sys};
     let Ok(dev) = x.device().as_cuda_device() else {
         return false;
@@ -989,7 +999,7 @@ pub fn fused_mamba2_gate_gnorm(
 
 #[cfg(test)]
 mod fits_shared_tests {
-    use super::fits_shared;
+    use super::{fits_shared, rms_quantize_shared_cols};
 
     #[test]
     fn fits_shared_below_the_limit() {
@@ -1005,6 +1015,17 @@ mod fits_shared_tests {
     fn fits_shared_above_the_limit() {
         assert!(!fits_shared(12289, 49152));
         assert!(!fits_shared(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn rms_quantize_shared_cols_counts_the_extra_bytes() {
+        assert_eq!(rms_quantize_shared_cols(4096) * 4, 4096 * 4 + 96);
+        assert!(fits_shared(rms_quantize_shared_cols(12264), 49152));
+        assert!(!fits_shared(rms_quantize_shared_cols(12265), 49152));
+        assert!(!fits_shared(
+            rms_quantize_shared_cols(usize::MAX),
+            usize::MAX
+        ));
     }
 
     #[test]

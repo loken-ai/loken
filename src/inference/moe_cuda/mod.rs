@@ -5,7 +5,7 @@
 //! stream, and wrap what the kernel wrote back into a tensor. Routing, the expert GEMMs and the
 //! fused attention epilogue each get their own file below.
 
-use crate::inference::kernel::cuda_launchers;
+use crate::inference::kernel::{cuda_launchers, launch_status};
 use crate::tensor::cuda_ext::{tensor_from_cuda_storage, CudaStorage, DevicePtr};
 use crate::tensor::{DType, Result, StorageView, Tensor};
 use core::ffi::c_void;
@@ -220,24 +220,24 @@ cuda_launchers! {
     loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
         input: *const f32, gate_up_weights: *const c_void,
         sorted_token_ids: *const i32, expert_ids: *const i32, output: *mut c_void,
-        num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32);
+        num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32) -> i32;
     loken_moe_gemm_gguf_gate_up_silu_mul(
         inputs: *const f32, gate_weights: *const c_void,
         up_weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, outputs: *mut f32, num_experts: i32, topk: i32, size_m: i32,
-        size_n: i32, size_k: i32, quant_type: i32);
+        size_n: i32, size_k: i32, quant_type: i32) -> i32;
     loken_moe_gemm_gguf_gate_up_silu_mul_two(
         inputs: *const f32, gate_weights: *const c_void,
         up_weights: *const c_void, alt_gate: *const c_void, alt_up: *const c_void,
         alt_from: i32, alt_at: *const *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, outputs: *mut f32, num_experts: i32, topk: i32, size_m: i32,
-        size_n: i32, size_k: i32, quant_type: i32);
+        size_n: i32, size_k: i32, quant_type: i32) -> i32;
     loken_moe_gemm_gguf_gate_up_swiglu_oai(
         inputs: *const f32, gate_weights: *const c_void,
         up_weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, gate_bias: *const f32, up_bias: *const f32, outputs: *mut f32,
         num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, quant_type: i32,
-        alpha: f32, limit: f32);
+        alpha: f32, limit: f32) -> i32;
 }
 cuda_launchers! {
     loken_tier_plan(
@@ -360,8 +360,10 @@ pub(crate) mod tp_local {
 }
 cuda_launchers! {
     loken_tier_tell(counter: *mut u32, told: *mut u32);
-    loken_embed_rows_iq4_xs(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
-    loken_embed_rows_q8_0(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
+    loken_embed_rows_iq4_xs(
+        table: *const c_void, ids: *const u32, n: i32, dim: i32, vocab: i32, out: *mut f32);
+    loken_embed_rows_q8_0(
+        table: *const c_void, ids: *const u32, n: i32, dim: i32, vocab: i32, out: *mut f32);
     loken_embed_rows_f16(
         table: *const c_void, ids: *const u32, n: i32, dim: i32, vocab: i32, out: *mut f32);
     loken_embed_rows_bf16(
@@ -375,28 +377,28 @@ cuda_launchers! {
         sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,
         topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
-        down_bias: *const f32, add_after: *const f32);
+        down_bias: *const f32, add_after: *const f32) -> i32;
     loken_moe_gemm_gguf_down_pairs_two(
         input: *const f32, weights: *const c_void, alt_weights: *const c_void, alt_from: i32,
         alt_at: *const *const c_void,
         sorted_token_ids: *const i32, expert_ids: *const i32, topk_weights: *const f32,
         pair_rows: *mut f32, num_experts: i32, topk: i32, size_m: i32, size_n: i32,
-        size_k: i32, gguf_dtype: i32);
+        size_k: i32, gguf_dtype: i32) -> i32;
     loken_moe_gemm_gguf_down_pairs_live(
         input: *const f32, weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, pair_rows: *mut f32,
         num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
-        live: *const u32);
+        live: *const u32) -> i32;
     loken_moe_gemm_gguf_gate_up_silu_mul_live(
         inputs: *const f32, gate_weights: *const c_void, up_weights: *const c_void,
         sorted_token_ids: *const i32, expert_ids: *const i32, outputs: *mut f32,
         num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, quant_type: i32,
-        live: *const u32);
+        live: *const u32) -> i32;
     loken_moe_gemm_gguf_down_reduce(
         input: *const f32, weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,
         topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
-        down_bias: *const f32, add_after: *const f32);
+        down_bias: *const f32, add_after: *const f32) -> i32;
 }
 cuda_launchers! {
     loken_moe_q4k_imma_m8_gate_up(
@@ -406,7 +408,7 @@ cuda_launchers! {
     loken_moe_q4k_imma_m8_down(
         weights: *const c_void, q8_1: *const c_void,
         sorted_token_ids: *const i32, expert_ids: *const i32, topk_weights: *const f32,
-        output: *mut f32, num_experts: i32, topk: i32, size_m: i32, hidden: i32, size_k: i32);
+        output: *mut f32, num_experts: i32, topk: i32, size_m: i32, hidden: i32, size_k: i32) -> i32;
     loken_dense_q4k_imma_m8_actmul(
         gate: *const c_void, up: *const c_void,
         q8_1: *const c_void, output: *mut f32, size_m: i32, size_n: i32,
@@ -432,12 +434,12 @@ cuda_launchers! {
     loken_moe_gemm_gguf(
         input: *const f32, weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, output: *mut c_void,
-        num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32);
+        num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32) -> i32;
     loken_moe_gemm_gguf_prefill(
         input: *const c_void, weights: *const u8, sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, output: *mut c_void,
         num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, input_dtype: i32,
-        gguf_dtype: i32);
+        gguf_dtype: i32) -> i32;
 }
 cuda_launchers! {
     loken_batched_argmax_f16(
@@ -494,12 +496,18 @@ pub fn embed_rows_gguf(
 ) -> crate::tensor::Result<()> {
     use crate::tensor::quantized::GgmlDType;
     match table.dtype() {
-        GgmlDType::Iq4Xs => embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
-            loken_embed_rows_iq4_xs(t, i, n, d, o, s)
-        }),
-        GgmlDType::Q8_0 => embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
-            loken_embed_rows_q8_0(t, i, n, d, o, s)
-        }),
+        GgmlDType::Iq4Xs => {
+            let vocab = table.shape().dims()[0] as i32;
+            embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+                loken_embed_rows_iq4_xs(t, i, n, d, vocab, o, s)
+            })
+        }
+        GgmlDType::Q8_0 => {
+            let vocab = table.shape().dims()[0] as i32;
+            embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {
+                loken_embed_rows_q8_0(t, i, n, d, vocab, o, s)
+            })
+        }
         GgmlDType::F16 => {
             let vocab = table.shape().dims()[0] as i32;
             embed_rows_launch(table, ids, out, |t, i, n, d, o, s| unsafe {

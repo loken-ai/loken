@@ -235,38 +235,44 @@ pub fn moe_gemm_gguf(
                 DType::BF16 => (dev_addr::<bf16>(&inp, "input")? as *const c_void, 1),
                 d => crate::tensor::bail!("{ENTRY}: prefill reads f16 or bf16, not {d:?}"),
             };
-            loken_moe_gemm_gguf_prefill(
-                input_ptr,
-                weight_ptr,
-                slots,
-                experts,
-                scale,
-                out,
-                ext.experts,
-                ext.topk,
-                ext.m,
-                ext.n,
-                ext.k,
-                input_dtype,
-                gguf_dtype,
-                stream,
-            );
+            launch_status(
+                loken_moe_gemm_gguf_prefill(
+                    input_ptr,
+                    weight_ptr,
+                    slots,
+                    experts,
+                    scale,
+                    out,
+                    ext.experts,
+                    ext.topk,
+                    ext.m,
+                    ext.n,
+                    ext.k,
+                    input_dtype,
+                    gguf_dtype,
+                    stream,
+                ),
+                "loken_moe_gemm_gguf_prefill",
+            )?;
         } else {
-            loken_moe_gemm_gguf(
-                dev_addr::<f32>(input, "input")? as *const f32,
-                weight_ptr as *const c_void,
-                slots,
-                experts,
-                scale,
-                out,
-                ext.experts,
-                ext.topk,
-                ext.m,
-                ext.n,
-                ext.k,
-                gguf_dtype,
-                stream,
-            );
+            launch_status(
+                loken_moe_gemm_gguf(
+                    dev_addr::<f32>(input, "input")? as *const f32,
+                    weight_ptr as *const c_void,
+                    slots,
+                    experts,
+                    scale,
+                    out,
+                    ext.experts,
+                    ext.topk,
+                    ext.m,
+                    ext.n,
+                    ext.k,
+                    gguf_dtype,
+                    stream,
+                ),
+                "loken_moe_gemm_gguf",
+            )?;
         }
     }
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
@@ -364,41 +370,47 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_over(
                     slots,
                 ),
             };
-            loken_moe_gemm_gguf_gate_up_silu_mul_two(
-                dev_addr::<f32>(input, "input")? as *const f32,
-                gate_weights.device_ptr()? as *const c_void,
-                up_weights.device_ptr()? as *const c_void,
-                alt_gate,
-                alt_up,
-                ext.experts,
-                alt_at,
-                slots,
-                experts,
-                output.device_ptr(output.stream()).0 as *mut f32,
-                ext.experts + more_slots as i32,
-                ext.topk,
-                ext.m,
-                ext.n,
-                ext.k,
-                gguf_dtype,
-                stream,
-            );
+            launch_status(
+                loken_moe_gemm_gguf_gate_up_silu_mul_two(
+                    dev_addr::<f32>(input, "input")? as *const f32,
+                    gate_weights.device_ptr()? as *const c_void,
+                    up_weights.device_ptr()? as *const c_void,
+                    alt_gate,
+                    alt_up,
+                    ext.experts,
+                    alt_at,
+                    slots,
+                    experts,
+                    output.device_ptr(output.stream()).0 as *mut f32,
+                    ext.experts + more_slots as i32,
+                    ext.topk,
+                    ext.m,
+                    ext.n,
+                    ext.k,
+                    gguf_dtype,
+                    stream,
+                ),
+                "loken_moe_gemm_gguf_gate_up_silu_mul_two",
+            )?;
         } else {
-            loken_moe_gemm_gguf_gate_up_silu_mul(
-                dev_addr::<f32>(input, "input")? as *const f32,
-                gate_weights.device_ptr()? as *const c_void,
-                up_weights.device_ptr()? as *const c_void,
-                slots,
-                experts,
-                output.device_ptr(output.stream()).0 as *mut f32,
-                ext.experts,
-                ext.topk,
-                ext.m,
-                ext.n,
-                ext.k,
-                gguf_dtype,
-                stream,
-            );
+            launch_status(
+                loken_moe_gemm_gguf_gate_up_silu_mul(
+                    dev_addr::<f32>(input, "input")? as *const f32,
+                    gate_weights.device_ptr()? as *const c_void,
+                    up_weights.device_ptr()? as *const c_void,
+                    slots,
+                    experts,
+                    output.device_ptr(output.stream()).0 as *mut f32,
+                    ext.experts,
+                    ext.topk,
+                    ext.m,
+                    ext.n,
+                    ext.k,
+                    gguf_dtype,
+                    stream,
+                ),
+                "loken_moe_gemm_gguf_gate_up_silu_mul",
+            )?;
         }
     }
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
@@ -437,22 +449,25 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_live(
     let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
-        loken_moe_gemm_gguf_gate_up_silu_mul_live(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            gate_weights.device_ptr()? as *const c_void,
-            up_weights.device_ptr()? as *const c_void,
-            sorted_token_ids as *const i32,
-            expert_ids as *const i32,
-            output.device_ptr(output.stream()).0 as *mut f32,
-            ext.experts,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            live as *const u32,
-            stream,
-        );
+        launch_status(
+            loken_moe_gemm_gguf_gate_up_silu_mul_live(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                gate_weights.device_ptr()? as *const c_void,
+                up_weights.device_ptr()? as *const c_void,
+                sorted_token_ids as *const i32,
+                expert_ids as *const i32,
+                output.device_ptr(output.stream()).0 as *mut f32,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                live as *const u32,
+                stream,
+            ),
+            "loken_moe_gemm_gguf_gate_up_silu_mul_live",
+        )?;
     }
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
 }
@@ -503,24 +518,27 @@ pub fn moe_gemm_gguf_down_pairs_over(
     };
     let experts_all = ext.experts + more_slots as i32;
     unsafe {
-        loken_moe_gemm_gguf_down_pairs_two(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            weights.device_ptr()? as *const c_void,
-            alt,
-            alt_from,
-            alt_at,
-            slots,
-            experts,
-            dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
-            out.device_ptr(out.stream()).0 as *mut f32,
-            experts_all,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            stream,
-        );
+        launch_status(
+            loken_moe_gemm_gguf_down_pairs_two(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                weights.device_ptr()? as *const c_void,
+                alt,
+                alt_from,
+                alt_at,
+                slots,
+                experts,
+                dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
+                out.device_ptr(out.stream()).0 as *mut f32,
+                experts_all,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                stream,
+            ),
+            "loken_moe_gemm_gguf_down_pairs_two",
+        )?;
     }
     tensor_from_f32_slice(out, (pairs, hidden), &input.device())
 }
@@ -548,22 +566,25 @@ pub fn moe_gemm_gguf_down_pairs_live(
     let out = unsafe { dev.alloc::<f32>(pairs * hidden) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
-        loken_moe_gemm_gguf_down_pairs_live(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            weights.device_ptr()? as *const c_void,
-            sorted_token_ids as *const i32,
-            expert_ids as *const i32,
-            topk_weights as *const f32,
-            out.device_ptr(out.stream()).0 as *mut f32,
-            ext.experts,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            live as *const u32,
-            stream,
-        );
+        launch_status(
+            loken_moe_gemm_gguf_down_pairs_live(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                weights.device_ptr()? as *const c_void,
+                sorted_token_ids as *const i32,
+                expert_ids as *const i32,
+                topk_weights as *const f32,
+                out.device_ptr(out.stream()).0 as *mut f32,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                live as *const u32,
+                stream,
+            ),
+            "loken_moe_gemm_gguf_down_pairs_live",
+        )?;
     }
     tensor_from_f32_slice(out, (pairs, hidden), &input.device())
 }
@@ -600,25 +621,28 @@ pub fn moe_gemm_gguf_gate_up_swiglu_oai(
     let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
-        loken_moe_gemm_gguf_gate_up_swiglu_oai(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            gate_weights.device_ptr()? as *const c_void,
-            up_weights.device_ptr()? as *const c_void,
-            slots,
-            experts,
-            gate_bias_ptr,
-            up_bias_ptr,
-            output.device_ptr(output.stream()).0 as *mut f32,
-            ext.experts,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            alpha as f32,
-            limit as f32,
-            stream,
-        );
+        launch_status(
+            loken_moe_gemm_gguf_gate_up_swiglu_oai(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                gate_weights.device_ptr()? as *const c_void,
+                up_weights.device_ptr()? as *const c_void,
+                slots,
+                experts,
+                gate_bias_ptr,
+                up_bias_ptr,
+                output.device_ptr(output.stream()).0 as *mut f32,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                alpha as f32,
+                limit as f32,
+                stream,
+            ),
+            "loken_moe_gemm_gguf_gate_up_swiglu_oai",
+        )?;
     }
     drop(gate_held);
     drop(up_held);
@@ -646,20 +670,23 @@ pub fn moe_gemm_gguf_gate_up_gelu_mul_concat(
     let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
-        loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            gate_up_weights.device_ptr()? as *const c_void,
-            slots,
-            experts,
-            output.device_ptr(output.stream()).0 as *mut c_void,
-            ext.experts,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            stream,
-        );
+        launch_status(
+            loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                gate_up_weights.device_ptr()? as *const c_void,
+                slots,
+                experts,
+                output.device_ptr(output.stream()).0 as *mut c_void,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                stream,
+            ),
+            "loken_moe_gemm_gguf_gate_up_gelu_mul_concat",
+        )?;
     }
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
 }
@@ -825,43 +852,49 @@ pub fn moe_gemm_gguf_down_reduce_over(
             {
                 crate::tensor::bail!("{ENTRY}: the second stack differs in format or shape");
             }
-            loken_moe_gemm_gguf_down_reduce_two(
-                dev_addr::<f32>(input, "input")? as *const f32,
-                weights.device_ptr()? as *const c_void,
-                more.device_ptr()? as *const c_void,
-                ext.experts,
-                slots,
-                experts,
-                dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
-                out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
-                ext.experts + more.shape().dims()[0] as i32,
-                ext.topk,
-                ext.m,
-                ext.n,
-                ext.k,
-                gguf_dtype,
-                down_bias_ptr,
-                add_addr as *const f32,
-                stream,
-            );
+            launch_status(
+                loken_moe_gemm_gguf_down_reduce_two(
+                    dev_addr::<f32>(input, "input")? as *const f32,
+                    weights.device_ptr()? as *const c_void,
+                    more.device_ptr()? as *const c_void,
+                    ext.experts,
+                    slots,
+                    experts,
+                    dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
+                    out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
+                    ext.experts + more.shape().dims()[0] as i32,
+                    ext.topk,
+                    ext.m,
+                    ext.n,
+                    ext.k,
+                    gguf_dtype,
+                    down_bias_ptr,
+                    add_addr as *const f32,
+                    stream,
+                ),
+                "loken_moe_gemm_gguf_down_reduce_two",
+            )?;
         } else {
-            loken_moe_gemm_gguf_down_reduce(
-                dev_addr::<f32>(input, "input")? as *const f32,
-                weights.device_ptr()? as *const c_void,
-                slots,
-                experts,
-                dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
-                out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
-                ext.experts,
-                ext.topk,
-                ext.m,
-                ext.n,
-                ext.k,
-                gguf_dtype,
-                down_bias_ptr,
-                add_addr as *const f32,
-                stream,
-            );
+            launch_status(
+                loken_moe_gemm_gguf_down_reduce(
+                    dev_addr::<f32>(input, "input")? as *const f32,
+                    weights.device_ptr()? as *const c_void,
+                    slots,
+                    experts,
+                    dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
+                    out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
+                    ext.experts,
+                    ext.topk,
+                    ext.m,
+                    ext.n,
+                    ext.k,
+                    gguf_dtype,
+                    down_bias_ptr,
+                    add_addr as *const f32,
+                    stream,
+                ),
+                "loken_moe_gemm_gguf_down_reduce",
+            )?;
         }
     }
     drop(bias_held);

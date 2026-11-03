@@ -3,6 +3,7 @@
 //! `use super::*` keeps the names its items referred to before the split in reach.
 
 use super::*;
+use crate::tensor::kernel_int;
 
 /// Launch a 1-elementwise or 2-operand elementwise kernel over `n` elements.
 pub(super) fn launch_elementwise(
@@ -14,12 +15,15 @@ pub(super) fn launch_elementwise(
     let func = dev.elementwise_fn(name)?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "kernel out", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     for inp in inputs {
         b.arg(*inp);

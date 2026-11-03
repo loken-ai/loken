@@ -65,8 +65,9 @@ pub struct HeteroZImage {
     // OpenCL blocks (indexed by layer number, only populated for OpenCL segments)
     #[cfg(feature = "opencl")]
     ocl_blocks: Vec<Option<OpenCLZImageBlock>>,
+    // Sized by the longest sequence seen, rebuilt larger when a request needs it.
     #[cfg(feature = "opencl")]
-    ocl_scratch: Option<OclZImageScratch>,
+    ocl_scratch: std::sync::Mutex<Option<OclZImageScratch>>,
     #[cfg(feature = "opencl")]
     ocl_pipelines: Option<Arc<OpenCLPipelines>>,
 
@@ -243,8 +244,6 @@ impl HeteroZImage {
         #[cfg(feature = "opencl")]
         let mut ocl_blocks: Vec<Option<OpenCLZImageBlock>> =
             (0..total_main).map(|_| None).collect();
-        #[cfg(feature = "opencl")]
-        let mut has_ocl_segments = false;
 
         // For OpenCL segments, we need raw safetensors access
         #[cfg(feature = "opencl")]
@@ -337,7 +336,6 @@ impl HeteroZImage {
                     start: seg.layer_start,
                     end: seg.layer_end,
                 });
-                has_ocl_segments = true;
                 continue;
             }
 
@@ -401,32 +399,9 @@ impl HeteroZImage {
             }
         }
 
-        // 4. Build OpenCL scratch buffers if needed
+        // 4. The OpenCL scratch buffers are built on the first request, from its length
         #[cfg(feature = "opencl")]
-        let ocl_scratch = if has_ocl_segments {
-            if let Some(ref pipelines) = ocl_pipelines {
-                let head_dim = cfg.head_dim();
-                let hidden_dim = cfg.hidden_dim();
-                // Max sequence length for image generation (1024x1024 -> ~4096 tokens + text)
-                let max_seq_len = 8192;
-                Some(
-                    OclZImageScratch::new(
-                        max_seq_len,
-                        cfg.dim,
-                        hidden_dim,
-                        cfg.n_heads,
-                        head_dim,
-                        cfg.n_kv_heads,
-                        pipelines,
-                    )
-                    .map_err(|e| crate::tensor::Error::msg(format!("OclZImageScratch: {}", e)))?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let ocl_scratch = std::sync::Mutex::new(None);
 
         // 5. Build final layer on primary device - read here, after the main stack, which is
         // where this loader has always read it.
@@ -831,10 +806,6 @@ impl HeteroZImage {
             .ocl_pipelines
             .as_ref()
             .ok_or_else(|| crate::tensor::Error::msg("OpenCL pipelines not initialized"))?;
-        let scratch = self
-            .ocl_scratch
-            .as_ref()
-            .ok_or_else(|| crate::tensor::Error::msg("OpenCL scratch not initialized"))?;
 
         let (b, seq_len, dim) = unified.dims3()?;
         if b != 1 {
@@ -842,6 +813,43 @@ impl HeteroZImage {
                 "OpenCL Z-Image only supports batch=1",
             ));
         }
+
+        // Refused before any command is queued, so no host buffer is freed under a running one.
+        crate::inference::kernel::image_attention::check_head_dim(self.cfg.head_dim())
+            .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+
+        // The scratch holds at least seq_len rows: it is rebuilt when a request is longer.
+        let mut scratch_slot = self
+            .ocl_scratch
+            .lock()
+            .map_err(|_| crate::tensor::Error::msg("OpenCL scratch lock poisoned"))?;
+        if scratch_slot
+            .as_ref()
+            .is_none_or(|s| s.max_seq_len < seq_len)
+        {
+            let cfg = &self.cfg;
+            *scratch_slot = None;
+            *scratch_slot = Some(
+                OclZImageScratch::new(
+                    seq_len,
+                    cfg.dim,
+                    cfg.hidden_dim(),
+                    cfg.n_heads,
+                    cfg.head_dim(),
+                    cfg.n_kv_heads,
+                    pipelines,
+                )
+                .map_err(|e| {
+                    crate::tensor::Error::msg(format!(
+                        "OclZImageScratch for {} tokens: {}",
+                        seq_len, e
+                    ))
+                })?,
+            );
+        }
+        let scratch = scratch_slot
+            .as_ref()
+            .ok_or_else(|| crate::tensor::Error::msg("OpenCL scratch not initialized"))?;
 
         // Convert tensor to contiguous F32 on CPU
         let unified_f32 = unified.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;

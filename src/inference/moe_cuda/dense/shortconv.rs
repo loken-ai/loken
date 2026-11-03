@@ -46,7 +46,7 @@ pub unsafe fn kv_residual_scatter_f16_dev_slot_raw(
 /// `src`, `dst` and `pos_dev` must be valid device pointers on `stream`'s device:
 /// `src` readable for `token_bytes`, `dst` writable at the position `pos_dev`
 /// names, `pos_dev` readable for one index. `token_bytes` must be a multiple of 4
-/// (checked only in debug builds). The position is read on the GPU and therefore
+/// (checked, an error otherwise). The position is read on the GPU and therefore
 /// unvalidated here.
 pub unsafe fn q4_v_scatter_bytes_dev_pos_raw(
     src: *const core::ffi::c_void,
@@ -54,9 +54,16 @@ pub unsafe fn q4_v_scatter_bytes_dev_pos_raw(
     pos_dev: *const core::ffi::c_void,
     token_bytes: i32,
     stream: i64,
-) {
-    debug_assert!(token_bytes % 4 == 0, "token_bytes must be multiple of 4");
-    loken_q4_v_scatter_bytes_dev_pos(src, dst, pos_dev, token_bytes, stream)
+) -> Result<()> {
+    if token_bytes < 0
+        || !crate::inference::cache::kv_core::v_scatter_words_ok(token_bytes as usize)
+    {
+        crate::tensor::bail!(
+            "q4_v_scatter_bytes_dev_pos: token_bytes {token_bytes} is not a positive multiple of 4"
+        );
+    }
+    loken_q4_v_scatter_bytes_dev_pos(src, dst, pos_dev, token_bytes, stream);
+    Ok(())
 }
 
 /// Conditional Q4_0 quantize+flush of the K residual under graph capture.
@@ -116,6 +123,14 @@ pub(crate) fn delta_net_launch(
 ) -> Result<(Tensor, Tensor)> {
     let dev = q.device().as_cuda_device()?;
     let (n_tokens, h, s_v) = q.dims3()?;
+    let (k_dim, v_dim) = (k.dims3()?.2, v.dims3()?.2);
+    if !crate::inference::generic_transformer::mixer::delta_net_head_dim_served(k_dim, v_dim)
+        || s_v != v_dim
+    {
+        crate::tensor::bail!(
+            "gated_delta_net: the kernels serve equal key and value head dims of 64, 128 or 256, got q {s_v}, k {k_dim}, v {v_dim}"
+        );
+    }
     let cuptr = |t: &Tensor| -> Result<*const f32> {
         let (st, layout) = t.storage_and_layout();
         match &*st {

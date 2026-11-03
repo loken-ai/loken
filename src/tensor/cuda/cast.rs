@@ -366,21 +366,24 @@ pub fn moe_gate_up_silu_mul(
     })?;
     let raw_stream = stream.cu_stream() as i64;
     unsafe {
-        loken_moe_gemm_gguf_gate_up_silu_mul(
-            x.device_ptr(stream).0 as *const f32,
-            gate_blob.device_ptr(stream).0 as *const core::ffi::c_void,
-            up_blob.device_ptr(stream).0 as *const core::ffi::c_void,
-            sorted_token_ids.device_ptr(stream).0 as *const i32,
-            expert_ids.device_ptr(stream).0 as *const i32,
-            out.device_ptr(stream).0 as *mut f32,
-            num_experts as i32,
-            topk as i32,
-            size_m as i32,
-            n as i32,
-            k as i32,
-            quant_code,
-            raw_stream,
-        );
+        crate::inference::kernel::launch_status(
+            loken_moe_gemm_gguf_gate_up_silu_mul(
+                x.device_ptr(stream).0 as *const f32,
+                gate_blob.device_ptr(stream).0 as *const core::ffi::c_void,
+                up_blob.device_ptr(stream).0 as *const core::ffi::c_void,
+                sorted_token_ids.device_ptr(stream).0 as *const i32,
+                expert_ids.device_ptr(stream).0 as *const i32,
+                out.device_ptr(stream).0 as *mut f32,
+                num_experts as i32,
+                topk as i32,
+                size_m as i32,
+                n as i32,
+                k as i32,
+                quant_code,
+                raw_stream,
+            ),
+            "loken_moe_gemm_gguf_gate_up_silu_mul",
+        )?;
     }
     Ok(out)
 }

@@ -12,6 +12,21 @@ mod shaders;
 pub mod stack;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod limits_tests {
+    use super::buffer_fits;
+
+    #[test]
+    fn buffer_fits_checks_both_limits() {
+        assert!(buffer_fits(0, 100, 200));
+        assert!(buffer_fits(99, 100, 200));
+        assert!(buffer_fits(100, 100, 200));
+        assert!(!buffer_fits(101, 100, 200));
+        assert!(buffer_fits(150, 200, 150));
+        assert!(!buffer_fits(151, 200, 150));
+        assert!(!buffer_fits(1, 0, 0));
+    }
+}
 
 use ash::vk;
 use std::collections::HashMap;
@@ -239,6 +254,16 @@ pub struct Context {
     /// Nanoseconds a timestamp tick lasts.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) timestamp_period: f32,
+    /// Bytes a storage buffer binding spans, as the device reports.
+    max_binding: u64,
+    /// Bytes a single memory allocation holds, as the device reports.
+    max_alloc: u64,
+}
+
+/// Whether a buffer of `bytes` is bound whole within `binding_limit` and allocated within
+/// `alloc_limit`. An empty buffer fits.
+pub(crate) fn buffer_fits(bytes: u64, binding_limit: u64, alloc_limit: u64) -> bool {
+    bytes <= binding_limit && bytes <= alloc_limit
 }
 
 unsafe impl Send for Context {}
@@ -293,11 +318,16 @@ impl Context {
         }
         // Kernels asking for 32-lane subgroups, where the device can run them.
         let mut size_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut size_props);
+        let mut maint3 = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut size_props)
+            .push_next(&mut maint3);
         unsafe {
             inst.instance
                 .get_physical_device_properties2(pd, &mut props2)
         };
+        let max_binding = u64::from(props2.properties.limits.max_storage_buffer_range);
+        let max_alloc = maint3.max_memory_allocation_size;
         let size_control = unsafe { inst.instance.enumerate_device_extension_properties(pd) }
             .unwrap_or_default()
             .iter()
@@ -379,6 +409,8 @@ impl Context {
             workgroup,
             coop,
             timestamp_period,
+            max_binding,
+            max_alloc,
         })
     }
 
@@ -428,6 +460,14 @@ impl Context {
     /// `host` is set.
     pub(crate) fn buffer(self: &Arc<Self>, size: u64, host: bool) -> anyhow::Result<Buffer> {
         let size = size.max(4);
+        if !buffer_fits(size, self.max_binding, self.max_alloc) {
+            anyhow::bail!(
+                "vulkan: a buffer of {size} bytes exceeds the device limits \
+                 (storage binding {} bytes, allocation {} bytes)",
+                self.max_binding,
+                self.max_alloc
+            );
+        }
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST;

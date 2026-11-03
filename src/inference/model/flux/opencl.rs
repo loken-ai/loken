@@ -164,6 +164,9 @@ pub struct OclFluxScratch {
     pub max_img_seq: usize,
     pub max_txt_seq: usize,
     pub dim: usize,
+    mlp_sz: usize,
+    num_heads: usize,
+    head_dim: usize,
 }
 
 impl OclFluxScratch {
@@ -232,7 +235,30 @@ impl OclFluxScratch {
             max_img_seq,
             max_txt_seq,
             dim,
+            mlp_sz,
+            num_heads,
+            head_dim,
         })
+    }
+
+    /// Rebuilds the buffers for a longer request, keeping the larger of each capacity.
+    /// The contents are lost, so the caller uploads after this.
+    pub fn ensure_capacity(
+        &mut self,
+        img_seq: usize,
+        txt_seq: usize,
+        pipelines: &OpenCLPipelines,
+    ) -> Result<()> {
+        if img_seq <= self.max_img_seq && txt_seq <= self.max_txt_seq {
+            return Ok(());
+        }
+        let (img, txt) = (img_seq.max(self.max_img_seq), txt_seq.max(self.max_txt_seq));
+        let (dim, mlp_sz, num_heads, head_dim) =
+            (self.dim, self.mlp_sz, self.num_heads, self.head_dim);
+        // The old buffers go before the new ones are made, and a failure leaves a valid scratch.
+        *self = Self::new(1, 1, dim, mlp_sz, num_heads, head_dim, pipelines)?;
+        *self = Self::new(img, txt, dim, mlp_sz, num_heads, head_dim, pipelines)?;
+        Ok(())
     }
 }
 
@@ -956,6 +982,7 @@ fn dispatch_image_attention(
     head_dim: usize,
     p: &OpenCLPipelines,
 ) -> Result<()> {
+    crate::inference::kernel::image_attention::check_head_dim(head_dim)?;
     let total_work = batch * n_heads * seq_len;
     unsafe {
         ExecuteKernel::new(&p.image_attention)
@@ -1091,6 +1118,15 @@ impl OpenCLFluxDoubleBlock {
         scratch: &mut OclFluxScratch,
         p: &OpenCLPipelines,
     ) -> Result<()> {
+        if img_seq > scratch.max_img_seq || txt_seq > scratch.max_txt_seq {
+            anyhow::bail!(
+                "sequences of {} image and {} text tokens exceed the scratch capacity of {} and {}",
+                img_seq,
+                txt_seq,
+                scratch.max_img_seq,
+                scratch.max_txt_seq
+            );
+        }
         let dim = self.dim;
         let n_heads = self.img_attn.num_heads;
         let head_dim = dim / n_heads;
@@ -1492,6 +1528,13 @@ impl OpenCLFluxSingleBlock {
         scratch: &mut OclFluxScratch,
         p: &OpenCLPipelines,
     ) -> Result<()> {
+        if seq_len > scratch.max_img_seq + scratch.max_txt_seq {
+            anyhow::bail!(
+                "sequence of {} tokens exceeds the scratch capacity of {}",
+                seq_len,
+                scratch.max_img_seq + scratch.max_txt_seq
+            );
+        }
         let dim = self.dim;
         let n_heads = self.num_heads;
         let head_dim = dim / n_heads;

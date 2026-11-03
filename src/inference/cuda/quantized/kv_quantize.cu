@@ -20,7 +20,7 @@ extern "C" __global__ void quantize_q8_0_kv_paired_dev_slot(
     const int ix = blockDim.x * blockIdx.x + threadIdx.x;
     if (ix >= kx_padded) return;
     const int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    const int i_padded = iy * kx_padded + ix;
+    const long long i_padded = (long long)iy * kx_padded + ix;
 
     const float * __restrict__ x = (blockIdx.z == 0) ? xk : xv;
     void * __restrict__ vy       = (blockIdx.z == 0) ? vyk : vyv;
@@ -28,10 +28,10 @@ extern "C" __global__ void quantize_q8_0_kv_paired_dev_slot(
     const int slot = slot_dev[0];
     block_q8_0 * y = (block_q8_0 *) vy + (size_t)slot * (size_t)num_blocks_per_token;
 
-    const int ib  = i_padded / QK8_0;
+    const long long ib = i_padded / QK8_0;
     const int iqs = i_padded % QK8_0;
 
-    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+    const float xi = ix < kx ? x[(long long)iy * kx + ix] : 0.0f;
     float amax = fabsf(xi);
     amax = warp_max(amax);
 
@@ -66,16 +66,16 @@ extern "C" __global__ void quantize_q8_0_kv_paired(
     const int ix = blockDim.x * blockIdx.x + threadIdx.x;
     if (ix >= kx_padded) return;
     const int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    const int i_padded = iy * kx_padded + ix;
+    const long long i_padded = (long long)iy * kx_padded + ix;
 
     const float * x   = (blockIdx.z == 0) ? xk  : xv;
     char        * vy0 = (blockIdx.z == 0) ? (char*)vyk : (char*)vyv;
     block_q8_0  * y   = (block_q8_0 *)(vy0 + dst_byte_offset);
 
-    const int ib  = i_padded / QK8_0;
+    const long long ib = i_padded / QK8_0;
     const int iqs = i_padded % QK8_0;
 
-    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+    const float xi = ix < kx ? x[(long long)iy * kx + ix] : 0.0f;
     float amax = fabsf(xi);
     amax = warp_max(amax);
 
@@ -100,13 +100,13 @@ extern "C" __global__ void quantize_q4_0(const float * __restrict__ x, void * __
     if (ix >= kx_padded) return;
 
     const int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    const int i_padded = iy * kx_padded + ix;
+    const long long i_padded = (long long)iy * kx_padded + ix;
 
     block_q4_0 * y = (block_q4_0 *) vy;
-    const int ib = i_padded / QK4_0;
+    const long long ib = i_padded / QK4_0;
     const int iqs = i_padded % QK4_0;
 
-    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+    const float xi = ix < kx ? x[(long long)iy * kx + ix] : 0.0f;
 
     // Warp reduction: find the signed value whose absolute magnitude is
     // largest across the 32 lanes of this block. We can't just take the
@@ -150,13 +150,13 @@ extern "C" __global__ void quantize_q4_0_f16(const half * __restrict__ x, void *
     if (ix >= kx_padded) return;
 
     const int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    const int i_padded = iy * kx_padded + ix;
+    const long long i_padded = (long long)iy * kx_padded + ix;
 
     block_q4_0 * y = (block_q4_0 *) vy;
-    const int ib = i_padded / QK4_0;
+    const long long ib = i_padded / QK4_0;
     const int iqs = i_padded % QK4_0;
 
-    const float xi = ix < kx ? __half2float(x[iy * kx + ix]) : 0.0f;
+    const float xi = ix < kx ? __half2float(x[(long long)iy * kx + ix]) : 0.0f;
 
     float amax = fabsf(xi);
     float mval = xi;

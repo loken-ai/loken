@@ -25,7 +25,7 @@ pub fn gate_topk_softmax(
     if hidden != w_hidden || hidden > 8192 || (hidden & 3) != 0 {
         return Ok(None);
     }
-    if !matches!(n_experts, 32 | 64 | 128 | 256 | 512) {
+    if !matches!(n_experts, 32 | 64 | 128 | 256) {
         return Ok(None);
     }
     if n_expert_used == 0 || n_expert_used > n_experts {
@@ -93,7 +93,7 @@ pub fn topk_sigmoid_post(
         return Ok(None);
     }
     let (n_rows, n_experts) = (d[0], d[1]);
-    if !matches!(n_experts, 32 | 64 | 128 | 256 | 512) {
+    if !matches!(n_experts, 32 | 64 | 128 | 256) {
         return Ok(None);
     }
     if n_expert_used == 0 || n_expert_used > n_experts {

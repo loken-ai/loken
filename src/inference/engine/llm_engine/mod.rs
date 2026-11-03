@@ -179,9 +179,10 @@ impl LoadedModelState {
                 self.moondream_graph = Some(MoondreamGraphState { graph });
                 Ok(logits)
             }
-            (Ok(logits), _) => {
-                warn!("moondream end_capture returned None; using fwd logits");
-                Ok(logits)
+            (Ok(_), _) => {
+                // A capture only records: the logits it returned were never computed.
+                warn!("moondream capture produced no graph; running the forward eagerly");
+                self.model.forward(&input_buf, pos)
             }
             (Err(e), _) => Err(e),
         }

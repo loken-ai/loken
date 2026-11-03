@@ -13,6 +13,9 @@ impl QKernelMatMul {
     ///
     /// `x_slice` holds the activation rows as F32, or as F16 when `type_x` is the ggml id of F16:
     /// the quantiser reads either.
+    ///
+    /// Returns `None` when no tile width fits the card's shared memory and the result was not
+    /// computed: the caller takes the dequantised path.
     pub(super) fn mmq_forward<T>(
         &self,
         dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
@@ -20,7 +23,7 @@ impl QKernelMatMul {
         x_slice: &crate::tensor::gpu_runtime::driver::CudaSlice<T>,
         type_x: i32,
         rows: usize,
-    ) -> Result<crate::tensor::gpu_runtime::driver::CudaSlice<f32>> {
+    ) -> Result<Option<crate::tensor::gpu_runtime::driver::CudaSlice<f32>>> {
         use crate::tensor::gpu_runtime::driver::DevicePtr;
         const QK8_1: usize = 32;
         const BLOCK_Q8_1_MMQ_SIZE: usize = 4 * QK8_1 + 4 * 4; // 128 qs + 16 scale bytes
@@ -108,7 +111,7 @@ impl QKernelMatMul {
         let w_ptr = blob.device_ptr(stream).0 as *const std::ffi::c_void;
         let out_ptr = out.device_ptr(stream).0 as *mut std::ffi::c_void;
 
-        unsafe {
+        let launched = unsafe {
             let quantize = mmq_quantize_launcher(self.dtype)?;
             quantize(
                 x_ptr,
@@ -126,7 +129,7 @@ impl QKernelMatMul {
                 stream_ptr,
             );
             let mmq = mmq_launcher(self.dtype)?;
-            mmq(
+            let launched = mmq(
                 fixup_ptr,
                 w_ptr,
                 ws_ptr as *const std::ffi::c_void,
@@ -142,13 +145,14 @@ impl QKernelMatMul {
                 info.warp_size,
                 stream_ptr,
             );
-        }
+            launched != 0
+        };
 
         // Publish our own mark before the mutex goes: from here the buffers are ours until
         // these two kernels retire, and the next taker waits on this.
         if recording {
             slot.main_in_graph = true;
-            return Ok(out);
+            return Ok(launched.then_some(out));
         }
         let ev = match slot.last_use.take() {
             Some(e) => e,
@@ -158,6 +162,6 @@ impl QKernelMatMul {
             .map_err(|e| Error(format!("mmq workspace mark: {e}")))?;
         slot.last_use = Some(ev);
 
-        Ok(out)
+        Ok(launched.then_some(out))
     }
 }

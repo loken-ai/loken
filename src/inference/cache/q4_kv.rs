@@ -880,7 +880,8 @@ impl Q4KvCache {
                     pos_ptr,
                     token_bytes as i32,
                     stream_h,
-                );
+                )
+                .map_err(|e| anyhow!("Q4KvCache: V scatter: {e}"))?;
             }
         } else {
             let dst_byte_offset = self.core.len() * token_bytes;

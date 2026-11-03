@@ -64,8 +64,8 @@ extern "C" __global__ void loken_flash_decode_f16_kernel(
         float s = scale * p + (mask ? mask[j] : 0.0f);
 
         float m_new = fmaxf(m, s);
-        float alpha = expf(m - m_new);       // rescale prior accumulators
-        float pj    = expf(s - m_new);
+        float alpha = (m_new == -INFINITY) ? 0.0f : expf(m - m_new);       // rescale prior accumulators
+        float pj    = (m_new == -INFINITY) ? 0.0f : expf(s - m_new);
         l = l * alpha + pj;
         const __half* vj = vh + (long)j * v_pos_stride;
         #pragma unroll
@@ -137,8 +137,8 @@ extern "C" __global__ void loken_flash_decode_split_f16_kernel(
         p = __shfl_sync(0xffffffff, p, 0);
         float s = scale * p + (mask ? mask[j] : 0.0f);
         float m_new = fmaxf(m, s);
-        float alpha = expf(m - m_new);
-        float pj = expf(s - m_new);
+        float alpha = (m_new == -INFINITY) ? 0.0f : expf(m - m_new);
+        float pj = (m_new == -INFINITY) ? 0.0f : expf(s - m_new);
         l = l * alpha + pj;
         const __half* vj = vh + (long)j * v_pos_stride;
         #pragma unroll
@@ -176,7 +176,7 @@ extern "C" __global__ void loken_flash_decode_combine_f16_kernel(
         #pragma unroll
         for (int t = 0; t < LL_MAX_DPL; ++t) if (t < dpl) acc[t] += pa[lane + (t << 5)] * w;
     }
-    const float inv = 1.0f / l;
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;   // no key in any chunk writes zeros
     __half* o = out + ((long)bi * n_head + head) * head_dim;
     #pragma unroll
     for (int t = 0; t < LL_MAX_DPL; ++t) if (t < dpl) o[lane + (t << 5)] = __float2half(acc[t] * inv);
@@ -264,8 +264,8 @@ extern "C" __global__ void loken_flash_decode_devkvlen_f16_kernel(
         p = __shfl_sync(0xffffffff, p, 0);
         float s = scale * p;
         float m_new = fmaxf(m, s);
-        float alpha = expf(m - m_new);
-        float pj = expf(s - m_new);
+        float alpha = (m_new == -INFINITY) ? 0.0f : expf(m - m_new);
+        float pj = (m_new == -INFINITY) ? 0.0f : expf(s - m_new);
         l = l * alpha + pj;
         const __half* vj = vh + (long)j * v_pos_stride;
         #pragma unroll
@@ -357,8 +357,8 @@ extern "C" __global__ void loken_paged_flash_decode_f16_kernel(
         p = __shfl_sync(0xffffffff, p, 0);
         float s = scale * p;
         float m_new = fmaxf(m, s);
-        float alpha = expf(m - m_new);
-        float pj = expf(s - m_new);
+        float alpha = (m_new == -INFINITY) ? 0.0f : expf(m - m_new);
+        float pj = (m_new == -INFINITY) ? 0.0f : expf(s - m_new);
         l = l * alpha + pj;
         const __half* vj = Vp + (long)slot * feat + hoff;
         #pragma unroll
@@ -442,8 +442,8 @@ extern "C" __global__ void loken_paged_flash_decode_split_f16_kernel(
         p = __shfl_sync(0xffffffff, p, 0);
         float s = scale * p;
         float m_new = fmaxf(m, s);
-        float alpha = expf(m - m_new);
-        float pj = expf(s - m_new);
+        float alpha = (m_new == -INFINITY) ? 0.0f : expf(m - m_new);
+        float pj = (m_new == -INFINITY) ? 0.0f : expf(s - m_new);
         l = l * alpha + pj;
         const __half* vj = Vp + (long)slot * feat + hoff;
         #pragma unroll
@@ -578,8 +578,8 @@ __global__ void __launch_bounds__(PGQ_WARPS * 32) loken_paged_flash_decode_gqa_f
             for (int o = RL / 2; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
             if (!live) continue;
             const float nm = fmaxf(m[g], s);
-            const float a = expf(m[g] - nm);
-            const float p = expf(s - nm);
+            const float a = (nm == -INFINITY) ? 0.0f : expf(m[g] - nm);
+            const float p = (nm == -INFINITY) ? 0.0f : expf(s - nm);
             l[g] = l[g] * a + p;
             #pragma unroll
             for (int i = 0; i < 8; ++i) acc[g][i] = acc[g][i] * a + p * vf[i];
@@ -756,8 +756,8 @@ __global__ void loken_flash_decode_split_devkvlen_f16_kernel(
         p = __shfl_sync(0xffffffff, p, 0);
         float s = scale * p;
         float m_new = fmaxf(m, s);
-        float alpha = expf(m - m_new);
-        float pj = expf(s - m_new);
+        float alpha = (m_new == -INFINITY) ? 0.0f : expf(m - m_new);
+        float pj = (m_new == -INFINITY) ? 0.0f : expf(s - m_new);
         l = l * alpha + pj;
         const __half* vj = vh + (long)j * v_pos_stride;
         #pragma unroll

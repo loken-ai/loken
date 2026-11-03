@@ -123,11 +123,11 @@ __global__ void loken_top_and_mass_kernel(const float* __restrict__ logits,
                                           unsigned int* __restrict__ ids,
                                           float* __restrict__ mass, int vocab) {
     const float* r = logits + (size_t)blockIdx.x * vocab;
-    float m = -INFINITY, s = 0.f; int idx = 0x7fffffff;
+    float m = -INFINITY, s = 0.f; int idx = 0;
     for (int k = threadIdx.x; k < vocab; k += blockDim.x) {
         float v = r[k];
         if (v > m) { s = s * expf(m - v) + 1.f; m = v; idx = k; }
-        else { s += expf(v - m); }
+        else if (m != -INFINITY) { s += expf(v - m); }
     }
     __shared__ float sm[TOP_MASS_THREADS];
     __shared__ float ss[TOP_MASS_THREADS];
@@ -216,6 +216,8 @@ __global__ void loken_repeat_penalty_kernel(T* __restrict__ logits, const int* _
         const unsigned int* __restrict__ toks, float rp, int n, int vocab) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // A token id outside [0, vocab) belongs to no logit of its row: the pair is skipped.
+    if (rows[i] < 0 || toks[i] >= (unsigned int)vocab) return;
     size_t off = (size_t)rows[i] * vocab + toks[i];
     float v = (float)logits[off];
     logits[off] = (T)(v > 0.f ? v / rp : v * rp);

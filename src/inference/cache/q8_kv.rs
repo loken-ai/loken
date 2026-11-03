@@ -856,7 +856,8 @@ impl Q8KvCache {
                     pos_ptr,
                     token_bytes as i32,
                     stream.cu_stream() as i64,
-                );
+                )
+                .map_err(|e| anyhow!("Q8KvCache: V scatter: {e}"))?;
             }
             return Ok(());
         }

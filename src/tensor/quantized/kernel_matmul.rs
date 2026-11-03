@@ -1401,13 +1401,20 @@ impl QKernelMatMul {
                         }
                     };
                     match y {
-                        Ok(y) => {
+                        Ok(Some(y)) => {
                             let out = crate::tensor::Tensor::from_cuda_storage(
                                 crate::tensor::cuda::CudaStorage::F32(y),
                                 qdev.clone(),
                                 odims,
                             )?;
                             return out.to_dtype(xdt);
+                        }
+                        Ok(None) => {
+                            warn_no_mmq_tile();
+                            #[cfg(feature = "gpu")]
+                            if let Some(y) = self.forward_dequant_transient(x)? {
+                                return Ok(y);
+                            }
                         }
                         Err(e) if e.is_oom() => {
                             tracing::warn!(
@@ -1437,12 +1444,19 @@ impl QKernelMatMul {
                     // request. An OOM must never reach the caller while a slower path is
                     // still available.
                     match self.mmq_forward(qdev, blob, x_slice, 0, rows) {
-                        Ok(y) => {
+                        Ok(Some(y)) => {
                             return crate::tensor::Tensor::from_cuda_storage(
                                 crate::tensor::cuda::CudaStorage::F32(y),
                                 qdev.clone(),
                                 odims,
                             );
+                        }
+                        Ok(None) => {
+                            warn_no_mmq_tile();
+                            #[cfg(feature = "gpu")]
+                            if let Some(y) = self.forward_dequant_transient(x)? {
+                                return Ok(y);
+                            }
                         }
                         Err(e) if e.is_oom() => {
                             tracing::warn!(
@@ -1683,4 +1697,12 @@ impl QKernelMatMul {
             _ => Ok(None),
         }
     }
+}
+
+/// Says once per process that no MMQ tile fits and matmuls take the dequantised path.
+fn warn_no_mmq_tile() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::warn!("mmq has no tile that fits; matmuls take the dequantised path instead")
+    });
 }

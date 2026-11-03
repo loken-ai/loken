@@ -364,12 +364,17 @@ __global__ void loken_moe_gemm_gguf_prefill_kernel(const act_t* __restrict__ inp
 /// The counts are working memory that no caller reads, so allocating and freeing them belongs
 /// with the call rather than around it - and both callers here were writing that scaffolding
 /// out themselves. `offsets` holds `num_experts + 1` ints and is the caller's to free.
-static void expert_offsets_on_stream(const int32_t* expert_ids, int size_m, int32_t* offsets,
+/// Returns false, with `offsets` untouched, when the counts could not be allocated.
+static bool expert_offsets_on_stream(const int32_t* expert_ids, int size_m, int32_t* offsets,
                                      int num_experts, cudaStream_t stream) {
     int32_t* counts = nullptr;
-    cudaMallocAsync(&counts, num_experts * sizeof(int32_t), stream);
+    if (cudaMallocAsync(&counts, num_experts * sizeof(int32_t), stream) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
     calculate_expert_offsets(expert_ids, size_m, counts, offsets, num_experts, stream);
     cudaFreeAsync(counts, stream);
+    return true;
 }
 
 /// One prefill launch.
@@ -405,7 +410,7 @@ static void launch_prefill(dim3 grid, cudaStream_t stream, const void* input,
 #undef MOE_PREFILL_LAUNCH
 }
 
-extern "C" void loken_moe_gemm_gguf_prefill(
+extern "C" int loken_moe_gemm_gguf_prefill(
     const void* input, const uint8_t* weights,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
     const float* topk_weights, float* output,
@@ -415,8 +420,15 @@ extern "C" void loken_moe_gemm_gguf_prefill(
     cudaStream_t stream
 ) {
     int32_t* expert_offsets = nullptr;
-    cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream);
-    expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream);
+    if (cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream) !=
+        cudaSuccess) {
+        cudaGetLastError();
+        return 1;
+    }
+    if (!expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream)) {
+        cudaFreeAsync(expert_offsets, stream);
+        return 1;
+    }
 
     // One block per expert per strip of output columns.
     const dim3 grid(num_experts, ceil_div(size_n, N_BLK), 1);
@@ -433,6 +445,7 @@ extern "C" void loken_moe_gemm_gguf_prefill(
 #endif
     }
     cudaFreeAsync(expert_offsets, stream);
+    return 0;
 }
 
 /// The offset builder on its own, for a judge that can compare it with a host prefix sum.
@@ -440,8 +453,10 @@ extern "C" void loken_moe_gemm_gguf_prefill(
 /// The expert offsets decide which tokens each expert's GEMM reads. Nothing downstream can
 /// tell a wrong offset from a wrong weight - both come out as a plausible number in the wrong
 /// place - so the builder needs a test that reaches it directly.
-extern "C" void loken_moe_expert_offsets(const int32_t* expert_ids, int size_m,
-                                         int32_t* expert_offsets, int num_experts,
-                                         cudaStream_t stream) {
-    expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream);
+/// Returns 0 when the offsets are on the stream, nonzero when the counts could not be allocated.
+extern "C" int loken_moe_expert_offsets(const int32_t* expert_ids, int size_m,
+                                        int32_t* expert_offsets, int num_experts,
+                                        cudaStream_t stream) {
+    return expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream) ? 0
+                                                                                           : 1;
 }

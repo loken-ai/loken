@@ -106,10 +106,10 @@ static __device__ void dequantize_block_nibbles(const void * __restrict__ vx,
 /// quarter of a block, which is eight consecutive values rather than four split pairs.
 template<typename dst_t>
 static __device__ void dequantize_block_q8_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
-    const int i = blockIdx.x;
+    const int64_t i = blockIdx.x;
     const int quarter = threadIdx.x / 8;
     const int which   = threadIdx.x % 8;
-    const int ib = 8*i + which;
+    const int64_t ib = 8*i + which;
     if (ib >= nb32) {
         return;
     }
@@ -221,14 +221,14 @@ extern "C" __global__ void quantize_q8_0(const float * __restrict__ x, void * __
 
     const int iy = blockDim.y*blockIdx.y + threadIdx.y;
 
-    const int i_padded = iy*kx_padded + ix;
+    const long long i_padded = (long long)iy*kx_padded + ix;
 
     block_q8_0 * y = (block_q8_0 *) vy;
 
-    const int ib = i_padded / QK8_0; // block index
+    const long long ib = i_padded / QK8_0; // block index
     const int iqs = i_padded % QK8_0; // quant index
 
-    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f;
+    const float xi = ix < kx ? x[(long long)iy*kx + ix] : 0.0f;
     float amax = fabsf(xi);
 
     amax = warp_max(amax);
@@ -273,16 +273,16 @@ extern "C" __global__ void quantize_q8_0_dev_slot(
         return;
     }
     const int iy = blockDim.y * blockIdx.y + threadIdx.y;
-    const int i_padded = iy * kx_padded + ix;
+    const long long i_padded = (long long)iy * kx_padded + ix;
 
     // Resolve the per-token destination offset at REPLAY time.
     const int slot = slot_dev[0];
     block_q8_0 * y = (block_q8_0 *) vy + (size_t)slot * (size_t)num_blocks_per_token;
 
-    const int ib  = i_padded / QK8_0;
+    const long long ib = i_padded / QK8_0;
     const int iqs = i_padded % QK8_0;
 
-    const float xi = ix < kx ? x[iy * kx + ix] : 0.0f;
+    const float xi = ix < kx ? x[(long long)iy * kx + ix] : 0.0f;
     float amax = fabsf(xi);
 
     amax = warp_max(amax);

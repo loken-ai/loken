@@ -447,7 +447,7 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
                 expert_offsets: *mut i32,
                 num_experts: i32,
                 stream: *mut std::ffi::c_void,
-            );
+            ) -> i32;
         }
     }
 
@@ -480,7 +480,7 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
             use crate::tensor::gpu_runtime::driver::DevicePtr;
             let ids_ptr = ids_dev.device_ptr(stream).0 as *const i32;
             let off_ptr = offsets.device_ptr(stream).0 as *mut i32;
-            unsafe {
+            let status = unsafe {
                 loken_moe_expert_offsets(
                     ids_ptr,
                     ids.len() as i32,
@@ -489,6 +489,10 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
                     stream.cu_stream() as *mut std::ffi::c_void,
                 )
             };
+            assert_eq!(
+                status, 0,
+                "loken_moe_expert_offsets skipped its launch: a scratch allocation failed"
+            );
         }
         let got = stream.clone_dtoh(&offsets).expect("download offsets");
         assert_eq!(

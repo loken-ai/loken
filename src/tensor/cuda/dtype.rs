@@ -3,6 +3,7 @@
 //! `use super::*` keeps the names its items referred to before the split in reach.
 
 use super::*;
+use crate::tensor::kernel_int;
 
 pub fn unary_f32(
     dev: &CudaDevice,
@@ -25,12 +26,15 @@ pub fn unary_f16(
     let out = with_oom_retry(dev, "kernel out", || unsafe {
         stream.alloc::<half::f16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -52,12 +56,15 @@ pub fn binary_f16(
     let out = with_oom_retry(dev, "kernel out", || unsafe {
         stream.alloc::<half::f16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut bd = stream.launch_builder(&func);
     bd.arg(a);
     bd.arg(b);
@@ -80,12 +87,15 @@ pub fn affine_f16(
     let out = with_oom_retry(dev, "affine f16", || unsafe {
         stream.alloc::<half::f16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -109,12 +119,15 @@ pub fn binary_bf16(
     let out = with_oom_retry(dev, "kernel out", || unsafe {
         stream.alloc::<half::bf16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut bd = stream.launch_builder(&func);
     bd.arg(a);
     bd.arg(b);
@@ -137,12 +150,15 @@ pub fn affine_bf16(
     let out = with_oom_retry(dev, "affine bf16", || unsafe {
         stream.alloc::<half::bf16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -163,12 +179,15 @@ pub fn scale_f32(
     let func = dev.elementwise_fn("native_scale_f32")?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "scale", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -190,12 +209,15 @@ pub fn broadcast_tail_f32(
     let func = dev.elementwise_fn(name)?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "kernel out", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, bn_i) = (n as i32, bn as i32);
+    let (n_i, bn_i) = (kernel_int(n)?, kernel_int(bn)?);
     let mut bd = stream.launch_builder(&func);
     bd.arg(a);
     bd.arg(b);
@@ -221,12 +243,15 @@ pub fn broadcast_tail_f16(
     let out = with_oom_retry(dev, "kernel out", || unsafe {
         stream.alloc::<half::f16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, bn_i) = (n as i32, bn as i32);
+    let (n_i, bn_i) = (kernel_int(n)?, kernel_int(bn)?);
     let mut bd = stream.launch_builder(&func);
     bd.arg(a);
     bd.arg(b);
@@ -251,12 +276,15 @@ pub fn broadcast_tail_bf16(
     let out = with_oom_retry(dev, "kernel out", || unsafe {
         stream.alloc::<half::bf16>(n)
     })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, bn_i) = (n as i32, bn as i32);
+    let (n_i, bn_i) = (kernel_int(n)?, kernel_int(bn)?);
     let mut bd = stream.launch_builder(&func);
     bd.arg(a);
     bd.arg(b);
@@ -291,6 +319,9 @@ pub fn broadcast_nd_f32(
     let d_meta = dev_const_i32(dev, &meta)?;
     // the kernel writes every output element - no zero-fill needed
     let out = with_oom_retry(dev, "broadcast_nd", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
@@ -331,7 +362,7 @@ pub fn layer_norm_f32(
         block_dim: (block, 1, 1),
         shared_mem_bytes: block * 8, // two f32 accumulator arrays
     };
-    let cols_i = cols as i32;
+    let cols_i = kernel_int(cols)?;
     let has_bias = bias.is_some() as i32;
     let b_slice = bias.unwrap_or(w); // dummy alias when absent (kernel skips it)
     let mut bd = stream.launch_builder(&func);
@@ -369,7 +400,7 @@ pub fn gemv_f16w_f32(
         block_dim: ((GEMV_ROWS * 32) as u32, 1, 1),
         shared_mem_bytes: (k * std::mem::size_of::<f32>()) as u32,
     };
-    let (k_i, n_i, has_bias) = (k as i32, n_out as i32, bias.is_some() as i32);
+    let (k_i, n_i, has_bias) = (kernel_int(k)?, kernel_int(n_out)?, bias.is_some() as i32);
     let mut bd = stream.launch_builder(&func);
     bd.arg(x);
     bd.arg(w);
@@ -439,12 +470,12 @@ pub fn attend_rows(
         shared_mem_bytes: attend_rows_shared_bytes(a.kv_len) as u32,
     };
     let ints = [
-        a.rows as i32,
+        kernel_int(a.rows)?,
         a.heads as i32,
         a.groups as i32,
         a.head_dim as i32,
-        a.cap as i32,
-        a.kv_len as i32,
+        kernel_int(a.cap)?,
+        kernel_int(a.kv_len)?,
         a.causal as i32,
     ];
     macro_rules! launch {
@@ -493,7 +524,11 @@ pub fn cat_copy_f32(
         shared_mem_bytes: 0,
     };
     let n_l = n as i64;
-    let (sr_i, ds_i, do_i) = (src_row as i32, dst_stride as i32, dst_off as i32);
+    let (sr_i, ds_i, do_i) = (
+        kernel_int(src_row)?,
+        kernel_int(dst_stride)?,
+        kernel_int(dst_off)?,
+    );
     let mut bd = stream.launch_builder(&func);
     bd.arg(src);
     bd.arg(&*dst);
@@ -532,7 +567,11 @@ pub fn cat_copy_storage(
         shared_mem_bytes: 0,
     };
     let n_l = n as i64;
-    let (sr_i, ds_i, do_i) = (src_row as i32, dst_stride as i32, dst_off as i32);
+    let (sr_i, ds_i, do_i) = (
+        kernel_int(src_row)?,
+        kernel_int(dst_stride)?,
+        kernel_int(dst_off)?,
+    );
     macro_rules! launch {
         ($s:expr, $d:expr) => {{
             let mut bd = stream.launch_builder(&func);
@@ -570,12 +609,15 @@ pub fn affine_f32(
     let func = dev.elementwise_fn("native_affine_f32")?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "affine", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -598,12 +640,15 @@ pub fn bias_chw_f32(
     let func = dev.elementwise_fn("native_bias_chw_f32")?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "bias_chw", || stream.alloc_zeros::<f32>(n))?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (n_i, sp_i, c_i) = (n as i32, spatial as i32, c as i32);
+    let (n_i, sp_i, c_i) = (kernel_int(n)?, kernel_int(spatial)?, kernel_int(c)?);
     let mut b = stream.launch_builder(&func);
     b.arg(a);
     b.arg(bias);
@@ -629,12 +674,21 @@ pub fn upsample2d_f32(
     let stream = dev.stream();
     let n = bc * oh * ow;
     let out = with_oom_retry(dev, "upsample", || stream.alloc_zeros::<f32>(n))?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (bc_i, h_i, w_i, oh_i, ow_i) = (bc as i32, h as i32, w as i32, oh as i32, ow as i32);
+    let (bc_i, h_i, w_i, oh_i, ow_i) = (
+        kernel_int(bc)?,
+        kernel_int(h)?,
+        kernel_int(w)?,
+        kernel_int(oh)?,
+        kernel_int(ow)?,
+    );
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -661,12 +715,21 @@ pub fn upsample_bilinear2d_f32(
     let stream = dev.stream();
     let n = bc * oh * ow;
     let out = with_oom_retry(dev, "upsample_bilinear", || stream.alloc_zeros::<f32>(n))?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (bc_i, h_i, w_i, oh_i, ow_i) = (bc as i32, h as i32, w as i32, oh as i32, ow as i32);
+    let (bc_i, h_i, w_i, oh_i, ow_i) = (
+        kernel_int(bc)?,
+        kernel_int(h)?,
+        kernel_int(w)?,
+        kernel_int(oh)?,
+        kernel_int(ow)?,
+    );
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -694,17 +757,20 @@ pub fn pad_dim_f32(
     let d_out = d_in + left + right;
     let n = outer * d_out * inner;
     let out = with_oom_retry(dev, "pad", || stream.alloc_zeros::<f32>(n))?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
     let (o_i, di_i, do_i, l_i, in_i) = (
-        outer as i32,
-        d_in as i32,
-        d_out as i32,
-        left as i32,
-        inner as i32,
+        kernel_int(outer)?,
+        kernel_int(d_in)?,
+        kernel_int(d_out)?,
+        kernel_int(left)?,
+        kernel_int(inner)?,
     );
     let mut b = stream.launch_builder(&func);
     b.arg(x);
@@ -731,13 +797,16 @@ pub fn snake1d_f32(
     let func = dev.elementwise_fn("native_snake1d_f32")?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "snake", || stream.alloc_zeros::<f32>(n))?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
     let n_l = n as i64;
-    let (l_i, c_i) = (l as i32, c as i32);
+    let (l_i, c_i) = (kernel_int(l)?, kernel_int(c)?);
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(alpha);

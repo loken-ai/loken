@@ -532,6 +532,13 @@ impl OpenCLZImageBlock {
         scratch: &OclZImageScratch,
         pipelines: &OpenCLPipelines,
     ) -> Result<()> {
+        if seq_len > scratch.max_seq_len {
+            anyhow::bail!(
+                "sequence of {} tokens exceeds the scratch capacity of {}",
+                seq_len,
+                scratch.max_seq_len
+            );
+        }
         if let Some(ref adaln) = self.adaln {
             self.forward_with_modulation(
                 x_buf,
@@ -1043,6 +1050,7 @@ impl OpenCLZImageBlock {
         let seq = seq_len as u32;
         let hd = attn.head_dim as u32;
         let mask_present = if mask_buf.is_some() { 1u32 } else { 0u32 };
+        crate::inference::kernel::image_attention::check_head_dim(attn.head_dim)?;
 
         // Use a dummy mask buffer if no mask
         let dummy_mask;

@@ -370,6 +370,15 @@ pub fn rms_norm_then_qmatmul_bf16(
             hidden
         );
     }
+    if !crate::inference::kernel::fused::fused_norm_fits(
+        x,
+        crate::inference::kernel::fused::rms_quantize_shared_cols(hidden),
+    ) {
+        crate::tensor::bail!(
+            "rms_norm_then_qmatmul_bf16: hidden {} does not fit the shared memory of one block",
+            hidden
+        );
+    }
     let dev = x.device().as_cuda_device()?;
     let x_c = x.contiguous()?;
     let wn_c = w_norm.contiguous()?;

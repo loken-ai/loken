@@ -3,6 +3,7 @@
 //! `use super::*` keeps the names its items referred to before the split in reach.
 
 use super::*;
+use crate::tensor::kernel_int;
 
 /// Device-side narrow of a contiguous tensor along one dim, dtype-agnostic
 /// (byte copy): rows = product of dims before+at the dim, the narrowed span
@@ -193,7 +194,7 @@ pub fn scatter_set_storage(
         shared_mem_bytes: 0,
     };
     let n_l = n as i64;
-    let (inner_i, srcd_i, dstd_i) = (inner as i32, src_d as i32, dst_d as i32);
+    let (inner_i, srcd_i, dstd_i) = (kernel_int(inner)?, kernel_int(src_d)?, kernel_int(dst_d)?);
     let es_i = src.dtype().size_in_bytes() as i32;
     macro_rules! go {
         ($s:expr, $d:expr, $ix:expr) => {{
@@ -260,7 +261,7 @@ pub fn index_select_storage(
         shared_mem_bytes: 0,
     };
     let n_l = n_out as i64;
-    let (inner_i, idxl_i, srcd_i) = (inner as i32, idx_len as i32, src_d as i32);
+    let (inner_i, idxl_i, srcd_i) = (kernel_int(inner)?, kernel_int(idx_len)?, kernel_int(src_d)?);
     let es_i = src.dtype().size_in_bytes() as i32;
     macro_rules! go {
         ($s:expr, $ix:expr, $t:ty, $variant:ident) => {{
@@ -330,7 +331,7 @@ pub fn gather_storage(
         shared_mem_bytes: 0,
     };
     let n_l = n_out as i64;
-    let (inner_i, idxd_i, srcd_i) = (inner as i32, idx_d as i32, src_d as i32);
+    let (inner_i, idxd_i, srcd_i) = (kernel_int(inner)?, kernel_int(idx_d)?, kernel_int(src_d)?);
     let es_i = src.dtype().size_in_bytes() as i32;
     macro_rules! go {
         ($s:expr, $ix:expr, $t:ty, $variant:ident) => {{
@@ -397,7 +398,7 @@ pub fn where_f32(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     macro_rules! go {
         ($c:expr) => {{
             let mut b = stream.launch_builder(&func);
@@ -422,12 +423,15 @@ pub fn pow_f32(dev: &CudaDevice, x: &CudaSlice<f32>, e: f32, n: usize) -> Result
     let func = dev.elementwise_fn("native_pow_f32")?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "pow", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let n_i = n as i32;
+    let n_i = kernel_int(n)?;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);
@@ -463,6 +467,9 @@ pub fn reduce_dim_f32(
     })?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "reduce", || unsafe { stream.alloc::<f32>(n) })?;
+    if n == 0 {
+        return Ok(out);
+    }
     let cfg = LaunchConfig {
         grid_dim: if blocked {
             (n as u32, 1, 1)
@@ -472,7 +479,7 @@ pub fn reduce_dim_f32(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (outer_i, red_i, inner_i) = (outer as i32, red as i32, inner as i32);
+    let (outer_i, red_i, inner_i) = (kernel_int(outer)?, kernel_int(red)?, kernel_int(inner)?);
     let mut b = stream.launch_builder(&func);
     b.arg(x);
     b.arg(&out);

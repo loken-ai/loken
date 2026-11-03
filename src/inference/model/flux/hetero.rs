@@ -1371,16 +1371,9 @@ impl HeteroFlux {
             if let Some(p) = ocl_pipelines.as_ref().filter(|_| ocl_count > 0) {
                 let mlp_sz = (cfg.hidden_size as f64 * cfg.mlp_ratio) as usize;
                 let head_dim = cfg.hidden_size / cfg.num_heads;
-                // Max sequence lengths: img=1024 (32x32 patches), txt=512 (T5 max)
-                let scratch = OclFluxScratch::new(
-                    1024,
-                    512,
-                    cfg.hidden_size,
-                    mlp_sz,
-                    cfg.num_heads,
-                    head_dim,
-                    p,
-                )?;
+                // Starts at the smallest sequences and grows to the longest request seen.
+                let scratch =
+                    OclFluxScratch::new(1, 1, cfg.hidden_size, mlp_sz, cfg.num_heads, head_dim, p)?;
                 info!("HeteroFlux: OpenCL scratch buffers allocated");
                 (ocl_pipelines, Some(std::sync::Mutex::new(scratch)))
             } else {
@@ -1785,6 +1778,9 @@ impl crate::inference::model::flux::sampling::WithForward for HeteroFlux {
 
                 let img_seq = img.dim(1)?;
                 let txt_seq = txt.dim(1)?;
+                scratch
+                    .ensure_capacity(img_seq, txt_seq, p)
+                    .map_err(|e| crate::tensor::Error::msg(format!("OclFluxScratch: {e}")))?;
 
                 // Upload tensors to OpenCL buffers
                 tensor_to_ocl_buf(&img, &mut scratch.img_buf, p)?;
@@ -1901,7 +1897,7 @@ impl HeteroFlux {
     fn process_single_blocks(
         &self,
         mut seq: Tensor,
-        _txt_len: usize,
+        txt_len: usize,
         start_idx: usize,
         cond_cache: &HashMap<String, (Tensor, Tensor)>,
     ) -> Result<Tensor> {
@@ -1931,6 +1927,9 @@ impl HeteroFlux {
 
                 let seq_len = seq.dim(1)?;
                 let dim = self.cfg.hidden_size;
+                scratch
+                    .ensure_capacity(seq_len.saturating_sub(txt_len), txt_len, p)
+                    .map_err(|e| crate::tensor::Error::msg(format!("OclFluxScratch: {e}")))?;
 
                 // Upload seq to merged_buf
                 tensor_to_ocl_buf(&seq, &mut scratch.merged_buf, p)?;

@@ -34,6 +34,8 @@ Messages are quoted as printed, and `...` stands for varying text.
 | `400` with `the prompt is N tokens and the model's context window is M; shorten the conversation or load the model with a larger num_ctx` | The prompt exceeds the window the model loaded with. | Shorten the prompt, or send a larger `num_ctx`. |
 | `400` with `` `model` '...' contains invalid characters `` | The name holds a space, a control character, a backslash, `..`, or starts with `/` or `.`. | Use the name `GET /api/tags` lists. |
 | The log says `...: placement failed (...); trying the host` | The cards could not take the model. It loads on the host, which decodes slower. | Free card memory, or pick a smaller quantisation. |
+| `vulkan: a buffer of N bytes exceeds the device limits (storage binding M bytes, allocation K bytes)` | A weight or a buffer is larger than the Vulkan device binds or allocates in one piece. | Pick a smaller quantisation, or leave `vulkan` out of `--backends`. |
+| `N heads in M groups` | The `N` query heads do not split evenly over the `M` key/value heads. The OpenCL stack refuses the layout. | Leave `opencl` out of `--backends`. |
 
 ## Out of memory
 

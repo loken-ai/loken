@@ -297,9 +297,25 @@ impl DevPos {
     }
 }
 
+/// Whether a token's quantised V bytes can be scattered by the device-position kernel,
+/// which moves 4 bytes per thread.
+pub fn v_scatter_words_ok(token_bytes: usize) -> bool {
+    token_bytes > 0 && token_bytes.is_multiple_of(4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_v_scatter_takes_whole_4_byte_words_only() {
+        // A token holds n_kv * (head_dim / 32) blocks of 18 (Q4_0) or 34 (Q8_0) bytes.
+        assert!(v_scatter_words_ok(8 * 18));
+        assert!(v_scatter_words_ok(6 * 34));
+        assert!(!v_scatter_words_ok(0));
+        assert!(!v_scatter_words_ok(3 * 18));
+        assert!(!v_scatter_words_ok(5 * 34));
+    }
 
     #[test]
     fn a_trim_unprimes_and_releases_the_graph() {

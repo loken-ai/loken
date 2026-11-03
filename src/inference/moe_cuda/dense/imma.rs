@@ -276,20 +276,23 @@ pub fn moe_q4k_imma_m8_down_reduce(
     let (e_i, t_i) = (num_experts as i32, topk as i32);
     let (m_i, h_i, k_i) = (size_m as i32, hidden as i32, size_k as i32);
     unsafe {
-        loken_moe_q4k_imma_m8_down(
-            weight_ptr as *const c_void,
-            q81_alloc.device_ptr(q81_alloc.stream()).0 as *const c_void,
-            so_ptr,
-            ex_ptr,
-            tw_ptr,
-            out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
-            e_i,
-            t_i,
-            m_i,
-            h_i,
-            k_i,
-            stream,
-        );
+        crate::inference::kernel::launch_status(
+            loken_moe_q4k_imma_m8_down(
+                weight_ptr as *const c_void,
+                q81_alloc.device_ptr(q81_alloc.stream()).0 as *const c_void,
+                so_ptr,
+                ex_ptr,
+                tw_ptr,
+                out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
+                e_i,
+                t_i,
+                m_i,
+                h_i,
+                k_i,
+                stream,
+            ),
+            "loken_moe_q4k_imma_m8_down",
+        )?;
     }
     let storage = CudaStorage::wrap_cuda_slice(out_alloc, dev.clone());
     tensor_from_cuda_storage(storage, (n_real_tokens, hidden))

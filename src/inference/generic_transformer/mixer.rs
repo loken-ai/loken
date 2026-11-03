@@ -941,6 +941,13 @@ pub enum DeltaProj {
     },
 }
 
+/// Whether the card recurrence kernels serve these head dimensions.
+/// The state is `[v_dim, k_dim]` per head and the kernels hold it square.
+/// They instantiate 64, 128 and 256.
+pub(crate) fn delta_net_head_dim_served(k_dim: usize, v_dim: usize) -> bool {
+    k_dim == v_dim && matches!(v_dim, 64 | 128 | 256)
+}
+
 /// Delta-rule dimensions, from the file's `ssm.*` metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaDims {
@@ -1140,7 +1147,7 @@ impl GatedDeltaNet {
     /// its state in place.
     pub fn steps_in_place(&self, device: &Device) -> bool {
         let d = self.dims;
-        device.is_cuda() && d.k_dim == d.v_dim && matches!(d.v_dim, 64 | 128 | 256)
+        device.is_cuda() && delta_net_head_dim_served(d.k_dim, d.v_dim)
     }
 
     /// `(qkv, z, alpha, beta)` of `x`, in the projection's dtype.
@@ -1206,8 +1213,7 @@ impl GatedDeltaNet {
         }
         let d = self.dims;
         #[cfg(feature = "gpu")]
-        if b == 1 && x.device().is_cuda() && d.k_dim == d.v_dim && matches!(d.v_dim, 64 | 128 | 256)
-        {
+        if b == 1 && x.device().is_cuda() && delta_net_head_dim_served(d.k_dim, d.v_dim) {
             return self.forward_card(x, seq);
         }
         if b == 1 && !x.device().is_cuda() {
@@ -1711,6 +1717,16 @@ impl GenericTransformerLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_card_recurrence_serves_equal_instantiated_head_dims_only() {
+        for d in [64, 128, 256] {
+            assert!(delta_net_head_dim_served(d, d));
+        }
+        for (k, v) in [(64, 128), (128, 64), (96, 96), (0, 0), (512, 512)] {
+            assert!(!delta_net_head_dim_served(k, v));
+        }
+    }
 
     #[test]
     fn a_restart_zeroes_the_card_state_where_it_lies() {
