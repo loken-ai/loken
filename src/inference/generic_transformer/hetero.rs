@@ -539,6 +539,16 @@ impl GenericHeteroTransformer {
         }
     }
 
+    /// The host copy of the output head, an error when a card copy serves the head and none was
+    /// built.
+    pub(crate) fn host_head(&self) -> Result<&crate::tensor::quantized::QMatMul> {
+        self.output_proj.as_ref().ok_or_else(|| {
+            crate::tensor::Error::msg(
+                "the output head lives on a card and has no host copy".to_string(),
+            )
+        })
+    }
+
     /// Adds the per-vocabulary logit bias when the architecture carries one.
     /// EVERY site that produces logits must route through this - the engine has
     /// several, and one that skips it is wrong without failing.
@@ -1428,7 +1438,7 @@ impl GenericHeteroTransformer {
             let host = f
                 .to_dtype(crate::tensor::DType::F32)?
                 .to_device(&Device::Cpu)?;
-            self.output_proj.forward(&host)?
+            self.host_head()?.forward(&host)?
         };
         self.apply_output_bias(logits)
     }
@@ -2630,7 +2640,9 @@ impl GenericHeteroTransformer {
             let normed = normed.reshape((b * n, self.config.embedding_length))?;
             let out = match (&self.output_proj_cuda_qmm, &self.output_proj_dev) {
                 (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?)?,
-                _ => self.output_proj.forward(&normed.to_device(&Device::Cpu)?)?,
+                _ => self
+                    .host_head()?
+                    .forward(&normed.to_device(&Device::Cpu)?)?,
             };
             let vocab = out.dim(1)?;
             if all_positions {
@@ -2704,7 +2716,7 @@ impl GenericHeteroTransformer {
             } else {
                 normed.i((.., seq_len - 1, ..))?
             };
-            self.output_proj.forward(&src)?
+            self.host_head()?.forward(&src)?
         };
         logits = self.apply_output_bias(logits)?;
 
@@ -3014,7 +3026,9 @@ impl GenericHeteroTransformer {
         let normed = normed.reshape((ROWS, self.config.embedding_length))?;
         let logits = match (&self.output_proj_cuda_qmm, &self.output_proj_dev) {
             (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?)?,
-            _ => self.output_proj.forward(&normed.to_device(&Device::Cpu)?)?,
+            _ => self
+                .host_head()?
+                .forward(&normed.to_device(&Device::Cpu)?)?,
         };
         let guessed = logits
             .to_dtype(crate::tensor::DType::F32)?

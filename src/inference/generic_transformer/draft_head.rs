@@ -412,7 +412,7 @@ impl GenericHeteroTransformer {
             .or(self.output_proj_cuda_qmm.as_ref());
         match (proj, &self.output_proj_dev) {
             (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?),
-            _ => self.output_proj.forward(&normed.to_device(&Device::Cpu)?),
+            _ => self.host_head()?.forward(&normed.to_device(&Device::Cpu)?),
         }
     }
 

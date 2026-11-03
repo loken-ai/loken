@@ -3706,7 +3706,7 @@ impl GenericHeteroTransformer {
                 )
             }
         };
-        let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?;
+        let output_proj = Some(crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?);
         info!("✅ Loaded output norm and projection on CPU");
 
         // -- 2b. Load PLE globals (Gemma4) - optional ---------------------
@@ -5400,21 +5400,25 @@ impl GenericHeteroTransformer {
         }
 
         // LM head: lm_head.weight, or embed_tokens if tied. F16 on the last layer's card for
-        // the cutlass path; Q8_0 on CPU as the required fallback `output_proj`. Placed before
-        // the layers, so the room each layer's second Marlin layout keeps free need not
-        // count it.
-        let lm_cpu_f32 = st.load(head_name, &Device::Cpu)?.to_dtype(DType::F32)?;
-        let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(
-            crate::tensor::quantized::QTensor::quantize(
-                &lm_cpu_f32,
-                crate::tensor::quantized::GgmlDType::Q8_0,
-            )?,
-        )?;
-        // A SECOND copy of the head, dense F16, beside the quantised one - the largest
-        // thing this branch decides, and a move rather than a launch.
-        let (output_proj_cuda, output_proj_dev) = if device.runs_as_card() {
+        // the cutlass path. A Q8_0 copy on the host, `output_proj`, only where no card copy
+        // serves the head. Placed before the layers, so the room each layer's second Marlin
+        // layout keeps free need not count it.
+        let head_stored = st.load(head_name, &Device::Cpu)?;
+        let card_head = device.runs_as_card();
+        // This load builds neither an output mixer nor a draft head.
+        let output_proj = if host_head_needed(card_head, false, false) {
+            Some(crate::tensor::quantized::QMatMul::from_qtensor(
+                crate::tensor::quantized::QTensor::quantize(
+                    &head_stored.to_dtype(DType::F32)?,
+                    crate::tensor::quantized::GgmlDType::Q8_0,
+                )?,
+            )?)
+        } else {
+            None
+        };
+        let (output_proj_cuda, output_proj_dev) = if card_head {
             (
-                Some(lm_cpu_f32.to_dtype(DType::F16)?.to_device(&device)?),
+                Some(head_stored.to_dtype(DType::F16)?.to_device(&device)?),
                 Some(device.clone()),
             )
         } else {
@@ -5623,6 +5627,16 @@ impl GenericHeteroTransformer {
     }
 }
 
+/// Whether the host Q8_0 copy of the output head has to be built.
+///
+/// The card copy serves every token when it exists.
+/// An output mixer and a draft head read the head through a quantised card matmul only,
+/// so with a dense card copy they read the host copy.
+/// The logit bias is added to the logits after the head and never reads it.
+fn host_head_needed(card_copy: bool, output_mixer: bool, draft_head: bool) -> bool {
+    !card_copy || output_mixer || draft_head
+}
+
 /// Whether a host spill of `want` bytes fits the budget the planner measured.
 ///
 /// Separated from the loader so the REFUSING side can be tested: exercising it
@@ -5635,6 +5649,36 @@ impl GenericHeteroTransformer {
 /// a number that was never measured.
 fn host_spill_fits(want: u64, budget: u64) -> bool {
     budget == 0 || want <= budget
+}
+
+#[cfg(test)]
+mod host_head_tests {
+    use super::host_head_needed;
+
+    #[test]
+    fn a_head_on_the_host_builds_the_host_copy() {
+        assert!(host_head_needed(false, false, false));
+    }
+
+    #[test]
+    fn a_card_copy_alone_skips_the_host_copy() {
+        assert!(!host_head_needed(true, false, false));
+    }
+
+    #[test]
+    fn an_output_mixer_keeps_the_host_copy_beside_the_card_copy() {
+        assert!(host_head_needed(true, true, false));
+    }
+
+    #[test]
+    fn a_draft_head_keeps_the_host_copy_beside_the_card_copy() {
+        assert!(host_head_needed(true, false, true));
+    }
+
+    #[test]
+    fn a_host_head_stays_built_whatever_else_is_present() {
+        assert!(host_head_needed(false, true, true));
+    }
 }
 
 #[cfg(test)]

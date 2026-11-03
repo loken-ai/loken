@@ -219,7 +219,10 @@ fn a_load_keeps_every_class_in_its_stored_format_unless_declared() {
                 *c == "output" && *from == stored && *to == got && !why.is_empty()
             })
         };
-        match &m.output_proj {
+        let Some(host_head) = m.output_proj.as_ref() else {
+            panic!("{stored}: the host copy of the output head is missing");
+        };
+        match host_head {
             crate::tensor::quantized::QMatMul::QTensor(q) if q.dtype() == dtype => {}
             crate::tensor::quantized::QMatMul::Tensor(t)
             | crate::tensor::quantized::QMatMul::TensorF16(t)

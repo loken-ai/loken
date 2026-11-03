@@ -504,7 +504,8 @@ pub struct GenericHeteroTransformer {
     /// The layers the plan gives an OpenCL device, which run there likewise.
     opencl: opencl_layers::OpenClLayers,
     output_norm: WeightedNorm, // CPU or CUDA - RmsNorm or LayerNorm-with-bias
-    output_proj: crate::tensor::quantized::QMatMul, // CPU fallback
+    /// The host copy of the output head. `None` when a card copy serves the head.
+    output_proj: Option<crate::tensor::quantized::QMatMul>,
     /// Per-vocabulary bias added to the logits (`output.bias`). Present on the
     /// phi2/GPT-NeoX family, absent on most others. It shifts each vocabulary
     /// entry independently, so dropping it leaves the residual stream exact and

@@ -2669,7 +2669,7 @@ impl GenericHeteroTransformer {
             let hidden_cpu = hidden.to_device(&Device::Cpu)?;
             let normed = self.output_norm.forward(&hidden_cpu)?;
             let last = normed.i((.., 0, ..))?;
-            self.output_proj.forward(&last)?
+            self.host_head()?.forward(&last)?
         };
         logits = self.apply_output_bias(logits)?;
 
