@@ -3591,6 +3591,7 @@ mod tests {
                 &host,
             )
             .unwrap();
+            // CONVERSION: the test builds the expert stack in the dtype under test.
             QTensor::quantize_onto(&w, dtype, &host).unwrap()
         }
         MoeWeights {

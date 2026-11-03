@@ -254,6 +254,7 @@ pub(super) fn repacked_q4_0_gemv_matches_vec_dot() {
         *w = BlockQ4_0::dot(&rows[r * nb..r * nb + nb], &act);
     }
     // repacked group GEMV; check the AVX2 kernel AND the scalar reference.
+    // CONVERSION: the test repacks the rows to check the grouped kernel against the per-row dot.
     let packed = repack_q4_0::repack(&rows, n, nb);
     let mut got = vec![0f32; n];
     let mut got_scalar = vec![0f32; n];
@@ -328,6 +329,7 @@ pub(super) fn repacked_q5_0_matches_vec_dot_and_oracle() {
             qs,
         });
     }
+    // CONVERSION: the test repacks the rows to check the grouped kernel against the per-row dot.
     let packed = repack_q5_0::repack(&rows, n, nb);
     // Oracle vs production per-column dot (row 0).
     let a0 = &acts[0..nb];
@@ -415,6 +417,7 @@ pub(super) fn q5_0_full_matmul_matches_reference() {
     let mut want = vec![0f32; m * n];
     matmul_bytes(GgmlDType::Q5_0, (m, k, n), &lhs, wbytes, &mut want).unwrap();
 
+    // CONVERSION: the test repacks the weights to check the tiled GEMM against the reference matmul.
     let g8 = repack_q5_0::repack(&wq, n, nb);
     let mut got = vec![0f32; m * n];
     matmul_q5_0_repacked_tiled((m, k, n), &lhs, &g8, &mut got).unwrap();
@@ -467,6 +470,7 @@ pub(super) fn repacked_q8_0_matches_vec_dot_and_oracle() {
             qs,
         });
     }
+    // CONVERSION: the test repacks the rows to check the grouped kernel against the per-row dot.
     let packed = repack_q8_0::repack(&rows, n, nb);
     // Oracle vs production per-column dot (row 0).
     let a0 = &acts[0..nb];
@@ -547,6 +551,7 @@ pub(super) fn q8_0_full_matmul_matches_reference() {
     let mut want = vec![0f32; m * n];
     matmul_bytes(GgmlDType::Q8_0, (m, k, n), &lhs, wbytes, &mut want).unwrap();
 
+    // CONVERSION: the test repacks the weights to check the tiled GEMM against the reference matmul.
     let g8 = repack_q8_0::repack(&wq, n, nb);
     let mut got = vec![0f32; m * n];
     matmul_q8_0_repacked_tiled((m, k, n), &lhs, &g8, &mut got).unwrap();
