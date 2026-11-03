@@ -704,3 +704,117 @@ fn batched_argmax_breaks_ties_to_the_lowest_index() {
         assert_eq!(got, want, "f16, vocab {vocab}");
     }
 }
+
+/// The prefill input stage in one launch against the separate launches it replaces: the head
+/// norm as `Tensor::rms_norm` on an F16 tensor, then `rope_apply`, then the rows of the store.
+/// It runs with and without the norms and for both pairings of the rotation. Q, k and v must
+/// equal the separate launches exactly, and the store holds k and v at the slot of each row and
+/// nothing elsewhere. The cases cover a head of 64, a fused projection of 4096 hidden values with
+/// 32 q heads and 8 kv heads at 130 rows, and heads of 80 and 96 values, whose block has idle
+/// threads.
+#[test]
+fn prefill_rope_kv_write_f16_matches_the_separate_launches() {
+    use crate::inference::cache::paged_attention::{rope_apply, rope_cos_sin};
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    // (rows, q heads, kv heads, head width)
+    let cases = [
+        (5usize, 4usize, 2usize, 64usize),
+        (130, 32, 8, 128),
+        (7, 4, 2, 80),
+        (6, 3, 1, 96),
+    ];
+    let host = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+    for (rows, nh, nkv, hd) in cases {
+        let (qd, kvd) = (nh * hd, nkv * hd);
+        let width = qd + 2 * kvd;
+        let values: Vec<half::f16> = (0..rows * width)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.0137).sin() * 2.0))
+            .collect();
+        let qkv = Tensor::from_slice(&values, (rows, width), &dev).unwrap();
+        let positions: Vec<usize> = (0..rows).collect();
+        let (cos, sin) = rope_cos_sin(&positions, hd, 10000.0, &dev, DType::F16).unwrap();
+        // Rows land in reverse order, after 5 slots that stay empty.
+        let num_slots = rows + 5;
+        let slots: Vec<i32> = (0..rows).map(|r| (num_slots - 1 - r) as i32).collect();
+        let slot_dev = Tensor::from_vec(slots.clone(), &[rows][..], &dev).unwrap();
+        let weight = |seed: f32| -> Tensor {
+            let w: Vec<f32> = (0..hd)
+                .map(|i| 0.5 + ((i as f32) * seed).cos().abs())
+                .collect();
+            Tensor::from_slice(&w, (hd,), &dev).unwrap()
+        };
+        let (qw, kw) = (weight(0.3), weight(0.7));
+        let eps = 1e-6f32;
+        for interleaved in [false, true] {
+            for with_norms in [true, false] {
+                let label =
+                    format!("rows {rows} hd {hd} interleaved {interleaved} norms {with_norms}");
+                let kp = Tensor::zeros_on((num_slots, kvd), DType::F16, &dev).unwrap();
+                let vp = Tensor::zeros_on((num_slots, kvd), DType::F16, &dev).unwrap();
+                let norms = with_norms.then(|| [(&qw, eps), (&kw, eps)]);
+                let (q, k, v) = prefill_rope_kv_write_f16(
+                    [(&qkv, 0), (&qkv, qd), (&qkv, qd + kvd)],
+                    norms,
+                    &cos,
+                    &sin,
+                    interleaved,
+                    &slot_dev,
+                    &slots,
+                    &kp,
+                    &vp,
+                    nh,
+                    nkv,
+                    hd,
+                )
+                .unwrap()
+                .expect("the fused launch fits");
+                let part = |col: usize, n: usize, heads: usize| {
+                    qkv.narrow(1, col, n)
+                        .unwrap()
+                        .reshape(&[rows, heads, hd][..])
+                        .unwrap()
+                };
+                let (mut qh, mut kh) = (part(0, qd, nh), part(qd, kvd, nkv));
+                if with_norms {
+                    qh = qh.contiguous().unwrap().rms_norm(&qw, eps).unwrap();
+                    kh = kh.contiguous().unwrap().rms_norm(&kw, eps).unwrap();
+                }
+                let q_ref = rope_apply(&qh, &cos, &sin, interleaved).unwrap();
+                let k_ref = rope_apply(&kh, &cos, &sin, interleaved).unwrap();
+                let v_ref = part(qd + kvd, kvd, nkv);
+                assert_eq!(host(&q), host(&q_ref), "q, {label}");
+                assert_eq!(host(&k), host(&k_ref), "k, {label}");
+                assert_eq!(host(&v), host(&v_ref), "v, {label}");
+                let (kp_host, vp_host) = (host(&kp), host(&vp));
+                let (k_host, v_host) = (host(&k), host(&v));
+                for slot in 0..num_slots {
+                    let row = slots.iter().position(|&s| s as usize == slot);
+                    for j in 0..kvd {
+                        let (gk, gv) = (kp_host[slot * kvd + j], vp_host[slot * kvd + j]);
+                        match row {
+                            Some(r) => {
+                                assert_eq!(
+                                    gk,
+                                    k_host[r * kvd + j],
+                                    "store k, slot {slot}, {label}"
+                                );
+                                assert_eq!(
+                                    gv,
+                                    v_host[r * kvd + j],
+                                    "store v, slot {slot}, {label}"
+                                );
+                            }
+                            None => assert!(
+                                gk.to_f32() == 0.0 && gv.to_f32() == 0.0,
+                                "slot {slot} was not written, {label}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

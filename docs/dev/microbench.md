@@ -18,10 +18,11 @@ cargo bench --features cuda,microbench --bench microbench -- list
 cargo bench --features cuda,microbench --bench microbench -- crossing --shapes-from /models/large.gguf
 cargo bench --features cuda,microbench --bench microbench -- expert-upload --shapes-from /models/large.gguf --json results/upload.json
 cargo bench --features cuda,microbench --bench microbench -- expert-read --shapes-from /models/large.gguf --layer 10
+cargo bench --features cuda,microbench --bench microbench -- prefill-layer --shapes-from /models/dense.gguf --json results/prefill-layer.json
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing` and `expert-upload`.
+A build without a GPU runtime omits `crossing`, `expert-upload` and `prefill-layer`.
 
 Arguments after `--`:
 
@@ -40,6 +41,10 @@ Arguments after `--`:
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, for `host-expert`. | iq2_xxs |
 | `--down-format` | The format of an expert's down weights, for `host-expert`. | q2_k |
+| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves. | 130 |
+| `--heads` | Query heads, without a file (`prefill-layer`). | the file's |
+| `--kv-heads` | Key-value heads, without a file (`prefill-layer`). | the file's, else the heads |
+| `--head-dim` | Elements of one head, without a file (`prefill-layer`). | the file's, else the hidden size over the heads |
 | `--pack` | Rows the packed variants of `crossing` move in one copy. | 8 |
 | `--file` | The file `expert-read` reads. | the shapes file |
 | `--offset` | Where the first expert read starts, when the file is not the shapes file. | 0 |
@@ -120,6 +125,31 @@ Its variants:
   Each runs through the thread pool in 3 regions, 1 thread per expert, and one after the other on 1 thread.
 - The same 4 experts on weights in the page cache of a mapped file, where a served model keeps them.
 - 4 and 6 experts per call through the function a decode calls for its host experts, on experts built as the store builds them.
+
+### prefill-layer
+
+`prefill-layer` runs the data movement of one layer of a prefill on synthetic F16 tensors.
+It measures what the separate launches of the layer loop cost against 1 fused launch.  
+It needs a card, and the heads from `--shapes-from` or from `--heads`, `--kv-heads` and `--head-dim`.
+
+One call is one layer: the copies of q, k and v out of the projections, the norms of q and k, the rotation of both, and the write of k and v into a paged store.  
+A call ends with a synchronisation of the card, so its time is the launches and the work together.
+
+Each variant name ends with its count of launches, read off the code path.  
+Its variants:
+
+- Old, separate projections, with the norms of q and k: 10 launches.
+- Old, one fused projection cut into q, k and v by copies, with the norms: 13 launches.
+- Old, separate projections, without norms: 4 launches.
+- New, separate projections, with the norms: 1 launch.
+- New, one fused projection read in place, with the norms: 1 launch.
+- New, separate projections, without norms: 1 launch.
+
+Each new variant carries in its note its speed against the old variant of the same inputs, by the median.  
+A new variant that does not fit the card or the widths says so in place of its figures.
+
+The rotation base only sets the angles and does not change the time.  
+Without a file it is 1.
 
 ### cache-policy
 

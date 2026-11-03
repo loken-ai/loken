@@ -30,6 +30,14 @@ cuda_launchers! {
     loken_paged_rope_f16(x: *const c_void, cos: *const c_void,
         sin: *const c_void, out: *mut c_void, outer: i32, heads: i32,
         hd: i32, rope_dim: i32, interleaved: i32);
+    loken_prefill_qk_rope_kv_f16(
+        q: *const c_void, k: *const c_void, v: *const c_void,
+        q_stride: i64, k_stride: i64, v_stride: i64,
+        q_weight: *const f32, k_weight: *const f32, q_eps: f32, k_eps: f32,
+        cos: *const c_void, sin: *const c_void,
+        q_out: *mut c_void, k_out: *mut c_void, v_out: *mut c_void,
+        kp: *mut c_void, vp: *mut c_void, slot_dev: *const i32,
+        rows: i32, n_head: i32, n_kv: i32, hd: i32, interleaved: i32);
     gptoss_flash_decode_f16(
         q: *const c_void, k: *const c_void, v: *const c_void,
         mask: *const f32, sinks: *const f32, out: *mut c_void, batch: i32,

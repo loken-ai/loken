@@ -119,6 +119,22 @@ pub fn paged_rope_f16(
 ) -> Result<Option<Tensor>> {
     Ok(None)
 }
+pub fn prefill_rope_kv_write_f16(
+    _srcs: [(&Tensor, usize); 3],
+    _norms: Option<[(&Tensor, f32); 2]>,
+    _cos: &Tensor,
+    _sin: &Tensor,
+    _interleaved: bool,
+    _slot_dev: &Tensor,
+    _slots: &[i32],
+    _kp: &Tensor,
+    _vp: &Tensor,
+    _n_head: usize,
+    _n_kv: usize,
+    _hd: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    Ok(None)
+}
 pub fn softplus_bias(_dt: &Tensor, _bias: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
 }

@@ -389,3 +389,127 @@ extern "C" void loken_paged_rope_f16(
         (const __half*)x, (const __half*)cos, (const __half*)sin, (__half*)out,
         outer, heads, hd, rope_dim, interleaved);
 }
+
+// Input stage of a prefill attention layer in one launch, one block per (row, head):
+//   q head: rope(rmsnorm(q) * q_weight) into q_out
+//   k head: rope(rmsnorm(k) * k_weight) into k_out and into the paged store Kp at the row's slot
+//   v head: v into v_out and into the paged store Vp at the row's slot
+// A null weight skips the norm of that group.
+// The norm is bit-identical to a cast to f32, fused_rmsnorm_f32, and a cast back to f16.
+// The block holds min(256, hd) rounded up to a power of two threads.
+// The norm output is rounded to f16 before the rotation, and the rotation rounds each operation
+// to f16, as the separate launches do.
+// The rotation covers the whole head: pair (i, i + hd/2), or (2i, 2i+1) when interleaved.
+// q, k and v point at the first element of their group in row 0 and are `*_stride` elements
+// apart from row to row. cos and sin are [rows, hd/2]. slot_dev holds one slot per row.
+extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
+    const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    long q_stride, long k_stride, long v_stride,
+    const float* __restrict__ q_weight, const float* __restrict__ k_weight,
+    float q_eps, float k_eps,
+    const __half* __restrict__ cos, const __half* __restrict__ sin,
+    __half* __restrict__ q_out, __half* __restrict__ k_out, __half* __restrict__ v_out,
+    __half* __restrict__ Kp, __half* __restrict__ Vp, const int* __restrict__ slot_dev,
+    int n_head, int n_kv, int hd, int interleaved
+) {
+    extern __shared__ float row[];
+    const long tok = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const __half* src;
+    const float* w = nullptr;
+    float eps = 0.0f;
+    __half* dst;
+    __half* store = nullptr;
+    bool rotate = true;
+    if (h < n_head) {
+        src = q + tok * q_stride + (long)h * hd;
+        w = q_weight;
+        eps = q_eps;
+        dst = q_out + (tok * n_head + h) * hd;
+    } else if (h < n_head + n_kv) {
+        const int head = h - n_head;
+        src = k + tok * k_stride + (long)head * hd;
+        w = k_weight;
+        eps = k_eps;
+        dst = k_out + (tok * n_kv + head) * hd;
+        store = Kp + (long)slot_dev[tok] * n_kv * hd + (long)head * hd;
+    } else {
+        const int head = h - n_head - n_kv;
+        src = v + tok * v_stride + (long)head * hd;
+        dst = v_out + (tok * n_kv + head) * hd;
+        store = Vp + (long)slot_dev[tok] * n_kv * hd + (long)head * hd;
+        rotate = false;
+    }
+    float local = 0.0f;
+    for (int d = tid; d < hd; d += blockDim.x) {
+        const float xv = __half2float(src[d]);
+        row[d] = xv;
+        local += xv * xv;
+    }
+    if (w != nullptr) {
+        // Same arithmetic as fused_rmsnorm_f32 on the values widened to f32:
+        // per-thread strided sums, a halving tree over blockDim.x entries, rsqrtf, x * rms * w.
+        float* tree = row + hd;
+        tree[tid] = local;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) tree[tid] += tree[tid + s];
+            __syncthreads();
+        }
+        const float rms = rsqrtf(tree[0] / (float)hd + eps);
+        for (int d = tid; d < hd; d += blockDim.x) {
+            row[d] = __half2float(__float2half(row[d] * rms * w[d]));
+        }
+    }
+    __syncthreads();
+    const int half = hd >> 1;
+    const __half* cr = cos + tok * half;
+    const __half* sr = sin + tok * half;
+    for (int d = tid; d < hd; d += blockDim.x) {
+        __half o;
+        if (!rotate) {
+            o = __float2half(row[d]);
+        } else {
+            // The pair index of lane d, and whether d is the first lane of its pair.
+            const int i = interleaved ? (d >> 1) : ((d < half) ? d : (d - half));
+            const bool first = interleaved ? ((d & 1) == 0) : (d < half);
+            const float x0 = interleaved ? row[2 * i] : row[i];
+            const float x1 = interleaved ? row[2 * i + 1] : row[i + half];
+            const float c = __half2float(cr[i]);
+            const float sn = __half2float(sr[i]);
+            if (first) {
+                const float a = __half2float(__float2half(x0 * c));
+                const float e = __half2float(__float2half(x1 * sn));
+                o = __float2half(a - e);
+            } else {
+                const float a = __half2float(__float2half(x0 * sn));
+                const float e = __half2float(__float2half(x1 * c));
+                o = __float2half(a + e);
+            }
+        }
+        dst[d] = o;
+        if (store != nullptr) store[d] = o;
+    }
+}
+
+extern "C" void loken_prefill_qk_rope_kv_f16(
+    const void* q, const void* k, const void* v,
+    long q_stride, long k_stride, long v_stride,
+    const float* q_weight, const float* k_weight, float q_eps, float k_eps,
+    const void* cos, const void* sin,
+    void* q_out, void* k_out, void* v_out, void* Kp, void* Vp, const int* slot_dev,
+    int rows, int n_head, int n_kv, int hd, int interleaved, cudaStream_t stream
+) {
+    // The block size of the row norm kernel: min(256, hd) rounded up to a power of two.
+    // Shared memory holds the head as f32 and one partial sum per thread.
+    int block = 1;
+    while (block < hd && block < 256) block <<= 1;
+    const int shmem = (hd + block) * (int)sizeof(float);
+    dim3 grid(rows, n_head + 2 * n_kv, 1);
+    loken_prefill_qk_rope_kv_f16_kernel<<<grid, block, shmem, stream>>>(
+        (const __half*)q, (const __half*)k, (const __half*)v, q_stride, k_stride, v_stride,
+        q_weight, k_weight, q_eps, k_eps, (const __half*)cos, (const __half*)sin,
+        (__half*)q_out, (__half*)k_out, (__half*)v_out, (__half*)Kp, (__half*)Vp, slot_dev,
+        n_head, n_kv, hd, interleaved);
+}

@@ -35,6 +35,55 @@ fn note_if_non_finite(stage: &str, x: &Tensor) {
     }
 }
 
+/// Whether the input stage of a prefill layer runs as one launch: the head norms, the
+/// rotation, and the write of k and v into the paged store.
+///
+/// It needs a card, activations and a store held in F16, a head of even width, and head norms
+/// that come as a pair or not at all.
+fn prefill_stage_fused(
+    on_card: bool,
+    activation: DType,
+    store: DType,
+    head_dim: usize,
+    norms_paired: bool,
+) -> bool {
+    on_card
+        && activation == DType::F16
+        && store == DType::F16
+        && head_dim > 0
+        && head_dim.is_multiple_of(2)
+        && norms_paired
+}
+
+/// What the projections of a prefill layer gave: one buffer holding q, k and v side by side,
+/// or one tensor for each.
+enum PrefillProjection {
+    Fused(Tensor),
+    Split(Tensor, Tensor, Tensor),
+}
+
+impl PrefillProjection {
+    /// The 3 groups as a kernel reads them: the tensor and the column the group starts at.
+    fn sources(&self, q_width: usize, kv_width: usize) -> [(&Tensor, usize); 3] {
+        match self {
+            Self::Fused(qkv) => [(qkv, 0), (qkv, q_width), (qkv, q_width + kv_width)],
+            Self::Split(q, k, v) => [(q, 0), (k, 0), (v, 0)],
+        }
+    }
+
+    /// q, k and v as 3 tensors.
+    fn split(self, q_width: usize, kv_width: usize) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Fused(qkv) => Ok((
+                qkv.narrow(1, 0, q_width)?,
+                qkv.narrow(1, q_width, kv_width)?,
+                qkv.narrow(1, q_width + kv_width, kv_width)?,
+            )),
+            Self::Split(q, k, v) => Ok((q, k, v)),
+        }
+    }
+}
+
 /// A prompt whose first `cached_len` tokens the paged cache already holds: the prompt, the
 /// paged slots of the tokens after them, and the block table that addresses the prefix.
 pub struct CachedPrompt<'a> {
@@ -1691,6 +1740,29 @@ impl GenericHeteroTransformer {
         )?;
 
         let mut slot_index: Vec<(usize, Device, Tensor)> = Vec::new();
+        // The slot of each row, read on the card by the kernel that writes the store.
+        // The slots as I32, kept on the host too for the kernel's range check.
+        let slots_i32: Option<Vec<i32>> = if dev.is_cuda() && cdt == DType::F16 {
+            let converted = slots
+                .iter()
+                .map(|&s| i32::try_from(s).ok())
+                .collect::<Option<Vec<_>>>();
+            if converted.is_none() {
+                static NOTED: std::sync::Once = std::sync::Once::new();
+                NOTED.call_once(|| {
+                    tracing::debug!(
+                        "fused prefill input stage declined (a slot does not fit an i32), separate launches run"
+                    );
+                });
+            }
+            converted
+        } else {
+            None
+        };
+        let slot_dev = match slots_i32.as_ref() {
+            Some(v) => Some(Tensor::from_vec(v.clone(), &[t][..], &dev)?),
+            None => None,
+        };
         note_if_non_finite("the embedding, before any layer", &x);
         // On a card in half precision the residual add and the norm that follows it run as one
         // kernel, the activation as another: the next layer's attention norm comes from the
@@ -1704,16 +1776,12 @@ impl GenericHeteroTransformer {
                 None => layer.attn_norm.forward(&x)?.to_dtype(cdt)?,
             };
             let (qd, kvd) = (nh * hd, nkv * hd);
-            let (q, k, v) = if let Some(qkvw) = layer.attn_qkv.as_ref() {
+            let projected = if let Some(qkvw) = layer.attn_qkv.as_ref() {
                 let mut qkv = qkvw.forward(&hn)?;
                 if let Some(bias) = layer.attn_qkv_bias.as_ref() {
                     qkv = qkv.broadcast_add(&bias.to_dtype(qkv.dtype())?)?;
                 }
-                (
-                    qkv.narrow(1, 0, qd)?,
-                    qkv.narrow(1, qd, kvd)?,
-                    qkv.narrow(1, qd + kvd, kvd)?,
-                )
+                PrefillProjection::Fused(qkv)
             } else {
                 let mut q = layer.attn_q.as_ref().unwrap().forward(&hn)?;
                 let mut k = layer.attn_k.as_ref().unwrap().forward(&hn)?;
@@ -1727,53 +1795,101 @@ impl GenericHeteroTransformer {
                 if let Some(bias) = layer.attn_v_bias.as_ref() {
                     v = v.broadcast_add(&bias.to_dtype(v.dtype())?)?;
                 }
-                (q, k, v)
+                PrefillProjection::Split(q, k, v)
             };
-            let qh = q.to_dtype(cdt)?.reshape(&[t, nh, hd][..])?;
-            let qh = if let Some(qn) = layer.attn_q_norm.as_ref() {
-                qn.forward(&qh.contiguous()?)?
-            } else {
-                qh
+            // One launch norms and rotates q and k, and writes k and v into the store.
+            let norms = match (layer.attn_q_norm.as_ref(), layer.attn_k_norm.as_ref()) {
+                (Some(qn), Some(kn)) => Some([
+                    (qn.weight(), qn.eps() as f32),
+                    (kn.weight(), kn.eps() as f32),
+                ]),
+                _ => None,
             };
-            let kh = k.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
-            let kh = if let Some(kn) = layer.attn_k_norm.as_ref() {
-                kn.forward(&kh.contiguous()?)?
-            } else {
-                kh
+            let norms_paired =
+                norms.is_some() || (layer.attn_q_norm.is_none() && layer.attn_k_norm.is_none());
+            let staged = match slot_dev.as_ref().zip(slots_i32.as_deref()) {
+                Some((slot_dev, slots_i32))
+                    if prefill_stage_fused(
+                        dev.is_cuda(),
+                        cdt,
+                        stores[li].k().dtype(),
+                        hd,
+                        norms_paired,
+                    ) =>
+                {
+                    crate::inference::kernel::fused::prefill_rope_kv_write_f16(
+                        projected.sources(qd, kvd),
+                        norms,
+                        &rcos,
+                        &rsin,
+                        self.config.flags.use_rope_i,
+                        slot_dev,
+                        slots_i32,
+                        stores[li].k(),
+                        stores[li].v(),
+                        nh,
+                        nkv,
+                        hd,
+                    )?
+                }
+                _ => None,
             };
-            let q_rot = crate::inference::cache::paged_attention::rope_apply(
-                &qh,
-                &rcos,
-                &rsin,
-                self.config.flags.use_rope_i,
-            )?;
-            let k_rot = crate::inference::cache::paged_attention::rope_apply(
-                &kh,
-                &rcos,
-                &rsin,
-                self.config.flags.use_rope_i,
-            )?;
-            let v_f = v.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
-            // persist all T positions' K/V for the subsequent decode phase
-            // The scatter index depends on the slots, the row width and the card: built once for
-            // each of them in the forward, not once per layer.
-            let feat = stores[li].feat();
-            let card = k_rot.device();
-            let at = match slot_index
-                .iter()
-                .position(|(f, d, _)| *f == feat && d.same_device(&card))
-            {
-                Some(at) => at,
+            let (q_rot, k_rot, v_f) = match staged {
+                Some(rows) => rows,
                 None => {
-                    slot_index.push((feat, card.clone(), stores[li].slot_index(&slots, &card)?));
-                    slot_index.len() - 1
+                    let (q, k, v) = projected.split(qd, kvd)?;
+                    let qh = q.to_dtype(cdt)?.reshape(&[t, nh, hd][..])?;
+                    let qh = if let Some(qn) = layer.attn_q_norm.as_ref() {
+                        qn.forward(&qh.contiguous()?)?
+                    } else {
+                        qh
+                    };
+                    let kh = k.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
+                    let kh = if let Some(kn) = layer.attn_k_norm.as_ref() {
+                        kn.forward(&kh.contiguous()?)?
+                    } else {
+                        kh
+                    };
+                    let q_rot = crate::inference::cache::paged_attention::rope_apply(
+                        &qh,
+                        &rcos,
+                        &rsin,
+                        self.config.flags.use_rope_i,
+                    )?;
+                    let k_rot = crate::inference::cache::paged_attention::rope_apply(
+                        &kh,
+                        &rcos,
+                        &rsin,
+                        self.config.flags.use_rope_i,
+                    )?;
+                    let v_f = v.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
+                    // persist all T positions' K/V for the subsequent decode phase
+                    // The scatter index depends on the slots, the row width and the card: built
+                    // once for each of them in the forward, not once per layer.
+                    let feat = stores[li].feat();
+                    let card = k_rot.device();
+                    let at = match slot_index
+                        .iter()
+                        .position(|(f, d, _)| *f == feat && d.same_device(&card))
+                    {
+                        Some(at) => at,
+                        None => {
+                            slot_index.push((
+                                feat,
+                                card.clone(),
+                                stores[li].slot_index(&slots, &card)?,
+                            ));
+                            slot_index.len() - 1
+                        }
+                    };
+                    stores[li].write_indexed(
+                        &slot_index[at].2,
+                        &k_rot.reshape(&[t, nkv * hd][..])?,
+                        &v_f.reshape(&[t, nkv * hd][..])?,
+                    )?;
+                    (q_rot, k_rot, v_f)
                 }
             };
-            stores[li].write_indexed(
-                &slot_index[at].2,
-                &k_rot.reshape(&[t, nkv * hd][..])?,
-                &v_f.reshape(&[t, nkv * hd][..])?,
-            )?;
             let mut parts: Vec<Tensor> = Vec::new();
             if !plain.is_empty() {
                 parts.push(
@@ -3060,6 +3176,82 @@ mod swa_mask_tests {
         assert_eq!(at(511, 511), 1);
         assert_eq!(at(511, 512), 0);
         assert_eq!(at(511, 1535), 0);
+    }
+}
+
+#[cfg(test)]
+mod prefill_stage_tests {
+    use super::{prefill_stage_fused, PrefillProjection};
+    use crate::tensor::{DType, Device, Tensor};
+
+    #[test]
+    fn the_stage_is_one_launch_on_a_card_in_f16_with_an_even_head() {
+        assert!(prefill_stage_fused(true, DType::F16, DType::F16, 128, true));
+        assert!(prefill_stage_fused(true, DType::F16, DType::F16, 64, true));
+    }
+
+    #[test]
+    fn the_stage_falls_back_off_the_card_or_off_f16_or_with_an_odd_head() {
+        use DType::{BF16, F16, F32};
+        let cases = [
+            (false, F16, F16, 128),
+            (true, F32, F16, 128),
+            (true, BF16, F16, 128),
+            (true, F16, F32, 128),
+            (true, F16, F16, 0),
+            (true, F16, F16, 127),
+        ];
+        for (on_card, activation, store, head_dim) in cases {
+            assert!(
+                !prefill_stage_fused(on_card, activation, store, head_dim, true),
+                "{on_card} {activation:?} {store:?} {head_dim}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stage_falls_back_when_only_one_of_q_and_k_has_a_norm() {
+        assert!(!prefill_stage_fused(
+            true,
+            DType::F16,
+            DType::F16,
+            128,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_fused_projection_is_read_in_place_and_split_by_copy() {
+        let (q_width, kv_width, rows) = (4, 2, 3);
+        let data: Vec<f32> = (0..rows * (q_width + 2 * kv_width))
+            .map(|i| i as f32)
+            .collect();
+        let qkv =
+            Tensor::from_vec(data, &[rows, q_width + 2 * kv_width][..], &Device::Cpu).unwrap();
+        let fused = PrefillProjection::Fused(qkv);
+        let cols: Vec<usize> = fused
+            .sources(q_width, kv_width)
+            .iter()
+            .map(|(_, col)| *col)
+            .collect();
+        assert_eq!(cols, vec![0, q_width, q_width + kv_width]);
+        let (q, k, v) = fused.split(q_width, kv_width).unwrap();
+        assert_eq!(q.dims(), &[rows, q_width]);
+        assert_eq!(k.dims(), &[rows, kv_width]);
+        assert_eq!(v.dims(), &[rows, kv_width]);
+        assert_eq!(
+            v.to_vec2::<f32>().unwrap()[1],
+            vec![14.0, 15.0],
+            "v of row 1 is columns 6 and 7 of that row"
+        );
+    }
+
+    #[test]
+    fn separate_projections_start_at_column_0() {
+        let part =
+            |w: usize| Tensor::from_vec(vec![0f32; 2 * w], &[2, w][..], &Device::Cpu).unwrap();
+        let split = PrefillProjection::Split(part(4), part(2), part(2));
+        assert!(split.sources(4, 2).iter().all(|(_, col)| *col == 0));
     }
 }
 

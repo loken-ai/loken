@@ -401,6 +401,185 @@ pub fn paged_rope_f16(
     Ok(Some(out))
 }
 
+/// The input stage of a prefill attention layer in one F16 launch: the head norms of q and k
+/// when `norms` holds them, the rotation of q and k, and the write of k and v into the paged
+/// store `kp`/`vp` at `slot_dev`.
+///
+/// `srcs` are q, k and v, each a `[rows, width]` tensor and the column its group starts at, so
+/// the three can be views of one fused projection. `slot_dev` is `[rows]` I32 and `slots` holds
+/// the same values on the host. `kp`/`vp` are `[num_slots, n_kv * hd]` and start at offset 0. `cos`/`sin` are
+/// `[rows, 1, hd/2]`. Returns q `[rows, n_head, hd]`, k and v `[rows, n_kv, hd]`, rotated and
+/// normed as the separate launches give them. Returns `None` when the card, a dtype, a width, a
+/// store shape, a slot or the shared memory does not fit, and the caller runs the separate
+/// launches. The first `None` of the process is noted at debug level with its reason.
+pub fn prefill_rope_kv_write_f16(
+    srcs: [(&Tensor, usize); 3],
+    norms: Option<[(&Tensor, f32); 2]>,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+    slot_dev: &Tensor,
+    slots: &[i32],
+    kp: &Tensor,
+    vp: &Tensor,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    use crate::tensor::kernel_ffi as kf;
+    use crate::tensor::StorageView::Cuda as C;
+    use core::ffi::c_void;
+    let rows = srcs[0].0.dims().first().copied().unwrap_or(0);
+    let widths = [n_head * hd, n_kv * hd, n_kv * hd];
+    let card = srcs[0].0.device();
+    let srcs_fit = srcs.iter().zip(widths).all(|((t, col), w)| {
+        t.device().same_device(&card)
+            && t.dtype() == DType::F16
+            && t.dims().len() == 2
+            && t.dims()[0] == rows
+            && col + w <= t.dims()[1]
+    });
+    let norms_fit = norms.is_none_or(|ns| {
+        ns.iter().all(|(w, _)| {
+            w.device().same_device(&card) && w.dtype() == DType::F32 && w.elem_count() == hd
+        })
+    });
+    let on_card = [cos, sin, slot_dev, kp, vp]
+        .iter()
+        .all(|t| t.device().same_device(&card));
+    // The store of the layer: `[num_slots, n_kv * hd]` for both k and v.
+    let store_slots = kp.dims().first().copied().unwrap_or(0);
+    let stores_fit = [kp, vp]
+        .iter()
+        .all(|t| t.dims() == [store_slots, n_kv * hd]);
+    let slots_fit = slots.len() == rows
+        && slots
+            .iter()
+            .all(|&s| usize::try_from(s).is_ok_and(|s| s < store_slots));
+    // The block size of the kernel, and the shared memory it asks for: the head as f32 and one
+    // partial sum per thread.
+    let block = hd.min(256).next_power_of_two();
+    let misfit = if rows == 0 || !card.is_cuda() || !on_card {
+        Some("device")
+    } else if hd == 0 || !hd.is_multiple_of(2) || !srcs_fit {
+        Some("shape")
+    } else if cos.dtype() != DType::F16
+        || sin.dtype() != DType::F16
+        || slot_dev.dtype() != DType::I32
+        || kp.dtype() != DType::F16
+        || vp.dtype() != DType::F16
+        || !norms_fit
+    {
+        Some("dtype")
+    } else if cos.elem_count() != rows * (hd / 2)
+        || sin.elem_count() != rows * (hd / 2)
+        || slot_dev.elem_count() != rows
+        || !stores_fit
+    {
+        Some("shape")
+    } else if !slots_fit {
+        Some("slot out of range")
+    } else if !fused_norm_fits(srcs[0].0, hd + block) {
+        Some("shared memory")
+    } else {
+        None
+    };
+    if let Some(reason) = misfit {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            tracing::debug!("fused prefill input stage declined ({reason}), separate launches run");
+        });
+        return Ok(None);
+    }
+    let q_out = unsafe { Tensor::empty((rows, n_head, hd), DType::F16, &card)? };
+    let k_out = unsafe { Tensor::empty((rows, n_kv, hd), DType::F16, &card)? };
+    let v_out = unsafe { Tensor::empty((rows, n_kv, hd), DType::F16, &card)? };
+    let dev = card.as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let (qs, ql) = srcs[0].0.storage_and_layout();
+    let (ks, kl) = srcs[1].0.storage_and_layout();
+    let (vs, vl) = srcs[2].0.storage_and_layout();
+    let (cs, cl) = cos.storage_and_layout();
+    let (ss, sl) = sin.storage_and_layout();
+    let (sds, sdl) = slot_dev.storage_and_layout();
+    let (kps, kpl) = kp.storage_and_layout();
+    let (vps, vpl) = vp.storage_and_layout();
+    let (qos, _) = q_out.storage_and_layout();
+    let (kos, _) = k_out.storage_and_layout();
+    let (vos, _) = v_out.storage_and_layout();
+    let qw = norms.map(|ns| ns[0].0.storage_and_layout());
+    let kw = norms.map(|ns| ns[1].0.storage_and_layout());
+    let weight_ptr = |w: &Option<(kf::StorageHandle, kf::Layout)>| -> *const f32 {
+        match w {
+            Some((handle, layout)) => match &**handle {
+                C(wc) => wc.as_cuda_slice::<f32>().map_or(core::ptr::null(), |s| {
+                    (s.device_ptr(s.stream()).0 + (layout.start_offset() * 4) as u64) as *const f32
+                }),
+                _ => core::ptr::null(),
+            },
+            None => core::ptr::null(),
+        }
+    };
+    let (q_eps, k_eps) = norms.map_or((0.0, 0.0), |ns| (ns[0].1, ns[1].1));
+    if norms.is_some() && (weight_ptr(&qw).is_null() || weight_ptr(&kw).is_null()) {
+        return Ok(None);
+    }
+    debug_assert_eq!(kpl.start_offset(), 0);
+    debug_assert_eq!(vpl.start_offset(), 0);
+    let (C(qc), C(kc), C(vc), C(cc), C(sc), C(sdc), C(kpc), C(vpc), C(qoc), C(koc), C(voc)) = (
+        &*qs, &*ks, &*vs, &*cs, &*ss, &*sds, &*kps, &*vps, &*qos, &*kos, &*vos,
+    ) else {
+        return Ok(None);
+    };
+    let f16_at = |c: &kf::CudaStorage, offset: usize| -> Result<u64> {
+        let s = c.as_cuda_slice::<half::f16>()?;
+        Ok(s.device_ptr(s.stream()).0 + (offset * 2) as u64)
+    };
+    let qp = f16_at(qc, ql.start_offset() + srcs[0].1)? as *const c_void;
+    let kp_in = f16_at(kc, kl.start_offset() + srcs[1].1)? as *const c_void;
+    let vp_in = f16_at(vc, vl.start_offset() + srcs[2].1)? as *const c_void;
+    let cp = f16_at(cc, cl.start_offset())? as *const c_void;
+    let sp = f16_at(sc, sl.start_offset())? as *const c_void;
+    let kpp = f16_at(kpc, 0)? as *mut c_void;
+    let vpp = f16_at(vpc, 0)? as *mut c_void;
+    let qop = f16_at(qoc, 0)? as *mut c_void;
+    let kop = f16_at(koc, 0)? as *mut c_void;
+    let vop = f16_at(voc, 0)? as *mut c_void;
+    let sdsl = sdc.as_cuda_slice::<i32>()?;
+    let sdp = (sdsl.device_ptr(sdsl.stream()).0 + (sdl.start_offset() * 4) as u64) as *const i32;
+    unsafe {
+        loken_prefill_qk_rope_kv_f16(
+            qp,
+            kp_in,
+            vp_in,
+            srcs[0].0.dims()[1] as i64,
+            srcs[1].0.dims()[1] as i64,
+            srcs[2].0.dims()[1] as i64,
+            weight_ptr(&qw),
+            weight_ptr(&kw),
+            q_eps,
+            k_eps,
+            cp,
+            sp,
+            qop,
+            kop,
+            vop,
+            kpp,
+            vpp,
+            sdp,
+            rows as i32,
+            n_head as i32,
+            n_kv as i32,
+            hd as i32,
+            interleaved as i32,
+            stream,
+        );
+    }
+    drop((qs, ks, vs, cs, ss, sds, kps, vps, qos, kos, vos, qw, kw));
+    Ok(Some((q_out, k_out, v_out)))
+}
+
 /// out = softplus(dt + bias) = log(exp(dt+bias)+1), one F32 launch (bit-identical
 /// to the reference ((dt.broadcast_add(bias)).exp()+1).log()). dt [rows,cols] F32, bias
 /// [cols] F32. Returns None (caller falls back) unless CUDA + F32.

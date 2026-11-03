@@ -21,6 +21,7 @@ pub mod expert_read;
 #[cfg(feature = "gpu")]
 pub mod expert_upload;
 pub mod host_expert;
+pub mod prefill_layer;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -145,6 +146,22 @@ pub struct Options {
     #[arg(long, default_value = "q2_k")]
     pub down_format: String,
 
+    /// Rows of the prompt batch one layer of `prefill-layer` moves
+    #[arg(long, default_value_t = 130)]
+    pub rows: usize,
+
+    /// Query heads, without a file (`prefill-layer`)
+    #[arg(long)]
+    pub heads: Option<usize>,
+
+    /// Key-value heads, without a file: the heads when absent (`prefill-layer`)
+    #[arg(long)]
+    pub kv_heads: Option<usize>,
+
+    /// Elements of one head, without a file (`prefill-layer`)
+    #[arg(long)]
+    pub head_dim: Option<usize>,
+
     /// Write the JSON record here
     #[arg(long)]
     pub json: Option<PathBuf>,
@@ -200,6 +217,12 @@ pub fn benches() -> Vec<Bench> {
             about: "one routed expert's weights host to card: compute or copy stream, pageable or pinned, the card idle or busy",
             needs_card: true,
             run: expert_upload::run,
+        });
+        all.push(Bench {
+            name: "prefill-layer",
+            about: "the data movement of one prefill layer, the copies, q and k norms, rotation and store write: separate launches against one fused launch",
+            needs_card: true,
+            run: prefill_layer::run,
         });
     }
     all.push(Bench {
