@@ -89,6 +89,7 @@ What each level chooses:
 | Float projections of an F32, F16 or BF16 checkpoint | As stored (BF16 held as F16 on a card) | Q8_0 when the stack sits on one kind of memory, Q4_K (Q6_K for the feed-forward output) when it is split between cards and host | Q4_K (Q6_K for the feed-forward output) |
 | KV cache format | Full width | Q8 for a model the quantised kernels serve | Q8 for a model the quantised kernels serve |
 | Float GEMMs on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 | TF32 and fast BF16 |
+| Parler-TTS decoder on a CUDA card | F32, as stored | F16 | F16 |
 | Context shift | Off | On | On |
 | Drafts verified in recorded windows | No | No | Yes |
 | Exactness the experts streamed from disk may give up | `exact` | `exact` | `fast` |

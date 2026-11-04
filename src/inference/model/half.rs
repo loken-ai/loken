@@ -38,6 +38,26 @@ pub fn linear(weight: &Tensor, bias: Option<&Tensor>, dev: &Device) -> Result<Li
     Linear::from_published(w, b)
 }
 
+/// The `[to, from]` projection under `vb`, with its bias when `bias` is set: read on the host
+/// and held at its resident half precision on a card when `half` is set, and in F32 otherwise.
+pub fn projection(
+    from: usize,
+    to: usize,
+    bias: bool,
+    half: bool,
+    vb: &crate::tensor::VarBuilder,
+) -> Result<Linear> {
+    if !(half && vb.device().is_cuda()) {
+        let w = vb.get((to, from), "weight")?;
+        let b = bias.then(|| vb.get(to, "bias")).transpose()?;
+        return Linear::new(w, b);
+    }
+    let host = vb.to(DType::F32, &Device::Cpu);
+    let w = host.get((to, from), "weight")?;
+    let b = bias.then(|| host.get(to, "bias")).transpose()?;
+    linear(&w, b.as_ref(), vb.device())
+}
+
 /// Timed runs of each precision in [`half_matmul_pays`], after one that is not timed; the
 /// fastest of them is the one compared.
 const MATMUL_PROBE_RUNS: usize = 3;

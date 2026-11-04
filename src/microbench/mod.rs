@@ -30,6 +30,7 @@ pub mod expert_upload;
 pub mod host_expert;
 pub mod marlin_rows;
 pub mod media_overlap;
+pub mod parler_step;
 pub mod prefill_layer;
 pub mod schedule_host;
 
@@ -216,6 +217,10 @@ pub struct Options {
     #[arg(long, default_value_t = crate::microbench::decode_layer::DEFAULT_VOCAB)]
     pub vocab: usize,
 
+    /// Codebooks of the decoder, one embedding and one head each (`parler-step`)
+    #[arg(long, default_value_t = 9)]
+    pub codebooks: usize,
+
     /// The rope base of the rope rows (`schedule-host`, `decode-inputs`)
     #[arg(long, default_value_t = 10000.0)]
     pub rope_base: f32,
@@ -332,6 +337,13 @@ pub fn benches() -> Vec<Bench> {
             run: prefill_layer::run,
         });
     }
+    #[cfg(all(feature = "gpu", feature = "audio"))]
+    all.push(Bench {
+        name: "parler-step",
+        about: "one decode step of a Parler-TTS decoder, its projections in F32 and in F16",
+        needs_card: true,
+        run: parler_step::run,
+    });
     #[cfg(feature = "gpu")]
     all.push(Bench {
         name: "media-overlap",

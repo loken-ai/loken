@@ -24,11 +24,12 @@ cargo bench --features cuda,microbench --bench microbench -- marlin-rows --json 
 cargo bench --features cuda,microbench --bench microbench -- decode-inputs --batch 64 --context 512
 cargo bench --features cuda,microbench --bench microbench -- decode-layer --batch 64 --context 512 --json results/decode-layer.json
 cargo bench --features cuda,microbench --bench microbench -- media-overlap --rows 1024 --hidden 1280 --layers 4
+cargo bench --features cuda,microbench --bench microbench -- parler-step --hidden 1024 --inter 4096 --layers 24 --heads 16 --vocab 1088
 cargo bench --features microbench --bench microbench -- schedule-host --batch 64 --context 512
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `expert-ahead`, `expert-upload`, `prefill-layer`, `marlin-rows`, `decode-inputs`, `decode-layer` and `media-overlap`.
+A build without a GPU runtime omits `crossing`, `expert-ahead`, `expert-upload`, `prefill-layer`, `marlin-rows`, `decode-inputs`, `decode-layer`, `media-overlap` and `parler-step`.
 
 Arguments after `--`:
 
@@ -422,6 +423,20 @@ Run it on an idle card: a second process on the card changes every figure.
 
 On a GTX 1650 with `--hidden 1280`, the 2 streams finish in 0.93 to 0.97 of the serial time and the batched step in 0.97 to 0.99, from 128 to 4096 rows.
 A step that fills the card leaves no room for the other.
+
+### parler-step
+
+`parler-step` times one decode step of a Parler-TTS decoder with its projections held in F32 and in F16.
+It answers how much of a step the bytes of the weights decide.
+It loads no model: the weights are deterministic values of the shapes given.
+
+A step runs the embeddings, every layer, the final norm and the heads.
+The logits row of each codebook is read back to the host, as a generation reads them.
+A sample is 1 prompt pass, not timed, then timed steps whose median is reported per step.
+
+`--hidden` sets the width, `--inter` the feed-forward length, `--layers` the layer count, `--heads` the attention heads, `--vocab` the audio tokens per codebook and `--codebooks` the codebooks.
+`--prompt-tokens` sets the text prefix the first pass carries.
+The note of each variant gives the rate at which the projections one step reads stream.
 
 ## Report
 

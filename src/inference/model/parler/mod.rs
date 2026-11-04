@@ -14,13 +14,17 @@
 use crate::inference::codec::dac;
 use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
 use crate::inference::model::block::CrossAttentionBlock;
+use crate::inference::model::half::projection;
 use crate::inference::model::t5::encoder as t5;
 use crate::inference::sample::token_sampling::{LogitsProcessor, Sampling};
-use crate::tensor::layer::{embedding, layer_norm, linear, linear_no_bias};
+use crate::tensor::layer::{embedding, layer_norm, linear};
 use crate::tensor::layer::{Embedding, LayerNorm, Linear};
 use crate::tensor::ops::Activation;
 use crate::tensor::VarBuilder;
 use crate::tensor::{IndexOp, Result, Tensor};
+
+#[cfg(any(test, feature = "microbench"))]
+pub mod synthetic;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct DecoderConfig {
@@ -74,10 +78,13 @@ pub struct Config {
 /// None of the four carries a bias. `kv_heads` may be fewer than the query heads - the model
 /// shares key heads across groups - and the two attentions of a layer are allowed to group
 /// differently, which is why it is a parameter rather than read from the config here.
+///
+/// With `half` set the four projections are held in half precision on a card.
 fn attention(
     cfg: &DecoderConfig,
     kv_heads: usize,
     kv: Kv,
+    half: bool,
     vb: VarBuilder,
 ) -> Result<MultiHeadAttention> {
     if cfg.rope_embeddings {
@@ -86,10 +93,10 @@ fn attention(
     let width = cfg.hidden_size;
     let kv_width = kv_heads * (width / cfg.num_attention_heads);
     MultiHeadAttention::new(
-        linear_no_bias(width, width, &vb.pp("q_proj"))?,
-        linear_no_bias(width, kv_width, &vb.pp("k_proj"))?,
-        linear_no_bias(width, kv_width, &vb.pp("v_proj"))?,
-        linear_no_bias(width, width, &vb.pp("out_proj"))?,
+        projection(width, width, false, half, &vb.pp("q_proj"))?,
+        projection(width, kv_width, false, half, &vb.pp("k_proj"))?,
+        projection(width, kv_width, false, half, &vb.pp("v_proj"))?,
+        projection(width, width, false, half, &vb.pp("out_proj"))?,
         width,
         cfg.num_attention_heads,
         kv_heads,
@@ -102,23 +109,27 @@ fn attention(
 /// The decoder attends to its own past a step at a time, and to the text encoder's output  -
 /// which does not change across a generation - through a projection taken once. Neither
 /// feed-forward projection carries a bias, and the activation between them is the config's.
-fn layer(cfg: &DecoderConfig, vb: VarBuilder) -> Result<CrossAttentionBlock> {
+///
+/// With `half` set every projection of the layer is held in half precision on a card and the
+/// norms stay F32.
+fn layer(cfg: &DecoderConfig, half: bool, vb: VarBuilder) -> Result<CrossAttentionBlock> {
     let kv_heads = cfg.num_key_value_heads.unwrap_or(cfg.num_attention_heads);
     let kv_heads_cross = cfg.num_cross_attention_key_value_heads.unwrap_or(kv_heads);
-    CrossAttentionBlock::new(
-        attention(cfg, kv_heads, Kv::Growing(None), vb.pp("self_attn"))?,
+    CrossAttentionBlock::with_projections(
+        attention(cfg, kv_heads, Kv::Growing(None), half, vb.pp("self_attn"))?,
         Some(attention(
             cfg,
             kv_heads_cross,
             Kv::Fixed(None),
+            half,
             vb.pp("encoder_attn"),
         )?),
         cfg.hidden_size,
         cfg.ffn_dim,
         1e-5,
-        false,
         cfg.activation_function,
         &vb,
+        |from, to, vb| projection(from, to, false, half, vb),
     )
 }
 
@@ -147,7 +158,9 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(cfg: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
+    /// With `half` set the layers and the heads are held in half precision on a card and the
+    /// stream between them runs F32. The embeddings and the norms stay F32.
+    pub fn new(cfg: &DecoderConfig, half: bool, vb: VarBuilder) -> Result<Self> {
         // Everything the trunk needs hangs off one prefix; the per-codebook output heads hang
         // beside it rather than inside it.
         let trunk = vb.pp("model.decoder");
@@ -163,10 +176,12 @@ impl Decoder {
                 embedding(cfg.vocab_size + 1, cfg.hidden_size, &vb)
             })?,
             lm_heads: numbered(&vb, "lm_heads", books, |vb| {
-                linear_no_bias(cfg.hidden_size, cfg.vocab_size, &vb)
+                projection(cfg.hidden_size, cfg.vocab_size, false, half, &vb)
             })?,
             embed_positions: trunk.get(table, "embed_positions.weights")?,
-            layers: numbered(&trunk, "layers", cfg.num_hidden_layers, |vb| layer(cfg, vb))?,
+            layers: numbered(&trunk, "layers", cfg.num_hidden_layers, |vb| {
+                layer(cfg, half, vb)
+            })?,
             layer_norm: layer_norm(cfg.hidden_size, 1e-5, &trunk.pp("layer_norm"))?,
         })
     }
@@ -389,10 +404,21 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder, t5_vb: crate::tensor::VarBuilder) -> Result<Self> {
-        let text_encoder = t5::T5EncoderModel::load(t5_vb.pp("text_encoder"), &cfg.text_encoder)
+    /// `half` holds the decoder's projections in half precision on a card.
+    /// The codec reads `t5_vb`.
+    /// The text encoder reads `text_vb`, which may sit on another device than the rest: it runs
+    /// once per description, and its output follows the device of the ids it is given.
+    /// The text encoder and the codec stay F32.
+    pub fn new(
+        cfg: &Config,
+        half: bool,
+        vb: VarBuilder,
+        t5_vb: crate::tensor::VarBuilder,
+        text_vb: crate::tensor::VarBuilder,
+    ) -> Result<Self> {
+        let text_encoder = t5::T5EncoderModel::load(text_vb.pp("text_encoder"), &cfg.text_encoder)
             .map_err(|e| crate::tensor::Error::msg(format!("parler t5: {}", e.0)))?;
-        let decoder = Decoder::new(&cfg.decoder, vb.pp("decoder"))?;
+        let decoder = Decoder::new(&cfg.decoder, half, vb.pp("decoder"))?;
         // The two halves need not be the same width. When they are not, a projection stands
         // between them - and it is the one projection in this model that carries a bias.
         let (text_width, audio_width) = (cfg.text_encoder.d_model, cfg.decoder.hidden_size);
@@ -769,5 +795,164 @@ mod decoding_tests {
         assert_eq!(g.step_limit(2600, 100), 2500);
         // A file without max_length leaves the table as the only bound.
         assert_eq!(Generation::default().step_limit(4096, 40), 4056);
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod half_tests {
+    use super::synthetic::{self, argmax, Conditioning, Shape};
+    use super::*;
+    use crate::tensor::{DType, Device};
+
+    /// How far a decoder held in half precision drifts from the same decoder in F32.
+    #[derive(Debug)]
+    struct Drift {
+        /// The largest difference between two logits of the same step and codebook.
+        max_logit: f32,
+        /// The largest logit magnitude of the F32 run, which the difference is read against.
+        scale: f32,
+        /// Steps times codebooks compared.
+        compared: usize,
+        /// Of those, the ones whose argmax differs when both runs are fed the F32 tokens.
+        forced_mismatch: usize,
+        /// Steps whose codebook 0 token differs when each run feeds back its own tokens.
+        free_mismatch: usize,
+    }
+
+    /// Both decoders run `steps` steps. The first pass feeds both the tokens the F32 run draws
+    /// greedily. The second lets each feed back its own.
+    fn drift(
+        full: &mut Decoder,
+        half: &mut Decoder,
+        cond: &Conditioning,
+        books: usize,
+        steps: usize,
+        device: &Device,
+    ) -> Result<Drift> {
+        let mut d = Drift {
+            max_logit: 0.0,
+            scale: 0.0,
+            compared: 0,
+            forced_mismatch: 0,
+            free_mismatch: 0,
+        };
+        full.clear_kv_cache();
+        half.clear_kv_cache();
+        let mut tokens = vec![0u32; books];
+        for n in 0..steps {
+            let a = synthetic::step(full, cond, &tokens, n, device)?;
+            let b = synthetic::step(half, cond, &tokens, n, device)?;
+            for (x, y) in a.iter().zip(&b) {
+                for (p, q) in x.iter().zip(y) {
+                    d.max_logit = d.max_logit.max((p - q).abs());
+                    d.scale = d.scale.max(p.abs());
+                }
+                d.compared += 1;
+                d.forced_mismatch += (argmax(x) != argmax(y)) as usize;
+            }
+            tokens = a.iter().map(|row| argmax(row)).collect();
+        }
+        full.clear_kv_cache();
+        half.clear_kv_cache();
+        let (mut own_full, mut own_half) = (vec![0u32; books], vec![0u32; books]);
+        for n in 0..steps {
+            let a = synthetic::step(full, cond, &own_full, n, device)?;
+            let b = synthetic::step(half, cond, &own_half, n, device)?;
+            own_full = a.iter().map(|row| argmax(row)).collect();
+            own_half = b.iter().map(|row| argmax(row)).collect();
+            d.free_mismatch += (own_full[0] != own_half[0]) as usize;
+        }
+        Ok(d)
+    }
+
+    /// The logits of a synthetic decoder held in half precision stay within a tolerance of its
+    /// F32 logits, and its greedy tokens agree.
+    #[test]
+    fn a_half_decoder_gives_the_logits_of_the_f32_one_within_tolerance() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let shape = Shape {
+            hidden: 128,
+            ffn: 512,
+            layers: 4,
+            heads: 4,
+            codebooks: 4,
+            vocab: 64,
+            positions: 64,
+        };
+        let cond = Conditioning::new(&shape, 8, 6, &device)?;
+        let mut full = synthetic::decoder(&shape, false, &device)?;
+        let mut half = synthetic::decoder(&shape, true, &device)?;
+        let d = drift(&mut full, &mut half, &cond, shape.codebooks, 20, &device)?;
+        eprintln!("synthetic decoder: {d:?}");
+        assert!(
+            d.max_logit > 0.0,
+            "the half decoder did not run in half precision"
+        );
+        assert!(
+            d.max_logit <= 2e-2 * d.scale,
+            "logits drift by {} against a scale of {}",
+            d.max_logit,
+            d.scale
+        );
+        Ok(())
+    }
+
+    /// The same comparison on the real mini checkpoint, which the local cache may hold.
+    #[test]
+    #[ignore = "needs the mini checkpoint in the hub cache and a card"]
+    fn the_mini_checkpoint_in_half_precision_stays_within_tolerance() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let repo = hf_hub::Cache::default().model("parler-tts/parler-tts-mini-v1".to_string());
+        let (Some(weights), Some(config)) =
+            (repo.get("model.safetensors"), repo.get("config.json"))
+        else {
+            return Ok(());
+        };
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(config).unwrap())
+            .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+        let cfg = &config.decoder;
+        let build = |half: bool| -> Result<Decoder> {
+            let vb = unsafe { VarBuilder::from_files(&[&weights], DType::F32, &device)? };
+            Decoder::new(cfg, half, vb.pp("decoder"))
+        };
+        let shape = Shape {
+            hidden: cfg.hidden_size,
+            ffn: cfg.ffn_dim,
+            layers: cfg.num_hidden_layers,
+            heads: cfg.num_attention_heads,
+            codebooks: cfg.num_codebooks,
+            vocab: cfg.vocab_size,
+            positions: cfg.max_position_embeddings,
+        };
+        // The conditioning is a real one: the prompt embedded and the description encoded
+        // by the F32 model on the host, then moved to the card.
+        let cond = {
+            let cpu = Device::Cpu;
+            let open = || unsafe { VarBuilder::from_files(&[&weights], DType::F32, &cpu) };
+            let mut model = Model::new(&config, false, open()?, open()?, open()?)?;
+            let tokenizer = tokenizers::Tokenizer::from_file(repo.get("tokenizer.json").unwrap())
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+            let ids = |text: &str| -> Result<Tensor> {
+                let enc = tokenizer
+                    .encode(text, true)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                Tensor::new(enc.get_ids(), &cpu)?.unsqueeze(0)
+            };
+            let description = ids("A female speaker delivers a slightly expressive and animated speech with a moderate speed and pitch.")?;
+            let prompt = ids("Hello, this is a test of the speech model.")?;
+            Conditioning {
+                prompt: prompt.apply(&model.embed_prompts)?.to_device(&device)?,
+                encoder: model.encode_description(&description)?.to_device(&device)?,
+            }
+        };
+        let (mut full, mut half) = (build(false)?, build(true)?);
+        let d = drift(&mut full, &mut half, &cond, shape.codebooks, 20, &device)?;
+        eprintln!("mini checkpoint: {d:?}");
+        assert!(d.max_logit <= 2e-2 * d.scale);
+        Ok(())
     }
 }

@@ -15,7 +15,7 @@
 
 use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention, Reserved};
 use crate::inference::model::block::CrossAttentionBlock;
-use crate::inference::model::half::half_matmul_pays;
+use crate::inference::model::half::{half_matmul_pays, projection};
 use crate::inference::model::whisper::Config;
 use crate::tensor::layer::{
     conv1d, embedding, layer_norm, same_length_1d, Conv1d, Conv1dConfig, Embedding, LayerNorm,
@@ -24,20 +24,6 @@ use crate::tensor::layer::{
 use crate::tensor::ops::Activation;
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Result, Tensor};
-
-/// The `[to, from]` projection under `vb`, with its bias when `bias` is set: read on the host
-/// and held at its resident half precision on a card when `half` is set, and in F32 otherwise.
-fn projection(from: usize, to: usize, bias: bool, half: bool, vb: &VarBuilder) -> Result<Linear> {
-    if !(half && vb.device().is_cuda()) {
-        let w = vb.get((to, from), "weight")?;
-        let b = bias.then(|| vb.get(to, "bias")).transpose()?;
-        return Linear::new(w, b);
-    }
-    let host = vb.to(DType::F32, &Device::Cpu);
-    let w = host.get((to, from), "weight")?;
-    let b = bias.then(|| host.get(to, "bias")).transpose()?;
-    crate::inference::model::half::linear(&w, b.as_ref(), vb.device())
-}
 
 /// One attention of this model, read off the four names its checkpoint uses.
 ///

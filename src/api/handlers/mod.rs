@@ -1542,6 +1542,8 @@ impl APIServer {
         let default_keep_alive = get_default_keep_alive();
         info!("Default keep_alive: {} minutes", default_keep_alive);
 
+        #[cfg(feature = "audio")]
+        let fidelity = inference_config.fidelity;
         let request_gate = crate::api::gate::RequestGate::new(1);
         let server = Self {
             ollama_models_dir,
@@ -1561,7 +1563,7 @@ impl APIServer {
             #[cfg(feature = "audio")]
             audio_engine: Arc::new(AudioEngine::new()),
             #[cfg(feature = "audio")]
-            tts_engine: Arc::new(crate::inference::engine::TtsEngine::new()),
+            tts_engine: Arc::new(crate::inference::engine::TtsEngine::new(fidelity)),
             forecast_engine: Arc::new(
                 crate::inference::engine::forecast_engine::ForecastEngine::new(),
             ),

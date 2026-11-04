@@ -45,6 +45,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: keep an AWQ model's activations in f16 between its projections.
 - Experts: split a mixture that 1 card holds across cards when the measured links make that faster.
 - Server: replace --cpu by --backends, which names the backends to compute on.
+- Speech: hold the Parler-TTS decoder in F16 on a card unless fidelity is reference.
 - Tokenizer: follow the file's add_bos_token on a bare prompt, as the reference does.
 - Experts: keep more of them in host memory, sized while serving, with read-ahead taken only when it runs faster.
 - Experts: read only the experts a prompt routes to, and run them on the cards.

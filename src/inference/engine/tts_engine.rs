@@ -11,10 +11,13 @@
 //!      44.1 kHz, large-v1: 24 kHz). The HTTP handler wraps that in a
 //!      WAV header sized for that rate.
 //!
-//! Parler-TTS runs in F32 only - the model weights and the DAC vocoder
-//! aren't tested under F16. Inference cost is dominated by the decoder
-//! sample loop, similar in shape to a small autoregressive LLM.
+//! Parler-TTS keeps its text encoder and its DAC vocoder in F32. The decoder, which
+//! dominates the cost of a synthesis, is held in half precision on a card unless the
+//! fidelity level asks for the weights as stored.
+//! The text encoder runs once per description, on the host, and is not part of the card's
+//! demand.
 
+use crate::inference::engine::llm_engine::{Fidelity, FloatWeights};
 use crate::inference::sample::token_sampling::LogitsProcessor;
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Tensor};
@@ -191,11 +194,14 @@ pub struct TtsEngine {
     name: Arc<Mutex<Option<String>>>,
     /// GPU bytes the load took, measured. `/api/ps` published 0 here.
     resident_bytes: Arc<Mutex<u64>>,
+    /// The server's fidelity level, which decides the precision a decoder is held in.
+    fidelity: Fidelity,
 }
 
 impl TtsEngine {
-    pub fn new() -> Self {
+    pub fn new(fidelity: Fidelity) -> Self {
         Self {
+            fidelity,
             model_state: Arc::new(Mutex::new(None)),
             resident_bytes: Arc::new(Mutex::new(0)),
             name: Arc::new(Mutex::new(None)),
@@ -296,8 +302,11 @@ impl TtsEngine {
         let model_id = resolve_tts_model_id(name);
         info!("Loading TTS model: {model_id}");
         let model_id_clone = model_id.clone();
-        let state =
-            watched_load("tts", watch, move || load_parler_blocking(&model_id_clone)).await?;
+        let fidelity = self.fidelity;
+        let state = watched_load("tts", watch, move || {
+            load_parler_blocking(&model_id_clone, fidelity)
+        })
+        .await?;
 
         let resident =
             free_before_load.saturating_sub(crate::inference::place::vram_manager::free_total());
@@ -439,7 +448,7 @@ impl TtsEngine {
 
 impl Default for TtsEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(Fidelity::default())
     }
 }
 
@@ -447,7 +456,7 @@ impl Default for TtsEngine {
 // Internal: HF download + load
 // ------------------------------------------------------------
 
-fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
+fn load_parler_blocking(model_id: &str, fidelity: Fidelity) -> AnyResult<TtsModelState> {
     let api = {
         let mut b = ApiBuilder::new();
         if let Ok(tok) = std::env::var("HF_TOKEN") {
@@ -500,12 +509,12 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
     let config: Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)
         .context("parse parler-tts config.json")?;
     let sample_rate = config.audio_encoder.sampling_rate as u32;
-    // Placed through the ladder in `place`: the weights as the card holds them in F32, and
-    // one decoder pass over its longest utterance beside them. Parler-TTS runs in F32 only:
-    // the DAC audio decoder is numerically strict.
-    let (weights_bytes, _) =
-        crate::inference::place::runtime_demand::safetensors_f32_split(&weights_path, |_| true)
-            .map_err(|e| anyhow!("size parler weights: {e}"))?;
+    // Placed through the ladder in `place`: the weights as the card holds them, and one decoder
+    // pass over its longest utterance beside them.
+    // The decoder is held in half precision unless the level keeps the weights as stored.
+    // The text encoder and the DAC audio decoder, which is numerically strict, stay F32.
+    let half = fidelity.float_weights() != FloatWeights::AsStored;
+    let weights_bytes = parler_weights_bytes(&weights_path, half)?;
     let dec = &config.decoder;
     let reserve = crate::inference::place::runtime_demand::transformer_work_reserve(
         weights_bytes,
@@ -521,13 +530,22 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
         |device| {
             let vb = unsafe { VarBuilder::from_files(&weights_path, DType::F32, device)? };
             let t5_vb = unsafe { VarBuilder::from_files(&weights_path, DType::F32, device)? };
-            let mut model = ParlerModel::new(&config, vb, t5_vb)?;
+            // The text encoder runs once per description, so it stays on the host in F32.
+            let text_vb =
+                unsafe { VarBuilder::from_files(&weights_path, DType::F32, &Device::Cpu)? };
+            let mut model = ParlerModel::new(&config, half, vb, t5_vb, text_vb)?;
             model.generation = generation.clone();
             Ok::<_, crate::tensor::Error>((device.clone(), model))
         },
     )
     .map_err(|e| anyhow!("load parler-tts weights: {e}"))?;
-    info!("TTS device: {device:?}, dtype: F32");
+    info!(
+        "TTS device: {device:?}, decoder: {}, encoder and codec: F32",
+        match half && device.is_cuda() {
+            true => "F16",
+            false => "F32",
+        }
+    );
 
     info!(
         "TTS loaded: parler-tts ({} Hz, vocab={})",
@@ -543,6 +561,29 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
         device,
         sample_rate,
     })
+}
+
+/// Whether a checkpoint tensor belongs to the decoder's projections, the ones held in half
+/// precision on a card: the layers and the heads.
+fn is_decoder_projection(name: &str) -> bool {
+    name.starts_with("decoder.model.decoder.layers.") || name.starts_with("decoder.lm_heads.")
+}
+
+/// Whether a checkpoint tensor belongs to the text encoder, which is held on the host.
+fn is_text_encoder(name: &str) -> bool {
+    name.starts_with("text_encoder.")
+}
+
+/// Bytes the checkpoint takes on a card: the decoder's projections as `card_bytes` counts them
+/// when `half` is set, the codec and the other tensors in F32, and none of the text encoder.
+fn parler_weights_bytes(paths: &[std::path::PathBuf], half: bool) -> AnyResult<u64> {
+    use crate::inference::place::runtime_demand::{safetensors_card_split, safetensors_f32_split};
+    let sized = |e: String| anyhow!("size parler weights: {e}");
+    let (decoder_f32, others) =
+        safetensors_f32_split(paths, is_decoder_projection).map_err(sized)?;
+    let (decoder_half, _) = safetensors_card_split(paths, is_decoder_projection).map_err(sized)?;
+    let (encoder, _) = safetensors_f32_split(paths, is_text_encoder).map_err(sized)?;
+    Ok(others - encoder + if half { decoder_half } else { decoder_f32 })
 }
 
 /// Load a native Piper (VITS) voice from its `.onnx` path (the `.onnx.json`
@@ -1007,5 +1048,90 @@ mod tests {
         .to_string();
         assert!(err.contains("cancelled"), "an error that says why: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, feature = "audio"))]
+mod placement_probe {
+    use super::*;
+
+    /// The large checkpoint's placement demand and the text encoder's time on the host.
+    /// Reads the checkpoint from the hub cache that the environment names.
+    #[test]
+    #[ignore = "needs the large checkpoint in the hub cache"]
+    fn the_large_checkpoint_places_its_decoder_and_codec_on_a_card() {
+        let repo = hf_hub::Cache::from_env().model("parler-tts/parler-tts-large-v1".to_string());
+        let (Some(config), Some(index)) = (
+            repo.get("config.json"),
+            repo.get("model.safetensors.index.json"),
+        ) else {
+            return;
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(index).unwrap()).unwrap();
+        let mut parts: Vec<String> = json["weight_map"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        parts.sort();
+        parts.dedup();
+        let paths: Vec<std::path::PathBuf> = parts.iter().map(|p| repo.get(p).unwrap()).collect();
+        let config: Config =
+            serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+        let gb = |b: u64| b as f64 / 1e9;
+        let all = parler_weights_bytes(&paths, false).unwrap();
+        let card = parler_weights_bytes(&paths, true).unwrap();
+        let (total, _) =
+            crate::inference::place::runtime_demand::safetensors_f32_split(&paths, |_| true)
+                .unwrap();
+        let (encoder, _) =
+            crate::inference::place::runtime_demand::safetensors_f32_split(&paths, is_text_encoder)
+                .unwrap();
+        let dec = &config.decoder;
+        let reserve = crate::inference::place::runtime_demand::transformer_work_reserve(
+            card,
+            dec.max_position_embeddings,
+            dec.hidden_size,
+            dec.num_attention_heads,
+            dec.ffn_dim,
+        );
+        let kv = 2
+            * dec.num_hidden_layers as u64
+            * dec.hidden_size as u64
+            * dec.max_position_embeddings as u64
+            * 4;
+        eprintln!(
+            "large: file in F32 {:.2} GB, text encoder {:.2} GB, card with F32 decoder {:.2} GB, \
+             card with F16 decoder {:.2} GB, reserve {:.2} GB, self-attention cache at the \
+             longest utterance {:.2} GB, demand {:.2} GB",
+            gb(total),
+            gb(encoder),
+            gb(all),
+            gb(card),
+            gb(reserve),
+            gb(kv),
+            gb(card + reserve)
+        );
+        // The text encoder on the host, F32.
+        let vb = unsafe { VarBuilder::from_files(&paths, DType::F32, &Device::Cpu).unwrap() };
+        let t0 = std::time::Instant::now();
+        let mut model = crate::inference::model::t5::encoder::T5EncoderModel::load(
+            vb.pp("text_encoder"),
+            &config.text_encoder,
+        )
+        .unwrap();
+        eprintln!("text encoder load {:?}", t0.elapsed());
+        let ids: Vec<u32> = (0..32).map(|i| 5 + i as u32).collect();
+        let ids = Tensor::new(ids.as_slice(), &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        for run in 0..3 {
+            let t = std::time::Instant::now();
+            let out = model.forward(&ids).unwrap();
+            eprintln!("text encoder run {run}: {:?} {:?}", t.elapsed(), out.dims());
+        }
     }
 }
