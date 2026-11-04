@@ -33,6 +33,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- MoE: read a long prompt layer by layer when its experts sit in host memory, each read once.
 - Serving: read the prompts that hit the prefix cache together in 1 pass.
 - Serving: keep an AWQ model's activations in f16 between its projections.
 - Server: replace --cpu by --backends, which names the backends to compute on.

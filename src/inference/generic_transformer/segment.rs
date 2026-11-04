@@ -374,4 +374,48 @@ mod layer_major_tests {
         }
         tiny_model::remove(&path);
     }
+
+    /// A mixture whose experts the host reads goes layer by layer once the rows of a chunk
+    /// route to nearly every expert, and not before; the logits and the state it leaves are
+    /// those of the chunk-by-chunk pass.
+    #[test]
+    fn a_prompt_routed_to_host_experts_goes_layer_by_layer() {
+        let path = tiny_model::write_moe("layer-major-moe", 3);
+        let prompt: Vec<u32> = (0..13u32).map(|i| (i * 7 + 3) % 11).collect();
+        let m = tiny_model::load(&path, 3);
+        // The tiny mixture has 8 experts and routes each row to 2 of them.
+        assert!(
+            !m.layer_major_pays(3, 2),
+            "3 rows route to 6 pairs of 8 experts"
+        );
+        assert!(
+            m.layer_major_pays(13, 5),
+            "13 rows route to 26 pairs of 8 experts"
+        );
+        assert!(
+            !m.layer_major_pays(5, 5),
+            "a prompt of 1 chunk has nothing to share"
+        );
+        for chunk in [2usize, 5] {
+            let mut by_chunk = tiny_model::load(&path, 3);
+            let mut by_layer = tiny_model::load(&path, 3);
+            let mut want = None;
+            let mut off = 0;
+            while off < prompt.len() {
+                let n = chunk.min(prompt.len() - off);
+                want = Some(row(&by_chunk
+                    .forward(&ids(&prompt[off..off + n]), off)
+                    .unwrap()));
+                off += n;
+            }
+            let got = row(&by_layer
+                .forward_prefill_layer_major(&ids(&prompt), 0, chunk)
+                .unwrap());
+            assert_eq!(got, want.unwrap(), "chunk {chunk}");
+            let a = row(&by_chunk.forward(&ids(&[4]), 13).unwrap());
+            let b = row(&by_layer.forward(&ids(&[4]), 13).unwrap());
+            assert_eq!(a, b, "chunk {chunk}, decode step");
+        }
+        tiny_model::remove(&path);
+    }
 }

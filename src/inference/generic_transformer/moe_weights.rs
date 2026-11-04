@@ -716,6 +716,13 @@ impl MoeWeights {
         !self.down_exps.device().runs_as_card()
     }
 
+    /// Whether `rows` rows routed together read nearly every expert of this layer from the
+    /// host's memory: the experts sit there, the card holds them in no cache that has them all,
+    /// and the routed pairs outnumber the experts.
+    pub fn reads_every_expert_on_host(&self, rows: usize) -> bool {
+        self.decodes_through_host() && rows * self.n_experts_used >= self.n_experts
+    }
+
     /// Whether a decoded token waits on the host for this layer's experts: they sit in host
     /// memory and the cache on the card does not hold them all.
     pub fn decodes_through_host(&self) -> bool {

@@ -352,7 +352,8 @@ impl GenericHeteroTransformer {
 
     /// Whether a prompt of `seq_len` rows in chunks of `chunk` goes through the layers better
     /// layer by layer: it takes several chunks, and some layer's experts come from the host in
-    /// full for a batch that wide, which a chunk at a time repeats for every chunk.
+    /// full for a batch that wide, or are read from the host's memory by the rows that route to
+    /// them, which a chunk at a time repeats for every chunk.
     pub fn layer_major_pays(&self, seq_len: usize, chunk: usize) -> bool {
         seq_len > chunk.max(1)
             && self.config.shared_kv_layers == 0
@@ -361,6 +362,7 @@ impl GenericHeteroTransformer {
                     m.tier
                         .as_ref()
                         .is_some_and(|t| t.stream_pays(seq_len, m.n_experts_used))
+                        || m.reads_every_expert_on_host(seq_len)
                 })
             })
     }
