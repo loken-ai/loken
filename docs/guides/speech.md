@@ -57,6 +57,11 @@ A larger Whisper, a distil or a faster-whisper checkpoint is named by its reposi
 | `model` | `tts-1` resolves to a Parler-TTS model. `piper/<voice>`, `pocket-tts` and `kyutai` name the other families. |
 | `voice` | An OpenAI preset name. `GET /v1/audio/voices` lists what the resident model offers. |
 | `voice_description` | Steers a Parler voice in words, in place of `voice`. |
+| `seed` | Fixes the draw of a Parler voice. Without it each request draws a new voice. |
+| `max_steps` | Lowers the number of steps a Parler sentence may take. The model's own limit applies without it. |
+
+A Parler voice holds steadier when the description names a speaker the model was trained on, as the model card lists.
+The presets add timbre words and no name, so pass `voice_description` to choose a speaker.
 
 ## Expected result
 

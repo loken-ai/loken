@@ -26,7 +26,7 @@ use crate::inference::model::kyutai::depformer::KyutaiDepformer;
 use crate::inference::model::kyutai::gen::{generate as kyutai_generate, prepare_entries};
 use crate::inference::model::kyutai::lm::KyutaiLm;
 use crate::inference::model::kyutai::mimi::KyutaiMimiDecoder;
-use crate::inference::model::parler::{Config, Model as ParlerModel};
+use crate::inference::model::parler::{Config, Generation, Model as ParlerModel};
 use crate::inference::model::piper::{PiperVoice, SynthOpts};
 use crate::inference::model::pocket_tts::{
     load_wav_mono_24k, resolve_paths, MimiEncoder, PocketTts,
@@ -49,17 +49,21 @@ pub const TTS_SAMPLE_RATE: u32 = 44_100;
 /// Synthesis-time options. `voice_description` is the free-form prompt
 /// Parler uses to control timbre / pitch / pace; `voice` is an
 /// OpenAI-style preset name that the HTTP layer maps to a description.
+///
+/// A knob left `None` takes the checkpoint's own `generation_config.json`.
 #[derive(Debug, Clone)]
 pub struct TtsSynthParams {
     pub voice_description: String,
-    /// Top-p nucleus sampling probability; `None` = pure greedy.
+    /// Nucleus mass.
     pub top_p: Option<f64>,
+    /// Candidate count.
+    pub top_k: Option<usize>,
     /// Temperature for the logits processor (0.0 = greedy).
-    pub temperature: f64,
+    pub temperature: Option<f64>,
     pub seed: u64,
-    /// Hard cap on autoregressive decode steps. Default 1024 (~ 20 s of
-    /// audio). Set higher for long-form synthesis.
-    pub max_steps: usize,
+    /// Cap on autoregressive decode steps.
+    /// It never exceeds what the model allows, and `None` runs to that limit.
+    pub max_steps: Option<usize>,
 }
 
 impl Default for TtsSynthParams {
@@ -67,18 +71,11 @@ impl Default for TtsSynthParams {
         Self {
             voice_description: "A clear, expressive English speaker in a high-quality recording."
                 .to_string(),
-            // Match Parler-TTS's official inference recipe
-            // (do_sample=True, top_p=0.95, temperature=1.0). Greedy
-            // decoding (temperature=0.0) was loop-prone on short
-            // inputs - the model gets stuck repeating the final
-            // phoneme of the last spoken syllable because the
-            // argmax keeps picking the highest-probability "stay
-            // on the current sound" token and never triggers the
-            // pad-all-codebooks EOS break.
-            top_p: Some(0.95),
-            temperature: 1.0,
+            top_p: None,
+            top_k: None,
+            temperature: None,
             seed: 0,
-            max_steps: 1024,
+            max_steps: None,
         }
     }
 }
@@ -492,6 +489,13 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
 
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("load parler tokenizer.json: {e}"))?;
+    // The checkpoint's decoding recipe. A checkpoint without the file decodes on the defaults.
+    let generation = repo
+        .get("generation_config.json")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|json| Generation::from_json(&json))
+        .unwrap_or_default();
 
     let config: Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)
         .context("parse parler-tts config.json")?;
@@ -517,7 +521,8 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
         |device| {
             let vb = unsafe { VarBuilder::from_files(&weights_path, DType::F32, device)? };
             let t5_vb = unsafe { VarBuilder::from_files(&weights_path, DType::F32, device)? };
-            let model = ParlerModel::new(&config, vb, t5_vb)?;
+            let mut model = ParlerModel::new(&config, vb, t5_vb)?;
+            model.generation = generation.clone();
             Ok::<_, crate::tensor::Error>((device.clone(), model))
         },
     )
@@ -817,10 +822,16 @@ fn synthesize_parler(
         enc
     };
 
-    let lp = LogitsProcessor::new(params.seed, Some(params.temperature), params.top_p);
+    let sampling = s
+        .model
+        .generation
+        .sampling(params.temperature, params.top_k, params.top_p);
+    let lp = LogitsProcessor::from_sampling(params.seed, sampling);
+    let limit = s.model.step_limit(prompt_ids.len());
+    let max_steps = params.max_steps.map_or(limit, |asked| asked.min(limit));
     let codes = s
         .model
-        .generate_with_encoded(&prompt, &encoded, lp, params.max_steps)?;
+        .generate_with_encoded(&prompt, &encoded, lp, max_steps)?;
     // The decode_codes path expects an [bsz, codebooks, T] tensor; the
     // generate result is [codebooks, T] on CPU.
     let codes = codes.to_dtype(DType::I64)?;
@@ -868,32 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn tts_synth_params_default_matches_parler_recipe() {
-        // Pin the documented Parler-TTS inference recipe
-        // (do_sample=True, top_p=0.95, temperature=1.0).
-        //
-        // Greedy decoding (temperature=0.0) was loop-prone on short
-        // inputs - the model got stuck repeating the final phoneme
-        // of the last syllable (user-reported: "Hello !" looped on
-        // the trailing "o"). Any future patch that flips back to
-        // greedy or drops top_p must update this test deliberately,
-        // not by accident.
+    fn tts_synth_params_default_leaves_decoding_to_the_model() {
+        // A knob the caller leaves unset is the checkpoint's to decide.
         let p = TtsSynthParams::default();
-        assert!(
-            (p.temperature - 1.0).abs() < f64::EPSILON,
-            "temperature must default to 1.0 (sampling), got {}",
-            p.temperature
-        );
-        assert_eq!(
-            p.top_p,
-            Some(0.95),
-            "top_p must default to 0.95 (Parler recipe)"
-        );
-        assert!(
-            p.max_steps >= 1024,
-            "max_steps default {} too small for ~20s clips",
-            p.max_steps
-        );
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+        assert_eq!(p.top_k, None);
+        assert_eq!(p.max_steps, None);
         assert!(
             p.voice_description.to_lowercase().contains("english"),
             "default voice_description should hint at English to avoid \

@@ -15,7 +15,7 @@ use crate::inference::codec::dac;
 use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
 use crate::inference::model::block::CrossAttentionBlock;
 use crate::inference::model::t5::encoder as t5;
-use crate::inference::sample::token_sampling::LogitsProcessor;
+use crate::inference::sample::token_sampling::{LogitsProcessor, Sampling};
 use crate::tensor::layer::{embedding, layer_norm, linear, linear_no_bias};
 use crate::tensor::layer::{Embedding, LayerNorm, Linear};
 use crate::tensor::ops::Activation;
@@ -248,8 +248,137 @@ fn speaking_at(step: usize, tokens: &[u32], pad: u32) -> Vec<usize> {
         .collect()
 }
 
+/// What the checkpoint's `generation_config.json` says about decoding.
+///
+/// A field the file leaves out is `None`, and the accessors then give what the library that
+/// wrote the format gives a field it is not told: every candidate kept up to `top_k`, no
+/// nucleus cut, temperature 1, no minimum length.
+#[derive(serde::Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Generation {
+    pub do_sample: Option<bool>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f64>,
+    pub temperature: Option<f64>,
+    /// Steps during which no codebook may end the utterance.
+    pub min_new_tokens: Option<usize>,
+    /// The start token plus the steps the model may take.
+    pub max_length: Option<usize>,
+}
+
+impl Generation {
+    /// The library's own defaults for a field the checkpoint does not set.
+    const TOP_K: usize = 50;
+    const TOP_P: f64 = 1.0;
+    const TEMPERATURE: f64 = 1.0;
+
+    /// The file's content; a file that does not parse says nothing.
+    pub fn from_json(json: &str) -> Self {
+        serde_json::from_str(json).unwrap_or_default()
+    }
+
+    /// How a token is drawn: the request's value where it gave one, else the file's, else the
+    /// library's. A checkpoint that says `do_sample` is false decodes greedily unless the
+    /// request names a temperature.
+    pub fn sampling(
+        &self,
+        temperature: Option<f64>,
+        top_k: Option<usize>,
+        top_p: Option<f64>,
+    ) -> Sampling {
+        if self.do_sample == Some(false) && temperature.is_none() {
+            return Sampling::ArgMax;
+        }
+        let temperature = temperature
+            .or(self.temperature)
+            .unwrap_or(Self::TEMPERATURE);
+        if temperature < 1e-7 {
+            return Sampling::ArgMax;
+        }
+        let k = top_k.or(self.top_k).unwrap_or(Self::TOP_K);
+        let p = top_p.or(self.top_p).unwrap_or(Self::TOP_P);
+        // Zero candidates and a nucleus of everything are both "no restriction".
+        match (k > 0, p < 1.0) {
+            (true, true) => Sampling::TopKThenTopP { k, p, temperature },
+            (true, false) => Sampling::TopK { k, temperature },
+            (false, true) => Sampling::TopP { p, temperature },
+            (false, false) => Sampling::All { temperature },
+        }
+    }
+
+    pub fn min_new_tokens(&self) -> usize {
+        self.min_new_tokens.unwrap_or(0)
+    }
+
+    /// The most steps an utterance may take: `max_length` less the start token, and never
+    /// past the `positions` of the table, which the prompt shares with the audio.
+    fn step_limit(&self, positions: usize, prompt_len: usize) -> usize {
+        let table = positions.saturating_sub(prompt_len);
+        match self.max_length {
+            Some(length) => length.saturating_sub(1).min(table),
+            None => table,
+        }
+    }
+}
+
+/// When a codebook may emit the end token.
+///
+/// No codebook may end before `min_new_tokens` steps have passed. After that, only the first
+/// codebook that has not ended may: a later one ending first would cut the others short.
+#[derive(Debug, Clone)]
+struct Ending {
+    first_unfinished: usize,
+    min_new_tokens: usize,
+}
+
+impl Ending {
+    fn new(min_new_tokens: usize) -> Self {
+        Self {
+            first_unfinished: 0,
+            min_new_tokens,
+        }
+    }
+
+    fn may_end(&self, book: usize, step: usize) -> bool {
+        step >= self.min_new_tokens && book <= self.first_unfinished
+    }
+
+    /// Called after a step's draws: the next codebook becomes the one that may end once the
+    /// current one has.
+    fn observe(&mut self, held: &[u32], pad: u32) {
+        let last = held.len().saturating_sub(1);
+        if held[self.first_unfinished] == pad && self.first_unfinished < last {
+            self.first_unfinished += 1;
+        }
+    }
+}
+
+/// One step's draws: each codebook that speaks takes a token from its row, never the end token
+/// where `ending` forbids it.
+fn draw_step(
+    step: usize,
+    held: &mut [u32],
+    pad: u32,
+    ending: &mut Ending,
+    sampler: &mut LogitsProcessor,
+    row: impl Fn(usize) -> Result<Tensor>,
+) -> Result<()> {
+    for book in speaking_at(step, held, pad) {
+        let row = row(book)?;
+        held[book] = match ending.may_end(book, step) {
+            true => sampler.sample(&row)?,
+            false => sampler.sample_avoiding(&row, &[pad])?,
+        };
+    }
+    ending.observe(held, pad);
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
+    /// The checkpoint's decoding recipe.
+    pub generation: Generation,
+    /// The learnt position table's length.
+    max_positions: usize,
     pub embed_prompts: Embedding,
     pub enc_to_dec_proj: Option<Linear>,
     pub decoder: Decoder,
@@ -272,6 +401,8 @@ impl Model {
             false => Some(linear(text_width, audio_width, &vb.pp("enc_to_dec_proj"))?),
         };
         Ok(Self {
+            generation: Generation::default(),
+            max_positions: cfg.decoder.max_position_embeddings,
             decoder,
             // What reads the description, and what fits its output to the decoder's width.
             text_encoder,
@@ -284,6 +415,14 @@ impl Model {
             decoder_start_token_id: cfg.decoder_start_token_id,
             pad_token_id: cfg.pad_token_id,
         })
+    }
+
+    /// The most steps one utterance of a `prompt_len`-token prompt may take.
+    ///
+    /// The checkpoint's `max_length` less the start token, and never past the position table,
+    /// which the prompt shares with the audio.
+    pub fn step_limit(&self, prompt_len: usize) -> usize {
+        self.generation.step_limit(self.max_positions, prompt_len)
     }
 
     /// Note that the returned tensor uses the CPU device.
@@ -341,6 +480,7 @@ impl Model {
         // the ones that were audio, which is everything that is not a marker.
         let mut held = vec![self.decoder_start_token_id; books];
         let mut spoken: Vec<Vec<u32>> = vec![Vec::new(); books];
+        let mut ending = Ending::new(self.generation.min_new_tokens());
 
         for step in 0..max_steps {
             // Autoregressive decode runs in spawn_blocking, so a dropped request can
@@ -355,10 +495,11 @@ impl Model {
                 _ => (None, step + prompt_len),
             };
             let logits = self.decoder.forward(&fed, prefix, encoded, pos)?;
-            for book in speaking_at(step, &held, self.pad_token_id) {
+            let pad = self.pad_token_id;
+            draw_step(step, &mut held, pad, &mut ending, &mut sampler, |book| {
                 let last = logits[book].dim(1)? - 1;
-                held[book] = sampler.sample(&logits[book].i((0, last))?)?;
-            }
+                logits[book].i((0, last))
+            })?;
             if held.iter().all(|&token| token == self.pad_token_id) {
                 break;
             }
@@ -507,5 +648,126 @@ impl Decoder {
     /// How many blocks the decoder stacks.
     pub fn n_layers(&self) -> usize {
         self.layers.len()
+    }
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::*;
+    use crate::tensor::Device;
+
+    const PAD: u32 = 7;
+    const START: u32 = 8;
+    const VOCAB: usize = 8;
+
+    /// Logits whose argmax is `leader`, with `PAD` the runner-up.
+    fn row_led_by(leader: usize) -> Result<Tensor> {
+        let mut v = vec![0.0f32; VOCAB];
+        v[PAD as usize] = 5.0;
+        v[leader] = 9.0;
+        Tensor::from_vec(v, (VOCAB,), &Device::Cpu)
+    }
+
+    /// Logits where the end token leads every codebook at every step, which is the worst case
+    /// for an utterance that must not stop early.
+    fn ending_leads(_book: usize) -> Result<Tensor> {
+        let mut v = vec![0.0f32; VOCAB];
+        v[PAD as usize] = 9.0;
+        v[3] = 5.0;
+        Tensor::from_vec(v, (VOCAB,), &Device::Cpu)
+    }
+
+    /// The rule of the reference processor: no end before `min_new_tokens` steps, then only the
+    /// first codebook that has not ended may end, and the next one is released the step after.
+    #[test]
+    fn only_the_first_unfinished_codebook_may_end_and_not_before_the_minimum() -> Result<()> {
+        let books = 3;
+        let mut held = vec![START; books];
+        let mut ending = Ending::new(2);
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let mut trace = Vec::new();
+        for step in 0..6 {
+            draw_step(
+                step,
+                &mut held,
+                PAD,
+                &mut ending,
+                &mut sampler,
+                ending_leads,
+            )?;
+            trace.push(held.clone());
+        }
+        // Steps 0 and 1: the minimum holds every end back, so a speaking codebook takes the
+        // runner-up. Codebooks that have not started hold the start token.
+        assert_eq!(trace[0], vec![3, START, START]);
+        assert_eq!(trace[1], vec![3, 3, START]);
+        // Step 2: only codebook 0 may end.
+        assert_eq!(trace[2], vec![PAD, 3, 3]);
+        // Step 3: codebook 1 is released, codebook 2 still may not.
+        assert_eq!(trace[3], vec![PAD, PAD, 3]);
+        // Step 4: the last one ends, and with it the utterance.
+        assert_eq!(trace[4], vec![PAD, PAD, PAD]);
+        assert_eq!(ending.first_unfinished, books - 1);
+        Ok(())
+    }
+
+    /// A codebook that may end still takes any other token its row leads with.
+    #[test]
+    fn a_codebook_that_may_end_still_draws_its_row() -> Result<()> {
+        let mut held = vec![START; 2];
+        let mut ending = Ending::new(0);
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        draw_step(0, &mut held, PAD, &mut ending, &mut sampler, |_| {
+            row_led_by(2)
+        })?;
+        assert_eq!(held, vec![2, START]);
+        Ok(())
+    }
+
+    #[test]
+    fn sampling_takes_the_request_then_the_file_then_the_library() {
+        let sampled = Generation::from_json(r#"{"do_sample": true, "min_new_tokens": 10}"#);
+        // The file is silent: top_k 50, no nucleus, temperature 1.
+        assert_eq!(
+            sampled.sampling(None, None, None),
+            Sampling::TopK {
+                k: 50,
+                temperature: 1.0
+            }
+        );
+        // The request wins over the library.
+        assert_eq!(
+            sampled.sampling(Some(0.5), Some(10), Some(0.9)),
+            Sampling::TopKThenTopP {
+                k: 10,
+                p: 0.9,
+                temperature: 0.5
+            }
+        );
+        // The file wins over the library.
+        let tuned = Generation::from_json(r#"{"top_k": 20, "top_p": 0.8, "temperature": 0.7}"#);
+        assert_eq!(
+            tuned.sampling(None, None, None),
+            Sampling::TopKThenTopP {
+                k: 20,
+                p: 0.8,
+                temperature: 0.7
+            }
+        );
+        // A zero temperature is greedy, and so is a checkpoint that does not sample.
+        assert_eq!(sampled.sampling(Some(0.0), None, None), Sampling::ArgMax);
+        let greedy = Generation::from_json(r#"{"do_sample": false}"#);
+        assert_eq!(greedy.sampling(None, None, None), Sampling::ArgMax);
+        assert_eq!(sampled.min_new_tokens(), 10);
+    }
+
+    #[test]
+    fn the_step_limit_comes_from_max_length_and_the_position_table() {
+        let g = Generation::from_json(r#"{"max_length": 2580}"#);
+        assert_eq!(g.step_limit(4096, 40), 2579);
+        // A prompt that leaves less room than max_length allows shortens the limit.
+        assert_eq!(g.step_limit(2600, 100), 2500);
+        // A file without max_length leaves the table as the only bound.
+        assert_eq!(Generation::default().step_limit(4096, 40), 4056);
     }
 }

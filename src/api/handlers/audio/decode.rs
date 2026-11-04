@@ -1989,23 +1989,11 @@ pub(crate) async fn audio_speech(
     let params = TtsSynthParams {
         voice_description: description,
         // Clamp via the finite-aware helper so NaN/Infinity in top_p
-        // (e.g. `{"top_p": "NaN"}`) doesn't propagate into the sampler
-        // - Rust's `f64::clamp` returns NaN for NaN inputs, which
-        // would silently disable nucleus filtering at runtime.
-        // Default 0.95 mirrors Parler-TTS's official inference recipe;
-        // pure greedy (None) was loop-prone on short inputs.
-        top_p: Some(
-            req.top_p
-                .map(|v| clamp_finite_f64(v, 0.0, 1.0, 0.95))
-                .unwrap_or(0.95),
-        ),
-        // Default 1.0 matches Parler-TTS's official inference recipe
-        // (do_sample=True, temperature=1.0). Greedy (temperature=0.0)
-        // is loop-prone on short inputs: the model gets stuck on the
-        // final phoneme because argmax keeps picking "stay on the
-        // current sound" and never triggers the pad-EOS break.
-        // Range [0, 2] still allowed via explicit caller value.
-        temperature: clamp_finite_f64(req.temperature.unwrap_or(1.0), 0.0, 2.0, 1.0),
+        // (e.g. `{"top_p": "NaN"}`) doesn't propagate into the sampler.
+        // A value the caller leaves out is the model's own.
+        top_p: req.top_p.map(|v| clamp_finite_f64(v, 0.0, 1.0, 1.0)),
+        top_k: None,
+        temperature: req.temperature.map(|v| clamp_finite_f64(v, 0.0, 2.0, 1.0)),
         // When the caller didn't supply a seed, draw a fresh one from
         // the system clock so successive `temperature > 0` calls
         // produce varied output instead of all using seed=0.
@@ -2018,13 +2006,9 @@ pub(crate) async fn audio_speech(
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0)
         }),
-        // Clamp to a sensible band: 16 (≈ 0.3 s of audio) prevents
-        // 0/runt outputs; 4096 (≈ 80 s) caps a single sentence so a
-        // pathological input can't tie the engine up indefinitely.
-        max_steps: req
-            .max_steps
-            .map(|v| (v as usize).clamp(16, 4096))
-            .unwrap_or(1024),
+        // A caller's cap is honoured up to the model's own limit; left out, the
+        // model's limit applies.
+        max_steps: req.max_steps.map(|v| v as usize),
     };
 
     // The event stream owns its load: it has to START before the checkpoint is read, or
@@ -2067,11 +2051,7 @@ pub(crate) async fn audio_speech(
     let mut all_pcm: Vec<f32> = Vec::new();
     let mut sample_rate = crate::inference::engine::tts_engine::TTS_SAMPLE_RATE;
     for (idx, sentence) in sentences.into_iter().enumerate() {
-        let mut p = params.clone();
-        // Cap per-sentence so a runaway sentence can't dominate; the
-        // total length is bounded by `sentences.len() * cap` which is
-        // generally fine for OpenAI-shaped inputs.
-        p.max_steps = p.max_steps.min(512);
+        let p = params.clone();
         // ONE seed for every sentence: Parler derives the speaker identity from
         // the sampling path, so a per-sentence seed advance (the old "varied
         // delivery" behavior) audibly CHANGED THE VOICE mid-narration - the
@@ -2337,15 +2317,10 @@ pub(super) async fn tts_stream_response(
         }
         let mut bytes_total: usize = 0;
         for (idx, sentence) in sentences.into_iter().enumerate() {
-            let mut params = base_params.clone();
-            // Each sentence is a self-contained synth call; cap the
-            // per-sentence steps tighter so a runaway one doesn't
-            // monopolize streaming.
-            params.max_steps = params.max_steps.min(512);
-            // Advance the seed per sentence so `temperature > 0` produces
-            // varied output across the stream instead of all sentences
-            // sharing the base seed.
-            params.seed = params.seed.wrapping_add(idx as u64);
+            let params = base_params.clone();
+            // One seed for every sentence: the voice is derived from the sampling
+            // path, so advancing it per sentence changes the voice mid-narration.
+            let _ = idx;
             match engine.synthesize(sentence, params).await {
                 Ok(r) => {
                     // Apply playback-speed time-domain resampling per
@@ -2526,11 +2501,10 @@ pub(super) fn tts_events_response(
                 failed = Some("synthesis cancelled".to_string());
                 break;
             }
-            let mut p = params.clone();
-            // Same per-sentence cap the non-stream path uses, and the SAME seed for every
-            // sentence: Parler derives the speaker identity from the sampling path, so
-            // advancing it per sentence audibly changes the voice mid-narration.
-            p.max_steps = p.max_steps.min(512);
+            let p = params.clone();
+            // The SAME seed for every sentence: Parler derives the speaker identity from
+            // the sampling path, so advancing it per sentence audibly changes the voice
+            // mid-narration.
             match state.tts_engine.synthesize(sentence, p).await {
                 Ok(r) => {
                     rate = r.sample_rate;
@@ -2655,7 +2629,6 @@ pub(crate) async fn audio_voices(
         // to know what's supported on this server.
         "supported_response_formats": ["wav", "pcm"],
         "max_input_chars": 4096,
-        "max_steps_cap": 4096,
         "supports_streaming": true,
         "supports_instructions": true,
     }))
