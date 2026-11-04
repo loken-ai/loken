@@ -187,6 +187,14 @@ pub struct LayerTier {
     transit_eighths: [AtomicU64; 2],
     /// Missing experts copied to the transit room for the token that wanted them.
     uploaded: AtomicU64,
+    /// The history of this layer's one-row requests: what they shared, what a guess of the
+    /// next one got right, and the lead the layer before leaves.
+    ahead: Mutex<super::expert_ahead::Ahead>,
+    /// The layer the worker serves after this one, which this layer's request may fetch for.
+    ahead_next: std::sync::OnceLock<std::sync::Weak<LayerTier>>,
+    /// Experts fetched for this layer before its request, and those its request used.
+    fetched_ahead: AtomicU64,
+    used_ahead: AtomicU64,
     /// The layer's side of a decode recorded in a graph, once enabled.
     graph: std::sync::OnceLock<graph::GraphSide>,
     /// The layer's formats and widths when the card, the transit room and the host compute its
@@ -349,6 +357,8 @@ pub struct CardStager {
     /// The transit room: two sets of arenas, each a stack of `transit` experts, that consecutive
     /// layers take turns over.
     buffers: [StageBuffer; 2],
+    /// What each buffer holds, for the layer it was filled for.
+    held: [Mutex<super::expert_ahead::Held>; 2],
     /// The room a wide batch fills with a layer's whole stacks, from the memory the caches lend
     /// while a prefill runs.
     full: Mutex<Option<[FullBuffer; 2]>>,
@@ -1311,6 +1321,10 @@ impl LayerTier {
             paced: [AtomicU64::new(0), AtomicU64::new(0)],
             transit_eighths: [AtomicU64::new(0), AtomicU64::new(0)],
             uploaded: AtomicU64::new(0),
+            ahead: Default::default(),
+            ahead_next: std::sync::OnceLock::new(),
+            fetched_ahead: AtomicU64::new(0),
+            used_ahead: AtomicU64::new(0),
             graph: std::sync::OnceLock::new(),
             exact,
         })
@@ -2524,28 +2538,39 @@ impl LayerTier {
         end: &crate::tensor::gpu_runtime::driver::CudaEvent,
         experts: &[u32],
     ) -> Result<()> {
+        let stage = self.stage.as_ref().expect("a copy to transit has a stage");
+        // The choice was waited for, so the layers that read this buffer before are done.
+        start
+            .record(&stage.stager.copy)
+            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
+        let puts: Vec<(u32, usize)> = experts.iter().copied().zip(0..).collect();
+        self.queue_copies(&puts)?;
+        stage.stager.held[stage.buffer]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        end.record(&stage.stager.copy)
+            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))
+    }
+
+    /// Queue the copies of experts into places of this layer's transit buffer: each entry of
+    /// `puts` is an expert and its place.
+    pub(super) fn queue_copies(&self, puts: &[(u32, usize)]) -> Result<()> {
         use crate::tensor::gpu_runtime::driver::DevicePtr;
         let stage = self.stage.as_ref().expect("a copy to transit has a stage");
         let copy = &stage.stager.copy;
         let buffer = &stage.stager.buffers[stage.buffer];
-        // The choice was waited for, so the layers that read this buffer before are done.
-        start
-            .record(copy)
-            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
         for i in 0..3 {
             let eb = self.expert_bytes[i];
             let arena = &buffer.arenas[i];
             let base = arena.device_ptr(arena.stream()).0;
             let data = self.host[i].native_qtensor().data();
-            for (at, &e) in experts.iter().enumerate() {
-                let e = e as usize;
-                self.upload_mapped(i, data, e * eb, eb, base + (at * eb) as u64, copy)?;
+            for &(e, at) in puts {
+                self.upload_mapped(i, data, e as usize * eb, eb, base + (at * eb) as u64, copy)?;
             }
         }
-        end.record(copy)
-            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
         self.uploaded
-            .fetch_add(experts.len() as u64, Ordering::Relaxed);
+            .fetch_add(puts.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2553,6 +2578,24 @@ impl LayerTier {
     /// the host's: [`Self::transit_share`] where the layer has a room.
     pub(super) fn transit_share_of(&self, missing: usize, rows: usize) -> usize {
         self.transit_share(missing, rows)
+    }
+
+    /// Places the transit room has, and the time to copy one expert into it in microseconds:
+    /// the measured pace, else the card's measured rate. Zero where there is no room.
+    pub(super) fn transit_room(&self) -> (usize, f64) {
+        let Some(stage) = self.stage.as_ref() else {
+            return (0, 0.0);
+        };
+        let measured = f64::from_bits(self.upload_us[0].load(Ordering::Relaxed));
+        let rate = stage.stager.bandwidth;
+        let copy = if measured > 0.0 {
+            measured
+        } else if rate > 0.0 {
+            self.expert_bytes.iter().sum::<usize>() as f64 / rate
+        } else {
+            0.0
+        };
+        (stage.stager.transit, copy)
     }
 
     /// The transit room's stacks, where the layer has one.
@@ -2756,6 +2799,7 @@ impl CardStager {
             widest,
             transit,
             buffers,
+            held: Default::default(),
             full: Mutex::new(None),
             decode_need: Mutex::new(None),
             free_after_return: Mutex::new(None),
@@ -4026,6 +4070,95 @@ mod tests {
             "the cache did not learn: {hits} of {routed}"
         );
         drop(worker);
+    }
+
+    /// Two layers on one card, served by one worker, run the same tokens with the next layer's
+    /// experts fetched ahead and without: both match the host, and the fetched experts are used.
+    #[test]
+    fn experts_fetched_a_layer_ahead_give_the_same_tokens() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let refs = [
+            layer(&Device::Cpu, experts, used, hidden, ffn),
+            layer(&Device::Cpu, experts, used, hidden, ffn),
+        ];
+        let x = values(hidden, 100, 1.0);
+        let on_host = Tensor::from_vec(x.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+        let through = |layers: &[MoeWeights; 2], x: &Tensor| {
+            let y = layers[0].forward(x, x, hidden, 1e-5, false).unwrap();
+            layers[1]
+                .forward(&y, &y, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let want = through(&refs, &on_host);
+        let run = |forced: u8| {
+            let mut layers = [
+                layer(&card, experts, used, hidden, ffn),
+                layer(&card, experts, used, hidden, ffn),
+            ];
+            let widest = [0, 1, 2].map(|i| {
+                [
+                    layers[0].gate_exps_sep.as_ref().unwrap(),
+                    layers[0].up_exps_sep.as_ref().unwrap(),
+                    &layers[0].down_exps,
+                ][i]
+                    .native_qtensor()
+                    .data()
+                    .len()
+            });
+            let stager = CardStager::new(&card, widest, experts).unwrap();
+            poison(&stager);
+            let mut named = Vec::new();
+            for (i, l) in layers.iter_mut().enumerate() {
+                let built = LayerTier::new(l, &card, 2)
+                    .unwrap()
+                    .with_stage(&stager, i, false)
+                    .unwrap();
+                l.tier = Some(Arc::new(built));
+                let tier = l.tier.clone().unwrap();
+                tier.enable_graph(hidden, used, 1).unwrap();
+                named.push((format!("layer {i}"), tier));
+            }
+            let worker = TierWorker::start(&card, named.clone()).unwrap();
+            GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+            graph::AHEAD_FOR_TEST.store(forced, Ordering::Relaxed);
+            let on_card = Tensor::from_vec(x.clone(), (1, 1, hidden), &card).unwrap();
+            let mut got = Vec::new();
+            for _ in 0..40 {
+                got.push(through(&layers, &on_card));
+                named.iter().for_each(|(_, t)| t.settle());
+            }
+            graph::AHEAD_FOR_TEST.store(0, Ordering::Relaxed);
+            GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+            drop(worker);
+            (got, named[1].1.fetched_ahead())
+        };
+        let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let close = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+                <= 2e-2 * peak
+        };
+        let (without, (none_fetched, _)) = run(1);
+        let (with, (fetched, used_ahead)) = run(2);
+        assert_eq!(none_fetched, 0, "nothing is fetched when it is off");
+        assert!(fetched > 0, "nothing was fetched ahead");
+        assert!(used_ahead > 0, "no fetched expert was used");
+        for (token, (a, b)) in without.iter().zip(&with).enumerate() {
+            assert!(close(a, &want), "token {token} without, off the host");
+            assert!(close(b, &want), "token {token} with, off the host");
+            assert!(close(a, b), "token {token}: with and without differ");
+        }
     }
 
     /// A worker that never answers a recorded token's request releases the card within the

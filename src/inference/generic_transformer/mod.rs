@@ -55,6 +55,8 @@ pub use loader::set_float_weights;
 mod context_parallel;
 #[cfg(test)]
 mod conversation_tests;
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+mod expert_ahead;
 pub mod expert_profile;
 #[cfg(feature = "gpu")]
 pub mod expert_tier;

@@ -336,7 +336,46 @@ struct WorkerStats {
     rows_many: std::sync::atomic::AtomicU64,
     missed_one: std::sync::atomic::AtomicU64,
     missed_many: std::sync::atomic::AtomicU64,
+    /// Of the one-row requests: the experts they routed to, those the request before routed to
+    /// as well, the experts a guess named from the missing set before, and those of them that
+    /// were missing.
+    ahead_routed: std::sync::atomic::AtomicU64,
+    ahead_shared: std::sync::atomic::AtomicU64,
+    ahead_guessed: std::sync::atomic::AtomicU64,
+    ahead_right: std::sync::atomic::AtomicU64,
+    /// Experts queued a layer ahead, and those the layer's request used.
+    ahead_queued: std::sync::atomic::AtomicU64,
+    ahead_used: std::sync::atomic::AtomicU64,
 }
+
+/// What the one-row requests have shown of the experts fetched a layer ahead.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AheadReport {
+    /// Share of a token's experts the token before also routed to.
+    pub shared: f64,
+    /// Share of the guess named from the missing set before that was missing.
+    pub guessed_right: f64,
+    /// Experts queued a layer ahead, and those the layer's request used.
+    pub queued: u64,
+    pub used: u64,
+}
+
+/// What the requests of every layer have shown, since the load.
+pub fn ahead_report() -> AheadReport {
+    let part = |a: &std::sync::atomic::AtomicU64, b: &std::sync::atomic::AtomicU64| {
+        a.load(Ordering::Relaxed) as f64 / b.load(Ordering::Relaxed).max(1) as f64
+    };
+    AheadReport {
+        shared: part(&WORKER.ahead_shared, &WORKER.ahead_routed),
+        guessed_right: part(&WORKER.ahead_right, &WORKER.ahead_guessed),
+        queued: WORKER.ahead_queued.load(Ordering::Relaxed),
+        used: WORKER.ahead_used.load(Ordering::Relaxed),
+    }
+}
+
+/// Whether a test forces the fetch ahead: `0` follows the measures, `1` never, `2` always.
+#[cfg(test)]
+pub(super) static AHEAD_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// One more expert landed in a slot of some layer.
 pub(super) fn note_promotion() {
@@ -358,6 +397,12 @@ static WORKER: WorkerStats = WorkerStats {
     rows_many: std::sync::atomic::AtomicU64::new(0),
     missed_one: std::sync::atomic::AtomicU64::new(0),
     missed_many: std::sync::atomic::AtomicU64::new(0),
+    ahead_routed: std::sync::atomic::AtomicU64::new(0),
+    ahead_shared: std::sync::atomic::AtomicU64::new(0),
+    ahead_guessed: std::sync::atomic::AtomicU64::new(0),
+    ahead_right: std::sync::atomic::AtomicU64::new(0),
+    ahead_queued: std::sync::atomic::AtomicU64::new(0),
+    ahead_used: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// The steps of a request the worker names in its heartbeat, by index.
@@ -543,6 +588,9 @@ pub(super) struct GraphSide {
     /// Around the copies of a request's late experts into the transit room.
     upload_start: crate::tensor::gpu_runtime::driver::CudaEvent,
     upload_end: crate::tensor::gpu_runtime::driver::CudaEvent,
+    /// Recorded on the copy stream when the experts fetched for this layer before its request
+    /// are queued.
+    ahead_end: crate::tensor::gpu_runtime::driver::CudaEvent,
     /// The buffers of the exact launches, for a layer that has them.
     exact: Option<super::exact::GraphRooms>,
 }
@@ -650,6 +698,7 @@ impl LayerTier {
             health: OnceLock::new(),
             upload_start: super::timed_event(dev)?,
             upload_end: super::timed_event(dev)?,
+            ahead_end: super::timed_event(dev)?,
             exact,
         };
         let _ = self.graph.set(side);
@@ -965,6 +1014,111 @@ impl LayerTier {
         Ok(product)
     }
 
+    /// Names this layer in a buffer's record.
+    fn tier_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// Queue the copies of `puts` (expert, place) into this layer's transit buffer between
+    /// two events.
+    fn copy_to_places(
+        &self,
+        start: &crate::tensor::gpu_runtime::driver::CudaEvent,
+        end: &crate::tensor::gpu_runtime::driver::CudaEvent,
+        puts: &[(u32, usize)],
+    ) -> Result<()> {
+        let stage = self.stage.as_ref().expect("a copy to transit has a stage");
+        start
+            .record(&stage.stager.copy)
+            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
+        self.queue_copies(puts)?;
+        end.record(&stage.stager.copy)
+            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))
+    }
+
+    /// The copy stream holds none of this request's copies from now on: the next layer's lead
+    /// starts.
+    fn note_lead_start(&self) {
+        if let Some(next) = self.ahead_next.get().and_then(std::sync::Weak::upgrade) {
+            next.ahead
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lead_starts(std::time::Instant::now());
+        }
+    }
+
+    /// Queue the experts the next layer found missing last time into that layer's buffer, the
+    /// one this layer does not use, when its measured hit rate beats the break-even of its
+    /// measured copy and lead times. The card has stopped at this layer's request, so every
+    /// layer that read that buffer before is done. Only for the requests of one row.
+    fn fetch_ahead(&self, rows: usize) -> Result<()> {
+        if rows != 1 {
+            return Ok(());
+        }
+        let Some(next) = self.ahead_next.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        let (Some(here), Some(there), Some(ng)) =
+            (self.stage.as_ref(), next.stage.as_ref(), next.graph.get())
+        else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(&here.stager, &there.stager) || here.buffer == there.buffer {
+            return Ok(());
+        }
+        let (room, copy_us) = next.transit_room();
+        let guess = {
+            let st = next.state.lock().unwrap_or_else(|e| e.into_inner());
+            next.ahead
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .guess(|e| st.slot_of[e as usize] >= 0, room)
+        };
+        if guess.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let forced = AHEAD_FOR_TEST.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let forced = 0u8;
+        let go = match forced {
+            1 => false,
+            2 => true,
+            _ => next
+                .ahead
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .worth(guess.len(), copy_us),
+        };
+        if !go {
+            return Ok(());
+        }
+        let puts: Vec<(u32, usize)> = guess.iter().copied().zip(0..).collect();
+        next.queue_copies(&puts)?;
+        ng.ahead_end
+            .record(&there.stager.copy)
+            .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
+        there.stager.held[there.buffer]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set(next.tier_key(), &puts);
+        next.fetched_ahead
+            .fetch_add(puts.len() as u64, Ordering::Relaxed);
+        WORKER
+            .ahead_queued
+            .fetch_add(puts.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Experts fetched for this layer before its request, and those its request used.
+    #[cfg(test)]
+    pub(crate) fn fetched_ahead(&self) -> (u64, u64) {
+        (
+            self.fetched_ahead.load(Ordering::Relaxed),
+            self.used_ahead.load(Ordering::Relaxed),
+        )
+    }
+
     /// Answer the layer's request if the card posted one since the last answer. Whether it did.
     /// `beat` tells the worker's health which step it is at.
     pub(super) fn serve_graph_request(self: &Arc<Self>, beat: &dyn Fn(usize)) -> Result<bool> {
@@ -989,6 +1143,8 @@ impl LayerTier {
         // of them at weight zero, so none of them is a victim.
         let mut in_use = vec![false; self.slots()];
         let mut missing: Vec<u32> = Vec::new();
+        // What a fetch ahead would have named for this request, one row only.
+        let mut guess: Vec<u32> = Vec::new();
         let mut miss_pairs: Vec<(usize, u32, f32)> = Vec::new();
         // Each missing pair's place among the request's pairs.
         let mut miss_at: Vec<usize> = Vec::new();
@@ -1015,24 +1171,84 @@ impl LayerTier {
                 in_use[0] = true;
             }
             st.tokens_routed(req.rows);
+            if req.rows == 1 {
+                guess = self
+                    .ahead
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .guess(|e| st.slot_of[e as usize] >= 0, self.transit_room().0);
+            }
         }
         self.routed.fetch_add(pairs as u64, Ordering::Relaxed);
         self.hits
             .fetch_add((pairs - miss_pairs.len()) as u64, Ordering::Relaxed);
+        {
+            let mut ahead = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
+            ahead.lead_ends(started);
+            if req.rows == 1 {
+                let seen = ahead.note_request(&req.ids, &missing, &guess);
+                let add = |cell: &std::sync::atomic::AtomicU64, n: usize| {
+                    cell.fetch_add(n as u64, Ordering::Relaxed);
+                };
+                add(&WORKER.ahead_routed, seen.routed);
+                add(&WORKER.ahead_shared, seen.shared);
+                add(&WORKER.ahead_guessed, seen.guessed);
+                add(&WORKER.ahead_right, seen.right);
+            } else {
+                ahead.forget();
+            }
+        }
         laps.mark("tier worker: bookkeeping");
         // The card waits for the product only when an expert was missing. Of the missing
         // experts, a share goes to the transit room by copy while the host computes the rest:
         // the card runs the copied ones once the answer says they landed.
         if miss_pairs.is_empty() {
             g.mail.hand_late(&[]);
+            self.fetch_ahead(req.rows)?;
             g.mail.raise(req.seq);
+            self.note_lead_start();
         } else {
-            let to_transit = self.transit_share_of(missing.len(), req.rows);
-            let (transit, host_experts) = missing.split_at(to_transit);
-            if !transit.is_empty() {
+            // Missing experts a fetch ahead put in the buffer keep their places and cost no
+            // copy. The others share the places left.
+            let key = self.tier_key();
+            let (room, _) = self.transit_room();
+            let plan = match self.stage.as_ref() {
+                Some(stage) => super::super::expert_ahead::plan(
+                    &stage.stager.held[stage.buffer]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    key,
+                    &missing,
+                    room,
+                ),
+                None => super::super::expert_ahead::Plan {
+                    hits: Vec::new(),
+                    free: Vec::new(),
+                },
+            };
+            let rest: Vec<u32> = missing
+                .iter()
+                .copied()
+                .filter(|e| !plan.hits.iter().any(|h| h.0 == *e))
+                .collect();
+            let to_transit = self
+                .transit_share_of(rest.len(), req.rows)
+                .min(plan.free.len());
+            let (transit, host_experts) = rest.split_at(to_transit);
+            let puts = super::super::expert_ahead::assign(&plan.free, transit);
+            let (puts_len, hits_used) = (puts.len(), plan.hits.len());
+            if !puts.is_empty() {
                 beat(TO_TRANSIT);
-                self.copy_to_transit_between(&g.upload_start, &g.upload_end, transit)?;
+                self.copy_to_places(&g.upload_start, &g.upload_end, &puts)?;
             }
+            let placed: Vec<(u32, usize)> = plan.hits.iter().copied().chain(puts).collect();
+            if let Some(stage) = self.stage.as_ref().filter(|_| !placed.is_empty()) {
+                stage.stager.held[stage.buffer]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set(key, &placed);
+            }
+            self.fetch_ahead(req.rows)?;
             let (host_at, host_pairs): (Vec<usize>, Vec<(usize, u32, f32)>) = miss_at
                 .iter()
                 .zip(&miss_pairs)
@@ -1042,7 +1258,7 @@ impl LayerTier {
             let late: Vec<(u32, u32, f32)> = miss_pairs
                 .iter()
                 .filter_map(|&(row, e, w)| {
-                    let place = transit.iter().position(|&t| t == e)?;
+                    let place = placed.iter().find(|p| p.0 == e)?.1;
                     let pair = req
                         .ids
                         .iter()
@@ -1074,18 +1290,31 @@ impl LayerTier {
             WORKER
                 .missing
                 .fetch_add(missing.len() as u64, Ordering::Relaxed);
-            if !transit.is_empty() {
+            if !placed.is_empty() {
                 beat(LANDING);
-                g.upload_end
-                    .synchronize()
-                    .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
-                if let Ok(ms) = g.upload_start.elapsed_ms(&g.upload_end) {
-                    self.note_upload_us(ms as f64 * 1e3 / transit.len() as f64, req.rows);
+                if hits_used > 0 {
+                    g.ahead_end
+                        .synchronize()
+                        .map_err(|e| crate::tensor::Error::msg(format!("fetch ahead: {e:?}")))?;
+                    self.used_ahead
+                        .fetch_add(hits_used as u64, Ordering::Relaxed);
+                    WORKER
+                        .ahead_used
+                        .fetch_add(hits_used as u64, Ordering::Relaxed);
+                }
+                if puts_len > 0 {
+                    g.upload_end
+                        .synchronize()
+                        .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
+                    if let Ok(ms) = g.upload_start.elapsed_ms(&g.upload_end) {
+                        self.note_upload_us(ms as f64 * 1e3 / puts_len as f64, req.rows);
+                    }
                 }
                 WORKER
                     .transit
-                    .fetch_add(transit.len() as u64, Ordering::Relaxed);
+                    .fetch_add(placed.len() as u64, Ordering::Relaxed);
             }
+            self.note_lead_start();
             laps.mark("tier worker: transit landed");
             beat(ANSWERING);
             g.mail.hand_late(&late);
@@ -1124,6 +1353,27 @@ impl LayerTier {
                 pct(&WORKER.missed_one, &WORKER.rows_one),
                 pct(&WORKER.missed_many, &WORKER.rows_many)
             );
+            let ahead = ahead_report();
+            let (hit, lead) = self.ahead.lock().unwrap_or_else(|e| e.into_inner()).pace();
+            let (room, copy_us) = self.transit_room();
+            tracing::info!(
+                "expert tier worker: one-row requests share {:.0}% of their experts with the request before, a guess from its missing set was {:.0}% right ({} us lead, {:.0} us a copy, {} places), {} experts fetched a layer ahead, {} used",
+                100.0 * ahead.shared,
+                100.0 * ahead.guessed_right,
+                lead.map_or(0, |l| l as u64),
+                copy_us,
+                room,
+                ahead.queued,
+                ahead.used,
+            );
+            if let Some(hit) = hit {
+                tracing::info!(
+                    "expert tier worker: this layer's guess is {:.0}% right, a fetch ahead pays above {}",
+                    100.0 * hit,
+                    super::super::expert_ahead::break_even(room, copy_us, lead.unwrap_or(0.0))
+                        .map_or("an unknown share".to_string(), |b| format!("{:.0}%", 100.0 * b)),
+                );
+            }
             tracing::info!(
                 "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request; transit share {}/8 (one row) {}/8 (rows), host {:.0}/{:.0} us an expert, copy {:.0}/{:.0} us",
                 total / n / 1000,
@@ -1173,6 +1423,10 @@ impl TierWorker {
             .filter_map(|(i, (_, t))| Some((i, t.graph.get()?)))
             .map(|(i, g)| (i, g.mail.clone(), g.done.clone()))
             .collect();
+        // A layer's request may fetch for the layer served after it.
+        for pair in tiers.windows(2) {
+            let _ = pair[0].1.ahead_next.set(Arc::downgrade(&pair[1].1));
+        }
         let health = Arc::new(Health::new(mails));
         for (_, t) in &tiers {
             if let Some(g) = t.graph.get() {
