@@ -671,7 +671,26 @@ mod tests {
         }
     }
 
-    const CHATML: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{{ '<|im_start|>assistant\\n' }}";
+    /// A clip's prompt states each temporal patch at its time between the vision markers, and
+    /// goes in front of the text of the last user turn that carries a clip.
+    #[test]
+    fn a_clip_states_each_patch_at_its_time() {
+        let p = clip_placeholder(&[0.5, 1.5]);
+        let one = QWEN35_IMAGE_SENTINEL;
+        assert_eq!(
+            p,
+            format!("<|vision_start|><0.5 seconds>{one}<1.5 seconds>{one}<|vision_end|>")
+        );
+        let mut clip = Message::new("user".to_string(), "what happens?".to_string());
+        clip.videos = Some(vec!["AAAA".to_string()]);
+        let msgs = [user("hello", None), clip, user("and then?", None)];
+        let out = with_clip_placeholder(&msgs, &p);
+        assert_eq!(out[0].content, "hello");
+        assert_eq!(out[1].content, format!("{p}what happens?"));
+        assert_eq!(out[2].content, "and then?");
+    }
+
+    const CHATML: &str ="{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{{ '<|im_start|>assistant\\n' }}";
 
     /// A required call constrains the generation to the call object in both dialects.
     #[test]
