@@ -221,6 +221,7 @@ impl StateCache {
         state: &mut DecodeState,
     ) -> Result<(Tensor, usize)> {
         let capture = state.capture_layers.clone();
+        let window = state.capture_window;
         let mut from = 0;
         if let Some(r) = self.restore(model, ids) {
             tracing::info!(
@@ -231,6 +232,7 @@ impl StateCache {
             from = r.covered;
             *state = r.state;
             state.capture_layers = capture;
+            state.capture_window = window;
             if let (true, Some(l)) = (r.covered == ids.len(), r.logits) {
                 let n = l.len();
                 return Ok((Tensor::from_vec(l, (1, n), &Device::Cpu)?, from));

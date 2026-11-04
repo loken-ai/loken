@@ -289,6 +289,10 @@ Limits:
 - The decode of a card with a cache is bound by the host launching its kernels 1 by 1, since the decode graph is off for these files.
 - **Multi-token prediction** runs as a draft head that `loken draft-head` writes beside the model from the checkpoint's `mtp.*` tensors.
   The decode drafts with it only when `fidelity = "fast"` is set and the decode graph is recorded.
+- **DeepSeek V4.1 native draft** is the DSpark head, the checkpoint's `mtp.*` tensors, read from the model file or a companion.
+  The decode loop drafts with it when it is loaded, verifies through the batched forward, and keeps the accepted prefix.
+  The prompt's last positions, the decoded tokens and the verified blocks feed its window.
+  Tests prove the same greedy text through the engine with a scripted guess. No speedup is measured on the real model.
 - A test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and passes alone.
 
 ## Costs

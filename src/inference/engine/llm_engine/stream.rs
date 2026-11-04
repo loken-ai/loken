@@ -1335,6 +1335,13 @@ impl LlmEngine {
                     s.model.draft_head_capture(false);
                 }
             }
+            // A model that drafts from its own head without a recorded step drafts here, as long
+            // as no drafter model or recorded head does.
+            let native_cap = model_state
+                .blocking_lock()
+                .as_ref()
+                .is_some_and(|s| s.model.capabilities().native_draft);
+            let native_on = native_cap && !spec_on && !head_on;
             if let Some(s) = model_state.blocking_lock().as_ref() {
                 s.model.settle_hot_experts();
             }
@@ -2418,6 +2425,11 @@ impl LlmEngine {
                         spec_engine.draft_length()
                     } else if head_on {
                         crate::inference::engine::decode_step::DRAFT_MAX
+                    } else if native_on {
+                        if let Some(s) = model_state.blocking_lock().as_ref() {
+                            spec_engine.learn_expert_cost(&s.model);
+                        }
+                        spec_engine.draft_length()
                     } else {
                         0
                     };
@@ -2431,6 +2443,11 @@ impl LlmEngine {
                         // until the policy tries it again.
                         time_plain = true;
                     }
+                    if native_on && want == 0 {
+                        // Plain steps are timed so the policy can try the head again.
+                        time_plain = true;
+                    }
+                    let mut native_round = false;
                     // A copy of a span already seen drafts before the head: it reaches
                     // farther and is right more often; the head drafts when there is none.
                     let copied: Vec<u32> = if head_on && pld_active && copies_pay {
@@ -2461,6 +2478,19 @@ impl LlmEngine {
                     } else if head_on {
                         draft_secs = head_draft_secs;
                         head_draft.clone()
+                    } else if native_on && want > 0 {
+                        let d = match model_state.blocking_lock().as_mut() {
+                            Some(s) => s.model.native_draft_tokens(next_token, want),
+                            None => Vec::new(),
+                        };
+                        draft_secs = cycle_start.elapsed().as_secs_f64();
+                        native_round = !d.is_empty();
+                        // A step the head has no guess for may still match the prompt.
+                        if native_round || !pld_active {
+                            d
+                        } else {
+                            pld_cache.lookup()
+                        }
                     } else if pld_active {
                         pld_cache.lookup()
                     } else {
@@ -2468,7 +2498,7 @@ impl LlmEngine {
                     };
 
                     // A drafter's single token is worth a verify; an n-gram match of one is not.
-                    let worth_verifying = if spec_on || head_on {
+                    let worth_verifying = if spec_on || head_on || native_round {
                         !draft.is_empty()
                     } else {
                         draft.len() >= 2
@@ -2661,19 +2691,22 @@ impl LlmEngine {
                                 pld_stats_accepted += accepted_drafts as u64;
                                 // Window-rate cooldown synced with /api/generate
                                 // path (shared: decode_step::pld_window_update).
-                                pld_window_update(
-                                    &mut pld_window_drafted,
-                                    &mut pld_window_accepted,
-                                    &mut pld_cooldown,
-                                    k,
-                                    accepted_drafts,
-                                );
+                                if !native_round {
+                                    pld_window_update(
+                                        &mut pld_window_drafted,
+                                        &mut pld_window_accepted,
+                                        &mut pld_cooldown,
+                                        k,
+                                        accepted_drafts,
+                                    );
+                                }
                                 let n_committed = 1 + accepted_drafts;
                                 let new_pos = pos + n_committed;
                                 // A cycle whose window was recorded as it ran paid the recording:
                                 // its acceptance counts, its cost does not.
                                 let cycle_secs = cycle_start.elapsed().as_secs_f64();
-                                let costed_round = !spec_on && !head_on && !window_recorded;
+                                let costed_round =
+                                    !spec_on && !head_on && !native_round && !window_recorded;
                                 if pld_enabled {
                                     pld_cache.push_many(&draft[..accepted_drafts]);
                                 }
@@ -2726,6 +2759,15 @@ impl LlmEngine {
                                 if costed_round {
                                     pld_cost
                                         .round(cycle_start.elapsed().as_secs_f64(), n_committed);
+                                }
+                                if native_round {
+                                    spec_drafted += k as u64;
+                                    spec_accepted += accepted_drafts as u64;
+                                    spec_engine
+                                        .draft_length
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .record(k, accepted_drafts, draft_secs, cycle_secs);
                                 }
                                 // Spec-decode: drafter KV lockstep (shared:
                                 // decode_step::spec_draft_lockstep).

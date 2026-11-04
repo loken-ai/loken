@@ -107,6 +107,11 @@ pub struct DecodeState {
     /// The last decode's mean-pooled hidden at each capture layer, in `capture_layers` order. Read
     /// by the draft after a decode; overwritten each decode.
     pub captured: Vec<Vec<f32>>,
+    /// The last block pass's hidden for each of its tokens: the capture layers' rows side by
+    /// side, in `capture_layers` order. Overwritten by each block pass.
+    pub block_hidden: Vec<Vec<f32>>,
+    /// The most prompt tokens a prefill keeps the hidden of, the draft's window. Zero keeps none.
+    pub capture_window: usize,
 }
 
 impl DecodeState {
@@ -117,6 +122,8 @@ impl DecodeState {
             pos: 0,
             capture_layers: Vec::new(),
             captured: Vec::new(),
+            block_hidden: Vec::new(),
+            capture_window: 0,
         }
     }
 

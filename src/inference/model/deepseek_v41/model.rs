@@ -621,6 +621,14 @@ impl DeepseekV41Model {
             }
         }
         let mut prefill = self.prefill_begin_at(tokens, base)?;
+        // The draft reads the hidden of the last positions its window holds.
+        let cap = state.capture_layers.clone();
+        let tail = tokens.len().min(state.capture_window);
+        state.block_hidden = if cap.is_empty() || tail == 0 {
+            Vec::new()
+        } else {
+            vec![vec![0f32; self.dim * cap.len()]; tail]
+        };
         // The residual stream goes to a card for the whole prompt when one has room: the
         // hyper-connection steps run there and only each sublayer's input and output cross.
         let mut held: Option<Box<dyn crate::inference::offload::HcStream>> =
@@ -661,6 +669,21 @@ impl DeepseekV41Model {
                 })?;
                 if let Some(ds) = held.as_mut() {
                     ds.replace(&prefill.x.flatten_all()?.to_vec1::<f32>()?)?;
+                }
+            }
+            if let Some(ci) = cap.iter().position(|&l| l == i) {
+                let s = tokens.len();
+                let flat = match held.as_mut() {
+                    Some(ds) => ds.rows(s - tail, tail)?,
+                    None => prefill
+                        .x
+                        .narrow(1, s - tail, tail)?
+                        .contiguous()?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                };
+                for (j, token) in flat.chunks_exact(self.hc_mult * self.dim).enumerate() {
+                    self.add_hidden_mean(token, &mut state.block_hidden[j], ci);
                 }
             }
             let rope = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
@@ -2242,6 +2265,23 @@ impl DeepseekV41Model {
         })
     }
 
+    /// Add the mean over the hyper-connection copies of one token's stream `flat` into the
+    /// capture slot `ci` of `row`.
+    fn add_hidden_mean(&self, flat: &[f32], row: &mut [f32], ci: usize) {
+        let (hc, dim) = (self.hc_mult, self.dim);
+        let out = &mut row[ci * dim..(ci + 1) * dim];
+        for copy in flat.chunks_exact(dim).take(hc) {
+            for (o, v) in out.iter_mut().zip(copy) {
+                *o += v / hc as f32;
+            }
+        }
+    }
+
+    /// The embedding table and the output head, which the draft reads beside its own weights.
+    pub fn draft_inputs(&self) -> (&Tensor, &Projection) {
+        (&self.embed, &self.output)
+    }
+
     /// Verify a block of `tokens` starting at `state.pos`, returning the next-token logits at
     /// every position, `[tokens.len(), vocab]`. Attention runs token by token over the ring, as
     /// decode does, so each token attends only to the ones before it and its own state carries a
@@ -2356,6 +2396,13 @@ impl DeepseekV41Model {
         // compressed KV pass down to a later band layer within a token, so the tokens of the
         // block cannot share one without a token reading another's keys.
         let mut shareds: Vec<SharedAttn> = (0..k).map(|_| SharedAttn::default()).collect();
+        // The draft reads the hidden of every token of the block at its capture layers.
+        let cap = state.capture_layers.clone();
+        state.block_hidden = if cap.is_empty() {
+            Vec::new()
+        } else {
+            vec![vec![0f32; dim * cap.len()]; k]
+        };
 
         for (i, block) in self.blocks.iter().enumerate() {
             let Some(block) = block.as_ref() else {
@@ -2376,6 +2423,10 @@ impl DeepseekV41Model {
                 {
                     let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
                     xj = engram.forward(&xj, &[ecfg.hash(which, recent)])?;
+                }
+                if let Some(ci) = cap.iter().position(|&l| l == i) {
+                    let flat = xj.flatten_all()?.to_vec1::<f32>()?;
+                    self.add_hidden_mean(&flat, &mut state.block_hidden[j], ci);
                 }
                 let (xj_attn, ampre_j) = block.forward_decode_attn(
                     &xj,
@@ -3344,14 +3395,14 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
-mod oracle_gate {
+pub(crate) mod oracle_gate {
     use super::*;
     use crate::tensor::gguf_write::write_gguf_with_metadata;
     use crate::tensor::quantized::gguf_file::open_mapped;
 
     /// A model of the tests' synthetic weights in the given band layout, its experts through a
     /// cache of `expert_cache` slots (0: all resident), and a prompt for it.
-    fn synthetic(
+    pub(crate) fn synthetic(
         ratios: &[u32],
         kv_src: &[u32],
         index_src: &[u32],
@@ -3915,6 +3966,139 @@ mod oracle_gate {
                     );
                 }
             }
+        }
+    }
+
+    /// A block pass keeps each token's hidden at the capture layers, the rows a decode of the same
+    /// tokens captures one at a time.
+    #[test]
+    fn a_verified_block_keeps_the_hidden_of_each_token() {
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let capture = vec![1usize, 2];
+        let split = tokens.len() - 5;
+        let mut stepped = model.new_decode_state();
+        stepped.capture_layers = capture.clone();
+        let mut want = Vec::new();
+        for (pos, &t) in tokens.iter().enumerate() {
+            model.forward_decode(t, &mut stepped).unwrap();
+            if pos >= split {
+                want.push(stepped.captured.concat());
+            }
+        }
+        let mut state = model.new_decode_state();
+        state.capture_layers = capture;
+        model.prefill_into(&tokens[..split], &mut state).unwrap();
+        model
+            .forward_verify_batch(&tokens[split..], &mut state)
+            .unwrap();
+        assert_eq!(state.block_hidden.len(), want.len());
+        for (j, (got, want)) in state.block_hidden.iter().zip(&want).enumerate() {
+            assert_eq!(got.len(), want.len());
+            let num: f32 = got.iter().zip(want).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = want.iter().map(|b| b * b).sum();
+            let rel = (num / den).sqrt();
+            assert!(rel < 1e-3, "token {j}: rel {rel}");
+        }
+    }
+
+    /// A prefill keeps the hidden of the last positions its window holds, the rows a decode of the
+    /// same tokens captures one at a time.
+    #[test]
+    fn a_prefill_keeps_the_hidden_of_its_last_positions() {
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let capture = vec![1usize, 2];
+        let tail = 6;
+        let mut stepped = model.new_decode_state();
+        stepped.capture_layers = capture.clone();
+        let mut want = Vec::new();
+        for &t in &tokens {
+            model.forward_decode(t, &mut stepped).unwrap();
+            want.push(stepped.captured.concat());
+        }
+        let want = &want[tokens.len() - tail..];
+        let mut state = model.new_decode_state();
+        state.capture_layers = capture;
+        state.capture_window = tail;
+        model.prefill_into(&tokens, &mut state).unwrap();
+        assert_eq!(state.block_hidden.len(), tail);
+        for (j, (got, want)) in state.block_hidden.iter().zip(want).enumerate() {
+            let num: f32 = got.iter().zip(want).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = want.iter().map(|b| b * b).sum();
+            let rel = (num / den).sqrt();
+            assert!(rel < 1e-3, "position {j}: rel {rel}");
+        }
+    }
+
+    /// A greedy decode that verifies drafted blocks through the backend, rolling back what is
+    /// rejected, gives the tokens of a plain greedy decode, whatever the drafts hold: right,
+    /// wrong from the start, or right then wrong.
+    #[test]
+    fn drafted_blocks_verified_by_the_backend_give_the_plain_greedy_text() {
+        use crate::inference::engine::model_backend::{DeepseekV41Backend, ModelBackend};
+        let argmax = |v: &[f32]| -> u32 {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        let tensor = |ids: &[u32]| {
+            Tensor::new(ids, &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap()
+        };
+        let (model, prompt) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let wanted = 14;
+        let draft_len = 4;
+
+        let mut plain = DeepseekV41Backend::new(model, 0, 128);
+        let mut next = argmax(&vecf_of(&plain.forward(&tensor(&prompt), 0).unwrap()));
+        let mut pos = prompt.len();
+        let mut truth = vec![next];
+        while truth.len() < wanted + draft_len {
+            next = argmax(&vecf_of(&plain.forward(&tensor(&[next]), pos).unwrap()));
+            pos += 1;
+            truth.push(next);
+        }
+
+        for (agree, tag) in [(draft_len, "right"), (0, "wrong"), (2, "right then wrong")] {
+            let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+            let mut spec = DeepseekV41Backend::new(model, 0, 128);
+            let mut next = argmax(&vecf_of(&spec.forward(&tensor(&prompt), 0).unwrap()));
+            let mut pos = prompt.len();
+            let mut out = vec![next];
+            while out.len() < wanted {
+                // The draft follows the plain text for `agree` tokens, then turns.
+                let draft: Vec<u32> = (0..draft_len)
+                    .map(|i| {
+                        let want = truth[out.len() + i];
+                        if i < agree {
+                            want
+                        } else {
+                            (want + 1) % 48
+                        }
+                    })
+                    .collect();
+                let mut input = vec![next];
+                input.extend(&draft);
+                let logits = spec.forward_all(&tensor(&input), pos).unwrap();
+                let rows = vecf_of(&logits);
+                let vocab = rows.len() / input.len();
+                let picks: Vec<u32> = rows.chunks(vocab).map(argmax).collect();
+                // The longest agreeing prefix, then the target's own token after it.
+                let mut taken = 0;
+                while taken < draft_len && picks[taken] == draft[taken] {
+                    taken += 1;
+                }
+                out.extend_from_slice(&picks[..=taken]);
+                if taken < draft_len {
+                    spec.trim_kv(pos + 1 + taken);
+                }
+                pos += 1 + taken;
+                next = picks[taken];
+            }
+            assert_eq!(&out[..wanted], &truth[..wanted], "{tag} drafts");
         }
     }
 

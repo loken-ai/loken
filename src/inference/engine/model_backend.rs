@@ -233,6 +233,9 @@ pub(crate) struct Capabilities {
     pub graph_mode: bool,
     /// The backend drives a draft/verify split of its own.
     pub speculative: bool,
+    /// `native_draft_tokens` guesses tokens from the model's own draft head, to be verified
+    /// through `forward_all` and kept through `trim_kv`.
+    pub native_draft: bool,
 }
 
 /// What a node measured about running a model's layers, for deciding whether to cut the stack
@@ -536,6 +539,12 @@ pub(crate) trait ModelBackend: Send {
 
     /// The draft head's history starts over.
     fn draft_head_reset(&mut self) {}
+
+    /// Up to `k` tokens the model's own draft head guesses after `next`, the token just chosen
+    /// and not yet in the cache. Empty when the head has no guess.
+    fn native_draft_tokens(&mut self, _next: u32, _k: usize) -> Vec<u32> {
+        Vec::new()
+    }
 
     /// The draft head's vocabulary chosen for a request whose prompt is `prompt`.
     fn draft_head_vocab(&mut self, _prompt: &[u32]) {}
@@ -1333,6 +1342,15 @@ pub(crate) struct DeepseekV41Backend {
     dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark>,
     /// The draft's running window state, beside `state`.
     dspark_state: Option<crate::inference::model::deepseek_v41::dspark::DsparkState>,
+    /// The hidden rows of the last verified block that the draft's window has not read yet: the
+    /// position of the first row, then one row per token the cache holds.
+    unread_rows: Option<(usize, Vec<Vec<f32>>)>,
+    /// The last token the cache took, which the draft block starts from.
+    last_fed: Option<u32>,
+    /// A draft that stands in for the head in the tests: from the cache's position, the token
+    /// just chosen and the length wanted, the tokens it guesses.
+    #[cfg(test)]
+    scripted_draft: Option<Box<dyn FnMut(usize, u32, usize) -> Vec<u32> + Send>>,
     /// When set, this node is the HEAD of a cross-node pipeline: it runs layers `[0, cut)` and
     /// hands the boundary to a tail over the link, which runs `[cut, n)` and returns the logits.
     /// Formed when the cluster's auto-tune decides a split pays; `None` keeps the whole-stack
@@ -1422,6 +1440,7 @@ impl DeepseekV41Backend {
         let dspark_state = match &dspark {
             Some(d) => {
                 state.capture_layers = d.cfg.target_layers.clone();
+                state.capture_window = d.cfg.window_size;
                 Some(
                     crate::inference::model::deepseek_v41::dspark::DsparkState::new(
                         d.stages.len(),
@@ -1440,10 +1459,24 @@ impl DeepseekV41Backend {
             verify: None,
             dspark,
             dspark_state,
+            unread_rows: None,
+            last_fed: None,
+            #[cfg(test)]
+            scripted_draft: None,
             pipeline: None,
             state_cache: None,
             restored: 0,
         }
+    }
+
+    /// The backend with `script` guessing in place of the draft head.
+    #[cfg(test)]
+    pub(crate) fn with_scripted_draft(
+        mut self,
+        script: Box<dyn FnMut(usize, u32, usize) -> Vec<u32> + Send>,
+    ) -> Self {
+        self.scripted_draft = Some(script);
+        self
     }
 
     /// Prompt tokens the last prompt took from the decode-state cache.
@@ -1547,6 +1580,88 @@ impl DeepseekV41Backend {
     /// One batched verify over `ids` from the current position: each layer's experts are read
     /// once for the whole block, on the cards when there are any. Advances `self.state` by the
     /// inputs and returns each position's logits `[seq, vocab]`.
+    /// The rows the last block pass captured stand unread from `base`, and `last` is the last
+    /// token the cache holds. A draft head reads them before it drafts or the cache moves on.
+    fn hold_rows(&mut self, base: usize, last: Option<u32>) {
+        self.last_fed = last;
+        let rows = std::mem::take(&mut self.state.block_hidden);
+        self.unread_rows =
+            (self.dspark.is_some() && last.is_some() && !rows.is_empty()).then_some((base, rows));
+    }
+
+    fn has_scripted_draft(&self) -> bool {
+        #[cfg(test)]
+        return self.scripted_draft.is_some();
+        #[cfg(not(test))]
+        false
+    }
+
+    /// The prompt's last positions, which the prefill captured, stand unread; they end at the
+    /// cache's position.
+    fn hold_prompt_rows(&mut self, last: Option<u32>) {
+        let first = self.state.pos.saturating_sub(self.state.block_hidden.len());
+        self.hold_rows(first, last);
+    }
+
+    /// Write the held rows into the draft's window, each at its position.
+    fn read_unread_rows(&mut self) {
+        let (Some(d), Some(ds), Some((base, rows))) = (
+            self.dspark.as_ref(),
+            self.dspark_state.as_mut(),
+            self.unread_rows.take(),
+        ) else {
+            return;
+        };
+        for (j, row) in rows.iter().enumerate() {
+            let _ = d.update_window_from_hidden(ds, row, base + j);
+        }
+    }
+
+    /// The tokens the draft head guesses after `next`, the token just chosen and not yet in the
+    /// cache, at most `k`. The head starts from the last token the cache holds, reading its
+    /// hidden; its first guess stands for `next`, and the rest are returned only when it agrees.
+    pub(crate) fn native_draft(&mut self, next: u32, k: usize) -> Vec<u32> {
+        #[cfg(test)]
+        if let Some(script) = self.scripted_draft.as_mut() {
+            return script(self.state.pos, next, k);
+        }
+        let Some(last) = self.last_fed else {
+            return Vec::new();
+        };
+        if self.state.pos == 0 || self.dspark.is_none() {
+            return Vec::new();
+        }
+        // The newest row is read by the draft pass itself, as the position it starts from.
+        let newest = match self.unread_rows.as_mut() {
+            Some((_, rows)) => rows.pop(),
+            None => {
+                let row = self.state.captured.concat();
+                (!row.is_empty()).then_some(row)
+            }
+        };
+        self.read_unread_rows();
+        let Some(newest) = newest else {
+            return Vec::new();
+        };
+        let (Some(d), Some(ds)) = (self.dspark.as_ref(), self.dspark_state.as_mut()) else {
+            return Vec::new();
+        };
+        let (embed, head) = self.model.draft_inputs();
+        // The head has read the cache's newest position; a second ask waits for the cache to move.
+        self.last_fed = None;
+        let guess = match d.forward_draft(ds, &newest, last, self.state.pos - 1, embed, head) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("draft head: {e}");
+                return Vec::new();
+            }
+        };
+        match guess.split_first() {
+            Some((&first, rest)) if first == next => rest.iter().copied().take(k).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn verify_batch(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
         let Self {
             model,
@@ -2844,6 +2959,10 @@ impl ModelBackend for GenericVisionBackend {
 }
 
 impl ModelBackend for DeepseekV41Backend {
+    fn native_draft_tokens(&mut self, next: u32, k: usize) -> Vec<u32> {
+        self.native_draft(next, k)
+    }
+
     fn prefix_covered(&self) -> usize {
         self.restored
     }
@@ -2913,9 +3032,15 @@ impl ModelBackend for DeepseekV41Backend {
         // is stale here and would otherwise hold a whole state clone across the decode.
         self.verify = None;
         if index_pos == 0 {
+            self.unread_rows = None;
+        }
+        self.read_unread_rows();
+        self.last_fed = ids.last().copied();
+        if index_pos == 0 {
             self.state = self.model.new_decode_state();
             if let Some(d) = &self.dspark {
                 self.state.capture_layers = d.cfg.target_layers.clone();
+                self.state.capture_window = d.cfg.window_size;
             }
         }
         if self.state.pos != index_pos {
@@ -2930,15 +3055,25 @@ impl ModelBackend for DeepseekV41Backend {
             // A prefix the cache holds is restored and only the rest is prefilled; the states the
             // prompt passes and ends in are written back for the next prompt that shares them.
             self.restored = 0;
-            if let Some(cache) = self.state_cache.clone() {
-                return self.prefill_cached(&cache, &ids);
+            self.state.block_hidden.clear();
+            let out = match self.state_cache.clone() {
+                Some(cache) => self.prefill_cached(&cache, &ids),
+                None => self.prefill(&ids),
+            };
+            if out.is_ok() {
+                self.hold_prompt_rows(ids.last().copied());
             }
-            return self.prefill(&ids);
+            return out;
         }
         // The rest of a prompt after a kept prefix continues the prefill from the state: one
         // layer-major pass, each layer's experts read once for all of it.
         if ids.len() > 1 {
-            return self.prefill(&ids);
+            self.state.block_hidden.clear();
+            let out = self.prefill(&ids);
+            if out.is_ok() {
+                self.hold_prompt_rows(ids.last().copied());
+            }
+            return out;
         }
         // The always-read weights answer a token from the card they were left on: the host reads
         // them at its memory's speed, the card at its own, and a decode reads every one of them
@@ -2973,6 +3108,12 @@ impl ModelBackend for DeepseekV41Backend {
             None => {
                 for &t in &ids {
                     last = Some(model.forward_decode(t, state)?);
+                    if let (Some(d), Some(ds)) = (dspark.as_ref(), dspark_state.as_mut()) {
+                        let mh = state.captured.concat();
+                        if !mh.is_empty() && state.pos > 0 {
+                            let _ = d.update_window_from_hidden(ds, &mh, state.pos - 1);
+                        }
+                    }
                 }
             }
         }
@@ -2990,6 +3131,7 @@ impl ModelBackend for DeepseekV41Backend {
             self.state = self.model.new_decode_state();
             if let Some(d) = &self.dspark {
                 self.state.capture_layers = d.cfg.target_layers.clone();
+                self.state.capture_window = d.cfg.window_size;
             }
         }
         if self.state.pos != index_pos {
@@ -2998,10 +3140,12 @@ impl ModelBackend for DeepseekV41Backend {
                 self.state.pos
             )));
         }
+        self.read_unread_rows();
         // The mark to return to if the caller keeps only a prefix: the window cannot be cut by
         // length, so a rejection replays the accepted tokens from here.
         self.verify = Some((self.state.checkpoint(), ids.clone(), index_pos));
         let logits = self.verify_batch(&ids)?;
+        self.hold_rows(index_pos, ids.last().copied());
         // [seq, vocab] -> [1, seq, vocab].
         logits.unsqueeze(0)
     }
@@ -3021,6 +3165,7 @@ impl ModelBackend for DeepseekV41Backend {
             // position check reports.
             let _ = self.verify_batch(&ids[..keep]);
         }
+        self.hold_rows(base, (keep > 0).then(|| ids[keep - 1]));
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -3029,6 +3174,7 @@ impl ModelBackend for DeepseekV41Backend {
         // request whether the lookup runs, whatever the placement.
         Capabilities {
             pld: true,
+            native_draft: self.dspark.is_some() || self.has_scripted_draft(),
             ..Capabilities::default()
         }
     }
@@ -3072,9 +3218,12 @@ impl ModelBackend for DeepseekV41Backend {
         // else is left in place and the next forward's position check reports it.
         self.verify = None;
         if keep == 0 {
+            self.unread_rows = None;
+            self.last_fed = None;
             self.state = self.model.new_decode_state();
             if let Some(d) = &self.dspark {
                 self.state.capture_layers = d.cfg.target_layers.clone();
+                self.state.capture_window = d.cfg.window_size;
             }
         }
     }
@@ -3287,6 +3436,7 @@ mod capabilities_tests {
                 pld: false,
                 graph_mode: false,
                 speculative: false,
+                native_draft: false,
             }
         );
     }

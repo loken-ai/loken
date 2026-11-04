@@ -803,6 +803,9 @@ impl LlmEngine {
             // verify: that step runs eagerly over the draft, and the next one replays again.
             let graph_auto_on_cached = graph_eligible && kv_safe_cached;
             let pld_enabled = pld_capable;
+            // A model that drafts from its own head without a recorded step drafts here, as long
+            // as no drafter model or recorded head does.
+            let native_on = state.model.capabilities().native_draft && !spec_on && !head_on;
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
@@ -1718,6 +1721,9 @@ impl LlmEngine {
                         spec_engine.draft_length()
                     } else if head_on {
                         crate::inference::engine::decode_step::DRAFT_MAX
+                    } else if native_on {
+                        spec_engine.learn_expert_cost(&state.model);
+                        spec_engine.draft_length()
                     } else {
                         0
                     };
@@ -1731,6 +1737,11 @@ impl LlmEngine {
                         // until the policy tries it again.
                         time_plain = true;
                     }
+                    if native_on && want == 0 {
+                        // Plain steps are timed so the policy can try the head again.
+                        time_plain = true;
+                    }
+                    let mut native_round = false;
                     let draft: Vec<u32> = if spec_on {
                         let d = spec_engine.draft_k(next_token, want, pos, &recent_tokens, repeat_penalty, repeat_last_n);
                         draft_secs = cycle_start.elapsed().as_secs_f64();
@@ -1739,6 +1750,12 @@ impl LlmEngine {
                     } else if head_on {
                         draft_secs = head_draft_secs;
                         head_draft.clone()
+                    } else if native_on && want > 0 {
+                        let d = state.model.native_draft_tokens(next_token, want);
+                        draft_secs = cycle_start.elapsed().as_secs_f64();
+                        native_round = !d.is_empty();
+                        // A step the head has no guess for may still match the prompt.
+                        if native_round || !pld_active { d } else { pld_cache.lookup() }
                     } else if pld_active {
                         pld_cache.lookup()
                     } else {
@@ -1857,10 +1874,12 @@ impl LlmEngine {
 
                         pld_stats_accepted += accepted_drafts as u64;
                         // Window-rate cooldown (shared: decode_step::pld_window_update).
-                        pld_window_update(
-                            &mut pld_window_drafted, &mut pld_window_accepted,
-                            &mut pld_cooldown, k, accepted_drafts,
-                        );
+                        if !native_round {
+                            pld_window_update(
+                                &mut pld_window_drafted, &mut pld_window_accepted,
+                                &mut pld_cooldown, k, accepted_drafts,
+                            );
+                        }
                         // Total committed this step = 1 (S_0) + accepted_drafts
                         let committed = 1 + accepted_drafts;
                         pos += committed;
@@ -1870,7 +1889,7 @@ impl LlmEngine {
                             committed,
                             cycle_start.elapsed().as_secs_f64() * 1e3
                         );
-                        let costed_round = !spec_on && !head_on;
+                        let costed_round = !spec_on && !head_on && !native_round;
                         if head_on {
                             head_tokens.clear();
                             head_tokens.extend_from_slice(&draft[..accepted_drafts]);
@@ -1907,6 +1926,14 @@ impl LlmEngine {
                         // The round's cost includes the rollback of its rejected rows.
                         if costed_round {
                             pld_cost.round(cycle_start.elapsed().as_secs_f64(), committed);
+                        }
+
+                        if native_round {
+                            spec_drafted += k as u64;
+                            spec_accepted += accepted_drafts as u64;
+                            spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
+                                k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64(),
+                            );
                         }
 
                         // Spec-decode: drafter KV lockstep (shared:
