@@ -17,6 +17,35 @@ pub(crate) fn shared(a: &[u32], b: &[u32]) -> usize {
     seen.len()
 }
 
+/// Experts, among those `resident` does not hold, that `rows` independent rows route to, on
+/// average.
+///
+/// A row routes to `per_row` experts, each expert in proportion to its `heat`. An expert a row
+/// picks with odds `q` is picked by at least 1 of `rows` rows with odds `1 - (1 - q)^rows`:
+/// the experts a draft adds grow slower than its rows where the routing concentrates. Without
+/// any heat the routing is taken as even.
+pub(crate) fn missing_after(
+    rows: usize,
+    per_row: usize,
+    heat: &[f32],
+    resident: impl Fn(usize) -> bool,
+) -> f64 {
+    let total: f64 = heat.iter().map(|&h| f64::from(h)).sum();
+    let even = per_row as f64 / heat.len().max(1) as f64;
+    heat.iter()
+        .enumerate()
+        .filter(|&(e, _)| !resident(e))
+        .map(|(_, &h)| {
+            let q = if total > 0.0 {
+                (per_row as f64 * f64::from(h) / total).min(1.0)
+            } else {
+                even
+            };
+            1.0 - (1.0 - q).powi(rows as i32)
+        })
+        .sum()
+}
+
 /// Place of an empty entry in a [`Held`] record.
 const EMPTY: u32 = u32::MAX;
 
@@ -205,6 +234,22 @@ mod tests {
         assert_eq!(shared(&[1, 2, 3, 4], &[3, 4, 5, 6]), 2);
         assert_eq!(shared(&[1, 1, 2], &[1, 2, 2]), 2);
         assert_eq!(shared(&[], &[1]), 0);
+    }
+
+    #[test]
+    fn missing_experts_grow_with_the_rows_and_stop_at_what_is_not_held() {
+        let heat = [1.0_f32; 8];
+        let none = |_: usize| false;
+        let one = missing_after(1, 2, &heat, none);
+        let four = missing_after(4, 2, &heat, none);
+        assert!((one - 2.0).abs() < 1e-9);
+        assert!(four > one && four < 4.0 * one);
+        // A held expert is never missing.
+        assert_eq!(missing_after(4, 2, &heat, |_| true), 0.0);
+        assert!(missing_after(4, 2, &heat, |e| e < 4) < four);
+        // Routing that concentrates on 2 experts leaves the rest missing hardly at all.
+        let skewed = [100.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert!(missing_after(8, 2, &skewed, |e| e < 2) < 1e-9);
     }
 
     #[test]

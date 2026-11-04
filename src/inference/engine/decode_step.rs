@@ -361,6 +361,9 @@ pub(crate) struct DraftLength {
     /// Cycles measured per class: a class's first few samples are averaged, so its cost is
     /// known after them instead of after a long run of blends.
     samples: [u32; DRAFT_MAX + 1],
+    /// Seconds the model spends on the experts that `m` rows route to and no card holds, at
+    /// index `m`: set for a model whose experts stream, read off its own routing and pace.
+    expert_secs: Option<Vec<f64>>,
 }
 
 /// Plain steps between the probes of a drafter whose cycles were losing, doubled at each probe
@@ -384,22 +387,47 @@ impl DraftLength {
         self.cap = Some(rows.saturating_sub(1).min(DRAFT_MAX));
     }
 
+    /// Sets the seconds the model spends on the experts that `m` rows route to and no card
+    /// holds, at index `m`.
+    pub(crate) fn set_expert_secs(&mut self, secs: Vec<f64>) {
+        self.expert_secs = Some(secs);
+    }
+
+    /// Whether the cost of the experts a draft adds is known.
+    pub(crate) fn knows_expert_cost(&self) -> bool {
+        self.expert_secs.is_some()
+    }
+
+    /// Seconds of the experts missing for a verify of `rows` rows.
+    fn expert_cost(&self, rows: usize) -> f64 {
+        self.expert_secs
+            .as_ref()
+            .and_then(|s| s.get(rows).or(s.last()))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
     pub(crate) fn next(&self) -> usize {
         let top = self.cap.unwrap_or(DRAFT_MAX);
         let draft_token = self.draft_token.unwrap_or(0.0);
         // A verify covers the carried token plus the draft: `k + 1` rows.
         // A window costs the plain step plus a share per row: the share comes from the
         // nearest measured length, and the plain step is the length-zero cycle.
+        // The share is the compute of a row. The experts a window adds that are not in memory
+        // grow with the rows it routes, not linearly: they are taken out of a measured verify
+        // and put back for the length priced.
+        let compute = |j: usize, v: f64| (v - self.expert_cost(j + 1)).max(0.0);
         let scaled_verify = |k: usize| {
-            let plain = self.cycle[0].map(|(_, v)| v);
+            let plain = self.cycle[0].map(|(_, v)| compute(0, v));
             (1..=DRAFT_MAX)
-                .filter_map(|j| self.cycle[j].map(|(_, v)| (j.abs_diff(k), j, v)))
+                .filter_map(|j| self.cycle[j].map(|(_, v)| (j.abs_diff(k), j, compute(j, v))))
                 .min_by(|a, b| a.0.cmp(&b.0))
                 .map(|(_, j, v)| match plain {
                     Some(p) if v > p => p + (v - p) * k as f64 / j as f64,
                     _ => v * (k + 1) as f64 / (j + 1) as f64,
                 })
                 .or_else(|| plain.map(|p| p * (k + 1) as f64))
+                .map(|v| v + self.expert_cost(k + 1))
         };
         let mut best = (0, f64::MIN);
         let mut best_drafting = (0, f64::MIN);
@@ -454,10 +482,10 @@ impl DraftLength {
         // The next class up is measured once, then again once its cost is old: the drafts grow
         // a row at a time from the shortest, and a longer draft is judged on this run's windows,
         // not on the first ones.
-        if best.0 > 0
-            && best.0 < top
-            && (self.cycle[best.0 + 1].is_none() || self.stale(best.0 + 1))
-        {
+        // Where the experts' cost is known, the estimate of a length never used stands in for a
+        // trial: it already counts the experts the longer draft adds.
+        let trial = |k: usize| self.cycle[k].is_none() && self.expert_secs.is_none();
+        if best.0 > 0 && best.0 < top && (trial(best.0 + 1) || self.stale(best.0 + 1)) {
             return best.0 + 1;
         }
         best.0
@@ -914,6 +942,41 @@ mod tests {
             }
         }
         assert!((1..=4).contains(&probes), "probed {probes} times");
+    }
+
+    /// A policy that measured plain steps and drafts of 1 on a model whose experts cost
+    /// `per_row` seconds for each row the verify routes: 0.05 s of compute a step, 0.01 s a row.
+    fn measured_with_experts(per_row: f64) -> DraftLength {
+        let experts: Vec<f64> = (0..=VERIFY_ROWS).map(|m| per_row * m as f64).collect();
+        let mut d = DraftLength::default();
+        d.set_expert_secs(experts.clone());
+        for _ in 0..DRAFT_PROBES {
+            d.record(0, 0, 0.0, 0.05 + experts[1]);
+            d.record(1, 1, 0.0, 0.06 + experts[2]);
+        }
+        d
+    }
+
+    #[test]
+    fn costly_experts_shorten_the_draft_that_cheap_experts_lengthen() {
+        let cheap = measured_with_experts(0.001).next();
+        let costly = measured_with_experts(0.08).next();
+        assert!(cheap > costly, "cheap {cheap}, costly {costly}");
+        assert!(costly <= 1, "costly {costly}");
+    }
+
+    #[test]
+    fn an_unused_length_is_priced_with_the_experts_it_adds() {
+        // The same verify times, read as compute alone: the longer draft looks cheaper than
+        // once its experts are counted.
+        let mut blind = DraftLength::default();
+        for _ in 0..DRAFT_PROBES {
+            blind.record(0, 0, 0.0, 0.13);
+            blind.record(1, 1, 0.0, 0.22);
+        }
+        let aware = measured_with_experts(0.08);
+        assert!(blind.next() >= aware.next());
+        assert!(aware.knows_expert_cost() && !blind.knows_expert_cost());
     }
 
     #[test]

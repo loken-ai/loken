@@ -522,6 +522,29 @@ impl LlmEngine {
             .next()
     }
 
+    /// Hands the draft length the cost of the experts a draft adds that no card holds, as the
+    /// model's routing and pace stand now. A model whose experts do not stream hands it nothing.
+    pub(crate) fn learn_expert_cost(&self, model: &BoxedModelBackend) {
+        let rows = crate::inference::engine::decode_step::VERIFY_ROWS;
+        if let Some(secs) = model.expert_miss_secs(rows) {
+            self.draft_length
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_expert_secs(secs);
+        }
+    }
+
+    /// The most rows the head is asked to draft, `rows` being what the window carries: fewer
+    /// where the experts a longer draft adds cost more than the tokens it commits.
+    pub(crate) fn head_draft_rows(&self, rows: usize) -> usize {
+        let length = self.draft_length.lock().unwrap_or_else(|e| e.into_inner());
+        if length.knows_expert_cost() {
+            rows.min(length.next().max(1))
+        } else {
+            rows
+        }
+    }
+
     /// Requests admitted and not yet finished.
     pub fn in_flight(&self) -> usize {
         self.active.load(std::sync::atomic::Ordering::Acquire)

@@ -148,6 +148,8 @@ pub struct LayerTier {
     /// Bytes of one expert in each stack.
     expert_bytes: [usize; 3],
     n_experts: usize,
+    /// Experts a row routes to.
+    per_row: usize,
     state: Mutex<TierState>,
     hits: AtomicU64,
     routed: AtomicU64,
@@ -1292,6 +1294,7 @@ impl LayerTier {
             extra_table: None,
             expert_bytes,
             n_experts: moe.n_experts,
+            per_row: moe.n_experts_used,
             state: Mutex::new(TierState {
                 slot_of,
                 owner,
@@ -1593,6 +1596,48 @@ impl LayerTier {
             .unwrap_or_else(|e| e.into_inner())
             .counts
             .clone()
+    }
+
+    /// Adds to `secs[m]` the time this layer spends on the experts that `m` rows route to and
+    /// the card does not hold: the expected count from the routing heat and what is resident,
+    /// at the pace a missing expert is brought in (the copy and the host's own product run
+    /// side by side). Returns whether the layer streams experts at all.
+    pub fn add_miss_secs(&self, secs: &mut [f64]) -> bool {
+        let Some(stage) = self.stage.as_ref() else {
+            return false;
+        };
+        if self.resident {
+            return false;
+        }
+        let pace = |cells: &[AtomicU64; 2]| {
+            [1, 0]
+                .iter()
+                .map(|&c| f64::from_bits(cells[c].load(Ordering::Relaxed)))
+                .find(|&v| v > 0.0)
+        };
+        let copy = pace(&self.upload_us).unwrap_or_else(|| {
+            let rate = stage.stager.bandwidth;
+            if rate > 0.0 {
+                self.expert_bytes.iter().sum::<usize>() as f64 / rate
+            } else {
+                0.0
+            }
+        });
+        let per_expert_us = match pace(&self.host_us) {
+            Some(host) if copy > 0.0 => copy * host / (copy + host),
+            _ => copy,
+        };
+        if per_expert_us <= 0.0 {
+            return true;
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (m, cell) in secs.iter_mut().enumerate() {
+            let missing = super::expert_ahead::missing_after(m, self.per_row, &st.heat, |e| {
+                st.slot_of[e] >= 0
+            });
+            *cell += missing * per_expert_us * 1e-6;
+        }
+        true
     }
 
     /// How many experts the layer routes to.

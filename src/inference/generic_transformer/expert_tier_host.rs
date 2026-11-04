@@ -95,6 +95,10 @@ impl LayerTier {
         crate::tensor::bail!("an expert cache lives on a card")
     }
 
+    pub fn add_miss_secs(&self, _: &mut [f64]) -> bool {
+        false
+    }
+
     pub fn counters(&self) -> (u64, u64, u64) {
         (0, 0, 0)
     }

@@ -745,6 +745,12 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
+    /// Seconds the model spends bringing in the experts that `m` rows route to and no card
+    /// holds, for `m` up to `rows`; `None` when no expert streams.
+    fn expert_miss_secs(&self, _rows: usize) -> Option<Vec<f64>> {
+        None
+    }
+
     /// The routing counts of the layers' expert caches since the load, when the model has them.
     fn expert_profile(
         &self,
@@ -2199,6 +2205,10 @@ impl ModelBackend for GenericBackend {
 
     fn expert_cache_counters(&self) -> Option<(u64, u64)> {
         self.0.expert_cache_counters()
+    }
+
+    fn expert_miss_secs(&self, rows: usize) -> Option<Vec<f64>> {
+        self.0.expert_miss_secs(rows)
     }
 
     #[cfg(feature = "gpu")]

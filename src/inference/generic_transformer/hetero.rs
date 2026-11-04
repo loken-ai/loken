@@ -1726,6 +1726,21 @@ impl GenericHeteroTransformer {
         any.then_some(total)
     }
 
+    /// Seconds the layers spend on the experts that `m` rows route to and no card holds, for `m`
+    /// up to `rows`, in the order of `m`; `None` when no layer streams experts.
+    pub fn expert_miss_secs(&self, rows: usize) -> Option<Vec<f64>> {
+        let mut secs = vec![0.0; rows + 1];
+        let mut any = false;
+        for tier in self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref()?.tier.as_ref())
+        {
+            any |= tier.add_miss_secs(&mut secs);
+        }
+        any.then_some(secs)
+    }
+
     pub fn kv_len(&self) -> Option<usize> {
         // A recurrent layer keeps no cache: the first attending layer holds the length.
         let l = self

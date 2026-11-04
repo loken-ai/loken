@@ -1866,6 +1866,8 @@ impl LlmEngine {
                                         DRAFT_MAX.min(rows - 1)
                                     }
                                 };
+                                spec_engine.learn_expert_cost(&s.model);
+                                let want = spec_engine.head_draft_rows(want);
                                 s.model.draft_head_tokens(&head_tokens, want, HEAD_MIN_ODDS)
                             }
                             None => Vec::new(),
@@ -2410,6 +2412,9 @@ impl LlmEngine {
                     let cycle_start = head_draft_started;
                     let mut draft_secs = 0.0;
                     let want = if spec_on {
+                        if let Some(s) = model_state.blocking_lock().as_ref() {
+                            spec_engine.learn_expert_cost(&s.model);
+                        }
                         spec_engine.draft_length()
                     } else if head_on {
                         crate::inference::engine::decode_step::DRAFT_MAX

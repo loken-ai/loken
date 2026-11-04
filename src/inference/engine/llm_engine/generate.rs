@@ -1016,6 +1016,8 @@ impl LlmEngine {
                             0 => DRAFT_MAX,
                             rows => DRAFT_MAX.min(rows - 1),
                         };
+                        spec_engine.learn_expert_cost(&state.model);
+                        let want = spec_engine.head_draft_rows(want);
                         state.model.draft_head_tokens(&head_tokens, want, HEAD_MIN_ODDS)
                     } else {
                         // Before the step is recorded the head drafts nothing, but reads the
@@ -1712,6 +1714,7 @@ impl LlmEngine {
                     let cycle_start = head_draft_started;
                     let mut draft_secs = 0.0;
                     let want = if spec_on {
+                        spec_engine.learn_expert_cost(&state.model);
                         spec_engine.draft_length()
                     } else if head_on {
                         crate::inference::engine::decode_step::DRAFT_MAX
