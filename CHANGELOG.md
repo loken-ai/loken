@@ -9,6 +9,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: keep an idle model in host memory instead of unloading it, and load it from there on the next request.
 - Speculation: try prompt lookup on models whose experts stream, kept while its rounds win.
 - Speculation: size the draft by the experts it adds that no card holds.
+- Serving: hand a prompt's cache over for a model split or cut across cards.
 - Microbench: time a decode through a few layers and the mechanisms of a model at its shapes.
 - Metrics: count the expert bytes missing from memory by asker, and the experts a token shares with the last.
 - Inference: run a decode layer whole on the card that keeps its weights, routed experts apart.

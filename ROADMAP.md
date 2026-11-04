@@ -51,7 +51,7 @@ Smaller, by state then by priority:
 | ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Done |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Planned |
-| Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
+| Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Partial |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Partial |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Partial |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Started |

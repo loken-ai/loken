@@ -4,6 +4,7 @@
 //! The decoding instance imports the rows as a snapshot of its own cache, which its prefix reuse
 //! then restores like any other, so the prompt is not read twice. Both instances serve the same
 //! model: the layout carried here is checked against the importer's before a row is read.
+//! The rows are those of whole layers, so the plans of the 2 instances may cut the stack differently.
 //!
 //! Layout on the wire, little-endian: the magic, a header length and the header as JSON, then for
 //! each layer a byte (1 when the layer holds rows), the count of key values and the keys as f32,

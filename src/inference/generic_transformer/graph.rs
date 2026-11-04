@@ -2293,7 +2293,7 @@ impl GenericHeteroTransformer {
             .iter()
             .find(|l| matches!(l.mixer, super::mixer::Mixer::Attention))
             .unwrap_or(&self.layers[0]);
-        (self.layers.len(), l.n_kv_head, l.head_dim)
+        (self.layers.len(), whole_n_kv_head(l), l.head_dim)
     }
 
     /// Tokens and KV length of snapshot `index`.
@@ -2367,7 +2367,7 @@ impl GenericHeteroTransformer {
                 // could not share a block hash without corrupting it; it travels in the
                 // manifest's own window blob instead.
                 match l.kv_len() {
-                    Some(n) if n == kv_len => l.host_rows(from, to),
+                    Some(n) if n == kv_len => l.host_rows_whole(from, to),
                     _ => Ok(None),
                 }
             })
@@ -2391,7 +2391,7 @@ impl GenericHeteroTransformer {
         snap.layers
             .iter()
             .map(|l| match l.kv_len() {
-                Some(n) if n < kv_len => l.host_rows(0, n.saturating_sub(drop)),
+                Some(n) if n < kv_len => l.host_rows_whole(0, n.saturating_sub(drop)),
                 _ => Ok(None),
             })
             .collect()
@@ -2411,8 +2411,7 @@ impl GenericHeteroTransformer {
             2 => crate::tensor::DType::BF16,
             _ => crate::tensor::DType::F16,
         };
-        // Rows on disk are a whole layer's: a layer split across cards has no place to put them.
-        if !self.supports_kv_snapshots() || self.has_split_layers() {
+        if !self.supports_kv_snapshots() {
             return Ok(());
         }
         let mut layers = Vec::with_capacity(self.layers.len());
@@ -2427,7 +2426,7 @@ impl GenericHeteroTransformer {
                 });
                 continue;
             };
-            layers.push(layer_snapshot_from_rows(l, &k, &v, kv_dtype)?);
+            layers.push(layer_snapshot_from_whole_rows(l, &k, &v, kv_dtype)?);
         }
         self.store_snapshot(tokens, kv_len, layers, None);
         Ok(())
@@ -2970,6 +2969,49 @@ fn layer_snapshot_bytes(l: &GenericTransformerLayer) -> u64 {
 /// kept aside. An unknown free figure (no card) never refuses.
 pub(super) fn snapshot_fits(need: u64, free: Option<u64>, reserve: u64) -> bool {
     free.is_none_or(|free| need <= free.saturating_sub(reserve))
+}
+
+/// The kv heads of the layer whole: its own and those of the shares it is split into.
+pub(super) fn whole_n_kv_head(l: &GenericTransformerLayer) -> usize {
+    l.n_kv_head + l.tp_shards.iter().map(|s| s.n_kv_head).sum::<usize>()
+}
+
+/// [`layer_snapshot_from_rows`] for rows of the layer whole (`[n, whole kv heads, head_dim]`): a
+/// layer split across cards gets, in the snapshot of each share, the heads that share holds.
+pub(super) fn layer_snapshot_from_whole_rows(
+    l: &GenericTransformerLayer,
+    k: &[f32],
+    v: &[f32],
+    kv_dtype: crate::tensor::DType,
+) -> crate::tensor::Result<super::LayerKvSnapshot> {
+    if l.tp_shards.is_empty() {
+        return layer_snapshot_from_rows(l, k, v, kv_dtype);
+    }
+    let hd = l.head_dim;
+    let whole = whole_n_kv_head(l);
+    if k.len() != v.len() || hd == 0 || whole == 0 || !k.len().is_multiple_of(whole * hd) {
+        return Err(crate::tensor::Error::msg(
+            "kv snapshot import: the rows do not fit the layer's heads".to_string(),
+        ));
+    }
+    let n = k.len() / (whole * hd);
+    let shares: Vec<&GenericTransformerLayer> = std::iter::once(l).chain(&l.tp_shards).collect();
+    let mut from = 0;
+    let mut parts = Vec::with_capacity(shares.len());
+    for share in &shares {
+        let width = share.n_kv_head * hd;
+        let cut = |rows: &[f32]| -> Vec<f32> {
+            (0..n)
+                .flat_map(|t| &rows[t * whole * hd + from..t * whole * hd + from + width])
+                .copied()
+                .collect()
+        };
+        parts.push(layer_snapshot_from_rows(share, &cut(k), &cut(v), kv_dtype)?);
+        from += width;
+    }
+    let mut owner = parts.remove(0);
+    owner.shards = parts;
+    Ok(owner)
 }
 
 /// A layer's KV snapshot rebuilt from host rows `k` and `v` (token-major, `[n, n_kv, head_dim]`),

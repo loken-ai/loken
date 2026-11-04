@@ -69,6 +69,8 @@ pub use hetero::CachedPrompt;
 #[cfg(test)]
 mod hf_reference_tests;
 pub mod hyper;
+#[cfg(test)]
+mod kv_handover_tests;
 mod layer_attn;
 mod layer_cpu_attn;
 mod layer_ffn;
@@ -742,6 +744,48 @@ impl LayerKvSnapshot {
             (None, None, Some(c)) => Ok(Some(c.host_rows(from, to))),
             (None, None, None) => Ok(None),
         }
+    }
+
+    /// [`Self::host_rows`] of the layer whole: the rows of its shares' heads follow its own
+    /// within each token, in the order of the shares.
+    pub(crate) fn host_rows_whole(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> crate::tensor::Result<Option<(Vec<f32>, Vec<f32>)>> {
+        let Some(own) = self.host_rows(from, to)? else {
+            return Ok(None);
+        };
+        if self.shards.is_empty() {
+            return Ok(Some(own));
+        }
+        let n = to.saturating_sub(from);
+        let mut parts = vec![own];
+        for share in &self.shards {
+            match share.host_rows(from, to)? {
+                Some(rows) => parts.push(rows),
+                None => {
+                    return Err(crate::tensor::Error::msg(
+                        "kv snapshot: a share holds no rows its layer holds".to_string(),
+                    ))
+                }
+            }
+        }
+        // Every part is `[n, heads of its share, head_dim]`: the width of a token's row.
+        let join = |pick: fn(&(Vec<f32>, Vec<f32>)) -> &Vec<f32>| -> Vec<f32> {
+            let widths: Vec<usize> = parts
+                .iter()
+                .map(|p| if n == 0 { 0 } else { pick(p).len() / n })
+                .collect();
+            let mut out = Vec::with_capacity(pick(&parts[0]).len() * parts.len());
+            for t in 0..n {
+                for (p, w) in parts.iter().zip(&widths) {
+                    out.extend_from_slice(&pick(p)[t * w..(t + 1) * w]);
+                }
+            }
+            out
+        };
+        Ok(Some((join(|p| &p.0), join(|p| &p.1))))
     }
 }
 

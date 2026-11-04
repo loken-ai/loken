@@ -119,6 +119,43 @@ fn a_layer_split_across_two_cards_computes_the_whole_layer() {
     tiny_model::remove(&path);
 }
 
+/// The KV a prompt leaves in a layer split across cards is handed over as the rows of the layer
+/// whole: the model whole imports what the split one exports, the split one imports what the
+/// whole one exports, and both decode on to the same logits.
+#[test]
+#[ignore = "needs a CUDA card"]
+fn rows_of_a_split_layer_are_handed_over_whole() {
+    // A single card holds both shares when no second one is there.
+    let second = usize::from(Device::new_cuda(1).is_ok());
+    let path = tiny_model::write("tp-handover", LAYERS);
+    let prompt = [1u32, 4, 2, 9, 3, 5];
+    let asked = [1u32, 4, 2, 9, 3, 5, 8];
+    let check = |from: &mut GenericHeteroTransformer, to: &mut GenericHeteroTransformer| {
+        from.forward(&ids(&prompt), 0).unwrap();
+        from.snapshot_kv(prompt.to_vec(), prompt.len()).unwrap();
+        let (index, held) = from.best_kv_snapshot(&asked).unwrap();
+        let kv = from.export_kv_rows(index, 0, held).unwrap();
+        assert_eq!(from.kv_layout(), to.kv_layout(), "one layout for both");
+        let dtype = from.kv_snapshot_dtype(index).unwrap();
+        to.import_kv_snapshot(prompt.to_vec(), held, kv.clone(), dtype)
+            .unwrap();
+        let (imported, _) = to.best_kv_snapshot(&asked).unwrap();
+        assert!(to.export_kv_rows(imported, 0, held).unwrap() == kv);
+        to.restore_kv_snapshot(imported).unwrap();
+        for (i, t) in [8u32, 2, 6].into_iter().enumerate() {
+            let at = prompt.len() + i;
+            close(
+                &rows(&to.forward(&ids(&[t]), at).unwrap()),
+                &rows(&from.forward(&ids(&[t]), at).unwrap()),
+                &format!("token {i} after the hand-over"),
+            );
+        }
+    };
+    check(&mut load(&path, &[0, second]), &mut load(&path, &[0]));
+    check(&mut load(&path, &[0]), &mut load(&path, &[0, second]));
+    tiny_model::remove(&path);
+}
+
 /// A mixture whose cards each hold a range of the experts computes what it computes whole on one
 /// card: a prompt, decoded tokens, a verify batch and a cut back.
 #[test]

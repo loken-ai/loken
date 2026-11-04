@@ -351,6 +351,10 @@ There is no consensus protocol: routing to a dead node costs a retry, not a corr
 A hand-over is priced on rates that each node measures from its own completed generations.
 Hardware nameplates play no part, because what a card could do is not what this build achieves on this model at this quantisation.
 
+A hand-over carries the rows of whole layers.
+A layer split across cards gives its rows whole and takes them back share by share, so the 2 instances may place the stack differently.
+A cache cut over cards has no snapshot form, so a model that cuts its cache is still read again.
+
 ### Sharding for DeepSeek V4.1
 
 Sharding runs for DeepSeek V4.1, unmeasured at 2 nodes.
