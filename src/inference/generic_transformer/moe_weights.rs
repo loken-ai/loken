@@ -624,6 +624,37 @@ impl ExpertShard {
     }
 }
 
+/// The routed pairs a card holding the experts `first..first + count` computes: every id as the
+/// card numbers it, and the weight of each pair, zero for a pair of another card's expert.
+///
+/// `ids` and `weights` hold `k` pairs per row. A pair of another card's expert reads an expert
+/// of this card its row does not route to, at weight zero, so that the kernels which group a
+/// row's pairs by expert take each expert of a row once.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(super) fn shard_pairs(
+    ids: &[u32],
+    weights: &[f32],
+    k: usize,
+    first: usize,
+    count: usize,
+) -> (Vec<u32>, Vec<f32>) {
+    let mut local = vec![0u32; ids.len()];
+    let mut weight = vec![0f32; ids.len()];
+    for (row, (ids, ws)) in ids.chunks(k).zip(weights.chunks(k)).enumerate() {
+        let mine = |e: u32| (e as usize).checked_sub(first).filter(|&l| l < count);
+        let taken: Vec<usize> = ids.iter().filter_map(|&e| mine(e)).collect();
+        let mut spare = (0..count).filter(|l| !taken.contains(l));
+        for (j, (&e, &w)) in ids.iter().zip(ws).enumerate() {
+            let at = row * k + j;
+            match mine(e) {
+                Some(l) => (local[at], weight[at]) = (l as u32, w),
+                None => local[at] = spare.next().unwrap_or(0) as u32,
+            }
+        }
+    }
+    (local, weight)
+}
+
 /// Where a split layer's card's experts start among the router's, and how many the router has.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalExperts {
@@ -1385,27 +1416,7 @@ impl MoeWeights {
             if shard.count < k {
                 crate::tensor::bail!("a shard holds fewer experts than a row routes to");
             }
-            // A pair of another shard's expert reads an expert of this shard its row does not
-            // route to, at weight zero: the kernels that group a row's pairs by expert take each
-            // expert of a row once.
-            let mut local = vec![0u32; ids.len()];
-            let mut weight = vec![0f32; ids.len()];
-            for (row, (ids, ws)) in ids.chunks(k).zip(weights.chunks(k)).enumerate() {
-                let mine = |e: u32| {
-                    (e as usize)
-                        .checked_sub(shard.first)
-                        .filter(|&l| l < shard.count)
-                };
-                let taken: Vec<usize> = ids.iter().filter_map(|&e| mine(e)).collect();
-                let mut spare = (0..shard.count).filter(|l| !taken.contains(l));
-                for (j, (&e, &w)) in ids.iter().zip(ws).enumerate() {
-                    let at = row * k + j;
-                    match mine(e) {
-                        Some(l) => (local[at], weight[at]) = (l as u32, w),
-                        None => local[at] = spare.next().unwrap_or(0) as u32,
-                    }
-                }
-            }
+            let (local, weight) = shard_pairs(&ids, &weights, k, shard.first, shard.count);
             let local = Tensor::from_vec(local, topk_ids.shape().clone(), &Device::Cpu)?
                 .to_dtype(topk_ids.dtype())?
                 .to_device(&shard.dev)?;
@@ -2072,6 +2083,124 @@ mod clamped_swiglu_tests {
                 .unwrap()
         };
         assert_eq!(run(&build(false)), run(&build(true)));
+    }
+
+    /// The cards of an expert-parallel layer each compute the pairs of their own experts on the
+    /// host here, and the sum of their products is the products of one holder of every expert,
+    /// for a decoded token, a few rows and a prompt, with ranges of unequal width.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn shares_of_the_experts_sum_to_the_whole_layer_on_the_host() {
+        use super::super::expert_tier::experts_range;
+        let (experts, used, hidden, ffn) = (8usize, 2usize, 64usize, 64usize);
+        let dev = Device::Cpu;
+        let stack = |seed, rows, cols| {
+            let w = Tensor::from_vec(
+                values(experts * rows * cols, seed, 1.0),
+                (experts, rows, cols),
+                &dev,
+            )
+            .unwrap();
+            Arc::new(QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap())
+        };
+        let (gate, up, down) = (
+            stack(41, ffn, hidden),
+            stack(42, ffn, hidden),
+            stack(43, hidden, ffn),
+        );
+        let router =
+            Tensor::from_vec(values(experts * hidden, 44, 0.5), (experts, hidden), &dev).unwrap();
+        let build = |first: usize, count: usize| {
+            let part = |s: &Arc<QTensor>| Arc::new(experts_range(s, first, count, &dev).unwrap());
+            MoeWeights {
+                gate_inp: QMatMul::Tensor(router.clone()),
+                gate_inp_scale: Tensor::ones(hidden, DType::F32, &dev).unwrap(),
+                gate_inp_bias: None,
+                gate_exps_bias: None,
+                up_exps_bias: None,
+                down_exps_bias: None,
+                swiglu_clamp: None,
+                gate_up_exps: None,
+                down_exps: part(&down),
+                gate_exps_sep: Some(part(&gate)),
+                up_exps_sep: Some(part(&up)),
+                down_exps_scale: None,
+                decode_slots: None,
+                n_experts: count,
+                shards: Vec::new(),
+                local: None,
+                n_experts_used: used,
+                expert_ffn_dim: ffn,
+                router_prenormed: true,
+                use_silu: true,
+                gelu: false,
+                norm_topk: true,
+                sigmoid_routing: None,
+                up_relu2: false,
+                shared_expert: None,
+                gate_up_exps_f32: None,
+                down_exps_f32: None,
+                tier: None,
+            }
+        };
+        let whole = build(0, experts);
+        let cut = experts * 5 / 8;
+        let shares = [
+            (0, cut, build(0, cut)),
+            (cut, experts - cut, build(cut, experts - cut)),
+        ];
+        for tokens in [1usize, 3, 40] {
+            let xs = Tensor::from_vec(
+                values(tokens * hidden, 45 + tokens as u64, 1.0),
+                (tokens, hidden),
+                &dev,
+            )
+            .unwrap();
+            let logits = whole.gate_inp.forward(&xs).unwrap();
+            let (weights, ids) = whole.top_k(&logits).unwrap();
+            let want: Vec<f32> = whole
+                .forward_cpu(&xs, &ids, &weights, tokens, hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let id_v: Vec<u32> = ids
+                .to_dtype(DType::U32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let w_v: Vec<f32> = weights.flatten_all().unwrap().to_vec1().unwrap();
+            let mut got = vec![0f32; want.len()];
+            for (first, count, share) in &shares {
+                let (local, weight) = shard_pairs(&id_v, &w_v, used, *first, *count);
+                let shape = ids.shape().clone();
+                let local = Tensor::from_vec(local, shape.clone(), &dev).unwrap();
+                let weight = Tensor::from_vec(weight, shape, &dev).unwrap();
+                let part: Vec<f32> = share
+                    .forward_cpu(&xs, &local, &weight, tokens, hidden)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                for (g, p) in got.iter_mut().zip(part) {
+                    *g += p;
+                }
+            }
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let worst = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 1e-5 * scale,
+                "{tokens} rows: off by {worst} of {scale}"
+            );
+        }
     }
 
     #[test]

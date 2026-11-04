@@ -1254,7 +1254,7 @@ impl LlmEngine {
                             let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
                             let holds = |d: &crate::inference::place::ladder::Demand| {
                                 (2..=cuda_devices.len()).any(|ranks| {
-                                    crate::inference::place::llm::tensor_parallel(d, &cuda_devices, ranks, weight)
+                                    crate::inference::place::llm::tensor_parallel(d, &cuda_devices, ranks, routed.is_some(), weight)
                                         .is_some()
                                 })
                             };

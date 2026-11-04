@@ -65,22 +65,116 @@ pub struct DenseStack {
 }
 
 impl DenseStack {
-    /// Bytes `rows` rows read of a layer: its shared weights and the experts they route to, at
-    /// most all of them.
+    /// Bytes `rows` rows read of a layer: its shared weights and the experts they route to.
     fn read_bytes(&self, rows: usize) -> f64 {
-        let routed = self.routed.map_or(0.0, |r| {
-            let touched = (rows * r.used) as f64 / r.experts.max(1) as f64;
-            r.bytes as f64 * touched.min(1.0)
-        });
+        let routed = self
+            .routed
+            .map_or(0.0, |r| r.bytes as f64 * r.touched_share(rows));
         self.layer_bytes as f64 + routed
     }
+}
+
+impl RoutedExperts {
+    /// The share of a layer's experts at least one of `rows` rows routes to, each row choosing
+    /// `used` of them uniformly.
+    fn touched_share(&self, rows: usize) -> f64 {
+        let miss = 1.0 - self.used as f64 / self.experts.max(1) as f64;
+        1.0 - miss.max(0.0).powi(rows.min(i32::MAX as usize) as i32)
+    }
+}
+
+/// Microseconds the slowest card's read of its experts exceeds the cards' mean, for `rows` rows.
+///
+/// Each card holds a share of the experts in proportion to its read rate and reads those the
+/// rows route to, each expert touched with the same chance independently of the others.
+/// The cards finish together on average, and the layer waits for the card that drew the most.
+fn imbalance_us(routed: RoutedExperts, rows: usize, cards: &[ShardCard]) -> f64 {
+    let total: f64 = cards.iter().map(|c| c.read_bytes_per_us).sum();
+    if cards.len() < 2 || routed.experts == 0 || total <= 0.0 {
+        return 0.0;
+    }
+    let touched = routed.touched_share(rows);
+    let per_expert = routed.bytes as f64 / routed.experts as f64;
+    let mut left = routed.experts;
+    let mut held = Vec::with_capacity(cards.len());
+    for (i, c) in cards.iter().enumerate() {
+        let n = if i + 1 == cards.len() {
+            left
+        } else {
+            ((c.read_bytes_per_us / total * routed.experts as f64).round() as usize).min(left)
+        };
+        left -= n;
+        held.push(n);
+    }
+    let us = |c: &ShardCard, x: usize| x as f64 * per_expert / c.read_bytes_per_us;
+    // Per card: the chance of reading at most `x` experts, for each `x`.
+    let cdf: Vec<Vec<f64>> = held
+        .iter()
+        .map(|&n| {
+            let mut pmf = (1.0 - touched).powi(n as i32);
+            let mut acc = 0.0;
+            (0..=n)
+                .map(|x| {
+                    acc += pmf;
+                    if x < n && touched < 1.0 {
+                        pmf *= (n - x) as f64 / (x + 1) as f64 * touched / (1.0 - touched);
+                    }
+                    acc.min(1.0)
+                })
+                .collect()
+        })
+        .collect();
+    let mut times: Vec<f64> = cards
+        .iter()
+        .zip(&held)
+        .flat_map(|(c, &n)| (0..=n).map(move |x| (c, x)))
+        .map(|(c, x)| us(c, x))
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * b.abs().max(1.0));
+    // The chance every card finishes by `t`.
+    let by = |t: f64| -> f64 {
+        cards
+            .iter()
+            .zip(&held)
+            .zip(&cdf)
+            .map(|((c, &n), cdf)| {
+                let x = ((t * c.read_bytes_per_us / per_expert) * (1.0 + 1e-9)).floor();
+                cdf[(x as usize).min(n)]
+            })
+            .product()
+    };
+    let (mut expected, mut before) = (0.0, 0.0);
+    for &t in &times {
+        let now = by(t);
+        expected += t * (now - before);
+        before = now;
+    }
+    let mean = cards
+        .iter()
+        .zip(&held)
+        .map(|(c, &n)| us(c, n) * touched)
+        .fold(0.0, f64::max);
+    (expected - mean).max(0.0)
 }
 
 /// Microseconds a card spends on `fraction` of a layer for `rows` rows: the longer of reading its
 /// part of the weights at `read` bytes and multiplying the rows through it at `flops` operations
 /// per microsecond.
 fn share_us(stack: &DenseStack, fraction: f64, read: f64, flops: f64, rows: usize) -> f64 {
-    let bytes = fraction * stack.read_bytes(rows) / read;
+    share_us_over(stack, fraction, read, flops, rows, 0.0)
+}
+
+/// [`share_us`] with `extra_read` microseconds added to the card's read.
+fn share_us_over(
+    stack: &DenseStack,
+    fraction: f64,
+    read: f64,
+    flops: f64,
+    rows: usize,
+    extra_read: f64,
+) -> f64 {
+    let bytes = fraction * stack.read_bytes(rows) / read + extra_read;
     let product = fraction * rows as f64 * stack.row_flops / flops;
     bytes.max(product)
 }
@@ -106,16 +200,18 @@ pub fn split_us(
 ) -> f64 {
     let n = cards.len() as f64;
     let total_read: f64 = cards.iter().map(|c| c.read_bytes_per_us).sum();
+    let extra = stack.routed.map_or(0.0, |r| imbalance_us(r, rows, cards));
     let share = cards
         .iter()
         .zip(flops)
         .map(|(c, &f)| {
-            share_us(
+            share_us_over(
                 stack,
                 c.read_bytes_per_us / total_read,
                 c.read_bytes_per_us,
                 f,
                 rows,
+                extra,
             )
         })
         .fold(0.0, f64::max);
@@ -287,7 +383,7 @@ pub fn plan(
         }
         let rates = super::expert_parallel::card_read_rates();
         let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
-        let group = super::llm::tensor_parallel(demand, cards, ranks, weight)?;
+        let group = super::llm::tensor_parallel(demand, cards, ranks, routed.is_some(), weight)?;
         if !pays_over(demand, &demand.plan(cards), &group, row_bytes, row_flops, routed, prompt_rows) {
             tracing::info!(
                 "stays layer by layer on {ranks} cards: the sums cost more than the split saves, for a token or for {prompt_rows} prompt rows"
@@ -405,7 +501,69 @@ mod tests {
             row_flops: 1e9,
         };
         assert_eq!(stack.read_bytes(1), 20_000_000.0 + 80_000_000.0);
-        assert_eq!(stack.read_bytes(512), 1_300_000_000.0);
+        assert!((stack.read_bytes(512) / 1_300_000_000.0 - 1.0).abs() < 1e-9);
+    }
+
+    /// Rows that route to the same experts read them once: 16 rows of 8 of 128 touch about 64%
+    /// of the experts, not the 100% that adding their pairs gives.
+    #[test]
+    fn rows_that_share_experts_read_them_once() {
+        let r = RoutedExperts {
+            bytes: 1_280_000_000,
+            experts: 128,
+            used: 8,
+        };
+        assert!((r.touched_share(1) - 0.0625).abs() < 1e-12);
+        let sixteen = r.touched_share(16);
+        assert!((0.63..0.65).contains(&sixteen), "{sixteen}");
+        assert!(r.touched_share(512) > 0.999_999);
+    }
+
+    /// A decoded token's experts fall unevenly on 2 equal cards: the slowest reads more than
+    /// the 4 of 8 the mean gives. Every expert read leaves no unevenness.
+    #[test]
+    fn the_slowest_card_reads_more_than_the_mean() {
+        let r = RoutedExperts {
+            bytes: 128 * 1_000_000,
+            experts: 128,
+            used: 8,
+        };
+        let cards = [card(1000.0, None), card(1000.0, Some((5.0, 50.0)))];
+        // An expert of 1 MB takes 1 us at 1000 GB/s: the excess in microseconds counts experts.
+        let excess = imbalance_us(r, 1, &cards);
+        assert!((0.9..1.6).contains(&excess), "{excess} experts too many");
+        assert!(imbalance_us(r, 4096, &cards) < 1e-6);
+        assert_eq!(imbalance_us(r, 1, &cards[..1]), 0.0);
+    }
+
+    /// A token whose experts split over 2 cards is predicted faster than on 1 card when the
+    /// cards are taken to read half each, and slower once the slowest card's draw is counted:
+    /// the sums cost what the unevenness leaves of the saving.
+    #[test]
+    fn unevenness_keeps_a_marginal_token_on_one_card() {
+        let stack = DenseStack {
+            layers: 32,
+            layer_bytes: 10_000_000,
+            routed: Some(RoutedExperts {
+                bytes: 128 * 2_000_000,
+                experts: 128,
+                used: 8,
+            }),
+            row_bytes: 8192,
+            row_flops: 1e6,
+        };
+        let cards = [card(900.0, None), card(900.0, Some((5.0, 25.0)))];
+        let flops = [tflops(50.0), tflops(50.0)];
+        let fabric = sum(6.6, 1000.0);
+        let layered = layered_us(&stack, &cards, &flops, &[32, 0], 1);
+        let mean = DenseStack {
+            routed: None,
+            layer_bytes: stack.read_bytes(1) as u64,
+            ..stack
+        };
+        assert!(split_us(&mean, &cards, &flops, fabric, 1) < layered);
+        assert!(split_us(&stack, &cards, &flops, fabric, 1) > layered);
+        assert!(!split_pays(&stack, &cards, &flops, fabric, &[32, 0], 1));
     }
 
     /// One card is no split.
