@@ -972,6 +972,15 @@ pub(crate) trait ModelBackend: Send {
         Ok(())
     }
 
+    /// Makes a [`Self::recurrent_checkpoint`] the states again, on the card or the host they
+    /// lie on, in new buffers when the old ones differ.
+    fn recurrent_rewind(
+        &mut self,
+        checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
+    ) -> crate::tensor::Result<()> {
+        self.recurrent_restore(checkpoint)
+    }
+
     /// Engine hook after a successful graph capture: a live CUDA graph now
     /// references the per-layer KV buffers. Freezes quantized-KV growth +
     /// the capture-time seq ceiling. Default no-op for non-graph backends.
@@ -2482,6 +2491,13 @@ impl ModelBackend for GenericBackend {
         self.0.recurrent_restore(checkpoint)
     }
 
+    fn recurrent_rewind(
+        &mut self,
+        checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
+    ) -> crate::tensor::Result<()> {
+        self.0.recurrent_rewind(checkpoint)
+    }
+
     #[cfg(feature = "gpu")]
     fn mark_graph_captured(&mut self) {
         self.0.note_graphs_recorded();
@@ -2705,6 +2721,13 @@ impl ModelBackend for GenericVisionBackend {
         checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
     ) -> crate::tensor::Result<()> {
         self.text.recurrent_restore(checkpoint)
+    }
+
+    fn recurrent_rewind(
+        &mut self,
+        checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
+    ) -> crate::tensor::Result<()> {
+        self.text.recurrent_rewind(checkpoint)
     }
 
     #[cfg(feature = "gpu")]

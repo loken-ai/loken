@@ -569,7 +569,14 @@ impl LlmEngine {
     pub fn draft_trim_kv(&self, len: usize) {
         if let Some(d) = self.draft_engine.blocking_lock().as_ref() {
             if let Some(s) = d.model_state.blocking_lock().as_mut() {
-                s.model.trim_kv(len);
+                match s.draft_mark.take() {
+                    Some(mark) => {
+                        if let Err(e) = mark.rewind(&mut *s.model, &s.device, len) {
+                            warn!("drafter: state not cut back to {len} tokens: {e}");
+                        }
+                    }
+                    None => s.model.trim_kv(len),
+                }
             }
         }
     }
@@ -662,6 +669,7 @@ impl LlmEngine {
             Some(s) => s,
             None => return Vec::new(),
         };
+        st.draft_mark = draft_mark::DraftMark::take(&*st.model, start_pos);
         let penalise = repeat_penalty > 1.0 && repeat_last_n > 0;
         // Growing penalty window: target's recent tokens + drafts committed so far.
         let mut window: Vec<u32> = if penalise {
@@ -677,6 +685,9 @@ impl LlmEngine {
                 Ok(l) => l,
                 Err(_) => break,
             };
+            if let Some(mark) = st.draft_mark.as_mut() {
+                mark.fed(tok);
+            }
             let mut v: Vec<f32> = match logits
                 .flatten_all()
                 .and_then(|t| t.to_dtype(crate::tensor::DType::F32))
@@ -717,6 +728,22 @@ impl LlmEngine {
             pos += 1;
         }
         out
+    }
+
+    /// Spec-decode: feed the drafter `token` at `pos` without drafting from it, so a drafter
+    /// that fed all its tokens ends at the target's length. Nothing is cut back from this
+    /// step, so its state is not marked.
+    pub fn draft_advance(&self, token: u32, pos: usize) {
+        let g = self.draft_engine.blocking_lock();
+        let Some(d) = g.as_ref() else {
+            return;
+        };
+        let mut sg = d.model_state.blocking_lock();
+        let Some(st) = sg.as_mut() else {
+            return;
+        };
+        st.draft_mark = None;
+        let _ = drafter_step(st, token, pos);
     }
 
     /// Get the last error message from model loading
@@ -1697,6 +1724,7 @@ pub use loading::configure_thread_pool;
 mod query;
 mod sequential;
 pub use query::SegmentInputs;
+pub(crate) mod draft_mark;
 mod spec;
 mod stream;
 

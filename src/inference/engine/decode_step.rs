@@ -708,7 +708,7 @@ pub(crate) fn spec_draft_lockstep(
 ) {
     let k = draft.len();
     if accepted_drafts == k {
-        let _ = spec_engine.draft_k(draft[k - 1], 1, new_pos - 1, &[], 1.0, 0);
+        spec_engine.draft_advance(draft[k - 1], new_pos - 1);
     } else {
         spec_engine.draft_trim_kv(new_pos);
     }

@@ -510,6 +510,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
         #[cfg(feature = "gpu")]
         draft_step: Default::default(),
         draft_primed: false,
+        draft_mark: None,
         exact_prefill: None,
         eos_token_ids_extra: Vec::new(),
         file_size,
@@ -999,6 +1000,9 @@ pub(crate) struct LoadedModelState {
     pub(super) draft_step: super::DraftStep,
     /// A drafter step primed or recorded the drafter's step since the decode last asked.
     pub(super) draft_primed: bool,
+    /// A recurrent drafter's state before the draft under way, to cut it back to the tokens
+    /// the target keeps.
+    pub(super) draft_mark: Option<super::draft_mark::DraftMark>,
     /// The prompt of the last text prefill and the logits it ended on, valid while the resident
     /// KV still holds that prompt's rows. Any request that touches the KV another way clears it.
     pub(super) exact_prefill: Option<(Vec<u32>, Tensor)>,

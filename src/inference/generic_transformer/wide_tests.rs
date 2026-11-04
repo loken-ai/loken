@@ -1510,3 +1510,146 @@ fn two_models_decoding_at_once_on_a_card_give_the_logits_each_gives_alone() {
         }
     }
 }
+
+/// A recurrent drafter fed a draft of 4 tokens and cut back to any length leaves the state of a
+/// drafter that was fed only the tokens kept.
+#[test]
+fn a_recurrent_drafter_cut_back_holds_the_state_of_the_tokens_kept() {
+    use crate::inference::engine::llm_engine::draft_mark::DraftMark;
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let step = |m: &mut GenericBackend, t: u32, at: usize| -> Vec<f32> {
+        let input = Tensor::from_vec(vec![t], (1, 1), &Device::Cpu).unwrap();
+        m.forward(&input, at)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let prefix = 3usize;
+    for len in prefix..=prefix + 4 {
+        let mut drafter = GenericBackend(toy());
+        assert!(drafter.is_recurrent(), "the toy has a recurrent layer");
+        for (i, t) in tokens[..prefix].iter().enumerate() {
+            step(&mut drafter, *t, i);
+        }
+        let mut mark = DraftMark::take(&drafter, prefix).expect("a recurrent drafter is marked");
+        for (i, t) in tokens[prefix..prefix + 4].iter().enumerate() {
+            step(&mut drafter, *t, prefix + i);
+            mark.fed(*t);
+        }
+        mark.rewind(&mut drafter, &Device::Cpu, len).unwrap();
+        let mut alone = GenericBackend(toy());
+        for (i, t) in tokens[..len].iter().enumerate() {
+            step(&mut alone, *t, i);
+        }
+        for i in len..len + 2 {
+            assert_eq!(
+                step(&mut drafter, tokens[i], i),
+                step(&mut alone, tokens[i], i),
+                "cut back to {len}: position {i} differs"
+            );
+        }
+    }
+}
+
+/// Greedy decoding with a recurrent drafter whose proposals are wrong on every other cycle gives
+/// the tokens of decoding without a draft.
+#[test]
+fn drafting_with_a_recurrent_drafter_gives_the_tokens_of_plain_decoding() {
+    use crate::inference::engine::llm_engine::draft_mark::DraftMark;
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let prompt = ids(&v, "b.ids")[..4].to_vec();
+    let dev = Device::Cpu;
+    let step = |m: &mut GenericBackend, t: u32, at: usize| -> Vec<f32> {
+        let input = Tensor::from_vec(vec![t], (1, 1), &dev).unwrap();
+        m.forward(&input, at)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let top = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap()
+    };
+    let prefill = |m: &mut GenericBackend| -> u32 {
+        let mut last = Vec::new();
+        for (i, t) in prompt.iter().enumerate() {
+            last = step(m, *t, i);
+        }
+        top(&last)
+    };
+    let wanted = 24usize;
+    let vocab = step(&mut GenericBackend(toy()), 0, 0).len() as u32;
+
+    let mut plain_model = GenericBackend(toy());
+    let mut cur = prefill(&mut plain_model);
+    let mut plain = vec![cur];
+    while plain.len() < wanted {
+        let at = prompt.len() + plain.len() - 1;
+        cur = top(&step(&mut plain_model, cur, at));
+        plain.push(cur);
+    }
+
+    let mut target = GenericBackend(toy());
+    let mut drafter = GenericBackend(toy());
+    let mut cur = prefill(&mut target);
+    prefill(&mut drafter);
+    let mut out = vec![cur];
+    let (mut cycle, mut rejected) = (0usize, 0usize);
+    let k = 3usize;
+    while out.len() < wanted {
+        let len = prompt.len() + out.len() - 1;
+        let mut mark = DraftMark::take(&drafter, len).expect("a recurrent drafter is marked");
+        let mut draft = Vec::new();
+        let mut tok = cur;
+        for i in 0..k {
+            let next = top(&step(&mut drafter, tok, len + i));
+            mark.fed(tok);
+            draft.push(next);
+            tok = next;
+        }
+        if cycle % 2 == 1 {
+            draft[1] = (draft[1] + 1) % vocab;
+        }
+        cycle += 1;
+        let mut rows = vec![cur];
+        rows.extend_from_slice(&draft);
+        let x = Tensor::from_vec(rows.clone(), (1, rows.len()), &dev).unwrap();
+        let logits = target
+            .forward_all(&x, len)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let rows_of: Vec<&[f32]> = logits.chunks(vocab as usize).collect();
+        let mut accepted = 0;
+        while accepted < k && top(rows_of[accepted]) == draft[accepted] {
+            accepted += 1;
+        }
+        out.extend_from_slice(&draft[..accepted]);
+        cur = top(rows_of[accepted]);
+        out.push(cur);
+        let kept = len + accepted + 1;
+        if accepted < k {
+            rejected += 1;
+            target.trim_kv(kept);
+            mark.rewind(&mut drafter, &dev, kept).unwrap();
+        } else {
+            step(&mut drafter, draft[k - 1], len + k);
+        }
+    }
+    assert!(rejected > 0, "the wrong proposals were rejected");
+    assert_eq!(out[..wanted], plain[..wanted]);
+}

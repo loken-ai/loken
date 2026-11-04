@@ -1580,6 +1580,7 @@ impl LlmEngine {
                 #[cfg(feature = "gpu")]
                 draft_step: Default::default(),
                 draft_primed: false,
+                draft_mark: None,
                 exact_prefill: None,
                 eos_token_ids_extra,
                 file_size,
