@@ -1867,9 +1867,7 @@ impl LlmEngine {
                             committed,
                             cycle_start.elapsed().as_secs_f64() * 1e3
                         );
-                        if !spec_on && !head_on {
-                            pld_cost.round(cycle_start.elapsed().as_secs_f64(), committed);
-                        }
+                        let costed_round = !spec_on && !head_on;
                         if head_on {
                             head_tokens.clear();
                             head_tokens.extend_from_slice(&draft[..accepted_drafts]);
@@ -1902,6 +1900,10 @@ impl LlmEngine {
                             // The verify wrote k+1 rows from `verify_pos`; keep
                             // the `committed` that were accepted.
                             state.model.trim_kv(verify_pos + committed);
+                        }
+                        // The round's cost includes the rollback of its rejected rows.
+                        if costed_round {
+                            pld_cost.round(cycle_start.elapsed().as_secs_f64(), committed);
                         }
 
                         // Spec-decode: drafter KV lockstep (shared:

@@ -811,6 +811,20 @@ mod tests {
         );
     }
 
+    /// A round whose rejected rows are replayed costs more than the same round that kept them:
+    /// the lookup wins on the first and is held off on the second.
+    #[test]
+    fn a_round_that_replays_its_rejected_rows_is_held_off() {
+        let mut kept = PldCost::default();
+        kept.plain_step(0.400);
+        kept.round(0.900, 3);
+        assert!(kept.worth_trying(), "3 tokens in 0.9 s against 1 in 0.4 s");
+        let mut replayed = PldCost::default();
+        replayed.plain_step(0.400);
+        replayed.round(1.800, 3);
+        assert!(!replayed.worth_trying(), "the replay doubles the round");
+    }
+
     /// A lookup is verified while its rounds commit tokens faster than plain steps do, held off
     /// for a run of plain steps once they do not, and tried again after it.
     #[test]

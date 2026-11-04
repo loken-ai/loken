@@ -2991,14 +2991,11 @@ impl ModelBackend for DeepseekV41Backend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // A batched verify pays only when the block's experts are already in memory: it reads
-        // their union once instead of per token. With the experts streamed from disk the union
-        // barely overlaps across a block, so a verify reads about as many expert bytes as
-        // decoding the tokens one at a time and a rejected tail replays a whole block on top -
-        // measured a net loss at 82% acceptance (2.5 vs 3.5 tok/s). Resident, the same verify
-        // saves the repeated reads, so the draft path is offered only then.
+        // A verify reads the union of its block's experts once, and a rejected tail replays
+        // the accepted rows on top. The round's measured cost, rollback included, decides per
+        // request whether the lookup runs, whatever the placement.
         Capabilities {
-            pld: self.streamed.is_none(),
+            pld: true,
             ..Capabilities::default()
         }
     }

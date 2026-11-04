@@ -2668,9 +2668,7 @@ impl LlmEngine {
                                 // A cycle whose window was recorded as it ran paid the recording:
                                 // its acceptance counts, its cost does not.
                                 let cycle_secs = cycle_start.elapsed().as_secs_f64();
-                                if !spec_on && !head_on && !window_recorded {
-                                    pld_cost.round(cycle_secs, n_committed);
-                                }
+                                let costed_round = !spec_on && !head_on && !window_recorded;
                                 if pld_enabled {
                                     pld_cache.push_many(&draft[..accepted_drafts]);
                                 }
@@ -2718,6 +2716,11 @@ impl LlmEngine {
                                     settles += 1;
                                 } else if n_committed < k + 1 {
                                     state.model.trim_kv(new_pos);
+                                }
+                                // The round's cost includes the rollback of its rejected rows.
+                                if costed_round {
+                                    pld_cost
+                                        .round(cycle_start.elapsed().as_secs_f64(), n_committed);
                                 }
                                 // Spec-decode: drafter KV lockstep (shared:
                                 // decode_step::spec_draft_lockstep).
