@@ -528,8 +528,28 @@ impl APIServer {
             let mut engines_guard = wait_until_idle(&engines, &model_id, duration).await;
             if let Some(pos) = engines_guard.iter().position(|e| e.model_id == model_id) {
                 let entry = engines_guard.remove(pos);
+                // The image is taken while the weights are resident, so it reads no disk.
+                let slept = match entry.engine.sleep_files() {
+                    Some(files) => {
+                        let sleepers = server.sleepers.clone();
+                        let id = entry.model_id.clone();
+                        tokio::task::spawn_blocking(move || sleepers.sleep(&id, &files))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => None,
+                };
                 if let Err(e) = entry.unload_all().await {
                     info!("Error unloading model {}: {}", entry.model_id, e);
+                    server.sleepers.release(&entry.model_id);
+                } else if let Some((bytes, pinned)) = slept {
+                    info!(
+                        "Model {} asleep after keep_alive expired: {} MB held in host memory ({}), card memory released",
+                        entry.model_id,
+                        bytes / 1_000_000,
+                        if pinned { "pinned" } else { "resident" }
+                    );
                 } else {
                     info!("Model {} unloaded after keep_alive expired", entry.model_id);
                 }
@@ -982,6 +1002,10 @@ impl APIServer {
     /// answer "unloaded" unconditionally - one of them while a name mismatch meant
     /// nothing was ever freed.
     pub(crate) async fn unload_model(&self, model_id: &str) -> Result<UnloadOutcome, ApiError> {
+        // An unload asked for gives the host memory back too.
+        if self.sleepers.release(model_id) {
+            info!("unload: {model_id} was asleep; host memory released");
+        }
         for kind in ResidentEngine::ALL {
             if self.release_named(*kind, model_id).await? {
                 return Ok(UnloadOutcome::Freed);

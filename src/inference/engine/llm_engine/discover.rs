@@ -349,6 +349,41 @@ impl LlmEngine {
         roots
     }
 
+    /// The files a load of this model reads: the image a sleeping model keeps in host memory.
+    ///
+    /// A GGUF brings every part of its set, the draft head beside it, its vision projector and
+    /// the tokenizer files beside it.
+    /// A checkpoint directory brings the weight shards of its layout and its JSON files.
+    /// `None` when the model resolves to neither.
+    pub(crate) fn sleep_files(&self) -> Option<Vec<PathBuf>> {
+        use std::io::Read;
+        let found = self.find_model_file(&self.config.model_id)?;
+        if found.is_dir() {
+            return checkpoint_files(&found);
+        }
+        let mut magic = [0u8; 4];
+        let mut open = std::fs::File::open(&found).ok()?;
+        if !(open.metadata().ok()?.is_file()
+            && open.read_exact(&mut magic).is_ok()
+            && &magic == b"GGUF")
+        {
+            return None;
+        }
+        let mut files = crate::tensor::quantized::gguf_source::set_files(&found).ok()?;
+        files.extend(
+            self.find_projector_blob_for_model(&self.config.model_id)
+                .filter(|p| p.is_file()),
+        );
+        let beside = found.parent()?;
+        files.extend(
+            ["tokenizer.json", "tokenizer_config.json"]
+                .into_iter()
+                .map(|name| beside.join(name))
+                .filter(|p| p.is_file()),
+        );
+        Some(files)
+    }
+
     pub(super) fn find_model_file(&self, model_id: &str) -> Option<PathBuf> {
         // AWQ (HF safetensors) checkpoint: the model reference is a
         // directory whose config.json declares quant_method==awq (a direct
@@ -726,6 +761,22 @@ pub(super) fn resolve_hub_checkpoint(model_id: &str, roots: &[PathBuf]) -> Optio
         }
     }
     None
+}
+
+/// The files of the checkpoint directory `dir` that a load reads: the shards of its layout and
+/// the JSON files that describe it and its tokenizer. `None` when it has no loadable layout.
+fn checkpoint_files(dir: &std::path::Path) -> Option<Vec<PathBuf>> {
+    let (_, shards) = crate::inference::load::awq_loader::checkpoint_shards(dir).ok()?;
+    let mut files: Vec<PathBuf> = shards.into_iter().map(PathBuf::from).collect();
+    let mut described: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    described.sort();
+    files.extend(described);
+    Some(files)
 }
 
 /// The part number of a split GGUF named `<stem>-NNNNN-of-MMMMM.gguf`, `None` for a whole file.

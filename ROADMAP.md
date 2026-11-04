@@ -49,7 +49,7 @@ Smaller, by state then by priority:
 | Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |
 | One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
 | ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
-| Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Planned |
+| Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Done |
 | Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Planned |
 | Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Planned |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Partial |

@@ -197,6 +197,22 @@ fn sibling_paths(path: &Path, count: usize) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The files of the set `path` opens, in the order a load reads them: the parts of a split, then
+/// the draft head beside them. A single file is a set of one. Only the first header is read.
+pub fn set_files<P: AsRef<Path>>(path: P) -> Result<Vec<PathBuf>> {
+    let path = path.as_ref();
+    let first = super::gguf_file::open_header(path)?;
+    let count = first
+        .metadata
+        .get("split.count")
+        .and_then(|v| v.to_u32().ok())
+        .unwrap_or(1) as usize;
+    let mut files = vec![path.to_path_buf()];
+    files.extend(sibling_paths(path, count)?);
+    files.extend(draft_head_beside(path));
+    Ok(files)
+}
+
 /// The elements every tensor of the set `path` belongs to holds: the model's parameter count. A
 /// part lists only the tensors it carries, so the set is counted across its parts. Only the
 /// headers are read: no part is mapped, so this is safe to ask of a listing.

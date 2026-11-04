@@ -1896,6 +1896,343 @@ mod alibi_placement_tests {
 }
 
 #[cfg(test)]
+mod sleep_tests {
+    use super::*;
+    use crate::inference::place::sleep::Sleepers;
+    use crate::tensor::DType;
+
+    /// The logits of one prefill of `prompt` on the loaded model, as bits.
+    async fn logit_bits(engine: &LlmEngine, prompt: &[u32]) -> Vec<u32> {
+        let mut guard = engine.model_state.lock().await;
+        let state = guard.as_mut().expect("a loaded model");
+        let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), &Device::Cpu).unwrap();
+        state
+            .model
+            .forward(&input.to_device(&state.device).unwrap(), 0)
+            .and_then(|t| t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>())
+            .expect("a forward")
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Where the layers of the loaded model run, as `device:layers` spans.
+    async fn placed(engine: &LlmEngine) -> String {
+        engine
+            .get_layer_distribution()
+            .await
+            .map(|(_, spans)| {
+                spans
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{}{}:{}-{}",
+                            s.device_type, s.device_id, s.layer_start, s.layer_end
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A word-level tokenizer of the tiny quantised model's vocabulary, saved as `path`.
+    fn save_tokenizer(path: &std::path::Path) {
+        use crate::inference::generic_transformer::tiny_model;
+        use tokenizers::models::wordlevel::WordLevel;
+        let vocab: ahash::AHashMap<String, u32> = (0..tiny_model::QUANT_VOCAB as u32)
+            .map(|i| (format!("t{i}"), i))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("t0".into())
+            .build()
+            .unwrap();
+        Tokenizer::new(model).save(path, false).unwrap();
+    }
+
+    /// Loads the model `models_dir` names, puts it to sleep and wakes it.
+    ///
+    /// Requires `files` files in the image and no weights held while the model sleeps.
+    /// Requires every page of every file in memory at the wake, after the system was asked to
+    /// drop them.
+    /// Requires the logits of before the sleep, bit for bit.
+    async fn sleeps_and_wakes(model_id: &str, models_dir: PathBuf, files: usize) {
+        use crate::inference::place::sleep::{forget, resident_bytes};
+        let engine = LlmEngine::with_config(InferenceConfig {
+            model_id: model_id.into(),
+            models_dir: Some(models_dir),
+            context_length: 64,
+            ..InferenceConfig::default()
+        });
+        let prompt = [1u32, 5, 9, 3, 12, 7];
+        engine.load_model().await.expect("the model loads");
+        let before = logit_bits(&engine, &prompt).await;
+
+        let image = engine.sleep_files().expect("the files of the model");
+        assert_eq!(image.len(), files, "{model_id}: {image:?}");
+        let size = |f: &PathBuf| std::fs::metadata(f).unwrap().len();
+        let total: u64 = image.iter().map(size).sum();
+        let sleepers = Sleepers::default();
+        let (bytes, _) = sleepers
+            .sleep(model_id, &image)
+            .expect("the files fit the host");
+        assert_eq!(bytes, total);
+        engine.unload().await.unwrap();
+        assert!(engine.model_state.lock().await.is_none());
+        assert!(sleepers.sleeping(model_id));
+
+        // The wake finds every byte it reads in memory: none comes from the disk.
+        for file in &image {
+            forget(file);
+            assert_eq!(
+                resident_bytes(file),
+                size(file),
+                "{} is in memory while the model sleeps",
+                file.display()
+            );
+        }
+        engine.load_model().await.expect("the model wakes");
+        assert!(sleepers.release(model_id));
+        eprintln!("{model_id}: placed {}", placed(&engine).await);
+        let after = logit_bits(&engine, &prompt).await;
+        engine.unload().await.unwrap();
+
+        // Without the image the same advice drops pages, where the file system lets it.
+        let left: u64 = image
+            .iter()
+            .map(|f| {
+                forget(f);
+                resident_bytes(f)
+            })
+            .sum();
+        eprintln!(
+            "{model_id}: {} of {total} bytes stay in memory without the image",
+            left
+        );
+        assert_eq!(before, after);
+    }
+
+    /// A model held in 1 GGUF file sleeps and wakes with its tokenizer file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_woken_model_gives_the_same_logits() {
+        use crate::inference::generic_transformer::tiny_model;
+        let path = tiny_model::write_quant("sleep", 2);
+        save_tokenizer(&path.with_file_name("tokenizer.json"));
+        sleeps_and_wakes("sleep", path.clone(), 2).await;
+        tiny_model::remove(&path);
+    }
+
+    /// A model held in a split GGUF set sleeps and wakes with every part.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_woken_split_model_gives_the_same_logits() {
+        use crate::inference::generic_transformer::tiny_model;
+        let first = tiny_model::write_quant_split("sleep-split", 2, 3);
+        save_tokenizer(&first.with_file_name("tokenizer.json"));
+        sleeps_and_wakes("sleep-split", first.clone(), 4).await;
+        tiny_model::remove(&first);
+    }
+
+    /// A model held in a safetensors checkpoint directory sleeps and wakes with every shard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_woken_checkpoint_directory_gives_the_same_logits() {
+        use crate::inference::generic_transformer::tiny_model;
+        let dir = tiny_model::write_quant_checkpoint("sleep-dir", 2, 2);
+        save_tokenizer(&dir.join("tokenizer.json"));
+        sleeps_and_wakes("sleep-dir", dir.clone(), 5).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The smallest model of the store, slept and woken against a cold read from disk: prints
+    /// both times and requires the same logits.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a model in the configured Ollama store, and a card to show the gain"]
+    async fn waking_beats_a_cold_load() {
+        let config = crate::config::Config::load_test();
+        let root = config
+            .ollama_models_dir
+            .as_ref()
+            .and_then(|d| d.paths().into_iter().next())
+            .expect("a configured store");
+        let library = root.join("manifests/registry.ollama.ai/library");
+        let mut best: Option<(u64, String)> = None;
+        for name in std::fs::read_dir(&library).unwrap().flatten() {
+            for tag in std::fs::read_dir(name.path()).unwrap().flatten() {
+                let id = format!(
+                    "{}:{}",
+                    name.file_name().to_string_lossy(),
+                    tag.file_name().to_string_lossy()
+                );
+                let probe = LlmEngine::with_config(InferenceConfig {
+                    model_id: id.clone(),
+                    models_dir: Some(root.clone()),
+                    ..InferenceConfig::default()
+                });
+                let Some(size) = probe.sleep_files().map(|files| image_bytes(&files)) else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|(s, _)| size < *s) {
+                    best = Some((size, id));
+                }
+            }
+        }
+        let (_, model_id) = best.expect("a model in the store");
+        wake_against_cold_load(&model_id, Some(root)).await;
+    }
+
+    /// The smallest text checkpoint directory of the configured hub store, measured as
+    /// `waking_beats_a_cold_load` measures a GGUF.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a checkpoint directory in the configured hub store, and a card to show the gain"]
+    async fn waking_a_checkpoint_directory_beats_a_cold_load() {
+        let mut best: Option<(u64, String, PathBuf)> = None;
+        for root in LlmEngine::with_config(InferenceConfig::default()).hub_roots() {
+            let Ok(repos) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for repo in repos.flatten() {
+                let name = repo.file_name().to_string_lossy().to_string();
+                let Some((org, model)) = name
+                    .strip_prefix("models--")
+                    .and_then(|n| n.split_once("--"))
+                else {
+                    continue;
+                };
+                let Some(snap) = super::load::resolve_awq_dir(&repo.path().to_string_lossy())
+                else {
+                    continue;
+                };
+                let id = format!("{org}/{model}");
+                let probe = LlmEngine::with_config(InferenceConfig {
+                    model_id: id.clone(),
+                    models_dir: Some(PathBuf::from(&snap)),
+                    ..InferenceConfig::default()
+                });
+                let Some(size) = probe.sleep_files().map(|files| image_bytes(&files)) else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|(s, ..)| size < *s) {
+                    best = Some((size, id, PathBuf::from(snap)));
+                }
+            }
+        }
+        let (_, model_id, dir) = best.expect("a checkpoint directory in the store");
+        wake_against_cold_load(&model_id, Some(dir)).await;
+    }
+
+    /// Bytes of `files`.
+    fn image_bytes(files: &[PathBuf]) -> u64 {
+        files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Bytes this process has read from the storage layer, page cache hits excluded.
+    fn disk_read_bytes() -> u64 {
+        std::fs::read_to_string("/proc/self/io")
+            .ok()
+            .and_then(|io| {
+                io.lines()
+                    .find_map(|l| l.strip_prefix("read_bytes: "))
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Bytes in use on the first card, `None` without one.
+    fn card_used_bytes() -> Option<u64> {
+        #[cfg(feature = "gpu")]
+        {
+            let card = Device::new_cuda(0).ok()?;
+            let (free, total) = crate::tensor::cuda_ext::mem_get_info(&card).ok()?;
+            Some((total - free) as u64)
+        }
+        #[cfg(not(feature = "gpu"))]
+        None
+    }
+
+    /// Loads the model 3 times from the disk and 3 times from its sleep image.
+    ///
+    /// Prints each time, the bytes read from the disk and the card memory before the sleep,
+    /// asleep and after the wake.
+    /// Requires the logits of the cold load after each wake, and no byte read from the disk by
+    /// a wake.
+    async fn wake_against_cold_load(model_id: &str, models_dir: Option<PathBuf>) {
+        use crate::inference::place::sleep::{forget, resident_bytes};
+        // The load log names the plan and the phases of each load.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init();
+        let engine = LlmEngine::with_config(InferenceConfig {
+            model_id: model_id.to_string(),
+            models_dir,
+            context_length: 512,
+            ..InferenceConfig::default()
+        });
+        let files = engine.sleep_files().unwrap();
+        let size = image_bytes(&files);
+        let prompt: Vec<u32> = (1..40).collect();
+        let mb = |b: Option<u64>| b.map_or("none".to_string(), |b| format!("{} MB", b / 1_000_000));
+        // The first load of a process also starts the card runtime.
+        engine.load_model().await.unwrap();
+        engine.unload().await.unwrap();
+        let sleepers = Sleepers::default();
+        let mut rows = Vec::new();
+        for round in 0..3 {
+            files.iter().for_each(|f| forget(f));
+            let cached: u64 = files.iter().map(|f| resident_bytes(f)).sum();
+            let read = disk_read_bytes();
+            let t = std::time::Instant::now();
+            engine.load_model().await.unwrap();
+            let cold = t.elapsed().as_secs_f64();
+            let cold_read = disk_read_bytes() - read;
+            let reference = logit_bits(&engine, &prompt).await;
+            let loaded = card_used_bytes();
+            let t = std::time::Instant::now();
+            let (_, pinned) = sleepers.sleep(model_id, &files).expect("the files fit");
+            let image = t.elapsed().as_secs_f64();
+            engine.unload().await.unwrap();
+            let asleep = card_used_bytes();
+            files.iter().for_each(|f| forget(f));
+            let read = disk_read_bytes();
+            let t = std::time::Instant::now();
+            engine.load_model().await.unwrap();
+            let wake = t.elapsed().as_secs_f64();
+            let wake_read = disk_read_bytes() - read;
+            sleepers.release(model_id);
+            assert_eq!(reference, logit_bits(&engine, &prompt).await);
+            let woken = card_used_bytes();
+            let layers = placed(&engine).await;
+            engine.unload().await.unwrap();
+            rows.push((cold, wake, wake_read));
+            eprintln!(
+                "sleep round {round}: {model_id} {} files {} MB placed {layers}, cold load {cold:.2}s \
+                 reading {} MB with {} MB cached, sleep {image:.2}s pinned {pinned}, wake {wake:.2}s \
+                 reading {} MB, card loaded {}, asleep {}, woken {}",
+                files.len(),
+                size / 1_000_000,
+                cold_read / 1_000_000,
+                cached / 1_000_000,
+                wake_read / 1_000_000,
+                mb(loaded),
+                mb(asleep),
+                mb(woken),
+            );
+        }
+        let best_cold = rows.iter().map(|r| r.0).fold(f64::MAX, f64::min);
+        let worst_wake = rows.iter().map(|r| r.1).fold(0.0, f64::max);
+        eprintln!("{model_id}: best cold load {best_cold:.2}s, worst wake {worst_wake:.2}s");
+        assert!(
+            rows.iter().all(|r| r.2 == 0),
+            "a wake read the disk: {rows:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod drafter_choice_tests {
     use super::can_draft;
 

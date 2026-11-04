@@ -258,6 +258,141 @@ pub(crate) const QUANT_VOCAB: usize = 64;
 /// Q6_K value, down and head, f32 norms and embedding. Written as [`write`] writes the dense
 /// model.
 pub(crate) fn write_quant(tag: &str, layers: usize) -> std::path::PathBuf {
+    let (metadata, entries) = quant_model(layers);
+    let path = scratch_dir(tag).join("m.gguf");
+    write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
+    path
+}
+
+/// The model of [`write_quant`] stored as a split set of `parts` files, its tensors dealt to the
+/// parts in order. Returns the path of the first part.
+pub(crate) fn write_quant_split(tag: &str, layers: usize, parts: usize) -> std::path::PathBuf {
+    let (mut metadata, entries) = quant_model(layers);
+    let dir = scratch_dir(tag);
+    let name = |i: usize| dir.join(format!("m-{:05}-of-{parts:05}.gguf", i + 1));
+    let split = |i: usize| {
+        vec![
+            ("split.count".to_string(), Value::U32(parts as u32)),
+            ("split.no".to_string(), Value::U32(i as u32)),
+        ]
+    };
+    metadata.extend(split(0));
+    let per = entries.len().div_ceil(parts);
+    for (i, chunk) in entries.chunks(per).enumerate() {
+        let md = if i == 0 { metadata.clone() } else { split(i) };
+        write_gguf_with_metadata(&name(i), &md, chunk).unwrap();
+    }
+    name(0)
+}
+
+/// The model of [`write_quant`] with float weights, stored as a qwen3 checkpoint directory of
+/// `shards` safetensors files, an index and its `config.json`. Returns the directory.
+pub(crate) fn write_quant_checkpoint(
+    tag: &str,
+    layers: usize,
+    shards: usize,
+) -> std::path::PathBuf {
+    let (_, entries) = quant_model(layers);
+    let dir = scratch_dir(tag);
+    let named = |n: &str| -> String {
+        match n {
+            "token_embd.weight" => "model.embed_tokens.weight".into(),
+            "output.weight" => "lm_head.weight".into(),
+            "output_norm.weight" => "model.norm.weight".into(),
+            _ => {
+                let (il, rest) = n
+                    .strip_prefix("blk.")
+                    .and_then(|r| r.split_once('.'))
+                    .unwrap();
+                let hf = match rest {
+                    "attn_norm.weight" => "input_layernorm.weight",
+                    "ffn_norm.weight" => "post_attention_layernorm.weight",
+                    "attn_q_norm.weight" => "self_attn.q_norm.weight",
+                    "attn_k_norm.weight" => "self_attn.k_norm.weight",
+                    "attn_q.weight" => "self_attn.q_proj.weight",
+                    "attn_k.weight" => "self_attn.k_proj.weight",
+                    "attn_v.weight" => "self_attn.v_proj.weight",
+                    "attn_output.weight" => "self_attn.o_proj.weight",
+                    "ffn_gate.weight" => "mlp.gate_proj.weight",
+                    "ffn_up.weight" => "mlp.up_proj.weight",
+                    "ffn_down.weight" => "mlp.down_proj.weight",
+                    other => panic!("no checkpoint name for {other}"),
+                };
+                format!("model.layers.{il}.{hf}")
+            }
+        }
+    };
+    // Each tensor as f32 bytes, its dimensions outer first.
+    let floats: Vec<(String, Vec<usize>, Vec<u8>)> = entries
+        .iter()
+        .map(|e| {
+            let n: usize = e.dims.iter().product();
+            let xs = if e.dtype == GgmlDType::F32 {
+                e.data.clone()
+            } else {
+                let mut out = vec![0f32; n];
+                crate::tensor::quant_cpu::to_float_bytes(e.dtype, &e.data, &mut out).unwrap();
+                out.iter().flat_map(|v| v.to_le_bytes()).collect()
+            };
+            (named(&e.name), e.dims.clone(), xs)
+        })
+        .collect();
+    let file = |i: usize| format!("model-{:05}-of-{shards:05}.safetensors", i + 1);
+    let mut weight_map = serde_json::Map::new();
+    let per = floats.len().div_ceil(shards);
+    for (i, chunk) in floats.chunks(per).enumerate() {
+        let views: Vec<_> = chunk
+            .iter()
+            .map(|(name, dims, bytes)| {
+                weight_map.insert(name.clone(), serde_json::Value::String(file(i)));
+                let view = safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    dims.clone(),
+                    bytes,
+                )
+                .unwrap();
+                (name.clone(), view)
+            })
+            .collect();
+        safetensors::serialize_to_file(views, None, &dir.join(file(i))).unwrap();
+    }
+    let index = serde_json::json!({ "metadata": {}, "weight_map": weight_map });
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    let config = serde_json::json!({
+        "architectures": ["Qwen3ForCausalLM"],
+        "hidden_size": QUANT_EMBD,
+        "intermediate_size": QUANT_FFN,
+        "num_hidden_layers": layers,
+        "num_attention_heads": QUANT_HEADS,
+        "num_key_value_heads": QUANT_KV_HEADS,
+        "head_dim": QUANT_EMBD / QUANT_HEADS,
+        "vocab_size": QUANT_VOCAB,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "tie_word_embeddings": false,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "torch_dtype": "float32"
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    dir
+}
+
+/// An empty directory of its own for the model `tag` in the temp dir.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("loken-tiny-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The metadata and tensors of the model [`write_quant`] writes.
+fn quant_model(layers: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
     let mut seed = 23u32;
     let mut values = |n: usize| -> Vec<f32> {
         (0..n)
@@ -336,10 +471,5 @@ pub(crate) fn write_quant(tag: &str, layers: usize) -> std::path::PathBuf {
         ),
         ("qwen3.rope.freq_base".into(), Value::F32(1_000_000.0)),
     ];
-    let dir = std::env::temp_dir().join(format!("loken-tiny-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("m.gguf");
-    write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
-    path
+    (metadata, entries)
 }

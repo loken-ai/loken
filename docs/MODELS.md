@@ -19,6 +19,12 @@
 A `.pth` archive that a media family needs is placed in the store by hand.  
 A request that names a model not yet loaded loads it.
 A model stays resident for the keep-alive the daemon was started with.
+When the keep-alive ends, a language model sleeps if its files fit the host memory budget: the files stay read into host memory and the card memory is released.
+A model in GGUF keeps every part of its set, the draft head beside it, its vision projector and its tokenizer files.
+A checkpoint directory keeps its safetensors shards and its JSON files.
+The next request loads it from that memory, without reading the disk.
+A model that does not fit is unloaded.
+An unload by name also frees a sleeping model.
 
 Quantisations are read as the file carries them.  
 On a card, the block formats run through their own kernels.  

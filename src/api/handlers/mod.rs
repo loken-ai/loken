@@ -422,6 +422,8 @@ pub struct APIServer {
     /// placement put them: the room it can give the model's layers. Published in gossip.
     model_card_bytes: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     engines: Arc<RwLock<Vec<LoadedModelEntry>>>,
+    /// The models that sleep in host memory after their keep-alive ran out.
+    sleepers: Arc<crate::inference::place::sleep::Sleepers>,
     gpu_manager: Option<Arc<GPUManagerImpl>>,
     stats_monitor: Arc<StatsMonitor>,
     default_keep_alive: i64,
@@ -1549,6 +1551,7 @@ impl APIServer {
             model_costs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             model_card_bytes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             engines: Arc::new(RwLock::new(Vec::new())),
+            sleepers: Arc::default(),
             gpu_manager: Some(gpu_manager),
             stats_monitor,
             default_keep_alive: keep_alive_minutes,
@@ -1783,6 +1786,10 @@ impl APIServer {
         // escalation and a memory of an old failure.
         #[cfg(feature = "audio")]
         crate::inference::place::vram_manager::vram_degrade_reset();
+        let woke_at = self
+            .sleepers
+            .sleeping(model_id)
+            .then(std::time::Instant::now);
         // Each attempt loads a fresh engine: the pools come back first, then idle residents
         // give way, then every re-plan loads one pressure rung further off the cards.
         let loaded = crate::inference::place::recover::retry_on_oom(
@@ -1810,6 +1817,13 @@ impl APIServer {
                 return Err(e);
             }
         };
+        if let Some(at) = woke_at {
+            self.sleepers.release(model_id);
+            info!(
+                "Model {model_id} woke from sleep in {:.2}s",
+                at.elapsed().as_secs_f64()
+            );
+        }
         // Measure this node's placement cost for the model, once, while it is loaded: the on-card
         // layer time and the cost of a routed expert missed to the cores. Published in gossip so the
         // cluster plans a cut from measured facts. A model with no streamed experts declares no
