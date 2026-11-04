@@ -69,8 +69,8 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
         .map(|&n| device_bytes(&compute, n))
         .collect::<Result<Vec<CudaSlice<u8>>, _>>()?;
     let done = dev.new_event().map_err(|e| format!("event: {e:?}"))?;
-    let k0 = dev.new_event().map_err(|e| format!("event: {e:?}"))?;
-    let k1 = dev.new_event().map_err(|e| format!("event: {e:?}"))?;
+    let k0 = dev.new_timed_event().map_err(|e| format!("event: {e:?}"))?;
+    let k1 = dev.new_timed_event().map_err(|e| format!("event: {e:?}"))?;
     let fail = Fail::default();
 
     // Queue the three copies on the lane and record `done` behind them.
@@ -127,7 +127,7 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
         fail.ok(spin.launch(&compute));
         fail.ok(k1.record(&compute));
         fail.ok(compute.synchronize());
-        elapsed_us(&k0, &k1).unwrap_or(0.0)
+        fail.value(elapsed_us(&k0, &k1))
     });
     fail.check("kernel alone")?;
     let alone_us = Summary::of(&alone).median_us;
@@ -150,7 +150,7 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
                 fail.ok(done.synchronize());
                 let us = t.elapsed().as_secs_f64() * 1e6;
                 fail.ok(compute.synchronize());
-                kernel_us.push(elapsed_us(&k0, &k1).unwrap_or(0.0));
+                kernel_us.push(fail.value(elapsed_us(&k0, &k1)));
                 us
             });
             let variant = format!("upload, {source_name}, {lane_name}, kernel running");

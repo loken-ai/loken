@@ -1020,6 +1020,17 @@ impl CudaDevice {
             .map_err(|e| Error(format!("cuda event create: {e}")))
     }
 
+    /// A fresh event that records a time, so `elapsed_ms` between two of them answers.
+    ///
+    /// `new_event` disables timing and its events cannot be subtracted.
+    pub fn new_timed_event(&self) -> Result<CudaEvent> {
+        self.ctx
+            .new_event(Some(
+                crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+            ))
+            .map_err(|e| Error(format!("cuda timed event create: {e}")))
+    }
+
     /// Hold this device's stream until everything queued on `src` has finished, without
     /// stopping the host.
     ///

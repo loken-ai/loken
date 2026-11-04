@@ -12,16 +12,26 @@ pub mod record;
 pub mod shapes;
 pub mod stats;
 
-#[cfg(feature = "gpu")]
 pub mod cache_policy;
+#[cfg(feature = "gpu")]
 pub mod card;
 #[cfg(feature = "gpu")]
 pub mod crossing;
+#[cfg(feature = "gpu")]
+pub mod decode_inputs;
+pub mod decode_layer;
+pub mod decode_layout;
+pub mod dequant_gemm;
+#[cfg(feature = "gpu")]
+pub mod expert_ahead;
 pub mod expert_read;
 #[cfg(feature = "gpu")]
 pub mod expert_upload;
 pub mod host_expert;
+pub mod marlin_rows;
+pub mod media_overlap;
 pub mod prefill_layer;
+pub mod schedule_host;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -64,9 +74,22 @@ pub struct Options {
     #[arg(long, default_value_t = 4)]
     pub element_bytes: usize,
 
-    /// The expert's feed-forward length, without a file
-    #[arg(long, default_value_t = 2048)]
-    pub inter: usize,
+    /// The feed-forward length, without a file: the expert's for the expert benches, the layer's
+    /// for `marlin-rows`; each bench has its own default when this is absent
+    #[arg(long)]
+    pub inter: Option<usize>,
+
+    /// Weights per quantisation group (`marlin-rows`)
+    #[arg(long, default_value_t = 128)]
+    pub group_size: usize,
+
+    /// Row counts the GEMM is timed at, 1 variant each (`marlin-rows`)
+    #[arg(long, value_delimiter = ',', default_values_t = vec![1, 8, 16, 32, 33, 64, 65, 130, 260, 512])]
+    pub rows_list: Vec<usize>,
+
+    /// The row count whose layer time is set against the time of 1 pass (`marlin-rows`)
+    #[arg(long, default_value_t = 130)]
+    pub compare_rows: usize,
 
     /// Bits per weight of a stored expert, without a file: 4.5 for q4_k, 8.5 for q8_0
     #[arg(long, default_value_t = 4.5)]
@@ -116,7 +139,7 @@ pub struct Options {
     pub slots: Vec<usize>,
 
     /// The share of a token's experts the read-ahead guess names, one variant for each
-    /// (`cache-policy`)
+    /// (`cache-policy`, `expert-ahead`)
     #[arg(long, value_delimiter = ',', default_values_t = vec![1.0])]
     pub guess_hit: Vec<f64>,
 
@@ -150,17 +173,52 @@ pub struct Options {
     #[arg(long, default_value_t = 130)]
     pub rows: usize,
 
-    /// Query heads, without a file (`prefill-layer`)
+    /// Query heads, without a file (`prefill-layer`, `marlin-rows`)
     #[arg(long)]
     pub heads: Option<usize>,
 
-    /// Key-value heads, without a file: the heads when absent (`prefill-layer`)
+    /// Key-value heads, without a file: the heads when absent for `prefill-layer`
+    /// (`prefill-layer`, `marlin-rows`)
     #[arg(long)]
     pub kv_heads: Option<usize>,
 
-    /// Elements of one head, without a file (`prefill-layer`)
+    /// Elements of one head, without a file: the `prefill-layer` and `marlin-rows` shapes, and the
+    /// size of the rope rows of `schedule-host` and `decode-inputs`; each bench has its own
+    /// default when this is absent
     #[arg(long)]
     pub head_dim: Option<usize>,
+
+    /// Tokens of each sequence's prompt (`schedule-host`)
+    #[arg(long, default_value_t = 53)]
+    pub prompt_tokens: usize,
+
+    /// Running sequences, one decode row each (`schedule-host`, `decode-inputs`)
+    #[arg(long, default_value_t = 64)]
+    pub batch: usize,
+
+    /// Tokens of context per sequence at the step timed (`schedule-host`, `decode-inputs`)
+    #[arg(long, default_value_t = 512)]
+    pub context: usize,
+
+    /// Tokens per block of the paged cache (`schedule-host`, `decode-inputs`)
+    #[arg(long, default_value_t = crate::inference::serve::continuous_serve::CB_BLOCK_SIZE)]
+    pub block_size: usize,
+
+    /// The width of a block table in `decode-inputs`, in place of the blocks of the context
+    #[arg(long)]
+    pub blocks_per_row: Option<usize>,
+
+    /// Layers of the stack a step runs (`decode-layer`, `expert-ahead`)
+    #[arg(long, default_value_t = crate::microbench::decode_layer::DEFAULT_LAYERS)]
+    pub layers: usize,
+
+    /// Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`)
+    #[arg(long, default_value_t = crate::microbench::decode_layer::DEFAULT_VOCAB)]
+    pub vocab: usize,
+
+    /// The rope base of the rope rows (`schedule-host`, `decode-inputs`)
+    #[arg(long, default_value_t = 10000.0)]
+    pub rope_base: f32,
 
     /// Write the JSON record here
     #[arg(long)]
@@ -170,6 +228,24 @@ pub struct Options {
     #[arg(long, hide = true)]
     #[serde(skip)]
     pub bench: bool,
+}
+
+/// The feed-forward length the expert benches use when `--inter` is absent.
+pub const DEFAULT_EXPERT_INTER: usize = 2048;
+
+/// The elements of one attention head when `--head-dim` is absent and the bench has no file.
+pub const DEFAULT_HEAD_DIM: usize = 128;
+
+impl Options {
+    /// The head size that sizes the rope rows: `--head-dim`, or the default.
+    pub fn rope_head_dim(&self) -> usize {
+        self.head_dim.unwrap_or(DEFAULT_HEAD_DIM)
+    }
+
+    /// The expert's feed-forward length: `--inter`, or the expert benches' default.
+    pub fn expert_inter(&self) -> usize {
+        self.inter.unwrap_or(DEFAULT_EXPERT_INTER)
+    }
 }
 
 /// One variant's calls, as a bench answers them.
@@ -202,6 +278,7 @@ pub struct Bench {
 }
 
 /// Every bench, in the order `list` shows them.
+#[cfg_attr(not(feature = "gpu"), allow(clippy::vec_init_then_push))]
 pub fn benches() -> Vec<Bench> {
     let mut all = Vec::new();
     #[cfg(feature = "gpu")]
@@ -211,6 +288,36 @@ pub fn benches() -> Vec<Bench> {
             about: "one activation row host to card and back: synchronous, asynchronous, packed, and a bare synchronisation",
             needs_card: true,
             run: crossing::run,
+        });
+        all.push(Bench {
+            name: "decode-inputs",
+            about: "the input upload between two decode steps of a batch: per-array uploads and copies, with and without synchronisations, packed",
+            needs_card: true,
+            run: decode_inputs::run,
+        });
+        all.push(Bench {
+            name: "decode-layer",
+            about: "the non-GEMM kernels of a batched decode step, one by one against the bytes they must move, and one layer of them in a graph",
+            needs_card: true,
+            run: decode_layer::run,
+        });
+        all.push(Bench {
+            name: "dequant-gemm",
+            about: "the 4-bit AWQ Marlin GEMM against the weight dequantised to f16 once and a dense f16 GEMM, by row count: the rows from which dequantising pays",
+            needs_card: true,
+            run: dequant_gemm::run,
+        });
+        all.push(Bench {
+            name: "marlin-rows",
+            about: "the 4-bit AWQ Marlin GEMM of one layer's 4 projections by row count: passes over the weights and streaming rate",
+            needs_card: true,
+            run: marlin_rows::run,
+        });
+        all.push(Bench {
+            name: "expert-ahead",
+            about: "the experts of the next layer copied to the card while the current layer runs: no prefetch, the last token's set, the early router, by experts missing and lead time",
+            needs_card: true,
+            run: expert_ahead::run,
         });
         all.push(Bench {
             name: "expert-upload",
@@ -225,6 +332,13 @@ pub fn benches() -> Vec<Bench> {
             run: prefill_layer::run,
         });
     }
+    #[cfg(feature = "gpu")]
+    all.push(Bench {
+        name: "media-overlap",
+        about: "2 denoise steps of 2 requests on 1 card: one after the other, on 2 streams, and as 1 step of twice the rows",
+        needs_card: true,
+        run: media_overlap::run,
+    });
     all.push(Bench {
         name: "host-expert",
         about: "one routed expert computed on the host cores from memory: the floor of a miss once its pages are there",
@@ -236,6 +350,12 @@ pub fn benches() -> Vec<Bench> {
         about: "the experts a host tier misses per token, for a policy and a size, on a routing drawn from an expert profile",
         needs_card: false,
         run: cache_policy::run,
+    });
+    all.push(Bench {
+        name: "schedule-host",
+        about: "the host work between 2 decode steps of the continuous-batching worker: schedule, items, decode inputs",
+        needs_card: false,
+        run: schedule_host::run,
     });
     all.push(Bench {
         name: "expert-read",
@@ -257,6 +377,28 @@ impl Fail {
             let mut g = self.0.borrow_mut();
             if g.is_none() {
                 *g = Some(format!("{e:?}"));
+            }
+        }
+    }
+
+    /// The value of `r`, or its default once its error is noted.
+    pub fn value<T: Default, E: std::fmt::Debug>(&self, r: Result<T, E>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                self.ok(Err::<(), E>(e));
+                T::default()
+            }
+        }
+    }
+
+    /// The value of `r` once it is `Ok`, `None` after noting its error.
+    pub fn some<T, E: std::fmt::Debug>(&self, r: Result<T, E>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.ok(Err::<(), E>(e));
+                None
             }
         }
     }

@@ -130,8 +130,7 @@ struct CapturedDecode {
 
 /// Context capacity bucket: gather/mask are padded to the next multiple of this so
 /// the captured shapes stay fixed as context grows (recapture only on bucket cross).
-#[cfg(feature = "gpu")]
-const CB_GRAPH_BUCKET: usize = 256;
+pub const CB_GRAPH_BUCKET: usize = 256;
 
 /// Tokens per block of the paged cache.
 pub const CB_BLOCK_SIZE: usize = 16;

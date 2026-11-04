@@ -100,7 +100,8 @@ pub fn resolve(opts: &Options) -> Result<Shapes, String> {
 pub fn from_options(opts: &Options) -> Result<Shapes, String> {
     let bytes: Vec<u64> = match opts.projection_bytes.len() {
         0 => {
-            let b = (opts.hidden as f64 * opts.inter as f64 * opts.weight_bits / 8.0).round();
+            let b =
+                (opts.hidden as f64 * opts.expert_inter() as f64 * opts.weight_bits / 8.0).round();
             vec![b as u64; PROJECTIONS.len()]
         }
         1 => vec![opts.projection_bytes[0]; PROJECTIONS.len()],

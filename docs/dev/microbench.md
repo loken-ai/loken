@@ -17,12 +17,18 @@ No release build enables it, so nothing reaches the daemon.
 cargo bench --features cuda,microbench --bench microbench -- list
 cargo bench --features cuda,microbench --bench microbench -- crossing --shapes-from /models/large.gguf
 cargo bench --features cuda,microbench --bench microbench -- expert-upload --shapes-from /models/large.gguf --json results/upload.json
+cargo bench --features cuda,microbench --bench microbench -- expert-ahead --shapes-from /models/large.gguf --guess-hit 0,0.5,1 --json results/expert-ahead.json
 cargo bench --features cuda,microbench --bench microbench -- expert-read --shapes-from /models/large.gguf --layer 10
 cargo bench --features cuda,microbench --bench microbench -- prefill-layer --shapes-from /models/dense.gguf --json results/prefill-layer.json
+cargo bench --features cuda,microbench --bench microbench -- marlin-rows --json results/marlin-rows.json
+cargo bench --features cuda,microbench --bench microbench -- decode-inputs --batch 64 --context 512
+cargo bench --features cuda,microbench --bench microbench -- decode-layer --batch 64 --context 512 --json results/decode-layer.json
+cargo bench --features cuda,microbench --bench microbench -- media-overlap --rows 1024 --hidden 1280 --layers 4
+cargo bench --features microbench --bench microbench -- schedule-host --batch 64 --context 512
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `expert-upload` and `prefill-layer`.
+A build without a GPU runtime omits `crossing`, `expert-ahead`, `expert-upload`, `prefill-layer`, `marlin-rows`, `decode-inputs`, `decode-layer` and `media-overlap`.
 
 Arguments after `--`:
 
@@ -36,29 +42,40 @@ Arguments after `--`:
 | `--hidden` | Elements of one activation row, without a file. | 4096 |
 | `--hc` | The hyper-connection multiple, without a file. | 1 |
 | `--element-bytes` | Bytes per element of a row. | 4 |
-| `--inter` | The expert's feed-forward length, without a file. | 2048 |
+| `--inter` | The feed-forward length, without a file. | 2048 for an expert, 12288 for `marlin-rows` |
 | `--weight-bits` | Bits per stored weight, without a file. 4.5 for q4_k, 8.5 for q8_0. | 4.5 |
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, for `host-expert`. | iq2_xxs |
 | `--down-format` | The format of an expert's down weights, for `host-expert`. | q2_k |
 | `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves. | 130 |
-| `--heads` | Query heads, without a file (`prefill-layer`). | the file's |
-| `--kv-heads` | Key-value heads, without a file (`prefill-layer`). | the file's, else the heads |
-| `--head-dim` | Elements of one head, without a file (`prefill-layer`). | the file's, else the hidden size over the heads |
+| `--heads` | Query heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's for `prefill-layer`, 32 for `marlin-rows` |
+| `--kv-heads` | Key-value heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's, else the heads for `prefill-layer`, 8 for `marlin-rows` |
+| `--head-dim` | Elements of one head, without a file. It sizes the rope rows of `schedule-host` and `decode-inputs`, and the heads of `decode-layer`. | the file's, else the hidden size over the heads for `prefill-layer`, 128 for the others |
 | `--pack` | Rows the packed variants of `crossing` move in one copy. | 8 |
 | `--file` | The file `expert-read` reads. | the shapes file |
 | `--offset` | Where the first expert read starts, when the file is not the shapes file. | 0 |
 | `--threads` | Threads of the threaded variants. | the processors the host reports |
 | `--card` | The card the card benches run on. | 0 |
 | `--seconds` | Wall time of each variant. A warm-up of a tenth of it comes first. | 1.0 |
+| `--batch` | Running sequences, 1 decode row each (`schedule-host`, `decode-inputs`, `decode-layer`). | 64 |
+| `--context` | Tokens of context per sequence (`schedule-host`, `decode-inputs`, `decode-layer`). | 512 |
+| `--prompt-tokens` | Tokens of each sequence's prompt (`schedule-host`). | 53 |
+| `--block-size` | Tokens per block of the paged cache (`schedule-host`, `decode-inputs`, `decode-layer`). | 16 |
+| `--layers` | Layers of the stack a step runs (`decode-layer`, `expert-ahead`). | 36 |
+| `--vocab` | Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`). | 131072 |
+| `--blocks-per-row` | The width of a block table (`decode-inputs`). | `--context` over `--block-size`, rounded up: 32 |
+| `--rope-base` | The rope base of the rope rows (`schedule-host`, `decode-inputs`). | 10000 |
 | `--json` | Where the JSON record is written. | none |
 | `--profile` | The expert profile `cache-policy` draws its routing from. | none |
 | `--card-slots` | The hottest experts per layer the cards hold, which the host tier never serves (`cache-policy`). | 58 |
 | `--slots` | Slots per layer the host tier is tried with, 1 variant each (`cache-policy`). | 94,130,170 |
-| `--guess-hit` | The share of a token's experts the read-ahead guess names, 1 variant each (`cache-policy`). | 1.0 |
+| `--guess-hit` | The share of a token's experts the read-ahead guess names, 1 variant each (`cache-policy`, `expert-ahead`). | 1.0 |
 | `--block` | Tokens verified together, a draft's block. The block reads its experts once. 1 variant each (`cache-policy`). | 1 |
 | `--accept` | The share of a draft token accepted once the token before it was (`cache-policy`). | 0.8 |
 | `--tokens` | Tokens routed per variant (`cache-policy`). | 20000 |
+| `--group-size` | Weights per quantisation group, only 128 runs (`marlin-rows`). | 128 |
+| `--rows-list` | Row counts of the GEMM, 1 variant each (`marlin-rows`). | 1,8,16,32,33,64,65,130,260,512 |
+| `--compare-rows` | The row count whose layer time is set against the time at 1 tile of rows (`marlin-rows`). | 130 |
 | `--disk-gbs` | The disk read rate in GB/s, which turns misses into time (`cache-policy`). | 6.0 |
 
 With `--shapes-from`, the row is the file's hidden size times its hyper-connection multiple.  
@@ -94,6 +111,128 @@ Its variants cross 3 choices:
 
 The kernel runs as long as 1 idle upload from page-locked memory on the compute stream.  
 Each busy variant gets a second row: the kernel's own time beside that upload, against its time alone.
+
+### decode-inputs
+
+`decode-inputs` uploads the per-step inputs of a batched decode, as the continuous-batching worker does between 2 steps.
+It loads no model and replays no decode graph.
+
+The inputs are the token ids, the slot of each row, the sequence lengths, the block tables padded to `--blocks-per-row`, and the rotary cos and sin rows in half precision.
+The blocks per row default to the blocks of `--context` tokens at `--block-size` tokens a block, 512 over 16 giving 32.
+Every row is at full context, the worst case for the block tables.
+The hidden state the worker also copies into its stable buffers is left out, since it is produced on the card.
+
+The variants run the real `Tensor::from_vec`, `rope_cos_sin` and `slice_set`.
+Each `from_vec` to a card is a host-to-card copy followed by a stream synchronisation.
+Its variants:
+
+- As the worker does: 6 `from_vec`, 6 `slice_set` into stable buffers, then 2 stream synchronisations.
+  The worker puts the graph replay between the 2, so here the second waits for nothing.
+- The same without the 2 explicit synchronisations, ending with 1 event wait.
+  The 6 synchronisations inside `from_vec` stay.
+- Packed: all the arrays written back to back into 1 page-locked buffer, each aligned to its element size, then 1 asynchronous copy to 1 card buffer, then 1 view per array, then 1 event wait.
+- The floors: a synchronisation and an event wait with nothing queued, and the replay of a graph holding a kernel that returns at once, waited on with a synchronisation and with an event.
+
+The 3 upload variants include the host work that builds the arrays, so the packed variant pays for writing the cos and sin rows too.
+The variant name carries its host-to-card copies (`h2d`), card-to-card copies (`d2d`) and synchronisations (`syncs`).
+The note of each upload variant gives its median over the first variant's.
+The views are byte ranges of the card buffer, and no kernel reads them.
+
+### decode-layer
+
+`decode-layer` times the kernels of a batched decode step that are not a GEMM.
+It answers where the time goes once the Marlin GEMMs are taken out, and which kernel sits far above the bytes it must move.
+It loads no model and replays no decode graph of a model.
+
+Each kernel is called through the wrapper the layer loop of the decode graph uses, on synthetic F16 tensors at the real shapes.
+The shapes come from `--hidden`, `--heads`, `--kv-heads`, `--head-dim`, `--inter` and `--vocab`, the defaults of `marlin-rows` for the others.
+The rows are `--batch` rounded up to its graph width, each at `--context` tokens, in blocks of `--block-size`.
+The paged store has a block table and a slot for every row.
+Copies of the store, together larger than twice the second-level cache, are read in turn, so the attention streams the cache from card memory.
+
+The kernels of a layer, in the order of the layer loop:
+
+- 3 copies that cut q, k and v out of the fused projection (`narrow`).
+- The norms on the heads of q and k (`fused_rmsnorm_f16`).
+- The rotation of k, then q (`rope_apply`).
+- The write of k and v into the paged store (`paged_kv_write`).
+- The paged flash decode (`paged_flash_decode`).
+- The add of the attention output and the feed-forward norm (`fused_add_rmsnorm_f16`).
+- 2 copies that cut the gate and the up out of the fused projection (`narrow`).
+- `silu_mul_f16`.
+- The add of the feed-forward output and the next layer's norm (`fused_add_rmsnorm_f16`).
+
+The kernels of a step:
+
+- The embedding gather (`embed_rows_gguf`) from a Q8_0 table, and the cast of its rows to F16.
+- The first layer's norm.
+- The copy of the hidden state out of the graph (`slice_set`).
+- The head matmul (`matmul_t`) of a float head, and the batched argmax over its logits.
+
+The upload of the step's inputs is `decode-inputs`.
+A model without a norm on the heads skips the 2 norms, and a model with separate projections skips the 5 copies.
+The record and the final lines give the sums that include them and the part they hold.
+
+Each kernel is one variant.
+Its time is the host clock around the call and a stream synchronisation, so it includes the launch of the kernel and the wait.
+The first variant is an empty kernel timed the same way, the cost to read the others against.
+
+The bytes of a kernel are its inputs and its outputs once each, and the key and value rows of every row's context for the attention.
+The floor is those bytes at the peak memory bandwidth, the double-rate memory clock over the bus width the driver reports.
+Each row's note gives the floor, the median over the floor, and the share of the peak.
+Small kernels read from the second-level cache, so their bandwidth can pass the peak.
+
+Then a graph:
+
+- The 14 kernels of 1 layer captured in 1 graph for each copy of the store.
+- 1 replay and 1 synchronise, against the sum of the individual medians.
+  The difference is the launch and the wait the individual numbers include.
+- `--layers` replays back to back and 1 synchronise, divided by the layers.
+  This is the in-graph cost of a layer.
+
+The final lines:
+
+- A table ranking the kernels by the time a step loses above their floor, `(median - floor)` times the calls of a step.
+  A last column does the same with the median of the empty kernel taken off first.
+- The sum of the medians of a layer, the layers over `--layers`, the once-a-step kernels, and the non-GEMM time of a step.
+- The same with the graph replay of a layer in place of the sum of its medians.
+
+The head matmul reads the whole vocabulary matrix, so it sets the memory the bench needs: `--vocab` times `--hidden` times 2 bytes.
+
+### expert-ahead
+
+`expert-ahead` copies the experts of the next layer to the card while the current layer runs.
+It measures what a copy queued one layer ahead takes off the token, and what a wrong guess costs.
+
+A token runs `--layers` layers.
+In every layer all the routed experts are missing from the card, and the layer takes them through the transit room, 2 buffers that consecutive layers take turns over.
+The copies come from page-locked memory on a copy stream.
+The card runs a kernel that holds the compute stream, then answers its router on the host, then reads the experts from the transit room.
+The read is a copy within card memory of the bytes the layer reads, so no expert arithmetic runs.
+
+The sweep crosses 2 axes, each a column of the table:
+
+- The experts missing per layer: 1, 2, 4 and 8.
+- The card time of a layer before its router answers, as 0.5, 1 and 2 times the idle copy time of the layer's missing experts.
+
+Its variants for each pair:
+
+- No prefetch: the copies start once the router of the layer has answered.
+- The last token's set, copied from the start of the layer before.
+- The last token's set, copied once the layer before has crossed to the host.
+- The early router: the same, with a router kernel run on the card for the next layer in the crossing of this one.
+
+A guess names each routed expert with the probability `--guess-hit`, 1 variant each.
+A wrong name copies an expert no layer reads.
+The layer copies the experts the guess missed after its router, behind the guess on the copy stream.
+
+The time of a call is the host clock around a whole token and its final synchronisation.
+Each prefetching variant carries its median over the median without prefetch.
+The bytes of a call are the copies a token queues, so the bandwidth shows the load a wrong guess puts on the bus.
+
+The bench does not know how often a real guess is right.
+It gives the hit rate from which a prefetch pays.
+The hit rate itself comes from the routing of a served model.
 
 ### expert-read
 
@@ -170,6 +309,93 @@ Each token's routing is drawn from the counts alone.
 The routing carries heat and no order, so a recency policy is judged without the locality a real answer adds.
 
 The time per token is the misses read at `--disk-gbs`.
+
+### schedule-host
+
+`schedule-host` times the host work of the continuous-batching worker between 2 decode steps, for `--batch` running sequences at `--context` tokens.
+The sequences hold `--prompt-tokens` of prompt each, in blocks of `--block-size`, and sample as a client of the API does: temperature, top-k, top-p and a repeat penalty over a window.
+It touches no model, no disk and no card.
+
+Its variants are:
+
+- Schedule and commit: `Scheduler::schedule` and `Scheduler::on_step_done` for the decoding rows. A sample is `--block-size` consecutive steps on a fresh scheduler, divided.
+- Step items with clones: the items the engine builds from the plan, with the block table, the repeat window, the token and slot vectors and the sampling options copied.
+- Step items with borrows: the same rows as references into the plan and the request, in a type local to the bench. A model taking them would need its signature changed.
+- Decode inputs, indices: the vectors of `GhBatched::step` and of `decode_graph` up to the first card call. Token ids, positions, slots, sequence lengths, the batch padded to a power of 2 and the block tables padded and flattened.
+- Decode inputs, rope rows: the cosine and sine rows of `rope_cos_sin` in f32 for the padded batch, sized by `--head-dim` and `--rope-base`.
+- Host stretch: the sum of the medians of schedule and commit, items with clones and both decode inputs. The card is idle for this long between 2 decode steps.
+- Engine step: `ContinuousBatchEngine::step_stream` over a model that answers at once, a cross-check of the sum above without the decode inputs.
+
+### dequant-gemm
+
+`dequant-gemm` finds the row count from which dequantising a 4-bit AWQ weight to f16 once and running a dense f16 GEMM beats the Marlin GEMM.
+It runs on the 4 projections of one layer, with the weights, the shapes and the copies of `marlin-rows`.
+
+Its variants, for each projection and each row count of `--rows-list`, are:
+
+- `marlin`: `MarlinAwqLayer::forward_into`, the call `marlin-rows` times.
+- `dequantise only`: `awq_dequant_f16_storage`, the AWQ prefill dequantisation, on the weight in the checkpoint layout. It writes a transient f16 weight `[k, n]` that is freed inside the timed call. It does not depend on the rows, so it is timed once per projection.
+- `dense f16 only`: `Tensor::matmul` of an f16 `[rows, k]` input and the f16 `[k, n]` weight, with the weight already present. The output allocation is timed.
+- `dequantise + dense f16`: the 2 above in sequence, including the transient allocation, as a prefill path runs them.
+
+Each call is timed with the host clock around a stream synchronisation before and after it.
+
+A table per projection gives the median time of each variant, the speed of `dequantise + dense f16` relative to `marlin`, and the TFLOPS of the dense GEMM, `2 * rows * k * n` over its time.
+A speed above 1 means the pair is faster.
+
+The last rows of the record and the final lines sum the 4 medians of a layer at each row count for `marlin` and for `dequantise + dense f16`.
+The last line gives the row count from which the pair stays faster than Marlin at every larger row count measured, or `none up to <max>`.
+
+### marlin-rows
+
+`marlin-rows` times the 4-bit AWQ Marlin GEMM on the 4 projections of one layer, for a series of row counts.
+It measures how the time of a call grows with the rows.
+
+The launcher cuts a batch into tiles of `MAX_M_PER_CHUNK` rows.
+Each tile reads the weights again, so a call makes `ceil(rows / MAX_M_PER_CHUNK)` passes over them.
+
+The weights are synthetic, of the byte sizes the loader produces, repacked by the loader's own routine.
+The call is the wrapper a served layer uses, on the stream of the card.  
+Copies of each weight, together larger than twice the card's second-level cache, are called in turn, so every call streams its weights from card memory.
+
+The projections come from `--hidden` or the shapes file, `--inter`, `--heads`, `--kv-heads` and `--head-dim`:
+
+- Fused query, key and value: `hidden` to `(heads + 2 * kv_heads) * head_dim`.
+- Output: `heads * head_dim` to `hidden`.
+- Fused gate and up: `hidden` to `2 * inter`.
+- Down: `inter` to `hidden`.
+
+Its variants are the pairs of a projection and a row count of `--rows-list`.
+A card event pair times each call.
+
+Each variant moves the weight bytes times the passes, so its bandwidth is the rate at which the weights stream.
+A table per projection gives the rows, the passes, the median time, the time per pass and that rate.
+
+The last rows of the record sum the 4 medians of a layer at each row count.
+The final line gives those sums and the ratio of the layer time at `--compare-rows` to the layer time at `MAX_M_PER_CHUNK` rows.
+A ratio near the ratio of the passes says the time follows the passes over the weights.
+
+### media-overlap
+
+`media-overlap` times the denoise steps of 2 image requests on 1 card.
+It answers whether 2 requests finish sooner together than one after the other.
+It loads no model.
+
+A step is `--layers` blocks of 4 dense f16 GEMMs on `--rows` tokens: the fused q, k and v projection, the output projection, and the feed-forward up and down.
+`--hidden` sets the width and `--inter` the feed-forward length, 4 times the width when absent.
+Each variant is timed from the launch of its work to the end of all of it:
+
+- 1 step, the reference.
+- 2 steps one after the other on the card's stream.
+- 2 steps on 2 streams, from 2 devices opened on the card, each with its own weights and launched layer by layer in turn.
+- 1 step of `2 * --rows` tokens, the 2 requests batched.
+
+The outputs of a step are freed after the last synchronisation, so no free waits for the card inside the timed run.
+The note of the last 2 variants gives the speed against the 2 steps one after the other.
+Run it on an idle card: a second process on the card changes every figure.
+
+On a GTX 1650 with `--hidden 1280`, the 2 streams finish in 0.93 to 0.97 of the serial time and the batched step in 0.97 to 0.99, from 128 to 4096 rows.
+A step that fills the card leaves no room for the other.
 
 ## Report
 

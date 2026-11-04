@@ -10,7 +10,7 @@ use std::time::Duration;
 
 pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
     let dim = cx.shapes.hidden;
-    let inter = cx.options.inter;
+    let inter = cx.options.expert_inter();
     let gate = format_of(&cx.options.gate_format)?;
     let down = format_of(&cx.options.down_format)?;
     let target = Duration::from_secs_f64(cx.options.seconds);
@@ -63,7 +63,7 @@ fn distinct(
     bytes: usize,
     target: Duration,
 ) -> Vec<Measured> {
-    let (dim, inter) = (cx.shapes.hidden, cx.options.inter);
+    let (dim, inter) = (cx.shapes.hidden, cx.options.expert_inter());
     let gate_len = inter * (dim / gate.block_size()) * gate.type_size();
     let down_len = dim * (inter / down.block_size()) * down.type_size();
     let heap: Vec<[Vec<u8>; 3]> = (0..SET)
@@ -157,7 +157,7 @@ fn measure(
     memory: &str,
 ) -> Vec<Measured> {
     use crate::tensor::quant_cpu::{matmul_bytes_multi, matmul_bytes_multi_serial};
-    let (dim, inter) = (cx.shapes.hidden, cx.options.inter);
+    let (dim, inter) = (cx.shapes.hidden, cx.options.expert_inter());
     let (x, h) = (vec![0.05f32; dim], vec![0.05f32; inter]);
     let mut next = 0usize;
     let mut pick = || -> Vec<&[&[u8]; 3]> {
@@ -272,7 +272,7 @@ fn through_the_decode_path(
     use crate::tensor::Device;
     use std::sync::Arc;
     const SET: usize = 48;
-    let (dim, inter) = (cx.shapes.hidden, cx.options.inter);
+    let (dim, inter) = (cx.shapes.hidden, cx.options.expert_inter());
     let gate_len = inter * (dim / gate.block_size()) * gate.type_size();
     let down_len = dim * (inter / down.block_size()) * down.type_size();
     let quant = |fill: u8, len: usize, dtype: GgmlDType, dims: Vec<usize>| {

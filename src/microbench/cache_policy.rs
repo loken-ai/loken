@@ -231,7 +231,7 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
                     }
                     blocks += 1;
                     t += block;
-                    if blocks % (BLOCK as u64 / block as u64).max(1) == 0 {
+                    if blocks.is_multiple_of((BLOCK as u64 / block as u64).max(1)) {
                         let bytes = in_block as f64 * expert_bytes as f64
                             / (BLOCK as f64 / block as f64 * emitted);
                         samples.push(bytes / disk * 1e6);
