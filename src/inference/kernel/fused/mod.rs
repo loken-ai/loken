@@ -13,9 +13,17 @@ cuda_launchers! {
         x: *const c_void, res: *const c_void, weight: *const f32,
         norm_out: *mut c_void, sum_out: *mut c_void, rows: i32,
         cols: i32, eps: f32);
+    loken_fused_rmsnorm_f16_regs(
+        x: *const c_void, res: *const c_void, weight: *const f32,
+        norm_out: *mut c_void, sum_out: *mut c_void, rows: i32,
+        cols: i32, eps: f32) -> i32;
     loken_silu_mul_f16(
         g: *const c_void, u: *const c_void, out: *mut c_void,
         n: i64);
+    loken_silu_mul_gu_f16(
+        gu: *const c_void, out: *mut c_void, f: i64, rows: i64);
+    loken_silu_mul_gu_vec_f16(
+        gu: *const c_void, out: *mut c_void, f: i64, rows: i64) -> i32;
     loken_sigmoid_mul_f16(
         g: *const c_void, y: *const c_void, out: *mut c_void,
         n: i64);
@@ -35,9 +43,16 @@ cuda_launchers! {
         q_stride: i64, k_stride: i64, v_stride: i64,
         q_weight: *const f32, k_weight: *const f32, q_eps: f32, k_eps: f32,
         cos: *const c_void, sin: *const c_void,
-        q_out: *mut c_void, k_out: *mut c_void, v_out: *mut c_void,
+        q_out: *mut c_void, q_head_major: *mut f32, k_out: *mut c_void, v_out: *mut c_void,
         kp: *mut c_void, vp: *mut c_void, slot_dev: *const i32,
-        rows: i32, n_head: i32, n_kv: i32, hd: i32, interleaved: i32);
+        rows: i32, n_head: i32, n_kv: i32, hd: i32, interleaved: i32, norm_mode: i32);
+    loken_decode_qkv_warp_f16(
+        q: *const c_void, k: *const c_void, v: *const c_void,
+        q_stride: i64, k_stride: i64, v_stride: i64,
+        q_weight: *const f32, k_weight: *const f32, q_eps: f32, k_eps: f32,
+        cos: *const c_void, sin: *const c_void,
+        q_out: *mut c_void, kp: *mut c_void, vp: *mut c_void, slot_dev: *const i32,
+        rows: i32, n_head: i32, n_kv: i32, hd: i32, interleaved: i32) -> i32;
     gptoss_flash_decode_f16(
         q: *const c_void, k: *const c_void, v: *const c_void,
         mask: *const f32, sinks: *const f32, out: *mut c_void, batch: i32,
@@ -149,6 +164,8 @@ pub use prefill_gqa::*;
 
 #[cfg(all(test, feature = "gpu"))]
 mod cuda_numerics_tests;
+#[cfg(all(test, feature = "gpu"))]
+mod cuda_reduction_order_tests;
 #[cfg(all(test, feature = "gpu"))]
 mod flash_prefill_gqa_parity;
 #[cfg(all(test, feature = "gpu"))]

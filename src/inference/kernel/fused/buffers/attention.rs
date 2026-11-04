@@ -224,6 +224,61 @@ pub fn silu_mul_f16(g: &Tensor, u: &Tensor) -> Result<Option<Tensor>> {
     Ok(Some(out))
 }
 
+/// out = silu(f32(g)) . f32(u) in one F16 launch, where g and u are the 2 halves of the rows of
+/// the fused gate and up buffer `gu`, `[rows, 2 * ffn]`. The arithmetic and the rounding are
+/// those of `silu_mul_f16`, so the result equals it on the 2 halves cut out by copies.
+/// `None` unless on a card with F16, 2 dims of width `2 * ffn`, an even `ffn`, at least 1 row and
+/// an even element offset. Nothing has run then.
+pub fn silu_mul_gu_f16(gu: &Tensor, ffn: usize) -> Result<Option<Tensor>> {
+    silu_mul_gu_f16_with(gu, ffn, false)
+}
+
+/// [`silu_mul_gu_f16`] with the choice of kernel. With `wide` a thread takes 8 columns by
+/// 16-byte accesses and the exponential and the division run on the fast math units, so a value
+/// can differ in its last bit. A shape or an alignment that does not allow it runs the exact
+/// kernel.
+pub fn silu_mul_gu_f16_with(gu: &Tensor, ffn: usize, wide: bool) -> Result<Option<Tensor>> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    use crate::tensor::StorageView::Cuda as C;
+    use core::ffi::c_void;
+    if !gu.device().is_cuda()
+        || gu.dtype() != DType::F16
+        || gu.rank() != 2
+        || ffn == 0
+        || !ffn.is_multiple_of(2)
+        || gu.dims()[1] != 2 * ffn
+        || gu.dims()[0] == 0
+    {
+        return Ok(None);
+    }
+    let gu = gu.contiguous()?;
+    let rows = gu.dims()[0];
+    let (gs, gl) = gu.storage_and_layout();
+    if !gl.start_offset().is_multiple_of(2) {
+        return Ok(None);
+    }
+    let out = unsafe { Tensor::empty(&[rows, ffn][..], DType::F16, &gu.device())? };
+    let dev = gu.device().as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let (os, _) = out.storage_and_layout();
+    if let (C(gc), C(oc)) = (&*gs, &*os) {
+        let gsl = gc.as_cuda_slice::<half::f16>()?;
+        let osl = oc.as_cuda_slice::<half::f16>()?;
+        let gp = (gsl.device_ptr(gsl.stream()).0 + (gl.start_offset() * 2) as u64) as *const c_void;
+        let op = osl.device_ptr(osl.stream()).0 as *mut c_void;
+        unsafe {
+            let declined =
+                !wide || loken_silu_mul_gu_vec_f16(gp, op, ffn as i64, rows as i64, stream) != 0;
+            if declined {
+                loken_silu_mul_gu_f16(gp, op, ffn as i64, rows as i64, stream);
+            }
+        }
+    }
+    drop(gs);
+    drop(os);
+    Ok(Some(out))
+}
+
 /// out = f32(y) . sigmoid(f32(g)) in one F16 launch, the sigmoid in F32 as the tensor ops
 /// compute it. g and y: the same shape, F16. `None` unless on a card with both F16; nothing
 /// has run then.
@@ -426,10 +481,170 @@ pub fn prefill_rope_kv_write_f16(
     n_kv: usize,
     hd: usize,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    prefill_rope_kv_write(
+        srcs,
+        norms,
+        cos,
+        sin,
+        interleaved,
+        slot_dev,
+        Some(slots),
+        kp,
+        vp,
+        n_head,
+        n_kv,
+        hd,
+        false,
+        0,
+    )
+}
+
+/// [`prefill_rope_kv_write_f16`] for a decode batch whose slots live in `slot_dev` only: the
+/// host never holds them, so the range check against the store does not run.
+///
+/// The head norms of `norms` use the arithmetic of `fused_rmsnorm_f16`, so q and k are the bits
+/// the separate decode launches give.
+///
+/// The caller guarantees that every value of `slot_dev` is a slot of `kp`/`vp`, which is what the
+/// scheduler that allocated the slots does. `slot_dev` is read by the kernel at execution time,
+/// so the launch is safe inside a captured graph whose `slot_dev` is refreshed before each
+/// replay. `cos`/`sin` hold one row for each row of q, k and v. The outputs are allocated as in
+/// [`prefill_rope_kv_write_f16`]. Returns `None` under the same conditions, but a slot.
+pub fn decode_rope_kv_write_f16(
+    srcs: [(&Tensor, usize); 3],
+    norms: Option<[(&Tensor, f32); 2]>,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+    slot_dev: &Tensor,
+    kp: &Tensor,
+    vp: &Tensor,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    prefill_rope_kv_write(
+        srcs,
+        norms,
+        cos,
+        sin,
+        interleaved,
+        slot_dev,
+        None,
+        kp,
+        vp,
+        n_head,
+        n_kv,
+        hd,
+        false,
+        1,
+    )
+}
+
+/// [`decode_rope_kv_write_f16`] for a caller that reads only q.
+///
+/// A head of 64, 128 or 256 values goes to one warp, which norms, rotates and stores it with no
+/// shared memory. The sum of squares reduces in another order than in
+/// [`decode_rope_kv_write_f16`], so q and k can differ in the last bit. Any other head runs the
+/// kernel of [`decode_rope_kv_write_f16`]. Returns `None` under the same conditions.
+pub fn decode_q_rope_kv_write_f16(
+    srcs: [(&Tensor, usize); 3],
+    norms: Option<[(&Tensor, f32); 2]>,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+    slot_dev: &Tensor,
+    kp: &Tensor,
+    vp: &Tensor,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+) -> Result<Option<Tensor>> {
+    Ok(prefill_rope_kv_write(
+        srcs,
+        norms,
+        cos,
+        sin,
+        interleaved,
+        slot_dev,
+        None,
+        kp,
+        vp,
+        n_head,
+        n_kv,
+        hd,
+        false,
+        DECODE_WARP_MODE,
+    )?
+    .map(|(q, _, _)| q))
+}
+
+/// The `norm_mode` that tries the warp kernel and falls back to the mode of
+/// [`decode_rope_kv_write_f16`]. Its k and v outputs are not written when the warp kernel runs.
+const DECODE_WARP_MODE: i32 = 2;
+
+/// [`prefill_rope_kv_write_f16`] with q returned as F32 `[n_head, rows, hd]`, the layout the
+/// flash prefill kernel reads. Each value is the F16 result of the separate launches widened,
+/// so the flash kernel sees the same numbers as after a cast and a transpose.
+pub fn prefill_rope_kv_write_head_major_f16(
+    srcs: [(&Tensor, usize); 3],
+    norms: Option<[(&Tensor, f32); 2]>,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+    slot_dev: &Tensor,
+    slots: &[i32],
+    kp: &Tensor,
+    vp: &Tensor,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    prefill_rope_kv_write(
+        srcs,
+        norms,
+        cos,
+        sin,
+        interleaved,
+        slot_dev,
+        Some(slots),
+        kp,
+        vp,
+        n_head,
+        n_kv,
+        hd,
+        true,
+        0,
+    )
+}
+
+/// The launch behind the entry points: q goes to an F16 `[rows, n_head, hd]` tensor, or with
+/// `q_head_major` to an F32 `[n_head, rows, hd]` one.
+///
+/// `norm_mode` 0 norms a head with the arithmetic of the prefill norm. `norm_mode` 1 norms it
+/// with the arithmetic of `fused_rmsnorm_f16`, bit for bit.
+fn prefill_rope_kv_write(
+    srcs: [(&Tensor, usize); 3],
+    norms: Option<[(&Tensor, f32); 2]>,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+    slot_dev: &Tensor,
+    slots: Option<&[i32]>,
+    kp: &Tensor,
+    vp: &Tensor,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    q_head_major: bool,
+    norm_mode: i32,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::kernel_ffi as kf;
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
+    let warp = norm_mode == DECODE_WARP_MODE;
+    let norm_mode = if warp { 1 } else { norm_mode };
     let rows = srcs[0].0.dims().first().copied().unwrap_or(0);
     let widths = [n_head * hd, n_kv * hd, n_kv * hd];
     let card = srcs[0].0.device();
@@ -453,13 +668,19 @@ pub fn prefill_rope_kv_write_f16(
     let stores_fit = [kp, vp]
         .iter()
         .all(|t| t.dims() == [store_slots, n_kv * hd]);
-    let slots_fit = slots.len() == rows
-        && slots
-            .iter()
-            .all(|&s| usize::try_from(s).is_ok_and(|s| s < store_slots));
+    let slots_fit = slots.is_none_or(|slots| {
+        slots.len() == rows
+            && slots
+                .iter()
+                .all(|&s| usize::try_from(s).is_ok_and(|s| s < store_slots))
+    });
     // The block size of the kernel, and the shared memory it asks for: the head as f32 and one
-    // partial sum per thread.
-    let block = hd.min(256).next_power_of_two();
+    // partial sum per thread. Norm mode 1 runs the 256 threads of the decode norm.
+    let block = if norm_mode == 1 && norms.is_some() {
+        256
+    } else {
+        hd.min(256).next_power_of_two()
+    };
     let misfit = if rows == 0 || !card.is_cuda() || !on_card {
         Some("device")
     } else if hd == 0 || !hd.is_multiple_of(2) || !srcs_fit {
@@ -492,7 +713,11 @@ pub fn prefill_rope_kv_write_f16(
         });
         return Ok(None);
     }
-    let q_out = unsafe { Tensor::empty((rows, n_head, hd), DType::F16, &card)? };
+    let q_out = if q_head_major {
+        unsafe { Tensor::empty((n_head, rows, hd), DType::F32, &card)? }
+    } else {
+        unsafe { Tensor::empty((rows, n_head, hd), DType::F16, &card)? }
+    };
     let k_out = unsafe { Tensor::empty((rows, n_kv, hd), DType::F16, &card)? };
     let v_out = unsafe { Tensor::empty((rows, n_kv, hd), DType::F16, &card)? };
     let dev = card.as_cuda_device()?;
@@ -543,38 +768,78 @@ pub fn prefill_rope_kv_write_f16(
     let sp = f16_at(sc, sl.start_offset())? as *const c_void;
     let kpp = f16_at(kpc, 0)? as *mut c_void;
     let vpp = f16_at(vpc, 0)? as *mut c_void;
-    let qop = f16_at(qoc, 0)? as *mut c_void;
+    // Exactly one of the 2 q destinations is set, the other is null.
+    let (qop, qhm) = if q_head_major {
+        let s = qoc.as_cuda_slice::<f32>()?;
+        (
+            core::ptr::null_mut::<c_void>(),
+            s.device_ptr(s.stream()).0 as *mut f32,
+        )
+    } else {
+        (f16_at(qoc, 0)? as *mut c_void, core::ptr::null_mut::<f32>())
+    };
     let kop = f16_at(koc, 0)? as *mut c_void;
     let vop = f16_at(voc, 0)? as *mut c_void;
     let sdsl = sdc.as_cuda_slice::<i32>()?;
     let sdp = (sdsl.device_ptr(sdsl.stream()).0 + (sdl.start_offset() * 4) as u64) as *const i32;
-    unsafe {
-        loken_prefill_qk_rope_kv_f16(
-            qp,
-            kp_in,
-            vp_in,
-            srcs[0].0.dims()[1] as i64,
-            srcs[1].0.dims()[1] as i64,
-            srcs[2].0.dims()[1] as i64,
-            weight_ptr(&qw),
-            weight_ptr(&kw),
-            q_eps,
-            k_eps,
-            cp,
-            sp,
-            qop,
-            kop,
-            vop,
-            kpp,
-            vpp,
-            sdp,
-            rows as i32,
-            n_head as i32,
-            n_kv as i32,
-            hd as i32,
-            interleaved as i32,
-            stream,
-        );
+    let warped = warp
+        && unsafe {
+            loken_decode_qkv_warp_f16(
+                qp,
+                kp_in,
+                vp_in,
+                srcs[0].0.dims()[1] as i64,
+                srcs[1].0.dims()[1] as i64,
+                srcs[2].0.dims()[1] as i64,
+                weight_ptr(&qw),
+                weight_ptr(&kw),
+                q_eps,
+                k_eps,
+                cp,
+                sp,
+                qop,
+                kpp,
+                vpp,
+                sdp,
+                rows as i32,
+                n_head as i32,
+                n_kv as i32,
+                hd as i32,
+                interleaved as i32,
+                stream,
+            )
+        } == 0;
+    if !warped {
+        unsafe {
+            loken_prefill_qk_rope_kv_f16(
+                qp,
+                kp_in,
+                vp_in,
+                srcs[0].0.dims()[1] as i64,
+                srcs[1].0.dims()[1] as i64,
+                srcs[2].0.dims()[1] as i64,
+                weight_ptr(&qw),
+                weight_ptr(&kw),
+                q_eps,
+                k_eps,
+                cp,
+                sp,
+                qop,
+                qhm,
+                kop,
+                vop,
+                kpp,
+                vpp,
+                sdp,
+                rows as i32,
+                n_head as i32,
+                n_kv as i32,
+                hd as i32,
+                interleaved as i32,
+                norm_mode,
+                stream,
+            );
+        }
     }
     drop((qs, ks, vs, cs, ss, sds, kps, vps, qos, kos, vos, qw, kw));
     Ok(Some((q_out, k_out, v_out)))

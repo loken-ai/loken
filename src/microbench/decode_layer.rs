@@ -450,7 +450,9 @@ mod device {
     use crate::inference::cache::paged_attention::{rope_apply, rope_cos_sin};
     use crate::inference::cache::paged_kv::PagedKvStore;
     use crate::inference::kernel::fused::{
-        fused_add_rmsnorm_f16, fused_rmsnorm_f16, paged_flash_decode, paged_kv_write, silu_mul_f16,
+        decode_q_rope_kv_write_f16, decode_rope_kv_write_f16, fused_add_rmsnorm_f16,
+        fused_add_rmsnorm_f16_with, fused_rmsnorm_f16, paged_flash_decode, paged_kv_write,
+        silu_mul_f16, silu_mul_gu_f16, silu_mul_gu_f16_with,
     };
     use crate::inference::moe_cuda::{batched_argmax, embed_rows_gguf};
     use crate::microbench::card::Spin;
@@ -668,8 +670,9 @@ mod device {
             Ok(())
         };
 
-        // One layer's kernels in the order of the layer loop, on the store `store`.
-        let layer_once = |store: &PagedKvStore| -> crate::tensor::Result<()> {
+        // The input stage of a layer as the loop runs it apart: the 3 copies out of the fused
+        // projection, the norms, the rotations and the write into the store. Returns q.
+        let stage_old = |store: &PagedKvStore| -> crate::tensor::Result<Tensor> {
             let (q, k, v) = (
                 qkv.narrow(1, 0, qd)?,
                 qkv.narrow(1, qd, kvd)?,
@@ -680,6 +683,42 @@ mod device {
             let k_new = rope_apply(&kh, &cos, &sin, false)?.reshape(&[b, kvd][..])?;
             let q_new = rope_apply(&qh, &cos, &sin, false)?;
             paged_kv_write(&k_new, &v, store.k(), store.v(), &slot_dev, b, kvd)?;
+            Ok(q_new)
+        };
+        // The same in one kernel, which reads the fused projection in place. Returns q, or `None`
+        // when the kernel declines the shapes.
+        let stage_new = |store: &PagedKvStore| -> crate::tensor::Result<Option<Tensor>> {
+            Ok(decode_rope_kv_write_f16(
+                [(&qkv, 0), (&qkv, qd), (&qkv, qd + kvd)],
+                Some([(&w_head, eps), (&w_head, eps)]),
+                &cos,
+                &sin,
+                false,
+                &slot_dev,
+                store.k(),
+                store.v(),
+                nh,
+                nkv,
+                hd,
+            )?
+            .map(|(q, _, _)| q))
+        };
+        // The activation of the feed-forward block from the fused gate and up buffer: 2 copies
+        // and `silu_mul_f16`, or one kernel.
+        let act_old = || -> crate::tensor::Result<Tensor> {
+            let (g, u) = (gu.narrow(1, 0, ffn)?, gu.narrow(1, ffn, ffn)?);
+            silu_mul_f16(&g, &u)?.ok_or_else(|| declined("silu_mul_f16"))
+        };
+        let act_new = || -> crate::tensor::Result<Option<Tensor>> { silu_mul_gu_f16(&gu, ffn) };
+
+        // One layer's kernels in the order of the layer loop, on the store `store`. With `fast`
+        // the input stage and the activation are the one-kernel versions.
+        let layer_once = |store: &PagedKvStore, fast: bool| -> crate::tensor::Result<()> {
+            let q_new = if fast {
+                stage_new(store)?.ok_or_else(|| declined("decode_rope_kv_write_f16"))?
+            } else {
+                stage_old(store)?
+            };
             let a = paged_flash_decode(
                 &q_new.reshape(&[b, nh, hd][..])?,
                 store.k(),
@@ -698,8 +737,11 @@ mod device {
             std::hint::black_box(&a);
             let (sum, norm) = fused_add_rmsnorm_f16(&attn_out, &residual, &w_hidden, eps)?;
             std::hint::black_box(&norm);
-            let (g, u) = (gu.narrow(1, 0, ffn)?, gu.narrow(1, ffn, ffn)?);
-            let act = silu_mul_f16(&g, &u)?.ok_or_else(|| declined("silu_mul_f16"))?;
+            let act = if fast {
+                act_new()?.ok_or_else(|| declined("silu_mul_gu_f16"))?
+            } else {
+                act_old()?
+            };
             std::hint::black_box(&act);
             let next = fused_add_rmsnorm_f16(&ffn_out, &sum, &w_hidden, eps)?;
             std::hint::black_box(&next);
@@ -745,15 +787,201 @@ mod device {
             entries.push(entry);
         }
 
+        // The fused variants against the loops they replace, timed as every kernel is.
+        let stage_fits = stage_new(&stores[0]).map_err(tensor)?.is_some();
+        let act_fits = act_new().map_err(tensor)?.is_some();
+        let mut group = |variant: &str,
+                         fits: bool,
+                         work: &mut dyn FnMut() -> crate::tensor::Result<()>|
+         -> Result<Option<f64>, String> {
+            if !fits {
+                measured.push(Measured {
+                    variant: variant.to_string(),
+                    bytes: None,
+                    samples_us: Vec::new(),
+                    note: Some("the kernel declines these shapes".to_string()),
+                });
+                return Ok(None);
+            }
+            let samples = time_calls(target, &stream, &fail, work);
+            fail.check(variant)?;
+            let median_us = Summary::of(&samples).median_us;
+            measured.push(Measured {
+                variant: variant.to_string(),
+                bytes: None,
+                samples_us: samples,
+                note: None,
+            });
+            Ok(Some(median_us))
+        };
+        let stage_old_us = group(
+            "q/k/v stage, old: 3 copies, 2 norms, 2 rope, kv write: 8 launches",
+            true,
+            &mut || stage_old(&stores[0]).map(drop),
+        )?;
+        let stage_new_us = group(
+            "q/k/v stage, new: one fused kernel",
+            stage_fits,
+            &mut || stage_new(&stores[0]).map(drop),
+        )?;
+        let act_old_us = group(
+            "MLP activation, old: 2 copies and silu_mul",
+            true,
+            &mut || act_old().map(drop),
+        )?;
+        let act_new_us = group("MLP activation, new: one kernel", act_fits, &mut || {
+            act_new().map(drop)
+        })?;
+        for (name, old, new) in [
+            ("q/k/v stage", stage_old_us, stage_new_us),
+            ("MLP activation", act_old_us, act_new_us),
+        ] {
+            if let (Some(old), Some(new)) = (old, new) {
+                println!(
+                    "{name}: {old:.1} us old, {new:.1} us new, {:.1} us saved a layer",
+                    old - new
+                );
+            }
+        }
+        println!();
+
+        // The calls of one mechanism repeated back to back inside one graph, timed per call.
+        // A graph removes the launch and the synchronisation of the individual timing, which
+        // the decode graph does not pay.
+        let mut in_graph = |variant: &str,
+                            calls: usize,
+                            work: &mut dyn FnMut() -> crate::tensor::Result<()>|
+         -> Result<f64, String> {
+            fail.ok(work());
+            fail.ok(stream.synchronize());
+            cuda_ext::begin_capture(&stream).map_err(|e| format!("graph capture: {e:?}"))?;
+            let mut ran = Ok(());
+            for _ in 0..calls {
+                ran = ran.and_then(|()| work());
+            }
+            let graph =
+                cuda_ext::end_capture(&stream).map_err(|e| format!("graph capture: {e:?}"))?;
+            ran.map_err(tensor)?;
+            let graph = graph.ok_or("graph capture: no graph")?;
+            let samples = run_for(
+                target,
+                timed(|| {
+                    fail.ok(graph.launch());
+                    fail.ok(stream.synchronize());
+                }),
+            );
+            fail.check(variant)?;
+            let per_call_us = Summary::of(&samples).median_us / calls as f64;
+            measured.push(Measured {
+                variant: variant.to_string(),
+                bytes: None,
+                samples_us: samples,
+                note: Some(format!("{per_call_us:.2} us a call")),
+            });
+            Ok(per_call_us)
+        };
+
+        // The add and norm of a layer: the kernel that caches the row in shared memory against
+        // the one that holds it in registers.
+        let norm_calls = 2 * layers;
+        let norm_old_us = in_graph(
+            "add and norm in a graph, old: row cached in shared memory",
+            norm_calls,
+            &mut || {
+                std::hint::black_box(fused_add_rmsnorm_f16_with(
+                    &attn_out, &residual, &w_hidden, eps, false,
+                )?);
+                Ok(())
+            },
+        )?;
+        let norm_new_us = in_graph(
+            "add and norm in a graph, new: row held in registers",
+            norm_calls,
+            &mut || {
+                std::hint::black_box(fused_add_rmsnorm_f16_with(
+                    &attn_out, &residual, &w_hidden, eps, true,
+                )?);
+                Ok(())
+            },
+        )?;
+        println!(
+            "add and norm in a graph: {norm_old_us:.2} us old, {norm_new_us:.2} us new, {:.2} us saved a call, {:.2} ms a step\n",
+            norm_old_us - norm_new_us,
+            (norm_old_us - norm_new_us) * norm_calls as f64 / 1e3
+        );
+
+        // The input stage of a layer: the block-per-head kernel against the warp-per-head one.
+        let stage_warp = || -> crate::tensor::Result<Option<Tensor>> {
+            decode_q_rope_kv_write_f16(
+                [(&qkv, 0), (&qkv, qd), (&qkv, qd + kvd)],
+                Some([(&w_head, eps), (&w_head, eps)]),
+                &cos,
+                &sin,
+                false,
+                &slot_dev,
+                stores[0].k(),
+                stores[0].v(),
+                nh,
+                nkv,
+                hd,
+            )
+        };
+        if stage_fits {
+            let old_us = in_graph(
+                "q/k/v stage in a graph, old: one block for each head",
+                layers,
+                &mut || {
+                    std::hint::black_box(stage_new(&stores[0])?);
+                    Ok(())
+                },
+            )?;
+            let new_us = in_graph(
+                "q/k/v stage in a graph, new: one warp for each head",
+                layers,
+                &mut || {
+                    std::hint::black_box(stage_warp()?.ok_or_else(|| declined("warp stage"))?);
+                    Ok(())
+                },
+            )?;
+            println!(
+                "q/k/v stage in a graph: {old_us:.2} us old, {new_us:.2} us new, {:.2} us saved a layer\n",
+                old_us - new_us
+            );
+        }
+
+        // The activation of the feed-forward block: the exact kernel against the wide one.
+        if act_fits {
+            let old_us = in_graph(
+                "MLP activation in a graph, old: 2 columns a thread, exact exponential",
+                layers,
+                &mut || {
+                    std::hint::black_box(act_new()?);
+                    Ok(())
+                },
+            )?;
+            let new_us = in_graph(
+                "MLP activation in a graph, new: 8 columns a thread, fast exponential",
+                layers,
+                &mut || {
+                    std::hint::black_box(silu_mul_gu_f16_with(&gu, ffn, true)?);
+                    Ok(())
+                },
+            )?;
+            println!(
+                "MLP activation in a graph: {old_us:.2} us old, {new_us:.2} us new, {:.2} us saved a layer\n",
+                old_us - new_us
+            );
+        }
+
         // One graph of the layer's kernels for each copy of the store, replayed in turn.
-        let eager = layer_once(&stores[0]);
+        let eager = layer_once(&stores[0], false);
         fail.ok(eager);
         fail.ok(stream.synchronize());
         fail.check("graph warm-up")?;
         let mut graphs = Vec::new();
         for store in &stores {
             cuda_ext::begin_capture(&stream).map_err(|e| format!("graph capture: {e:?}"))?;
-            let ran = layer_once(store);
+            let ran = layer_once(store, false);
             let graph =
                 cuda_ext::end_capture(&stream).map_err(|e| format!("graph capture: {e:?}"))?;
             ran.map_err(tensor)?;
@@ -801,6 +1029,67 @@ mod device {
             samples_us: samples,
             note: Some(format!("{chain_us:.1} us a layer")),
         });
+
+        // The same layer with the one-kernel input stage and activation.
+        if stage_fits && act_fits {
+            let eager = layer_once(&stores[0], true);
+            fail.ok(eager);
+            fail.ok(stream.synchronize());
+            fail.check("graph warm-up, new kernels")?;
+            let mut fast_graphs = Vec::new();
+            for store in &stores {
+                cuda_ext::begin_capture(&stream).map_err(|e| format!("graph capture: {e:?}"))?;
+                let ran = layer_once(store, true);
+                let graph =
+                    cuda_ext::end_capture(&stream).map_err(|e| format!("graph capture: {e:?}"))?;
+                ran.map_err(tensor)?;
+                fast_graphs.push(graph.ok_or("graph capture: no graph")?);
+            }
+            let variant = "graph, new kernels: the 5 kernels of one layer, 1 replay, 1 synchronise"
+                .to_string();
+            let mut next = 0usize;
+            let samples = run_for(
+                target,
+                timed(|| {
+                    fail.ok(fast_graphs[next % fast_graphs.len()].launch());
+                    fail.ok(stream.synchronize());
+                    next += 1;
+                }),
+            );
+            fail.check(&variant)?;
+            let fast_replay_us = Summary::of(&samples).median_us;
+            measured.push(Measured {
+                variant,
+                bytes: None,
+                samples_us: samples,
+                note: Some(format!(
+                    "{:.1} us under the replay of the old kernels",
+                    replay_us - fast_replay_us
+                )),
+            });
+            let variant =
+                format!("graph, new kernels: {layers} replays back to back, 1 synchronise");
+            let samples = run_for(
+                target,
+                timed(|| {
+                    for i in 0..layers {
+                        fail.ok(fast_graphs[i % fast_graphs.len()].launch());
+                    }
+                    fail.ok(stream.synchronize());
+                }),
+            );
+            fail.check(&variant)?;
+            let fast_chain_us = Summary::of(&samples).median_us / layers as f64;
+            measured.push(Measured {
+                variant,
+                bytes: None,
+                samples_us: samples,
+                note: Some(format!(
+                    "{fast_chain_us:.1} us a layer, {:.1} us under the old kernels",
+                    chain_us - fast_chain_us
+                )),
+            });
+        }
 
         let t = totals(&entries, layers);
         println!(

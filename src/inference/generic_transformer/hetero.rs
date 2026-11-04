@@ -55,6 +55,52 @@ fn prefill_stage_fused(
         && norms_paired
 }
 
+/// Whether the input stage of a decode layer runs as one launch: the head norms of q and k, their
+/// rotation and the write of k and v into the paged store, with q and k read in place from the
+/// fused projection.
+///
+/// It needs what [`prefill_stage_fused`] needs. The launch norms a head with the arithmetic of
+/// the norm the decode loop runs, so the bits match the separate launches.
+fn decode_stage_fused(
+    on_card: bool,
+    activation: DType,
+    store: DType,
+    head_dim: usize,
+    norms_paired: bool,
+) -> bool {
+    prefill_stage_fused(on_card, activation, store, head_dim, norms_paired)
+}
+
+/// Whether the attention of a prefill layer takes q straight from the input stage in the flash
+/// kernel's layout, and gives its output in F16: the input stage is one launch, no prompt
+/// attends over cached rows, the card runs the flash kernel, the flash kernel has the head
+/// width, and the heads group evenly.
+///
+/// q then stays F32 `[n_head, rows, hd]` between the 2 launches, and the casts and the
+/// transpose around the attention do not run.
+fn prefill_attention_head_major(
+    stage_fused: bool,
+    cached_prompts: usize,
+    flash_card: bool,
+    head_dim_in_kernel: bool,
+    n_head: usize,
+    n_kv: usize,
+) -> bool {
+    stage_fused
+        && cached_prompts == 0
+        && flash_card
+        && head_dim_in_kernel
+        && n_kv > 0
+        && n_head.is_multiple_of(n_kv)
+}
+
+/// Whether the activation of a prefill layer's feed-forward block reads the fused gate and up
+/// buffer in place, in one launch: a card, activations held in F16, a silu gate and an even
+/// width.
+fn mlp_activation_fused(on_card: bool, activation: DType, ffn: usize, use_gelu: bool) -> bool {
+    on_card && activation == DType::F16 && !use_gelu && ffn > 0 && ffn.is_multiple_of(2)
+}
+
 /// What the projections of a prefill layer gave: one buffer holding q, k and v side by side,
 /// or one tensor for each.
 enum PrefillProjection {
@@ -1291,7 +1337,7 @@ impl GenericHeteroTransformer {
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let scale = 1.0f32 / (hd as f32).sqrt();
         use crate::inference::kernel::fused::{
-            fused_add_rmsnorm_f16, fused_rmsnorm_f16, silu_mul_f16,
+            fused_add_rmsnorm_f16_with, fused_rmsnorm_f16, silu_mul_f16,
         };
         let cdt = DType::F16;
         let mut x = x.clone();
@@ -1321,16 +1367,12 @@ impl GenericHeteroTransformer {
                 }
             };
             let (qd, kvd) = (nh * hd, nkv * hd);
-            let (q, k, v) = if let Some(qkvw) = layer.attn_qkv.as_ref() {
+            let projected = if let Some(qkvw) = layer.attn_qkv.as_ref() {
                 let mut qkv = qkvw.forward(&hn)?;
                 if let Some(bias) = layer.attn_qkv_bias.as_ref() {
                     qkv = qkv.broadcast_add(&bias.to_dtype(qkv.dtype())?)?;
                 }
-                (
-                    qkv.narrow(1, 0, qd)?,
-                    qkv.narrow(1, qd, kvd)?,
-                    qkv.narrow(1, qd + kvd, kvd)?,
-                )
+                PrefillProjection::Fused(qkv)
             } else {
                 let mut q = layer.attn_q.as_ref().unwrap().forward(&hn)?;
                 let mut k = layer.attn_k.as_ref().unwrap().forward(&hn)?;
@@ -1344,48 +1386,90 @@ impl GenericHeteroTransformer {
                 if let Some(bias) = layer.attn_v_bias.as_ref() {
                     v = v.broadcast_add(&bias.to_dtype(v.dtype())?)?;
                 }
-                (q, k, v)
+                PrefillProjection::Split(q, k, v)
             };
-            let qh = q.to_dtype(cdt)?.reshape(&[b, nh, hd][..])?;
-            let qh = if let Some(qn) = layer.attn_q_norm.as_ref() {
-                fused_rmsnorm_f16(&qh.contiguous()?, qn.weight(), qn.eps() as f32)?
+            // One launch rotates q and k and writes k and v into the store. It reads the slots
+            // from `slot_dev` at execution time, so the slots are not checked on the host: the
+            // scheduler allocated them inside the store.
+            let norms = match (layer.attn_q_norm.as_ref(), layer.attn_k_norm.as_ref()) {
+                (Some(qn), Some(kn)) => Some([
+                    (qn.weight(), qn.eps() as f32),
+                    (kn.weight(), kn.eps() as f32),
+                ]),
+                _ => None,
+            };
+            let norms_paired =
+                norms.is_some() || (layer.attn_q_norm.is_none() && layer.attn_k_norm.is_none());
+            let staged = if decode_stage_fused(
+                x.device().is_cuda(),
+                cdt,
+                stores[li].k().dtype(),
+                hd,
+                norms_paired,
+            ) {
+                crate::inference::kernel::fused::decode_q_rope_kv_write_f16(
+                    projected.sources(qd, kvd),
+                    norms,
+                    rcos,
+                    rsin,
+                    self.config.flags.use_rope_i,
+                    slot_dev,
+                    stores[li].k(),
+                    stores[li].v(),
+                    nh,
+                    nkv,
+                    hd,
+                )?
             } else {
-                qh
+                None
             };
-            let kh = k.to_dtype(cdt)?.reshape(&[b, nkv, hd][..])?;
-            let kh = if let Some(kn) = layer.attn_k_norm.as_ref() {
-                fused_rmsnorm_f16(&kh.contiguous()?, kn.weight(), kn.eps() as f32)?
-            } else {
-                kh
+            let q_rot = match staged {
+                Some(q_rot) => q_rot,
+                None => {
+                    let (q, k, v) = projected.split(qd, kvd)?;
+                    let qh = q.to_dtype(cdt)?.reshape(&[b, nh, hd][..])?;
+                    let qh = if let Some(qn) = layer.attn_q_norm.as_ref() {
+                        fused_rmsnorm_f16(&qh.contiguous()?, qn.weight(), qn.eps() as f32)?
+                    } else {
+                        qh
+                    };
+                    let kh = k.to_dtype(cdt)?.reshape(&[b, nkv, hd][..])?;
+                    let kh = if let Some(kn) = layer.attn_k_norm.as_ref() {
+                        fused_rmsnorm_f16(&kh.contiguous()?, kn.weight(), kn.eps() as f32)?
+                    } else {
+                        kh
+                    };
+                    let k_rot = crate::inference::cache::paged_attention::rope_apply(
+                        &kh,
+                        rcos,
+                        rsin,
+                        self.config.flags.use_rope_i,
+                    )?
+                    .reshape(&[b, nkv * hd][..])?;
+                    let q_rot = crate::inference::cache::paged_attention::rope_apply(
+                        &qh,
+                        rcos,
+                        rsin,
+                        self.config.flags.use_rope_i,
+                    )?;
+                    let v_f = v.to_dtype(cdt)?;
+                    // Fully capture-safe paged write + fused paged flash-decode: both index
+                    // the paged store via DEVICE buffers (slot/block_table/seq_lens) read at
+                    // kernel-exec time - no index_select/scatter (which BAKE host-read
+                    // indices at capture) and no cuBLAS (not graph-replay-safe). This is what
+                    // makes the captured graph replay correctly.
+                    crate::inference::kernel::fused::paged_kv_write(
+                        &k_rot,
+                        &v_f,
+                        stores[li].k(),
+                        stores[li].v(),
+                        slot_dev,
+                        b,
+                        nkv * hd,
+                    )?;
+                    q_rot
+                }
             };
-            let k_rot = crate::inference::cache::paged_attention::rope_apply(
-                &kh,
-                rcos,
-                rsin,
-                self.config.flags.use_rope_i,
-            )?
-            .reshape(&[b, nkv * hd][..])?;
-            let q_rot = crate::inference::cache::paged_attention::rope_apply(
-                &qh,
-                rcos,
-                rsin,
-                self.config.flags.use_rope_i,
-            )?;
-            let v_f = v.to_dtype(cdt)?;
-            // Fully capture-safe paged write + fused paged flash-decode: both index
-            // the paged store via DEVICE buffers (slot/block_table/seq_lens) read at
-            // kernel-exec time - no index_select/scatter (which BAKE host-read
-            // indices at capture) and no cuBLAS (not graph-replay-safe). This is what
-            // makes the captured graph replay correctly.
-            crate::inference::kernel::fused::paged_kv_write(
-                &k_rot,
-                &v_f,
-                stores[li].k(),
-                stores[li].v(),
-                slot_dev,
-                b,
-                nkv * hd,
-            )?;
             let qb = q_rot.reshape(&[b, nh, hd][..])?;
             let bs = stores[li].block_size();
             let a = crate::inference::kernel::fused::paged_flash_decode(
@@ -1409,25 +1493,45 @@ impl GenericHeteroTransformer {
                 .and_then(|a| layer.attn_output.forward(&a))?
                 .to_dtype(cdt)?;
             let ffn_norm = layer.ffn_norm.as_ref().unwrap();
-            let (sum, hn2) =
-                fused_add_rmsnorm_f16(&o, &residual, ffn_norm.weight(), ffn_norm.eps() as f32)?;
+            let (sum, hn2) = fused_add_rmsnorm_f16_with(
+                &o,
+                &residual,
+                ffn_norm.weight(),
+                ffn_norm.eps() as f32,
+                true,
+            )?;
             x = sum;
             let residual2 = x.clone();
-            let (g, u) = if let Some(gate) = layer.ffn_gate.as_ref() {
-                (gate.forward(&hn2)?, layer.ffn_up.forward(&hn2)?)
+            let activate = |g: &Tensor, u: &Tensor| -> Result<Tensor> {
+                if c.flags.use_gelu {
+                    g.gelu()?.mul(u)
+                } else {
+                    match silu_mul_f16(g, u)? {
+                        Some(a) => Ok(a),
+                        None => g.silu()?.mul(u),
+                    }
+                }
+            };
+            let act = if let Some(gate) = layer.ffn_gate.as_ref() {
+                activate(&gate.forward(&hn2)?, &layer.ffn_up.forward(&hn2)?)?
             } else {
                 let gu = layer.ffn_up.forward(&hn2)?;
-                (
-                    gu.narrow(1, 0, c.ffn_dim)?,
-                    gu.narrow(1, c.ffn_dim, c.ffn_dim)?,
-                )
-            };
-            let act = if c.flags.use_gelu {
-                g.gelu()?.mul(&u)?
-            } else {
-                match silu_mul_f16(&g, &u)? {
+                let fused = if mlp_activation_fused(
+                    gu.device().is_cuda(),
+                    gu.dtype(),
+                    c.ffn_dim,
+                    c.flags.use_gelu,
+                ) {
+                    crate::inference::kernel::fused::silu_mul_gu_f16(&gu, c.ffn_dim)?
+                } else {
+                    None
+                };
+                match fused {
                     Some(a) => a,
-                    None => g.silu()?.mul(&u)?,
+                    None => activate(
+                        &gu.narrow(1, 0, c.ffn_dim)?,
+                        &gu.narrow(1, c.ffn_dim, c.ffn_dim)?,
+                    )?,
                 }
             };
             let d = layer.ffn_down.forward(&act)?.to_dtype(cdt)?;
@@ -1437,7 +1541,8 @@ impl GenericHeteroTransformer {
                 Some(next) => (next.attn_norm.weight().clone(), next.attn_norm.eps() as f32),
                 None => (norm_w.clone(), self.output_norm.eps() as f32),
             };
-            let (sum, h) = fused_add_rmsnorm_f16(&d, &residual2, &next_weight, next_eps)?;
+            let (sum, h) =
+                fused_add_rmsnorm_f16_with(&d, &residual2, &next_weight, next_eps, true)?;
             x = sum;
             next_norm = Some(h);
             note_if_non_finite(&format!("layer {li}"), &x);
@@ -1809,16 +1914,47 @@ impl GenericHeteroTransformer {
             };
             let norms_paired =
                 norms.is_some() || (layer.attn_q_norm.is_none() && layer.attn_k_norm.is_none());
+            let stage_fused =
+                prefill_stage_fused(dev.is_cuda(), cdt, stores[li].k().dtype(), hd, norms_paired);
+            #[cfg(feature = "gpu")]
+            let flash_head_dim =
+                crate::inference::kernel::fused::FLASH_PREFILL_GQA_HEAD_DIMS.contains(&hd);
+            #[cfg(not(feature = "gpu"))]
+            let flash_head_dim = false;
+            #[cfg(feature = "gpu")]
+            let flash_card = crate::inference::kernel::fused::flash_prefill_gqa_card(&dev)?;
+            #[cfg(not(feature = "gpu"))]
+            let flash_card = false;
+            let want_head_major = prefill_attention_head_major(
+                stage_fused,
+                cached.len(),
+                flash_card,
+                flash_head_dim,
+                nh,
+                nkv,
+            );
+            let mut q_head_major = false;
             let staged = match slot_dev.as_ref().zip(slots_i32.as_deref()) {
-                Some((slot_dev, slots_i32))
-                    if prefill_stage_fused(
-                        dev.is_cuda(),
-                        cdt,
-                        stores[li].k().dtype(),
-                        hd,
-                        norms_paired,
-                    ) =>
-                {
+                Some((slot_dev, slots_i32)) if want_head_major => {
+                    let rows =
+                        crate::inference::kernel::fused::prefill_rope_kv_write_head_major_f16(
+                            projected.sources(qd, kvd),
+                            norms,
+                            &rcos,
+                            &rsin,
+                            self.config.flags.use_rope_i,
+                            slot_dev,
+                            slots_i32,
+                            stores[li].k(),
+                            stores[li].v(),
+                            nh,
+                            nkv,
+                            hd,
+                        )?;
+                    q_head_major = rows.is_some();
+                    rows
+                }
+                Some((slot_dev, slots_i32)) if stage_fused => {
                     crate::inference::kernel::fused::prefill_rope_kv_write_f16(
                         projected.sources(qd, kvd),
                         norms,
@@ -1893,7 +2029,21 @@ impl GenericHeteroTransformer {
                 }
             };
             let mut parts: Vec<Tensor> = Vec::new();
-            if !plain.is_empty() {
+            if q_head_major {
+                parts.push(
+                    crate::inference::cache::paged_attention::paged_prefill_attn_seqs_head_major(
+                        &q_rot,
+                        &k_rot,
+                        &v_f,
+                        &lens[..plain.len()],
+                        nh,
+                        nkv,
+                        hd,
+                        scale,
+                    )?
+                    .reshape(&[plain_rows, nh * hd][..])?,
+                );
+            } else if !plain.is_empty() {
                 parts.push(
                     crate::inference::cache::paged_attention::paged_prefill_attn_seqs(
                         &q_rot.narrow(0, 0, plain_rows)?,
@@ -1956,24 +2106,46 @@ impl GenericHeteroTransformer {
                 ffn_norm.forward(&x)?.to_dtype(cdt)?
             };
             let residual2 = x.clone();
-            let (g, u) = if let Some(gate) = layer.ffn_gate.as_ref() {
-                (
-                    gate.forward(&hn2)?.to_dtype(cdt)?,
-                    layer.ffn_up.forward(&hn2)?.to_dtype(cdt)?,
-                )
+            let act = if let Some(gate) = layer.ffn_gate.as_ref() {
+                let g = gate.forward(&hn2)?.to_dtype(cdt)?;
+                let u = layer.ffn_up.forward(&hn2)?.to_dtype(cdt)?;
+                if c.flags.use_gelu {
+                    g.gelu()?.mul(&u)?
+                } else {
+                    match crate::inference::kernel::fused::silu_mul_f16(&g, &u)? {
+                        Some(a) => a,
+                        None => g.silu()?.mul(&u)?,
+                    }
+                }
             } else {
                 let gu = layer.ffn_up.forward(&hn2)?.to_dtype(cdt)?;
-                (
-                    gu.narrow(1, 0, c.ffn_dim)?,
-                    gu.narrow(1, c.ffn_dim, c.ffn_dim)?,
-                )
-            };
-            let act = if c.flags.use_gelu {
-                g.gelu()?.mul(&u)?
-            } else {
-                match crate::inference::kernel::fused::silu_mul_f16(&g, &u)? {
+                let one_launch = mlp_activation_fused(
+                    gu.device().is_cuda(),
+                    gu.dtype(),
+                    c.ffn_dim,
+                    c.flags.use_gelu,
+                );
+                let fused = if one_launch {
+                    crate::inference::kernel::fused::silu_mul_gu_f16(&gu, c.ffn_dim)?
+                } else {
+                    None
+                };
+                match fused {
                     Some(a) => a,
-                    None => g.silu()?.mul(&u)?,
+                    None => {
+                        let (g, u) = (
+                            gu.narrow(1, 0, c.ffn_dim)?,
+                            gu.narrow(1, c.ffn_dim, c.ffn_dim)?,
+                        );
+                        if c.flags.use_gelu {
+                            g.gelu()?.mul(&u)?
+                        } else {
+                            match crate::inference::kernel::fused::silu_mul_f16(&g, &u)? {
+                                Some(a) => a,
+                                None => g.silu()?.mul(&u)?,
+                            }
+                        }
+                    }
                 }
             };
             let d = layer.ffn_down.forward(&act)?.to_dtype(cdt)?;
@@ -3183,7 +3355,10 @@ mod swa_mask_tests {
 
 #[cfg(test)]
 mod prefill_stage_tests {
-    use super::{prefill_stage_fused, PrefillProjection};
+    use super::{
+        decode_stage_fused, mlp_activation_fused, prefill_attention_head_major,
+        prefill_stage_fused, PrefillProjection,
+    };
     use crate::tensor::{DType, Device, Tensor};
 
     #[test]
@@ -3220,6 +3395,81 @@ mod prefill_stage_tests {
             128,
             false
         ));
+    }
+
+    #[test]
+    fn the_decode_stage_is_one_launch_on_a_card_in_f16_with_an_even_head_and_paired_norms() {
+        assert!(decode_stage_fused(true, DType::F16, DType::F16, 128, true));
+        assert!(decode_stage_fused(true, DType::F16, DType::F16, 64, true));
+    }
+
+    #[test]
+    fn the_decode_stage_falls_back_where_the_prefill_stage_does() {
+        use DType::{BF16, F16, F32};
+        let cases = [
+            (true, F16, F16, 128, false),
+            (false, F16, F16, 128, true),
+            (true, F32, F16, 128, true),
+            (true, BF16, F16, 128, true),
+            (true, F16, F32, 128, true),
+            (true, F16, F16, 0, true),
+            (true, F16, F16, 127, true),
+        ];
+        for (on_card, activation, store, head_dim, paired) in cases {
+            assert!(
+                !decode_stage_fused(on_card, activation, store, head_dim, paired),
+                "{on_card} {activation:?} {store:?} {head_dim} {paired}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_attention_takes_q_head_major_from_a_fused_stage_with_no_cached_prompt() {
+        assert!(prefill_attention_head_major(true, 0, true, true, 32, 8));
+        assert!(prefill_attention_head_major(true, 0, true, true, 8, 8));
+    }
+
+    #[test]
+    fn the_attention_keeps_the_casts_without_a_fused_stage_or_with_a_cached_prompt() {
+        let cases = [
+            (false, 0, true, true, 32, 8),
+            (true, 1, true, true, 32, 8),
+            (true, 0, false, true, 32, 8),
+            (true, 0, true, false, 32, 8),
+            (true, 0, true, true, 32, 0),
+            (true, 0, true, true, 30, 8),
+        ];
+        for (stage, cached, flash_card, head_dim, n_head, n_kv) in cases {
+            assert!(
+                !prefill_attention_head_major(stage, cached, flash_card, head_dim, n_head, n_kv),
+                "{stage} {cached} {flash_card} {head_dim} {n_head} {n_kv}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_activation_is_one_launch_on_a_card_in_f16_with_a_silu_gate_and_an_even_width() {
+        assert!(mlp_activation_fused(true, DType::F16, 12288, false));
+        assert!(mlp_activation_fused(true, DType::F16, 96, false));
+    }
+
+    #[test]
+    fn the_activation_falls_back_off_the_card_or_off_f16_or_with_gelu_or_an_odd_width() {
+        use DType::{BF16, F16, F32};
+        let cases = [
+            (false, F16, 96, false),
+            (true, F32, 96, false),
+            (true, BF16, 96, false),
+            (true, F16, 96, true),
+            (true, F16, 95, false),
+            (true, F16, 0, false),
+        ];
+        for (on_card, activation, ffn, use_gelu) in cases {
+            assert!(
+                !mlp_activation_fused(on_card, activation, ffn, use_gelu),
+                "{on_card} {activation:?} {ffn} {use_gelu}"
+            );
+        }
     }
 
     #[test]

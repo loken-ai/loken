@@ -136,6 +136,80 @@ extern "C" __global__ void loken_fused_rmsnorm_f16_vec_kernel(
     }
 }
 
+// The same normalisation with one 16-byte vector per thread, held in registers.
+// A block has one thread per vector of the row, so a row is read once and written once and
+// no row is cached in shared memory. The sum of squares reduces by warp shuffles.
+extern "C" __global__ void loken_fused_rmsnorm_f16_regs_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ res,
+    const float*  __restrict__ weight,
+    __half* __restrict__ norm_out,
+    __half* __restrict__ sum_out,
+    int rows, int cols, float eps
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int v = threadIdx.x;
+    const uint4* xv = (const uint4*)(x + (size_t)row * cols);
+    const uint4* rv = res ? (const uint4*)(res + (size_t)row * cols) : nullptr;
+    const float4* wv = (const float4*)weight;
+    const uint4 xu = xv[v];
+    uint4 ru;
+    if (rv) ru = rv[v];
+    const float4 wa = wv[2 * v], wb = wv[2 * v + 1];
+    const __half2* xh = (const __half2*)&xu;
+    const __half2* rh = (const __half2*)&ru;
+    uint4 su;
+    __half2* sh = (__half2*)&su;
+    float f[8];
+    float local = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float2 xf = __half22float2(xh[k]);
+        if (rv) {
+            const float2 rf = __half22float2(rh[k]);
+            sh[k] = __floats2half2_rn(xf.x + rf.x, xf.y + rf.y);
+            xf = __half22float2(sh[k]);
+        }
+        f[2 * k] = xf.x;
+        f[2 * k + 1] = xf.y;
+        local += xf.x * xf.x + xf.y * xf.y;
+    }
+    if (rv) ((uint4*)(sum_out + (size_t)row * cols))[v] = su;
+    local = ll_warp_sum(local);
+    __shared__ float wsum[32];
+    const int warp = v >> 5, lane = v & 31, nwarps = blockDim.x >> 5;
+    if (lane == 0) wsum[warp] = local;
+    __syncthreads();
+    float t = (lane < nwarps) ? wsum[lane] : 0.0f;
+    t = ll_warp_sum(t);
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const float denom = sqrtf(t / (float)cols + eps);
+    uint4 ou;
+    __half2* oh = (__half2*)&ou;
+    oh[0] = __floats2half2_rn(f[0] / denom * wa.x, f[1] / denom * wa.y);
+    oh[1] = __floats2half2_rn(f[2] / denom * wa.z, f[3] / denom * wa.w);
+    oh[2] = __floats2half2_rn(f[4] / denom * wb.x, f[5] / denom * wb.y);
+    oh[3] = __floats2half2_rn(f[6] / denom * wb.z, f[7] / denom * wb.w);
+    ((uint4*)(norm_out + (size_t)row * cols))[v] = ou;
+}
+
+// Launches the register kernel when the row is one vector per thread of a whole number of warps
+// and the pointers allow 16-byte accesses. Returns 0 when launched, 1 when it declined.
+extern "C" int loken_fused_rmsnorm_f16_regs(
+    const void* x, const void* res, const float* weight,
+    void* norm_out, void* sum_out, int rows, int cols, float eps, cudaStream_t stream
+) {
+    const int nvec = cols >> 3;
+    const bool aligned = (cols & 7) == 0 &&
+        (((size_t)x | (size_t)res | (size_t)weight | (size_t)norm_out | (size_t)sum_out) & 15) == 0;
+    if (!aligned || nvec % 32 != 0 || nvec > 1024) return 1;
+    loken_fused_rmsnorm_f16_regs_kernel<<<rows, nvec, 0, stream>>>(
+        (const __half*)x, (const __half*)res, weight,
+        (__half*)norm_out, (__half*)sum_out, rows, cols, eps);
+    return 0;
+}
+
 extern "C" void loken_fused_rmsnorm_f16(
     const void* x, const void* res, const float* weight,
     void* norm_out, void* sum_out, int rows, int cols, float eps, cudaStream_t stream
@@ -178,6 +252,79 @@ extern "C" void loken_silu_mul_f16(
     const long grid = (n + block - 1) / block;
     loken_silu_mul_f16_kernel<<<grid, block, 0, stream>>>(
         (const __half*)g, (const __half*)u, (__half*)out, n);
+}
+
+// out[r, c] = silu(f32(gu[r, c])) * f32(gu[r, f + c]) for a fused gate+up buffer gu of
+// rows x 2f F16, out rows x f. Same F32 arithmetic and single rounding as
+// loken_silu_mul_f16_kernel. f is even: a thread takes 2 adjacent columns by one half2 access,
+// and gu and out are 4-byte aligned. n2 = rows * f / 2 pairs.
+__global__ void loken_silu_mul_gu_f16_kernel(
+    const __half* __restrict__ gu, __half* __restrict__ out, long f, long n2
+) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n2) return;
+    const long half_f = f >> 1;
+    const long row = i / half_f;
+    const long c2 = i - row * half_f;
+    const __half2* gp = (const __half2*)(gu + row * 2 * f) + c2;
+    const __half2* up = (const __half2*)(gu + row * 2 * f + f) + c2;
+    const float2 gf = __half22float2(*gp);
+    const float2 uf = __half22float2(*up);
+    const float y0 = (gf.x / (1.0f + expf(-gf.x))) * uf.x;
+    const float y1 = (gf.y / (1.0f + expf(-gf.y))) * uf.y;
+    ((__half2*)out)[i] = __halves2half2(__float2half(y0), __float2half(y1));
+}
+
+extern "C" void loken_silu_mul_gu_f16(
+    const void* gu, void* out, long f, long rows, cudaStream_t stream
+) {
+    const long n2 = rows * (f >> 1);
+    if (n2 <= 0) return;
+    const int block = 256;
+    const long grid = (n2 + block - 1) / block;
+    loken_silu_mul_gu_f16_kernel<<<grid, block, 0, stream>>>(
+        (const __half*)gu, (__half*)out, f, n2);
+}
+
+// The same activation 8 columns per thread, by 16-byte accesses, with the exponential and the
+// division of the fast math units. The result differs from the kernel above in the last bit of
+// some values.
+__global__ void loken_silu_mul_gu_vec_f16_kernel(
+    const __half* __restrict__ gu, __half* __restrict__ out, long f, long n8
+) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n8) return;
+    const long per_row = f >> 3;
+    const long row = i / per_row;
+    const long c8 = i - row * per_row;
+    const uint4 gv = ((const uint4*)(gu + row * 2 * f))[c8];
+    const uint4 uv = ((const uint4*)(gu + row * 2 * f + f))[c8];
+    const __half2* gh = (const __half2*)&gv;
+    const __half2* uh = (const __half2*)&uv;
+    uint4 ov;
+    __half2* oh = (__half2*)&ov;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 g = __half22float2(gh[k]);
+        const float2 u = __half22float2(uh[k]);
+        const float y0 = __fdividef(g.x, 1.0f + __expf(-g.x)) * u.x;
+        const float y1 = __fdividef(g.y, 1.0f + __expf(-g.y)) * u.y;
+        oh[k] = __floats2half2_rn(y0, y1);
+    }
+    ((uint4*)out)[i] = ov;
+}
+
+// Returns 0 when launched, 1 when f is not a multiple of 8 or a pointer is not 16-byte aligned.
+extern "C" int loken_silu_mul_gu_vec_f16(
+    const void* gu, void* out, long f, long rows, cudaStream_t stream
+) {
+    if (rows <= 0 || (f & 7) != 0 || (((size_t)gu | (size_t)out) & 15) != 0) return 1;
+    const long n8 = rows * (f >> 3);
+    const int block = 256;
+    const long grid = (n8 + block - 1) / block;
+    loken_silu_mul_gu_vec_f16_kernel<<<grid, block, 0, stream>>>(
+        (const __half*)gu, (__half*)out, f, n8);
+    return 0;
 }
 
 // out = f32(y) . sigmoid(f32(g)) in one F16 launch: an output gate over a head's rows, the
@@ -395,22 +542,30 @@ extern "C" void loken_paged_rope_f16(
 //   k head: rope(rmsnorm(k) * k_weight) into k_out and into the paged store Kp at the row's slot
 //   v head: v into v_out and into the paged store Vp at the row's slot
 // A null weight skips the norm of that group.
-// The norm is bit-identical to a cast to f32, fused_rmsnorm_f32, and a cast back to f16.
-// The block holds min(256, hd) rounded up to a power of two threads.
+// norm_mode 0: the norm is bit-identical to a cast to f32, fused_rmsnorm_f32, and a cast back
+// to f16. The block holds min(256, hd) rounded up to a power of two threads.
+// norm_mode 1: the norm is bit-identical to loken_fused_rmsnorm_f16 without a residual on the
+// same head: 256 threads, a warp-shuffle sum, then x / sqrtf(mean + eps) * w rounded once to f16.
+// norm_vec holds bit 0 for the q norm and bit 1 for the k norm. A set bit sums 8 columns per
+// step, as loken_fused_rmsnorm_f16_vec_kernel does. A clear bit sums one column per step.
 // The norm output is rounded to f16 before the rotation, and the rotation rounds each operation
 // to f16, as the separate launches do.
 // The rotation covers the whole head: pair (i, i + hd/2), or (2i, 2i+1) when interleaved.
 // q, k and v point at the first element of their group in row 0 and are `*_stride` elements
 // apart from row to row. cos and sin are [rows, hd/2]. slot_dev holds one slot per row.
+// A null q_head_major writes the rotated q to q_out as f16 [rows, n_head, hd].
+// A non-null q_head_major writes it there as f32 [n_head, rows, hd] and leaves q_out unread.
+// The f32 values are the f16 results widened, so no rounding differs between the 2 layouts.
 extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     long q_stride, long k_stride, long v_stride,
     const float* __restrict__ q_weight, const float* __restrict__ k_weight,
     float q_eps, float k_eps,
     const __half* __restrict__ cos, const __half* __restrict__ sin,
-    __half* __restrict__ q_out, __half* __restrict__ k_out, __half* __restrict__ v_out,
+    __half* __restrict__ q_out, float* __restrict__ q_head_major,
+    __half* __restrict__ k_out, __half* __restrict__ v_out,
     __half* __restrict__ Kp, __half* __restrict__ Vp, const int* __restrict__ slot_dev,
-    int n_head, int n_kv, int hd, int interleaved
+    int n_head, int n_kv, int hd, int interleaved, int norm_mode, int norm_vec
 ) {
     extern __shared__ float row[];
     const long tok = blockIdx.x;
@@ -419,19 +574,27 @@ extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
     const __half* src;
     const float* w = nullptr;
     float eps = 0.0f;
-    __half* dst;
+    bool vec = false;
+    __half* dst = nullptr;
+    float* dst_f32 = nullptr;
     __half* store = nullptr;
     bool rotate = true;
     if (h < n_head) {
         src = q + tok * q_stride + (long)h * hd;
         w = q_weight;
         eps = q_eps;
-        dst = q_out + (tok * n_head + h) * hd;
+        vec = (norm_vec & 1) != 0;
+        if (q_head_major != nullptr) {
+            dst_f32 = q_head_major + ((long)h * gridDim.x + tok) * hd;
+        } else {
+            dst = q_out + (tok * n_head + h) * hd;
+        }
     } else if (h < n_head + n_kv) {
         const int head = h - n_head;
         src = k + tok * k_stride + (long)head * hd;
         w = k_weight;
         eps = k_eps;
+        vec = (norm_vec & 2) != 0;
         dst = k_out + (tok * n_kv + head) * hd;
         store = Kp + (long)slot_dev[tok] * n_kv * hd + (long)head * hd;
     } else {
@@ -447,7 +610,43 @@ extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
         row[d] = xv;
         local += xv * xv;
     }
-    if (w != nullptr) {
+    if (w != nullptr && norm_mode == 1) {
+        // The row is complete in shared memory before any thread sums a column it did not load.
+        __syncthreads();
+        local = 0.0f;
+        if (vec) {
+            const int nvec = hd >> 3;
+            for (int u = tid; u < nvec; u += blockDim.x) {
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    float2 xf;
+                    xf.x = row[8 * u + 2 * c];
+                    xf.y = row[8 * u + 2 * c + 1];
+                    local += xf.x * xf.x + xf.y * xf.y;
+                }
+            }
+        } else {
+            for (int j = tid; j < hd; j += blockDim.x) {
+                const float sf = row[j];
+                local += sf * sf;
+            }
+        }
+        local = ll_warp_sum(local);
+        __shared__ float wsum[32];
+        const int warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
+        if (lane == 0) wsum[warp] = local;
+        __syncthreads();
+        if (warp == 0) {
+            float t = (lane < nwarps) ? wsum[lane] : 0.0f;
+            t = ll_warp_sum(t);
+            if (lane == 0) wsum[0] = t;
+        }
+        __syncthreads();
+        const float denom = sqrtf(wsum[0] / (float)hd + eps);
+        for (int d = tid; d < hd; d += blockDim.x) {
+            row[d] = __half2float(__float2half(row[d] / denom * w[d]));
+        }
+    } else if (w != nullptr) {
         // Same arithmetic as fused_rmsnorm_f32 on the values widened to f32:
         // per-thread strided sums, a halving tree over blockDim.x entries, rsqrtf, x * rms * w.
         float* tree = row + hd;
@@ -488,7 +687,11 @@ extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
                 o = __float2half(a + e);
             }
         }
-        dst[d] = o;
+        if (dst_f32 != nullptr) {
+            dst_f32[d] = __half2float(o);
+        } else {
+            dst[d] = o;
+        }
         if (store != nullptr) store[d] = o;
     }
 }
@@ -498,18 +701,188 @@ extern "C" void loken_prefill_qk_rope_kv_f16(
     long q_stride, long k_stride, long v_stride,
     const float* q_weight, const float* k_weight, float q_eps, float k_eps,
     const void* cos, const void* sin,
-    void* q_out, void* k_out, void* v_out, void* Kp, void* Vp, const int* slot_dev,
-    int rows, int n_head, int n_kv, int hd, int interleaved, cudaStream_t stream
+    void* q_out, float* q_head_major, void* k_out, void* v_out, void* Kp, void* Vp,
+    const int* slot_dev,
+    int rows, int n_head, int n_kv, int hd, int interleaved, int norm_mode, cudaStream_t stream
 ) {
     // The block size of the row norm kernel: min(256, hd) rounded up to a power of two.
     // Shared memory holds the head as f32 and one partial sum per thread.
     int block = 1;
     while (block < hd && block < 256) block <<= 1;
+    // Mode 1 runs the thread count of loken_fused_rmsnorm_f16, whatever the head width.
+    if (norm_mode == 1 && (q_weight != nullptr || k_weight != nullptr)) block = 256;
+    // A norm sums 8 columns per step where loken_fused_rmsnorm_f16 takes its vector kernel:
+    // the width is a multiple of 8 and the weight is 16-byte aligned.
+    const int vec_width = (hd & 7) == 0;
+    const int norm_vec = (vec_width && (((size_t)q_weight) & 15) == 0 ? 1 : 0) |
+                         (vec_width && (((size_t)k_weight) & 15) == 0 ? 2 : 0);
     const int shmem = (hd + block) * (int)sizeof(float);
     dim3 grid(rows, n_head + 2 * n_kv, 1);
     loken_prefill_qk_rope_kv_f16_kernel<<<grid, block, shmem, stream>>>(
         (const __half*)q, (const __half*)k, (const __half*)v, q_stride, k_stride, v_stride,
         q_weight, k_weight, q_eps, k_eps, (const __half*)cos, (const __half*)sin,
-        (__half*)q_out, (__half*)k_out, (__half*)v_out, (__half*)Kp, (__half*)Vp, slot_dev,
-        n_head, n_kv, hd, interleaved);
+        (__half*)q_out, q_head_major, (__half*)k_out, (__half*)v_out, (__half*)Kp, (__half*)Vp,
+        slot_dev, n_head, n_kv, hd, interleaved, norm_mode, norm_vec);
+}
+
+// The decode input stage with one warp for each head of a row.
+//   q head: rope(rmsnorm(q) * q_weight) into q_out
+//   k head: rope(rmsnorm(k) * k_weight) into the paged store Kp at the row's slot
+//   v head: v into the paged store Vp at the row's slot
+// A null weight skips the norm of that group. Each lane holds E consecutive values of the head,
+// so hd is 32 * E. The sum of squares reduces by a butterfly of shuffles, and the partner of a
+// value in the rotation is read from the lane hd / 2 values away, or from the same lane when the
+// pairs are interleaved. The norm output is rounded to f16 before the rotation, and the rotation
+// rounds each operation to f16.
+template <int E> struct LaneVec;
+template <> struct LaneVec<2> { typedef unsigned int type; };
+template <> struct LaneVec<4> { typedef uint2 type; };
+template <> struct LaneVec<8> { typedef uint4 type; };
+
+template <int E>
+__device__ __forceinline__ void ll_load_lane(const __half* p, float (&f)[E]) {
+    typename LaneVec<E>::type u = *(const typename LaneVec<E>::type*)p;
+    const __half2* h = (const __half2*)&u;
+    #pragma unroll
+    for (int k = 0; k < E / 2; ++k) {
+        const float2 t = __half22float2(h[k]);
+        f[2 * k] = t.x;
+        f[2 * k + 1] = t.y;
+    }
+}
+
+template <int E>
+__device__ __forceinline__ void ll_store_lane(__half* p, const float (&f)[E]) {
+    typename LaneVec<E>::type u;
+    __half2* h = (__half2*)&u;
+    #pragma unroll
+    for (int k = 0; k < E / 2; ++k) h[k] = __floats2half2_rn(f[2 * k], f[2 * k + 1]);
+    *(typename LaneVec<E>::type*)p = u;
+}
+
+template <int E>
+__global__ void loken_decode_qkv_warp_f16_kernel(
+    const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    long q_stride, long k_stride, long v_stride,
+    const float* __restrict__ q_weight, const float* __restrict__ k_weight,
+    float q_eps, float k_eps,
+    const __half* __restrict__ cos, const __half* __restrict__ sin,
+    __half* __restrict__ q_out, __half* __restrict__ Kp, __half* __restrict__ Vp,
+    const int* __restrict__ slot_dev, int rows, int n_head, int n_kv, int interleaved
+) {
+    constexpr int HD = 32 * E;
+    const int lane = threadIdx.x & 31;
+    const long gw = (long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int per_row = n_head + 2 * n_kv;
+    if (gw >= (long)rows * per_row) return;
+    const long tok = gw / per_row;
+    const int h = (int)(gw - tok * per_row);
+    const int d0 = E * lane;
+    const __half* src;
+    const float* w = nullptr;
+    float eps = 0.0f;
+    __half* dst;
+    bool rotate = true;
+    if (h < n_head) {
+        src = q + tok * q_stride + (long)h * HD;
+        w = q_weight;
+        eps = q_eps;
+        dst = q_out + (tok * n_head + h) * HD;
+    } else if (h < n_head + n_kv) {
+        const int head = h - n_head;
+        src = k + tok * k_stride + (long)head * HD;
+        w = k_weight;
+        eps = k_eps;
+        dst = Kp + (long)slot_dev[tok] * n_kv * HD + (long)head * HD;
+    } else {
+        const int head = h - n_head - n_kv;
+        src = v + tok * v_stride + (long)head * HD;
+        dst = Vp + (long)slot_dev[tok] * n_kv * HD + (long)head * HD;
+        rotate = false;
+    }
+    float x[E];
+    ll_load_lane<E>(src + d0, x);
+    if (!rotate) {
+        ll_store_lane<E>(dst + d0, x);
+        return;
+    }
+    if (w != nullptr) {
+        float local = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < E; ++j) local += x[j] * x[j];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) local += __shfl_xor_sync(0xffffffffu, local, o);
+        const float denom = sqrtf(local / (float)HD + eps);
+        #pragma unroll
+        for (int j = 0; j < E; ++j)
+            x[j] = __half2float(__float2half(x[j] / denom * w[d0 + j]));
+    }
+    constexpr int HALF_HD = HD / 2;
+    float out[E];
+    if (interleaved) {
+        float c[E / 2], sn[E / 2];
+        const __half* cr = cos + tok * HALF_HD + (d0 >> 1);
+        const __half* sr = sin + tok * HALF_HD + (d0 >> 1);
+        #pragma unroll
+        for (int j = 0; j < E / 2; ++j) {
+            c[j] = __half2float(cr[j]);
+            sn[j] = __half2float(sr[j]);
+            const float x0 = x[2 * j], x1 = x[2 * j + 1];
+            out[2 * j] = __half2float(__float2half(x0 * c[j])) -
+                         __half2float(__float2half(x1 * sn[j]));
+            out[2 * j + 1] = __half2float(__float2half(x0 * sn[j])) +
+                             __half2float(__float2half(x1 * c[j]));
+        }
+    } else {
+        float c[E], sn[E], other[E];
+        const int i0 = d0 & (HALF_HD - 1);
+        ll_load_lane<E>(cos + tok * HALF_HD + i0, c);
+        ll_load_lane<E>(sin + tok * HALF_HD + i0, sn);
+        #pragma unroll
+        for (int j = 0; j < E; ++j) other[j] = __shfl_xor_sync(0xffffffffu, x[j], 16);
+        const bool first = d0 < HALF_HD;
+        #pragma unroll
+        for (int j = 0; j < E; ++j) {
+            if (first) {
+                out[j] = __half2float(__float2half(x[j] * c[j])) -
+                         __half2float(__float2half(other[j] * sn[j]));
+            } else {
+                out[j] = __half2float(__float2half(other[j] * sn[j])) +
+                         __half2float(__float2half(x[j] * c[j]));
+            }
+        }
+    }
+    ll_store_lane<E>(dst + d0, out);
+}
+
+// Launches the warp kernel when the head is 64, 128 or 256 values and every pointer and stride
+// allows the lane's vector access. Returns 0 when launched, 1 when it declined.
+extern "C" int loken_decode_qkv_warp_f16(
+    const void* q, const void* k, const void* v,
+    long q_stride, long k_stride, long v_stride,
+    const float* q_weight, const float* k_weight, float q_eps, float k_eps,
+    const void* cos, const void* sin,
+    void* q_out, void* Kp, void* Vp, const int* slot_dev,
+    int rows, int n_head, int n_kv, int hd, int interleaved, cudaStream_t stream
+) {
+    if (hd != 64 && hd != 128 && hd != 256) return 1;
+    const int e = hd / 32;
+    const size_t mask = (size_t)(2 * e) - 1;
+    if ((((size_t)q | (size_t)k | (size_t)v | (size_t)cos | (size_t)sin | (size_t)q_out |
+          (size_t)Kp | (size_t)Vp | (size_t)(q_stride * 2) | (size_t)(k_stride * 2) |
+          (size_t)(v_stride * 2)) & mask) != 0) return 1;
+    const long warps = (long)rows * (n_head + 2 * n_kv);
+    if (warps <= 0) return 1;
+    const int block = 128;
+    const long grid = (warps * 32 + block - 1) / block;
+#define LOKEN_QKV_WARP(E) \
+    loken_decode_qkv_warp_f16_kernel<E><<<grid, block, 0, stream>>>( \
+        (const __half*)q, (const __half*)k, (const __half*)v, q_stride, k_stride, v_stride, \
+        q_weight, k_weight, q_eps, k_eps, (const __half*)cos, (const __half*)sin, \
+        (__half*)q_out, (__half*)Kp, (__half*)Vp, slot_dev, rows, n_head, n_kv, interleaved)
+    if (e == 2) { LOKEN_QKV_WARP(2); }
+    else if (e == 4) { LOKEN_QKV_WARP(4); }
+    else { LOKEN_QKV_WARP(8); }
+#undef LOKEN_QKV_WARP
+    return 0;
 }

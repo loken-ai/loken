@@ -55,11 +55,37 @@ crate::tensor::gpu_runtime::aot_kernels! {
             scale: f32,
             stream: i64,
         ) -> i32;
+        fn loken_flash_prefill_gqa_varlen_f16kv_f16out(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            o: *mut c_void,
+            starts: *const i32,
+            lens: *const i32,
+            n_seq: i32,
+            n_head: i32,
+            n_kv: i32,
+            head_dim: i32,
+            q_head_stride: i64,
+            kv_tok_stride: i64,
+            kv_head_stride: i64,
+            scale: f32,
+            stream: i64,
+        ) -> i32;
     }
 }
 
 /// Head sizes `flash_prefill_gqa` has a kernel for.
 pub const FLASH_PREFILL_GQA_HEAD_DIMS: [usize; 3] = [64, 128, 256];
+
+/// Whether the flash prefill kernels run on this device: an NVIDIA card, or a card with bf16
+/// matrix instructions.
+pub fn flash_prefill_gqa_card(dev: &crate::tensor::Device) -> Result<bool> {
+    if !dev.is_cuda() {
+        return Ok(false);
+    }
+    Ok(dev.as_cuda_device()?.has_bf16_matrix_cores())
+}
 
 /// Elements per 16-byte `cp.async` run of F16: every K/V row start must be a multiple.
 const F16_PER_CP_ASYNC: usize = 16 / std::mem::size_of::<half::f16>();
@@ -124,16 +150,53 @@ pub fn flash_prefill_gqa_varlen(
     lens: &[usize],
     scale: f32,
 ) -> Result<Option<Tensor>> {
-    use crate::tensor::cuda_ext::DevicePtr;
-    use crate::tensor::StorageView::Cuda as C;
-    if !q.device().is_cuda()
-        || !(q.device().is_nvidia() || q.device().as_cuda_device()?.has_bf16_matrix_cores())
-        || k.dtype() != DType::F16
-        || v.dtype() != DType::F16
-    {
+    if !q.device().is_cuda() {
         return Ok(None);
     }
     let (t, n_head, hd) = q.dims3()?;
+    if !varlen_fits(q, k, v, lens, t, n_head, hd)? {
+        return Ok(None);
+    }
+    // Heads first, so each sequence's queries of one head are one run.
+    let qh = q.to_dtype(DType::F32)?.transpose(0, 1)?.contiguous()?;
+    varlen_launch(&qh, k, v, lens, scale, false)
+}
+
+/// [`flash_prefill_gqa_varlen`] over a `q` already in the kernel's layout, F32
+/// `[n_head, tokens, hd]` contiguous, with the result stored in F16 `[tokens, n_head * hd]`:
+/// each value is the F32 result rounded to nearest even, as a cast after the F32 call gives it.
+pub fn flash_prefill_gqa_varlen_head_major(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    lens: &[usize],
+    scale: f32,
+) -> Result<Option<Tensor>> {
+    if !q.device().is_cuda() || q.dtype() != DType::F32 || !q.is_contiguous() {
+        return Ok(None);
+    }
+    let (n_head, t, hd) = q.dims3()?;
+    if !varlen_fits(q, k, v, lens, t, n_head, hd)? {
+        return Ok(None);
+    }
+    varlen_launch(q, k, v, lens, scale, true)
+}
+
+/// Whether the varlen kernel takes these shapes: `q` holds `t` tokens of `n_head` heads of `hd`
+/// values, `k` and `v` are contiguous F16 `[t, n_kv, hd]` from an offset the 16-byte loads
+/// keep aligned, and `lens` split `t` into non-empty runs.
+fn varlen_fits(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    lens: &[usize],
+    t: usize,
+    n_head: usize,
+    hd: usize,
+) -> Result<bool> {
+    if !flash_prefill_gqa_card(&q.device())? || k.dtype() != DType::F16 || v.dtype() != DType::F16 {
+        return Ok(false);
+    }
     let (tk, n_kv, hdk) = k.dims3()?;
     let feat = n_kv * hd;
     if tk != t
@@ -149,20 +212,36 @@ pub fn flash_prefill_gqa_varlen(
         || !v.is_contiguous()
         || !feat.is_multiple_of(F16_PER_CP_ASYNC)
     {
-        return Ok(None);
+        return Ok(false);
     }
+    let (_, kl) = k.storage_and_layout();
+    let (_, vl) = v.storage_and_layout();
+    Ok([kl.start_offset(), vl.start_offset()]
+        .iter()
+        .all(|s| s % F16_PER_CP_ASYNC == 0))
+}
+
+/// The varlen launch over a `qh` F32 `[n_head, t, hd]` that [`varlen_fits`] accepted, with the
+/// output in F32 or, with `out_f16`, in F16. `None` for an unsupported head size or a device
+/// below sm_80.
+fn varlen_launch(
+    qh: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    lens: &[usize],
+    scale: f32,
+    out_f16: bool,
+) -> Result<Option<Tensor>> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    use crate::tensor::StorageView::Cuda as C;
+    let (n_head, t, hd) = qh.dims3()?;
+    let (_, n_kv, _) = k.dims3()?;
+    let feat = n_kv * hd;
     let (ks, kl) = k.storage_and_layout();
     let (vs, vl) = v.storage_and_layout();
-    if [kl.start_offset(), vl.start_offset()]
-        .iter()
-        .any(|s| s % F16_PER_CP_ASYNC != 0)
-    {
-        return Ok(None);
-    }
-    // Heads first, so each sequence's queries of one head are one run.
-    let qh = q.to_dtype(DType::F32)?.transpose(0, 1)?.contiguous()?;
-    let out = unsafe { Tensor::empty((t, n_head * hd), DType::F32, &q.device())? };
-    let dev = q.device().as_cuda_device()?;
+    let out_dtype = if out_f16 { DType::F16 } else { DType::F32 };
+    let out = unsafe { Tensor::empty((t, n_head * hd), out_dtype, &qh.device())? };
+    let dev = qh.device().as_cuda_device()?;
     dev.cuda_stream()
         .context()
         .bind_to_thread()
@@ -176,11 +255,16 @@ pub fn flash_prefill_gqa_varlen(
     let qsl = qc.as_cuda_slice::<f32>()?;
     let ksl = kc.as_cuda_slice::<half::f16>()?;
     let vsl = vc.as_cuda_slice::<half::f16>()?;
-    let osl = oc.as_cuda_slice::<f32>()?;
+    let op = if out_f16 {
+        let osl = oc.as_cuda_slice::<half::f16>()?;
+        osl.device_ptr(osl.stream()).0 as *mut c_void
+    } else {
+        let osl = oc.as_cuda_slice::<f32>()?;
+        osl.device_ptr(osl.stream()).0 as *mut c_void
+    };
     let qp = (qsl.device_ptr(qsl.stream()).0 + (ql.start_offset() * 4) as u64) as *const c_void;
     let kp = (ksl.device_ptr(ksl.stream()).0 + (kl.start_offset() * 2) as u64) as *const c_void;
     let vp = (vsl.device_ptr(vsl.stream()).0 + (vl.start_offset() * 2) as u64) as *const c_void;
-    let op = osl.device_ptr(osl.stream()).0 as *mut c_void;
     let starts: Vec<i32> = lens
         .iter()
         .scan(0usize, |at, &n| {
@@ -190,8 +274,13 @@ pub fn flash_prefill_gqa_varlen(
         })
         .collect();
     let lens32: Vec<i32> = lens.iter().map(|&n| n as i32).collect();
+    let launch = if out_f16 {
+        loken_flash_prefill_gqa_varlen_f16kv_f16out
+    } else {
+        loken_flash_prefill_gqa_varlen_f16kv
+    };
     let rc = unsafe {
-        loken_flash_prefill_gqa_varlen_f16kv(
+        launch(
             qp,
             kp,
             vp,

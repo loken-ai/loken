@@ -190,6 +190,32 @@ Then a graph:
 - `--layers` replays back to back and 1 synchronise, divided by the layers.
   This is the in-graph cost of a layer.
 
+2 groups of variants set the loops of a layer against the kernels that replace them, on the same tensors:
+
+- `q/k/v stage, old: 3 copies, 2 norms, 2 rope, kv write: 8 launches` against `q/k/v stage, new: one fused kernel`.
+  The new variant is `decode_rope_kv_write_f16`, which reads q, k and v in place from the fused projection and writes k and v into the store.
+- `MLP activation, old: 2 copies and silu_mul` against `MLP activation, new: one kernel`.
+  The new variant is `silu_mul_gu_f16`, which reads the gate and the up in place.
+
+3 groups of variants time a kernel against its replacement inside a graph.
+Each variant captures the kernel back to back, once for each layer or twice for the add and norm, and divides one replay by the calls.
+The launch and the synchronisation of the individual timing are not in these numbers.
+
+- `add and norm in a graph`: `fused_add_rmsnorm_f16` with the row cached in shared memory, against the kernel that holds one 16-byte vector of the row in registers for each thread.
+- `q/k/v stage in a graph`: `decode_rope_kv_write_f16` with one block for each head, against `decode_q_rope_kv_write_f16` with one warp for each head and no shared memory.
+- `MLP activation in a graph`: `silu_mul_gu_f16` with 2 columns a thread, against the kernel with 8 columns a thread and the fast exponential.
+
+The replacements sum in another order or use the fast math units, so a value can differ from the old kernel in its last bits.
+The card tests of `cuda_reduction_order_tests.rs` bound the gap.
+
+A variant the kernel declines is a row without samples, and its note says so.
+The bench times the fused stage with the head norms, as the old loop runs them.
+The decode loop of a model uses the fused stage only for a layer without head norms.
+
+When both kernels fit, a second graph holds the layer with them, 5 kernels in place of 14:
+
+- `graph, new kernels` rows give the replay and the back-to-back replays, each noted against the graph of the old kernels.
+
 The final lines:
 
 - A table ranking the kernels by the time a step loses above their floor, `(median - floor)` times the calls of a step.

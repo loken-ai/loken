@@ -6,7 +6,7 @@ use crate::tensor::{Device, Tensor};
 /// CUDA device that can be opened. If none are usable (CI without
 /// GPU, contended VRAM), the test is silently skipped - it must
 /// never fail spuriously when CUDA is simply unavailable.
-fn try_open_cuda() -> Option<Device> {
+pub(super) fn try_open_cuda() -> Option<Device> {
     for idx in 0..4 {
         if let Ok(dev) = Device::new_cuda(idx) {
             // Touch the device with a 4-byte allocation to confirm
@@ -705,6 +705,96 @@ fn batched_argmax_breaks_ties_to_the_lowest_index() {
     }
 }
 
+/// The activation of a fused gate and up buffer in one launch against the 2 copies and the
+/// `silu_mul_f16` it replaces. The result must equal them bit for bit. The cases are a width of
+/// 12288 at 130 rows and a small width of 96 at 5 rows, then a view of rows narrowed out of a
+/// larger buffer at an even and at an odd element offset. The odd offset must return `None`, and
+/// the fallback on the 2 halves must then equal the reference. A buffer of 0 rows returns `None`.
+#[test]
+fn silu_mul_gu_f16_matches_the_narrow_copies_and_silu_mul() {
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    let bits = |t: &Tensor| {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<half::f16>()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<u16>>()
+    };
+    let values = |n: usize| -> Vec<half::f16> {
+        (0..n)
+            .map(|i| half::f16::from_f32(((i as f32) * 0.0071).sin() * 6.0))
+            .collect()
+    };
+    // The reference: the 2 halves cut out by copies, then `silu_mul_f16`.
+    let reference = |gu: &Tensor, ffn: usize| -> Tensor {
+        let g = gu.narrow(1, 0, ffn).unwrap().contiguous().unwrap();
+        let u = gu.narrow(1, ffn, ffn).unwrap().contiguous().unwrap();
+        silu_mul_f16(&g, &u).unwrap().expect("the sibling fits")
+    };
+    // (rows, ffn)
+    for (rows, ffn) in [(130usize, 12288usize), (5, 96)] {
+        let gu = Tensor::from_slice(&values(rows * 2 * ffn), (rows, 2 * ffn), &dev).unwrap();
+        let got = silu_mul_gu_f16(&gu, ffn)
+            .unwrap()
+            .expect("the fused launch fits");
+        assert_eq!(got.dims(), &[rows, ffn][..], "shape, rows {rows} ffn {ffn}");
+        let g = gu.narrow(1, 0, ffn).unwrap();
+        let u = gu.narrow(1, ffn, ffn).unwrap();
+        let want = silu_mul_f16(&g, &u).unwrap().expect("the sibling fits");
+        assert_eq!(bits(&got), bits(&want), "rows {rows} ffn {ffn}");
+    }
+    // A view of 5 rows narrowed out of a buffer of 9, at an even element offset.
+    let (rows, ffn) = (5usize, 96usize);
+    let big = Tensor::from_slice(&values(9 * 2 * ffn), (9, 2 * ffn), &dev).unwrap();
+    let view = big.narrow(0, 2, rows).unwrap();
+    let got = silu_mul_gu_f16(&view, ffn)
+        .unwrap()
+        .expect("an even offset fits");
+    assert_eq!(
+        bits(&got),
+        bits(&reference(&view, ffn)),
+        "row-narrowed view at an even offset"
+    );
+    // The same rows at an odd element offset: the wrapper declines, the fallback is the reference.
+    let flat =
+        Tensor::from_slice(&values(rows * 2 * ffn + 1), (rows * 2 * ffn + 1,), &dev).unwrap();
+    let odd = flat
+        .narrow(0, 1, rows * 2 * ffn)
+        .unwrap()
+        .reshape((rows, 2 * ffn))
+        .unwrap();
+    // A reshape of a narrowed flat tensor may pack the view to offset 0: the wrapper then
+    // serves it, and the result must match the reference like any other input.
+    if let Some(fused) = silu_mul_gu_f16(&odd, ffn).unwrap() {
+        assert_eq!(
+            bits(&fused),
+            bits(&reference(&odd, ffn)),
+            "odd view served by the fused launch"
+        );
+    }
+    let (g, u) = (
+        odd.narrow(1, 0, ffn).unwrap(),
+        odd.narrow(1, ffn, ffn).unwrap(),
+    );
+    let fallback = silu_mul_f16(&g, &u).unwrap().expect("the sibling fits");
+    assert_eq!(
+        bits(&fallback),
+        bits(&reference(&odd, ffn)),
+        "fallback on an odd offset"
+    );
+    // No rows: nothing to launch.
+    let empty = big.narrow(0, 0, 0).unwrap();
+    assert!(
+        silu_mul_gu_f16(&empty, ffn).unwrap().is_none(),
+        "0 rows have no fused launch"
+    );
+}
+
 /// The prefill input stage in one launch against the separate launches it replaces: the head
 /// norm as `Tensor::rms_norm` on an F16 tensor, then `rope_apply`, then the rows of the store.
 /// It runs with and without the norms and for both pairings of the rotation. Q, k and v must
@@ -816,5 +906,237 @@ fn prefill_rope_kv_write_f16_matches_the_separate_launches() {
                 }
             }
         }
+    }
+}
+
+/// The input stage of a decode batch in one launch, against the loop it replaces: the head norms
+/// of q and k by `fused_rmsnorm_f16`, their rotation by `rope_apply` and the write of k and v by
+/// `paged_kv_write`.
+///
+/// The batch is 64 rows, each at its own position and in its own slot, with 32 q heads and 8 kv
+/// heads, for both pairings of the rotation, with and without head norms. The head is 128 values,
+/// 64 values (the vector norm with a single step) and 96 values (the vector norm with threads left
+/// idle). Q and every row of the store must equal the separate launches bit for bit, and the slots
+/// that no row owns stay zero.
+#[test]
+fn decode_rope_kv_write_f16_matches_rope_apply_and_paged_kv_write_bitwise() {
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    for hd in [128usize, 64, 96] {
+        for with_norms in [false, true] {
+            decode_stage_case(&dev, hd, with_norms);
+        }
+    }
+}
+
+fn decode_stage_case(dev: &Device, hd: usize, with_norms: bool) {
+    use crate::inference::cache::paged_attention::{rope_apply, rope_cos_sin};
+    let (rows, nh, nkv) = (64usize, 32usize, 8usize);
+    let (qd, kvd) = (nh * hd, nkv * hd);
+    let width = qd + 2 * kvd;
+    let values: Vec<half::f16> = (0..rows * width)
+        .map(|i| half::f16::from_f32(((i as f32) * 0.0137).sin() * 2.0))
+        .collect();
+    let qkv = Tensor::from_slice(&values, (rows, width), dev).unwrap();
+    // Distinct positions, and slots in an order that is not the row order.
+    let positions: Vec<usize> = (0..rows).map(|r| 3 + 7 * r).collect();
+    let (cos, sin) = rope_cos_sin(&positions, hd, 10000.0, dev, DType::F16).unwrap();
+    let num_slots = 2 * rows;
+    let slots: Vec<i32> = (0..rows)
+        .map(|r| (2 * ((r * 5) % rows) + 1) as i32)
+        .collect();
+    let slot_dev = Tensor::from_vec(slots.clone(), &[rows][..], dev).unwrap();
+    let weight = |seed: f32| -> Tensor {
+        let w: Vec<f32> = (0..hd)
+            .map(|i| 0.5 + ((i as f32) * seed).cos().abs())
+            .collect();
+        Tensor::from_slice(&w, (hd,), dev).unwrap()
+    };
+    let (qw, kw) = (weight(0.3), weight(0.7));
+    let eps = 1e-6f32;
+    let bits = |t: &Tensor| -> Vec<u16> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<half::f16>()
+            .unwrap()
+            .iter()
+            .map(|h| h.to_bits())
+            .collect()
+    };
+    for interleaved in [false, true] {
+        let label = format!("head {hd}, norms {with_norms}, interleaved {interleaved}");
+        let store = || Tensor::zeros_on((num_slots, kvd), DType::F16, dev).unwrap();
+        let (kp_new, vp_new, kp_old, vp_old) = (store(), store(), store(), store());
+        let norms = with_norms.then_some([(&qw, eps), (&kw, eps)]);
+        let (q_new, _, _) = decode_rope_kv_write_f16(
+            [(&qkv, 0), (&qkv, qd), (&qkv, qd + kvd)],
+            norms,
+            &cos,
+            &sin,
+            interleaved,
+            &slot_dev,
+            &kp_new,
+            &vp_new,
+            nh,
+            nkv,
+            hd,
+        )
+        .unwrap()
+        .expect("the fused launch fits");
+        let (q, k, v) = (
+            qkv.narrow(1, 0, qd).unwrap(),
+            qkv.narrow(1, qd, kvd).unwrap(),
+            qkv.narrow(1, qd + kvd, kvd).unwrap(),
+        );
+        let mut qh = q.reshape(&[rows, nh, hd][..]).unwrap();
+        let mut kh = k.reshape(&[rows, nkv, hd][..]).unwrap();
+        if with_norms {
+            qh = fused_rmsnorm_f16(&qh.contiguous().unwrap(), &qw, eps).unwrap();
+            kh = fused_rmsnorm_f16(&kh.contiguous().unwrap(), &kw, eps).unwrap();
+        }
+        let q_old = rope_apply(&qh, &cos, &sin, interleaved).unwrap();
+        let k_old = rope_apply(&kh, &cos, &sin, interleaved)
+            .unwrap()
+            .reshape(&[rows, kvd][..])
+            .unwrap();
+        paged_kv_write(&k_old, &v, &kp_old, &vp_old, &slot_dev, rows, kvd).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(bits(&q_new), bits(&q_old), "q, {label}");
+        assert_eq!(bits(&kp_new), bits(&kp_old), "store k, {label}");
+        assert_eq!(bits(&vp_new), bits(&vp_old), "store v, {label}");
+        let written = bits(&kp_new);
+        for slot in (0..num_slots).filter(|s| !slots.contains(&(*s as i32))) {
+            assert!(
+                written[slot * kvd..(slot + 1) * kvd]
+                    .iter()
+                    .all(|&b| b & 0x7fff == 0),
+                "slot {slot} was written, {label}"
+            );
+        }
+    }
+}
+
+/// The attention of a prefill layer fed by the fused stage in the flash kernel's layout, against
+/// the path it replaces: the q cast to F32, the transpose to heads first, the flash kernel with
+/// an F32 output, and the cast of that output to F16. The outputs must equal bit for bit. The
+/// cases are 1 sequence of 130 rows and 2 sequences of 70 and 60 rows, with 32 q heads, 8 kv
+/// heads and a head of 64, 128 and 256 values. On a card that has the flash kernel, the
+/// head-major launch must take the shapes.
+#[test]
+fn head_major_attention_matches_the_cast_transpose_and_cast_path() {
+    let Some(dev) = try_open_cuda() else {
+        eprintln!("skipping: no usable CUDA device");
+        return;
+    };
+    for hd in [64usize, 128, 256] {
+        head_major_attention_case(&dev, hd);
+    }
+}
+
+fn head_major_attention_case(dev: &Device, hd: usize) {
+    use crate::inference::cache::paged_attention::{
+        paged_prefill_attn_seqs, paged_prefill_attn_seqs_head_major, rope_cos_sin,
+    };
+    let (rows, nh, nkv) = (130usize, 32usize, 8usize);
+    let (qd, kvd) = (nh * hd, nkv * hd);
+    let width = qd + 2 * kvd;
+    let values: Vec<half::f16> = (0..rows * width)
+        .map(|i| half::f16::from_f32(((i as f32) * 0.0137).sin() * 2.0))
+        .collect();
+    let qkv = Tensor::from_slice(&values, (rows, width), dev).unwrap();
+    let positions: Vec<usize> = (0..rows).collect();
+    let (cos, sin) = rope_cos_sin(&positions, hd, 10000.0, dev, DType::F16).unwrap();
+    let slots: Vec<i32> = (0..rows as i32).collect();
+    let slot_dev = Tensor::from_vec(slots.clone(), &[rows][..], dev).unwrap();
+    let weight = |seed: f32| -> Tensor {
+        let w: Vec<f32> = (0..hd)
+            .map(|i| 0.5 + ((i as f32) * seed).cos().abs())
+            .collect();
+        Tensor::from_slice(&w, (hd,), dev).unwrap()
+    };
+    let (qw, kw) = (weight(0.3), weight(0.7));
+    let stage = |head_major: bool| {
+        let kp = Tensor::zeros_on((rows, kvd), DType::F16, dev).unwrap();
+        let vp = Tensor::zeros_on((rows, kvd), DType::F16, dev).unwrap();
+        let srcs = [(&qkv, 0), (&qkv, qd), (&qkv, qd + kvd)];
+        let norms = Some([(&qw, 1e-6f32), (&kw, 1e-6f32)]);
+        let out = if head_major {
+            prefill_rope_kv_write_head_major_f16(
+                srcs, norms, &cos, &sin, false, &slot_dev, &slots, &kp, &vp, nh, nkv, hd,
+            )
+        } else {
+            prefill_rope_kv_write_f16(
+                srcs, norms, &cos, &sin, false, &slot_dev, &slots, &kp, &vp, nh, nkv, hd,
+            )
+        };
+        out.unwrap().expect("the fused launch fits")
+    };
+    let (q_dense, k, v) = stage(false);
+    let (q_major, k2, v2) = stage(true);
+    assert_eq!(
+        q_major.dims(),
+        &[nh, rows, hd][..],
+        "head-major shape, head {hd}"
+    );
+    assert_eq!(q_major.dtype(), DType::F32, "head-major dtype, head {hd}");
+    let host16 = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<half::f16>().unwrap();
+    assert_eq!(
+        host16(&k),
+        host16(&k2),
+        "k is the same in both modes, head {hd}"
+    );
+    assert_eq!(
+        host16(&v),
+        host16(&v2),
+        "v is the same in both modes, head {hd}"
+    );
+    // The head-major q is the dense q widened and transposed.
+    let widened: Vec<f32> = q_dense
+        .to_dtype(DType::F32)
+        .unwrap()
+        .transpose(0, 1)
+        .unwrap()
+        .contiguous()
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let got_q: Vec<f32> = q_major.flatten_all().unwrap().to_vec1().unwrap();
+    assert_eq!(got_q, widened, "head-major q, head {hd}");
+    let scale = 1.0 / (hd as f32).sqrt();
+    if flash_prefill_gqa_card(dev).unwrap() {
+        let (k3, v3) = (
+            k.reshape((rows, nkv, hd)).unwrap(),
+            v.reshape((rows, nkv, hd)).unwrap(),
+        );
+        assert!(
+            flash_prefill_gqa_varlen_head_major(&q_major, &k3, &v3, &[rows], scale)
+                .unwrap()
+                .is_some(),
+            "the head-major launch takes head {hd}"
+        );
+    }
+    for lens in [vec![rows], vec![70usize, 60]] {
+        let want = paged_prefill_attn_seqs(&q_dense, &k, &v, &lens, nh, nkv, hd, scale).unwrap();
+        let got = paged_prefill_attn_seqs_head_major(&q_major, &k, &v, &lens, nh, nkv, hd, scale)
+            .unwrap();
+        assert_eq!(
+            got.dtype(),
+            DType::F16,
+            "output dtype, head {hd}, lens {lens:?}"
+        );
+        assert_eq!(
+            got.dims(),
+            want.dims(),
+            "output shape, head {hd}, lens {lens:?}"
+        );
+        assert_eq!(
+            host16(&got),
+            host16(&want),
+            "attention, head {hd}, lens {lens:?}"
+        );
     }
 }

@@ -103,6 +103,12 @@ pub fn flash_prefill_parts_f16(
 pub fn silu_mul_f16(_g: &Tensor, _u: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
 }
+pub fn silu_mul_gu_f16(_gu: &Tensor, _ffn: usize) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+pub fn silu_mul_gu_f16_with(_gu: &Tensor, _ffn: usize, _wide: bool) -> Result<Option<Tensor>> {
+    Ok(None)
+}
 pub fn neox_rope_f16(
     _x: &Tensor,
     _cos: &Tensor,
@@ -120,6 +126,52 @@ pub fn paged_rope_f16(
     Ok(None)
 }
 pub fn prefill_rope_kv_write_f16(
+    _srcs: [(&Tensor, usize); 3],
+    _norms: Option<[(&Tensor, f32); 2]>,
+    _cos: &Tensor,
+    _sin: &Tensor,
+    _interleaved: bool,
+    _slot_dev: &Tensor,
+    _slots: &[i32],
+    _kp: &Tensor,
+    _vp: &Tensor,
+    _n_head: usize,
+    _n_kv: usize,
+    _hd: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    Ok(None)
+}
+pub fn decode_rope_kv_write_f16(
+    _srcs: [(&Tensor, usize); 3],
+    _norms: Option<[(&Tensor, f32); 2]>,
+    _cos: &Tensor,
+    _sin: &Tensor,
+    _interleaved: bool,
+    _slot_dev: &Tensor,
+    _kp: &Tensor,
+    _vp: &Tensor,
+    _n_head: usize,
+    _n_kv: usize,
+    _hd: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    Ok(None)
+}
+pub fn decode_q_rope_kv_write_f16(
+    _srcs: [(&Tensor, usize); 3],
+    _norms: Option<[(&Tensor, f32); 2]>,
+    _cos: &Tensor,
+    _sin: &Tensor,
+    _interleaved: bool,
+    _slot_dev: &Tensor,
+    _kp: &Tensor,
+    _vp: &Tensor,
+    _n_head: usize,
+    _n_kv: usize,
+    _hd: usize,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+pub fn prefill_rope_kv_write_head_major_f16(
     _srcs: [(&Tensor, usize); 3],
     _norms: Option<[(&Tensor, f32); 2]>,
     _cos: &Tensor,
@@ -218,6 +270,16 @@ pub fn fused_add_rmsnorm_f16(
     let s = (x + residual)?;
     let n = rmsnorm(&s, weight, eps)?;
     Ok((n, s))
+}
+
+pub fn fused_add_rmsnorm_f16_with(
+    x: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    _registers: bool,
+) -> Result<(Tensor, Tensor)> {
+    fused_add_rmsnorm_f16(x, residual, weight, eps)
 }
 
 pub fn fused_add_rmsnorm_dual(

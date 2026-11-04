@@ -6,6 +6,7 @@
 //   K  F16, token t / kv head h at  K + t * kv_tok_stride + h * kv_head_stride  (HD contiguous)
 //   V  F16, same strides as K
 //   O  F32 [seq_q, n_head, HD] contiguous
+//      The OUT_F16 variants store F16 instead: each F32 value rounded to nearest even.
 //
 // Query token i sits at position i + pos_off; it attends key j iff j <= pos and
 // (window <= 0 or j + window >= pos).
@@ -34,10 +35,10 @@ constexpr int PAD = 8;  // halfs of padding per shared row
 /// Keys per tile for a head size: a narrower tile keeps a 256-wide head's tiles in 64 KB.
 constexpr int tile_keys(int hd) { return hd >= 256 ? 32 : 64; }
 
-template <int HD, int NW>
+template <int HD, int NW, bool OUT_F16>
 __global__ void __launch_bounds__(NW * Core::wave)
     flash_prefill_gqa_amd(const float* __restrict__ Q, const _Float16* __restrict__ K,
-                          const _Float16* __restrict__ V, float* __restrict__ O, int n_head,
+                          const _Float16* __restrict__ V, void* __restrict__ O, int n_head,
                           int n_kv, int seq_q, int seq_kv, long long q_head_stride, long long kv_tok_stride,
                           long long kv_head_stride, float scale_log2, int window, int pos_off,
                           float* __restrict__ ML) {
@@ -206,15 +207,25 @@ __global__ void __launch_bounds__(NW * Core::wave)
         ml[0] = m_run * 0.6931471805599453f;
         ml[1] = l;
     }
-    float* orow = O + ((long long) r_tok * n_head + r_head) * HD;
+    const long long obase = ((long long) r_tok * n_head + r_head) * HD;
+    if (OUT_F16) {
+        _Float16* orow = reinterpret_cast<_Float16*>(O) + obase;
 #pragma unroll
-    for (int n = 0; n < KS; ++n)
+        for (int n = 0; n < KS; ++n)
 #pragma unroll
-        for (int e = 0; e < Core::acc; ++e) orow[n * 16 + Core::row(lane, e)] = o[n][e] * inv;
+            for (int e = 0; e < Core::acc; ++e)
+                orow[n * 16 + Core::row(lane, e)] = (_Float16) loken_f32_fence(o[n][e] * inv);
+    } else {
+        float* orow = reinterpret_cast<float*>(O) + obase;
+#pragma unroll
+        for (int n = 0; n < KS; ++n)
+#pragma unroll
+            for (int e = 0; e < Core::acc; ++e) orow[n * 16 + Core::row(lane, e)] = o[n][e] * inv;
+    }
 }
 
-template <int HD, int NW>
-int launch(const float* Q, const _Float16* K, const _Float16* V, float* O, int n_head, int n_kv,
+template <int HD, int NW, bool OUT_F16>
+int launch(const float* Q, const _Float16* K, const _Float16* V, void* O, int n_head, int n_kv,
            int seq_q, int seq_kv, long long q_head_stride, long long tok_stride,
            long long head_stride, float scale,
            int window, int pos_off, float* ML, hipStream_t stream) {
@@ -224,12 +235,13 @@ int launch(const float* Q, const _Float16* K, const _Float16* V, float* O, int n
     const float log2e = 1.4426950408889634f;
     // The check below reads this launch's error, not one an earlier call left on the thread.
     (void) hipGetLastError();
-    flash_prefill_gqa_amd<HD, NW><<<grid, NW * Core::wave, 0, stream>>>(
+    flash_prefill_gqa_amd<HD, NW, OUT_F16><<<grid, NW * Core::wave, 0, stream>>>(
         Q, K, V, O, n_head, n_kv, seq_q, seq_kv, q_head_stride, tok_stride, head_stride, scale * log2e, window,
         pos_off, ML);
     return hipGetLastError() == hipSuccess ? 0 : 4;
 }
 
+template <bool OUT_F16>
 int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, int n_head,
              int n_kv, int seq_q, int seq_kv, int head_dim, long long q_head_stride,
              long long kv_tok_stride, long long kv_head_stride, float scale, int window, int pos_off,
@@ -238,16 +250,16 @@ int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, in
     const float* q = (const float*) Q;
     const _Float16* k = (const _Float16*) K;
     const _Float16* v = (const _Float16*) V;
-    float* o = (float*) O;
+    void* o = O;
     switch (head_dim) {
         case 64:
-            return launch<64, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
+            return launch<64, 4, OUT_F16>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                  kv_head_stride, scale, window, pos_off, ML, stream);
         case 128:
-            return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
+            return launch<128, 4, OUT_F16>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                   kv_head_stride, scale, window, pos_off, ML, stream);
         case 256:
-            return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
+            return launch<256, 2, OUT_F16>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
                                   kv_head_stride, scale, window, pos_off, ML, stream);
         default:
             return 1;
@@ -262,7 +274,7 @@ extern "C" int loken_flash_prefill_gqa_f16kv(const void* Q, const void* K, const
                                              int seq_kv, int head_dim, long long kv_tok_stride,
                                              long long kv_head_stride, float scale, int window,
                                              long long stream_i64) {
-    return dispatch(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
+    return dispatch<false>(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
                     kv_head_stride, scale, window, seq_kv - seq_q, stream_i64);
 }
 
@@ -272,9 +284,30 @@ extern "C" int loken_flash_prefill_gqa_parts_f16kv(const void* Q, const void* K,
                                                    long long kv_tok_stride,
                                                    long long kv_head_stride, float scale,
                                                    int pos_off, long long stream_i64) {
-    return dispatch(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
+    return dispatch<false>(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
                     kv_head_stride, scale, 0, pos_off, stream_i64);
 }
+
+namespace {
+template <bool OUT_F16>
+int varlen(const void* Q, const void* K, const void* V, void* O, const int* starts,
+           const int* lens, int n_seq, int n_head, int n_kv, int head_dim,
+           long long q_head_stride, long long kv_tok_stride, long long kv_head_stride,
+           float scale, long long stream_i64) {
+    const size_t out_bytes = OUT_F16 ? sizeof(_Float16) : sizeof(float);
+    for (int i = 0; i < n_seq; ++i) {
+        const long long t0 = starts[i];
+        const int rc = dispatch<OUT_F16>((const float*) Q + t0 * head_dim,
+                                         (const _Float16*) K + t0 * kv_tok_stride,
+                                         (const _Float16*) V + t0 * kv_tok_stride,
+                                         (char*) O + t0 * n_head * head_dim * out_bytes, nullptr,
+                                         n_head, n_kv, lens[i], lens[i], head_dim, q_head_stride,
+                                         kv_tok_stride, kv_head_stride, scale, 0, 0, stream_i64);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+}  // namespace
 
 // The causal attention of several sequences laid end to end, each over its own tokens only:
 // sequence i holds `lens[i]` tokens from token `starts[i]`. `Q` is F32 `[n_head, tokens, HD]`
@@ -285,15 +318,16 @@ extern "C" int loken_flash_prefill_gqa_varlen_f16kv(
     const void* Q, const void* K, const void* V, void* O, const int* starts, const int* lens,
     int n_seq, int n_head, int n_kv, int head_dim, long long q_head_stride,
     long long kv_tok_stride, long long kv_head_stride, float scale, long long stream_i64) {
-    for (int i = 0; i < n_seq; ++i) {
-        const long long t0 = starts[i];
-        const int rc = dispatch((const float*) Q + t0 * head_dim,
-                                (const _Float16*) K + t0 * kv_tok_stride,
-                                (const _Float16*) V + t0 * kv_tok_stride,
-                                (float*) O + t0 * n_head * head_dim, nullptr, n_head, n_kv,
-                                lens[i], lens[i], head_dim, q_head_stride, kv_tok_stride,
-                                kv_head_stride, scale, 0, 0, stream_i64);
-        if (rc != 0) return rc;
-    }
-    return 0;
+    return varlen<false>(Q, K, V, O, starts, lens, n_seq, n_head, n_kv, head_dim, q_head_stride,
+                         kv_tok_stride, kv_head_stride, scale, stream_i64);
+}
+
+// The same attention with `O` F16 `[tokens, n_head, HD]`, each value the F32 result rounded to
+// nearest even.
+extern "C" int loken_flash_prefill_gqa_varlen_f16kv_f16out(
+    const void* Q, const void* K, const void* V, void* O, const int* starts, const int* lens,
+    int n_seq, int n_head, int n_kv, int head_dim, long long q_head_stride,
+    long long kv_tok_stride, long long kv_head_stride, float scale, long long stream_i64) {
+    return varlen<true>(Q, K, V, O, starts, lens, n_seq, n_head, n_kv, head_dim, q_head_stride,
+                        kv_tok_stride, kv_head_stride, scale, stream_i64);
 }

@@ -369,6 +369,43 @@ pub fn paged_prefill_attn_seqs(
     crate::tensor::Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)
 }
 
+/// [`paged_prefill_attn_seqs`] over a `q` in the flash kernel's layout: F32 `[nh, t, hd]`
+/// contiguous, as the fused input stage writes it. Returns `[t, nh, hd]` in F16, the F32 result
+/// rounded to nearest even by the kernel itself, so no cast, transpose or second cast launches.
+/// Where the card has no kernel for the shape, `q` goes back to F16 `[t, nh, hd]`, which loses
+/// nothing since its values are F16 widened, and the other path runs.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_attn_seqs_head_major(
+    q: &crate::tensor::Tensor,
+    k: &crate::tensor::Tensor,
+    v: &crate::tensor::Tensor,
+    lens: &[usize],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+) -> crate::tensor::Result<crate::tensor::Tensor> {
+    #[cfg(feature = "gpu")]
+    if q.device().is_cuda() {
+        use crate::tensor::DType;
+        let f16 = |x: &crate::tensor::Tensor| x.to_dtype(DType::F16)?.contiguous();
+        if let Some(y) = crate::inference::kernel::fused::flash_prefill_gqa_varlen_head_major(
+            q,
+            &f16(k)?,
+            &f16(v)?,
+            lens,
+            scale,
+        )? {
+            return y.reshape(&[q.dims()[1], nh, hd][..]);
+        }
+    }
+    let q = q
+        .to_dtype(crate::tensor::DType::F16)?
+        .transpose(0, 1)?
+        .contiguous()?;
+    paged_prefill_attn_seqs(&q, k, v, lens, nh, nkv, hd, scale)
+}
+
 /// Causal multi-token PREFILL attention for ONE sequence (GQA). Processes all T
 /// prompt positions in one shot - q,k,v are [T, heads, hd]. Returns [T, nh, hd].
 /// This is the prefill counterpart to the decode paths: one forward over the

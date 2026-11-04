@@ -2,6 +2,14 @@
 //! norms of q and k, the rotation, and the write of k and v into a paged store. The separate
 //! launches of the layer loop run against the one fused launch, on synthetic F16 tensors of a
 //! model's head shapes, with the launches of each variant counted.
+//!
+//! A second group runs the activation of the feed-forward block: the 2 copies that cut the gate
+//! and the up halves out of the fused projection and `silu_mul_f16`, against the one kernel that
+//! reads the fused buffer.
+//!
+//! A third group runs the stage from the fused input launch to the attention output: the q cast
+//! to F32, the copy of q to heads first, the flash kernel and the cast of its output, against a
+//! fused launch that writes q in the flash kernel's layout and a flash kernel that stores F16.
 
 use super::stats::{run_for, Summary};
 use super::{Measured, Options};
@@ -81,6 +89,13 @@ pub fn read_file(path: &std::path::Path) -> Result<(FileHeads, usize), String> {
     ))
 }
 
+/// The feed-forward length the activation group runs at: the `--inter` option, else the layer
+/// length `marlin-rows` uses.
+pub fn ffn_len(opts: &Options) -> usize {
+    opts.inter
+        .unwrap_or(crate::microbench::marlin_rows::DEFAULT_INTER)
+}
+
 /// The speed of `new` against `old`, from their median times.
 pub fn ratio_note(old: &Measured, new: &Measured) -> Option<String> {
     if old.samples_us.is_empty() || new.samples_us.is_empty() {
@@ -96,9 +111,14 @@ pub fn ratio_note(old: &Measured, new: &Measured) -> Option<String> {
 #[cfg(feature = "gpu")]
 pub fn run(cx: &super::Context) -> Result<Vec<Measured>, String> {
     use super::Fail;
-    use crate::inference::cache::paged_attention::{rope_apply, rope_cos_sin};
+    use crate::inference::cache::paged_attention::{
+        paged_prefill_attn_seqs, paged_prefill_attn_seqs_head_major, rope_apply, rope_cos_sin,
+    };
     use crate::inference::cache::paged_kv::PagedKvStore;
-    use crate::inference::kernel::fused::prefill_rope_kv_write_f16;
+    use crate::inference::kernel::fused::{
+        flash_prefill_gqa_varlen_head_major, prefill_rope_kv_write_f16,
+        prefill_rope_kv_write_head_major_f16, silu_mul_f16, silu_mul_gu_f16,
+    };
     use crate::tensor::layer::RmsNorm;
     use crate::tensor::{DType, Device, Tensor};
     use std::time::Duration;
@@ -293,8 +313,170 @@ pub fn run(cx: &super::Context) -> Result<Vec<Measured>, String> {
         false,
     )?;
 
+    // The activation group: the fused gate and up projection of the layer's feed-forward block.
+    let ffn = ffn_len(cx.options);
+    if ffn == 0 {
+        return Err("--inter must be above zero".to_string());
+    }
+    let gu = synth(2 * ffn, DType::F16)?;
+    let old_act = || -> crate::tensor::Result<()> {
+        let g = gu.narrow(1, 0, ffn)?;
+        let u = gu.narrow(1, ffn, ffn)?;
+        std::hint::black_box(silu_mul_f16(&g, &u)?);
+        Ok(())
+    };
+    let samples = run_for(
+        target,
+        super::stats::timed(|| {
+            fail.ok(old_act());
+            fail.ok(dev.synchronize());
+        }),
+    );
+    let variant = "MLP activation, old, 2 narrow copies and silu_mul: 3 launches".to_string();
+    fail.check(&variant)?;
+    rows_out.push(Measured {
+        variant,
+        bytes: None,
+        samples_us: samples,
+        note: None,
+    });
+    let variant = "MLP activation, new, one kernel from the fused buffer: 1 launch".to_string();
+    let fits = silu_mul_gu_f16(&gu, ffn).map_err(tensor)?.is_some();
+    if fits {
+        let samples = run_for(
+            target,
+            super::stats::timed(|| {
+                fail.ok(silu_mul_gu_f16(&gu, ffn).map(|out| {
+                    std::hint::black_box(out);
+                }));
+                fail.ok(dev.synchronize());
+            }),
+        );
+        fail.check(&variant)?;
+        rows_out.push(Measured {
+            variant,
+            bytes: None,
+            samples_us: samples,
+            note: None,
+        });
+    } else {
+        rows_out.push(Measured {
+            variant,
+            bytes: None,
+            samples_us: Vec::new(),
+            note: Some("the fused launch does not fit this card or this width".to_string()),
+        });
+    }
+
+    // The attention I/O group: the fused input launch and the attention, one sequence of all rows.
+    let stage = |head_major: bool| -> crate::tensor::Result<Option<(Tensor, Tensor, Tensor)>> {
+        let srcs = [(&qkv, 0), (&qkv, qd), (&qkv, qd + kvd)];
+        let weights = Some([
+            (qn.weight(), qn.eps() as f32),
+            (kn.weight(), kn.eps() as f32),
+        ]);
+        if head_major {
+            prefill_rope_kv_write_head_major_f16(
+                srcs,
+                weights,
+                &rcos,
+                &rsin,
+                false,
+                &slot_dev,
+                &slots_i32,
+                store.k(),
+                store.v(),
+                nh,
+                nkv,
+                hd,
+            )
+        } else {
+            prefill_rope_kv_write_f16(
+                srcs,
+                weights,
+                &rcos,
+                &rsin,
+                false,
+                &slot_dev,
+                &slots_i32,
+                store.k(),
+                store.v(),
+                nh,
+                nkv,
+                hd,
+            )
+        }
+    };
+    let scale = 1.0 / (hd as f32).sqrt();
+    let lens = [rows];
+    let old_attn = || -> crate::tensor::Result<()> {
+        if let Some((q, k, v)) = stage(false)? {
+            std::hint::black_box(paged_prefill_attn_seqs(
+                &q, &k, &v, &lens, nh, nkv, hd, scale,
+            )?);
+        }
+        Ok(())
+    };
+    let new_attn = || -> crate::tensor::Result<()> {
+        if let Some((q, k, v)) = stage(true)? {
+            std::hint::black_box(paged_prefill_attn_seqs_head_major(
+                &q, &k, &v, &lens, nh, nkv, hd, scale,
+            )?);
+        }
+        Ok(())
+    };
+    // The new row only means something where both launches run, not their fallback.
+    let new_runs = match stage(true).map_err(tensor)? {
+        Some((q, k, v)) => flash_prefill_gqa_varlen_head_major(&q, &k, &v, &lens, scale)
+            .map_err(tensor)?
+            .is_some(),
+        None => false,
+    };
+    let old_runs = stage(false).map_err(tensor)?.is_some();
+    let attention_rows: [(&str, bool, &dyn Fn() -> crate::tensor::Result<()>); 2] = [
+        (
+            "attention I/O, old, fused stage, q cast, q transpose copy, flash, output cast: 5 launches",
+            old_runs,
+            &old_attn,
+        ),
+        (
+            "attention I/O, new, q written head-major f32 by the fused stage, flash with f16 output: 2 launches",
+            new_runs,
+            &new_attn,
+        ),
+    ];
+    for (name, runs, work) in attention_rows {
+        let variant = name.to_string();
+        if !runs {
+            rows_out.push(Measured {
+                variant,
+                bytes: None,
+                samples_us: Vec::new(),
+                note: Some(
+                    "the fused launch or the flash kernel does not fit this card or these widths"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+        let samples = run_for(
+            target,
+            super::stats::timed(|| {
+                fail.ok(work());
+                fail.ok(dev.synchronize());
+            }),
+        );
+        fail.check(&variant)?;
+        rows_out.push(Measured {
+            variant,
+            bytes: None,
+            samples_us: samples,
+            note: None,
+        });
+    }
+
     // Each new variant is set against the old one on the same inputs.
-    for (old_at, new_at) in [(0, 3), (1, 4), (2, 5)] {
+    for (old_at, new_at) in [(0, 3), (1, 4), (2, 5), (6, 7), (8, 9)] {
         if let Some(note) = rows_out
             .get(old_at)
             .zip(rows_out.get(new_at))
@@ -349,6 +531,11 @@ mod tests {
     fn heads_that_do_not_group_are_refused() {
         let o = opts(&["--heads", "32", "--kv-heads", "5", "--head-dim", "128"]);
         assert!(resolve_heads(&o, &FileHeads::default(), None).is_err());
+    }
+
+    #[test]
+    fn the_activation_group_runs_at_the_inter_option() {
+        assert_eq!(ffn_len(&opts(&["--inter", "12288"])), 12288);
     }
 
     #[test]

@@ -125,6 +125,19 @@ pub fn fused_add_rmsnorm_f16(
     weight: &Tensor,
     eps: f32,
 ) -> Result<(Tensor, Tensor)> {
+    fused_add_rmsnorm_f16_with(x, residual, weight, eps, false)
+}
+
+/// `fused_add_rmsnorm_f16` with the choice of kernel. With `registers` the row is held in
+/// registers, one vector per thread, when the row allows it. Otherwise the row is cached in
+/// shared memory.
+pub fn fused_add_rmsnorm_f16_with(
+    x: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    registers: bool,
+) -> Result<(Tensor, Tensor)> {
     use crate::tensor::cuda_ext::DevicePtr;
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
@@ -161,7 +174,12 @@ pub fn fused_add_rmsnorm_f16(
         let np = nsl.device_ptr(nsl.stream()).0 as *mut c_void;
         let sp = ssl.device_ptr(ssl.stream()).0 as *mut c_void;
         unsafe {
-            loken_fused_rmsnorm_f16(xp, rp, wp, np, sp, rows, cols as i32, eps, stream);
+            let declined = !registers
+                || loken_fused_rmsnorm_f16_regs(xp, rp, wp, np, sp, rows, cols as i32, eps, stream)
+                    != 0;
+            if declined {
+                loken_fused_rmsnorm_f16(xp, rp, wp, np, sp, rows, cols as i32, eps, stream);
+            }
         }
     }
     drop(xs);
