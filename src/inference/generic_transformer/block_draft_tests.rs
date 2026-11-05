@@ -205,6 +205,43 @@ pub(crate) fn toy_files(
     files
 }
 
+/// The synthetic model's file in a band layout without a draft, and beside it a file that carries
+/// the draft of [`draft_config`] alone, in a directory of their own.
+///
+/// Returns the model file's path.
+/// The caller removes its directory.
+pub(crate) fn toy_with_companion(
+    (ratios, kv_src, index_src): (&[u32], &[u32], &[u32]),
+) -> std::path::PathBuf {
+    let bands: Vec<bool> = (0..ratios.len())
+        .map(|l| ratios[l] != 0 || kv_src.contains(&(l as u32)) || index_src.contains(&(l as u32)))
+        .collect();
+    let md = real_md_layout(ratios, kv_src, index_src);
+    let dim = md
+        .iter()
+        .find(|(k, _)| k.ends_with(".embedding_length"))
+        .map(|(_, v)| v.to_u32().unwrap() as usize)
+        .unwrap();
+    let c = draft_config(dim);
+    // Unique per call: cargo runs the tests in parallel.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "loken-block-draft-companion-{}-{seq}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("model.gguf");
+    write_gguf_with_metadata(&model, &md, &real_entries_for(&bands)).unwrap();
+    write_gguf_with_metadata(
+        &dir.join("draft.gguf"),
+        &c.to_metadata(),
+        &draft_entries(&c),
+    )
+    .unwrap();
+    model
+}
+
 /// The generic model of `file`, every layer on the host.
 pub(crate) fn generic_of(file: MappedGguf) -> GenericHeteroTransformer {
     let MappedGguf { content, mmap, .. } = file;

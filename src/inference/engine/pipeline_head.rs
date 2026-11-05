@@ -5,6 +5,9 @@
 //! prefill chunk or a decode step alike, to the next segment, which answers with the logits.
 //! A verify batch asks the last segment for the logits of every position; a cache shift is
 //! refused, since it moves positions the later segments hold too.
+//!
+//! A Sinkhorn wide residual hands on a wide boundary, its mixer state with it.
+//! Its cut reaches the later segments with what its band sources left for the rows kept.
 
 use super::model_backend::{BoxedModelBackend, Capabilities, ModelBackend, PrefillShape};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
@@ -75,23 +78,73 @@ impl PipelineHeadBackend {
 
     /// Cut the caches of every segment back to `new_len`; a cut that does not reach the
     /// others ends the pipeline.
+    ///
+    /// A wide residual sends what its band sources left for the kept rows of a verify.
     fn cut(&mut self, new_len: usize) {
-        self.model.trim_kv(new_len);
-        if let Err(e) = self.link.cut(new_len) {
+        let sent = if self.model.cuts_wide() {
+            self.model
+                .wide_trim(new_len)
+                .and_then(|settle| self.link.cut_with(new_len, settle.as_ref()))
+        } else {
+            self.model.trim_kv(new_len);
+            self.link.cut(new_len)
+        };
+        if let Err(e) = sent {
             self.broken = Some(format!(
                 "a cut to {new_len} did not reach the next segment: {e}"
             ));
+        }
+    }
+
+    /// The logits the last segment gives for the rows `x` from `index_pos`: every row's with
+    /// `all_rows`, else the last row's.
+    fn exchange(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        all_rows: bool,
+    ) -> crate::tensor::Result<Tensor> {
+        self.check()?;
+        let answer = if self.model.cuts_wide() {
+            let b = self.model.wide_head_forward(x, index_pos, all_rows)?;
+            self.link.wide_boundary(&b, all_rows)
+        } else {
+            let hidden = self.model.segment_head_forward(x, index_pos)?;
+            match all_rows {
+                true => self.link.boundary_all(&hidden, index_pos),
+                false => self.link.boundary(&hidden, index_pos),
+            }
+        };
+        match answer {
+            Ok(logits) => Ok(logits),
+            Err(e) => {
+                // The segments hold the sequence up to the position this forward started at.
+                self.cut(index_pos);
+                Err(e)
+            }
         }
     }
 }
 
 impl ModelBackend for PipelineHeadBackend {
     fn capabilities(&self) -> Capabilities {
+        // A recurrent state is cut back only inside the verify just recorded, as on the whole
+        // model.
+        if self.model.is_recurrent() {
+            return Capabilities {
+                pld: true,
+                ..Capabilities::default()
+            };
+        }
         Capabilities {
             trim_kv: true,
             pld: true,
             ..Capabilities::default()
         }
+    }
+
+    fn is_recurrent(&self) -> bool {
+        self.model.is_recurrent()
     }
 
     fn kv_capacity(&self) -> Option<usize> {
@@ -103,28 +156,11 @@ impl ModelBackend for PipelineHeadBackend {
     }
 
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.check()?;
-        let hidden = self.model.segment_head_forward(x, index_pos)?;
-        match self.link.boundary(&hidden, index_pos) {
-            Ok(logits) => Ok(logits),
-            Err(e) => {
-                // The segments hold the sequence up to the position this forward started at.
-                self.cut(index_pos);
-                Err(e)
-            }
-        }
+        self.exchange(x, index_pos, false)
     }
 
     fn forward_all(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.check()?;
-        let hidden = self.model.segment_head_forward(x, index_pos)?;
-        match self.link.boundary_all(&hidden, index_pos) {
-            Ok(logits) => Ok(logits),
-            Err(e) => {
-                self.cut(index_pos);
-                Err(e)
-            }
-        }
+        self.exchange(x, index_pos, true)
     }
 
     fn widest_ffn(&self) -> usize {

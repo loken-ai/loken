@@ -373,7 +373,8 @@ impl GenericHeteroTransformer {
     /// The model `content` describes, its tensors read from `source`.
     ///
     /// A layer on a CUDA card runs its token mixer there, the rest on the host.
-    /// A plan that gives a layer another device, or places part of the stack, is refused.
+    /// A plan that gives a layer another device is refused.
+    /// A plan over part of the stack gives a model holding those layers alone, without a draft.
     pub(super) fn from_wide_sparse(
         content: &gguf_file::Content,
         source: &TensorSource<'_>,
@@ -398,6 +399,10 @@ impl GenericHeteroTransformer {
             kv_quant,
             max_kv_seq_len,
         )?;
+        // A share takes no draft: the draft reads the layers of every range of the stack.
+        if plan.range() != (0, meta.n_layers) {
+            return Ok(model);
+        }
         // A draft the file declares and that does not load leaves the model without one.
         let draft = BlockDraftMeta::from_metadata(&content.metadata).and_then(|meta| {
             meta.map(|m| build_block_draft(&tensors, m).and_then(|h| model.attach_block_draft(h)))
@@ -414,8 +419,12 @@ impl GenericHeteroTransformer {
     ///
     /// A file is one whose metadata holds a key under the draft's prefix.
     /// A file that does not load is passed over for the next.
+    /// A model that is not a Sinkhorn wide residual reads no file.
     /// Returns whether a file beside `model` gave the draft.
     pub fn locate_block_draft(&mut self, model: &std::path::Path) -> bool {
+        if self.wide_sparse.is_none() {
+            return false;
+        }
         let prefix = format!("{}.dspark.", crate::inference::model::deepseek_v41::ARCH);
         for path in crate::inference::model::deepseek_v41::sibling::find_beside(model, &prefix) {
             let loaded = companion_draft(&path)
@@ -476,11 +485,14 @@ impl GenericHeteroTransformer {
             .segments
             .iter()
             .all(|s| matches!(s.kind, DeviceKind::Cpu | DeviceKind::Cuda(_)));
-        if !hosted || plan.range() != (0, n_layers) {
+        let (from, to) = plan.range();
+        if !hosted || from >= to || to > n_layers {
             crate::tensor::bail!(
-                "a Sinkhorn wide residual around latent attention runs its whole stack, on the host or on CUDA cards"
+                "a Sinkhorn wide residual around latent attention runs on the host or on CUDA cards, layers within its stack"
             );
         }
+        // A share is built on the whole stack, then keeps its own layers.
+        // A layer outside the share is built on the host.
         // The card of each layer: the CUDA card its segment names.
         let card_of = |il: usize| {
             plan.segments
@@ -906,7 +918,7 @@ impl GenericHeteroTransformer {
             draft: None,
         };
         tensors.finish();
-        Ok(Self {
+        let mut model = Self {
             adapters: Vec::new(),
             config,
             embeddings,
@@ -970,7 +982,12 @@ impl GenericHeteroTransformer {
             ngram: None,
             draft: None,
             wide_sparse: Some(wide_sparse),
-        })
+        };
+        if (from, to) != (0, n_layers) {
+            model.narrow_to_layers(from, to)?;
+            model.first_layer = from;
+        }
+        Ok(model)
     }
 }
 

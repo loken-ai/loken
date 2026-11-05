@@ -600,6 +600,21 @@ enum Placed {
     Spliced(crate::inference::model::qwen35::vision::Qwen35Vision),
 }
 
+/// `model` with the block draft a file beside `model_file` declares, in place of the one the
+/// model file carried.
+///
+/// A share of the layers takes none: a block draft reads the layers of every range of the stack.
+pub(super) fn with_companion_draft(
+    mut model: GenericHeteroTransformer,
+    model_file: &std::path::Path,
+    layer_share: Option<(usize, usize)>,
+) -> GenericHeteroTransformer {
+    if layer_share.is_none() {
+        model.locate_block_draft(model_file);
+    }
+    model
+}
+
 pub(super) fn try_wrap_with_vision(
     mut text: GenericHeteroTransformer,
     projector_blob: Option<&std::path::Path>,

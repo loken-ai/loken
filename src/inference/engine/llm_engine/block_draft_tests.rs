@@ -2,13 +2,17 @@
 //! generic model of a small Sinkhorn wide-residual file: port of `native_draft_tests` from the
 //! V4.1 backend to the generic one.
 //!
-//! The head is the block draft the file carries, or a scripted guess in its place.
+//! The head is the block draft the file carries, the one a file beside it carries, or a scripted
+//! guess in its place.
 
 use super::*;
 use crate::inference::engine::model_backend::GenericBackend;
 use crate::inference::generic_transformer::block_draft::ScriptedDraft;
-use crate::inference::generic_transformer::block_draft_tests::{generic_of, prompt, toy_files};
+use crate::inference::generic_transformer::block_draft_tests::{
+    generic_of, prompt, toy_files, toy_with_companion,
+};
 use crate::inference::model::deepseek_v41::model::tests::VOCAB;
+use crate::tensor::quantized::gguf_file::open_mapped;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
@@ -55,11 +59,17 @@ async fn engine_with(head: Head) -> (LlmEngine, String) {
     if let Head::Scripted(script) = head {
         model.set_scripted_block_draft(script).unwrap();
     }
+    engine_of(model).await
+}
+
+/// An engine holding `model`, a generic model of the small file.
+pub(super) async fn engine_of(model: GenericHeteroTransformer) -> (LlmEngine, String) {
+    let num_layers = model.segment_layers();
     let backend = GenericBackend(model);
     let engine = LlmEngine::with_config(InferenceConfig::default());
     *engine.model_state.lock().await = Some(LoadedModelState {
         name: "small".into(),
-        num_layers: LAYOUT.0.len(),
+        num_layers,
         hidden_size: 0,
         num_heads: 0,
         vocab_size: VOCAB,
@@ -97,7 +107,7 @@ async fn engine_with(head: Head) -> (LlmEngine, String) {
     (engine, prompt)
 }
 
-fn params(new: usize) -> GenerationParams {
+pub(super) fn params(new: usize) -> GenerationParams {
     GenerationParams {
         max_tokens: Some(new),
         temperature: Some(0.0),
@@ -106,11 +116,11 @@ fn params(new: usize) -> GenerationParams {
     }
 }
 
-async fn run(engine: &LlmEngine, prompt: &str, new: usize) -> GenerationResult {
+pub(super) async fn run(engine: &LlmEngine, prompt: &str, new: usize) -> GenerationResult {
     engine.generate(prompt, params(new)).await.unwrap()
 }
 
-async fn collect(engine: LlmEngine, prompt: String, new: usize) -> String {
+pub(super) async fn collect(engine: LlmEngine, prompt: String, new: usize) -> String {
     let mut rx = engine.generate_stream(&prompt, params(new)).await.unwrap();
     let mut text = String::new();
     while let Some(chunk) = rx.recv().await {
@@ -212,4 +222,40 @@ async fn the_block_draft_of_the_file_gives_the_plain_greedy_text() {
         plain,
         "the streamed text"
     );
+}
+
+/// The block draft of a file beside the model, taken by the generic load arm, drafts through the
+/// same arm and gives the plain greedy text.
+/// A share of the layers takes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_block_draft_beside_the_file_gives_the_plain_greedy_text() {
+    let new = 20;
+    let path = toy_with_companion(LAYOUT);
+    let open = || generic_of(open_mapped(&path).unwrap());
+    let alone = open();
+    assert!(!alone.has_block_draft(), "the model file carries no draft");
+    let share = with_companion_draft(open(), &path, Some((0, 2)));
+    assert!(!share.has_block_draft(), "a share takes no draft");
+    let model = with_companion_draft(open(), &path, None);
+    assert!(
+        model.has_block_draft(),
+        "the draft beside the file is taken"
+    );
+
+    let (plain_engine, prompt) = engine_of(alone).await;
+    let plain = run(&plain_engine, &prompt, new).await;
+    let (engine, prompt) = engine_of(model).await;
+    let drafted = run(&engine, &prompt, new).await;
+    assert_eq!(drafted.tokens, plain.tokens, "the tokens");
+    assert_eq!(drafted.text, plain.text, "the text");
+
+    let (plain_engine, prompt) = engine_of(open()).await;
+    let plain = collect(plain_engine, prompt.clone(), new).await;
+    let (engine, prompt) = engine_of(with_companion_draft(open(), &path, None)).await;
+    assert_eq!(
+        collect(engine, prompt, new).await,
+        plain,
+        "the streamed text"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

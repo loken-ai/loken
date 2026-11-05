@@ -50,7 +50,12 @@ impl GenericHeteroTransformer {
         if !self.adapters.is_empty() {
             return Some("an adapter is applied to its layers");
         }
-        if self.layers.iter().any(|l| !l.attends()) {
+        if self.has_block_draft() {
+            return Some("its block draft reads the layers of every range of the stack");
+        }
+        // A Sinkhorn wide residual hands its mixer state on in its wide boundary.
+        // A cut inside the verify just recorded crosses with it.
+        if !self.cuts_wide() && self.layers.iter().any(|l| !l.attends()) {
             return Some("a layer keeps a recurrent state that a cache trim cannot cut");
         }
         if self

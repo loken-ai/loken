@@ -11,6 +11,8 @@
 //! and names it as a model in the store, servable at once.
 
 use super::*;
+use crate::inference::generic_transformer::{wide_sparse_convert, BlockScaledCheckpoint};
+use crate::inference::load::block_scaled_convert::{self, Formats};
 use crate::inference::load::calibrated::Recipe;
 use crate::inference::load::{calibration, requantize::parse_dtype};
 use crate::inference::model::deepseek_v41::{
@@ -330,8 +332,8 @@ pub(crate) async fn convert_model(
             parse_dtype(n).ok_or_else(|| ApiError::Validation(format!("unknown format {n}")))
         })
     };
-    let defaults = convert::Formats::default();
-    let formats = convert::Formats {
+    let defaults = Formats::default();
+    let formats = Formats {
         gate_up: format(request.gate_up.as_deref(), defaults.gate_up)?,
         down: format(request.down.as_deref(), defaults.down)?,
         always_read: format(request.always_read.as_deref(), defaults.always_read)?,
@@ -358,10 +360,12 @@ pub(crate) async fn convert_model(
     let draft_work = work_file(&blobs, "draft");
     let first = format!("converting {} into '{}'", request.model, request.name);
     let name = request.name.clone();
+    let checkpoint_id = request.model.clone();
     Ok(detached(request.stream, first, move |progress| {
         let run = || -> std::result::Result<(), String> {
-            let src = SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?;
-            let cfg = convert::released_config(&src, &dir).map_err(|e| e.to_string())?;
+            let src = BlockScaledCheckpoint::open(&dir).map_err(|e| e.to_string())?;
+            let cfg =
+                wide_sparse_convert::checkpoint_config(&src, &dir).map_err(|e| e.to_string())?;
             let layers = layers.unwrap_or(0..cfg.n_layers);
             let started = std::time::Instant::now();
             // Only the layers written: a record is named `blk.{layer}.` and the projection.
@@ -380,22 +384,33 @@ pub(crate) async fn convert_model(
             // The draft is written after the model, on the same disk: the model's room covers it.
             use crate::inference::model::deepseek_v41::complete;
             let layout = complete::Layout::for_paths(&[blobs.as_path()]);
-            let has_draft = src.shape("mtp.0.main_proj.weight").is_some();
-            let draft_bytes = if has_draft {
-                complete::draft_bytes_planned(&src, &dir, &draft_work, layout, formats.always_read)
-                    .map_err(|e| e.to_string())?
-            } else {
-                0
+            // The draft writer reads the stored draft through its own reader.
+            let draft_src = match src.stored_shape("mtp.0.main_proj.weight") {
+                Some(_) => Some(SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?),
+                None => None,
             };
-            let digest = convert::convert(
+            let draft_bytes = match &draft_src {
+                Some(d) => {
+                    complete::draft_bytes_planned(d, &dir, &draft_work, layout, formats.always_read)
+                        .map_err(|e| e.to_string())?
+                }
+                None => 0,
+            };
+            let plan = wide_sparse_convert::plan(
                 &src,
                 &cfg,
-                &records,
-                &work,
                 formats,
-                recipe,
                 layers,
+                wide_sparse_convert::model_name(&checkpoint_id),
                 Some(&tokenizer),
+            )
+            .map_err(|e| e.to_string())?;
+            let digest = block_scaled_convert::convert(
+                &src,
+                &plan,
+                &records,
+                recipe,
+                &work,
                 draft_bytes,
                 &|done, total, _name| progress(done, total, "converting tensors"),
             )
@@ -403,9 +418,9 @@ pub(crate) async fn convert_model(
             progress(0, 0, "writing manifest");
             ollama::store_gguf_with_digest(manager.ollama(), &work, &digest, &name, [None; 4])?;
             // The draft is a companion of its own, which the loader finds beside the model.
-            if has_draft {
+            if let Some(draft_src) = &draft_src {
                 let digest = complete::write_draft(
-                    &src,
+                    draft_src,
                     &dir,
                     &draft_work,
                     layout,

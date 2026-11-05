@@ -14,14 +14,16 @@ use crate::inference::load::block_scaled_convert::{
     bytes_per, written_format, ConvertPlan, Formats, Produce, StackRecords,
 };
 use crate::inference::model::deepseek_v41::convert::{tokenizer_metadata, TokenizerFiles};
+use crate::inference::model::deepseek_v41::engram::EngramConfig;
 use crate::inference::model::deepseek_v41::mainline;
 use crate::inference::model::deepseek_v41::source::{llamacpp_name, ENGRAM_TABLE};
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
+use crate::inference::model::deepseek_v41::{token_map, DeepseekV41Config};
 use crate::tensor::gguf_write::PlannedEntry;
 use crate::tensor::quantized::gguf_file::Value;
 use crate::tensor::quantized::GgmlDType;
 use crate::tensor::{Error, Result};
 use std::ops::Range;
+use std::path::Path;
 
 /// The record of what layer `layer`'s MoE block took in.
 ///
@@ -43,6 +45,21 @@ pub fn down_seen(layer: usize, expert: usize) -> String {
 /// The record of every down projection of layer `layer`, importance only.
 pub fn down_pooled(layer: usize) -> String {
     format!("blk.{layer}.ffn_down_exps")
+}
+
+/// The model name the file of the checkpoint whose hub id is `checkpoint` carries: the id's last
+/// segment.
+pub fn model_name(checkpoint: &str) -> &str {
+    checkpoint.rsplit('/').next().unwrap_or(checkpoint)
+}
+
+/// The configuration of the checkpoint in `dir`, its reference arguments read by `src`.
+///
+/// The engram layers hash over the token map of the checkpoint's `tokenizer.json`.
+pub fn checkpoint_config(src: &BlockScaledCheckpoint, dir: &Path) -> Result<DeepseekV41Config> {
+    let (map, _) = token_map::build_from_file(&dir.join("tokenizer.json"))?;
+    let engram = EngramConfig::derive(&src.reference, map);
+    DeepseekV41Config::from_reference_config(&src.reference, engram)
 }
 
 /// The routed expert matrices of a layer in file order: gate, up, down, with their stack names.

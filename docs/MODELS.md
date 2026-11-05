@@ -133,6 +133,7 @@ The DeepSeek V4.1 route reads this layout.
 | Element | Content |
 |---|---|
 | Keys and tensor names | llama.cpp's |
+| Model name | The last segment of the checkpoint's Hugging Face id |
 | Vocabulary | llama.cpp's arrays, beside the checkpoint's own `tokenizer.json` |
 | Engram tables | 1 `per_layer_token_embd` table in `Q8_0`. ggml has no fp8 type, and `Q8_0` holds the released values in about the same bytes |
 | Engram layer weights | Each layer's query and key weights, stored as their product |
@@ -140,6 +141,9 @@ The DeepSeek V4.1 route reads this layout.
 | DSpark draft | Stored apart as `<name>:<tag>-dspark`, a companion the loader finds beside the model |
 
 A partial conversion of layers `0:N` is a model of N + 1 layers that llama.cpp loads as such.
+
+The model file is read and written by the generic block-scaled reader and its streaming driver.
+The calibration, the DSpark draft and `--complete` still run on the DeepSeek V4.1 path.
 
 The route still reads the files loken wrote before, under `deepseek_v41` and its own names.  
 A file that `--complete` lays out is loken's own layout, not llama.cpp's.

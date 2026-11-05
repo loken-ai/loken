@@ -13,7 +13,7 @@ use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 
 use super::block_scaled_oracle_tests::{checkpoint_of, entries};
-use super::wide_sparse_convert::plan;
+use super::wide_sparse_convert::{checkpoint_config, model_name, plan};
 use super::BlockScaledCheckpoint;
 use crate::inference::load::block_scaled_convert::{self, ConvertPlan, Formats, Produce};
 use crate::inference::load::calibrated::{Recipe, Records};
@@ -342,5 +342,102 @@ fn engram_layers_and_a_partial_file_write_the_bytes_of_the_v41_converter() {
         .tensors
         .iter()
         .any(|(_, p)| matches!(p, Produce::Table { .. })));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The hub id of the checkpoint a convert request names.
+const CHECKPOINT: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+
+/// Writes beside the checkpoint in `dir` a word-level `tokenizer.json` of `vocab` ids, its last 2
+/// the sequence and end tokens, and the `tokenizer_config.json` that names them.
+fn add_tokenizer(dir: &Path, vocab: usize) {
+    use tokenizers::models::wordlevel::WordLevel;
+    let words: ahash::AHashMap<String, u32> = (0..vocab as u32 - 2)
+        .map(|i| (format!("t{i}"), i))
+        .collect();
+    let model = WordLevel::builder()
+        .vocab(words)
+        .unk_token("t0".into())
+        .build()
+        .unwrap();
+    let mut tokenizer = tokenizers::Tokenizer::new(model);
+    tokenizer.add_special_tokens(&[
+        tokenizers::AddedToken::from("<bos>", true),
+        tokenizers::AddedToken::from("<eos>", true),
+    ]);
+    tokenizer.save(dir.join("tokenizer.json"), false).unwrap();
+    let config = serde_json::json!({ "bos_token": "<bos>", "eos_token": "<eos>" });
+    std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+}
+
+/// The model name is the last segment of the checkpoint id, the name the V4.1 converter writes.
+#[test]
+fn the_model_name_is_the_last_segment_of_the_checkpoint_id() {
+    assert_eq!(model_name(CHECKPOINT), NAME);
+    assert_eq!(model_name(NAME), NAME);
+}
+
+/// The steps a convert request runs on the generic route write the bytes of the V4.1 converter
+/// run as the request ran it before: its own configuration, its model name, the tokenizer files.
+#[test]
+fn the_convert_request_writes_the_bytes_of_the_v41_converter() {
+    let dir = fixture("convert-request");
+    let ours = BlockScaledCheckpoint::open(&dir).unwrap();
+    let vocab = DeepseekV41Config::from_reference_config(&ours.reference, None)
+        .unwrap()
+        .vocab_size;
+    add_tokenizer(&dir, vocab);
+    let old_src = SafeTensorsSource::open(&dir).unwrap();
+    let old_cfg = v41::released_config(&old_src, &dir).unwrap();
+    let cfg = checkpoint_config(&ours, &dir).unwrap();
+    assert_eq!(
+        format!("{cfg:?}"),
+        format!("{old_cfg:?}"),
+        "the configurations"
+    );
+    let tokenizer = v41::TokenizerFiles::read(&dir).unwrap();
+    let records = records(&ours);
+    let formats = Formats::default();
+    let old_formats = v41::Formats {
+        gate_up: formats.gate_up,
+        down: formats.down,
+        always_read: formats.always_read,
+    };
+    let old_out = dir.join("request-v41.gguf");
+    let old_digest = v41::convert(
+        &old_src,
+        &old_cfg,
+        &records,
+        &old_out,
+        old_formats,
+        RECIPE,
+        0..old_cfg.n_layers,
+        Some(&tokenizer),
+        0,
+        &|_, _, _| {},
+    )
+    .unwrap();
+    let new_out = dir.join("request-generic.gguf");
+    let p = plan(
+        &ours,
+        &cfg,
+        formats,
+        0..cfg.n_layers,
+        model_name(CHECKPOINT),
+        Some(&tokenizer),
+    )
+    .unwrap();
+    let new_digest =
+        block_scaled_convert::convert(&ours, &p, &records, RECIPE, &new_out, 0, &|_, _, _| {})
+            .unwrap();
+    let (a, b) = (
+        std::fs::read(&old_out).unwrap(),
+        std::fs::read(&new_out).unwrap(),
+    );
+    assert_eq!(a.len(), b.len(), "file lengths");
+    if let Some(at) = a.iter().zip(&b).position(|(x, y)| x != y) {
+        panic!("the files first differ at byte {at}");
+    }
+    assert_eq!(old_digest, new_digest, "digests");
     let _ = std::fs::remove_dir_all(&dir);
 }

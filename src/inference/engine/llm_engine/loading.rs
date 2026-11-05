@@ -1483,6 +1483,7 @@ impl LlmEngine {
                                 },
                             )
                             .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
+                            let model = with_companion_draft(model, &model_file, layer_share);
                             try_wrap_with_vision(
                                 model,
                                 projector_blob.as_deref().filter(|_| layer_share.is_none()),
