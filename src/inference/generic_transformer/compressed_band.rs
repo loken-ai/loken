@@ -184,6 +184,48 @@ impl BandCell {
         let mut theirs = other.0.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::swap(&mut *mine, &mut *theirs);
     }
+
+    /// What the sources left for the forward over the rows `first..first + rows`.
+    pub fn left_at(&self, at: (usize, usize)) -> BandLeft {
+        self.with(|p| BandLeft {
+            compressed: read(&p.compressed, at, "compressed rows").ok(),
+            index_keys: read(&p.index_keys, at, "index keys").ok(),
+            picks: read(&p.picks, at, "compressed picks").ok(),
+            candidates: read(&p.candidates, at, "candidate blocks").ok(),
+        })
+    }
+
+    /// Holds `left` as what the sources left for the forward over the rows
+    /// `first..first + rows`.
+    ///
+    /// A value `left` does not carry is no longer held for those rows.
+    pub fn leave_at(&self, at: (usize, usize), left: BandLeft) {
+        fn hold<T>(slot: &mut Vec<Stamped<T>>, at: (usize, usize), value: Option<T>) {
+            slot.retain(|s| (s.first, s.rows) != at);
+            if let Some(value) = value {
+                put(slot, at, value);
+            }
+        }
+        self.with(|p| {
+            hold(&mut p.compressed, at, left.compressed);
+            hold(&mut p.index_keys, at, left.index_keys);
+            hold(&mut p.picks, at, left.picks);
+            hold(&mut p.candidates, at, left.candidates);
+        });
+    }
+}
+
+/// What the sources of a band left for 1 forward, each value present when a source left it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BandLeft {
+    /// The compressed rows of a kv-source, `head_dim` values each.
+    pub compressed: Option<Vec<f32>>,
+    /// The index keys of an index-source that pools, `index_head_dim` values each.
+    pub index_keys: Option<Vec<f32>>,
+    /// `index_topk` picks per row of an index-source, `-1` for an empty slot.
+    pub picks: Option<Vec<i32>>,
+    /// The candidate block mask of a candidate source, 1 flag per row and compressed row.
+    pub candidates: Option<Vec<bool>>,
 }
 
 /// Drops the values of `slot` left for a forward that reaches outside `first..first + rows`.

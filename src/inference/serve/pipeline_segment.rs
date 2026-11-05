@@ -14,15 +14,26 @@
 //!  - cut: `layer_id` is the length the KV caches are cut back to, one `Q8` byte carries the
 //!    operation; the answer is an empty `Q8` frame;
 //!  - failure: a non-empty `Q8` answer, whose bytes are the message.
+//!
+//! A Sinkhorn wide-residual model crosses a cut with more than its residual:
+//!  - wide boundary: a `Q8` frame, the operation byte then the bytes of a `WideBoundary`.
+//!    `layer_id` holds only the bit that asks for every token's logits.
+//!    The answer is a boundary's answer.
+//!  - wide cut: the cut's byte, then the bytes of a `WideSettle` when the cut keeps part of a
+//!    verify.
 
 use crate::distributed::wire::{FrameHeader, WireDType};
 use crate::distributed::wire_link::WireLink;
+use crate::inference::generic_transformer::wide_pipeline::{WideBoundary, WideSettle};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
 use crate::tensor::{DType, Device, Tensor};
 use std::net::{SocketAddr, TcpListener};
 
-/// The one operation a `Q8` frame asks for: cut the KV caches back.
+/// The operation of a `Q8` frame that cuts the KV caches back.
 const OP_CUT: u8 = 1;
+
+/// The operation of a `Q8` frame that carries a wide boundary.
+const OP_WIDE: u8 = 2;
 
 /// The bit of a boundary's `layer_id` that asks for the logits of every token.
 const ALL_ROWS: u32 = 1 << 31;
@@ -159,12 +170,51 @@ impl SegmentLink {
         from_frame(&h, &payload)
     }
 
-    /// Cut the KV cache of every later segment back to `new_len` positions.
-    pub fn cut(&mut self, new_len: usize) -> crate::tensor::Result<()> {
-        let len = u32::try_from(new_len).map_err(|_| invalid("length above u32"))?;
+    /// Hand the wide boundary `b` to the next segment and return the logits of its last token,
+    /// `[1, vocab]`, or of every token with `all_rows`, `[1, tokens, vocab]`.
+    pub fn wide_boundary(
+        &mut self,
+        b: &WideBoundary,
+        all_rows: bool,
+    ) -> crate::tensor::Result<Tensor> {
+        let mut bytes = vec![OP_WIDE];
+        bytes.extend(b.to_bytes()?);
+        let shape = vec![u32::try_from(bytes.len()).map_err(|_| invalid("boundary above u32"))?];
+        let flag = if all_rows { ALL_ROWS } else { 0 };
         let (h, payload) = self
             .link
-            .request(len, WireDType::Q8, vec![1], &[OP_CUT])
+            .request(flag, WireDType::Q8, shape, &bytes)
+            .map_err(|e| invalid(format!("pipeline link: {e}")))?;
+        if h.dtype == WireDType::Q8 {
+            return Err(invalid(format!(
+                "pipeline segment: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        from_frame(&h, &payload)
+    }
+
+    /// Cut the KV cache of every later segment back to `new_len` positions.
+    pub fn cut(&mut self, new_len: usize) -> crate::tensor::Result<()> {
+        self.cut_with(new_len, None)
+    }
+
+    /// [`Self::cut`] for a wide residual: `settle` is what the band's sources before the cut
+    /// left for the rows of a verify the cut keeps.
+    pub fn cut_with(
+        &mut self,
+        new_len: usize,
+        settle: Option<&WideSettle>,
+    ) -> crate::tensor::Result<()> {
+        let len = u32::try_from(new_len).map_err(|_| invalid("length above u32"))?;
+        let mut bytes = vec![OP_CUT];
+        if let Some(s) = settle {
+            bytes.extend(s.to_bytes()?);
+        }
+        let shape = vec![u32::try_from(bytes.len()).map_err(|_| invalid("cut above u32"))?];
+        let (h, payload) = self
+            .link
+            .request(len, WireDType::Q8, shape, &bytes)
             .map_err(|e| invalid(format!("pipeline link: {e}")))?;
         match (h.dtype, payload.is_empty()) {
             (WireDType::Q8, true) => Ok(()),
@@ -186,18 +236,40 @@ fn handle(
     payload: &[u8],
 ) -> crate::tensor::Result<(FrameHeader, Vec<u8>)> {
     let io = |e: std::io::Error| invalid(format!("pipeline link: {e}"));
+    if h.dtype == WireDType::Q8 && payload.first() == Some(&OP_WIDE) {
+        return handle_wide(model, down, h, &payload[1..]);
+    }
     if h.dtype == WireDType::Q8 {
         if payload.first() != Some(&OP_CUT) {
             return Err(invalid("unknown pipeline operation"));
         }
-        model.trim_kv(h.layer_id as usize);
+        let new_len = h.layer_id as usize;
+        // A wide residual's later segments take what this one's band sources left.
+        let relay = if model.cuts_wide() {
+            let settle = match payload.len() > 1 {
+                true => Some(WideSettle::from_bytes(&payload[1..])?),
+                false => None,
+            };
+            let mut relay = vec![OP_CUT];
+            if let Some(s) = model.wide_trim_after(new_len, settle.as_ref())? {
+                relay.extend(s.to_bytes()?);
+            }
+            relay
+        } else {
+            model.trim_kv(new_len);
+            payload.to_vec()
+        };
         if let Some(down) = down {
+            let shape = vec![relay.len() as u32];
             let (rh, rp) = down
-                .request(h.layer_id, WireDType::Q8, h.shape.clone(), payload)
+                .request(h.layer_id, WireDType::Q8, shape, &relay)
                 .map_err(io)?;
             return Ok((rh, rp));
         }
         return Ok(answer(WireDType::Q8, vec![0], Vec::new()));
+    }
+    if model.cuts_wide() {
+        return Err(invalid("a wide residual takes wide boundaries"));
     }
     let all_rows = h.layer_id & ALL_ROWS != 0;
     let index_pos = (h.layer_id & !ALL_ROWS) as usize;
@@ -216,6 +288,34 @@ fn handle(
                 model.segment_tail_forward(hidden, index_pos)?
             }
             .to_dtype(DType::F32)?;
+            let (dtype, shape, bytes) = to_frame(&logits)?;
+            Ok(answer(dtype, shape, bytes))
+        }
+    }
+}
+
+/// One wide boundary of the head, the bytes `bytes`, run by this segment.
+fn handle_wide(
+    model: &mut GenericHeteroTransformer,
+    down: Option<&mut WireLink>,
+    h: &FrameHeader,
+    bytes: &[u8],
+) -> crate::tensor::Result<(FrameHeader, Vec<u8>)> {
+    let all_rows = h.layer_id & ALL_ROWS != 0;
+    let b = WideBoundary::from_bytes(bytes)?;
+    match down {
+        Some(down) => {
+            let out = model.wide_interior_forward(&b, all_rows)?;
+            let mut relay = vec![OP_WIDE];
+            relay.extend(out.to_bytes()?);
+            let shape = vec![relay.len() as u32];
+            down.request(h.layer_id, WireDType::Q8, shape, &relay)
+                .map_err(|e| invalid(format!("pipeline link: {e}")))
+        }
+        None => {
+            let logits = model
+                .wide_tail_forward(&b, all_rows)?
+                .to_dtype(DType::F32)?;
             let (dtype, shape, bytes) = to_frame(&logits)?;
             Ok(answer(dtype, shape, bytes))
         }

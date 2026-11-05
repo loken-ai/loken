@@ -140,6 +140,9 @@ mod vulkan_layers;
 #[cfg(all(test, feature = "vulkan"))]
 mod vulkan_parity;
 mod wide;
+pub mod wide_pipeline;
+#[cfg(test)]
+mod wide_pipeline_tests;
 #[cfg(test)]
 mod wide_sparse_batch_tests;
 pub mod wide_sparse_config;

@@ -70,12 +70,12 @@ impl PreMixCarry {
     }
 
     /// Leaves `pre` for the next layer of the forward over the rows `first..first + rows`.
-    fn put(&self, first: usize, rows: usize, pre: Vec<Vec<f32>>) {
+    pub(super) fn put(&self, first: usize, rows: usize, pre: Vec<Vec<f32>>) {
         self.with(|c| *c = Some(Carried { first, rows, pre }));
     }
 
     /// The pre mix left for the forward over the rows `first..first + rows`.
-    fn get(&self, first: usize, rows: usize) -> Result<Vec<Vec<f32>>> {
+    pub(super) fn get(&self, first: usize, rows: usize) -> Result<Vec<Vec<f32>>> {
         self.with(|c| match c {
             Some(c) if c.first == first && c.rows == rows => Ok(c.pre.clone()),
             _ => Err(crate::tensor::Error::msg(format!(
@@ -98,23 +98,73 @@ impl PreMixCarry {
 /// The token ids of a sequence by position.
 ///
 /// A forward from position `first` keeps the ids before `first` and writes its own after them.
+///
+/// A log on the far side of a cut of the stack holds instead the compressed ids it received.
+/// They are the ids of the positions the engram reads for the rows of 1 forward.
 #[derive(Debug, Default, Clone)]
-pub struct TokenLog(Vec<u32>);
+pub struct TokenLog {
+    /// The ids from position 0.
+    ids: Vec<u32>,
+    /// The position of the first id received and the compressed ids from there.
+    received: Option<(usize, Vec<u32>)>,
+}
 
 impl TokenLog {
     /// Writes `tokens` at the positions `first..`, after the ids of the positions before `first`.
     ///
     /// Refused, with nothing written, when the log holds fewer than `first` ids.
     pub(super) fn open(&mut self, first: usize, tokens: &[u32]) -> Result<()> {
-        if self.0.len() < first {
+        if self.ids.len() < first {
             crate::tensor::bail!(
                 "the token log holds {} positions but the forward starts at {first}",
-                self.0.len()
+                self.ids.len()
             );
         }
-        self.0.truncate(first);
-        self.0.extend_from_slice(tokens);
+        self.received = None;
+        self.ids.truncate(first);
+        self.ids.extend_from_slice(tokens);
         Ok(())
+    }
+
+    /// Holds the compressed ids `compressed` of the positions `from..` in place of any id.
+    pub(super) fn receive(&mut self, from: usize, compressed: Vec<u32>) {
+        self.ids.clear();
+        self.received = Some((from, compressed));
+    }
+
+    /// The first position whose id an engram row at `first` reads.
+    pub(super) fn window_start(meta: &EngramMeta, first: usize) -> usize {
+        (first + 1).saturating_sub(meta.max_ngram)
+    }
+
+    /// The compressed ids of the positions `window_start(first)..first + rows`, oldest first.
+    ///
+    /// They are every id the engram rows of the positions `first..first + rows` read.
+    pub(super) fn window(&self, meta: &EngramMeta, first: usize, rows: usize) -> Result<Vec<u32>> {
+        let start = Self::window_start(meta, first);
+        match &self.received {
+            Some((from, compressed)) => {
+                if start < *from || first + rows > from + compressed.len() {
+                    crate::tensor::bail!(
+                        "the token log received {} ids from position {from}, not those of the {rows} rows from position {first}",
+                        compressed.len()
+                    );
+                }
+                Ok(compressed[start - from..first + rows - from].to_vec())
+            }
+            None => {
+                if self.ids.len() < first + rows {
+                    crate::tensor::bail!(
+                        "the token log holds {} positions, not the {rows} from position {first}",
+                        self.ids.len()
+                    );
+                }
+                Ok(self.ids[start..first + rows]
+                    .iter()
+                    .map(|&t| meta.compress(t))
+                    .collect())
+            }
+        }
     }
 
     /// The table rows engram layer `which` reads for the positions `first..first + rows`.
@@ -128,20 +178,12 @@ impl TokenLog {
         first: usize,
         rows: usize,
     ) -> Result<Vec<Vec<u64>>> {
-        if self.0.len() < first + rows {
-            crate::tensor::bail!(
-                "the token log holds {} positions, not the {rows} from position {first}",
-                self.0.len()
-            );
-        }
+        let window = self.window(meta, first, rows)?;
+        let start = Self::window_start(meta, first);
         Ok((first..first + rows)
             .map(|p| {
-                let start = (p + 1).saturating_sub(meta.max_ngram);
-                let recent: Vec<u32> = self.0[start..=p]
-                    .iter()
-                    .map(|&t| meta.compress(t))
-                    .collect();
-                meta.hash(which, &recent)
+                let from = Self::window_start(meta, p) - start;
+                meta.hash(which, &window[from..=p - start])
             })
             .collect())
     }
@@ -164,7 +206,24 @@ impl TokenCarry {
 
     /// Holds `tokens` as the whole sequence.
     pub fn reset(&self, tokens: &[u32]) {
-        self.with(|log| *log = TokenLog(tokens.to_vec()));
+        self.with(|log| {
+            *log = TokenLog {
+                ids: tokens.to_vec(),
+                received: None,
+            }
+        });
+    }
+
+    /// Holds the compressed ids `compressed` of the positions `from..`, as
+    /// [`TokenLog::receive`] does.
+    pub(super) fn receive(&self, from: usize, compressed: Vec<u32>) {
+        self.with(|log| log.receive(from, compressed));
+    }
+
+    /// The compressed ids the engram rows of the positions `first..first + rows` read, as
+    /// [`TokenLog::window`] gives them.
+    pub(super) fn window(&self, meta: &EngramMeta, first: usize, rows: usize) -> Result<Vec<u32>> {
+        self.with(|log| log.window(meta, first, rows))
     }
 
     /// Exchanges the log held with `other`.
@@ -466,6 +525,8 @@ pub struct WideSparseHead {
     pub head: Projection,
     /// Shared with every engram layer, `None` for a model without one.
     pub tokens: Option<Arc<TokenCarry>>,
+    /// The hash layout of every engram layer, `None` for a model without one.
+    pub engram: Option<Arc<EngramMeta>>,
     /// The block draft, `None` for a model without one.
     pub draft: Option<BlockDraft>,
 }
@@ -657,6 +718,21 @@ impl GenericHeteroTransformer {
     /// The model runs its serial forward over the sequence's own states.
     /// It holds its own states again once the call returns.
     pub fn prefill_sequence(&mut self, tokens: &[u32], seq: &mut SequenceMixers) -> Result<Tensor> {
+        self.with_sequence(seq, |model| {
+            let ids = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu)?;
+            model.forward(&ids, 0)
+        })
+    }
+
+    /// What `run` gives with the model over the state of the sequence `seq`: every layer's
+    /// mixer state, the band cell and the token log.
+    ///
+    /// The model holds its own states again once the call returns.
+    pub fn with_sequence<R>(
+        &mut self,
+        seq: &mut SequenceMixers,
+        run: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
         let cell = self.shared_cell()?;
         let log = self.shared_tokens();
         self.exchange_states(seq)?;
@@ -664,14 +740,13 @@ impl GenericHeteroTransformer {
         if let Some(log) = &log {
             log.exchange(&mut seq.tokens);
         }
-        let logits = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu)
-            .and_then(|ids| self.forward(&ids, 0));
+        let out = run(self);
         if let Some(log) = &log {
             log.exchange(&mut seq.tokens);
         }
         cell.exchange(&seq.cell);
         self.exchange_states(seq)?;
-        logits
+        out
     }
 
     /// 1 decode step of each sequence of `seqs`: token `tokens[j]` at `positions[j]` of

@@ -139,14 +139,18 @@ pub(super) fn engram_file(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> 
 }
 
 /// The generic model of the engram file in a band layout, every layer on the host.
-fn generic_engram(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> GenericHeteroTransformer {
+pub(super) fn generic_engram(
+    ratios: &[u32],
+    kv_src: &[u32],
+    index_src: &[u32],
+) -> GenericHeteroTransformer {
     let MappedGguf { content, mmap, .. } = engram_file(ratios, kv_src, index_src);
     let plan = HeteroPlan::calculate_with_kv(ratios.len(), 1 << 20, &[], &[], 1.0, 0);
     GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
 }
 
 /// The V4.1 model of the engram file in a band layout.
-fn v41_engram(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> DeepseekV41Model {
+pub(super) fn v41_engram(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> DeepseekV41Model {
     let g = engram_file(ratios, kv_src, index_src);
     let cfg = DeepseekV41Config::from_gguf(&g.content).unwrap();
     assert_eq!(
