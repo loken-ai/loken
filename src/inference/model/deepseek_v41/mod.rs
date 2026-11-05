@@ -177,7 +177,7 @@ pub const ARCH_LLAMACPP: &str = "deepseek4";
 /// Values llama.cpp's `deepseek4` converter does not write into the file. They are the
 /// V4.1-Flash release's, from the model's own inference config at the revision the converter
 /// names, and are read only when the key is absent from one of that converter's files.
-mod release {
+pub(crate) mod release {
     pub const ROPE_HEAD_DIM: usize = 64;
     pub const ROPE_FACTOR: f32 = 16.0;
     pub const ORIGINAL_SEQ_LEN: usize = 65536;

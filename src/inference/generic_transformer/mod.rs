@@ -110,6 +110,9 @@ mod vulkan_layers;
 #[cfg(all(test, feature = "vulkan"))]
 mod vulkan_parity;
 mod wide;
+pub mod wide_sparse_config;
+#[cfg(test)]
+mod wide_sparse_config_tests;
 pub use config::*;
 pub use dense::{text_bytes, DenseCheckpoint};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};
