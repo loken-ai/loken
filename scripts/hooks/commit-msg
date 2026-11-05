@@ -1,0 +1,6 @@
+#!/bin/sh
+# Repository hook of loken: the conventions hook, then nothing else.
+g=$(git config --global core.hooksPath) || exit 0
+g=$(eval echo "$g")
+[ -x "$g/commit-msg" ] || exit 0
+exec "$g/commit-msg" "$@"

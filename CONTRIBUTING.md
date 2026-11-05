@@ -51,3 +51,10 @@ Tests marked `#[ignore]` need model weights on disk or several cards.
 
 Give the model, the prompt, the hardware and the expected output.  
 For a wrong output, say whether it is wrong the same way each time.
+
+## Hooks
+
+The hooks of this repository chain to the conventions hooks.
+After a clone, run `git config core.hooksPath scripts/hooks`.
+The pre-commit refuses a model backend, a model family or a streaming client outside the hetero route.
+`scripts/hetero_route.txt` lists them, and the debt there only shrinks.

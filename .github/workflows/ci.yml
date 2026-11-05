@@ -53,6 +53,10 @@ jobs:
       - name: Documentation links
         run: python3 scripts/check_docs.py
 
+      # Every model backend and family loads through the hetero route or is listed as debt.
+      - name: Hetero route
+        run: python3 scripts/check_hetero.py
+
   native:
     name: host build, native SIMD
     runs-on: ubuntu-latest

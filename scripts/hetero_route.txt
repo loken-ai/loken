@@ -1,0 +1,56 @@
+# Every model backend and every model family of loken, classified against the rule:
+# the generic hetero route (HeteroPlan and the OOM ladder in src/inference/place/) is the only
+# loading and placement path. scripts/check_hetero.py reads this file.
+#
+# backend  X     an `impl ModelBackend for X` that conforms (serves the generic route)
+# debt-backend X an `impl ModelBackend for X` that bypasses the route. The list only shrinks:
+#                the check fails when an entry no longer exists, and when a backend is not listed.
+# family   D     a directory src/inference/model/D that loads through the route or through the
+#                ladder (a block placed whole, acceptable for a component that has no layers)
+# debt-family D  a directory that bypasses the route. Shrinks only.
+# debt-path P    a path where a commit may not add lines (it may delete, and it may add tests).
+backend GenericBackend
+backend GenericVisionBackend
+backend PipelineHeadBackend
+backend ContinuousBackend
+backend BatchedBackend
+backend TakenBackend
+debt-backend DeepseekV41Backend
+debt-backend MoondreamBackend
+family acestep
+family audio_in
+family boogu
+family chronos2
+family clip
+family embedding
+family ezaudio
+family flux
+family flux2
+family kyutai
+family parler
+family piper
+family pixtral
+family pocket_tts
+family qwen25
+family qwen3
+family qwen35
+family qwen3vl
+family qwen_image
+family reranker
+family sdxl
+family stable_audio
+family t5
+family timestral
+family ultravox
+family umt5
+family voxtral
+family wan
+family whisper
+family zimage
+debt-family deepseek_v41
+debt-family mixformer
+debt-family moondream
+debt-path src/inference/model/deepseek_v41/
+debt-path src/inference/offload/
+debt-path src/inference/model/mixformer/
+debt-path src/inference/model/moondream/

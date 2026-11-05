@@ -1,0 +1,8 @@
+#!/bin/sh
+# Repository pre-commit of loken: the conventions pre-commit, then the hetero route check.
+# A model, a backend or a streaming client outside the hetero route is refused.
+g=$(git config --global core.hooksPath) && g=$(eval echo "$g")
+if [ -n "$g" ] && [ -x "$g/pre-commit" ]; then
+  "$g/pre-commit" "$@" || exit 1
+fi
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check_hetero.py" --staged
