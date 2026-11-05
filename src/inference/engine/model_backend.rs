@@ -2665,8 +2665,11 @@ impl ModelBackend for GenericBackend {
         self.0.device_layer_distribution()
     }
 
+    /// A model whose layers keep each sequence's state batches when its token mixers run on a
+    /// card.
     fn cb_eligible_gpu(&self) -> bool {
-        self.0.cb_eligible() && !self.0.compute_device().is_cpu()
+        let paged = self.0.cb_eligible() && !self.0.compute_device().is_cpu();
+        paged || (self.0.mixers_on_card() && self.0.sequence_mixers().is_ok())
     }
 
     fn is_vision_model(&self) -> bool {

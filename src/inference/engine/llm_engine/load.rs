@@ -804,17 +804,35 @@ pub(super) fn sniff_projector_type(path: &std::path::Path) -> Option<String> {
 /// `ContinuousServer` worker for batched concurrent serving. The card's room is divided by
 /// `place::paged` from the model's shape. Returns the model back unchanged on any failure
 /// so the caller keeps the serial path.
+///
+/// A model whose layers keep each sequence's state goes to a worker that owns it, at most
+/// `max_sequences` decoding together.
 #[cfg(feature = "gpu")]
 pub(super) fn try_spawn_continuous(
     model: GenericHeteroTransformer,
     eos: Vec<u32>,
     context_length: usize,
+    max_sequences: usize,
 ) -> std::result::Result<
     crate::inference::serve::continuous_serve::ContinuousServer,
     GenericHeteroTransformer,
 > {
     use crate::inference::place::{paged, runtime_demand};
     use crate::inference::serve::continuous_serve::ContinuousServer;
+    if model.sequence_mixers().is_ok() {
+        info!("CB serve: ContinuousServer over per-sequence states, max_running {max_sequences}");
+        return ContinuousServer::spawn_sequences(
+            model,
+            eos,
+            context_length,
+            max_sequences,
+            PREFILL_CHUNK_TOKENS,
+        )
+        .map_err(|(model, e)| {
+            warn!("CB serve: spawn failed ({e}) - staying serial");
+            model
+        });
+    }
     let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
     let block_size = crate::inference::serve::continuous_serve::CB_BLOCK_SIZE;
     // K and V, F16, every layer.
@@ -910,10 +928,11 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         };
         let mut ends = state.eos_token_ids_extra.clone();
         ends.push(eos);
-        let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, ends, ctx) {
-            Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
-            Err(m) => (Box::new(GenericBackend(m)), false),
-        };
+        let (model, batched): (BoxedModelBackend, bool) =
+            match try_spawn_continuous(m, ends, ctx, V41_MAX_BATCH) {
+                Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
+                Err(m) => (Box::new(GenericBackend(m)), false),
+            };
         state.model = model;
         batched
     }

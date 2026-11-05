@@ -167,6 +167,8 @@ mod wide_sparse_real_card_tests;
 #[cfg(test)]
 mod wide_sparse_real_tests;
 #[cfg(test)]
+mod wide_sparse_serve_tests;
+#[cfg(test)]
 mod wide_sparse_state_tests;
 pub use config::*;
 pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint, TableRows};

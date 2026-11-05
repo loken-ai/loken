@@ -694,6 +694,18 @@ impl GenericHeteroTransformer {
         })
     }
 
+    /// True when the token mixer of a layer runs on a card.
+    pub fn mixers_on_card(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return self.layers.iter().any(|l| match &l.mixer {
+            mixer::Mixer::LatentMqa(m) => m.card.is_some(),
+            mixer::Mixer::CompressedBand(b) => b.base.card.is_some(),
+            _ => false,
+        });
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
     /// The token log the engram layers share, `None` for a model without one.
     fn shared_tokens(&self) -> Option<Arc<TokenCarry>> {
         self.wide_sparse.as_ref().and_then(|ws| ws.tokens.clone())
@@ -875,14 +887,19 @@ pub struct SequenceMixers {
 
 /// Exchanges the state `mixer` holds with `held`.
 ///
+/// The exchange counts as a replaced state.
+/// A buffer a card built from the state before it is then rebuilt from the host state.
+///
 /// Refused, with nothing exchanged, when `held` is not a state of `mixer`'s kind.
 fn exchange_state(mixer: &mut mixer::Mixer, held: &mut mixer::MixerState) -> Result<()> {
     match (mixer, held) {
         (mixer::Mixer::LatentMqa(m), mixer::MixerState::LatentMqa(s)) => {
-            std::mem::swap(&mut m.state, s)
+            std::mem::swap(&mut m.state, s);
+            m.moves += 1;
         }
         (mixer::Mixer::CompressedBand(m), mixer::MixerState::CompressedBand(s)) => {
-            std::mem::swap(&mut m.state, s)
+            std::mem::swap(&mut m.state, s);
+            m.moves += 1;
         }
         _ => crate::tensor::bail!("a sequence's state is not of its layer's mixer kind"),
     }

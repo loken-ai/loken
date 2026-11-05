@@ -12,6 +12,9 @@
 //! requests here and must NOT call the model itself - that sole-caller contract
 //! is what keeps the lock-free sharing sound). Supported for the models
 //! `cb_unsupported_reason` lets through; callers fall back to the serial path otherwise.
+//!
+//! A model whose layers keep each sequence's state is served by `spawn_sequences`.
+//! Its worker owns the model and holds each sequence's state, see `SequenceBatched`.
 use crate::inference::cache::paged_kv::{PagedKvStore, SeqId};
 use crate::inference::generic_transformer::wide_sparse_layer::SequenceMixers;
 use crate::inference::generic_transformer::GenericHeteroTransformer;
@@ -48,9 +51,10 @@ struct Submission {
 pub struct ContinuousServer {
     submit_tx: Sender<Submission>,
     /// The worker thread, joined by `stop`.
-    worker: std::thread::JoinHandle<()>,
-    /// The served model, shared with the worker; `stop` takes it back once the worker ends.
-    model: Arc<GenericHeteroTransformer>,
+    worker: Worker,
+    /// The served model when the worker shares it; `stop` takes it back once the worker ends.
+    /// `None` when the worker owns it.
+    model: Option<Arc<GenericHeteroTransformer>>,
 }
 
 /// The model-side adapter: decode items run in ONE batched `batched_paged_decode`
@@ -549,19 +553,30 @@ impl BatchedModel for GhBatched {
 }
 
 /// The model-side adapter of a model whose layers keep each sequence's state beside the paged
-/// store: a Sinkhorn wide residual over latent and band layers, on the host.
+/// store: a Sinkhorn wide residual over latent and band layers, its token mixers on the host or
+/// on a card.
 ///
-/// It holds 1 [`SequenceMixers`] per sequence the engine runs.
-/// A prompt starts its sequence again from position 0, whole, whatever part of it the paged
-/// prefix cache holds.
+/// It holds 1 [`SequenceMixers`] per sequence the engine runs, with the tokens its state stands
+/// after.
+/// A prompt starts its sequence again from position 0, whatever part of it the paged prefix
+/// cache holds.
+/// With a state cache on the model, the prompt starts from the longest stored state it extends.
+/// The states its prefill passes and the state a finished sequence stands in are kept.
 /// The decode items of a step run as 1 batch across their sequences.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SequenceBatched {
     model: GenericHeteroTransformer,
-    seqs: HashMap<SeqId, SequenceMixers>,
+    seqs: HashMap<SeqId, Sequence>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// What [`SequenceBatched`] keeps for 1 sequence.
+struct Sequence {
+    mixers: SequenceMixers,
+    /// The tokens the state stands after, the prompt first.
+    fed: Vec<u32>,
+    /// The prompt tokens a stored state covered at the prefill.
+    covered: usize,
+}
+
 impl SequenceBatched {
     /// Refused for a model whose layers do not keep latent and band states.
     pub(crate) fn new(model: GenericHeteroTransformer) -> crate::tensor::Result<Self> {
@@ -571,15 +586,50 @@ impl SequenceBatched {
             seqs: HashMap::new(),
         })
     }
+
+    /// The logits of the last row of `tokens` read from position 0 over `seq`, `[1, vocab]`, and
+    /// the tokens a stored state covered.
+    ///
+    /// Without a state cache on the model, the prompt is 1 forward and covers none.
+    fn prefill(
+        &mut self,
+        tokens: &[u32],
+        seq: &mut SequenceMixers,
+    ) -> crate::tensor::Result<(Tensor, usize)> {
+        let Some(cache) = self.model.state_cache().filter(|_| tokens.len() > 1) else {
+            return Ok((self.model.prefill_sequence(tokens, seq)?, 0));
+        };
+        self.model.with_sequence(seq, |model| {
+            let covered = cache.restore(model, tokens);
+            let rest = tokens.len() - covered;
+            let started = std::time::Instant::now();
+            let (logits, grid) = model.prefill_with_grid(
+                tokens,
+                covered,
+                rest,
+                cache.stride(rest),
+                cache.layout(),
+            )?;
+            let secs = started.elapsed().as_secs_f64();
+            cache.tuning().prefilled(rest, secs);
+            cache.save(model, tokens, grid, Some(secs));
+            Ok((logits, covered))
+        })
+    }
 }
 
 impl BatchedModel for SequenceBatched {
     fn step(&mut self, items: &[StepItem]) -> crate::tensor::Result<Vec<u32>> {
         let mut out = vec![0u32; items.len()];
         for (i, it) in items.iter().enumerate().filter(|(_, it)| it.is_prefill) {
-            let mut seq = self.model.sequence_mixers()?;
-            let logits = self.model.prefill_sequence(&it.tokens, &mut seq)?;
+            let mut mixers = self.model.sequence_mixers()?;
+            let (logits, covered) = self.prefill(&it.tokens, &mut mixers)?;
             out[i] = sample_row(&logits, 0, &it.sampling, &it.recent_tokens)?;
+            let seq = Sequence {
+                mixers,
+                fed: it.tokens.clone(),
+                covered,
+            };
             self.seqs.insert(it.seq, seq);
         }
         let dec: Vec<usize> = (0..items.len()).filter(|&i| !items[i].is_prefill).collect();
@@ -605,10 +655,15 @@ impl BatchedModel for SequenceBatched {
             }
         }
         let logits = {
-            let mut refs: Vec<&mut SequenceMixers> = taken.iter_mut().map(|(_, s)| s).collect();
+            let mut refs: Vec<&mut SequenceMixers> =
+                taken.iter_mut().map(|(_, s)| &mut s.mixers).collect();
             self.model.decode_sequences(&tokens, &positions, &mut refs)
         };
-        for (id, seq) in taken {
+        let fed = logits.is_ok();
+        for ((id, mut seq), &t) in taken.into_iter().zip(&tokens) {
+            if fed {
+                seq.fed.push(t);
+            }
             self.seqs.insert(id, seq);
         }
         let logits = logits?;
@@ -618,8 +673,45 @@ impl BatchedModel for SequenceBatched {
         Ok(out)
     }
 
+    fn cached_prompt(&self, seq: SeqId) -> Option<usize> {
+        self.seqs.get(&seq).map(|s| s.covered)
+    }
+
+    /// The state the sequence stands in is kept when the model has a state cache.
+    /// The cache refuses a state whose layers do not all stand after the fed tokens.
     fn release(&mut self, seq: SeqId) {
-        self.seqs.remove(&seq);
+        let Some(mut s) = self.seqs.remove(&seq) else {
+            return;
+        };
+        let Some(cache) = self.model.state_cache() else {
+            return;
+        };
+        let fed = &s.fed;
+        let kept = self.model.with_sequence(&mut s.mixers, |model| {
+            cache.save(model, fed, Vec::new(), None);
+            Ok(())
+        });
+        if let Err(e) = kept {
+            tracing::info!("state cache: sequence {seq} not stored: {e}");
+        }
+    }
+}
+
+/// What the adapter of a worker hands back once the worker ends.
+trait Served: BatchedModel {
+    /// The model the adapter owned, `None` when it shared it.
+    fn into_owned(self) -> Option<GenericHeteroTransformer>;
+}
+
+impl Served for GhBatched {
+    fn into_owned(self) -> Option<GenericHeteroTransformer> {
+        None
+    }
+}
+
+impl Served for SequenceBatched {
+    fn into_owned(self) -> Option<GenericHeteroTransformer> {
+        Some(self.model)
     }
 }
 
@@ -873,8 +965,61 @@ impl GhBatched {
 
 // The worker thread is the sole owner/caller of the model; CUDA handles inside
 // are only ever touched from that one thread (same contract as ModelVariant).
-struct SendWrap(GhBatched);
-unsafe impl Send for SendWrap {}
+struct SendWrap<T>(T);
+unsafe impl<T> Send for SendWrap<T> {}
+
+/// The worker thread a server joins: it ends with the model its adapter owned, if it owned one.
+type Worker = std::thread::JoinHandle<SendWrap<Option<GenericHeteroTransformer>>>;
+
+/// Starts the worker thread over `adapter`, and the channel requests reach it through.
+///
+/// The adapter crosses to the thread once the thread runs.
+/// `Err` hands the adapter back when no thread takes it.
+#[allow(clippy::type_complexity)]
+fn launch<M: Served + 'static>(
+    adapter: M,
+    eos: Vec<u32>,
+    num_blocks: usize,
+    block_size: usize,
+    max_running: usize,
+    max_prefill_tokens: usize,
+) -> std::result::Result<(Sender<Submission>, Worker), (M, crate::tensor::Error)> {
+    let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
+    let (hand_tx, hand_rx) = mpsc::channel::<SendWrap<M>>();
+    let worker = std::thread::Builder::new()
+        .name("cb-worker".into())
+        .spawn(move || {
+            let Ok(SendWrap(adapter)) = hand_rx.recv() else {
+                return SendWrap(None);
+            };
+            let ended = worker_loop(
+                adapter,
+                eos,
+                num_blocks,
+                block_size,
+                max_running,
+                max_prefill_tokens,
+                submit_rx,
+            );
+            SendWrap(ended.and_then(Served::into_owned))
+        });
+    let worker = match worker {
+        Ok(w) => w,
+        Err(e) => {
+            return Err((
+                adapter,
+                crate::tensor::Error::msg(format!("cb-worker spawn: {e}")),
+            ))
+        }
+    };
+    match hand_tx.send(SendWrap(adapter)) {
+        Ok(()) => Ok((submit_tx, worker)),
+        Err(mpsc::SendError(SendWrap(adapter))) => Err((
+            adapter,
+            crate::tensor::Error::msg("cb-worker ended before it took its model"),
+        )),
+    }
+}
 
 impl ContinuousServer {
     /// Spawn the worker. `model` is moved in and owned for the worker's lifetime;
@@ -915,7 +1060,7 @@ impl ContinuousServer {
             .map(|_| PagedKvStore::new(num_blocks, block_size, n_kv, hd, store_dt, &cdev))
             .collect::<crate::tensor::Result<_>>()?;
         let served = Arc::clone(&model);
-        let adapter = SendWrap(GhBatched {
+        let adapter = GhBatched {
             model,
             stores,
             #[cfg(feature = "gpu")]
@@ -923,34 +1068,68 @@ impl ContinuousServer {
             #[cfg(feature = "gpu")]
             graph_failed: false,
             pace: StepPace::default(),
-        });
-        let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
-
-        let worker = std::thread::Builder::new()
-            .name("cb-worker".into())
-            .spawn(move || {
-                let gh = adapter; // SendWrap (Send); unwrap inside the worker thread
-                worker_loop(
-                    gh.0,
-                    eos,
-                    num_blocks,
-                    block_size,
-                    max_running,
-                    max_prefill_tokens,
-                    submit_rx,
-                )
-            })
-            .map_err(|e| crate::tensor::Error::msg(format!("cb-worker spawn: {e}")))?;
+        };
+        let (submit_tx, worker) = launch(
+            adapter,
+            eos,
+            num_blocks,
+            block_size,
+            max_running,
+            max_prefill_tokens,
+        )
+        .map_err(|(_, e)| e)?;
 
         Ok(Self {
             submit_tx,
             worker,
-            model: served,
+            model: Some(served),
         })
     }
 
+    /// Spawn the worker over a model whose layers keep each sequence's state, see
+    /// [`SequenceBatched`]. The worker owns the model, and `stop` hands it back.
+    ///
+    /// `max_running` caps the concurrent decode batch width.
+    /// The paged allocator counts the blocks of `context_length` tokens for each of
+    /// `max_running` sequences.
+    /// No store holds those blocks: each sequence's state lives beside them.
+    /// `Err` hands the model back with the reason it is not served.
+    pub fn spawn_sequences(
+        model: GenericHeteroTransformer,
+        eos: Vec<u32>,
+        context_length: usize,
+        max_running: usize,
+        max_prefill_tokens: usize,
+    ) -> std::result::Result<Self, (GenericHeteroTransformer, crate::tensor::Error)> {
+        if let Err(e) = model.sequence_mixers() {
+            return Err((model, e));
+        }
+        let adapter = SequenceBatched {
+            model,
+            seqs: HashMap::new(),
+        };
+        let block_size = CB_BLOCK_SIZE;
+        let num_blocks = max_running.max(1) * context_length.max(1).div_ceil(block_size);
+        match launch(
+            adapter,
+            eos,
+            num_blocks,
+            block_size,
+            max_running,
+            max_prefill_tokens,
+        ) {
+            Ok((submit_tx, worker)) => Ok(Self {
+                submit_tx,
+                worker,
+                model: None,
+            }),
+            Err((adapter, e)) => Err((adapter.model, e)),
+        }
+    }
+
     /// Stops the worker once its sequences finish and hands the model back for serial
-    /// serving. `Err` returns the server when another holder still shares the model.
+    /// serving. `Err` says why: another holder still shares the model, or the worker ended
+    /// without it.
     pub fn stop(self) -> std::result::Result<GenericHeteroTransformer, String> {
         let Self {
             submit_tx,
@@ -958,10 +1137,16 @@ impl ContinuousServer {
             model,
         } = self;
         drop(submit_tx);
-        worker
+        let SendWrap(owned) = worker
             .join()
             .map_err(|_| "cb-worker panicked".to_string())?;
-        Arc::try_unwrap(model).map_err(|_| "the model is still shared".to_string())
+        match (owned, model) {
+            (Some(owned), _) => Ok(owned),
+            (None, Some(shared)) => {
+                Arc::try_unwrap(shared).map_err(|_| "the model is still shared".to_string())
+            }
+            (None, None) => Err("the worker ended without its model".to_string()),
+        }
     }
 
     /// Submit a request; returns a receiver that yields its tokens as they are
@@ -1015,15 +1200,17 @@ impl BatchedServer for ContinuousServer {
     }
 }
 
-fn worker_loop(
-    model: GhBatched,
+/// Serves the submissions until every submitter is gone and no sequence runs, then hands the
+/// adapter back. `None` when the engine did not start.
+fn worker_loop<M: BatchedModel>(
+    model: M,
     eos: Vec<u32>,
     num_blocks: usize,
     block_size: usize,
     max_running: usize,
     max_prefill_tokens: usize,
     submit_rx: Receiver<Submission>,
-) {
+) -> Option<M> {
     let mut engine = match ContinuousBatchEngine::new(
         model,
         eos,
@@ -1033,7 +1220,7 @@ fn worker_loop(
         max_prefill_tokens,
     ) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return None,
     };
     // Tokens reach their clients from a thread of their own, in the order they were produced:
     // waking a client from the step loop lets the woken threads take the core before the next
@@ -1084,7 +1271,7 @@ fn worker_loop(
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     if engine.is_idle() {
-                        return;
+                        return Some(engine.into_model());
                     }
                     break;
                 }
@@ -1106,7 +1293,7 @@ fn worker_loop(
                     });
                     chans.insert(id, sub.tx);
                 }
-                Err(_) => return, // all submitters gone, no work left
+                Err(_) => return Some(engine.into_model()), // all submitters gone, no work left
             }
             continue;
         }
@@ -1139,7 +1326,7 @@ fn worker_loop(
                         batch.push((tx, CbToken::Done(FinishReason::Stop)));
                     }
                     emit(batch);
-                    return;
+                    return Some(engine.into_model());
                 }
                 emit(batch);
                 continue;

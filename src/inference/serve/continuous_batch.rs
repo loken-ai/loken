@@ -105,6 +105,13 @@ fn recent_window(prompt: &[u32], generated: &[u32], last_n: usize) -> Vec<u32> {
 pub trait BatchedModel {
     fn step(&mut self, items: &[StepItem]) -> Result<Vec<u32>>;
 
+    /// The prompt tokens of `seq` its prefill read from a cache the model keeps beside the paged
+    /// store.
+    /// `None` leaves the count the paged prefix cache gave.
+    fn cached_prompt(&self, _seq: SeqId) -> Option<usize> {
+        None
+    }
+
     /// Drops what the model keeps for `seq` beside the paged store: the sequence finished or
     /// was aborted.
     fn release(&mut self, _seq: SeqId) {}
@@ -200,6 +207,11 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         self.sched.is_idle()
     }
 
+    /// The model the engine ran.
+    pub fn into_model(self) -> M {
+        self.model
+    }
+
     /// Abort all in-flight sequences (free their KV, clear per-seq state) after a
     /// model step error, returning their ids so the caller can close their channels.
     /// Lets the worker recover and keep serving instead of dying on one bad step.
@@ -229,6 +241,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         }
         // Build model inputs from the plan + per-request token state.
         let started = std::time::Instant::now();
+        let admitted_before = self.admitted.len();
         let mut items = Vec::with_capacity(plan.num_seqs());
         for p in &plan.prefills {
             let r = self.reqs.get_mut(&p.seq).expect("submitted");
@@ -281,6 +294,11 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
 
         let sampled = self.model.step(&items)?;
         debug_assert_eq!(sampled.len(), items.len());
+        for (seq, _, cached) in &mut self.admitted[admitted_before..] {
+            if let Some(read) = self.model.cached_prompt(*seq) {
+                *cached = read;
+            }
+        }
 
         // Publish freshly-prefilled prompts' full blocks to the prefix cache so
         // later requests with a shared prefix reuse them (no-op when disabled).
