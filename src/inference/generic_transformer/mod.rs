@@ -142,6 +142,9 @@ mod wide_sparse_batch_tests;
 pub mod wide_sparse_config;
 #[cfg(test)]
 mod wide_sparse_config_tests;
+pub mod wide_sparse_convert;
+#[cfg(all(test, not(feature = "gpu")))]
+mod wide_sparse_convert_tests;
 #[cfg(test)]
 mod wide_sparse_engram_tests;
 pub mod wide_sparse_layer;
@@ -156,7 +159,7 @@ mod wide_sparse_real_tests;
 #[cfg(test)]
 mod wide_sparse_state_tests;
 pub use config::*;
-pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint};
+pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint, TableRows};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};
 pub use moe_weights::*;
 pub use segment::LayerRates;

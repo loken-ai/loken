@@ -5,6 +5,7 @@
 //! part of the system a file belongs to, which is the whole reason the directory exists.
 pub mod awq;
 pub mod awq_loader;
+pub mod block_scaled_convert;
 pub mod calibrated;
 pub mod calibration;
 pub mod compensate;

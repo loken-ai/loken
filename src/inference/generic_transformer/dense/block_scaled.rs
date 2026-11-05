@@ -17,7 +17,9 @@
 use super::{fp8_block_of, read_header};
 use crate::inference::model::deepseek_v41::source::{expert_unit_name, gguf_names, EXPERT_STACKS};
 use crate::tensor::blockscaled::bf16::Bf16Weight;
-use crate::tensor::blockscaled::dequant::{dequant_fp4_blocked, dequant_fp8_blocked, e8m0_to_f32};
+use crate::tensor::blockscaled::dequant::{
+    dequant_fp4_blocked, dequant_fp8_blocked, e4m3_to_f32, e8m0_to_f32,
+};
 use crate::tensor::blockscaled::fp4::Fp4Weight;
 use crate::tensor::blockscaled::fp8::Fp8Weight;
 use crate::tensor::blockscaled::projection::Projection;
@@ -53,6 +55,74 @@ pub struct BlockScaledCheckpoint {
     fp8_block: Option<usize>,
     /// The reference arguments of the model, `inference/config.json`.
     pub reference: serde_json::Value,
+    /// The model's own configuration, `config.json`.
+    pub config: serde_json::Value,
+}
+
+/// The rows of a stored table, as a conversion copies them.
+pub enum TableRows {
+    /// e4m3 values, 1 ue8m0 scale per `block` values of a row.
+    Fp8 {
+        bytes: MappedBytes,
+        scales: MappedBytes,
+        rows: usize,
+        row_len: usize,
+        block: usize,
+    },
+    /// Values decoded to F32, row-major.
+    Dense {
+        values: Vec<f32>,
+        rows: usize,
+        row_len: usize,
+    },
+}
+
+impl TableRows {
+    pub fn n_rows(&self) -> usize {
+        match self {
+            Self::Fp8 { rows, .. } | Self::Dense { rows, .. } => *rows,
+        }
+    }
+
+    /// Rows `rows` decoded to F32, in row order.
+    ///
+    /// An e4m3 value is multiplied by the scale of its run of the row.
+    pub fn values(&self, rows: std::ops::Range<usize>) -> Vec<f32> {
+        use rayon::prelude::*;
+        match self {
+            Self::Fp8 {
+                bytes,
+                scales,
+                row_len,
+                block,
+                ..
+            } => {
+                let per_row = row_len / block;
+                rows.into_par_iter()
+                    .map(|r| {
+                        let row = &bytes.as_slice()[r * row_len..(r + 1) * row_len];
+                        let sc = &scales.as_slice()[r * per_row..(r + 1) * per_row];
+                        row.iter()
+                            .enumerate()
+                            .map(|(j, &b)| e4m3_to_f32(b) * e8m0_to_f32(sc[j / block]))
+                            .collect::<Vec<f32>>()
+                    })
+                    .collect::<Vec<_>>()
+                    .concat()
+            }
+            Self::Dense {
+                values, row_len, ..
+            } => values[rows.start * row_len..rows.end * row_len].to_vec(),
+        }
+    }
+
+    /// Asks the kernel to read the stored rows in order.
+    pub fn advise_sequential(&self) {
+        if let Self::Fp8 { bytes, scales, .. } = self {
+            bytes.advise_sequential();
+            scales.advise_sequential();
+        }
+    }
 }
 
 /// Bytes 1 stored value takes, `None` for a type no read decodes.
@@ -160,6 +230,75 @@ impl BlockScaledCheckpoint {
             names,
             fp8_block: fp8_block_of(&config),
             reference,
+            config,
+        })
+    }
+
+    /// Every stored name, scales included.
+    pub fn stored_names(&self) -> Vec<&str> {
+        self.stored.keys().map(String::as_str).collect()
+    }
+
+    /// The shape of the stored tensor `stored` in values.
+    ///
+    /// An fp4 tensor counts 2 values a stored byte: its last dimension is twice the stored one.
+    pub fn stored_shape(&self, stored: &str) -> Option<Vec<usize>> {
+        let e = self.stored.get(stored)?;
+        let mut shape = e.shape.clone();
+        if e.dtype == "I8" {
+            if let Some(last) = shape.last_mut() {
+                *last *= 2;
+            }
+        }
+        Some(shape)
+    }
+
+    /// The values of the stored tensor `stored`, decoded to F32, row-major.
+    pub fn stored_values(&self, stored: &str) -> Result<Vec<f32>> {
+        self.decode(stored).map(|(values, _)| values)
+    }
+
+    /// Asks the kernel to read the stored tensor `stored`, and its scales, ahead of their use.
+    pub fn will_need_stored(&self, stored: &str) {
+        if let Ok((_, view)) = self.bytes(stored) {
+            view.will_need();
+        }
+        if let Ok((_, view)) = self.scales(stored) {
+            view.will_need();
+        }
+    }
+
+    /// The stored 2-D table `stored`, read a run of rows at a time.
+    ///
+    /// An e4m3 table keeps its rows in the mapping, with 1 run of ue8m0 scales per row.
+    /// Any other table is decoded to F32 whole.
+    pub fn table(&self, stored: &str) -> Result<TableRows> {
+        let (e, view) = self.bytes(stored)?;
+        let shape = self.stored_shape(stored).unwrap_or_default();
+        let [rows, row_len] = shape[..] else {
+            return Err(Error::msg(format!("{stored}: table is not 2-D")));
+        };
+        if e.dtype != "F8_E4M3" {
+            return Ok(TableRows::Dense {
+                values: self.stored_values(stored)?,
+                rows,
+                row_len,
+            });
+        }
+        let (scales, scale_view) = self.scales(stored)?;
+        let per_row = scales.shape.get(1).copied().unwrap_or(0);
+        if scales.shape.first().copied() != Some(rows) || per_row == 0 || row_len % per_row != 0 {
+            return Err(Error::msg(format!(
+                "{stored}: scales {:?} do not tile [{rows}, {row_len}] by rows",
+                scales.shape
+            )));
+        }
+        Ok(TableRows::Fp8 {
+            bytes: view,
+            scales: scale_view,
+            rows,
+            row_len,
+            block: row_len / per_row,
         })
     }
 
@@ -265,7 +404,14 @@ impl BlockScaledCheckpoint {
     ///
     /// An fp4 matrix counts its values: its last dimension is twice the stored one.
     pub fn dense_f32(&self, name: &str) -> Result<Tensor> {
-        let stored = self.stored_name(name)?;
+        let (values, shape) = self.decode(self.stored_name(name)?)?;
+        Tensor::from_vec(values, shape, &Device::Cpu)
+    }
+
+    /// The values of the stored tensor `stored` decoded to F32, with their shape.
+    ///
+    /// An fp4 matrix counts its values: its last dimension is twice the stored one.
+    fn decode(&self, stored: &str) -> Result<(Vec<f32>, Vec<usize>)> {
         let (e, view) = self.bytes(stored)?;
         let bytes = view.as_slice();
         let (values, shape): (Vec<f32>, Vec<usize>) = match e.dtype.as_str() {
@@ -310,7 +456,7 @@ impl BlockScaledCheckpoint {
                 return Err(Error::msg(format!("{stored}: unsupported dtype {other}")));
             }
         };
-        Tensor::from_vec(values, shape, &Device::Cpu)
+        Ok((values, shape))
     }
 
     /// The matrix the loader reads as `name`, in place where it is stored block-scaled or bf16.

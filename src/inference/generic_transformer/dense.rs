@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 mod block_scaled;
-pub use block_scaled::BlockScaledCheckpoint;
+pub use block_scaled::{BlockScaledCheckpoint, TableRows};
 
 /// One mapped shard, its tensors listed under loader names.
 pub(super) struct DensePart {

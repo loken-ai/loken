@@ -58,11 +58,11 @@ enum Format {
 
 /// One tensor of the checkpoint: its official name, the loader's name for it, its storage and
 /// its logical shape.
-struct Entry {
-    reference: String,
+pub(super) struct Entry {
+    pub(super) reference: String,
     loader: String,
     format: Format,
-    shape: Vec<usize>,
+    pub(super) shape: Vec<usize>,
 }
 
 fn entry(reference: String, loader: String, format: Format, shape: &[usize]) -> Entry {
@@ -75,7 +75,7 @@ fn entry(reference: String, loader: String, format: Format, shape: &[usize]) -> 
 }
 
 /// Every tensor of the checkpoint, the top tensors first, then layer after layer.
-fn entries() -> Vec<Entry> {
+pub(super) fn entries() -> Vec<Entry> {
     use Format::*;
     let mut out = vec![
         entry(
@@ -320,6 +320,11 @@ fn scratch(tag: &str) -> PathBuf {
 /// Writes the checkpoint into a new directory: the top tensors and layer 0 in the first shard,
 /// the other layers in the second.
 pub(super) fn checkpoint(tag: &str) -> PathBuf {
+    checkpoint_of(tag, &entries())
+}
+
+/// Writes the checkpoint of `entries` into a new directory, as `checkpoint` writes its own.
+pub(super) fn checkpoint_of(tag: &str, entries: &[Entry]) -> PathBuf {
     let dir = scratch(tag);
     let config = serde_json::json!({
         "quantization_config": { "weight_block_size": [FP8_BLOCK, FP8_BLOCK] }
@@ -331,7 +336,7 @@ pub(super) fn checkpoint(tag: &str) -> PathBuf {
     )
     .unwrap();
     let mut shards: [Vec<(String, Dtype, Vec<usize>, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
-    for (seed, e) in entries().iter().enumerate() {
+    for (seed, e) in entries.iter().enumerate() {
         let second = e.reference.starts_with("layers.") && !e.reference.starts_with("layers.0.");
         shards[usize::from(second)].extend(stored(e, seed));
     }
