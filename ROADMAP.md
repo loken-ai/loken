@@ -92,6 +92,8 @@ Major, by state then by priority:
 | Feature | Category | Done when | State |
 |---|---|---|---|
 | GLM-5.3 on the host and the cards | Models | GLM-5.3 loads from its published checkpoint and answers as the reference implementation does, its experts read from disk when they do not fit, and it drafts with its own draft head. | Planned |
+| Text prepared for speech | Audio | Every speech model reads acronyms letter by letter and takes a pronunciation written inline in the text, through one text preparation step with an English pronunciation lexicon, and a sentence holding VRAM, KV, MoE, OOM and TP is transcribed back with the same words. | Planned |
+| Speech from a style vector | Audio | A speech model whose voice is a style tensor and whose decoder is an inverse STFT speaks English, French, Spanish, Hindi, Italian and Portuguese through the speech route, its voice the same from one request to the next and its output within the bounds of the acceptance table. | Planned |
 | A cluster that survives a node | Cluster | When a machine drops out mid-request, the others finish the request. | Planned |
 | Routing across loken nodes | Cluster | One model name sends each request to the loken node that serves it best by load, speed and energy, to the node that already holds its conversation's KV, and to another node when one fails. | Planned |
 | A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an encrypted link. | Planned |
