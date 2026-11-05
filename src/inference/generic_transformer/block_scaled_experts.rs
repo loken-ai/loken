@@ -18,6 +18,13 @@ pub struct BlockScaledExpert {
 }
 
 impl BlockScaledExpert {
+    /// Asks for the 3 projections' mapped bytes to be read in, without waiting.
+    pub fn will_need(&self) {
+        self.gate.will_need();
+        self.up.will_need();
+        self.down.will_need();
+    }
+
     /// The expert over the rows `x` `[n, dim]` F32 on the host, `[n, dim]`.
     ///
     /// Each projection runs once over all `n` rows.

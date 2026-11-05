@@ -242,3 +242,323 @@ fn wide_sparse_real_generic_against_v41() {
         generic.greedy == v41.greedy
     );
 }
+
+/// Drops the file's pages from the page cache, so a run that follows starts cold.
+///
+/// The mappings of the file must be gone: a mapped page stays.
+fn evict(path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(path).expect("the file opens");
+    // SAFETY: the descriptor is open for the whole call.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    assert_eq!(rc, 0, "posix_fadvise refused");
+}
+
+/// Seconds a closure takes, with its value.
+fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
+    let t = Instant::now();
+    let r = f();
+    (r, t.elapsed().as_secs_f64())
+}
+
+/// Seconds per named stage, summed over the calls.
+#[derive(Default)]
+struct Stages(std::collections::BTreeMap<&'static str, (f64, u64)>);
+
+impl Stages {
+    fn time<R>(&mut self, name: &'static str, f: impl FnOnce() -> R) -> R {
+        let (r, s) = timed(f);
+        let e = self.0.entry(name).or_default();
+        e.0 += s;
+        e.1 += 1;
+        r
+    }
+
+    fn print(&self, who: &str) {
+        for (name, (s, n)) in &self.0 {
+            println!("{who} stage {name:<22} {s:8.3}s over {n} calls");
+        }
+    }
+}
+
+/// A forward of the generic model over `ids` from `pos`, stage by stage, as `forward_sinkhorn`
+/// runs it. The last row of logits comes back. A layer with an engram runs whole.
+fn staged_forward(
+    model: &mut GenericHeteroTransformer,
+    ids: &[u32],
+    pos: usize,
+    st: &mut Stages,
+    layer_secs: &mut Vec<f64>,
+) -> Vec<f32> {
+    use crate::tensor::ops::rms_norm;
+    let tensor = Tensor::from_vec(ids.to_vec(), (1, ids.len()), &Device::Cpu).unwrap();
+    model.spec_clear();
+    let (mut hidden, _) = st
+        .time("embed", || model.embed_stage(&tensor, pos))
+        .unwrap();
+    let seq = ids.len();
+    layer_secs.clear();
+    for il in 0..model.layers.len() {
+        let started = Instant::now();
+        let layer = &mut model.layers[il];
+        let block = layer.sinkhorn.as_ref().expect("a Sinkhorn layer");
+        if block.engram.is_some() {
+            hidden = st
+                .time("engram layer (whole)", || {
+                    layer.forward_sinkhorn(&hidden, pos)
+                })
+                .unwrap();
+            layer_secs.push(started.elapsed().as_secs_f64());
+            continue;
+        }
+        let r = hidden
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let pre = block.carry.get(pos, seq).unwrap();
+        let mixes = st.time("hc mixes", || block.attn_mix.mixes(&r)).unwrap();
+        let input = st
+            .time("hc pre and norm", || {
+                rms_norm(
+                    &block.attn_mix.pre(&r, &pre).unwrap(),
+                    &block.attn_norm,
+                    block.eps,
+                )
+            })
+            .unwrap();
+        let mixed = st
+            .time("attention mixer", || layer.mixer.forward(&input, pos))
+            .unwrap();
+        let (b, s, width) = mixed.dims3().unwrap();
+        let out = st
+            .time("attention output", || {
+                block
+                    .output
+                    .apply_here(&mixed.reshape((b * s, width)).unwrap())
+                    .unwrap()
+                    .reshape((b, s, block.attn_mix.dim()))
+            })
+            .unwrap();
+        let mid = st
+            .time("hc post", || {
+                block.attn_mix.post(&out, &r, &mixes.post, &mixes.comb)
+            })
+            .unwrap();
+        let fmixes = st.time("hc mixes", || block.ffn_mix.mixes(&mid)).unwrap();
+        let finput = st
+            .time("hc pre and norm", || {
+                rms_norm(
+                    &block.ffn_mix.pre(&mid, &mixes.pre).unwrap(),
+                    &block.ffn_norm,
+                    block.eps,
+                )
+            })
+            .unwrap();
+        let fout = st.time("moe", || block.ffn.forward(&finput)).unwrap();
+        // The router and the shared expert again, warm, to split the block's time.
+        let x2 = finput.reshape((seq, finput.elem_count() / seq)).unwrap();
+        let _ = st.time("moe router (again)", || block.ffn.router.apply_here(&x2));
+        if let Some(shared) = &block.ffn.shared {
+            let _ = st.time("moe shared (again)", || {
+                shared.forward(&x2, block.ffn.limit)
+            });
+        }
+        hidden = st
+            .time("hc post", || {
+                block.ffn_mix.post(&fout, &mid, &fmixes.post, &fmixes.comb)
+            })
+            .unwrap();
+        block.carry.put(pos, seq, fmixes.pre);
+        layer_secs.push(started.elapsed().as_secs_f64());
+    }
+    let logits = st
+        .time("head", || model.output_stage(hidden, false, seq, false))
+        .unwrap();
+    row(&logits)
+}
+
+/// Prefill twice and decode `STEPS` tokens after each, on the generic route.
+///
+/// The first prefill starts from a cold page cache, the second from the state the first left.
+/// A third pass runs stage by stage.
+fn generic_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
+    evict(path);
+    let split = SplitGguf::open(path).expect("the file opens");
+    let content = split.merged_content();
+    let arch = content.metadata["general.architecture"]
+        .to_string()
+        .unwrap()
+        .clone();
+    let layers = content
+        .metadata
+        .get(&format!("{arch}.block_count"))
+        .and_then(|v| v.to_u32().ok())
+        .expect("a block count") as usize;
+    let plan = HeteroPlan::calculate_with_kv(layers, 1 << 20, &[], &[], 1.0, 0);
+    let (model, s) = timed(|| {
+        GenericHeteroTransformer::from_split_gguf(
+            &split,
+            &HashMap::new(),
+            &plan,
+            crate::inference::engine::llm_engine::KvQuant::Off,
+            None,
+            false,
+            false,
+        )
+    });
+    let mut model = model.expect("the generic loader accepts the file");
+    println!("generic: loaded in {s:.1}s, resident {} MB", resident_mb());
+    let tensor = |t: &[u32]| Tensor::from_vec(t.to_vec(), (1, t.len()), &Device::Cpu).unwrap();
+    let mut first: Vec<f32> = Vec::new();
+    for pass in ["cold", "warm"] {
+        let (logits, s) = timed(|| row(&model.forward(&tensor(ids), 0).unwrap()));
+        println!(
+            "generic {pass}: prefill {} tokens {s:.2}s, resident {} MB",
+            ids.len(),
+            resident_mb()
+        );
+        if first.is_empty() {
+            first = logits.clone();
+        } else {
+            assert_eq!(first, logits, "the warm prefill changed the logits");
+        }
+        let mut last = logits;
+        let mut total = 0.0;
+        for i in 0..STEPS {
+            let id = argmax(&last);
+            let (l, s) = timed(|| row(&model.forward(&tensor(&[id]), ids.len() + i).unwrap()));
+            total += s;
+            last = l;
+        }
+        println!(
+            "generic {pass}: {STEPS} decode steps {total:.2}s ({:.3}s each)",
+            total / STEPS as f64
+        );
+    }
+    let mut prefill = Stages::default();
+    let mut decode = Stages::default();
+    let mut per_layer = Vec::new();
+    let (logits, s) = timed(|| staged_forward(&mut model, ids, 0, &mut prefill, &mut per_layer));
+    assert_eq!(first, logits, "the staged prefill changed the logits");
+    println!("generic staged: prefill {s:.2}s");
+    println!(
+        "generic staged: prefill seconds per layer {:?}",
+        per_layer
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>()
+    );
+    prefill.print("generic prefill");
+    let mut last = logits;
+    let mut total = 0.0;
+    for i in 0..STEPS {
+        let id = argmax(&last);
+        let (l, s) = timed(|| {
+            staged_forward(
+                &mut model,
+                &[id],
+                ids.len() + i,
+                &mut decode,
+                &mut per_layer,
+            )
+        });
+        total += s;
+        last = l;
+    }
+    println!("generic staged: {STEPS} decode steps {total:.2}s");
+    decode.print("generic decode");
+    first
+}
+
+/// The same on the V4.1 path, its own stage profile on for the third pass.
+fn v41_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
+    evict(path);
+    let split = SplitGguf::open(path).expect("the file opens");
+    let (model, s) = timed(|| {
+        let cfg = DeepseekV41Config::from_meta(&split).expect("the V4.1 config");
+        DeepseekV41Model::load(&split, &cfg).expect("the V4.1 loader")
+    });
+    println!("v41: loaded in {s:.1}s, resident {} MB", resident_mb());
+    let mut first: Vec<f32> = Vec::new();
+    for pass in ["cold", "warm", "profiled"] {
+        let profiled = pass == "profiled";
+        if profiled {
+            crate::inference::offload::stage_prof_enable(true);
+        }
+        let mut state = model.new_decode_state();
+        let (logits, s) = timed(|| row(&model.prefill_into(ids, &mut state).unwrap()));
+        println!(
+            "v41 {pass}: prefill {} tokens {s:.2}s, resident {} MB",
+            ids.len(),
+            resident_mb()
+        );
+        if first.is_empty() {
+            first = logits.clone();
+        } else {
+            assert_eq!(first, logits, "the repeated prefill changed the logits");
+        }
+        let after_prefill = crate::inference::offload::stage_prof_snapshot();
+        let mut last = logits;
+        let mut total = 0.0;
+        for _ in 0..STEPS {
+            let id = argmax(&last);
+            let (l, s) = timed(|| row(&model.forward_decode(id, &mut state).unwrap()));
+            total += s;
+            last = l;
+        }
+        println!(
+            "v41 {pass}: {STEPS} decode steps {total:.2}s ({:.3}s each)",
+            total / STEPS as f64
+        );
+        if profiled {
+            for (name, ns, n) in &after_prefill {
+                println!(
+                    "v41 prefill stage {name:<22} {:8.3}s over {n} calls",
+                    *ns as f64 / 1e9
+                );
+            }
+            for (name, ns, n) in crate::inference::offload::stage_prof_snapshot() {
+                let (ns0, n0) = after_prefill
+                    .iter()
+                    .find(|(k, _, _)| *k == name)
+                    .map_or((0, 0), |(_, a, b)| (*a, *b));
+                println!(
+                    "v41 decode stage {name:<22} {:8.3}s over {} calls",
+                    (ns - ns0) as f64 / 1e9,
+                    n - n0
+                );
+            }
+            crate::inference::offload::stage_prof_enable(false);
+        }
+    }
+    first
+}
+
+/// Each route cold, warm and stage by stage, the page cache emptied before each load.
+#[test]
+#[ignore]
+fn wide_sparse_real_cold_and_warm() {
+    let path = blob(TAG);
+    let ids = {
+        let split = SplitGguf::open(&path).expect("the file opens");
+        prompt_ids(&split.merged_content())
+    };
+    println!("prompt ids: {ids:?}");
+    let generic = generic_cold_warm(&path, &ids);
+    let v41 = v41_cold_warm(&path, &ids);
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (a, b) in generic.iter().zip(&v41) {
+        let (a, b) = (*a as f64, *b as f64);
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
+    }
+    println!(
+        "cosine {:.6}, bits equal {}",
+        dot / (na.sqrt() * nb.sqrt()),
+        generic == v41
+    );
+}

@@ -373,14 +373,16 @@ impl RoutedFfn {
                 }
             }
         }
+        let active: Vec<usize> = (0..assign.len())
+            .filter(|&e| !assign[e].is_empty())
+            .collect();
+        // Every routed expert's bytes are asked for at once, so the reads overlap the compute.
+        active.par_iter().for_each(|&e| self.experts[e].will_need());
         let mut y: Vec<Vec<f32>> = match &self.shared {
             Some(s) => s.forward(&x2, self.limit)?.to_vec2::<f32>()?,
             None => vec![vec![0f32; dim]; n],
         };
         let rows = x2.flatten_all()?.to_vec1::<f32>()?;
-        let active: Vec<usize> = (0..assign.len())
-            .filter(|&e| !assign[e].is_empty())
-            .collect();
         let outs: Vec<Vec<f32>> = active
             .par_iter()
             .map(|&e| -> Result<Vec<f32>> {

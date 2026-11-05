@@ -132,6 +132,7 @@ impl SinkhornMixer {
     /// Each token takes one RMS statistic over its whole residual.
     /// The projection of the residual is scaled by that statistic.
     /// A batch of tokens takes the projection in 8 lanes, a single token in one running sum.
+    /// The rows of a single token's projection run across the cores, each in its own running sum.
     pub fn mixes(&self, r: &Tensor) -> Result<SinkhornMixes> {
         use rayon::prelude::*;
         let hc = self.meta.streams;
@@ -159,6 +160,7 @@ impl SinkhornMixer {
             out
         } else {
             (0..mix_hc * n)
+                .into_par_iter()
                 .map(|m| {
                     w[m * flat..(m + 1) * flat]
                         .iter()
