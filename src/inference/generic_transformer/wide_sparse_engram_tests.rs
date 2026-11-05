@@ -323,17 +323,138 @@ fn a_restored_prefix_hashes_the_ids_of_its_own_sequence() {
     assert_eq!(bits(&got), bits(&want));
 }
 
-/// The token ids of the engram layers have no stored form: the state cache is refused for the
-/// engram model and taken by the same model without engram layers.
+/// The state cache keeps the states of a model with engram layers, as it keeps those of the
+/// same model without them.
+///
+/// A state written to bytes at a split and read into a fresh model with the prompt's ids
+/// continues as the live model does: the remainder and 3 decoded tokens give the same bits.
+/// The same state read with other ids gives other logits over the rows of the remainder, so the
+/// restored ids are the ones the engram layers hash.
+/// Ids of another length are refused.
+///
+/// Through the store, a longer prompt restored at a first prompt's end gives the bits of a twin
+/// that read both prompts, and so does the decode after it.
 #[test]
-fn a_model_with_engram_layers_keeps_no_state_cache() {
+fn a_model_with_engram_layers_restores_its_states_to_the_bit() {
+    use super::state_cache::{manifest_bytes, restore_from_bytes};
+    // Tokens per block, as the state tests of the model without engram layers cut them.
+    const BLOCK: usize = 8;
+    let tokens: Vec<u32> = (0..80).map(|i| (i * 7 + 3) % VOCAB as u32).collect();
+    let decode = |m: &mut GenericHeteroTransformer, steps: &[u32], pos: usize| -> Vec<Vec<u32>> {
+        steps
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| bits(&m.forward(&ids(&[t]), pos + i).unwrap()))
+            .collect()
+    };
     for (ratios, kv_src, index_src) in LAYOUTS {
         let identity = [0u8; 32];
         let mut plain = generic(ratios, kv_src, index_src);
         let store = Arc::new(StateStore::in_memory(1 << 20, 0));
         assert!(plain.attach_state_cache(store, identity), "{ratios:?}");
-        let mut hashed = generic_engram(ratios, kv_src, index_src);
-        let store = Arc::new(StateStore::in_memory(1 << 20, 0));
-        assert!(!hashed.attach_state_cache(store, identity), "{ratios:?}");
+
+        for split in [1usize, 2, 5, 17, 33] {
+            let mut live = generic_engram(ratios, kv_src, index_src);
+            live.forward(&ids(&tokens[..split]), 0).unwrap();
+            let layout = live.state_layout(BLOCK);
+            let point = live.capture_point(split, &layout).unwrap();
+            let blocks: Vec<Vec<u8>> = (0..split / BLOCK)
+                .map(|b| live.capture_block(b, &layout).unwrap())
+                .collect();
+            let manifest = manifest_bytes(&point, &layout);
+            let rest = &tokens[split..];
+
+            let mut short = generic_engram(ratios, kv_src, index_src);
+            let refused = restore_from_bytes(
+                &mut short,
+                &manifest,
+                &blocks,
+                &layout,
+                &tokens[..split - 1],
+            );
+            assert!(
+                refused.is_err(),
+                "{ratios:?} split {split}: ids of another length"
+            );
+
+            // Only tokens 3 and 4 share a compressed id: a shift of 5 changes every id.
+            let shifted: Vec<u32> = tokens[..split]
+                .iter()
+                .map(|&t| (t + 5) % VOCAB as u32)
+                .collect();
+            let mut other = generic_engram(ratios, kv_src, index_src);
+            restore_from_bytes(&mut other, &manifest, &blocks, &layout, &shifted).unwrap();
+
+            let mut restored = generic_engram(ratios, kv_src, index_src);
+            restore_from_bytes(&mut restored, &manifest, &blocks, &layout, &tokens[..split])
+                .unwrap();
+
+            let want = bits(&live.forward(&ids(rest), split).unwrap());
+            let got = bits(&restored.forward(&ids(rest), split).unwrap());
+            assert_eq!(got, want, "{ratios:?} split {split}: the remainder");
+            // Every row of the remainder: only the first rows hash a restored id.
+            let mut again = generic_engram(ratios, kv_src, index_src);
+            restore_from_bytes(&mut again, &manifest, &blocks, &layout, &tokens[..split]).unwrap();
+            let rows = bits(&again.forward_all(&ids(rest), split).unwrap());
+            let elsewhere = bits(&other.forward_all(&ids(rest), split).unwrap());
+            assert_ne!(elsewhere, rows, "{ratios:?} split {split}: other ids");
+            let steps = [3u32, 9, 11];
+            assert_eq!(
+                decode(&mut restored, &steps, tokens.len()),
+                decode(&mut live, &steps, tokens.len()),
+                "{ratios:?} split {split}: decode after the restore"
+            );
+        }
+
+        let (first, second) = (&tokens[..41], &tokens[..60]);
+        let store = Arc::new(StateStore::in_memory(1 << 26, BLOCK));
+        let mut writer = generic_engram(ratios, kv_src, index_src);
+        assert!(
+            writer.attach_state_cache(store.clone(), identity),
+            "{ratios:?}"
+        );
+        let cache = writer.state_cache().unwrap();
+        let layout = writer.state_layout(BLOCK);
+        let (_, grid) = writer
+            .prefill_with_grid(first, 0, BLOCK, BLOCK, &layout)
+            .unwrap();
+        cache.save(&writer, first, grid, None);
+        let mut stored = false;
+        for _ in 0..600 {
+            if store.lengths().contains(&first.len()) {
+                stored = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            stored,
+            "{ratios:?}: no state was stored: {:?}",
+            store.lengths()
+        );
+
+        let mut restored = generic_engram(ratios, kv_src, index_src);
+        assert!(restored.attach_state_cache(store.clone(), identity));
+        let covered = restored
+            .state_cache()
+            .unwrap()
+            .restore(&mut restored, second);
+        assert_eq!(covered, first.len(), "{ratios:?}");
+        let (got, _) = restored
+            .prefill_with_grid(second, covered, BLOCK, BLOCK, &layout)
+            .unwrap();
+        let mut twin = generic_engram(ratios, kv_src, index_src);
+        twin.prefill_with_grid(first, 0, BLOCK, BLOCK, &layout)
+            .unwrap();
+        let (want, _) = twin
+            .prefill_with_grid(second, first.len(), BLOCK, BLOCK, &layout)
+            .unwrap();
+        assert_eq!(bits(&got), bits(&want), "{ratios:?}: the remainder");
+        let steps = [5u32, 7, 13];
+        assert_eq!(
+            decode(&mut restored, &steps, second.len()),
+            decode(&mut twin, &steps, second.len()),
+            "{ratios:?}: decode after the restore"
+        );
     }
 }

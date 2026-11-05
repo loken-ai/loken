@@ -47,6 +47,8 @@ mod wide_tests;
 pub mod block_draft;
 #[cfg(test)]
 pub(crate) mod block_draft_tests;
+#[cfg(test)]
+mod block_scaled_engram_tests;
 pub mod block_scaled_experts;
 #[cfg(test)]
 mod block_scaled_oracle_tests;

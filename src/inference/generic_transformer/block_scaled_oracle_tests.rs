@@ -22,8 +22,8 @@ use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::inference::offload::store::ExpertLoader;
 use crate::tensor::blockscaled::projection::Projection;
 
-const LAYERS: usize = 3;
-const DIM: usize = 256;
+pub(super) const LAYERS: usize = 3;
+pub(super) const DIM: usize = 256;
 const HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
 const Q_LORA: usize = 64;
@@ -31,12 +31,12 @@ const O_LORA: usize = 64;
 const O_GROUPS: usize = 4;
 const EXPERTS: usize = 8;
 const INTER: usize = 256;
-const STREAMS: usize = 4;
+pub(super) const STREAMS: usize = 4;
 /// Rows of a Sinkhorn mixing function: pre and post per stream, and the stream by stream mix.
 const MIX: usize = (2 + STREAMS) * STREAMS;
 const INDEX_HEADS: usize = 4;
 const INDEX_HEAD_DIM: usize = 64;
-const VOCAB: usize = 48;
+pub(super) const VOCAB: usize = 48;
 /// Side of the square tiles of an fp8 matrix.
 const FP8_BLOCK: usize = 32;
 /// Inputs of a row that share 1 fp4 scale.
@@ -47,13 +47,15 @@ const BAND: usize = 1;
 
 /// How a tensor is stored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Format {
+pub(super) enum Format {
     F32,
     Bf16,
     /// e4m3 values, ue8m0 scales per `FP8_BLOCK` square tile.
     Fp8,
     /// e2m1 values 2 a byte, ue8m0 scales per `FP4_BLOCK` inputs of a row.
     Fp4,
+    /// e4m3 rows, ue8m0 scales per run of the given count of values of a row.
+    Fp8Rows(usize),
 }
 
 /// One tensor of the checkpoint: its official name, the loader's name for it, its storage and
@@ -65,7 +67,7 @@ pub(super) struct Entry {
     pub(super) shape: Vec<usize>,
 }
 
-fn entry(reference: String, loader: String, format: Format, shape: &[usize]) -> Entry {
+pub(super) fn entry(reference: String, loader: String, format: Format, shape: &[usize]) -> Entry {
     Entry {
         reference,
         loader,
@@ -285,11 +287,33 @@ fn stored(e: &Entry, seed: usize) -> Vec<(String, Dtype, Vec<usize>, Vec<u8>)> {
                 (scale_name(), Dtype::F8_E8M0, runs, scales),
             ]
         }
+        Format::Fp8Rows(run) => {
+            let (rows, cols) = (e.shape[0], e.shape[1]);
+            let bytes = (0..n)
+                .map(|i| {
+                    let magnitude = ((i * 13 + seed * 7) % 0x38) as u8;
+                    let sign = if (i + seed).is_multiple_of(3) {
+                        0x80
+                    } else {
+                        0
+                    };
+                    sign | magnitude
+                })
+                .collect();
+            let runs = vec![rows, cols / run];
+            let scales = (0..runs[0] * runs[1])
+                .map(|r| 120 + ((r + seed) % 6) as u8)
+                .collect();
+            vec![
+                (e.reference.clone(), Dtype::F8_E4M3, e.shape.clone(), bytes),
+                (scale_name(), Dtype::F8_E8M0, runs, scales),
+            ]
+        }
     }
 }
 
 /// The reference arguments of the checkpoint's model.
-fn reference_config() -> serde_json::Value {
+pub(super) fn reference_config() -> serde_json::Value {
     serde_json::json!({
         "n_layers": LAYERS, "dim": DIM, "vocab_size": VOCAB, "norm_eps": 1e-20,
         "n_heads": HEADS, "head_dim": HEAD_DIM, "rope_head_dim": 32,
@@ -325,6 +349,16 @@ pub(super) fn checkpoint(tag: &str) -> PathBuf {
 
 /// Writes the checkpoint of `entries` into a new directory, as `checkpoint` writes its own.
 pub(super) fn checkpoint_of(tag: &str, entries: &[Entry]) -> PathBuf {
+    checkpoint_with(tag, entries, &reference_config())
+}
+
+/// Writes the checkpoint of `entries` described by the reference arguments `reference` into a
+/// new directory, as `checkpoint` writes its own.
+pub(super) fn checkpoint_with(
+    tag: &str,
+    entries: &[Entry],
+    reference: &serde_json::Value,
+) -> PathBuf {
     let dir = scratch(tag);
     let config = serde_json::json!({
         "quantization_config": { "weight_block_size": [FP8_BLOCK, FP8_BLOCK] }
@@ -332,7 +366,7 @@ pub(super) fn checkpoint_of(tag: &str, entries: &[Entry]) -> PathBuf {
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     std::fs::write(
         dir.join("inference").join("config.json"),
-        reference_config().to_string(),
+        reference.to_string(),
     )
     .unwrap();
     let mut shards: [Vec<(String, Dtype, Vec<usize>, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
@@ -462,7 +496,7 @@ fn the_block_scaled_reader_hands_out_the_bytes_of_the_v41_source() {
 
 /// The tokens of the checkpoint test: a prompt longer than the verified block and the greedy
 /// prompt.
-fn tokens() -> Vec<u32> {
+pub(super) fn tokens() -> Vec<u32> {
     (0..12).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect()
 }
 

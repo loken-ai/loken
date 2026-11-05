@@ -30,7 +30,7 @@ use super::super::dense::BlockScaledCheckpoint;
 use super::super::hyper::sinkhorn::{SinkhornMeta, SinkhornMixer};
 use super::super::latent_mqa::{frequencies, LatentMqa, LatentMqaDims, LatentMqaWeights};
 use super::super::ngram::engram::{EngramBlock, EngramMeta, EngramTable};
-use super::super::wide_sparse_config::{LayerKind, WideSparseMeta};
+use super::super::wide_sparse_config::{LayerKind, NgramHashFields, WideSparseMeta};
 use super::super::wide_sparse_layer::{
     LayerEngram, PreMixCarry, RoutedFfn, SinkhornBlock, TokenCarry, WideSparseHead,
 };
@@ -120,14 +120,10 @@ impl Tensors<'_, '_> {
     }
 
     /// The engram table `name`.
-    ///
-    /// A checkpoint's tables are refused.
     fn engram_table(&self, name: &str) -> Result<EngramTable> {
         match self {
             Self::File { source, .. } => engram_table(source, name),
-            Self::Checkpoint(_) => crate::tensor::bail!(
-                "the engram tables of a checkpoint do not run on the generic route"
-            ),
+            Self::Checkpoint(ck) => checkpoint_engram_table(ck, name),
         }
     }
 
@@ -201,6 +197,81 @@ fn released_fp8_rows(
     };
     table.advise_random();
     Ok(Some(table))
+}
+
+/// The engram table `name` of a block-scaled checkpoint.
+///
+/// An e4m3 table is read in place as its rows beside their ue8m0 scales.
+/// Any other table is held dense F32.
+fn checkpoint_engram_table(ck: &BlockScaledCheckpoint, name: &str) -> Result<EngramTable> {
+    Ok(match ck.table_of(name)? {
+        TableRows::Fp8 {
+            bytes,
+            scales,
+            rows,
+            row_len,
+            block,
+        } => {
+            let table = EngramTable::Fp8Rows {
+                bytes,
+                scales,
+                rows,
+                row_len,
+                block,
+            };
+            table.advise_random();
+            table
+        }
+        TableRows::Dense {
+            values,
+            rows,
+            row_len,
+        } => EngramTable::Resident(Tensor::from_vec(values, (rows, row_len), &Device::Cpu)?),
+    })
+}
+
+/// The hash layout of the engram layers of a block-scaled checkpoint.
+///
+/// The token map comes from the checkpoint's `tokenizer.json`.
+/// `None` when the checkpoint declares no engram layer.
+/// `None`, with a warning, when the token map cannot be built or the layout does not derive from
+/// the reference arguments and that map: the model then runs without its engram layers.
+fn checkpoint_engram(ck: &BlockScaledCheckpoint) -> Option<EngramMeta> {
+    let declared = ck
+        .reference
+        .get("engram_layer_ids")
+        .and_then(|v| v.as_array())
+        .is_some_and(|layers| !layers.is_empty());
+    if !declared {
+        return None;
+    }
+    let path = ck.dir.join("tokenizer.json");
+    let engram = match crate::inference::model::deepseek_v41::token_map::build_from_file(&path) {
+        Ok((map, _)) => EngramMeta::derive(&ck.reference, map),
+        Err(e) => {
+            tracing::warn!("no engram, the token map could not be built: {e}");
+            None
+        }
+    };
+    if engram.is_none() {
+        tracing::warn!("running without the engram layers");
+    }
+    engram
+}
+
+/// The n-gram hash fields of the model description, from the engram layout `m`.
+fn ngram_fields(m: &EngramMeta) -> NgramHashFields {
+    NgramHashFields {
+        layer_ids: m.layer_ids.clone(),
+        heads: m.heads,
+        head_dim: m.head_dim,
+        max_ngram: m.max_ngram,
+        token_map: m.token_map.clone(),
+        pad_id: m.pad_id,
+        multipliers: m.multipliers.clone(),
+        primes: m.primes.clone(),
+        offsets: m.offsets.clone(),
+    }
 }
 
 /// The names block `il` may carry a tensor under: each stem bare, then with the `.weight`
@@ -364,7 +435,7 @@ impl GenericHeteroTransformer {
     /// The model a block-scaled checkpoint holds, described by its reference arguments.
     ///
     /// The routed experts are views of the checkpoint's shards.
-    /// A checkpoint that declares n-gram hash layers is refused.
+    /// The engram layers hash with the layout `checkpoint_engram` derives.
     /// A layer on a CUDA card runs its token mixer there, the rest on the host.
     pub fn from_block_scaled(
         checkpoint: &BlockScaledCheckpoint,
@@ -372,22 +443,16 @@ impl GenericHeteroTransformer {
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
     ) -> Result<Self> {
-        let hashed = checkpoint
-            .reference
-            .get("engram_layer_ids")
-            .and_then(|v| v.as_array())
-            .is_some_and(|layers| !layers.is_empty());
-        if hashed {
-            crate::tensor::bail!(
-                "the n-gram hash layers of this checkpoint do not run on the generic route"
-            );
-        }
-        let meta = WideSparseMeta::from_reference(&checkpoint.reference, None)?;
+        let engram = checkpoint_engram(checkpoint);
+        let meta = WideSparseMeta::from_reference(
+            &checkpoint.reference,
+            engram.as_ref().map(ngram_fields),
+        )?;
         Self::build_wide_sparse(
             &meta,
             crate::inference::model::deepseek_v41::ARCH,
             &Tensors::Checkpoint(checkpoint),
-            None,
+            engram,
             plan,
             kv_quant,
             max_kv_seq_len,
@@ -1117,5 +1182,74 @@ mod tests {
                 panic!("the pair of byte tensors was not read as released fp8 rows by both readers")
             }
         }
+    }
+
+    /// The engram tables of a block-scaled checkpoint are read in place as e4m3 rows beside their
+    /// scales, with the geometry and bytes the V4.1 checkpoint source gives.
+    #[test]
+    fn checkpoint_engram_rows_are_read_as_the_v41_source_reads_them() {
+        use super::super::super::block_scaled_engram_tests::{engram_checkpoint, ENGRAM_LAYERS};
+        use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
+        let dir = engram_checkpoint("tables");
+        let ck = BlockScaledCheckpoint::open(&dir).unwrap();
+        let v41_src = SafeTensorsSource::open(&dir).unwrap();
+        for l in ENGRAM_LAYERS {
+            let got = checkpoint_engram_table(&ck, &format!("blk.{l}.engram_embd")).unwrap();
+            let want = v41_src
+                .engram_table(&format!("layers.{l}.engram.embed.weight"))
+                .unwrap();
+            match (&got, &want) {
+                (
+                    EngramTable::Fp8Rows {
+                        bytes,
+                        scales,
+                        rows,
+                        row_len,
+                        block,
+                    },
+                    v41::EngramTable::Fp8Rows {
+                        bytes: v41_bytes,
+                        scales: v41_scales,
+                        rows: v41_rows,
+                        row_len: v41_row_len,
+                        block: v41_block,
+                    },
+                ) => {
+                    assert_eq!((rows, row_len, block), (v41_rows, v41_row_len, v41_block));
+                    assert_eq!(bytes.as_slice(), v41_bytes.as_slice());
+                    assert_eq!(scales.as_slice(), v41_scales.as_slice());
+                }
+                _ => panic!("layer {l}: the table is not read as fp8 rows by both readers"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hash layout of a block-scaled checkpoint, its token map built from the shipped
+    /// tokenizer, is the layout the V4.1 checkpoint loader derives from the same directory.
+    /// A checkpoint whose token map cannot be built keeps no layout, as the V4.1 loader keeps
+    /// none when its token map builder fails.
+    #[test]
+    fn the_checkpoint_engram_layout_is_the_v41_layout() {
+        use super::super::super::block_scaled_engram_tests::engram_checkpoint;
+        use crate::inference::model::deepseek_v41::token_map;
+        let dir = engram_checkpoint("layout");
+        let ck = BlockScaledCheckpoint::open(&dir).unwrap();
+        let got = checkpoint_engram(&ck).expect("a layout");
+        let (map, _) = token_map::build_from_file(&dir.join("tokenizer.json")).unwrap();
+        let want = v41::EngramConfig::derive(&ck.reference, map).expect("a V4.1 layout");
+        assert_eq!(got.layer_ids, want.layer_ids);
+        assert_eq!(got.heads, want.n_heads);
+        assert_eq!(got.head_dim, want.head_dim);
+        assert_eq!(got.max_ngram, want.max_ngram);
+        assert_eq!(got.token_map, want.token_map);
+        assert_eq!(got.pad_id, want.pad_id);
+        assert_eq!(got.multipliers, want.multipliers);
+        assert_eq!(got.primes, want.primes);
+        assert_eq!(got.offsets, want.offsets);
+        std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        assert!(checkpoint_engram(&ck).is_none());
+        assert!(token_map::build_from_file(&dir.join("tokenizer.json")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

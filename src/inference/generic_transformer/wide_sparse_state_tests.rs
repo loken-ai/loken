@@ -124,11 +124,18 @@ fn a_restored_snapshot_decodes_the_bits_of_the_live_model() {
 
             if nb > 0 {
                 let mut short = generic(ratios, kv_src, index_src);
-                let refused = restore_from_bytes(&mut short, &manifest, &blocks[1..], &layout);
+                let refused = restore_from_bytes(
+                    &mut short,
+                    &manifest,
+                    &blocks[1..],
+                    &layout,
+                    &tokens[..split],
+                );
                 assert!(refused.is_err(), "{ratios:?} split {split}: too few blocks");
             }
             let mut restored = generic(ratios, kv_src, index_src);
-            restore_from_bytes(&mut restored, &manifest, &blocks, &layout).unwrap();
+            restore_from_bytes(&mut restored, &manifest, &blocks, &layout, &tokens[..split])
+                .unwrap();
 
             let rest = &tokens[split..];
             let want = bits(&live.forward(&ids(rest), split).unwrap());
@@ -164,6 +171,7 @@ fn a_state_left_by_decoding_restores_to_the_bit() {
             &manifest_bytes(&point, &layout),
             &blocks,
             &layout,
+            &tokens[..20],
         )
         .unwrap();
         assert_eq!(

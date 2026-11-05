@@ -57,6 +57,8 @@ pub struct BlockScaledCheckpoint {
     pub reference: serde_json::Value,
     /// The model's own configuration, `config.json`.
     pub config: serde_json::Value,
+    /// The directory the checkpoint was opened from.
+    pub dir: std::path::PathBuf,
 }
 
 /// The rows of a stored table, as a conversion copies them.
@@ -231,6 +233,7 @@ impl BlockScaledCheckpoint {
             fp8_block: fp8_block_of(&config),
             reference,
             config,
+            dir: dir.to_path_buf(),
         })
     }
 
@@ -300,6 +303,11 @@ impl BlockScaledCheckpoint {
             row_len,
             block: row_len / per_row,
         })
+    }
+
+    /// The 2-D table the loader reads as `name`, as [`Self::table`] reads it.
+    pub fn table_of(&self, name: &str) -> Result<TableRows> {
+        self.table(self.stored_name(name)?)
     }
 
     /// Whether the checkpoint holds a tensor the loader reads as `name`.

@@ -26,6 +26,8 @@
 //! - A model with a draft head also keeps the head's state in the manifest: its layer's rows
 //!   for the pairs it has read, its indexer, and the prompt row whose pair waits for the next
 //!   token, so a restored head drafts as if it had read the prefix.
+//! - A state holds no token ids.
+//!   A restore gives the engram layers the ids of the prompt prefix the state is named by.
 //!
 //! The layer kinds are read from the layers the model really has: a state is refused when the
 //! kinds, the row geometry or the placement it was written under are not the model's. Every file
@@ -1035,15 +1037,9 @@ impl GenericHeteroTransformer {
         identity: [u8; 32],
     ) -> bool {
         // A gated wide-residual layer's indexer and n-gram state have no stored form yet.
-        // A Sinkhorn wide residual keeps nothing from one forward to the next but the token ids
-        // its engram layers hash.
-        // Those ids have no stored form.
+        // The token ids a Sinkhorn wide residual's engram layers hash are the restored prompt's.
         if !self.is_recurrent()
             || self.output_hyper.is_some()
-            || self
-                .wide_sparse
-                .as_ref()
-                .is_some_and(|ws| ws.tokens.is_some())
             || self.layers.iter().any(|l| l.cpu_q8_kv.is_some())
         {
             return false;
@@ -1343,11 +1339,29 @@ impl GenericHeteroTransformer {
     }
 
     /// Makes `point`, with the rows of `blocks` before its tail, the resident state.
-    fn restore_point(&mut self, point: &Point, blocks: &[Vec<(Vec<f32>, Vec<f32>)>]) -> Result<()> {
+    ///
+    /// `tokens` are the ids of the positions the state holds.
+    /// The engram layers hash them.
+    fn restore_point(
+        &mut self,
+        point: &Point,
+        blocks: &[Vec<(Vec<f32>, Vec<f32>)>],
+        tokens: &[u32],
+    ) -> Result<()> {
+        if tokens.len() != point.pos {
+            crate::tensor::bail!(
+                "a state of {} tokens restored with {} ids",
+                point.pos,
+                tokens.len()
+            );
+        }
         let snaps = self.point_snapshots(point, blocks)?;
         super::graph::restore_layers(&mut self.layers, &snaps)?;
         for l in &mut self.layers {
             rebuild_host_rows(l);
+        }
+        if let Some(log) = self.wide_sparse.as_ref().and_then(|ws| ws.tokens.as_ref()) {
+            log.reset(tokens);
         }
         self.restore_draft(point.draft.as_ref())?;
         self.invalidate_graph_state();
@@ -1707,7 +1721,7 @@ impl HybridStateCache {
                 continue;
             }
             let started = std::time::Instant::now();
-            match self.restore_entry(model, &entry) {
+            match self.restore_entry(model, &entry, prompt) {
                 Ok(()) => {
                     let secs = started.elapsed().as_secs_f64();
                     self.store.tuning().restored(bytes, secs);
@@ -1728,11 +1742,20 @@ impl HybridStateCache {
         0
     }
 
-    fn restore_entry(&self, model: &mut GenericHeteroTransformer, entry: &Entry) -> AnyResult<()> {
+    /// Makes the stored state `entry` of a prefix of `prompt` the state of `model`.
+    fn restore_entry(
+        &self,
+        model: &mut GenericHeteroTransformer,
+        entry: &Entry,
+        prompt: &[u32],
+    ) -> AnyResult<()> {
         let layout = &*self.layout;
         let identity = model.cache_scope.mixed_into(&self.identity);
         let point = decode_manifest(&self.store.read(entry)?, &identity, layout)?;
-        if point.pos != entry.len || entry.blocks.len() != point.pos / layout.block_tokens {
+        if point.pos != entry.len
+            || point.pos > prompt.len()
+            || entry.blocks.len() != point.pos / layout.block_tokens
+        {
             bail!("state cache: a manifest that does not match its name");
         }
         let blocks = entry
@@ -1741,7 +1764,7 @@ impl HybridStateCache {
             .map(|h| decode_block(&self.store.read_block(h)?, layout))
             .collect::<AnyResult<Vec<_>>>()?;
         model
-            .restore_point(&point, &blocks)
+            .restore_point(&point, &blocks, &prompt[..point.pos])
             .map_err(|e| anyhow!("{e}"))
     }
 
@@ -1884,14 +1907,15 @@ pub(crate) fn manifest_bytes(point: &Point, layout: &Layout) -> Vec<u8> {
     encode_manifest(&[0u8; 32], layout, point)
 }
 
-/// Makes the manifest `bytes` and the encoded `blocks` the state of `model`, with the checks
-/// a restore from the store makes, for the tests.
+/// Makes the manifest `bytes` and the encoded `blocks` of the positions of `tokens` the state of
+/// `model`, with the checks a restore from the store makes, for the tests.
 #[cfg(test)]
 pub(crate) fn restore_from_bytes(
     model: &mut GenericHeteroTransformer,
     bytes: &[u8],
     blocks: &[Vec<u8>],
     layout: &Layout,
+    tokens: &[u32],
 ) -> AnyResult<()> {
     let point = decode_manifest(bytes, &[0u8; 32], layout)?;
     if blocks.len() != point.pos / layout.block_tokens {
@@ -1906,6 +1930,6 @@ pub(crate) fn restore_from_bytes(
         .map(|b| decode_block(b, layout))
         .collect::<AnyResult<Vec<_>>>()?;
     model
-        .restore_point(&point, &rows)
+        .restore_point(&point, &rows, tokens)
         .map_err(|e| anyhow!("{e}"))
 }
