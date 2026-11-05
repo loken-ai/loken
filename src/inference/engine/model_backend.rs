@@ -2235,6 +2235,16 @@ impl ModelBackend for GenericBackend {
         self.0.draft_reset();
     }
 
+    fn native_draft_tokens(&mut self, next: u32, k: usize) -> Vec<u32> {
+        match self.0.block_draft_tokens(next, k) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("block draft: {e}");
+                Vec::new()
+            }
+        }
+    }
+
     fn draft_head_vocab(&mut self, prompt: &[u32]) {
         if let Err(e) = self.0.draft_vocab_for(prompt) {
             tracing::warn!("the draft head keeps its whole vocabulary: {e}");
@@ -2482,6 +2492,7 @@ impl ModelBackend for GenericBackend {
                 graph_mode: true,
                 // A verify of drafted rows is recorded and cut back by `trim_kv`.
                 pld: true,
+                native_draft: self.0.has_block_draft(),
                 ..Capabilities::default()
             };
         }
@@ -2497,6 +2508,7 @@ impl ModelBackend for GenericBackend {
             shift_kv: !self.0.has_learned_positions(),
             pld: true,
             graph_mode: true,
+            native_draft: self.0.has_block_draft(),
             ..Capabilities::default()
         }
     }

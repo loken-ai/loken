@@ -19,7 +19,10 @@
 //! An engram layer adds hashed n-gram rows to its residual before its token mixer.
 //! The hashes read the token ids of the sequence from a [`TokenCarry`] the model shares.
 //! The rows of a verify take their engram 1 row at a time, a prompt's all at once.
+//!
+//! A layer a block draft reads adds its input, after the engram, to the draft's capture.
 
+use super::block_draft::{BlockDraft, LayerCapture};
 use super::block_scaled_experts::BlockScaledExpert;
 use super::compressed_band::BandCell;
 use super::hyper::sinkhorn::SinkhornMixer;
@@ -195,11 +198,16 @@ impl LayerEngram {
 /// the model's token log.
 ///
 /// `r` itself for a layer without an engram.
+/// A layer a block draft reads adds the result to the draft's capture.
 fn with_engram(block: &SinkhornBlock, r: &Tensor, first: usize) -> Result<Tensor> {
-    match block.engram.as_ref() {
-        Some(e) => e.tokens.with(|log| e.add(r, log, first)),
-        None => Ok(r.clone()),
+    let r = match block.engram.as_ref() {
+        Some(e) => e.tokens.with(|log| e.add(r, log, first))?,
+        None => r.clone(),
+    };
+    if let Some(c) = block.capture.as_ref() {
+        c.log.add(c.slot, first, &r)?;
     }
+    Ok(r)
 }
 
 /// Routing that gives up exactness for speed, and what it saved.
@@ -357,6 +365,8 @@ pub struct SinkhornBlock {
     pub carry: Arc<PreMixCarry>,
     /// What an engram layer adds to the residual before the token mixer reads it.
     pub engram: Option<LayerEngram>,
+    /// Where a layer a block draft reads adds its input.
+    pub capture: Option<LayerCapture>,
 }
 
 /// The token mixer's half of a layer over the residual rows `r` `[1, seq, streams * hidden]` at
@@ -456,6 +466,8 @@ pub struct WideSparseHead {
     pub head: Projection,
     /// Shared with every engram layer, `None` for a model without one.
     pub tokens: Option<Arc<TokenCarry>>,
+    /// The block draft, `None` for a model without one.
+    pub draft: Option<BlockDraft>,
 }
 
 impl WideSparseHead {
@@ -463,15 +475,20 @@ impl WideSparseHead {
     /// of each row per stream.
     ///
     /// The carry and the band cell open for the forward over those rows.
-    /// The token log takes `input_ids`, the ids of those rows.
+    /// The token log and the block draft's capture take `input_ids`, the ids of those rows.
     pub fn widen(&self, hidden: &Tensor, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
         let seq = hidden.dim(1)?;
-        if let Some(tokens) = &self.tokens {
+        if self.tokens.is_some() || self.draft.is_some() {
             let ids = input_ids
                 .flatten_all()?
                 .to_dtype(DType::U32)?
                 .to_vec1::<u32>()?;
-            tokens.open(index_pos, &ids)?;
+            if let Some(tokens) = &self.tokens {
+                tokens.open(index_pos, &ids)?;
+            }
+            if let Some(draft) = &self.draft {
+                draft.capture.open(index_pos, &ids);
+            }
         }
         self.carry.open(index_pos, seq, self.streams);
         self.cell.open(index_pos, seq);

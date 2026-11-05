@@ -1701,6 +1701,8 @@ fn _assert_generate_future_send(e: &LlmEngine, prompt: &str, params: GenerationP
 }
 
 #[cfg(test)]
+mod block_draft_tests;
+#[cfg(test)]
 mod native_draft_tests;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod quality;

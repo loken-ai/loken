@@ -398,6 +398,7 @@ The comment above `kv_reuse_start` in `src/inference/engine/llm_engine/load.rs` 
 | File | Role |
 |---|---|
 | `src/inference/generic_transformer/draft_head.rs` | The draft head a checkpoint ships: 1 more layer of the model's own kind over the hidden state and the next token's embedding. The decode drafts with it under `fidelity = "fast"`. |
+| `src/inference/generic_transformer/block_draft.rs` | The block draft of a Sinkhorn wide-residual model: stages of latent attention and routed experts that guess a block of tokens in 1 pass. It reads the input of the target layers its file names, and keeps each stage's keys in a ring. The decode drafts with it whenever the model carries it. |
 | `src/inference/serve/eagle.rs` | EAGLE-1 head: 1 decoder layer over the target's feature and the next token's embedding. Reuses the target's embedding table and output head. No request path builds it. The module comment describes the method in full. |
 | `src/inference/serve/prompt_lookup.rs` | Prompt-lookup drafting from a rolling buffer of prompt and generated tokens. |
 | `src/inference/engine/llm_engine/mod.rs` | `draft_k` drafts k tokens with a separate model. The target samples its own token at every position. |

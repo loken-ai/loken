@@ -292,6 +292,8 @@ Limits:
 - **DeepSeek V4.1 native draft** is the DSpark head, the checkpoint's `mtp.*` tensors, read from the model file or a companion.
   The decode loop drafts with it when it is loaded, verifies through the batched forward, and keeps the accepted prefix.
   The prompt's last positions, the decoded tokens and the verified blocks feed its window.
+  The generic route reads the same head from the model file as a block draft and offers it to the same decode arm.
+  V4.1 files still load on the V4.1 path.
   Tests prove the same greedy text through the engine with a scripted guess. No speedup is measured on the real model.
 - A test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and passes alone.
 

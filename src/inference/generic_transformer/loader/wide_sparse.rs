@@ -16,7 +16,12 @@
 //! An engram layer reads its table in place: e4m3 rows beside their scales, or blocks a host
 //! kernel reads.
 //! A table in any other format is held dense F32.
+//!
+//! A file whose metadata declares a block draft gives the model its draft head.
+//! The head's tensors keep the checkpoint's names, `mtp.{stage}.*`.
+//! Its projections and routed experts are read as the layers' are.
 
+use super::super::block_draft::{BlockDraftHead, BlockDraftMeta, DraftStage};
 use super::super::block_scaled_experts::BlockScaledExpert;
 use super::super::compressed_band::{
     BandCell, BandDims, BandIndexerWeights, CompressedBand, CompressorWeights,
@@ -312,15 +317,48 @@ impl GenericHeteroTransformer {
             .and_then(|v| v.to_string().ok().cloned())
             .unwrap_or_default();
         let engram = EngramMeta::from_gguf(content, &arch);
-        Self::build_wide_sparse(
+        let tensors = Tensors::File { content, source };
+        let mut model = Self::build_wide_sparse(
             &meta,
             &arch,
-            &Tensors::File { content, source },
+            &tensors,
             engram,
             plan,
             kv_quant,
             max_kv_seq_len,
-        )
+        )?;
+        // A draft the file declares and that does not load leaves the model without one.
+        let draft = BlockDraftMeta::from_metadata(&content.metadata).and_then(|meta| {
+            meta.map(|m| build_block_draft(&tensors, m).and_then(|h| model.attach_block_draft(h)))
+                .transpose()
+        });
+        if let Err(e) = draft {
+            tracing::warn!("the block draft of the model file is not loaded: {e}");
+        }
+        Ok(model)
+    }
+
+    /// Takes the block draft the first file beside `model` declares, in place of the one the
+    /// model file carried.
+    ///
+    /// A file is one whose metadata holds a key under the draft's prefix.
+    /// A file that does not load is passed over for the next.
+    /// Returns whether a file beside `model` gave the draft.
+    pub fn locate_block_draft(&mut self, model: &std::path::Path) -> bool {
+        let prefix = format!("{}.dspark.", crate::inference::model::deepseek_v41::ARCH);
+        for path in crate::inference::model::deepseek_v41::sibling::find_beside(model, &prefix) {
+            let loaded = companion_draft(&path)
+                .and_then(|d| d.map(|h| self.attach_block_draft(h)).transpose());
+            match loaded {
+                Ok(Some(())) => {
+                    tracing::info!("block draft loaded from {}", path.display());
+                    return true;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("block draft in {} not loaded: {e}", path.display()),
+            }
+        }
+        false
     }
 
     /// The model a block-scaled checkpoint holds, described by its reference arguments.
@@ -641,6 +679,7 @@ impl GenericHeteroTransformer {
                 ffn,
                 carry: carry.clone(),
                 engram: layer_engram,
+                capture: None,
             };
 
             // The forward reads no rotation table of the layer: its token mixer turns its own.
@@ -798,6 +837,7 @@ impl GenericHeteroTransformer {
             eps,
             head,
             tokens: engram.map(|(_, tokens)| tokens),
+            draft: None,
         };
         tensors.finish();
         Ok(Self {
@@ -865,6 +905,142 @@ impl GenericHeteroTransformer {
             draft: None,
             wide_sparse: Some(wide_sparse),
         })
+    }
+}
+
+/// The block draft `meta` describes, its tensors read from `tensors` under the checkpoint's
+/// names.
+///
+/// A stage is `mtp.{stage}`: its attention, its 2 Sinkhorn mixers, its router and experts.
+/// The main projection is read under stage 0, the final norm and the Markov head under the last.
+/// A stage carries a shared expert only when the source holds its 3 projections.
+fn build_block_draft(tensors: &Tensors<'_, '_>, meta: BlockDraftMeta) -> Result<BlockDraftHead> {
+    let dense = |name: &str| tensors.dense(name);
+    let projection = |name: &str| tensors.projection(name);
+    let mixing = SinkhornMeta {
+        streams: meta.streams,
+        iterations: meta.sinkhorn_iters,
+        eps: meta.hc_eps,
+    };
+    let dims = LatentMqaDims {
+        heads: meta.heads,
+        head_dim: meta.head_dim,
+        rope_dim: meta.rope_dim,
+        o_groups: meta.o_groups,
+        o_lora_rank: meta.o_lora_rank,
+        window: meta.window,
+        eps: meta.rms_eps,
+    };
+    // The stages turn at the base theta, unstretched.
+    let inv_freq = frequencies(meta.rope_dim, 0, meta.rope_theta, 1.0);
+    let mut stages = Vec::with_capacity(meta.stages);
+    for s in 0..meta.stages {
+        let name = |rest: &str| format!("mtp.{s}.{rest}");
+        let attn = LatentMqa::new(
+            dims,
+            LatentMqaWeights {
+                wq_a: projection(&name("attn.wq_a.weight"))?,
+                q_norm: dense(&name("attn.q_norm.weight"))?,
+                wq_b: projection(&name("attn.wq_b.weight"))?,
+                wkv: projection(&name("attn.wkv.weight"))?,
+                kv_norm: dense(&name("attn.kv_norm.weight"))?,
+                sink: dense(&name("attn.attn_sink"))?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                wo_a: projection(&name("attn.wo_a.weight"))?,
+            },
+            inv_freq.clone(),
+        )?;
+        let mixer = |part: &str| -> Result<SinkhornMixer> {
+            SinkhornMixer::new(
+                &dense(&name(&format!("hc_{part}_fn")))?,
+                &dense(&name(&format!("hc_{part}_scale")))?,
+                &dense(&name(&format!("hc_{part}_base")))?,
+                mixing,
+                meta.dim,
+                meta.rms_eps,
+            )
+        };
+        // An expert's gate is `w1`, its up `w3` and its down `w2`.
+        let expert = |stem: &str| -> Result<BlockScaledExpert> {
+            Ok(BlockScaledExpert {
+                gate: projection(&name(&format!("{stem}.w1.weight")))?,
+                up: projection(&name(&format!("{stem}.w3.weight")))?,
+                down: projection(&name(&format!("{stem}.w2.weight")))?,
+            })
+        };
+        let shared_held = ["w1", "w3", "w2"]
+            .iter()
+            .all(|w| tensors.has(&name(&format!("ffn.shared_experts.{w}.weight"))));
+        let ffn = RoutedFfn {
+            router: Projection::Dense(dense(&name("ffn.gate.weight"))?),
+            bias: dense(&name("ffn.gate.bias"))?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            experts: (0..meta.routed)
+                .map(|e| expert(&format!("ffn.experts.{e}")))
+                .collect::<Result<Vec<_>>>()?,
+            shared: shared_held
+                .then(|| expert("ffn.shared_experts"))
+                .transpose()?,
+            used: meta.used,
+            temperature: meta.gate_temp,
+            normalize: meta.norm_topk,
+            scale: meta.route_scale,
+            limit: meta.swiglu_limit,
+            lossy: Default::default(),
+        };
+        stages.push(DraftStage {
+            attn,
+            wo_b: projection(&name("attn.wo_b.weight"))?,
+            attn_norm: dense(&name("attn_norm.weight"))?,
+            ffn_norm: dense(&name("ffn_norm.weight"))?,
+            attn_mix: mixer("attn")?,
+            ffn_mix: mixer("ffn")?,
+            ffn,
+        });
+    }
+    let last = meta.stages.saturating_sub(1);
+    let main_proj = projection("mtp.0.main_proj.weight")?;
+    let main_norm = dense("mtp.0.main_norm.weight")?;
+    let final_norm = dense(&format!("mtp.{last}.norm.weight"))?;
+    let markov_embed = dense(&format!("mtp.{last}.markov_head.embed.weight"))?;
+    let markov_head = projection(&format!("mtp.{last}.markov_head.head.weight"))?;
+    BlockDraftHead::new(
+        meta,
+        stages,
+        main_proj,
+        main_norm,
+        final_norm,
+        markov_embed,
+        markov_head,
+    )
+}
+
+/// The block draft the file set at `path` declares, `None` when it declares none.
+fn companion_draft(path: &std::path::Path) -> Result<Option<BlockDraftHead>> {
+    let split = crate::tensor::quantized::gguf_source::SplitGguf::open(path)?;
+    let content = split.merged_content();
+    let Some(meta) = BlockDraftMeta::from_metadata(&content.metadata)? else {
+        return Ok(None);
+    };
+    let source = TensorSource::of_split(&split);
+    let tensors = Tensors::File {
+        content: &content,
+        source: &source,
+    };
+    let head = build_block_draft(&tensors, meta)?;
+    tensors.finish();
+    Ok(Some(head))
+}
+
+impl BlockDraftHead {
+    /// The block draft a block-scaled checkpoint holds, its shape `meta`.
+    pub fn from_checkpoint(
+        checkpoint: &BlockScaledCheckpoint,
+        meta: BlockDraftMeta,
+    ) -> Result<Self> {
+        build_block_draft(&Tensors::Checkpoint(checkpoint), meta)
     }
 }
 

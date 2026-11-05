@@ -2447,6 +2447,7 @@ impl GenericHeteroTransformer {
     /// `current_seq_len` counter (see `SpecKvCache::trim_to`).
     pub fn trim_kv(&mut self, new_len: usize) {
         self.spec_settle(new_len);
+        self.block_draft_trim(new_len);
         for layer in &mut self.layers {
             // A recurrent state cannot be cut to a shorter length: it is dropped only when
             // nothing is kept.

@@ -869,7 +869,7 @@ fn index_score(q: &[f32], key: &[f32], weights: &[f32], scale: f32) -> f32 {
 /// Every query head of `q` `[n, heads * hd]` against the rows of `keys` `[rows, hd]` its row's
 /// `width` slots name, `-1` naming none. The rows are the values too. The sink logit of the head
 /// takes softmax mass and adds no value. Returns `[n, heads * hd]`.
-fn attend_slots(
+pub(super) fn attend_slots(
     q: &[f32],
     keys: &[f32],
     sink: &[f32],
