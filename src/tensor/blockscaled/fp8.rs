@@ -248,6 +248,26 @@ impl Fp8Weight {
         })
     }
 
+    /// The weight decoded to `[out, in]` f32, row-major.
+    pub fn dense_f32(&self) -> Vec<f32> {
+        let table: [f32; 256] = std::array::from_fn(|i| e4m3_to_f32(i as u8));
+        let (bytes, sc) = (self.bytes.as_slice(), self.scales.as_slice());
+        let (inp, block) = (self.inp, self.block);
+        let tiles_per_row = inp.div_ceil(block);
+        let mut w = vec![0f32; self.out * inp];
+        w.par_chunks_mut(inp.max(1))
+            .enumerate()
+            .for_each(|(o, row)| {
+                let row_abs = self.row0 + o;
+                let first_tile = (row_abs / block) * tiles_per_row;
+                let src = &bytes[row_abs * inp..(row_abs + 1) * inp];
+                for (j, (v, &b)) in row.iter_mut().zip(src).enumerate() {
+                    *v = table[b as usize] * self.scale_format.at(sc, first_tile + j / block);
+                }
+            });
+        w
+    }
+
     /// `x` [n, in] f32 -> [n, out] f32.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
@@ -431,6 +451,25 @@ mod tests {
             }
         }
         assert!(fw.rows(5, 32).is_err());
+    }
+
+    /// The decoded weight and the decoded row range are the values the block decoder gives.
+    #[test]
+    fn the_dense_form_is_the_block_decoders_values() {
+        let (out, inp, block) = (96usize, 160usize, 32usize);
+        let bytes: Vec<u8> = (0..out * inp)
+            .map(|i| ((i * 29 + 7) % 251) as u8)
+            .map(|b| if b & 0x7F == 0x7F { 0x40 } else { b })
+            .collect();
+        let scales: Vec<u8> = (0..(out / block) * (inp / block))
+            .map(|i| (118 + (i % 11)) as u8)
+            .collect();
+        let scales_f: Vec<f32> = scales.iter().map(|&s| e8m0_to_f32(s)).collect();
+        let want = dequant_fp8_blocked(&bytes, &scales_f, out, inp, block);
+        let fw = Fp8Weight::new(mapped(&bytes), mapped(&scales), out, inp, block).unwrap();
+        assert_eq!(fw.dense_f32(), want);
+        let sub = fw.rows(32, 32).unwrap();
+        assert_eq!(sub.dense_f32(), want[32 * inp..64 * inp]);
     }
 
     /// The tensors torch wrote: f32 scales per 128 x 128 tile, the last tiles partial.

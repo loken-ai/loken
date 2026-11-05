@@ -10,7 +10,8 @@
 //! The tensors come from a GGUF file or from a block-scaled checkpoint.
 //! A projection is read in place when a host kernel reads its format, else held dense F32.
 //! Norms, mixing weights, the router and the pooling and index weights are held dense F32.
-//! Every layer and the head run on the host.
+//! A layer on a CUDA card runs the projections and the attention of its token mixer there.
+//! The residual mixing, the feed-forward and the head run on the host.
 
 use super::super::block_scaled_experts::BlockScaledExpert;
 use super::super::compressed_band::{
@@ -210,7 +211,7 @@ fn generic_config(
 impl GenericHeteroTransformer {
     /// The model `content` describes, its tensors read from `source`.
     ///
-    /// Every layer and the head run on the host.
+    /// A layer on a CUDA card runs its token mixer there, the rest on the host.
     /// A plan that gives a layer another device, or places part of the stack, is refused.
     pub(super) fn from_wide_sparse(
         content: &gguf_file::Content,
@@ -239,7 +240,7 @@ impl GenericHeteroTransformer {
     ///
     /// The routed experts are views of the checkpoint's shards.
     /// A checkpoint that declares n-gram hash layers is refused.
-    /// Every layer and the head run on the host.
+    /// A layer on a CUDA card runs its token mixer there, the rest on the host.
     pub fn from_block_scaled(
         checkpoint: &BlockScaledCheckpoint,
         plan: &HeteroPlan,
@@ -277,15 +278,25 @@ impl GenericHeteroTransformer {
         max_kv_seq_len: Option<usize>,
     ) -> Result<Self> {
         let n_layers = meta.n_layers;
-        let on_host = plan
+        let hosted = plan
             .segments
             .iter()
-            .all(|s| matches!(s.kind, DeviceKind::Cpu));
-        if !on_host || plan.range() != (0, n_layers) {
+            .all(|s| matches!(s.kind, DeviceKind::Cpu | DeviceKind::Cuda(_)));
+        if !hosted || plan.range() != (0, n_layers) {
             crate::tensor::bail!(
-                "a Sinkhorn wide residual around latent attention runs its whole stack on the host"
+                "a Sinkhorn wide residual around latent attention runs its whole stack, on the host or on CUDA cards"
             );
         }
+        // The card of each layer: the CUDA card its segment names.
+        let card_of = |il: usize| {
+            plan.segments
+                .iter()
+                .find(|s| (s.layer_start..s.layer_end).contains(&il))
+                .and_then(|s| match s.kind {
+                    DeviceKind::Cuda(ordinal) => Some(ordinal),
+                    _ => None,
+                })
+        };
         if meta.ngram.is_some() {
             crate::tensor::bail!(
                 "the n-gram hash layers of this file do not run on the generic route"
@@ -614,6 +625,19 @@ impl GenericHeteroTransformer {
                 ngram: None,
                 sinkhorn: Some(block),
             });
+        }
+
+        // A layer on a card runs its token mixer's projections and attention there.
+        // The residual mixing, the feed-forward and the head stay on the host.
+        for (il, layer) in layers.iter_mut().enumerate() {
+            if let Some(ordinal) = card_of(il) {
+                #[cfg(feature = "gpu")]
+                layer.mixer.on_card(ordinal)?;
+                #[cfg(not(feature = "gpu"))]
+                crate::tensor::bail!(
+                    "layer {il} is placed on CUDA card {ordinal}: no card feature"
+                );
+            }
         }
 
         let embed = need(&["token_embd".to_string(), "token_embd.weight".to_string()])?;

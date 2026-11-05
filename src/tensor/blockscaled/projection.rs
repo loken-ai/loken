@@ -9,7 +9,7 @@ use super::bf16::Bf16Weight;
 use super::fp4::Fp4Weight;
 use super::fp8::Fp8Weight;
 use crate::tensor::quantized::QTensor;
-use crate::tensor::{Device, Result, Tensor};
+use crate::tensor::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
 /// One projection of an expert, `[out, in]`: dense f32, GGUF blocks the CPU dot engine reads in
@@ -59,6 +59,25 @@ impl Projection {
                     "projection: no row range view for this storage",
                 ));
             }
+        })
+    }
+
+    /// The weight decoded to `[out, in]` f32, row-major, on the host.
+    pub fn dense_f32(&self) -> Result<Vec<f32>> {
+        Ok(match self {
+            Self::Dense(w) => w
+                .to_dtype(DType::F32)?
+                .contiguous()?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            Self::Quant(q) => q
+                .dequantize(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            Self::Fp8(f) => f.dense_f32(),
+            Self::Fp4(f) => f.dense_f32(),
+            Self::Bf16(f) => f.dense_f32(),
         })
     }
 

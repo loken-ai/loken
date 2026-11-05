@@ -49,6 +49,8 @@ mod quant;
 pub use quant::*;
 mod decode_stream;
 pub use decode_stream::*;
+mod mixer_dev;
+pub use mixer_dev::*;
 mod correct;
 pub mod prequant;
 pub use correct::*;

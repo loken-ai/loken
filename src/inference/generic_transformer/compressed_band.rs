@@ -289,6 +289,26 @@ impl CompressedBand {
         })
     }
 
+    /// Runs the layer's projections and attention on the card `ordinal`.
+    ///
+    /// The compressor, the index keys and the indexer stay on the host.
+    #[cfg(feature = "gpu")]
+    pub fn on_card(&mut self, ordinal: usize) -> Result<()> {
+        self.base.on_card(ordinal)
+    }
+
+    /// Bytes of weights the layer holds on its card.
+    #[cfg(feature = "gpu")]
+    pub fn card_bytes(&self) -> usize {
+        self.base.card_bytes()
+    }
+
+    /// Tokens the layer's window ring on its card stands for, 0 before the first decode step.
+    #[cfg(feature = "gpu")]
+    pub fn card_ring_tokens(&self) -> usize {
+        self.base.card_ring_tokens()
+    }
+
     /// Tokens seen.
     pub fn len(&self) -> usize {
         self.state.as_ref().map_or(0, |s| s.window.len)
@@ -361,13 +381,14 @@ impl CompressedBand {
         let (hd, ratio) = (d.head_dim, band.ratio);
         let at = (base, seq);
         let (cos, sin) = phases(&m.inv_freq, base..base + seq);
-        let qr = m.query_factor(x2)?;
+        let front = m.front(x2, &cos, &sin)?;
+        let qr = &front.qr;
 
         // The window: the kept rows, then this forward's. Row `old_rows + i` is query `i`'s own.
-        let kv = m.key_rows(x2, &cos, &sin)?;
+        let kv = &front.kv;
         let old_rows = state.window.window.len() / hd;
         let mut keys = std::mem::take(&mut state.window.window);
-        keys.extend_from_slice(&kv);
+        keys.extend_from_slice(kv);
         let kept = (old_rows + seq).min(d.window) * hd;
         state.window.window = keys[keys.len() - kept..].to_vec();
         state.window.len += seq;
@@ -405,7 +426,7 @@ impl CompressedBand {
                     None => self.cell.with(|p| read(&p.index_keys, at, "index keys"))?,
                 };
                 let offset = old_rows + seq;
-                self.pick_prefill(ix, x2, &qr, &index_keys, base, offset, &cos, &sin)?
+                self.pick_prefill(ix, x2, qr, &index_keys, base, offset, &cos, &sin)?
             }
             None => self.cell.with(|p| read(&p.picks, at, "compressed picks"))?,
         };
@@ -457,7 +478,11 @@ impl CompressedBand {
             row[win..].copy_from_slice(&picks[i * itopk..(i + 1) * itopk]);
         }
         keys.extend_from_slice(&compressed);
-        let q = m.queries(&qr, &cos, &sin)?;
+        #[cfg(feature = "gpu")]
+        if let (Some(card), Some(cf)) = (&m.card, &front.card) {
+            return card.attend_rows(m, cf, &keys, &slots, width, seq);
+        }
+        let q = m.queries(qr, &cos, &sin)?;
         let o = attend_slots(
             &q,
             &keys,
@@ -478,13 +503,12 @@ impl CompressedBand {
         let (hd, ratio) = (d.head_dim, band.ratio);
         let at = (pos, 1);
         let (cos, sin) = phases(&m.inv_freq, pos..pos + 1);
-        let qr = m.query_factor(x2)?;
-        let q = m.queries(&qr, &cos, &sin)?;
+        let front = m.front(x2, &cos, &sin)?;
+        let qr = &front.qr;
 
         // The window after this row's key, oldest first.
-        let kv = m.key_rows(x2, &cos, &sin)?;
         let ring = &mut state.window.window;
-        ring.extend_from_slice(&kv);
+        ring.extend_from_slice(&front.kv);
         let excess = ring.len().saturating_sub(d.window * hd);
         ring.drain(..excess);
         let w = ring.len() / hd;
@@ -519,7 +543,7 @@ impl CompressedBand {
         }
 
         let picks = match &self.indexer {
-            Some(ix) => self.pick_decode(ix, x2, &qr, pos, w, state)?,
+            Some(ix) => self.pick_decode(ix, x2, qr, pos, w, state)?,
             None => self.cell.with(|p| read(&p.picks, at, "compressed picks"))?,
         };
         let compressed = match &self.compressor {
@@ -536,12 +560,20 @@ impl CompressedBand {
             )));
         }
 
+        #[cfg(feature = "gpu")]
+        if let (Some(card), Some(cf)) = (&m.card, &front.card) {
+            let stamp = (self.moves, state.window.len);
+            let rows = (Some(compressed.as_slice()), picks.as_slice());
+            return card.decode(m, cf, stamp, &state.window.window, rows);
+        }
+
         // Every window row, then the picked compressed rows.
         let width = w + itopk;
         let mut slots: Vec<i32> = (0..w as i32).collect();
         slots.extend_from_slice(&picks);
         let mut keys = state.window.window.clone();
         keys.extend_from_slice(&compressed);
+        let q = m.queries(qr, &cos, &sin)?;
         let o = attend_slots(
             &q,
             &keys,

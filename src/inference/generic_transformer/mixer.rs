@@ -341,6 +341,19 @@ impl Mixer {
         }
     }
 
+    /// Runs the mixer's projections and attention on the card `ordinal`, its host weights and
+    /// host state staying. Only the latent attention mixers have a card form.
+    #[cfg(feature = "gpu")]
+    pub fn on_card(&mut self, ordinal: usize) -> Result<()> {
+        match self {
+            Mixer::LatentMqa(m) => m.on_card(ordinal),
+            Mixer::CompressedBand(m) => m.on_card(ordinal),
+            _ => Err(crate::tensor::Error::msg(
+                "this mixer has no form that runs on a card",
+            )),
+        }
+    }
+
     /// True for a mixer whose decode step advances its state where it lies, so a step run
     /// again reads and writes the same buffers, and that is worth recording: the delta rule
     /// through its fused recurrence, and the short convolution, on a card.

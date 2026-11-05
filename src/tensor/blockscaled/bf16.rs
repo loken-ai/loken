@@ -108,6 +108,15 @@ impl Bf16Weight {
         Ok(Self { bytes, out, inp })
     }
 
+    /// The weight widened to `[out, in]` f32, row-major.
+    pub fn dense_f32(&self) -> Vec<f32> {
+        self.bytes
+            .as_slice()
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect()
+    }
+
     /// `x` [n, in] f32 -> [n, out] f32.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();

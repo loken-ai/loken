@@ -21,6 +21,8 @@ use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
 use crate::tensor::{DType, Device, Result, Tensor};
 use rayon::prelude::*;
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 
 /// The largest magnitude of e4m3fn. The round trip clamps there.
 pub(super) const FP8_E4M3_MAX: f32 = 448.0;
@@ -107,12 +109,26 @@ pub struct LatentMqa {
     pub(super) dims: LatentMqaDims,
     pub(super) w: LatentMqaWeights,
     /// `wo_a` cut into its groups.
-    wo_groups: Vec<Projection>,
+    pub(super) wo_groups: Vec<Projection>,
     /// Rotation frequency of each lane pair of the rotated tail.
     pub(super) inv_freq: Vec<f32>,
     pub state: Option<LatentMqaState>,
     /// Times the state was dropped or replaced.
     pub(super) moves: u64,
+    /// The layer's projections and buffers on a card, when it runs there.
+    #[cfg(feature = "gpu")]
+    pub(super) card: Option<Arc<super::card_mixers::CardLatent>>,
+}
+
+/// The query factor and the key rows of a forward, on the host, and the card's copy when the
+/// layer runs on a card.
+pub(super) struct Front {
+    /// `[seq, q_lora_rank]`.
+    pub(super) qr: Tensor,
+    /// `[seq, head_dim]`, rotated and rounded to the fp8 grid.
+    pub(super) kv: Vec<f32>,
+    #[cfg(feature = "gpu")]
+    pub(super) card: Option<super::card_mixers::CardFront>,
 }
 
 impl LatentMqa {
@@ -174,6 +190,23 @@ impl LatentMqa {
             inv_freq,
             state: None,
             moves: 0,
+            #[cfg(feature = "gpu")]
+            card: None,
+        })
+    }
+
+    /// The query factor and the key rows of the rows `x2` `[seq, hidden]`, whose phases are
+    /// `cos` and `sin`. On the card when the layer runs there, else on the host.
+    pub(super) fn front(&self, x2: &Tensor, cos: &[f32], sin: &[f32]) -> Result<Front> {
+        #[cfg(feature = "gpu")]
+        if let Some(card) = &self.card {
+            return card.front(self, x2, cos, sin);
+        }
+        Ok(Front {
+            qr: self.query_factor(x2)?,
+            kv: self.key_rows(x2, cos, sin)?,
+            #[cfg(feature = "gpu")]
+            card: None,
         })
     }
 
@@ -265,6 +298,14 @@ impl LatentMqa {
         let (device, dtype) = (x.device(), x.dtype());
         let x2 = host_rows(x, seq, hidden)?;
         let d = self.dims;
+        #[cfg(feature = "gpu")]
+        if self.card.is_some() {
+            return self
+                .forward_card(&x2, index_pos)?
+                .reshape((1, seq, d.out_width()))?
+                .to_device(&device)?
+                .to_dtype(dtype);
+        }
         let (nh, hd) = (d.heads, d.head_dim);
         let (cos, sin) = phases(&self.inv_freq, index_pos..index_pos + seq);
         let q = self.queries(&self.query_factor(&x2)?, &cos, &sin)?;

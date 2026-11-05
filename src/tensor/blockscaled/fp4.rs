@@ -149,6 +149,23 @@ impl Fp4Weight {
         })
     }
 
+    /// The weight decoded to `[out, in]` f32, row-major.
+    pub fn dense_f32(&self) -> Vec<f32> {
+        let scales: Vec<f32> = self
+            .scales
+            .as_slice()
+            .iter()
+            .map(|&s| e8m0_to_f32(s))
+            .collect();
+        super::dequant::dequant_fp4_blocked(
+            self.nibbles.as_slice(),
+            &scales,
+            self.out,
+            self.inp,
+            self.block,
+        )
+    }
+
     /// `x` [n, in] f32 -> [n, out] f32.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
@@ -268,6 +285,17 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() <= 1e-2 * scale, "{g} vs {w} (scale {scale})");
         }
+    }
+
+    /// The decoded weight is the block decoder's values.
+    #[test]
+    fn the_dense_form_is_the_block_decoders_values() {
+        let (out, inp, block, n) = (24usize, 128usize, 32usize, 3usize);
+        let (nibbles, scales, _) = fixture(out, inp, block, n);
+        let scales_f: Vec<f32> = scales.iter().map(|&s| e8m0_to_f32(s)).collect();
+        let want = dequant_fp4_blocked(&nibbles, &scales_f, out, inp, block);
+        let fw = Fp4Weight::new(mapped(&nibbles), mapped(&scales), out, inp).unwrap();
+        assert_eq!(fw.dense_f32(), want);
     }
 
     /// On a card the weight is dequantised and applied at full precision: the dense matmul over the
