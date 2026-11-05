@@ -5,4 +5,4 @@ g=$(git config --global core.hooksPath) && g=$(eval echo "$g")
 if [ -n "$g" ] && [ -x "$g/pre-commit" ]; then
   "$g/pre-commit" "$@" || exit 1
 fi
-exec python3 "$(git rev-parse --show-toplevel)/scripts/check_hetero.py" --staged
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check_hetero.py"

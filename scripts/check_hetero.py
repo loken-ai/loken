@@ -5,8 +5,12 @@ The rule: the generic hetero route (HeteroPlan and the OOM ladder in src/inferen
 the only loading and placement path. A backend, a family or a streaming client outside it
 duplicates placement, batching and expert streaming.
 
-  python3 scripts/check_hetero.py            the whole tree (CI)
-  python3 scripts/check_hetero.py --staged   the whole tree and the staged diff (pre-commit)
+  python3 scripts/check_hetero.py                    the whole tree (CI, pre-commit)
+  python3 scripts/check_hetero.py --message FILE     the staged diff against a commit message
+                                                     (commit-msg)
+
+A commit whose subject has the scope `hetero` is a migration step and may add lines to the paths
+that bypass the route. Any other commit may only shrink them, or add tests.
 
 scripts/hetero_route.txt classifies every backend and every model family. A new one must be
 listed there, which is a decision, and a bypass is listed as debt that only shrinks.
@@ -78,6 +82,11 @@ def is_test_file(rel):
             or "/tests/" in rel)
 
 
+def migration(message_file):
+    subject = Path(message_file).read_text(errors="replace").splitlines()[0] if message_file else ""
+    return re.match(r"^\w+\(hetero\)!?:", subject) is not None
+
+
 def check_staged(kinds):
     problems = []
     out = subprocess.run(["git", "diff", "--cached", "--numstat", "--diff-filter=ACMR"],
@@ -89,15 +98,19 @@ def check_staged(kinds):
         if any(rel.startswith(p) for p in kinds["debt-path"]) and not is_test_file(rel):
             if int(added) > int(removed):
                 problems.append(f"{rel}: +{added} -{removed}: this path bypasses the hetero route and may only shrink "
-                                "(tests may be added). Move the capability onto the generic route.")
+                                "(tests may be added). Move the capability onto the generic route, "
+                                "or give the commit the scope `hetero` if it is a migration step.")
     return problems
 
 
 def main():
     kinds = read_list()
-    problems = check_tree(kinds)
-    if "--staged" in sys.argv:
-        problems += check_staged(kinds)
+    problems = []
+    if "--message" in sys.argv:
+        if not migration(sys.argv[sys.argv.index("--message") + 1]):
+            problems += check_staged(kinds)
+    else:
+        problems += check_tree(kinds)
     if problems:
         print("check_hetero: a model path outside the hetero route", file=sys.stderr)
         for p in problems:
