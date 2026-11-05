@@ -40,6 +40,9 @@ struct TierState {
     since_decay: usize,
     /// The card's copy of `slot_of`, while a recorded decode reads it.
     table: Option<Arc<graph::SlotTable>>,
+    /// Each expert's route count when a promotion gave it the slot it holds.
+    /// `None` once the expert left that slot, and for an expert placed any other way.
+    admitted: Vec<Option<u32>>,
 }
 
 impl TierState {
@@ -55,6 +58,7 @@ impl TierState {
     /// Say that `expert` is in `slot`, or in none (`-1`), to the card as well.
     fn set_slot(&mut self, expert: usize, slot: i32) {
         self.slot_of[expert] = slot;
+        self.admitted[expert] = None;
         if let Some(t) = &self.table {
             t.set(expert, slot);
         }
@@ -202,6 +206,13 @@ pub struct LayerTier {
     /// The layer's formats and widths when the card, the transit room and the host compute its
     /// experts in the same steps; `None` for the formats without an exact kernel.
     exact: Option<exact::Exact>,
+    /// The card's admission by measured payback, shared by its cached layers.
+    admission: std::sync::OnceLock<Arc<super::expert_admission::Admission>>,
+    /// The card's read-ahead of the experts its layers are expected to miss, shared by its
+    /// cached layers. Set only where a host tier keeps part of the experts.
+    readahead: std::sync::OnceLock<Arc<super::expert_readahead::ReadAhead>>,
+    /// The last cached layer of the card: a one-row request here ends the token's span.
+    closer: std::sync::atomic::AtomicBool,
 }
 
 /// What one decoded token moves between the card and the host, in page-locked memory and in
@@ -679,6 +690,8 @@ impl super::GenericHeteroTransformer {
             .sum();
         let per_expert = cfg!(target_os = "linux") && tiered_bytes > pin_left;
         let mut hot_tiers: Vec<(usize, Arc<LayerTier>)> = Vec::new();
+        // The read-ahead's reader count, measured once for every card.
+        let mut readers: Option<usize> = None;
         let mut ordinals: Vec<_> = cuda_devices.keys().copied().collect();
         ordinals.sort_unstable();
         for ordinal in ordinals {
@@ -820,6 +833,9 @@ impl super::GenericHeteroTransformer {
                 .saturating_add(stager.full_bytes());
             let extra = (lent / bytes.max(1) as u64) as usize;
             let mut locked = 0usize;
+            // One admission for the card's cached layers: a token crosses each of them once.
+            let admission = Arc::new(super::expert_admission::Admission::new(tiered.len()));
+            let mut readahead: Option<Arc<super::expert_readahead::ReadAhead>> = None;
             for (rank, &l) in tiered.iter().enumerate() {
                 let moe = self.layers[l]
                     .moe
@@ -838,11 +854,30 @@ impl super::GenericHeteroTransformer {
                 if l == first {
                     tier.leader.store(true, Ordering::Relaxed);
                 }
+                if tiered.last() == Some(&l) {
+                    tier.closer.store(true, Ordering::Relaxed);
+                }
+                let _ = tier.admission.set(admission.clone());
+                // Where a host tier keeps part of the experts, the card reads ahead from the
+                // disk the experts its layers are expected to miss.
+                if per_expert {
+                    let ra = readahead.get_or_insert_with(|| {
+                        let n = *readers.get_or_insert_with(|| read_ahead_readers(&tier));
+                        Arc::new(super::expert_readahead::ReadAhead::new(n, tiered.len()))
+                    });
+                    let _ = tier.readahead.set(ra.clone());
+                }
                 let tier = Arc::new(tier);
                 if per_expert {
                     hot_tiers.push((l, tier.clone()));
                 }
                 moe.tier = Some(tier);
+            }
+            if let Some(ra) = &readahead {
+                tracing::info!(
+                    "expert tier on card {ordinal}: {} threads read the experts the next layer is expected to miss from the disk, while a token runs faster with them",
+                    ra.readers()
+                );
             }
             // The head's layer runs as one loaded on the card: every expert there, no host
             // answer to wait for at a guess.
@@ -1265,6 +1300,17 @@ pub fn expert_bytes(moe: &MoeWeights) -> usize {
         .sum()
 }
 
+/// Reader threads for the read-ahead of `tier`'s experts: the fewest that reach the rate of the
+/// device its file is on, measured now over the host's cores, else the experts a row routes to.
+fn read_ahead_readers(tier: &LayerTier) -> usize {
+    let data = tier.host[0].native_qtensor().data();
+    let unit = tier.expert_bytes.iter().sum::<usize>();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    crate::tensor::mapped::file_span(data.as_ptr() as usize, data.len())
+        .and_then(|(file, _)| super::expert_readahead::probe_readers(&file, unit, cores))
+        .unwrap_or(tier.per_row)
+}
+
 impl LayerTier {
     /// A cache of `slots` experts on `dev` for the layer `moe`, filled with its first experts.
     pub fn new(moe: &MoeWeights, dev: &Device, slots: usize) -> Result<Self> {
@@ -1309,6 +1355,7 @@ impl LayerTier {
                 counts: vec![0; moe.n_experts],
                 since_decay: 0,
                 table: None,
+                admitted: vec![None; moe.n_experts],
             }),
             hits: AtomicU64::new(0),
             routed: AtomicU64::new(0),
@@ -1337,6 +1384,9 @@ impl LayerTier {
             used_ahead: AtomicU64::new(0),
             graph: std::sync::OnceLock::new(),
             exact,
+            admission: std::sync::OnceLock::new(),
+            readahead: std::sync::OnceLock::new(),
+            closer: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1872,7 +1922,7 @@ impl LayerTier {
         if self.leader.load(Ordering::Relaxed) && routed % window < k as u64 {
             let (_, h, p) = self.counters();
             tracing::info!(
-                "expert tier layer sample: {:.1}% of {} routed experts on the card, {} copies, {} to transit, {:.0} us copy {:.0} us host per expert, {} us a token in the layer",
+                "expert tier layer sample: {:.1}% of {} routed experts on the card, {} copies, {} to transit, {:.0} us copy {:.0} us host per expert, {} us a token in the layer, {:.0} routes take a slot",
                 100.0 * h as f64 / routed as f64,
                 routed,
                 p,
@@ -1880,8 +1930,11 @@ impl LayerTier {
                 f64::from_bits(self.upload_us[0].load(Ordering::Relaxed)),
                 f64::from_bits(self.host_us[0].load(Ordering::Relaxed)),
                 self.decode_us.load(Ordering::Relaxed),
+                self.heat_to_take_a_slot(),
             );
         }
+        self.mark_token();
+        self.read_next_ahead();
         // The misses the transit room runs, and those the host does.
         let to_transit = self.transit_share(miss_ids.len(), 1);
         let (transit_ids, host_ids) = miss_ids.split_at(to_transit);
@@ -2662,6 +2715,97 @@ impl LayerTier {
         self.paced[class].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Nanoseconds the host takes for one expert of a one-row request, measured on this layer,
+    /// `0` before a measure.
+    fn host_expert_ns(&self) -> u64 {
+        super::expert_admission::ns_of_us(f64::from_bits(self.host_us[0].load(Ordering::Relaxed)))
+    }
+
+    /// The heat a missing expert needs to take a slot: the routes that repay its upload, as the
+    /// card's admission measures them, never below `ADAPT_MIN_HEAT`.
+    fn heat_to_take_a_slot(&self) -> f32 {
+        super::expert_admission::heat_to_take_a_slot(
+            self.admission.get().map(|a| a.as_ref()),
+            self.host_expert_ns(),
+            ADAPT_MIN_HEAT,
+        )
+    }
+
+    /// The bytes of `expert` in the three host stacks, gate, up and down.
+    fn expert_spans(&self, expert: usize) -> Vec<super::expert_readahead::Span> {
+        (0..3)
+            .map(|i| {
+                let base = self.host[i].native_qtensor().data().as_ptr() as usize;
+                let eb = self.expert_bytes[i];
+                (base + expert * eb, eb)
+            })
+            .collect()
+    }
+
+    /// A one-row request reached this layer: the card's first cached layer starts the token's
+    /// span and its last ends it, which times the read-ahead's trials.
+    fn mark_token(&self) {
+        let Some(ra) = self.readahead.get() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if self.closer.load(Ordering::Relaxed) {
+            ra.token_ends(now);
+        }
+        if self.leader.load(Ordering::Relaxed) {
+            ra.token_starts(now);
+        }
+    }
+
+    /// Queue the disk reads of the experts the next layer is expected to miss, while the
+    /// read-ahead runs: its guess from its last request, of the experts one row routes to.
+    /// An expert locked in host memory is not read.
+    fn read_next_ahead(&self) {
+        let Some(ra) = self.readahead.get().filter(|ra| ra.reads()) else {
+            return;
+        };
+        let Some(next) = self.ahead_next.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let guess = {
+            let st = next.state.lock().unwrap_or_else(|e| e.into_inner());
+            next.ahead
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .guess(|e| st.slot_of[e as usize] >= 0, next.per_row)
+        };
+        for e in guess {
+            let spans = next.expert_spans(e as usize);
+            if !spans
+                .iter()
+                .any(|&(at, len)| hot::overlaps_registered(at, at + len))
+            {
+                ra.read(spans);
+            }
+        }
+    }
+
+    /// Drop from the page cache the pages of `used`, experts the card missed and the host read,
+    /// while a tuned host tier exists and the host's memory is short.
+    /// An expert locked in host memory keeps its pages.
+    fn drop_after_use(&self, used: &[u32]) {
+        let Some(ra) = self.readahead.get() else {
+            return;
+        };
+        if used.is_empty() || !super::expert_host_tune::drops_unkept_pages() {
+            return;
+        }
+        for &e in used {
+            let spans = self.expert_spans(e as usize);
+            if !spans
+                .iter()
+                .any(|&(at, len)| hot::overlaps_registered(at, at + len))
+            {
+                ra.drop_pages(spans);
+            }
+        }
+    }
+
     /// Hand the worker the hottest missing experts that earn a slot over the coldest slots this
     /// token did not read. The copy runs beside the tokens that follow: an expert is routed to
     /// the card only once it has landed.
@@ -2672,16 +2816,32 @@ impl LayerTier {
     /// [`Self::promote`] for up to `most` experts at once: the hottest missing ones, each hotter
     /// than the coldest slot left, copied in one job. A request of several rows misses as many
     /// experts as rows, and the cache learns at that pace.
+    ///
+    /// Every request ends here with the experts the card missed.
+    /// Those not promoted have their pages dropped where memory is short (`drop_after_use`).
     pub(super) fn promote_up_to(self: &Arc<Self>, missing: &[u32], in_use: &[bool], most: usize) {
+        let promoted = self.promote_some(missing, in_use, most);
+        let left: Vec<u32> = missing
+            .iter()
+            .copied()
+            .filter(|&e| !promoted.contains(&(e as usize)))
+            .collect();
+        self.drop_after_use(&left);
+    }
+
+    /// [`Self::promote_up_to`] without the drop: the experts handed to the copy worker.
+    fn promote_some(self: &Arc<Self>, missing: &[u32], in_use: &[bool], most: usize) -> Vec<usize> {
         if most == 0 || self.promoting.swap(true, Ordering::AcqRel) {
-            return;
+            return Vec::new();
         }
+        let host_ns = self.host_expert_ns();
+        let bar = self.heat_to_take_a_slot();
         let chosen: Vec<(usize, usize)> = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let mut hot: Vec<u32> = missing
                 .iter()
                 .copied()
-                .filter(|&e| st.heat[e as usize] >= ADAPT_MIN_HEAT)
+                .filter(|&e| st.heat[e as usize] >= bar)
                 .collect();
             hot.sort_unstable();
             hot.dedup();
@@ -2699,7 +2859,12 @@ impl LayerTier {
                 }
                 let old = st.owner[victim];
                 if old >= 0 {
-                    st.set_slot(old as usize, -1);
+                    let old = old as usize;
+                    // A promoted expert leaves: what it earned there moves the admission's bias.
+                    if let (Some(at), Some(a)) = (st.admitted[old], self.admission.get()) {
+                        a.settle(u64::from(st.counts[old].saturating_sub(at)), host_ns);
+                    }
+                    st.set_slot(old, -1);
                 }
                 st.owner[victim] = -2;
                 pairs.push((expert as usize, victim));
@@ -2708,11 +2873,13 @@ impl LayerTier {
         };
         if chosen.is_empty() {
             self.promoting.store(false, Ordering::Release);
-            return;
+            return Vec::new();
         }
+        let promoted: Vec<usize> = chosen.iter().map(|&(expert, _)| expert).collect();
         let tier = self.clone();
         copier(self.dev.as_cuda_device().map_or(0, |d| d.0.ordinal()))
             .send(Box::new(move || {
+                let started = std::time::Instant::now();
                 let landed = (|| -> Result<()> {
                     for &(expert, slot) in &chosen {
                         tier.copy_in_async(expert, slot)?;
@@ -2721,12 +2888,20 @@ impl LayerTier {
                         .synchronize()
                         .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))
                 })();
+                // The job copied its experts one after the other: each took its share.
+                let upload_ns = started.elapsed().as_nanos() as u64 / chosen.len() as u64;
+                crate::inference::offload::prof_record("tier slot upload", upload_ns);
                 let mut st = tier.state.lock().unwrap_or_else(|e| e.into_inner());
                 for &(expert, slot) in &chosen {
                     match &landed {
                         Ok(()) => {
                             st.owner[slot] = expert as i32;
                             st.set_slot(expert, slot as i32);
+                            let count = st.counts[expert];
+                            st.admitted[expert] = Some(count);
+                            if let Some(a) = tier.admission.get() {
+                                a.note_upload(upload_ns);
+                            }
                             tier.promotions.fetch_add(1, Ordering::Relaxed);
                             graph::note_promotion();
                         }
@@ -2742,6 +2917,7 @@ impl LayerTier {
                 tier.promoting.store(false, Ordering::Release);
             }))
             .ok();
+        promoted
     }
 
     /// Expert `expert` of the host stacks into slot `slot` of the card's, queued on the copy

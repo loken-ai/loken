@@ -60,13 +60,21 @@ mod context_parallel;
 #[cfg(test)]
 mod conversation_tests;
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+mod expert_admission;
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 mod expert_ahead;
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+mod expert_host_tune;
 pub mod expert_profile;
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+mod expert_readahead;
 #[cfg(feature = "gpu")]
 pub mod expert_tier;
 #[cfg(not(feature = "gpu"))]
 #[path = "expert_tier_host.rs"]
 pub mod expert_tier;
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+mod expert_tuner;
 mod graph;
 pub mod hetero;
 pub use hetero::CachedPrompt;

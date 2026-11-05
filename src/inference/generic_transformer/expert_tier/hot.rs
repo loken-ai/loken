@@ -2,8 +2,9 @@
 //! hold the layers whole: their pages in the file mapping are locked with `mlock`, ranked across
 //! layers by heat, and moved between requests.
 
+use super::super::expert_host_tune::{available_bytes, TierTune};
 use super::LayerTier;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A half-open byte range `[lo, hi)` of the address space.
@@ -160,6 +161,13 @@ pub(crate) fn for_each_piece(
     Ok(())
 }
 
+/// Whether any byte of `[lo, hi)` lies in a range registered now or on its way in or out.
+pub(crate) fn overlaps_registered(lo: usize, hi: usize) -> bool {
+    let reg = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    let first = reg.partition_point(|r| r.1 <= lo);
+    reg.get(first).is_some_and(|r| r.0 < hi)
+}
+
 /// Locks `r` in host memory: registered with the card's driver, which pins the pages outside
 /// the process's locked-memory limit and lets copies from them run as transfers.
 #[cfg(feature = "gpu")]
@@ -227,7 +235,10 @@ struct Locked {
 pub struct HotLocks {
     /// The tiers, with the model layer each serves.
     tiers: Vec<(usize, Arc<LayerTier>)>,
-    budget: u64,
+    /// Bytes the locks may take: moved at a request's end by `tune`.
+    budget: AtomicU64,
+    /// The budget in experts per layer, moved by the host's memory stalls.
+    tune: Mutex<TierTune>,
     page: usize,
     state: Mutex<Locked>,
     /// A re-rank is applying its locks: the next one is skipped.
@@ -246,9 +257,19 @@ impl HotLocks {
             tiers.len(),
             budget as f64 / 1e9
         );
+        // One more expert in every layer: what a step of the tuned size costs.
+        let step: u64 = tiers
+            .iter()
+            .map(|(_, t)| pair_cost(&t.expert_bytes, page))
+            .sum();
+        let ceiling = tiers.iter().map(|(_, t)| t.n_experts).max().unwrap_or(0);
+        // What the host keeps outside the locks: the memory it can give beyond the budget.
+        let need = available_bytes().saturating_sub(budget);
+        let slots = (budget / step.max(1)) as usize;
         Some(Self {
             tiers,
-            budget,
+            budget: AtomicU64::new(budget),
+            tune: Mutex::new(TierTune::new(slots, ceiling, need, step)),
             page,
             state: Mutex::new(Locked {
                 ranges: Vec::new(),
@@ -318,6 +339,7 @@ impl HotLocks {
         if self.busy.load(Ordering::Acquire) {
             return;
         }
+        self.retune();
         let (covered, routed, weights) = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let now: Vec<Vec<u32>> = self.tiers.iter().map(|(_, t)| t.routing_counts()).collect();
@@ -341,12 +363,30 @@ impl HotLocks {
         self.start(weights, Some((covered, routed)));
     }
 
+    /// Move the budget by what the host reports of its memory: a step is one more or one fewer
+    /// expert in every layer. The next ranking locks within the new budget.
+    fn retune(&self) {
+        let mut tune = self.tune.lock().unwrap_or_else(|e| e.into_inner());
+        let before = tune.slots;
+        let Some(slots) = tune.look(available_bytes()) else {
+            return;
+        };
+        if slots != before {
+            let budget = slots as u64 * tune.step_bytes;
+            self.budget.store(budget, Ordering::Relaxed);
+            tracing::info!(
+                "hot experts: host tier from {before} to {slots} experts per layer, {:.2} GB",
+                budget as f64 / 1e9
+            );
+        }
+    }
+
     /// Rank `weights` and apply the result on a thread of its own, unless one is applying.
     fn start(self: &Arc<Self>, weights: Vec<Vec<f32>>, traffic: Option<(u64, u64)>) {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
-        let hot = rank(&weights, &self.costs(), self.budget);
+        let hot = rank(&weights, &self.costs(), self.budget.load(Ordering::Relaxed));
         let me = self.clone();
         let spawned = std::thread::Builder::new()
             .name("hot-experts".into())
@@ -432,7 +472,7 @@ impl HotLocks {
             st.hot.len(),
             self.tiers.len(),
             span(&st.ranges) as f64 / 1e9,
-            self.budget as f64 / 1e9
+            self.budget.load(Ordering::Relaxed) as f64 / 1e9
         );
     }
 }
@@ -518,6 +558,27 @@ mod tests {
         assert_eq!(all, vec![(0, 10), (10, 20), (20, 30), (30, 40), (40, 50)]);
         assert_eq!(mid, vec![(15, 20), (20, 30), (30, 35)]);
         assert_eq!(inside, vec![(21, 29)]);
+    }
+
+    #[test]
+    fn a_span_that_touches_a_registered_range_overlaps_it() {
+        // Addresses no mapping holds, apart from the other test's.
+        let base = usize::MAX / 4;
+        let r = (base + 10, base + 20);
+        {
+            let mut reg = REGISTERED.write().unwrap();
+            let at = reg.partition_point(|x| x.0 < r.0);
+            reg.insert(at, r);
+        }
+        let seen = [
+            overlaps_registered(base, base + 10),
+            overlaps_registered(base, base + 11),
+            overlaps_registered(base + 12, base + 14),
+            overlaps_registered(base + 19, base + 30),
+            overlaps_registered(base + 20, base + 30),
+        ];
+        REGISTERED.write().unwrap().retain(|x| *x != r);
+        assert_eq!(seen, [false, true, true, true, false]);
     }
 
     #[test]

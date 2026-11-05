@@ -1199,6 +1199,10 @@ impl LayerTier {
             }
         }
         laps.mark("tier worker: bookkeeping");
+        if req.rows == 1 {
+            self.mark_token();
+            self.read_next_ahead();
+        }
         // The card waits for the product only when an expert was missing. Of the missing
         // experts, a share goes to the transit room by copy while the host computes the rest:
         // the card runs the copied ones once the answer says they landed.
@@ -1375,7 +1379,7 @@ impl LayerTier {
                 );
             }
             tracing::info!(
-                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request; transit share {}/8 (one row) {}/8 (rows), host {:.0}/{:.0} us an expert, copy {:.0}/{:.0} us",
+                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request; transit share {}/8 (one row) {}/8 (rows), host {:.0}/{:.0} us an expert, copy {:.0}/{:.0} us, {:.0} routes take a slot",
                 total / n / 1000,
                 100.0 * missed as f64 / n as f64,
                 WORKER.missing.load(Ordering::Relaxed) as f64 / missed as f64,
@@ -1391,6 +1395,7 @@ impl LayerTier {
                 f64::from_bits(self.host_us[1].load(Ordering::Relaxed)),
                 f64::from_bits(self.upload_us[0].load(Ordering::Relaxed)),
                 f64::from_bits(self.upload_us[1].load(Ordering::Relaxed)),
+                self.heat_to_take_a_slot(),
             );
         }
         Ok(true)
