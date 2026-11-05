@@ -45,7 +45,7 @@ Smaller, by state then by priority:
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Partial |
 | Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
 | Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
-| Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a signature so that a copy cannot change under the same name. | Partial |
+| Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a seal that shows any change. | Done |
 | Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |
 | One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
 | ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
@@ -62,8 +62,10 @@ Smaller, by state then by priority:
 | Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
 | Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
-| Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Planned |
-| Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Planned |
+| Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Partial |
+| Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Partial |
+| DeepSeek V4.1 through the hetero route | Models | DeepSeek V4.1 loads and is placed through HeteroPlan and the ladder, with no loader, backend, batch server or expert streamer of its own, and its tokens equal those of the frozen oracle. | Planned |
+| Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Planned |
 
 Fixes, by state then by priority:
 
@@ -89,6 +91,7 @@ Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| GLM-5.3 on the host and the cards | Models | GLM-5.3 loads from its published checkpoint and answers as the reference implementation does, its experts read from disk when they do not fit, and it drafts with its own draft head. | Planned |
 | A cluster that survives a node | Cluster | When a machine drops out mid-request, the others finish the request. | Planned |
 | Routing across loken nodes | Cluster | One model name sends each request to the loken node that serves it best by load, speed and energy, to the node that already holds its conversation's KV, and to another node when one fails. | Planned |
 | A cluster across networks | Cluster | Machines on different networks, even behind NAT, form one cluster over an encrypted link. | Planned |
