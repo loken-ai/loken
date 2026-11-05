@@ -29,6 +29,8 @@ pub mod load;
 pub mod mainline;
 pub mod model;
 pub mod moe;
+#[cfg(test)]
+mod oracle_freeze;
 pub mod packed;
 pub mod quality;
 pub mod safetensors_source;
