@@ -196,7 +196,7 @@ impl MixerHost {
                     "a wide-residual layer's state has no stored form",
                 ))
             }
-            MixerState::Mla(_) => {
+            MixerState::Mla(_) | MixerState::LatentMqa(_) | MixerState::CompressedBand(_) => {
                 return Err(crate::tensor::Error::msg(
                     "a latent attention layer's cache has no stored form",
                 ))

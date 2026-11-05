@@ -8,6 +8,8 @@
 //!
 //! Which mixer a layer runs is read from the tensors its block carries.
 
+use super::compressed_band::{BandState, CompressedBand};
+use super::latent_mqa::{LatentMqa, LatentMqaState};
 use super::mla::{Mla, MlaState};
 #[allow(unused_imports)]
 use super::*;
@@ -88,6 +90,11 @@ pub enum Mixer {
     DeltaNet(GatedDeltaNet),
     /// Latent attention, which keeps its own cache of latent rows.
     Mla(Mla),
+    /// Latent attention over 1 shared key head, which keeps its own window of key rows.
+    LatentMqa(LatentMqa),
+    /// Latent attention over 1 shared key head and a compressed copy of the past, which keeps
+    /// its window and, on a source, its compressed rows.
+    CompressedBand(CompressedBand),
     /// The block has no mixing sublayer.
     Absent,
 }
@@ -99,6 +106,8 @@ pub enum MixerState {
     Ssm(Option<SsmState>),
     DeltaNet(Option<SsmState>),
     Mla(Option<MlaState>),
+    LatentMqa(Option<LatentMqaState>),
+    CompressedBand(Option<BandState>),
     /// A wide-residual layer's: its mixer's state beside the caches of its indexer and of its
     /// n-gram features.
     Wide(Box<WideState>),
@@ -125,7 +134,11 @@ impl MixerState {
                 .iter()
                 .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
                 .sum(),
-            MixerState::Ssm(_) | MixerState::DeltaNet(_) | MixerState::Mla(_) => 0,
+            MixerState::Ssm(_)
+            | MixerState::DeltaNet(_)
+            | MixerState::Mla(_)
+            | MixerState::LatentMqa(_)
+            | MixerState::CompressedBand(_) => 0,
             MixerState::Wide(w) => {
                 w.mixer.as_ref().map_or(0, MixerState::device_bytes)
                     + w.ngram.as_ref().map_or(0, |n| n.device_bytes())
@@ -332,6 +345,8 @@ impl Mixer {
             Mixer::Ssm(_) => false,
             // Its cache grows on the host with every token.
             Mixer::Mla(_) => false,
+            // Its window is kept on the host.
+            Mixer::LatentMqa(_) | Mixer::CompressedBand(_) => false,
         }
     }
 
@@ -355,7 +370,7 @@ impl Mixer {
             Mixer::ShortConv(m) => m.state.clone().map(|s| MixerState::ShortConv(Some(s))),
             Mixer::Ssm(m) => m.state.clone().map(|s| MixerState::Ssm(Some(s))),
             Mixer::DeltaNet(m) => m.state.clone().map(|s| MixerState::DeltaNet(Some(s))),
-            Mixer::Mla(_) => {
+            Mixer::Mla(_) | Mixer::LatentMqa(_) | Mixer::CompressedBand(_) => {
                 return Err(crate::tensor::Error::msg(
                     "a latent cache has no buffer to keep in place",
                 ))
@@ -374,7 +389,9 @@ impl Mixer {
             Mixer::ShortConv(m) => m.state.clone().map(|s| MixerState::ShortConv(Some(s))),
             Mixer::Ssm(m) => m.state.clone().map(|s| MixerState::Ssm(Some(s))),
             Mixer::DeltaNet(m) => m.state.clone().map(|s| MixerState::DeltaNet(Some(s))),
-            Mixer::Mla(_) => return self.restore(state),
+            Mixer::Mla(_) | Mixer::LatentMqa(_) | Mixer::CompressedBand(_) => {
+                return self.restore(state)
+            }
         };
         match current {
             Some(cur) => copy_state_in_place(&cur, state),
@@ -398,6 +415,8 @@ impl Mixer {
             Mixer::Ssm(m) => m.forward(x, index_pos),
             Mixer::DeltaNet(m) => m.forward(x, index_pos),
             Mixer::Mla(m) => m.forward(x, index_pos),
+            Mixer::LatentMqa(m) => m.forward(x, index_pos),
+            Mixer::CompressedBand(m) => m.forward(x, index_pos),
         }
     }
 
@@ -414,6 +433,16 @@ impl Mixer {
                     m.moves += 1;
                 }
             }
+            Mixer::LatentMqa(m) => {
+                if m.state.take().is_some() {
+                    m.moves += 1;
+                }
+            }
+            Mixer::CompressedBand(m) => {
+                if m.state.take().is_some() {
+                    m.moves += 1;
+                }
+            }
         }
     }
 
@@ -425,6 +454,8 @@ impl Mixer {
             Mixer::Ssm(m) => m.moves,
             Mixer::DeltaNet(m) => m.moves,
             Mixer::Mla(m) => m.moves,
+            Mixer::LatentMqa(m) => m.moves,
+            Mixer::CompressedBand(m) => m.moves,
         }
     }
 
@@ -442,6 +473,8 @@ impl Mixer {
                 m.state.as_ref().map(SsmState::deep_copy).transpose()?,
             )),
             Mixer::Mla(m) => Some(MixerState::Mla(m.state.clone())),
+            Mixer::LatentMqa(m) => Some(MixerState::LatentMqa(m.state.clone())),
+            Mixer::CompressedBand(m) => Some(MixerState::CompressedBand(m.state.clone())),
         })
     }
 
@@ -459,7 +492,11 @@ impl Mixer {
                     _ => 0,
                 }
             }
-            Mixer::Attention | Mixer::Absent | Mixer::Mla(_) => 0,
+            Mixer::Attention
+            | Mixer::Absent
+            | Mixer::Mla(_)
+            | Mixer::LatentMqa(_)
+            | Mixer::CompressedBand(_) => 0,
         }
     }
 
@@ -482,6 +519,16 @@ impl Mixer {
                 Ok(())
             }
             (Mixer::Mla(m), MixerState::Mla(s)) => {
+                m.state = s.clone();
+                m.moves += 1;
+                Ok(())
+            }
+            (Mixer::LatentMqa(m), MixerState::LatentMqa(s)) => {
+                m.state = s.clone();
+                m.moves += 1;
+                Ok(())
+            }
+            (Mixer::CompressedBand(m), MixerState::CompressedBand(s)) => {
                 m.state = s.clone();
                 m.moves += 1;
                 Ok(())

@@ -45,6 +45,7 @@ mod card_host_parity;
 mod wide_tests;
 
 pub mod block_scaled_experts;
+pub mod compressed_band;
 mod config;
 #[cfg(test)]
 mod conversion_tests;
@@ -73,6 +74,7 @@ mod hf_reference_tests;
 pub mod hyper;
 #[cfg(test)]
 mod kv_handover_tests;
+pub mod latent_mqa;
 mod layer_attn;
 mod layer_cpu_attn;
 mod layer_ffn;
