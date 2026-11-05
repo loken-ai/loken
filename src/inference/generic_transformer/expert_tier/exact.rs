@@ -45,15 +45,17 @@ pub(super) struct Exact {
     pub(super) down: Fmt,
     pub(super) dim: usize,
     pub(super) inter: usize,
+    /// The bound of the SwiGLU, `0` for none: the `limit` of `offload::experts::swiglu`.
+    pub(super) limit: f32,
 }
 
 /// Values of a q8_K block, the unit both widths are counted in.
 const BLOCK: usize = crate::tensor::quant_cpu::QK_K;
 
 impl Exact {
-    /// The exact form of the stacks `[gate, up, down]`, `None` when a format has no exact kernel
-    /// or a width is not whole blocks.
-    pub(super) fn of(host: &[Arc<QTensor>; 3]) -> Option<Self> {
+    /// The exact form of the stacks `[gate, up, down]` under the SwiGLU bound `limit`, `None`
+    /// when a format has no exact kernel or a width is not whole blocks.
+    pub(super) fn of(host: &[Arc<QTensor>; 3], limit: f32) -> Option<Self> {
         let gate = Fmt::of(host[0].dtype())?;
         if host[1].dtype() != host[0].dtype() {
             return None;
@@ -69,6 +71,7 @@ impl Exact {
             down,
             dim,
             inter,
+            limit,
         })
     }
 
@@ -185,6 +188,7 @@ pub(super) fn run_pairs(
     b.arg(&rooms.h);
     b.arg(&dim);
     b.arg(&inter);
+    b.arg(&exact.limit);
     launched(&name, unsafe { b.launch(warps((inter as u32, n as u32))) })?;
     let f = cd.0.quantized_fn("tx_quantize_h")?;
     let mut b = stream.launch_builder(&f);
@@ -312,7 +316,7 @@ pub(super) fn host_pairs(
             typed::<G>(&host[1]),
             typed::<D>(&host[2]),
         );
-        host_rows::<G, D>(gate, up, down, exact.dim, exact.inter, x, pairs)
+        host_rows::<G, D>(gate, up, down, exact, x, pairs)
     }
     Ok(match (exact.gate, exact.down) {
         (Fmt::Q2K, Fmt::Q2K) => run::<BlockQ2K, BlockQ2K>(exact, host, x, pairs),
@@ -333,11 +337,11 @@ fn host_rows<G: ExactDot, D: ExactDot>(
     gate: &[G],
     up: &[G],
     down: &[D],
-    dim: usize,
-    inter: usize,
+    exact: &Exact,
     x: &[f32],
     pairs: &[(usize, u32, f32)],
 ) -> Vec<f32> {
+    let (dim, inter, limit) = (exact.dim, exact.inter, exact.limit);
     let (nb, nbi) = (dim / BLOCK, inter / BLOCK);
     let rows = x.len() / dim;
     let mut xq = vec![BlockQ8K::zeros(); rows * nb];
@@ -388,7 +392,7 @@ fn host_rows<G: ExactDot, D: ExactDot>(
                     let v = crate::inference::offload::experts::swiglu(
                         G::dot_exact(gw, a),
                         G::dot_exact(uw, a),
-                        0.0,
+                        limit,
                     );
                     // SAFETY: each (pair, row) is written by the one unit that holds the row of
                     // the pair's expert.
@@ -813,7 +817,7 @@ mod tests {
                 stack(experts, inter, dim, 2, gate_dt),
                 stack(experts, dim, inter, 3, down_dt),
             ];
-            let exact = Exact::of(&host).expect("formats with exact kernels");
+            let exact = Exact::of(&host, 0.0).expect("formats with exact kernels");
             let x: Vec<f32> = (0..rows * dim)
                 .map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 4.0)
                 .collect();
@@ -838,5 +842,88 @@ mod tests {
                 bits(&sum_in_order(&alone, used, dim))
             );
         }
+    }
+
+    /// The pairs of one row worked out one value at a time: the gate and up products of
+    /// `ExactDot`, the clamp and SwiGLU of `offload::experts::swiglu` at `limit`, the row as
+    /// q8_K blocks, the down product, the weight.
+    fn pairs_one_value_at_a_time<G: ExactDot, D: ExactDot>(
+        host: &[Arc<QTensor>; 3],
+        dim: usize,
+        inter: usize,
+        limit: f32,
+        x: &[f32],
+        pairs: &[(usize, u32, f32)],
+    ) -> (Vec<f32>, usize) {
+        fn typed<T: BlockFormat>(t: &QTensor) -> &[T] {
+            let bytes = t.native_qtensor().data();
+            // Safety: the stack holds blocks of `T`, its format.
+            unsafe {
+                std::slice::from_raw_parts(
+                    bytes.as_ptr() as *const T,
+                    bytes.len() / std::mem::size_of::<T>(),
+                )
+            }
+        }
+        let (gate, up, down) = (
+            typed::<G>(&host[0]),
+            typed::<G>(&host[1]),
+            typed::<D>(&host[2]),
+        );
+        let (nb, nbi) = (dim / BLOCK, inter / BLOCK);
+        let mut out = Vec::with_capacity(pairs.len() * dim);
+        let mut bound = 0usize;
+        for &(row, e, w) in pairs {
+            let e = e as usize;
+            let mut xq = vec![BlockQ8K::zeros(); nb];
+            BlockQ8K::quantize(&x[row * dim..(row + 1) * dim], &mut xq);
+            let h: Vec<f32> = (0..inter)
+                .map(|r| {
+                    let at = (e * inter + r) * nb;
+                    let g = G::dot_exact(&gate[at..at + nb], &xq);
+                    let u = G::dot_exact(&up[at..at + nb], &xq);
+                    bound += usize::from(g > limit || u.abs() > limit);
+                    crate::inference::offload::experts::swiglu(g, u, limit)
+                })
+                .collect();
+            let mut hq = vec![BlockQ8K::zeros(); nbi];
+            BlockQ8K::quantize(&h, &mut hq);
+            for c in 0..dim {
+                let at = (e * dim + c) * nbi;
+                out.push(w * D::dot_exact(&down[at..at + nbi], &hq));
+            }
+        }
+        (out, bound)
+    }
+
+    /// Under a SwiGLU bound the host's pairs are the bits of the bounded SwiGLU of
+    /// `offload::experts::swiglu` taken one value at a time, and differ from the unbounded ones.
+    #[test]
+    fn a_bounded_swiglu_gives_the_bits_of_the_offload_swiglu() {
+        let (experts, dim, inter, rows) = (4usize, 512usize, 256usize, 3usize);
+        let host = [
+            stack(experts, inter, dim, 1, GgmlDType::Q4K),
+            stack(experts, inter, dim, 2, GgmlDType::Q4K),
+            stack(experts, dim, inter, 3, GgmlDType::Q6K),
+        ];
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 4.0)
+            .collect();
+        let pairs: Vec<(usize, u32, f32)> = (0..rows)
+            .flat_map(|r| {
+                [0usize, 2].map(|d| (r, ((r + d) % experts) as u32, 0.3 + 0.1 * d as f32))
+            })
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        let free = host_pairs(&Exact::of(&host, 0.0).unwrap(), &host, &x, &pairs).unwrap();
+        // A bound below the largest products, so that the clamp moves some of them.
+        let limit = 0.5f32;
+        let exact = Exact::of(&host, limit).expect("formats with exact kernels");
+        let got = host_pairs(&exact, &host, &x, &pairs).unwrap();
+        let (want, bound) =
+            pairs_one_value_at_a_time::<BlockQ4K, BlockQ6K>(&host, dim, inter, limit, &x, &pairs);
+        assert!(bound > 0, "the bound moves no product");
+        assert_eq!(bits(&got), bits(&want));
+        assert_ne!(bits(&got), bits(&free), "the bound changes nothing");
     }
 }

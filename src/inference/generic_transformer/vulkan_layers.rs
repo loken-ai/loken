@@ -210,6 +210,8 @@ fn unsupported_experts(m: &super::moe_weights::MoeWeights) -> bool {
         || m.up_relu2
         || m.gelu
         || m.swiglu_clamp.is_some()
+        || m.swiglu_limit.is_some()
+        || m.block_scaled.is_some()
         || m.gate_inp_bias.is_some()
         || m.gate_exps_bias.is_some()
         || m.down_exps_scale.is_some()

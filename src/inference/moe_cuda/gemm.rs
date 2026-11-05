@@ -20,7 +20,7 @@ use half::{bf16, f16};
 /// `cuda/moe/moe_gguf.cu` dispatches on that number and its table is these same rows  -
 /// the entry points used to carry a copy each, differing by a row or two, which is how a
 /// format came to be accepted here and unhandled there.
-const EXPERT_QUANT_CODES: [(GgmlDType, i32); 15] = [
+const EXPERT_QUANT_CODES: [(GgmlDType, i32); 16] = [
     (GgmlDType::Q8_0, 0),
     (GgmlDType::Q4K, 1),
     (GgmlDType::Q2K, 2),
@@ -36,6 +36,7 @@ const EXPERT_QUANT_CODES: [(GgmlDType, i32); 15] = [
     (GgmlDType::Iq3S, 12),
     (GgmlDType::Iq2S, 13),
     (GgmlDType::Q2_0, 14),
+    (GgmlDType::Iq2Xxs, 15),
 ];
 
 /// Whether the expert kernels serve this weight format at all.
@@ -646,6 +647,58 @@ pub fn moe_gemm_gguf_gate_up_swiglu_oai(
     }
     drop(gate_held);
     drop(up_held);
+    tensor_from_f32_slice(output, ext.out_shape(), &input.device())
+}
+
+/// Fused MoE gate GEMM + up GEMM + the bounded SwiGLU in one launch: the gate clamped from
+/// above at `limit`, the up value on both sides, then `silu(gate) * up`.
+/// `input` [M, K] f32; `gate_weights`/`up_weights` [E, N, K]; returns [M.topk, N].
+pub fn moe_gemm_gguf_gate_up_swiglu_limited(
+    input: &Tensor,
+    gate_weights: &crate::tensor::quantized::QTensor,
+    up_weights: &crate::tensor::quantized::QTensor,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    limit: f32,
+) -> Result<Tensor> {
+    const ENTRY: &str = "gate_up_swiglu_limited";
+    if input.dtype() != DType::F32 {
+        crate::tensor::bail!("{ENTRY} only accepts f32 inputs");
+    }
+    if up_weights.shape().dims() != gate_weights.shape().dims()
+        || up_weights.dtype() != gate_weights.dtype()
+    {
+        crate::tensor::bail!("{ENTRY}: the gate and up stacks differ in shape or format");
+    }
+    let ext = Extents::read(ENTRY, input, gate_weights.shape().dims(), topk, false)?;
+    ext.require_k_by_eight(ENTRY)?;
+    let gguf_dtype = gguf_quant_code(gate_weights.dtype(), ENTRY)?;
+    let dev = input.device().as_cuda_device()?;
+    let (slots, experts) = plan_addrs(sorted_token_ids, experts_ids)?;
+    let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    unsafe {
+        launch_status(
+            loken_moe_gemm_gguf_gate_up_swiglu_limited(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                gate_weights.device_ptr()? as *const c_void,
+                up_weights.device_ptr()? as *const c_void,
+                slots,
+                experts,
+                output.device_ptr(output.stream()).0 as *mut f32,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                limit,
+                stream,
+            ),
+            "loken_moe_gemm_gguf_gate_up_swiglu_limited",
+        )?;
+    }
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
 }
 

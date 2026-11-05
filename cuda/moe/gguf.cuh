@@ -67,7 +67,8 @@ static __device__ __forceinline__ float warp_sum(float x) {
     X(11, iq3_xxs, QK_IQ3_XXS, QI_IQ3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ) \
     X(12, iq3_s,  QK_IQ3_S,   QI_IQ3_S,   VDR_IQ3_S_Q8_1_MMVQ)    \
     X(13, iq2_s,  QK_IQ2_S,   QI_IQ2_S,   VDR_IQ2_S_Q8_1_MMVQ)    \
-    X(14, q2_0,   QK_Q2_0,    QI_Q2_0,    VDR_Q2_0_Q8_1_MMVQ)
+    X(14, q2_0,   QK_Q2_0,    QI_Q2_0,    VDR_Q2_0_Q8_1_MMVQ)     \
+    X(15, iq2_xxs, QK_IQ2_XXS, QI_IQ2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ)
 
 /// The subset of the table above that a block dequantiser exists for.
 ///
@@ -88,7 +89,8 @@ static __device__ __forceinline__ float warp_sum(float x) {
     X(11, iq3_xxs, QK_IQ3_XXS, QI_IQ3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ) \
     X(12, iq3_s,  QK_IQ3_S,   QI_IQ3_S,   VDR_IQ3_S_Q8_1_MMVQ)    \
     X(13, iq2_s,  QK_IQ2_S,   QI_IQ2_S,   VDR_IQ2_S_Q8_1_MMVQ)    \
-    X(14, q2_0,   QK_Q2_0,    QI_Q2_0,    VDR_Q2_0_Q8_1_MMVQ)
+    X(14, q2_0,   QK_Q2_0,    QI_Q2_0,    VDR_Q2_0_Q8_1_MMVQ)     \
+    X(15, iq2_xxs, QK_IQ2_XXS, QI_IQ2_XXS, VDR_IQ2_XXS_Q8_1_MMVQ)
 
 /// `a` divided by `b`, rounded up - how many whole `b`s it takes to cover `a`.
 ///

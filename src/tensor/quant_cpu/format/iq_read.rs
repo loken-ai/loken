@@ -335,6 +335,13 @@ mod tests {
         );
         same("IQ3S_GRID", IQ3S_GRID.iter().map(|&v| v as i64).collect());
         same(
+            "IQ2XXS_GRID",
+            super::super::iq2_xxs::IQ2XXS_GRID
+                .iter()
+                .map(|&v| v as i64)
+                .collect(),
+        );
+        same(
             "KSIGNS_IQ2XS",
             KSIGNS_IQ2XS.iter().map(|&v| v as i64).collect(),
         );

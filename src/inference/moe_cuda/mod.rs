@@ -238,6 +238,11 @@ cuda_launchers! {
         expert_ids: *const i32, gate_bias: *const f32, up_bias: *const f32, outputs: *mut f32,
         num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, quant_type: i32,
         alpha: f32, limit: f32) -> i32;
+    loken_moe_gemm_gguf_gate_up_swiglu_limited(
+        inputs: *const f32, gate_weights: *const c_void,
+        up_weights: *const c_void, sorted_token_ids: *const i32,
+        expert_ids: *const i32, outputs: *mut f32, num_experts: i32, topk: i32, size_m: i32,
+        size_n: i32, size_k: i32, quant_type: i32, limit: f32) -> i32;
 }
 cuda_launchers! {
     loken_tier_plan(

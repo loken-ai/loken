@@ -1167,6 +1167,125 @@ pub fn moe_gemm_gguf_gate_up_swiglu_oai(
     Ok(h)
 }
 
+/// The bounded SwiGLU of the fused gate+up path: gate and up products by the format's dot,
+/// then `offload::experts::swiglu` of the pair at `limit`.
+#[allow(clippy::too_many_arguments)]
+fn fused_gate_up_limited_t<T: crate::tensor::quant_cpu::BlockFormat>(
+    input: &Tensor,
+    gate_weights: &Arc<QTensor>,
+    up_weights: &Arc<QTensor>,
+    sti: &[u32],
+    eid: &[u32],
+    topk: usize,
+    n: usize,
+    k: usize,
+    limit: f32,
+) -> Result<Option<Tensor>> {
+    use crate::tensor::quant_cpu::BlockFormat;
+    if !k.is_multiple_of(T::BLOCK_LEN)
+        || !k.is_multiple_of(<T::ActivationBlock as BlockFormat>::BLOCK_LEN)
+    {
+        return Ok(None);
+    }
+    let m = sti.len();
+    let blocks_per_row = k / T::BLOCK_LEN;
+    let gd = gate_weights.data()?;
+    let ud = up_weights.data()?;
+    let gw: &[T] = unsafe {
+        std::slice::from_raw_parts(gd.as_ptr() as *const T, gd.len() / std::mem::size_of::<T>())
+    };
+    let uw: &[T] = unsafe {
+        std::slice::from_raw_parts(ud.as_ptr() as *const T, ud.len() / std::mem::size_of::<T>())
+    };
+    let xs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
+    let vblk = <T::ActivationBlock as BlockFormat>::BLOCK_LEN;
+    let xq: Vec<Vec<T::ActivationBlock>> = xs
+        .iter()
+        .map(|row| {
+            let mut q = vec![<T::ActivationBlock as BlockFormat>::zeros(); k / vblk];
+            <T::ActivationBlock as BlockFormat>::quantize(row, &mut q);
+            q
+        })
+        .collect();
+    let mut h = vec![0f32; m * n];
+    crate::tensor::quant_cpu::pool_for_each_mut(&mut h, 64, &|i, out| {
+        let (j, r) = (i / n, i % n);
+        let e = eid[j] as usize;
+        let t = (sti[j] as usize) / topk;
+        let row = (e * n + r) * blocks_per_row;
+        let x = &xq[t];
+        let g = T::dot(&gw[row..row + blocks_per_row], x);
+        let u = T::dot(&uw[row..row + blocks_per_row], x);
+        *out = crate::inference::offload::experts::swiglu(g, u, limit);
+    });
+    Ok(Some(Tensor::from_vec(h, (m, n), &input.device())?))
+}
+
+/// gate/up expert GEMM + the bounded SwiGLU: for each sorted slot j,
+/// `h[j] = offload::experts::swiglu(gate[e].x, up[e].x, limit)`, the gate clamped from above and
+/// the up value on both sides.
+pub fn moe_gemm_gguf_gate_up_swiglu_limited(
+    input: &Tensor,              // [n_tok, hidden] F32
+    gate_weights: &Arc<QTensor>, // [E, N, K]
+    up_weights: &Arc<QTensor>,   // [E, N, K]
+    sorted_token_ids: &Tensor,   // [M] u32 (flattened pair idx, sorted by expert)
+    expert_ids: &Tensor,         // [M] u32
+    topk: usize,
+    limit: f32,
+) -> Result<Tensor> {
+    let dev = input.device();
+    let n = gate_weights.shape().dims()[1];
+    let k_dim = gate_weights.shape().dims()[2];
+    let sti: Vec<u32> = sorted_token_ids.to_vec1()?;
+    let eid: Vec<u32> = expert_ids.to_vec1()?;
+    if gate_weights.dtype() == up_weights.dtype() {
+        use crate::tensor::quant_cpu::*;
+        macro_rules! disp { ($($q:ident => $t:ty),+ $(,)?) => { match gate_weights.dtype() {
+            $(GgmlDType::$q => fused_gate_up_limited_t::<$t>(input, gate_weights, up_weights, &sti, &eid, topk, n, k_dim, limit)?,)+
+            _ => None, } } }
+        if let Some(h) = disp!(Q4_0 => BlockQ4_0, Q5_0 => BlockQ5_0, Q8_0 => BlockQ8_0,
+            Q2K => BlockQ2K, Q3K => BlockQ3K, Q4K => BlockQ4K,
+            Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4,
+            Q5_1 => BlockQ5_1, Iq4Nl => BlockIq4Nl, Iq4Xs => BlockIq4Xs, Iq3Xxs => BlockIq3Xxs,
+            Iq3S => BlockIq3S, Iq2S => BlockIq2S, Q2_0 => BlockQ2_0)
+        {
+            return Ok(h);
+        }
+    }
+    let qg = expert_qmms(gate_weights);
+    let qu = expert_qmms(up_weights);
+    let (gate_all, up_all) = if qg.is_none() || qu.is_none() {
+        (
+            Some(gate_weights.dequantize(&dev)?),
+            Some(up_weights.dequantize(&dev)?),
+        )
+    } else {
+        (None, None)
+    };
+    let m = sorted_token_ids.dim(0)?;
+    let xs = input.to_dtype(DType::F32)?.contiguous()?;
+    let mut h = vec![0f32; m * n];
+    for (e, j0, j1) in expert_runs(&eid) {
+        let toks: Vec<u32> = (j0..j1).map(|s| sti[s] / topk as u32).collect();
+        let sel = Tensor::from_vec(toks, (j1 - j0,), &dev)?;
+        let x_e = xs.index_select(&sel, 0)?.contiguous()?;
+        let g = match &qg {
+            Some(q) => q[e].forward(&x_e)?,
+            None => x_e.matmul(&gate_all.as_ref().unwrap().i(e)?.t()?)?,
+        };
+        let u = match &qu {
+            Some(q) => q[e].forward(&x_e)?,
+            None => x_e.matmul(&up_all.as_ref().unwrap().i(e)?.t()?)?,
+        };
+        let g: Vec<f32> = g.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let u: Vec<f32> = u.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        for (o, (&gv, &uv)) in h[j0 * n..j1 * n].iter_mut().zip(g.iter().zip(&u)) {
+            *o = crate::inference::offload::experts::swiglu(gv, uv, limit);
+        }
+    }
+    Tensor::from_vec(h, (m, n), &dev)
+}
+
 /// Plain expert GEMM (single weight, optional per-slot topk weighting).
 /// Fused UP + relu² for gateless MoE (nemotron_h's up->relu²->down): ONE
 /// work-stealing region over (slot, out-row), each job = one dot + relu².

@@ -431,6 +431,10 @@ pub struct GenericTransformerConfig {
     /// The router scores experts by sigmoid: `expert_gating_func` 2 in the file, or the
     /// architecture's convention.
     pub expert_sigmoid_gating: bool,
+    /// The router scores experts by `sqrt(softplus(logit / temperature))`, the temperature
+    /// held here: `expert_gating_func` 4 in the file, the temperature its `expert_gate_temp`
+    /// or 1. It then chooses and weighs as the sigmoid router does.
+    pub expert_sqrt_softplus_gating: Option<f32>,
     /// Sigmoid-routed weights are renormalised over the chosen experts.
     pub expert_weights_norm: bool,
     /// Softmax-routed weights are renormalised over the chosen experts: the file's
@@ -693,12 +697,16 @@ impl GenericTransformerConfig {
         let shared_kv_layers =
             meta_u32(content, arch, "attention.shared_kv_layers").unwrap_or(0) as usize;
 
-        // llama.cpp's gating function numbering: 1 softmax, 2 sigmoid.
+        // llama.cpp's gating function numbering: 1 softmax, 2 sigmoid, 4 sqrt softplus.
         const GATING_SIGMOID: u32 = 2;
-        let expert_sigmoid_gating = match meta_u32(content, arch, "expert_gating_func") {
+        const GATING_SQRT_SOFTPLUS: u32 = 4;
+        let gating_func = meta_u32(content, arch, "expert_gating_func");
+        let expert_sigmoid_gating = match gating_func {
             Some(f) => f == GATING_SIGMOID,
             None => facts.sigmoid_expert_gating,
         };
+        let expert_sqrt_softplus_gating = (gating_func == Some(GATING_SQRT_SOFTPLUS))
+            .then(|| meta_f32(content, arch, "expert_gate_temp").unwrap_or(1.0));
         let meta_bool = |key: &str| {
             content
                 .metadata
@@ -806,6 +814,7 @@ impl GenericTransformerConfig {
             swa_period,
             expert_swiglu_clamp: facts.expert_swiglu_clamp,
             expert_sigmoid_gating,
+            expert_sqrt_softplus_gating,
             expert_weights_norm,
             expert_topk_norm,
             expert_weights_scale,
@@ -1081,6 +1090,24 @@ mod arch_facts_tests {
         assert_eq!(cfg.head_dim, 8, "embedding length over heads");
         assert!(!cfg.flags.use_rope_i);
         assert!(!cfg.flags.parallel_attn);
+        assert_eq!(cfg.expert_sqrt_softplus_gating, None);
+    }
+
+    /// Gating function 4 names the sqrt-softplus router, at the file's temperature or at 1.
+    #[test]
+    fn gating_function_4_routes_by_sqrt_softplus_at_the_files_temperature() {
+        let mut content = lfm2moe_like();
+        content
+            .metadata
+            .insert("lfm2moe.expert_gating_func".to_string(), Value::U32(4));
+        let cfg = GenericTransformerConfig::from_gguf(&content, "lfm2moe").unwrap();
+        assert!(!cfg.expert_sigmoid_gating);
+        assert_eq!(cfg.expert_sqrt_softplus_gating, Some(1.0));
+        content
+            .metadata
+            .insert("lfm2moe.expert_gate_temp".to_string(), Value::F32(0.5));
+        let cfg = GenericTransformerConfig::from_gguf(&content, "lfm2moe").unwrap();
+        assert_eq!(cfg.expert_sqrt_softplus_gating, Some(0.5));
     }
 
     #[test]

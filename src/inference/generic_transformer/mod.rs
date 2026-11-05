@@ -44,6 +44,7 @@ mod card_host_parity;
 #[cfg(test)]
 mod wide_tests;
 
+pub mod block_scaled_experts;
 mod config;
 #[cfg(test)]
 mod conversion_tests;

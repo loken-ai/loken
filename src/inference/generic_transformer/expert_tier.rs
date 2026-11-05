@@ -1180,6 +1180,9 @@ pub use super::moe_weights::prefill_bytes_per_token;
 
 /// What a layer's tier can serve: separate gate and up stacks read by a SiLU, no biases, and a
 /// format both the card's expert kernels and the host's dot read.
+///
+/// A SwiGLU bounded by `swiglu_limit` is served only in a format the exact kernels read.
+/// The card, the transit room and the host then all run it through those kernels.
 pub fn serves(moe: &MoeWeights) -> bool {
     let (Some(gate), Some(up)) = (moe.gate_exps_sep.as_ref(), moe.up_exps_sep.as_ref()) else {
         return false;
@@ -1188,7 +1191,11 @@ pub fn serves(moe: &MoeWeights) -> bool {
         crate::inference::moe_cuda::gemm::expert_kernels_serve(t.dtype())
             && crate::inference::moe_cpu::cpu_qmatmul_supported(t.dtype())
     };
-    moe.use_silu
+    let bound_served = moe.swiglu_limit.is_none_or(|limit| {
+        exact::Exact::of(&[gate.clone(), up.clone(), moe.down_exps.clone()], limit).is_some()
+    });
+    bound_served
+        && moe.use_silu
         && !moe.gelu
         && !moe.up_relu2
         && moe.swiglu_clamp.is_none()
@@ -1278,7 +1285,7 @@ impl LayerTier {
         ];
         let expert_bytes = [0, 1, 2]
             .map(|i| host[i].native_qtensor().data().len() / host[i].shape().dims()[0].max(1));
-        let exact = exact::Exact::of(&host);
+        let exact = exact::Exact::of(&host, moe.swiglu_limit.unwrap_or(0.0));
         let mut slot_of = vec![-1i32; moe.n_experts];
         let mut owner = vec![-1i32; slots];
         for s in 0..slots {
@@ -3578,6 +3585,25 @@ mod tests {
             .collect()
     }
 
+    /// A SwiGLU bound below the gate and up products of the test layers: the clamp moves some.
+    const BOUNDED_SWIGLU_LIMIT: f32 = 0.5;
+
+    /// A bounded SwiGLU is served only in a format the exact kernels read.
+    #[test]
+    fn a_bounded_swiglu_is_served_only_through_the_exact_kernels() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let mut plain = layer(&card, 8, 2, 512, 256);
+        assert!(serves(&plain), "a Q8_0 layer is served unbounded");
+        plain.swiglu_limit = Some(BOUNDED_SWIGLU_LIMIT);
+        assert!(!serves(&plain), "Q8_0 has no exact kernel");
+        let mut k_quants = layer_of(&card, 8, 2, 512, 256, [GgmlDType::Q4K, GgmlDType::Q6K]);
+        k_quants.swiglu_limit = Some(BOUNDED_SWIGLU_LIMIT);
+        assert!(serves(&k_quants));
+    }
+
     /// Fill the arenas of `stager` with 0xFF, which read as f16 is not a number.
     /// The memory pool of what is lent is the card's, shared by the tests of a process: a test that
     /// measures what lending gives back runs while no other holds a room in it.
@@ -3693,6 +3719,7 @@ mod tests {
             up_exps_bias: None,
             down_exps_bias: None,
             swiglu_clamp: None,
+            swiglu_limit: None,
             gate_up_exps: None,
             down_exps: stack(3, hidden, ffn, down),
             gate_exps_sep: Some(stack(1, ffn, hidden, gate_up)),
@@ -3718,6 +3745,7 @@ mod tests {
             shared_expert: None,
             gate_up_exps_f32: None,
             tier: None,
+            block_scaled: None,
             down_exps_f32: None,
         }
     }
@@ -4739,9 +4767,21 @@ mod tests {
             [GgmlDType::Iq3Xxs, GgmlDType::Iq4Nl],
             [GgmlDType::Iq3S, GgmlDType::Q2_0],
             [GgmlDType::Iq4Xs, GgmlDType::Q8_0],
-        ] {
-            let reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+            [GgmlDType::Iq2Xxs, GgmlDType::Q2_0],
+            [GgmlDType::Iq2Xxs, GgmlDType::Iq2Xxs],
+        ]
+        .into_iter()
+        .flat_map(|f| [(f, None), (f, Some(BOUNDED_SWIGLU_LIMIT))])
+        {
+            let (formats, limit) = formats;
+            // A bounded SwiGLU over IQ2_XXS experts runs on the host.
+            if limit.is_some() && formats.contains(&GgmlDType::Iq2Xxs) {
+                continue;
+            }
+            let mut reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+            reference.swiglu_limit = limit;
             let mut resident = layer_of(&card, experts, used, hidden, ffn, formats);
+            resident.swiglu_limit = limit;
             resident.tier = Some(Arc::new(LayerTier::all_on_card(&resident, &card).unwrap()));
             let _order = crate::tensor::quantized::DecodeOrder::enter();
             for rows in [1usize, 3, 7] {
@@ -4768,10 +4808,18 @@ mod tests {
                         &got[r * hidden..(r + 1) * hidden],
                     );
                     let distance = crate::inference::engine::decode_step::replay_distance(g, w);
-                    eprintln!("{formats:?} rows {rows} row {r}: relative distance {distance:.5}");
+                    eprintln!(
+                        "{formats:?} bound {limit:?} rows {rows} row {r}: relative distance {distance:.5}"
+                    );
+                    // IQ2_XXS reads its activations as 8 bit blocks on the card.
+                    let tolerance = if formats.contains(&GgmlDType::Iq2Xxs) {
+                        2e-2
+                    } else {
+                        1e-2
+                    };
                     assert!(
-                        distance <= 1e-2,
-                        "{formats:?}, {rows} rows, row {r}: the card is {distance:.4} of the host's norm away"
+                        distance <= tolerance,
+                        "{formats:?} bound {limit:?}, {rows} rows, row {r}: the card is {distance:.4} of the host's norm away"
                     );
                 }
             }
@@ -5069,14 +5117,23 @@ mod tests {
             [GgmlDType::Q6K, GgmlDType::Q6K],
             [GgmlDType::Q2K, GgmlDType::Q2K],
             [GgmlDType::Q2K, GgmlDType::Q4K],
-        ] {
-            let moe = layer_of(&card, experts, used, hidden, ffn, formats);
+        ]
+        .into_iter()
+        .flat_map(|f| [(f, 0.0f32), (f, BOUNDED_SWIGLU_LIMIT)])
+        {
+            let (formats, limit) = formats;
+            let bounded = |mut m: MoeWeights| {
+                m.swiglu_limit = (limit > 0.0).then_some(limit);
+                m
+            };
+            let moe = bounded(layer_of(&card, experts, used, hidden, ffn, formats));
+            assert!(serves(&moe), "{formats:?} bounded at {limit}");
             let stacks = [
                 moe.gate_exps_sep.clone().unwrap(),
                 moe.up_exps_sep.clone().unwrap(),
                 moe.down_exps.clone(),
             ];
-            let exact = exact::Exact::of(&stacks).expect("a format with exact kernels");
+            let exact = exact::Exact::of(&stacks, limit).expect("a format with exact kernels");
             let widest = [0, 1, 2].map(|i| stacks[i].native_qtensor().data().len());
             let stager = CardStager::new(&card, widest, experts).unwrap();
             for rows in [1usize, 3] {
@@ -5098,7 +5155,8 @@ mod tests {
                 for slots in [1usize, 8, experts] {
                     for eighths in [1u64, 4, 7] {
                         for recorded in [false, true] {
-                            let mut tiered = layer_of(&card, experts, used, hidden, ffn, formats);
+                            let mut tiered =
+                                bounded(layer_of(&card, experts, used, hidden, ffn, formats));
                             // The stacks page-locked: a copy from pageable memory waits for a
                             // card that waits on the worker.
                             let built = LayerTier::new(&tiered, &card, slots)
@@ -5168,8 +5226,9 @@ mod tests {
                             drop(tier);
                             assert!(
                                 bits(&got) == bits(&want),
-                                "{formats:?}, {rows} rows, {slots} slots, {eighths}/8 to transit, \
-                                 recorded {recorded}: the layer's output moved with the cache"
+                                "{formats:?} bounded at {limit}, {rows} rows, {slots} slots, \
+                                 {eighths}/8 to transit, recorded {recorded}: the layer's output \
+                                 moved with the cache"
                             );
                         }
                     }

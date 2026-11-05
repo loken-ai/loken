@@ -1124,6 +1124,100 @@ extern "C" int loken_moe_gemm_gguf_gate_up_swiglu_oai(
 }
 
 // ------------------------------------------------------------
+// Fused gate+up MoE GEMM with the bounded SwiGLU epilogue.
+//
+// Computes:    g = min(dot(gate_w[expert][n], input[m]), limit)
+//              u = clamp(dot(up_w[expert][n], input[m]), -limit, limit)
+//              output[m, n] = silu(g) * u
+//
+// The clamps are the ones of offload::experts::swiglu, taken in its order.
+// ------------------------------------------------------------
+namespace loken_moe {
+
+template <int qk, int qi, typename block_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ROWS_PER_WARP>
+__global__ void loken_moe_gemm_gguf_gate_up_swiglu_limited_kernel(
+    const void * __restrict__ gate_weights,         // [experts, cols, depth], quantised
+    const void * __restrict__ up_weights,           // [experts, cols, depth], quantised
+    const void * __restrict__ all_inputs,           // one q8_1 row per token
+    const int32_t * __restrict__ sorted_token_ids,
+    const int32_t * __restrict__ expert_ids,
+    float * __restrict__ all_outputs,               // the bounded SwiGLU, one row per routed pair
+    moe_dims dims,
+    float limit
+) {
+    const warp_slot slot = claim_slot<ROWS_PER_WARP>();
+    if (slot.row0 >= dims.cols || slot.pair >= dims.pairs) return;
+
+    const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
+    if (routed.expert < 0 || routed.expert >= dims.experts) return;
+
+    const block_t * __restrict__ wg_expert =
+        expert_slab_alt<qk, block_t>(gate_weights, alt_stack(dims, 0), dims, routed.expert, dims.cols, dims.depth);
+    const block_t * __restrict__ wu_expert =
+        expert_slab_alt<qk, block_t>(up_weights, alt_stack(dims, 1), dims, routed.expert, dims.cols, dims.depth);
+
+    // The `topk` entries of a token share the row that token quantised into.
+    const block_q8_1 * __restrict__ y_ptr =
+        activation_row(all_inputs, routed.token / dims.topk, dims.depth_padded);
+
+    const k_walk walk = plan_k_walk<qk, qi, vdr>(slot.lane, dims.depth);
+    float acc_g[ROWS_PER_WARP];
+    float acc_u[ROWS_PER_WARP];
+    accumulate_gated_rows<qk, qi, block_t, vdr, vec_dot_q_cuda, ROWS_PER_WARP>(
+        &wg_expert[(size_t)slot.row0 * walk.per_row],
+        &wu_expert[(size_t)slot.row0 * walk.per_row],
+        y_ptr, walk, slot.row0, dims.cols, acc_g, acc_u);
+
+    float * __restrict__ out_ptr = output_row(all_outputs, routed.token, dims.cols);
+    emit_gated_rows(slot.lane, slot.row0, dims.cols, acc_g, acc_u,
+                    [&](int row, float g, float u) {
+                        g = fminf(g, limit);
+                        u = u < -limit ? -limit : (u > limit ? limit : u);
+                        out_ptr[row] = g / (1.0f + __expf(-g)) * u;
+                    });
+}
+
+} // namespace loken_moe
+
+#define LAUNCH_MOE_GGUF_GATE_UP_LIMITED(qk, qi, block_t, vdr, vec_dot_q_cuda) \
+    loken_moe::loken_moe_gemm_gguf_gate_up_swiglu_limited_kernel<qk, qi, block_t, vdr, vec_dot_q_cuda, ROWS_PER_WARP> \
+        <<<shape.grid, shape.block, 0, stream>>>( \
+            gate_weights, up_weights, y_q8_1, sorted_token_ids, expert_ids, outputs, dims, limit);
+
+// Fused gate+up GEMM with the bounded SwiGLU epilogue, gate and up stacks kept apart.
+extern "C" int loken_moe_gemm_gguf_gate_up_swiglu_limited(
+    const float* inputs,
+    const void* gate_weights, const void* up_weights,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    float* outputs,
+    int num_experts, int topk, int size_m, int size_n, int size_k,
+    int quant_type,        // the weight format, numbered as `MOE_GGUF_FORMATS` numbers it
+    float limit,
+    cudaStream_t stream
+) {
+    const int kx_padded = pad_to(size_k, MATRIX_ROW_PADDING);
+    // Held until the GEMM below is on the stream - see `y_q8_1_reservation`.
+    const y_q8_1_reservation y_q8_1 =
+        stage_activation(inputs, size_m / topk, size_k, kx_padded, stream);
+    if (y_q8_1.ptr == nullptr) return 1;
+
+    const int nWraps = 2;
+    constexpr int ROWS_PER_WARP = 1;
+    const moe_launch shape = mat_vec_launch(size_n, size_m, nWraps, ROWS_PER_WARP);
+    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0, nullptr, nullptr };
+
+    switch (quant_type) {
+#define MOE_CASE(id, name, qk, qi, vdr)                            \
+        case id: { LAUNCH_MOE_GGUF_GATE_UP_LIMITED(qk, qi, block_##name, vdr, vec_dot_##name##_q8_1); break; }
+        MOE_GGUF_FORMATS(MOE_CASE)
+#undef MOE_CASE
+        default: break;
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------
 // MoE gate||up GEMM with GELU(tanh) activation and elementwise multiply,
 // for the gemma4-MoE concat weight layout where gate and up share one
 // [num_experts, 2*N, K] tensor (gate = rows 0..N, up = rows N..2N).

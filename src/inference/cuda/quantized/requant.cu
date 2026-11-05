@@ -2731,13 +2731,13 @@ __device__ static __forceinline__ const unsigned char * tx_expert(
     return (const unsigned char *) (extra[stack] + (unsigned long long) ((int) slot - base_slots) * bytes);
 }
 
-// The rows entering the down projections: h[pair, row] = swiglu(gate . x, up . x). A warp per
-// (output row, instance).
+// The rows entering the down projections: h[pair, row] = swiglu(gate . x, up . x), bounded at
+// `limit` when it is positive. A warp per (output row, instance).
 template <int F> __device__ static void tx_h(
         const unsigned long long gate, const unsigned long long up, const unsigned long long * extra,
         const int base_slots, const long long bytes, const unsigned int * slots,
         const unsigned int * pairs, const int k, const unsigned char * xq, float * h,
-        const int dim, const int inter) {
+        const int dim, const int inter, const float limit) {
     const int row = blockIdx.x, i = blockIdx.y, lane = threadIdx.x;
     const unsigned int slot = slots[i];
     const unsigned char * g = tx_expert(gate, extra, 0, base_slots, bytes, slot);
@@ -2749,7 +2749,7 @@ template <int F> __device__ static void tx_h(
     const unsigned char * a = xq + (long) (pair / k) * nsb * CX_Q8K_BYTES;
     const float gv = tx_row<F>(g + roff, a, nsb, lane);
     const float uv = tx_row<F>(u + roff, a, nsb, lane);
-    if (lane == 0) h[(long) pair * inter + row] = cx_swiglu(gv, uv, 0.0f);
+    if (lane == 0) h[(long) pair * inter + row] = cx_swiglu(gv, uv, limit);
 }
 
 // The rows of `h` of the launch's instances as q8_K blocks. A warp per (block, instance).
@@ -2783,8 +2783,8 @@ extern "C" __global__ void tx_h_##name(                                         
         const unsigned long long gate, const unsigned long long up, const unsigned long long * extra,\
         const int base_slots, const long long bytes, const unsigned int * slots,                     \
         const unsigned int * pairs, const int k, const unsigned char * xq, float * h,                \
-        const int dim, const int inter) {                                                            \
-    tx_h<F>(gate, up, extra, base_slots, bytes, slots, pairs, k, xq, h, dim, inter);                 \
+        const int dim, const int inter, const float limit) {                                         \
+    tx_h<F>(gate, up, extra, base_slots, bytes, slots, pairs, k, xq, h, dim, inter, limit);          \
 }                                                                                                    \
 extern "C" __global__ void tx_down_##name(                                                           \
         const unsigned long long down, const unsigned long long * extra, const int base_slots,      \

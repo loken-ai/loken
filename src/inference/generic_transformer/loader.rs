@@ -2290,6 +2290,7 @@ fn build_generic_layer(
                         w.to_dtype(crate::tensor::DType::F32)?.reshape((n, 1))
                     })
                     .transpose()?,
+                swiglu_limit: None,
             }),
             _ => None,
         };
@@ -2315,6 +2316,7 @@ fn build_generic_layer(
             up_exps_bias,
             down_exps_bias,
             swiglu_clamp,
+            swiglu_limit: None,
             gate_up_exps: gus.map(std::sync::Arc::new),
             down_exps: std::sync::Arc::new(des),
             gate_exps_sep: gate_sep,
@@ -2332,23 +2334,28 @@ fn build_generic_layer(
             gelu: flags.use_gelu,
             // Whether the chosen experts' softmax weights are rescaled to sum to one.
             norm_topk: config.expert_topk_norm,
-            sigmoid_routing: config
-                .expert_sigmoid_gating
-                .then(|| -> Result<SigmoidRouting> {
-                    Ok(SigmoidRouting {
-                        selection_bias: load_bias(raw.moe_exp_probs_b_qt)?
-                            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
-                            .map(|b| b.to_dtype(crate::tensor::DType::F32))
-                            .transpose()?,
-                        normalize: config.expert_weights_norm,
-                        scale: config.expert_weights_scale,
-                    })
+            sigmoid_routing: (config.expert_sigmoid_gating
+                || config.expert_sqrt_softplus_gating.is_some())
+            .then(|| -> Result<SigmoidRouting> {
+                Ok(SigmoidRouting {
+                    selection_bias: load_bias(raw.moe_exp_probs_b_qt)?
+                        // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
+                        .map(|b| b.to_dtype(crate::tensor::DType::F32))
+                        .transpose()?,
+                    normalize: config.expert_weights_norm,
+                    scale: config.expert_weights_scale,
+                    score: match config.expert_sqrt_softplus_gating {
+                        Some(temperature) => RouterScore::SqrtSoftplus { temperature },
+                        None => RouterScore::Sigmoid,
+                    },
                 })
-                .transpose()?,
+            })
+            .transpose()?,
             up_relu2: up_only,
             shared_expert,
             gate_up_exps_f32: gus_f32,
             tier: None,
+            block_scaled: None,
             down_exps_f32: des_f32,
         })
     } else {

@@ -1,4 +1,5 @@
-// The formats whose values come out of a codebook: IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S and Q2_0.
+// The formats whose values come out of a codebook: IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S,
+// IQ2_XXS and Q2_0.
 //
 // Each format is one function that gives the value of a weight (or of a run of them) from its
 // block, and both the decode dot and the prefill dequantiser are written over it. A dot reads a
@@ -70,6 +71,15 @@ typedef struct {
     uint8_t scales[QK_K / 32];
 } block_iq2_s;
 static_assert(sizeof(block_iq2_s) == 82, "wrong iq2_s block size/padding");
+
+#define QK_IQ2_XXS QK_K
+#define QI_IQ2_XXS QI_IQ_RUNS
+#define VDR_IQ2_XXS_Q8_1_MMVQ VDR_IQ_RUN_Q8_1_MMVQ
+typedef struct {
+    half     d;
+    uint16_t qs[QK_K / 8];
+} block_iq2_xxs;
+static_assert(sizeof(block_iq2_xxs) == 66, "wrong iq2_xxs block size/padding");
 
 #define QK_Q2_0 64
 #define QI_Q2_0 4
@@ -173,6 +183,37 @@ static __device__ __forceinline__ void iq2_s_run(const block_iq2_s * b, int ib, 
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             y[8 * l + j] = db * (float) ((grid >> (8 * j)) & 0xFF) * sign_of(sign, j);
+        }
+    }
+}
+
+/// The 2 words of run `ib` of an iq2_xxs block: the low one holds 4 grid indices, a byte each.
+/// The high one holds 4 seven-bit sign selectors and, in its top nibble, the run's scale.
+static __device__ __forceinline__ void iq2_xxs_words(
+    const block_iq2_xxs * b, int ib, uint32_t * lo, uint32_t * hi) {
+    const uint16_t * q = b->qs + 4 * ib;
+    *lo = (uint32_t) q[0] | ((uint32_t) q[1] << 16);
+    *hi = (uint32_t) q[2] | ((uint32_t) q[3] << 16);
+}
+
+/// The scale of a run of an iq2_xxs block from the block's `d` and the run's high word.
+static __device__ __forceinline__ float iq2_xxs_scale(const block_iq2_xxs * b, uint32_t hi) {
+    return __half2float(b->d) * (0.5f + (float) (hi >> 28)) * 0.25f;
+}
+
+/// Run `ib` of an iq2_xxs block: 4 indices into the three-magnitude grid of 8 values each, and
+/// a sign pattern per index.
+static __device__ __forceinline__ void iq2_xxs_run(const block_iq2_xxs * b, int ib, float (&y)[32]) {
+    uint32_t lo, hi;
+    iq2_xxs_words(b, ib, &lo, &hi);
+    const float db = iq2_xxs_scale(b, hi);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t grid = IQ2XXS_GRID[(lo >> (8 * l)) & 0xFF];
+        const uint8_t signs = KSIGNS_IQ2XS[(hi >> (7 * l)) & 127];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            y[8 * l + j] = db * (float) ((grid >> (8 * j)) & 0xFF) * sign_of(signs, j);
         }
     }
 }
@@ -335,6 +376,26 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     return (db0 * (float) low + db1 * (float) high) * __low2float(q8->ds);
 }
 
+/// iq2_xxs, run `iqs` against its q8_1 block: 8 magnitudes per index, signed by its pattern,
+/// dotted in integers and scaled once.
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_iq2_xxs * b = (const block_iq2_xxs *) vbq;
+    const block_q8_1 * q8 = bq8_1 + iqs;
+    const int * act = (const int *) q8->qs;
+    uint32_t lo, hi;
+    iq2_xxs_words(b, iqs, &lo, &hi);
+    int sum = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t grid = IQ2XXS_GRID[(lo >> (8 * l)) & 0xFF];
+        const uint32_t signs = KSIGNS_IQ2XS[(hi >> (7 * l)) & 127];
+        sum = dot4_signed((uint32_t) grid,         signs,      act[2 * l],     sum);
+        sum = dot4_signed((uint32_t) (grid >> 32), signs >> 4, act[2 * l + 1], sum);
+    }
+    return iq2_xxs_scale(b, hi) * (float) sum * __low2float(q8->ds);
+}
+
 /// q2_0: sixty-four weights, `y = (q - 1) . d`, four codes to a byte lowest first. A lane takes
 /// the four bytes at `iqs` (sixteen weights), which lie in one of the two activation blocks.
 static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
@@ -370,6 +431,7 @@ DEQUANTISE_RUNS(iq4_xs,  block_iq4_xs,  iq4_xs_run,  QK_K)
 DEQUANTISE_RUNS(iq3_xxs, block_iq3_xxs, iq3_xxs_run, QK_K)
 DEQUANTISE_RUNS(iq3_s,   block_iq3_s,   iq3_s_run,   QK_K)
 DEQUANTISE_RUNS(iq2_s,   block_iq2_s,   iq2_s_run,   QK_K)
+DEQUANTISE_RUNS(iq2_xxs, block_iq2_xxs, iq2_xxs_run, QK_K)
 #undef DEQUANTISE_RUNS
 
 template<typename dst_t>
