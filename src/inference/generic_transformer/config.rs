@@ -448,6 +448,8 @@ pub struct GenericTransformerConfig {
     pub indexer: Option<super::qsa::IndexerMeta>,
     /// The hashed n-gram embedding, when the file declares one.
     pub ngram: Option<super::ngram::NgramMeta>,
+    /// The latent attention and its sparse indexer, when the file declares a latent rank.
+    pub mla: Option<super::mla_config::MlaMeta>,
     /// The attention Q projection interleaves Q and an output gate per head.
     pub attn_output_gate: bool,
     /// Name of the norm ahead of the feed-forward.
@@ -737,6 +739,9 @@ impl GenericTransformerConfig {
             .unwrap_or_else(|| meta_u32(content, arch, "vocab_size").unwrap_or(32000) as usize);
 
         let flags = GenericLayerFlags::detect(content, ffn_dim, arch);
+        let mla = super::mla_config::MlaMeta::from_gguf(content, arch)?;
+        // A head of a latent attention is as wide as its query and key.
+        let head_dim = mla.as_ref().map_or(head_dim, |m| m.qk_dim());
 
         // Embedding scaling: the file's value, else the square root of the width when the
         // architecture scales by it.
@@ -809,6 +814,7 @@ impl GenericTransformerConfig {
             hyper: super::hyper::HyperMeta::from_gguf(content, arch),
             indexer: super::qsa::IndexerMeta::from_gguf(content, arch),
             ngram: super::ngram::NgramMeta::from_gguf(content, arch),
+            mla,
             attn_output_gate: q_carries_output_gate(content, n_layers, n_head, head_dim),
             ffn_norm_stem: ffn_norm_stem(content),
             shared_kv_layers,

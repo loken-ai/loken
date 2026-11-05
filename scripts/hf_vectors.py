@@ -29,6 +29,13 @@ import transformers as tf
 from safetensors.torch import load_file, save_file
 
 PROMPT = [1, 17, 42, 99, 5, 73]
+# A model whose attention selects a few tokens per query needs a prompt longer than that budget.
+LONG_PROMPT = [1, 17, 42, 99, 5, 73, 8, 61, 30, 12]
+PROMPTS = {name: LONG_PROMPT for name in ("glm_moe_dsa", "glm_moe_dsa_dense", "glm_moe_dsa_sparse", "glm_moe_dsa_fp8")}
+# The models whose reference also records every decoder layer's output over the prompt.
+PER_LAYER = set(PROMPTS)
+# The models whose checkpoint stores its projections in fp8.
+FP8 = {"glm_moe_dsa_fp8"}
 STEPS = 4
 VOCAB = 128
 HIDDEN = 32
@@ -87,8 +94,54 @@ YARN = dict(
     llama_4_scaling_beta=0.1,
 )
 
+# A latent attention with a sparse indexer, widths that fill the 8-bit blocks the loader rounds
+# to: 4 layers, the first 2 dense; the indexer runs on layers 0 and 2 and the others reuse the
+# selection of the one before; `index_topk` leaves 4 of the 10 prompt tokens to each query.
+GLM = dict(
+    vocab_size=VOCAB,
+    hidden_size=HIDDEN,
+    intermediate_size=64,
+    moe_intermediate_size=HIDDEN,
+    num_hidden_layers=4,
+    num_attention_heads=4,
+    num_key_value_heads=4,
+    n_shared_experts=1,
+    n_routed_experts=4,
+    num_experts_per_tok=2,
+    kv_lora_rank=32,
+    q_lora_rank=32,
+    qk_rope_head_dim=8,
+    qk_nope_head_dim=16,
+    v_head_dim=16,
+    index_topk=4,
+    index_head_dim=16,
+    index_n_heads=4,
+    first_k_dense_replace=2,
+    indexer_types=["full", "shared", "full", "shared"],
+    rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+    max_position_embeddings=256,
+    pad_token_id=0,
+    eos_token_id=1,
+)
+
 # Folder name: (config class, model class, configuration keys).
 ARCHS = {
+    "glm_moe_dsa": ("GlmMoeDsaConfig", "GlmMoeDsaForCausalLM", dict(GLM)),
+    # Every layer dense and the budget above the prompt: the latent attention alone.
+    "glm_moe_dsa_dense": (
+        "GlmMoeDsaConfig",
+        "GlmMoeDsaForCausalLM",
+        dict(GLM, first_k_dense_replace=4, index_topk=64),
+    ),
+    # The budget below the prompt, every layer dense: the indexer and the sparse attention.
+    "glm_moe_dsa_sparse": (
+        "GlmMoeDsaConfig",
+        "GlmMoeDsaForCausalLM",
+        dict(GLM, first_k_dense_replace=4),
+    ),
+    # The first model with every weight a projection stores in fp8 held as its dequantised
+    # value, so that the reference runs on what the checkpoint says.
+    "glm_moe_dsa_fp8": ("GlmMoeDsaConfig", "GlmMoeDsaForCausalLM", dict(GLM)),
     "llama": ("LlamaConfig", "LlamaForCausalLM", base()),
     "mistral": ("MistralConfig", "MistralForCausalLM", base(sliding_window=None)),
     "mixtral": (
@@ -501,6 +554,10 @@ def randomise(model, seed):
                     p.copy_(normal(p, 0.1))
                 elif p.ndim >= 2:
                     p.copy_(normal(p, 1.0 / math.sqrt(p.shape[-1])))
+        # A router's selection bias is a buffer; nonzero, it changes which experts are chosen.
+        for name, buf in model.named_buffers():
+            if name.endswith("e_score_correction_bias"):
+                buf.copy_(normal(buf, 0.1))
 
 
 def margin(logits):
@@ -546,6 +603,136 @@ def route_gap(model, ids, used):
     return min(gaps) if gaps else math.inf
 
 
+# The modules whose weights a fp8 release stores as e4m3 bytes with a scale per 128 x 128 tile.
+FP8_FRAGMENTS = (
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
+    "o_proj",
+    "indexer.wq_b",
+    "indexer.wk",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+    "experts.",
+)
+FP8_TILE = 128
+FP8_MAX = 448.0
+
+
+def fp8_tiles(w):
+    """`w` as e4m3 bytes and the f32 scale of each tile: the tile's largest value over the
+    format's, so a tile fills the range."""
+    rows, cols = w.shape
+    tiles = ((rows + FP8_TILE - 1) // FP8_TILE, (cols + FP8_TILE - 1) // FP8_TILE)
+    scale = torch.ones(tiles)
+    for i in range(tiles[0]):
+        for j in range(tiles[1]):
+            block = w[i * FP8_TILE : (i + 1) * FP8_TILE, j * FP8_TILE : (j + 1) * FP8_TILE]
+            scale[i, j] = max(float(block.abs().max()), 1e-12) / FP8_MAX
+    expand = scale.repeat_interleave(FP8_TILE, 0)[:rows].repeat_interleave(FP8_TILE, 1)[:, :cols]
+    q = (w / expand).to(torch.float8_e4m3fn)
+    return q, scale, q.to(torch.float32) * expand
+
+
+def stored_as_fp8(key, t):
+    return key.endswith(".weight") and t.ndim == 2 and any(f in key for f in FP8_FRAGMENTS)
+
+
+def fp8_round_trip(model):
+    """Every weight a fp8 release stores in fp8 replaced by the value its bytes and scales give.
+    The bytes and scales are kept on the model under the names the checkpoint gives the weights,
+    each routed expert's matrices apart as the checkpoint stores them."""
+    stored = {}
+    with torch.no_grad():
+        for key, p in model.named_parameters():
+            if key.endswith("experts.gate_up_proj"):
+                half = p.shape[1] // 2
+                for e in range(p.shape[0]):
+                    for name, rows in (("gate_proj", slice(0, half)), ("up_proj", slice(half, None))):
+                        q, scale, back = fp8_tiles(p[e, rows])
+                        p[e, rows].copy_(back)
+                        stored[key.removesuffix("gate_up_proj") + f"{e}.{name}.weight"] = (q, scale, back)
+            elif key.endswith("experts.down_proj"):
+                for e in range(p.shape[0]):
+                    q, scale, back = fp8_tiles(p[e])
+                    p[e].copy_(back)
+                    stored[key.removesuffix("down_proj") + f"{e}.down_proj.weight"] = (q, scale, back)
+            elif stored_as_fp8(key, p):
+                q, scale, back = fp8_tiles(p)
+                p.copy_(back)
+                stored[key] = (q, scale, back)
+    model.fp8_stored = stored
+
+
+def write_fp8(path, model):
+    """The checkpoint saved at `path` rewritten as a fp8 release writes it: the bytes of each
+    weight it stores in fp8 and its tile scales beside them, the other tensors as they are."""
+    state = load_file(str(path))
+    out = {}
+    for key, t in state.items():
+        if key in model.fp8_stored:
+            q, scale, back = model.fp8_stored[key]
+            assert torch.equal(back, t), f"{key}: the weight is not its own fp8 value"
+            out[key] = q.contiguous()
+            out[key + "_scale_inv"] = scale.contiguous()
+        else:
+            assert not stored_as_fp8(key, t), f"{key}: a weight left out of fp8"
+            out[key] = t
+    save_file(out, str(path), metadata={"format": "pt"})
+
+
+def topk_gap(model, ids):
+    """The smallest gap, over every call of `Tensor.topk` of the model, between the last value
+    kept and the first dropped: a router's choice and an indexer's selection both go through
+    it. A row with no unmasked value past the cut is not counted."""
+    gaps = []
+    original = torch.Tensor.topk
+
+    def patched(self, k, *args, **kw):
+        if self.shape[-1] > k:
+            top = original(self, k + 1, dim=-1).values
+            kept, dropped = top[..., k - 1], top[..., k]
+            # A masked score is the type's lowest value, or minus infinity.
+            ok = (kept > -1e30) & (dropped > -1e30)
+            if ok.any():
+                gaps.append(float((kept - dropped)[ok].min()))
+        return original(self, k, *args, **kw)
+
+    torch.Tensor.topk = patched
+    try:
+        with torch.no_grad():
+            model(torch.tensor([ids]))
+    finally:
+        torch.Tensor.topk = original
+    return min(gaps) if gaps else math.inf
+
+
+def layer_record(model, ids):
+    """Every decoder layer's output over `ids`, and the tokens each query of a layer selects
+    when the layer returns them, in the order the layers run."""
+    outputs = []
+
+    def hook(module, args, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        picked = output[1] if isinstance(output, tuple) and len(output) > 1 else None
+        outputs.append((hidden.detach()[0], None if picked is None else picked.detach()[0]))
+
+    handles = [layer.register_forward_hook(hook) for layer in model.model.layers]
+    with torch.no_grad():
+        model(torch.tensor([ids]))
+    for h in handles:
+        h.remove()
+    return [
+        {
+            "hidden": [float(x) for x in hidden.flatten()],
+            "selected": None if picked is None else [[int(i) for i in row] for row in picked],
+        }
+        for hidden, picked in outputs
+    ]
+
+
 def q8(t):
     """`t` rounded as 8-bit blocks of 32 along its last axis, each with its own scale."""
     if t.ndim < 1 or t.shape[-1] % 32:
@@ -556,7 +743,7 @@ def q8(t):
     return (torch.round(blocks / scale) * scale).reshape(t.shape)
 
 
-def rounding_cosine(model, ids, steps):
+def rounding_cosine(model, ids, steps, prompt_len):
     """The smallest cosine, over the steps, between the logits of each step and those of a copy
     of the model whose projections, and the inputs of its linear layers, are rounded to 8 bits
     as the loader's block format rounds them."""
@@ -577,7 +764,7 @@ def rounding_cosine(model, ids, steps):
                 module.forward = lambda x, forward=forward: forward(q8(x))
         cosines = []
         for i, want in enumerate(steps):
-            got = rounded(torch.tensor([ids[: len(PROMPT) + i]])).logits[0, -1].float()
+            got = rounded(torch.tensor([ids[: prompt_len + i]])).logits[0, -1].float()
             cosines.append(float(torch.nn.functional.cosine_similarity(got, want, dim=0)))
     return min(cosines)
 
@@ -587,6 +774,8 @@ def rounding_cosine(model, ids, steps):
 ROUTE_GAP = 0.05
 ROUNDING_COSINE = 0.9995
 ATTEMPTS = 64
+# A model with a choice at every layer, over few tokens, cannot clear all of them by as much.
+ROUTE_GAP_OF = {name: 0.003 for name in PER_LAYER}
 
 
 def run(name, attempt):
@@ -597,7 +786,9 @@ def run(name, attempt):
     config._attn_implementation = "eager"
     model = getattr(tf, model_class)(config).to(torch.float32).eval()
     randomise(model, seed)
-    ids = list(PROMPT)
+    if name in FP8:
+        fp8_round_trip(model)
+    ids = list(PROMPTS.get(name, PROMPT))
     steps = []
     nexts, margins = [], []
     with torch.no_grad():
@@ -608,25 +799,31 @@ def run(name, attempt):
             margins.append(margin(logits))
             ids.append(nexts[-1])
     used = experts_used(config)
-    gap = route_gap(model, ids, used) if used else math.inf
-    rounding = rounding_cosine(model, ids, steps)
+    if getattr(config, "index_topk", None):
+        gap = topk_gap(model, ids)
+    else:
+        gap = route_gap(model, ids, used) if used else math.inf
+    rounding = rounding_cosine(model, ids, steps, len(PROMPTS.get(name, PROMPT)))
     return model, steps, nexts, margins, gap, rounding
 
 
-def score(got):
+def score(got, name):
     """How far a seed stays from both limits, in units of each: at least one when both hold."""
     gap, rounding = got[4], got[5]
-    return min(gap / ROUTE_GAP, (1 - ROUNDING_COSINE) / max(1 - rounding, 1e-9))
+    limit = ROUTE_GAP_OF.get(name, ROUTE_GAP)
+    return min(gap / limit, (1 - ROUNDING_COSINE) / max(1 - rounding, 1e-9))
 
 
 def build(name, out_root):
     """The first seed that holds both limits, else the best of `ATTEMPTS`."""
     best = None
-    for attempt in range(ATTEMPTS):
+    # A model that selects tokens and experts at several places needs more seeds to find one
+    # whose every choice is clear of a tie.
+    for attempt in range(ATTEMPTS * 10 if name in PER_LAYER else ATTEMPTS):
         got = run(name, attempt)
-        if best is None or score(got) > score(best):
+        if best is None or score(got, name) > score(best, name):
             best = got
-        if score(got) >= 1:
+        if score(got, name) >= 1:
             break
     model, steps, nexts, margins, gap, rounding = best
     out = out_root / name
@@ -636,14 +833,27 @@ def build(name, out_root):
         for f in ("config.json", "model.safetensors"):
             shutil.copy(Path(tmp) / f, out / f)
     released_names(name, out / "model.safetensors")
+    if name in FP8:
+        write_fp8(out / "model.safetensors", model)
+        config = json.loads((out / "config.json").read_text())
+        config["quantization_config"] = {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [FP8_TILE, FP8_TILE],
+        }
+        (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    prompt = PROMPTS.get(name, PROMPT)
     reference = {
         "class": ARCHS[name][1],
-        "prompt": PROMPT,
+        "prompt": prompt,
         "logits": [float(x) for x in steps[0]],
         "next_ids": nexts,
         "step_logits": [[float(x) for x in step] for step in steps],
         "next_margins": margins,
     }
+    if name in PER_LAYER:
+        reference["layers"] = layer_record(model, prompt)
     if gap != math.inf:
         reference["route_gap"] = gap
     reference["rounding_cosine"] = rounding

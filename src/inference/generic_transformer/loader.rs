@@ -129,6 +129,15 @@ struct RawNgram {
     conv: QTensor,
 }
 
+/// The tensors of a latent attention layer's sparse indexer.
+struct RawSparseIndexer {
+    wq_b: QTensor,
+    wk: QTensor,
+    k_norm_w: QTensor,
+    k_norm_b: QTensor,
+    proj: QTensor,
+}
+
 /// A block's mixer tensors, as read.
 enum RawMixer {
     Attention,
@@ -152,6 +161,16 @@ enum RawMixer {
         d: QTensor,
         dt_bias: QTensor,
         norm: QTensor,
+    },
+    Mla {
+        q_a: QTensor,
+        q_a_norm: QTensor,
+        q_b: QTensor,
+        kv_a: QTensor,
+        kv_a_norm: QTensor,
+        kv_b: QTensor,
+        /// The indexer, on a layer that runs one.
+        indexer: Option<RawSparseIndexer>,
     },
     Absent,
 }
@@ -769,9 +788,16 @@ fn concat_rows(parts: &[QTensor], device: &Device) -> crate::tensor::Result<Opti
 #[derive(Default)]
 pub(crate) struct LayerRopes(
     std::sync::Mutex<HashMap<(String, usize, u32, String, usize), (Tensor, Tensor)>>,
+    /// The selection the model's latent attention layers hand to one another.
+    Arc<super::dsa::SelectionCell>,
 );
 
 impl LayerRopes {
+    /// The cell the latent attention layers of this build share.
+    fn selection(&self) -> Arc<super::dsa::SelectionCell> {
+        self.1.clone()
+    }
+
     fn table(
         &self,
         dim: usize,
@@ -2444,6 +2470,83 @@ fn build_generic_layer(
                 eps,
                 device,
             )?)
+        }
+        RawMixer::Mla {
+            q_a,
+            q_a_norm,
+            q_b,
+            kv_a,
+            kv_a_norm,
+            kv_b,
+            indexer,
+        } => {
+            let meta = config.mla.clone().ok_or_else(|| {
+                crate::tensor::Error::msg("latent attention layer in a file without kv_lora_rank")
+            })?;
+            if config.yarn.is_some() {
+                return Err(crate::tensor::Error::msg(
+                    "latent attention with a stretched rotation is not read",
+                ));
+            }
+            // The mixer runs on the host: its projections stay there whatever the layer's card.
+            let host_projection = |qt: QTensor| -> Result<QMatMul> {
+                let qt = match requant_dtype {
+                    Some(d) if is_float_format(qt.dtype()) => {
+                        requant_float_weight(qt, d, &Device::Cpu, "projection")?
+                    }
+                    _ => qt,
+                };
+                QMatMul::from_qtensor(qt)
+            };
+            // CONVERSION: a latent attention reads its small matrices and norms F32 on the host.
+            let floats = |qt: QTensor| -> Result<Vec<f32>> {
+                qt.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()
+            };
+            let facts = crate::inference::model_facts::facts_or_default(&config.arch);
+            let norm_eps = facts.latent_norm_eps.unwrap_or(config.rms_norm_eps) as f32;
+            let scale = config
+                .attention_scale
+                .unwrap_or(1.0 / (meta.qk_dim() as f64).sqrt()) as f32;
+            let indexer = indexer
+                .zip(meta.index.as_ref())
+                .map(|(ix, index)| -> Result<super::dsa::Indexer> {
+                    super::dsa::Indexer::new(
+                        super::dsa::IndexerWeights {
+                            wq_b: floats(ix.wq_b)?,
+                            wk: floats(ix.wk)?,
+                            k_norm_w: floats(ix.k_norm_w)?,
+                            k_norm_b: floats(ix.k_norm_b)?,
+                            proj: floats(ix.proj)?,
+                        },
+                        index.heads,
+                        index.head_dim,
+                        index.top_k,
+                        config.embedding_length,
+                        meta.q_lora_rank.unwrap_or(0),
+                        facts.indexer_norm_eps.unwrap_or(1e-6) as f32,
+                    )
+                })
+                .transpose()?;
+            let sparse = meta.index.is_some();
+            let mla = super::mla::Mla::new(
+                meta,
+                config.n_head,
+                super::mla::MlaWeights {
+                    q_a: host_projection(q_a)?,
+                    q_a_norm: floats(q_a_norm)?,
+                    q_b: host_projection(q_b)?,
+                    kv_a: host_projection(kv_a)?,
+                    kv_a_norm: floats(kv_a_norm)?,
+                    kv_b: floats(kv_b)?,
+                },
+                config.rope_freq_base,
+                scale,
+                norm_eps,
+            )?;
+            super::mixer::Mixer::Mla(match sparse {
+                true => mla.with_selection(indexer, ropes.selection()),
+                false => mla,
+            })
         }
         RawMixer::Absent => super::mixer::Mixer::Absent,
     };
@@ -4174,6 +4277,51 @@ impl GenericHeteroTransformer {
                 ),
                 // A feed-forward block alone: its output projection is never read, so a tiny
                 // placeholder stands in for the non-optional field.
+                super::mixer::MixerKind::Mla => {
+                    // A layer runs an indexer when its file lists the tensors, and the header
+                    // says which layers do.
+                    let runs_indexer =
+                        ti.contains_key(&format!("{prefix}.indexer.attn_q_b.weight"));
+                    if let Some(index) = config.mla.as_ref().and_then(|m| m.index.as_ref()) {
+                        if index.full.get(idx).copied() != Some(runs_indexer) {
+                            return Err(crate::tensor::Error::msg(format!(
+                                "{prefix}: the header says the layer {} an indexer and the file {}",
+                                if index.full.get(idx).copied() == Some(true) {
+                                    "runs"
+                                } else {
+                                    "reuses"
+                                },
+                                if runs_indexer {
+                                    "has its tensors"
+                                } else {
+                                    "has none"
+                                },
+                            )));
+                        }
+                    }
+                    let indexer = match runs_indexer {
+                        true => Some(RawSparseIndexer {
+                            wq_b: req_cpu!(&format!("{prefix}.indexer.attn_q_b.weight"))?,
+                            wk: req_cpu!(&format!("{prefix}.indexer.attn_k.weight"))?,
+                            k_norm_w: req_cpu!(&format!("{prefix}.indexer.k_norm.weight"))?,
+                            k_norm_b: req_cpu!(&format!("{prefix}.indexer.k_norm.bias"))?,
+                            proj: req_cpu!(&format!("{prefix}.indexer.proj.weight"))?,
+                        }),
+                        false => None,
+                    };
+                    (
+                        req!(&format!("{prefix}.{attn_output_stem}.weight"))?,
+                        RawMixer::Mla {
+                            q_a: req_cpu!(&format!("{prefix}.attn_q_a.weight"))?,
+                            q_a_norm: req_cpu!(&format!("{prefix}.attn_q_a_norm.weight"))?,
+                            q_b: req_cpu!(&format!("{prefix}.attn_q_b.weight"))?,
+                            kv_a: req_cpu!(&format!("{prefix}.attn_kv_a_mqa.weight"))?,
+                            kv_a_norm: req_cpu!(&format!("{prefix}.attn_kv_a_norm.weight"))?,
+                            kv_b: req_cpu!(&format!("{prefix}.attn_kv_b.weight"))?,
+                            indexer,
+                        },
+                    )
+                }
                 super::mixer::MixerKind::Absent => (placeholder()?, RawMixer::Absent),
             };
             // Phi2: attn_output bias

@@ -87,6 +87,11 @@ pub struct ArchFacts {
     pub turn_stop_pieces: &'static [&'static str],
     /// The pre-tokenizer a file naming `default` was trained with.
     pub default_pre_tokenizer: Option<&'static str>,
+    /// Epsilon of the layer norm on the sparse indexer's keys; the file states none.
+    pub indexer_norm_eps: Option<f64>,
+    /// Epsilon of the norms on a latent attention's query factor and latent row, when it is not
+    /// the model's `rms_norm_eps`.
+    pub latent_norm_eps: Option<f64>,
 }
 
 impl ArchFacts {
@@ -113,6 +118,8 @@ impl ArchFacts {
             forces_bos: false,
             turn_stop_pieces: &[],
             default_pre_tokenizer: None,
+            indexer_norm_eps: None,
+            latent_norm_eps: None,
         }
     }
 }
@@ -219,6 +226,17 @@ const FACTS: &[(&str, ArchFacts)] = &[
     ("phi4", HALF_SPLIT),
     ("chatglm", HALF_SPLIT),
     ("glm4", HALF_SPLIT),
+    // The latent attention rotates adjacent lane pairs of its own rope slice and reads no
+    // pairing from the loader. The norms inside the attention carry an epsilon the
+    // configuration does not.
+    (
+        "glm_moe_dsa",
+        ArchFacts {
+            indexer_norm_eps: Some(1e-6),
+            latent_norm_eps: Some(1e-6),
+            ..ADJACENT
+        },
+    ),
     ("stablelm", HALF_SPLIT),
     ("starcoder2", HALF_SPLIT),
     ("olmo2", HALF_SPLIT),

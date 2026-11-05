@@ -2568,3 +2568,77 @@ mod clamped_swiglu_tests {
 pub fn prefill_bytes_per_token(used: usize, hidden: usize, ffn: usize) -> usize {
     used * (hidden * 4 + hidden + hidden / 8 + ffn * 4 * 3) + hidden * 4 * 3
 }
+
+#[cfg(test)]
+mod sigmoid_router_tests {
+    use super::*;
+
+    fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
+        let mut s = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    }
+
+    /// The router of a mixture that scores by sigmoid, chooses on the score plus a bias, weighs
+    /// by the score alone, renormalises over the chosen and scales, written out as its
+    /// reference library writes it.
+    #[test]
+    fn the_sigmoid_router_chooses_on_the_biased_score_and_weighs_by_the_plain_one() {
+        let (tokens, experts, used) = (6usize, 16usize, 4usize);
+        let dev = Device::Cpu;
+        let scores = values(tokens * experts, 41, 3.0);
+        let bias = values(experts, 42, 0.5);
+        let routing = SigmoidRouting {
+            selection_bias: Some(Tensor::from_vec(bias.clone(), (experts,), &dev).unwrap()),
+            normalize: true,
+            scale: 2.5,
+        };
+        let input = Tensor::from_vec(scores.clone(), (tokens, experts), &dev).unwrap();
+        let (weights, ids) = routing.select(&input, used).unwrap();
+        let weights = weights.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let ids = ids.flatten_all().unwrap().to_vec1::<u32>().unwrap();
+        let mut biased_apart = 0;
+        for t in 0..tokens {
+            let probs: Vec<f32> = scores[t * experts..(t + 1) * experts]
+                .iter()
+                .map(|l| 1.0 / (1.0 + (-l).exp()))
+                .collect();
+            let by = |score: &dyn Fn(usize) -> f32| {
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &b| score(b).total_cmp(&score(a)));
+                let mut kept = order[..used].to_vec();
+                kept.sort_unstable();
+                kept
+            };
+            let want = by(&|e| probs[e] + bias[e]);
+            if want != by(&|e| probs[e]) {
+                biased_apart += 1;
+            }
+            let chosen: Vec<(usize, f32)> = ids[t * used..(t + 1) * used]
+                .iter()
+                .map(|&e| e as usize)
+                .zip(weights[t * used..(t + 1) * used].iter().copied())
+                .collect();
+            let mut got: Vec<usize> = chosen.iter().map(|c| c.0).collect();
+            got.sort_unstable();
+            assert_eq!(got, want, "token {t}: the experts chosen");
+            let sum: f32 = want.iter().map(|&e| probs[e]).sum();
+            for (e, w) in chosen {
+                let expected = probs[e] / (sum + 1e-20) * 2.5;
+                assert!(
+                    (w - expected).abs() <= 1e-6 * expected.max(1.0),
+                    "token {t} expert {e}: {w} vs {expected}"
+                );
+            }
+        }
+        assert!(biased_apart > 0, "the bias changed no choice");
+    }
+}

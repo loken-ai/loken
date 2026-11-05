@@ -59,6 +59,14 @@ enum Op {
     },
     /// Every value through a function, written F32.
     Map(fn(f32) -> f32),
+    /// Each source pair is fp8 e4m3 bytes `[rows, cols]` and the f32 scale of each `block x
+    /// block` tile, `[ceil(rows / block), ceil(cols / block)]`; the pairs are dequantised one
+    /// after another, written F32.
+    Fp8Blocks {
+        rows: usize,
+        cols: usize,
+        block: usize,
+    },
 }
 
 /// The shards of a checkpoint, and the header the loader reads the model from.
@@ -77,6 +85,7 @@ pub struct DenseCheckpoint {
 }
 
 /// One tensor of a shard: its name, the shard, stored type, dimensions and start in the data.
+#[derive(Clone)]
 struct Listed {
     name: String,
     part: usize,
@@ -97,8 +106,9 @@ fn dtype_of(s: &str) -> Option<GgmlDType> {
         "F32" => GgmlDType::F32,
         "F16" => GgmlDType::F16,
         "BF16" => GgmlDType::BF16,
-        // Raw bytes: the blocks and scales of a quantised stack.
-        "U8" => GgmlDType::I8,
+        // Raw bytes: the blocks and scales of a quantised stack, and the fp8 values whose
+        // block scales sit in a tensor of their own.
+        "U8" | "F8_E4M3" => GgmlDType::I8,
         _ => return None,
     })
 }
@@ -154,6 +164,8 @@ struct Shapes {
     groups: usize,
     delta: (usize, usize, usize, usize),
     grouped_qkv: bool,
+    /// Side of the square tiles the checkpoint's fp8 weights are scaled in.
+    fp8_block: Option<usize>,
 }
 
 impl Shapes {
@@ -183,8 +195,25 @@ impl Shapes {
             ),
             grouped_qkv: lookup_b(r, &["new_decoder_architecture"]) == Some(true)
                 || lookup_b(r, &["multi_query"]) == Some(false),
+            fp8_block: fp8_block_of(r),
         }
     }
+}
+
+/// Side of the square tiles an fp8 `quantization_config` scales its weights in; `None` for a
+/// configuration without fp8 tiles or with tiles that are not square.
+fn fp8_block_of(root: &serde_json::Value) -> Option<usize> {
+    let qc = crate::inference::load::hf_config::lookup(root, &["quantization_config"])?;
+    let size = qc.get("weight_block_size")?.as_array()?;
+    match (size.first()?.as_u64()?, size.get(1)?.as_u64()?) {
+        (r, c) if r == c && r > 0 => Some(r as usize),
+        _ => None,
+    }
+}
+
+/// The name of the tensor that holds the tile scales of the fp8 weight `name`.
+fn fp8_scales_of(name: &str) -> String {
+    format!("{name}_scale_inv")
 }
 
 /// The rows of a fused projection grouped by key-value head, as query rows, key rows and
@@ -259,6 +288,67 @@ impl Translation {
         ))
     }
 
+    /// The fp8 pair of a weight `l`: its bytes and the tile scales the checkpoint stores beside
+    /// them, with the tile side the configuration gives.
+    fn fp8_pair(
+        l: &Listed,
+        by_name: &HashMap<&str, &Listed>,
+        shapes: &Shapes,
+    ) -> Result<(Vec<(usize, TensorInfo)>, usize)> {
+        let block = shapes.fp8_block.ok_or_else(|| {
+            Error(format!(
+                "{} is fp8 and the configuration gives no square weight_block_size",
+                l.name
+            ))
+        })?;
+        let [rows, cols] = l.shape[..] else {
+            return Err(Error(format!("{}: an fp8 weight is a matrix", l.name)));
+        };
+        let scales = by_name
+            .get(fp8_scales_of(&l.name).as_str())
+            .ok_or_else(|| Error(format!("{} has no {}", l.name, fp8_scales_of(&l.name))))?;
+        let tiles = vec![rows.div_ceil(block), cols.div_ceil(block)];
+        if scales.dtype != "F32" || scales.shape != tiles {
+            return Err(Error(format!(
+                "{}: scales {:?} {} do not tile [{rows}, {cols}] by {block}: {tiles:?} f32 wanted",
+                l.name, scales.shape, scales.dtype
+            )));
+        }
+        Ok((vec![Self::source(l)?, Self::source(scales)?], block))
+    }
+
+    /// An fp8 weight read as stored: dequantised to F32 when the loader asks for it.
+    fn apply_fp8(
+        &mut self,
+        rule: Rule,
+        l: &Listed,
+        by_name: &HashMap<&str, &Listed>,
+        shapes: &Shapes,
+        name: &dyn Fn(&str) -> String,
+    ) -> Result<()> {
+        let Rule::Same(t) = rule else {
+            return Err(Error(format!(
+                "{} is fp8, which is read as stored and cannot be reshaped",
+                l.name
+            )));
+        };
+        let (srcs, block) = Self::fp8_pair(l, by_name, shapes)?;
+        self.put_assembly(
+            name(t),
+            Assembly {
+                dtype: GgmlDType::F32,
+                dims: l.shape.clone(),
+                srcs,
+                op: Op::Fp8Blocks {
+                    rows: l.shape[0],
+                    cols: l.shape[1],
+                    block,
+                },
+            },
+        );
+        Ok(())
+    }
+
     /// `rule` applied to the stored tensor `l`, its results named `name(tail)`.
     fn apply(
         &mut self,
@@ -268,6 +358,9 @@ impl Translation {
         shapes: &Shapes,
         name: &dyn Fn(&str) -> String,
     ) -> Result<()> {
+        if l.dtype == "F8_E4M3" {
+            return self.apply_fp8(rule, l, by_name, shapes, name);
+        }
         let dims = &l.shape;
         let cols = if dims.len() >= 2 {
             dims[dims.len() - 1]
@@ -573,6 +666,27 @@ fn translate(items: &[Listed], layout: &Layout, cfg: &AwqConfigJson) -> Result<T
             return Err(Error(format!("{name}: experts are not numbered from 0")));
         }
         let first = experts.values().next().expect("a stack has an expert");
+        if first.dtype == "F8_E4M3" {
+            let mut srcs = Vec::new();
+            for l in experts.values() {
+                if l.shape != first.shape || l.dtype != first.dtype {
+                    return Err(Error(format!("{name}: experts differ in shape or type")));
+                }
+                srcs.extend(Translation::fp8_pair(l, &by_name, &shapes)?.0);
+            }
+            let block = Translation::fp8_pair(first, &by_name, &shapes)?.1;
+            let (rows, cols) = (first.shape[0], first.shape[1]);
+            out.put_assembly(
+                name,
+                Assembly {
+                    dtype: GgmlDType::F32,
+                    dims: vec![count, rows, cols],
+                    srcs,
+                    op: Op::Fp8Blocks { rows, cols, block },
+                },
+            );
+            continue;
+        }
         let dtype = float_dtype(first)?;
         let mut srcs = Vec::new();
         for l in experts.values() {
@@ -637,6 +751,7 @@ pub fn text_bytes(
             let dtype = match sizes.get(*n)? / elems {
                 4 => "F32",
                 2 => "BF16",
+                1 if sizes.contains_key(&fp8_scales_of(n)) => "F8_E4M3",
                 _ => "U8",
             };
             Some(Listed {
@@ -774,6 +889,20 @@ impl Assembly {
                             out.extend((0..16).map(|j| value(j) | (value(j + 16) << 4)));
                         }
                     }
+                }
+                out
+            }
+            Op::Fp8Blocks { rows, cols, block } => {
+                let mut out = Vec::with_capacity(self.srcs.len() / 2 * rows * cols * 4);
+                for pair in sources.chunks_exact(2) {
+                    let scales: Vec<f32> = pair[1]
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let values = crate::tensor::blockscaled::dequant::dequant_fp8_blocked(
+                        pair[0], &scales, *rows, *cols, *block,
+                    );
+                    out.extend(values.iter().flat_map(|v| v.to_le_bytes()));
                 }
                 out
             }
@@ -1508,5 +1637,125 @@ mod tests {
             cached_worst <= 1e-4,
             "the cached prompt changed by {cached_worst}"
         );
+    }
+
+    /// The vectors' `both` tensor and its tile scales, as one anonymous shard and the listing of
+    /// the two tensors in it.
+    fn fp8_shard() -> (Vec<DensePart>, Listed, Listed, Vec<f32>) {
+        let v = crate::tensor::blockscaled::test_vectors::block_vectors();
+        let (w, sc) = (&v["both.weight"], &v["both.weight_scale_inv"]);
+        let mut data = w.bytes.clone();
+        let scales_at = data.len() as u64;
+        data.extend(&sc.bytes);
+        let mut m = memmap2::MmapMut::map_anon(data.len()).unwrap();
+        m.copy_from_slice(&data);
+        let part = DensePart {
+            content: Content {
+                magic: VersionedMagic::GgufV3,
+                metadata: HashMap::new(),
+                tensor_infos: HashMap::new(),
+                tensor_data_offset: 0,
+                mmap_owner: None,
+            },
+            mmap: Arc::new(m.make_read_only().unwrap()),
+        };
+        let weight = Listed {
+            name: "w.weight".into(),
+            part: 0,
+            dtype: "F8_E4M3".into(),
+            shape: w.shape.clone(),
+            start: 0,
+        };
+        let scales = Listed {
+            name: "w.weight_scale_inv".into(),
+            part: 0,
+            dtype: "F32".into(),
+            shape: sc.shape.clone(),
+            start: scales_at,
+        };
+        (vec![part], weight, scales, v["both.expected"].f32s())
+    }
+
+    fn fp8_config() -> AwqConfigJson {
+        config_with(
+            "Qwen3MoeForCausalLM",
+            r#", "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}"#,
+        )
+    }
+
+    fn floats(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// A weight stored as fp8 beside `weight_scale_inv` is read as the F32 torch computes from
+    /// them, and a stack of such experts as those weights one after another.
+    #[test]
+    fn fp8_weights_and_stacks_are_dequantised_with_their_tile_scales() {
+        let cfg = fp8_config();
+        let l = layout_of(&cfg).unwrap();
+        let (parts, weight, scales, expected) = fp8_shard();
+        let named = |l: &Listed, name: &str| Listed {
+            name: name.into(),
+            ..l.clone()
+        };
+        let mut all = listed(&[("model.embed_tokens.weight", &[4, 8])]);
+        let proj = "model.layers.0.self_attn.q_proj.weight";
+        all.push(named(&weight, proj));
+        all.push(named(&scales, &format!("{proj}_scale_inv")));
+        for e in 0..2 {
+            let stem = format!("model.layers.1.mlp.experts.{e}.gate_proj.weight");
+            all.push(named(&weight, &stem));
+            all.push(named(&scales, &format!("{stem}_scale_inv")));
+        }
+        let t = translate(&all, l, &cfg).unwrap();
+        let dims = |n: &str| t.assembled[n].dims.clone();
+        assert_eq!(dims("blk.0.attn_q.weight"), vec![129, 130]);
+        assert_eq!(dims("blk.1.ffn_gate_exps.weight"), vec![2, 129, 130]);
+        let read = |n: &str| floats(&t.assembled[n].bytes(&parts).unwrap());
+        assert_eq!(read("blk.0.attn_q.weight"), expected);
+        let both: Vec<f32> = expected.iter().chain(&expected).copied().collect();
+        assert_eq!(read("blk.1.ffn_gate_exps.weight"), both);
+    }
+
+    /// An fp8 weight without scales, with scales of another shape, or in a checkpoint that
+    /// states no tile side is refused with the tensor named.
+    #[test]
+    fn fp8_weights_that_cannot_be_scaled_are_refused() {
+        let cfg = fp8_config();
+        let l = layout_of(&cfg).unwrap();
+        let (_, weight, scales, _) = fp8_shard();
+        let proj = "model.layers.0.self_attn.q_proj.weight";
+        let weight = Listed {
+            name: proj.into(),
+            ..weight
+        };
+        let scales = Listed {
+            name: format!("{proj}_scale_inv"),
+            ..scales
+        };
+        let table = listed(&[("model.embed_tokens.weight", &[4, 8])]);
+        let run = |extra: Vec<Listed>, cfg: &AwqConfigJson| {
+            let mut all = table.clone();
+            all.push(weight.clone());
+            all.extend(extra);
+            translate(&all, layout_of(cfg).unwrap(), cfg)
+                .err()
+                .map(|e| e.0)
+        };
+        let message = run(vec![], &cfg).expect("scales are missing");
+        assert!(message.contains("weight_scale_inv"), "{message}");
+        let wrong = Listed {
+            shape: vec![1, 2],
+            ..scales.clone()
+        };
+        let message = run(vec![wrong], &cfg).expect("scales of another shape");
+        assert!(message.contains("do not tile"), "{message}");
+        assert!(run(vec![scales.clone()], &cfg).is_none());
+        let message = run(vec![scales], &config("Qwen3MoeForCausalLM")).expect("no tile side");
+        assert!(message.contains("weight_block_size"), "{message}");
+        let _ = l;
     }
 }

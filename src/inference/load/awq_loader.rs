@@ -54,12 +54,18 @@ pub struct AwqConfigJson {
 }
 
 /// Whether a `quantization_config` sends the checkpoint down the quantised route: any but one
-/// whose method stores its tensors as MXFP4 blocks and scales, which the dense layouts read.
+/// whose method stores its tensors as MXFP4 blocks and scales, or as fp8 values with a scale per
+/// square tile, which the dense layouts read.
 pub fn quantized_route(qc: Option<&serde_json::Value>) -> bool {
     qc.is_some_and(|q| {
-        !q.get("quant_method")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| m.eq_ignore_ascii_case("mxfp4"))
+        let method = q.get("quant_method").and_then(|m| m.as_str());
+        let tiles = q
+            .get("weight_block_size")
+            .and_then(|b| b.as_array())
+            .is_some_and(|b| b.len() == 2 && b[0] == b[1] && b[0].as_u64().is_some_and(|n| n > 0));
+        let dense_reads =
+            |m: &str| m.eq_ignore_ascii_case("mxfp4") || (m.eq_ignore_ascii_case("fp8") && tiles);
+        !method.is_some_and(dense_reads)
     })
 }
 
@@ -87,9 +93,6 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         }
     };
     let v: serde_json::Value = serde_json::from_str(&txt)?;
-    let u = |keys: &[&str]| lookup_u(&v, keys);
-    let f = |keys: &[&str]| lookup_f(&v, keys);
-
     let hf_arch = v
         .get("architectures")
         .and_then(|a| a.get(0))
@@ -97,6 +100,17 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         .ok_or_else(|| anyhow!("config.json: missing architectures[0]"))?
         .to_string();
     let gguf_arch = map_hf_arch(&hf_arch)?.to_string();
+    config_from_value(v, hf_arch, gguf_arch)
+}
+
+/// The essentials of a parsed `config.json` `v` of the class `hf_arch`, read as `gguf_arch`.
+pub fn config_from_value(
+    v: serde_json::Value,
+    hf_arch: String,
+    gguf_arch: String,
+) -> Result<AwqConfigJson> {
+    let u = |keys: &[&str]| lookup_u(&v, keys);
+    let f = |keys: &[&str]| lookup_f(&v, keys);
 
     let hidden_size =
         u(&["hidden_size", "d_model", "n_embd"]).ok_or_else(|| anyhow!("missing hidden_size"))?;
@@ -184,7 +198,11 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
             .ok_or_else(|| anyhow!("missing num_hidden_layers"))?,
         n_head,
         n_kv_head,
-        head_dim: u(&["head_dim", "kv_channels"]),
+        // A latent attention's head is as wide as its query and key, whatever `head_dim` the
+        // configuration carries for the rotated slice.
+        head_dim: u(&["kv_lora_rank"])
+            .and_then(|_| Some(u(&["qk_nope_head_dim"])? + u(&["qk_rope_head_dim"])?))
+            .or_else(|| u(&["head_dim", "kv_channels"])),
         // The configuration's own default, four times the width, when it has none.
         intermediate_size: u(&[
             "intermediate_size",
@@ -673,5 +691,24 @@ mod layout_tests {
         );
         assert!(message.contains("consolidated*.safetensors"), "{message}");
         assert!(!message.contains("lacks: params.json"), "{message}");
+    }
+
+    /// Methods whose tensors the dense layouts read stay off the quantised route.
+    #[test]
+    fn fp8_tiles_and_mxfp4_are_read_by_the_dense_layouts() {
+        let route = |text: &str| {
+            let q: serde_json::Value = serde_json::from_str(text).unwrap();
+            quantized_route(Some(&q))
+        };
+        assert!(!quantized_route(None));
+        assert!(!route(
+            r#"{"quant_method": "fp8", "weight_block_size": [128, 128]}"#
+        ));
+        assert!(!route(r#"{"quant_method": "mxfp4"}"#));
+        assert!(route(r#"{"quant_method": "fp8"}"#));
+        assert!(route(
+            r#"{"quant_method": "fp8", "weight_block_size": [128, 64]}"#
+        ));
+        assert!(route(r#"{"quant_method": "awq", "bits": 4}"#));
     }
 }

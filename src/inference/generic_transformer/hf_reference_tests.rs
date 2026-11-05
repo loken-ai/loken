@@ -269,6 +269,96 @@ reference_logits! {
     gemma4_moe_matches_reference: "gemma4_moe";
     mistral3_matches_reference: "mistral3";
     voxtral_matches_reference: "voxtral";
+    glm_moe_dsa_matches_reference: "glm_moe_dsa";
+    glm_moe_dsa_dense_matches_reference: "glm_moe_dsa_dense";
+    glm_moe_dsa_sparse_matches_reference: "glm_moe_dsa_sparse";
+    glm_moe_dsa_fp8_matches_reference: "glm_moe_dsa_fp8";
+}
+
+/// The positions a row of the reference's selection keeps that the row may see.
+fn visible_picks(row: &Json, t: usize) -> Vec<u32> {
+    let mut kept: Vec<u32> = row
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j.as_u64().unwrap() as u32)
+        .filter(|j| *j as usize <= t)
+        .collect();
+    kept.sort_unstable();
+    kept
+}
+
+/// Each decoder layer of the folder's checkpoint, run on the output of the layer before it, gives
+/// the reference's output over the prompt with the cosine the logits keep, and a layer of a
+/// sparse model keeps the tokens the reference's keeps.
+fn check_layers(name: &str) {
+    use super::mixer::Mixer;
+    let reference = reference_of(name);
+    let (prompt, _) = prompt_and_next(&reference);
+    let layers = reference["layers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: reference.json has layers"));
+    let mut model = load_files(name, COMPOSITE);
+    assert_eq!(model.layers.len(), layers.len(), "{name}: the layers");
+    let ids = Tensor::from_vec(prompt.clone(), (1usize, prompt.len()), &Device::Cpu).unwrap();
+    let (mut hidden, _) = model.embed_stage(&ids, 0).unwrap();
+    for (i, want) in layers.iter().enumerate() {
+        hidden = model
+            .run_layers_in(hidden, None, 0, prompt.len(), i, i + 1)
+            .unwrap()
+            .0;
+        let got = hidden
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cos = cosine(&got, &floats(want, "hidden"));
+        assert!(
+            cos >= MIN_COSINE,
+            "{name}: layer {i}: cosine {cos} with the reference's output"
+        );
+        let Some(rows) = want["selected"].as_array() else {
+            continue;
+        };
+        let Mixer::Mla(mla) = &model.layers[i].mixer else {
+            continue;
+        };
+        let Some(cell) = mla.selection_cell() else {
+            continue;
+        };
+        let kept = cell.get(0, prompt.len()).unwrap();
+        for (t, row) in rows.iter().enumerate() {
+            let ours: Vec<u32> = match &kept.rows[t] {
+                Some(k) => k.clone(),
+                None => (0..=t as u32).collect(),
+            };
+            assert_eq!(
+                ours,
+                visible_picks(row, t),
+                "{name}: layer {i}: the tokens row {t} attends to"
+            );
+        }
+    }
+}
+
+macro_rules! reference_layers {
+    ($($test:ident: $folder:literal;)*) => {
+        $(
+            #[test]
+            fn $test() {
+                check_layers($folder);
+            }
+        )*
+    };
+}
+
+reference_layers! {
+    glm_moe_dsa_layers_match_reference: "glm_moe_dsa";
+    glm_moe_dsa_dense_layers_match_reference: "glm_moe_dsa_dense";
+    glm_moe_dsa_sparse_layers_match_reference: "glm_moe_dsa_sparse";
+    glm_moe_dsa_fp8_layers_match_reference: "glm_moe_dsa_fp8";
 }
 
 /// The checkpoint whose attention adds an ALiBi bias is read as one only the host runs; one

@@ -70,9 +70,10 @@ const FP4_VALUES: [f32; 16] = {
     t
 };
 
-/// Dequantize a block-scaled fp8 weight. `bytes` is [out, in] e4m3, `scale` [out/block, in/block]
-/// the power-of-two block scales already decoded to f32. Returns [out, in] f32, rows decoded
-/// across the rayon pool.
+/// Dequantize a block-scaled fp8 weight. `bytes` is [out, in] e4m3, `scale`
+/// [ceil(out/block), ceil(in/block)] the block scales already decoded to f32: powers of two
+/// for the V4.1 release, any f32 for a release that stores `weight_scale_inv`. A last row or
+/// column of tiles may be partial. Returns [out, in] f32, rows decoded across the rayon pool.
 pub fn dequant_fp8_blocked(
     bytes: &[u8],
     scale: &[f32],
@@ -81,7 +82,7 @@ pub fn dequant_fp8_blocked(
     block: usize,
 ) -> Vec<f32> {
     use rayon::prelude::*;
-    let sib = in_dim / block;
+    let sib = in_dim.div_ceil(block);
     let table = e4m3_table();
     let mut w = vec![0f32; out * in_dim];
     w.par_chunks_mut(in_dim.max(1))

@@ -33,6 +33,15 @@ const SSM_GROUPS: usize = 2;
 const SSM_HEADS: usize = 4;
 const MAMBA_HEADS: usize = 8;
 const PROMPT: [u32; 5] = [1, 17, 42, 8, 63];
+/// The latent attention's ranks and widths, and the sparse indexer's heads, width and budget.
+const Q_LORA: usize = 32;
+const KV_LORA: usize = 32;
+const NOPE: usize = 16;
+const ROPE: usize = 8;
+const V_DIM: usize = 16;
+const INDEX_HEADS: usize = 2;
+const INDEX_DIM: usize = 16;
+const INDEX_TOP_K: usize = 4;
 
 /// What mixes a block's tokens.
 #[derive(Clone, Copy, PartialEq)]
@@ -44,6 +53,9 @@ enum Mix {
     Delta,
     /// Gated delta rule with them packed in one `ssm_ba`.
     DeltaPacked,
+    /// Latent attention; the blocks at even positions run the sparse indexer and the others reuse
+    /// the selection of the block before.
+    Mla,
     /// A feed-forward alone.
     Nothing,
 }
@@ -253,6 +265,24 @@ impl Recipe {
         if self.mixers.contains(&Mix::ShortConv) {
             meta.push(u("shortconv.l_cache", CONV_KERNEL));
         }
+        if self.mixers.contains(&Mix::Mla) {
+            meta.push(u("attention.q_lora_rank", Q_LORA));
+            meta.push(u("attention.kv_lora_rank", KV_LORA));
+            meta.push(u("attention.key_length_mla", NOPE + ROPE));
+            meta.push(u("attention.value_length_mla", V_DIM));
+            meta.push(u("rope.dimension_count", ROPE));
+            meta.push(u("attention.indexer.head_count", INDEX_HEADS));
+            meta.push(u("attention.indexer.key_length", INDEX_DIM));
+            meta.push(u("attention.indexer.top_k", INDEX_TOP_K));
+            meta.push((
+                format!("{a}.attention.indexer.types"),
+                Value::Array(
+                    (0..self.mixers.len())
+                        .map(|il| Value::Bool(il % 2 == 0))
+                        .collect(),
+                ),
+            ));
+        }
         if self
             .mixers
             .iter()
@@ -419,6 +449,25 @@ impl Recipe {
                     put("ssm_dt", &[SSM_HEADS]);
                     put("ssm_norm.weight", &[SSM_INNER / SSM_HEADS]);
                     put("ssm_out.weight", &[HIDDEN, SSM_INNER]);
+                }
+                Mix::Mla => {
+                    put("attn_q_a.weight", &[Q_LORA, HIDDEN]);
+                    put("attn_q_a_norm.weight", &[Q_LORA]);
+                    put("attn_q_b.weight", &[HEADS * (NOPE + ROPE), Q_LORA]);
+                    put("attn_kv_a_mqa.weight", &[KV_LORA + ROPE, HIDDEN]);
+                    put("attn_kv_a_norm.weight", &[KV_LORA]);
+                    put("attn_kv_b.weight", &[HEADS * (NOPE + V_DIM), KV_LORA]);
+                    put("attn_output.weight", &[HIDDEN, HEADS * V_DIM]);
+                    if il % 2 == 0 {
+                        put(
+                            "indexer.attn_q_b.weight",
+                            &[INDEX_HEADS * INDEX_DIM, Q_LORA],
+                        );
+                        put("indexer.attn_k.weight", &[INDEX_DIM, HIDDEN]);
+                        put("indexer.k_norm.weight", &[INDEX_DIM]);
+                        put("indexer.k_norm.bias", &[INDEX_DIM]);
+                        put("indexer.proj.weight", &[INDEX_HEADS, HIDDEN]);
+                    }
                 }
                 Mix::Nothing => {}
             }
@@ -633,6 +682,7 @@ fn build_gguf_with(
             Mix::ShortConv => MixerKind::ShortConv,
             Mix::Mamba => MixerKind::Ssm,
             Mix::Delta | Mix::DeltaPacked => MixerKind::DeltaNet,
+            Mix::Mla => MixerKind::Mla,
             Mix::Nothing => MixerKind::Absent,
         };
         assert_eq!(
@@ -808,6 +858,12 @@ gguf_loads! {
         post_attention_as_ffn_norm: true,
         shared_expert: true,
         ..hybrid("qwen3next", vec![Mix::DeltaPacked, Mix::Attention]).qk().moe()
+    };
+    glm_moe_dsa_loads_from_gguf: Recipe {
+        dense_blocks: vec![0, 1],
+        shared_expert: true,
+        sigmoid_router: true,
+        ..hybrid("glm_moe_dsa", vec![Mix::Mla; 4]).moe()
     };
     nemotron_h_moe_loads_from_gguf: Recipe {
         ffn_blocks: vec![1],
@@ -3133,7 +3189,7 @@ const READ_AS: [(&str, &str, &str); 4] = [
 
 /// Architectures whose safetensors are tested only against the reference's logits, in
 /// `hf_reference_tests.rs`: the architecture and its folder under `tests/vectors/hf`.
-const REFERENCE_TESTED: [(&str, &str); 1] = [("gemma4", "gemma4")];
+const REFERENCE_TESTED: [(&str, &str); 2] = [("gemma4", "gemma4"), ("glm_moe_dsa", "glm_moe_dsa")];
 
 /// Architectures whose publisher ships no safetensors the loader can read, and why.
 const NO_SAFETENSORS: [(&str, &str); 2] = [

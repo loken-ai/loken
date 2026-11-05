@@ -8,6 +8,7 @@
 //!
 //! Which mixer a layer runs is read from the tensors its block carries.
 
+use super::mla::{Mla, MlaState};
 #[allow(unused_imports)]
 use super::*;
 use crate::tensor::D;
@@ -23,6 +24,8 @@ pub enum MixerKind {
     /// Gated delta-rule linear attention: `attn_qkv`, `attn_gate`, `ssm_{alpha,beta}` or
     /// `ssm_ba`, `ssm_{conv1d,a,dt,norm,out}`.
     DeltaNet,
+    /// Latent attention: `attn_q_a`, `attn_q_b`, `attn_kv_a_mqa`, `attn_kv_a_norm`, `attn_kv_b`.
+    Mla,
     /// No mixing sublayer: the block is a feed-forward alone.
     Absent,
 }
@@ -34,7 +37,9 @@ pub fn layer_mixer_kind(content: &gguf_file::Content, il: usize) -> MixerKind {
             .tensor_infos
             .contains_key(&format!("blk.{il}.{suffix}"))
     };
-    if has("shortconv.conv.weight") {
+    if has("attn_kv_a_mqa.weight") {
+        MixerKind::Mla
+    } else if has("shortconv.conv.weight") {
         MixerKind::ShortConv
     } else if has("ssm_in.weight") {
         MixerKind::Ssm
@@ -81,6 +86,8 @@ pub enum Mixer {
     ShortConv(ShortConv),
     Ssm(Mamba2),
     DeltaNet(GatedDeltaNet),
+    /// Latent attention, which keeps its own cache of latent rows.
+    Mla(Mla),
     /// The block has no mixing sublayer.
     Absent,
 }
@@ -91,6 +98,7 @@ pub enum MixerState {
     ShortConv(Option<ConvState>),
     Ssm(Option<SsmState>),
     DeltaNet(Option<SsmState>),
+    Mla(Option<MlaState>),
     /// A wide-residual layer's: its mixer's state beside the caches of its indexer and of its
     /// n-gram features.
     Wide(Box<WideState>),
@@ -117,7 +125,7 @@ impl MixerState {
                 .iter()
                 .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
                 .sum(),
-            MixerState::Ssm(_) | MixerState::DeltaNet(_) => 0,
+            MixerState::Ssm(_) | MixerState::DeltaNet(_) | MixerState::Mla(_) => 0,
             MixerState::Wide(w) => {
                 w.mixer.as_ref().map_or(0, MixerState::device_bytes)
                     + w.ngram.as_ref().map_or(0, |n| n.device_bytes())
@@ -322,6 +330,8 @@ impl Mixer {
             // Its step advances in place too, but the recorded step measured slower than the
             // eager one, so it is not recorded.
             Mixer::Ssm(_) => false,
+            // Its cache grows on the host with every token.
+            Mixer::Mla(_) => false,
         }
     }
 
@@ -345,6 +355,11 @@ impl Mixer {
             Mixer::ShortConv(m) => m.state.clone().map(|s| MixerState::ShortConv(Some(s))),
             Mixer::Ssm(m) => m.state.clone().map(|s| MixerState::Ssm(Some(s))),
             Mixer::DeltaNet(m) => m.state.clone().map(|s| MixerState::DeltaNet(Some(s))),
+            Mixer::Mla(_) => {
+                return Err(crate::tensor::Error::msg(
+                    "a latent cache has no buffer to keep in place",
+                ))
+            }
         };
         match current {
             Some(cur) => copy_state_in_place(keep, &cur),
@@ -359,6 +374,7 @@ impl Mixer {
             Mixer::ShortConv(m) => m.state.clone().map(|s| MixerState::ShortConv(Some(s))),
             Mixer::Ssm(m) => m.state.clone().map(|s| MixerState::Ssm(Some(s))),
             Mixer::DeltaNet(m) => m.state.clone().map(|s| MixerState::DeltaNet(Some(s))),
+            Mixer::Mla(_) => return self.restore(state),
         };
         match current {
             Some(cur) => copy_state_in_place(&cur, state),
@@ -381,6 +397,7 @@ impl Mixer {
             Mixer::ShortConv(m) => m.forward(x, index_pos),
             Mixer::Ssm(m) => m.forward(x, index_pos),
             Mixer::DeltaNet(m) => m.forward(x, index_pos),
+            Mixer::Mla(m) => m.forward(x, index_pos),
         }
     }
 
@@ -392,6 +409,11 @@ impl Mixer {
             Mixer::ShortConv(m) => restart_conv(&mut m.state, None, &mut m.moves),
             Mixer::Ssm(m) => restart_ssm(&mut m.state, None, &mut m.moves),
             Mixer::DeltaNet(m) => restart_ssm(&mut m.state, None, &mut m.moves),
+            Mixer::Mla(m) => {
+                if m.state.take().is_some() {
+                    m.moves += 1;
+                }
+            }
         }
     }
 
@@ -402,6 +424,7 @@ impl Mixer {
             Mixer::ShortConv(m) => m.moves,
             Mixer::Ssm(m) => m.moves,
             Mixer::DeltaNet(m) => m.moves,
+            Mixer::Mla(m) => m.moves,
         }
     }
 
@@ -418,6 +441,7 @@ impl Mixer {
             Mixer::DeltaNet(m) => Some(MixerState::DeltaNet(
                 m.state.as_ref().map(SsmState::deep_copy).transpose()?,
             )),
+            Mixer::Mla(m) => Some(MixerState::Mla(m.state.clone())),
         })
     }
 
@@ -435,7 +459,7 @@ impl Mixer {
                     _ => 0,
                 }
             }
-            Mixer::Attention | Mixer::Absent => 0,
+            Mixer::Attention | Mixer::Absent | Mixer::Mla(_) => 0,
         }
     }
 
@@ -454,6 +478,11 @@ impl Mixer {
             }
             (Mixer::DeltaNet(m), MixerState::DeltaNet(s)) => {
                 m.state = s.as_ref().map(SsmState::deep_copy).transpose()?;
+                m.moves += 1;
+                Ok(())
+            }
+            (Mixer::Mla(m), MixerState::Mla(s)) => {
+                m.state = s.clone();
                 m.moves += 1;
                 Ok(())
             }

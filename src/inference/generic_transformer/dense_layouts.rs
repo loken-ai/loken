@@ -771,6 +771,62 @@ const QWEN35MOE: Layout = Layout {
     ..LLAMA
 };
 
+/// The latent attention with its sparse indexer, and the router, bias and shared expert of a
+/// mixture whose first blocks are dense.
+const LATENT_BLOCK: Table = &[
+    ("input_layernorm.weight", Same("attn_norm.weight")),
+    ("post_attention_layernorm.weight", Same("ffn_norm.weight")),
+    ("self_attn.q_a_proj.weight", Same("attn_q_a.weight")),
+    (
+        "self_attn.q_a_layernorm.weight",
+        Same("attn_q_a_norm.weight"),
+    ),
+    ("self_attn.q_b_proj.weight", Same("attn_q_b.weight")),
+    (
+        "self_attn.kv_a_proj_with_mqa.weight",
+        Same("attn_kv_a_mqa.weight"),
+    ),
+    (
+        "self_attn.kv_a_layernorm.weight",
+        Same("attn_kv_a_norm.weight"),
+    ),
+    ("self_attn.kv_b_proj.weight", Same("attn_kv_b.weight")),
+    ("self_attn.o_proj.weight", Same("attn_output.weight")),
+    (
+        "self_attn.indexer.wq_b.weight",
+        Same("indexer.attn_q_b.weight"),
+    ),
+    ("self_attn.indexer.wk.weight", Same("indexer.attn_k.weight")),
+    (
+        "self_attn.indexer.k_norm.weight",
+        Same("indexer.k_norm.weight"),
+    ),
+    ("self_attn.indexer.k_norm.bias", Same("indexer.k_norm.bias")),
+    (
+        "self_attn.indexer.weights_proj.weight",
+        Same("indexer.proj.weight"),
+    ),
+    ("mlp.gate.weight", Same("ffn_gate_inp.weight")),
+    ("mlp.gate.e_score_correction_bias", Same("exp_probs_b.bias")),
+    (
+        "mlp.shared_experts.gate_proj.weight",
+        Same("ffn_gate_shexp.weight"),
+    ),
+    (
+        "mlp.shared_experts.up_proj.weight",
+        Same("ffn_up_shexp.weight"),
+    ),
+    (
+        "mlp.shared_experts.down_proj.weight",
+        Same("ffn_down_shexp.weight"),
+    ),
+];
+
+const LATENT_MOE: Layout = Layout {
+    layer: &[LATENT_BLOCK, EXPERTS, GATED_MLP],
+    ..LLAMA
+};
+
 const NEMOTRON_H: Layout = Layout {
     embed: &["embeddings.weight"],
     top: &[("norm_f.weight", Same("output_norm.weight"))],
@@ -846,5 +902,6 @@ pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
         LayoutKind::Qwen35 => &QWEN35,
         LayoutKind::Qwen35Moe => &QWEN35MOE,
         LayoutKind::NemotronH => &NEMOTRON_H,
+        LayoutKind::GlmMoeDsa => &LATENT_MOE,
     }
 }

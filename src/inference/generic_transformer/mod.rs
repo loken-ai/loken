@@ -66,6 +66,7 @@ pub mod expert_tier;
 mod graph;
 pub mod hetero;
 pub use hetero::CachedPrompt;
+pub mod dsa;
 #[cfg(test)]
 mod hf_reference_tests;
 pub mod hyper;
@@ -80,6 +81,8 @@ mod loader;
 #[cfg(test)]
 mod loading_tests;
 pub mod mixer;
+pub mod mla;
+pub mod mla_config;
 mod moe_weights;
 pub mod ngram;
 mod opencl_layers;

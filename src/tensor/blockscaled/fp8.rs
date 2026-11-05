@@ -1,8 +1,9 @@
 //! A block-scaled fp8 projection read in place: the released checkpoint's attention and shared
 //! expert weights.
 //!
-//! A `[out, in]` weight is stored as e4m3 bytes row-major with one ue8m0 scale per
-//! `block x block` tile (`[out / block, in / block]`). The product with an activation runs a row
+//! A `[out, in]` weight is stored as e4m3 bytes row-major with one scale per `block x block`
+//! tile (`[ceil(out / block), ceil(in / block)]`): a ue8m0 byte, or an f32 where a release
+//! stores `weight_scale_inv`. The last row and column of tiles may be partial. The product with an activation runs a row
 //! at a time, one tile-column of `block` inputs at a time - bytes decoded through a 256-entry
 //! table, the partial sum scaled once per tile - straight from the mapping. A row range of the
 //! weight is a view of the same bytes, so a grouped projection reads its group in place too.
@@ -125,11 +126,43 @@ fn tile_dot(bytes: &[u8], x: &[f32], table: &[f32; 256]) -> f32 {
         .sum()
 }
 
+/// How a tile's scale is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleFormat {
+    /// One byte, a power of two `2^(e - 127)`.
+    E8m0,
+    /// 4 little-endian bytes, an f32.
+    F32,
+}
+
+impl ScaleFormat {
+    /// Bytes one scale takes.
+    pub fn width(self) -> usize {
+        match self {
+            Self::E8m0 => 1,
+            Self::F32 => 4,
+        }
+    }
+
+    /// The scale at index `i` of `bytes`.
+    #[inline]
+    fn at(self, bytes: &[u8], i: usize) -> f32 {
+        match self {
+            Self::E8m0 => e8m0_to_f32(bytes[i]),
+            Self::F32 => {
+                let b = &bytes[4 * i..4 * i + 4];
+                f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            }
+        }
+    }
+}
+
 /// One `[out, in]` fp8 weight in its storage.
 #[derive(Clone)]
 pub struct Fp8Weight {
     pub bytes: MappedBytes,
     pub scales: MappedBytes,
+    pub scale_format: ScaleFormat,
     pub out: usize,
     pub inp: usize,
     pub block: usize,
@@ -158,6 +191,18 @@ impl Fp8Weight {
         inp: usize,
         block: usize,
     ) -> Result<Self> {
+        Self::with_scales(bytes, scales, ScaleFormat::E8m0, out, inp, block)
+    }
+
+    /// The weight with scales stored as `format`.
+    pub fn with_scales(
+        bytes: MappedBytes,
+        scales: MappedBytes,
+        format: ScaleFormat,
+        out: usize,
+        inp: usize,
+        block: usize,
+    ) -> Result<Self> {
         if bytes.len() != out * inp {
             return Err(Error::msg(format!(
                 "fp8 weight: {} bytes for [{out}, {inp}]",
@@ -165,15 +210,16 @@ impl Fp8Weight {
             )));
         }
         let tiles = out.div_ceil(block) * inp.div_ceil(block);
-        if scales.len() != tiles {
+        if scales.len() != tiles * format.width() {
             return Err(Error::msg(format!(
-                "fp8 weight: {} scales for [{out}, {inp}] in {block}x{block} tiles ({tiles} wanted)",
+                "fp8 weight: {} scale bytes for [{out}, {inp}] in {block}x{block} tiles ({tiles} {format:?} wanted)",
                 scales.len()
             )));
         }
         Ok(Self {
             bytes,
             scales,
+            scale_format: format,
             out,
             inp,
             block,
@@ -193,6 +239,7 @@ impl Fp8Weight {
         Ok(Self {
             bytes: self.bytes.clone(),
             scales: self.scales.clone(),
+            scale_format: self.scale_format,
             out: count,
             inp: self.inp,
             block: self.block,
@@ -225,15 +272,15 @@ impl Fp8Weight {
         y.par_chunks_mut(n).enumerate().for_each(|(o, col)| {
             let row_abs = self.row0 + o;
             let row = &bytes[row_abs * inp..(row_abs + 1) * inp];
-            let scales =
-                &sc[(row_abs / block) * tiles_per_row..(row_abs / block + 1) * tiles_per_row];
+            let first_tile = (row_abs / block) * tiles_per_row;
             for (t, out) in col.iter_mut().enumerate() {
                 let xt = &xs[t * inp..(t + 1) * inp];
                 let mut acc = 0f32;
-                for (b, &s) in scales.iter().enumerate() {
+                for b in 0..tiles_per_row {
                     let lo = b * block;
                     let hi = (lo + block).min(inp);
-                    acc += tile_dot(&row[lo..hi], &xt[lo..hi], &table) * e8m0_to_f32(s);
+                    acc += tile_dot(&row[lo..hi], &xt[lo..hi], &table)
+                        * self.scale_format.at(sc, first_tile + b);
                 }
                 *out = acc;
             }
@@ -384,5 +431,107 @@ mod tests {
             }
         }
         assert!(fw.rows(5, 32).is_err());
+    }
+
+    /// The tensors torch wrote: f32 scales per 128 x 128 tile, the last tiles partial.
+    fn torch_weight(name: &str) -> (Fp8Weight, Vec<f32>) {
+        let v = crate::tensor::blockscaled::test_vectors::block_vectors();
+        let w = &v[&format!("{name}.weight")];
+        let s = &v[&format!("{name}.weight_scale_inv")];
+        let expected = v[&format!("{name}.expected")].f32s();
+        let (out, inp) = (w.shape[0], w.shape[1]);
+        let fw = Fp8Weight::with_scales(
+            mapped(&w.bytes),
+            mapped(&s.bytes),
+            ScaleFormat::F32,
+            out,
+            inp,
+            128,
+        )
+        .unwrap();
+        (fw, expected)
+    }
+
+    /// The dequantised weight is torch's value by value, bit for bit, for a tensor of 4.5 tile
+    /// rows and for one partial in both directions.
+    #[test]
+    fn f32_scales_dequantise_as_torch_does() {
+        let v = crate::tensor::blockscaled::test_vectors::block_vectors();
+        for name in ["rows", "both"] {
+            let w = &v[&format!("{name}.weight")];
+            let s = v[&format!("{name}.weight_scale_inv")].f32s();
+            let want = v[&format!("{name}.expected")].f32s();
+            let got = dequant_fp8_blocked(&w.bytes, &s, w.shape[0], w.shape[1], 128);
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "{name}[{i}]: {g} vs {w}");
+            }
+        }
+    }
+
+    /// The in-place product over f32 scales is the product with torch's dequantised weight,
+    /// and a row range on a tile boundary is the same rows of it.
+    #[test]
+    fn f32_scales_in_place_product_matches_torch() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
+        for name in ["rows", "both"] {
+            let (fw, expected) = torch_weight(name);
+            let (out, inp) = (fw.out, fw.inp);
+            let n = 3;
+            let x: Vec<f32> = (0..n * inp).map(|i| ((i as f32) * 0.17).sin()).collect();
+            let xt = Tensor::from_vec(x.clone(), (n, inp), &Device::Cpu).unwrap();
+            let got = fw
+                .apply(&xt)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for t in 0..n {
+                for o in 0..out {
+                    let want: f64 = (0..inp)
+                        .map(|k| expected[o * inp + k] as f64 * x[t * inp + k] as f64)
+                        .sum();
+                    let g = got[t * out + o] as f64;
+                    assert!(
+                        (g - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "{name}[{t},{o}]: {g} vs {want}"
+                    );
+                }
+            }
+            let tail = fw.rows(128, out - 128).unwrap();
+            let got_tail = tail
+                .apply(&xt)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for t in 0..n {
+                for o in 0..out - 128 {
+                    assert_eq!(got_tail[t * (out - 128) + o], got[t * out + 128 + o]);
+                }
+            }
+        }
+    }
+
+    /// Scales that do not tile the weight, or are stored in the other width, are refused.
+    #[test]
+    fn scales_that_do_not_tile_the_weight_are_refused() {
+        let bytes = vec![0u8; 129 * 130];
+        // 129 x 130 in 128 x 128 tiles: 2 x 2 tiles.
+        let one_byte_each = vec![0u8; 4];
+        let four_bytes_each = vec![0u8; 16];
+        let too_many = vec![0u8; 24];
+        let f32s = ScaleFormat::F32;
+        let args =
+            |s: &Vec<u8>, f| Fp8Weight::with_scales(mapped(&bytes), mapped(s), f, 129, 130, 128);
+        assert!(args(&four_bytes_each, f32s).is_ok());
+        assert!(args(&one_byte_each, ScaleFormat::E8m0).is_ok());
+        assert!(args(&one_byte_each, f32s).is_err());
+        assert!(args(&four_bytes_each, ScaleFormat::E8m0).is_err());
+        assert!(args(&too_many, f32s).is_err());
     }
 }

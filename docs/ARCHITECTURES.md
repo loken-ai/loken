@@ -117,6 +117,7 @@ The `Verified` column says how the safetensors layout is checked:
 | `lfm2` | `Lfm2ForCausalLM` | GGUF, HF safetensors | `lfm2_loads_from_gguf`, `lfm2_loads_from_safetensors` | reference, synthetic, real checkpoint |
 | `lfm2moe` | `Lfm2MoeForCausalLM` | GGUF, HF safetensors | `lfm2moe_loads_from_gguf`, `lfm2moe_loads_from_safetensors` | reference, synthetic |
 | `nemotron_h_moe` | `NemotronHForCausalLM` | GGUF, HF safetensors | `nemotron_h_moe_loads_from_gguf`, `nemotron_h_moe_loads_from_safetensors` | reference, synthetic |
+| `glm_moe_dsa` | `GlmMoeDsaForCausalLM` (latent attention, sparse indexer shared across layers, sigmoid router with a selection bias, shared expert, dense first blocks, fp8 weights with 128 by 128 tile scales) | GGUF, HF safetensors | `glm_moe_dsa_loads_from_gguf`, `glm_moe_dsa_matches_reference`, `glm_moe_dsa_dense_matches_reference`, `glm_moe_dsa_sparse_matches_reference`, `glm_moe_dsa_fp8_matches_reference`, `glm_moe_dsa_layers_match_reference` | reference (`glm_moe_dsa`, `glm_moe_dsa_dense`, `glm_moe_dsa_sparse`, `glm_moe_dsa_fp8`), synthetic |
 | `llama` text model of a speech release | `VoxtralForConditionalGeneration`, native layout with the table in the tower's namespace | HF safetensors composite, native layout | `voxtral_loads_from_safetensors`, `voxtral_loads_from_native_layout`, `voxtral_matches_reference`, `voxtral_native_matches_reference`, `voxtral_native_matches_composite` | reference (`voxtral`), synthetic |
 
 ## Notes

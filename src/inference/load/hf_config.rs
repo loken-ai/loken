@@ -39,6 +39,7 @@ pub enum LayoutKind {
     Qwen35,
     Qwen35Moe,
     NemotronH,
+    GlmMoeDsa,
 }
 
 /// One class a checkpoint's configuration can name.
@@ -214,6 +215,11 @@ pub const CLASSES: &[HfClass] = &[
         "nemotron_h_moe",
         LayoutKind::NemotronH,
     ),
+    sigmoid(class(
+        "GlmMoeDsaForCausalLM",
+        "glm_moe_dsa",
+        LayoutKind::GlmMoeDsa,
+    )),
 ];
 
 /// The row of `name`, `None` for a class the loader does not read.
@@ -488,6 +494,10 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
         }
     }
 
+    if let Some(kv_rank) = lookup_u(root, &["kv_lora_rank"]) {
+        latent_attention_metadata(cfg, kv_rank, &mut put);
+    }
+
     // The global layers' head width, the layers that read another's keys and values, and the
     // width of the per-layer inputs.
     if let Some(global) = global_head_dim(root).filter(|g| *g != head_dim) {
@@ -530,4 +540,61 @@ pub fn hf_metadata(cfg: &AwqConfigJson) -> Vec<(String, Value)> {
         put("ssm.group_count", Value::U32(groups.unwrap_or(1) as u32));
     }
     out
+}
+
+/// The header keys of a latent attention: its ranks and widths, the rotated slice of a head,
+/// and the sparse indexer with the layers that run it.
+fn latent_attention_metadata(
+    cfg: &AwqConfigJson,
+    kv_rank: usize,
+    put: &mut dyn FnMut(&str, Value),
+) {
+    let root = &cfg.root;
+    let nope = lookup_u(root, &["qk_nope_head_dim"]).unwrap_or(0);
+    let rope = lookup_u(root, &["qk_rope_head_dim"]).unwrap_or(0);
+    let v_dim = lookup_u(root, &["v_head_dim"]).unwrap_or(nope + rope);
+    put("attention.kv_lora_rank", Value::U32(kv_rank as u32));
+    if let Some(rank) = lookup_u(root, &["q_lora_rank"]) {
+        put("attention.q_lora_rank", Value::U32(rank as u32));
+    }
+    put("attention.key_length_mla", Value::U32((nope + rope) as u32));
+    put("attention.value_length_mla", Value::U32(v_dim as u32));
+    put("attention.key_length", Value::U32((nope + rope) as u32));
+    put("attention.value_length", Value::U32(v_dim as u32));
+    put("rope.dimension_count", Value::U32(rope as u32));
+    if let Some(width) = lookup_u(root, &["moe_intermediate_size"]) {
+        put("expert_feed_forward_length", Value::U32(width as u32));
+    }
+    let (Some(heads), Some(head_dim), Some(top_k)) = (
+        lookup_u(root, &["index_n_heads"]),
+        lookup_u(root, &["index_head_dim"]),
+        lookup_u(root, &["index_topk"]),
+    ) else {
+        return;
+    };
+    put("attention.indexer.head_count", Value::U32(heads as u32));
+    put("attention.indexer.key_length", Value::U32(head_dim as u32));
+    put("attention.indexer.top_k", Value::U32(top_k as u32));
+    let listed: Option<Vec<String>> = lookup(root, &["indexer_types"])
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        });
+    let pattern = lookup(root, &["index_topk_pattern"]).and_then(Json::as_str);
+    // The schedule's defaults are the configuration class's.
+    let freq = lookup_u(root, &["index_topk_freq"]).unwrap_or(1);
+    let offset = lookup_u(root, &["index_skip_topk_offset"]).unwrap_or(2);
+    let full = crate::inference::generic_transformer::mla_config::indexer_layers(
+        cfg.n_layers,
+        listed.as_deref(),
+        pattern,
+        freq,
+        offset,
+    );
+    put(
+        "attention.indexer.types",
+        Value::Array(full.into_iter().map(Value::Bool).collect()),
+    );
 }
