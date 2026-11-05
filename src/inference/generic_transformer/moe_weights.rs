@@ -467,6 +467,122 @@ pub(crate) fn sqrt_softplus_choice(
     (chosen, w)
 }
 
+/// Routing that gives up some of a token's experts for speed.
+///
+/// Every field's zero is exact routing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Truncation {
+    /// Keep at most this many of a token's experts, the heaviest. `0` keeps them all.
+    pub keep: usize,
+    /// Drop the lightest experts while the weight they carry together stays below this share
+    /// of the token's total. `0` drops none.
+    pub drop_mass: f32,
+    /// A chosen expert whose share of the token's weight is below this and that is not
+    /// resident is replaced, or dropped. `0` touches none.
+    pub miss_below: f32,
+    /// Drop such an expert instead of replacing it with the best resident one.
+    pub miss_drops: bool,
+}
+
+impl Truncation {
+    /// Whether a field gives up exactness.
+    pub fn active(&self) -> bool {
+        self.keep > 0 || self.drop_mass > 0.0 || self.miss_below > 0.0
+    }
+}
+
+/// [`sqrt_softplus_choice`] under `truncation`, with the slots it saved.
+///
+/// The `k` experts of the highest biased score are chosen first.
+/// A light chosen expert that is not `resident` gives its slot and its score to the best-ranked
+/// resident expert beyond the choice, or is dropped with `miss_drops`.
+/// The slots are then ordered heaviest first, `keep` cuts the lightest, and `drop_mass` drops
+/// the lightest while their share stays under it.
+/// The weights are the kept slots' scores, normalised as the plain choice normalises them.
+///
+/// A saved slot is one of an expert that is not resident and that the truncation removed or
+/// replaced.
+pub(crate) fn sqrt_softplus_truncated_choice(
+    row: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    temperature: f32,
+    normalize: bool,
+    truncation: Truncation,
+    resident: &dyn Fn(usize) -> bool,
+) -> (Vec<usize>, Vec<f32>, u64) {
+    let scores: Vec<f32> = row
+        .iter()
+        .map(|&z| softplus(z / temperature).sqrt())
+        .collect();
+    let biased = |e: usize| scores[e] + bias.map_or(0.0, |b| b[e]);
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        biased(b)
+            .partial_cmp(&biased(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let chosen = k.min(row.len());
+    let mut slots: Vec<(usize, f32)> = order[..chosen].iter().map(|&e| (e, scores[e])).collect();
+    let mut saved = 0u64;
+    if truncation.miss_below > 0.0 {
+        let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
+        let heaviest = slots.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+        // The next expert beyond the choice that may take a slot.
+        let mut next = chosen;
+        let mut out = Vec::with_capacity(chosen);
+        for &(e, s) in &slots {
+            let light = s / total < truncation.miss_below && s < heaviest;
+            if !light || resident(e) {
+                out.push((e, s));
+            } else if truncation.miss_drops {
+                saved += 1;
+            } else {
+                while next < order.len() && !resident(order[next]) {
+                    next += 1;
+                }
+                match order.get(next) {
+                    Some(&r) => {
+                        saved += 1;
+                        out.push((r, s));
+                        next += 1;
+                    }
+                    None => out.push((e, s)),
+                }
+            }
+        }
+        slots = out;
+    }
+    slots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if truncation.keep > 0 && truncation.keep < slots.len() {
+        saved += slots[truncation.keep..]
+            .iter()
+            .filter(|s| !resident(s.0))
+            .count() as u64;
+        slots.truncate(truncation.keep);
+    }
+    if truncation.drop_mass > 0.0 {
+        let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
+        let mut dropped = 0f32;
+        while slots.len() > 1 && (dropped + slots[slots.len() - 1].1) / total < truncation.drop_mass
+        {
+            if let Some(gone) = slots.pop() {
+                dropped += gone.1;
+                saved += !resident(gone.0) as u64;
+            }
+        }
+    }
+    let ids: Vec<usize> = slots.iter().map(|s| s.0).collect();
+    let mut w: Vec<f32> = slots.iter().map(|s| s.1).collect();
+    if normalize && k > 1 {
+        let s: f32 = w.iter().sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
+        for wi in w.iter_mut() {
+            *wi /= s;
+        }
+    }
+    (ids, w, saved)
+}
+
 /// Biased-choice expert routing: every expert scores its logit by [`RouterScore`], the experts
 /// are chosen on the scores plus a selection bias, and each chosen expert weighs by its
 /// unbiased score, optionally renormalised over the chosen ones and scaled.
@@ -3431,5 +3547,205 @@ mod sqrt_softplus_router_tests {
         let row = [1.0f32, 2.0, 2.0, 1.0];
         let (chosen, _) = sqrt_softplus_choice(&row, None, 3, 1.0, true);
         assert_eq!(chosen, vec![1, 2, 0]);
+    }
+
+    /// The routing of the 4-expert case under `truncation`, with `resident` the experts in
+    /// memory, from the block's own gate and from the generic truncated choice.
+    ///
+    /// Returns, per token, the experts and the bits of their scaled weights from each, then
+    /// the slots each saved.
+    #[allow(clippy::type_complexity)]
+    fn truncated_both(
+        truncation: Truncation,
+        resident: &std::collections::HashSet<usize>,
+    ) -> (Vec<Vec<(usize, u32)>>, Vec<Vec<(usize, u32)>>, u64, u64) {
+        let case = Case {
+            used: 4,
+            temperature: 1.0,
+            route_scale: 1.5,
+            norm_topk: true,
+            gate_amp: 0.2,
+            bias_amp: 0.1,
+        };
+        use crate::inference::model::deepseek_v41::moe::Truncation as V41Truncation;
+        let moe = reference(&case);
+        *moe.truncation.write().unwrap() = V41Truncation {
+            keep: truncation.keep,
+            drop_mass: truncation.drop_mass,
+            miss_below: truncation.miss_below,
+            miss_drops: truncation.miss_drops,
+        };
+        *moe.resident_override.write().unwrap() = Some(resident.clone());
+        let x = drawn(7, &[1, TOKENS, DIM], 1.0);
+        moe.forward(&x).unwrap();
+        let old: Vec<Vec<(usize, u32)>> = moe
+            .last_routing
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row.iter().map(|&(e, w)| (e, w.to_bits())).collect())
+            .collect();
+        let old_saved = moe.saved.load(std::sync::atomic::Ordering::Relaxed);
+
+        let rows = x.reshape((TOKENS, DIM)).unwrap();
+        let logits = crate::inference::offload::linear(&rows, &moe.gate_weight)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let bias = moe
+            .gate_bias
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let in_memory = |e: usize| resident.contains(&e);
+        let mut new_saved = 0;
+        // As the routed feed-forward routes: the truncated choice only when a field is on.
+        let new: Vec<Vec<(usize, u32)>> = logits
+            .iter()
+            .map(|row| {
+                let (ids, w, saved) = match truncation.active() {
+                    true => sqrt_softplus_truncated_choice(
+                        row,
+                        Some(bias.as_slice()),
+                        case.used,
+                        case.temperature,
+                        case.norm_topk,
+                        truncation,
+                        &in_memory,
+                    ),
+                    false => {
+                        let (ids, w) = sqrt_softplus_choice(
+                            row,
+                            Some(bias.as_slice()),
+                            case.used,
+                            case.temperature,
+                            case.norm_topk,
+                        );
+                        (ids, w, 0)
+                    }
+                };
+                new_saved += saved;
+                ids.iter()
+                    .zip(&w)
+                    .map(|(&e, &wi)| (e, (wi * case.route_scale).to_bits()))
+                    .collect()
+            })
+            .collect();
+        (old, new, old_saved, new_saved)
+    }
+
+    /// Off, the truncated choice routes as the plain one does. Keeping 1 expert leaves each
+    /// token the heaviest, alone, with the whole route scale. Each case gives the experts, the
+    /// weight bits and the saved slots of the block's own gate.
+    #[test]
+    fn truncation_keeps_the_heaviest_and_weights_it_whole() {
+        let none = std::collections::HashSet::new();
+        let (_, exact, _, _) = truncated_both(Truncation::default(), &none);
+        let (plain, _, _) = both(&Case {
+            used: 4,
+            temperature: 1.0,
+            route_scale: 1.5,
+            norm_topk: true,
+            gate_amp: 0.2,
+            bias_amp: 0.1,
+        });
+        assert_eq!(exact, plain, "zeros changed the routing");
+
+        for keep in [1, 2, 3] {
+            let t = Truncation {
+                keep,
+                ..Default::default()
+            };
+            let (old, new, old_saved, new_saved) = truncated_both(t, &none);
+            assert_eq!(new, old, "keep {keep}");
+            assert_eq!(new_saved, old_saved, "keep {keep}");
+        }
+        let one = Truncation {
+            keep: 1,
+            ..Default::default()
+        };
+        let (_, kept, _, saved) = truncated_both(one, &none);
+        assert_eq!(saved, (TOKENS * 3) as u64, "every cut slot was a read");
+        for (kept, full) in kept.iter().zip(&exact) {
+            assert_eq!(kept.len(), 1);
+            let heaviest = full
+                .iter()
+                .max_by(|a, b| f32::from_bits(a.1).total_cmp(&f32::from_bits(b.1)))
+                .unwrap();
+            assert_eq!(kept[0].0, heaviest.0);
+            assert!((f32::from_bits(kept[0].1) - 1.5).abs() < 1e-6);
+        }
+    }
+
+    /// A light expert that is not resident gives its slot to a resident one, or is dropped.
+    /// The heaviest of a token is never touched. Each case gives the experts, the weight bits
+    /// and the saved slots of the block's own gate.
+    #[test]
+    fn a_missed_light_expert_is_replaced_by_a_resident_one() {
+        let none = std::collections::HashSet::new();
+        let (_, exact, _, _) = truncated_both(Truncation::default(), &none);
+        let resident: std::collections::HashSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
+        let miss = Truncation {
+            miss_below: 1.1,
+            ..Default::default()
+        };
+        let (old, got, old_saved, new_saved) = truncated_both(miss, &resident);
+        assert_eq!(got, old);
+        assert_eq!(new_saved, old_saved);
+        for (got, full) in got.iter().zip(&exact) {
+            assert_eq!(got.len(), full.len());
+            let heaviest = full
+                .iter()
+                .max_by(|a, b| f32::from_bits(a.1).total_cmp(&f32::from_bits(b.1)))
+                .unwrap()
+                .0;
+            assert!(got.iter().any(|g| g.0 == heaviest));
+            for g in got.iter().filter(|g| g.0 != heaviest) {
+                assert!(resident.contains(&g.0), "expert {} is not resident", g.0);
+            }
+        }
+        let drops = Truncation {
+            miss_drops: true,
+            ..miss
+        };
+        let (old, got, old_saved, new_saved) = truncated_both(drops, &resident);
+        assert_eq!(got, old);
+        assert_eq!(new_saved, old_saved);
+        for got in got {
+            assert!(!got.is_empty() && got.len() <= 4);
+        }
+    }
+
+    /// Shares a quality calibration tries, a dropped mass, and both at once give the experts,
+    /// the weight bits and the saved slots of the block's own gate.
+    #[test]
+    fn every_truncation_routes_as_the_blocks_own_gate() {
+        let resident: std::collections::HashSet<usize> = (0..ROUTED).step_by(2).collect();
+        let cases = [
+            Truncation {
+                miss_below: 0.5 / 4.0,
+                ..Default::default()
+            },
+            Truncation {
+                miss_below: 1.0 / 4.0,
+                ..Default::default()
+            },
+            Truncation {
+                drop_mass: 0.3,
+                ..Default::default()
+            },
+            Truncation {
+                keep: 3,
+                drop_mass: 0.2,
+                miss_below: 0.75 / 4.0,
+                miss_drops: false,
+            },
+        ];
+        for t in cases {
+            let (old, new, old_saved, new_saved) = truncated_both(t, &resident);
+            assert_eq!(new, old, "{t:?}");
+            assert_eq!(new_saved, old_saved, "{t:?}");
+        }
     }
 }

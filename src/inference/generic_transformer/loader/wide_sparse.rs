@@ -478,6 +478,7 @@ impl GenericHeteroTransformer {
                 normalize: m.norm_topk,
                 scale: m.route_scale,
                 limit: m.swiglu_limits.get(il).copied().unwrap_or(0.0),
+                lossy: Default::default(),
             };
             let attn_norm = dense(&name(&["attn_norm"])?)?;
             let ffn_norm = dense(&name(&["ffn_norm"])?)?;

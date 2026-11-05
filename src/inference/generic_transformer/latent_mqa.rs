@@ -23,7 +23,7 @@ use crate::tensor::{DType, Device, Result, Tensor};
 use rayon::prelude::*;
 
 /// The largest magnitude of e4m3fn. The round trip clamps there.
-const FP8_E4M3_MAX: f32 = 448.0;
+pub(super) const FP8_E4M3_MAX: f32 = 448.0;
 
 /// Values of a key row that share 1 power-of-two scale in the round trip.
 pub(crate) const FP8_BLOCK: usize = 32;

@@ -1702,8 +1702,8 @@ fn _assert_generate_future_send(e: &LlmEngine, prompt: &str, params: GenerationP
 
 #[cfg(test)]
 mod native_draft_tests;
-#[cfg(test)]
-mod quality;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod quality;
 #[cfg(test)]
 mod sampling_tests;
 use std::io::Cursor;

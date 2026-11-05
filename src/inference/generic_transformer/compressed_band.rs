@@ -34,16 +34,16 @@ use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
 /// The e2m1 magnitudes.
-const FP4_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+pub(super) const FP4_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
 /// The largest e2m1 magnitude. The round trip clamps there.
-const FP4_MAX: f32 = 6.0;
+pub(super) const FP4_MAX: f32 = 6.0;
 
 /// Values of an index query or index key that share 1 power-of-two scale.
-const INDEX_BLOCK: usize = 32;
+pub(super) const INDEX_BLOCK: usize = 32;
 
 /// Values of a compressed row that share 1 scale.
-const COMPRESSED_BLOCK: usize = 16;
+pub(super) const COMPRESSED_BLOCK: usize = 16;
 
 /// What a band layer adds to the window mixer's widths, and its roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +283,21 @@ impl CompressedBand {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Values per row of what the layer keeps: a window key row, a compressed row and an
+    /// index key.
+    ///
+    /// A layer that builds no compressed row or no index key keeps rows of 0 values of it.
+    pub(super) fn state_widths(&self) -> (usize, usize, usize) {
+        let row = self.base.dims.head_dim;
+        let compressed = if self.band.kv_source { row } else { 0 };
+        let index = if self.owns_keys() {
+            self.band.index_head_dim
+        } else {
+            0
+        };
+        (row, compressed, index)
     }
 
     /// The layer keeps index keys of its own.

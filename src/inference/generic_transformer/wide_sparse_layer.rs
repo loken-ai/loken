@@ -19,11 +19,13 @@
 use super::block_scaled_experts::BlockScaledExpert;
 use super::compressed_band::BandCell;
 use super::hyper::sinkhorn::SinkhornMixer;
-use super::moe_weights::sqrt_softplus_choice;
+use super::moe_weights::{sqrt_softplus_choice, sqrt_softplus_truncated_choice, Truncation};
 use super::*;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
 use rayon::prelude::*;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The pre mix one layer left for the rows `first..first + rows`.
 struct Carried {
@@ -83,6 +85,21 @@ impl PreMixCarry {
     }
 }
 
+/// Routing that gives up exactness for speed, and what it saved.
+///
+/// The default routes exactly.
+#[derive(Default)]
+pub struct LossyRouting {
+    pub truncation: Truncation,
+    /// The experts counted as in memory.
+    ///
+    /// `None` counts none: the layer reads every routed expert from its mapping on use.
+    pub resident: Option<HashSet<usize>>,
+    /// Slots of experts not in memory that the truncation removed or replaced, since last
+    /// taken.
+    pub saved: AtomicU64,
+}
+
 /// The feed-forward of a layer: a sqrt-softplus router over routed experts, beside a shared
 /// expert.
 pub struct RoutedFfn {
@@ -101,9 +118,55 @@ pub struct RoutedFfn {
     pub scale: f32,
     /// The bound of the SwiGLU, `0` for none.
     pub limit: f32,
+    pub lossy: LossyRouting,
 }
 
 impl RoutedFfn {
+    /// Each row's experts and their weights before the scale.
+    ///
+    /// A row takes the truncated choice when the truncation gives up exactness, the plain
+    /// choice otherwise.
+    fn route(&self, logits: &[Vec<f32>]) -> Vec<(Vec<usize>, Vec<f32>)> {
+        let t = self.lossy.truncation;
+        if !t.active() {
+            return logits
+                .par_iter()
+                .map(|row| {
+                    sqrt_softplus_choice(
+                        row,
+                        Some(self.bias.as_slice()),
+                        self.used,
+                        self.temperature,
+                        self.normalize,
+                    )
+                })
+                .collect();
+        }
+        let resident = |e: usize| {
+            self.lossy
+                .resident
+                .as_ref()
+                .is_some_and(|set| set.contains(&e))
+        };
+        let picks: Vec<(Vec<usize>, Vec<f32>, u64)> = logits
+            .par_iter()
+            .map(|row| {
+                sqrt_softplus_truncated_choice(
+                    row,
+                    Some(self.bias.as_slice()),
+                    self.used,
+                    self.temperature,
+                    self.normalize,
+                    t,
+                    &resident,
+                )
+            })
+            .collect();
+        let saved: u64 = picks.iter().map(|p| p.2).sum();
+        self.lossy.saved.fetch_add(saved, Ordering::Relaxed);
+        picks.into_iter().map(|(ids, w, _)| (ids, w)).collect()
+    }
+
     /// The block over the rows of `x` `[.., hidden]` F32 on the host, in `x`'s shape.
     ///
     /// Each row starts from its shared expert's output.
@@ -115,18 +178,7 @@ impl RoutedFfn {
         let n = x.elem_count() / dim.max(1);
         let x2 = x.reshape((n, dim))?;
         let logits = self.router.apply_here(&x2)?.to_vec2::<f32>()?;
-        let picks: Vec<(Vec<usize>, Vec<f32>)> = logits
-            .par_iter()
-            .map(|row| {
-                sqrt_softplus_choice(
-                    row,
-                    Some(self.bias.as_slice()),
-                    self.used,
-                    self.temperature,
-                    self.normalize,
-                )
-            })
-            .collect();
+        let picks = self.route(&logits);
         // Per expert, the rows routed to it in row order, with their weights.
         let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
         for (t, (chosen, w)) in picks.into_iter().enumerate() {
@@ -355,5 +407,47 @@ impl GenericHeteroTransformer {
             bytes += block.output.bytes() + ffn.router.bytes() + bias + shared;
         }
         Some(bytes as u64)
+    }
+
+    /// The routed feed-forward of every layer that has one, by layer index.
+    fn routed_ffns(&mut self) -> impl Iterator<Item = (usize, &mut RoutedFfn)> {
+        self.layers
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(il, l)| l.sinkhorn.as_mut().map(|b| (il, &mut b.ffn)))
+    }
+
+    /// Routed experts a token passes through beside the shared one, `0` without a routed
+    /// feed-forward.
+    pub fn routed_per_token(&self) -> usize {
+        self.layers
+            .iter()
+            .find_map(|l| l.sinkhorn.as_ref())
+            .map_or(0, |b| b.ffn.used)
+    }
+
+    /// Sets every routed feed-forward's truncation.
+    pub fn set_truncation(&mut self, t: Truncation) {
+        for (_, ffn) in self.routed_ffns() {
+            ffn.lossy.truncation = t;
+        }
+    }
+
+    /// The slots the truncation saved since last asked, summed over the layers.
+    pub fn take_saved(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| l.sinkhorn.as_ref())
+            .map(|b| b.ffn.lossy.saved.swap(0, Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Counts, per layer index, the given experts as the ones in memory.
+    ///
+    /// `None`, or a layer past the end of `per_layer`, counts none.
+    pub fn set_resident_override(&mut self, per_layer: Option<&[HashSet<usize>]>) {
+        for (il, ffn) in self.routed_ffns() {
+            ffn.lossy.resident = per_layer.and_then(|p| p.get(il).cloned());
+        }
     }
 }

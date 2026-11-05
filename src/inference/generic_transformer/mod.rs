@@ -101,7 +101,9 @@ pub mod ngram;
 mod opencl_layers;
 #[cfg(all(test, feature = "opencl"))]
 mod opencl_parity;
+mod packed_rows;
 pub mod qsa;
+pub mod routing_calibration;
 mod segment;
 mod speculate;
 mod splice;
@@ -131,6 +133,10 @@ pub mod wide_sparse_layer;
 mod wide_sparse_oracle_tests;
 #[cfg(test)]
 mod wide_sparse_plan_tests;
+#[cfg(test)]
+mod wide_sparse_quality_tests;
+#[cfg(test)]
+mod wide_sparse_state_tests;
 pub use config::*;
 pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};

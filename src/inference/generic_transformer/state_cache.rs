@@ -15,6 +15,14 @@
 //!   restore returns every value bit for bit). It is named by the chain hash of the tokens up to
 //!   its end, so states of one conversation, and of conversations sharing a prefix, store it once.
 //!
+//! - A latent attention layer keeps its token count and its window of key rows in the
+//!   manifest.
+//! - A compressed band layer keeps its compressed rows and index keys of a block's groups in
+//!   the block, and the rest of its state in the manifest.
+//!   A block is then a whole number of groups at every compression ratio.
+//! - Latent attention rows are written as the codes of the fp8 or fp4 grid they lie on, and
+//!   as f32 when a value is off it, so a restore returns every value bit for bit.
+//!
 //! - A model with a draft head also keeps the head's state in the manifest: its layer's rows
 //!   for the pairs it has read, its indexer, and the prompt row whose pair waits for the next
 //!   token, so a restored head drafts as if it had read the prefix.
@@ -24,7 +32,10 @@
 //! carries a version, the identity it was written under and a checksum; a file that fails any of
 //! them is refused and dropped.
 
+use super::compressed_band::BandState;
+use super::latent_mqa::LatentMqaState;
 use super::mixer::{ConvState, Mixer, MixerState, SsmState};
+use super::packed_rows::Grid;
 use super::*;
 use crate::inference::cache::state_disk::{Entry, StateStore};
 use crate::inference::cache::state_tune;
@@ -38,6 +49,12 @@ const HANDOVER_MAGIC: &[u8; 8] = b"LKHYBH01";
 pub const FORMAT_VERSION: u32 = 2;
 const SUM_BYTES: usize = 16;
 
+/// The tag of a latent window layer in a manifest.
+const LATENT_TAG: u8 = 4;
+
+/// The tag of a compressed band layer in a manifest.
+const BAND_TAG: u8 = 5;
+
 /// What a layer contributes to a stored state, fixed by the layer and not by the position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StateKind {
@@ -49,6 +66,26 @@ pub(crate) enum StateKind {
     Window,
     /// A recurrent mixer: its state is in the manifest.
     Mixer,
+    /// Latent attention over a window: its token count and its key rows are in the manifest.
+    Latent {
+        /// Values of a key row.
+        row: usize,
+    },
+    /// Compressed band attention.
+    ///
+    /// The compressed rows and index keys of a block's groups are in the block.
+    /// The token count, the window, the rows past the last whole block and the filling group
+    /// are in the manifest.
+    Band {
+        /// Values of a key row.
+        row: usize,
+        /// Tokens pooled into 1 compressed row.
+        ratio: usize,
+        /// Values of a compressed row, `0` on a layer that builds none.
+        compressed: usize,
+        /// Values of an index key, `0` on a layer that keeps none.
+        index: usize,
+    },
 }
 
 impl StateKind {
@@ -58,7 +95,47 @@ impl StateKind {
             StateKind::Global => 1,
             StateKind::Window => 2,
             StateKind::Mixer => 3,
+            StateKind::Latent { .. } => LATENT_TAG,
+            StateKind::Band { .. } => BAND_TAG,
         }
+    }
+
+    /// The widths a latent attention layer's state is checked against, `None` for another kind.
+    fn shape(self) -> Option<[usize; 4]> {
+        match self {
+            StateKind::Latent { row } => Some([row, 0, 0, 0]),
+            StateKind::Band {
+                row,
+                ratio,
+                compressed,
+                index,
+            } => Some([row, ratio, compressed, index]),
+            _ => None,
+        }
+    }
+
+    /// The kind has rows in the blocks.
+    fn in_blocks(self) -> bool {
+        matches!(self, StateKind::Global | StateKind::Band { .. })
+    }
+
+    /// The tokens 1 compressed row pools, for a band layer that builds compressed rows.
+    fn compression_ratio(self) -> Option<usize> {
+        match self {
+            StateKind::Band {
+                ratio, compressed, ..
+            } if compressed > 0 => Some(ratio),
+            _ => None,
+        }
+    }
+}
+
+/// The greatest common divisor of `a` and `b`.
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
     }
 }
 
@@ -90,12 +167,37 @@ enum MixerHost {
     Delta(Option<(Tens, Tens)>),
 }
 
+/// What a latent attention layer keeps at a position.
+#[derive(Clone)]
+struct WindowHeld {
+    /// Tokens seen.
+    len: usize,
+    /// The window's key rows, oldest first.
+    window: Vec<f32>,
+}
+
+/// What a compressed band layer keeps at a position, but the rows of the whole blocks.
+#[derive(Clone)]
+struct BandHeld {
+    window: WindowHeld,
+    /// Compressed rows built, those of the blocks included.
+    groups: usize,
+    /// The compressed rows past the last whole block.
+    compressed: Vec<f32>,
+    /// The index keys past the last whole block.
+    index: Vec<f32>,
+    /// The input rows of the group still filling.
+    filling: Vec<f32>,
+}
+
 #[derive(Clone)]
 enum Held {
     Nothing,
     Global(Rows),
     Window(Rows),
     Mixer(MixerHost),
+    Latent(WindowHeld),
+    Band(BandHeld),
 }
 
 /// A model's state after `pos` tokens, copied to the host: all of it but the blocks.
@@ -283,6 +385,29 @@ impl Writer {
         }
     }
 
+    /// The count of `xs`, then their codes on `grid` when each is on it, else their f32 bits:
+    /// a read returns the same bits.
+    fn grid(&mut self, grid: Grid, xs: &[f32]) {
+        self.u64(xs.len());
+        match grid.pack(xs) {
+            Some(bytes) => {
+                self.u8(1);
+                self.u64(bytes.len());
+                self.0.extend(bytes);
+            }
+            None => {
+                self.u8(0);
+                self.raw(xs);
+            }
+        }
+    }
+
+    /// A latent attention layer's token count and window.
+    fn window(&mut self, h: &WindowHeld) {
+        self.u64(h.len);
+        self.grid(Grid::Fp8, &h.window);
+    }
+
     fn rows(&mut self, r: &Rows) {
         self.u8(r.dtype);
         self.u32(r.n_kv);
@@ -378,6 +503,39 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Values [`Writer::grid`] wrote on `grid`.
+    fn grid(&mut self, grid: Grid) -> AnyResult<Vec<f32>> {
+        let n = self.u64()?;
+        // A value takes half a byte at the least.
+        if n / 2 > self.b.len() - self.i {
+            bail!("state cache: file ends inside a section");
+        }
+        match self.u8()? {
+            1 => {
+                let len = self.u64()?;
+                if grid.packed_len(n) != Some(len) {
+                    bail!("state cache: {n} packed values in {len} bytes");
+                }
+                Ok(grid.unpack(self.take(len)?, n))
+            }
+            0 => self.raw(n),
+            t => bail!("state cache: unknown packing {t}"),
+        }
+    }
+
+    /// A latent attention layer's token count and window of key rows of `row` values.
+    fn window(&mut self, row: usize) -> AnyResult<WindowHeld> {
+        let len = self.u64()?;
+        let window = self.grid(Grid::Fp8)?;
+        if row == 0 || !window.len().is_multiple_of(row) || window.len() / row > len {
+            bail!(
+                "state cache: a window of {} values for {len} tokens",
+                window.len()
+            );
+        }
+        Ok(WindowHeld { len, window })
+    }
+
     fn rows(&mut self) -> AnyResult<Rows> {
         let dtype = self.u8()?;
         let (n_kv, head_dim, n) = (self.u32()?, self.u32()?, self.u32()?);
@@ -431,13 +589,9 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    fn global_geometry(&self) -> Vec<(usize, usize)> {
-        self.kinds
-            .iter()
-            .zip(&self.geometry)
-            .filter(|(k, _)| **k == StateKind::Global)
-            .map(|(_, g)| *g)
-            .collect()
+    /// The compression ratios of the band layers that build compressed rows.
+    fn compression_ratios(&self) -> impl Iterator<Item = usize> + '_ {
+        self.kinds.iter().filter_map(|k| k.compression_ratio())
     }
 }
 
@@ -481,6 +635,19 @@ fn encode_manifest(identity: &[u8; 32], layout: &Layout, p: &Point) -> Vec<u8> {
                         None => w.u8(0),
                     },
                 }
+            }
+            Held::Latent(h) => {
+                w.u8(LATENT_TAG);
+                w.window(h);
+            }
+            Held::Band(h) => {
+                w.u8(BAND_TAG);
+                w.window(&h.window);
+                w.u64(h.groups);
+                w.grid(Grid::Fp4Scaled, &h.compressed);
+                w.grid(Grid::Fp4Pow2, &h.index);
+                w.u64(h.filling.len());
+                w.raw(&h.filling);
             }
         }
     }
@@ -601,6 +768,44 @@ fn decode_manifest(bytes: &[u8], identity: &[u8; 32], layout: &Layout) -> AnyRes
                     v => bail!("state cache: unknown mixer {v}"),
                 })
             }
+            StateKind::Latent { row } => Held::Latent(r.window(*row)?),
+            StateKind::Band {
+                row,
+                ratio,
+                compressed,
+                index,
+            } => {
+                let window = r.window(*row)?;
+                let groups = r.u64()?;
+                let tail_compressed = r.grid(Grid::Fp4Scaled)?;
+                let tail_index = r.grid(Grid::Fp4Pow2)?;
+                let filling = {
+                    let n = r.u64()?;
+                    r.raw(n)?
+                };
+                // The blocks hold the groups of the whole blocks, the manifest the rest.
+                let blocked = match *compressed {
+                    0 => 0,
+                    _ => pos / layout.block_tokens * layout.block_tokens / ratio,
+                };
+                let tail = groups.checked_sub(blocked);
+                let fits = |rows: &[f32], width: usize| {
+                    tail.and_then(|t| t.checked_mul(width)) == Some(rows.len())
+                };
+                if (*compressed == 0 && groups != 0)
+                    || !fits(&tail_compressed, *compressed)
+                    || !fits(&tail_index, *index)
+                {
+                    bail!("state cache: layer {il} holds {groups} compressed rows that do not fit");
+                }
+                Held::Band(BandHeld {
+                    window,
+                    groups,
+                    compressed: tail_compressed,
+                    index: tail_index,
+                    filling,
+                })
+            }
         });
     }
     let draft = match r.u8()? {
@@ -611,19 +816,32 @@ fn decode_manifest(bytes: &[u8], identity: &[u8; 32], layout: &Layout) -> AnyRes
     Ok(Point { pos, layers, draft })
 }
 
-fn encode_block(rows: &[(Vec<f32>, Vec<f32>)]) -> Vec<u8> {
+/// A block of `rows`, 1 pair per layer with rows in the blocks, in layer order.
+///
+/// A global layer's pair is its `(k, v)` rows.
+/// A band layer's pair is its compressed rows and its index keys, written on their grids.
+fn encode_block(rows: &[(Vec<f32>, Vec<f32>)], layout: &Layout) -> Vec<u8> {
     let mut w = Writer(Vec::new());
     w.0.extend(BLOCK_MAGIC);
     w.0.extend(FORMAT_VERSION.to_le_bytes());
     w.u32(rows.len());
-    for (k, v) in rows {
-        w.packed(k);
-        w.packed(v);
+    let kinds = layout.kinds.iter().filter(|k| k.in_blocks());
+    for ((a, b), kind) in rows.iter().zip(kinds) {
+        match kind {
+            StateKind::Band { .. } => {
+                w.grid(Grid::Fp4Scaled, a);
+                w.grid(Grid::Fp4Pow2, b);
+            }
+            _ => {
+                w.packed(a);
+                w.packed(b);
+            }
+        }
     }
     w.seal()
 }
 
-/// The `(k, v)` rows of every global layer in a block.
+/// The pairs of [`encode_block`] of every layer with rows in the blocks.
 fn decode_block(bytes: &[u8], layout: &Layout) -> AnyResult<Vec<(Vec<f32>, Vec<f32>)>> {
     let mut r = Reader::open(bytes)?;
     if r.take(8)? != BLOCK_MAGIC {
@@ -633,14 +851,35 @@ fn decode_block(bytes: &[u8], layout: &Layout) -> AnyResult<Vec<(Vec<f32>, Vec<f
     if version != FORMAT_VERSION {
         bail!("state cache: format version {version}, this build reads {FORMAT_VERSION}");
     }
-    let geometry = layout.global_geometry();
-    if r.u32()? != geometry.len() {
+    let blocked: Vec<usize> = (0..layout.kinds.len())
+        .filter(|&il| layout.kinds[il].in_blocks())
+        .collect();
+    if r.u32()? != blocked.len() {
         bail!("state cache: a block of another layer count");
     }
-    let mut out = Vec::with_capacity(geometry.len());
-    for (n_kv, hd) in geometry {
-        let n = layout.block_tokens * n_kv * hd;
-        out.push((r.packed(n)?, r.packed(n)?));
+    let mut out = Vec::with_capacity(blocked.len());
+    for il in blocked {
+        out.push(match layout.kinds[il] {
+            StateKind::Band {
+                ratio,
+                compressed,
+                index,
+                ..
+            } => {
+                let groups = layout.block_tokens / ratio;
+                let rows = r.grid(Grid::Fp4Scaled)?;
+                let keys = r.grid(Grid::Fp4Pow2)?;
+                if rows.len() != groups * compressed || keys.len() != groups * index {
+                    bail!("state cache: layer {il} has another row geometry");
+                }
+                (rows, keys)
+            }
+            _ => {
+                let (n_kv, hd) = layout.geometry[il];
+                let n = layout.block_tokens * n_kv * hd;
+                (r.packed(n)?, r.packed(n)?)
+            }
+        });
     }
     r.done()?;
     Ok(out)
@@ -759,6 +998,18 @@ impl GenericHeteroTransformer {
                 Mixer::Attention if l.kv_cache.is_windowed() => StateKind::Window,
                 Mixer::Attention => StateKind::Global,
                 Mixer::Absent => StateKind::Nothing,
+                Mixer::LatentMqa(m) => StateKind::Latent {
+                    row: m.dims.head_dim,
+                },
+                Mixer::CompressedBand(b) => {
+                    let (row, compressed, index) = b.state_widths();
+                    StateKind::Band {
+                        row,
+                        ratio: b.band.ratio,
+                        compressed,
+                        index,
+                    }
+                }
                 _ => StateKind::Mixer,
             })
             .collect();
@@ -783,9 +1034,10 @@ impl GenericHeteroTransformer {
         store: Arc<StateStore>,
         identity: [u8; 32],
     ) -> bool {
-        // A wide-residual layer's indexer and n-gram state have no stored form yet.
+        // A gated wide-residual layer's indexer and n-gram state have no stored form yet.
+        // A Sinkhorn wide residual keeps nothing from one forward to the next.
         if !self.is_recurrent()
-            || self.is_wide()
+            || self.output_hyper.is_some()
             || self.layers.iter().any(|l| l.cpu_q8_kv.is_some())
         {
             return false;
@@ -800,22 +1052,48 @@ impl GenericHeteroTransformer {
             h.update([probe.kinds[il].tag(), l.cos.device().is_cuda() as u8]);
             h.update((probe.geometry[il].0 as u64).to_le_bytes());
             h.update((probe.geometry[il].1 as u64).to_le_bytes());
+            for width in probe.kinds[il].shape().into_iter().flatten() {
+                h.update((width as u64).to_le_bytes());
+            }
         }
         h.update([self.draft.is_some() as u8]);
         let identity: [u8; 32] = h.finalize().into();
         // What one token adds to the blocks: both rows of every global layer, at the widest
-        // element a cache holds.
+        // element a cache holds, and a band layer's share of a compressed row and index key.
+        let f32_bytes = std::mem::size_of::<f32>();
         let token_bytes: usize = probe
             .kinds
             .iter()
             .zip(&probe.geometry)
-            .filter(|(k, _)| **k == StateKind::Global)
-            .map(|(_, (n_kv, hd))| 2 * n_kv * hd * std::mem::size_of::<f32>())
+            .map(|(k, (n_kv, hd))| match *k {
+                StateKind::Global => 2 * n_kv * hd * f32_bytes,
+                StateKind::Band {
+                    ratio,
+                    compressed,
+                    index,
+                    ..
+                } => ((compressed + index) * f32_bytes).div_ceil(ratio),
+                _ => 0,
+            })
             .sum();
-        let Some(block) = state_tune::settle_block_tokens(&store, &identity, 1, token_bytes) else {
+        // A block holds whole groups of every band layer: a multiple of every ratio.
+        let granule = probe
+            .compression_ratios()
+            .fold(1usize, |a, r| a / gcd(a, r) * r);
+        let Some(block) = state_tune::settle_block_tokens(&store, &identity, granule, token_bytes)
+        else {
             tracing::warn!("state cache off: the directory cannot be written to measure it");
             return false;
         };
+        if let Some(r) = probe
+            .compression_ratios()
+            .find(|r| !block.is_multiple_of(*r))
+        {
+            tracing::warn!(
+                "state cache off: a block of {block} tokens is not a whole number of groups at ratio {r}"
+            );
+            return false;
+        }
         let layout = self.state_layout(block);
         self.hybrid_cache = Some(HybridStateCache {
             store,
@@ -857,6 +1135,9 @@ impl GenericHeteroTransformer {
                     Held::Global(live_rows(l, tail_from, pos)?)
                 }
                 StateKind::Window => Held::Window(live_rows(l, 0, resident_len(l))?),
+                StateKind::Latent { .. } | StateKind::Band { .. } => {
+                    latent_held(*kind, l.mixer.snapshot()?.as_ref(), pos, g)?
+                }
             });
         }
         Ok(Point {
@@ -943,17 +1224,48 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
-    /// Block `b` of the global layers' rows, encoded.
+    /// Block `b` of the global layers' rows and of the band layers' compressed rows and index
+    /// keys, encoded.
     pub(crate) fn capture_block(&self, b: usize, layout: &Layout) -> Result<Vec<u8>> {
         let g = layout.block_tokens;
         let mut rows = Vec::new();
         for (l, kind) in self.layers.iter().zip(&layout.kinds) {
-            if *kind == StateKind::Global {
-                let r = live_rows(l, b * g, (b + 1) * g)?;
-                rows.push((r.k, r.v));
+            match *kind {
+                StateKind::Global => {
+                    let r = live_rows(l, b * g, (b + 1) * g)?;
+                    rows.push((r.k, r.v));
+                }
+                StateKind::Band {
+                    ratio,
+                    compressed,
+                    index,
+                    ..
+                } => {
+                    let Mixer::CompressedBand(band) = &l.mixer else {
+                        return Err(crate::tensor::Error::msg(
+                            "state cache: a band layer without its mixer".to_string(),
+                        ));
+                    };
+                    let empty = BandState::default();
+                    let s = band.state.as_ref().unwrap_or(&empty);
+                    // The groups of block `b`.
+                    let per_block = g / ratio;
+                    let groups = b * per_block..(b + 1) * per_block;
+                    let cut = |all: &[f32], width: usize| -> Result<Vec<f32>> {
+                        all.get(groups.start * width..groups.end * width)
+                            .map(<[f32]>::to_vec)
+                            .ok_or_else(|| {
+                                crate::tensor::Error::msg(format!(
+                                    "state cache: a band layer holds no rows for block {b}"
+                                ))
+                            })
+                    };
+                    rows.push((cut(&s.compressed, compressed)?, cut(&s.index_keys, index)?));
+                }
+                _ => {}
             }
         }
-        Ok(encode_block(&rows))
+        Ok(encode_block(&rows, layout))
     }
 
     /// The per-layer snapshots of `point` with the rows of `blocks` before its tail.
@@ -963,7 +1275,27 @@ impl GenericHeteroTransformer {
         blocks: &[Vec<(Vec<f32>, Vec<f32>)>],
     ) -> Result<Vec<super::LayerKvSnapshot>> {
         let mut snaps = Vec::with_capacity(self.layers.len());
-        let mut global = 0;
+        // The pair of the next layer with rows in the blocks.
+        let mut slot = 0;
+        // The pairs of `slot` in every block, then `tail`.
+        let joined = |slot: usize, tail: (&[f32], &[f32])| -> (Vec<f32>, Vec<f32>) {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for block in blocks {
+                a.extend_from_slice(&block[slot].0);
+                b.extend_from_slice(&block[slot].1);
+            }
+            a.extend_from_slice(tail.0);
+            b.extend_from_slice(tail.1);
+            (a, b)
+        };
+        let with_mixer = |state: MixerState| super::LayerKvSnapshot {
+            spec: None,
+            quant: None,
+            cpu_f16: None,
+            mixer: Some(state),
+            shards: Vec::new(),
+        };
         for (l, held) in self.layers.iter().zip(&point.layers) {
             snaps.push(match held {
                 Held::Nothing => super::LayerKvSnapshot {
@@ -973,25 +1305,31 @@ impl GenericHeteroTransformer {
                     mixer: None,
                     shards: Vec::new(),
                 },
-                Held::Mixer(m) => super::LayerKvSnapshot {
-                    spec: None,
-                    quant: None,
-                    cpu_f16: None,
-                    mixer: Some(m.state(&l.cos.device())?),
-                    shards: Vec::new(),
-                },
+                Held::Mixer(m) => with_mixer(m.state(&l.cos.device())?),
                 Held::Window(r) => rows_snapshot(l, &r.k, &r.v, r.dtype)?,
                 Held::Global(tail) => {
-                    let mut k = Vec::new();
-                    let mut v = Vec::new();
-                    for block in blocks {
-                        k.extend_from_slice(&block[global].0);
-                        v.extend_from_slice(&block[global].1);
-                    }
-                    k.extend_from_slice(&tail.k);
-                    v.extend_from_slice(&tail.v);
-                    global += 1;
+                    let (k, v) = joined(slot, (tail.k.as_slice(), tail.v.as_slice()));
+                    slot += 1;
                     rows_snapshot(l, &k, &v, tail.dtype)?
+                }
+                Held::Latent(h) => with_mixer(MixerState::LatentMqa(Some(LatentMqaState {
+                    len: h.len,
+                    window: h.window.clone(),
+                }))),
+                Held::Band(h) => {
+                    let tail = (h.compressed.as_slice(), h.index.as_slice());
+                    let (compressed, index_keys) = joined(slot, tail);
+                    slot += 1;
+                    with_mixer(MixerState::CompressedBand(Some(BandState {
+                        window: LatentMqaState {
+                            len: h.window.len,
+                            window: h.window.window.clone(),
+                        },
+                        groups: h.groups,
+                        compressed,
+                        index_keys,
+                        filling: h.filling.clone(),
+                    })))
                 }
             });
         }
@@ -1081,6 +1419,9 @@ impl GenericHeteroTransformer {
                     Held::Global(rows)
                 }
                 StateKind::Window => Held::Window(snapshot_rows(l, s)?),
+                StateKind::Latent { .. } | StateKind::Band { .. } => {
+                    latent_held(*kind, s.mixer.as_ref(), pos, layout.block_tokens)?
+                }
             });
         }
         let point = Point {
@@ -1188,8 +1529,67 @@ fn handover_identity(layout: &Layout) -> [u8; 32] {
         h.update([kind.tag()]);
         h.update((*n_kv as u64).to_le_bytes());
         h.update((*head_dim as u64).to_le_bytes());
+        for width in kind.shape().into_iter().flatten() {
+            h.update((width as u64).to_le_bytes());
+        }
     }
     h.finalize().into()
+}
+
+/// What a latent attention layer of `kind` keeps after `pos` tokens, from its mixer `state`,
+/// but the compressed rows of the whole blocks of `block_tokens`.
+fn latent_held(
+    kind: StateKind,
+    state: Option<&MixerState>,
+    pos: usize,
+    block_tokens: usize,
+) -> Result<Held> {
+    let err = |m: String| crate::tensor::Error::msg(format!("state cache: {m}"));
+    let window = |s: &LatentMqaState| -> Result<WindowHeld> {
+        if s.len != pos {
+            return Err(err(format!(
+                "a latent layer holds {} tokens at position {pos}",
+                s.len
+            )));
+        }
+        Ok(WindowHeld {
+            len: s.len,
+            window: s.window.clone(),
+        })
+    };
+    match (kind, state) {
+        (StateKind::Latent { .. }, Some(MixerState::LatentMqa(Some(s)))) => {
+            Ok(Held::Latent(window(s)?))
+        }
+        (
+            StateKind::Band {
+                ratio,
+                compressed,
+                index,
+                ..
+            },
+            Some(MixerState::CompressedBand(Some(s))),
+        ) => {
+            // The groups of the whole blocks, which the blocks hold.
+            let blocked = match compressed {
+                0 => 0,
+                _ => pos / block_tokens * block_tokens / ratio,
+            };
+            let tail = |rows: &[f32], width: usize| -> Result<Vec<f32>> {
+                rows.get(blocked * width..)
+                    .map(<[f32]>::to_vec)
+                    .ok_or_else(|| err(format!("a band layer holds fewer than {blocked} rows")))
+            };
+            Ok(Held::Band(BandHeld {
+                window: window(&s.window)?,
+                groups: s.groups,
+                compressed: tail(&s.compressed, compressed)?,
+                index: tail(&s.index_keys, index)?,
+                filling: s.filling.clone(),
+            }))
+        }
+        _ => Err(err("a latent layer holds no state".to_string())),
+    }
 }
 
 /// The rows a layer's snapshot holds, as host f32 with the element type they are held in.
@@ -1469,5 +1869,37 @@ pub(crate) fn block_round_trip(
     rows: &[(Vec<f32>, Vec<f32>)],
     layout: &Layout,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
-    decode_block(&encode_block(rows), layout).unwrap()
+    decode_block(&encode_block(rows, layout), layout).unwrap()
+}
+
+/// The manifest of `point`, under an identity of zeros, for the tests.
+#[cfg(test)]
+pub(crate) fn manifest_bytes(point: &Point, layout: &Layout) -> Vec<u8> {
+    encode_manifest(&[0u8; 32], layout, point)
+}
+
+/// Makes the manifest `bytes` and the encoded `blocks` the state of `model`, with the checks
+/// a restore from the store makes, for the tests.
+#[cfg(test)]
+pub(crate) fn restore_from_bytes(
+    model: &mut GenericHeteroTransformer,
+    bytes: &[u8],
+    blocks: &[Vec<u8>],
+    layout: &Layout,
+) -> AnyResult<()> {
+    let point = decode_manifest(bytes, &[0u8; 32], layout)?;
+    if blocks.len() != point.pos / layout.block_tokens {
+        bail!(
+            "state cache: {} blocks for a {}-token state",
+            blocks.len(),
+            point.pos
+        );
+    }
+    let rows = blocks
+        .iter()
+        .map(|b| decode_block(b, layout))
+        .collect::<AnyResult<Vec<_>>>()?;
+    model
+        .restore_point(&point, &rows)
+        .map_err(|e| anyhow!("{e}"))
 }

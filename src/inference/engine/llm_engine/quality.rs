@@ -31,6 +31,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::{Read, Write};
+#[cfg(test)]
 use std::path::Path;
 
 /// Positions' recorded candidates.
