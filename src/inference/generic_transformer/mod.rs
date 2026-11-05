@@ -136,6 +136,8 @@ mod wide_sparse_batch_tests;
 pub mod wide_sparse_config;
 #[cfg(test)]
 mod wide_sparse_config_tests;
+#[cfg(test)]
+mod wide_sparse_engram_tests;
 pub mod wide_sparse_layer;
 #[cfg(test)]
 mod wide_sparse_oracle_tests;
@@ -143,6 +145,8 @@ mod wide_sparse_oracle_tests;
 mod wide_sparse_plan_tests;
 #[cfg(test)]
 mod wide_sparse_quality_tests;
+#[cfg(test)]
+mod wide_sparse_real_tests;
 #[cfg(test)]
 mod wide_sparse_state_tests;
 pub use config::*;

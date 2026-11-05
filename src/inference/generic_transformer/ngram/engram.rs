@@ -457,6 +457,11 @@ impl EngramBlock {
         })
     }
 
+    /// Bytes of the fused key and value projection as held: what every token of the layer reads.
+    pub fn wkv_bytes(&self) -> usize {
+        self.wkv.bytes()
+    }
+
     /// The residual `r` `[1, seq, streams * dim]` with the gated value added to every stream.
     /// `hashes` holds the table rows of each position.
     pub fn forward(&self, r: &Tensor, hashes: &[Vec<u64>]) -> Result<Tensor> {

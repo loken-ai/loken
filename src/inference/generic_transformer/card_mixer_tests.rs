@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use super::mixer::Mixer;
+use super::wide_sparse_engram_tests::engram_file;
 use super::wide_sparse_oracle_tests::{generic, record_generic, toy_file, Record, LAYOUTS};
 use super::*;
 use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
@@ -33,18 +34,40 @@ fn card_present() -> bool {
 
 /// The generic model of the synthetic file, every layer on card 0.
 fn generic_on_card(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> GenericHeteroTransformer {
-    let MappedGguf { content, mmap, .. } = toy_file(ratios, kv_src, index_src);
+    on_card(toy_file(ratios, kv_src, index_src), ratios.len())
+}
+
+/// The generic model of the file `g` of `layers` layers, every layer on card 0.
+fn on_card(g: MappedGguf, layers: usize) -> GenericHeteroTransformer {
+    let MappedGguf { content, mmap, .. } = g;
     let plan = HeteroPlan {
         segments: vec![HeteroSegment {
             kind: DeviceKind::Cuda(0),
             layer_start: 0,
-            layer_end: ratios.len(),
+            layer_end: layers,
             free_memory_bytes: 1 << 30,
         }],
         tp_cards: None,
-        total_layers: ratios.len(),
+        total_layers: layers,
         host_experts_from: None,
     };
+    GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
+}
+
+/// The generic model of the synthetic file with engram layers, every layer on the host or on
+/// card 0.
+fn engram_model(
+    ratios: &[u32],
+    kv_src: &[u32],
+    index_src: &[u32],
+    card: bool,
+) -> GenericHeteroTransformer {
+    let g = engram_file(ratios, kv_src, index_src);
+    if card {
+        return on_card(g, ratios.len());
+    }
+    let MappedGguf { content, mmap, .. } = g;
+    let plan = HeteroPlan::calculate_with_kv(ratios.len(), 1 << 20, &[], &[], 1.0, 0);
     GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
 }
 
@@ -167,6 +190,33 @@ fn the_card_mixers_give_the_host_records_within_the_card_policy() {
     assert!(
         failed.is_empty(),
         "the card mixers leave the policy:\n{}",
+        failed.join("\n")
+    );
+}
+
+/// The engram model with its token mixers on the card gives the records of the same model on
+/// the host, within the card versus host policy, and the same greedy tokens.
+/// The engram, the residual mixing and the feed-forward stay on the host.
+#[test]
+fn the_card_mixers_with_engram_layers_give_the_host_records_within_the_card_policy() {
+    if !card_present() {
+        return;
+    }
+    let mut failed = Vec::new();
+    for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
+        let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+        let (mut want, mut got) = (BTreeMap::new(), BTreeMap::new());
+        let mut host = engram_model(ratios, kv_src, index_src, false);
+        record_generic(&mut host, &tokens, n, &mut want);
+        let mut card = engram_model(ratios, kv_src, index_src, true);
+        record_generic(&mut card, &tokens, n, &mut got);
+        let (cos, l2, bad) = compare(&want, &got);
+        eprintln!("layout {n} with engram layers: worst cosine {cos}, worst relative L2 {l2}");
+        failed.extend(bad);
+    }
+    assert!(
+        failed.is_empty(),
+        "the card mixers with engram layers leave the policy:\n{}",
         failed.join("\n")
     );
 }

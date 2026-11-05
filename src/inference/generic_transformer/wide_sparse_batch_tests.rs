@@ -23,7 +23,7 @@ const STEPS: usize = 8;
 const LATE: usize = 2;
 
 /// 4 prompts of other tokens: the 1st and the 3rd stand at the same positions.
-fn prompts() -> Vec<Vec<u32>> {
+pub(super) fn prompts() -> Vec<Vec<u32>> {
     [(12usize, 7u32, 3u32), (9, 5, 1), (12, 3, 2), (7, 11, 4)]
         .iter()
         .map(|&(len, step, start)| {
@@ -65,10 +65,10 @@ fn bits(logits: &Tensor) -> Vec<u32> {
 }
 
 /// What a sequence gives: its greedy tokens, and the bits of the logits each was chosen from.
-type Run = (Vec<u32>, Vec<Vec<u32>>);
+pub(super) type Run = (Vec<u32>, Vec<Vec<u32>>);
 
 /// Each prompt run alone on `model`, one after the other.
-fn serial(model: &mut GenericHeteroTransformer, prompts: &[Vec<u32>]) -> Vec<Run> {
+pub(super) fn serial(model: &mut GenericHeteroTransformer, prompts: &[Vec<u32>]) -> Vec<Run> {
     prompts
         .iter()
         .map(|p| {
@@ -89,7 +89,7 @@ fn serial(model: &mut GenericHeteroTransformer, prompts: &[Vec<u32>]) -> Vec<Run
 
 /// The prompts batched on `model`: each prefilled over a state of its own, the live sequences
 /// decoded together, the last prompt prefilled after [`LATE`] steps.
-fn batched(model: &mut GenericHeteroTransformer, prompts: &[Vec<u32>]) -> Vec<Run> {
+pub(super) fn batched(model: &mut GenericHeteroTransformer, prompts: &[Vec<u32>]) -> Vec<Run> {
     let n = prompts.len();
     let mut seqs: Vec<SequenceMixers> = (0..n).map(|_| model.sequence_mixers().unwrap()).collect();
     let mut out: Vec<Run> = vec![(Vec::new(), Vec::new()); n];

@@ -11,7 +11,11 @@
 //! A projection is read in place when a host kernel reads its format, else held dense F32.
 //! Norms, mixing weights, the router and the pooling and index weights are held dense F32.
 //! A layer on a CUDA card runs the projections and the attention of its token mixer there.
-//! The residual mixing, the feed-forward and the head run on the host.
+//! The residual mixing, the feed-forward, the engram and the head run on the host.
+//!
+//! An engram layer reads its table in place: e4m3 rows beside their scales, or blocks a host
+//! kernel reads.
+//! A table in any other format is held dense F32.
 
 use super::super::block_scaled_experts::BlockScaledExpert;
 use super::super::compressed_band::{
@@ -20,11 +24,16 @@ use super::super::compressed_band::{
 use super::super::dense::BlockScaledCheckpoint;
 use super::super::hyper::sinkhorn::{SinkhornMeta, SinkhornMixer};
 use super::super::latent_mqa::{frequencies, LatentMqa, LatentMqaDims, LatentMqaWeights};
+use super::super::ngram::engram::{EngramBlock, EngramMeta, EngramTable};
 use super::super::wide_sparse_config::{LayerKind, WideSparseMeta};
-use super::super::wide_sparse_layer::{PreMixCarry, RoutedFfn, SinkhornBlock, WideSparseHead};
+use super::super::wide_sparse_layer::{
+    LayerEngram, PreMixCarry, RoutedFfn, SinkhornBlock, TokenCarry, WideSparseHead,
+};
 use super::super::*;
 use super::TensorSource;
+use crate::inference::model::deepseek_v41::source::ENGRAM_TABLE;
 use crate::tensor::blockscaled::projection::Projection;
+use crate::tensor::mapped::MappedBytes;
 use crate::tensor::quantized::GgmlDType;
 
 /// Where the builder reads a tensor, by the loader's name.
@@ -105,12 +114,88 @@ impl Tensors<'_, '_> {
         }
     }
 
+    /// The engram table `name`.
+    ///
+    /// A checkpoint's tables are refused.
+    fn engram_table(&self, name: &str) -> Result<EngramTable> {
+        match self {
+            Self::File { source, .. } => engram_table(source, name),
+            Self::Checkpoint(_) => crate::tensor::bail!(
+                "the engram tables of a checkpoint do not run on the generic route"
+            ),
+        }
+    }
+
     /// The load is over.
     fn finish(&self) {
         if let Self::File { source, .. } = self {
             source.count.finish();
         }
     }
+}
+
+/// The engram table `name` of a file.
+///
+/// A pair of byte tensors, the rows and the `.scale` beside them, is read in place as e4m3 rows
+/// with 1 ue8m0 scale per block.
+/// A table in a format a host kernel reads is read in place, block by block.
+/// Any other table is held dense F32.
+fn engram_table(source: &TensorSource<'_>, name: &str) -> Result<EngramTable> {
+    let scale = format!("{}.scale", name.strip_suffix(".weight").unwrap_or(name));
+    if let Some(table) = released_fp8_rows(source, name, &scale)? {
+        return Ok(table);
+    }
+    let qt = source.read(name, &Device::Cpu)?;
+    if crate::tensor::quant_view::native_view_supported(qt.dtype()) {
+        return Ok(EngramTable::Streamed(Arc::new(qt)));
+    }
+    // CONVERSION: a table no host kernel reads in place is held dense F32.
+    Ok(EngramTable::Resident(
+        qt.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?,
+    ))
+}
+
+/// The table `weight` as e4m3 rows beside their ue8m0 scales `scale`, both byte tensors of a
+/// mapped file.
+///
+/// `None` when the file does not hold the pair as byte tensors of a mapping.
+/// The block is the row length over the scales per row.
+fn released_fp8_rows(
+    source: &TensorSource<'_>,
+    weight: &str,
+    scale: &str,
+) -> Result<Option<EngramTable>> {
+    let (Some(w), Some(s)) = (source.info(weight), source.info(scale)) else {
+        return Ok(None);
+    };
+    if w.ggml_dtype != GgmlDType::I8 || s.ggml_dtype != GgmlDType::I8 {
+        return Ok(None);
+    }
+    let (&[rows, row_len], &[scale_rows, per_row]) = (w.shape.dims(), s.shape.dims()) else {
+        crate::tensor::bail!("{weight}: an engram table is two-dimensional");
+    };
+    if scale_rows != rows || per_row == 0 || !row_len.is_multiple_of(per_row) {
+        crate::tensor::bail!(
+            "{weight}: scales {:?} do not tile [{rows}, {row_len}] by rows",
+            s.shape.dims()
+        );
+    }
+    let (Some((wm, wo, wl)), Some((sm, so, sl))) =
+        (source.mapped_range(weight), source.mapped_range(scale))
+    else {
+        return Ok(None);
+    };
+    source.count.read(weight, w);
+    source.count.read(scale, s);
+    let table = EngramTable::Fp8Rows {
+        bytes: MappedBytes::new(wm, wo, wl)?,
+        scales: MappedBytes::new(sm, so, sl)?,
+        rows,
+        row_len,
+        block: row_len / per_row,
+    };
+    table.advise_random();
+    Ok(Some(table))
 }
 
 /// The names block `il` may carry a tensor under: each stem bare, then with the `.weight`
@@ -226,10 +311,12 @@ impl GenericHeteroTransformer {
             .get("general.architecture")
             .and_then(|v| v.to_string().ok().cloned())
             .unwrap_or_default();
+        let engram = EngramMeta::from_gguf(content, &arch);
         Self::build_wide_sparse(
             &meta,
             &arch,
             &Tensors::File { content, source },
+            engram,
             plan,
             kv_quant,
             max_kv_seq_len,
@@ -262,6 +349,7 @@ impl GenericHeteroTransformer {
             &meta,
             crate::inference::model::deepseek_v41::ARCH,
             &Tensors::Checkpoint(checkpoint),
+            None,
             plan,
             kv_quant,
             max_kv_seq_len,
@@ -269,10 +357,13 @@ impl GenericHeteroTransformer {
     }
 
     /// The model `meta` describes, its tensors read from `tensors`.
+    ///
+    /// `engram` is the hash layout of the engram layers, `None` for a model without one.
     fn build_wide_sparse(
         meta: &WideSparseMeta,
         arch: &str,
         tensors: &Tensors<'_, '_>,
+        engram: Option<EngramMeta>,
         plan: &HeteroPlan,
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
@@ -297,11 +388,14 @@ impl GenericHeteroTransformer {
                     _ => None,
                 })
         };
-        if meta.ngram.is_some() {
+        // The description and the engram blocks read the same hash layout.
+        if meta.ngram.is_some() != engram.is_some() {
             crate::tensor::bail!(
-                "the n-gram hash layers of this file do not run on the generic route"
+                "the n-gram hash layout of this file reads differently for the engram blocks"
             );
         }
+        // Every engram layer hashes from the token ids of 1 log the model shares.
+        let engram = engram.map(|m| (Arc::new(m), Arc::new(TokenCarry::default())));
 
         let present =
             |names: &[String]| -> Option<String> { names.iter().find(|n| tensors.has(n)).cloned() };
@@ -491,6 +585,50 @@ impl GenericHeteroTransformer {
                 limit: m.swiglu_limits.get(il).copied().unwrap_or(0.0),
                 lossy: Default::default(),
             };
+            // An engram layer: its table, under its own name or as the table every layer shares,
+            // its fused key and value projection, and its gate.
+            // The gate is the file's, else the product of the query and key weights.
+            let layer_engram = match engram
+                .as_ref()
+                .and_then(|(hash, tokens)| hash.which(il).map(|which| (hash, tokens, which)))
+            {
+                None => None,
+                Some((hash, tokens, which)) => {
+                    let table = match present(&spellings(il, &["engram_embd"])) {
+                        Some(n) => n,
+                        None => need(&[ENGRAM_TABLE.to_string()])?,
+                    };
+                    let gate = match present(&spellings(il, &["engram_gate"])) {
+                        Some(n) => dense(&n)?,
+                        None => {
+                            let q = dense(&name(&["engram_q"])?)?.to_vec2::<f32>()?;
+                            let k = dense(&name(&["engram_k"])?)?.to_vec2::<f32>()?;
+                            let width = q.first().map_or(0, Vec::len);
+                            let product: Vec<f32> = q
+                                .iter()
+                                .zip(&k)
+                                .flat_map(|(qr, kr)| qr.iter().zip(kr).map(|(a, b)| a * b))
+                                .collect();
+                            Tensor::from_vec(product, (q.len(), width), &Device::Cpu)?
+                        }
+                    };
+                    Some(LayerEngram {
+                        block: EngramBlock::new(
+                            tensors.engram_table(&table)?,
+                            projection(&name(&["engram_wkv", "engram_kv"])?)?,
+                            &gate,
+                            hash,
+                            mixing.streams,
+                            meta.d_model,
+                            eps,
+                        )?,
+                        meta: hash.clone(),
+                        which,
+                        tokens: tokens.clone(),
+                    })
+                }
+            };
+
             let attn_norm = dense(&name(&["attn_norm"])?)?;
             let ffn_norm = dense(&name(&["ffn_norm"])?)?;
             let block = SinkhornBlock {
@@ -502,6 +640,7 @@ impl GenericHeteroTransformer {
                 output: projection(&name(&["attn_output_b", "attn_o_b"])?)?,
                 ffn,
                 carry: carry.clone(),
+                engram: layer_engram,
             };
 
             // The forward reads no rotation table of the layer: its token mixer turns its own.
@@ -658,6 +797,7 @@ impl GenericHeteroTransformer {
             norm: norm.clone(),
             eps,
             head,
+            tokens: engram.map(|(_, tokens)| tokens),
         };
         tensors.finish();
         Ok(Self {
@@ -725,5 +865,80 @@ impl GenericHeteroTransformer {
             draft: None,
             wide_sparse: Some(wide_sparse),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::model::deepseek_v41::engram as v41;
+    use crate::inference::model::deepseek_v41::source::WeightSource;
+    use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+    use crate::tensor::quantized::gguf_file::{open_mapped, Value};
+
+    /// Port of the V4.1 test of the same name: a table the file carries as fp8 rows beside their
+    /// ue8m0 scales, both byte tensors, is read in place as those rows.
+    /// The geometry and the bytes are the ones the V4.1 reader gives the same file.
+    #[test]
+    fn engram_rows_are_read_as_released_fp8() {
+        let (rows, row_len, per_row) = (7usize, 64usize, 2usize);
+        let weight: Vec<u8> = (0..rows * row_len).map(|i| (i % 251) as u8).collect();
+        let scales: Vec<u8> = (0..rows * per_row).map(|i| (120 + i % 9) as u8).collect();
+        let md = vec![(
+            "general.architecture".to_string(),
+            Value::String("deepseek4".into()),
+        )];
+        let entries = vec![
+            GgufEntry {
+                name: "blk.1.engram_embd.weight".to_string(),
+                dims: vec![rows, row_len],
+                dtype: GgmlDType::I8,
+                data: weight.clone(),
+            },
+            GgufEntry {
+                name: "blk.1.engram_embd.scale".to_string(),
+                dims: vec![rows, per_row],
+                dtype: GgmlDType::I8,
+                data: scales.clone(),
+            },
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "loken-generic-engram-fp8-{}.gguf",
+            std::process::id()
+        ));
+        write_gguf_with_metadata(&path, &md, &entries).unwrap();
+        let g = open_mapped(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let source = TensorSource::one(&g.content, &g.mmap[..]);
+        let got = engram_table(&source, "blk.1.engram_embd.weight").unwrap();
+        let want = g.engram_table("layers.1.engram.embed.weight").unwrap();
+        match (got, want) {
+            (
+                EngramTable::Fp8Rows {
+                    bytes,
+                    scales: sc,
+                    rows: r,
+                    row_len: rl,
+                    block,
+                },
+                v41::EngramTable::Fp8Rows {
+                    bytes: v41_bytes,
+                    scales: v41_scales,
+                    rows: v41_rows,
+                    row_len: v41_row_len,
+                    block: v41_block,
+                },
+            ) => {
+                assert_eq!((r, rl, block), (rows, row_len, row_len / per_row));
+                assert_eq!((r, rl, block), (v41_rows, v41_row_len, v41_block));
+                assert_eq!(bytes.as_slice(), weight.as_slice());
+                assert_eq!(sc.as_slice(), scales.as_slice());
+                assert_eq!(bytes.as_slice(), v41_bytes.as_slice());
+                assert_eq!(sc.as_slice(), v41_scales.as_slice());
+            }
+            _ => {
+                panic!("the pair of byte tensors was not read as released fp8 rows by both readers")
+            }
+        }
     }
 }

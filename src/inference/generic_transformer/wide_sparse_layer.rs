@@ -15,11 +15,16 @@
 //!
 //! The rows of a verify attend 1 at a time, each as the decode step of its row.
 //! Their feed-forward runs over every row at once.
+//!
+//! An engram layer adds hashed n-gram rows to its residual before its token mixer.
+//! The hashes read the token ids of the sequence from a [`TokenCarry`] the model shares.
+//! The rows of a verify take their engram 1 row at a time, a prompt's all at once.
 
 use super::block_scaled_experts::BlockScaledExpert;
 use super::compressed_band::BandCell;
 use super::hyper::sinkhorn::SinkhornMixer;
 use super::moe_weights::{sqrt_softplus_choice, sqrt_softplus_truncated_choice, Truncation};
+use super::ngram::engram::{EngramBlock, EngramMeta};
 use super::*;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
@@ -84,6 +89,116 @@ impl PreMixCarry {
                 "no pre mix for the {rows} rows of the head: the last layer has not run"
             ))),
         })
+    }
+}
+
+/// The token ids of a sequence by position.
+///
+/// A forward from position `first` keeps the ids before `first` and writes its own after them.
+#[derive(Debug, Default, Clone)]
+pub struct TokenLog(Vec<u32>);
+
+impl TokenLog {
+    /// Writes `tokens` at the positions `first..`, after the ids of the positions before `first`.
+    ///
+    /// Refused, with nothing written, when the log holds fewer than `first` ids.
+    pub(super) fn open(&mut self, first: usize, tokens: &[u32]) -> Result<()> {
+        if self.0.len() < first {
+            crate::tensor::bail!(
+                "the token log holds {} positions but the forward starts at {first}",
+                self.0.len()
+            );
+        }
+        self.0.truncate(first);
+        self.0.extend_from_slice(tokens);
+        Ok(())
+    }
+
+    /// The table rows engram layer `which` reads for the positions `first..first + rows`.
+    ///
+    /// A position hashes the compressed ids of the last `max_ngram` positions up to it, oldest
+    /// first.
+    pub(super) fn engram_hashes(
+        &self,
+        meta: &EngramMeta,
+        which: usize,
+        first: usize,
+        rows: usize,
+    ) -> Result<Vec<Vec<u64>>> {
+        if self.0.len() < first + rows {
+            crate::tensor::bail!(
+                "the token log holds {} positions, not the {rows} from position {first}",
+                self.0.len()
+            );
+        }
+        Ok((first..first + rows)
+            .map(|p| {
+                let start = (p + 1).saturating_sub(meta.max_ngram);
+                let recent: Vec<u32> = self.0[start..=p]
+                    .iter()
+                    .map(|&t| meta.compress(t))
+                    .collect();
+                meta.hash(which, &recent)
+            })
+            .collect())
+    }
+}
+
+/// The token log of the sequence the model's layers hold, shared by the layers that read it.
+#[derive(Default)]
+pub struct TokenCarry(std::sync::Mutex<TokenLog>);
+
+impl TokenCarry {
+    fn with<R>(&self, f: impl FnOnce(&mut TokenLog) -> R) -> R {
+        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut held)
+    }
+
+    /// Opens the forward of `tokens` at the positions `first..`, as [`TokenLog::open`] does.
+    pub fn open(&self, first: usize, tokens: &[u32]) -> Result<()> {
+        self.with(|log| log.open(first, tokens))
+    }
+
+    /// Holds `tokens` as the whole sequence.
+    pub fn reset(&self, tokens: &[u32]) {
+        self.with(|log| *log = TokenLog(tokens.to_vec()));
+    }
+
+    /// Exchanges the log held with `other`.
+    fn exchange(&self, other: &mut TokenLog) {
+        self.with(|log| std::mem::swap(log, other));
+    }
+}
+
+/// The engram a layer adds to its residual before its token mixer.
+pub struct LayerEngram {
+    pub block: EngramBlock,
+    /// The hash layout of every engram layer of the model.
+    pub meta: Arc<EngramMeta>,
+    /// The layer's index among the engram layers.
+    pub which: usize,
+    /// Shared by every layer of the model and its head.
+    pub tokens: Arc<TokenCarry>,
+}
+
+impl LayerEngram {
+    /// The residual rows `r` `[1, rows, streams * hidden]` at the positions `first..` with the
+    /// engram added, hashed from the ids `log` holds.
+    fn add(&self, r: &Tensor, log: &TokenLog, first: usize) -> Result<Tensor> {
+        let rows = r.dims3()?.1;
+        let hashes = log.engram_hashes(&self.meta, self.which, first, rows)?;
+        self.block.forward(r, &hashes)
+    }
+}
+
+/// The residual rows `r` at the positions `first..` with the layer's engram added, hashed from
+/// the model's token log.
+///
+/// `r` itself for a layer without an engram.
+fn with_engram(block: &SinkhornBlock, r: &Tensor, first: usize) -> Result<Tensor> {
+    match block.engram.as_ref() {
+        Some(e) => e.tokens.with(|log| e.add(r, log, first)),
+        None => Ok(r.clone()),
     }
 }
 
@@ -240,6 +355,8 @@ pub struct SinkhornBlock {
     pub ffn: RoutedFfn,
     /// Shared by every layer of the model and its head.
     pub carry: Arc<PreMixCarry>,
+    /// What an engram layer adds to the residual before the token mixer reads it.
+    pub engram: Option<LayerEngram>,
 }
 
 /// The token mixer's half of a layer over the residual rows `r` `[1, seq, streams * hidden]` at
@@ -290,6 +407,7 @@ impl GenericTransformerLayer {
                 let (mut mids, mut pres, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
                 for j in 0..seq {
                     let rj = r.narrow(1, j, 1)?.contiguous()?;
+                    let rj = with_engram(block, &rj, index_pos + j)?;
                     let (m, p, i) =
                         attention_half(block, &mut self.mixer, &rj, &pre[j..j + 1], index_pos + j)?;
                     mids.push(m);
@@ -300,6 +418,7 @@ impl GenericTransformerLayer {
                 let inputs: Vec<&Tensor> = inputs.iter().collect();
                 (Tensor::cat(&mids, 1)?, pres, Tensor::cat(&inputs, 1)?)
             } else {
+                let r = with_engram(block, &r, index_pos)?;
                 attention_half(block, &mut self.mixer, &r, &pre, index_pos)?
             }
         };
@@ -335,6 +454,8 @@ pub struct WideSparseHead {
     pub eps: f32,
     /// `[vocab, hidden]`.
     pub head: Projection,
+    /// Shared with every engram layer, `None` for a model without one.
+    pub tokens: Option<Arc<TokenCarry>>,
 }
 
 impl WideSparseHead {
@@ -342,8 +463,16 @@ impl WideSparseHead {
     /// of each row per stream.
     ///
     /// The carry and the band cell open for the forward over those rows.
-    pub fn widen(&self, hidden: &Tensor, index_pos: usize) -> Result<Tensor> {
+    /// The token log takes `input_ids`, the ids of those rows.
+    pub fn widen(&self, hidden: &Tensor, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
         let seq = hidden.dim(1)?;
+        if let Some(tokens) = &self.tokens {
+            let ids = input_ids
+                .flatten_all()?
+                .to_dtype(DType::U32)?
+                .to_vec1::<u32>()?;
+            tokens.open(index_pos, &ids)?;
+        }
         self.carry.open(index_pos, seq, self.streams);
         self.cell.open(index_pos, seq);
         super::wide::widen_embedding(hidden, self.streams)
@@ -387,7 +516,7 @@ impl GenericHeteroTransformer {
     /// Bytes of the weights every token of a Sinkhorn wide-residual model reads, as held.
     ///
     /// Per layer: the token mixer's resident weights, its output projection, the router with
-    /// its bias and the shared expert.
+    /// its bias, the shared expert and the engram projection.
     /// Then the head.
     /// The routed experts are not counted.
     /// `None` for a model of another kind.
@@ -406,7 +535,8 @@ impl GenericHeteroTransformer {
                 .as_ref()
                 .map_or(0, |s| s.gate.bytes() + s.up.bytes() + s.down.bytes());
             let bias = ffn.bias.len() * std::mem::size_of::<f32>();
-            bytes += block.output.bytes() + ffn.router.bytes() + bias + shared;
+            let engram = block.engram.as_ref().map_or(0, |e| e.block.wkv_bytes());
+            bytes += block.output.bytes() + ffn.router.bytes() + bias + shared + engram;
         }
         Some(bytes as u64)
     }
@@ -480,7 +610,13 @@ impl GenericHeteroTransformer {
         Ok(SequenceMixers {
             states,
             cell: BandCell::default(),
+            tokens: TokenLog::default(),
         })
+    }
+
+    /// The token log the engram layers share, `None` for a model without one.
+    fn shared_tokens(&self) -> Option<Arc<TokenCarry>> {
+        self.wide_sparse.as_ref().and_then(|ws| ws.tokens.clone())
     }
 
     /// Exchanges every layer's mixer state with the one `seq` holds for that layer.
@@ -505,10 +641,17 @@ impl GenericHeteroTransformer {
     /// It holds its own states again once the call returns.
     pub fn prefill_sequence(&mut self, tokens: &[u32], seq: &mut SequenceMixers) -> Result<Tensor> {
         let cell = self.shared_cell()?;
+        let log = self.shared_tokens();
         self.exchange_states(seq)?;
         cell.exchange(&seq.cell);
+        if let Some(log) = &log {
+            log.exchange(&mut seq.tokens);
+        }
         let logits = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu)
             .and_then(|ids| self.forward(&ids, 0));
+        if let Some(log) = &log {
+            log.exchange(&mut seq.tokens);
+        }
         cell.exchange(&seq.cell);
         self.exchange_states(seq)?;
         logits
@@ -541,15 +684,20 @@ impl GenericHeteroTransformer {
             None => crate::tensor::bail!("a batch of sequences needs a Sinkhorn wide residual"),
         };
         let cell = self.shared_cell()?;
+        let hashed = self.shared_tokens().is_some();
         if seqs.iter().any(|s| s.states.len() != self.layers.len()) {
             crate::tensor::bail!("a sequence keeps states for another model");
         }
         crate::tensor::quant_cpu::set_small_model_prefill(false);
 
         // Each row's residual as the embedding stage of its decode starts it.
+        // A sequence's own token log takes the row's token where an engram layer reads it.
         let emb_device = self.embeddings.embeddings().device();
         let mut rows = Vec::with_capacity(rows_in);
-        for (seq, (&t, &pos)) in seqs.iter().zip(tokens.iter().zip(positions)) {
+        for (seq, (&t, &pos)) in seqs.iter_mut().zip(tokens.iter().zip(positions)) {
+            if hashed {
+                seq.tokens.open(pos, &[t])?;
+            }
             let ids = Tensor::from_vec(vec![t], (1, 1), &emb_device)?;
             let hidden = self.add_positions(self.embeddings.forward(&ids)?, pos)?;
             let hidden = match self.config.embed_scale {
@@ -574,6 +722,10 @@ impl GenericHeteroTransformer {
                 let block = layer.sinkhorn.as_ref().ok_or_else(|| {
                     crate::tensor::Error::msg("a Sinkhorn layer without its block")
                 })?;
+                let r = match block.engram.as_ref() {
+                    Some(e) => e.add(&r, &seq.tokens, positions[j])?,
+                    None => r,
+                };
                 exchange_state(&mut layer.mixer, &mut seq.states[il])?;
                 cell.exchange(&seq.cell);
                 let half = attention_half(block, &mut layer.mixer, &r, &pres[j], positions[j]);
@@ -623,6 +775,8 @@ pub struct SequenceMixers {
     states: Vec<mixer::MixerState>,
     /// What the sequence's band sources leave for its band readers within a step.
     cell: BandCell,
+    /// The sequence's token ids, which its engram layers hash.
+    tokens: TokenLog,
 }
 
 /// Exchanges the state `mixer` holds with `held`.

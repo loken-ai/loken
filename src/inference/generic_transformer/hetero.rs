@@ -2645,9 +2645,10 @@ impl GenericHeteroTransformer {
             None => hidden,
         };
         // A Sinkhorn wide residual starts the same way, and the state its layers pass to each
-        // other opens for the rows of this forward.
+        // other opens for the rows of this forward, the token ids its engram layers hash
+        // included.
         let hidden = match self.wide_sparse.as_ref() {
-            Some(ws) => ws.widen(&hidden, index_pos)?,
+            Some(ws) => ws.widen(&hidden, input_ids, index_pos)?,
             None => hidden,
         };
 

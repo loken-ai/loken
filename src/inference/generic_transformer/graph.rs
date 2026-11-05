@@ -2259,6 +2259,10 @@ impl GenericHeteroTransformer {
         let snap = &kv_snapshots[index];
         restore_layers(layers, &snap.layers)?;
         let out = (snap.tokens.clone(), snap.kv_len);
+        // The engram layers hash the ids of the restored sequence.
+        if let Some(tokens) = self.wide_sparse.as_ref().and_then(|ws| ws.tokens.as_ref()) {
+            tokens.reset(&out.0[..out.1.min(out.0.len())]);
+        }
         self.rebuild_host_stores();
         self.kv_snapshot_tick += 1;
         let used = &mut self.kv_snapshots[index];

@@ -1035,9 +1035,15 @@ impl GenericHeteroTransformer {
         identity: [u8; 32],
     ) -> bool {
         // A gated wide-residual layer's indexer and n-gram state have no stored form yet.
-        // A Sinkhorn wide residual keeps nothing from one forward to the next.
+        // A Sinkhorn wide residual keeps nothing from one forward to the next but the token ids
+        // its engram layers hash.
+        // Those ids have no stored form.
         if !self.is_recurrent()
             || self.output_hyper.is_some()
+            || self
+                .wide_sparse
+                .as_ref()
+                .is_some_and(|ws| ws.tokens.is_some())
             || self.layers.iter().any(|l| l.cpu_q8_kv.is_some())
         {
             return false;

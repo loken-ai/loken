@@ -432,6 +432,22 @@ impl<'a> TensorSource<'a> {
         }
     }
 
+    /// The header entry of `name`, `None` when no part lists it.
+    fn info(&self, name: &str) -> Option<&gguf_file::TensorInfo> {
+        self.part_of(name)?.content.tensor_infos.get(name)
+    }
+
+    /// The mapping that holds the bytes of `name`, and their offset and length in it.
+    ///
+    /// `None` when no part lists `name` or its part is not a mapped file.
+    fn mapped_range(&self, name: &str) -> Option<(std::sync::Arc<memmap2::Mmap>, usize, usize)> {
+        let part = self.part_of(name)?;
+        let info = part.content.tensor_infos.get(name)?;
+        let map = part.owner.clone()?.downcast::<memmap2::Mmap>().ok()?;
+        let start = part.content.tensor_data_offset as usize + info.offset as usize;
+        Some((map, start, info.size_in_bytes()))
+    }
+
     /// The first part's header and bytes: what a reader of its own - a family's vision tower -
     /// takes, since it reads by a cursor over one mapping.
     fn first(&self) -> (&'a gguf_file::Content, &'a [u8]) {
