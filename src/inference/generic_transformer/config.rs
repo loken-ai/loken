@@ -515,7 +515,7 @@ pub(super) fn meta_u32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option
         .and_then(|v| v.to_u32().ok())
 }
 
-fn meta_f32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<f32> {
+pub(super) fn meta_f32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<f32> {
     ct.metadata
         .get(&format!("{arch}.{key}"))
         .or_else(|| ct.metadata.get(key))

@@ -36,6 +36,34 @@ impl HyperMeta {
     }
 }
 
+pub mod sinkhorn;
+
+/// The kind of wide residual a file declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HyperKind {
+    /// A low-rank gate mixes the streams down, a per-stream weight writes back.
+    LowRank(HyperMeta),
+    /// A full-rank projection gives the pre, post and Sinkhorn comb mixes.
+    Sinkhorn(sinkhorn::SinkhornMeta),
+}
+
+impl HyperKind {
+    /// The kind of `arch`, `None` when the file has no wide residual of either kind.
+    pub fn from_gguf(content: &gguf_file::Content, arch: &str) -> Option<Self> {
+        HyperMeta::from_gguf(content, arch)
+            .map(Self::LowRank)
+            .or_else(|| sinkhorn::SinkhornMeta::from_gguf(content, arch).map(Self::Sinkhorn))
+    }
+
+    /// Parallel copies of the hidden state.
+    pub fn streams(&self) -> usize {
+        match self {
+            Self::LowRank(m) => m.streams,
+            Self::Sinkhorn(m) => m.streams,
+        }
+    }
+}
+
 /// One mixer of the wide residual: the grouped norm, the low-rank gate and, for a sublayer
 /// that writes back, the per-stream write weights.
 ///
@@ -607,5 +635,30 @@ mod tests {
         ]);
         let m = HyperMeta::from_gguf(&c, "a").unwrap();
         assert_eq!((m.streams, m.rank, m.width(2560)), (4, 320, 10240));
+    }
+
+    /// A low-rank file is of the low-rank kind, a file with Sinkhorn passes and no rank is of
+    /// the Sinkhorn kind.
+    #[test]
+    fn the_kind_follows_the_metadata() {
+        let low = content(&[
+            ("hyper_connection.count", 4),
+            ("hyper_connection.low_rank", 320),
+            ("hyper_connection.sinkhorn_iterations", 20),
+        ]);
+        assert!(matches!(
+            HyperKind::from_gguf(&low, "a"),
+            Some(HyperKind::LowRank(_))
+        ));
+        let mut sk = content(&[
+            ("hyper_connection.count", 4),
+            ("hyper_connection.sinkhorn_iterations", 20),
+        ]);
+        sk.metadata
+            .insert("a.hyper_connection.epsilon".into(), Value::F32(1e-6));
+        let kind = HyperKind::from_gguf(&sk, "a").unwrap();
+        assert!(matches!(kind, HyperKind::Sinkhorn(_)));
+        assert_eq!(kind.streams(), 4);
+        assert_eq!(HyperKind::from_gguf(&content(&[]), "a"), None);
     }
 }
