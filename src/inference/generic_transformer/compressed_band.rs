@@ -138,17 +138,19 @@ struct Stamped<T> {
     value: T,
 }
 
-/// What the sources of a band left for the forward in progress.
+/// What the sources of a band left, one value per forward over its rows.
 #[derive(Default)]
 struct Published {
-    compressed: Option<Stamped<Vec<f32>>>,
-    index_keys: Option<Stamped<Vec<f32>>>,
-    picks: Option<Stamped<Vec<i32>>>,
-    candidates: Option<Stamped<Vec<bool>>>,
+    compressed: Vec<Stamped<Vec<f32>>>,
+    index_keys: Vec<Stamped<Vec<f32>>>,
+    picks: Vec<Stamped<Vec<i32>>>,
+    candidates: Vec<Stamped<Vec<bool>>>,
 }
 
-/// Where the layers of a band leave and find what their sources built in the forward in
-/// progress.
+/// Where the layers of a band leave and find what their sources built.
+///
+/// A value is kept per forward, so the rows of a verify that attend 1 at a time each find
+/// their own.
 #[derive(Default)]
 pub struct BandCell(Mutex<Published>);
 
@@ -157,22 +159,38 @@ impl BandCell {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut held)
     }
+
+    /// Opens the pass over the rows `first..first + rows`.
+    ///
+    /// The values left for a row outside them go.
+    pub fn open(&self, first: usize, rows: usize) {
+        self.with(|p| {
+            keep_inside(&mut p.compressed, first, rows);
+            keep_inside(&mut p.index_keys, first, rows);
+            keep_inside(&mut p.picks, first, rows);
+            keep_inside(&mut p.candidates, first, rows);
+        });
+    }
 }
 
-/// `value` stamped with the forward over the rows `first..first + rows`.
-fn stamp<T>((first, rows): (usize, usize), value: T) -> Option<Stamped<T>> {
-    Some(Stamped { first, rows, value })
+/// Drops the values of `slot` left for a forward that reaches outside `first..first + rows`.
+fn keep_inside<T>(slot: &mut Vec<Stamped<T>>, first: usize, rows: usize) {
+    slot.retain(|s| s.first >= first && s.first + s.rows <= first + rows);
+}
+
+/// Leaves `value` in `slot` for the forward over the rows `first..first + rows`.
+///
+/// It replaces what an earlier forward over the same rows left.
+fn put<T>(slot: &mut Vec<Stamped<T>>, (first, rows): (usize, usize), value: T) {
+    slot.retain(|s| (s.first, s.rows) != (first, rows));
+    slot.push(Stamped { first, rows, value });
 }
 
 /// The value `slot` holds for the forward over `first..first + rows`, or why there is none.
-fn read<T: Clone>(
-    slot: &Option<Stamped<T>>,
-    (first, rows): (usize, usize),
-    what: &str,
-) -> Result<T> {
-    match slot {
-        Some(s) if s.first == first && s.rows == rows => Ok(s.value.clone()),
-        _ => Err(crate::tensor::Error::msg(format!(
+fn read<T: Clone>(slot: &[Stamped<T>], (first, rows): (usize, usize), what: &str) -> Result<T> {
+    match slot.iter().find(|s| s.first == first && s.rows == rows) {
+        Some(s) => Ok(s.value.clone()),
+        None => Err(crate::tensor::Error::msg(format!(
             "no {what} for the {rows} rows from position {first}: their source has not run"
         ))),
     }
@@ -331,7 +349,7 @@ impl CompressedBand {
                     all.extend(self.index_keys_of(ix, latent, groups, &gcos, &gsin, false)?);
                 }
                 let published = all.clone();
-                self.cell.with(|p| p.index_keys = stamp(at, published));
+                self.cell.with(|p| put(&mut p.index_keys, at, published));
                 Some(all)
             }
             _ => None,
@@ -360,7 +378,7 @@ impl CompressedBand {
                     all.extend_from_slice(&fresh);
                 }
                 let published = all.clone();
-                self.cell.with(|p| p.compressed = stamp(at, published));
+                self.cell.with(|p| put(&mut p.compressed, at, published));
                 state.compressed = all.clone();
                 state.groups = held_groups + groups;
                 if let Some(k) = own_keys {
@@ -449,10 +467,10 @@ impl CompressedBand {
                 state.groups += 1;
             }
             let compressed = state.compressed.clone();
-            self.cell.with(|p| p.compressed = stamp(at, compressed));
+            self.cell.with(|p| put(&mut p.compressed, at, compressed));
             if self.owns_keys() {
                 let index_keys = state.index_keys.clone();
-                self.cell.with(|p| p.index_keys = stamp(at, index_keys));
+                self.cell.with(|p| put(&mut p.index_keys, at, index_keys));
             }
         }
 
@@ -567,7 +585,7 @@ impl CompressedBand {
         if gtot == 0 {
             let out = vec![-1i32; seq * itopk];
             let published = out.clone();
-            self.cell.with(|p| p.picks = stamp(at, published));
+            self.cell.with(|p| put(&mut p.picks, at, published));
             return Ok(out);
         }
         let q = self.index_queries(ix, qr, cos, sin)?;
@@ -592,7 +610,7 @@ impl CompressedBand {
         if band.candidate_source {
             let (blocks, size) = (band.candidate_blocks, band.candidate_block_size);
             let mask = select_candidate_blocks(&scores, seq, gtot, &reaches, blocks, size);
-            self.cell.with(|p| p.candidates = stamp(at, mask));
+            self.cell.with(|p| put(&mut p.candidates, at, mask));
         } else if band.uses_candidates {
             let mask = self
                 .cell
@@ -621,7 +639,7 @@ impl CompressedBand {
                 }
             });
         let published = out.clone();
-        self.cell.with(|p| p.picks = stamp(at, published));
+        self.cell.with(|p| put(&mut p.picks, at, published));
         Ok(out)
     }
 
@@ -664,7 +682,7 @@ impl CompressedBand {
         if band.candidate_source {
             let (blocks, size) = (band.candidate_blocks, band.candidate_block_size);
             let mask = select_candidate_blocks(&scores, 1, gtot, &[reach], blocks, size);
-            self.cell.with(|p| p.candidates = stamp(at, mask));
+            self.cell.with(|p| put(&mut p.candidates, at, mask));
         } else if band.uses_candidates {
             let mask = self
                 .cell
@@ -681,7 +699,7 @@ impl CompressedBand {
             *slot = (t + w_offset) as i32;
         }
         let published = out.clone();
-        self.cell.with(|p| p.picks = stamp(at, published));
+        self.cell.with(|p| put(&mut p.picks, at, published));
         Ok(out)
     }
 }

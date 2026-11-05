@@ -11,7 +11,7 @@
 //! indexer and compressor fields, the stream mixing and the n-gram hash. Nothing here loads a
 //! weight.
 
-use crate::inference::model::deepseek_v41::{engram, mainline};
+use crate::inference::model::deepseek_v41::{engram, mainline, release, ARCH};
 use crate::tensor::quantized::gguf_file::Value;
 use crate::tensor::quantized::gguf_source::GgufMeta;
 use crate::tensor::{Error, Result};
@@ -186,6 +186,28 @@ impl WideSparseMeta {
             .any(|n| src.info(n).is_some());
         mix || ((has("hyper_connection.count") || has("hyper_connection_mult"))
             && !has("hyper_connection.low_rank"))
+    }
+
+    /// Read the description from a file's header and tensor directory, as the family's own reader
+    /// reads it.
+    ///
+    /// A file whose architecture tag is not the in-tree scheme's is a converted one.
+    /// It takes the release values for the keys its converter does not write.
+    pub fn from_file(src: &impl GgufMeta) -> Result<Self> {
+        let converted = src
+            .metadata()
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .is_some_and(|a| a != ARCH);
+        let values = ReleaseValues {
+            rope_dim: release::ROPE_HEAD_DIM,
+            rope_scaling_factor: release::ROPE_FACTOR,
+            original_context: release::ORIGINAL_SEQ_LEN,
+            candidate_source_layer: release::CANDIDATE_SOURCE_LAYER,
+            candidate_top_k_blocks: release::CANDIDATE_TOPK_BLOCKS,
+            candidate_block_size: release::CANDIDATE_BLOCK_SIZE,
+        };
+        Self::from_meta(src, ARCH, &values, converted)
     }
 
     /// Read the description from a file's header and tensor directory, keys looked up under the

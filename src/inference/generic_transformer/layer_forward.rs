@@ -1398,6 +1398,9 @@ impl GenericTransformerLayer {
         if self.runs_split(x) {
             return self.forward_split(x, mask, Some(index_pos));
         }
+        if self.sinkhorn.is_some() {
+            return self.forward_sinkhorn(x, index_pos);
+        }
         if self.is_wide() {
             return self.forward_wide(x, mask, index_pos, ple_layer_input);
         }

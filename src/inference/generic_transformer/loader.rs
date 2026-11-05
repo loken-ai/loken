@@ -3,6 +3,10 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// The layers of a model whose residual mixes through Sinkhorn projections around latent
+/// attention.
+mod wide_sparse;
+
 // ------------------------------------------------------------
 // Parallel loading helpers
 // ------------------------------------------------------------
@@ -2915,6 +2919,7 @@ fn build_generic_layer(
         hyper,
         sparse,
         ngram,
+        sinkhorn: None,
     };
     // A layer that selects tokens reads its history from the one cache the selection reads.
     #[cfg(feature = "gpu")]
@@ -3400,6 +3405,7 @@ fn build_awq_layer(
         hyper: None,
         sparse: None,
         ngram: None,
+        sinkhorn: None,
     })
 }
 impl GenericHeteroTransformer {
@@ -3617,6 +3623,12 @@ impl GenericHeteroTransformer {
             plan.segments.len(),
             kv_quant
         );
+        // A file whose residual mixes through Sinkhorn projections is built by its own layer
+        // reader.
+        // Its blocks hold no dense attention and no dense feed-forward for the loop below.
+        if super::wide_sparse_config::WideSparseMeta::claims(content) {
+            return Self::from_wide_sparse(content, &source, plan, kv_quant, max_kv_seq_len);
+        }
         let free_before: HashMap<usize, u64> = cuda_devices
             .iter()
             .map(|(&i, d)| (i, crate::inference::place::expert_cache::free_now(d)))
@@ -4330,6 +4342,13 @@ impl GenericHeteroTransformer {
                     )
                 }
                 super::mixer::MixerKind::Absent => (placeholder()?, RawMixer::Absent),
+                // The family of these layers builds them with its Sinkhorn residual, before
+                // this loop.
+                super::mixer::MixerKind::LatentMqa => {
+                    return Err(crate::tensor::Error::msg(format!(
+                        "{prefix}: a latent attention over 1 key head is built with its wide residual"
+                    )))
+                }
             };
             // Phi2: attn_output bias
             let attn_output_bias_qt = if attends && f.has_attn_output_bias {
@@ -5221,6 +5240,7 @@ impl GenericHeteroTransformer {
             output_hyper,
             ngram: ngram_model,
             draft,
+            wide_sparse: None,
         };
         // The layers the plan gives a Vulkan device go there from the file's blocks.
         if plan
@@ -5778,6 +5798,7 @@ impl GenericHeteroTransformer {
             output_hyper: None,
             ngram: None,
             draft: None,
+            wide_sparse: None,
         })
     }
 }

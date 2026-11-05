@@ -802,14 +802,19 @@ impl GenericHeteroTransformer {
         self.config.rope_freq_base
     }
 
-    /// Whether the residual is wide: parallel streams behind gated mixers.
+    /// Whether the residual is wide: parallel streams behind gated or Sinkhorn mixers.
     pub fn is_wide(&self) -> bool {
-        self.output_hyper.is_some()
+        self.output_hyper.is_some() || self.wide_sparse.is_some()
     }
 
     /// Width of the residual a layer reads: the model width, times the streams of a wide one.
     pub fn stream_width(&self) -> usize {
-        self.config.embedding_length * self.config.hyper.map_or(1, |h| h.streams)
+        let streams = match (self.config.hyper, self.wide_sparse.as_ref()) {
+            (Some(h), _) => h.streams,
+            (None, Some(ws)) => ws.streams,
+            (None, None) => 1,
+        };
+        self.config.embedding_length * streams
     }
 
     /// The model width: the residual stream and the embedding.
@@ -2501,6 +2506,12 @@ impl GenericHeteroTransformer {
             }
             None => hidden,
         };
+        // A Sinkhorn wide residual starts the same way, and the state its layers pass to each
+        // other opens for the rows of this forward.
+        let hidden = match self.wide_sparse.as_ref() {
+            Some(ws) => ws.widen(&hidden, index_pos)?,
+            None => hidden,
+        };
 
         // -- Compute PLE per-layer inputs (Gemma4) ------------------------
         let ple_inputs: Option<Vec<Tensor>> = if self.ple_dim > 0 {
@@ -2989,7 +3000,18 @@ impl GenericHeteroTransformer {
             };
             self.last_feature = Some(f.to_dtype(crate::tensor::DType::F32)?);
         }
-        let mut logits = if let Some(oh) = self.output_hyper.as_ref() {
+        let mut logits = if let Some(ws) = self.wide_sparse.as_ref() {
+            // The streams collapse with the last layer's pre mix, then the final norm and the
+            // head run on the host.
+            let last = self
+                .layers
+                .last()
+                .and_then(|l| l.sinkhorn.as_ref())
+                .ok_or_else(|| {
+                    crate::tensor::Error::msg("a Sinkhorn wide residual without its last layer")
+                })?;
+            ws.logits(&last.ffn_mix, &hidden, all_positions)?
+        } else if let Some(oh) = self.output_hyper.as_ref() {
             // The final mixer is the output norm: it mixes the streams, then the head reads
             // the result.
             let (b, s, _) = hidden.dims3()?;

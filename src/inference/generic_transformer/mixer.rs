@@ -28,6 +28,11 @@ pub enum MixerKind {
     DeltaNet,
     /// Latent attention: `attn_q_a`, `attn_q_b`, `attn_kv_a_mqa`, `attn_kv_a_norm`, `attn_kv_b`.
     Mla,
+    /// Latent attention over 1 shared key head: `attn_q_a` and `attn_kv` without
+    /// `attn_kv_a_mqa`, under either spelling.
+    ///
+    /// The header's compress ratio of the layer says whether it attends over a window or a band.
+    LatentMqa,
     /// No mixing sublayer: the block is a feed-forward alone.
     Absent,
 }
@@ -39,8 +44,12 @@ pub fn layer_mixer_kind(content: &gguf_file::Content, il: usize) -> MixerKind {
             .tensor_infos
             .contains_key(&format!("blk.{il}.{suffix}"))
     };
+    // A converter writes the latent tensors bare or with the `.weight` suffix.
+    let has_either = |stem: &str| has(stem) || has(&format!("{stem}.weight"));
     if has("attn_kv_a_mqa.weight") {
         MixerKind::Mla
+    } else if has_either("attn_q_a") && has_either("attn_kv") {
+        MixerKind::LatentMqa
     } else if has("shortconv.conv.weight") {
         MixerKind::ShortConv
     } else if has("ssm_in.weight") {

@@ -116,6 +116,9 @@ mod wide;
 pub mod wide_sparse_config;
 #[cfg(test)]
 mod wide_sparse_config_tests;
+pub mod wide_sparse_layer;
+#[cfg(test)]
+mod wide_sparse_oracle_tests;
 pub use config::*;
 pub use dense::{text_bytes, DenseCheckpoint};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};
@@ -458,6 +461,9 @@ pub struct GenericTransformerLayer {
     pub sparse: Option<qsa::SparseAttention>,
     /// The gated n-gram features this layer adds to the residual before it mixes.
     pub ngram: Option<ngram::PleBlock>,
+    /// The Sinkhorn wide residual around the token mixer, with the norms, the mixer's output
+    /// projection and the feed-forward it holds, on a model whose residual mixes that way.
+    pub sinkhorn: Option<wide_sparse_layer::SinkhornBlock>,
 }
 
 impl std::fmt::Debug for GenericTransformerLayer {
@@ -638,6 +644,9 @@ pub struct GenericHeteroTransformer {
     ngram: Option<NgramModel>,
     /// The draft head the checkpoint shipped beside its layers, if the model came with one.
     draft: Option<draft_head::DraftHead>,
+    /// The pre mix carry, the band cell and the head of a model whose layers mix their residual
+    /// through Sinkhorn projections.
+    wide_sparse: Option<wide_sparse_layer::WideSparseHead>,
 }
 
 /// The model-level part of the n-gram embedding; the token history lives with its layer.
