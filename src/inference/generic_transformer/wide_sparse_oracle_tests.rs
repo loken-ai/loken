@@ -23,7 +23,7 @@ use crate::tensor::gguf_write::write_gguf_with_metadata;
 use crate::tensor::quantized::gguf_file::{open_mapped, MappedGguf};
 
 /// The oracle's band layouts: compress ratios, kv source layers, index source layers.
-const LAYOUTS: [(&[u32], &[u32], &[u32]); 2] =
+pub(super) const LAYOUTS: [(&[u32], &[u32], &[u32]); 2] =
     [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
 
 /// Tokens of the oracle's greedy run.
@@ -42,7 +42,7 @@ const BLOCK: usize = 6;
 const FROZEN_ROW_TOLERANCE: f32 = 1e-4;
 
 /// The records of a layout, in the order a forward builds on the one before.
-const RECORDS: [&str; 7] = [
+pub(super) const RECORDS: [&str; 7] = [
     "prefill",
     "decode",
     "verify",
@@ -54,7 +54,7 @@ const RECORDS: [&str; 7] = [
 
 /// One recorded array.
 #[derive(Debug, Clone)]
-enum Record {
+pub(super) enum Record {
     /// Row-major logits, `[rows, cols]`.
     Logits(usize, usize, Vec<f32>),
     /// Token ids.
@@ -86,7 +86,7 @@ fn ids(tokens: &[u32]) -> Tensor {
 }
 
 /// The synthetic model's file in a band layout, mapped.
-fn toy_file(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> MappedGguf {
+pub(super) fn toy_file(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> MappedGguf {
     let bands: Vec<bool> = (0..ratios.len())
         .map(|l| ratios[l] != 0 || kv_src.contains(&(l as u32)) || index_src.contains(&(l as u32)))
         .collect();
@@ -106,7 +106,11 @@ fn toy_file(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> MappedGguf {
 }
 
 /// The generic model of the synthetic file in a band layout, every layer on the host.
-fn generic(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> GenericHeteroTransformer {
+pub(super) fn generic(
+    ratios: &[u32],
+    kv_src: &[u32],
+    index_src: &[u32],
+) -> GenericHeteroTransformer {
     let MappedGguf { content, mmap, .. } = toy_file(ratios, kv_src, index_src);
     let plan = HeteroPlan::calculate_with_kv(ratios.len(), 1 << 20, &[], &[], 1.0, 0);
     GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
@@ -124,7 +128,7 @@ fn v41_decode(model: &DeepseekV41Model, tokens: &[u32], state: &mut DecodeState)
 }
 
 /// What the V4.1 path computes for layout `n`, as the oracle records it.
-fn record_v41(
+pub(super) fn record_v41(
     model: &DeepseekV41Model,
     tokens: &[u32],
     n: usize,
@@ -195,7 +199,7 @@ fn generic_decode(model: &mut GenericHeteroTransformer, tokens: &[u32], pos: usi
 /// A prefill and a verify return every position's logits, a prompt and a decode step the last
 /// one's.
 /// The rewind cuts the model back to the verified block's start.
-fn record_generic(
+pub(super) fn record_generic(
     model: &mut GenericHeteroTransformer,
     tokens: &[u32],
     n: usize,
@@ -245,7 +249,7 @@ fn record_generic(
 }
 
 /// The first value of `got` whose bits differ from `want`'s, or `None` when every bit agrees.
-fn bit_difference(want: &Record, got: &Record) -> Option<String> {
+pub(super) fn bit_difference(want: &Record, got: &Record) -> Option<String> {
     match (want, got) {
         (Record::Ids(w), Record::Ids(g)) => (w != g).then(|| format!("ids {g:?} != {w:?}")),
         (Record::Logits(wr, wc, w), Record::Logits(gr, gc, g)) => {

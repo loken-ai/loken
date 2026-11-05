@@ -210,6 +210,22 @@ pub struct CompressedBand {
 }
 
 impl CompressedBand {
+    /// Bytes of the weights every token reads, as held: the window mixer's projections, the
+    /// indexer's query factor, head weights and key projection, and the pooling weights.
+    ///
+    /// The F32 weights count 4 bytes a value.
+    pub fn resident_bytes(&self) -> usize {
+        let dense = |t: &Tensor| t.elem_count() * std::mem::size_of::<f32>();
+        let indexer = self.indexer.as_ref().map_or(0, |i| {
+            i.wq_b.bytes() + dense(&i.weights_proj) + i.wk.as_ref().map_or(0, dense)
+        });
+        let compressor = self
+            .compressor
+            .as_ref()
+            .map_or(0, |c| dense(&c.wkv) + c.wgate.as_ref().map_or(0, dense));
+        self.base.resident_bytes() + indexer + compressor
+    }
+
     /// The layer over the window mixer `base`, with the weights of its roles.
     pub fn new(
         base: LatentMqa,

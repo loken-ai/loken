@@ -116,6 +116,12 @@ pub struct LatentMqa {
 }
 
 impl LatentMqa {
+    /// Bytes of the projections every token reads, as held: the query factors, the key row
+    /// and the grouped output.
+    pub fn resident_bytes(&self) -> usize {
+        self.w.wq_a.bytes() + self.w.wq_b.bytes() + self.w.wkv.bytes() + self.w.wo_a.bytes()
+    }
+
     /// The layer over `w`. `inv_freq` holds `rope_dim / 2` frequencies.
     pub fn new(dims: LatentMqaDims, w: LatentMqaWeights, inv_freq: Vec<f32>) -> Result<Self> {
         let d = dims;

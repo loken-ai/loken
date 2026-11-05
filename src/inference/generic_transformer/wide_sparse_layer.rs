@@ -328,3 +328,32 @@ impl WideSparseHead {
         }
     }
 }
+
+impl GenericHeteroTransformer {
+    /// Bytes of the weights every token of a Sinkhorn wide-residual model reads, as held.
+    ///
+    /// Per layer: the token mixer's resident weights, its output projection, the router with
+    /// its bias and the shared expert.
+    /// Then the head.
+    /// The routed experts are not counted.
+    /// `None` for a model of another kind.
+    pub fn resident_path_bytes(&self) -> Option<u64> {
+        let mut bytes = self.wide_sparse.as_ref()?.head.bytes();
+        for layer in &self.layers {
+            let block = layer.sinkhorn.as_ref()?;
+            bytes += match &layer.mixer {
+                mixer::Mixer::LatentMqa(m) => m.resident_bytes(),
+                mixer::Mixer::CompressedBand(b) => b.resident_bytes(),
+                _ => return None,
+            };
+            let ffn = &block.ffn;
+            let shared = ffn
+                .shared
+                .as_ref()
+                .map_or(0, |s| s.gate.bytes() + s.up.bytes() + s.down.bytes());
+            let bias = ffn.bias.len() * std::mem::size_of::<f32>();
+            bytes += block.output.bytes() + ffn.router.bytes() + bias + shared;
+        }
+        Some(bytes as u64)
+    }
+}

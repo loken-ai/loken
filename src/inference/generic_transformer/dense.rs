@@ -23,6 +23,9 @@ use crate::tensor::{Error, Result, Shape};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+mod block_scaled;
+pub use block_scaled::BlockScaledCheckpoint;
+
 /// One mapped shard, its tensors listed under loader names.
 pub(super) struct DensePart {
     pub content: Content,

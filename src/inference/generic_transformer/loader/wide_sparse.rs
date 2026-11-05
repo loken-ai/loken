@@ -7,6 +7,7 @@
 //! Its feed-forward is a sqrt-softplus router over routed experts, beside a shared expert.
 //!
 //! Each tensor is read under every spelling a converter writes for it.
+//! The tensors come from a GGUF file or from a block-scaled checkpoint.
 //! A projection is read in place when a host kernel reads its format, else held dense F32.
 //! Norms, mixing weights, the router and the pooling and index weights are held dense F32.
 //! Every layer and the head run on the host.
@@ -15,6 +16,7 @@ use super::super::block_scaled_experts::BlockScaledExpert;
 use super::super::compressed_band::{
     BandCell, BandDims, BandIndexerWeights, CompressedBand, CompressorWeights,
 };
+use super::super::dense::BlockScaledCheckpoint;
 use super::super::hyper::sinkhorn::{SinkhornMeta, SinkhornMixer};
 use super::super::latent_mqa::{frequencies, LatentMqa, LatentMqaDims, LatentMqaWeights};
 use super::super::wide_sparse_config::{LayerKind, WideSparseMeta};
@@ -23,6 +25,92 @@ use super::super::*;
 use super::TensorSource;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::quantized::GgmlDType;
+
+/// Where the builder reads a tensor, by the loader's name.
+enum Tensors<'s, 'a> {
+    /// A GGUF file through the loader's source.
+    /// The routed experts are views of their stacks.
+    File {
+        content: &'s gguf_file::Content,
+        source: &'s TensorSource<'a>,
+    },
+    /// A block-scaled checkpoint.
+    /// The routed experts are views of their own matrices.
+    Checkpoint(&'s BlockScaledCheckpoint),
+}
+
+impl Tensors<'_, '_> {
+    /// Whether the source holds `name`.
+    fn has(&self, name: &str) -> bool {
+        match self {
+            Self::File { content, .. } => content.tensor_infos.contains_key(name),
+            Self::Checkpoint(ck) => ck.has(name),
+        }
+    }
+
+    /// `name` held dense F32 on the host.
+    fn dense(&self, name: &str) -> Result<Tensor> {
+        match self {
+            Self::File { source, .. } => {
+                // CONVERSION: norms, mixing weights, the router and the pooling and index weights
+                // are held dense F32, the form the layer's host arithmetic reads.
+                source
+                    .read(name, &Device::Cpu)?
+                    .dequantize(&Device::Cpu)?
+                    .to_dtype(DType::F32)
+            }
+            Self::Checkpoint(ck) => ck.dense_f32(name),
+        }
+    }
+
+    /// `name` in place when a host kernel reads its format, else held dense F32.
+    fn projection(&self, name: &str) -> Result<Projection> {
+        match self {
+            Self::File { source, .. } => {
+                let qt = source.read(name, &Device::Cpu)?;
+                if crate::tensor::quant_view::native_view_supported(qt.dtype()) {
+                    return Ok(Projection::Quant(Arc::new(qt)));
+                }
+                // CONVERSION: a format no host kernel reads in place is held dense F32.
+                Ok(Projection::Dense(
+                    qt.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?,
+                ))
+            }
+            Self::Checkpoint(ck) => ck.projection(name),
+        }
+    }
+
+    /// The stack `name` of a layer's routed experts.
+    ///
+    /// `None` when the source holds no such stack.
+    /// A checkpoint holds every expert as its own matrices.
+    fn stack(&self, name: &str) -> Result<Option<Arc<QTensor>>> {
+        match self {
+            Self::File { source, .. } => source.read(name, &Device::Cpu).map(|q| Some(Arc::new(q))),
+            Self::Checkpoint(_) => Ok(None),
+        }
+    }
+
+    /// The embedding table `name`.
+    ///
+    /// A file's table is kept in its stored blocks.
+    /// A checkpoint's is held dense F32.
+    fn embedding(&self, name: &str) -> Result<Embedding> {
+        match self {
+            Self::File { source, .. } => {
+                Embedding::from_stored(Arc::new(source.read(name, &Device::Cpu)?))
+            }
+            Self::Checkpoint(ck) => Ok(Embedding::new(ck.dense_f32(name)?)),
+        }
+    }
+
+    /// The load is over.
+    fn finish(&self) {
+        if let Self::File { source, .. } = self {
+            source.count.finish();
+        }
+    }
+}
 
 /// The names block `il` may carry a tensor under: each stem bare, then with the `.weight`
 /// suffix.
@@ -132,6 +220,62 @@ impl GenericHeteroTransformer {
         max_kv_seq_len: Option<usize>,
     ) -> Result<Self> {
         let meta = WideSparseMeta::from_file(content)?;
+        let arch = content
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok().cloned())
+            .unwrap_or_default();
+        Self::build_wide_sparse(
+            &meta,
+            &arch,
+            &Tensors::File { content, source },
+            plan,
+            kv_quant,
+            max_kv_seq_len,
+        )
+    }
+
+    /// The model a block-scaled checkpoint holds, described by its reference arguments.
+    ///
+    /// The routed experts are views of the checkpoint's shards.
+    /// A checkpoint that declares n-gram hash layers is refused.
+    /// Every layer and the head run on the host.
+    pub fn from_block_scaled(
+        checkpoint: &BlockScaledCheckpoint,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
+        max_kv_seq_len: Option<usize>,
+    ) -> Result<Self> {
+        let hashed = checkpoint
+            .reference
+            .get("engram_layer_ids")
+            .and_then(|v| v.as_array())
+            .is_some_and(|layers| !layers.is_empty());
+        if hashed {
+            crate::tensor::bail!(
+                "the n-gram hash layers of this checkpoint do not run on the generic route"
+            );
+        }
+        let meta = WideSparseMeta::from_reference(&checkpoint.reference, None)?;
+        Self::build_wide_sparse(
+            &meta,
+            crate::inference::model::deepseek_v41::ARCH,
+            &Tensors::Checkpoint(checkpoint),
+            plan,
+            kv_quant,
+            max_kv_seq_len,
+        )
+    }
+
+    /// The model `meta` describes, its tensors read from `tensors`.
+    fn build_wide_sparse(
+        meta: &WideSparseMeta,
+        arch: &str,
+        tensors: &Tensors<'_, '_>,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
+        max_kv_seq_len: Option<usize>,
+    ) -> Result<Self> {
         let n_layers = meta.n_layers;
         let on_host = plan
             .segments
@@ -147,42 +291,17 @@ impl GenericHeteroTransformer {
                 "the n-gram hash layers of this file do not run on the generic route"
             );
         }
-        let arch = content
-            .metadata
-            .get("general.architecture")
-            .and_then(|v| v.to_string().ok().cloned())
-            .unwrap_or_default();
 
-        let present = |names: &[String]| -> Option<String> {
-            names
-                .iter()
-                .find(|n| content.tensor_infos.contains_key(n.as_str()))
-                .cloned()
-        };
+        let present =
+            |names: &[String]| -> Option<String> { names.iter().find(|n| tensors.has(n)).cloned() };
         let need = |names: &[String]| -> Result<String> {
             present(names).ok_or_else(|| {
                 let first = names.first().map_or("", String::as_str);
                 crate::tensor::Error::msg(format!("missing tensor: {first}"))
             })
         };
-        let dense = |name: &str| -> Result<Tensor> {
-            // CONVERSION: norms, mixing weights, the router and the pooling and index weights are
-            // held dense F32, the form the layer's host arithmetic reads.
-            source
-                .read(name, &Device::Cpu)?
-                .dequantize(&Device::Cpu)?
-                .to_dtype(DType::F32)
-        };
-        let projection = |name: &str| -> Result<Projection> {
-            let qt = source.read(name, &Device::Cpu)?;
-            if crate::tensor::quant_view::native_view_supported(qt.dtype()) {
-                return Ok(Projection::Quant(Arc::new(qt)));
-            }
-            // CONVERSION: a format no host kernel reads in place is held dense F32.
-            Ok(Projection::Dense(
-                qt.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?,
-            ))
-        };
+        let dense = |name: &str| tensors.dense(name);
+        let projection = |name: &str| tensors.projection(name);
         // A projection field of the layer that its forward never reads.
         let placeholder = || -> Result<QMatMul> {
             let side = GgmlDType::Q8_0.block_size();
@@ -203,7 +322,7 @@ impl GenericHeteroTransformer {
         let eps = meta.rms_eps as f32;
         let carry = Arc::new(PreMixCarry::default());
         let cell = Arc::new(BandCell::default());
-        let config = Arc::new(generic_config(&meta, &arch, kv_quant, max_kv_seq_len));
+        let config = Arc::new(generic_config(meta, arch, kv_quant, max_kv_seq_len));
         let flags = Arc::new(config.flags.clone());
         let m = &meta.mixture;
 
@@ -231,7 +350,7 @@ impl GenericHeteroTransformer {
                 ),
             };
             let window = LatentMqa::new(
-                LatentMqaDims::from_meta(&meta),
+                LatentMqaDims::from_meta(meta),
                 LatentMqaWeights {
                     wq_a: projection(&name(&["attn_q_a"])?)?,
                     q_norm: dense(&name(&["attn_q_a_norm"])?)?,
@@ -246,7 +365,7 @@ impl GenericHeteroTransformer {
                 inv_freq,
             )?;
             // A kv-source holds the pooling weights, an index-source the indexer's.
-            let token_mixer = match BandDims::from_meta(&meta, il) {
+            let token_mixer = match BandDims::from_meta(meta, il) {
                 None => mixer::Mixer::LatentMqa(window),
                 Some(band) => {
                     let compressor = match band.kv_source {
@@ -294,9 +413,10 @@ impl GenericHeteroTransformer {
 
             // The routed experts: 1 stack per projection, or 3 tensors of its own per expert.
             let stack = |stem: &str| -> Result<Option<Arc<QTensor>>> {
-                present(&spellings(il, &[stem]))
-                    .map(|n| source.read(&n, &Device::Cpu).map(Arc::new))
-                    .transpose()
+                match present(&spellings(il, &[stem])) {
+                    Some(n) => tensors.stack(&n),
+                    None => Ok(None),
+                }
             };
             let one = |stack: &Arc<QTensor>, e: usize| -> Result<Projection> {
                 if !crate::tensor::quant_view::native_view_supported(stack.dtype()) {
@@ -496,7 +616,7 @@ impl GenericHeteroTransformer {
         }
 
         let embed = need(&["token_embd".to_string(), "token_embd.weight".to_string()])?;
-        let embeddings = Embedding::from_stored(Arc::new(source.read(&embed, &Device::Cpu)?))?;
+        let embeddings = tensors.embedding(&embed)?;
         let norm = dense(&need(&[
             "output_norm".to_string(),
             "output_norm.weight".to_string(),
@@ -514,7 +634,7 @@ impl GenericHeteroTransformer {
             eps,
             head,
         };
-        source.count.finish();
+        tensors.finish();
         Ok(Self {
             adapters: Vec::new(),
             config,

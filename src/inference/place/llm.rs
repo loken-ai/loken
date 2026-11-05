@@ -200,6 +200,25 @@ pub fn tensor_parallel(
         .then(|| ranked.iter().map(|(idx, _)| *idx).collect())
 }
 
+/// What a Sinkhorn wide-residual model with latent attention asks of the cards at `tokens` of
+/// context: its blocks, its head, the cache of its largest layer for each block, and
+/// `runtime_reserve` beside them.
+pub fn wide_sparse_demand(
+    meta: &crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta,
+    block_bytes: u64,
+    head_bytes: u64,
+    tokens: usize,
+    runtime_reserve: u64,
+) -> Demand {
+    Demand {
+        layers: meta.n_layers,
+        block_bytes,
+        head_bytes,
+        kv_bytes_per_layer: meta.kv_bytes_per_layer(tokens),
+        runtime_reserve,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

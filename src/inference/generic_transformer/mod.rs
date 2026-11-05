@@ -45,6 +45,8 @@ mod card_host_parity;
 mod wide_tests;
 
 pub mod block_scaled_experts;
+#[cfg(test)]
+mod block_scaled_oracle_tests;
 pub mod compressed_band;
 mod config;
 #[cfg(test)]
@@ -119,8 +121,10 @@ mod wide_sparse_config_tests;
 pub mod wide_sparse_layer;
 #[cfg(test)]
 mod wide_sparse_oracle_tests;
+#[cfg(test)]
+mod wide_sparse_plan_tests;
 pub use config::*;
-pub use dense::{text_bytes, DenseCheckpoint};
+pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};
 pub use moe_weights::*;
 pub use segment::LayerRates;

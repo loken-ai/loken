@@ -550,6 +550,55 @@ impl WideSparseMeta {
         Ok(meta)
     }
 
+    /// Bytes layer `il` holds of what `tokens` tokens leave, every value f32.
+    ///
+    /// Every layer keeps its window of key rows, `head_dim` wide.
+    /// A kv-source also keeps 1 compressed row per `ratio` tokens, `head_dim` wide.
+    /// A kv-source that is an index-source keeps 1 index key per compressed row,
+    /// `index_head_dim` wide.
+    /// A kv-source keeps the input rows of the group still filling, `d_model` wide.
+    pub fn cache_bytes(&self, il: usize, tokens: usize) -> u64 {
+        let window = tokens.min(self.window) * self.head_dim;
+        let band = match self.layer_kind(il) {
+            LayerKind::Compressed {
+                ratio,
+                kv_source: true,
+                index_source,
+            } => {
+                let groups = tokens / ratio;
+                let keys = if index_source {
+                    groups * self.indexer.head_dim
+                } else {
+                    0
+                };
+                groups * self.head_dim + keys + tokens % ratio * self.d_model
+            }
+            _ => 0,
+        };
+        ((window + band) * std::mem::size_of::<f32>()) as u64
+    }
+
+    /// The cache bytes a plan reserves for each layer at `tokens`: the largest layer's.
+    pub fn kv_bytes_per_layer(&self, tokens: usize) -> u64 {
+        (0..self.n_layers)
+            .map(|il| self.cache_bytes(il, tokens))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Bytes a token adds to a stored state's blocks, at least 1.
+    ///
+    /// Per layer that compresses, 1 compressed row and 1 index key per `ratio` tokens, in f32.
+    pub fn state_bytes_per_token(&self) -> usize {
+        self.compress_ratios
+            .iter()
+            .take(self.n_layers)
+            .filter(|&&r| r > 0)
+            .map(|&r| (self.head_dim + self.indexer.head_dim) * std::mem::size_of::<f32>() / r)
+            .sum::<usize>()
+            .max(1)
+    }
+
     /// A description of a model without routed experts is not of this family.
     fn check(&self) -> Result<()> {
         if self.mixture.routed == 0 {
