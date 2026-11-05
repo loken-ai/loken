@@ -33,7 +33,11 @@ fn card_present() -> bool {
 }
 
 /// The generic model of the synthetic file, every layer on card 0.
-fn generic_on_card(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> GenericHeteroTransformer {
+pub(super) fn generic_on_card(
+    ratios: &[u32],
+    kv_src: &[u32],
+    index_src: &[u32],
+) -> GenericHeteroTransformer {
     on_card(toy_file(ratios, kv_src, index_src), ratios.len())
 }
 

@@ -160,6 +160,8 @@ mod wide_sparse_oracle_tests;
 mod wide_sparse_plan_tests;
 #[cfg(test)]
 mod wide_sparse_quality_tests;
+#[cfg(all(test, feature = "cuda"))]
+mod wide_sparse_real_card_tests;
 #[cfg(test)]
 mod wide_sparse_real_tests;
 #[cfg(test)]

@@ -16,19 +16,19 @@ use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::quantized::gguf_source::SplitGguf;
 
 /// The store tag of the file the test reads.
-const TAG: &str = "deepseek-v4.1-flash:iq2-q6attn";
+pub(super) const TAG: &str = "deepseek-v4.1-flash:iq2-q6attn";
 
 /// The text whose tokens both routes prefill.
-const PROMPT: &str = "The capital of France is";
+pub(super) const PROMPT: &str = "The capital of France is";
 
 /// Greedy tokens each route decodes after the prompt.
-const STEPS: usize = 4;
+pub(super) const STEPS: usize = 4;
 
 /// Logits listed per route.
 const TOP: usize = 10;
 
 /// The path of the blob a store tag names.
-fn blob(tag: &str) -> std::path::PathBuf {
+pub(super) fn blob(tag: &str) -> std::path::PathBuf {
     let store = crate::config::Config::load_test().get_ollama_models_dir();
     let (name, ver) = tag.split_once(':').unwrap_or((tag, "latest"));
     let manifest = std::fs::read_to_string(
@@ -51,7 +51,7 @@ fn blob(tag: &str) -> std::path::PathBuf {
 }
 
 /// The tokens of the prompt: the file's own tokenizer, after the begin token it names.
-fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u32> {
+pub(super) fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u32> {
     use crate::inference::engine::llm_engine::{build_tokenizer_from_gguf, EMBEDDED_TOKENIZER_KEY};
     let text = |k: &str| {
         content
@@ -74,13 +74,13 @@ fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u32
 }
 
 /// The last row of logits of any rank.
-fn row(t: &Tensor) -> Vec<f32> {
+pub(super) fn row(t: &Tensor) -> Vec<f32> {
     let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     let cols = *t.dims().last().unwrap();
     v[v.len() - cols..].to_vec()
 }
 
-fn argmax(r: &[f32]) -> u32 {
+pub(super) fn argmax(r: &[f32]) -> u32 {
     r.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
@@ -96,7 +96,7 @@ fn top(r: &[f32]) -> Vec<(usize, f32)> {
 }
 
 /// The resident set of this process in MB.
-fn resident_mb() -> u64 {
+pub(super) fn resident_mb() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| {
@@ -246,7 +246,7 @@ fn wide_sparse_real_generic_against_v41() {
 /// Drops the file's pages from the page cache, so a run that follows starts cold.
 ///
 /// The mappings of the file must be gone: a mapped page stays.
-fn evict(path: &std::path::Path) {
+pub(super) fn evict(path: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::File::open(path).expect("the file opens");
     // SAFETY: the descriptor is open for the whole call.
@@ -255,7 +255,7 @@ fn evict(path: &std::path::Path) {
 }
 
 /// Seconds a closure takes, with its value.
-fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
+pub(super) fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
     let t = Instant::now();
     let r = f();
     (r, t.elapsed().as_secs_f64())
@@ -263,10 +263,10 @@ fn timed<R>(f: impl FnOnce() -> R) -> (R, f64) {
 
 /// Seconds per named stage, summed over the calls.
 #[derive(Default)]
-struct Stages(std::collections::BTreeMap<&'static str, (f64, u64)>);
+pub(super) struct Stages(std::collections::BTreeMap<&'static str, (f64, u64)>);
 
 impl Stages {
-    fn time<R>(&mut self, name: &'static str, f: impl FnOnce() -> R) -> R {
+    pub(super) fn time<R>(&mut self, name: &'static str, f: impl FnOnce() -> R) -> R {
         let (r, s) = timed(f);
         let e = self.0.entry(name).or_default();
         e.0 += s;
@@ -274,7 +274,7 @@ impl Stages {
         r
     }
 
-    fn print(&self, who: &str) {
+    pub(super) fn print(&self, who: &str) {
         for (name, (s, n)) in &self.0 {
             println!("{who} stage {name:<22} {s:8.3}s over {n} calls");
         }
@@ -283,7 +283,7 @@ impl Stages {
 
 /// A forward of the generic model over `ids` from `pos`, stage by stage, as `forward_sinkhorn`
 /// runs it. The last row of logits comes back. A layer with an engram runs whole.
-fn staged_forward(
+pub(super) fn staged_forward(
     model: &mut GenericHeteroTransformer,
     ids: &[u32],
     pos: usize,
@@ -329,9 +329,12 @@ fn staged_forward(
                 )
             })
             .unwrap();
-        let mixed = st
-            .time("attention mixer", || layer.mixer.forward(&input, pos))
-            .unwrap();
+        let kind = match &layer.mixer {
+            super::mixer::Mixer::LatentMqa(_) => "mixer latent",
+            super::mixer::Mixer::CompressedBand(_) => "mixer band",
+            _ => "attention mixer",
+        };
+        let mixed = st.time(kind, || layer.mixer.forward(&input, pos)).unwrap();
         let (b, s, width) = mixed.dims3().unwrap();
         let out = st
             .time("attention output", || {
