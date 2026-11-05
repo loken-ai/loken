@@ -47,6 +47,8 @@ mod wide_tests;
 pub mod block_scaled_experts;
 #[cfg(test)]
 mod block_scaled_oracle_tests;
+#[cfg(test)]
+mod cb_variant_tests;
 pub mod compressed_band;
 mod config;
 #[cfg(test)]
@@ -125,6 +127,8 @@ mod vulkan_layers;
 #[cfg(all(test, feature = "vulkan"))]
 mod vulkan_parity;
 mod wide;
+#[cfg(test)]
+mod wide_sparse_batch_tests;
 pub mod wide_sparse_config;
 #[cfg(test)]
 mod wide_sparse_config_tests;

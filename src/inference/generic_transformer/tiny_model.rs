@@ -101,6 +101,19 @@ pub(crate) fn write_moe(tag: &str, layers: usize) -> std::path::PathBuf {
 
 /// The tiny mixture's shape with its experts, or with a dense feed-forward of their width.
 pub(crate) fn write_wide(tag: &str, layers: usize, routed: bool) -> std::path::PathBuf {
+    write_wide_with(tag, layers, routed, Vec::new())
+}
+
+/// Width of a head of the tiny mixture: its width over its 2 heads.
+pub(crate) const MOE_HEAD_DIM: usize = MOE_EMBD / 2;
+
+/// [`write_wide`] with `extra` keys added to the header.
+pub(crate) fn write_wide_with(
+    tag: &str,
+    layers: usize,
+    routed: bool,
+    extra: Vec<(String, Value)>,
+) -> std::path::PathBuf {
     let mut seed = 11u32;
     let mut entry = |name: String, dims: Vec<usize>| {
         let n: usize = dims.iter().product();
@@ -186,6 +199,7 @@ pub(crate) fn write_wide(tag: &str, layers: usize, routed: bool) -> std::path::P
                 .into_iter()
                 .flatten(),
         )
+        .chain(extra)
         .collect();
     let dir = std::env::temp_dir().join(format!("loken-tiny-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

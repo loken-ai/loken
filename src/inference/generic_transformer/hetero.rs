@@ -35,6 +35,60 @@ fn note_if_non_finite(stage: &str, x: &Tensor) {
     }
 }
 
+/// `x` `[rows, heads, head_dim]` rotated by `layer`'s own tables, row `i` at `positions[i]`.
+///
+/// Each row gets the rotation the layer's serial forward gives a token at that position.
+/// The rows stand on the position axis of the serial `[1, heads, seq, head_dim]` layout.
+fn rotate_rows_by_table(
+    layer: &GenericTransformerLayer,
+    x: &Tensor,
+    positions: &[usize],
+) -> Result<Tensor> {
+    let table = layer.rope_table();
+    let dev = x.device();
+    let mut cos = Vec::with_capacity(positions.len());
+    let mut sin = Vec::with_capacity(positions.len());
+    for &p in positions {
+        let (c, s) = table.rows(p, 1, &dev)?;
+        cos.push(c);
+        sin.push(s);
+    }
+    let cos = Tensor::cat(&cos.iter().collect::<Vec<_>>(), 0)?;
+    let sin = Tensor::cat(&sin.iter().collect::<Vec<_>>(), 0)?;
+    let heads_first = x.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+    layer
+        .apply_rotary_with(&heads_first, &cos, &sin)?
+        .squeeze(0)?
+        .transpose(0, 1)?
+        .contiguous()
+}
+
+/// The mixture block of `layer` over the rows `hn` `[rows, hidden]` of several prompts.
+///
+/// The rows `start..start + len` of each span go through the block as one forward of their
+/// prompt alone.
+/// `residual` holds the rows `hn` was normed from.
+fn moe_rows_per_prompt(
+    layer: &GenericTransformerLayer,
+    moe: &MoeWeights,
+    hn: &Tensor,
+    residual: &Tensor,
+    spans: &[(usize, usize)],
+) -> Result<Tensor> {
+    let parts = spans
+        .iter()
+        .map(|&(start, len)| {
+            moe.forward_rows(
+                &hn.narrow(0, start, len)?.contiguous()?.unsqueeze(0)?,
+                &residual.narrow(0, start, len)?.contiguous()?.unsqueeze(0)?,
+                layer.embedding_length_for_moe,
+                layer.ffn_norm_eps,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?.squeeze(0)
+}
+
 /// Whether the input stage of a prefill layer runs as one launch: the head norms, the
 /// rotation, and the write of k and v into the paged store.
 ///
@@ -731,11 +785,14 @@ impl GenericHeteroTransformer {
         if c.final_logit_softcapping.is_some() {
             return Some("logit softcapping");
         }
-        if c.yarn.is_some() {
-            return Some("yarn");
+        // The host paths rotate with each layer's own tables.
+        // The card paths rotate with the plain base.
+        let host = self.cb_on_host();
+        if c.yarn.is_some() && !host {
+            return Some("yarn on a card");
         }
-        if c.rope_dim.unwrap_or(0) != 0 && c.rope_dim != Some(c.head_dim) {
-            return Some("partial rope");
+        if self.cb_partial_rope() && !host {
+            return Some("partial rope on a card");
         }
         for l in &self.layers {
             let split = l.attn_q.is_some() && l.attn_k.is_some() && l.attn_v.is_some();
@@ -761,8 +818,15 @@ impl GenericHeteroTransformer {
             if l.attn_q_norm.is_some() != l.attn_k_norm.is_some() {
                 return Some("asymmetric QK-norm");
             }
-            if l.moe.is_some() {
-                return Some("MoE");
+            // The host paths route each row of a mixture alone.
+            // The card paths carry no expert block.
+            if let Some(moe) = l.moe.as_ref() {
+                if !host {
+                    return Some("MoE on a card");
+                }
+                if !moe.router_prenormed {
+                    return Some("MoE beside a dense feed-forward");
+                }
             }
             if l.attn_sinks.is_some() {
                 return Some("attention sinks");
@@ -777,6 +841,27 @@ impl GenericHeteroTransformer {
     /// True if this model can be served through the continuous-batch worker.
     pub fn cb_eligible(&self) -> bool {
         self.cb_unsupported_reason().is_none()
+    }
+
+    /// Every layer and the batched forward's device are the host.
+    fn cb_on_host(&self) -> bool {
+        self.compute_device().is_cpu()
+            && self
+                .layer_devs
+                .iter()
+                .all(|d| matches!(d, LayerDevice::Cpu))
+    }
+
+    /// The rotation covers part of each head.
+    fn cb_partial_rope(&self) -> bool {
+        let c = &self.config;
+        c.rope_dim.unwrap_or(0) != 0 && c.rope_dim != Some(c.head_dim)
+    }
+
+    /// The batched paths rotate with each layer's own tables, not with the plain base: a
+    /// stretched or partial rotation.
+    fn cb_rope_from_tables(&self) -> bool {
+        self.config.yarn.is_some() || self.cb_partial_rope()
     }
 
     /// Whether the tokens' positions come from a learned table added to their embeddings.
@@ -962,8 +1047,9 @@ impl GenericHeteroTransformer {
     /// attends over `block_tables[b]` (`context_lens[b]` tokens). Returns logits
     /// `[B, vocab]`.
     ///
-    /// FIRST CUT - dense CPU path only (split Q/K/V, full RoPE, SwiGLU, serial
-    /// attention, no QK-norm / PLE / MoE / special scales / YaRN). Anything else
+    /// The variants it serves are the ones `cb_unsupported_reason` lets through: on the host
+    /// that includes a mixture, routed row by row, and a stretched or partial rotation, taken
+    /// from each layer's tables. Anything else
     /// -> `Err` so the caller falls back to the serial engine. The batched
     /// projections (one GEMM over B rows) are the throughput win; RoPE + paged
     /// attention run per-sequence in f32 (the slow parts a fused paged-attention
@@ -1019,6 +1105,7 @@ impl GenericHeteroTransformer {
         // RoPE cos/sin depend only on positions - compute ONCE, reuse every layer.
         let (rcos, rsin) =
             crate::inference::cache::paged_attention::rope_cos_sin(positions, hd, base, &dev, cdt)?;
+        let table_rope = self.cb_rope_from_tables();
         // Ragged attention mask (GPU path, any B) depends only on lens - compute ONCE.
         let ragged_mask = if !dev.is_cpu() {
             let max_ctx = *context_lens.iter().max().unwrap();
@@ -1152,20 +1239,29 @@ impl GenericHeteroTransformer {
             } else {
                 kh
             };
-            let q_rot = crate::inference::cache::paged_attention::rope_apply(
-                &qh,
-                &rcos,
-                &rsin,
-                self.config.flags.use_rope_i,
-            )?
-            .reshape(&[b, nh * hd][..])?;
-            let k_rot = crate::inference::cache::paged_attention::rope_apply(
-                &kh,
-                &rcos,
-                &rsin,
-                self.config.flags.use_rope_i,
-            )?
-            .reshape(&[b, nkv * hd][..])?;
+            let (q_rot, k_rot) = if table_rope {
+                (
+                    rotate_rows_by_table(layer, &qh, positions)?,
+                    rotate_rows_by_table(layer, &kh, positions)?,
+                )
+            } else {
+                (
+                    crate::inference::cache::paged_attention::rope_apply(
+                        &qh,
+                        &rcos,
+                        &rsin,
+                        self.config.flags.use_rope_i,
+                    )?,
+                    crate::inference::cache::paged_attention::rope_apply(
+                        &kh,
+                        &rcos,
+                        &rsin,
+                        self.config.flags.use_rope_i,
+                    )?,
+                )
+            };
+            let q_rot = q_rot.reshape(&[b, nh * hd][..])?;
+            let k_rot = k_rot.reshape(&[b, nkv * hd][..])?;
             let v_f = v.to_dtype(cdt)?;
             if let Some((slot_dev, _, _, _)) = paged_dev.as_ref() {
                 crate::inference::kernel::fused::paged_kv_write(
@@ -1294,6 +1390,23 @@ impl GenericHeteroTransformer {
                 .unwrap()
                 .forward(&x)?
                 .to_dtype(cdt)?;
+            if let Some(moe) = layer.moe.as_ref() {
+                // Under the decode order each row routes and sums its experts as the decoded
+                // token it stands for, whatever rows share the batch.
+                let _order = crate::tensor::quantized::DecodeOrder::enter();
+                let d = moe
+                    .forward_rows(
+                        &hn2.unsqueeze(0)?,
+                        &residual2.unsqueeze(0)?,
+                        layer.embedding_length_for_moe,
+                        layer.ffn_norm_eps,
+                    )?
+                    .squeeze(0)?
+                    .to_dtype(cdt)?;
+                x = residual2.broadcast_add(&d)?;
+                note_if_non_finite(&format!("layer {li}"), &x);
+                continue;
+            }
             // gate/up: split weights OR fused gate||up in ffn_up ([B,2.ffn_dim], qwen3/Phi3).
             let (g, u) = if let Some(gate) = layer.ffn_gate.as_ref() {
                 (
@@ -1865,6 +1978,9 @@ impl GenericHeteroTransformer {
         let (rcos, rsin) = crate::inference::cache::paged_attention::rope_cos_sin(
             &positions, hd, base, &dev, cdt,
         )?;
+        let table_rope = self.cb_rope_from_tables();
+        // The rows of each prompt: a mixture routes them as one forward of that prompt alone.
+        let spans: Vec<(usize, usize)> = starts.iter().copied().zip(lens.iter().copied()).collect();
 
         let mut slot_index: Vec<(usize, Device, Tensor)> = Vec::new();
         // The slot of each row, read on the card by the kernel that writes the store.
@@ -2008,18 +2124,27 @@ impl GenericHeteroTransformer {
                     } else {
                         kh
                     };
-                    let q_rot = crate::inference::cache::paged_attention::rope_apply(
-                        &qh,
-                        &rcos,
-                        &rsin,
-                        self.config.flags.use_rope_i,
-                    )?;
-                    let k_rot = crate::inference::cache::paged_attention::rope_apply(
-                        &kh,
-                        &rcos,
-                        &rsin,
-                        self.config.flags.use_rope_i,
-                    )?;
+                    let (q_rot, k_rot) = if table_rope {
+                        (
+                            rotate_rows_by_table(layer, &qh, &positions)?,
+                            rotate_rows_by_table(layer, &kh, &positions)?,
+                        )
+                    } else {
+                        (
+                            crate::inference::cache::paged_attention::rope_apply(
+                                &qh,
+                                &rcos,
+                                &rsin,
+                                self.config.flags.use_rope_i,
+                            )?,
+                            crate::inference::cache::paged_attention::rope_apply(
+                                &kh,
+                                &rcos,
+                                &rsin,
+                                self.config.flags.use_rope_i,
+                            )?,
+                        )
+                    };
                     let v_f = v.to_dtype(cdt)?.reshape(&[t, nkv, hd][..])?;
                     // persist all T positions' K/V for the subsequent decode phase
                     // The scatter index depends on the slots, the row width and the card: built
@@ -2126,6 +2251,13 @@ impl GenericHeteroTransformer {
                 ffn_norm.forward(&x)?.to_dtype(cdt)?
             };
             let residual2 = x.clone();
+            if let Some(moe) = layer.moe.as_ref() {
+                // The next layer norms its own input: no fused sum leaves it one.
+                let d = moe_rows_per_prompt(layer, moe, &hn2, &residual2, &spans)?.to_dtype(cdt)?;
+                x = residual2.broadcast_add(&d)?;
+                note_if_non_finite(&format!("layer {li}"), &x);
+                continue;
+            }
             let act = if let Some(gate) = layer.ffn_gate.as_ref() {
                 let g = gate.forward(&hn2)?.to_dtype(cdt)?;
                 let u = layer.ffn_up.forward(&hn2)?.to_dtype(cdt)?;
@@ -2210,6 +2342,12 @@ impl GenericHeteroTransformer {
         stores: &mut [crate::inference::cache::paged_kv::PagedKvStore],
     ) -> Result<Tensor> {
         use crate::tensor::Tensor;
+        if self.layers.iter().any(|l| l.moe.is_some()) || self.cb_rope_from_tables() {
+            return Err(crate::tensor::Error::msg(
+                "paged_prefill_seq_cached: a mixture or a table rotation prefills through \
+                 paged_prefill_mixed",
+            ));
+        }
         let c = &self.config;
         let t = tokens.len();
         let tsfx = t - cached_len;

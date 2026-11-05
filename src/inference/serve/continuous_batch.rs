@@ -104,6 +104,10 @@ fn recent_window(prompt: &[u32], generated: &[u32], last_n: usize) -> Vec<u32> {
 /// L KV caches) and keeps the engine model-agnostic.
 pub trait BatchedModel {
     fn step(&mut self, items: &[StepItem]) -> Result<Vec<u32>>;
+
+    /// Drops what the model keeps for `seq` beside the paged store: the sequence finished or
+    /// was aborted.
+    fn release(&mut self, _seq: SeqId) {}
 }
 
 /// A generation request.
@@ -203,6 +207,9 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         let ids: Vec<SeqId> = self.reqs.keys().copied().collect();
         self.sched.reset();
         self.reqs.clear();
+        for &id in &ids {
+            self.model.release(id);
+        }
         ids
     }
 
@@ -297,6 +304,9 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
             results.push((it.seq, ends.contains(&tok)));
         }
         let finished = self.sched.on_step_done(&results);
+        for (id, _) in &finished {
+            self.model.release(*id);
+        }
 
         let done = finished
             .into_iter()
@@ -538,6 +548,50 @@ mod tests {
         let done = e.run_to_idle().unwrap();
         assert_eq!(done[0].reason, FinishReason::Eos);
         assert_eq!(done[0].tokens, vec![1002]);
+    }
+
+    /// Model that logs the sequences the engine tells it to drop.
+    #[derive(Default)]
+    struct ReleaseLog {
+        released: Vec<SeqId>,
+    }
+    impl BatchedModel for ReleaseLog {
+        fn step(&mut self, items: &[StepItem]) -> Result<Vec<u32>> {
+            Ok(items.iter().map(|_| 1).collect())
+        }
+        fn release(&mut self, seq: SeqId) {
+            self.released.push(seq);
+        }
+    }
+
+    /// A sequence is released once, when it finishes or when the engine aborts it.
+    #[test]
+    fn a_finished_or_aborted_sequence_is_released_once() {
+        let mut e =
+            ContinuousBatchEngine::new(ReleaseLog::default(), vec![0], 64, 16, 8, 4096).unwrap();
+        let submit = |e: &mut ContinuousBatchEngine<ReleaseLog>, id: SeqId, max_new: usize| {
+            e.submit(GenReq {
+                id,
+                prompt: vec![5, 6],
+                max_new,
+                sampling: SamplingParams::greedy(),
+            })
+        };
+        for id in 1..=3 {
+            submit(&mut e, id, 2 + id as usize);
+        }
+        e.run_to_idle().unwrap();
+        let mut finished = e.model.released.clone();
+        finished.sort();
+        assert_eq!(finished, vec![1, 2, 3]);
+        for id in 4..=5 {
+            submit(&mut e, id, 10);
+        }
+        e.step().unwrap();
+        e.abort_all();
+        let mut aborted = e.model.released[3..].to_vec();
+        aborted.sort();
+        assert_eq!(aborted, vec![4, 5]);
     }
 
     #[test]

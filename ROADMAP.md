@@ -65,7 +65,7 @@ Smaller, by state then by priority:
 | Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Partial |
 | Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Partial |
 | DeepSeek V4.1 through the hetero route | Models | DeepSeek V4.1 loads and is placed through HeteroPlan and the ladder, with no loader, backend, batch server or expert streamer of its own, and its tokens equal those of the frozen oracle. | Started |
-| Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Planned |
+| Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Started |
 
 Fixes, by state then by priority:
 

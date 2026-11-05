@@ -171,6 +171,19 @@ impl BandCell {
             keep_inside(&mut p.candidates, first, rows);
         });
     }
+
+    /// Exchanges what this cell and `other` hold.
+    ///
+    /// A batch of sequences keeps 1 cell per sequence and brings it into the model's cell
+    /// for the sequence's own rows.
+    pub fn exchange(&self, other: &BandCell) {
+        if std::ptr::eq(self, other) {
+            return;
+        }
+        let mut mine = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut theirs = other.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::swap(&mut *mine, &mut *theirs);
+    }
 }
 
 /// Drops the values of `slot` left for a forward that reaches outside `first..first + rows`.

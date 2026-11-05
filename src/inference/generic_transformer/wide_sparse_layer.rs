@@ -27,6 +27,15 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The pre mix of a row that collapses onto stream 0 of `streams`.
+fn onto_first(streams: usize) -> Vec<f32> {
+    let mut row = vec![0f32; streams];
+    if let Some(w) = row.first_mut() {
+        *w = 1.0;
+    }
+    row
+}
+
 /// The pre mix one layer left for the rows `first..first + rows`.
 struct Carried {
     first: usize,
@@ -48,14 +57,7 @@ impl PreMixCarry {
     /// Opens the forward over the rows `first..first + rows`: every row collapses onto
     /// stream 0 of `streams`.
     pub fn open(&self, first: usize, rows: usize, streams: usize) {
-        let onto_first = || {
-            let mut row = vec![0f32; streams];
-            if let Some(w) = row.first_mut() {
-                *w = 1.0;
-            }
-            row
-        };
-        let pre = (0..rows).map(|_| onto_first()).collect();
+        let pre = (0..rows).map(|_| onto_first(streams)).collect();
         self.with(|c| *c = Some(Carried { first, rows, pre }));
     }
 
@@ -450,4 +452,191 @@ impl GenericHeteroTransformer {
             ffn.lossy.resident = per_layer.and_then(|p| p.get(il).cloned());
         }
     }
+
+    /// The band cell the layers of a Sinkhorn wide residual share.
+    fn shared_cell(&self) -> Result<Arc<BandCell>> {
+        match self.wide_sparse.as_ref() {
+            Some(ws) => Ok(Arc::clone(&ws.cell)),
+            None => crate::tensor::bail!("a batch of sequences needs a Sinkhorn wide residual"),
+        }
+    }
+
+    /// What a sequence keeps before its first token: no state in any layer.
+    ///
+    /// Refused for a model that is not a Sinkhorn wide residual over latent and band layers.
+    pub fn sequence_mixers(&self) -> Result<SequenceMixers> {
+        self.shared_cell()?;
+        let states = self
+            .layers
+            .iter()
+            .map(|l| match &l.mixer {
+                mixer::Mixer::LatentMqa(_) => Ok(mixer::MixerState::LatentMqa(None)),
+                mixer::Mixer::CompressedBand(_) => Ok(mixer::MixerState::CompressedBand(None)),
+                _ => Err(crate::tensor::Error::msg(
+                    "a batch of sequences keeps latent and band states only",
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SequenceMixers {
+            states,
+            cell: BandCell::default(),
+        })
+    }
+
+    /// Exchanges every layer's mixer state with the one `seq` holds for that layer.
+    fn exchange_states(&mut self, seq: &mut SequenceMixers) -> Result<()> {
+        if seq.states.len() != self.layers.len() {
+            crate::tensor::bail!(
+                "a sequence keeps {} layer states for {} layers",
+                seq.states.len(),
+                self.layers.len()
+            );
+        }
+        for (layer, held) in self.layers.iter_mut().zip(seq.states.iter_mut()) {
+            exchange_state(&mut layer.mixer, held)?;
+        }
+        Ok(())
+    }
+
+    /// The prompt `tokens` of the sequence `seq` from position 0: the logits of its last row,
+    /// `[1, vocab]`.
+    ///
+    /// The model runs its serial forward over the sequence's own states.
+    /// It holds its own states again once the call returns.
+    pub fn prefill_sequence(&mut self, tokens: &[u32], seq: &mut SequenceMixers) -> Result<Tensor> {
+        let cell = self.shared_cell()?;
+        self.exchange_states(seq)?;
+        cell.exchange(&seq.cell);
+        let logits = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu)
+            .and_then(|ids| self.forward(&ids, 0));
+        cell.exchange(&seq.cell);
+        self.exchange_states(seq)?;
+        logits
+    }
+
+    /// 1 decode step of each sequence of `seqs`: token `tokens[j]` at `positions[j]` of
+    /// sequence `j`, the logits of every row, `[seqs, vocab]`.
+    ///
+    /// The layers run in order, each over every row before the next.
+    /// The token mixer runs per sequence, over the sequence's own mixer state and band cell.
+    /// Each row keeps its own residual and the pre mix its next sublayer collapses with.
+    /// Every step of a row runs the operations of the serial decode of its token, on the same
+    /// values, so each row gives the bits of its sequence decoded alone.
+    pub fn decode_sequences(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        seqs: &mut [&mut SequenceMixers],
+    ) -> Result<Tensor> {
+        let rows_in = tokens.len();
+        if positions.len() != rows_in || seqs.len() != rows_in {
+            crate::tensor::bail!(
+                "{rows_in} tokens for {} positions and {} sequences",
+                positions.len(),
+                seqs.len()
+            );
+        }
+        let (streams, carry) = match self.wide_sparse.as_ref() {
+            Some(ws) => (ws.streams, Arc::clone(&ws.carry)),
+            None => crate::tensor::bail!("a batch of sequences needs a Sinkhorn wide residual"),
+        };
+        let cell = self.shared_cell()?;
+        if seqs.iter().any(|s| s.states.len() != self.layers.len()) {
+            crate::tensor::bail!("a sequence keeps states for another model");
+        }
+        crate::tensor::quant_cpu::set_small_model_prefill(false);
+
+        // Each row's residual as the embedding stage of its decode starts it.
+        let emb_device = self.embeddings.embeddings().device();
+        let mut rows = Vec::with_capacity(rows_in);
+        for (seq, (&t, &pos)) in seqs.iter().zip(tokens.iter().zip(positions)) {
+            let ids = Tensor::from_vec(vec![t], (1, 1), &emb_device)?;
+            let hidden = self.add_positions(self.embeddings.forward(&ids)?, pos)?;
+            let hidden = match self.config.embed_scale {
+                Some(scale) => (hidden * scale)?,
+                None => hidden,
+            };
+            rows.push(super::wide::widen_embedding(&hidden, streams)?);
+            seq.cell.open(pos, 1);
+        }
+        let mut pres: Vec<Vec<Vec<f32>>> =
+            (0..rows_in).map(|_| vec![onto_first(streams)]).collect();
+
+        for il in 0..self.layers.len() {
+            let layer = &mut self.layers[il];
+            let mut mids = Vec::with_capacity(rows_in);
+            let mut attn_pres = Vec::with_capacity(rows_in);
+            for (j, seq) in seqs.iter_mut().enumerate() {
+                let r = rows[j]
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .contiguous()?;
+                let block = layer.sinkhorn.as_ref().ok_or_else(|| {
+                    crate::tensor::Error::msg("a Sinkhorn layer without its block")
+                })?;
+                exchange_state(&mut layer.mixer, &mut seq.states[il])?;
+                cell.exchange(&seq.cell);
+                let half = attention_half(block, &mut layer.mixer, &r, &pres[j], positions[j]);
+                cell.exchange(&seq.cell);
+                exchange_state(&mut layer.mixer, &mut seq.states[il])?;
+                let (mid, pre, _) = half?;
+                mids.push(mid);
+                attn_pres.push(pre);
+            }
+            let block = layer
+                .sinkhorn
+                .as_ref()
+                .ok_or_else(|| crate::tensor::Error::msg("a Sinkhorn layer without its block"))?;
+            let each = rows
+                .iter_mut()
+                .zip(pres.iter_mut())
+                .zip(mids.iter().zip(&attn_pres));
+            for ((row, pre), (mid, attn_pre)) in each {
+                let mixes = block.ffn_mix.mixes(mid)?;
+                let input = rms_norm(
+                    &block.ffn_mix.pre(mid, attn_pre)?,
+                    &block.ffn_norm,
+                    block.eps,
+                )?;
+                let out = block.ffn.forward(&input)?;
+                *row = block.ffn_mix.post(&out, mid, &mixes.post, &mixes.comb)?;
+                *pre = mixes.pre;
+            }
+        }
+
+        // Each row's head collapses with the pre mix its last layer left.
+        let mut logits = Vec::with_capacity(rows_in);
+        for (j, row) in rows.into_iter().enumerate() {
+            carry.put(positions[j], 1, std::mem::take(&mut pres[j]));
+            logits.push(self.output_stage(row, false, 1, false)?);
+        }
+        Tensor::cat(&logits.iter().collect::<Vec<_>>(), 0)
+    }
+}
+
+/// What one sequence of a batch keeps between its steps on a Sinkhorn wide-residual model.
+///
+/// The model's layers hold 1 sequence's state at a time.
+/// A batch brings each sequence's state into its layer for that sequence's rows.
+pub struct SequenceMixers {
+    /// Each layer's mixer state, in layer order.
+    states: Vec<mixer::MixerState>,
+    /// What the sequence's band sources leave for its band readers within a step.
+    cell: BandCell,
+}
+
+/// Exchanges the state `mixer` holds with `held`.
+///
+/// Refused, with nothing exchanged, when `held` is not a state of `mixer`'s kind.
+fn exchange_state(mixer: &mut mixer::Mixer, held: &mut mixer::MixerState) -> Result<()> {
+    match (mixer, held) {
+        (mixer::Mixer::LatentMqa(m), mixer::MixerState::LatentMqa(s)) => {
+            std::mem::swap(&mut m.state, s)
+        }
+        (mixer::Mixer::CompressedBand(m), mixer::MixerState::CompressedBand(s)) => {
+            std::mem::swap(&mut m.state, s)
+        }
+        _ => crate::tensor::bail!("a sequence's state is not of its layer's mixer kind"),
+    }
+    Ok(())
 }

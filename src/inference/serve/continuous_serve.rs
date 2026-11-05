@@ -10,10 +10,10 @@
 //! the worker. The model is held as an `Arc<GenericHeteroTransformer>` so it can
 //! be SHARED with the owning `LlmEngine` (which delegates a CB-served model's
 //! requests here and must NOT call the model itself - that sole-caller contract
-//! is what keeps the lock-free sharing sound). Supported for the dense archs
-//! `batched_paged_decode` covers (Qwen2/Qwen3 today); callers fall back to the
-//! serial path otherwise.
-use crate::inference::cache::paged_kv::PagedKvStore;
+//! is what keeps the lock-free sharing sound). Supported for the models
+//! `cb_unsupported_reason` lets through; callers fall back to the serial path otherwise.
+use crate::inference::cache::paged_kv::{PagedKvStore, SeqId};
+use crate::inference::generic_transformer::wide_sparse_layer::SequenceMixers;
 use crate::inference::generic_transformer::GenericHeteroTransformer;
 use crate::inference::serve::continuous_batch::{
     BatchedModel, ContinuousBatchEngine, GenReq, SamplingParams, StepItem,
@@ -545,6 +545,81 @@ impl BatchedModel for GhBatched {
         self.pace.prefill += prefill_start.elapsed();
         self.pace.report_each_second();
         Ok(out)
+    }
+}
+
+/// The model-side adapter of a model whose layers keep each sequence's state beside the paged
+/// store: a Sinkhorn wide residual over latent and band layers, on the host.
+///
+/// It holds 1 [`SequenceMixers`] per sequence the engine runs.
+/// A prompt starts its sequence again from position 0, whole, whatever part of it the paged
+/// prefix cache holds.
+/// The decode items of a step run as 1 batch across their sequences.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SequenceBatched {
+    model: GenericHeteroTransformer,
+    seqs: HashMap<SeqId, SequenceMixers>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SequenceBatched {
+    /// Refused for a model whose layers do not keep latent and band states.
+    pub(crate) fn new(model: GenericHeteroTransformer) -> crate::tensor::Result<Self> {
+        model.sequence_mixers()?;
+        Ok(Self {
+            model,
+            seqs: HashMap::new(),
+        })
+    }
+}
+
+impl BatchedModel for SequenceBatched {
+    fn step(&mut self, items: &[StepItem]) -> crate::tensor::Result<Vec<u32>> {
+        let mut out = vec![0u32; items.len()];
+        for (i, it) in items.iter().enumerate().filter(|(_, it)| it.is_prefill) {
+            let mut seq = self.model.sequence_mixers()?;
+            let logits = self.model.prefill_sequence(&it.tokens, &mut seq)?;
+            out[i] = sample_row(&logits, 0, &it.sampling, &it.recent_tokens)?;
+            self.seqs.insert(it.seq, seq);
+        }
+        let dec: Vec<usize> = (0..items.len()).filter(|&i| !items[i].is_prefill).collect();
+        if dec.is_empty() {
+            return Ok(out);
+        }
+        let tokens: Vec<u32> = dec.iter().map(|&i| items[i].tokens[0]).collect();
+        let positions: Vec<usize> = dec.iter().map(|&i| items[i].context_len - 1).collect();
+        // Each decoded sequence's state leaves the map for the step and comes back after it.
+        let mut taken = Vec::with_capacity(dec.len());
+        for &i in &dec {
+            match self.seqs.remove(&items[i].seq) {
+                Some(seq) => taken.push((items[i].seq, seq)),
+                None => {
+                    for (id, seq) in taken {
+                        self.seqs.insert(id, seq);
+                    }
+                    return Err(crate::tensor::Error::msg(format!(
+                        "sequence {} decodes without a prompt",
+                        items[i].seq
+                    )));
+                }
+            }
+        }
+        let logits = {
+            let mut refs: Vec<&mut SequenceMixers> = taken.iter_mut().map(|(_, s)| s).collect();
+            self.model.decode_sequences(&tokens, &positions, &mut refs)
+        };
+        for (id, seq) in taken {
+            self.seqs.insert(id, seq);
+        }
+        let logits = logits?;
+        for (j, &i) in dec.iter().enumerate() {
+            out[i] = sample_row(&logits, j, &items[i].sampling, &items[i].recent_tokens)?;
+        }
+        Ok(out)
+    }
+
+    fn release(&mut self, seq: SeqId) {
+        self.seqs.remove(&seq);
     }
 }
 
