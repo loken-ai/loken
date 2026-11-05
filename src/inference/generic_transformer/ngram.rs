@@ -78,6 +78,27 @@ impl NgramMeta {
     }
 }
 
+pub mod engram;
+pub mod engram_hash;
+
+/// The kind of n-gram layer a file declares.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NgramKind {
+    /// 1 layer of hashed rows with a dilated convolution, the window cut at end of sequence.
+    Ple(NgramMeta),
+    /// Several layers of hashed rows over compressed ids, the start padded, no convolution.
+    Engram(engram::EngramMeta),
+}
+
+impl NgramKind {
+    /// The kind of `arch`, `None` when the file declares no n-gram layer of either kind.
+    pub fn from_gguf(content: &gguf_file::Content, arch: &str) -> Option<Self> {
+        NgramMeta::from_gguf(content, arch)
+            .map(Self::Ple)
+            .or_else(|| engram::EngramMeta::from_gguf(content, arch).map(Self::Engram))
+    }
+}
+
 /// Bytes of the file the load does not place: the n-gram table, read by row from the mapping
 /// whatever the placement, so only the pages its tokens touch ever count. Zero for a file
 /// without one.
@@ -579,5 +600,30 @@ mod tests {
     #[test]
     fn arrays_shorter_than_the_heads_are_refused() {
         assert_eq!(NgramMeta::from_gguf(&content(3), "a"), None);
+    }
+
+    /// A file with the convolution's keys is of the single-layer kind.
+    /// The same hash keys with a token map and a pad, and no convolution, are of the engram kind.
+    #[test]
+    fn the_kind_follows_the_metadata() {
+        assert!(matches!(
+            NgramKind::from_gguf(&content(4), "a"),
+            Some(NgramKind::Ple(_))
+        ));
+        let mut c = content(4);
+        c.metadata.remove("a.ple.conv_kernel");
+        c.metadata.remove("a.ple.eos_token_id");
+        assert_eq!(NgramKind::from_gguf(&c, "a"), None);
+        c.metadata.insert(
+            "a.engram.token_map".into(),
+            Value::Array((0..10u64).map(Value::U64).collect()),
+        );
+        c.metadata
+            .insert("a.engram.pad_token_id".into(), Value::U32(7));
+        let Some(NgramKind::Engram(m)) = NgramKind::from_gguf(&c, "a") else {
+            panic!("an engram layout");
+        };
+        assert_eq!(m.layer_ids, vec![1usize]);
+        assert_eq!((m.n_cols(), m.pad_id), (4usize, 7u32));
     }
 }
