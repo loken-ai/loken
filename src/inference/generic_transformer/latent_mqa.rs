@@ -134,7 +134,13 @@ pub(super) struct Front {
 impl LatentMqa {
     /// Bytes of the projections every token reads, as held: the query factors, the key row
     /// and the grouped output.
+    ///
+    /// A layer on a card counts what the card holds, which is the packed form of the host's.
     pub fn resident_bytes(&self) -> usize {
+        #[cfg(feature = "gpu")]
+        if self.card.is_some() {
+            return self.card_bytes();
+        }
         self.w.wq_a.bytes() + self.w.wq_b.bytes() + self.w.wkv.bytes() + self.w.wo_a.bytes()
     }
 
@@ -197,11 +203,19 @@ impl LatentMqa {
 
     /// The query factor and the key rows of the rows `x2` `[seq, hidden]`, whose phases are
     /// `cos` and `sin`. On the card when the layer runs there, else on the host.
-    pub(super) fn front(&self, x2: &Tensor, cos: &[f32], sin: &[f32]) -> Result<Front> {
+    pub(super) fn front(
+        &self,
+        x2: &Tensor,
+        cos: &[f32],
+        sin: &[f32],
+        need_qr: bool,
+    ) -> Result<Front> {
         #[cfg(feature = "gpu")]
         if let Some(card) = &self.card {
-            return card.front(self, x2, cos, sin);
+            return card.front(self, x2, cos, sin, need_qr);
         }
+        #[cfg(not(feature = "gpu"))]
+        let _ = need_qr;
         Ok(Front {
             qr: self.query_factor(x2)?,
             kv: self.key_rows(x2, cos, sin)?,

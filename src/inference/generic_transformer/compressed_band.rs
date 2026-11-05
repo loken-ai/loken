@@ -132,7 +132,7 @@ pub struct BandState {
 }
 
 /// A value a layer left for the forward over the rows `first..first + rows`.
-struct Stamped<T> {
+pub(super) struct Stamped<T> {
     first: usize,
     rows: usize,
     value: T,
@@ -140,11 +140,11 @@ struct Stamped<T> {
 
 /// What the sources of a band left, one value per forward over its rows.
 #[derive(Default)]
-struct Published {
-    compressed: Vec<Stamped<Vec<f32>>>,
-    index_keys: Vec<Stamped<Vec<f32>>>,
-    picks: Vec<Stamped<Vec<i32>>>,
-    candidates: Vec<Stamped<Vec<bool>>>,
+pub(super) struct Published {
+    pub(super) compressed: Vec<Stamped<Vec<f32>>>,
+    pub(super) index_keys: Vec<Stamped<Vec<f32>>>,
+    pub(super) picks: Vec<Stamped<Vec<i32>>>,
+    pub(super) candidates: Vec<Stamped<Vec<bool>>>,
 }
 
 /// Where the layers of a band leave and find what their sources built.
@@ -155,7 +155,7 @@ struct Published {
 pub struct BandCell(Mutex<Published>);
 
 impl BandCell {
-    fn with<R>(&self, f: impl FnOnce(&mut Published) -> R) -> R {
+    pub(super) fn with<R>(&self, f: impl FnOnce(&mut Published) -> R) -> R {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut held)
     }
@@ -194,13 +194,17 @@ fn keep_inside<T>(slot: &mut Vec<Stamped<T>>, first: usize, rows: usize) {
 /// Leaves `value` in `slot` for the forward over the rows `first..first + rows`.
 ///
 /// It replaces what an earlier forward over the same rows left.
-fn put<T>(slot: &mut Vec<Stamped<T>>, (first, rows): (usize, usize), value: T) {
+pub(super) fn put<T>(slot: &mut Vec<Stamped<T>>, (first, rows): (usize, usize), value: T) {
     slot.retain(|s| (s.first, s.rows) != (first, rows));
     slot.push(Stamped { first, rows, value });
 }
 
 /// The value `slot` holds for the forward over `first..first + rows`, or why there is none.
-fn read<T: Clone>(slot: &[Stamped<T>], (first, rows): (usize, usize), what: &str) -> Result<T> {
+pub(super) fn read<T: Clone>(
+    slot: &[Stamped<T>],
+    (first, rows): (usize, usize),
+    what: &str,
+) -> Result<T> {
     match slot.iter().find(|s| s.first == first && s.rows == rows) {
         Some(s) => Ok(s.value.clone()),
         None => Err(crate::tensor::Error::msg(format!(
@@ -212,14 +216,17 @@ fn read<T: Clone>(slot: &[Stamped<T>], (first, rows): (usize, usize), what: &str
 /// A compressed band attention layer.
 pub struct CompressedBand {
     /// The window mixer's weights and widths.
-    base: LatentMqa,
+    pub(super) base: LatentMqa,
     pub(super) band: BandDims,
     compressor: Option<CompressorWeights>,
     indexer: Option<BandIndexerWeights>,
-    cell: Arc<BandCell>,
+    pub(super) cell: Arc<BandCell>,
     pub state: Option<BandState>,
     /// Times the state was dropped or replaced.
     pub(super) moves: u64,
+    /// The compressor and the indexer on a card, when the layer runs there.
+    #[cfg(feature = "gpu")]
+    card_band: Option<Arc<super::card_band::CardBand>>,
 }
 
 impl CompressedBand {
@@ -227,7 +234,12 @@ impl CompressedBand {
     /// indexer's query factor, head weights and key projection, and the pooling weights.
     ///
     /// The F32 weights count 4 bytes a value.
+    /// A layer on a card counts what the card holds.
     pub fn resident_bytes(&self) -> usize {
+        #[cfg(feature = "gpu")]
+        if self.card_band.is_some() {
+            return self.card_bytes();
+        }
         let dense = |t: &Tensor| t.elem_count() * std::mem::size_of::<f32>();
         let indexer = self.indexer.as_ref().map_or(0, |i| {
             i.wq_b.bytes() + dense(&i.weights_proj) + i.wk.as_ref().map_or(0, dense)
@@ -286,21 +298,33 @@ impl CompressedBand {
             cell,
             state: None,
             moves: 0,
+            #[cfg(feature = "gpu")]
+            card_band: None,
         })
     }
 
-    /// Runs the layer's projections and attention on the card `ordinal`.
+    /// Runs the layer's projections and attention on the card `ordinal`, and its compressor,
+    /// index keys and indexer on a decode step.
     ///
-    /// The compressor, the index keys and the indexer stay on the host.
+    /// The host weights and the host state stay.
     #[cfg(feature = "gpu")]
     pub fn on_card(&mut self, ordinal: usize) -> Result<()> {
-        self.base.on_card(ordinal)
+        self.base.on_card(ordinal)?;
+        let Some(card) = self.base.card.as_ref() else {
+            return Err(crate::tensor::Error::msg("the layer is not on a card"));
+        };
+        self.card_band = Some(Arc::new(super::card_band::CardBand::new(
+            card.dev(),
+            self.compressor.as_ref(),
+            self.indexer.as_ref(),
+        )?));
+        Ok(())
     }
 
     /// Bytes of weights the layer holds on its card.
     #[cfg(feature = "gpu")]
     pub fn card_bytes(&self) -> usize {
-        self.base.card_bytes()
+        self.base.card_bytes() + self.card_band.as_ref().map_or(0, |c| c.weight_bytes())
     }
 
     /// Tokens the layer's window ring on its card stands for, 0 before the first decode step.
@@ -334,7 +358,7 @@ impl CompressedBand {
     }
 
     /// The layer keeps index keys of its own.
-    fn owns_keys(&self) -> bool {
+    pub(super) fn owns_keys(&self) -> bool {
         self.band.kv_source && self.band.index_source
     }
 
@@ -381,7 +405,7 @@ impl CompressedBand {
         let (hd, ratio) = (d.head_dim, band.ratio);
         let at = (base, seq);
         let (cos, sin) = phases(&m.inv_freq, base..base + seq);
-        let front = m.front(x2, &cos, &sin)?;
+        let front = m.front(x2, &cos, &sin, self.indexer.is_some())?;
         let qr = &front.qr;
 
         // The window: the kept rows, then this forward's. Row `old_rows + i` is query `i`'s own.
@@ -497,13 +521,17 @@ impl CompressedBand {
 
     /// The row `x2` `[1, hidden]` at position `pos`, after the rows the state holds.
     fn decode(&self, x2: &Tensor, pos: usize, state: &mut BandState) -> Result<Tensor> {
+        #[cfg(feature = "gpu")]
+        if let Some(card_band) = &self.card_band {
+            return card_band.decode(self, x2, pos, state);
+        }
         let hidden = x2.dim(1)?;
         let m = &self.base;
         let (d, band) = (m.dims, self.band);
         let (hd, ratio) = (d.head_dim, band.ratio);
         let at = (pos, 1);
         let (cos, sin) = phases(&m.inv_freq, pos..pos + 1);
-        let front = m.front(x2, &cos, &sin)?;
+        let front = m.front(x2, &cos, &sin, true)?;
         let qr = &front.qr;
 
         // The window after this row's key, oldest first.
@@ -558,13 +586,6 @@ impl CompressedBand {
                 "{} compressed picks for 1 row of {itopk}",
                 picks.len()
             )));
-        }
-
-        #[cfg(feature = "gpu")]
-        if let (Some(card), Some(cf)) = (&m.card, &front.card) {
-            let stamp = (self.moves, state.window.len);
-            let rows = (Some(compressed.as_slice()), picks.as_slice());
-            return card.decode(m, cf, stamp, &state.window.window, rows);
         }
 
         // Every window row, then the picked compressed rows.

@@ -44,8 +44,8 @@ pub fn rope_tokens(
     dev: &CudaDevice,
     x: &mut CudaSlice<f32>,
     (n, h, hd, rd): (usize, usize, usize, usize),
-    cos: &CudaSlice<f32>,
-    sin: &CudaSlice<f32>,
+    cos: &CudaView<'_, f32>,
+    sin: &CudaView<'_, f32>,
 ) -> Result<()> {
     let half = rd / 2;
     if x.len() < n * h * hd || rd > hd || cos.len() < n * half || sin.len() < n * half {

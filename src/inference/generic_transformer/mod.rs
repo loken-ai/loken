@@ -80,10 +80,16 @@ mod expert_tuner;
 mod graph;
 pub mod hetero;
 pub use hetero::CachedPrompt;
+#[cfg(feature = "gpu")]
+mod card_band;
 #[cfg(all(test, feature = "gpu"))]
 mod card_mixer_tests;
 #[cfg(feature = "gpu")]
 mod card_mixers;
+#[cfg(feature = "gpu")]
+mod card_packed;
+#[cfg(all(test, feature = "gpu"))]
+mod card_packed_tests;
 pub mod dsa;
 #[cfg(test)]
 mod hf_reference_tests;

@@ -22,10 +22,10 @@ use crate::inference::place::layer_executor::HeteroSegment;
 use crate::tensor::quantized::gguf_file::MappedGguf;
 
 /// The worst cosine of a row the policy lets through.
-const MIN_COSINE: f64 = 0.999;
+pub(super) const MIN_COSINE: f64 = 0.999;
 
 /// The largest relative L2 distance of a row the policy lets through.
-const MAX_REL_L2: f64 = 0.05;
+pub(super) const MAX_REL_L2: f64 = 0.05;
 
 /// Whether card 0 opens.
 fn card_present() -> bool {
@@ -72,7 +72,7 @@ fn engram_model(
 }
 
 /// The cosine and the relative L2 distance of `got` to `want`.
-fn closeness(want: &[f32], got: &[f32]) -> (f64, f64) {
+pub(super) fn closeness(want: &[f32], got: &[f32]) -> (f64, f64) {
     let (mut dot, mut ww, mut gg, mut dd) = (0f64, 0f64, 0f64, 0f64);
     for (&w, &g) in want.iter().zip(got) {
         let (w, g) = (w as f64, g as f64);
@@ -277,4 +277,63 @@ fn the_mixer_outputs_of_the_card_stay_close_to_the_host_ones() {
         }
     }
     eprintln!("mixer outputs: worst cosine {worst_cos}, worst relative L2 {worst_l2}");
+}
+
+/// Mean milliseconds of one decode step through every layer's token mixer, on the card and on
+/// the host, over the steps after the first few.
+///
+/// The step ends with the output on the host, so the host clock around it spans the card's work.
+/// The figures are for comparing two builds on one machine.
+#[test]
+fn a_decode_step_through_the_token_mixers_is_timed() {
+    if !card_present() {
+        return;
+    }
+    const WARM: usize = 6;
+    const STEPS: usize = 40;
+    let mut total = (0f64, 0f64);
+    let mut count = 0usize;
+    for (ratios, kv_src, index_src) in LAYOUTS {
+        let mut host = generic(ratios, kv_src, index_src);
+        let mut card = generic_on_card(ratios, kv_src, index_src);
+        let hidden = host.config.embedding_length;
+        let layers = ratios.len();
+        let mut spent = (0f64, 0f64);
+        for (step, pos) in (0..STEPS).map(|s| (s, if s == 0 { 0 } else { 8 + s })) {
+            let seq = if step == 0 { 9 } else { 1 };
+            for model in [&host, &card] {
+                if let Some(head) = &model.wide_sparse {
+                    head.cell.open(pos, seq);
+                }
+            }
+            let mut took = (0f64, 0f64);
+            for il in 0..layers {
+                let x = rows((step * 31 + il) as u64, seq, hidden);
+                let t = std::time::Instant::now();
+                host.layers[il].mixer.forward(&x, pos).unwrap();
+                took.0 += t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
+                card.layers[il].mixer.forward(&x, pos).unwrap();
+                took.1 += t.elapsed().as_secs_f64();
+            }
+            if step >= WARM {
+                spent.0 += took.0;
+                spent.1 += took.1;
+            }
+        }
+        let n = (STEPS - WARM) as f64;
+        eprintln!(
+            "layout {ratios:?}: {layers} layers, host {:.3} ms, card {:.3} ms per decode step",
+            spent.0 / n * 1e3,
+            spent.1 / n * 1e3
+        );
+        total.0 += spent.0 / n;
+        total.1 += spent.1 / n;
+        count += 1;
+    }
+    eprintln!(
+        "decode step through the token mixers: host {:.3} ms, card {:.3} ms (mean over {count} layouts)",
+        total.0 / count as f64 * 1e3,
+        total.1 / count as f64 * 1e3
+    );
 }
