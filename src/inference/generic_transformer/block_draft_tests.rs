@@ -256,7 +256,7 @@ pub(crate) fn generic_of(file: MappedGguf) -> GenericHeteroTransformer {
 }
 
 /// The V4.1 model of `file`, every expert resident.
-fn v41_of(file: &MappedGguf) -> DeepseekV41Model {
+pub(crate) fn v41_of(file: &MappedGguf) -> DeepseekV41Model {
     let mut cfg = DeepseekV41Config::from_gguf(&file.content).unwrap();
     cfg.expert_cache_count = 0;
     DeepseekV41Model::load(file, &cfg).unwrap()

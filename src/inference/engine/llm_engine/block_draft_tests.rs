@@ -39,7 +39,7 @@ enum Head {
     Scripted(ScriptedDraft),
 }
 
-fn tokenizer() -> Tokenizer {
+pub(super) fn tokenizer() -> Tokenizer {
     let vocab: ahash::AHashMap<String, u32> =
         (0..VOCAB as u32).map(|i| (format!("t{i}"), i)).collect();
     let model = WordLevel::builder()
@@ -65,7 +65,14 @@ async fn engine_with(head: Head) -> (LlmEngine, String) {
 /// An engine holding `model`, a generic model of the small file.
 pub(super) async fn engine_of(model: GenericHeteroTransformer) -> (LlmEngine, String) {
     let num_layers = model.segment_layers();
-    let backend = GenericBackend(model);
+    engine_holding(Box::new(GenericBackend(model)), num_layers).await
+}
+
+/// An engine holding `backend`, a backend of `num_layers` layers of the small file.
+pub(super) async fn engine_holding(
+    backend: BoxedModelBackend,
+    num_layers: usize,
+) -> (LlmEngine, String) {
     let engine = LlmEngine::with_config(InferenceConfig::default());
     *engine.model_state.lock().await = Some(LoadedModelState {
         name: "small".into(),
@@ -89,7 +96,7 @@ pub(super) async fn engine_of(model: GenericHeteroTransformer) -> (LlmEngine, St
         exact_prefill: None,
         eos_token_ids_extra: Vec::new(),
         file_size: 0,
-        model: Box::new(backend),
+        model: backend,
         tokenizer: std::sync::Arc::new(tokenizer()),
         device: Device::Cpu,
         image_embeds: None,

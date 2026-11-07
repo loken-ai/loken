@@ -1036,7 +1036,7 @@ impl GenericHeteroTransformer {
         store: Arc<StateStore>,
         identity: [u8; 32],
     ) -> bool {
-        // A gated wide-residual layer's indexer and n-gram state have no stored form yet.
+        // A residual that mixes through output hyper-connections has no stored form.
         // The token ids a Sinkhorn wide residual's engram layers hash are the restored prompt's.
         if !self.is_recurrent()
             || self.output_hyper.is_some()

@@ -936,10 +936,6 @@ pub(crate) fn tp_file_refusal(
     arch: &str,
     ranks: usize,
 ) -> Option<String> {
-    let config = match GenericTransformerConfig::from_gguf(content, arch) {
-        Ok(c) => c,
-        Err(e) => return Some(e.to_string()),
-    };
     let names: Vec<&String> = content.tensor_infos.keys().collect();
     let has = |part: &str| {
         names
@@ -956,9 +952,18 @@ pub(crate) fn tp_file_refusal(
         ("inp_gate", "per-layer inputs"),
         ("hc_", "a wide residual"),
     ];
+    // A layout the split refuses is refused before the config is built.
+    // A wide residual's config is its own description, not the generic config.
+    if super::wide_sparse_config::WideSparseMeta::claims(content) {
+        return Some("a wide residual".to_string());
+    }
     if let Some((_, why)) = refused.iter().find(|(part, _)| has(part)) {
         return Some((*why).to_string());
     }
+    let config = match GenericTransformerConfig::from_gguf(content, arch) {
+        Ok(c) => c,
+        Err(e) => return Some(e.to_string()),
+    };
     let block = |name: &str| {
         content
             .tensor_infos

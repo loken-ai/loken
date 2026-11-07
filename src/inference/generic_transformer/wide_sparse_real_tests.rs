@@ -16,10 +16,10 @@ use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::quantized::gguf_source::SplitGguf;
 
 /// The store tag of the file the test reads.
-pub(super) const TAG: &str = "deepseek-v4.1-flash:iq2-q6attn";
+pub(crate) const TAG: &str = "deepseek-v4.1-flash:iq2-q6attn";
 
 /// The text whose tokens both routes prefill.
-pub(super) const PROMPT: &str = "The capital of France is";
+pub(crate) const PROMPT: &str = "The capital of France is";
 
 /// Greedy tokens each route decodes after the prompt.
 pub(super) const STEPS: usize = 4;
@@ -28,7 +28,7 @@ pub(super) const STEPS: usize = 4;
 const TOP: usize = 10;
 
 /// The path of the blob a store tag names.
-pub(super) fn blob(tag: &str) -> std::path::PathBuf {
+pub(crate) fn blob(tag: &str) -> std::path::PathBuf {
     let store = crate::config::Config::load_test().get_ollama_models_dir();
     let (name, ver) = tag.split_once(':').unwrap_or((tag, "latest"));
     let manifest = std::fs::read_to_string(
@@ -51,7 +51,7 @@ pub(super) fn blob(tag: &str) -> std::path::PathBuf {
 }
 
 /// The tokens of the prompt: the file's own tokenizer, after the begin token it names.
-pub(super) fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u32> {
+pub(crate) fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u32> {
     use crate::inference::engine::llm_engine::{build_tokenizer_from_gguf, EMBEDDED_TOKENIZER_KEY};
     let text = |k: &str| {
         content

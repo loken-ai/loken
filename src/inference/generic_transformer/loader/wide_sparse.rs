@@ -916,6 +916,7 @@ impl GenericHeteroTransformer {
             engram: engram.as_ref().map(|(hash, _)| Arc::clone(hash)),
             tokens: engram.map(|(_, tokens)| tokens),
             draft: None,
+            meta: Arc::new(meta.clone()),
         };
         tensors.finish();
         let mut model = Self {

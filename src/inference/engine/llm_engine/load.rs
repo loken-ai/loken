@@ -397,6 +397,7 @@ pub(super) fn resolve_awq_repo(model_id: &str, roots: &[PathBuf]) -> Option<Stri
 /// `inference/config.json`, `tokenizer.json` - loaded on the CPU through the deepseek_v41
 /// source: the always-resident path dequantised to f32, the routed experts read in place, the
 /// engram layers on when the tokenizer lets their hash layout be derived.
+#[allow(dead_code)] // The old path stays until its equality tests are read; no claim reaches it.
 pub(super) fn load_deepseek_v41_checkpoint(
     dir: &std::path::Path,
     model_id: &str,
@@ -498,6 +499,167 @@ pub(super) fn load_deepseek_v41_checkpoint(
         hidden_size: cfg.d_model,
         num_heads: cfg.n_head,
         vocab_size: cfg.vocab_size,
+        context_length,
+        eos_token_id,
+        #[cfg(feature = "gpu")]
+        moondream_graph: None,
+        moondream_decode_count: 0,
+        #[cfg(feature = "gpu")]
+        kept_graphs: Default::default(),
+        #[cfg(feature = "gpu")]
+        draft_graph: Default::default(),
+        #[cfg(feature = "gpu")]
+        draft_step: Default::default(),
+        draft_primed: false,
+        draft_mark: None,
+        exact_prefill: None,
+        eos_token_ids_extra: Vec::new(),
+        file_size,
+        model: backend,
+        tokenizer: std::sync::Arc::new(tokenizer),
+        device: Device::Cpu,
+        image_embeds: None,
+        audio: None,
+        qwen35_vision: Vec::new(),
+        image_embed_cache: None,
+        grammar_factory: std::sync::OnceLock::new(),
+        generation_defaults: Default::default(),
+    })
+}
+
+/// A block-scaled checkpoint directory of a Sinkhorn wide residual, loaded through the generic
+/// route: placed by the plan and the ladder, served by `GenericBackend`.
+///
+/// The layers read the shards in place.
+/// The routed experts stay views of the shards.
+/// The engram layers load when the tokenizer lets their hash layout be derived.
+pub(super) fn load_wide_checkpoint(
+    dir: &std::path::Path,
+    model_id: &str,
+    user_context_length: usize,
+    quality: QualityLevel,
+    kv_quant: KvQuant,
+    state_cache: Option<std::sync::Arc<crate::inference::cache::state_disk::StateStore>>,
+) -> AnyResult<LoadedModelState> {
+    use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
+    use crate::inference::generic_transformer::{BlockScaledCheckpoint, GenericHeteroTransformer};
+    use crate::inference::place::ladder::load_placed;
+
+    let t0 = std::time::Instant::now();
+    let checkpoint =
+        BlockScaledCheckpoint::open(dir).map_err(|e| anyhow!("{}: {e}", dir.display()))?;
+    let tokenizer_path = dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("{}: {e}", tokenizer_path.display()))?;
+    let meta = WideSparseMeta::from_reference(&checkpoint.reference, None)
+        .map_err(|e| anyhow!("{}: {e}", dir.display()))?;
+    let shards: Vec<std::path::PathBuf> = {
+        let mut found: Vec<_> = std::fs::read_dir(dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .collect();
+        found.sort();
+        found
+    };
+    let file_size: u64 = shards
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    let eos_token_id = super::gguf::sidecar_token_id(&dir.join("config.json"), "eos_token")
+        .ok_or_else(|| anyhow!("{}: no eos_token in tokenizer_config.json", dir.display()))?;
+    let context_length = if user_context_length > 0 {
+        user_context_length
+    } else {
+        declared_context(dir)
+    };
+    let planned_ctx = context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+    let reserve = crate::inference::place::runtime_demand::llm_work_reserve(
+        meta.d_model,
+        PREFILL_CHUNK_TOKENS,
+    );
+    let demand =
+        crate::inference::place::llm::wide_sparse_demand(&meta, file_size, 0, planned_ctx, reserve);
+    let offer = if crate::gpu::cards_allowed() {
+        crate::inference::place::llm::offer(None, file_size.saturating_add(reserve), 0)
+    } else {
+        crate::inference::place::llm::Offer::default()
+    };
+    let mut model = load_placed(
+        "wide-residual checkpoint",
+        &demand,
+        &offer.cards,
+        || false,
+        |plan| {
+            GenericHeteroTransformer::from_block_scaled(
+                &checkpoint,
+                plan,
+                kv_quant,
+                Some(context_length),
+            )
+        },
+    )
+    .map_err(|e| anyhow!("Failed to load {}: {e}", dir.display()))?;
+    if quality != QualityLevel::Exact {
+        let ids = crate::inference::generic_transformer::routing_calibration::calibration_ids(
+            &tokenizer,
+            super::gguf::sidecar_token_id(&dir.join("config.json"), "bos_token"),
+        );
+        let identity = format!("{}:{file_size}", dir.display());
+        if let Some(ids) = ids {
+            if let Err(e) =
+                crate::inference::generic_transformer::routing_calibration::calibrate_loaded(
+                    &mut model, quality, &identity, &ids,
+                )
+            {
+                warn!("quality calibration failed, routing stays exact: {e}");
+            }
+        }
+    }
+    let n_layers = model.segment_layers();
+    info!(
+        "✅ wide-residual checkpoint loaded through the generic route from {} in {:.1}s ({} layers, {} routed experts, engram {})",
+        dir.display(),
+        t0.elapsed().as_secs_f32(),
+        n_layers,
+        meta.mixture.routed,
+        if meta.ngram.is_some() { "on" } else { "off" },
+    );
+    let mut backend: BoxedModelBackend = Box::new(
+        crate::inference::engine::model_backend::GenericBackend(model),
+    );
+    // The states of a prompt are stored under the shards and the configuration they were
+    // computed with.
+    if let Some(store) = state_cache {
+        let mut files = crate::inference::cache::state_disk::FilesDigest::new();
+        let mut hashed: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x == "safetensors" || x == "json")
+            })
+            .collect();
+        hashed.sort();
+        match hashed.iter().try_for_each(|p| files.path(p)) {
+            Ok(()) => {
+                let identity = crate::inference::cache::state_disk::identity(&[
+                    &files.finish(),
+                    format!("{kv_quant:?}").as_bytes(),
+                ]);
+                if backend.attach_state_cache(store, identity) {
+                    info!("state cache on for the wide-residual checkpoint");
+                }
+            }
+            Err(e) => warn!("state cache off: {e}"),
+        }
+    }
+    Ok(LoadedModelState {
+        name: model_id.to_string(),
+        num_layers: n_layers,
+        hidden_size: meta.d_model,
+        num_heads: meta.heads,
+        vocab_size: meta.vocab,
         context_length,
         eos_token_id,
         #[cfg(feature = "gpu")]
@@ -815,19 +977,34 @@ pub(super) fn sniff_projector_type(path: &std::path::Path) -> Option<String> {
         .and_then(|(_, v)| v.to_string().ok().cloned())
 }
 
+/// How many sequences a model that keeps per-sequence state may decode together.
+///
+/// Each sequence holds the state of `context_length` positions in host memory.
+/// `host_budget` is what the host may give to the sequences.
+/// `None` when it holds fewer than 2: batching gains nothing over serial decode.
+#[cfg(any(feature = "gpu", test))]
+pub(super) fn sequence_cap(
+    model: &GenericHeteroTransformer,
+    context_length: usize,
+    host_budget: u64,
+) -> Option<usize> {
+    let per_sequence = model.sequence_state_bytes(context_length)?.max(1);
+    let cap = usize::try_from(host_budget / per_sequence).unwrap_or(usize::MAX);
+    (cap >= 2).then_some(cap)
+}
+
 /// Try to move a loaded `cb_eligible` GPU `GenericHetero` model into a
 /// `ContinuousServer` worker for batched concurrent serving. The card's room is divided by
 /// `place::paged` from the model's shape. Returns the model back unchanged on any failure
 /// so the caller keeps the serial path.
 ///
 /// A model whose layers keep each sequence's state goes to a worker that owns it, at most
-/// `max_sequences` decoding together.
+/// `sequence_cap` sequences decoding together.
 #[cfg(feature = "gpu")]
 pub(super) fn try_spawn_continuous(
     model: GenericHeteroTransformer,
     eos: Vec<u32>,
     context_length: usize,
-    max_sequences: usize,
 ) -> std::result::Result<
     crate::inference::serve::continuous_serve::ContinuousServer,
     GenericHeteroTransformer,
@@ -835,6 +1012,14 @@ pub(super) fn try_spawn_continuous(
     use crate::inference::place::{paged, runtime_demand};
     use crate::inference::serve::continuous_serve::ContinuousServer;
     if model.sequence_mixers().is_ok() {
+        let Some(max_sequences) = sequence_cap(
+            &model,
+            context_length,
+            crate::inference::place::layer_executor::host_spill_budget_bytes(),
+        ) else {
+            warn!("CB serve: the host holds fewer than two sequences of {context_length} tokens - staying serial");
+            return Err(model);
+        };
         info!("CB serve: ContinuousServer over per-sequence states, max_running {max_sequences}");
         return ContinuousServer::spawn_sequences(
             model,
@@ -943,11 +1128,10 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         };
         let mut ends = state.eos_token_ids_extra.clone();
         ends.push(eos);
-        let (model, batched): (BoxedModelBackend, bool) =
-            match try_spawn_continuous(m, ends, ctx, V41_MAX_BATCH) {
-                Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
-                Err(m) => (Box::new(GenericBackend(m)), false),
-            };
+        let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, ends, ctx) {
+            Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
+            Err(m) => (Box::new(GenericBackend(m)), false),
+        };
         state.model = model;
         batched
     }

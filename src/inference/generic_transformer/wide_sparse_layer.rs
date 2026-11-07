@@ -531,6 +531,8 @@ pub struct WideSparseHead {
     pub engram: Option<Arc<EngramMeta>>,
     /// The block draft, `None` for a model without one.
     pub draft: Option<BlockDraft>,
+    /// The description the layers were built from.
+    pub meta: Arc<super::wide_sparse_config::WideSparseMeta>,
 }
 
 impl WideSparseHead {
@@ -619,6 +621,19 @@ impl GenericHeteroTransformer {
             bytes += block.output.bytes() + ffn.router.bytes() + bias + shared + engram;
         }
         Some(bytes as u64)
+    }
+
+    /// Bytes of mixer state 1 sequence keeps once it holds `tokens` positions, summed over the
+    /// layers.
+    ///
+    /// `None` for a model of another kind.
+    pub fn sequence_state_bytes(&self, tokens: usize) -> Option<u64> {
+        let meta = &self.wide_sparse.as_ref()?.meta;
+        Some(
+            (0..self.layers.len())
+                .map(|il| meta.cache_bytes(il, tokens))
+                .sum(),
+        )
     }
 
     /// The routed feed-forward of every layer that has one, by layer index.

@@ -44,7 +44,7 @@ const FOLD: usize = 8;
 /// The tokenizer the checkpoint ships.
 ///
 /// Token `i` is `t{i}`, except every `FOLD`th, which spells the token before it in upper case.
-fn tokenizer() -> tokenizers::Tokenizer {
+pub(crate) fn tokenizer() -> tokenizers::Tokenizer {
     let vocab: ahash::AHashMap<String, u32> = (0..VOCAB)
         .map(|i| {
             let word = if i % FOLD == FOLD - 1 {
@@ -110,7 +110,7 @@ fn engram_entries() -> Vec<Entry> {
 }
 
 /// Writes the checkpoint with engram layers into a new directory, its tokenizer files beside it.
-pub(super) fn engram_checkpoint(tag: &str) -> PathBuf {
+pub(crate) fn engram_checkpoint(tag: &str) -> PathBuf {
     let tokenizer = tokenizer();
     let (_, compressed) = token_map::build(&tokenizer).unwrap();
     let mut reference = reference_config();

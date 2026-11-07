@@ -9,13 +9,11 @@
 use std::net::TcpListener;
 
 /// Whether the model at `gguf` serves a pipeline tail of its own from the file, as opposed to
-/// being a generic transformer whose share the engine loads. A file that cannot be read claims
-/// nothing.
-pub fn claims_tail(gguf: &str) -> bool {
-    use crate::tensor::quantized::gguf_source::SplitGguf;
-    SplitGguf::open(gguf)
-        .map(|src| crate::inference::model::deepseek_v41::claims_gguf(&src.merged_content()))
-        .unwrap_or(false)
+/// being a generic transformer whose share the engine loads.
+///
+/// No model does: every share is placed by the engine's ladder.
+pub fn claims_tail(_gguf: &str) -> bool {
+    false
 }
 
 /// Load the model at `gguf` from layer `from` and serve segment `[from, to)` on `listener` until the

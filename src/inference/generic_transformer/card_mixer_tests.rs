@@ -33,7 +33,7 @@ fn card_present() -> bool {
 }
 
 /// The generic model of the synthetic file, every layer on card 0.
-pub(super) fn generic_on_card(
+pub(crate) fn generic_on_card(
     ratios: &[u32],
     kv_src: &[u32],
     index_src: &[u32],

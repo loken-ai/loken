@@ -48,10 +48,10 @@ pub mod block_draft;
 #[cfg(test)]
 pub(crate) mod block_draft_tests;
 #[cfg(test)]
-mod block_scaled_engram_tests;
+pub(crate) mod block_scaled_engram_tests;
 pub mod block_scaled_experts;
 #[cfg(test)]
-mod block_scaled_oracle_tests;
+pub(crate) mod block_scaled_oracle_tests;
 #[cfg(test)]
 mod cb_variant_tests;
 pub mod compressed_band;
@@ -88,7 +88,7 @@ pub use hetero::CachedPrompt;
 #[cfg(feature = "gpu")]
 mod card_band;
 #[cfg(all(test, feature = "gpu"))]
-mod card_mixer_tests;
+pub(crate) mod card_mixer_tests;
 #[cfg(feature = "gpu")]
 mod card_mixers;
 #[cfg(feature = "gpu")]
@@ -158,6 +158,7 @@ mod wide_sparse_engram_tests;
 pub mod wide_sparse_layer;
 #[cfg(test)]
 mod wide_sparse_oracle_tests;
+pub mod wide_sparse_plan;
 #[cfg(test)]
 mod wide_sparse_plan_tests;
 #[cfg(test)]
@@ -165,7 +166,7 @@ mod wide_sparse_quality_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod wide_sparse_real_card_tests;
 #[cfg(test)]
-mod wide_sparse_real_tests;
+pub(crate) mod wide_sparse_real_tests;
 #[cfg(test)]
 mod wide_sparse_serve_tests;
 #[cfg(test)]

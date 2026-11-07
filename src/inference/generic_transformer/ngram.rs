@@ -99,23 +99,46 @@ impl NgramKind {
     }
 }
 
-/// Bytes of the file the load does not place: the n-gram table, read by row from the mapping
-/// whatever the placement, so only the pages its tokens touch ever count. Zero for a file
-/// without one.
-pub fn demand_paged_bytes(content: &gguf_file::Content, arch: &str) -> u64 {
-    NgramMeta::from_gguf(content, arch)
-        .and_then(|_| content.tensor_infos.get("per_layer_token_embd.weight"))
-        .map_or(0, |t| t.size_in_bytes() as u64)
+/// The per-layer table of a file that declares one, which is read by row from the mapping.
+fn paged_name(content: &gguf_file::Content, arch: &str) -> Option<&'static str> {
+    NgramMeta::from_gguf(content, arch).map(|_| "per_layer_token_embd.weight")
 }
 
-/// Size of the largest tensor the load places on a card: the tensors that are placed, so not
-/// the n-gram table, which stays in the mapping. This is what a load stages one tensor at a time.
-pub fn largest_placed_tensor(content: &gguf_file::Content, arch: &str) -> u64 {
-    let paged = NgramMeta::from_gguf(content, arch).map(|_| "per_layer_token_embd.weight");
+/// Whether tensor `name` is read by row from the mapping whatever the placement: the per-layer
+/// table `paged`, or the table of an engram layer with its scales.
+fn is_demand_paged(name: &str, paged: Option<&str>) -> bool {
+    if Some(name) == paged {
+        return true;
+    }
+    let tail = name
+        .strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .map_or("", |(_, tail)| tail);
+    tail == "engram_embd" || tail.starts_with("engram_embd.")
+}
+
+/// Bytes of the file the load does not place: the n-gram and engram tables, read by row from the
+/// mapping whatever the placement, so only the pages their tokens touch ever count. Zero for a
+/// file without one.
+pub fn demand_paged_bytes(content: &gguf_file::Content, arch: &str) -> u64 {
+    let paged = paged_name(content, arch);
     content
         .tensor_infos
         .iter()
-        .filter(|(name, _)| Some(name.as_str()) != paged)
+        .filter(|(name, _)| is_demand_paged(name, paged))
+        .map(|(_, t)| t.size_in_bytes() as u64)
+        .sum()
+}
+
+/// Size of the largest tensor the load places on a card: the tensors that are placed, so not
+/// the n-gram and engram tables, which stay in the mapping. This is what a load stages one
+/// tensor at a time.
+pub fn largest_placed_tensor(content: &gguf_file::Content, arch: &str) -> u64 {
+    let paged = paged_name(content, arch);
+    content
+        .tensor_infos
+        .iter()
+        .filter(|(name, _)| !is_demand_paged(name, paged))
         .map(|(_, t)| t.size_in_bytes() as u64)
         .max()
         .unwrap_or(0)
@@ -557,6 +580,35 @@ mod tests {
         plain.metadata.retain(|k, _| !k.contains(".ple."));
         plain.tensor_infos = c.tensor_infos.clone();
         assert_eq!(largest_placed_tensor(&plain, "a"), 100_000 * 64 * 4);
+    }
+
+    /// An engram layer's table and its scales are read by row from the mapping, so a load stages
+    /// neither of them and the plan does not place them.
+    #[test]
+    fn an_engram_table_is_not_the_tensor_a_load_stages() {
+        use crate::tensor::quantized::GgmlDType;
+        use crate::tensor::Shape;
+        let mut c = content(4);
+        c.metadata.retain(|k, _| !k.contains(".ple."));
+        let info = |dtype: GgmlDType, rows: usize| gguf_file::TensorInfo {
+            ggml_dtype: dtype,
+            shape: Shape::from((rows, 256)),
+            offset: 0,
+        };
+        c.tensor_infos
+            .insert("blk.0.attn_q_a".into(), info(GgmlDType::F32, 10));
+        c.tensor_infos
+            .insert("blk.1.engram_embd".into(), info(GgmlDType::F32, 1_000_000));
+        c.tensor_infos.insert(
+            "blk.1.engram_embd.scale".into(),
+            info(GgmlDType::F32, 2_000_000),
+        );
+        c.tensor_infos.insert(
+            "blk.14.engram_embd.weight".into(),
+            info(GgmlDType::F32, 3_000_000),
+        );
+        assert_eq!(largest_placed_tensor(&c, "a"), 10 * 256 * 4);
+        assert_eq!(demand_paged_bytes(&c, "a"), 6_000_000 * 256 * 4);
     }
 
     #[test]

@@ -496,7 +496,7 @@ fn the_block_scaled_reader_hands_out_the_bytes_of_the_v41_source() {
 
 /// The tokens of the checkpoint test: a prompt longer than the verified block and the greedy
 /// prompt.
-pub(super) fn tokens() -> Vec<u32> {
+pub(crate) fn tokens() -> Vec<u32> {
     (0..12).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect()
 }
 

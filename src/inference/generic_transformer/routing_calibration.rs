@@ -358,6 +358,37 @@ pub fn apply_level(
     apply_budget(model, budget, key, ids, resident, run)
 }
 
+/// Sets the truncation `level` allows on a loaded model, measured on `ids`.
+///
+/// `identity` names the model file, and the table is kept under it.
+/// No expert is counted in memory: the layers read every routed expert from its mapping.
+/// The noise needs a second run to compare with, which a model on 1 device kind does not have:
+/// routing then stays exact.
+/// A model without routed experts is left as loaded.
+pub fn calibrate_loaded(
+    model: &mut GenericHeteroTransformer,
+    level: QualityLevel,
+    identity: &str,
+    ids: &[u32],
+) -> Result<Option<Measured>> {
+    if level == QualityLevel::Exact || model.routed_per_token() == 0 {
+        return Ok(None);
+    }
+    let resident = vec![HashSet::new(); model.segment_layers()];
+    let key = format!("{identity}|resident:0");
+    let mut prefill = |m: &mut GenericHeteroTransformer, toks: &[u32]| -> Result<Vec<Vec<f32>>> {
+        let x = crate::tensor::Tensor::from_vec(
+            toks.to_vec(),
+            (1, toks.len()),
+            &crate::tensor::Device::Cpu,
+        )?;
+        let all = m.forward_all(&x, 0)?.flatten_all()?.to_vec1::<f32>()?;
+        let vocab = all.len() / toks.len().max(1);
+        Ok(all.chunks(vocab.max(1)).map(<[f32]>::to_vec).collect())
+    };
+    apply_level(model, level, &key, ids, &resident, &mut prefill, None)
+}
+
 /// The text the calibration runs: some code and some prose, long enough to route a few
 /// hundred tokens.
 pub const CALIBRATION_TEXT: &str = include_str!("../model/deepseek_v41/calibration_text.txt");

@@ -1709,7 +1709,11 @@ pub(crate) mod quality;
 #[cfg(test)]
 mod sampling_tests;
 #[cfg(test)]
+mod wide_load_tests;
+#[cfg(test)]
 mod wide_pipeline_tests;
+#[cfg(test)]
+mod wide_real_tests;
 use std::io::Cursor;
 use std::time::Instant;
 

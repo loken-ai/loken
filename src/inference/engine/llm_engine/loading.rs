@@ -168,10 +168,26 @@ pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
     let arch = get_gguf_string(&content, "general.architecture")?;
     let context_length = trained_context(&content, &arch)
         .unwrap_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
-    let staging = crate::inference::place::runtime_demand::tensor_load_staging(
-        crate::inference::generic_transformer::ngram::largest_placed_tensor(&content, &arch),
-    );
+    let staging = load_staging(&content, &arch);
     Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + staging)
+}
+
+/// Card memory a load keeps free on each card it uses for the staging of one upload.
+///
+/// A wide residual uploads its token mixers' projections one at a time.
+/// Any other file uploads its largest placed tensor.
+fn load_staging(content: &gguf_file::Content, arch: &str) -> u64 {
+    let largest =
+        crate::inference::generic_transformer::wide_sparse_plan::card_mixer_bytes(content)
+            .map_or_else(
+                || {
+                    crate::inference::generic_transformer::ngram::largest_placed_tensor(
+                        content, arch,
+                    )
+                },
+                |mixers| mixers.largest_upload,
+            );
+    crate::inference::place::runtime_demand::tensor_load_staging(largest)
 }
 
 /// Size the rayon pool the host kernels run on, once per process.
@@ -382,10 +398,12 @@ impl LlmEngine {
 
             // --- 0a. A checkpoint directory the deepseek_v41 source serves ---
             if crate::inference::model::deepseek_v41::claims_checkpoint_dir(&model_file) {
-                let mut state = load_deepseek_v41_checkpoint(
+                let mut state = load_wide_checkpoint(
                     &model_file,
                     &model_id_clone,
                     user_context_length,
+                    quality,
+                    kv_quant,
                     state_cache.clone(),
                 )?;
                 state.generation_defaults = generation_defaults.clone();
@@ -753,11 +771,9 @@ impl LlmEngine {
             // and the runtime reserve: the cache at the reserve window, the cuBLAS workspace
             // and a prefill chunk's activations, sized from the model's own dimensions.
             let runtime_reserve_bytes = dims.runtime_reserve(context_length);
-            let staging = crate::inference::place::runtime_demand::tensor_load_staging(
-                crate::inference::generic_transformer::ngram::largest_placed_tensor(
-                    &content,
-                    &get_gguf_string(&content, "general.architecture").unwrap_or_default(),
-                ),
+            let staging = load_staging(
+                &content,
+                &get_gguf_string(&content, "general.architecture").unwrap_or_default(),
             );
             // A model whose layers only the host runs is offered no card and no accelerator.
             let host_only = crate::inference::generic_transformer::host_only_reason(&content, &arch);
@@ -887,7 +903,11 @@ impl LlmEngine {
                 }
                 // Residual hyper-connections mark the DeepSeek V4.1 checkpoint, whatever its
                 // converter named the architecture.
-                _ if crate::inference::model::deepseek_v41::claims_gguf(&content) => {
+                // Only a file whose manifest names expert variants takes this arm: the generic
+                // route does not choose between variant files.
+                _ if crate::inference::model::deepseek_v41::claims_gguf(&content)
+                    && !variant_blobs.is_empty() =>
+                {
                     // The CPU port: latent MQA, CSA2 bands, hyper-connections, and a MoE whose
                     // routed experts are read in place from the mapping by the quantised dot
                     // engine. The model may ship as one file or a split set; every part is
@@ -1044,11 +1064,14 @@ impl LlmEngine {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // A config needs the RoPE pairing the file does not carry: an architecture
                     // the facts table does not know is refused here, before any weight is placed.
-                    crate::inference::model_facts::rope_pairing(&arch).map_err(|e| {
-                        let err = format!("cannot build {arch:?} through the generic transformer: {e}");
-                        error!("❌ {err}");
-                        anyhow!(err)
-                    })?;
+                    // A Sinkhorn wide residual reads its rotation from its own description.
+                    if !crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims(&content) {
+                        crate::inference::model_facts::rope_pairing(&arch).map_err(|e| {
+                            let err = format!("cannot build {arch:?} through the generic transformer: {e}");
+                            error!("❌ {err}");
+                            anyhow!(err)
+                        })?;
+                    }
                     // For generic models: CUDA + CPU only (no OpenCL, those need per-model kernels).
                     // Per-layer KV cache memory cost. Used by HeteroPlan to
                     // reserve headroom on each GPU so weights + KV both fit.
@@ -1099,7 +1122,15 @@ impl LlmEngine {
                             bytes
                         }
                     };
+                    // A Sinkhorn wide residual keeps its own windows and compressed rows: its
+                    // description prices the cache.
+                    let wide_meta = crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims(&content)
+                        .then(|| crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::from_file(&content).ok())
+                        .flatten();
                     let kv_bytes_at = |ctx: u64| -> u64 {
+                        if let Some(meta) = &wide_meta {
+                            return meta.kv_bytes_per_layer(ctx as usize);
+                        }
                         let avg = if !pattern.is_empty() && sliding_window > 0 {
                             let n_swa = pattern.iter().filter(|&&is_swa| is_swa).count() as u64;
                             let n_global = pattern.len() as u64 - n_swa;
@@ -1123,9 +1154,18 @@ impl LlmEngine {
                             return Err(anyhow!("layers [{from}, {to}) are not within the {num_layers} of {arch}"));
                         }
                     }
-                    let (block_bytes, head_bytes) = generic_weights
-                        .block_and_head_bytes(&content, layer_share, num_layers)
-                        .unwrap_or((file_size, 0));
+                    // A wide residual puts its token mixers on a card and keeps everything else on
+                    // the host: the mixers are the blocks the cards hold.
+                    let card_mixers = layer_share
+                        .is_none()
+                        .then(|| crate::inference::generic_transformer::wide_sparse_plan::card_mixer_bytes(&content))
+                        .flatten();
+                    let (block_bytes, head_bytes) = match &card_mixers {
+                        Some(mixers) => (mixers.total(), 0),
+                        None => generic_weights
+                            .block_and_head_bytes(&content, layer_share, num_layers)
+                            .unwrap_or((file_size, 0)),
+                    };
                     let demand_at = |ctx: u64| crate::inference::place::ladder::Demand {
                         layers: layer_share.map_or(num_layers, |(from, to)| to - from),
                         block_bytes,
@@ -1314,7 +1354,7 @@ impl LlmEngine {
                             let cached_experts = crate::inference::generic_transformer::expert_tier::header_serves(&content);
                             let expert_split = generic_weights
                                 .layer_dense_and_expert_bytes(&content, num_layers)
-                                .filter(|_| layer_share.is_none())
+                                .filter(|_| layer_share.is_none() && card_mixers.is_none())
                                 .and_then(|layers| demand.plan_host_experts(&first_plan, &cuda_devices, &layers, cached_experts));
                             if let Some(p) = &expert_split {
                                 info!(
@@ -1483,6 +1523,29 @@ impl LlmEngine {
                                 },
                             )
                             .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
+                            let mut model = model;
+                            if quality != QualityLevel::Exact && layer_share.is_none() {
+                                let bos = get_gguf_u32(&content, "tokenizer.ggml.bos_token_id");
+                                let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
+                                let name = model_file
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                if let Some(ids) =
+                                    crate::inference::generic_transformer::routing_calibration::calibration_ids(&tokenizer, bos)
+                                {
+                                    if let Err(e) =
+                                        crate::inference::generic_transformer::routing_calibration::calibrate_loaded(
+                                            &mut model,
+                                            quality,
+                                            &format!("{name}:{file_len}"),
+                                            &ids,
+                                        )
+                                    {
+                                        warn!("quality calibration failed, routing stays exact: {e}");
+                                    }
+                                }
+                            }
                             let model = with_companion_draft(model, &model_file, layer_share);
                             try_wrap_with_vision(
                                 model,
@@ -1506,9 +1569,16 @@ impl LlmEngine {
             if let Some(store) = state_cache.clone() {
                 let mut files = crate::inference::cache::state_disk::FilesDigest::new();
                 let head = &mmap[..mmap.len().min(crate::inference::cache::state_disk::DIGEST_HEAD_BYTES)];
-                match std::fs::metadata(&model_file) {
-                    Ok(meta) => {
-                        files.file(&meta, head);
+                // Every part of a set names the states: a state is valid for the files it ran on.
+                let digested = match &split {
+                    Some(set) => set.parts().iter().try_for_each(|part| {
+                        let part_head = &part.mmap[..part.mmap.len().min(crate::inference::cache::state_disk::DIGEST_HEAD_BYTES)];
+                        part.file.metadata().map(|meta| files.file(&meta, part_head))
+                    }),
+                    None => std::fs::metadata(&model_file).map(|meta| files.file(&meta, head)),
+                };
+                match digested {
+                    Ok(()) => {
                         let identity = crate::inference::cache::state_disk::identity(&[
                             &files.finish(),
                             format!("{kv_quant:?}").as_bytes(),
