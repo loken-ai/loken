@@ -33,6 +33,7 @@ Major, by state then by priority:
 | Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Planned |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
+| Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Planned |
 
 Smaller, by state then by priority:
 
@@ -65,6 +66,7 @@ Smaller, by state then by priority:
 | Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Partial |
 | Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Partial |
 | DeepSeek V4.1 through the hetero route | Models | DeepSeek V4.1 loads and is placed through HeteroPlan and the ladder, with no loader, backend, batch server or expert streamer of its own, and its tokens equal those of the frozen oracle. | Started |
+| Documents checked against the hetero route | Documentation | Every page, scene and exercise that names DeepSeek V4.1, in `docs/` and on the site, matches the hetero route, with no dedicated loader, engine or port left in the text. | Planned |
 | Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Started |
 
 Fixes, by state then by priority:
