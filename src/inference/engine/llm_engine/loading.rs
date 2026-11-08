@@ -865,6 +865,25 @@ impl LlmEngine {
             // --- 5. Load model weights based on architecture ---
             debug!("⚖️  Architecture: {}, Device: {:?}", arch, device);
             let weights_t = std::time::Instant::now();
+            // The routing counts a run wrote, read once.
+            // The generic arm ranks a wide residual's experts by them.
+            // The expert caches are filled from them once the model is loaded.
+            let profile = expert_profile.as_deref().and_then(|path| {
+                use crate::inference::generic_transformer::expert_profile::ExpertProfile;
+                match ExpertProfile::read_if_present(std::path::Path::new(path)) {
+                    Ok(Some(profile)) => Some(profile),
+                    Ok(None) => {
+                        debug!("no expert profile at {path} yet");
+                        None
+                    }
+                    Err(e) => {
+                        warn!("expert profile not read: {e}");
+                        None
+                    }
+                }
+            });
+            // The further files of the checkpoint the routed experts are read from.
+            let mut variant_files: Vec<crate::tensor::quantized::gguf_source::SplitGguf> = Vec::new();
             // A special loader claims a file by what it contains; every other file takes the
             // generic hetero route, which builds what the file describes or says what it cannot.
             let model: BoxedModelBackend = match () {
@@ -901,165 +920,6 @@ impl LlmEngine {
                     device = built_on;
                     Box::new(MoondreamBackend(model))
                 }
-                // Residual hyper-connections mark the DeepSeek V4.1 checkpoint, whatever its
-                // converter named the architecture.
-                // Only a file whose manifest names expert variants takes this arm: the generic
-                // route does not choose between variant files.
-                _ if crate::inference::model::deepseek_v41::claims_gguf(&content)
-                    && !variant_blobs.is_empty() =>
-                {
-                    // The CPU port: latent MQA, CSA2 bands, hyper-connections, and a MoE whose
-                    // routed experts are read in place from the mapping by the quantised dot
-                    // engine. The model may ship as one file or a split set; every part is
-                    // mapped and stays the tensor source, so only the always-resident path is
-                    // committed and the page cache holds whichever experts the prompts route to.
-                    use crate::inference::model::deepseek_v41::{
-                        model::DeepseekV41Model, DeepseekV41Config,
-                    };
-                    let source = crate::tensor::quantized::gguf_source::SplitGguf::open(&model_file)
-                        .map_err(|e| anyhow!("deepseek_v41: open parts: {e}"))?;
-                    let mut cfg = DeepseekV41Config::from_meta(&source)?;
-                    // A file that carries no routing prior borrows the one a companion file beside
-                    // it declares, so its cards start filled instead of filling over the first
-                    // request.
-                    if cfg.hot_experts.iter().all(Vec::is_empty) {
-                        if let Some(prior) =
-                            crate::inference::model::deepseek_v41::sibling::prior_beside(
-                                &model_file,
-                                cfg.n_layers,
-                                cfg.n_routed_experts,
-                            )
-                        {
-                            cfg.hot_experts = prior;
-                        }
-                    }
-                    // The further files of the checkpoint, each checked to be of it before any
-                    // expert is read from it.
-                    let variants = variant_blobs
-                        .iter()
-                        .map(|p| {
-                            let t = std::time::Instant::now();
-                            let v = crate::tensor::quantized::gguf_source::SplitGguf::open(p)
-                                .map_err(|e| anyhow!("{}: {e}", p.display()))?;
-                            crate::inference::load::variant_files::check_variant(
-                                &source,
-                                &v,
-                                &|name| name.contains("engram_embd"),
-                            )
-                            .map_err(|e| anyhow!("{} cannot serve {model_id_clone}: {e}", p.display()))?;
-                            info!(
-                                "expert variant {} checked against the model's file in {:.1}s",
-                                p.display(),
-                                t.elapsed().as_secs_f32()
-                            );
-                            Ok(v)
-                        })
-                        .collect::<AnyResult<Vec<_>>>()?;
-                    let model = if variants.is_empty() {
-                        DeepseekV41Model::load(&source, &cfg)
-                    } else {
-                        DeepseekV41Model::load(
-                            &crate::inference::model::deepseek_v41::source::VariantSource {
-                                primary: &source,
-                                variants: &variants,
-                            },
-                            &cfg,
-                        )
-                    }
-                    .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
-                    // The routing heat: the model's own profile first, then the file's prior. The
-                    // profile's counts carry into the one this run writes.
-                    let ranks = expert_profile.as_deref().and_then(|path| {
-                        use crate::inference::generic_transformer::expert_profile::ExpertProfile;
-                        let profile = match ExpertProfile::read_if_present(std::path::Path::new(path)) {
-                            Ok(p) => p?,
-                            Err(e) => {
-                                warn!("expert profile not read: {e}");
-                                return None;
-                            }
-                        };
-                        if let Err(e) = model.seed_routing_profile(&profile) {
-                            warn!("expert profile {path} not used: {e}");
-                            return None;
-                        }
-                        info!("routing heat read from the expert profile {path}");
-                        crate::inference::place::expert_variants::ranks_from_counts(
-                            &profile.counts,
-                            profile.layers,
-                            profile.experts,
-                            &cfg.hot_experts,
-                        )
-                    });
-                    model.set_variant_policy(expert_variants, ranks);
-                    if quality != QualityLevel::Exact {
-                        let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
-                        let name = model_file
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        if let Some(ids) =
-                            crate::inference::model::deepseek_v41::calibrate::calibration_ids(&source)
-                        {
-                            model.set_quality_policy(quality, format!("{name}:{file_len}"), ids);
-                        }
-                    }
-                    // Without a kept tier the page cache is the only cache, and a prompt's
-                    // prefill sweeps every expert through it: the decode that follows starts
-                    // with the early layers evicted. The tier keeps each layer's most routed
-                    // experts within what the host memory allows.
-                    let slots = model
-                        .size_expert_cache_to_memory(&cfg)
-                        .map_err(|e| anyhow!("deepseek_v41: {e}"))?;
-                    info!(
-                        "✅ deepseek_v41 loaded on CPU from {} part(s) ({} layers, {} routed + {} \
-                         shared experts, {} kept per layer)",
-                        source.parts().len(),
-                        cfg.n_layers,
-                        cfg.n_routed_experts,
-                        cfg.n_shared_experts,
-                        slots,
-                    );
-                    // The draft the file carries first, the hub checkpoint's when it has none.
-                    let draft =
-                        crate::inference::model::deepseek_v41::dspark::Dspark::locate(&model_file, &source);
-                    let n_layers = cfg.n_layers;
-                    let mut backend =
-                        crate::inference::engine::model_backend::DeepseekV41Backend::with_draft(
-                            model,
-                            cfg.moe_inter_dim,
-                            user_context_length,
-                            draft,
-                        );
-                    // The states of a prompt are stored under the model files and the numerics
-                    // they were computed with.
-                    if let Some(store) = state_cache.clone() {
-                        let mut files = crate::inference::cache::state_disk::FilesDigest::new();
-                        let mut readable = true;
-                        for part in source.parts() {
-                            let head = &part.mmap[..part.mmap.len().min(
-                                crate::inference::cache::state_disk::DIGEST_HEAD_BYTES,
-                            )];
-                            match part.file.metadata() {
-                                Ok(meta) => files.file(&meta, head),
-                                Err(e) => {
-                                    warn!("state cache off: {e}");
-                                    readable = false;
-                                }
-                            }
-                        }
-                        if readable {
-                            backend = backend.with_state_cache(
-                                store,
-                                crate::inference::model::deepseek_v41::snapshot::identity(&[
-                                    &files.finish(),
-                                    &(n_layers as u64).to_le_bytes(),
-                                ]),
-                                cfg.state_bytes_per_token(),
-                            );
-                        }
-                    }
-                    Box::new(backend)
-                }
                 _ => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // A config needs the RoPE pairing the file does not carry: an architecture
@@ -1071,6 +931,24 @@ impl LlmEngine {
                             error!("❌ {err}");
                             anyhow!(err)
                         })?;
+                    }
+                    // The further files of the checkpoint the manifest names, each checked to be
+                    // of it before any weight is placed.
+                    // A wide residual reads its routed experts from them as well.
+                    if !variant_blobs.is_empty() {
+                        if crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims(&content) {
+                            variant_files = crate::inference::generic_transformer::wide_sparse_variants::open_checked(
+                                &model_file,
+                                &variant_blobs,
+                                &model_id_clone,
+                            )
+                            .map_err(|e| anyhow!("{e}"))?;
+                        } else {
+                            warn!(
+                                "{} expert variant file(s) of {model_id_clone} left unread: the experts of a wide residual alone are read from them",
+                                variant_blobs.len()
+                            );
+                        }
                     }
                     // For generic models: CUDA + CPU only (no OpenCL, those need per-model kernels).
                     // Per-layer KV cache memory cost. Used by HeteroPlan to
@@ -1524,6 +1402,23 @@ impl LlmEngine {
                             )
                             .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
                             let mut model = model;
+                            // A wide residual whose file carries no routing prior takes the one a
+                            // companion file beside it declares.
+                            // The profile then ranks its experts, the prior ordering the uncounted.
+                            model.locate_routing_prior(&model_file);
+                            if let (Some(path), Some(profile)) = (expert_profile.as_deref(), profile.as_ref()) {
+                                if let Err(e) = model.prime_routing_heat(profile) {
+                                    warn!("expert profile {path} not used: {e}");
+                                }
+                            }
+                            // Each routed expert is read from the file the policy chooses, in the
+                            // order of the heat.
+                            if !variant_files.is_empty() {
+                                model
+                                    .attach_expert_variants(&variant_files)
+                                    .map_err(|e| anyhow!("{model_id_clone}: {e}"))?;
+                                model.place_expert_variants(expert_variants);
+                            }
                             if quality != QualityLevel::Exact && layer_share.is_none() {
                                 let bos = get_gguf_u32(&content, "tokenizer.ggml.bos_token_id");
                                 let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
@@ -1577,12 +1472,24 @@ impl LlmEngine {
                     }),
                     None => std::fs::metadata(&model_file).map(|meta| files.file(&meta, head)),
                 };
+                // The files the routed experts are read from name the states too, with the policy
+                // that chose between them.
+                let digested = digested.and_then(|()| {
+                    variant_files.iter().flat_map(|v| v.parts()).try_for_each(|part| {
+                        let part_head = &part.mmap[..part.mmap.len().min(crate::inference::cache::state_disk::DIGEST_HEAD_BYTES)];
+                        part.file.metadata().map(|meta| files.file(&meta, part_head))
+                    })
+                });
+                let policy = format!("{expert_variants:?}");
                 match digested {
                     Ok(()) => {
-                        let identity = crate::inference::cache::state_disk::identity(&[
-                            &files.finish(),
-                            format!("{kv_quant:?}").as_bytes(),
-                        ]);
+                        let digest = files.finish();
+                        let kv = format!("{kv_quant:?}");
+                        let mut parts: Vec<&[u8]> = vec![&digest[..], kv.as_bytes()];
+                        if !variant_files.is_empty() {
+                            parts.push(policy.as_bytes());
+                        }
+                        let identity = crate::inference::cache::state_disk::identity(&parts);
                         if model.attach_state_cache(store, identity) {
                             info!("state cache on for {arch}");
                         }
@@ -1616,15 +1523,10 @@ impl LlmEngine {
 
             // The expert caches filled from a profile, before any prompt routes.
             let mut model = model;
-            if let Some(path) = expert_profile.as_deref() {
-                use crate::inference::generic_transformer::expert_profile::ExpertProfile;
-                match ExpertProfile::read_if_present(std::path::Path::new(path)) {
-                    Ok(Some(profile)) => match model.prime_expert_caches(&profile) {
-                        Ok(n) => info!("expert caches filled from {path}: {n} experts copied"),
-                        Err(e) => warn!("expert caches not filled from {path}: {e}"),
-                    },
-                    Ok(None) => debug!("no expert profile at {path} yet"),
-                    Err(e) => warn!("expert profile not read: {e}"),
+            if let (Some(path), Some(profile)) = (expert_profile.as_deref(), profile.as_ref()) {
+                match model.prime_expert_caches(profile) {
+                    Ok(n) => info!("expert caches filled from {path}: {n} experts copied"),
+                    Err(e) => warn!("expert caches not filled from {path}: {e}"),
                 }
             }
 

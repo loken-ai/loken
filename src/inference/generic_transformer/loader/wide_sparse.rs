@@ -17,6 +17,9 @@
 //! kernel reads.
 //! A table in any other format is held dense F32.
 //!
+//! The routed experts of a GGUF file may also be read from further files of its checkpoint,
+//! each storing them in its own format.
+//!
 //! A file whose metadata declares a block draft gives the model its draft head.
 //! The head's tensors keep the checkpoint's names, `mtp.{stage}.*`.
 //! Its projections and routed experts are read as the layers' are.
@@ -32,7 +35,7 @@ use super::super::latent_mqa::{frequencies, LatentMqa, LatentMqaDims, LatentMqaW
 use super::super::ngram::engram::{EngramBlock, EngramMeta, EngramTable};
 use super::super::wide_sparse_config::{LayerKind, NgramHashFields, WideSparseMeta};
 use super::super::wide_sparse_layer::{
-    LayerEngram, PreMixCarry, RoutedFfn, SinkhornBlock, TokenCarry, WideSparseHead,
+    ExpertVariants, LayerEngram, PreMixCarry, RoutedFfn, SinkhornBlock, TokenCarry, WideSparseHead,
 };
 use super::super::*;
 use super::TensorSource;
@@ -283,6 +286,67 @@ fn spellings(il: usize, stems: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// The `routed` experts of block `il`, read from `tensors`.
+///
+/// A block stores them as 1 stack per projection, or as 3 tensors of its own per expert.
+/// An expert of a stack is a view of its rows.
+/// A stack in a format no host kernel reads in place is refused.
+fn routed_experts(
+    tensors: &Tensors<'_, '_>,
+    il: usize,
+    routed: usize,
+) -> Result<Vec<BlockScaledExpert>> {
+    let stack = |stem: &str| -> Result<Option<Arc<QTensor>>> {
+        match spellings(il, &[stem]).into_iter().find(|n| tensors.has(n)) {
+            Some(n) => tensors.stack(&n),
+            None => Ok(None),
+        }
+    };
+    let one = |stack: &Arc<QTensor>, e: usize| -> Result<Projection> {
+        if !crate::tensor::quant_view::native_view_supported(stack.dtype()) {
+            crate::tensor::bail!(
+                "the experts of layer {il} are {:?}: no host kernel reads them in place",
+                stack.dtype()
+            );
+        }
+        Ok(Projection::Quant(Arc::new(
+            crate::tensor::quant_view::expert_view(stack, e)?,
+        )))
+    };
+    let stacks = (
+        stack("ffn_gate_exps")?,
+        stack("ffn_up_exps")?,
+        stack("ffn_down_exps")?,
+    );
+    match stacks {
+        (Some(gate), Some(up), Some(down)) => (0..routed)
+            .map(|e| -> Result<BlockScaledExpert> {
+                Ok(BlockScaledExpert {
+                    gate: one(&gate, e)?,
+                    up: one(&up, e)?,
+                    down: one(&down, e)?,
+                })
+            })
+            .collect(),
+        _ => (0..routed)
+            .map(|e| -> Result<BlockScaledExpert> {
+                Ok(BlockScaledExpert {
+                    gate: tensors.projection(&format!("blk.{il}.ffn_gate_exps.{e}"))?,
+                    up: tensors.projection(&format!("blk.{il}.ffn_up_exps.{e}"))?,
+                    down: tensors.projection(&format!("blk.{il}.ffn_down_exps.{e}"))?,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Whether every projection of `expert` is read in place from its file's blocks.
+fn read_in_place(expert: &BlockScaledExpert) -> bool {
+    [&expert.gate, &expert.up, &expert.down]
+        .iter()
+        .all(|p| matches!(p, Projection::Quant(_)))
+}
+
 /// The configuration the generic forward around the layers reads.
 ///
 /// The token mixers, the residual mixers and the feed-forward hold their own widths.
@@ -439,6 +503,71 @@ impl GenericHeteroTransformer {
             }
         }
         false
+    }
+
+    /// Reads the routed experts of every layer this model holds from `files` as well: further
+    /// files of the checkpoint the model's own file belongs to, each storing them in its own
+    /// format.
+    ///
+    /// Variant 0 is the model's own file, variant `i + 1` is `files[i]`.
+    /// Every expert reads variant 0 until `place_expert_variants` chooses.
+    /// An expert that is not read in place from its file's blocks, in any file, refuses the
+    /// variants and leaves the model as it was.
+    /// A model that is not a Sinkhorn wide residual is refused.
+    pub fn attach_expert_variants(
+        &mut self,
+        files: &[crate::tensor::quantized::gguf_source::SplitGguf],
+    ) -> Result<()> {
+        let Some(ws) = self.wide_sparse.as_ref() else {
+            crate::tensor::bail!("expert variants: the model is not a Sinkhorn wide residual");
+        };
+        let routed = ws.meta.mixture.routed;
+        // Each file's tensors, read without counting toward the load's progress.
+        let contents: Vec<gguf_file::Content> = files.iter().map(|f| f.merged_content()).collect();
+        let sources: Vec<TensorSource<'_>> = files
+            .iter()
+            .map(|f| {
+                let mut source = TensorSource::of_split(f);
+                source.count = super::LoadCount::none();
+                source
+            })
+            .collect();
+        let mut attached = Vec::with_capacity(self.layers.len());
+        for (i, layer) in self.layers.iter().enumerate() {
+            let il = self.first_layer + i;
+            let Some(block) = layer.sinkhorn.as_ref() else {
+                attached.push(None);
+                continue;
+            };
+            if !block.ffn.experts.iter().all(read_in_place) {
+                crate::tensor::bail!(
+                    "expert variants: the experts of layer {il} have no format read in place"
+                );
+            }
+            let mut stored = vec![block.ffn.experts.clone()];
+            for (v, (content, source)) in contents.iter().zip(&sources).enumerate() {
+                let tensors = Tensors::File { content, source };
+                let experts = routed_experts(&tensors, il, routed)?;
+                if !experts.iter().all(read_in_place) {
+                    crate::tensor::bail!(
+                        "expert variants: the experts of layer {il} in variant {} have no \
+                         format read in place",
+                        v + 1
+                    );
+                }
+                stored.push(experts);
+            }
+            attached.push(Some(stored));
+        }
+        for (layer, stored) in self.layers.iter_mut().zip(attached) {
+            if let (Some(block), Some(stored)) = (layer.sinkhorn.as_mut(), stored) {
+                block.ffn.variants = ExpertVariants {
+                    chosen: vec![0; block.ffn.experts.len()],
+                    stored,
+                };
+            }
+        }
+        Ok(())
     }
 
     /// The model a block-scaled checkpoint holds, described by its reference arguments.
@@ -631,49 +760,7 @@ impl GenericHeteroTransformer {
                 )
             };
 
-            // The routed experts: 1 stack per projection, or 3 tensors of its own per expert.
-            let stack = |stem: &str| -> Result<Option<Arc<QTensor>>> {
-                match present(&spellings(il, &[stem])) {
-                    Some(n) => tensors.stack(&n),
-                    None => Ok(None),
-                }
-            };
-            let one = |stack: &Arc<QTensor>, e: usize| -> Result<Projection> {
-                if !crate::tensor::quant_view::native_view_supported(stack.dtype()) {
-                    crate::tensor::bail!(
-                        "the experts of layer {il} are {:?}: no host kernel reads them in place",
-                        stack.dtype()
-                    );
-                }
-                Ok(Projection::Quant(Arc::new(
-                    crate::tensor::quant_view::expert_view(stack, e)?,
-                )))
-            };
-            let stacks = (
-                stack("ffn_gate_exps")?,
-                stack("ffn_up_exps")?,
-                stack("ffn_down_exps")?,
-            );
-            let experts = match stacks {
-                (Some(gate), Some(up), Some(down)) => (0..m.routed)
-                    .map(|e| -> Result<BlockScaledExpert> {
-                        Ok(BlockScaledExpert {
-                            gate: one(&gate, e)?,
-                            up: one(&up, e)?,
-                            down: one(&down, e)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                _ => (0..m.routed)
-                    .map(|e| -> Result<BlockScaledExpert> {
-                        Ok(BlockScaledExpert {
-                            gate: projection(&format!("blk.{il}.ffn_gate_exps.{e}"))?,
-                            up: projection(&format!("blk.{il}.ffn_up_exps.{e}"))?,
-                            down: projection(&format!("blk.{il}.ffn_down_exps.{e}"))?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            };
+            let experts = routed_experts(tensors, il, m.routed)?;
             let shared = match m.shared {
                 0 => None,
                 _ => Some(BlockScaledExpert {
@@ -699,6 +786,7 @@ impl GenericHeteroTransformer {
                 scale: m.route_scale,
                 limit: m.swiglu_limits.get(il).copied().unwrap_or(0.0),
                 lossy: Default::default(),
+                variants: Default::default(),
             };
             // An engram layer: its table, under its own name or as the table every layer shares,
             // its fused key and value projection, and its gate.
@@ -917,6 +1005,8 @@ impl GenericHeteroTransformer {
             tokens: engram.map(|(_, tokens)| tokens),
             draft: None,
             meta: Arc::new(meta.clone()),
+            prior: meta.mixture.hot.clone(),
+            heat: None,
         };
         tensors.finish();
         let mut model = Self {
@@ -1073,6 +1163,7 @@ fn build_block_draft(tensors: &Tensors<'_, '_>, meta: BlockDraftMeta) -> Result<
             scale: meta.route_scale,
             limit: meta.swiglu_limit,
             lossy: Default::default(),
+            variants: Default::default(),
         };
         stages.push(DraftStage {
             attn,

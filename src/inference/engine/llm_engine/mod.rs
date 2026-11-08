@@ -1714,6 +1714,10 @@ mod wide_load_tests;
 mod wide_pipeline_tests;
 #[cfg(test)]
 mod wide_real_tests;
+#[cfg(test)]
+mod wide_routing_tests;
+#[cfg(test)]
+mod wide_variant_tests;
 use std::io::Cursor;
 use std::time::Instant;
 

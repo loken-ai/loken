@@ -95,8 +95,11 @@ Each further file is a layer of media type `application/vnd.loken.image.model.va
 Every tensor is read from the first file, except the routed experts.
 The placement reads the routed experts expert by expert, from 1 file or another.
 
-The placement fills the cards, then the host tier, in routing-heat order.
-The heat is the model's routing profile in `profiles/` of the store, else the routing prior the file records.
+The placement fills the tiers that keep routed experts in routing-heat order: the cards, then the host tier.
+The heat is the model's routing profile in `profiles/` of the store.
+The routing prior orders the experts the profile never counted, and every expert when there is no profile.
+The prior is the one the file records, else the one a companion GGUF beside it declares.
+A wide-residual model runs its routed experts on the host's cores, read from their file: no tier keeps them.
 The `fidelity` level in [Configuration](CONFIGURATION.md) picks the file:
 
 ```mermaid
@@ -124,7 +127,8 @@ A further file is refused at load, with what differs, unless it matches the firs
 
 A table read row by row (the engram tables) is compared on evenly spread spans.  
 Tensors that only the further file carries are ignored.  
-The DeepSeek V4.1 route reads this layout.
+The generic route reads this layout for a wide-residual model, DeepSeek V4.1 among them.
+Another model's further files are left unread, and the log says so.
 
 ### Convert DeepSeek V4.1
 

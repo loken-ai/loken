@@ -284,6 +284,19 @@ pub struct LossyRouting {
     pub saved: AtomicU64,
 }
 
+/// The routed experts of a layer in every file of the checkpoint that stores them.
+///
+/// Empty for a model read from 1 file.
+#[derive(Default)]
+pub struct ExpertVariants {
+    /// Per variant, per expert.
+    ///
+    /// Variant 0 is the model's own file.
+    pub stored: Vec<Vec<BlockScaledExpert>>,
+    /// Per expert, the variant the layer reads.
+    pub chosen: Vec<usize>,
+}
+
 /// The feed-forward of a layer: a sqrt-softplus router over routed experts, beside a shared
 /// expert.
 pub struct RoutedFfn {
@@ -291,6 +304,9 @@ pub struct RoutedFfn {
     pub router: Projection,
     /// Added to the scores for the choice only, `[experts]`.
     pub bias: Vec<f32>,
+    /// The experts the layer reads, by id.
+    ///
+    /// Each one is the variant `variants` chose, when the experts have variants.
     pub experts: Vec<BlockScaledExpert>,
     pub shared: Option<BlockScaledExpert>,
     /// Experts a row is routed to.
@@ -303,9 +319,40 @@ pub struct RoutedFfn {
     /// The bound of the SwiGLU, `0` for none.
     pub limit: f32,
     pub lossy: LossyRouting,
+    pub variants: ExpertVariants,
 }
 
 impl RoutedFfn {
+    /// Bytes of expert `e` as variant `v` stores it, `None` when there is no such variant.
+    ///
+    /// Variant 0 of a layer without variants is the expert the layer reads.
+    pub fn variant_bytes(&self, e: usize, v: usize) -> Option<u64> {
+        let expert = match self.variants.stored.is_empty() {
+            true => self.experts.get(e).filter(|_| v == 0),
+            false => self.variants.stored.get(v).and_then(|s| s.get(e)),
+        }?;
+        Some((expert.gate.bytes() + expert.up.bytes() + expert.down.bytes()) as u64)
+    }
+
+    /// Reads expert `e` from variant `v` from now on.
+    ///
+    /// False when there is no such variant, and the layer reads what it read.
+    pub fn choose_variant(&mut self, e: usize, v: usize) -> bool {
+        let stored = self.variants.stored.get(v).and_then(|s| s.get(e)).cloned();
+        match (
+            stored,
+            self.experts.get_mut(e),
+            self.variants.chosen.get_mut(e),
+        ) {
+            (Some(expert), Some(slot), Some(chosen)) => {
+                *slot = expert;
+                *chosen = v;
+                true
+            }
+            _ => v == 0 && self.variants.stored.is_empty(),
+        }
+    }
+
     /// Each row's experts and their weights before the scale.
     ///
     /// A row takes the truncated choice when the truncation gives up exactness, the plain
@@ -533,6 +580,16 @@ pub struct WideSparseHead {
     pub draft: Option<BlockDraft>,
     /// The description the layers were built from.
     pub meta: Arc<super::wide_sparse_config::WideSparseMeta>,
+    /// Per layer of the stack, the experts from the most to the least routed to.
+    ///
+    /// The file's own, or a companion file's when the file carries none.
+    /// Empty lists without a prior.
+    pub prior: Vec<Vec<usize>>,
+    /// Per layer of the stack, the experts ranked by a routing profile, the prior ordering the
+    /// ones it never counted.
+    ///
+    /// `None` without a profile that counted a route.
+    pub heat: Option<Vec<Vec<usize>>>,
 }
 
 impl WideSparseHead {

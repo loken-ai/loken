@@ -167,10 +167,16 @@ mod wide_sparse_quality_tests;
 mod wide_sparse_real_card_tests;
 #[cfg(test)]
 pub(crate) mod wide_sparse_real_tests;
+mod wide_sparse_routing;
+#[cfg(test)]
+pub(crate) mod wide_sparse_routing_tests;
 #[cfg(test)]
 mod wide_sparse_serve_tests;
 #[cfg(test)]
 mod wide_sparse_state_tests;
+#[cfg(test)]
+pub(crate) mod wide_sparse_variant_tests;
+pub mod wide_sparse_variants;
 pub use config::*;
 pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint, TableRows};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};
