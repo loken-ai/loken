@@ -15,7 +15,7 @@ A kernel without such a test has shipped wrong answers for 2 days.
 ## Find the code
 
 [The code map](docs/dev/code-map.md) names the code behind each part of lokend.  
-[Inside lokend](docs/inside/map.md) explains the same parts without the code.
+[Inside lokend](https://loken-ai.github.io/loken/map/) explains the same parts without the code.
 
 ## Build
 

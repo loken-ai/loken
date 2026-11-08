@@ -4,24 +4,24 @@ The same pages are served at <https://loken-ai.github.io/loken/>.
 
 | Page | Read it to |
 |---|---|
-| [`start/overview.md`](start/overview.md) | See what loken serves and in which state |
-| [`start/install.md`](start/install.md) | Build the 2 binaries |
-| [`start/first-run.md`](start/first-run.md) | Start the daemon, pull a model and get an answer |
-| [`start/choose-a-model.md`](start/choose-a-model.md) | Pick a family, a size and a quantisation that fit your memory |
-| [`start/concepts.md`](start/concepts.md) | Learn the terms of the guides and how a request reaches a model |
-| [`guides/openai-sdk.md`](guides/openai-sdk.md) | Serve a chat model to an OpenAI client |
-| [`guides/ollama-clients.md`](guides/ollama-clients.md) | Point an Ollama client at loken |
-| [`guides/agents.md`](guides/agents.md) | Run Claude Code or Cline on loken |
-| [`guides/embeddings.md`](guides/embeddings.md) | Embed texts and images |
-| [`guides/images.md`](guides/images.md) | Generate an image |
-| [`guides/speech.md`](guides/speech.md) | Transcribe and synthesise speech |
-| [`guides/drafter.md`](guides/drafter.md) | Speed up a model that spills to the host with a drafter |
-| [`guides/kv-memory.md`](guides/kv-memory.md) | Keep conversations in memory between requests |
-| [`operate/cluster.md`](operate/cluster.md) | Serve from 2 machines |
-| [`operate/network.md`](operate/network.md) | Expose loken on a network with a key and a rate limit |
-| [`operate/troubleshooting.md`](operate/troubleshooting.md) | Find the cause of a failure by its message |
-| [`inside/map.md`](inside/map.md) | See how lokend serves a request, part by part, one figure each |
-| [`learn/README.md`](learn/README.md) | Follow the series of 10 lessons, one exercise each |
+| [`start/overview.md`](https://loken-ai.github.io/loken/overview/) | See what loken serves and in which state |
+| [`start/install.md`](https://loken-ai.github.io/loken/install/) | Build the 2 binaries |
+| [`start/first-run.md`](https://loken-ai.github.io/loken/first-run/) | Start the daemon, pull a model and get an answer |
+| [`start/choose-a-model.md`](https://loken-ai.github.io/loken/choose-a-model/) | Pick a family, a size and a quantisation that fit your memory |
+| [`start/concepts.md`](https://loken-ai.github.io/loken/concepts/) | Learn the terms of the guides and how a request reaches a model |
+| [`guides/openai-sdk.md`](https://loken-ai.github.io/loken/openai-sdk/) | Serve a chat model to an OpenAI client |
+| [`guides/ollama-clients.md`](https://loken-ai.github.io/loken/ollama-clients/) | Point an Ollama client at loken |
+| [`guides/agents.md`](https://loken-ai.github.io/loken/agents/) | Run Claude Code or Cline on loken |
+| [`guides/embeddings.md`](https://loken-ai.github.io/loken/embeddings/) | Embed texts and images |
+| [`guides/images.md`](https://loken-ai.github.io/loken/images/) | Generate an image |
+| [`guides/speech.md`](https://loken-ai.github.io/loken/speech/) | Transcribe and synthesise speech |
+| [`guides/drafter.md`](https://loken-ai.github.io/loken/drafter/) | Speed up a model that spills to the host with a drafter |
+| [`guides/kv-memory.md`](https://loken-ai.github.io/loken/kv-memory/) | Keep conversations in memory between requests |
+| [`operate/cluster.md`](https://loken-ai.github.io/loken/cluster/) | Serve from 2 machines |
+| [`operate/network.md`](https://loken-ai.github.io/loken/network/) | Expose loken on a network with a key and a rate limit |
+| [`operate/troubleshooting.md`](https://loken-ai.github.io/loken/troubleshooting/) | Find the cause of a failure by its message |
+| [`inside/map.md`](https://loken-ai.github.io/loken/map/) | See how lokend serves a request, part by part, one figure each |
+| [`learn/README.md`](https://loken-ai.github.io/loken/course/) | Follow the series of 10 lessons, one exercise each |
 | [`MODELS.md`](MODELS.md) | Find the families served, their stores, and how a request names them |
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Look up a key of `config.toml` and its default |
 | [`API.md`](API.md) | Look up a route on the 3 surfaces |

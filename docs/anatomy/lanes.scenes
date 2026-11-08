@@ -1,0 +1,347 @@
+# The gate of a model, the queue in front of it, and the move into the batch worker.
+# A vehicle is a request: an ambulance for fill in the middle, a car for interactive, a truck for batch.
+# The ticket is the lane of the gate, held by the request in flight.
+# The meter counts a request from its arrival to its end.
+
+let LANE = 320
+let BAY = {fim: 262, interactive: 320, batch: 378}
+let FRONT = 320
+let SECOND = 258
+let STOP = (372, 320)
+let PAST = (452, 320)
+let BOOTH = (434, 269)
+let RUN = (765, 320)
+let EXIT = (1070, 320)
+let ENTRY = (-60, 320)
+let METER = 32
+let S = {meter: 0, led: none, ticket: none, running: 0}
+
+# The heading of a move of `dx`, `dy`, in degrees, or none when it does not move.
+to heading(dx, dy)
+  let ax = abs(dx)
+  let ay = abs(dy)
+  if ax + ay < 0.001
+    return none
+  end
+  let t = min(ax, ay) / max(ax, ay)
+  let a = 57.2958 * (0.7854 * t + 0.273 * t * (1 - t))
+  if ay > ax
+    a = 90 - a
+  end
+  if dx < 0
+    a = 180 - a
+  end
+  if dy < 0
+    a = -a
+  end
+  return a
+end
+
+# A straight cubic from `a` to `b`.
+to line(a, b)
+  let dx = (b[0] - a[0]) / 3
+  let dy = (b[1] - a[1]) / 3
+  return [a, (a[0] + dx, a[1] + dy), (a[0] + 2 * dx, a[1] + 2 * dy), b]
+end
+
+# A cubic from `a` to `b` that leaves and lands level, as a change of lane does.
+to bend(a, b)
+  let m = (b[0] - a[0]) / 2
+  return [a, (a[0] + m, a[1]), (b[0] - m, b[1]), b]
+end
+
+# The point of the cubic `c` at `e`, from 0 to 1, with the direction it goes.
+to point(c, e)
+  let u = 1 - e
+  let w = [u * u * u, 3 * u * u * e, 3 * u * e * e, e * e * e]
+  let x = w[0] * c[0][0] + w[1] * c[1][0] + w[2] * c[2][0] + w[3] * c[3][0]
+  let y = w[0] * c[0][1] + w[1] * c[1][1] + w[2] * c[2][1] + w[3] * c[3][1]
+  let dx = 3 * u * u * (c[1][0] - c[0][0]) + 6 * u * e * (c[2][0] - c[1][0]) + 3 * e * e * (c[3][0] - c[2][0])
+  let dy = 3 * u * u * (c[1][1] - c[0][1]) + 6 * u * e * (c[2][1] - c[1][1]) + 3 * e * e * (c[3][1] - c[2][1])
+  return [x, y, dx, dy]
+end
+
+# Sets a vehicle or the ticket at `x`, `y`, turned by `a` degrees.
+to put(v, x, y, a)
+  setAttr(v, "data-x", x)
+  setAttr(v, "data-y", y)
+  setAttr(v, "data-a", a)
+  setAttr(v, "transform", "translate(" + fixed(x, 1) + " " + fixed(y, 1) + ") rotate(" + fixed(a, 1) + ")")
+end
+
+# The meter counts `d` more requests, and its display flashes.
+to count(d)
+  S.meter += d
+  retext(S.led, str(S.meter))
+  light "meter" "beat"
+end
+
+# The Worker row of the Now box.
+to worker(d)
+  S.running += d
+  let t = str(S.running) + " running"
+  row 2 t
+end
+
+# Moves the vehicle `v` along the cubics of `path` in `ms`.
+# It speeds up, slows down and turns to face where it goes.
+# A vehicle that backs up keeps its heading.
+# The ticket `t`, when given, rides on its roof.
+# Passing the meter counts the vehicle once.
+to drive(v, path, ms, t, back)
+  let lens = [hypot(c[3][0] - c[0][0], c[3][1] - c[0][1]) + 1 for c in path]
+  let total = 0
+  for n in lens
+    total += n
+  end
+  let t0 = clock()
+  let k = 0
+  while k < 1
+    k = min(1, (clock() - t0) / ms)
+    let e = 2 * k * k if k < 0.5 else 1 - 2 * (1 - k) * (1 - k)
+    let d = e * total
+    let i = 0
+    while i < len(path) - 1 and d > lens[i]
+      d -= lens[i]
+      i += 1
+    end
+    let p = point(path[i], min(1, d / lens[i]))
+    let a = heading(p[2], p[3])
+    if a == none or back
+      a = attr(v, "data-a")
+    end
+    if attr(v, "data-x") < METER and p[0] >= METER
+      count(1)
+    end
+    put(v, p[0], p[1], a)
+    if t
+      put(t, p[0], p[1] - 1, 0)
+    end
+    if k < 1
+      wait 16ms
+    end
+  end
+end
+
+# A new request of the `kind` of vehicle, waiting out of sight on the left.
+to arrive(kind)
+  let v = sprite(kind, ENTRY)
+  put(v, ENTRY[0], ENTRY[1], 0)
+  return v
+end
+
+# The way from the entry into the bay at `y`, up to `x`.
+to toBay(y, x)
+  return [[ENTRY, (110, LANE), (150, y), (x, y)]]
+end
+
+# The way from the entry along the road that skips the gate, onto the deck at `spot`.
+to toWorker(spot)
+  return [[ENTRY, (30, LANE), (40, 380), (110, 432)], bend((110, 432), (180, 446)), line((180, 446), (560, 446)), bend((560, 446), spot)]
+end
+
+# The way from the place `src` of the deck or the card to the response.
+to toExit(src)
+  return [bend(src, (930, LANE)), line((930, LANE), EXIT)]
+end
+
+# The vehicle `v` takes the lane: the ticket leaves the booth for its roof, the lamp turns red and the arm lifts.
+# The ticket is drawn again on top of the vehicles.
+to take(v, ms)
+  let here = pos(S.ticket)
+  remove S.ticket
+  S.ticket = sprite("ticket", here)
+  glideAll([[S.ticket, pos(v)]], ms)
+  light "gate" "held" on
+  light "gate" "open" on
+end
+
+# The lane is given up: the ticket goes back to the booth and the lamp turns green.
+to giveUp(ms)
+  glideAll([[S.ticket, BOOTH]], ms)
+  light "gate" "held" off
+end
+
+# The request `v` ends: it leaves the card, the meter counts it out and it is gone.
+to depart(v, src, ms)
+  dropClass("run", v)
+  drive(v, toExit(src), ms)
+  count(-1)
+  remove v
+end
+
+scene flow
+  S.meter = 0
+  S.running = 0
+  S.led = shape("text", {class: "led", x: 32, y: 251}, "0")
+  S.ticket = sprite("ticket", BOOTH)
+  row 0 "serial"
+  row 1 "0 in flight, 0 queued"
+  row 2 "none"
+
+  # Step 0: A model serves requests 1 at a time, in serial.
+  # A request asks the gate for a lane, takes it and is in flight.
+  step 0
+  wait 500
+  let a = arrive("car")
+  drive(a, [line(ENTRY, STOP)], 1700)
+  take(a, 450)
+  row 1 "1 in flight, 0 queued"
+  drive(a, [line(STOP, RUN)], 1700, S.ticket)
+  light "gate" "open" off
+  addClass("run", a)
+  light "bridge" "go" on
+  light "card" "go" on
+  say "1 request in flight" busy
+  wait 900
+
+  # Step 1: When no lane is free, the request joins the queue, by priority then by arrival.
+  # These requests arrive while another runs, so the model will batch.
+  step 1
+  let c = arrive("truck")
+  drive(c, toBay(BAY.batch, FRONT), 1900)
+  light "mode" "next" on
+  emit at (478, 208) "overlap"
+  row 1 "1 in flight, 1 queued"
+  wait 300
+  let b = arrive("car")
+  drive(b, toBay(BAY.interactive, FRONT), 1800)
+  row 1 "1 in flight, 2 queued"
+  wait 900
+
+  # Step 2: A request that waits too long for a lane is answered with 503.
+  step 2
+  wait 300
+  let board = sprite("refuse", (378, 400))
+  addClass("hazard", c)
+  noise(220, 0.08)
+  wait 1100
+  addClass("fade", c)
+  drive(c, [line((FRONT, BAY.batch), (170, BAY.batch))], 1300, none, true)
+  count(-1)
+  remove c, board
+  row 1 "1 in flight, 1 queued"
+  wait 400
+
+  # Step 3: A fill in the middle completion goes ahead of the queue.
+  # The gate does not preempt, and the request in flight runs to its end.
+  step 3
+  let f = arrive("ambulance")
+  let d = arrive("car")
+  together
+    drive(f, toBay(BAY.fim, FRONT), 1800)
+    row 1 "1 in flight, 2 queued"
+  also
+    wait 700
+    drive(d, toBay(BAY.interactive, SECOND), 1800)
+    row 1 "1 in flight, 3 queued"
+  end
+  say "The request in flight runs to its end" busy
+  wait 1200
+
+  # Step 4: The request in flight ends, and the lane goes to the waiting request of the highest priority.
+  # That request moves the model into its batch worker on the cards, then gives the lane up.
+  step 4
+  together
+    depart(a, RUN, 1500)
+  also
+    wait 200
+    light "bridge" "go" off
+    giveUp(500)
+    row 1 "0 in flight, 3 queued"
+  end
+  wait 300
+  take(f, 450)
+  row 1 "1 in flight, 2 queued"
+  drive(f, [bend((FRONT, BAY.fim), PAST)], 1200, S.ticket)
+  light "mode" "batch" on
+  light "mode" "next" off
+  light "bridge" "gone" on
+  light "deck" "up" on
+  light "deck" "go" on
+  light "bypass" "open" on
+  row 0 "batched"
+  emit at (650, 524) "batching"
+  wait 900
+  giveUp(450)
+  row 1 "0 in flight, 2 queued"
+  drive(f, [bend(PAST, (700, 352))], 900)
+  addClass("run", f)
+  worker(1)
+  wait 500
+
+  # Step 5: The requests queued behind it reach the worker at once.
+  # A request on a model that batches does not cross the gate: the worker takes it at once.
+  step 5
+  together
+    drive(b, [line((FRONT, LANE), PAST), bend(PAST, (700, 290))], 1500)
+    addClass("run", b)
+    worker(1)
+  also
+    wait 350
+    drive(d, [line((SECOND, LANE), PAST), bend(PAST, (830, 290))], 1700)
+    addClass("run", d)
+    worker(1)
+  also
+    take(b, 180)
+    giveUp(180)
+    take(d, 200)
+    giveUp(200)
+    row 1 "0 in flight, 0 queued"
+  end
+  light "gate" "open" off
+  wait 300
+  let e = arrive("car")
+  drive(e, toWorker((700, 430)), 2400)
+  addClass("run", e)
+  worker(1)
+  wait 900
+
+  # Step 6: A run of lone requests returns the model to serial.
+  # A request then crosses the gate again.
+  step 6
+  together
+    depart(f, (700, 352), 1300)
+    worker(-1)
+  also
+    wait 400
+    depart(d, (830, 290), 1300)
+    worker(-1)
+  also
+    wait 900
+    depart(b, (700, 290), 1400)
+    worker(-1)
+  also
+    wait 1300
+    depart(e, (700, 430), 1400)
+    worker(-1)
+  end
+  row 2 "0 running"
+  for n in range(2)
+    let g = arrive("car")
+    drive(g, toWorker((760, 430)), 2000)
+    addClass("run", g)
+    worker(1)
+    emit at (760, 398) "alone"
+    wait 700
+    depart(g, (760, 430), 1100)
+    worker(-1)
+  end
+  let i = arrive("car")
+  light "deck" "up" off
+  light "deck" "go" off
+  light "bridge" "gone" off
+  light "bypass" "open" off
+  light "mode" "batch" off
+  row 0 "serial"
+  row 2 "none"
+  emit at (478, 208) "serial"
+  drive(i, [line(ENTRY, STOP)], 1700)
+  take(i, 400)
+  row 1 "1 in flight, 0 queued"
+  drive(i, [line(STOP, RUN)], 1600, S.ticket)
+  light "gate" "open" off
+  addClass("run", i)
+  light "bridge" "go" on
+  wait 1200
+end

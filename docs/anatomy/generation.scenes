@@ -1,164 +1,446 @@
-# The scenes of the generation: a prompt read in chunks, and a draft checked in one pass.
+# The scenes of the generation loop: a prompt read in chunks, and a draft checked in 1 pass.
 
-to mid(b)
-  return (attr(b, "x") + 4, attr(b, "y") + 4)
+let DEMO = {answer: ["The", " capital", " is", " Paris", "."]}
+# The centre of the column and the row under layer 0 where tokens line up.
+let XC = 240
+let BASE = layers[0].y + 16
+let HEAD = (240, 112)
+
+# A row of dots centred on the column at the height y.
+to lineUp(ds, y, gap)
+  return [(d, (XC + (i - (len(ds) - 1) / 2) * gap, y)) for [i, d] in enumerate(ds)]
+end
+
+# The run that holds layer i, as the Now line names it.
+to cardOf(i)
+  return "the CUDA card" if layers[i].kind == "dc" else "the ROCm card"
+end
+
+# The left edge of what the camera frames on a phone while dots climb the column.
+let CAMX = 170
+
+# Dots up the column, layer by layer, up to layer `last`: each layer lights, and its cells `cells[i]`
+#   take the class `cls`.
+# The cells `reads[i]` of a layer flash while the dots pass it: what its tokens attend to.
+to climbLayers(ds, last, gap, cells, cls, reads)
+  for i in range(last + 1)
+    if i == 0
+      view (CAMX, 320, 420, 400)
+    elif i == 11
+      view (CAMX, 130, 420, 400)
+    end
+    if i == 0 or layers[i].kind != layers[i - 1].kind
+      say "Computing on " + cardOf(i) busy
+    end
+    add "hot" to layers[i].el
+    if reads
+      add "att" to reads[i]
+    end
+    glideAll(lineUp(ds, layers[i].y, gap), 44)
+    add cls to cells[i]
+    later 260ms
+      drop "hot" from layers[i].el
+      if reads
+        drop "att" from reads[i]
+      end
+    end
+  end
 end
 
 scene chunks
   # A long prompt read in chunks.
   let N = 24
-  let failAt = [v for v in layers if v.run == "dc"][4]
-  let slots = [shape("rect", {class: "box kvb", x: 366 + (i % 8) * 10, y: 152 + floor(i / 8) * 10, width: 8, height: 8, rx: 1.2}) for i in range(N)]
-  label(366, 145, "KV cache", size=8)
-  to place(i, size)
-    return (522 + i * 5 + floor(i / size) * 6, 150)
-  end
-  let toks = [dotAt(place(i, 8), 2.4, "small") for i in range(N)]
-  let ref = shape("circle", {class: "apath", r: 0, "data-r": 0, "data-big": 0})
+  let kc = query(".gn-kc")
+  let pt = query(".gn-pt")
+  # The share of free memory a chunk may take, in drawing units: its top and bottom, a token's
+  #   activations, and what a chunk of 8 adds for its attention and the KV growth.
+  let MT = 214
+  let MB = 534
+  let BLK = 32
+  let BAND = 50
   let read = 0
+  let length = 8
+  let shown = []
+  let value = shape("text", {class: "gn-val", x: 74, y: 589, "text-anchor": "middle"}, "")
+  let mark = sprite("bookmark", (397, 52))
   row 0 "0 of " + str(N)
-  # Step 0: A long prompt arrives.
-  # Its chunk length comes from the free memory of the tightest card and the widest feed-forward of
-  #   the model.
-  step 0
-  wait 1200
-  # A chunk of tokens in a line at the height y.
-  to lineUp(chunk, y)
-    return [(d, (500 + (i - (len(chunk) - 1) / 2) * 5.5, y)) for [i, d] in enumerate(chunk)]
+
+  to cell(i, j)
+    return kc[i * N + j]
   end
-  # One chunk up the stack: to the top, or to `stop` where the card runs out of memory.
-  to climb(chunk, stop)
+  # The peak of a chunk of `n` tokens: 1 block a token, then the attention and the KV growth.
+  to fillGauge(n, slow)
+    remove shown
+    shown = []
+    let y = MB
+    for k in range(n)
+      y -= BLK
+      let b = shape("rect", {class: "gn-blk", x: 31, y: y + 1.5, width: 84, height: BLK - 3, rx: 3})
+      shown += [b]
+      if k == 0
+        shown += [shape("text", {class: "gn-gl", x: 73, y: y + BLK / 2 + 5, "text-anchor": "middle"}, "1 token")]
+      end
+      if slow
+        wait 60
+      end
+    end
+    let bh = BAND * n / 8
+    y -= bh
+    shown += [shape("rect", {class: "gn-band", x: 31, y: y + 1, width: 84, height: bh - 2, rx: 3})]
+    if bh >= 40
+      shown += [shape("text", {class: "gn-bandcap", x: 73, y: y + bh / 2 - 3, "text-anchor": "middle"}, "attention,")]
+      shown += [shape("text", {class: "gn-bandcap", x: 73, y: y + bh / 2 + 13, "text-anchor": "middle"}, "KV growth")]
+    end
+    return y
+  end
+  # The brackets of the chunks under the prompt, from token `from` on, `size` tokens each.
+  let brackets = []
+  to drawChunks(a, size, cls)
+    let k = 0
+    for c in range(a, N, size)
+      let x0 = 400 + c * 13
+      let x1 = 400 + (c + size) * 13 - 2
+      brackets += [shape("path", {class: "gn-brk " + cls, d: "M" + str(x0) + ",74 L" + str(x0) + ",80 L" + str(x1) + ",80 L" + str(x1) + ",74"})]
+      brackets += [shape("text", {class: "gn-brkcap " + cls, x: (x0 + x1) / 2, y: 95, "text-anchor": "middle"}, str(size))]
+      k += 1
+    end
+  end
+  # Tokens `a` to `b`: dots from the prompt, down beside the column, into its foot.
+  to enter(a, b)
+    view (360, 0, 420, 354)
+    let ds = [dot(406 + j * 13, 76, 4, "small") for j in range(a, b)]
+    add "cur" to pt[a:b]
+    glideAll([[d, (308 + (k % 8) * 11, 112)] for [k, d] in enumerate(ds)], 500)
+    glideAll([[d, (308 + (k % 8) * 11, BASE)] for [k, d] in enumerate(ds)], 700)
+    glideAll(lineUp(ds, BASE, 11), 350)
+    for d in ds
+      drop "small" from d
+      add "busy" to d
+    end
+    return ds
+  end
+  # A chunk of tokens `a` to `b` up the column to layer `last`: each layer writes their KV.
+  to climb(a, b, last)
     # Step 1: Each chunk climbs the layers in one pass.
     # Each of its tokens attends to the tokens before it.
     step 1
     light "loop" "breathe"
-    glideAll(lineUp(chunk, base), 600)
-    for d in chunk
-      drop "small" from d
-      setAttr(d, "r", 3 * z)
-      add "busy" to d
-    end
-    glideAll(lineUp(chunk, stop.y if stop else top.y), 900 if stop else 1200, follow(ref, 500))
+    let ds = enter(a, b)
+    let top = fillGauge(b - a, false)
+    climbLayers(ds, last, 11, [[cell(i, j) for j in range(a, b)] for i in range(N)], "tent", [[cell(i, j) for j in range(0, b)] for i in range(N)])
+    return [ds, top]
   end
-  to keep(chunk)
+  # The chunk's cells join the cache, and the prompt is read up to its end.
+  to keep(ds, a, b)
     # Step 2: The chunk's tokens add their key and value to the cache.
     step 2
-    let kvs = [dotAt(pos(d), 2, "kv") for d in chunk]
-    for d in chunk
-      setAttr(d, "opacity", 0)
+    row 0 str(b) + " of " + str(N)
+    view (340, 120, 420, 354)
+    focus("kv")
+    for i in range(N)
+      for j in range(a, b)
+        drop "tent" from cell(i, j)
+        add "on" to cell(i, j)
+      end
+      wait 14
     end
-    glideAll([[d, mid(slots[read + i])] for [i, d] in enumerate(kvs)], 700)
-    remove kvs
-    add "on" to slots[read:read + len(chunk)]
-    light "kv" "glow"
-    read += len(chunk)
-    row 0 str(read) + " of " + str(N)
+    read = b
+    remove shown
+    shown = []
+    drop "cur" from pt[a:b]
+    add "done" to pt[a:b]
+    glide mark to (397 + b * 13, 52) over 500
+    say "Kept, the bookmark moves on"
+    focus()
   end
-  let first = toks[0:8]
-  climb(first)
-  keep(first)
-  remove first
-  let second = toks[8:16]
-  climb(second, failAt)
-  for d in second
-    drop "busy" from d
-    add "fail" to d
+  # Only the last chunk's logits are kept: the others fade at the top.
+  to dropLogits(ds)
+    say "Its logits are not kept"
+    for d in ds
+      add "other" to d
+    end
+    wait 350
+    remove ds
   end
-  say "Out of memory on the CUDA card" busy
-  wait 900
+
+  # Step 0: A long prompt arrives.
+  # Its chunk length comes from the free memory of the tightest card and the widest feed-forward of
+  #   the model.
+  step 0
+  view (0, 120, 420, 354)
+  focus("loop")
+  say "Measuring the tightest card"
+  fillGauge(length, true)
+  retext(value, str(length))
+  view (0, 280, 420, 354)
+  say "8 tokens fit: length 8"
+  drawChunks(0, length, "")
+  wait 1200
+  remove shown
+  shown = []
+  focus()
+
+  let first = climb(0, 8, N - 1)
+  dropLogits(first[0])
+  keep(first[0], 0, 8)
+
+  # The second chunk runs the CUDA card out of memory at its 5th layer.
+  let second = climb(8, 16, 4)
   # Step 3: A chunk that runs a card out of memory is halved.
   # When the cache can be cut back and the model keeps no recurrent state, reading goes on from that
   #   chunk and the tokens before it keep their cache.
   # Otherwise the prompt is read again from where this reading began.
   step 3
-  for d in second
-    drop "fail" from d
-    add "small" to d
-    setAttr(d, "r", data(d, "r"))
+  view (0, 120, 420, 354)
+  let spill = shape("rect", {class: "gn-over", x: 29, y: MT - 28, width: 88, height: 72, rx: 3})
+  let oom = [shape("text", {class: "gn-oom", x: 73, y: MT - 8, "text-anchor": "middle"}, "OUT OF"), shape("text", {class: "gn-oom", x: 73, y: MT + 10, "text-anchor": "middle"}, "MEMORY")]
+  for d in second[0]
+    drop "busy" from d
+    add "fail" to d
   end
-  let rest = toks[8:]
-  glideAll([[d, place(i + 8, 4)] for [i, d] in enumerate(rest)], 900)
-  wait 500
-  for c in range(0, len(rest), 4)
-    let chunk = rest[c:c + 4]
-    climb(chunk)
-    keep(chunk)
-    if c + 4 < len(rest)
-      remove chunk
+  for i in range(5)
+    for j in range(8, 16)
+      drop "tent" from cell(i, j)
+      add "fail" to cell(i, j)
     end
   end
+  say "Out of memory on the CUDA card" busy
+  wait 1000
+
+  focus("loop")
+  remove second[0]
+  remove spill
+  remove oom
+  for i in range(5)
+    for j in range(8, 16)
+      drop "fail" from cell(i, j)
+    end
+  end
+  drop "cur" from pt[8:16]
+  remove brackets
+  brackets = []
+  drawChunks(0, 8, "")
+  remove brackets[2:]
+  brackets = brackets[0:2]
+  length = 4
+  fillGauge(length, false)
+  retext(value, str(length))
+  drawChunks(8, length, "half")
+  shape("text", {class: "gn-gl", x: 74, y: 614, "text-anchor": "middle"}, "kept length: 4")
+  shape("text", {class: "gn-gl", x: 74, y: 632, "text-anchor": "middle"}, "for next requests")
+  view (0, 330, 420, 400)
+  wait 1000
+  view (300, 0, 420, 354)
+  say "Halved to 4, reading goes on from token 9"
+  wait 1400
+  remove shown
+  shown = []
+  focus()
+
+  let last = []
+  for c in range(8, N, 4)
+    let ch = climb(c, c + 4, N - 1)
+    if c + 4 < N
+      dropLogits(ch[0])
+    else
+      last = ch[0]
+    end
+    keep(ch[0], c, c + 4)
+  end
+
   # Step 4: Only the last chunk's logits are kept.
   # They give the first token.
   step 4
-  let last = rest[-1]
-  remove rest[0:-1]
-  setAttr(last, "opacity", 1)
-  compute last for 800 say "The output head drawing the first token"
-  emit at (512, top.y - 10) DEMO.answer[0]
+  view (60, 30, 420, 354)
+  focus("requests")
+  let tip = last[-1]
+  remove last[0:-1]
+  glide tip to HEAD over 400
+  add "on" to named("ohead")
+  compute tip for 700 say "Drawing the first token"
+  remove tip
+  drop "on" from named("ohead")
+  shape("text", {class: "gn-word new", x: 240, y: 106, "text-anchor": "middle"}, DEMO.answer[0])
   light "requests" "speak"
-  wait 1300
+  wait 900
+  say "Prompt read, first token drawn"
+  focus()
 end
 
 scene draft
   # Tokens guessed ahead, then checked.
-  shape("rect", {class: "box dh", x: 512, y: 137, width: 22, height: 8, rx: 2})
-  label(538, 144, "draft head")
-  let words = []
+  let kd = query(".gn-kd")
+  let C = 11
+  to dcell(i, j)
+    return kd[i * C + j]
+  end
+  # The KV of the earlier tokens is in the cache.
+  for i in range(len(layers))
+    for j in range(6)
+      add "on" to dcell(i, j)
+    end
+  end
+  # The answer slots and the guess slots: their centres.
+  to aslot(j)
+    return (410 + j * 72, 49)
+  end
+  to gslot(j)
+    return (410 + (j + 1) * 72, 111)
+  end
+  to word(pt, text, cls)
+    return shape("text", {class: "gn-word " + cls, x: pt[0], y: pt[1] + 5, "text-anchor": "middle"}, text)
+  end
+  # The dial points at `k` tokens to guess.
+  let CX = 92
+  let CY = 250
+  let needle = shape("line", {class: "gn-needle", x1: CX, y1: CY, x2: CX - 40, y2: CY})
+  to point(k)
+    let a = 3.14159 - k * 3.14159 / 8
+    setAttr(needle, "x2", CX + 40 * cos(a))
+    setAttr(needle, "y2", CY - 40 * sin(a))
+  end
+  point(0)
+  # The pass counter starts unlit: its bars light as the passes happen.
+  dropClass("on", query(".gn-passes .on"))
+  # The cells of KV columns `js`, layer by layer.
+  to columns(js)
+    return [[dcell(i, j) for j in js] for i in range(len(layers))]
+  end
+
   # Step 0: The decode step climbs the layers and the output head draws a token.
   step 0
-  row 0 DEMO.answer[0]
+  focus("loop")
   light "loop" "breathe"
-  let p = dot(500, layers[0].y + 14)
-  travel(p, [(500, top.y)], 520, true)
-  compute p for 500 say "The output head drawing a token"
+  let p = dot(XC, BASE, 4.5)
+  add "busy" to p
+  climbLayers([p], len(layers) - 1, 11, columns([6]), "on", [])
+  view (150, 0, 420, 354)
+  glide p to HEAD over 300
+  add "on" to named("ohead")
+  compute p for 500 say "Drawing a token"
+  drop "on" from named("ohead")
+  let answer = [word(aslot(0), DEMO.answer[0], "")]
+  row 0 DEMO.answer[0]
+
   # Step 1: The draft head guesses the next tokens.
   # It is 1 more layer of the model's own kind, shipped with the checkpoint.
   # It drafts only under `fidelity = "fast"`.
   step 1
-  glide p to (523, 141) over 400
+  view (280, 0, 420, 354)
+  focus("loop")
+  glide p to (layers[-1].x + 54, layers[-1].y + 2) over 300
+  say "The draft head reads the last hidden state"
+  move p along named("hidden") speed 260
+  add "on" to query(".gn-dlayer")
   let guesses = ["capital", "is", "London"]
-  for i in range(len(guesses))
-    light "loop" "breathe"
-    compute p for 380
-    words += [label(560, 166 + i * 13, guesses[i], class="draft")]
-    wait 200
+  let gw = []
+  for [k, g] in enumerate(guesses)
+    compute p for 380 say "The draft head guessing token " + str(k + 1)
+    let f = dot(333, 111, 3.4, "small")
+    glide f to gslot(k) over 320
+    remove f
+    gw += [word(gslot(k), g, "guess")]
   end
+  drop "on" from query(".gn-dlayer")
+  remove p
+  # The pass counter: the draft.
+  add "on" to query(".gn-d1")
+
   # Step 2: The loop learns how many tokens to guess from the measured acceptance and the cost of a
   #   cycle.
   step 2
-  row 1 "3 ahead"
-  label(538, 154, "3 ahead", size=7)
-  compute p for 700 say "Weighing the measured acceptance against the cost of a cycle"
+  view (0, 130, 420, 354)
+  focus("loop")
+  say "Weighing acceptance against cost"
+  for k in range(0, 13)
+    point(k / 4)
+    wait 50
+  end
+  for k in range(0, 6)
+    point(3 + (0.4 if k % 2 == 0 else -0.4) * (6 - k) / 6)
+    wait 70
+  end
+  point(3)
+  say "3 tokens ahead"
+  wait 900
+
   # Step 3: The model checks every guess in one pass through the layers.
   # When every layer and the head sit on 1 card, that pass is replayed as a recorded graph.
   # A model with a wide residual stream replays it across several cards too.
   step 3
-  remove p
-  to lineAt(y)
-    return [(500 + dx, y) for dx in [-6, 0, 6]]
-  end
-  let band = [dot(pt[0], pt[1], 3.4) for pt in lineAt(layers[0].y + 14)]
-  let ref = shape("circle", {class: "apath", r: 0, "data-r": 0, "data-big": 0})
+  view (300, 0, 420, 354)
+  focus("stack")
+  let band = [dot(pt[0], 80, 3.6, "small") for pt in [aslot(0), gslot(0), gslot(1), gslot(2)]]
+  glideAll([[d, (318 + k * 12, 80)] for [k, d] in enumerate(band)], 500)
+  glideAll([[d, (318 + k * 12, BASE)] for [k, d] in enumerate(band)], 700)
+  glideAll(lineUp(band, BASE, 12), 300)
   add "busy" to band
   light "loop" "breathe"
-  glideAll([[d, lineAt(top.y)[i]] for [i, d] in enumerate(band)], 1500, follow(ref, 500))
-  remove ref
-  compute band for 500 say "The output head scoring every guess at once"
-  # Step 4: The guesses the model agrees with are kept, with 1 token of its own.
+  climbLayers(band, len(layers) - 1, 12, columns(range(7, 11)), "tent", [])
+  view (150, 0, 420, 354)
+  glideAll([[d, (XC + (k - 1.5) * 12, 112)] for [k, d] in enumerate(band)], 300)
+  add "on" to named("ohead")
+  compute band for 600 say "The model's own token after each"
+  drop "on" from named("ohead")
+  remove band
+  # The model's own token after each input, faint in the answer slots.
+  let picks = [shape("text", {class: "gn-pick", x: aslot(k + 1)[0], y: 54, "text-anchor": "middle"}, w) for [k, w] in enumerate(["capital", "is", "Paris"])]
+  view (300, 0, 420, 354)
+  # The pass counter: the checking pass.
+  add "on" to query(".gn-p1, .gn-c1, .gn-c1b")
+
+  # Step 4: The model keeps the guesses up to the first one it disagrees with, and adds 1 token of
+  #   its own.
   # The KV cache and a recurrent state are cut back to the kept tokens.
   step 4
-  add "kept" to words[0]
-  add "kept" to words[1]
-  add "cut" to words[2]
-  add "fail" to band[2]
-  wait 500
-  say "Cutting the KV cache back to the kept tokens"
-  glide band[2] to (506, layers[0].y + 14) over 700
-  remove band[2]
-  light "requests" "speak"
-  let own = label(560, 166 + 3 * 13, "Paris", class="draft")
-  add "kept" to own
+  view (330, 0, 420, 354)
+  focus("kv")
+  for i in range(len(layers))
+    drop "tent" from dcell(i, 7)
+    add "on" to dcell(i, 7)
+  end
+  for [k, g] in enumerate(guesses)
+    let x = aslot(k + 1)[0]
+    if k < 2
+      shape("path", {class: "gn-ok", d: "M" + str(x - 7) + ",80 L" + str(x - 2) + ",86 L" + str(x + 8) + ",74"})
+      remove picks[k]
+      answer += [word(aslot(k + 1), g, "new")]
+      for i in range(len(layers))
+        drop "tent" from dcell(i, 8 + k)
+        add "on" to dcell(i, 8 + k)
+      end
+      say "Same token: " + g + " is kept"
+      wait 600
+    else
+      shape("path", {class: "gn-bad", d: "M" + str(x - 7) + ",73 L" + str(x + 7) + ",87 M" + str(x + 7) + ",73 L" + str(x - 7) + ",87"})
+      add "cut" to gw[k]
+      let w = textWidth(gw[k])
+      shape("line", {class: "gn-strike", x1: x - w / 2 - 3, y1: 111, x2: x + w / 2 + 3, y2: 111})
+      say "London is not Paris: the check stops here"
+      wait 700
+      remove picks[k]
+      answer += [word(aslot(k + 1), "Paris", "new")]
+      view (340, 240, 420, 354)
+      say "Cutting the KV cache back"
+      for i in range(len(layers))
+        drop "tent" from dcell(len(layers) - 1 - i, 10)
+        add "cut" to dcell(len(layers) - 1 - i, 10)
+        wait 22
+      end
+    end
+  end
   row 0 join(DEMO.answer[0:4])
-  remove band
-  wait 1200
+  # The pass counter: the same 3 tokens without a draft, 1 pass each.
+  view (0, 286, 420, 354)
+  for bar in query(".gn-p0")
+    add "on" to bar
+    wait 160
+  end
+  add "on" to query(".gn-c0")
+  light "requests" "speak"
+  wait 900
+  drop "new" from answer
+  view (330, 0, 420, 354)
+  say "3 tokens from 1 checking pass"
+  focus()
 end

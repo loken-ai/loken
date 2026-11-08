@@ -51,6 +51,8 @@ perf.data*
 *.webm
 *.mid
 *.midi
+# The narrations of the pages of the documentation.
+!docs/**/narration/*.mp3
 
 # EAGLE training corpora. They were assembled from this project's own working documents  - 
 # task descriptions, development notes, commit text - mixed with generic prose, and they are

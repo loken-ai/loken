@@ -1,0 +1,64 @@
+/* A model larger than the server: the file on the disk, the page cache of the host and the card. */
+.dkt-scenes{--st-g0:#eef2ee;--st-g1:#dde6e0;--st-d0:#e3e0d3;--st-d1:#cfcbb9;--st-h0:#f1ead2;--st-h1:#e2d8b4;--st-c0:#cfe1f1;--st-c1:#b4cde4;
+  --st-tr:#7fa6c6;--st-line:#7e8b86;--st-ink:#1f2d33;--st-mute:#566a70;--st-ex:#c9c5b3;--st-ex-l:#a29e8a;--st-hot:#2f7fd0;--st-cache:#d79a2b;
+  --st-box:#f8f7ef;--st-slab:#8fb0cf;--st-ok:#2f9e5b;--st-warn:#d8892b;--st-miss:#d8443a;--st-pk:#f2c14e;--st-core:#c9a64a}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .dkt-scenes{--st-g0:#0f1b1c;--st-g1:#0a1314;--st-d0:#2b2a24;--st-d1:#201f1a;--st-h0:#3a3321;--st-h1:#2a2517;--st-c0:#1e3b55;--st-c1:#142a3e;
+  --st-tr:#3f6c91;--st-line:#6d7f7a;--st-ink:#dce8e6;--st-mute:#8fa8ac;--st-ex:#47443a;--st-ex-l:#6d6a5a;--st-hot:#5ba8f0;--st-cache:#f0b441;
+  --st-box:#171d1e;--st-slab:#3a6a94;--st-ok:#4fd07f;--st-warn:#f0a350;--st-miss:#ff6257;--st-pk:#f2c14e;--st-core:#b88d2a}}
+:root[data-theme="dark"] .dkt-scenes{--st-g0:#0f1b1c;--st-g1:#0a1314;--st-d0:#2b2a24;--st-d1:#201f1a;--st-h0:#3a3321;--st-h1:#2a2517;--st-c0:#1e3b55;--st-c1:#142a3e;
+  --st-tr:#3f6c91;--st-line:#6d7f7a;--st-ink:#dce8e6;--st-mute:#8fa8ac;--st-ex:#47443a;--st-ex-l:#6d6a5a;--st-hot:#5ba8f0;--st-cache:#f0b441;
+  --st-box:#171d1e;--st-slab:#3a6a94;--st-ok:#4fd07f;--st-warn:#f0a350;--st-miss:#ff6257;--st-pk:#f2c14e;--st-core:#b88d2a}
+
+.dkt-scenes .dkt-runs b.st-disk{background:var(--st-ex-l)}
+.dkt-scenes .dkt-runs b.st-cache{background:var(--st-cache)}
+.dkt-scenes .dkt-runs b.st-card{background:var(--st-hot)}
+.dkt-scenes .dkt-runs b.st-pk{background:var(--st-pk)}
+.dkt-scenes .dkt-runs b.st-row{background:var(--st-ink)}
+
+.st .st-g0{stop-color:var(--st-g0)} .st .st-g1{stop-color:var(--st-g1)}
+.st .st-d0{stop-color:var(--st-d0)} .st .st-d1{stop-color:var(--st-d1)}
+.st .st-h0{stop-color:var(--st-h0)} .st .st-h1{stop-color:var(--st-h1)}
+.st .st-c0{stop-color:var(--st-c0)} .st .st-c1{stop-color:var(--st-c1)}
+.st .st-tr{fill:none;stroke:var(--st-tr);stroke-width:1} .st .st-via{fill:var(--st-tr)}
+.st .rim{fill:none;stroke:var(--st-line);stroke-width:1.4}
+.st .lab{font:700 15px var(--a-f-body);letter-spacing:.14em;fill:var(--st-ink)}
+.st .sub{font:12px var(--a-f-body);fill:var(--st-mute)}
+.st .cap{font:600 10.5px var(--a-f-body);letter-spacing:.12em;fill:var(--st-mute)}
+.st .bump{stroke:var(--st-line);stroke-width:1;stroke-dasharray:3 4;fill:none}
+.st .spin{fill:none;stroke:var(--st-line);stroke-width:1.2} .st .spin-c{fill:var(--st-line)}
+.st .box{fill:var(--st-box);fill-opacity:.55;stroke:var(--st-line);stroke-width:1}
+.st .ex{fill:var(--st-ex);stroke:var(--st-ex-l);stroke-width:.8;transition:fill .3s,opacity .3s,stroke .3s}
+.st .slab{fill:var(--st-slab);fill-opacity:.55;stroke:var(--st-hot);stroke-width:1;transition:fill-opacity .3s}
+.st .slab.al{fill:var(--st-ex-l);fill-opacity:.5;stroke:var(--st-line)}
+.st .slab.on{fill:var(--st-hot);fill-opacity:.85}
+.st .slab.al.on{fill:var(--st-hot);fill-opacity:.8;stroke:var(--st-hot)}
+.st .core{fill:var(--st-core);fill-opacity:.35;stroke:var(--st-core);stroke-width:1}
+.st .core.run{fill-opacity:.95;animation:st-beat .5s ease-in-out infinite alternate}
+.st .flow{fill:none;stroke:var(--st-mute);stroke-width:1.4;stroke-dasharray:4 3}
+.st .st-ah{fill:var(--st-mute)}
+.st .flb{font:600 10px var(--a-f-body);letter-spacing:.04em;fill:var(--st-mute)}
+.st .pc,.st .cd,.st .sx,.st .csx,.st .lcx{fill:none;stroke:var(--st-ex-l);stroke-dasharray:3 3;opacity:.7}
+.st .tokn{font:700 20px var(--a-f-mono);fill:var(--st-ink)}
+.st .toks{font:12px var(--a-f-mono);fill:var(--st-mute)}
+.st .dk.inram{fill:var(--st-cache);stroke:var(--st-cache)}
+.st .dk.hot{fill:var(--st-hot);stroke:var(--st-hot)}
+.st .dk.moved{opacity:.28}
+.st .dk.want{fill:var(--st-pk);stroke:var(--st-pk)}
+.st .dk.miss{fill:var(--st-miss);stroke:var(--st-miss)}
+.st .pc.in{fill:var(--st-cache);stroke:var(--st-cache);stroke-dasharray:none;opacity:1}
+.st .cd.in{fill:var(--st-hot);stroke:var(--st-hot);stroke-dasharray:none;opacity:1}
+.st .cd.run{animation:st-beat .5s ease-in-out infinite alternate}
+.st .cd.fresh{stroke:var(--st-pk);stroke-width:2.2;stroke-dasharray:none;opacity:1}
+.st .csx.in,.st .lcx.in{fill:var(--st-pk);stroke:var(--st-pk);stroke-dasharray:none;opacity:1}
+.st .sx.in{fill:var(--st-cache);stroke:var(--st-cache);stroke-dasharray:none;opacity:1}
+.st .rowdot{}
+.st .gone{opacity:0} .st .dim{opacity:.3}
+.st .apath{fill:none;stroke:none}
+.st [data-part="slab"]{transition:opacity .3s}
+.st .routes{pointer-events:none}
+.dkt-scenes svg .pulse.pk{fill:var(--st-pk);stroke:var(--st-ink);stroke-width:.8;filter:drop-shadow(0 0 4px var(--st-pk))}
+.dkt-scenes svg .pulse.pkc{fill:var(--st-cache);stroke:var(--st-ink);stroke-width:.8}
+.dkt-scenes svg .pulse.pkr{fill:var(--st-ink);stroke:var(--st-box);stroke-width:.8}
+.dkt-scenes svg .pulse.pkh{fill:var(--st-hot);stroke:var(--st-ink);stroke-width:.8}
+@keyframes st-beat{from{opacity:.55}to{opacity:1}}
+@media (prefers-reduced-motion:reduce){.st .core.run,.st .cd.run{animation:none}}

@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="st" viewBox="0 0 1000 650" role="img" aria-label="A model file on a disk that is larger than the RAM of the host and the VRAM of the card together: the card keeps what every token reads and some experts, the host reads the others in place from the file through its page cache">
+<defs>
+<linearGradient id="st-ground" x1="0" y1="0" x2="0.3" y2="1"><stop offset="0" class="st-g0"/><stop offset="1" class="st-g1"/></linearGradient>
+<linearGradient id="st-disk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="st-d0"/><stop offset="1" class="st-d1"/></linearGradient>
+<linearGradient id="st-host" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="st-h0"/><stop offset="1" class="st-h1"/></linearGradient>
+<linearGradient id="st-card" x1="0" y1="0" x2="1" y2="1"><stop offset="0" class="st-c0"/><stop offset="1" class="st-c1"/></linearGradient>
+<pattern id="st-trace" width="40" height="40" patternUnits="userSpaceOnUse"><path class="st-tr" d="M0 10 H14 L22 18 H40 M8 0 V6 M30 40 V30 L36 24 M0 32 H10 L16 26"/><circle class="st-via" cx="22" cy="18" r="1.6"/><circle class="st-via" cx="30" cy="30" r="1.6"/></pattern>
+<marker id="st-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="st-ah" d="M0,0 L10,5 L0,10 z"/></marker>
+<marker id="st-tail" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="st-ah" d="M0,0 L10,5 L0,10 z"/></marker>
+</defs>
+<rect class="st-bg" width="1000" height="650" fill="url(#st-ground)"/>
+<g data-part="disk">
+<rect class="pan disk" x="20" y="112" width="240" height="360" rx="16" fill="url(#st-disk)"/>
+<rect class="rim" x="20" y="112" width="240" height="360" rx="16"/>
+<circle class="spin" cx="236" cy="136" r="9"/><circle class="spin-c" cx="236" cy="136" r="2.6"/>
+<text class="lab" x="36" y="140">DISK</text><text class="sub" x="36" y="157">the model file, mapped</text>
+<text class="cap" x="36" y="186">READ BY EVERY TOKEN</text>
+<rect id="dk-a0" class="slab al" x="32" y="194" width="68" height="28" rx="5"/>
+<rect id="dk-a1" class="slab al" x="108" y="194" width="68" height="28" rx="5"/>
+<rect id="dk-a2" class="slab al" x="184" y="194" width="68" height="28" rx="5"/>
+<text class="cap" x="36" y="250">ROUTED EXPERTS</text>
+<rect id="dk-0-0" class="ex dk" x="32" y="260" width="20" height="18" rx="3" data-name="dk-0-0"/>
+<rect id="dk-0-1" class="ex dk" x="56" y="260" width="20" height="18" rx="3" data-name="dk-0-1"/>
+<rect id="dk-0-2" class="ex dk" x="80" y="260" width="20" height="18" rx="3" data-name="dk-0-2"/>
+<rect id="dk-0-3" class="ex dk" x="104" y="260" width="20" height="18" rx="3" data-name="dk-0-3"/>
+<rect id="dk-0-4" class="ex dk" x="128" y="260" width="20" height="18" rx="3" data-name="dk-0-4"/>
+<rect id="dk-0-5" class="ex dk" x="152" y="260" width="20" height="18" rx="3" data-name="dk-0-5"/>
+<rect id="dk-0-6" class="ex dk" x="176" y="260" width="20" height="18" rx="3" data-name="dk-0-6"/>
+<rect id="dk-0-7" class="ex dk" x="200" y="260" width="20" height="18" rx="3" data-name="dk-0-7"/>
+<rect id="dk-0-8" class="ex dk" x="224" y="260" width="20" height="18" rx="3" data-name="dk-0-8"/>
+<rect id="dk-1-0" class="ex dk" x="32" y="284" width="20" height="18" rx="3" data-name="dk-1-0"/>
+<rect id="dk-1-1" class="ex dk" x="56" y="284" width="20" height="18" rx="3" data-name="dk-1-1"/>
+<rect id="dk-1-2" class="ex dk" x="80" y="284" width="20" height="18" rx="3" data-name="dk-1-2"/>
+<rect id="dk-1-3" class="ex dk" x="104" y="284" width="20" height="18" rx="3" data-name="dk-1-3"/>
+<rect id="dk-1-4" class="ex dk" x="128" y="284" width="20" height="18" rx="3" data-name="dk-1-4"/>
+<rect id="dk-1-5" class="ex dk" x="152" y="284" width="20" height="18" rx="3" data-name="dk-1-5"/>
+<rect id="dk-1-6" class="ex dk" x="176" y="284" width="20" height="18" rx="3" data-name="dk-1-6"/>
+<rect id="dk-1-7" class="ex dk" x="200" y="284" width="20" height="18" rx="3" data-name="dk-1-7"/>
+<rect id="dk-1-8" class="ex dk" x="224" y="284" width="20" height="18" rx="3" data-name="dk-1-8"/>
+<rect id="dk-2-0" class="ex dk" x="32" y="308" width="20" height="18" rx="3" data-name="dk-2-0"/>
+<rect id="dk-2-1" class="ex dk" x="56" y="308" width="20" height="18" rx="3" data-name="dk-2-1"/>
+<rect id="dk-2-2" class="ex dk" x="80" y="308" width="20" height="18" rx="3" data-name="dk-2-2"/>
+<rect id="dk-2-3" class="ex dk" x="104" y="308" width="20" height="18" rx="3" data-name="dk-2-3"/>
+<rect id="dk-2-4" class="ex dk" x="128" y="308" width="20" height="18" rx="3" data-name="dk-2-4"/>
+<rect id="dk-2-5" class="ex dk" x="152" y="308" width="20" height="18" rx="3" data-name="dk-2-5"/>
+<rect id="dk-2-6" class="ex dk" x="176" y="308" width="20" height="18" rx="3" data-name="dk-2-6"/>
+<rect id="dk-2-7" class="ex dk" x="200" y="308" width="20" height="18" rx="3" data-name="dk-2-7"/>
+<rect id="dk-2-8" class="ex dk" x="224" y="308" width="20" height="18" rx="3" data-name="dk-2-8"/>
+<rect id="dk-3-0" class="ex dk" x="32" y="332" width="20" height="18" rx="3" data-name="dk-3-0"/>
+<rect id="dk-3-1" class="ex dk" x="56" y="332" width="20" height="18" rx="3" data-name="dk-3-1"/>
+<rect id="dk-3-2" class="ex dk" x="80" y="332" width="20" height="18" rx="3" data-name="dk-3-2"/>
+<rect id="dk-3-3" class="ex dk" x="104" y="332" width="20" height="18" rx="3" data-name="dk-3-3"/>
+<rect id="dk-3-4" class="ex dk" x="128" y="332" width="20" height="18" rx="3" data-name="dk-3-4"/>
+<rect id="dk-3-5" class="ex dk" x="152" y="332" width="20" height="18" rx="3" data-name="dk-3-5"/>
+<rect id="dk-3-6" class="ex dk" x="176" y="332" width="20" height="18" rx="3" data-name="dk-3-6"/>
+<rect id="dk-3-7" class="ex dk" x="200" y="332" width="20" height="18" rx="3" data-name="dk-3-7"/>
+<rect id="dk-3-8" class="ex dk" x="224" y="332" width="20" height="18" rx="3" data-name="dk-3-8"/>
+<rect id="dk-4-0" class="ex dk" x="32" y="356" width="20" height="18" rx="3" data-name="dk-4-0"/>
+<rect id="dk-4-1" class="ex dk" x="56" y="356" width="20" height="18" rx="3" data-name="dk-4-1"/>
+<rect id="dk-4-2" class="ex dk" x="80" y="356" width="20" height="18" rx="3" data-name="dk-4-2"/>
+<rect id="dk-4-3" class="ex dk" x="104" y="356" width="20" height="18" rx="3" data-name="dk-4-3"/>
+<rect id="dk-4-4" class="ex dk" x="128" y="356" width="20" height="18" rx="3" data-name="dk-4-4"/>
+<rect id="dk-4-5" class="ex dk" x="152" y="356" width="20" height="18" rx="3" data-name="dk-4-5"/>
+<rect id="dk-4-6" class="ex dk" x="176" y="356" width="20" height="18" rx="3" data-name="dk-4-6"/>
+<rect id="dk-4-7" class="ex dk" x="200" y="356" width="20" height="18" rx="3" data-name="dk-4-7"/>
+<rect id="dk-4-8" class="ex dk" x="224" y="356" width="20" height="18" rx="3" data-name="dk-4-8"/>
+<text class="sub" x="36" y="404">1 unit per expert, side by side</text>
+<text class="sub" x="36" y="424">in the order the file lays them out</text>
+<path class="bump" d="M36 440 H244"/>
+<text class="cap" x="36" y="458">LARGER THAN RAM + VRAM</text>
+</g>
+<g data-part="host">
+<rect class="pan host" x="340" y="232" width="300" height="240" rx="16" fill="url(#st-host)"/>
+<rect class="rim" x="340" y="232" width="300" height="240" rx="16"/>
+<text class="lab" x="356" y="260">HOST</text><text class="sub" x="356" y="277">RAM and cores</text>
+<rect class="box pc" x="354" y="290" width="272" height="92" rx="10"/>
+<text class="cap" x="366" y="308">PAGE CACHE, THE MAPPED FILE</text>
+<rect id="pc-0-0" class="ex pc" x="364" y="318" width="24" height="20" rx="3" data-name="pc-0-0"/>
+<rect id="pc-0-1" class="ex pc" x="393" y="318" width="24" height="20" rx="3" data-name="pc-0-1"/>
+<rect id="pc-0-2" class="ex pc" x="422" y="318" width="24" height="20" rx="3" data-name="pc-0-2"/>
+<rect id="pc-0-3" class="ex pc" x="451" y="318" width="24" height="20" rx="3" data-name="pc-0-3"/>
+<rect id="pc-0-4" class="ex pc" x="480" y="318" width="24" height="20" rx="3" data-name="pc-0-4"/>
+<rect id="pc-0-5" class="ex pc" x="509" y="318" width="24" height="20" rx="3" data-name="pc-0-5"/>
+<rect id="pc-0-6" class="ex pc" x="538" y="318" width="24" height="20" rx="3" data-name="pc-0-6"/>
+<rect id="pc-0-7" class="ex pc" x="567" y="318" width="24" height="20" rx="3" data-name="pc-0-7"/>
+<rect id="pc-0-8" class="ex pc" x="596" y="318" width="24" height="20" rx="3" data-name="pc-0-8"/>
+<rect id="pc-1-0" class="ex pc" x="364" y="346" width="24" height="20" rx="3" data-name="pc-1-0"/>
+<rect id="pc-1-1" class="ex pc" x="393" y="346" width="24" height="20" rx="3" data-name="pc-1-1"/>
+<rect id="pc-1-2" class="ex pc" x="422" y="346" width="24" height="20" rx="3" data-name="pc-1-2"/>
+<rect id="pc-1-3" class="ex pc" x="451" y="346" width="24" height="20" rx="3" data-name="pc-1-3"/>
+<rect id="pc-1-4" class="ex pc" x="480" y="346" width="24" height="20" rx="3" data-name="pc-1-4"/>
+<rect id="pc-1-5" class="ex pc" x="509" y="346" width="24" height="20" rx="3" data-name="pc-1-5"/>
+<rect id="pc-1-6" class="ex pc" x="538" y="346" width="24" height="20" rx="3" data-name="pc-1-6"/>
+<rect id="pc-1-7" class="ex pc" x="567" y="346" width="24" height="20" rx="3" data-name="pc-1-7"/>
+<rect id="pc-1-8" class="ex pc" x="596" y="346" width="24" height="20" rx="3" data-name="pc-1-8"/>
+<g data-part="cores">
+<rect class="box hc" x="354" y="398" width="110" height="60" rx="10"/>
+<text class="cap" x="364" y="416">HOST CORES</text>
+<rect class="core" x="364" y="426" width="20" height="22" rx="4"/>
+<rect class="core" x="389" y="426" width="20" height="22" rx="4"/>
+<rect class="core" x="414" y="426" width="20" height="22" rx="4"/>
+<rect class="core" x="439" y="426" width="20" height="22" rx="4"/>
+</g>
+<g data-part="slab">
+<rect class="box sl" x="474" y="398" width="152" height="60" rx="10"/>
+<text class="cap" x="484" y="416">PAGE-LOCKED SLAB</text>
+<rect id="sl-0" class="ex sx" x="488" y="426" width="26" height="22" rx="3"/>
+<rect id="sl-1" class="ex sx" x="520" y="426" width="26" height="22" rx="3"/>
+<rect id="sl-2" class="ex sx" x="552" y="426" width="26" height="22" rx="3"/>
+<rect id="sl-3" class="ex sx" x="584" y="426" width="26" height="22" rx="3"/>
+</g>
+</g>
+<g data-part="card">
+<rect class="pan card" x="720" y="204" width="264" height="268" rx="16" fill="url(#st-card)"/>
+<rect class="pan card" x="720" y="204" width="264" height="268" rx="16" fill="url(#st-trace)" opacity=".35"/>
+<rect class="rim" x="720" y="204" width="264" height="268" rx="16"/>
+<text class="lab" x="736" y="232">CARD</text><text class="sub" x="736" y="249">VRAM</text>
+<text class="cap" x="736" y="272">READ BY EVERY TOKEN</text>
+<rect id="cd-always" class="slab" x="736" y="280" width="232" height="26" rx="5" data-name="cd-always"/>
+<text class="cap" x="736" y="328">EXPERT SLOTS</text>
+<rect id="cd-0-0" class="ex cd" x="736" y="336" width="22" height="20" rx="3" data-name="cd-0-0"/>
+<rect id="cd-0-1" class="ex cd" x="762" y="336" width="22" height="20" rx="3" data-name="cd-0-1"/>
+<rect id="cd-0-2" class="ex cd" x="788" y="336" width="22" height="20" rx="3" data-name="cd-0-2"/>
+<rect id="cd-0-3" class="ex cd" x="814" y="336" width="22" height="20" rx="3" data-name="cd-0-3"/>
+<rect id="cd-0-4" class="ex cd" x="840" y="336" width="22" height="20" rx="3" data-name="cd-0-4"/>
+<rect id="cd-0-5" class="ex cd" x="866" y="336" width="22" height="20" rx="3" data-name="cd-0-5"/>
+<rect id="cd-0-6" class="ex cd" x="892" y="336" width="22" height="20" rx="3" data-name="cd-0-6"/>
+<rect id="cd-0-7" class="ex cd" x="918" y="336" width="22" height="20" rx="3" data-name="cd-0-7"/>
+<rect id="cd-0-8" class="ex cd" x="944" y="336" width="22" height="20" rx="3" data-name="cd-0-8"/>
+<rect id="cd-1-0" class="ex cd" x="736" y="362" width="22" height="20" rx="3" data-name="cd-1-0"/>
+<rect id="cd-1-1" class="ex cd" x="762" y="362" width="22" height="20" rx="3" data-name="cd-1-1"/>
+<rect id="cd-1-2" class="ex cd" x="788" y="362" width="22" height="20" rx="3" data-name="cd-1-2"/>
+<rect id="cd-1-3" class="ex cd" x="814" y="362" width="22" height="20" rx="3" data-name="cd-1-3"/>
+<rect id="cd-1-4" class="ex cd" x="840" y="362" width="22" height="20" rx="3" data-name="cd-1-4"/>
+<rect id="cd-1-5" class="ex cd" x="866" y="362" width="22" height="20" rx="3" data-name="cd-1-5"/>
+<rect id="cd-1-6" class="ex cd" x="892" y="362" width="22" height="20" rx="3" data-name="cd-1-6"/>
+<rect id="cd-1-7" class="ex cd" x="918" y="362" width="22" height="20" rx="3" data-name="cd-1-7"/>
+<rect id="cd-1-8" class="ex cd" x="944" y="362" width="22" height="20" rx="3" data-name="cd-1-8"/>
+<rect class="box cs" x="736" y="396" width="108" height="60" rx="8"/>
+<text class="cap" x="746" y="412">COPY STREAM</text>
+<rect id="cs-0" class="ex csx" x="778" y="422" width="28" height="26" rx="4"/>
+<rect class="box lcb" x="856" y="396" width="112" height="60" rx="8"/>
+<text class="cap" x="866" y="412">LAYER COPIES</text>
+<rect id="lc-0" class="ex lcx" x="872" y="422" width="28" height="26" rx="4"/>
+<rect id="lc-1" class="ex lcx" x="908" y="422" width="28" height="26" rx="4"/>
+</g>
+<g class="flows">
+<path class="flow" data-name="f-fault" d="M262,296 H336" marker-end="url(#st-head)"/><text class="flb" x="264" y="288">page faults</text>
+<path class="flow" data-name="f-ahead" d="M262,334 H336" marker-end="url(#st-head)"/><text class="flb" x="264" y="326">read ahead</text>
+<path class="flow" data-name="f-up" d="M642,300 H716" marker-end="url(#st-head)"/><text class="flb" x="652" y="292">uploads</text>
+<path class="flow" data-name="f-rows" d="M642,350 H716" marker-end="url(#st-head)" marker-start="url(#st-tail)"/><text class="flb" x="662" y="342">rows</text>
+<path class="flow" data-name="f-prod" d="M642,372 H716" marker-end="url(#st-head)" marker-start="url(#st-tail)"/><text class="flb" x="650" y="386">products</text>
+</g>
+<text class="tokn" data-name="tok-n" x="284" y="150"></text><text class="toks" data-name="tok-stat" x="284" y="174"></text>
+<g class="routes">
+<path class="apath" data-name="r-disk-pc" d="M262,296 C300,296 330,314 376,328"/>
+<path class="apath" data-name="r-pc-core" d="M440,342 C440,372 420,392 414,430"/>
+<path class="apath" data-name="r-pc-cs" d="M626,328 C680,320 700,400 794,435"/>
+<path class="apath" data-name="r-disk-slab" d="M262,360 C330,440 460,420 500,436"/>
+<path class="apath" data-name="r-slab-lc" d="M620,436 C680,480 800,480 882,436"/>
+</g>
+<g data-anim="" data-reach="14"></g>
+</svg>

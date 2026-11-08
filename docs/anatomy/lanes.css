@@ -1,0 +1,211 @@
+/* The toll road of the gate: its colours in light and dark, its states and its motion. */
+.dkt-scenes{--ln-g0:#e9efe6;--ln-g1:#d5e0d1;--ln-mow:#ffffff;--ln-mow-a:.09;--ln-t0:#9dc08e;--ln-t1:#5f8c5a;--ln-tshd:#3d5a3c;
+  --ln-asph:#5a6369;--ln-curb:#c7cfcb;--ln-paint:#f7f4ea;--ln-island:#e8ece6;--ln-hatch:#b9c3bd;
+  --ln-p0:#2f6b58;--ln-p1:#245748;--ln-trace:#9fd3b6;--ln-chip:#1d2a2c;--ln-au:#d4a73c;
+  --ln-d0:#dfe7ee;--ln-d1:#c3cfd9;--ln-dline:#8996a0;--ln-tread:#9aa7b0;
+  --ln-int:#2f6eb8;--ln-int-d:#1f4f8a;--ln-bat:#6f8a6a;--ln-bat-c:#c9d3c0;--ln-fim:#cf352d;--ln-amb:#f7f6f1;
+  --ln-glass:#26343d;--ln-tyre:#15191b;--ln-lamp:#ffe89a;--ln-tail:#e0483c;
+  --ln-ok:#2f9e5b;--ln-stop:#d8443a;--ln-amber:#e3a52a;--ln-run:#3b8fd9;
+  --ln-roof:#ffffff;--ln-roof-a:.5;--ln-booth:#f4efe2;--ln-booth-l:#9b927c;
+  --ln-vms:#1b2226;--ln-ticket:#f2c14e;--ln-ticket-t:#3a2a00;--ln-led:#ffb648}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .dkt-scenes{--ln-g0:#0f1c1b;--ln-g1:#0a1413;--ln-mow:#9fd3b6;--ln-mow-a:.035;--ln-t0:#3f6b45;--ln-t1:#1e3a26;--ln-tshd:#000000;
+  --ln-asph:#2c353a;--ln-curb:#46524f;--ln-paint:#b9c2bd;--ln-island:#25302e;--ln-hatch:#3b4744;
+  --ln-p0:#183f34;--ln-p1:#10302a;--ln-trace:#4f9a7a;--ln-chip:#060b0c;--ln-au:#b88d2a;
+  --ln-d0:#2e3b43;--ln-d1:#222d34;--ln-dline:#6f8290;--ln-tread:#55666f;
+  --ln-int:#5b98e6;--ln-int-d:#3a6fb3;--ln-bat:#8fa98a;--ln-bat-c:#4e5d4c;--ln-fim:#f0625a;--ln-amb:#e6e4dc;
+  --ln-glass:#0e171c;--ln-tyre:#030506;--ln-lamp:#fff3b8;--ln-tail:#ff6a5c;
+  --ln-ok:#4fd07f;--ln-stop:#ff6257;--ln-amber:#f2c14e;--ln-run:#6db4ff;
+  --ln-roof:#c9d6d3;--ln-roof-a:.16;--ln-booth:#3a4440;--ln-booth-l:#7f8a85;
+  --ln-vms:#05090b;--ln-ticket:#f2c14e;--ln-ticket-t:#2a1e00;--ln-led:#ffb648}}
+:root[data-theme="dark"] .dkt-scenes{--ln-g0:#0f1c1b;--ln-g1:#0a1413;--ln-mow:#9fd3b6;--ln-mow-a:.035;--ln-t0:#3f6b45;--ln-t1:#1e3a26;--ln-tshd:#000000;
+  --ln-asph:#2c353a;--ln-curb:#46524f;--ln-paint:#b9c2bd;--ln-island:#25302e;--ln-hatch:#3b4744;
+  --ln-p0:#183f34;--ln-p1:#10302a;--ln-trace:#4f9a7a;--ln-chip:#060b0c;--ln-au:#b88d2a;
+  --ln-d0:#2e3b43;--ln-d1:#222d34;--ln-dline:#6f8290;--ln-tread:#55666f;
+  --ln-int:#5b98e6;--ln-int-d:#3a6fb3;--ln-bat:#8fa98a;--ln-bat-c:#4e5d4c;--ln-fim:#f0625a;--ln-amb:#e6e4dc;
+  --ln-glass:#0e171c;--ln-tyre:#030506;--ln-lamp:#fff3b8;--ln-tail:#ff6a5c;
+  --ln-ok:#4fd07f;--ln-stop:#ff6257;--ln-amber:#f2c14e;--ln-run:#6db4ff;
+  --ln-roof:#c9d6d3;--ln-roof-a:.16;--ln-booth:#3a4440;--ln-booth-l:#7f8a85;
+  --ln-vms:#05090b;--ln-ticket:#f2c14e;--ln-ticket-t:#2a1e00;--ln-led:#ffb648}
+
+/* The key of the priorities under the figure. */
+.dkt-scenes .dkt-runs b.ln-fim{background:var(--ln-fim)}
+.dkt-scenes .dkt-runs b.ln-int{background:var(--ln-int)}
+.dkt-scenes .dkt-runs b.ln-bat{background:var(--ln-bat)}
+.dkt-scenes .dkt-runs b.ln-lane{background:var(--ln-ticket)}
+
+/* The scenery. */
+.ln stop.ln-g0{stop-color:var(--ln-g0)} .ln stop.ln-g1{stop-color:var(--ln-g1)}
+.ln stop.ln-t0{stop-color:var(--ln-t0)} .ln stop.ln-t1{stop-color:var(--ln-t1)}
+.ln stop.ln-p0{stop-color:var(--ln-p0)} .ln stop.ln-p1{stop-color:var(--ln-p1)}
+.ln stop.ln-d0{stop-color:var(--ln-d0)} .ln stop.ln-d1{stop-color:var(--ln-d1)}
+.ln stop.ln-r0{stop-color:var(--ln-roof);stop-opacity:calc(var(--ln-roof-a) + .15)} .ln stop.ln-r1{stop-color:var(--ln-roof);stop-opacity:var(--ln-roof-a)}
+.ln .ln-mowing{fill:var(--ln-mow);opacity:var(--ln-mow-a)}
+.ln .lab-s{font-size:8.5px;letter-spacing:.06em}
+.ln .tshd{fill:var(--ln-tshd);opacity:.18}
+.ln .lab{font:600 10.5px var(--a-f-body);letter-spacing:.14em;fill:var(--a-muted)}
+.ln .lab-b{font:700 13px var(--a-f-body);letter-spacing:.2em;fill:var(--a-ink)}
+
+/* The road. */
+.ln .asph{fill:var(--ln-asph)}
+.ln .curb{fill:none;stroke:var(--ln-curb);stroke-width:6;stroke-linejoin:round}
+.ln rect.curb{fill:var(--ln-curb)}
+.ln .edge{fill:none;stroke:var(--ln-paint);stroke-width:1.6;opacity:.75}
+.ln .island{fill:var(--ln-island);stroke:var(--ln-paint);stroke-width:1}
+.ln .stop{fill:none;stroke:var(--ln-paint);stroke-width:3;opacity:.85}
+.ln .paint{font:700 9px var(--a-f-body);letter-spacing:.16em;fill:var(--ln-paint);opacity:.62}
+.ln .chev{fill:none;stroke:var(--ln-paint);stroke-width:3;stroke-linecap:round;stroke-linejoin:round;opacity:.7}
+.ln .bay-fim{fill:var(--ln-fim)} .ln .bay-int{fill:var(--ln-int)} .ln .bay-bat{fill:var(--ln-bat)}
+
+/* The card. */
+.ln .pcb-shd,.ln .dk-shd,.ln .br-shd,.ln .booth-shd{fill:#000;opacity:.14}
+.ln .pcb{stroke:var(--ln-p1);stroke-width:1.5}
+.ln .ln-tr{fill:none;stroke:var(--ln-trace);stroke-width:1.2;opacity:.32}
+.ln .ln-via{fill:var(--ln-trace);opacity:.45}
+.ln .ln-au{fill:var(--ln-au)}
+.ln .chips rect{fill:var(--ln-chip);stroke:var(--ln-trace);stroke-width:.6;stroke-opacity:.5}
+.ln .chips .die{fill:#2a3436;stroke:var(--ln-au);stroke-width:1.2}
+.ln .chip-t{font:700 10px var(--a-f-mono);letter-spacing:.18em;fill:var(--ln-au);text-anchor:middle}
+.ln .fan-ring{fill:#0f1517;stroke:#3a474a;stroke-width:3}
+.ln .blades path{fill:#53636a}
+.ln .hub{fill:#2a3436;stroke:var(--ln-au);stroke-width:1.5}
+.ln .blades{transform-box:view-box;transform-origin:0 0}
+.ln .card.go .blades{animation:ln-spin 1.6s linear infinite}
+
+/* The serial lane across the card, which scrolls under the request that runs. */
+.ln .bridge{transition:opacity .6s}
+.ln .rail{fill:none;stroke:var(--ln-curb);stroke-width:4}
+.ln .post{fill:none;stroke:var(--ln-booth-l);stroke-width:6;stroke-linecap:round}
+.ln .flow{fill:none;stroke:var(--ln-paint);stroke-width:3;stroke-dasharray:16 18;opacity:.55}
+.ln .bridge.go .flow{animation:ln-flow .55s linear infinite;opacity:.8}
+.ln .bridge.gone{opacity:0}
+
+/* The batch worker. */
+.ln .deck{opacity:0;transform:scale(.9);transform-box:fill-box;transform-origin:center;transition:opacity .7s,transform .8s cubic-bezier(.2,1.3,.4,1)}
+.ln .deck.up{opacity:1;transform:none}
+.ln .dk{stroke:var(--ln-dline);stroke-width:2}
+.ln .ln-tq{fill:none;stroke:var(--ln-tread);stroke-width:1.3;stroke-linecap:round;opacity:.55}
+.ln .rim{fill:none;stroke:var(--ln-run);stroke-width:2.5;stroke-dasharray:3 9;stroke-linecap:round;opacity:.75}
+.ln .deck.go .rim{animation:ln-rim 1s linear infinite}
+.ln .gear path{fill:var(--ln-dline)} .ln .gear-h{fill:var(--ln-d0)}
+.ln .gear{transform-box:fill-box;transform-origin:center}
+.ln .deck.go .gear{animation:ln-spin 4s linear infinite}
+.ln .dk-t{font:700 12px var(--a-f-body);letter-spacing:.2em;fill:var(--a-ink)}
+.ln .dk-s{font:500 10px var(--a-f-body);fill:var(--a-muted)}
+
+/* The road that skips the gate. */
+.ln .bypass{opacity:.42;transition:opacity .6s}
+.ln .bypass.open{opacity:1}
+.ln .by-curb{fill:none;stroke:var(--ln-curb);stroke-width:44}
+.ln .by-asph{fill:none;stroke:var(--ln-asph);stroke-width:38}
+.ln .by-arrows{fill:none;stroke:var(--ln-paint);stroke-width:2.5;stroke-dasharray:10 30;opacity:0}
+.ln .bypass.open .by-arrows{opacity:.7;animation:ln-flow-r .9s linear infinite}
+.ln .by-t{font:700 9px var(--a-f-body);letter-spacing:.2em;fill:var(--ln-paint);opacity:.75;text-anchor:middle}
+.ln .cones path{fill:#e8792d;stroke:#fff;stroke-width:1.2;transition:opacity .4s}
+.ln .bypass.open .cones path{opacity:0}
+.ln .by-c{font:600 9.5px var(--a-f-body);letter-spacing:.14em;fill:var(--a-muted);transition:opacity .4s}
+.ln .bypass.open .by-c{opacity:0}
+
+/* The meter. */
+.ln .gantry,.ln .beam-g{fill:none;stroke:var(--ln-booth-l);stroke-width:4;stroke-linecap:round}
+.ln .beam-g{stroke-width:5}
+.ln .gpost{fill:var(--ln-booth-l)}
+.ln .led-box{fill:var(--ln-vms);stroke:var(--ln-booth-l);stroke-width:1.5}
+.ln .led-ghost{font:700 21px var(--a-f-mono);fill:var(--ln-led);opacity:.1;text-anchor:middle}
+.ln .led{font:700 21px var(--a-f-mono);fill:var(--ln-led);text-anchor:middle}
+.ln .meter.beat .led-box{animation:ln-flash .55s ease-out}
+
+/* The gate: booth, arm and lamp. */
+.ln .booth{fill:var(--ln-booth);stroke:var(--ln-booth-l);stroke-width:1.5}
+.ln .slot{fill:none;stroke:var(--ln-booth-l);stroke-width:1;stroke-dasharray:3 2}
+.ln .pivot{fill:var(--ln-booth-l)}
+.ln .arm{transform-box:view-box;transform-origin:404px 291px;transition:transform .5s cubic-bezier(.3,1.4,.5,1)}
+.ln .gate.open .arm{transform:rotate(-86deg)}
+.ln .arm-b{fill:#f5f2ea;stroke:#9a3a32;stroke-width:1}
+.ln .arm-s{stroke:#d8443a;stroke-width:6}
+.ln .canopy{stroke:var(--ln-booth-l);stroke-width:1.2;stroke-opacity:.6}
+.ln .canopy-l{stroke:var(--ln-booth-l);stroke-width:1;opacity:.35}
+.ln .lamp-box{fill:var(--ln-vms);stroke:var(--ln-booth-l);stroke-width:1}
+.ln .lamp-r{fill:var(--ln-stop);opacity:.18;transition:opacity .25s}
+.ln .lamp-g{fill:var(--ln-ok);transition:opacity .25s;filter:drop-shadow(0 0 3px var(--ln-ok))}
+.ln .gate.held .lamp-r{opacity:1;filter:drop-shadow(0 0 3px var(--ln-stop))}
+.ln .gate.held .lamp-g{opacity:.18;filter:none}
+
+/* The mode sign. */
+.ln .vms{fill:var(--ln-vms);stroke:var(--ln-booth-l);stroke-width:1.5}
+.ln .m{font:700 12.5px var(--a-f-mono);letter-spacing:.12em;text-anchor:middle;opacity:0;transition:opacity .3s}
+.ln .m-serial{fill:var(--ln-ok);opacity:1}
+.ln .m-next{fill:var(--ln-amber)}
+.ln .m-batch{fill:var(--ln-run)}
+.ln .mode.next .m-serial,.ln .mode.batch .m-serial,.ln .mode.batch .m-next{opacity:0}
+.ln .mode.next .m-next{opacity:1;animation:ln-blink 1s steps(2,jump-none) infinite}
+.ln .mode.batch .m-batch{opacity:1}
+
+/* The vehicles, coloured by priority. */
+.ln .veh .shd{fill:#000;opacity:.2}
+.ln .veh .tyre{fill:var(--ln-tyre)}
+.ln .veh .glass{fill:var(--ln-glass)}
+.ln .veh .sheen{fill:#fff;opacity:.22}
+.ln .veh .crease{fill:none;stroke:#000;stroke-opacity:.18;stroke-width:1}
+.ln .veh .lamp{fill:var(--ln-lamp)}
+.ln .veh .tail{fill:var(--ln-tail)}
+.ln .veh .beam{opacity:0;transition:opacity .4s}
+.ln stop.ln-b0{stop-color:var(--ln-lamp);stop-opacity:.9} .ln stop.ln-b1{stop-color:var(--ln-lamp);stop-opacity:0}
+.ln .veh .haz circle{fill:var(--ln-amber);opacity:0}
+.ln .veh .spark{fill:var(--ln-ticket);opacity:0}
+.ln .car .body{fill:var(--ln-int)} .ln .car .roof{fill:var(--ln-int-d)}
+.ln .truck .body{fill:var(--ln-bat)} .ln .truck .cargo{fill:var(--ln-bat-c);stroke:var(--ln-bat);stroke-width:1.5}
+.ln .truck .rib{stroke:var(--ln-bat);stroke-width:1;opacity:.6}
+.ln .amb .body{fill:var(--ln-amb);stroke:#9aa0a0;stroke-width:.8} .ln .amb .stripe{fill:var(--ln-fim)}
+.ln .amb .roofw{fill:#fff;stroke:#c8cccb;stroke-width:.8} .ln .amb .cross{fill:var(--ln-fim)}
+.ln .amb .bar-r{fill:#e0362c} .ln .amb .bar-b{fill:#2f78e0}
+.ln .amb .halo{opacity:0}
+.ln .amb .hr{fill:#ff5a4f} .ln .amb .hb{fill:#5aa0ff}
+.ln .amb .hr{animation:ln-siren .5s steps(2,jump-none) infinite}
+.ln .amb .hb{animation:ln-siren .5s steps(2,jump-none) -.25s infinite}
+.ln .veh.run .beam{opacity:.75}
+.ln .veh.run .spark{animation:ln-spark 1.1s ease-out infinite}
+.ln .veh.run .spark.s2{animation-delay:-.37s}
+.ln .veh.run .spark.s3{animation-delay:-.74s}
+.ln .veh.hazard .haz circle{animation:ln-blink .6s steps(2,jump-none) infinite}
+.ln .veh.fade{opacity:0;transition:opacity 1.1s ease-in}
+
+/* The lane, as a ticket held by the request in flight. */
+.ln .ticket .tk{fill:var(--ln-ticket);stroke:#8a5a00;stroke-width:1}
+.ln .ticket .tk-glow{fill:var(--ln-ticket);opacity:.28;animation:ln-breathe 1.6s ease-in-out infinite}
+.ln .ticket .tk-t{font:800 9.5px var(--a-f-mono);letter-spacing:.12em;fill:var(--ln-ticket-t);text-anchor:middle}
+
+/* The 503 board. */
+.ln .refuse .pop{animation:ln-pop .45s cubic-bezier(.3,1.6,.5,1) both;transform-box:fill-box;transform-origin:center bottom}
+.ln .refuse .rf{fill:var(--ln-stop);stroke:#fff;stroke-width:1.5}
+.ln .refuse .rf-post{fill:var(--ln-booth-l)}
+.ln .refuse .rf-t{font:800 13px var(--a-f-mono);fill:#fff;text-anchor:middle}
+.ln .refuse .rf-s{font:700 7px var(--a-f-body);letter-spacing:.2em;fill:#fff;text-anchor:middle}
+
+/* The words of the story. */
+.ln .tok{font-family:var(--a-f-body);letter-spacing:.06em}
+
+@keyframes ln-spin{to{transform:rotate(360deg)}}
+@keyframes ln-flow{to{stroke-dashoffset:34}}
+@keyframes ln-flow-r{to{stroke-dashoffset:-40}}
+@keyframes ln-rim{to{stroke-dashoffset:-12}}
+@keyframes ln-blink{50%{opacity:.25}}
+@keyframes ln-siren{0%{opacity:.55}50%{opacity:0}}
+@keyframes ln-spark{0%{opacity:0;transform:translate(0,0)}20%{opacity:1}100%{opacity:0;transform:translate(-26px,-22px)}}
+@keyframes ln-breathe{50%{opacity:.08}}
+@keyframes ln-flash{30%{stroke:var(--ln-led);stroke-width:3}}
+@keyframes ln-pop{from{transform:scale(.2);opacity:0}}
+
+/* A narrow figure keeps the main words readable and drops the small ones. */
+@container (max-width:620px){
+  .ln .lab{font-size:17px}
+  .ln .lab-b{font-size:20px}
+  .ln .dk-t{font-size:19px}
+  .ln .dk-s,.ln .by-c,.ln .paint,.ln .by-t,.ln .chip-t,.ln .lq,.ln .lr{display:none}
+  .ln .lm{text-anchor:start;transform:translateX(-26px)}
+  .ln .m{font-size:17px}
+}
+
+@media (prefers-reduced-motion:reduce){
+  .ln .blades,.ln .flow,.ln .rim,.ln .gear,.ln .by-arrows,.ln .spark,.ln .halo,.ln .haz circle,.ln .tk-glow,.ln .refuse .pop,.ln .m-next,.ln .led-box{animation:none!important}
+  .ln .deck,.ln .arm,.ln .bridge,.ln .bypass,.ln .veh .beam,.ln .veh.fade{transition:none}
+}

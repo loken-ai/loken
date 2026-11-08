@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="eg" viewBox="0 0 800 640" role="img" aria-label="Three engines, vLLM, Ollama and loken, given the same model and the same server: each row shows where the layers of the model go">
+<defs><linearGradient id="eg-ground" x1="0" y1="0" x2="0.3" y2="1"><stop offset="0" class="eg-g0"/><stop offset="1" class="eg-g1"/></linearGradient>
+<pattern id="eg-trace" width="40" height="40" patternUnits="userSpaceOnUse"><path class="eg-tr" d="M0 10 H14 L22 18 H40 M8 0 V6 M30 40 V30 L36 24 M0 32 H10 L16 26"/><circle class="eg-via" cx="22" cy="18" r="1.6"/></pattern></defs>
+<rect width="800" height="640" fill="url(#eg-ground)"/>
+<g data-part="row-vllm">
+<rect class="row vllm" x="6" y="100" width="788" height="140" rx="14"/>
+<rect class="chip vllm" x="14" y="108" width="84" height="124" rx="10"/>
+<text class="name vllm" x="56" y="144">vLLM</text>
+<g class="badge gone" data-name="stop-vllm"><circle cx="56" cy="186" r="19" class="stopc"/><path class="stopx" d="M47,177 L65,195 M65,177 L47,195"/></g>
+<g class="badge gone" data-name="ok-vllm"><circle cx="56" cy="186" r="19" class="okc"/><path class="okx" d="M46,186 L53,194 L67,178"/></g>
+<text class="cap" x="112" y="126" data-name="strip-vllm">MODEL, 8 LAYERS</text>
+<rect id="ly-vllm-0" class="layer" x="112" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-1" class="layer" x="137" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-2" class="layer" x="162" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-3" class="layer" x="187" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-4" class="layer" x="212" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-5" class="layer" x="237" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-6" class="layer" x="262" y="138" width="21" height="50" rx="4"/>
+<rect id="ly-vllm-7" class="layer" x="287" y="138" width="21" height="50" rx="4"/>
+<text class="note" x="112" y="216" data-name="note-vllm"></text>
+<g data-name="dev-vllm-0">
+<rect id="dv-vllm-0" class="dev d0" x="330" y="112" width="150" height="120" rx="10"/>
+<text class="cap" x="340" y="130" data-name="devname-vllm-0"></text>
+<rect id="c-vllm-0-0" class="cell" x="342" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-1" class="cell" x="376" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-2" class="cell" x="410" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-3" class="cell" x="444" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-4" class="cell" x="342" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-5" class="cell" x="376" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-6" class="cell" x="410" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-0-7" class="cell" x="444" y="174" width="28" height="26" rx="4"/>
+<text class="note" x="340" y="222" data-name="devnote-vllm-0"></text>
+</g>
+<g data-name="dev-vllm-1">
+<rect id="dv-vllm-1" class="dev d1" x="496" y="112" width="150" height="120" rx="10"/>
+<text class="cap" x="506" y="130" data-name="devname-vllm-1"></text>
+<rect id="c-vllm-1-0" class="cell" x="508" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-1" class="cell" x="542" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-2" class="cell" x="576" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-3" class="cell" x="610" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-4" class="cell" x="508" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-5" class="cell" x="542" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-6" class="cell" x="576" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-1-7" class="cell" x="610" y="174" width="28" height="26" rx="4"/>
+<text class="note" x="506" y="222" data-name="devnote-vllm-1"></text>
+</g>
+<g data-name="dev-vllm-2">
+<rect id="dv-vllm-2" class="dev d2" x="662" y="112" width="130" height="120" rx="10"/>
+<text class="cap" x="672" y="130" data-name="devname-vllm-2"></text>
+<rect id="c-vllm-2-0" class="cell" x="674" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-2-1" class="cell" x="708" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-2-2" class="cell" x="742" y="142" width="28" height="26" rx="4"/>
+<rect id="c-vllm-2-3" class="cell" x="674" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-2-4" class="cell" x="708" y="174" width="28" height="26" rx="4"/>
+<rect id="c-vllm-2-5" class="cell" x="742" y="174" width="28" height="26" rx="4"/>
+<text class="note" x="672" y="222" data-name="devnote-vllm-2"></text>
+</g>
+</g>
+<g data-part="row-ollama">
+<rect class="row ollama" x="6" y="250" width="788" height="140" rx="14"/>
+<rect class="chip ollama" x="14" y="258" width="84" height="124" rx="10"/>
+<text class="name ollama" x="56" y="294">Ollama</text>
+<g class="badge gone" data-name="stop-ollama"><circle cx="56" cy="336" r="19" class="stopc"/><path class="stopx" d="M47,327 L65,345 M65,327 L47,345"/></g>
+<g class="badge gone" data-name="ok-ollama"><circle cx="56" cy="336" r="19" class="okc"/><path class="okx" d="M46,336 L53,344 L67,328"/></g>
+<text class="cap" x="112" y="276" data-name="strip-ollama">MODEL, 8 LAYERS</text>
+<rect id="ly-ollama-0" class="layer" x="112" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-1" class="layer" x="137" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-2" class="layer" x="162" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-3" class="layer" x="187" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-4" class="layer" x="212" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-5" class="layer" x="237" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-6" class="layer" x="262" y="288" width="21" height="50" rx="4"/>
+<rect id="ly-ollama-7" class="layer" x="287" y="288" width="21" height="50" rx="4"/>
+<text class="note" x="112" y="366" data-name="note-ollama"></text>
+<g data-name="dev-ollama-0">
+<rect id="dv-ollama-0" class="dev d0" x="330" y="262" width="150" height="120" rx="10"/>
+<text class="cap" x="340" y="280" data-name="devname-ollama-0"></text>
+<rect id="c-ollama-0-0" class="cell" x="342" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-1" class="cell" x="376" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-2" class="cell" x="410" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-3" class="cell" x="444" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-4" class="cell" x="342" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-5" class="cell" x="376" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-6" class="cell" x="410" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-0-7" class="cell" x="444" y="324" width="28" height="26" rx="4"/>
+<text class="note" x="340" y="372" data-name="devnote-ollama-0"></text>
+</g>
+<g data-name="dev-ollama-1">
+<rect id="dv-ollama-1" class="dev d1" x="496" y="262" width="150" height="120" rx="10"/>
+<text class="cap" x="506" y="280" data-name="devname-ollama-1"></text>
+<rect id="c-ollama-1-0" class="cell" x="508" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-1" class="cell" x="542" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-2" class="cell" x="576" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-3" class="cell" x="610" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-4" class="cell" x="508" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-5" class="cell" x="542" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-6" class="cell" x="576" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-1-7" class="cell" x="610" y="324" width="28" height="26" rx="4"/>
+<text class="note" x="506" y="372" data-name="devnote-ollama-1"></text>
+</g>
+<g data-name="dev-ollama-2">
+<rect id="dv-ollama-2" class="dev d2" x="662" y="262" width="130" height="120" rx="10"/>
+<text class="cap" x="672" y="280" data-name="devname-ollama-2"></text>
+<rect id="c-ollama-2-0" class="cell" x="674" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-2-1" class="cell" x="708" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-2-2" class="cell" x="742" y="292" width="28" height="26" rx="4"/>
+<rect id="c-ollama-2-3" class="cell" x="674" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-2-4" class="cell" x="708" y="324" width="28" height="26" rx="4"/>
+<rect id="c-ollama-2-5" class="cell" x="742" y="324" width="28" height="26" rx="4"/>
+<text class="note" x="672" y="372" data-name="devnote-ollama-2"></text>
+</g>
+</g>
+<g data-part="row-loken">
+<rect class="row loken" x="6" y="400" width="788" height="140" rx="14"/>
+<rect class="chip loken" x="14" y="408" width="84" height="124" rx="10"/>
+<text class="name loken" x="56" y="444">loken</text>
+<g class="badge gone" data-name="stop-loken"><circle cx="56" cy="486" r="19" class="stopc"/><path class="stopx" d="M47,477 L65,495 M65,477 L47,495"/></g>
+<g class="badge gone" data-name="ok-loken"><circle cx="56" cy="486" r="19" class="okc"/><path class="okx" d="M46,486 L53,494 L67,478"/></g>
+<text class="cap" x="112" y="426" data-name="strip-loken">MODEL, 8 LAYERS</text>
+<rect id="ly-loken-0" class="layer" x="112" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-1" class="layer" x="137" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-2" class="layer" x="162" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-3" class="layer" x="187" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-4" class="layer" x="212" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-5" class="layer" x="237" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-6" class="layer" x="262" y="438" width="21" height="50" rx="4"/>
+<rect id="ly-loken-7" class="layer" x="287" y="438" width="21" height="50" rx="4"/>
+<text class="note" x="112" y="516" data-name="note-loken"></text>
+<g data-name="dev-loken-0">
+<rect id="dv-loken-0" class="dev d0" x="330" y="412" width="150" height="120" rx="10"/>
+<text class="cap" x="340" y="430" data-name="devname-loken-0"></text>
+<rect id="c-loken-0-0" class="cell" x="342" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-1" class="cell" x="376" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-2" class="cell" x="410" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-3" class="cell" x="444" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-4" class="cell" x="342" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-5" class="cell" x="376" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-6" class="cell" x="410" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-0-7" class="cell" x="444" y="474" width="28" height="26" rx="4"/>
+<text class="note" x="340" y="522" data-name="devnote-loken-0"></text>
+</g>
+<g data-name="dev-loken-1">
+<rect id="dv-loken-1" class="dev d1" x="496" y="412" width="150" height="120" rx="10"/>
+<text class="cap" x="506" y="430" data-name="devname-loken-1"></text>
+<rect id="c-loken-1-0" class="cell" x="508" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-1" class="cell" x="542" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-2" class="cell" x="576" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-3" class="cell" x="610" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-4" class="cell" x="508" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-5" class="cell" x="542" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-6" class="cell" x="576" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-1-7" class="cell" x="610" y="474" width="28" height="26" rx="4"/>
+<text class="note" x="506" y="522" data-name="devnote-loken-1"></text>
+</g>
+<g data-name="dev-loken-2">
+<rect id="dv-loken-2" class="dev d2" x="662" y="412" width="130" height="120" rx="10"/>
+<text class="cap" x="672" y="430" data-name="devname-loken-2"></text>
+<rect id="c-loken-2-0" class="cell" x="674" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-2-1" class="cell" x="708" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-2-2" class="cell" x="742" y="442" width="28" height="26" rx="4"/>
+<rect id="c-loken-2-3" class="cell" x="674" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-2-4" class="cell" x="708" y="474" width="28" height="26" rx="4"/>
+<rect id="c-loken-2-5" class="cell" x="742" y="474" width="28" height="26" rx="4"/>
+<text class="note" x="672" y="522" data-name="devnote-loken-2"></text>
+</g>
+</g>
+<g data-anim="" data-reach="14"></g>
+</svg>

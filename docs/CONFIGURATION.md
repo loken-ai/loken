@@ -156,7 +156,7 @@ The next turn of a conversation keeps the rows it shares with the turn before, u
 
 An instance with `prefill_peer` set has its long prompts read by that peer, which serves the same model.
 The peer answers with its KV cache over `/api/cluster/prefill`, and this instance imports it and decodes.  
-[Across machines](inside/nodes.md) draws the steps.
+[Across machines](https://loken-ai.github.io/loken/nodes/) draws the steps.
 
 The instance asks the peer only while handing the whole prompt over is expected to take no longer than reading the tokens its cache lacks.
 Both speeds are measured by the instance itself, the first from its hand-overs and the second from its prefills.

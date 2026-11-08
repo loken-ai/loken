@@ -1,8 +1,8 @@
 # Building
 
 Build `lokend` and `loken` from source.
-A release archive needs no build, see [Install](start/install.md).  
-First start: [First run](start/first-run.md).
+A release archive needs no build, see [Install](https://loken-ai.github.io/loken/install/).  
+First start: [First run](https://loken-ai.github.io/loken/first-run/).
 
 ```sh
 cargo build --release   # target/release/{lokend,loken}

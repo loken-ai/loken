@@ -1,0 +1,123 @@
+/* The generation loop: tokens for both themes, then the column, the objects of each scene and their states. */
+.dkt-scenes{--gn-paper:#fffdf6;--gn-paper-line:#9c8f6e;--gn-tok:#efe4c6;--gn-tok-line:#a8925c;--gn-cell:#f4f1fa;--gn-cell-line:#b6a6d8;
+  --gn-cuda:#2f6ea8;--gn-rocm:#b4473a;--gn-flash:#e0a21a;--gn-ok:#2f8f4e;--gn-bad:#c0392b;--gn-skin:#d9e2e0;--gn-skin-line:#4b5f63;
+  --gn-headfill:#f2e3b3;--gn-shadow:rgba(30,40,44,.16);--gn-colback:#e3e9e7;--gn-board-c:#e6eff7;--gn-board-r:#f8ebe8;--gn-gold:#c99a2e}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .dkt-scenes{--gn-paper:#1b2a30;--gn-paper-line:#8fa3a8;--gn-tok:#33434a;--gn-tok-line:#9fb2b6;--gn-cell:#1a242c;--gn-cell-line:#5e5280;
+  --gn-cuda:#79b2e8;--gn-rocm:#ef8f82;--gn-flash:#f2c14e;--gn-ok:#6fd38f;--gn-bad:#ff7b6b;--gn-skin:#16262c;--gn-skin-line:#7d9aa2;
+  --gn-headfill:#6b5a26;--gn-shadow:rgba(0,0,0,.45);--gn-colback:#111d22;--gn-board-c:#0f1f2e;--gn-board-r:#24130f;--gn-gold:#a8842e}}
+:root[data-theme="dark"] .dkt-scenes{--gn-paper:#1b2a30;--gn-paper-line:#8fa3a8;--gn-tok:#33434a;--gn-tok-line:#9fb2b6;--gn-cell:#1a242c;--gn-cell-line:#5e5280;
+  --gn-cuda:#79b2e8;--gn-rocm:#ef8f82;--gn-flash:#f2c14e;--gn-ok:#6fd38f;--gn-bad:#ff7b6b;--gn-skin:#16262c;--gn-skin-line:#7d9aa2;
+  --gn-headfill:#6b5a26;--gn-shadow:rgba(0,0,0,.45);--gn-colback:#111d22;--gn-board-c:#0f1f2e;--gn-board-r:#24130f;--gn-gold:#a8842e}
+
+/* A lit group keeps the others readable. */
+.dkt-scenes svg.has-sel [data-source]:not(.lit):not(.sel){opacity:.62}
+
+/* Each scene shows its own objects. */
+.dkt-scenes .gs-draft{display:none}
+.dkt-scenes:has(.dkt-modes button[data-scene="draft"][aria-pressed="true"]) .gs-draft{display:inline}
+.dkt-scenes:has(.dkt-modes button[data-scene="draft"][aria-pressed="true"]) .gs-chunks{display:none}
+
+.dkt-scenes .gn-bg{fill:transparent}
+.dkt-scenes .gn-cap{font:700 14.5px var(--a-f-body);letter-spacing:.08em;fill:var(--a-muted)}
+.dkt-scenes .gn-small{font:500 14.5px var(--a-f-body);fill:var(--a-ink)}
+.dkt-scenes .gn-b{font-weight:600}
+.dkt-scenes .gn-name{font:600 14.5px var(--a-f-body);fill:var(--a-ink);paint-order:stroke;stroke:var(--a-ground);stroke-width:3px;stroke-linejoin:round}
+.dkt-scenes .gn-name-d{fill:var(--a-g-loop)}
+
+/* The map vignette. */
+.dkt-scenes .gn-vig-body{fill:var(--gn-skin);stroke:var(--gn-skin-line);stroke-width:1.2}
+.dkt-scenes .gn-vig-vert{fill:var(--a-accent)}
+.dkt-scenes .gn-vig-t{font:500 14.5px var(--a-f-body);fill:var(--a-ink)}
+
+/* The boards of the 2 cards. */
+.dkt-scenes .gn-board{stroke-width:1.4}
+.dkt-scenes .gn-board.dc{fill:var(--gn-board-c);stroke:var(--gn-cuda);stroke-opacity:.5}
+.dkt-scenes .gn-board.dr{fill:var(--gn-board-r);stroke:var(--gn-rocm);stroke-opacity:.5}
+.dkt-scenes .gn-finger{fill:var(--gn-gold);stroke:none}
+
+/* The column of layers. */
+.dkt-scenes .gn-colback{fill:var(--gn-colback);stroke:var(--a-rule);filter:drop-shadow(0 2px 3px var(--gn-shadow))}
+.dkt-scenes .gn-proc{fill:var(--a-bone);stroke:var(--a-bone-line);stroke-width:.8}
+.dkt-scenes .gn-layer{stroke:var(--a-bone-line);stroke-width:1.2;transition:fill .3s}
+.dkt-scenes .gn-layer.dc{fill:var(--a-dev-cuda)}
+.dkt-scenes .gn-layer.dr{fill:var(--a-dev-rocm)}
+.dkt-scenes .gn-layer.hot{fill:var(--a-accent)}
+.dkt-scenes .gn-col.lit .gn-colback{stroke:var(--a-accent);stroke-width:1.6}
+.dkt-scenes .gn-lnum{font:500 14.5px var(--a-f-mono);fill:var(--a-ink)}
+.dkt-scenes .gn-run{fill:none;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.dkt-scenes .gn-run.dc{stroke:var(--gn-cuda)}
+.dkt-scenes .gn-run.dr{stroke:var(--gn-rocm)}
+.dkt-scenes .gn-runcap{font:700 14.5px var(--a-f-body);letter-spacing:.08em}
+.dkt-scenes .gn-runcap.dc{fill:var(--gn-cuda)}
+.dkt-scenes .gn-runcap.dr{fill:var(--gn-rocm)}
+.dkt-scenes .gn-ohead{fill:var(--gn-headfill);stroke:var(--a-accent);stroke-width:1.5;transition:fill .3s}
+.dkt-scenes .gn-ohead.on{fill:var(--a-accent)}
+
+/* Tapes, slots and words. */
+.dkt-scenes .gn-tape{fill:var(--gn-paper);stroke:var(--gn-paper-line);stroke-width:1.2;filter:drop-shadow(0 2px 2px var(--gn-shadow))}
+.dkt-scenes .gn-pt{fill:var(--gn-tok);stroke:var(--gn-tok-line);stroke-width:1;transition:fill .25s,opacity .25s}
+.dkt-scenes .gn-pt.cur{fill:var(--a-accent);stroke:var(--a-accent)}
+.dkt-scenes .gn-pt.done{opacity:.55}
+.dkt-scenes .gn-slot,.dkt-scenes .gn-aslot,.dkt-scenes .gn-gslot{fill:var(--a-surface);stroke:var(--a-muted);stroke-width:1;stroke-dasharray:3 3}
+.dkt-scenes .gn-word{font:600 14.5px var(--a-f-mono);fill:var(--a-ink)}
+.dkt-scenes .gn-word.guess{fill:var(--a-g-loop)}
+.dkt-scenes .gn-word.new{fill:var(--a-accent)}
+.dkt-scenes .gn-word.cut{opacity:.45}
+.dkt-scenes .gn-pick{font:italic 500 14.5px var(--a-f-mono);fill:var(--a-muted)}
+.dkt-scenes .gn-strike{stroke:var(--gn-bad);stroke-width:2.4;stroke-linecap:round}
+.dkt-scenes .gn-ok{fill:none;stroke:var(--gn-ok);stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.dkt-scenes .gn-bad{fill:none;stroke:var(--gn-bad);stroke-width:3;stroke-linecap:round}
+.dkt-scenes .gn-mark{fill:var(--a-accent);stroke:var(--a-ground);stroke-width:1.5;filter:drop-shadow(0 2px 2px var(--gn-shadow))}
+.dkt-scenes .gn-markcap{font:700 14.5px var(--a-f-body);letter-spacing:.1em;fill:var(--a-accent)}
+.dkt-scenes .gn-brk{fill:none;stroke:var(--a-ink);stroke-width:1.4}
+.dkt-scenes .gn-brk.half{stroke:var(--a-accent);stroke-width:2}
+.dkt-scenes .gn-brkcap{font:700 14.5px var(--a-f-body);fill:var(--a-ink)}
+.dkt-scenes .gn-brkcap.half{fill:var(--a-accent)}
+
+/* The KV cache. */
+.dkt-scenes .gn-kc,.dkt-scenes .gn-kd{fill:var(--gn-cell);stroke:var(--gn-cell-line);stroke-width:.8;transition:fill .3s,stroke .3s,opacity .4s}
+.dkt-scenes .gn-kc.on,.dkt-scenes .gn-kd.on{fill:var(--a-g-kv);stroke:var(--a-g-kv)}
+.dkt-scenes .gn-kc.tent,.dkt-scenes .gn-kd.tent{fill:var(--gn-flash);stroke:var(--gn-flash)}
+.dkt-scenes .gn-kc.fail,.dkt-scenes .gn-kd.fail{fill:var(--gn-bad);stroke:var(--gn-bad)}
+.dkt-scenes .gn-kd.cut{fill:var(--gn-cell);stroke:var(--gn-bad);stroke-dasharray:2 2}
+.dkt-scenes .gn-kv.lit .gn-cap{fill:var(--a-g-kv)}
+.dkt-scenes .gn-brace{fill:none;stroke:var(--a-muted);stroke-width:1.2}
+.dkt-scenes .gn-kw{font-family:var(--a-f-mono)}
+
+/* The memory of the tightest card. */
+.dkt-scenes .gn-gauge{fill:var(--a-surface);stroke:var(--a-ink);stroke-width:1.6;filter:drop-shadow(0 2px 3px var(--gn-shadow))}
+.dkt-scenes .gn-gtick{stroke:var(--a-muted);stroke-width:1.2}
+.dkt-scenes .gn-level{stroke:var(--a-accent);stroke-width:2;stroke-dasharray:5 3}
+.dkt-scenes .gn-blk{fill:var(--a-g-loop);fill-opacity:.45;stroke:var(--a-g-loop);stroke-width:1.2}
+.dkt-scenes .gn-band{fill:var(--a-g-loop);fill-opacity:.16;stroke:var(--a-g-loop);stroke-width:1.2;stroke-dasharray:4 3}
+.dkt-scenes .gn-bandcap{font:500 14.5px var(--a-f-body);fill:var(--a-ink)}
+.dkt-scenes .gn-kvseg{fill:var(--a-g-kv);stroke:var(--a-g-kv)}
+.dkt-scenes .gn-over{fill:var(--gn-bad);fill-opacity:.85;stroke:var(--gn-bad);filter:drop-shadow(0 0 6px var(--gn-bad))}
+.dkt-scenes .gn-plaque{fill:var(--a-surface);stroke:var(--a-rule);stroke-width:1.2;filter:drop-shadow(0 2px 3px var(--gn-shadow))}
+.dkt-scenes .gn-val{font:700 19px var(--a-f-mono);fill:var(--a-accent)}
+.dkt-scenes .gn-gl{font:500 14.5px var(--a-f-body);fill:var(--a-ink)}
+.dkt-scenes .gn-oom{font:700 14.5px var(--a-f-body);letter-spacing:.06em;fill:#fff}
+
+/* The draft head, the dial and the passes. */
+.dkt-scenes .gn-dlayer{fill:var(--a-g-loop);fill-opacity:.55;stroke:var(--a-g-loop);stroke-width:1.4;transition:fill-opacity .3s}
+.dkt-scenes .gn-dhead.lit .gn-dlayer,.dkt-scenes .gn-dlayer.on{fill-opacity:.95}
+.dkt-scenes .gn-link{fill:none;stroke:var(--a-g-loop);stroke-width:1.6;stroke-dasharray:4 4}
+.dkt-scenes .gn-arrowhead{fill:var(--a-g-loop)}
+.dkt-scenes .gn-arc{fill:none;stroke:var(--a-ink);stroke-width:2}
+.dkt-scenes .gn-hub{fill:var(--a-accent)}
+.dkt-scenes .gn-needle{stroke:var(--a-accent);stroke-width:3.2;stroke-linecap:round}
+.dkt-scenes .gn-chip{stroke-width:1.2;transition:opacity .3s}
+.dkt-scenes .gn-chip.pass rect{fill:var(--a-dev-cuda);stroke:var(--a-bone-line);stroke-width:1.2}
+.dkt-scenes .gn-chip.pass path{stroke:var(--a-bone-line);stroke-width:1.2}
+.dkt-scenes .gn-chip.draft{fill:var(--a-g-loop);fill-opacity:.8;stroke:var(--a-g-loop)}
+.dkt-scenes .gn-chip.pass.on rect{stroke:var(--a-accent);stroke-width:2.2}
+.dkt-scenes .gn-chip.draft.on{stroke:var(--a-accent);stroke-width:2.2;fill-opacity:1}
+.dkt-scenes .gn-count{font:700 15px var(--a-f-mono);fill:var(--a-ink)}
+.dkt-scenes .gn-count.on,.dkt-scenes .gn-small.on{fill:var(--a-accent)}
+.dkt-scenes .gn-rule{stroke:var(--a-rule);stroke-width:1.2}
+
+@media (prefers-reduced-motion:reduce){.dkt-scenes .gn-layer,.dkt-scenes .gn-kc,.dkt-scenes .gn-kd,.dkt-scenes .gn-pt{transition:none}}
+
+/* The last line of the hint keeps its descenders. */
+.dkt-scenes:has(svg .gn-col) figcaption{padding-bottom:6px}
+.dkt-scenes .gn-kc.att{stroke:var(--a-accent);stroke-width:2.2}

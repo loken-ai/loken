@@ -1,0 +1,181 @@
+# A model larger than the server
+
+```scenes
+figure = "../anatomy/streamed.svg"
+program = "../anatomy/streamed.scenes"
+style = ["../anatomy/figures.css", "../anatomy/streamed.css"]
+eyebrow = "lokend anatomy"
+title = "A model larger than the server"
+caption = "A model that does not fit"
+hint = "Each square is an expert. The disk holds the model file, mapped. The RAM is the memory of the host, and its page cache holds the pages of the file that were read. The VRAM is the memory of the card. Large dots are bytes of experts on the move, small dark dots are rows of activations. The counts and sizes are an example drawn to show the shape."
+soundtheme = "soft"
+legendLabel = "Key:"
+legend = [["st-disk", "an expert on the disk"], ["st-cache", "in the page cache"], ["st-card", "on the card"], ["st-pk", "bytes on the move"], ["st-row", "a row of activations"]]
+
+[sounds]
+load1 = "narration/streamed-load1.mp3"
+load2 = "narration/streamed-load2.mp3"
+load3 = "narration/streamed-load3.mp3"
+load4 = "narration/streamed-load4.mp3"
+load5 = "narration/streamed-load5.mp3"
+time1 = "narration/streamed-time1.mp3"
+time2 = "narration/streamed-time2.mp3"
+time3 = "narration/streamed-time3.mp3"
+time4 = "narration/streamed-time4.mp3"
+time5 = "narration/streamed-time5.mp3"
+time6 = "narration/streamed-time6.mp3"
+layer1 = "narration/streamed-layer1.mp3"
+layer2 = "narration/streamed-layer2.mp3"
+layer3 = "narration/streamed-layer3.mp3"
+layer4 = "narration/streamed-layer4.mp3"
+layer5 = "narration/streamed-layer5.mp3"
+disk1 = "narration/streamed-disk1.mp3"
+disk2 = "narration/streamed-disk2.mp3"
+disk3 = "narration/streamed-disk3.mp3"
+disk4 = "narration/streamed-disk4.mp3"
+card1 = "narration/streamed-card1.mp3"
+card2 = "narration/streamed-card2.mp3"
+card3 = "narration/streamed-card3.mp3"
+card4 = "narration/streamed-card4.mp3"
+card5 = "narration/streamed-card5.mp3"
+card6 = "narration/streamed-card6.mp3"
+prompt1 = "narration/streamed-prompt1.mp3"
+prompt2 = "narration/streamed-prompt2.mp3"
+prompt3 = "narration/streamed-prompt3.mp3"
+prompt4 = "narration/streamed-prompt4.mp3"
+prompt5 = "narration/streamed-prompt5.mp3"
+prompt6 = "narration/streamed-prompt6.mp3"
+
+[camera]
+below = 640
+over = 600
+ratio = 1.4
+
+[inlay]
+pad = [0, 0]
+below = 640
+title = [[8, 6, 540, 84]]
+now = [[690, 6, 992, 186]]
+note = [[690, 6, 992, 186]]
+step = [[8, 484, 992, 642]]
+
+[[scene]]
+key = "load"
+keep = true
+eyebrow = "Scene 1 of 6"
+name = "Load"
+title = "Loading a model that does not fit"
+about = "A mixture of experts such as DeepSeek V4.1 can be larger than the RAM of the host and the VRAM of the card together. Loken maps its file, keeps on the card what every token reads, and fills the rest of the card with the experts used most."
+steps = [
+  "The file is larger than the RAM and the VRAM together, so it is not read whole. The host maps it, and a page is read from the disk only when something touches it.",
+  "The weights every token reads cross to the card once and stay there. They are read from the disk through the RAM, and copied into the VRAM before any routed expert.",
+  "The room left in the VRAM is cut into expert slots. Before the first request, the slots are filled from the routing prior, the most used experts of every layer first. Each expert is read from the disk, copied to the card, and its pages leave the RAM.",
+  "Every other expert stays on the disk. The host reads it in place when a token routes to it, and its page cache keeps the pages that were read.",
+  "How many experts the page cache keeps for each layer moves while the server runs. It grows while the host has the room and the kernel reports no more memory stalls, and it falls back when it does.",
+]
+narration = ["load1", "load2", "load3", "load4", "load5"]
+done = "Loaded, most of the file still on the disk"
+deeper = [{ text = "How a model is loaded", href = "weights.md#load" }, { text = "When layers spill to the host", href = "layers.md#spill" }]
+now = ["Mapping the file", "Setting aside what every token reads", "Filling the slots from the prior", "The rest stays on the disk", "Sizing the page cache"]
+
+[[scene]]
+key = "time"
+keep = true
+eyebrow = "Scene 2 of 6"
+name = "Over time"
+title = "Experts moving over time"
+about = "The experts of the file move between the disk, the RAM and the VRAM as tokens go by. Each square of the file takes the colour of where its expert is, and a counter gives where the experts of each token came from."
+steps = [
+  "The first tokens after the load. An expert on the card runs there. The others run on the host, and each is read from the disk the first time.",
+  "The next tokens route to some of the same experts. Those are in the RAM already, so they are not read from the disk again, and the card counts each sighting.",
+  "An expert seen often enough repays an upload. It moves from the RAM to the card, its pages leave the RAM, and the card trades out its least frequently routed expert.",
+  "The conversation moves on to other experts. They are read from the disk, and the page cache turns over: the experts used last stay and the others give way.",
+  "The new experts become frequent. They move to the card one by one, each trading out a colder expert, so the VRAM follows the experts the text keeps returning to.",
+  "After many tokens, most of the experts a token routes to are on the card, some are in the RAM, and the disk is read only for the rare expert.",
+] 
+narration = ["time1", "time2", "time3", "time4", "time5", "time6"]
+done = "The experts sit where the text needs them"
+deeper = [{ text = "Experts on a card, in the library", href = "weights.md#experts" }]
+now = ["The first tokens", "Found in the RAM", "From the RAM to the card", "A new topic", "The card follows", "Settled"]
+
+[[scene]]
+key = "layer"
+keep = true
+eyebrow = "Scene 3 of 6"
+name = "A layer"
+title = "A layer of a token"
+about = "A token crosses the layers one after the other. In each layer, the attention runs on the card, the router names the experts, and each expert runs on the card or on the host."
+steps = [
+  "A token runs the attention of a layer on the card, from the weights kept there.",
+  "A row of the stream crosses to the host, where the router names the experts.",
+  "An expert kept in the VRAM runs on the card. Its row crosses the bus, the card computes, and the product comes back.",
+  "An expert that is not on the card runs on the host cores, at the same time. It reads its weights from the mapping in place: they are never dequantised or copied.",
+  "The products of both sides are summed with the router's weights, and the stream goes on in the card.",
+]
+narration = ["layer1", "layer2", "layer3", "layer4", "layer5"]
+done = "The stream goes on to the next layer"
+deeper = [{ text = "Experts on a card, in the library", href = "weights.md#experts" }]
+now = ["Attention on the card", "The router names the experts", "Experts kept on the card", "Experts read in place by the host", "Summing the products"]
+
+[[scene]]
+key = "disk"
+keep = true
+eyebrow = "Scene 4 of 6"
+name = "Disk reads"
+title = "Reading from the disk"
+about = "What the host needs and the RAM does not hold is read from the disk. The reads are made one at a time on a fault, or ahead of time by reader threads."
+steps = [
+  "A page that is not in the RAM is read from the disk when a core touches it. A fault reads 1 expert at a time.",
+  "Reader threads read the experts of the next layers before they are needed. They guess them from the stream the token has by then.",
+  "How many layers ahead they read is moved by the decode's own timing. A controller tries each neighbour for a window and keeps one only when the tokens run faster.",
+  "The page cache keeps the experts used last. The pages of the others are dropped only while the kernel reports memory stalls, and stay otherwise.",
+]
+narration = ["disk1", "disk2", "disk3", "disk4"]
+done = "The pages are where the next token needs them"
+deeper = [{ text = "Streamed mixtures, how each quantity is derived", href = "../CONFIGURATION.md#streamed-mixtures-deepseek-v41" }]
+now = ["A page fault", "Reading ahead", "Tuning the depth", "Keeping or dropping pages"]
+
+[[scene]]
+key = "card"
+keep = true
+eyebrow = "Scene 5 of 6"
+name = "To the card"
+title = "An expert moves to the card"
+about = "An expert that the host runs again and again is worth the card's room. The card counts, copies it on a stream of its own, and trades out its coldest expert when it is full."
+steps = [
+  "An expert that is not on the card runs on the host, and the card counts each time it sees it.",
+  "Once an expert was seen as many times as an upload needs uses to pay for itself, it is queued for the copy thread. An upload costs a measured time, and each use on the card saves the measured time of the host.",
+  "The copy thread sends the expert on a stream of its own. The copy goes beside the card's compute and off the token's path, so the token runs the expert on the host.",
+  "The card now holds the copy, so the host pages that were read for it are released. They would take the room of experts that the host still needs.",
+  "When the VRAM is full, a newcomer takes the place of the least frequently routed expert. It never takes the place of an expert used within the layers of this token, and only of one colder than itself.",
+  "The heat of an evicted expert outlives its slot. It comes back at the count it earned, so the slots settle on the hottest experts instead of churning.",
+]
+narration = ["card1", "card2", "card3", "card4", "card5", "card6"]
+done = "The slots follow the hottest experts"
+deeper = [{ text = "Experts on a card, in the library", href = "weights.md#experts" }]
+now = ["Counting the sightings", "The upload pays back", "Copying on its own stream", "Releasing the host pages", "Trading out the coldest", "The heat outlives the slot"]
+
+[[scene]]
+key = "prompt"
+keep = true
+eyebrow = "Scene 6 of 6"
+name = "A prompt"
+title = "A prompt through the experts"
+about = "A prompt routes to many experts in each layer. Each expert goes where it costs least, and the copies for a layer never take a kept expert's place."
+steps = [
+  "A prompt routes its tokens to many experts in each layer. The layer starts when the router has named them.",
+  "Each expert goes where it costs least. An expert kept on a card runs there from the card's copy. Another runs on a card when a copy of it costs less than its rows cost the host, and stays on the host otherwise.",
+  "The copies are read from the file into a page-locked slab, in runs of adjacent experts, around the page cache.",
+  "The card computes the experts it keeps and the copies, and the host computes its own. All of it happens at the same time.",
+  "A copy made for the layer is let go after it unless the card has the room free to keep it. Nothing is evicted for it: it never takes a kept expert's place.",
+  "When the cards take no part of the prompt and it routes to most of the experts, whole layers are read in. The next layer is read into the RAM while the current layer computes.",
+]
+narration = ["prompt1", "prompt2", "prompt3", "prompt4", "prompt5", "prompt6"]
+done = "Prompt read, layer by layer"
+deeper = [{ text = "The prompt in chunks", href = "generation.md#chunks" }]
+now = ["Naming the experts", "Choosing card or host", "Reading adjacent experts", "Everything at the same time", "Letting the copies go", "Reading the next layer ahead"]
+```
+
+DeepSeek V4.1 is served this way: the host maps the file, and the cards keep what every token reads and as many routed experts as they have room for.
+
+The experts a card keeps, the room for copies and the number of experts the page cache keeps for each layer all come from measurement at load. See [Streamed mixtures](../CONFIGURATION.md#streamed-mixtures-deepseek-v41) for how each quantity is derived and what the `fidelity` setting trades.

@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" role="img" aria-label="A rail yard seen from above: requests arrive as trains at node A, a signal box tests the routing rules in order and sets the switches toward the local platform or across the network to node B or node C">
+<defs>
+<pattern id="gravel" width="14" height="14" patternUnits="userSpaceOnUse"><circle class="rt-grit" cx="3" cy="4" r=".9"/><circle class="rt-grit" cx="10" cy="9" r=".7"/><circle class="rt-grit" cx="6" cy="12" r=".6"/></pattern>
+<pattern id="tufts" width="46" height="38" patternUnits="userSpaceOnUse"><path class="rt-tuft" d="M8,14 l2,-5 l1,5 M11,14 l3,-4 M30,32 l1.5,-5 l1,5 M33,32 l2.5,-4"/></pattern>
+<pattern id="bricks" width="16" height="8" patternUnits="userSpaceOnUse"><path class="rt-brick-line" d="M0,0 H16 M0,4 H16 M4,0 V4 M12,4 V8"/></pattern>
+<pattern id="planks" width="8" height="7" patternUnits="userSpaceOnUse"><path class="rt-plank" d="M0,0 H8"/></pattern>
+<linearGradient id="water" x1="0" y1="0" x2="1" y2="0"><stop offset="0" class="rt-water-a"/><stop offset=".5" class="rt-water-b"/><stop offset="1" class="rt-water-a"/></linearGradient>
+<radialGradient id="halo-lamp"><stop offset="0" class="rt-lamp-a"/><stop offset="1" class="rt-lamp-b"/></radialGradient>
+<radialGradient id="halo"><stop offset="0" class="rt-halo-a"/><stop offset="1" class="rt-halo-b"/></radialGradient>
+<g data-sprite="loco" class="rt-car"><rect class="rt-car-shadow" x="-20" y="-6" width="44" height="17" rx="5"/><path class="rt-flag" d="M-12,-7 V-27 M-12,-27 L5,-22 L-12,-17 Z"/><path class="rt-body" d="M-21,-8.5 H13 Q21.5,-8.5 21.5,-2 V2 Q21.5,8.5 13,8.5 H-21 Z"/><rect class="rt-cab" x="-19" y="-7" width="13" height="14" rx="2"/><path class="rt-louvre" d="M-2,-5.5 V5.5 M3,-5.5 V5.5 M8,-5.5 V5.5"/><rect class="rt-sheen" x="-19" y="-7" width="38" height="3" rx="1.5"/><circle class="rt-headlight" cx="19.5" cy="-4" r="1.6"/><circle class="rt-headlight" cx="19.5" cy="4" r="1.6"/></g>
+<g data-sprite="wagon" class="rt-car"><rect class="rt-car-shadow" x="-16" y="-5.5" width="36" height="16" rx="3"/><rect class="rt-coupler" x="-21" y="-1.5" width="42" height="3"/><rect class="rt-body" x="-18" y="-8" width="36" height="16" rx="2.5"/><path class="rt-slats" d="M-12,-8 V8 M-6,-8 V8 M0,-8 V8 M6,-8 V8 M12,-8 V8"/><rect class="rt-sheen" x="-16" y="-6.5" width="32" height="2.5" rx="1.2"/><text class="rt-wtag" x="0" y="2.6" text-anchor="middle">BATCH</text></g>
+<g data-sprite="gwagon" class="rt-gwagon"><rect class="rt-gcrate" x="-22" y="-60" width="44" height="44" rx="2"/><rect class="rt-gcrate-planks" fill="url(#planks)" x="-22" y="-60" width="44" height="44"/><text class="rt-gcrate-t" x="0" y="-21" text-anchor="middle">NODE B</text><rect class="rt-gchassis" x="-27" y="-16" width="54" height="6" rx="1.5"/><circle class="rt-gwheel" cx="-15" cy="-6" r="6"/><circle class="rt-gwheel" cx="15" cy="-6" r="6"/><circle class="rt-ghub" cx="-15" cy="-6" r="1.8"/><circle class="rt-ghub" cx="15" cy="-6" r="1.8"/></g>
+</defs>
+<rect class="rt-grass" x="-20" y="-20" width="1040" height="660"/>
+<rect fill="url(#tufts)" class="rt-texture" x="-20" y="-20" width="1040" height="660"/>
+<rect class="rt-yard" x="10" y="10" width="578" height="600" rx="18"/>
+<rect fill="url(#gravel)" class="rt-texture" x="10" y="10" width="578" height="600" rx="18"/>
+<path class="rt-fence" d="M10,335 V28 Q10,10 28,10 H570 Q588,10 588,28 V592 Q588,610 570,610 H28 Q10,610 10,592 V385"/>
+<path class="rt-fence-post" d="M10,335 h-4 M10,385 h-4"/>
+<path class="rt-bank" d="M604,-20 C590,60 612,140 600,220 C590,300 612,380 598,460 C588,540 606,600 600,640 L694,640 C700,560 684,500 692,420 C700,330 682,260 690,180 C698,100 684,40 690,-20 Z"/>
+<path class="rt-reed" d="M592,130 l-3,-9 M595,130 l0,-11 M598,130 l3,-8 M588,300 l-3,-9 M591,300 l0,-11 M594,300 l3,-8 M586,530 l-3,-9 M589,530 l0,-11 M592,530 l3,-8 M694,90 l-3,-9 M697,90 l0,-11 M700,90 l3,-8 M690,420 l-3,-9 M693,420 l0,-11 M696,420 l3,-8 M700,560 l-3,-9 M703,560 l0,-11 M706,560 l3,-8"/>
+<path class="rt-water" fill="url(#water)" d="M604,-20 C590,60 612,140 600,220 C590,300 612,380 598,460 C588,540 606,600 600,640 L694,640 C700,560 684,500 692,420 C700,330 682,260 690,180 C698,100 684,40 690,-20 Z"/>
+<g class="rt-waves"><path class="rt-wave w0" d="M620,40 q6,-4 12,0 t12,0"/><path class="rt-wave w1" d="M660,110 q6,-4 12,0 t12,0"/><path class="rt-wave w2" d="M630,190 q6,-4 12,0 t12,0"/><path class="rt-wave w0" d="M668,300 q6,-4 12,0 t12,0"/><path class="rt-wave w1" d="M622,420 q6,-4 12,0 t12,0"/><path class="rt-wave w2" d="M660,520 q6,-4 12,0 t12,0"/><path class="rt-wave w0" d="M632,590 q6,-4 12,0 t12,0"/><path class="rt-wave w1" d="M648,60 q6,-4 12,0 t12,0"/><path class="rt-wave w2" d="M640,470 q6,-4 12,0 t12,0"/></g>
+<text class="rt-river-t" x="651" y="560" text-anchor="middle" transform="rotate(-90 651 560)">NETWORK</text>
+<ellipse class="rt-shadow" cx="727" cy="57" rx="21" ry="10"/><circle class="rt-tree" cx="720" cy="46" r="20"/><circle class="rt-tree-2" cx="725.6" cy="50.4" r="12.4"/><circle class="rt-tree-hi" cx="713.6" cy="39.2" r="6.8"/>
+<ellipse class="rt-shadow" cx="764.9" cy="77.7" rx="14.7" ry="7"/><circle class="rt-tree" cx="760" cy="70" r="14"/><circle class="rt-tree-2" cx="763.9" cy="73.1" r="8.7"/><circle class="rt-tree-hi" cx="755.5" cy="65.2" r="4.8"/>
+<ellipse class="rt-shadow" cx="987.7" cy="52.1" rx="23.1" ry="11"/><circle class="rt-tree" cx="980" cy="40" r="22"/><circle class="rt-tree-2" cx="986.2" cy="44.8" r="13.6"/><circle class="rt-tree-hi" cx="973" cy="32.5" r="7.5"/>
+<ellipse class="rt-shadow" cx="944.5" cy="77.2" rx="13.7" ry="6.5"/><circle class="rt-tree" cx="940" cy="70" r="13"/><circle class="rt-tree-2" cx="943.6" cy="72.9" r="8.1"/><circle class="rt-tree-hi" cx="935.8" cy="65.6" r="4.4"/>
+<ellipse class="rt-shadow" cx="718.3" cy="599.9" rx="18.9" ry="9"/><circle class="rt-tree" cx="712" cy="590" r="18"/><circle class="rt-tree-2" cx="717" cy="594" r="11.2"/><circle class="rt-tree-hi" cx="706.2" cy="583.9" r="6.1"/>
+<ellipse class="rt-shadow" cx="756.2" cy="606.6" rx="12.6" ry="6"/><circle class="rt-tree" cx="752" cy="600" r="12"/><circle class="rt-tree-2" cx="755.4" cy="602.6" r="7.4"/><circle class="rt-tree-hi" cx="748.2" cy="595.9" r="4.1"/>
+<ellipse class="rt-shadow" cx="990.6" cy="598.8" rx="16.8" ry="8"/><circle class="rt-tree" cx="985" cy="590" r="16"/><circle class="rt-tree-2" cx="989.5" cy="593.5" r="9.9"/><circle class="rt-tree-hi" cx="979.9" cy="584.6" r="5.4"/>
+<ellipse class="rt-shadow" cx="724.2" cy="166.6" rx="12.6" ry="6"/><circle class="rt-tree" cx="720" cy="160" r="12"/><circle class="rt-tree-2" cx="723.4" cy="162.6" r="7.4"/><circle class="rt-tree-hi" cx="716.2" cy="155.9" r="4.1"/>
+<rect class="rt-shadow" x="588" y="237" width="116" height="34" rx="3"/>
+<rect class="rt-deck" x="584" y="232" width="116" height="36" rx="3"/>
+<rect fill="url(#planks)" class="rt-texture" x="584" y="232" width="116" height="36" rx="3"/>
+<path class="rt-rail-guard" d="M584,232 H700 M584,268 H700"/>
+<path class="rt-guard-post" d="M590,229 v6 M590,265 v6 M608,229 v6 M608,265 v6 M626,229 v6 M626,265 v6 M644,229 v6 M644,265 v6 M662,229 v6 M662,265 v6 M680,229 v6 M680,265 v6 M698,229 v6 M698,265 v6"/>
+<text class="rt-rtt-t" x="644" y="223" text-anchor="middle">ROUND TRIP</text>
+<rect class="rt-shadow" x="588" y="347" width="116" height="34" rx="3"/>
+<rect class="rt-deck" x="584" y="342" width="116" height="36" rx="3"/>
+<rect fill="url(#planks)" class="rt-texture" x="584" y="342" width="116" height="36" rx="3"/>
+<path class="rt-rail-guard" d="M584,342 H700 M584,378 H700"/>
+<path class="rt-guard-post" d="M590,339 v6 M590,375 v6 M608,339 v6 M608,375 v6 M626,339 v6 M626,375 v6 M644,339 v6 M644,375 v6 M662,339 v6 M662,375 v6 M680,339 v6 M680,375 v6 M698,339 v6 M698,375 v6"/>
+<text class="rt-rtt-t" x="644" y="333" text-anchor="middle">ROUND TRIP</text>
+<g><path class="rt-ballast" d="M-10,360 L700,360 C760,360 770,500 830,500 L984,500"/><path class="rt-ballast" d="M430,360 C485,360 500,250 560,250 L984,250"/><path class="rt-ballast" d="M280,360 C340,360 340,520 410,520 L566,520"/></g>
+<g><path class="rt-sleepers" d="M-10,360 L700,360 C760,360 770,500 830,500 L984,500"/><path class="rt-sleepers" d="M430,360 C485,360 500,250 560,250 L984,250"/><path class="rt-sleepers" d="M280,360 C340,360 340,520 410,520 L566,520"/></g>
+<g><path class="rt-rails" d="M-10,360 L700,360 C760,360 770,500 830,500 L984,500"/><path class="rt-rails" d="M430,360 C485,360 500,250 560,250 L984,250"/><path class="rt-rails" d="M280,360 C340,360 340,520 410,520 L566,520"/></g>
+<g><path class="rt-gauge" d="M-10,360 L700,360 C760,360 770,500 830,500 L984,500"/><path class="rt-gauge" d="M430,360 C485,360 500,250 560,250 L984,250"/><path class="rt-gauge" d="M280,360 C340,360 340,520 410,520 L566,520"/></g>
+<g><path class="rt-sleepers-in" d="M-10,360 L700,360 C760,360 770,500 830,500 L984,500"/><path class="rt-sleepers-in" d="M430,360 C485,360 500,250 560,250 L984,250"/><path class="rt-sleepers-in" d="M280,360 C340,360 340,520 410,520 L566,520"/></g>
+<rect class="rt-buffer" x="986" y="239" width="7" height="22" rx="1.5"/><rect class="rt-buffer-lamp" x="987.5" y="247" width="4" height="6" rx="1"/><rect class="rt-buffer" x="986" y="489" width="7" height="22" rx="1.5"/><rect class="rt-buffer-lamp" x="987.5" y="497" width="4" height="6" rx="1"/><rect class="rt-buffer" x="568" y="509" width="7" height="22" rx="1.5"/><rect class="rt-buffer-lamp" x="569.5" y="517" width="4" height="6" rx="1"/>
+<path class="rt-lit" data-name="lit-local" d="M-10,360 L280,360 C340,360 340,520 410,520 L560,520"/>
+<path class="rt-lit" data-name="lit-b" d="M-10,360 L430,360 C485,360 500,250 560,250 L972,250"/>
+<path class="rt-lit" data-name="lit-c" d="M-10,360 L700,360 C760,360 770,500 830,500 L972,500"/>
+<path class="rt-lit rt-lit-stop" data-name="lit-stop" d="M-10,360 L250,360"/>
+<g class="rt-points"><path class="rt-blade" data-name="s1-local" d="M284,360 C300,360 308,366 314,374"/><path class="rt-blade" data-name="s1-peers" d="M284,360 H318"/><path class="rt-blade" data-name="s2-b" d="M434,360 C450,360 458,354 464,346"/><path class="rt-blade" data-name="s2-c" d="M434,360 H468"/><circle class="rt-lever" cx="282" cy="378" r="4"/><circle class="rt-lever" cx="432" cy="378" r="4"/></g>
+<rect class="rt-plat" x="720" y="220" width="264" height="16" rx="2"/><path class="rt-plat-edge" d="M723,234 H981"/>
+<rect class="rt-plat" x="752" y="474" width="232" height="14" rx="2"/><path class="rt-plat-edge" d="M755,476 H981"/>
+<rect class="rt-plat" x="410" y="494" width="154" height="14" rx="2"/><path class="rt-plat-edge" d="M413,506 H561"/>
+<g class="rt-station" data-name="st-b"><rect class="rt-shadow" x="776" y="106" width="164" height="122" rx="4"/><rect class="rt-wall" x="776" y="136" width="152" height="84" rx="2"/><rect class="rt-wall-base" x="776" y="212" width="152" height="8"/><rect class="rt-win" x="788" y="152" width="22" height="52" rx="2"/><path class="rt-win-frame" d="M799,152 V204 M788,178 H810"/><path class="rt-glint" d="M791,200 L797,155"/><rect class="rt-win" x="894" y="152" width="22" height="52" rx="2"/><path class="rt-win-frame" d="M905,152 V204 M894,178 H916"/><path class="rt-glint" d="M897,200 L903,155"/><rect class="rt-door" x="841" y="190" width="22" height="22" rx="2"/><path class="rt-roof" d="M770,140 L796,98 L908,98 L934,140 Z"/><path class="rt-roof-2" d="M908,98 L934,140 L894,140 Z"/><path class="rt-tiles" d="M776,126 H928 M785,112 H919"/><path class="rt-ridge" d="M796,98 H908"/><rect class="rt-eave" x="768" y="138" width="168" height="5" rx="2"/><rect class="rt-plate" x="821.4" y="115" width="61.2" height="16" rx="3"/><text class="rt-plate-t" x="852" y="127" text-anchor="middle">NODE B</text><circle class="rt-clock-rim" cx="852" cy="176" r="23"/><circle class="rt-clock" cx="852" cy="176" r="19.5"/><path class="rt-ticks" d="M852,162.5 L852,158 M859.8,162.6 L861,160.4 M865.4,168.2 L867.6,167 M865.5,176 L870,176 M865.4,183.8 L867.6,185 M859.8,189.4 L861,191.6 M852,189.5 L852,194 M844.2,189.4 L843,191.6 M838.6,183.8 L836.4,185 M838.5,176 L834,176 M838.6,168.2 L836.4,167 M844.2,162.6 L843,160.4"/><circle class="rt-pin" cx="852" cy="176" r="2.2"/><circle class="rt-halo" cx="852" cy="90" r="16" fill="url(#halo)"/><path class="rt-mast" d="M852,98 V92"/><circle class="rt-beacon" cx="852" cy="89" r="4.5"/></g>
+<g class="rt-station" data-name="st-c"><rect class="rt-shadow" x="812" y="388" width="164" height="92" rx="4"/><rect class="rt-wall" x="812" y="416" width="152" height="56" rx="2"/><rect class="rt-wall-base" x="812" y="464" width="152" height="8"/><rect class="rt-win" x="824" y="432" width="22" height="24" rx="2"/><path class="rt-win-frame" d="M835,432 V456 M824,444 H846"/><path class="rt-glint" d="M827,452 L833,435"/><rect class="rt-win" x="930" y="432" width="22" height="24" rx="2"/><path class="rt-win-frame" d="M941,432 V456 M930,444 H952"/><path class="rt-glint" d="M933,452 L939,435"/><rect class="rt-door" x="877" y="442" width="22" height="22" rx="2"/><path class="rt-roof" d="M806,420 L832,380 L944,380 L970,420 Z"/><path class="rt-roof-2" d="M944,380 L970,420 L930,420 Z"/><path class="rt-tiles" d="M812,406.7 H964 M821,393.3 H955"/><path class="rt-ridge" d="M832,380 H944"/><rect class="rt-eave" x="804" y="418" width="168" height="5" rx="2"/><rect class="rt-plate" x="857.4" y="395" width="61.2" height="16" rx="3"/><text class="rt-plate-t" x="888" y="407" text-anchor="middle">NODE C</text><circle class="rt-clock-rim" cx="888" cy="444" r="23"/><circle class="rt-clock" cx="888" cy="444" r="19.5"/><path class="rt-ticks" d="M888,430.5 L888,426 M895.8,430.6 L897,428.4 M901.4,436.2 L903.6,435 M901.5,444 L906,444 M901.4,451.8 L903.6,453 M895.8,457.4 L897,459.6 M888,457.5 L888,462 M880.2,457.4 L879,459.6 M874.6,451.8 L872.4,453 M874.5,444 L870,444 M874.6,436.2 L872.4,435 M880.2,430.6 L879,428.4"/><circle class="rt-pin" cx="888" cy="444" r="2.2"/><circle class="rt-halo" cx="888" cy="372" r="16" fill="url(#halo)"/><path class="rt-mast" d="M888,380 V374"/><circle class="rt-beacon" cx="888" cy="371" r="4.5"/></g>
+<g class="rt-station rt-home" data-name="st-here"><rect class="rt-shadow" x="420" y="400" width="148" height="100" rx="4"/><rect class="rt-wall" x="420" y="426" width="136" height="66" rx="2"/><rect class="rt-wall-base" x="420" y="484" width="136" height="8"/><rect class="rt-win" x="432" y="442" width="22" height="34" rx="2"/><path class="rt-win-frame" d="M443,442 V476 M432,459 H454"/><path class="rt-glint" d="M435,472 L441,445"/><rect class="rt-win" x="522" y="442" width="22" height="34" rx="2"/><path class="rt-win-frame" d="M533,442 V476 M522,459 H544"/><path class="rt-glint" d="M525,472 L531,445"/><path class="rt-roof" d="M414,430 L440,392 L536,392 L562,430 Z"/><path class="rt-roof-2" d="M536,392 L562,430 L522,430 Z"/><path class="rt-tiles" d="M420,417.3 H556 M429,404.7 H547"/><path class="rt-ridge" d="M440,392 H536"/><rect class="rt-eave" x="412" y="428" width="152" height="5" rx="2"/><rect class="rt-plate" x="465.6" y="407" width="44.8" height="16" rx="3"/><text class="rt-plate-t" x="488" y="419" text-anchor="middle">HERE</text><circle class="rt-clock-rim" cx="488" cy="454" r="23"/><circle class="rt-clock" cx="488" cy="454" r="19.5"/><path class="rt-ticks" d="M488,440.5 L488,436 M495.8,440.6 L497,438.4 M501.4,446.2 L503.6,445 M501.5,454 L506,454 M501.4,461.8 L503.6,463 M495.8,467.4 L497,469.6 M488,467.5 L488,472 M480.2,467.4 L479,469.6 M474.6,461.8 L472.4,463 M474.5,454 L470,454 M474.6,446.2 L472.4,445 M480.2,440.6 L479,438.4"/><circle class="rt-pin" cx="488" cy="454" r="2.2"/></g>
+<g class="rt-closed" data-name="closed"><path class="rt-post" d="M944,214 V150 M988,214 V150"/><rect class="rt-closed-board" x="936" y="140" width="60" height="58" rx="4"/><text class="rt-closed-t" x="966" y="156" text-anchor="middle">CLOSED</text><circle class="rt-pen" data-name="pen0" cx="945" cy="168" r="3.4"/><circle class="rt-pen" data-name="pen1" cx="955.5" cy="168" r="3.4"/><circle class="rt-pen" data-name="pen2" cx="966" cy="168" r="3.4"/><circle class="rt-pen" data-name="pen3" cx="976.5" cy="168" r="3.4"/><circle class="rt-pen" data-name="pen4" cx="987" cy="168" r="3.4"/><circle class="rt-pen" data-name="pen5" cx="945" cy="178" r="3.4"/><circle class="rt-pen" data-name="pen6" cx="955.5" cy="178" r="3.4"/><circle class="rt-pen" data-name="pen7" cx="966" cy="178" r="3.4"/><circle class="rt-pen" data-name="pen8" cx="976.5" cy="178" r="3.4"/><circle class="rt-pen" data-name="pen9" cx="987" cy="178" r="3.4"/><text class="rt-closed-s" x="966" y="193" text-anchor="middle">GOSSIP</text></g>
+<g class="rt-tower">
+<rect class="rt-shadow" x="34" y="70" width="240" height="258" rx="6"/>
+<rect class="rt-brick" x="36" y="248" width="220" height="72" rx="2"/>
+<rect fill="url(#bricks)" class="rt-texture rt-brick-tex" x="36" y="248" width="220" height="72"/>
+<rect class="rt-door" x="134" y="284" width="24" height="36" rx="2"/>
+<rect class="rt-win" x="56" y="278" width="34" height="22" rx="2"/><rect class="rt-win" x="202" y="278" width="34" height="22" rx="2"/>
+<rect class="rt-plate" x="104" y="255" width="84" height="18" rx="3"/><text class="rt-plate-t" x="146" y="268" text-anchor="middle">ROUTER</text>
+<rect class="rt-cabin" x="26" y="96" width="240" height="154" rx="3"/>
+<rect class="rt-panel" x="34" y="104" width="224" height="140" rx="5"/>
+<text class="rt-panel-h" x="46" y="121">TESTS, IN ORDER</text>
+<g class="rt-lamp" data-name="lamp1"><circle class="rt-lamp-halo" cx="52" cy="139" r="11"/><circle class="rt-lamp-glass" cx="52" cy="139" r="7"/><text class="rt-lamp-n" x="52" y="142.2" text-anchor="middle">1</text><text class="rt-lamp-t" x="67" y="143.2">JOIN EMPTY, MARKER</text></g>
+<g class="rt-lamp" data-name="lamp2"><circle class="rt-lamp-halo" cx="52" cy="158" r="11"/><circle class="rt-lamp-glass" cx="52" cy="158" r="7"/><text class="rt-lamp-n" x="52" y="161.2" text-anchor="middle">2</text><text class="rt-lamp-t" x="67" y="162.2">YIELDS (BATCH)</text></g>
+<g class="rt-lamp" data-name="lamp3"><circle class="rt-lamp-halo" cx="52" cy="177" r="11"/><circle class="rt-lamp-glass" cx="52" cy="177" r="7"/><text class="rt-lamp-n" x="52" y="180.2" text-anchor="middle">3</text><text class="rt-lamp-t" x="67" y="181.2">NO LOCAL PRICE</text></g>
+<g class="rt-lamp" data-name="lamp4"><circle class="rt-lamp-halo" cx="52" cy="196" r="11"/><circle class="rt-lamp-glass" cx="52" cy="196" r="7"/><text class="rt-lamp-n" x="52" y="199.2" text-anchor="middle">4</text><text class="rt-lamp-t" x="67" y="200.2">PREDICT EACH</text></g>
+<g class="rt-lamp" data-name="lamp5"><circle class="rt-lamp-halo" cx="52" cy="215" r="11"/><circle class="rt-lamp-glass" cx="52" cy="215" r="7"/><text class="rt-lamp-n" x="52" y="218.2" text-anchor="middle">5</text><text class="rt-lamp-t" x="67" y="219.2">MIN_SPEEDUP</text></g>
+<g class="rt-lamp" data-name="lamp6"><circle class="rt-lamp-halo" cx="52" cy="234" r="11"/><circle class="rt-lamp-glass" cx="52" cy="234" r="7"/><text class="rt-lamp-n" x="52" y="237.2" text-anchor="middle">6</text><text class="rt-lamp-t" x="67" y="238.2">HAND-OVER</text></g>
+<path class="rt-roof" d="M14,100 L44,58 L248,58 L278,100 Z"/>
+<path class="rt-roof-2" d="M248,58 L278,100 L258,100 Z"/>
+<path class="rt-tiles" d="M24,86 H268 M34,72 H258"/><path class="rt-ridge" d="M44,58 H248"/>
+<rect class="rt-eave" x="12" y="98" width="268" height="5" rx="2"/>
+<rect class="rt-chimney" x="210" y="40" width="12" height="20" rx="1"/>
+</g>
+<path class="rt-wire" d="M256,304 C270,322 278,350 282,374 M256,314 C330,330 410,340 432,374"/>
+<g class="rt-signal" data-name="signal"><path class="rt-post" d="M270,346 V298"/><rect class="rt-sig-head" x="261" y="266" width="18" height="34" rx="5"/><circle class="rt-sig-red" cx="270" cy="276" r="5"/><circle class="rt-sig-green" cx="270" cy="290" r="5"/></g>
+<g class="rt-board" data-name="board409"><path class="rt-post" d="M208,376 V408 M250,376 V408"/><rect class="rt-board-plate" x="196" y="380" width="66" height="30" rx="4"/><text class="rt-board-t" x="229" y="401" text-anchor="middle">409</text></g>
+<g class="rt-join" data-name="join"><path class="rt-post" d="M120,470 V412"/><path class="rt-sign" d="M112,414 H178 L188,423 L178,432 H112 Z"/><path class="rt-sign" d="M112,438 H178 L188,447 L178,456 H112 Z"/><text class="rt-sign-t" x="116" y="427">NODE B</text><text class="rt-sign-t" x="116" y="451">NODE C</text><text class="rt-cap" x="120" y="408" text-anchor="middle">JOIN</text><ellipse class="rt-shadow" cx="124" cy="471" rx="10" ry="3"/></g>
+<g class="rt-gauge-board">
+<path class="rt-post" d="M318,228 V240 M552,228 V240"/>
+<rect class="rt-shadow" x="296" y="24" width="286" height="210" rx="8"/>
+<rect class="rt-sign-board" x="292" y="18" width="286" height="212" rx="8"/>
+<text class="rt-gauge-h" x="306" y="38">MIN_SPEEDUP GAUGE</text>
+<path class="rt-ground" d="M304,190 H566"/>
+<path class="rt-ground-ties" d="M304,193 H566"/>
+<path class="rt-here-line" d="M304,60 H566"/>
+<rect class="rt-ghost" x="314" y="60" width="44" height="114" rx="2"/>
+<path class="rt-ghost-chassis" d="M309,176 H363"/><circle class="rt-ghost" cx="323" cy="184" r="6"/><circle class="rt-ghost" cx="349" cy="184" r="6"/>
+<text class="rt-cap rt-here-t" x="336" y="120" text-anchor="middle">HERE</text>
+<text class="rt-cap rt-here-t" x="336" y="133" text-anchor="middle">ESTIMATE</text>
+<path class="rt-portal" d="M466,190 V48 M550,190 V48"/>
+<rect class="rt-portal-beam" x="458" y="42" width="100" height="8" rx="2"/>
+<path class="rt-portal-rod" d="M482,50 V65 M534,50 V65"/>
+<rect class="rt-gbar" data-name="gbar" x="470" y="65" width="76" height="12" rx="2"/>
+<path class="rt-gbar-hz" d="M478,65 l-8,12 M492,65 l-8,12 M534,65 l-8,12 M546,65 l-8,12"/>
+<text class="rt-gbar-v" x="508" y="74.5" text-anchor="middle">÷ 1.15</text>
+<circle class="rt-glamp" data-name="glamp" cx="508" cy="34" r="5"/>
+<text class="rt-cap" x="306" y="209">THE BEST PEER MUST FIT UNDER THE BAR</text>
+<text class="rt-cap" x="306" y="222">BAR: HERE ÷ MIN_SPEEDUP, 1.15 BY DEFAULT</text>
+</g>
+<rect class="rt-shadow" x="199" y="533" width="24" height="22" rx="2"/><rect class="rt-crate" x="196" y="530" width="24" height="22" rx="2"/><path class="rt-crate-x" d="M199,533 L217,549 M217,533 L199,549"/><rect class="rt-shadow" x="225" y="533" width="24" height="22" rx="2"/><rect class="rt-crate" x="222" y="530" width="24" height="22" rx="2"/><path class="rt-crate-x" d="M225,533 L243,549 M243,533 L225,549"/><rect class="rt-shadow" x="212" y="511" width="24" height="22" rx="2"/><rect class="rt-crate" x="209" y="508" width="24" height="22" rx="2"/><path class="rt-crate-x" d="M212,511 L230,527 M230,511 L212,527"/>
+<circle class="rt-glow" cx="60" cy="466" r="14" fill="url(#halo-lamp)"/><circle class="rt-lamppost" cx="60" cy="466" r="4"/>
+<circle class="rt-glow" cx="322" cy="590" r="14" fill="url(#halo-lamp)"/><circle class="rt-lamppost" cx="322" cy="590" r="4"/>
+<text class="rt-area" x="26" y="584">NODE A</text>
+<text class="rt-cap" x="26" y="600">THIS NODE: IT RECEIVED THE REQUEST</text>
+<text class="rt-cap" x="22" y="392">REQUESTS IN</text>
+<path class="rt-chevrons" d="M40,352 l8,8 l-8,8 M54,352 l8,8 l-8,8"/>
+<g data-anim="" data-reach="30"></g>
+</svg>

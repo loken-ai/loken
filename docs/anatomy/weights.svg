@@ -1,1 +1,388 @@
-<svg xmlns="http://www.w3.org/2000/svg" class="plate" id="ana-weights-v-trunk" data-plate="trunk" viewBox="0 0 1000 750" role="group" aria-label="Generation, experts and models"><defs><marker id="ana-weights-arrow" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="arrow" d="M0,0 L8,4 L0,8 Z"/></marker></defs><g transform="translate(-375 -232.5) scale(1.75)"><g class="part" data-part="operations" style="--c:var(--a-g-operations)" data-group="operations" tabindex="0" role="button" aria-label="Security and operations"><path class="sk" d="M500,40 C538,40 548,70 546,100 C545,128 532,150 516,158 L518,178 C540,192 580,196 598,208 C615,216 620,238 618,262 C620,297.3 626,343.8 626,390.3 C628,436.8 638,483.3 640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 C610,483.3 602,436.8 600,390.3 C598,334.5 592,297.3 585,271.3 C582,320 566,360 564,400 C562,430 586,455 590,495 C594,560 580,650 572,710 C578,760 576,820 560,900 C562,920 578,940 582,955 C584,965 550,968 530,962 C526,940 530,920 530,900 C526,840 518,770 524,712 C528,640 516,580 500,535 Z" stroke="none"/><path class="sk" d="M500,40 C538,40 548,70 546,100 C545,128 532,150 516,158 L518,178 C540,192 580,196 598,208 C615,216 620,238 618,262 C620,297.3 626,343.8 626,390.3 C628,436.8 638,483.3 640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 C610,483.3 602,436.8 600,390.3 C598,334.5 592,297.3 585,271.3 C582,320 566,360 564,400 C562,430 586,455 590,495 C594,560 580,650 572,710 C578,760 576,820 560,900 C562,920 578,940 582,955 C584,965 550,968 530,962 C526,940 530,920 530,900 C526,840 518,770 524,712 C528,640 516,580 500,535 Z" stroke="none" transform="matrix(-1 0 0 1 1000 0)"/><path class="skl" d="M500,40 C538,40 548,70 546,100 C545,128 532,150 516,158 L518,178 C540,192 580,196 598,208 C615,216 620,238 618,262 C620,297.3 626,343.8 626,390.3 C628,436.8 638,483.3 640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 C610,483.3 602,436.8 600,390.3 C598,334.5 592,297.3 585,271.3 C582,320 566,360 564,400 C562,430 586,455 590,495 C594,560 580,650 572,710 C578,760 576,820 560,900 C562,920 578,940 582,955 C584,965 550,968 530,962 C526,940 530,920 530,900 C526,840 518,770 524,712 C528,640 516,580 500,535"/><path class="skl" d="M500,40 C538,40 548,70 546,100 C545,128 532,150 516,158 L518,178 C540,192 580,196 598,208 C615,216 620,238 618,262 C620,297.3 626,343.8 626,390.3 C628,436.8 638,483.3 640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 C610,483.3 602,436.8 600,390.3 C598,334.5 592,297.3 585,271.3 C582,320 566,360 564,400 C562,430 586,455 590,495 C594,560 580,650 572,710 C578,760 576,820 560,900 C562,920 578,940 582,955 C584,965 550,968 530,962 C526,940 530,920 530,900 C526,840 518,770 524,712 C528,640 516,580 500,535" transform="matrix(-1 0 0 1 1000 0)"/></g><g class="part ghost" data-part="backends" style="--c:var(--a-g-backends)"><path class="t" d="M609,278.7 C622,297.3 622,353.1 609,382.9 C598,353.1 598,297.3 609,278.7 Z"/><path class="t" d="M609,278.7 C622,297.3 622,353.1 609,382.9 C598,353.1 598,297.3 609,278.7 Z" transform="matrix(-1 0 0 1 1000 0)"/><path class="t" d="M621,401.5 C634,427.5 636,483.3 626,509.4 C614,483.3 610,427.5 621,401.5 Z"/><path class="t" d="M621,401.5 C634,427.5 636,483.3 626,509.4 C614,483.3 610,427.5 621,401.5 Z" transform="matrix(-1 0 0 1 1000 0)"/><path class="t" d="M552,508 C580,540 584,640 558,690 C532,650 528,560 552,508 Z"/><path class="t" d="M552,508 C580,540 584,640 558,690 C532,650 528,560 552,508 Z" transform="matrix(-1 0 0 1 1000 0)"/><path class="t" d="M548,724 C568,752 568,820 550,872 C532,820 530,752 548,724 Z"/><path class="t" d="M548,724 C568,752 568,820 550,872 C532,820 530,752 548,724 Z" transform="matrix(-1 0 0 1 1000 0)"/></g><g class="part" data-part="models" style="--c:var(--a-g-models)" data-group="models" tabindex="0" role="button" aria-label="Models and formats"><path class="s" stroke-width="4" stroke-opacity=".6" d="M501,182 L502,330 C503,352 512,368 526,378"/><path class="t" d="M526,378 C540,370 558,374 559,392 C560,414 548,430 528,430 C516,430 508,422 514,414 C524,406 526,396 526,378 Z"/><rect class="hit" x="452" y="430" width="96" height="76"/><path class="s" stroke-width="8" stroke-opacity=".55" d="M458,502 L458,446 Q458,434 470,434 L530,434 Q542,434 542,446 L542,502"/><path class="s" stroke-width="3.2" d="M471,444 q7.5,-7 15,0 t15,0 t15,0 t15,0"/><path class="s" stroke-width="3.2" d="M471,460 q7.5,-7 15,0 t15,0 t15,0 t15,0"/><path class="s" stroke-width="3.2" d="M471,476 q7.5,-7 15,0 t15,0 t15,0 t15,0"/><path class="s" stroke-width="3.2" d="M471,492 q7.5,-7 15,0 t15,0 t15,0 t15,0"/></g><g class="part" data-part="loop" style="--c:var(--a-g-loop)" data-group="loop" tabindex="0" role="button" aria-label="Generation loop"><path class="t" d="M488,222 C470,222 448,240 440,280 C434,320 436,350 440,362 C460,366 480,358 490,350 C494,320 492,260 488,222 Z"/><path class="t" d="M512,222 C530,222 552,240 560,280 C566,320 564,350 560,362 C540,366 524,360 518,352 C524,330 518,312 512,300 Z"/><rect class="hit" x="436" y="356" width="128" height="16"/><path class="s" stroke-width="4" d="M436,370 C456,352 480,354 500,362 C520,354 544,352 564,370"/></g><g class="part" data-part="experts" style="--c:var(--a-g-experts)" data-group="experts" tabindex="0" role="button" aria-label="Experts and streaming"><path class="s" stroke-width="2.4" d="M508,292 C506,270 520,262 528,270 C534,278 514,286 512,300 L512,450 C512,462 530,472 540,500 C548,540 552,600 550,690"/><path class="s" stroke-width="2.4" d="M512,450 C508,462 470,472 460,500 C452,540 448,600 450,690"/><path class="s" stroke-width="1.6" d="M511,268 L512,176 M496,272 L490,176 M524,265.7 C560,250.0 592,262.0 602,297.3 L612,390.3 M498,271.3 C440,250.0 408,262.0 398,297.3 L388,390.3"/><path class="t" d="M505,290 C520,280 545,285 548,305 C550,325 532,340 515,350 C505,340 496,325 497,305 C498,296 500,292 505,290 Z"/></g><g class="part ghost" data-part="kv" style="--c:var(--a-g-kv)"><path class="t" d="M466,86 C462,60 480,48 500,48 C520,48 538,60 534,86 C524,96 476,96 466,86 Z"/><path class="s" stroke-width=".8" d="M500,50 L500,92 M478,58 C486,68 480,78 488,86 M522,58 C514,68 520,78 512,86"/></g><g class="part ghost" data-part="senses" style="--c:var(--a-g-senses)"><path class="t" d="M474,106 C478,101 486,101 490,106 C486,111 478,111 474,106 Z"/><path class="t" d="M510,106 C514,101 522,101 526,106 C522,111 514,111 510,106 Z"/><ellipse class="s" cx="482" cy="106" rx="2.6" ry="2.6"/><ellipse class="s" cx="518" cy="106" rx="2.6" ry="2.6"/><path class="t" d="M545,94 C556,90 560,112 551,122 C548,125 545,122 545,118 Z"/><path class="t" d="M545,94 C556,90 560,112 551,122 C548,125 545,122 545,118 Z" transform="matrix(-1 0 0 1 1000 0)"/></g><g class="part ghost" data-part="requests" style="--c:var(--a-g-requests)"><path class="t" d="M487,140 C494,135 506,135 513,140 C506,146 494,146 487,140 Z"/></g><g class="part ghost" data-part="media" style="--c:var(--a-g-media)"><path class="t" d="M640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 Z"/><rect class="t" x="494" y="163" width="12" height="15" rx="4"/></g><g class="part ghost" data-part="cluster" style="--c:var(--a-g-cluster)"><path class="t" d="M640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 Z" transform="matrix(-1 0 0 1 1000 0)"/></g><g class="part ghost" data-part="stack" style="--c:var(--a-g-stack)"><path class="limb" d="M604,263.9 L612,392.2" stroke-width="6"/><path class="limb" d="M604,263.9 L612,392.2" stroke-width="6" transform="matrix(-1 0 0 1 1000 0)"/><path class="limb" d="M612,399.6 L628,515.9" stroke-width="3"/><path class="limb" d="M612,399.6 L628,515.9" stroke-width="3" transform="matrix(-1 0 0 1 1000 0)"/><path class="limb" d="M606,399.6 L618,515.9" stroke-width="3"/><path class="limb" d="M606,399.6 L618,515.9" stroke-width="3" transform="matrix(-1 0 0 1 1000 0)"/><path class="limb" d="M566,514 L550,698" stroke-width="8"/><path class="limb" d="M566,514 L550,698" stroke-width="8" transform="matrix(-1 0 0 1 1000 0)"/><path class="limb" d="M550,714 L546,900" stroke-width="6"/><path class="limb" d="M550,714 L546,900" stroke-width="6" transform="matrix(-1 0 0 1 1000 0)"/><path class="limb" d="M560,716 L556,896" stroke-width="3"/><path class="limb" d="M560,716 L556,896" stroke-width="3" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,214 C526.0,206 540.0,226 536.0,240 C532.0,254 530,260 506,256"/><path class="rib" d="M509,214 C526.0,206 540.0,226 536.0,240 C532.0,254 530,260 506,256" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,229 C530.4,221 544.4,241 540.4,255 C536.4,269 530,275 506,271"/><path class="rib" d="M509,229 C530.4,221 544.4,241 540.4,255 C536.4,269 530,275 506,271" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,244 C534.8,236 548.8,256 544.8,270 C540.8,284 530,290 506,286"/><path class="rib" d="M509,244 C534.8,236 548.8,256 544.8,270 C540.8,284 530,290 506,286" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,259 C539.2,251 553.2,271 549.2,285 C545.2,299 530,305 506,301"/><path class="rib" d="M509,259 C539.2,251 553.2,271 549.2,285 C545.2,299 530,305 506,301" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,274 C543.6,266 557.6,286 553.6,300 C549.6,314 530,320 506,316"/><path class="rib" d="M509,274 C543.6,266 557.6,286 553.6,300 C549.6,314 530,320 506,316" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,289 C548.0,281 562.0,301 558.0,315 C554.0,329 530,335 506,331"/><path class="rib" d="M509,289 C548.0,281 562.0,301 558.0,315 C554.0,329 530,335 506,331" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,304 C548.0,296 562.0,316 558.0,330 C554.0,344 530,350 506,346"/><path class="rib" d="M509,304 C548.0,296 562.0,316 558.0,330 C554.0,344 530,350 506,346" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,319 C548.0,311 562.0,331 558.0,345 C554.0,359 530,365 506,361"/><path class="rib" d="M509,319 C548.0,311 562.0,331 558.0,345 C554.0,359 530,365 506,361" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,334 C548.0,326 562.0,346 558.0,360 C554.0,374 530,380 506,376"/><path class="rib" d="M509,334 C548.0,326 562.0,346 558.0,360 C554.0,374 530,380 506,376" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M509,349 C548.0,341 562.0,361 558.0,375 C554.0,389 530,395 506,391"/><path class="rib" d="M509,349 C548.0,341 562.0,361 558.0,375 C554.0,389 530,395 506,391" transform="matrix(-1 0 0 1 1000 0)"/><path class="rib" d="M506,208 C530,200 560,212 592,208"/><path class="rib" d="M506,208 C530,200 560,212 592,208" transform="matrix(-1 0 0 1 1000 0)"/><rect class="b" x="495" y="208" width="10" height="94" rx="4"/><path class="b dash" d="M552,214 L594,220 L566,300 Z"/><path class="b dash" d="M552,214 L594,220 L566,300 Z" transform="matrix(-1 0 0 1 1000 0)"/><path class="s" d="M508,470 C540,500 556,520 556,560 C556,620 552,680 548,700 C546,760 544,820 546,890" stroke-width="1.2" stroke-opacity=".6"/><path class="s" d="M508,470 C540,500 556,520 556,560 C556,620 552,680 548,700 C546,760 544,820 546,890" stroke-width="1.2" stroke-opacity=".6" transform="matrix(-1 0 0 1 1000 0)"/><path class="b" d="M512,472 C528,458 552,452 576,458 C584,474 580,492 568,504 C560,516 544,528 506,534 L504,526 C526,518 540,510 542,500 C536,492 522,488 512,488 Z" fill-opacity=".55"/><path class="b" d="M512,472 C528,458 552,452 576,458 C584,474 580,492 568,504 C560,516 544,528 506,534 L504,526 C526,518 540,510 542,500 C536,492 522,488 512,488 Z" fill-opacity=".55" transform="matrix(-1 0 0 1 1000 0)"/><ellipse class="b" cx="564" cy="510" rx="8" ry="8"/><ellipse class="b" cx="436" cy="510" rx="8" ry="8"/><path class="b" d="M482,466 L518,466 L510,516 L500,526 L490,516 Z"/><path class="b" d="M496,528 L504,528 L500,538 Z"/><ellipse class="b" cx="548" cy="704" rx="7" ry="9"/><ellipse class="b" cx="452" cy="704" rx="7" ry="9"/><rect class="b" x="487.0" y="163.0" width="26.0" height="3" rx="1.5"/><rect class="b dh vt" data-run="dh" x="493.0" y="162.0" width="14.0" height="5" rx="1.7"/><rect class="b" x="487.0" y="169.4" width="26.0" height="3" rx="1.5"/><rect class="b dh vt" data-run="dh" x="493.0" y="168.4" width="14.0" height="5" rx="1.7"/><rect class="b" x="487.0" y="175.8" width="26.0" height="3" rx="1.5"/><rect class="b dh vt" data-run="dh" x="493.0" y="174.8" width="14.0" height="5" rx="1.7"/><rect class="b" x="487.0" y="182.2" width="26.0" height="3" rx="1.5"/><rect class="b dh vt" data-run="dh" x="493.0" y="181.2" width="14.0" height="5" rx="1.7"/><rect class="b" x="487.0" y="188.6" width="26.0" height="3" rx="1.5"/><rect class="b dh vt" data-run="dh" x="493.0" y="187.6" width="14.0" height="5" rx="1.7"/><rect class="b" x="487.0" y="195.0" width="26.0" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="493.0" y="194.0" width="14.0" height="5" rx="1.7"/><rect class="b" x="487.0" y="201.4" width="26.0" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="493.0" y="200.4" width="14.0" height="5" rx="1.7"/><rect class="b" x="485.0" y="211.8" width="30.0" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="491.0" y="208.0" width="18.0" height="10.5" rx="3.0"/><rect class="b" x="484.7" y="225.2" width="30.6" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="490.7" y="221.4" width="18.6" height="10.5" rx="3.0"/><rect class="b" x="484.4" y="238.6" width="31.2" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="490.4" y="234.8" width="19.2" height="10.5" rx="3.0"/><rect class="b" x="484.1" y="251.9" width="31.8" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="490.1" y="248.2" width="19.8" height="10.5" rx="3.0"/><rect class="b" x="483.8" y="265.4" width="32.4" height="3" rx="1.5"/><rect class="b dr vt" data-run="dr" x="489.8" y="261.6" width="20.4" height="10.5" rx="3.0"/><rect class="b" x="483.5" y="278.8" width="33.0" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="489.5" y="275.0" width="21.0" height="10.5" rx="3.0"/><rect class="b" x="483.2" y="292.1" width="33.6" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="489.2" y="288.4" width="21.6" height="10.5" rx="3.0"/><rect class="b" x="482.9" y="305.6" width="34.2" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="488.9" y="301.8" width="22.2" height="10.5" rx="3.0"/><rect class="b" x="482.6" y="318.9" width="34.8" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="488.6" y="315.2" width="22.8" height="10.5" rx="3.0"/><rect class="b" x="482.3" y="332.4" width="35.4" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="488.3" y="328.6" width="23.4" height="10.5" rx="3.0"/><rect class="b" x="482.0" y="345.8" width="36.0" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="488.0" y="342.0" width="24.0" height="10.5" rx="3.0"/><rect class="b" x="481.7" y="359.1" width="36.6" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="487.7" y="355.4" width="24.6" height="10.5" rx="3.0"/><rect class="b" x="480.0" y="377.0" width="40.0" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="486.0" y="371.0" width="28.0" height="15" rx="3.0"/><rect class="b" x="479.4" y="395.6" width="41.2" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="485.4" y="389.6" width="29.2" height="15" rx="3.0"/><rect class="b" x="478.8" y="414.2" width="42.4" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="484.8" y="408.2" width="30.4" height="15" rx="3.0"/><rect class="b" x="478.2" y="432.8" width="43.6" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="484.2" y="426.8" width="31.6" height="15" rx="3.0"/><rect class="b" x="477.6" y="451.4" width="44.8" height="3" rx="1.5"/><rect class="b dc vt" data-run="dc" x="483.6" y="445.4" width="32.8" height="15" rx="3.0"/></g><g class="anim"></g><g class="nerves"></g></g><path class="lead" d="M224,308.5 L412.5,313.5"/><circle class="ldot" cx="412.5" cy="313.5" r="2"/><g class="label" style="--c:var(--a-g-loop)" data-group="loop"><circle class="sw" cx="220" cy="308.5" r="3.5"/><text class="la" x="210" y="313.5" text-anchor="end">Generation loop</text></g><path class="lead" d="M776,319.0 L570.0,324.0"/><circle class="ldot" cx="570.0" cy="324.0" r="2"/><g class="label" style="--c:var(--a-g-experts)" data-group="experts"><circle class="sw" cx="780" cy="319.0" r="3.5"/><text class="la" x="790" y="324.0" text-anchor="start">Experts and streaming</text></g><path class="lead" d="M776,469.5 L577.0,474.5"/><circle class="ldot" cx="577.0" cy="474.5" r="2"/><g class="label" style="--c:var(--a-g-models)" data-group="models"><circle class="sw" cx="780" cy="469.5" r="3.5"/><text class="la" x="790" y="474.5" text-anchor="start">Models and formats</text></g></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" role="img" aria-label="A library. Loading: branches hold the book, a catalogue picks the first branch listed, a plan measures each reading room and gives it volumes, porters copy them, and an image model stays unpacked on a cart in the hall. Experts: a reader asks the router, manuals on the shelf are read at the desk, a missing one is photocopied onto a tray or read in the archives, the answers fill a jar by weight, and a librarian copies a hot manual onto the coldest place.">
+<defs>
+<pattern id="parquet" width="40" height="20" patternUnits="userSpaceOnUse"><path class="wl-floor-line" d="M0,0 H40 M0,10 H40 M0,20 H40 M10,0 V10 M30,10 V20"/></pattern>
+<pattern id="tiles" width="28" height="28" patternUnits="userSpaceOnUse"><rect class="wl-tile" x="0" y="0" width="14" height="14"/><rect class="wl-tile" x="14" y="14" width="14" height="14"/></pattern>
+<pattern id="cobbles" width="18" height="12" patternUnits="userSpaceOnUse"><path class="wl-cobble" d="M0,6 H18 M6,0 V6 M15,6 V12"/></pattern>
+<pattern id="grain" width="30" height="8" patternUnits="userSpaceOnUse"><path class="wl-grain" d="M0,3 C8,1 14,5 30,3 M0,7 C10,6 18,8 30,6.5"/></pattern>
+<linearGradient id="lamp" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="wl-lamp-a"/><stop offset="1" class="wl-lamp-b"/></linearGradient>
+<radialGradient id="glow"><stop offset="0" class="wl-glow-a"/><stop offset="1" class="wl-glow-b"/></radialGradient>
+<linearGradient id="glass" x1="0" y1="0" x2="1" y2="0"><stop offset="0" class="wl-glass-a"/><stop offset=".5" class="wl-glass-b"/><stop offset="1" class="wl-glass-a"/></linearGradient>
+<g data-sprite="trolley" class="wl-trolley"><g transform="scale(1.3)"><ellipse class="wl-shadow" cx="0" cy="13" rx="13" ry="3.5"/><path class="wl-truck" d="M-9,12 H9 M-7,12 V-14"/><rect class="wl-vol" x="-5" y="-13" width="13" height="23" rx="1.5"/><path class="wl-vol-band" d="M-5,-8 H8 M-5,4 H8"/><circle class="wl-wheel" cx="-6" cy="13" r="3"/><circle class="wl-wheel" cx="7" cy="13" r="3"/></g></g>
+<g data-sprite="sheet" class="wl-sheet"><rect class="wl-shadow" x="-9" y="-11" width="22" height="28" rx="2"/><path class="wl-sheet-p" d="M-11,-14 H6 L11,-9 V14 H-11 Z"/><path class="wl-sheet-l" d="M-7,-6 H7 M-7,-1 H7 M-7,4 H7 M-7,9 H3"/></g>
+<g data-sprite="manual" class="wl-manual-s"><rect class="wl-shadow" x="-8" y="-14" width="20" height="32" rx="2"/><rect class="wl-man" x="-10" y="-17" width="20" height="32" rx="2"/><path class="wl-man-band" d="M-10,-10 H10 M-10,8 H10"/></g>
+<g data-sprite="drop" class="wl-drop"><path class="wl-drop-p" d="M0,-12 C6,-4 9,1 9,5 A9,9 0 0 1 -9,5 C-9,1 -6,-4 0,-12 Z"/><path class="wl-drop-hi" d="M-4,2 a4,4 0 0 1 3,-4"/></g>
+<g data-sprite="reader" class="wl-reader-s"><g transform="scale(1.35)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat-r" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g><rect class="wl-slip-s" x="7" y="-27" width="9" height="12" rx="1"/></g></g>
+</defs>
+<rect class="wl-ground" x="0" y="0" width="1000" height="620"/>
+<g class="wl-plate wl-load">
+<rect class="wl-street" x="0" y="0" width="258" height="620"/>
+<rect fill="url(#cobbles)" class="wl-texture" x="0" y="0" width="258" height="620"/>
+<g data-name="catalogue" class="wl-catalogue">
+<ellipse class="wl-shadow" cx="130" cy="160" rx="96" ry="7"/>
+<rect class="wl-wood" x="36" y="40" width="188" height="112" rx="4"/>
+<rect fill="url(#grain)" class="wl-texture" x="36" y="40" width="188" height="112" rx="4"/>
+<rect class="wl-wood-2" x="30" y="34" width="200" height="10" rx="3"/>
+<path class="wl-leg-w" d="M46,152 V164 M214,152 V164"/>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="44" y="50" width="52" height="27" rx="2"/><rect class="wl-label-card" x="60" y="55" width="20" height="8" rx="1"/><rect class="wl-brass" x="63" y="67" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="104" y="50" width="52" height="27" rx="2"/><rect class="wl-label-card" x="120" y="55" width="20" height="8" rx="1"/><rect class="wl-brass" x="123" y="67" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="164" y="50" width="52" height="27" rx="2"/><rect class="wl-label-card" x="180" y="55" width="20" height="8" rx="1"/><rect class="wl-brass" x="183" y="67" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="44" y="83" width="52" height="27" rx="2"/><rect class="wl-label-card" x="60" y="88" width="20" height="8" rx="1"/><rect class="wl-brass" x="63" y="100" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer" data-name="cat-drawer"><rect class="wl-drawer-f" x="104" y="83" width="52" height="27" rx="2"/><rect class="wl-label-card" x="120" y="88" width="20" height="8" rx="1"/><rect class="wl-brass" x="123" y="100" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="164" y="83" width="52" height="27" rx="2"/><rect class="wl-label-card" x="180" y="88" width="20" height="8" rx="1"/><rect class="wl-brass" x="183" y="100" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="44" y="116" width="52" height="27" rx="2"/><rect class="wl-label-card" x="60" y="121" width="20" height="8" rx="1"/><rect class="wl-brass" x="63" y="133" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="104" y="116" width="52" height="27" rx="2"/><rect class="wl-label-card" x="120" y="121" width="20" height="8" rx="1"/><rect class="wl-brass" x="123" y="133" width="14" height="4" rx="2"/></g>
+<g class="wl-drawer"><rect class="wl-drawer-f" x="164" y="116" width="52" height="27" rx="2"/><rect class="wl-label-card" x="180" y="121" width="20" height="8" rx="1"/><rect class="wl-brass" x="183" y="133" width="14" height="4" rx="2"/></g>
+</g>
+<text class="wl-h" x="130" y="26" text-anchor="middle">CATALOGUE</text>
+<text class="wl-tm" x="130" y="184" text-anchor="middle">= THE STORES READ AS ONE</text>
+<g data-name="cat-card" class="wl-card"><rect class="wl-shadow" x="70" y="80" width="170" height="80" rx="4"/><rect class="wl-paper" x="64" y="74" width="170" height="80" rx="4"/><path class="wl-paper-rule" d="M64,94 H234"/><text class="wl-pt wl-ptb" x="76" y="89">THE MODEL</text><text class="wl-pt" x="76" y="114">HELD BY 1 AND 2</text><text class="wl-pt wl-ptk" x="76" y="140">READ FROM 1</text></g>
+<g data-name="b1" class="wl-branch">
+<ellipse class="wl-shadow" cx="130" cy="382" rx="104" ry="6"/>
+<rect class="wl-stone" x="36" y="236" width="188" height="140"/>
+<path class="wl-roof" d="M26,238 L130,200 L234,238 Z"/>
+<path class="wl-roof-in" d="M50,233 L130,209 L210,233 Z"/>
+<rect class="wl-frieze" x="32" y="238" width="196" height="20"/>
+<text class="wl-plate-t" x="130" y="231" text-anchor="middle">BRANCH 1</text>
+<text class="wl-frieze-t" x="130" y="253" text-anchor="middle">= STORE 1</text>
+<rect class="wl-column" x="41" y="258" width="14" height="112"/><path class="wl-column-l" d="M45,262 V366 M51,262 V366"/>
+<rect class="wl-column" x="205" y="258" width="14" height="112"/><path class="wl-column-l" d="M209,262 V366 M215,262 V366"/>
+<rect class="wl-window" fill="url(#glass)" x="64" y="266" width="132" height="58" rx="3"/>
+<rect class="wl-shelf-board" x="66" y="318" width="128" height="4"/>
+<g class="wl-book">
+<rect class="wl-spine" x="69.0" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M69.0,284 h9 M69.0,309 h9"/>
+<rect class="wl-spine alt" x="79.4" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M79.4,284 h9 M79.4,309 h9"/>
+<rect class="wl-spine" x="89.8" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M89.8,284 h9 M89.8,309 h9"/>
+<rect class="wl-spine" x="100.2" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M100.2,284 h9 M100.2,309 h9"/>
+<rect class="wl-spine alt" x="110.6" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M110.6,284 h9 M110.6,309 h9"/>
+<rect class="wl-spine" x="121.0" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M121.0,284 h9 M121.0,309 h9"/>
+<rect class="wl-spine" x="131.4" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M131.4,284 h9 M131.4,309 h9"/>
+<rect class="wl-spine alt" x="141.8" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M141.8,284 h9 M141.8,309 h9"/>
+<rect class="wl-spine" x="152.2" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M152.2,284 h9 M152.2,309 h9"/>
+<rect class="wl-spine" x="162.6" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M162.6,284 h9 M162.6,309 h9"/>
+<rect class="wl-spine alt" x="173.0" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M173.0,284 h9 M173.0,309 h9"/>
+<rect class="wl-spine" x="183.4" y="276" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M183.4,284 h9 M183.4,309 h9"/>
+</g>
+<g class="wl-picture"><rect class="wl-pic-f" x="104" y="280" width="52" height="32" rx="2"/><path class="wl-pic-m" d="M108,308 L122,292 L132,302 L140,295 L152,308 Z"/><circle class="wl-pic-s" cx="145" cy="288" r="4"/></g>
+<rect class="wl-door" data-name="door1" x="108" y="330" width="44" height="46" rx="3"/>
+<path class="wl-door-l" d="M130,332 V376"/>
+<rect class="wl-step" x="98" y="376" width="64" height="6" rx="1"/>
+</g>
+<g data-name="tag-b1" class="wl-tag wl-tag1"><rect x="50.0" y="336" width="160" height="24" rx="12"/><text x="130" y="353" text-anchor="middle">READ FROM HERE</text></g>
+<g data-name="b2" class="wl-branch">
+<ellipse class="wl-shadow" cx="130" cy="590" rx="104" ry="6"/>
+<rect class="wl-stone" x="36" y="444" width="188" height="140"/>
+<path class="wl-roof" d="M26,446 L130,408 L234,446 Z"/>
+<path class="wl-roof-in" d="M50,441 L130,417 L210,441 Z"/>
+<rect class="wl-frieze" x="32" y="446" width="196" height="20"/>
+<text class="wl-plate-t" x="130" y="439" text-anchor="middle">BRANCH 2</text>
+<text class="wl-frieze-t" x="130" y="461" text-anchor="middle">= STORE 2</text>
+<rect class="wl-column" x="41" y="466" width="14" height="112"/><path class="wl-column-l" d="M45,470 V574 M51,470 V574"/>
+<rect class="wl-column" x="205" y="466" width="14" height="112"/><path class="wl-column-l" d="M209,470 V574 M215,470 V574"/>
+<rect class="wl-window" fill="url(#glass)" x="64" y="474" width="132" height="58" rx="3"/>
+<rect class="wl-shelf-board" x="66" y="526" width="128" height="4"/>
+<g class="wl-book">
+<rect class="wl-spine" x="69.0" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M69.0,492 h9 M69.0,517 h9"/>
+<rect class="wl-spine alt" x="79.4" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M79.4,492 h9 M79.4,517 h9"/>
+<rect class="wl-spine" x="89.8" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M89.8,492 h9 M89.8,517 h9"/>
+<rect class="wl-spine" x="100.2" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M100.2,492 h9 M100.2,517 h9"/>
+<rect class="wl-spine alt" x="110.6" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M110.6,492 h9 M110.6,517 h9"/>
+<rect class="wl-spine" x="121.0" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M121.0,492 h9 M121.0,517 h9"/>
+<rect class="wl-spine" x="131.4" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M131.4,492 h9 M131.4,517 h9"/>
+<rect class="wl-spine alt" x="141.8" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M141.8,492 h9 M141.8,517 h9"/>
+<rect class="wl-spine" x="152.2" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M152.2,492 h9 M152.2,517 h9"/>
+<rect class="wl-spine" x="162.6" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M162.6,492 h9 M162.6,517 h9"/>
+<rect class="wl-spine alt" x="173.0" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M173.0,492 h9 M173.0,517 h9"/>
+<rect class="wl-spine" x="183.4" y="484" width="9" height="42" rx="1"/><path class="wl-spine-band" d="M183.4,492 h9 M183.4,517 h9"/>
+</g>
+<g class="wl-picture"><rect class="wl-pic-f" x="104" y="488" width="52" height="32" rx="2"/><path class="wl-pic-m" d="M108,516 L122,500 L132,510 L140,503 L152,516 Z"/><circle class="wl-pic-s" cx="145" cy="496" r="4"/></g>
+<rect class="wl-door" data-name="door2" x="108" y="538" width="44" height="46" rx="3"/>
+<path class="wl-door-l" d="M130,540 V584"/>
+<rect class="wl-step" x="98" y="584" width="64" height="6" rx="1"/>
+</g>
+<g data-name="tag-b2" class="wl-tag wl-tag2"><rect x="31.0" y="544" width="198" height="24" rx="12"/><text x="130" y="561" text-anchor="middle">SAME BOOK, NOT READ</text></g>
+<text class="wl-tm" x="130" y="610" text-anchor="middle">THE SAME BOOK IN BOTH</text>
+<path class="wl-street-path" data-name="street" d="M130,382 V392 H282"/>
+<rect class="wl-hall" x="268" y="0" width="290" height="620"/>
+<rect fill="url(#tiles)" class="wl-texture" x="268" y="300" width="290" height="320"/>
+<path class="wl-wall-l" d="M268,0 V378 M268,408 V620 M558,0 V82 M558,128 V292 M558,318 V434 M558,586 V620"/>
+<g data-name="plan" class="wl-plan">
+<rect class="wl-shadow" x="286" y="22" width="250" height="270" rx="5"/>
+<rect class="wl-board" x="280" y="16" width="250" height="270" rx="5"/>
+<rect class="wl-paper" x="288" y="30" width="234" height="246" rx="2"/>
+<rect class="wl-clip" x="375" y="10" width="60" height="16" rx="4"/>
+<text class="wl-pt wl-ptb wl-pth" x="405" y="52" text-anchor="middle">PLACEMENT PLAN</text>
+<text class="wl-pt wl-ptm" x="298" y="74" text-anchor="start">PER CARD</text>
+<rect class="wl-chip cuda" x="486" y="62" width="14" height="14" rx="3"/>
+<rect class="wl-chip rocm" x="503" y="62" width="14" height="14" rx="3"/>
+<rect data-name="pr0" class="wl-prow" x="292" y="83" width="226" height="21" rx="3"/>
+<text class="wl-pt" x="298" y="98" text-anchor="start">SHELF = FREE MEMORY</text>
+<g data-name="tk-c-0" class="wl-tick"><rect class="wl-tick-b" x="486" y="86" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M489,93 l3,4 l6,-8"/></g>
+<g data-name="tk-r-0" class="wl-tick"><rect class="wl-tick-b" x="503" y="86" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M506,93 l3,4 l6,-8"/></g>
+<rect data-name="pr1" class="wl-prow" x="292" y="106" width="226" height="21" rx="3"/>
+<text class="wl-pt" x="298" y="121" text-anchor="start">SPEED = READ RATE</text>
+<g data-name="tk-c-1" class="wl-tick"><rect class="wl-tick-b" x="486" y="109" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M489,116 l3,4 l6,-8"/></g>
+<g data-name="tk-r-1" class="wl-tick"><rect class="wl-tick-b" x="503" y="109" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M506,116 l3,4 l6,-8"/></g>
+<rect data-name="pr2" class="wl-prow" x="292" y="129" width="226" height="21" rx="3"/>
+<text class="wl-pt" x="298" y="144" text-anchor="start">STAFF = COMPUTE RATE</text>
+<g data-name="tk-c-2" class="wl-tick"><rect class="wl-tick-b" x="486" y="132" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M489,139 l3,4 l6,-8"/></g>
+<g data-name="tk-r-2" class="wl-tick"><rect class="wl-tick-b" x="503" y="132" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M506,139 l3,4 l6,-8"/></g>
+<rect data-name="pr3" class="wl-prow" x="292" y="152" width="226" height="21" rx="3"/>
+<text class="wl-pt" x="298" y="167" text-anchor="start">CORRIDOR = LINK</text>
+<g data-name="tk-c-3" class="wl-tick"><rect class="wl-tick-b" x="486" y="155" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M489,162 l3,4 l6,-8"/></g>
+<g data-name="tk-r-3" class="wl-tick"><rect class="wl-tick-b" x="503" y="155" width="14" height="14" rx="2"/><path class="wl-tick-m" d="M506,162 l3,4 l6,-8"/></g>
+<path class="wl-paper-rule" d="M296,186 H514"/>
+<text class="wl-pt wl-ptm" x="298" y="206" text-anchor="start">RUNS OF VOLUMES</text>
+<rect data-name="pc0" class="wl-pcell" x="298.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc1" class="wl-pcell" x="316.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc2" class="wl-pcell" x="334.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc3" class="wl-pcell" x="352.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc4" class="wl-pcell" x="370.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc5" class="wl-pcell" x="388.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc6" class="wl-pcell" x="406.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc7" class="wl-pcell" x="424.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc8" class="wl-pcell" x="442.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc9" class="wl-pcell" x="460.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc10" class="wl-pcell" x="478.0" y="214" width="16" height="26" rx="2"/>
+<rect data-name="pc11" class="wl-pcell" x="496.0" y="214" width="16" height="26" rx="2"/>
+<g data-name="pb-cuda" class="wl-pb cuda"><path d="M298.0,246 v5 H404.0 v-5"/><text x="351.0" y="266" text-anchor="middle">CUDA</text></g>
+<g data-name="pb-rocm" class="wl-pb rocm"><path d="M406.0,246 v5 H476.0 v-5"/><text x="441.0" y="266" text-anchor="middle">ROCM</text></g>
+<g data-name="pb-host" class="wl-pb host"><path d="M478.0,246 v5 H512.0 v-5"/><text x="495.0" y="266" text-anchor="middle">HOST</text></g>
+</g>
+<text class="wl-h" x="282" y="318" text-anchor="start">HALL = HOST MEMORY</text>
+<rect class="wl-rug" x="292" y="368" width="232" height="92" rx="6"/>
+<rect class="wl-rug-in" x="300" y="376" width="216" height="76" rx="4"/>
+<path class="wl-rug-f" d="M292,372 h-6 M292,384 h-6 M292,396 h-6 M292,408 h-6 M292,420 h-6 M292,432 h-6 M292,444 h-6 M292,456 h-6 M524,372 h6 M524,384 h6 M524,396 h6 M524,408 h6 M524,420 h6 M524,432 h6 M524,444 h6 M524,456 h6"/>
+<g data-name="cart" class="wl-cart">
+<ellipse class="wl-shadow" cx="384" cy="566" rx="100" ry="8"/>
+<rect class="wl-cart-shelf" x="290" y="494" width="188" height="10" rx="2"/>
+<rect class="wl-cart-shelf" x="290" y="534" width="188" height="10" rx="2"/>
+<path class="wl-cart-frame" d="M294,470 V556 M474,470 V556 M474,470 L496,456"/>
+<circle class="wl-wheel" cx="304" cy="560" r="7"/><circle class="wl-wheel" cx="464" cy="560" r="7"/>
+<g data-name="cu0" class="wl-open"><path class="wl-open-p" d="M298.0,492 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M310.0,476 v16"/></g>
+<g data-name="cu1" class="wl-open"><path class="wl-open-p" d="M327.5,492 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M339.5,476 v16"/></g>
+<g data-name="cu2" class="wl-open"><path class="wl-open-p" d="M357.0,492 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M369.0,476 v16"/></g>
+<g data-name="cu3" class="wl-open"><path class="wl-open-p" d="M386.5,492 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M398.5,476 v16"/></g>
+<g data-name="cu4" class="wl-open"><path class="wl-open-p" d="M416.0,492 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M428.0,476 v16"/></g>
+<g data-name="cu5" class="wl-open"><path class="wl-open-p" d="M445.5,492 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M457.5,476 v16"/></g>
+<g data-name="cu6" class="wl-open"><path class="wl-open-p" d="M298.0,532 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M310.0,516 v16"/></g>
+<g data-name="cu7" class="wl-open"><path class="wl-open-p" d="M327.5,532 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M339.5,516 v16"/></g>
+<g data-name="cu8" class="wl-open"><path class="wl-open-p" d="M357.0,532 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M369.0,516 v16"/></g>
+<g data-name="cu9" class="wl-open"><path class="wl-open-p" d="M386.5,532 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M398.5,516 v16"/></g>
+<g data-name="cu10" class="wl-open"><path class="wl-open-p" d="M416.0,532 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M428.0,516 v16"/></g>
+<g data-name="cu11" class="wl-open"><path class="wl-open-p" d="M445.5,532 q6,-5 12,0 q6,-5 12,0 v-16 q-6,-5 -12,0 q-6,-5 -12,0 Z"/><path class="wl-open-l" d="M457.5,516 v16"/></g>
+</g>
+<text class="wl-t" x="290" y="586" text-anchor="start">CART = PARSED CHECKPOINT</text>
+<g data-name="cart-note" class="wl-note"><rect x="282" y="333" width="250" height="24" rx="12"/><text x="407" y="350" text-anchor="middle">KEPT WHILE MEMORY ALLOWS</text></g>
+<path class="wl-lane" data-name="lane" d="M282,392 H544 V105 M544,305 H558 M544,392 V507"/>
+<g data-name="street-x" class="wl-cross"><rect x="124" y="379" width="156" height="26" rx="13"/><path d="M136,386 l12,12 M148,386 l-12,12"/><text x="214" y="397" text-anchor="middle">NO DISK READ</text></g>
+<rect data-name="corr-cuda" class="wl-corr" x="556" y="85" width="26" height="40"/>
+<rect data-name="corr-rocm" class="wl-corr" x="556" y="293" width="26" height="24"/>
+<rect class="wl-arch" x="556" y="436" width="26" height="148"/>
+<g data-name="room-cuda" class="wl-room cuda">
+<rect class="wl-room-f" x="580" y="8" width="414" height="190" rx="10"/>
+<rect fill="url(#parquet)" class="wl-texture" x="580" y="8" width="414" height="190" rx="10"/>
+<rect class="wl-room-band" x="580" y="8" width="414" height="8" rx="4"/>
+<text class="wl-room-t" x="596" y="38" text-anchor="start">CUDA CARD</text>
+<text class="wl-tm" x="596" y="57" text-anchor="start">READING ROOM = DEVICE</text>
+<g data-name="shelf-cuda" class="wl-bookcase"><rect class="wl-wood" x="594" y="68" width="140" height="70" rx="3"/><rect class="wl-case-in" x="599" y="74" width="130" height="56" rx="1"/><rect class="wl-wood-2" x="594" y="130" width="140" height="8" rx="2"/><path class="wl-tape" d="M596,62 H732 M596,58 v8 M732,58 v8"/></g>
+<g data-name="s-cuda-0" class="wl-slot"><rect class="wl-slot-e" x="601" y="77" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="601" y="77" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M601,86 h18 M601,118 h18"/></g>
+<g data-name="s-cuda-1" class="wl-slot"><rect class="wl-slot-e" x="623" y="77" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="623" y="77" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M623,86 h18 M623,118 h18"/></g>
+<g data-name="s-cuda-2" class="wl-slot"><rect class="wl-slot-e" x="645" y="77" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="645" y="77" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M645,86 h18 M645,118 h18"/></g>
+<g data-name="s-cuda-3" class="wl-slot"><rect class="wl-slot-e" x="667" y="77" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="667" y="77" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M667,86 h18 M667,118 h18"/></g>
+<g data-name="s-cuda-4" class="wl-slot"><rect class="wl-slot-e" x="689" y="77" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="689" y="77" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M689,86 h18 M689,118 h18"/></g>
+<g data-name="s-cuda-5" class="wl-slot"><rect class="wl-slot-e" x="711" y="77" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="711" y="77" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M711,86 h18 M711,118 h18"/></g>
+<text class="wl-tm" x="596" y="156" text-anchor="start">SHELF</text>
+<g data-name="dial-cuda" class="wl-dial"><circle class="wl-dial-f" cx="836" cy="100" r="30"/><path class="wl-dial-t" d="M815,112 A24,24 0 1 1 857,112"/><path class="wl-dial-k" d="M812,100 h5 M855,100 h5 M836,76 v5 M819,83 l3.5,3.5 M853,83 l-3.5,3.5"/><g class="wl-needle" data-name="needle-cuda" style="--a:46deg;--o:836px 100px"><path d="M836,100 L836,78"/></g><circle class="wl-dial-c" cx="836" cy="100" r="3.5"/></g>
+<text class="wl-tm" x="836" y="156" text-anchor="middle">SPEED</text>
+<g data-name="staff-cuda" class="wl-staff">
+<g transform="translate(912 136)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+<g transform="translate(938 136)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+<g transform="translate(964 136)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+</g>
+<text class="wl-tm" x="938" y="156" text-anchor="middle">STAFF</text>
+</g>
+<g data-name="run-cuda" class="wl-run cuda"><rect x="774" y="22" width="208" height="24" rx="12"/><text x="878" y="39" text-anchor="middle">RUN: VOLUMES 1 TO 6</text></g>
+<g data-name="room-rocm" class="wl-room rocm">
+<rect class="wl-room-f" x="580" y="210" width="414" height="190" rx="10"/>
+<rect fill="url(#parquet)" class="wl-texture" x="580" y="210" width="414" height="190" rx="10"/>
+<rect class="wl-room-band" x="580" y="210" width="414" height="8" rx="4"/>
+<text class="wl-room-t" x="596" y="240" text-anchor="start">ROCM CARD</text>
+<g data-name="shelf-rocm" class="wl-bookcase"><rect class="wl-wood" x="594" y="270" width="96" height="70" rx="3"/><rect class="wl-case-in" x="599" y="276" width="86" height="56" rx="1"/><rect class="wl-wood-2" x="594" y="332" width="96" height="8" rx="2"/><path class="wl-tape" d="M596,264 H688 M596,260 v8 M688,260 v8"/></g>
+<g data-name="s-rocm-0" class="wl-slot"><rect class="wl-slot-e" x="601" y="279" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="601" y="279" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M601,288 h18 M601,320 h18"/></g>
+<g data-name="s-rocm-1" class="wl-slot"><rect class="wl-slot-e" x="623" y="279" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="623" y="279" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M623,288 h18 M623,320 h18"/></g>
+<g data-name="s-rocm-2" class="wl-slot"><rect class="wl-slot-e" x="645" y="279" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="645" y="279" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M645,288 h18 M645,320 h18"/></g>
+<g data-name="s-rocm-3" class="wl-slot"><rect class="wl-slot-e" x="667" y="279" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="667" y="279" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M667,288 h18 M667,320 h18"/></g>
+<text class="wl-tm" x="596" y="358" text-anchor="start">SHELF</text>
+<g data-name="dial-rocm" class="wl-dial"><circle class="wl-dial-f" cx="836" cy="302" r="30"/><path class="wl-dial-t" d="M815,314 A24,24 0 1 1 857,314"/><path class="wl-dial-k" d="M812,302 h5 M855,302 h5 M836,278 v5 M819,285 l3.5,3.5 M853,285 l-3.5,3.5"/><g class="wl-needle" data-name="needle-rocm" style="--a:-6deg;--o:836px 302px"><path d="M836,302 L836,280"/></g><circle class="wl-dial-c" cx="836" cy="302" r="3.5"/></g>
+<text class="wl-tm" x="836" y="358" text-anchor="middle">SPEED</text>
+<g data-name="staff-rocm" class="wl-staff">
+<g transform="translate(912 338)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+<g transform="translate(938 338)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+</g>
+<text class="wl-tm" x="938" y="358" text-anchor="middle">STAFF</text>
+</g>
+<g data-name="run-rocm" class="wl-run rocm"><rect x="774" y="224" width="208" height="24" rx="12"/><text x="878" y="241" text-anchor="middle">RUN: VOLUMES 7 TO 10</text></g>
+<g data-name="room-host" class="wl-room host">
+<rect class="wl-room-f" x="580" y="412" width="414" height="200" rx="10"/>
+<rect fill="url(#parquet)" class="wl-texture" x="580" y="412" width="414" height="200" rx="10"/>
+<rect class="wl-room-band" x="580" y="412" width="414" height="8" rx="4"/>
+<text class="wl-room-t" x="596" y="442" text-anchor="start">HOST</text>
+<text class="wl-tm" x="596" y="468" text-anchor="start">TAKES WHAT NO CARD HOLDS</text>
+<g data-name="shelf-host" class="wl-bookcase"><rect class="wl-wood" x="594" y="472" width="272" height="70" rx="3"/><rect class="wl-case-in" x="599" y="478" width="262" height="56" rx="1"/><rect class="wl-wood-2" x="594" y="534" width="272" height="8" rx="2"/><path class="wl-tape" d="M596,466 H864 M596,462 v8 M864,462 v8"/></g>
+<g data-name="s-host-0" class="wl-slot"><rect class="wl-slot-e" x="601" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="601" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M601,490 h18 M601,522 h18"/></g>
+<g data-name="s-host-1" class="wl-slot"><rect class="wl-slot-e" x="623" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="623" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M623,490 h18 M623,522 h18"/></g>
+<g data-name="s-host-2" class="wl-slot"><rect class="wl-slot-e" x="645" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="645" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M645,490 h18 M645,522 h18"/></g>
+<g data-name="s-host-3" class="wl-slot"><rect class="wl-slot-e" x="667" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="667" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M667,490 h18 M667,522 h18"/></g>
+<g data-name="s-host-4" class="wl-slot"><rect class="wl-slot-e" x="689" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="689" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M689,490 h18 M689,522 h18"/></g>
+<g data-name="s-host-5" class="wl-slot"><rect class="wl-slot-e" x="711" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="711" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M711,490 h18 M711,522 h18"/></g>
+<g data-name="s-host-6" class="wl-slot"><rect class="wl-slot-e" x="733" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="733" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M733,490 h18 M733,522 h18"/></g>
+<g data-name="s-host-7" class="wl-slot"><rect class="wl-slot-e" x="755" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="755" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M755,490 h18 M755,522 h18"/></g>
+<g data-name="s-host-8" class="wl-slot"><rect class="wl-slot-e" x="777" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="777" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M777,490 h18 M777,522 h18"/></g>
+<g data-name="s-host-9" class="wl-slot"><rect class="wl-slot-e" x="799" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="799" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M799,490 h18 M799,522 h18"/></g>
+<g data-name="s-host-10" class="wl-slot"><rect class="wl-slot-e" x="821" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="821" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M821,490 h18 M821,522 h18"/></g>
+<g data-name="s-host-11" class="wl-slot"><rect class="wl-slot-e" x="843" y="481" width="18" height="52" rx="1.5"/><rect class="wl-vol" x="843" y="481" width="18" height="52" rx="1.5"/><path class="wl-vol-band" d="M843,490 h18 M843,522 h18"/></g>
+<text class="wl-tm" x="596" y="560" text-anchor="start">SHELF</text>
+</g>
+<g data-name="run-host" class="wl-run host"><rect x="774" y="426" width="208" height="24" rx="12"/><text x="878" y="443" text-anchor="middle">RUN: VOLUMES 11 TO 12</text></g>
+<text class="wl-tm" x="880" y="600" text-anchor="middle">OPENS ON THE HALL</text>
+</g>
+<g class="wl-plate wl-experts">
+<rect class="wl-wall" x="0" y="0" width="1000" height="620"/>
+<rect fill="url(#parquet)" class="wl-texture" x="0" y="0" width="1000" height="620"/>
+<rect class="wl-gallery" x="0" y="10" width="1000" height="44"/>
+<path class="wl-gallery-l" d="M0,32 H1000"/>
+<circle class="wl-sconce-g" cx="230" cy="58" r="26" fill="url(#glow)"/><path class="wl-sconce" d="M223,54 h14 l-3,7 h-8 Z"/>
+<circle class="wl-sconce-g" cx="520" cy="58" r="26" fill="url(#glow)"/><path class="wl-sconce" d="M513,54 h14 l-3,7 h-8 Z"/>
+<circle class="wl-sconce-g" cx="760" cy="58" r="26" fill="url(#glow)"/><path class="wl-sconce" d="M753,54 h14 l-3,7 h-8 Z"/>
+<text class="wl-tb" x="966" y="26" text-anchor="end">NEXT LAYER</text>
+<path class="wl-arrow" data-name="exit" d="M972,32 h18 m-7,-6 l7,6 l-7,6"/>
+<g class="wl-router">
+<ellipse class="wl-shadow" cx="128" cy="292" rx="108" ry="7"/>
+<rect class="wl-wood" x="22" y="78" width="212" height="210" rx="6"/>
+<rect fill="url(#grain)" class="wl-texture" x="22" y="78" width="212" height="210" rx="6"/>
+<rect class="wl-wood-2" x="16" y="72" width="224" height="12" rx="4"/>
+</g>
+<text class="wl-h wl-on-wood" x="128" y="106" text-anchor="middle">ROUTER</text>
+<text class="wl-t wl-on-wood" x="128" y="126" text-anchor="middle">MANUAL = EXPERT</text>
+<g data-name="slip" class="wl-slip"><rect class="wl-paper" x="34" y="138" width="188" height="140" rx="3"/><text class="wl-pt wl-ptm" x="44" y="158">PICKS, BY WEIGHT</text>
+<g data-name="pick0" class="wl-pick"><text class="wl-pt wl-id" x="44" y="182">#5</text><rect class="wl-wbar" x="80" y="171" width="76" height="12" rx="3"/><text class="wl-pt wl-place" x="214" y="182" text-anchor="end">CARD</text></g>
+<g data-name="pick1" class="wl-pick"><text class="wl-pt wl-id" x="44" y="207">#12</text><rect class="wl-wbar" x="80" y="196" width="56" height="12" rx="3"/><text class="wl-pt wl-place" x="214" y="207" text-anchor="end">TRAY</text></g>
+<g data-name="pick2" class="wl-pick"><text class="wl-pt wl-id" x="44" y="232">#3</text><rect class="wl-wbar" x="80" y="221" width="38" height="12" rx="3"/><text class="wl-pt wl-place" x="214" y="232" text-anchor="end">CARD</text></g>
+<g data-name="pick3" class="wl-pick"><text class="wl-pt wl-id" x="44" y="257">#27</text><rect class="wl-wbar" x="80" y="246" width="21" height="12" rx="3"/><text class="wl-pt wl-place" x="214" y="257" text-anchor="end">HOST</text></g>
+</g>
+<g data-name="reader" class="wl-reader" transform="translate(128 372) scale(1.35)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat-r" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g><rect class="wl-slip-s" x="7" y="-27" width="9" height="12" rx="1"/></g>
+<text class="wl-t" x="128" y="400" text-anchor="middle">READER = TOKEN</text>
+<g class="wl-vig" transform="translate(-10.8 465.2) scale(0.12)"><path class="wl-vig-b" d="M500,40 C538,40 548,70 546,100 C545,128 532,150 516,158 L518,178 C540,192 580,196 598,208 C615,216 620,238 618,262 C620,297.3 626,343.8 626,390.3 C628,436.8 638,483.3 640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 C610,483.3 602,436.8 600,390.3 C598,334.5 592,297.3 585,271.3 C582,320 566,360 564,400 C562,430 586,455 590,495 C594,560 580,650 572,710 C578,760 576,820 560,900 C562,920 578,940 582,955 C584,965 550,968 530,962 C526,940 530,920 530,900 C526,840 518,770 524,712 C528,640 516,580 500,535 Z"/><path class="wl-vig-b" d="M500,40 C538,40 548,70 546,100 C545,128 532,150 516,158 L518,178 C540,192 580,196 598,208 C615,216 620,238 618,262 C620,297.3 626,343.8 626,390.3 C628,436.8 638,483.3 640,520.5 C644,526.1 648,531.7 651,540.0 C656,549.3 660,562.4 660,571.7 Q659,580.0 652,578.2 C648,571.7 645,564.2 643,557.7 L645.5,602.3 Q641.5,608.9 637.5,602.3 L637,568.9 L636.5,610.7 Q632.5,617.2 628.5,610.7 L628,568.9 L627.5,607.0 Q623.5,613.5 619.5,607.0 L619,568.9 L618.5,596.8 Q614.8,603.3 611,596.8 L610.5,563.3 C610,548.4 611,534.5 614,520.5 C610,483.3 602,436.8 600,390.3 C598,334.5 592,297.3 585,271.3 C582,320 566,360 564,400 C562,430 586,455 590,495 C594,560 580,650 572,710 C578,760 576,820 560,900 C562,920 578,940 582,955 C584,965 550,968 530,962 C526,940 530,920 530,900 C526,840 518,770 524,712 C528,640 516,580 500,535 Z" transform="matrix(-1 0 0 1 1000 0)"/><circle class="wl-vig-halo" cx="523" cy="314" r="70"/><circle class="wl-vig-dot" cx="523" cy="314" r="30"/></g>
+<text class="wl-tm" x="83.2" y="510" text-anchor="start">IN LOKEND</text>
+<text class="wl-tb" x="83.2" y="528" text-anchor="start">EXPERTS</text>
+<rect class="wl-cardzone" x="262" y="62" width="484" height="334" rx="12"/>
+<text class="wl-room-t" x="278" y="88" text-anchor="start">CUDA CARD</text>
+<text class="wl-t" x="730" y="88" text-anchor="end">SHELF = SLOTS ON THE CARD</text>
+<rect class="wl-wood" x="276" y="96" width="456" height="108" rx="4"/>
+<rect class="wl-case-in" x="282" y="102" width="444" height="84" rx="2"/>
+<rect class="wl-wood-2" x="276" y="186" width="456" height="10" rx="2"/>
+<rect data-name="place0" class="wl-place" x="286" y="105" width="47" height="78" rx="3"/>
+<g data-name="m0" class="wl-manual"><rect class="wl-man" x="290" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M290,120 h39 M290,170 h39"/><text class="wl-id-m" x="309.5" y="150" text-anchor="middle">#3</text></g>
+<g data-name="tally0" class="wl-tally c3"><path class="k k1" d="M292,212 v-13"/><path class="k k2" d="M298,212 v-13"/><path class="k k3" d="M304,212 v-13"/><path class="k k4" d="M310,212 v-13"/><path class="k k5" d="M316,212 v-13"/><path class="k k6" d="M322,212 v-13"/></g>
+<rect data-name="place1" class="wl-place" x="341" y="105" width="47" height="78" rx="3"/>
+<g data-name="m1" class="wl-manual"><rect class="wl-man" x="345" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M345,120 h39 M345,170 h39"/><text class="wl-id-m" x="364.5" y="150" text-anchor="middle">#5</text></g>
+<g data-name="tally1" class="wl-tally c5"><path class="k k1" d="M347,212 v-13"/><path class="k k2" d="M353,212 v-13"/><path class="k k3" d="M359,212 v-13"/><path class="k k4" d="M365,212 v-13"/><path class="k k5" d="M371,212 v-13"/><path class="k k6" d="M377,212 v-13"/></g>
+<rect data-name="place2" class="wl-place" x="396" y="105" width="47" height="78" rx="3"/>
+<g data-name="m2" class="wl-manual"><rect class="wl-man" x="400" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M400,120 h39 M400,170 h39"/><text class="wl-id-m" x="419.5" y="150" text-anchor="middle">#9</text></g>
+<g data-name="m2new" class="wl-manual wl-new"><rect class="wl-man" x="400" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M400,120 h39 M400,170 h39"/><text class="wl-id-m" x="419.5" y="150" text-anchor="middle">#27</text><g class="wl-newtag"><rect x="399" y="96" width="41" height="18" rx="9"/><text x="419.5" y="109" text-anchor="middle">NEW</text></g></g>
+<g data-name="tally2" class="wl-tally c1"><path class="k k1" d="M402,212 v-13"/><path class="k k2" d="M408,212 v-13"/><path class="k k3" d="M414,212 v-13"/><path class="k k4" d="M420,212 v-13"/><path class="k k5" d="M426,212 v-13"/><path class="k k6" d="M432,212 v-13"/></g>
+<rect data-name="place3" class="wl-place" x="451" y="105" width="47" height="78" rx="3"/>
+<g data-name="m3" class="wl-manual"><rect class="wl-man" x="455" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M455,120 h39 M455,170 h39"/><text class="wl-id-m" x="474.5" y="150" text-anchor="middle">#14</text></g>
+<g data-name="tally3" class="wl-tally c3"><path class="k k1" d="M457,212 v-13"/><path class="k k2" d="M463,212 v-13"/><path class="k k3" d="M469,212 v-13"/><path class="k k4" d="M475,212 v-13"/><path class="k k5" d="M481,212 v-13"/><path class="k k6" d="M487,212 v-13"/></g>
+<rect data-name="place4" class="wl-place" x="506" y="105" width="47" height="78" rx="3"/>
+<g data-name="m4" class="wl-manual"><rect class="wl-man" x="510" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M510,120 h39 M510,170 h39"/><text class="wl-id-m" x="529.5" y="150" text-anchor="middle">#17</text></g>
+<g data-name="tally4" class="wl-tally c2"><path class="k k1" d="M512,212 v-13"/><path class="k k2" d="M518,212 v-13"/><path class="k k3" d="M524,212 v-13"/><path class="k k4" d="M530,212 v-13"/><path class="k k5" d="M536,212 v-13"/><path class="k k6" d="M542,212 v-13"/></g>
+<rect data-name="place5" class="wl-place" x="561" y="105" width="47" height="78" rx="3"/>
+<g data-name="m5" class="wl-manual"><rect class="wl-man" x="565" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M565,120 h39 M565,170 h39"/><text class="wl-id-m" x="584.5" y="150" text-anchor="middle">#20</text></g>
+<g data-name="tally5" class="wl-tally c3"><path class="k k1" d="M567,212 v-13"/><path class="k k2" d="M573,212 v-13"/><path class="k k3" d="M579,212 v-13"/><path class="k k4" d="M585,212 v-13"/><path class="k k5" d="M591,212 v-13"/><path class="k k6" d="M597,212 v-13"/></g>
+<rect data-name="place6" class="wl-place" x="616" y="105" width="47" height="78" rx="3"/>
+<g data-name="m6" class="wl-manual"><rect class="wl-man" x="620" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M620,120 h39 M620,170 h39"/><text class="wl-id-m" x="639.5" y="150" text-anchor="middle">#22</text></g>
+<g data-name="tally6" class="wl-tally c2"><path class="k k1" d="M622,212 v-13"/><path class="k k2" d="M628,212 v-13"/><path class="k k3" d="M634,212 v-13"/><path class="k k4" d="M640,212 v-13"/><path class="k k5" d="M646,212 v-13"/><path class="k k6" d="M652,212 v-13"/></g>
+<rect data-name="place7" class="wl-place" x="671" y="105" width="47" height="78" rx="3"/>
+<g data-name="m7" class="wl-manual"><rect class="wl-man" x="675" y="110" width="39" height="72" rx="2"/><path class="wl-man-band" d="M675,120 h39 M675,170 h39"/><text class="wl-id-m" x="694.5" y="150" text-anchor="middle">#30</text></g>
+<g data-name="tally7" class="wl-tally c2"><path class="k k1" d="M677,212 v-13"/><path class="k k2" d="M683,212 v-13"/><path class="k k3" d="M689,212 v-13"/><path class="k k4" d="M695,212 v-13"/><path class="k k5" d="M701,212 v-13"/><path class="k k6" d="M707,212 v-13"/></g>
+<text class="wl-tm" x="728" y="230" text-anchor="end">TALLY = USE COUNT</text>
+<g data-name="cold" class="wl-cold"><rect x="354" y="216" width="132" height="20" rx="10"/><text x="420" y="231" text-anchor="middle">COLDEST FREE</text></g>
+<rect class="wl-desk" x="278" y="244" width="282" height="140" rx="6"/>
+<rect fill="url(#grain)" class="wl-texture" x="278" y="244" width="282" height="140" rx="6"/>
+<text class="wl-t wl-on-wood" x="290" y="266" text-anchor="start">READ ON THE CARD</text>
+<rect class="wl-traybox" x="576" y="244" width="154" height="140" rx="6"/>
+<text class="wl-tb" x="588" y="266" text-anchor="start">TRAY</text>
+<text class="wl-tm" x="588" y="284" text-anchor="start">= TRANSIT ROOM</text>
+<rect class="wl-tray" x="602" y="292" width="102" height="54" rx="6"/>
+<rect class="wl-tray-in" x="608" y="298" width="90" height="42" rx="4"/>
+<text class="wl-tm" x="653" y="374" text-anchor="middle">NOT A SLOT</text>
+<g data-name="readA" class="wl-read"><path class="wl-open-p big" d="M326,330 q13,-9 26,0 q13,-9 26,0 v-30 q-13,-9 -26,0 q-13,-9 -26,0 Z"/><path class="wl-open-l" d="M352,300 v30"/><text class="wl-pt wl-id" x="352" y="292" text-anchor="middle">#5</text><rect class="wl-bar-t" x="309.0" y="340" width="86" height="8" rx="4"/><rect data-name="barA" class="wl-bar A" x="309.0" y="340" width="0" height="8" rx="4"/></g>
+<g data-name="readB" class="wl-read"><path class="wl-open-p big" d="M460,330 q13,-9 26,0 q13,-9 26,0 v-30 q-13,-9 -26,0 q-13,-9 -26,0 Z"/><path class="wl-open-l" d="M486,300 v30"/><text class="wl-pt wl-id" x="486" y="292" text-anchor="middle">#3</text><rect class="wl-bar-t" x="443.0" y="340" width="86" height="8" rx="4"/><rect data-name="barB" class="wl-bar B" x="443.0" y="340" width="0" height="8" rx="4"/></g>
+<g data-name="readT" class="wl-read"><path class="wl-open-p big" d="M627,334 q13,-9 26,0 q13,-9 26,0 v-30 q-13,-9 -26,0 q-13,-9 -26,0 Z"/><path class="wl-open-l" d="M653,304 v30"/><text class="wl-pt wl-id" x="653" y="296" text-anchor="middle">#12</text><rect class="wl-bar-t" x="613.0" y="344" width="80" height="8" rx="4"/><rect data-name="barT" class="wl-bar T" x="613.0" y="344" width="0" height="8" rx="4"/></g>
+<path class="wl-chute" data-name="chute" d="M716,404 V350"/>
+<rect class="wl-archzone" x="262" y="408" width="484" height="206" rx="10"/>
+<text class="wl-tb" x="278" y="430" text-anchor="start">ARCHIVES = EXPERTS IN HOST MEMORY</text>
+<rect class="wl-wood" x="276" y="440" width="456" height="166" rx="4"/>
+<g data-name="d0" class="wl-dr"><rect class="wl-drawer-f" x="282" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="308" y="463.0" text-anchor="middle">#0</text><rect class="wl-brass" x="301" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d1" class="wl-dr"><rect class="wl-drawer-f" x="338" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="364" y="463.0" text-anchor="middle">#1</text><rect class="wl-brass" x="357" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d2" class="wl-dr"><rect class="wl-drawer-f" x="394" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="420" y="463.0" text-anchor="middle">#2</text><rect class="wl-brass" x="413" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d3" class="wl-dr"><rect class="wl-drawer-f" x="450" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="476" y="463.0" text-anchor="middle">#3</text><rect class="wl-brass" x="469" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d4" class="wl-dr"><rect class="wl-drawer-f" x="506" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="532" y="463.0" text-anchor="middle">#4</text><rect class="wl-brass" x="525" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d5" class="wl-dr"><rect class="wl-drawer-f" x="562" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="588" y="463.0" text-anchor="middle">#5</text><rect class="wl-brass" x="581" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d6" class="wl-dr"><rect class="wl-drawer-f" x="618" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="644" y="463.0" text-anchor="middle">#6</text><rect class="wl-brass" x="637" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d7" class="wl-dr"><rect class="wl-drawer-f" x="674" y="446.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="700" y="463.0" text-anchor="middle">#7</text><rect class="wl-brass" x="693" y="471.0" width="14" height="4" rx="2"/></g>
+<g data-name="d8" class="wl-dr"><rect class="wl-drawer-f" x="282" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="308" y="502.5" text-anchor="middle">#8</text><rect class="wl-brass" x="301" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d9" class="wl-dr"><rect class="wl-drawer-f" x="338" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="364" y="502.5" text-anchor="middle">#9</text><rect class="wl-brass" x="357" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d10" class="wl-dr"><rect class="wl-drawer-f" x="394" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="420" y="502.5" text-anchor="middle">#10</text><rect class="wl-brass" x="413" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d11" class="wl-dr"><rect class="wl-drawer-f" x="450" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="476" y="502.5" text-anchor="middle">#11</text><rect class="wl-brass" x="469" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d12" class="wl-dr"><rect class="wl-drawer-f" x="506" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="532" y="502.5" text-anchor="middle">#12</text><rect class="wl-brass" x="525" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d13" class="wl-dr"><rect class="wl-drawer-f" x="562" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="588" y="502.5" text-anchor="middle">#13</text><rect class="wl-brass" x="581" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d14" class="wl-dr"><rect class="wl-drawer-f" x="618" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="644" y="502.5" text-anchor="middle">#14</text><rect class="wl-brass" x="637" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d15" class="wl-dr"><rect class="wl-drawer-f" x="674" y="485.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="700" y="502.5" text-anchor="middle">#15</text><rect class="wl-brass" x="693" y="510.5" width="14" height="4" rx="2"/></g>
+<g data-name="d16" class="wl-dr"><rect class="wl-drawer-f" x="282" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="308" y="542.0" text-anchor="middle">#16</text><rect class="wl-brass" x="301" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d17" class="wl-dr"><rect class="wl-drawer-f" x="338" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="364" y="542.0" text-anchor="middle">#17</text><rect class="wl-brass" x="357" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d18" class="wl-dr"><rect class="wl-drawer-f" x="394" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="420" y="542.0" text-anchor="middle">#18</text><rect class="wl-brass" x="413" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d19" class="wl-dr"><rect class="wl-drawer-f" x="450" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="476" y="542.0" text-anchor="middle">#19</text><rect class="wl-brass" x="469" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d20" class="wl-dr"><rect class="wl-drawer-f" x="506" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="532" y="542.0" text-anchor="middle">#20</text><rect class="wl-brass" x="525" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d21" class="wl-dr"><rect class="wl-drawer-f" x="562" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="588" y="542.0" text-anchor="middle">#21</text><rect class="wl-brass" x="581" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d22" class="wl-dr"><rect class="wl-drawer-f" x="618" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="644" y="542.0" text-anchor="middle">#22</text><rect class="wl-brass" x="637" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d23" class="wl-dr"><rect class="wl-drawer-f" x="674" y="525.0" width="52" height="35" rx="2"/><text class="wl-id-d" x="700" y="542.0" text-anchor="middle">#23</text><rect class="wl-brass" x="693" y="550.0" width="14" height="4" rx="2"/></g>
+<g data-name="d24" class="wl-dr"><rect class="wl-drawer-f" x="282" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="308" y="581.5" text-anchor="middle">#24</text><rect class="wl-brass" x="301" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d25" class="wl-dr"><rect class="wl-drawer-f" x="338" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="364" y="581.5" text-anchor="middle">#25</text><rect class="wl-brass" x="357" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d26" class="wl-dr"><rect class="wl-drawer-f" x="394" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="420" y="581.5" text-anchor="middle">#26</text><rect class="wl-brass" x="413" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d27" class="wl-dr"><rect class="wl-drawer-f" x="450" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="476" y="581.5" text-anchor="middle">#27</text><rect class="wl-brass" x="469" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d28" class="wl-dr"><rect class="wl-drawer-f" x="506" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="532" y="581.5" text-anchor="middle">#28</text><rect class="wl-brass" x="525" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d29" class="wl-dr"><rect class="wl-drawer-f" x="562" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="588" y="581.5" text-anchor="middle">#29</text><rect class="wl-brass" x="581" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d30" class="wl-dr"><rect class="wl-drawer-f" x="618" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="644" y="581.5" text-anchor="middle">#30</text><rect class="wl-brass" x="637" y="589.5" width="14" height="4" rx="2"/></g>
+<g data-name="d31" class="wl-dr"><rect class="wl-drawer-f" x="674" y="564.5" width="52" height="35" rx="2"/><text class="wl-id-d" x="700" y="581.5" text-anchor="middle">#31</text><rect class="wl-brass" x="693" y="589.5" width="14" height="4" rx="2"/></g>
+<g class="wl-lectern"><path class="wl-wood" d="M770,560 L790,500 H846 L866,560 Z"/><rect class="wl-wood-2" x="808" y="560" width="20" height="40"/><rect class="wl-wood-2" x="790" y="598" width="56" height="6" rx="2"/></g>
+<g data-name="readH" class="wl-read"><path class="wl-open-p big" d="M792,532 q13,-9 26,0 q13,-9 26,0 v-30 q-13,-9 -26,0 q-13,-9 -26,0 Z"/><path class="wl-open-l" d="M818,502 v30"/><text class="wl-pt wl-id" x="818" y="494" text-anchor="middle">#27</text><rect class="wl-bar-t" x="780.0" y="542" width="76" height="8" rx="4"/><rect data-name="barH" class="wl-bar H" x="780.0" y="542" width="0" height="8" rx="4"/></g>
+<g data-name="archivist" class="wl-worker" transform="translate(772 600) scale(1.35)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat-h" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+<text class="wl-tb" x="814" y="440" text-anchor="middle">ARCHIVIST</text>
+<text class="wl-tm" x="814" y="458" text-anchor="middle">= HOST CORES</text>
+<g data-name="librarian" class="wl-worker" transform="translate(960 600) scale(1.35)"><g class="wl-p"><ellipse class="wl-shadow" cx="0" cy="1" rx="11" ry="3"/><path class="wl-leg" d="M-4,0 V-14 M4,0 V-14"/><path class="wl-coat-w" d="M-10,-14 C-10,-28 -8,-33 0,-33 C8,-33 10,-28 10,-14 Z"/><circle class="wl-skin" cx="0" cy="-39" r="6.5"/><path class="wl-hair" d="M-6.5,-41 C-6,-47 6,-47 6.5,-41 C3,-43 -3,-43 -6.5,-41 Z"/></g></g>
+<text class="wl-tb" x="944" y="440" text-anchor="middle">LIBRARIAN</text>
+<text class="wl-tm" x="944" y="458" text-anchor="middle">= WORKER</text>
+<rect class="wl-paper" x="874" y="466" width="116" height="66" rx="3"/>
+<path class="wl-paper-rule" d="M874,484 H990"/>
+<text class="wl-pt wl-ptm" x="882" y="480" text-anchor="start">LEDGER</text>
+<text class="wl-pt wl-id" x="882" y="504" text-anchor="start">#27</text>
+<g data-name="lg27" class="wl-tally c4 on-paper"><path class="k k1" d="M926,506 v-14"/><path class="k k2" d="M935,506 v-14"/><path class="k k3" d="M944,506 v-14"/><path class="k k4" d="M953,506 v-14"/><path class="k k5" d="M962,506 v-14"/><path class="k k6" d="M971,506 v-14"/></g>
+<text class="wl-pt wl-id" x="882" y="526" text-anchor="start">#12</text>
+<g data-name="lg12" class="wl-tally c0 on-paper"><path class="k k1" d="M926,528 v-14"/><path class="k k2" d="M935,528 v-14"/><path class="k k3" d="M944,528 v-14"/><path class="k k4" d="M953,528 v-14"/><path class="k k5" d="M962,528 v-14"/><path class="k k6" d="M971,528 v-14"/></g>
+<text class="wl-tb" x="870" y="86" text-anchor="middle">WEIGHTED SUM</text>
+<text class="wl-tm" x="870" y="104" text-anchor="middle">HEIGHT = WEIGHT</text>
+<g class="wl-jar">
+<ellipse class="wl-shadow" cx="870" cy="352" rx="62" ry="7"/>
+<path class="wl-jar-g" fill="url(#glass)" d="M818,128 H922 V136 L914,144 V336 Q914,348 902,348 H838 Q826,348 826,336 V144 L818,136 Z"/>
+<g data-name="j0" class="wl-layer card"><rect x="830" y="274" width="80" height="70" rx="2"/><text x="870" y="314" text-anchor="middle">#5</text></g>
+<g data-name="j1" class="wl-layer transit"><rect x="830" y="223" width="80" height="51" rx="2"/><text x="870" y="254" text-anchor="middle">#12</text></g>
+<g data-name="j2" class="wl-layer card"><rect x="830" y="188" width="80" height="35" rx="2"/><text x="870" y="210" text-anchor="middle">#3</text></g>
+<g data-name="j3" class="wl-layer host"><rect x="830" y="169" width="80" height="19" rx="2"/><text x="870" y="184" text-anchor="middle">#27</text></g>
+<path class="wl-jar-m" d="M914,180 h-10 M914,220 h-10 M914,260 h-10 M914,300 h-10"/>
+<path class="wl-jar-hi" d="M834,150 V330"/>
+</g>
+</g>
+<g data-anim="" data-reach="30"></g>
+</svg>

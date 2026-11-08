@@ -1,133 +1,476 @@
-# The scenes of the weights: a model loaded from the catalogue, and an expert the card lacks.
+# The scenes of the weights, told in a library.
+# Load: the branches are the stores, the catalogue reads them as one, the plan measures each reading room, porters copy the volumes.
+# Experts: the shelf is the slots on the card, the tray the transit room, the archives the experts in host memory.
 
-to mid(b)
-  return (attr(b, "x") + 5, attr(b, "y") + 5)
+let ROOMS = ["cuda", "rocm", "host"]
+let ROOM_NAME = {cuda: "the CUDA card", rocm: "the ROCm card"}
+# The tick column of each card on the plan.
+let TICK = {cuda: "c", rocm: "r"}
+# The places of each shelf, and the volumes each run takes: the cards are full, the host takes the rest.
+let SLOTS = {cuda: 6, rocm: 4, host: 12}
+let RUN = {cuda: 6, rocm: 4, host: 2}
+let RUN_OF = ["cuda", "cuda", "cuda", "cuda", "cuda", "cuda", "rocm", "rocm", "rocm", "rocm", "host", "host"]
+# The height of the middle of each shelf, where the corridor or the arch enters.
+let SHELF_Y = {cuda: 103, rocm: 305, host: 507}
+let LANE = 544
+# The frame of each room on a narrow screen.
+let ROOM_VIEW = {cuda: (580, 0, 420, 260), rocm: (580, 200, 420, 260), host: (580, 360, 420, 260)}
+let SPEED = 430
+
+# The lengths of the reading bars of the experts.
+let BARW = {A: 86, B: 86, T: 80, H: 76}
+
+# The middle of place `i` of a shelf of the loading plate.
+to slotAt(r, i)
+  return (610 + i * 22, SHELF_Y[r])
 end
 
-scene load
-  # A model loaded through the plan.
-  let stomach = centre(select("#v-trunk [data-group=\"models\"] .t"))
-  let store = (500, 470)
-  # Step 0: The catalogue finds the model in the stores of the configuration, read as one.
-  # A model held by several stores is read from the first one listed.
-  step 0
-  let p = dotAt(store)
-  light "models" "churn" on
-  compute p for 500 say "Reading the catalogue"
-  glide p to stomach over 600
-  # Step 1: The placement plan reads what each card offers: its free memory, its read rate, its
-  #   compute rate and its link.
-  # It gives each run of layers to one device.
-  step 1
-  for r in ["dc", "dr", "dh"]
-    let run = [v for v in layers if v.run == r]
-    add "hot" to run
-    say "Measuring and placing on " + RUN_NAMES[r] busy
-    wait 600
-    drop "hot" from run
+# The middle of volume `i` on the cart.
+to cartAt(i)
+  let tier = 0
+  if i >= 6
+    tier = 1
   end
-  # Step 2: The loaders read each layer's weights into the device of its run.
-  step 2
-  for r in ["dc", "dr", "dh"]
-    say "Reading weights into " + RUN_NAMES[r]
-    for v in [x for x in layers if x.run == r]
-      let d = dotAt(stomach, 2.6, "small")
-      travel(d, [(500, max(v.y, 380)), (500, v.y)], 900)
-      remove d
-      add "hot" to v
-      later 400
-        drop "hot" from v
+  return (310 + (i % 6) * 29.5, 484 + tier * 40)
+end
+
+# The number of the volume that is place `i` of room `r`.
+to volumeOf(r, i)
+  if r == "cuda"
+    return i
+  elif r == "rocm"
+    return 6 + i
+  end
+  return 10 + i
+end
+
+# The way from the door of branch 1 to place `i` of room `r`.
+to fromBranch(r, i)
+  let s = slotAt(r, i)
+  return "M130,382 V392 H" + str(LANE) + " V" + str(s[1]) + " H" + str(s[0])
+end
+
+# The way from volume `j` of the cart to place `i` of room `r`.
+to fromCart(j, r, i)
+  let c = cartAt(j)
+  let s = slotAt(r, i)
+  return "M" + str(c[0]) + "," + str(c[1]) + " V452 H" + str(LANE) + " V" + str(s[1]) + " H" + str(s[0])
+end
+
+# A porter walks a way with a volume of room `r` and leaves it on its place.
+to porter(path, r, i)
+  let p = sprite("trolley", (130, 382))
+  add r to p
+  move p along path speed SPEED
+  remove p
+  add "full" to named("s-" + r + "-" + str(i))
+  tone(660 + i * 40, 50, "triangle", 0.05)
+end
+
+# The camera visits the rooms in turn while the porters walk.
+to visitRooms()
+  later 1300ms
+    view ROOM_VIEW.cuda
+  end
+  later 2500ms
+    view ROOM_VIEW.rocm
+  end
+  later 3600ms
+    view ROOM_VIEW.host
+  end
+end
+
+# Every room of the plan gets its volumes, each porter a little after the one before.
+to deliver(fromCartToo)
+  together for r in ROOMS
+    together for i in range(RUN[r])
+      wait i * 360
+      if fromCartToo
+        porter(fromCart(volumeOf(r, i), r, i), r, i)
+      else
+        porter(fromBranch(r, i), r, i)
       end
     end
   end
-  # Step 3: For an image, video or audio model, the parsed checkpoint stays in host memory while
-  #   memory allows.
-  # Loading that model again skips the disk.
-  step 3
-  add "kv" to p
-  compute p for 1200 say "Keeping the parsed checkpoint in host memory"
-  say "Loading that model again: no disk read, only the uploads"
-  for v in layers
-    let d = dotAt(stomach, 2.6, "small")
-    travel(d, [(500, max(v.y, 380)), (500, v.y)], 2400)
-    remove d
-    add "hot" to v
-    later 300
-      drop "hot" from v
+end
+
+to emptyRooms()
+  for r in ROOMS
+    for i in range(SLOTS[r])
+      dropClass("full", named("s-" + r + "-" + str(i)))
     end
   end
-  light "models" "churn" off
+end
+
+# Sets the bars from `a` to `b` of their length, all ending together at the clock `until`.
+to fill(bars, a, b, until)
+  let t0 = clock()
+  let span = max(until - t0, 1)
+  let u = 0
+  while u < 1
+    u = min(1, (clock() - t0) / span)
+    for k in bars
+      setAttr(named("bar" + k), "width", fixed(BARW[k] * (a + (b - a) * u), 1))
+    end
+    if u < 1
+      wait 16
+    end
+  end
+end
+
+# Every class the stories give to the drawing is taken back.
+to reset()
+  for k in ["cat-card", "tag-b1", "tag-b2", "street-x", "cart-note", "slip", "m2new", "cold", "readA", "readB", "readT", "readH", "j0", "j1", "j2", "j3"]
+    dropClass("on", named(k))
+  end
+  dropClass("out", named("cat-drawer"))
+  for k in ["b1", "b2"]
+    for c in ["read", "skip", "img"]
+      dropClass(c, named(k))
+    end
+  end
+  dropClass("lit", named("street"))
+  dropClass("crossed", named("street"))
+  dropClass("lit", named("lane"))
+  dropClass("shut", named("door1"))
+  for i in range(4)
+    dropClass("hl", named("pr" + str(i)))
+    dropClass("on", named("tk-c-" + str(i)))
+    dropClass("on", named("tk-r-" + str(i)))
+    for c in ["on", "card", "transit", "host"]
+      dropClass(c, named("pick" + str(i)))
+    end
+  end
+  for i in range(12)
+    for c in ROOMS
+      dropClass(c, named("pc" + str(i)))
+    end
+    dropClass("on", named("cu" + str(i)))
+  end
+  for r in ROOMS
+    dropClass("on", named("pb-" + r))
+    dropClass("on", named("run-" + r))
+    dropClass("measure", named("shelf-" + r))
+  end
+  for r in ["cuda", "rocm"]
+    for k in ["dial-", "staff-", "corr-"]
+      dropClass("measure", named(k + r))
+    end
+    dropClass("set", named("needle-" + r))
+  end
+  emptyRooms()
+  dropClass("away", named("reader"))
+  for i in range(8)
+    dropClass("inuse", named("place" + str(i)))
+    dropClass("out", named("m" + str(i)))
+    dropClass("gone", named("m" + str(i)))
+  end
+  for k in ["A", "B", "T", "H"]
+    dropClass("reading", named("read" + k))
+    setAttr(named("bar" + k), "width", 0)
+  end
+  dropClass("lit", named("chute"))
+  for k in ["d9", "d12", "d27"]
+    dropClass("pull", named(k))
+  end
+  dropClass("busy", named("archivist"))
+  dropClass("busy", named("librarian"))
+  let counts = [3, 5, 1, 3, 2, 3, 2, 2]
+  for i in range(8)
+    setAttr(named("tally" + str(i)), "class", "wl-tally c" + str(counts[i]))
+  end
+  setAttr(named("lg27"), "class", "wl-tally c4 on-paper")
+  setAttr(named("lg12"), "class", "wl-tally c0 on-paper")
+end
+
+reset()
+
+scene load
+  # A model loaded through the plan.
+  row 0 ""
+
+  # Step 0: The catalogue finds the model in the stores of the configuration, read as one.
+  # A model held by several stores is read from the first one listed.
+  step 0
+  view (0, 0, 420, 260)
+  add "out" to named("cat-drawer")
+  tone(520, 60, "sine", 0.05)
+  wait 350
+  add "on" to named("cat-card")
+  wait 700
+  let link = shape("path", {class: "wl-link", d: "M234,120 C258,130 258,200 232,230"})
+  view (0, 180, 420, 260)
+  add "read" to named("b1")
+  add "on" to named("tag-b1")
+  wait 500
+  view (0, 360, 420, 260)
+  add "skip" to named("b2")
+  add "on" to named("tag-b2")
+  row 0 "branch 1, the first store listed"
+  wait 1200
+  remove link
+
+  # Step 1: The placement plan reads what each card offers: its free memory, its read rate, its
+  #   compute rate and its link.
+  # It gives each run of layers to one device.
+  # The host takes only the layers no card holds.
+  step 1
+  for r in ["cuda", "rocm"]
+    view ROOM_VIEW[r]
+    say "Measuring " + ROOM_NAME[r] busy
+    let parts = [named("shelf-" + r), named("dial-" + r), named("staff-" + r), named("corr-" + r)]
+    for [i, part] in enumerate(parts)
+      add "hl" to named("pr" + str(i))
+      add "measure" to part
+      if i == 1
+        add "set" to named("needle-" + r)
+      end
+      tone(880, 40, "sine", 0.04)
+      wait 420
+      add "on" to named("tk-" + TICK[r] + "-" + str(i))
+      drop "measure" from part
+      drop "hl" from named("pr" + str(i))
+    end
+  end
+  view (270, 0, 420, 260)
+  say "Giving each run of volumes to a room" busy
+  for i in range(12)
+    add RUN_OF[i] to named("pc" + str(i))
+    wait 90
+  end
+  for r in ROOMS
+    add "on" to named("pb-" + r)
+    add "on" to named("run-" + r)
+    wait 250
+  end
+  view ROOM_VIEW.host
+  wait 900
+
+  # Step 2: The loaders read each layer's weights into the device of its run.
+  step 2
+  add "lit" to named("street")
+  add "lit" to named("lane")
+  row 0 "branch 1, then the rooms"
+  visitRooms()
+  deliver(false)
+  drop "lit" from named("street")
+  drop "lit" from named("lane")
+  wait 600
+
+  # Step 3: For an image, video or audio model, the parsed checkpoint stays in host memory while
+  #   memory allows.
+  step 3
+  row 0 "branch 1, the cart, then the rooms"
+  emptyRooms()
+  view (110, 330, 420, 260)
+  drop "on" from named("cat-card"), named("tag-b2")
+  drop "skip" from named("b2")
+  add "img" to named("b1")
+  emit at (244, 300) "an image model"
+  wait 700
+  add "lit" to named("street")
+  say "Unpacking the book onto the cart" busy
+  together for j in range(12)
+    wait j * 160
+    let p = sprite("trolley", (130, 382))
+    add "img" to p
+    let c = cartAt(j)
+    move p along "M130,382 V392 H" + str(c[0]) + " V" + str(c[1]) speed SPEED
+    remove p
+    add "on" to named("cu" + str(j))
+  end
+  drop "lit" from named("street")
+  emit at (384, 470) "unpacked"
+  add "on" to named("cart-note")
+  add "lit" to named("lane")
+  visitRooms()
+  deliver(true)
+  drop "lit" from named("lane")
+  wait 600
+
+  # Step 4: Loading that model again skips the disk.
+  # Only the uploads to the devices remain.
+  step 4
+  row 0 "the cart, then the rooms"
+  emit at (780, 190) "unloaded"
+  emptyRooms()
+  wait 700
+  view (60, 330, 420, 260)
+  drop "read" from named("b1")
+  drop "on" from named("tag-b1")
+  add "crossed" to named("street")
+  add "on" to named("street-x")
+  add "shut" to named("door1")
+  noise(60, 0.05)
+  wait 600
+  add "lit" to named("lane")
+  visitRooms()
+  deliver(true)
+  drop "lit" from named("lane")
+  wait 900
+  view all
 end
 
 scene experts
   # A token through a mixture of experts.
-  let spot = [v for v in layers if v.run == "dc"][5]
-  let heart = centre(select("#v-trunk [data-group=\"experts\"] .t"))
-  let slots = [shape("rect", {class: "box slot", x: 546 + i * 13, y: 236, width: 10, height: 10, rx: 1.5}) for i in range(6)]
-  let room = shape("rect", {class: "box slot", x: 632, y: 236, width: 10, height: 10, rx: 1.5})
-  let hosts = [shape("rect", {class: "box host", x: 344 + i * 11.5, y: 420, width: 10, height: 10, rx: 1.5}) for i in range(9)]
-  label(546, 230, "slots on the card", size=8)
-  label(626, 258, "transit room", size=7)
-  label(344, 413, "experts in host memory", size=8)
-  let used = [slots[0], slots[2], slots[3]]
-  let miss = hosts[6]
-  let moved = hosts[2]
-  let aims = used + [room, miss]
+
   # Step 0: A token reaches a mixture layer.
-  # The router picks its experts.
+  # The router picks its experts, each with a weight.
   step 0
-  let p = dot(500, spot.y)
-  add "hot" to spot
-  glide p to heart over 600
-  light "experts" "beat" in ".t"
-  compute p for 400 say "The router scoring the experts"
-  let goes = [dotAt(heart, 3.2, "small") for a in aims]
-  glideAll([[d, mid(used[i])] for [i, d] in enumerate(goes[0:3])] + [[goes[3], heart], [goes[4], mid(miss)]], 800)
-  # Step 1: The experts that have a slot on the card run there.
-  step 1
-  add "on" to used
-  light "experts" "beat" in ".t"
-  light "backends" "flex" on
-  swell goes[0:3] on
-  say "Computing on the card" busy
+  view (0, 0, 420, 260)
+  add "away" to named("reader")
+  let rd = sprite("reader", (-30, 50))
+  move rd along "M-30,50 L128,50 L128,372" speed 300
+  remove rd
+  drop "away" from named("reader")
+  view (0, 145, 420, 260)
+  add "on" to named("slip")
+  say "The router weighing the experts" busy
+  for i in range(4)
+    add "on" to named("pick" + str(i))
+    tone(700 + i * 90, 50, "triangle", 0.05)
+    wait 300
+  end
   wait 700
+
+  # Step 1: The experts that have a slot on the card run there at once.
+  step 1
+  view (270, 80, 420, 260)
+  add "card" to named("pick0"), named("pick2")
+  let s5 = sprite("manual", (364, 146))
+  let s3 = sprite("manual", (309, 146))
+  add "out" to named("m1"), named("m0")
+  add "inuse" to named("place1"), named("place0")
+  glide s5 to (352, 310), s3 to (486, 310) over 700
+  remove s5, s3
+  add "on" to named("readA"), named("readB")
+  add "reading" to named("readA"), named("readB")
+  say "Reading on the card" busy
+  fill(["A", "B"], 0, 0.3, clock() + 1600)
+
   # Step 2: An expert without a slot runs in one of 2 places, split by the rates measured on the
   #   layer.
-  # It is copied into the card's transit room and run with the others, or computed on the host cores
-  #   beside the card.
+  # It is copied into the card's transit room and run with the others, or computed on the host
+  #   cores beside the card.
+  # The card, the transit room and the host work at the same time.
   step 2
-  let copy = dotAt(mid(moved), 2.6, "small")
-  say "Copying an expert into the transit room"
-  travel(copy, [(612, 400), mid(room)], 320)
-  remove copy
-  glide goes[3] to mid(room) over 300
-  add "on" to room
-  add "on" to miss
-  light "experts" "beat" in ".t"
-  swell goes[3:] on
-  say "The card and the host cores computing together" busy
-  wait 1s
-  swell goes off
-  drop "on" from used + [room, miss]
-  light "backends" "flex" off
-  light "experts" "beat" in ".t"
+  view (452, 340, 420, 260)
+  add "transit" to named("pick1")
+  add "host" to named("pick3")
+  emit at (760, 402) "split by measured rates"
+  add "pull" to named("d12"), named("d27")
+  add "busy" to named("archivist")
+  let done = clock() + 3000
+  say "The card, the tray and the host cores at once" busy
+  together
+    let mh = sprite("manual", (476, 581))
+    glide mh to (818, 512) over 700
+    remove mh
+    add "on" to named("readH")
+    add "reading" to named("readH")
+    fill(["H"], 0, 1, done)
+  also
+    let sh = sprite("sheet", (532, 502))
+    add "lit" to named("chute")
+    move sh along "M532,502 L532,404 L716,404 L716,350 L653,318" speed 400
+    remove sh
+    drop "lit" from named("chute")
+    add "on" to named("readT")
+    add "reading" to named("readT")
+    fill(["T"], 0, 1, done)
+  also
+    wait 1200
+    view (440, 290, 430, 267)
+    fill(["A", "B"], 0.3, 1, done)
+  end
+  for k in ["A", "B", "T", "H"]
+    dropClass("reading", named("read" + k))
+  end
+  view (452, 340, 420, 260)
+  tone(990, 80, "sine", 0.06)
+  emit at (286, 238) "4 answers, together"
+  drop "pull" from named("d12"), named("d27")
+  drop "busy" from named("archivist")
+  wait 700
+
   # Step 3: The outputs of the experts are summed, each weighted by the router, and the token goes
   #   on.
   step 3
-  glideAll([[d, heart] for d in goes], 700)
-  remove goes
-  compute p for 400 say "Summing the outputs, each weighted by the router"
-  glide p to (500, spot.y) over 500
-  drop "hot" from spot
-  glide p to (500, layers[spot.n + 1].y) over 300
-  remove p
+  view (580, 80, 420, 260)
+  say "Pouring each answer by its weight" busy
+  let pours = [[(352, 300), 9, "card", "j0"], [(653, 304), 7.5, "transit", "j1"], [(486, 300), 6, "card", "j2"], [(818, 500), 4.5, "host", "j3"]]
+  for [pt, r, look, layer] in pours
+    let d = dot(pt[0], pt[1], r, "wl-dd " + look)
+    glide d to (870, 140) over 650
+    remove d
+    add "on" to named(layer)
+    tone(520, 60, "sine", 0.05)
+    wait 120
+  end
+  emit at (762, 384) "summed by weight"
+  wait 400
+  # The manuals go back to their places, and the tray and the lectern are free again.
+  let b5 = sprite("manual", (352, 310))
+  let b3 = sprite("manual", (486, 310))
+  drop "on" from named("readA"), named("readB"), named("readT"), named("readH")
+  for k in ["A", "B", "T", "H"]
+    setAttr(named("bar" + k), "width", 0)
+  end
+  wait 350
+  emit at (612, 325) "tray free"
+  glide b5 to (364, 146), b3 to (309, 146) over 600
+  remove b5, b3
+  drop "out" from named("m1"), named("m0")
+  drop "inuse" from named("place1"), named("place0")
+  add "away" to named("reader")
+  view (580, 0, 420, 260)
+  let rd2 = sprite("reader", (128, 372))
+  move rd2 along "M128,372 L128,50 L836,50" speed 420
+  emit at (560, 28) "the token goes on"
+  wait 300
+  remove rd2
+
   # Step 4: Every expert's use is counted.
   # A worker copies an expert that the counts show hotter than the coldest slot the token leaves
   #   unused into that slot, and never holds up a token.
   step 4
-  let w = dotAt(mid(miss), 3.2, "small")
-  travel(w, [(612, 400), mid(slots[5])], 260)
+  view (580, 350, 420, 260)
+  for k in ["j0", "j1", "j2", "j3"]
+    dropClass("on", named(k))
+  end
+  emit at (762, 384) "the sum went on"
+  say "Counting every expert's use" busy
+  setAttr(named("tally0"), "class", "wl-tally c4")
+  setAttr(named("tally1"), "class", "wl-tally c6")
+  setAttr(named("lg12"), "class", "wl-tally c1 on-paper")
+  setAttr(named("lg27"), "class", "wl-tally c5 on-paper hot")
+  tone(880, 40, "sine", 0.04)
+  wait 700
+  add "on" to named("cold")
+  emit at (640, 404) "#27 is hot"
+  wait 700
+  view (270, 80, 420, 260)
+  say "Copying #27 onto the coldest free place" busy
+  add "busy" to named("librarian")
+  add "pull" to named("d27")
+  let w = sprite("sheet", (476, 581))
+  add "fresh" to w
+  move w along "M476,581 L476,404 L716,404 L716,240 L420,240 L420,146" speed 380
   remove w
-  add "fresh" to slots[5]
-  wait 1s
+  drop "on" from named("cold")
+  add "gone" to named("m2")
+  wait 350
+  emit at (360, 236) "copy of #9 dropped"
+  add "on" to named("m2new")
+  setAttr(named("tally2"), "class", "wl-tally c5")
+  tone(1320, 70, "triangle", 0.06)
+  add "pull" to named("d9")
+  emit at (300, 404) "the original of #9 stays"
+  emit at (560, 28) "no token waited"
+  drop "busy" from named("librarian")
+  drop "pull" from named("d27")
+  wait 1500
+  drop "pull" from named("d9")
+  wait 2500
+  view all
 end

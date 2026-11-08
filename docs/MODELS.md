@@ -283,7 +283,7 @@ On the host that includes `F32`, through the dense expert product, which copies 
 |---|---|
 | BERT-shaped encoders (`nomic`, `bge` and the like) | `/v1/embeddings`, `/api/embed` |
 | Qwen3-Reranker checkpoint | `/v1/rerank` |
-| CLIP or SigLIP checkpoint directory | `/v1/embeddings`, `/v2/embed`, texts and images in 1 space ([guide](guides/embeddings.md)) |
+| CLIP or SigLIP checkpoint directory | `/v1/embeddings`, `/v2/embed`, texts and images in 1 space ([guide](https://loken-ai.github.io/loken/embeddings/)) |
 
 ## The qwen4exp family
 

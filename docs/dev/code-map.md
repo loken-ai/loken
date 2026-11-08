@@ -1,7 +1,7 @@
 # Code map of lokend
 
 Each part of lokend, with the code that holds it and the plan levels that code reads.
-[Inside lokend](../inside/map.md) explains the same parts to a user, without the code.
+[Inside lokend](https://loken-ai.github.io/loken/map/) explains the same parts to a user, without the code.
 
 ## Plan levels
 

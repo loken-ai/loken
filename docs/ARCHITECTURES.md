@@ -258,7 +258,7 @@ Each lesson in `learn/` describes a behaviour, and the tables below list the sou
 
 ### Lesson 1: Tokens
 
-[Lesson](learn/01-tokens.md)
+[Lesson](https://loken-ai.github.io/loken/tokens/)
 
 | File | Role |
 |---|---|
@@ -270,7 +270,7 @@ Each lesson in `learn/` describes a behaviour, and the tables below list the sou
 
 ### Lesson 2: What a model file holds
 
-[Lesson](learn/02-model-file.md)
+[Lesson](https://loken-ai.github.io/loken/model-file/)
 
 | File | Role |
 |---|---|
@@ -286,7 +286,7 @@ Each lesson in `learn/` describes a behaviour, and the tables below list the sou
 
 ### Lesson 3: Fewer bits per weight, and what it costs
 
-[Lesson](learn/03-quantisation.md)
+[Lesson](https://loken-ai.github.io/loken/quantisation/)
 
 | File | Role |
 |---|---|
@@ -311,7 +311,7 @@ cargo test --lib oracle_parity
 
 ### Lesson 4: One layer, then 40 of them
 
-[Lesson](learn/04-forward-pass.md)
+[Lesson](https://loken-ai.github.io/loken/forward-pass/)
 
 | File | Role |
 |---|---|
@@ -345,7 +345,7 @@ The assertion names the measured difference.
 
 ### Lesson 5: 2 regimes, one model
 
-[Lesson](learn/05-prefill-and-decode.md)
+[Lesson](https://loken-ai.github.io/loken/prefill-and-decode/)
 
 | File | Role |
 |---|---|
@@ -360,7 +360,7 @@ The 70B host-placement figure comes from [`STATUS.md`](STATUS.md#placement-measu
 
 ### Lesson 6: What the model remembers between tokens
 
-[Lesson](learn/06-kv-cache.md)
+[Lesson](https://loken-ai.github.io/loken/kv-cache/)
 
 | File | Role |
 |---|---|
@@ -373,11 +373,11 @@ The 70B host-placement figure comes from [`STATUS.md`](STATUS.md#placement-measu
 | `src/inference/engine/llm_engine/params.rs` | Keys `kv_disk_dir` (and its budget) and `fidelity`. Snapshots need no key. `fidelity = reference` turns the shift past the window off. |
 
 - The prefill chunk size comes from `adaptive_prefill_chunk` in `src/inference/engine/model_backend.rs`.
-- [`guides/kv-memory.md`](guides/kv-memory.md) is the user guide.
+- [`guides/kv-memory.md`](https://loken-ai.github.io/loken/kv-memory/) is the user guide.
 
 ### Lesson 7: From logits to a token
 
-[Lesson](learn/07-sampling.md)
+[Lesson](https://loken-ai.github.io/loken/sampling/)
 
 | File | Role |
 |---|---|
@@ -393,7 +393,7 @@ The comment above `kv_reuse_start` in `src/inference/engine/llm_engine/load.rs` 
 
 ### Lesson 8: More than one token per weight read
 
-[Lesson](learn/08-speculative-decoding.md)
+[Lesson](https://loken-ai.github.io/loken/speculative-decoding/)
 
 | File | Role |
 |---|---|
@@ -409,7 +409,7 @@ The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment
 
 ### Lesson 9: Fitting a model on the machine you have
 
-[Lesson](learn/09-placement.md)
+[Lesson](https://loken-ai.github.io/loken/placement/)
 
 | File | Role |
 |---|---|
@@ -425,7 +425,7 @@ The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment
 
 ### Lesson 10: Measuring an engine without fooling yourself
 
-[Lesson](learn/10-measuring.md)
+[Lesson](https://loken-ai.github.io/loken/measuring/)
 
 | Resource | Role |
 |---|---|

@@ -1,65 +1,223 @@
-# The scene of the backends: an image drawn by a card and decoded by the host.
+# The scene of the backends: an image generated, drawn as a literal schematic.
+# The line carries the prompt through 3 models to a PNG file.
+# The latent canvas clears from noise at each denoising step.
+# The decoder fills the larger pixel canvas tile by tile.
+# The band below shows where the blocks of the denoiser run.
 
-to target(i, j)
-  return 0.25 + 0.75 * max(0, 1 - hypot(i - 1.2, j - 1.5) / 2.6)
+let FIG = named("fig")
+let CELLS = query(".bk-cell")
+let RUNS = [["c0", 0, 5], ["c1", 5, 9], ["h", 9, 12]]
+
+# The latent value of the picture at a point of the 300 by 300 painting.
+to target(x, y)
+  let v = 0
+  if y < 188
+    v = 0.22 + 0.5 * y / 188
+  else
+    v = 0.2 - 0.12 * (y - 188) / 112
+    if 178 < x < 262 and y < 280
+      v += 0.3
+    end
+  end
+  v += 0.55 * max(0, 1 - hypot(x - 222, y - 186) / 52)
+  if (x < 140 and y > 206) or (x < 172 and y > 244)
+    v = 0.05
+  end
+  if 64 < x < 100 and 62 < y < 198
+    v = 0.92
+  end
+  if 66 < x < 98 and 40 < y < 64
+    v = 1
+  end
+  if y < 100 and x > 90 and abs(y - 58) < 6 + (x - 90) * 0.16
+    v += 0.14
+  end
+  let w = min(1, v)
+  return 0.06 + 0.94 * w * (0.3 + 0.7 * w)
+end
+
+let AIM = [target((num(data(c, "i")) + 0.5) * 15, (num(data(c, "j")) + 0.5) * 15) for c in CELLS]
+
+# Every element the story changes starts as drawn.
+for c in ["on", "in", "read", "feed", "busy", "tight", "over", "scan", "done", "ask"]
+  dropClass(c, query(".bk-x"))
+end
+retext(named("ctr"), "STEP 0 OF N")
+retext(named("tled"), "READY")
+retext(named("plate"), "12 BLOCKS TO PLACE")
+setAttr(named("gfill"), "width", 0)
+for c in CELLS
+  style(c, "fillOpacity", fixed(0.06 + 0.94 * random(), 2))
+end
+
+# Lights a rail of the line for a moment.
+to flow(name, ms)
+  addClass("on", named(name))
+  wait ms
+  dropClass("on", named(name))
+end
+
+# The centre of a slot of the band.
+to slot(name)
+  return centre(named(name))
+end
+
+# 1 denoising step: fresh noise mixed with the picture, the picture weighing `a`.
+to denoise(a)
+  for [k, c] in enumerate(CELLS)
+    style(c, "fillOpacity", fixed(a * AIM[k] + (1 - a) * random(), 2))
+  end
+end
+
+# Restarts the sweep of a canvas.
+to sweep(name)
+  dropClass("on", named(name))
+  wait 30ms
+  addClass("on", named(name))
 end
 
 scene image
-  # An image generated.
-  let muscles = sortBy([c for c in [centre(e) for e in query("[data-group=\"backends\"] .t")] if c[0] > 500], 1)
-  let media = sortBy([centre(e) for e in query("[data-group=\"media\"] .t")], 0)
-  let throat = media[0]
-  let hand = media[-1]
-  let upper = muscles[0]
-  let fore = muscles[1]
-  let n = 4
-  let cell = 12
-  let x0 = hand[0] - 2 * cell
-  let y0 = hand[1] + 40
-  let cells = []
-  for j in range(n)
-    for i in range(n)
-      let c = shape("rect", {class: "cell", x: x0 + i * cell, y: y0 + j * cell, width: cell - 1, height: cell - 1})
-      style(c, "fillOpacity", fixed(0.2 + 0.8 * random(), 2))
-      cells += [(c, i, j)]
-    end
-  end
+  let bricks = []
   # Step 0: The images route takes the prompt.
   step 0
-  let p = dotAt(throat)
-  wait 700
+  view named("ticket"), named("enc")
+  wait 300ms
+  addClass("in", named("ticket"))
+  cue("pop", 2)
+  wait 900ms
+  addClass("read", named("ticket"))
+  wait 2.2s
+
   # Step 1: The text encoder reads the prompt.
   step 1
-  travel(p, [(upper[0], upper[1] - 60), upper], 260)
-  light "backends" "flex" on
-  compute p for 800 say "Computing on a card"
-  # Step 2: The denoiser clears a latent image step by step.
-  # The placement plan puts it whole on a card that holds it, else spreads its blocks over the cards
-  #   and the host.
+  view named("ticket"), named("enc")
+  addClass("on", named("enc"))
+  addClass("on", named("r0"))
+  let toks = [dotAt(p, 4, "bk-tok") for p in [(40, 188), (100, 188), (160, 188), (60, 206)]]
+  together for [i, t] in enumerate(toks)
+    wait i * 160
+    move t via (214, 180), (286, 176) speed 260
+    remove t
+  end
+  dropClass("on", named("r0"))
+  for i in range(8)
+    addClass("on", named("v" + str(i)))
+    tone(520 + i * 40, 50, "sine", 0.04)
+    wait 110ms
+  end
+  dropClass("on", named("enc"))
+  wait 2s
+
+  # Step 2: The placement plan puts the denoiser whole on a card that holds it,
+  #   else spreads its blocks over the cards and the host.
   step 2
-  glide p to fore over 500
-  for s in range(1, 7)
-    compute p for 380 say "Computing on a card"
-    for [c, i, j] in cells
-      let now = num(style(c, "fillOpacity"))
-      let aim = target(i, j)
-      style(c, "fillOpacity", fixed(now + (aim - now) * s / 6, 2))
-    end
-    wait 140
-  end
-  # Step 3: The decoder turns the latent into pixels.
-  # It works tile by tile when the whole image does not fit the card.
-  # Boogu decodes every image larger than 1 tile in tiles.
+  view "plan", named("dc0")
+  bricks = [sprite("b" + str(n + 1), slot("st" + str(n))) for n in range(12)]
+  wait 500ms
+  retext(named("plate"), "A CARD HOLDS IT: WHOLE")
+  say "Whole on a card that holds it"
+  glideAll([[b, slot("c0s" + str(n))] for [n, b] in enumerate(bricks)], 900)
+  addClass("on-c0", bricks)
+  cue("click", 0)
+  wait 2s
+  retext(named("plate"), "ELSE: SPREAD")
+  say "Else: spread over cards and host"
+  addClass("tight", FIG)
+  view named("dc0"), named("dc1")
+  wait 900ms
+  let aims = [slot("c1s" + str(n - 5)) for n in range(5, 9)] + [slot("hs" + str(n - 9)) for n in range(9, 12)]
+  let moving = bricks[5:12]
+  glideAll([[b, (pos(b)[0], 640)] for b in moving], 350)
+  glideAll([[b, (aims[i][0], 640)] for [i, b] in enumerate(moving)], 800)
+  glideAll([[b, aims[i]] for [i, b] in enumerate(moving)], 350)
+  dropClass("on-c0", bricks[5:12])
+  addClass("on-c1", bricks[5:9])
+  addClass("on-h", bricks[9:12])
+  cue("click", 4)
+  view named("dc1"), named("dh")
+  say "Card 0, card 1, then the host"
+  wait 2.4s
+
+  # Step 3: The denoiser clears a latent image step by step, from noise.
+  #   Each step reads the encoded prompt and runs every block in order.
   step 3
-  light "backends" "flex" off
-  glide p to hand over 500
-  for [ti, tj] in [(0, 0), (1, 0), (0, 1), (1, 1)]
-    light "media" "draw" in "path.t"
-    compute p for 350 say "Decoding a tile"
-    add "px" to [c for [c, i, j] in cells if floor(i / 2) == ti and floor(j / 2) == tj]
+  view (310, 158, 276, 416)
+  addClass("on", named("den"))
+  for s in range(1, 7)
+    retext(named("ctr"), "STEP " + ("N" if s == 6 else str(s)) + " OF N")
+    addClass("feed", query(".bk-vec"))
+    addClass("on", named("r1"))
+    wait 160ms
+    dropClass("feed", query(".bk-vec"))
+    dropClass("on", named("r1"))
+    for [dev, lo, hi] in RUNS
+      addClass("busy", named("d" + dev))
+      for b in bricks[lo:hi]
+        addClass("hot", b)
+        wait 45ms
+        dropClass("hot", b)
+      end
+      dropClass("busy", named("d" + dev))
+    end
+    denoise(s / 6)
+    sweep("lsweep")
+    addClass("on", named("k" + str(s - 1)))
+    tone(330 + s * 55, 90, "triangle", 0.05)
+    wait 380ms
   end
-  # Step 4: The image leaves as a PNG, or re-encoded as JPEG or WebP when the request asks.
+  dropClass("on", [named("den"), named("lsweep")])
+  wait 1.6s
+
+  # Step 4: The decoder turns the latent into pixels.
+  #   It works in overlapping tiles when the whole image does not fit the card.
+  #   It works on the host when no tile fits.
   step 4
-  emit at (x0, y0 + n * cell + 16) "image.png"
-  wait 1500
+  view (556, 112, 400, 150)
+  addClass("on", named("dec"))
+  flow("r2", 700)
+  retext(named("tled"), "WHOLE IMAGE?")
+  addClass("over", named("gfill"))
+  setAttr(named("gfill"), "width", 124)
+  wait 1.1s
+  say "The whole image does not fit"
+  cue("error", 0)
+  wait 900ms
+  dropClass("over", named("gfill"))
+  setAttr(named("gfill"), "width", 40)
+  retext(named("tled"), "A TILE FITS")
+  say "A tile fits: decode in tiles"
+  wait 1.2s
+  view "pixels"
+  for k in range(4)
+    retext(named("tled"), "TILE " + str(k + 1) + " OF 4")
+    say "Decoding tile " + str(k + 1) + " of 4"
+    addClass("on", [named("q" + str(k)), named("t" + str(k)), named("tt" + str(k))])
+    addClass("on", named("r4"))
+    addClass("scan", named("c" + str(k)))
+    if k == 1
+      addClass("on", named("ovl"))
+    end
+    tone(440 + k * 60, 80, "sine", 0.05)
+    wait 750ms
+    addClass("done", named("c" + str(k)))
+    dropClass("on", [named("q" + str(k)), named("r4")])
+    wait 250ms
+    dropClass("on", [named("t" + str(k)), named("tt" + str(k))])
+  end
+  dropClass("on", [named("dec"), named("ovl")])
+  retext(named("tled"), "4 TILES DONE")
+  wait 1.6s
+
+  # Step 5: The image leaves as a PNG, or re-encoded as JPEG or WebP when the request asks.
+  step 5
+  view named("dec"), named("file"), named("fpng"), named("fwebp")
+  flow("r3", 600)
+  addClass("on", named("file"))
+  addClass("on", named("fpng"))
+  cue("ding", 5)
+  wait 1.4s
+  say "JPEG or WebP if asked"
+  addClass("ask", [named("fjpg"), named("fwebp")])
+  wait 2.6s
+  say "Image written"
 end

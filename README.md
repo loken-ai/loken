@@ -36,7 +36,7 @@ It reaches the network to fetch a model you asked for, and to announce a cluster
 - Replicated serving and sharding across machines.
 - Energy reported per request.
 
-[`docs/start/overview.md`](docs/start/overview.md) holds the full table: each capability, its route, its configuration key and its state.
+[`docs/site/01-get-started/01-overview.md`](https://loken-ai.github.io/loken/overview/) holds the full table: each capability, its route, its configuration key and its state.
 
 ## Expose it on a network
 
@@ -47,9 +47,9 @@ Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` in `
 
 | Page | Read it to |
 |---|---|
-| [`docs/start/install.md`](docs/start/install.md) | Build and install loken |
-| [`docs/guides/`](docs/guides/) | Do one task, with the smallest configuration and one request |
-| [`docs/learn/`](docs/learn/) | Learn the fundamentals of inference in 10 lessons |
+| [`docs/site/01-get-started/02-install.md`](https://loken-ai.github.io/loken/install/) | Build and install loken |
+| [`docs/site/02-guides/`](https://loken-ai.github.io/loken/) | Do one task, with the smallest configuration and one request |
+| [`docs/site/05-learn/`](https://loken-ai.github.io/loken/) | Learn the fundamentals of inference in 10 lessons |
 | [`docs/API.md`](docs/API.md) | Look up a route on the 3 surfaces |
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Look up a key of `config.toml` and its default |
 | [`docs/STATUS.md`](docs/STATUS.md) | See what is measured, what is slower, and what has never run |
