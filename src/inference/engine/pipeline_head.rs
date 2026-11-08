@@ -196,6 +196,25 @@ impl ModelBackend for PipelineHeadBackend {
         self.model.device_layer_distribution()
     }
 
+    fn expert_cost_shape(
+        &self,
+    ) -> Option<(
+        usize,
+        usize,
+        crate::tensor::quantized::GgmlDType,
+        crate::tensor::quantized::GgmlDType,
+    )> {
+        self.model.wide_expert_cost_shape()
+    }
+
+    fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        self.model.wide_placement_inputs()
+    }
+
+    fn card_residency(&self) -> Option<Vec<(usize, u64)>> {
+        self.model.wide_card_residency()
+    }
+
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Err(self)
     }

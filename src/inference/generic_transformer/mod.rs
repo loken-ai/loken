@@ -147,6 +147,9 @@ pub mod wide_pipeline;
 mod wide_pipeline_tests;
 #[cfg(test)]
 mod wide_sparse_batch_tests;
+mod wide_sparse_cluster;
+#[cfg(test)]
+pub(crate) mod wide_sparse_cluster_tests;
 pub mod wide_sparse_config;
 #[cfg(test)]
 mod wide_sparse_config_tests;

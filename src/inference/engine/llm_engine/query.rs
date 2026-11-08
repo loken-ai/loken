@@ -117,19 +117,23 @@ impl LlmEngine {
     }
 
     /// Where the loaded model's weights are read from: whether some are on the host (a layer,
-    /// or experts streamed from there), and whether some layers are on a card. `None` when no
-    /// model is loaded.
+    /// or experts streamed from there), and whether some are on a card (a layer, or weights a
+    /// card holds for layers that run on the host). `None` when no model is loaded.
     pub async fn layers_on_host_and_cards(&self) -> Option<(bool, bool)> {
         let guard = self.model_state.lock().await;
         let s = guard.as_ref()?;
         let streams = s.model.placement_model_inputs().is_some();
+        let resident = s.model.card_residency().is_some_and(|c| !c.is_empty());
         let segs = s.model.device_layer_distribution();
         if segs.is_empty() {
-            return Some((streams || !s.device.is_cuda(), s.device.is_cuda()));
+            return Some((
+                streams || !s.device.is_cuda(),
+                resident || s.device.is_cuda(),
+            ));
         }
         Some((
             streams || segs.iter().any(|(dev, ..)| dev == "CPU"),
-            segs.iter().any(|(dev, ..)| dev != "CPU"),
+            resident || segs.iter().any(|(dev, ..)| dev != "CPU"),
         ))
     }
 

@@ -2665,6 +2665,25 @@ impl ModelBackend for GenericBackend {
         self.0.device_layer_distribution()
     }
 
+    fn expert_cost_shape(
+        &self,
+    ) -> Option<(
+        usize,
+        usize,
+        crate::tensor::quantized::GgmlDType,
+        crate::tensor::quantized::GgmlDType,
+    )> {
+        self.0.wide_expert_cost_shape()
+    }
+
+    fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        self.0.wide_placement_inputs()
+    }
+
+    fn card_residency(&self) -> Option<Vec<(usize, u64)>> {
+        self.0.wide_card_residency()
+    }
+
     /// A model whose layers keep each sequence's state batches when its token mixers run on a
     /// card.
     fn cb_eligible_gpu(&self) -> bool {

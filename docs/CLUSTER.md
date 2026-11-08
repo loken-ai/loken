@@ -138,7 +138,7 @@ sequenceDiagram
 
 | Model | Cost of a node's run of layers |
 |---|---|
-| Mixture of experts (DeepSeek V4.1) | Layers at `layer_ms`, plus the routed experts the cards do not hold at `miss_ms` each. Residency is the room left after the always-read weights. |
+| Wide-residual mixture of experts (DeepSeek V4.1) | Layers at `layer_ms`, plus the routed experts the cards do not hold at `miss_ms` each. Residency is the room left after the token mixers. The working set of a layer is the length of the routing prior of the file. A file without a prior is not split. |
 | Dense transformer | Each layer at `layer_ms` on a card, or `miss_ms` on the host. The stack starts on the node that holds the request. |
 
 When a split pays, the head calls `/api/pipeline/tail` on every later segment, the last first, then connects its own model to the first tail.

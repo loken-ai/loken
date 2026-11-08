@@ -282,6 +282,18 @@ impl CompressedBand {
         if self.card_band.is_some() {
             return self.card_bytes();
         }
+        self.base.resident_bytes() + self.role_bytes()
+    }
+
+    /// Bytes of the weights every token reads, as the host holds them: the window mixer's
+    /// projections as stored, and the weights of the layer's roles.
+    pub fn stored_bytes(&self) -> usize {
+        self.base.stored_bytes() + self.role_bytes()
+    }
+
+    /// Bytes of the indexer's query factor as stored, and of its head weights, its key
+    /// projection and the pooling weights as F32.
+    fn role_bytes(&self) -> usize {
         let dense = |t: &Tensor| t.elem_count() * std::mem::size_of::<f32>();
         let indexer = self.indexer.as_ref().map_or(0, |i| {
             i.wq_b.bytes() + dense(&i.weights_proj) + i.wk.as_ref().map_or(0, dense)
@@ -290,7 +302,7 @@ impl CompressedBand {
             .compressor
             .as_ref()
             .map_or(0, |c| dense(&c.wkv) + c.wgate.as_ref().map_or(0, dense));
-        self.base.resident_bytes() + indexer + compressor
+        indexer + compressor
     }
 
     /// The layer over the window mixer `base`, with the weights of its roles.
@@ -367,6 +379,12 @@ impl CompressedBand {
     #[cfg(feature = "gpu")]
     pub fn card_bytes(&self) -> usize {
         self.base.card_bytes() + self.card_band.as_ref().map_or(0, |c| c.weight_bytes())
+    }
+
+    /// The ordinal of the card the layer runs on, `None` on the host.
+    #[cfg(feature = "gpu")]
+    pub fn card_ordinal(&self) -> Option<usize> {
+        self.base.card_ordinal()
     }
 
     /// Tokens the layer's window ring on its card stands for, 0 before the first decode step.

@@ -467,6 +467,11 @@ impl LatentMqa {
         self.card.as_ref().map_or(0, |c| c.weight_bytes())
     }
 
+    /// The ordinal of the card the layer runs on, `None` on the host.
+    pub fn card_ordinal(&self) -> Option<usize> {
+        self.card.as_ref().map(|c| c.dev().ordinal())
+    }
+
     /// Tokens the layer's window ring on its card stands for, 0 before the first decode step.
     pub fn card_ring_tokens(&self) -> usize {
         self.card.as_ref().map_or(0, |c| c.ring_tokens())

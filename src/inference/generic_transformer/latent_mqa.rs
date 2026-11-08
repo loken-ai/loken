@@ -141,6 +141,12 @@ impl LatentMqa {
         if self.card.is_some() {
             return self.card_bytes();
         }
+        self.stored_bytes()
+    }
+
+    /// Bytes of the projections every token reads, as the file stores them: the query factors,
+    /// the key row and the grouped output.
+    pub fn stored_bytes(&self) -> usize {
         self.w.wq_a.bytes() + self.w.wq_b.bytes() + self.w.wkv.bytes() + self.w.wo_a.bytes()
     }
 

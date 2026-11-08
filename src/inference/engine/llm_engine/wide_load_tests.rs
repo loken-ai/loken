@@ -160,6 +160,51 @@ async fn a_wide_file_loaded_by_the_engine_answers_as_the_oracle_models() {
     }
 }
 
+/// An engine that loads a wide file whose prior lies beside it gives the cluster the cost shape
+/// and the placement inputs of the V4.1 backend of the file, and says its experts run on the
+/// host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loaded_wide_file_gives_the_cluster_the_inputs_of_the_v41_backend() {
+    use crate::inference::generic_transformer::wide_sparse_cluster_tests::v41_with_prior;
+    use crate::inference::generic_transformer::wide_sparse_routing_tests::{turning, ROUTED};
+    use crate::inference::model::deepseek_v41::sibling;
+    for layout in LAYOUTS {
+        let label = format!("layout {:?}", layout.0);
+        let path = toy_on_disk(layout, false);
+        sibling::write_prior(
+            &path.with_file_name("side"),
+            &turning(layout.0.len(), ROUTED as u32),
+        )
+        .unwrap();
+        let engine = loaded(&path, InferenceConfig::default()).await;
+        assert_eq!(is_wide_generic(&engine).await, (true, false), "{label}");
+        let v41 = DeepseekV41Backend::new(v41_with_prior(&path), 0, 128);
+        let (old, _) = engine_holding(Box::new(v41), layout.0.len()).await;
+
+        let shape = engine.expert_cost_shape().await;
+        assert!(
+            shape.is_some(),
+            "{label}: a clustered node prices a missed expert"
+        );
+        assert_eq!(shape, old.expert_cost_shape().await, "{label}");
+        let inputs = engine.placement_model_inputs().await;
+        assert!(
+            inputs.is_some(),
+            "{label}: the prior beside the file sizes the working set"
+        );
+        assert_eq!(inputs, old.placement_model_inputs().await, "{label}");
+        let (host, cards) = engine.layers_on_host_and_cards().await.unwrap();
+        assert!(host, "{label}: the experts are read on the host");
+        if !cfg!(feature = "gpu") {
+            assert!(
+                !cards,
+                "{label}: a build without cards holds nothing on one"
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
 /// A quality level other than exact loads and calibrates through the engine: a model on 1
 /// device kind has no second run to measure its noise against, so routing stays exact and the
 /// answer is the exact one.
