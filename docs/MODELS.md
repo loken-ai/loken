@@ -205,6 +205,9 @@ The routed experts stay in the file, which may be split, and the placement plan 
 
 The routed experts stay in the file, which may be split, and are read as routing asks for them.
 The always-read weights and the busiest experts sit on the cards.
+A packed weight on the card runs the fastest of its products that is no farther from the exact product than the host.
+Products whose measured times differ by less than their measured noise are tied.
+A tie falls to the product nearest the exact one, so the timing noise of a load does not change the text.
 
 A routing prior that the file lacks is borrowed from a companion GGUF beside it, found by the metadata it declares.
 

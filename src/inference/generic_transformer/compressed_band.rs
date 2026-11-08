@@ -272,6 +272,16 @@ pub struct CompressedBand {
 }
 
 impl CompressedBand {
+    /// Every projection as dense F32 values, so a product reads the weights unquantised.
+    #[cfg(all(test, feature = "gpu"))]
+    pub(super) fn dequantise_projections(&mut self) -> Result<()> {
+        self.base.dequantise_projections()?;
+        if let Some(ix) = &mut self.indexer {
+            ix.wq_b = ix.wq_b.dense_form()?;
+        }
+        Ok(())
+    }
+
     /// Bytes of the weights every token reads, as held: the window mixer's projections, the
     /// indexer's query factor, head weights and key projection, and the pooling weights.
     ///
@@ -358,12 +368,16 @@ impl CompressedBand {
     }
 
     /// Runs the layer's projections and attention on the card `ordinal`, and its compressor,
-    /// index keys and indexer on a decode step.
+    /// index keys and indexer on a decode step, its block weights in their units of `choices`.
     ///
     /// The host weights and the host state stay.
     #[cfg(feature = "gpu")]
-    pub fn on_card(&mut self, ordinal: usize) -> Result<()> {
-        self.base.on_card(ordinal)?;
+    pub(super) fn on_card(
+        &mut self,
+        ordinal: usize,
+        choices: &super::card_packed::Choices,
+    ) -> Result<()> {
+        self.base.on_card(ordinal, choices)?;
         let Some(card) = self.base.card.as_ref() else {
             return Err(crate::tensor::Error::msg("the layer is not on a card"));
         };
@@ -371,6 +385,7 @@ impl CompressedBand {
             card.dev(),
             self.compressor.as_ref(),
             self.indexer.as_ref(),
+            choices,
         )?));
         Ok(())
     }

@@ -23,7 +23,7 @@
 //! A restore, a rewind or a restart changes the stamp, so a buffer never serves a state it does
 //! not hold.
 
-use super::card_packed::PackedDev;
+use super::card_packed::{Choices, PackedDev};
 use super::latent_mqa::{phases, Front, LatentMqa, LatentMqaState, FP8_BLOCK};
 use crate::tensor::cuda::{
     alloc_f32, fp8_round, gather_ring, pack_download, put_cols, rms_norm_f32, rope_tokens,
@@ -199,19 +199,19 @@ pub(super) fn window_slots(old: usize, seq: usize, window: usize) -> Vec<i32> {
 }
 
 impl CardLatent {
-    /// The layer `m` on `dev`.
-    pub(super) fn new(dev: Arc<CudaDevice>, m: &LatentMqa) -> Result<Self> {
+    /// The layer `m` on `dev`, its block weights in their units of `choices`.
+    pub(super) fn new(dev: Arc<CudaDevice>, m: &LatentMqa, choices: &Choices) -> Result<Self> {
         Ok(Self {
-            wq_a: PackedDev::new(&dev, &m.w.wq_a)?,
+            wq_a: PackedDev::new(&dev, &m.w.wq_a, choices)?,
             q_norm: vector(&dev, &m.w.q_norm)?,
-            wq_b: PackedDev::new(&dev, &m.w.wq_b)?,
-            wkv: PackedDev::new(&dev, &m.w.wkv)?,
+            wq_b: PackedDev::new(&dev, &m.w.wq_b, choices)?,
+            wkv: PackedDev::new(&dev, &m.w.wkv, choices)?,
             kv_norm: vector(&dev, &m.w.kv_norm)?,
             sink: upload_f32(&dev, "mixer sink", &m.w.sink)?,
             wo: m
                 .wo_groups
                 .iter()
-                .map(|g| PackedDev::new(&dev, g))
+                .map(|g| PackedDev::new(&dev, g, choices))
                 .collect::<Result<Vec<_>>>()?,
             iota: upload_i32(
                 &dev,
@@ -451,14 +451,15 @@ impl CardLatent {
 }
 
 impl LatentMqa {
-    /// Runs the layer's projections and attention on the card `ordinal`.
+    /// Runs the layer's projections and attention on the card `ordinal`, its block weights in
+    /// their units of `choices`.
     ///
     /// The host weights and the host state stay.
-    pub fn on_card(&mut self, ordinal: usize) -> Result<()> {
+    pub(super) fn on_card(&mut self, ordinal: usize, choices: &Choices) -> Result<()> {
         let Device::Cuda(dev) = Device::new_cuda(ordinal)? else {
             return Err(Error::msg("card mixers need a CUDA device"));
         };
-        self.card = Some(Arc::new(CardLatent::new(dev, self)?));
+        self.card = Some(Arc::new(CardLatent::new(dev, self, choices)?));
         Ok(())
     }
 

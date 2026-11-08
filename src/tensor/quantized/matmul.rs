@@ -305,6 +305,22 @@ impl QMatMul {
         }
     }
 
+    /// The blocks of a quantised weight on a card, as stored: `(blocks, type, n, k)`.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn card_blocks(
+        &self,
+    ) -> Option<(
+        &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
+        GgmlDType,
+        usize,
+        usize,
+    )> {
+        match self {
+            Self::QTensor(qt) => qt.native_qmm().ok()?.card_blocks(),
+            _ => None,
+        }
+    }
+
     /// Raw CPU quantized weight `(dtype, k, n, bytes)` for fused multi-weight
     /// regions (MoE flat `matmul_bytes_multi`). Forwards to the kernel matmul
     /// (the borrow lives as long as `self` - `native_qmm` caches a reference).

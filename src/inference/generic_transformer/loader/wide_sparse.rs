@@ -972,10 +972,13 @@ impl GenericHeteroTransformer {
 
         // A layer on a card runs its token mixer's projections and attention there.
         // The residual mixing, the feed-forward and the head stay on the host.
+        // The block weights of every card layer share the products measured per unit.
+        #[cfg(feature = "gpu")]
+        let choices = super::super::card_packed::Choices::default();
         for (il, layer) in layers.iter_mut().enumerate() {
             if let Some(ordinal) = card_of(il) {
                 #[cfg(feature = "gpu")]
-                layer.mixer.on_card(ordinal)?;
+                layer.mixer.on_card(ordinal, &choices)?;
                 #[cfg(not(feature = "gpu"))]
                 crate::tensor::bail!(
                     "layer {il} is placed on CUDA card {ordinal}: no card feature"

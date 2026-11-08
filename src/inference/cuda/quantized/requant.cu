@@ -2797,6 +2797,51 @@ TX_ENTRIES(q2_k, TX_Q2K)
 TX_ENTRIES(q4_k, TX_Q4K)
 TX_ENTRIES(q6_k, TX_Q6K)
 
+// A dense projection on a card as the host computes it: the weight rows `w` [n, nsb * block bytes]
+// against `rows` q8_K rows `xq` [rows, nsb * CX_Q8K_BYTES], written to y [rows, n]. A warp per
+// (output row, group of PX_ROWS activation rows): the weight block is read once for the group,
+// and each row takes the steps of tx_row, the dot of ExactDot.
+#define PX_ROWS 4
+template <int F> __device__ static void px_matvec(
+        const unsigned char * __restrict__ w, const unsigned char * __restrict__ xq,
+        float * __restrict__ y, const int nsb, const int n, const int rows) {
+    const int row = blockIdx.x, r0 = blockIdx.y * PX_ROWS, lane = threadIdx.x;
+    const int cnt = min(PX_ROWS, rows - r0);
+    const unsigned char * wr = w + (long) row * nsb * TxFmt<F>::BYTES;
+    float acc[PX_ROWS];
+    #pragma unroll
+    for (int t = 0; t < PX_ROWS; ++t) acc[t] = -0.0f;
+    for (int b = 0; b < nsb; ++b) {
+        const unsigned char * wb = wr + (long) b * TxFmt<F>::BYTES;
+        #pragma unroll
+        for (int t = 0; t < PX_ROWS; ++t) {
+            if (t < cnt) {
+                const unsigned char * ab = xq + ((long) (r0 + t) * nsb + b) * CX_Q8K_BYTES;
+                int scaled, offset;
+                tx_lane_sums<F>(wb, ab, lane, &scaled, &offset);
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    scaled += __shfl_xor_sync(0xffffffffu, scaled, off);
+                    offset += __shfl_xor_sync(0xffffffffu, offset, off);
+                }
+                acc[t] = __fadd_rn(acc[t], tx_combine<F>(wb, *reinterpret_cast<const float *>(ab), scaled, offset));
+            }
+        }
+    }
+    if (lane == 0) {
+        for (int t = 0; t < cnt; ++t) y[(long) (r0 + t) * n + row] = acc[t];
+    }
+}
+
+#define PX_ENTRY(name, F)                                                                            \
+extern "C" __global__ void px_matvec_##name(                                                         \
+        const unsigned char * __restrict__ w, const unsigned char * __restrict__ xq,                 \
+        float * __restrict__ y, const int nsb, const int n, const int rows) {                        \
+    px_matvec<F>(w, xq, y, nsb, n, rows);                                                            \
+}
+PX_ENTRY(q4_k, TX_Q4K)
+PX_ENTRY(q6_k, TX_Q6K)
+
 // After a recorded decode's answer: which pairs the transit room runs (late_slots, the expert's
 // place there, all ones for the others) and where each pair's row is read from (src: -1 for the
 // card's rows, the pair for the host's). The late pairs are read from the mailbox only when the

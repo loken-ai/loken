@@ -81,6 +81,17 @@ impl Projection {
         })
     }
 
+    /// The same weight as dense F32 values: what a product with no weight quantisation reads.
+    #[cfg(all(test, feature = "gpu"))]
+    pub fn dense_form(&self) -> Result<Self> {
+        let dims = self.dims();
+        Ok(Self::Dense(Tensor::from_vec(
+            self.dense_f32()?,
+            (dims[0], dims[1]),
+            &Device::Cpu,
+        )?))
+    }
+
     /// The bytes behind the projection, as stored.
     pub fn bytes(&self) -> usize {
         match self {

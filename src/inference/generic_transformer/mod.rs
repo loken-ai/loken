@@ -168,6 +168,8 @@ mod wide_sparse_plan_tests;
 mod wide_sparse_quality_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod wide_sparse_real_card_tests;
+#[cfg(all(test, feature = "cuda"))]
+mod wide_sparse_real_exact_tests;
 #[cfg(test)]
 pub(crate) mod wide_sparse_real_tests;
 mod wide_sparse_routing;

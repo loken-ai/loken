@@ -365,6 +365,21 @@ impl QKernelMatMul {
         x32.matmul_t(&wt)
     }
 
+    /// The blocks on the card as stored, with their type and the weight's `[n, k]`.
+    /// `None` for a weight that is not on a card.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn card_blocks(
+        &self,
+    ) -> Option<(
+        &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
+        GgmlDType,
+        usize,
+        usize,
+    )> {
+        let blob = self.blob.as_ref()?;
+        Some((blob, self.dtype, self.n, self.k))
+    }
+
     /// The whole weight dequantised on its card to a fresh dense F32 buffer of `n * k` values.
     /// `None` for a weight that is not a GPU K-quant (Q4_K, Q5_K, Q6_K) or Q8_0 blob.
     #[cfg(feature = "gpu")]

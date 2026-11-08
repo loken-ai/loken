@@ -15,7 +15,7 @@
 //! the cell of the band.
 
 use super::card_mixers::{sync_rows, vector, Arenas, CardFront, CardLatent};
-use super::card_packed::PackedDev;
+use super::card_packed::{Choices, PackedDev};
 use super::compressed_band::{
     put, read, BandIndexerWeights, BandState, CompressedBand, CompressorWeights, COMPRESSED_BLOCK,
     INDEX_BLOCK,
@@ -105,8 +105,9 @@ impl CardBand {
         dev: &Arc<CudaDevice>,
         compressor: Option<&CompressorWeights>,
         indexer: Option<&BandIndexerWeights>,
+        choices: &Choices,
     ) -> Result<Self> {
-        let dense = |t: &Tensor| PackedDev::new(dev, &Projection::Dense(t.clone()));
+        let dense = |t: &Tensor| PackedDev::new(dev, &Projection::Dense(t.clone()), choices);
         let compressor = compressor
             .map(|c| -> Result<CardCompressor> {
                 Ok(CardCompressor {
@@ -119,7 +120,7 @@ impl CardBand {
         let indexer = indexer
             .map(|i| -> Result<CardIndexer> {
                 Ok(CardIndexer {
-                    wq_b: PackedDev::new(dev, &i.wq_b)?,
+                    wq_b: PackedDev::new(dev, &i.wq_b, choices)?,
                     weights: dense(&i.weights_proj)?,
                     wk: i.wk.as_ref().map(dense).transpose()?,
                     k_norm: i.k_norm.as_ref().map(|t| vector(dev, t)).transpose()?,

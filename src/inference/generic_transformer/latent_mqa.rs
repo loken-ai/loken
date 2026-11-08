@@ -230,6 +230,25 @@ impl LatentMqa {
         })
     }
 
+    /// Every projection as dense F32 values, so a product reads the weights unquantised.
+    #[cfg(all(test, feature = "gpu"))]
+    pub(super) fn dequantise_projections(&mut self) -> Result<()> {
+        let d = self.dims;
+        self.w.wq_a = self.w.wq_a.dense_form()?;
+        self.w.wq_b = self.w.wq_b.dense_form()?;
+        self.w.wkv = self.w.wkv.dense_form()?;
+        // The groups are what a forward reads: `wo_a` stays as stored.
+        self.wo_groups = (0..d.o_groups)
+            .map(|g| {
+                self.w
+                    .wo_a
+                    .rows(g * d.o_lora_rank, d.o_lora_rank)?
+                    .dense_form()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(())
+    }
+
     /// Multiplies a score before the softmax.
     pub(super) fn scale(&self) -> f32 {
         (self.dims.head_dim as f32).powf(-0.5)

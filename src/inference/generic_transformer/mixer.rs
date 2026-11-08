@@ -343,11 +343,17 @@ impl Mixer {
 
     /// Runs the mixer's projections and attention on the card `ordinal`, its host weights and
     /// host state staying. Only the latent attention mixers have a card form.
+    ///
+    /// Its block weights join their units of `choices`, which the model's card weights share.
     #[cfg(feature = "gpu")]
-    pub fn on_card(&mut self, ordinal: usize) -> Result<()> {
+    pub(super) fn on_card(
+        &mut self,
+        ordinal: usize,
+        choices: &super::card_packed::Choices,
+    ) -> Result<()> {
         match self {
-            Mixer::LatentMqa(m) => m.on_card(ordinal),
-            Mixer::CompressedBand(m) => m.on_card(ordinal),
+            Mixer::LatentMqa(m) => m.on_card(ordinal, choices),
+            Mixer::CompressedBand(m) => m.on_card(ordinal, choices),
             _ => Err(crate::tensor::Error::msg(
                 "this mixer has no form that runs on a card",
             )),

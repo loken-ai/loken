@@ -52,6 +52,14 @@ pub(crate) fn blob(tag: &str) -> std::path::PathBuf {
 
 /// The tokens of the prompt: the file's own tokenizer, after the begin token it names.
 pub(crate) fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u32> {
+    ids_of(content, PROMPT)
+}
+
+/// The tokens of `prompt`: the file's own tokenizer, after the begin token it names.
+pub(crate) fn ids_of(
+    content: &crate::tensor::quantized::gguf_file::Content,
+    prompt: &str,
+) -> Vec<u32> {
     use crate::inference::engine::llm_engine::{build_tokenizer_from_gguf, EMBEDDED_TOKENIZER_KEY};
     let text = |k: &str| {
         content
@@ -69,7 +77,7 @@ pub(crate) fn prompt_ids(content: &crate::tensor::quantized::gguf_file::Content)
         .and_then(|v| v.to_u32().ok())
         .into_iter()
         .collect();
-    ids.extend_from_slice(tokenizer.encode(PROMPT, false).unwrap().get_ids());
+    ids.extend_from_slice(tokenizer.encode(prompt, false).unwrap().get_ids());
     ids
 }
 
@@ -281,8 +289,334 @@ impl Stages {
     }
 }
 
+/// The mixer output and the hidden state after each layer, last row, of the staged forwards that
+/// run while it holds `Some`.
+pub(super) static TRACE: std::sync::Mutex<Option<Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>>> =
+    std::sync::Mutex::new(None);
+
+/// Records one layer of the trace when it is on.
+fn trace_layer(mixed: Option<&Tensor>, twin: Option<&Tensor>, hidden: &Tensor) {
+    let mut t = TRACE.lock().unwrap();
+    if let Some(v) = t.as_mut() {
+        let flat = |x: &Tensor| {
+            row(&x
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap())
+        };
+        v.push((
+            mixed.map(flat).unwrap_or_default(),
+            twin.map(flat).unwrap_or_default(),
+            flat(hidden),
+        ));
+    }
+}
+
+/// The mixer's output for `input` with its card set aside, `None` for a mixer of another kind.
+#[cfg(not(feature = "gpu"))]
+fn host_twin(_: &mut super::mixer::Mixer, _: &Tensor, _: usize) -> Option<Tensor> {
+    None
+}
+
+/// The mixer's output for `input` with its card set aside, `None` for a mixer of another kind.
+#[cfg(feature = "gpu")]
+fn host_twin(mixer: &mut super::mixer::Mixer, input: &Tensor, pos: usize) -> Option<Tensor> {
+    use super::mixer::Mixer;
+    match mixer {
+        Mixer::LatentMqa(m) => {
+            let card = m.card.take();
+            let y = m.forward(input, pos).ok();
+            m.card = card;
+            y
+        }
+        Mixer::CompressedBand(b) => {
+            let card = b.base.card.take();
+            let y = b.forward(input, pos).ok();
+            b.base.card = card;
+            y
+        }
+        _ => None,
+    }
+}
+
+/// What one layer of a staged forward computed, every row, as the stage that made it names it.
+pub(super) struct LayerRec {
+    pub(super) stages: Vec<(&'static str, Tensor)>,
+    /// Per row: the experts chosen, the biased score of the last one kept and of the first one
+    /// dropped.
+    pub(super) picks: Vec<(Vec<usize>, f32, f32)>,
+    /// The engram table rows each position reads, for a layer with an engram.
+    pub(super) hashes: Vec<Vec<u64>>,
+    /// The pre mix the layer leaves for the next one.
+    pub(super) pre: Vec<Vec<f32>>,
+}
+
+impl LayerRec {
+    pub(super) fn stage(&self, name: &str) -> Option<&Tensor> {
+        self.stages.iter().find(|s| s.0 == name).map(|s| &s.1)
+    }
+}
+
+/// The layers recorded by the staged forwards that run while it holds `Some`.
+pub(super) static RECORD: std::sync::Mutex<Option<Vec<LayerRec>>> = std::sync::Mutex::new(None);
+
+/// A record whose hidden states and pre mixes the staged forwards that run while it holds
+/// `Some` take as the input of each layer.
+pub(super) static FORCED: std::sync::Mutex<Option<Vec<LayerRec>>> = std::sync::Mutex::new(None);
+
+/// While `Some(eps)`, the staged forwards scale every value of each mixer input by a factor in
+/// `1 +- eps`, from a fixed pseudo-random sequence.
+pub(super) static PERTURB: std::sync::Mutex<Option<f32>> = std::sync::Mutex::new(None);
+
+/// `t` with each value scaled by a factor in `1 +- eps`.
+fn perturbed(t: &Tensor, eps: f32) -> Tensor {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    for x in v.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let u = (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0;
+        *x *= 1.0 + eps * u;
+    }
+    Tensor::from_vec(v, t.dims().to_vec(), &Device::Cpu).unwrap()
+}
+
+/// Keeps `t` as stage `name` of the layer being recorded, when a record runs.
+fn note(rec: &mut Option<LayerRec>, name: &'static str, t: &Tensor) {
+    if let Some(r) = rec.as_mut() {
+        let t = t
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        r.stages.push((name, t));
+    }
+}
+
+/// The host's window attention over key rows `keys` that are the values too, from position 0:
+/// the heads' outputs `[seq, heads * hd]` and, per row and head, the largest logit minus the
+/// sink's.
+fn attention_replica(
+    q: &[f32],
+    keys: &[f32],
+    sink: &[f32],
+    (heads, hd): (usize, usize),
+    window: usize,
+    scale: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0f32; q.len()];
+    let mut gaps = vec![0f32; q.len() / hd];
+    for pair in 0..q.len() / hd {
+        let (i, h) = (pair / heads, pair % heads);
+        let lo = i.saturating_sub(window - 1);
+        let qv = &q[pair * hd..(pair + 1) * hd];
+        let seen = &keys[lo * hd..(i + 1) * hd];
+        let mut m = sink[h];
+        let logits: Vec<f32> = seen
+            .chunks_exact(hd)
+            .map(|key| {
+                let mut dot = 0f32;
+                for (a, k) in qv.iter().zip(key) {
+                    dot += a * k;
+                }
+                let l = dot * scale;
+                if l > m {
+                    m = l;
+                }
+                l
+            })
+            .collect();
+        gaps[pair] = m - sink[h];
+        let o = &mut out[pair * hd..(pair + 1) * hd];
+        let mut denom = (sink[h] - m).exp();
+        for (l, key) in logits.iter().zip(seen.chunks_exact(hd)) {
+            let w = (l - m).exp();
+            denom += w;
+            for (acc, &v) in o.iter_mut().zip(key) {
+                *acc += w * v;
+            }
+        }
+        for v in o.iter_mut() {
+            *v /= denom;
+        }
+    }
+    (out, gaps)
+}
+
+/// The Q8_K codes the host quantiser gives the heads' outputs `o` turned back by the phases of
+/// their rows, as floats `[1, seq, heads * hd]`.
+fn turned_back_codes(
+    o: &[f32],
+    d: &super::latent_mqa::LatentMqaDims,
+    cos: &[f32],
+    sin: &[f32],
+    seq: usize,
+) -> Tensor {
+    use crate::tensor::quant_cpu::{BlockFormat, BlockQ8K};
+    let mut o = o.to_vec();
+    let back: Vec<f32> = sin.iter().map(|&s| 0.0 - s).collect();
+    super::latent_mqa::rotate_tails(&mut o, d.heads, d.head_dim, d.rope_dim, cos, &back);
+    let mut blocks = vec![BlockQ8K::zeros(); o.len() / 256];
+    BlockQ8K::quantize(&o, &mut blocks);
+    let codes: Vec<f32> = blocks
+        .iter()
+        .flat_map(|b| b.qs.iter().map(|&q| q as f32))
+        .collect();
+    Tensor::from_vec(codes, (1, seq, d.heads * d.head_dim), &Device::Cpu).unwrap()
+}
+
+/// The query factor, the queries and the key rows the mixer makes of `input`, as the mixer makes
+/// them: on its card when it has one, else on the host.
+#[cfg(not(feature = "gpu"))]
+fn mixer_front(_: &super::mixer::Mixer, _: &Tensor, _: usize) -> Vec<(&'static str, Tensor)> {
+    Vec::new()
+}
+
+/// The query factor, the queries and the key rows the mixer makes of `input`, as the mixer makes
+/// them: on its card when it has one, else on the host.
+#[cfg(feature = "gpu")]
+fn mixer_front(
+    mixer: &super::mixer::Mixer,
+    input: &Tensor,
+    pos: usize,
+) -> Vec<(&'static str, Tensor)> {
+    use super::mixer::Mixer;
+    let base = match mixer {
+        Mixer::LatentMqa(m) => m,
+        Mixer::CompressedBand(b) => &b.base,
+        _ => return Vec::new(),
+    };
+    let (_, seq, hidden) = input.dims3().unwrap();
+    let x2 = super::latent_mqa::host_rows(input, seq, hidden).unwrap();
+    let (cos, sin) = super::latent_mqa::phases(&base.inv_freq, pos..pos + seq);
+    let d = base.dims;
+    let host_qr = base.query_factor(&x2).unwrap();
+    let q_rank = host_qr.dims()[1];
+    let wide =
+        |v: Vec<f32>, cols: usize| Tensor::from_vec(v, (1, seq, cols), &Device::Cpu).unwrap();
+    match &base.card {
+        Some(card) => {
+            let f = card.front_dev(base, &x2, &cos, &sin).unwrap();
+            let dev = card.dev();
+            let dl = |s: &crate::tensor::gpu_runtime::driver::CudaSlice<f32>, n: usize| {
+                super::card_mixers::download(dev, s, n).unwrap()
+            };
+            let (qd, kd) = (
+                dl(&f.q, seq * d.heads * d.head_dim),
+                dl(&f.kv, seq * d.head_dim),
+            );
+            let mut stages = vec![
+                ("qr", wide(dl(&f.qr, seq * q_rank), q_rank)),
+                ("q", wide(qd.clone(), d.heads * d.head_dim)),
+                ("kv", wide(kd.clone(), d.head_dim)),
+            ];
+            if pos == 0 {
+                use crate::tensor::cuda::{slots_attention, upload_f32, upload_i32};
+                let dev: &crate::tensor::cuda::CudaDevice = dev;
+                let keys = upload_f32(dev, "keys", &kd).unwrap();
+                let sink = upload_f32(dev, "sink", &base.w.sink).unwrap();
+                let slots = upload_i32(
+                    dev,
+                    "slots",
+                    &super::card_mixers::window_slots(0, seq, d.window),
+                )
+                .unwrap();
+                let o = slots_attention(
+                    dev,
+                    &f.q,
+                    &keys,
+                    &sink,
+                    &slots,
+                    (seq, d.heads, d.head_dim, d.window),
+                    base.scale(),
+                )
+                .unwrap();
+                let n = seq * d.heads * d.head_dim;
+                let (ro, gaps) = attention_replica(
+                    &qd,
+                    &kd,
+                    &base.w.sink,
+                    (d.heads, d.head_dim),
+                    d.window,
+                    base.scale(),
+                );
+                let ok = dl(&o, n);
+                stages.push(("attn_o_q8", turned_back_codes(&ok, &d, &cos, &sin, seq)));
+                stages.push(("attn_o", wide(ok, d.heads * d.head_dim)));
+                stages.push(("attn_o_replica", wide(ro, d.heads * d.head_dim)));
+                stages.push(("attn_gap", wide(gaps, d.heads)));
+            }
+            stages
+        }
+        None => {
+            let q = base.queries(&host_qr, &cos, &sin).unwrap();
+            let kv = base.key_rows(&x2, &cos, &sin).unwrap();
+            let mut stages = vec![
+                (
+                    "qr",
+                    wide(host_qr.flatten_all().unwrap().to_vec1().unwrap(), q_rank),
+                ),
+                ("q", wide(q.clone(), d.heads * d.head_dim)),
+                ("kv", wide(kv.clone(), d.head_dim)),
+            ];
+            if pos == 0 {
+                let (ro, gaps) = attention_replica(
+                    &q,
+                    &kv,
+                    &base.w.sink,
+                    (d.heads, d.head_dim),
+                    d.window,
+                    base.scale(),
+                );
+                stages.push(("attn_o_q8", turned_back_codes(&ro, &d, &cos, &sin, seq)));
+                stages.push(("attn_o", wide(ro.clone(), d.heads * d.head_dim)));
+                stages.push(("attn_o_replica", wide(ro, d.heads * d.head_dim)));
+                stages.push(("attn_gap", wide(gaps, d.heads)));
+            }
+            stages
+        }
+    }
+}
+
+/// The experts of each row of router `logits`, the biased score of the last kept expert and of
+/// the first dropped one, as `sqrt_softplus_choice` scores them.
+fn picks_of(
+    ffn: &super::wide_sparse_layer::RoutedFfn,
+    logits: &Tensor,
+) -> Vec<(Vec<usize>, f32, f32)> {
+    let soft = |z: f32| if z > 20.0 { z } else { z.exp().ln_1p() };
+    logits
+        .to_vec2::<f32>()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let biased: Vec<f32> = row
+                .iter()
+                .zip(&ffn.bias)
+                .map(|(&z, &b)| soft(z / ffn.temperature).sqrt() + b)
+                .collect();
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_by(|&a, &b| {
+                biased[b]
+                    .partial_cmp(&biased[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let k = ffn.used;
+            (order[..k].to_vec(), biased[order[k - 1]], biased[order[k]])
+        })
+        .collect()
+}
+
 /// A forward of the generic model over `ids` from `pos`, stage by stage, as `forward_sinkhorn`
-/// runs it. The last row of logits comes back. A layer with an engram runs whole.
+/// runs it. The last row of logits comes back.
+///
+/// While `RECORD` holds `Some`, every layer's stages are recorded.
+/// While `FORCED` holds `Some`, every layer starts from the hidden state and the pre mix the
+/// forced record holds for the layer before.
 pub(super) fn staged_forward(
     model: &mut GenericHeteroTransformer,
     ids: &[u32],
@@ -302,15 +636,18 @@ pub(super) fn staged_forward(
         let started = Instant::now();
         let layer = &mut model.layers[il];
         let block = layer.sinkhorn.as_ref().expect("a Sinkhorn layer");
-        if block.engram.is_some() {
-            hidden = st
-                .time("engram layer (whole)", || {
-                    layer.forward_sinkhorn(&hidden, pos)
-                })
-                .unwrap();
-            layer_secs.push(started.elapsed().as_secs_f64());
-            continue;
+        if il > 0 {
+            if let Some(f) = FORCED.lock().unwrap().as_ref() {
+                hidden = f[il - 1].stage("hidden").unwrap().clone();
+                block.carry.put(pos, seq, f[il - 1].pre.clone());
+            }
         }
+        let mut rec = RECORD.lock().unwrap().is_some().then(|| LayerRec {
+            stages: Vec::new(),
+            picks: Vec::new(),
+            hashes: Vec::new(),
+            pre: Vec::new(),
+        });
         let r = hidden
             .to_device(&Device::Cpu)
             .unwrap()
@@ -318,6 +655,27 @@ pub(super) fn staged_forward(
             .unwrap()
             .contiguous()
             .unwrap();
+        // The engram, hashed from the model's token log as `with_engram` does.
+        let r = match block.engram.as_ref() {
+            Some(e) => {
+                use super::wide_sparse_layer::TokenLog;
+                let window = e.tokens.window(&e.meta, pos, seq).unwrap();
+                let start = TokenLog::window_start(&e.meta, pos);
+                let hashes: Vec<Vec<u64>> = (pos..pos + seq)
+                    .map(|p| {
+                        let from = TokenLog::window_start(&e.meta, p) - start;
+                        e.meta.hash(e.which, &window[from..=p - start])
+                    })
+                    .collect();
+                let with = st.time("engram", || e.block.forward(&r, &hashes)).unwrap();
+                if let Some(rc) = rec.as_mut() {
+                    rc.hashes = hashes;
+                }
+                note(&mut rec, "engram_add", &with.broadcast_sub(&r).unwrap());
+                with
+            }
+            None => r,
+        };
         let pre = block.carry.get(pos, seq).unwrap();
         let mixes = st.time("hc mixes", || block.attn_mix.mixes(&r)).unwrap();
         let input = st
@@ -329,12 +687,30 @@ pub(super) fn staged_forward(
                 )
             })
             .unwrap();
+        note(&mut rec, "input", &input);
+        if rec.is_some() {
+            for (name, t) in mixer_front(&layer.mixer, &input, pos) {
+                note(&mut rec, name, &t);
+            }
+        }
+        let input = match *PERTURB.lock().unwrap() {
+            Some(eps) => perturbed(&input, eps),
+            None => input,
+        };
         let kind = match &layer.mixer {
             super::mixer::Mixer::LatentMqa(_) => "mixer latent",
             super::mixer::Mixer::CompressedBand(_) => "mixer band",
             _ => "attention mixer",
         };
         let mixed = st.time(kind, || layer.mixer.forward(&input, pos)).unwrap();
+        note(&mut rec, "mixed", &mixed);
+        // While a trace runs: the same input through the mixer without its card.
+        let twin = TRACE
+            .lock()
+            .unwrap()
+            .is_some()
+            .then(|| host_twin(&mut layer.mixer, &input, pos))
+            .flatten();
         let (b, s, width) = mixed.dims3().unwrap();
         let out = st
             .time("attention output", || {
@@ -345,11 +721,13 @@ pub(super) fn staged_forward(
                     .reshape((b, s, block.attn_mix.dim()))
             })
             .unwrap();
+        note(&mut rec, "out", &out);
         let mid = st
             .time("hc post", || {
                 block.attn_mix.post(&out, &r, &mixes.post, &mixes.comb)
             })
             .unwrap();
+        note(&mut rec, "mid", &mid);
         let fmixes = st.time("hc mixes", || block.ffn_mix.mixes(&mid)).unwrap();
         let finput = st
             .time("hc pre and norm", || {
@@ -360,10 +738,18 @@ pub(super) fn staged_forward(
                 )
             })
             .unwrap();
+        note(&mut rec, "finput", &finput);
         let fout = st.time("moe", || block.ffn.forward(&finput)).unwrap();
+        note(&mut rec, "fout", &fout);
         // The router and the shared expert again, warm, to split the block's time.
         let x2 = finput.reshape((seq, finput.elem_count() / seq)).unwrap();
-        let _ = st.time("moe router (again)", || block.ffn.router.apply_here(&x2));
+        let logits = st.time("moe router (again)", || block.ffn.router.apply_here(&x2));
+        if let (Some(rc), Ok(l)) = (rec.as_mut(), logits.as_ref()) {
+            rc.picks = picks_of(&block.ffn, l);
+        }
+        if let Ok(l) = logits.as_ref() {
+            note(&mut rec, "logits", l);
+        }
         if let Some(shared) = &block.ffn.shared {
             let _ = st.time("moe shared (again)", || {
                 shared.forward(&x2, block.ffn.limit)
@@ -374,7 +760,15 @@ pub(super) fn staged_forward(
                 block.ffn_mix.post(&fout, &mid, &fmixes.post, &fmixes.comb)
             })
             .unwrap();
+        note(&mut rec, "hidden", &hidden);
+        if let Some(mut rc) = rec.take() {
+            rc.pre = fmixes.pre.clone();
+            if let Some(all) = RECORD.lock().unwrap().as_mut() {
+                all.push(rc);
+            }
+        }
         block.carry.put(pos, seq, fmixes.pre);
+        trace_layer(Some(&mixed), twin.as_ref(), &hidden);
         layer_secs.push(started.elapsed().as_secs_f64());
     }
     let logits = st

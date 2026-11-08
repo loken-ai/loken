@@ -5,11 +5,12 @@
 //! The records are the oracle's: prefill, decode, verify, the rewound verify and decode, and the
 //! greedy run.
 //!
-//! A card and the host sum in another order, so the logits agree within the card versus host
-//! policy:
-//! - the worst cosine of a row above `MIN_COSINE`,
-//! - the relative L2 distance of a row below `MAX_REL_L2`,
-//! - the same greedy tokens.
+//! The host quantises the rows it multiplies and a card sums in another order, so neither is the
+//! truth. The truth is the exact reference: the host model with every mixer projection read as
+//! dense F32 values. A card passes when:
+//! - the relative L2 distance of a row to the reference is no larger than the host's, up to the
+//!   rounding of F32 (`no_farther`),
+//! - it chooses the reference's greedy tokens.
 
 use std::collections::BTreeMap;
 
@@ -21,11 +22,31 @@ use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
 use crate::inference::place::layer_executor::HeteroSegment;
 use crate::tensor::quantized::gguf_file::MappedGguf;
 
-/// The worst cosine of a row the policy lets through.
-pub(super) const MIN_COSINE: f64 = 0.999;
+/// The bar the card measures its products by is the bar of these tests.
+pub(super) use super::card_packed::no_farther;
 
-/// The largest relative L2 distance of a row the policy lets through.
-pub(super) const MAX_REL_L2: f64 = 0.05;
+/// The relative L2 distances of `host` and of `card` to `reference`.
+pub(super) fn distances(reference: &[f32], host: &[f32], card: &[f32]) -> (f64, f64) {
+    (closeness(reference, host).1, closeness(reference, card).1)
+}
+
+/// Every token mixer of `model` reads its projections as dense F32 values: the exact reference.
+pub(super) fn dequantise_mixers(model: &mut GenericHeteroTransformer) {
+    for layer in model.layers.iter_mut() {
+        match &mut layer.mixer {
+            Mixer::LatentMqa(m) => m.dequantise_projections().unwrap(),
+            Mixer::CompressedBand(m) => m.dequantise_projections().unwrap(),
+            _ => {}
+        }
+    }
+}
+
+/// The host model of the synthetic file with its mixers made exact.
+pub(super) fn exact(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> GenericHeteroTransformer {
+    let mut model = generic(ratios, kv_src, index_src);
+    dequantise_mixers(&mut model);
+    model
+}
 
 /// Whether card 0 opens.
 fn card_present() -> bool {
@@ -88,43 +109,53 @@ pub(super) fn closeness(want: &[f32], got: &[f32]) -> (f64, f64) {
     (dot / (ww.sqrt() * gg.sqrt()), (dd / ww).sqrt())
 }
 
-/// The worst cosine and the worst relative L2 distance over the rows of every record, and the
-/// records whose greedy tokens differ or whose rows pass outside the policy.
+/// The worst relative L2 distance of the host and of the card to the reference over the rows of
+/// every record, and the records whose greedy tokens differ from the reference's or whose rows
+/// the card holds farther from the reference than the host, up to the rounding of a sum of
+/// `terms` terms.
 fn compare(
-    want: &BTreeMap<String, Record>,
-    got: &BTreeMap<String, Record>,
+    reference: &BTreeMap<String, Record>,
+    host: &BTreeMap<String, Record>,
+    card: &BTreeMap<String, Record>,
+    terms: usize,
 ) -> (f64, f64, Vec<String>) {
-    let (mut worst_cos, mut worst_l2) = (1f64, 0f64);
+    let (mut worst_host, mut worst_card) = (0f64, 0f64);
     let mut failed = Vec::new();
-    for (name, w) in want {
-        let Some(g) = got.get(name) else {
+    for (name, w) in reference {
+        let (Some(h), Some(c)) = (host.get(name), card.get(name)) else {
             failed.push(format!("{name}: missing"));
             continue;
         };
-        match (w, g) {
-            (Record::Ids(a), Record::Ids(b)) => {
+        match (w, h, c) {
+            (Record::Ids(a), _, Record::Ids(b)) => {
                 if a != b {
                     failed.push(format!("{name}: tokens {b:?} != {a:?}"));
                 }
             }
-            (Record::Logits(wr, wc, a), Record::Logits(gr, gc, b)) => {
+            (Record::Logits(wr, wc, a), Record::Logits(_, _, hb), Record::Logits(gr, gc, b)) => {
                 if (wr, wc) != (gr, gc) {
                     failed.push(format!("{name}: shape [{gr}, {gc}] != [{wr}, {wc}]"));
                     continue;
                 }
-                for (row, (x, y)) in a.chunks_exact(*wc).zip(b.chunks_exact(*wc)).enumerate() {
-                    let (cos, l2) = closeness(x, y);
-                    worst_cos = worst_cos.min(cos);
-                    worst_l2 = worst_l2.max(l2);
-                    if cos.is_nan() || cos < MIN_COSINE || l2.is_nan() || l2 > MAX_REL_L2 {
-                        failed.push(format!("{name} row {row}: cosine {cos}, relative L2 {l2}"));
+                let rows = a
+                    .chunks_exact(*wc)
+                    .zip(hb.chunks_exact(*wc))
+                    .zip(b.chunks_exact(*wc));
+                for (row, ((x, y), z)) in rows.enumerate() {
+                    let (host_l2, card_l2) = distances(x, y, z);
+                    worst_host = worst_host.max(host_l2);
+                    worst_card = worst_card.max(card_l2);
+                    if card_l2.is_nan() || !no_farther(host_l2, card_l2, terms) {
+                        failed.push(format!(
+                            "{name} row {row}: card {card_l2} from the reference, host {host_l2}"
+                        ));
                     }
                 }
             }
             _ => failed.push(format!("{name}: kind changed")),
         }
     }
-    (worst_cos, worst_l2, failed)
+    (worst_host, worst_card, failed)
 }
 
 /// Every layer's token mixer holds weights on the card, and none is left on the host.
@@ -155,18 +186,21 @@ fn every_token_mixer_of_a_card_plan_holds_weights_on_the_card() {
     }
 }
 
-/// The model with its token mixers on the card gives the host model's records, within the card
-/// versus host policy, and the same greedy tokens.
+/// The model with its token mixers on the card gives records no farther from the exact
+/// reference's than the host model's, and the reference's greedy tokens.
 #[test]
-fn the_card_mixers_give_the_host_records_within_the_card_policy() {
+fn the_card_mixers_stay_as_close_to_the_exact_reference_as_the_host() {
     if !card_present() {
         return;
     }
-    let (mut worst_cos, mut worst_l2) = (1f64, 0f64);
+    let (mut worst_host, mut worst_card) = (0f64, 0f64);
     let mut failed = Vec::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
         let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
-        let (mut want, mut got) = (BTreeMap::new(), BTreeMap::new());
+        let (mut truth, mut want, mut got) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let mut reference = exact(ratios, kv_src, index_src);
+        let terms = reference.config.embedding_length;
+        record_generic(&mut reference, &tokens, n, &mut truth);
         let mut host = generic(ratios, kv_src, index_src);
         record_generic(&mut host, &tokens, n, &mut want);
         let mut card = generic_on_card(ratios, kv_src, index_src);
@@ -184,43 +218,49 @@ fn the_card_mixers_give_the_host_records_within_the_card_policy() {
                 "layer {il}: the card ring does not stand for the state"
             );
         }
-        let (cos, l2, bad) = compare(&want, &got);
-        eprintln!("layout {n}: worst cosine {cos}, worst relative L2 {l2}");
-        worst_cos = worst_cos.min(cos);
-        worst_l2 = worst_l2.max(l2);
+        let (host_l2, card_l2, bad) = compare(&truth, &want, &got, terms);
+        eprintln!("layout {n}: from the reference, host {host_l2}, card {card_l2}");
+        worst_host = worst_host.max(host_l2);
+        worst_card = worst_card.max(card_l2);
         failed.extend(bad);
     }
-    eprintln!("card versus host: worst cosine {worst_cos}, worst relative L2 {worst_l2}");
+    eprintln!("worst relative L2 from the reference: host {worst_host}, card {worst_card}");
     assert!(
         failed.is_empty(),
-        "the card mixers leave the policy:\n{}",
+        "the card mixers are farther from the reference than the host:\n{}",
         failed.join("\n")
     );
 }
 
-/// The engram model with its token mixers on the card gives the records of the same model on
-/// the host, within the card versus host policy, and the same greedy tokens.
+/// The engram model with its token mixers on the card gives records no farther from the exact
+/// reference's than the same model on the host, and the reference's greedy tokens.
 /// The engram, the residual mixing and the feed-forward stay on the host.
 #[test]
-fn the_card_mixers_with_engram_layers_give_the_host_records_within_the_card_policy() {
+fn the_card_mixers_with_engram_layers_stay_as_close_to_the_exact_reference_as_the_host() {
     if !card_present() {
         return;
     }
     let mut failed = Vec::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
         let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
-        let (mut want, mut got) = (BTreeMap::new(), BTreeMap::new());
+        let (mut truth, mut want, mut got) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let mut reference = engram_model(ratios, kv_src, index_src, false);
+        dequantise_mixers(&mut reference);
+        let terms = reference.config.embedding_length;
+        record_generic(&mut reference, &tokens, n, &mut truth);
         let mut host = engram_model(ratios, kv_src, index_src, false);
         record_generic(&mut host, &tokens, n, &mut want);
         let mut card = engram_model(ratios, kv_src, index_src, true);
         record_generic(&mut card, &tokens, n, &mut got);
-        let (cos, l2, bad) = compare(&want, &got);
-        eprintln!("layout {n} with engram layers: worst cosine {cos}, worst relative L2 {l2}");
+        let (host_l2, card_l2, bad) = compare(&truth, &want, &got, terms);
+        eprintln!(
+            "layout {n} with engram layers: from the reference, host {host_l2}, card {card_l2}"
+        );
         failed.extend(bad);
     }
     assert!(
         failed.is_empty(),
-        "the card mixers with engram layers leave the policy:\n{}",
+        "the card mixers with engram layers are farther from the reference than the host:\n{}",
         failed.join("\n")
     );
 }
@@ -241,15 +281,17 @@ fn rows(seed: u64, n: usize, width: usize) -> Tensor {
     Tensor::from_vec(v, (1, n, width), &Device::Cpu).unwrap()
 }
 
-/// Every layer's mixer output, before the layer's output projection, agrees between the card and
-/// the host on the same rows: a prompt, a decode past the window, and a continued prompt.
+/// Every layer's mixer output, before the layer's output projection, is no farther from the exact
+/// reference's on the card than on the host, on the same rows: a prompt, a decode past the
+/// window, and a continued prompt.
 #[test]
-fn the_mixer_outputs_of_the_card_stay_close_to_the_host_ones() {
+fn the_mixer_outputs_of_the_card_stay_as_close_to_the_exact_ones_as_the_host() {
     if !card_present() {
         return;
     }
-    let (mut worst_cos, mut worst_l2) = (1f64, 0f64);
+    let (mut worst_host, mut worst_card) = (0f64, 0f64);
     for (ratios, kv_src, index_src) in LAYOUTS {
+        let mut reference = exact(ratios, kv_src, index_src);
         let mut host = generic(ratios, kv_src, index_src);
         let mut card = generic_on_card(ratios, kv_src, index_src);
         let hidden = host.config.embedding_length;
@@ -259,28 +301,31 @@ fn the_mixer_outputs_of_the_card_stay_close_to_the_host_ones() {
             .chain(std::iter::once((29, 5)))
             .collect();
         for (step, &(pos, seq)) in steps.iter().enumerate() {
-            for model in [&host, &card] {
+            for model in [&reference, &host, &card] {
                 if let Some(head) = &model.wide_sparse {
                     head.cell.open(pos, seq);
                 }
             }
             for il in 0..ratios.len() {
                 let x = rows((step * 31 + il) as u64, seq, hidden);
+                let truth = reference.layers[il].mixer.forward(&x, pos).unwrap();
                 let want = host.layers[il].mixer.forward(&x, pos).unwrap();
                 let got = card.layers[il].mixer.forward(&x, pos).unwrap();
                 let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                let (cos, l2) = closeness(&flat(&want), &flat(&got));
-                worst_cos = worst_cos.min(cos);
-                worst_l2 = worst_l2.max(l2);
+                let (host_l2, card_l2) = distances(&flat(&truth), &flat(&want), &flat(&got));
+                worst_host = worst_host.max(host_l2);
+                worst_card = worst_card.max(card_l2);
                 assert!(
-                    cos > MIN_COSINE && l2 < MAX_REL_L2,
-                    "layer {il}, rows {pos}..{}: cosine {cos}, relative L2 {l2}",
+                    no_farther(host_l2, card_l2, hidden),
+                    "layer {il}, rows {pos}..{}: card {card_l2} from the reference, host {host_l2}",
                     pos + seq
                 );
             }
         }
     }
-    eprintln!("mixer outputs: worst cosine {worst_cos}, worst relative L2 {worst_l2}");
+    eprintln!(
+        "mixer outputs, worst relative L2 from the reference: host {worst_host}, card {worst_card}"
+    );
 }
 
 /// Mean milliseconds of one decode step through every layer's token mixer, on the card and on
