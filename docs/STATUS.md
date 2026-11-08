@@ -294,7 +294,6 @@ Limits:
   The prompt's last positions, the decoded tokens and the verified blocks feed its window.
   The generic route reads the same head as a block draft and offers it to the same decode arm.
   Its load takes the head of a companion beside the model first, then the model file's.
-  V4.1 files still load on the V4.1 path.
   Tests prove the same greedy text through the engine with a scripted guess. No speedup is measured on the real model.
 - A test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and passes alone.
 
@@ -424,7 +423,6 @@ Sharding refuses a model, with the reason, when its layers:
 - Run through Vulkan or OpenCL.
 - Take per-layer inputs.
 - Share KV.
-- Mix a wide residual stream outside the layers.
 - Keep a recurrent state.
 - Hold experts in host memory.
 - Carry an adapter or an image tower.
@@ -464,11 +462,11 @@ Trace replay judges the correction, not a cluster.
   The Z-Image, FLUX and other image loaders call it.  
   Every language-model placement is budgeted by formula.
 
-## Shipped as source, never compiled
+## AMD kernels
 
 The CUDA kernels carry AMD arms: MFMA on CDNA and WMMA on RDNA3+, guarded and complete.
-No hipcc build ran on the measurement machine, so none has been through a compiler.  
-Treat AMD as source, not support.
+A hipcc build and a campaign ran on an RX 9070 XT, which the benchmarks site lists.
+The other AMD families have not been measured.
 
 ## Judged partially
 

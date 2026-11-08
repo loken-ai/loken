@@ -29,13 +29,8 @@ model_id = "qwen3:0.6b"
 # requests run in parallel. A model that does not fit one card is served once.
 # replicas = 1
 
-# Seconds a conversation's kept state stays after its last turn, so the next turn reads only the
-# tokens it adds. Past it the state is dropped. 0 keeps a state until the memory is needed.
-# kv_lease_secs = 1800
-
 # The disk tier keeps conversation snapshots across a restart, within a disk budget.
 # kv_disk_dir = "/var/lib/loken/kv"
-# kv_disk_budget_gb = 0             # 0 = no limit
 
 # Another instance serving the same model reads this one's long prompts: it hands back their KV
 # cache over the network and this one decodes. A prompt within a prefill chunk of what the cache
@@ -51,7 +46,6 @@ model_id = "qwen3:0.6b"
 # states stay in host memory for the life of the process; with one they go on disk and survive a
 # restart. The files hold state derived from prompts (KV tensors, no text).
 # state_cache_dir = "/var/lib/loken/state"
-# state_cache_budget_gb = 0         # 0 = derived from the directory's free space
 
 # How closely the output follows the published model, against speed and memory. `reference`
 # serves float weights as stored with a full-width cache and no context shift. `balanced`
@@ -59,25 +53,15 @@ model_id = "qwen3:0.6b"
 # four-bit float weights and recorded drafts. See docs/CONFIGURATION.md for the table.
 # fidelity = "balanced"             # reference, balanced or fast
 
-# Models whose routed experts stream from disk: `exact` keeps every output identical. Unset,
-# `fidelity` decides: fast at `fast`, exact otherwise.
-# quality = "exact"                 # exact, balanced (within the model's own noise) or fast
-
 # Files, moderation and the URLs handed out.
 # files_dir = "/var/lib/loken/files"   # uploads and batch outputs, default: files/ beside the model store
 # moderation_model = "llama-guard3:1b" # Llama Guard, Shieldstral, ShieldGemma, Granite Guardian or gpt-oss Safeguard
 # public_url = "https://loken.example.org" # the origin clients reach this server at, default: the request's Host
 
 # [energy]
-# enabled = true
 # carbon_intensity = 50             # gCO2eq per kWh
-# cpu_tdp_w = 0                     # host estimate when RAPL is unreadable, 0 = measured domains only
-# water_l_per_kwh = 1.8
 
-# [cpu]
-# level = "avx512"                  # cap for the CPU kernels: generic (scalar reference), avx2 or avx512; default: the best the CPU has
-
-# Clustering: see docs/CLUSTER.md. Absent, the node runs alone.
+# Clustering: see docs/CLUSTER.md. A node routes and plans only when join is not empty.
 # [cluster]
 # name = "home"
 # advertise = "http://192.0.2.10:11435"

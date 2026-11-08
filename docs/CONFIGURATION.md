@@ -60,7 +60,7 @@ These are looked up in the first Hugging Face directory only.
 |---|---|---|
 | `host` | `"127.0.0.1"` | Listening address. The address is the security boundary: see [SECURITY.md](../SECURITY.md). |
 | `port` | `11435` | Listening port. |
-| `require_auth` | `false` | Demand an API key on every request but the health probes (`/health`, `/healthz`, `/api/health`, `/ping`). Turn it on before the daemon listens on anything but localhost. |
+| `require_auth` | `false` | Demand an API key on every request but the health probes (`/health`, `/ping`). Turn it on before the daemon listens on anything but localhost. |
 | `api_keys` | `[]` | Accepted keys, sent as `Authorization: Bearer <key>` or `X-API-Key: <key>`. Empty with `require_auth = true` refuses every request. |
 | `allowed_origins` | `[]` | Browser origins allowed when authentication is on. Empty allows none. |
 | `rate_limit_per_minute` | `0` | Requests per minute per client. `0` is unlimited. |
@@ -434,8 +434,8 @@ See [CLUSTER.md](CLUSTER.md) for the model.
 |---|---|---|
 | `name` | `"default"` | Cluster name. Nodes announcing another name are ignored. |
 | `node_id` | hostname | How this node calls itself. |
-| `advertise` | empty | The URL peers reach this node at. Empty stays a client of the others. |
-| `join` | `[]` | Seeds for peers multicast cannot reach. |
+| `advertise` | empty | The URL peers reach this node at. Empty advertises `http://<node_id>:<port>`. |
+| `join` | `[]` | Seed URLs of peers. Discovery adds to the list. A node routes and plans only when this list is not empty. |
 | `gossip_interval_ms` | `1000` | How often peers exchange state. |
 | `min_speedup` | `1.15` | Predicted speedup below which a request is not handed over. |
 <!-- site: end -->
@@ -445,7 +445,7 @@ See [CLUSTER.md](CLUSTER.md) for the model.
 | Setting | Default | What it does |
 |---|---|---|
 | `LOKEN_API_KEY` | unset | Read by `loken launch`: the key handed to the agent when the daemon requires one. |
-| `OLLAMA_KEEP_ALIVE` | unset | The keep-alive of a loaded model. |
+| `OLLAMA_KEEP_ALIVE` | unset | The keep-alive of a loaded model, 5 minutes when unset. A bare number is minutes. |
 | `HF_TOKEN` | unset | Sent when a pull fetches from Hugging Face. |
 
 ## Build features

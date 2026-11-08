@@ -224,7 +224,8 @@ The reference vectors hold none of these.
 The loader does not map the 2 input norms of the grouped `falcon` decoder, so it refuses such a checkpoint for a missing tensor.  
 It refuses a quantised checkpoint other than AWQ of the llama, mistral and qwen families.
 
-Architectures with their own model code (image, speech, video, forecasting, DeepSeek V4.1) are outside this table, and the generic transformer does not read them.
+Architectures with their own model code (image, speech, video, forecasting) are outside this table, and the generic transformer does not read them.
+DeepSeek V4.1 is read by the generic transformer as a wide-residual model.
 
 ## Embeddings towers
 

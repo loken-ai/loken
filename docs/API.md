@@ -7,7 +7,7 @@ Bodies are read as JSON whatever `Content-Type` says.
 Each API answers a malformed body in its own error envelope.
 
 With `[server] require_auth` on, every route needs a key, as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
-`/health`, `/healthz`, `/api/health` and `/ping` need none, and the rate limit skips them.
+`/health` and `/ping` need none, and the rate limit skips them.
 
 ## Ollama surface
 
@@ -396,7 +396,7 @@ A client that follows the SSE specification ignores comment lines.
 <!-- site: widget table id=api-server -->
 | Route | What it does |
 |---|---|
-| `GET /health` | `status`, `service`, `version`, `time`, `uptime_seconds`, `loaded_models` and `loaded` (count of language models, and whether image, audio and tts are warm). Exempt from authentication, as are `/healthz`, `/api/health` and `GET` or `POST /ping` (an empty 200, for SageMaker and vLLM clients). |
+| `GET /health` | `status`, `service`, `version`, `time`, `uptime_seconds`, `loaded_models` and `loaded` (count of language models, and whether image, audio and tts are warm). Exempt from authentication, as is `GET` or `POST /ping` (an empty 200, for SageMaker and vLLM clients). |
 | `GET /version` | The server's version, in vLLM's shape. |
 | `GET /load` | Requests running and queued, as vLLM's `server_load`. |
 | `POST /reset_prefix_cache` | Every loaded language model drops its session records, its resident KV and the logits of its last prefill. The KV snapshots, the disk tier and the batch worker's prefix cache stay. |

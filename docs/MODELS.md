@@ -180,13 +180,13 @@ At load, the loader:
 <!-- site: widget table id=models-architectures -->
 | Line | Architectures as the GGUF header declares them |
 |---|---|
-| Llama and its distils | `llama`, `mistral`, `mistral3`, `yi`, `falcon`, `falcon3`, `internlm2`, `neox`, `stablelm` |
+| Llama and its distils | `llama`, `mistral`, `mistral3`, `yi`, `falcon`, `falcon3`, `internlm2`, `stablelm` |
 | Qwen | `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp` |
 | Gemma | `gemma`, `gemma2`, `gemma3`, `gemma4` |
 | Phi | `phi`, `phi2`, `phi3`, `phi4` |
 | Granite | `granite`, `granite3`, `granitemoe` |
 | OLMo | `olmo2`, `olmoe` |
-| Others | `gptoss`, `lfm2`, `lfm2moe`, `nemotron_h_moe`, `smollm3`, `starcoder`, `starcoder2`, `glm4`, `chatglm`, `ernie4_5`, `dbrx` |
+| Others | `gptoss`, `lfm2`, `lfm2moe`, `nemotron_h_moe`, `smollm3`, `starcoder`, `starcoder2`, `glm4`, `chatglm`, `ernie4_5`, `dbrx`, `glm_moe_dsa`, `mpt`, `orion` |
 <!-- site: end -->
 
 Mixtures route their experts on the card.
@@ -199,8 +199,9 @@ Reasoning models return their thinking apart from the answer on every surface.
 
 ### DeepSeek V4.1
 
-DeepSeek V4.1 has its own loader.
-The file or the checkpoint directory selects it by its hyper-connection tensors, not by name.
+DeepSeek V4.1 loads through the generic route as a wide-residual model.
+The hyper-connection tensors of the file or the checkpoint directory select its layers.
+The routed experts stay in the file, which may be split, and the placement plan decides which sit on the cards.
 
 The routed experts stay in the file, which may be split, and are read as routing asks for them.
 The always-read weights and the busiest experts sit on the cards.
@@ -213,7 +214,7 @@ Across machines, the model splits into runs of layers as a dense stack does, see
 
 | Input | Families | Transport |
 |---|---|---|
-| Vision | `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`) | Base64 in the request, on all 3 surfaces |
+| Vision | `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`, `qwen35`) | Base64 in the request, on all 3 surfaces |
 | Speech | `voxtral`, `ultravox` | Base64 clip in a chat turn |
 
 A model whose files carry a speech tower lists `audio` among its capabilities.

@@ -24,7 +24,7 @@ curl -s localhost:11435/v1/chat/completions -H 'Content-Type: application/json' 
 ```
 
 Inference stays on the machine. loken needs no account and no API key, and has no hosted fallback.
-It reaches the network to fetch a model you asked for, and to announce a cluster node you configured.
+It reaches the network to fetch a model you asked for, to announce a cluster node you configured, and to forward a request to a peer you configured.
 
 ## What it does
 
@@ -36,7 +36,7 @@ It reaches the network to fetch a model you asked for, and to announce a cluster
 - Replicated serving and sharding across machines.
 - Energy reported per request.
 
-[`docs/site/01-get-started/01-overview.md`](https://loken-ai.github.io/loken/overview/) holds the full table: each capability, its route, its configuration key and its state.
+[The overview](https://loken-ai.github.io/loken/overview/) holds the full table: each capability, its route, its configuration key and its state.
 
 ## Expose it on a network
 
@@ -47,9 +47,9 @@ Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` in `
 
 | Page | Read it to |
 |---|---|
-| [`docs/site/01-get-started/02-install.md`](https://loken-ai.github.io/loken/install/) | Build and install loken |
-| [`docs/site/02-guides/`](https://loken-ai.github.io/loken/) | Do one task, with the smallest configuration and one request |
-| [`docs/site/05-learn/`](https://loken-ai.github.io/loken/) | Learn the fundamentals of inference in 10 lessons |
+| [Install](https://loken-ai.github.io/loken/install/) | Build and install loken |
+| [Guides](https://loken-ai.github.io/loken/) | Do one task, with the smallest configuration and one request |
+| [Learn](https://loken-ai.github.io/loken/) | Learn the fundamentals of inference in 10 lessons |
 | [`docs/API.md`](docs/API.md) | Look up a route on the 3 surfaces |
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Look up a key of `config.toml` and its default |
 | [`docs/STATUS.md`](docs/STATUS.md) | See what is measured, what is slower, and what has never run |

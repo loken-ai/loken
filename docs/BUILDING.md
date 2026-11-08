@@ -37,7 +37,8 @@ A toolkit that does not know `sm_120a` fails the build.
 | Variable | Effect |
 |---|---|
 | `CUDA_PATH`, `CUDA_HOME` | Locates the toolkit when it is not where the build looks |
-| `CUDNN_LIB` | Locates cuDNN |
+| `LOKEN_CUDA_ARCHS` | Narrows the list of NVIDIA architectures the kernels are built for |
+| `LOKEN_STATIC_CXX` | Links the C++ runtime statically |
 
 ## AMD cards (ROCm)
 
