@@ -1,28 +1,38 @@
-//! No model or family name decides anything outside the facts table.
+//! No criterion is applied model by model outside the facts table.
 //!
-//! What a model is comes from its file: the tensors a block carries, their shapes, the
-//! metadata keys. The few facts a file does not carry sit in one table,
+//! Behaviour comes from tensors, metadata or the chat template, never from a table or a test
+//! on a model name. What a model is comes from its file: the tensors a block carries, their
+//! shapes, the metadata keys. The few facts a file does not carry sit in one table,
 //! `inference/model_facts.rs`, keyed by the file's `general.architecture`; what a media
 //! checkpoint's files declare is read in `inference/media_facts.rs`, keyed by the pipeline
-//! class, model type or architecture they carry. Anywhere else, a string literal naming an
-//! architecture or a model family inside a comparison, a match pattern or a list of names
-//! is a decision taken on a name, and this gate refuses it.
+//! class, model type or architecture they carry.
+//!
+//! Code that is specific to a family carries the real name of that family: a module, a
+//! directory, a type, a function, a test fixture, and a string literal compared with a value
+//! the model's own configuration, tensors or metadata declare (`model_type`,
+//! `architectures`, a tensor name). Such a literal is detection, and the gate accepts it
+//! where `model_name_rule` finds the operand read from the files.
+//!
+//! A string literal naming an architecture or a model family inside a comparison, a match
+//! pattern, a list of names or the key of a table, with an operand that is not read from
+//! the files, is a criterion applied by name, and this gate refuses it.
 //!
 //! Writing an identifier is not deciding on one: a converter that stores
 //! `general.architecture` in the file it produces, or a translation whose RESULT is an
 //! architecture tag, places the literal where a value is built (a constructor argument, the
 //! right of `=>`), which the gate does not count. Reading a file-format identifier that
-//! shares its spelling with a family (a `tokenizer.ggml.pre` value, an HF `architectures`
-//! class) sits under an `ARCH-NAME-EXEMPT:` comment that says so; the exemption covers the
+//! shares its spelling with a family (a `tokenizer.ggml.pre` value, a configuration key)
+//! sits under an `ARCH-NAME-EXEMPT:` comment that says so; the exemption covers the
 //! statement below it.
 
+use super::model_name_rule::reads_the_model_itself;
 use super::placement_invariants::{fleet_sources, production};
 
 /// The tables: the files allowed to decide by an identifier a checkpoint's files carry.
 const FACTS_TABLES: [&str; 2] = ["inference/model_facts.rs", "inference/media_facts.rs"];
 
-/// Trees this gate does not read yet. `api/` routes requests by model and carries its own
-/// coverage for now; extend this gate to it once that lands.
+/// Trees this gate does not read. `api/` handles requests and carries its own gate,
+/// `api/api_names_invariants.rs`.
 const NOT_YET_GATED: &[&str] = &["api/"];
 
 /// Words that begin a model family's name. A literal equal to one, or to one followed by
@@ -142,6 +152,10 @@ struct Literal {
     end: usize,
     text: String,
     inside: Option<char>,
+    /// The bracket that holds the one the literal sits in.
+    outside: Option<char>,
+    /// Whether nothing but an opening bracket precedes the literal in its bracket.
+    first: bool,
 }
 
 /// The string literals of `text` outside comments, and the bracket depth at the end of each
@@ -205,7 +219,7 @@ fn scan(text: &str) -> (Vec<Literal>, Vec<usize>) {
         .filter(|&h| chars.get(i + 1 + h) == Some(&'"'));
         if c == '"' || raw_hashes.is_some() {
             let hashes = raw_hashes.unwrap_or(0);
-            let (start_line, start_col) = (line, col);
+            let (start_line, start_col, start_i) = (line, col, i);
             let open = if raw_hashes.is_some() { 2 + hashes } else { 1 };
             for _ in 0..open {
                 advance(&mut i, &mut line, &mut col, stack.len(), &mut depth_at_end);
@@ -245,6 +259,12 @@ fn scan(text: &str) -> (Vec<Literal>, Vec<usize>) {
                     end: col,
                     text: content,
                     inside: stack.last().copied(),
+                    outside: stack.len().checked_sub(2).map(|i| stack[i]),
+                    first: chars[..start_i]
+                        .iter()
+                        .rev()
+                        .find(|c| !c.is_whitespace())
+                        .is_some_and(|c| matches!(c, '(' | '[')),
                 });
             }
             continue;
@@ -321,8 +341,10 @@ fn name_decisions(text: &str) -> Vec<(usize, String)> {
         .filter(|lit| names_a_model(&lit.text))
         .filter(|lit| {
             lit.inside == Some('[')
+                || (lit.inside == Some('(') && lit.outside == Some('[') && lit.first)
                 || compared(lines.get(lit.line).unwrap_or(&""), lit.start, lit.end)
         })
+        .filter(|lit| !reads_the_model_itself(&lines, lit.line))
         .map(|lit| (lit.line + 1, lit.text.clone()))
         .collect()
 }
@@ -334,6 +356,12 @@ fn a_name_is_caught_where_it_decides_and_nowhere_else() {
         "fn f(a: &str) -> bool { a.starts_with(\"gemma\") }",
         "fn f(a: &str) -> u8 { match a {\n    \"llama\" |\n    \"mistral\" => 1,\n    _ => 0,\n} }",
         "const L: &[&str] = &[\n    \"qwen3\",\n];",
+        "const S: &[(&str, f32)] = &[(\"qwen3\", 0.7)];",
+        "const SETTINGS: &[(&str, f32, usize)] = &[\n    (\"qwen3\", 0.7, 4),\n    (\"llama3\", 0.9, 8),\n];",
+        "fn threshold(model: &str) -> f32 {\n    match model {\n        \"gemma3\" => 0.5,\n        _ => 1.0,\n    }\n}",
+        "fn f(req: &Request) -> bool { req.model.contains(\"qwen\") }",
+        "fn f(name: &str) -> bool { name.contains(\"qwen\") }",
+        "fn f(tag: &str) -> u8 {\n    match tag {\n        \"qwen3\" => 1,\n        _ => 0,\n    }\n}",
         "fn f(a: Option<&str>) -> bool { a == Some(\"gptoss\") }",
         "fn f(a: &str) -> bool { matches!(a, \"olmoe\" | \"x\") }",
         "fn f(a: &str) -> bool { a.contains(\"flux\") }",
@@ -343,6 +371,10 @@ fn a_name_is_caught_where_it_decides_and_nowhere_else() {
         assert!(!name_decisions(src).is_empty(), "missed: {src}");
     }
     let writes = [
+        "fn f(cfg: &Config) -> bool { cfg.model_type == \"qwen3_tts\" }",
+        "fn f(h: &Hf) -> bool { h.architectures.iter().any(|a| a == \"Qwen2ForCausalLM\") }",
+        "fn f(cfg: &Config) -> u8 {\n    match cfg.model_type.as_str() {\n        \"qwen3_tts\" => 1,\n        _ => 0,\n    }\n}",
+        "mod qwen3_tts;\npub struct Qwen3Tts;\nfn load_qwen3_tts() {}",
         "fn f() -> V { V::String(\"qwen3\".into()) }",
         "fn f(hf: &str) -> &str { match hf { \"X\" => \"qwen2\", _ => \"\" } }",
         "fn f() { log(\"gemma4 loaded\"); }",
@@ -406,7 +438,8 @@ fn no_architecture_name_decides_outside_the_facts_table() {
     }
     assert!(
         problems.is_empty(),
-        "behaviour comes from the file's tensors and metadata, read in {FACTS_TABLES:?}:\n{}",
+        "no criterion is applied model by model: behaviour comes from tensors, metadata or the \
+         chat template, read in {FACTS_TABLES:?}, never from a table or a test on a name:\n{}",
         problems.join("\n")
     );
 }

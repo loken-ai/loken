@@ -1,14 +1,20 @@
-//! No model, family or publisher name decides anything in the API: the chat template decides
-//! how a conversation and its tools are written and read, the vocabulary stands in when there
-//! is no template, the file's declared architecture is the family reported, and a media
-//! checkpoint's own files say what it is (`inference/media_facts.rs`).
+//! No criterion is applied model by model in the API.
+//!
+//! Behaviour comes from tensors, metadata or the chat template, never from a table or a test
+//! on a model name. The chat template decides how a conversation and its tools are written
+//! and read, the vocabulary stands in when there is no template, the file's declared
+//! architecture is the family reported, and a media checkpoint's own files say what it is
+//! (`inference/media_facts.rs`).
 //!
 //! The gate reads every production source under `src/api` and fails on a string literal
 //! naming a model family or its publisher that sits in a comparison: a `contains`,
 //! `starts_with`, `ends_with`, `strip_prefix`, `eq_ignore_ascii_case`, `==` or `!=` operand,
-//! or a match pattern. A name may still be a value - an alias the catalogue looks up, an
-//! entry it registers - but never an operand.
+//! or a match pattern. Code specific to a family carries its real name as a module, a type
+//! or a function. A name may be a value (an alias the catalogue looks up, an entry it
+//! registers), and a literal may be compared with a value the model's own configuration,
+//! tensors or metadata declare (`model_type`, `architectures`).
 
+use crate::inference::place::model_name_rule::reads_the_model_itself;
 use std::path::{Path, PathBuf};
 
 /// Text model and family names, lowercase. A literal holds one when the name starts it or
@@ -208,10 +214,12 @@ fn named(literal: &str) -> Option<&'static str> {
 /// The name comparisons in one source, as `line: code` strings.
 fn violations(src: &str) -> Vec<String> {
     let mut found = Vec::new();
-    for (n, line) in production_lines(src).iter().enumerate() {
+    let production = production_lines(src);
+    let lines: Vec<&str> = production.iter().map(String::as_str).collect();
+    for (n, line) in production.iter().enumerate() {
         for (before, literal, after) in literals(line) {
             if let Some(name) = named(literal) {
-                if compared(before, after) {
+                if compared(before, after) && !reads_the_model_itself(&lines, n) {
                     found.push(format!("{}: {name}: {}", n + 1, line.trim()));
                 }
             }
@@ -252,14 +260,20 @@ fn no_model_name_decides_anything_in_the_api() {
     }
     assert!(
         failures.is_empty(),
-        "a model name decides behaviour; read the template, vocabulary, header or the \
-         checkpoint's files instead:\n  {}",
+        "a criterion is applied by model name: behaviour comes from tensors, metadata or the \
+         chat template, never from a test on a name:\n  {}",
         failures.join("\n  ")
     );
 }
 
 #[test]
 fn the_gate_sees_every_comparison_shape() {
+    // A per-model settings table keyed by names.
+    let table = "const K: &[(&str, f32)] = &[\n    (\"qwen3\", 0.7),\n];\nfn k(m: &str) -> f32 {\n    match m {\n        \"qwen3\" => 0.7,\n        _ => 1.0,\n    }\n}";
+    assert!(!violations(table).is_empty(), "missed a per-model table");
+    // A handler branching on a name from the request.
+    let handler = "async fn chat(req: Request) {\n    if req.model.contains(\"qwen\") {\n        slow();\n    }\n}";
+    assert!(!violations(handler).is_empty(), "missed a handler branch");
     let caught = [
         r#"if lower.contains("gemma4") {"#,
         r#"    m.starts_with("qwen3") => x,"#,
@@ -277,6 +291,12 @@ fn the_gate_sees_every_comparison_shape() {
         assert!(!violations(line).is_empty(), "missed: {line}");
     }
     let passed = [
+        r#"if cfg.model_type == "qwen3_tts" {"#,
+        r#"if hf.architectures.iter().any(|a| a == "Qwen2ForCausalLM") {"#,
+        r#"let Some(f) = Qwen3Tts::open(path) else { return };"#,
+        r#"mod qwen3_tts;"#,
+        r#"pub struct Qwen3Tts;"#,
+        r#"pub mod flux2 { pub struct Flux2Dit; }"#,
         r#"// if lower.contains("gemma") {"#,
         r#"let s = "<|im_start|>";"#,
         r#"Self::LlamaGuard => "llama-guard","#,
