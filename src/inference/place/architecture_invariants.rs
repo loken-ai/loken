@@ -127,9 +127,7 @@ const FAMILY_WORDS: &[&str] = &[
 ];
 
 /// Files that still decide by a name, with how many literals. The list only shrinks.
-///
-/// `distributed/layer_scheduler.rs` estimates a model's geometry from its id.
-const NAME_DEBT: &[(&str, usize)] = &[("distributed/layer_scheduler.rs", 1)];
+const NAME_DEBT: &[(&str, usize)] = &[];
 
 /// Written on or above a statement that reads a file-format identifier.
 const EXEMPT: &str = "ARCH-NAME-EXEMPT:";

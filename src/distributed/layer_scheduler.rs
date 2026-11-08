@@ -6,14 +6,10 @@
 
 use crate::distributed::device_manager::{ComputeDevice, DeviceManager, DeviceType};
 use crate::distributed::protocol::{DeviceInfo, DistributionPlan};
+use crate::tensor::quantized::gguf_file::Content;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tracing::{info, warn};
-
-/// Memory per layer for different model sizes (approximate, FP16)
-const MEMORY_PER_LAYER_7B_FP16: u64 = 256 * 1024 * 1024; // ~256 MB per layer
-const MEMORY_PER_LAYER_13B_FP16: u64 = 512 * 1024 * 1024; // ~512 MB per layer
-const MEMORY_PER_LAYER_70B_FP16: u64 = 2 * 1024 * 1024 * 1024; // ~2 GB per layer
 
 /// Quantization type for memory estimation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,94 +80,61 @@ pub struct ModelInfo {
     pub num_heads: usize,
 }
 
-/// Everything a [`ModelInfo`] needs beyond the id it was asked about: the geometry a family
-/// is published with, and what one of its layers weighs at FP16 before a quantisation is
-/// applied to it.
-#[derive(Clone, Copy)]
-struct Family {
-    num_layers: u32,
-    memory_per_layer_fp16: u64,
-    hidden_size: usize,
-    num_heads: usize,
-}
-
-/// The 7B/8B shape, and what an id nobody recognises is estimated as.
-const SEVEN_B: Family = Family {
-    num_layers: 32,
-    memory_per_layer_fp16: MEMORY_PER_LAYER_7B_FP16,
-    hidden_size: 4096,
-    num_heads: 32,
-};
-
-/// The families told apart by what their names contain, MOST SPECIFIC FIRST - the order is
-/// part of the rule, not a presentation of it. A name carries every substring in it:
-/// `devstral-small-24b` carries `24b`, and `llama-13b` carries `3b`, so a table consulted in
-/// any other order answers a question the caller did not ask.
-///
-/// A 24B checkpoint is 40 layers, and a Q4 publication of one is ~15 GB on disk - which is
-/// where the ~1.5 GB an FP16 layer of it weighs comes from.
-const FAMILIES: &[(&[&str], Family)] = &[
-    (
-        &["devstral", "24b"],
-        Family {
-            num_layers: 40,
-            memory_per_layer_fp16: 1536 * 1024 * 1024,
-            hidden_size: 5120,
-            num_heads: 32,
-        },
-    ),
-    (&["7b", "8b"], SEVEN_B),
-    (
-        &["13b", "14b"],
-        Family {
-            num_layers: 40,
-            memory_per_layer_fp16: MEMORY_PER_LAYER_13B_FP16,
-            hidden_size: 5120,
-            num_heads: 40,
-        },
-    ),
-    (
-        &["70b"],
-        Family {
-            num_layers: 80,
-            memory_per_layer_fp16: MEMORY_PER_LAYER_70B_FP16,
-            hidden_size: 8192,
-            num_heads: 64,
-        },
-    ),
-    (
-        &["3b"],
-        Family {
-            num_layers: 28,
-            memory_per_layer_fp16: MEMORY_PER_LAYER_7B_FP16 / 2,
-            hidden_size: 3072,
-            num_heads: 24,
-        },
-    ),
-];
-
 impl ModelInfo {
-    /// Create model info for known architectures (FP16 by default)
-    pub fn from_model_id(model_id: &str) -> Self {
-        Self::from_model_id_with_quant(model_id, QuantizationType::FP16)
+    /// Read the geometry of a model from its own GGUF header and tensor directory.
+    ///
+    /// Layers, hidden size and attention heads come from the `{architecture}.*` keys.
+    /// Bytes per layer is the size of the heaviest `blk.{i}.*` group of the directory.
+    /// A header that lacks one of these facts, or declares a layer with no tensor, is refused.
+    pub fn from_gguf(model_id: &str, content: &Content) -> Result<Self> {
+        let arch = content
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .ok_or_else(|| anyhow!("{model_id}: the header names no architecture"))?;
+        let key = |name: &str| -> Result<u64> {
+            content
+                .metadata
+                .get(&format!("{arch}.{name}"))
+                .and_then(|v| v.to_u64().ok())
+                .filter(|v| *v > 0)
+                .ok_or_else(|| anyhow!("{model_id}: the header has no {arch}.{name}"))
+        };
+        let num_layers = u32::try_from(key("block_count")?)?;
+        let hidden_size = usize::try_from(key("embedding_length")?)?;
+        let num_heads = usize::try_from(key("attention.head_count")?)?;
+
+        let mut per_layer = vec![0u64; num_layers as usize];
+        for (name, info) in &content.tensor_infos {
+            let layer = name
+                .strip_prefix("blk.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok());
+            if let Some(slot) = layer.and_then(|l| per_layer.get_mut(l)) {
+                *slot += info.size_in_bytes() as u64;
+            }
+        }
+        if let Some(empty) = per_layer.iter().position(|b| *b == 0) {
+            return Err(anyhow!(
+                "{model_id}: the directory holds no tensor for layer {empty}"
+            ));
+        }
+        let memory_per_layer = per_layer.iter().copied().max().unwrap_or(0);
+
+        Ok(Self {
+            model_id: model_id.to_string(),
+            num_layers,
+            memory_per_layer,
+            hidden_size,
+            num_heads,
+        })
     }
 
-    /// Create model info for known architectures with specific quantization
-    pub fn from_model_id_with_quant(model_id: &str, quant: QuantizationType) -> Self {
-        let model_lower = model_id.to_lowercase();
-        let quant_factor = quant.bytes_per_param() / 2.0; // Ratio vs FP16
-        let family = FAMILIES
-            .iter()
-            .find(|(names, _)| names.iter().any(|n| model_lower.contains(n)))
-            .map_or(SEVEN_B, |(_, f)| *f);
-
-        Self {
-            model_id: model_id.to_string(),
-            num_layers: family.num_layers,
-            memory_per_layer: (family.memory_per_layer_fp16 as f32 * quant_factor) as u64,
-            hidden_size: family.hidden_size,
-            num_heads: family.num_heads,
-        }
+    /// Read the geometry of the model held by the GGUF file at `path`, header only.
+    pub fn from_gguf_path(model_id: &str, path: &std::path::Path) -> Result<Self> {
+        let content = crate::tensor::quantized::gguf_file::open_header(path)
+            .map_err(|e| anyhow!("{model_id}: {e}"))?;
+        Self::from_gguf(model_id, &content)
     }
 
     /// Estimate total model memory (weights only, no KV cache)
@@ -510,42 +473,11 @@ mod tests {
     use crate::distributed::device_manager::{DeviceAvailability, UnavailableReason};
 
     #[test]
-    fn test_model_info_7b() {
-        let model = ModelInfo::from_model_id("llama-7b");
-        assert_eq!(model.num_layers, 32);
-        assert_eq!(model.hidden_size, 4096);
-    }
-
-    #[test]
-    fn test_model_info_70b() {
-        let model = ModelInfo::from_model_id("llama-70b");
-        assert_eq!(model.num_layers, 80);
-        assert_eq!(model.hidden_size, 8192);
-    }
-
-    #[test]
-    fn test_memory_estimation() {
-        let model = ModelInfo::from_model_id("llama-7b");
-        let total = model.total_memory();
-        assert!(total > 0);
-
-        let kv_per_token = model.kv_cache_per_token();
-        assert!(kv_per_token > 0);
-    }
-
-    #[test]
     fn test_scheduler_creation() {
         let dm = DeviceManager::new();
         let scheduler = LayerScheduler::new(dm);
 
         assert!(scheduler.current_plan().is_none());
-    }
-
-    #[test]
-    fn test_devstral_layer_count() {
-        // Devstral-small-24b has 40 layers
-        let model = ModelInfo::from_model_id("devstral-small-24b");
-        assert_eq!(model.num_layers, 40);
     }
 
     #[test]
@@ -632,29 +564,6 @@ mod tests {
             QuantizationType::from_gguf_name("q3_k_l"),
             QuantizationType::Q3,
             "q3 lookup must not leak through to higher quants"
-        );
-    }
-
-    #[test]
-    fn model_info_quantization_scales_memory_per_layer() {
-        // Same model, different quants: memory_per_layer must scale
-        // linearly with bytes_per_param relative to FP16.
-        let fp16 = ModelInfo::from_model_id_with_quant("llama-7b", QuantizationType::FP16);
-        let q4 = ModelInfo::from_model_id_with_quant("llama-7b", QuantizationType::Q4);
-        let q8 = ModelInfo::from_model_id_with_quant("llama-7b", QuantizationType::Q8);
-        // Layer counts identical (same architecture).
-        assert_eq!(fp16.num_layers, q4.num_layers);
-        assert_eq!(fp16.num_layers, q8.num_layers);
-        // Q4 is 1/4 the memory of FP16 (0.5 / 2.0), Q8 is 1/2.
-        let ratio_q4 = q4.memory_per_layer as f64 / fp16.memory_per_layer as f64;
-        let ratio_q8 = q8.memory_per_layer as f64 / fp16.memory_per_layer as f64;
-        assert!(
-            (ratio_q4 - 0.25).abs() < 0.001,
-            "Q4/FP16 ratio = {ratio_q4}, want 0.25"
-        );
-        assert!(
-            (ratio_q8 - 0.5).abs() < 0.001,
-            "Q8/FP16 ratio = {ratio_q8}, want 0.50"
         );
     }
 
@@ -795,7 +704,7 @@ mod tests {
 
     /// One 256 MiB layer - the FP16 weight of a 7B block, and the unit every
     /// budget in the case table below is expressed in.
-    const L: u64 = MEMORY_PER_LAYER_7B_FP16;
+    const L: u64 = 256 * 1024 * 1024;
 
     /// A model of `num_layers` blocks weighing `memory_per_layer` each. The
     /// geometry fields play no part in placement.
@@ -1021,28 +930,10 @@ mod tests {
             ),
             (
                 "a real checkpoint over two unequal cards",
-                ModelInfo::from_model_id_with_quant("devstral-small-24b", QuantizationType::Q4),
+                model_of(40, 384 * 1024 * 1024),
                 vec![
-                    card(
-                        0,
-                        DeviceType::Cuda,
-                        13,
-                        ModelInfo::from_model_id_with_quant(
-                            "devstral-small-24b",
-                            QuantizationType::Q4,
-                        )
-                        .memory_per_layer,
-                    ),
-                    card(
-                        1,
-                        DeviceType::Cuda,
-                        40,
-                        ModelInfo::from_model_id_with_quant(
-                            "devstral-small-24b",
-                            QuantizationType::Q4,
-                        )
-                        .memory_per_layer,
-                    ),
+                    card(0, DeviceType::Cuda, 13, 384 * 1024 * 1024),
+                    card(1, DeviceType::Cuda, 40, 384 * 1024 * 1024),
                 ],
             ),
         ];
@@ -1056,87 +947,116 @@ mod tests {
         }
     }
 
-    /// The family table is consulted in order and matches on substrings, so a name
-    /// carries every substring in it: `llama-13b` carries `3b`, `devstral-small-24b`
-    /// carries `24b`. This pins which row each name reaches.
-    fn reference_model_info(model_id: &str, quant: QuantizationType) -> (u32, u64, usize, usize) {
-        let model_lower = model_id.to_lowercase();
-        let quant_factor = quant.bytes_per_param() / 2.0;
+    // ---------------------------------------------------------------------
+    // The geometry read from the model.
+    //
+    // `old_table` is the function that estimated a geometry from fragments of an id. It is
+    // kept here only to compare values: the production code reads the header.
+    // ---------------------------------------------------------------------
 
-        if model_lower.contains("devstral") || model_lower.contains("24b") {
-            let memory_per_layer_fp16 = 1536 * 1024 * 1024;
-            (
-                40,
-                (memory_per_layer_fp16 as f32 * quant_factor) as u64,
-                5120,
-                32,
-            )
-        } else if model_lower.contains("7b") || model_lower.contains("8b") {
-            (
-                32,
-                (MEMORY_PER_LAYER_7B_FP16 as f32 * quant_factor) as u64,
-                4096,
-                32,
-            )
-        } else if model_lower.contains("13b") || model_lower.contains("14b") {
-            (
-                40,
-                (MEMORY_PER_LAYER_13B_FP16 as f32 * quant_factor) as u64,
-                5120,
-                40,
-            )
-        } else if model_lower.contains("70b") {
-            (
-                80,
-                (MEMORY_PER_LAYER_70B_FP16 as f32 * quant_factor) as u64,
-                8192,
-                64,
-            )
-        } else if model_lower.contains("3b") {
-            (
-                28,
-                (MEMORY_PER_LAYER_7B_FP16 as f32 * quant_factor / 2.0) as u64,
-                3072,
-                24,
-            )
-        } else {
-            (
-                32,
-                (MEMORY_PER_LAYER_7B_FP16 as f32 * quant_factor) as u64,
-                4096,
-                32,
-            )
+    const MIB: u64 = 1024 * 1024;
+
+    /// What the old estimate answered: layers, bytes per layer, hidden size, heads.
+    type Geometry = (u32, u64, usize, usize);
+
+    /// The old family table, copied as it was. Most specific first.
+    fn old_table(model_id: &str, quant: QuantizationType) -> Geometry {
+        const SEVEN_B: Geometry = (32, 256 * MIB, 4096, 32);
+        let table: &[(&[&str], Geometry)] = &[
+            (&["devstral", "24b"], (40, 1536 * MIB, 5120, 32)),
+            (&["7b", "8b"], SEVEN_B),
+            (&["13b", "14b"], (40, 512 * MIB, 5120, 40)),
+            (&["70b"], (80, 2048 * MIB, 8192, 64)),
+            (&["3b"], (28, 256 * MIB / 2, 3072, 24)),
+        ];
+        let lower = model_id.to_lowercase();
+        let family = table
+            .iter()
+            .find(|(names, _)| names.iter().any(|n| lower.contains(n)))
+            .map_or(SEVEN_B, |(_, f)| *f);
+        let factor = quant.bytes_per_param() / 2.0;
+        (
+            family.0,
+            (family.1 as f32 * factor) as u64,
+            family.2,
+            family.3,
+        )
+    }
+
+    /// A header-only description of a model: the `{arch}.*` keys and, for each layer, 2
+    /// tensors that together weigh `per_layer` bytes, plus one tensor outside any layer.
+    fn synthetic_model(layers: u32, per_layer: u64, hidden: usize, heads: usize) -> Content {
+        use crate::tensor::quantized::gguf_file::{TensorInfo, Value, VersionedMagic};
+        use crate::tensor::quantized::GgmlDType;
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            Value::String("arch".to_string()),
+        );
+        metadata.insert("arch.block_count".to_string(), Value::U32(layers));
+        metadata.insert(
+            "arch.embedding_length".to_string(),
+            Value::U32(hidden as u32),
+        );
+        metadata.insert(
+            "arch.attention.head_count".to_string(),
+            Value::U32(heads as u32),
+        );
+        let mut tensor_infos = HashMap::new();
+        let mut put = |name: String, bytes: u64| {
+            tensor_infos.insert(
+                name,
+                TensorInfo {
+                    ggml_dtype: GgmlDType::F16,
+                    shape: vec![(bytes / 2) as usize].into(),
+                    offset: 0,
+                },
+            );
+        };
+        for l in 0..layers {
+            put(format!("blk.{l}.attn.weight"), per_layer / 4);
+            put(format!("blk.{l}.ffn.weight"), per_layer - per_layer / 4);
+        }
+        put("token_embd.weight".to_string(), 64 * MIB);
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos,
+            tensor_data_offset: 0,
+            mmap_owner: None,
         }
     }
 
+    fn geometry(info: &ModelInfo) -> Geometry {
+        (
+            info.num_layers,
+            info.memory_per_layer,
+            info.hidden_size,
+            info.num_heads,
+        )
+    }
+
+    /// Devices that split each stack of the table across 2 cards and the host.
+    fn ladder_for(per_layer: u64) -> Vec<(ComputeDevice, Option<String>)> {
+        vec![
+            card(0, DeviceType::Cuda, 9, per_layer),
+            card(1, DeviceType::Cuda, 17, per_layer),
+            card(2, DeviceType::Cpu, 80, per_layer),
+        ]
+    }
+
     #[test]
-    fn family_lookup_agrees_on_the_names_that_share_a_prefix() {
-        let names = [
-            // The pair the ordering exists for: `13b` must win over the `3b` it
-            // contains, and `14b` likewise.
+    fn the_header_gives_what_the_family_table_gave() {
+        let ids = [
             "llama-3b",
-            "llama-13b",
-            "llama-14b",
-            "Llama-13B",
-            // `8b` is tested before `13b`, so a 13B published in 8-bit reads as
-            // the 7B/8B row. Pinned because it is the surprising one.
-            "llama-13b-8bit",
-            // `70b` does not contain `7b` - the substring is `70b`.
-            "llama-70b",
-            "llama-3-70b",
             "llama-7b",
             "llama-3.1-8b",
-            // `devstral` and a bare `24b` reach the same geometry.
+            "llama-13b",
+            "llama-14b",
+            "llama-70b",
             "devstral-small-24b",
             "mistral-24b",
-            "Devstral-Small-2507",
-            // An MoE tag whose expert size ends in `3b`.
-            "qwen3-30b-a3b",
-            // Names carrying no family token at all.
-            "yi-34b",
-            "phi-3-mini-4k",
-            "",
-            "gpt-oss-20b",
+            "unknown-model",
         ];
         let quants = [
             QuantizationType::FP16,
@@ -1147,20 +1067,94 @@ mod tests {
             QuantizationType::Q3,
             QuantizationType::Q2,
         ];
-
-        for name in names {
+        let scheduler = LayerScheduler::new(DeviceManager::new());
+        for id in ids {
             for quant in quants {
-                let want = reference_model_info(name, quant);
-                let info = ModelInfo::from_model_id_with_quant(name, quant);
-                let got = (
-                    info.num_layers,
-                    info.memory_per_layer,
-                    info.hidden_size,
-                    info.num_heads,
+                let want = old_table(id, quant);
+                let (layers, per_layer, hidden, heads) = want;
+                let content = synthetic_model(layers, per_layer, hidden, heads);
+                let info = ModelInfo::from_gguf(id, &content).expect("a complete header is read");
+                assert_eq!(
+                    geometry(&info),
+                    want,
+                    "geometry differs for {id:?} at {quant:?}"
                 );
-                assert_eq!(want, got, "family lookup differs for {name:?} at {quant:?}");
-                assert_eq!(info.model_id, name);
+                assert_eq!(info.model_id, id);
+                assert_eq!(info.total_memory(), per_layer * layers as u64);
+
+                let old = ModelInfo {
+                    model_id: id.to_string(),
+                    num_layers: layers,
+                    memory_per_layer: per_layer,
+                    hidden_size: hidden,
+                    num_heads: heads,
+                };
+                let devices = ladder_for(per_layer);
+                assert_eq!(
+                    observe(&scheduler.assign_layers_by_memory(&old, &devices)),
+                    observe(&scheduler.assign_layers_by_memory(&info, &devices)),
+                    "layer ranges differ for {id:?} at {quant:?}"
+                );
+                assert_eq!(info.kv_cache_per_token(), old.kv_cache_per_token());
             }
         }
+    }
+
+    #[test]
+    fn the_heaviest_layer_sets_the_bytes_per_layer() {
+        use crate::tensor::quantized::gguf_file::TensorInfo;
+        let mut content = synthetic_model(4, 8 * MIB, 64, 4);
+        let template = content.tensor_infos["blk.2.ffn.weight"].clone();
+        content.tensor_infos.insert(
+            "blk.2.extra.weight".to_string(),
+            TensorInfo {
+                shape: vec![(8 * MIB / 2) as usize].into(),
+                ..template
+            },
+        );
+        let info = ModelInfo::from_gguf("m", &content).unwrap();
+        assert_eq!(info.memory_per_layer, 16 * MIB);
+    }
+
+    #[test]
+    fn a_header_that_lacks_a_fact_is_refused() {
+        use crate::tensor::quantized::gguf_file::Value;
+        let complete = || synthetic_model(4, 8 * MIB, 64, 4);
+        assert!(ModelInfo::from_gguf("m", &complete()).is_ok());
+
+        for key in [
+            "general.architecture",
+            "arch.block_count",
+            "arch.embedding_length",
+            "arch.attention.head_count",
+        ] {
+            let mut content = complete();
+            content.metadata.remove(key);
+            let err = ModelInfo::from_gguf("m", &content).unwrap_err().to_string();
+            assert!(err.starts_with("m:"), "{key}: {err}");
+        }
+
+        let mut zero = complete();
+        zero.metadata
+            .insert("arch.attention.head_count".to_string(), Value::U32(0));
+        assert!(ModelInfo::from_gguf("m", &zero).is_err());
+
+        let mut hole = complete();
+        hole.tensor_infos.retain(|n, _| !n.starts_with("blk.3."));
+        let err = ModelInfo::from_gguf("m", &hole).unwrap_err().to_string();
+        assert!(err.contains("layer 3"), "{err}");
+
+        let mut bare = complete();
+        bare.tensor_infos.clear();
+        assert!(ModelInfo::from_gguf("m", &bare).is_err());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_refused() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-model.gguf");
+        let err = ModelInfo::from_gguf_path("m", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("m:"), "{err}");
     }
 }
