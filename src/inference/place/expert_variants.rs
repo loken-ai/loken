@@ -54,7 +54,7 @@ impl VariantPlan {
 
 /// Layer `layer`'s experts, hottest first: the ranked ones, then every expert the ranking does
 /// not name, by id.
-fn order(ranks: &[Vec<usize>], layer: usize, experts: usize) -> Vec<usize> {
+pub fn order(ranks: &[Vec<usize>], layer: usize, experts: usize) -> Vec<usize> {
     let mut seen = vec![false; experts];
     let mut out = Vec::with_capacity(experts);
     for &e in ranks.get(layer).into_iter().flatten() {

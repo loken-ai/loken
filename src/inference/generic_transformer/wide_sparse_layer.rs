@@ -28,6 +28,7 @@ use super::compressed_band::BandCell;
 use super::hyper::sinkhorn::SinkhornMixer;
 use super::moe_weights::{sqrt_softplus_choice, sqrt_softplus_truncated_choice, Truncation};
 use super::ngram::engram::{EngramBlock, EngramMeta};
+use super::wide_expert_card::CardExperts;
 use super::*;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
@@ -320,6 +321,8 @@ pub struct RoutedFfn {
     pub limit: f32,
     pub lossy: LossyRouting,
     pub variants: ExpertVariants,
+    /// The experts the cards keep, each the variant `variants` chose.
+    pub card: CardExperts,
 }
 
 impl RoutedFfn {
@@ -423,27 +426,60 @@ impl RoutedFfn {
         let active: Vec<usize> = (0..assign.len())
             .filter(|&e| !assign[e].is_empty())
             .collect();
-        // Every routed expert's bytes are asked for at once, so the reads overlap the compute.
-        active.par_iter().for_each(|&e| self.experts[e].will_need());
+        // The experts a card keeps run there, the others on the host's cores.
+        let (on_card, on_host): (Vec<usize>, Vec<usize>) =
+            active.iter().partition(|&&e| self.card.holds(e));
+        // Every host expert's bytes are asked for at once, so the reads overlap the compute.
+        on_host
+            .par_iter()
+            .for_each(|&e| self.experts[e].will_need());
         let mut y: Vec<Vec<f32>> = match &self.shared {
             Some(s) => s.forward(&x2, self.limit)?.to_vec2::<f32>()?,
             None => vec![vec![0f32; dim]; n],
         };
         let rows = x2.flatten_all()?.to_vec1::<f32>()?;
+        let host_run = |ids: &[usize]| -> Result<Vec<Vec<f32>>> {
+            ids.par_iter()
+                .map(|&e| -> Result<Vec<f32>> {
+                    let picked: Vec<f32> = assign[e]
+                        .iter()
+                        .flat_map(|&(t, _)| rows[t * dim..(t + 1) * dim].iter().copied())
+                        .collect();
+                    let xe = Tensor::from_vec(picked, (assign[e].len(), dim), &Device::Cpu)?;
+                    self.experts[e]
+                        .forward(&xe, self.limit)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                })
+                .collect()
+        };
+        // The cards and the cores run at once: a scoped thread drives the cards.
+        let card_rows: Vec<Vec<usize>> = on_card
+            .iter()
+            .map(|&e| assign[e].iter().map(|&(t, _)| t).collect())
+            .collect();
+        let (card_outs, host_outs) = std::thread::scope(|scope| {
+            let card = (!on_card.is_empty()).then(|| {
+                scope.spawn(|| self.card.run(&on_card, &card_rows, &rows, dim, self.limit))
+            });
+            let host = host_run(&on_host);
+            let card = card.and_then(|h| h.join().ok().flatten());
+            (card, host)
+        });
+        let host_outs = host_outs?;
+        // A card that failed leaves its experts to the host, which gives the same bits.
+        let card_outs = match card_outs {
+            Some(outs) => outs,
+            None => host_run(&on_card)?,
+        };
+        // Each active expert's outputs, in the order of `active`.
+        let mut by_id: std::collections::HashMap<usize, Vec<f32>> =
+            on_card.into_iter().zip(card_outs).collect();
+        by_id.extend(on_host.into_iter().zip(host_outs));
         let outs: Vec<Vec<f32>> = active
-            .par_iter()
-            .map(|&e| -> Result<Vec<f32>> {
-                let picked: Vec<f32> = assign[e]
-                    .iter()
-                    .flat_map(|&(t, _)| rows[t * dim..(t + 1) * dim].iter().copied())
-                    .collect();
-                let xe = Tensor::from_vec(picked, (assign[e].len(), dim), &Device::Cpu)?;
-                self.experts[e]
-                    .forward(&xe, self.limit)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .iter()
+            .map(|e| by_id.remove(e).unwrap_or_default())
+            .collect();
         for (out, &e) in outs.iter().zip(&active) {
             for (r, &(t, w)) in assign[e].iter().enumerate() {
                 for (a, b) in y[t].iter_mut().zip(&out[r * dim..(r + 1) * dim]) {
@@ -590,6 +626,10 @@ pub struct WideSparseHead {
     ///
     /// `None` without a profile that counted a route.
     pub heat: Option<Vec<Vec<usize>>>,
+    /// Per card ordinal, the bytes the routed experts may take on it, cards in ordinal order.
+    ///
+    /// Empty when no card keeps routed experts.
+    pub card_rooms: Vec<(usize, u64)>,
 }
 
 impl WideSparseHead {

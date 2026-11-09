@@ -120,18 +120,23 @@ pub(super) fn first_card(plan: &HeteroPlan) -> usize {
         .unwrap_or(0)
 }
 
+/// What the card plan asks of the cards for prompts of `ids` tokens and their steps.
+pub(super) fn card_demand(facts: &Facts, meta: &WideSparseMeta, ids: usize) -> Demand {
+    Demand {
+        layers: facts.mixer_bytes.len(),
+        block_bytes: facts.mixer_bytes.iter().sum(),
+        head_bytes: 0,
+        kv_bytes_per_layer: meta.kv_bytes_per_layer(ids + STEPS),
+        runtime_reserve: llm_work_reserve(facts.width, ids),
+    }
+}
+
 /// The plan that puts the layers whose mixers fit on the cards offered, and the cards.
 ///
 /// The cards, their free bytes and the plan are the loader's own: `offer` and `Demand::plan`.
 pub(super) fn card_plan(facts: &Facts, meta: &WideSparseMeta, ids: usize) -> HeteroPlan {
     let layers = facts.mixer_bytes.len();
-    let demand = Demand {
-        layers,
-        block_bytes: facts.mixer_bytes.iter().sum(),
-        head_bytes: 0,
-        kv_bytes_per_layer: meta.kv_bytes_per_layer(ids + STEPS),
-        runtime_reserve: llm_work_reserve(facts.width, ids),
-    };
+    let demand = card_demand(facts, meta, ids);
     let cards = offer(None, demand.whole(), 0);
     assert!(
         !cards.cards.is_empty(),

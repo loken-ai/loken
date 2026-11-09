@@ -5,7 +5,7 @@
 //! bytes the model gives here.
 //! The bytes are each held layer's token mixer with its output projection as stored, 1 routed
 //! expert as stored, the experts the prior names per layer, and the experts a token routes to.
-//! The model also gives the bytes its token mixers hold on each card.
+//! The model also gives the bytes its token mixers and routed experts hold on each card.
 
 use super::mixer::Mixer;
 use super::wide_sparse_layer::SinkhornBlock;
@@ -88,18 +88,22 @@ impl GenericHeteroTransformer {
         ))
     }
 
-    /// Per card, the bytes the token mixers that run there hold on it, by ordinal.
+    /// Per card, the bytes the token mixers and the routed experts held there take, by ordinal.
     ///
-    /// `None` for a model of another kind, or one whose token mixers all run on the host.
+    /// `None` for a model of another kind, or one that holds nothing on a card.
     pub fn wide_card_residency(&self) -> Option<Vec<(usize, u64)>> {
         let mut cards: Vec<(usize, u64)> = Vec::new();
-        for (mixer, _) in self.wide_blocks() {
-            let Some((ordinal, bytes)) = held_on_card(mixer) else {
-                continue;
-            };
-            match cards.iter_mut().find(|(o, _)| *o == ordinal) {
+        let mut add =
+            |ordinal: usize, bytes: u64| match cards.iter_mut().find(|(o, _)| *o == ordinal) {
                 Some((_, held)) => *held += bytes,
                 None => cards.push((ordinal, bytes)),
+            };
+        for (mixer, block) in self.wide_blocks() {
+            if let Some((ordinal, bytes)) = held_on_card(mixer) {
+                add(ordinal, bytes);
+            }
+            for (ordinal, bytes) in block.ffn.card.bytes_by_card() {
+                add(ordinal, bytes);
             }
         }
         cards.sort_unstable();

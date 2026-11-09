@@ -1350,6 +1350,13 @@ impl LlmEngine {
                                         stem_on_card,
                                         draft_resident,
                                     )?;
+                                    // A wide residual's routed experts may take what the cards have
+                                    // left beside the plan's cache and a request's work.
+                                    m.note_wide_card_rooms(
+                                        &placed,
+                                        demand.kv_bytes_per_layer,
+                                        demand.runtime_reserve,
+                                    );
                                     // Every card the machine shows, the plan's first, takes a
                                     // range of each attention layer's cache.
                                     if context_parallel {
@@ -1412,13 +1419,13 @@ impl LlmEngine {
                                 }
                             }
                             // Each routed expert is read from the file the policy chooses, in the
-                            // order of the heat.
+                            // order of the heat, and the cards that pay keep the hottest.
                             if !variant_files.is_empty() {
                                 model
                                     .attach_expert_variants(&variant_files)
                                     .map_err(|e| anyhow!("{model_id_clone}: {e}"))?;
-                                model.place_expert_variants(expert_variants);
                             }
+                            model.place_wide_experts(expert_variants);
                             if quality != QualityLevel::Exact && layer_share.is_none() {
                                 let bos = get_gguf_u32(&content, "tokenizer.ggml.bos_token_id");
                                 let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());

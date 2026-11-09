@@ -142,11 +142,15 @@ mod vulkan_layers;
 #[cfg(all(test, feature = "vulkan"))]
 mod vulkan_parity;
 mod wide;
+pub mod wide_expert_card;
 pub mod wide_pipeline;
 #[cfg(test)]
 mod wide_pipeline_tests;
 #[cfg(test)]
 mod wide_sparse_batch_tests;
+pub mod wide_sparse_card_tier;
+#[cfg(test)]
+mod wide_sparse_card_tier_tests;
 mod wide_sparse_cluster;
 #[cfg(test)]
 pub(crate) mod wide_sparse_cluster_tests;

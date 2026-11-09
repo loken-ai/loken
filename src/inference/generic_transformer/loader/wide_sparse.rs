@@ -787,6 +787,7 @@ impl GenericHeteroTransformer {
                 limit: m.swiglu_limits.get(il).copied().unwrap_or(0.0),
                 lossy: Default::default(),
                 variants: Default::default(),
+                card: Default::default(),
             };
             // An engram layer: its table, under its own name or as the table every layer shares,
             // its fused key and value projection, and its gate.
@@ -1010,6 +1011,7 @@ impl GenericHeteroTransformer {
             meta: Arc::new(meta.clone()),
             prior: meta.mixture.hot.clone(),
             heat: None,
+            card_rooms: Vec::new(),
         };
         tensors.finish();
         let mut model = Self {
@@ -1167,6 +1169,7 @@ fn build_block_draft(tensors: &Tensors<'_, '_>, meta: BlockDraftMeta) -> Result<
             limit: meta.swiglu_limit,
             lossy: Default::default(),
             variants: Default::default(),
+            card: Default::default(),
         };
         stages.push(DraftStage {
             attn,

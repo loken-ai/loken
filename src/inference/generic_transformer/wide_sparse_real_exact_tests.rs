@@ -22,7 +22,9 @@
 use super::card_mixer_tests::{closeness, dequantise_mixers};
 use super::card_packed::route::{self, Route};
 use super::wide_sparse_config::WideSparseMeta;
-use super::wide_sparse_real_card_tests::{card_plan, first_card, layers_of, mixer_bytes, Facts};
+use super::wide_sparse_real_card_tests::{
+    card_demand, card_plan, first_card, layers_of, mixer_bytes, Facts,
+};
 use super::wide_sparse_real_tests::{argmax, blob, evict, ids_of, resident_mb, row, timed, TAG};
 use super::*;
 use crate::tensor::quantized::gguf_source::SplitGguf;
@@ -348,4 +350,76 @@ fn wide_sparse_real_exact_card() {
         table(name, &runs, &lens, &host_l2);
     }
     route::clear();
+}
+
+/// The card model with and without the routed experts the load gives the card, against the
+/// reference kept by `wide_sparse_real_exact_reference`.
+///
+/// 1 model in the process: the mixers go to the card by the plan, the prompts run without card
+/// experts, then the load's measure places the card tier and the prompts run again.
+/// The page cache of the file is dropped before each set of runs.
+/// The plan's facts come from the file's header, as the engine reads them.
+#[test]
+#[ignore]
+fn wide_sparse_real_exact_card_tier() {
+    use crate::inference::place::expert_variants::VariantChoice;
+    assert!(
+        Device::new_cuda(0).is_ok(),
+        "no CUDA device: this test measures the routed experts on a card"
+    );
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+    let path = blob(TAG);
+    let (meta, prompts) = prompts_of(&path);
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    let longest = *lens.iter().max().unwrap();
+    let content = SplitGguf::open(&path)
+        .expect("the file opens")
+        .merged_content();
+    let facts = Facts {
+        mixer_bytes: super::wide_sparse_plan::card_mixer_bytes(&content)
+            .expect("a wide residual")
+            .per_layer,
+        width: meta.d_model,
+    };
+    let demand = card_demand(&facts, &meta, longest + STEPS);
+    let plan = card_plan(&facts, &meta, longest + STEPS);
+    evict(&path);
+    let (mut card, ordinal) = load(&path, &|_, _| plan.clone());
+    println!("card: resident {} MB, ordinal {ordinal}", resident_mb());
+    let bare = both_runs(&mut card, &prompts);
+    let bare_l2 = table("card_bare", &bare, &lens, &[]);
+    card.note_wide_card_rooms(&plan, demand.kv_bytes_per_layer, demand.runtime_reserve);
+    println!("rooms for routed experts: {:?}", card.wide_card_rooms());
+    let (_, secs) = timed(|| card.place_wide_experts(VariantChoice::Plan));
+    let kept = card.wide_card_expert_count();
+    println!(
+        "card tier: {kept} routed experts kept, rooms {:?}, residency {:?}, placed in {secs:.1}s",
+        card.wide_card_rooms(),
+        card.wide_card_residency()
+    );
+    evict(&path);
+    let tier = both_runs(&mut card, &prompts);
+    table("card_tier", &tier, &lens, &bare_l2);
+    let pairs: u64 = card
+        .layers
+        .iter()
+        .filter_map(|l| l.sinkhorn.as_ref())
+        .map(|b| b.ffn.card.pairs_run())
+        .sum();
+    let cold = |runs: &Runs| runs.iter().map(|(f, _)| f.prefill_secs).sum::<f64>();
+    let cold_decode = |runs: &Runs| {
+        runs.iter()
+            .map(|(f, _)| f.decode_secs / STEPS as f64)
+            .sum::<f64>()
+    };
+    println!(
+        "COLD card_bare prefill {:.2}s decode {:.3}s per step, card_tier prefill {:.2}s decode {:.3}s per step (sums over prompts), card expert pairs run {pairs}",
+        cold(&bare),
+        cold_decode(&bare),
+        cold(&tier),
+        cold_decode(&tier)
+    );
 }

@@ -99,7 +99,10 @@ The placement fills the tiers that keep routed experts in routing-heat order: th
 The heat is the model's routing profile in `profiles/` of the store.
 The routing prior orders the experts the profile never counted, and every expert when there is no profile.
 The prior is the one the file records, else the one a companion GGUF beside it declares.
-A wide-residual model runs its routed experts on the host's cores, read from their file: no tier keeps them.
+A wide-residual model keeps its hottest routed experts on a card when the load measures the card faster than the host's cores on a token's experts.
+The card keeps them in the room it has left after the token mixers, the cache and a request's work.
+An expert on a card gives the bits it gives on the host.
+The other routed experts run on the host's cores, read from their file.
 The `fidelity` level in [Configuration](CONFIGURATION.md) picks the file:
 
 ```mermaid

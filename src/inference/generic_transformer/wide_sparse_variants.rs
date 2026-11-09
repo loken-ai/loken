@@ -72,25 +72,33 @@ impl GenericHeteroTransformer {
 
     /// The tiers that keep the routed experts of a wide layer, in the order a plan fills them.
     ///
-    /// The host's cores run a wide layer's routed experts from their mapping.
-    /// No card and no host tier keeps them.
-    fn wide_expert_tiers(&self) -> Vec<Tier> {
-        Vec::new()
+    /// 1 tier per card with a room for experts, cards in ordinal order.
+    /// A card computes an expert at the same speed whatever its variant: it takes the precise one.
+    /// The host's cores run the other experts from their mapping, with no tier of their own.
+    pub(super) fn wide_expert_tiers(&self) -> Vec<Tier> {
+        self.wide_sparse
+            .as_ref()
+            .map_or(&[][..], |ws| ws.card_rooms.as_slice())
+            .iter()
+            .map(|&(_, bytes)| Tier {
+                bytes,
+                precise: true,
+            })
+            .collect()
     }
 
-    /// Chooses the variant each routed expert is read from, by `choice` over the heat and the
-    /// tiers that keep the experts.
+    /// The plan of the routed experts over the tiers that keep them, by `choice` and the heat.
     ///
     /// A variant a layer lacks counts as too large for any tier.
-    /// `None` when the experts are stored in 1 file.
-    pub fn place_expert_variants(&mut self, choice: VariantChoice) -> Option<VariantPlan> {
+    /// `None` for a model without a Sinkhorn wide layer.
+    pub(super) fn plan_wide_experts(&self, choice: VariantChoice) -> Option<VariantPlan> {
         let variants = self.expert_variants();
-        if variants < 2 {
-            return None;
-        }
         let held: Vec<usize> = (0..self.layers.len())
             .filter(|&i| self.layers[i].sinkhorn.is_some())
             .collect();
+        if held.is_empty() {
+            return None;
+        }
         let ffn = |i: usize| self.layers[i].sinkhorn.as_ref().map(|b| &b.ffn);
         let experts = held
             .iter()
@@ -114,13 +122,9 @@ impl GenericHeteroTransformer {
                     .collect()
             })
             .collect();
-        let heat = self.routing_heat();
-        let ranks: Vec<Vec<usize>> = held
-            .iter()
-            .map(|&i| heat.get(self.first_layer + i).cloned().unwrap_or_default())
-            .collect();
+        let ranks = self.held_heat();
         let tiers = self.wide_expert_tiers();
-        let p = plan(
+        Some(plan(
             held.len(),
             experts,
             variants,
@@ -128,7 +132,32 @@ impl GenericHeteroTransformer {
             &ranks,
             &tiers,
             choice,
-        );
+        ))
+    }
+
+    /// Per held wide layer, its experts ranked by the heat.
+    pub(super) fn held_heat(&self) -> Vec<Vec<usize>> {
+        let heat = self.routing_heat();
+        (0..self.layers.len())
+            .filter(|&i| self.layers[i].sinkhorn.is_some())
+            .map(|i| heat.get(self.first_layer + i).cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// Chooses the variant each routed expert is read from, by `choice` over the heat and the
+    /// tiers that keep the experts.
+    ///
+    /// A variant a layer lacks counts as too large for any tier.
+    /// `None` when the experts are stored in 1 file.
+    pub fn place_expert_variants(&mut self, choice: VariantChoice) -> Option<VariantPlan> {
+        let variants = self.expert_variants();
+        if variants < 2 {
+            return None;
+        }
+        let p = self.plan_wide_experts(choice)?;
+        let held: Vec<usize> = (0..self.layers.len())
+            .filter(|&i| self.layers[i].sinkhorn.is_some())
+            .collect();
         for (l, &i) in held.iter().enumerate() {
             if let Some(block) = self.layers[i].sinkhorn.as_mut() {
                 for (e, &v) in p.chosen[l].iter().enumerate() {
