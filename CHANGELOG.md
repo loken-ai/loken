@@ -102,6 +102,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - DeepSeek V4.1: size a prompt's chunk for the residual copies each token keeps.
 - API: end a chat stream on an engine error with the error alone.
 - Kernels: refuse the inputs and launches that failed without an error.
+- State cache: load when the disk probe measures no rate.
 
 ### Removed
 

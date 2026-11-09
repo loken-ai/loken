@@ -108,14 +108,22 @@ pub fn block_tokens(
     cap_bytes: u64,
 ) -> usize {
     let granule = granule.max(1);
-    let unit_bytes = (granule * token_bytes.max(1)) as f64;
-    let wanted = (file_cost_s * write_bps / unit_bytes).ceil().max(1.0) as usize;
-    let mut mult = wanted.next_power_of_two();
-    let fits = |m: usize| (m as f64) * unit_bytes <= (cap_bytes / 2) as f64;
+    let unit_bytes = (granule as f64) * (token_bytes.max(1) as f64);
+    let room = (cap_bytes / 2) as f64;
+    // The multiple is clamped to the units half the room holds.
+    // An infinite or undefined cost times rate asks for that bound.
+    let wanted = (file_cost_s * write_bps / unit_bytes)
+        .ceil()
+        .max(1.0)
+        .min((room / unit_bytes).max(1.0)) as usize;
+    let mut mult = wanted
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX / 2 + 1);
+    let fits = |m: usize| (m as f64) * unit_bytes <= room;
     while mult > 1 && !fits(mult) {
         mult /= 2;
     }
-    granule * mult
+    granule.saturating_mul(mult)
 }
 
 /// The spacing, in tokens, of the states a prefill keeps: the least a write of one manifest
@@ -308,6 +316,33 @@ mod tests {
         let capped = block_tokens(1, 1000, 1.0, 1.0e9, 64 << 20);
         assert!(big > capped);
         assert!(capped as u64 * 1000 <= 32 << 20);
+    }
+
+    #[test]
+    fn an_unresolved_or_huge_disk_cost_gives_the_largest_block_the_room_holds() {
+        let rooms = [64u64 << 20, u64::MAX];
+        let costs = [
+            (0.01, f64::INFINITY),
+            (f64::INFINITY, 1.0e9),
+            (1.0e300, 1.0e300),
+            (0.0, f64::INFINITY),
+        ];
+        for room in rooms {
+            for (cost, bps) in costs {
+                let b = block_tokens(4, 1000, cost, bps, room);
+                assert_eq!(b % 4, 0, "a multiple of the granule");
+                assert!(b >= 4, "at least the granule");
+                assert!(
+                    b as u128 * 1000 <= (room / 2) as u128 || b == 4,
+                    "{b} tokens for room {room}, cost {cost}, rate {bps}"
+                );
+            }
+        }
+        assert!(
+            block_tokens(4, 1000, 0.01, f64::INFINITY, 64 << 20)
+                > block_tokens(4, 1000, 0.002, 1.0e9, 64 << 20),
+            "an unresolved rate asks for the largest block"
+        );
     }
 
     #[test]
