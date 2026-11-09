@@ -60,6 +60,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- API: open the window a load request's num_ctx asks for.
 - Speech: decode Parler with its checkpoint's sampling, length limit, end rule and 1 seed.
 - Delete: unload a model after releasing the table of loaded models.
 - Chat: return one log probability per token, streamed or not, and on the Responses route.

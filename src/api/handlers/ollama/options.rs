@@ -188,8 +188,15 @@ pub(crate) async fn ollama_chat(
         } else if keep_alive_minutes > 0 {
             // LOAD - model load via the dedup'd loader (per-model lock,
             // re-check after acquire, no double-engine on race).
+            // The window `options.num_ctx` asks for is the one the load opens.
+            let window = ollama_load_request(
+                &state,
+                request.options.as_ref(),
+                request.keep_alive.as_deref(),
+            )
+            .window;
             state
-                .ensure_loaded(&model_name, keep_alive_minutes)
+                .ensure_loaded_with_window(&model_name, keep_alive_minutes, window)
                 .await
                 .map_err(|e| ApiError::Internal(format!("load {model_name}: {e}")))?;
 
@@ -927,9 +934,19 @@ pub(crate) async fn ollama_generate(
             }
 
             // LOAD - model load (LLM path) via the dedup'd loader.
+            // The window `options.num_ctx` asks for is the one the load opens.
+            let window = ollama_load_request(
+                &state,
+                request.options.as_ref(),
+                request.keep_alive.as_deref(),
+            )
+            .window;
             let mut load_successful = false;
             let mut load_error = String::new();
-            match state.ensure_loaded(&model_name, keep_alive_minutes).await {
+            match state
+                .ensure_loaded_with_window(&model_name, keep_alive_minutes, window)
+                .await
+            {
                 Ok(()) => {
                     load_successful = true;
                     info!("✅ Model {} ready", model_name);

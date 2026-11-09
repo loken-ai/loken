@@ -121,7 +121,7 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 | Sampling (`temperature`, `top_p`, `top_k`, repetition penalty, stop sequences) | The request, else the model's own recommendation (the `params` layer of an Ollama manifest, the checkpoint's generation config), else the Ollama API defaults. |
 | Seed | The request's, else a fresh one per request. |
 | Generation length | The request's cap, else the end of the context window. |
-| Context window | The request's `num_ctx`, else what the checkpoint declares. A quantised cache grows into it on demand. An F16 cache is sized by the placement plan. |
+| Context window | The request's `num_ctx`, a load request's included, else what the checkpoint declares. A quantised cache grows into it on demand. An F16 cache is sized by the placement plan. A model whose cards keep some of its weights in the room the plan leaves opens the working window when no request asks for more: a larger cache would take that room. A longer prompt reloads it with a wider window. |
 | Card a model loads on | The fastest card that holds it, from the probe. |
 | Memory each card offers | The measured free memory. The load keeps its own runtime reserve and backs off after an out-of-memory. |
 | Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
