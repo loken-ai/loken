@@ -26,18 +26,21 @@ use super::block_draft::{BlockDraft, LayerCapture};
 use super::block_scaled_experts::BlockScaledExpert;
 use super::compressed_band::BandCell;
 use super::hyper::sinkhorn::SinkhornMixer;
-use super::moe_weights::{sqrt_softplus_choice, sqrt_softplus_truncated_choice, Truncation};
+use super::moe_weights::{
+    sqrt_softplus_choice, sqrt_softplus_truncated_choice, sqrt_softplus_weigh, Truncation,
+};
 use super::ngram::engram::{EngramBlock, EngramMeta};
+use super::wide::staged;
 use super::wide_expert_card::CardExperts;
 use super::*;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// The pre mix of a row that collapses onto stream 0 of `streams`.
-fn onto_first(streams: usize) -> Vec<f32> {
+pub(super) fn onto_first(streams: usize) -> Vec<f32> {
     let mut row = vec![0f32; streams];
     if let Some(w) = row.first_mut() {
         *w = 1.0;
@@ -283,6 +286,30 @@ pub struct LossyRouting {
     /// Slots of experts not in memory that the truncation removed or replaced, since last
     /// taken.
     pub saved: AtomicU64,
+    /// Routes a measurement imposes on the next single-row forwards, 1 per forward, oldest first.
+    ///
+    /// Empty in service.
+    pub script: std::sync::Mutex<std::collections::VecDeque<Vec<usize>>>,
+    /// Routes `script` holds, read before the lock so that a layer with none pays no lock.
+    pub scripted: AtomicUsize,
+}
+
+impl LossyRouting {
+    /// The next route a measurement imposes, `None` when none is queued.
+    fn next_scripted(&self) -> Option<Vec<usize>> {
+        if self.scripted.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let route = self
+            .script
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        if route.is_some() {
+            self.scripted.fetch_sub(1, Ordering::Relaxed);
+        }
+        route
+    }
 }
 
 /// The routed experts of a layer in every file of the checkpoint that stores them.
@@ -360,7 +387,18 @@ impl RoutedFfn {
     ///
     /// A row takes the truncated choice when the truncation gives up exactness, the plain
     /// choice otherwise.
-    fn route(&self, logits: &[Vec<f32>]) -> Vec<(Vec<usize>, Vec<f32>)> {
+    pub(super) fn route(&self, logits: &[Vec<f32>]) -> Vec<(Vec<usize>, Vec<f32>)> {
+        // A queued route stands in for the choice of a single row, weighed by the gate's row.
+        if let [row] = logits {
+            if let Some(chosen) = self.lossy.next_scripted() {
+                return vec![sqrt_softplus_weigh(
+                    row,
+                    chosen,
+                    self.temperature,
+                    self.normalize,
+                )];
+            }
+        }
         let t = self.lossy.truncation;
         if !t.active() {
             return logits
@@ -527,7 +565,9 @@ fn attention_half(
 ) -> Result<(Tensor, Vec<Vec<f32>>, Tensor)> {
     let mixes = block.attn_mix.mixes(r)?;
     let input = rms_norm(&block.attn_mix.pre(r, pre)?, &block.attn_norm, block.eps)?;
-    let mixed = mixer.forward(&input, pos)?;
+    let mixed = staged("token mixer", &Device::Cpu, false, || {
+        mixer.forward(&input, pos)
+    })?;
     let (b, seq, width) = mixed.dims3()?;
     let out = block
         .output
@@ -587,7 +627,7 @@ impl GenericTransformerLayer {
             &block.ffn_norm,
             block.eps,
         )?;
-        let out = block.ffn.forward(&input)?;
+        let out = staged("experts", &Device::Cpu, false, || block.ffn.forward(&input))?;
         let next = block.ffn_mix.post(&out, &mid, &mixes.post, &mixes.comb)?;
         block.carry.put(index_pos, seq, mixes.pre);
         Ok(next)

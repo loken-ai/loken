@@ -4,13 +4,13 @@
 //!
 //! The layers are held from the file's mapping alone. The input is a synthetic stream, and the
 //! routing is the model's own distribution replayed from the file's prior or an expert profile,
-//! so the experts read, uploaded and missed are the ones a served decode reads. The report is
-//! the stage profile the server keeps, the crossings at the card seam, the expert tiers'
-//! counters and the kernel's counts of faults and disk reads, as a table and as a JSON record
-//! that carries the build, the machine and the controls.
+//! so the experts read are the ones a served decode reads. The report is the stage profile the
+//! server keeps, the crossings at the card seam, the expert tiers' counters and the kernel's
+//! counts of faults and disk reads, as a table and as a JSON record that carries the build, the
+//! machine and the controls.
 //!
-//! A model joins through [`subject::Subject`]: the first is the streamed MoE the offload
-//! serves, and another streamed or resident model adds an implementation and a line in
+//! A model joins through [`subject::Subject`]: the first is the wide-residual mixture the
+//! generic route loads, and another model adds an implementation and an arm in
 //! [`subject::open`].
 
 pub mod args;
@@ -28,9 +28,10 @@ pub enum Placement {
     /// The placement a served model gets: the cards present take what they hold in service,
     /// the host tier keeps the rest.
     Auto,
-    /// No card: every step on the host, the experts through the host tier.
+    /// No card: every step on the host.
     Host,
-    /// The cards as in service, with no host tier: an expert off the cards is read from the file.
+    /// The cards as in service, with no host tier. The generic route keeps none, so a subject on
+    /// it refuses this placement.
     Cards,
 }
 
@@ -79,7 +80,8 @@ pub struct Controls {
     pub warm: usize,
     pub placement: Placement,
     pub page_cache: PageCache,
-    /// The expert read-ahead depth, in layers; `None` leaves it to the model's controller.
+    /// The expert read-ahead depth, in layers; `None` leaves it to the model. A subject with no
+    /// depth to pin refuses a value.
     pub readahead: Option<usize>,
     /// Routed experts per held layer the cards keep; `None` gives each layer the share a served
     /// model's layers get.

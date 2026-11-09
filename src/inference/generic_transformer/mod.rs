@@ -103,6 +103,8 @@ pub mod hyper;
 mod kv_handover_tests;
 pub mod latent_mqa;
 mod layer_attn;
+#[cfg(feature = "microbench")]
+pub mod layer_bench;
 mod layer_cpu_attn;
 mod layer_ffn;
 mod layer_forward;

@@ -24,11 +24,11 @@ cargo bench --features cuda,microbench --bench layerbench -- /models/large.gguf 
 | `--layers` | The layers held, `from..to` with the end excluded, or 1 index. | required |
 | `--tokens` | Decode steps timed. | 32 |
 | `--warm` | Decode steps run before the timed ones. | 4 |
-| `--placement` | `auto` as served, `host` with no card, `cards` with no host tier. | `auto` |
+| `--placement` | `auto` as served, `host` with no card. `cards` is refused: the generic route keeps no host tier for the experts. | `auto` |
 | `--page-cache` | `warm` reads the held layers' experts in first, `cold` drops them first. | `warm` |
-| `--readahead` | The expert read-ahead depth in layers. | the model's controller |
-| `--card-experts` | Routed experts per held layer the cards keep. | the share a served layer gets |
-| `--guess-hit` | The share of a token's experts its read-ahead guess names, 0 to 1. | 1.0 |
+| `--readahead` | Refused: the generic route has no read-ahead depth to pin for the experts. | none |
+| `--card-experts` | Routed experts per held layer the first card keeps, as the room it gives them. | what the card has free |
+| `--guess-hit` | The share of a token's experts its read-ahead guess names, 0 to 1. Unused: the generic route makes no guess. | 1.0 |
 | `--seed` | The seed of the synthetic stream and of the routing drawn. | 1 |
 | `--expert-profile` | A profile whose counts give the routing heat. | the file's prior |
 | `--json` | Where the JSON record is written. | none |
@@ -40,20 +40,21 @@ A range that starts elsewhere is refused, and the refusal lists the layers a ran
 
 ## What runs
 
-The layers are read from the file's mapping alone.  
+The layers are loaded through the generic route, as the engine loads a share of the stack.
+The file is read through its mapping, so the experts of other layers are never read.
 The embedding, the final norm and the output head are loaded whatever the range, so a range that ends the stack runs to logits.
 
 ### Placement
 
-The placement is the one a served model gets:
+The placement is the one the engine gives a model:
 
-- The weights every token reads are set aside on the cards as if the whole stack were held.
-- The room for routed experts is the held layers' share of what the experts of the whole stack would get.
-  A held layer keeps on the cards what it keeps in service.
-- The host tier is sized as the server sizes it: the memory left, divided over every layer of the stack.
+- The mixers of the held layers are the blocks the cards hold, as the plan of the engine sizes them.
+- The routed experts stay on the host.
+  After the load, each card that pays keeps the hottest experts in the room it has left, as in service.
+- `--placement host` opens no card.
 
-`--placement host` opens no card.  
-`--placement cards` keeps no host tier, so an expert off the cards is read from the file.
+The routing prior is the file's, or the one a companion file beside it declares.
+A profile given with `--expert-profile` ranks the experts in its place.
 
 ### Steps
 
@@ -61,13 +62,8 @@ Each step starts from a synthetic stream when the range starts inside the stack.
 It starts from a token drawn from the vocabulary when the range starts at layer 0.
 
 The routing is scripted.
-For every step and layer, the experts are drawn from the file's routing prior, or from the profile's counts when one is given.  
-The gate takes them in place of its own choice, and its weights stay the gate's.
-
-The read-ahead guess of the next layer is scripted the same way.
-`--guess-hit` sets how many of the token's experts it names.
-
-The read-ahead, the host tier, the card lanes and the deferral of host experts run as in service.
+For every step and layer, the experts are drawn from the file's routing prior, or from the profile's counts when one is given.
+The router takes them in place of its own choice, and its weights stay the router's.
 
 ## Report
 
@@ -75,26 +71,22 @@ The table starts with the run:
 
 - the layers held
 - the placement obtained
-- the experts the cards hold per layer and the host tier's slots
+- the experts the cards hold per layer (the host tier's slots are 0 on the generic route)
 - where the routing heat came from
 
 Then it gives the time per token over the timed steps.
 
 The stages are the server's stage profile, by time: milliseconds per token, calls per token, and the share of the stages' total.
 A stage name is the one `/api/stage_perf` reports.
+The generic route reports the token mixer and the experts of each layer.
 
-The steps at the card seam are what the layers offered a card, by kind:
-
-- A taken step ran on the card and returned its answer before the layer went on.
-  Each taken step is 1 wait on the card's stream.
-- A declined step ran on the host.
-
-The bytes are those handed to the card and those read back, per token.
+The record has a section for the steps at the card seam, by kind.
+The generic route has no such seam, so the section is empty.
 
 The counters, over the timed steps:
 
-- the expert uploads to the cards
-- the host tier's hits, misses and evictions
+- the expert uploads to the cards (a stage the generic route does not record)
+- the host tier's hits, misses and evictions (0 on the generic route)
 - the major page faults
 - the bytes the process read from disk
 

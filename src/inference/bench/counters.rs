@@ -1,16 +1,11 @@
-//! What a decode step moves and waits on, counted where the model hands its steps to the cards
-//! and read from the kernel's accounting of the process.
+//! What a decode step moves and waits on at the card seam, and what the kernel counts of the
+//! process.
 //!
-//! The crossings are counted at the `Offload` seam: every step a layer offers a card is one call,
-//! its arguments the bytes handed over and its answer the bytes read back. A step the card takes
-//! returns its answer to the host before the layer goes on, so each taken step is also one wait
-//! on the card's stream. A step the card declines runs on the host and moves nothing.
+//! The crossings are the calls a layer offers a card, by kind, with the bytes handed over and read
+//! back. A route with no such seam leaves them empty.
 
-use crate::inference::offload::projection::Projection;
-use crate::inference::offload::{AttnBlock, DecodeStream, HcStream, Offload, PrefillAttn};
-use crate::tensor::Result;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// One kind of step, as counted at the seam.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -58,185 +53,6 @@ impl Crossings {
     /// Zero every count.
     pub fn reset(&self) {
         self.steps.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-}
-
-/// Bytes of a slice of `f32`.
-fn f32_bytes(xs: &[f32]) -> u64 {
-    std::mem::size_of_val(xs) as u64
-}
-
-/// Bytes of a slice of `i32`.
-fn i32_bytes(xs: &[i32]) -> u64 {
-    std::mem::size_of_val(xs) as u64
-}
-
-/// The bytes an answer brings back: a vector of `f32`, or nothing for an error.
-fn back_bytes(r: &Result<Vec<f32>>) -> u64 {
-    r.as_ref().map_or(0, |v| f32_bytes(v))
-}
-
-/// An offload that counts every step through `crossings` and hands it to `inner`. Without an
-/// inner offload every step is declined, which is what the host alone answers: the counts then
-/// say how many steps a card would have been offered.
-pub struct Counting {
-    inner: Option<Arc<dyn Offload>>,
-    pub crossings: Arc<Crossings>,
-}
-
-impl Counting {
-    pub fn new(inner: Option<Arc<dyn Offload>>) -> Self {
-        Self {
-            inner,
-            crossings: Arc::new(Crossings::default()),
-        }
-    }
-}
-
-impl Offload for Counting {
-    fn prefill_attention(&self, a: &PrefillAttn) -> Option<Result<Vec<f32>>> {
-        let r = self.inner.as_ref().and_then(|o| o.prefill_attention(a));
-        let out = f32_bytes(a.qr) + f32_bytes(a.kv) + f32_bytes(a.sink) + i32_bytes(a.idxs);
-        self.crossings.note(
-            "prefill attention",
-            r.is_some(),
-            out,
-            r.as_ref().map_or(0, back_bytes),
-        );
-        r
-    }
-
-    fn decode_stream(&self, x: &[f32], hc: usize, d: usize) -> Option<Box<dyn DecodeStream>> {
-        let r = self.inner.as_ref().and_then(|o| o.decode_stream(x, hc, d));
-        self.crossings
-            .note("decode stream", r.is_some(), f32_bytes(x), 0);
-        r
-    }
-
-    fn hc_stream(&self, x: &[f32], hc: usize, d: usize) -> Option<Box<dyn HcStream>> {
-        let r = self.inner.as_ref().and_then(|o| o.hc_stream(x, hc, d));
-        self.crossings
-            .note("hc stream", r.is_some(), f32_bytes(x), 0);
-        r
-    }
-
-    fn projection(&self, p: &Projection, xs: &[f32]) -> Option<Result<Vec<f32>>> {
-        let r = self.inner.as_ref().and_then(|o| o.projection(p, xs));
-        self.crossings.note(
-            "projection",
-            r.is_some(),
-            f32_bytes(xs),
-            r.as_ref().map_or(0, back_bytes),
-        );
-        r
-    }
-
-    fn sparse_attention(
-        &self,
-        q: &[f32],
-        kv: &[f32],
-        sink: &[f32],
-        idxs: &[i32],
-        dims: (usize, usize, usize, usize),
-        scale: f32,
-    ) -> Option<Result<Vec<f32>>> {
-        let r = self
-            .inner
-            .as_ref()
-            .and_then(|o| o.sparse_attention(q, kv, sink, idxs, dims, scale));
-        let out = f32_bytes(q) + f32_bytes(kv) + f32_bytes(sink) + i32_bytes(idxs);
-        self.crossings.note(
-            "sparse attention",
-            r.is_some(),
-            out,
-            r.as_ref().map_or(0, back_bytes),
-        );
-        r
-    }
-
-    fn index_scores(
-        &self,
-        q: &[f32],
-        k: &[f32],
-        weights: &[f32],
-        dims: (usize, usize, usize, usize),
-        ratio: usize,
-        scale: f32,
-        q_off: usize,
-    ) -> Option<Result<Vec<f32>>> {
-        let r = self
-            .inner
-            .as_ref()
-            .and_then(|o| o.index_scores(q, k, weights, dims, ratio, scale, q_off));
-        let out = f32_bytes(q) + f32_bytes(k) + f32_bytes(weights);
-        self.crossings.note(
-            "index scores",
-            r.is_some(),
-            out,
-            r.as_ref().map_or(0, back_bytes),
-        );
-        r
-    }
-
-    fn attn_block(&self, p: &AttnBlock) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
-        let r = self.inner.as_ref().and_then(|o| o.attn_block(p));
-        let out = f32_bytes(p.x) + f32_bytes(p.cos) + f32_bytes(p.sin) + f32_bytes(p.window);
-        let back = r.as_ref().map_or(0, |r| {
-            r.as_ref().map_or(0, |(o, kv)| f32_bytes(o) + f32_bytes(kv))
-        });
-        self.crossings
-            .note("attention block", r.is_some(), out, back);
-        r
-    }
-
-    fn expert_dev(
-        &self,
-        w1: &Projection,
-        w3: &Projection,
-        w2: &Projection,
-        x: &[f32],
-        limit: f32,
-    ) -> Option<Result<Vec<f32>>> {
-        let r = self
-            .inner
-            .as_ref()
-            .and_then(|o| o.expert_dev(w1, w3, w2, x, limit));
-        self.crossings.note(
-            "shared expert",
-            r.is_some(),
-            f32_bytes(x),
-            r.as_ref().map_or(0, back_bytes),
-        );
-        r
-    }
-
-    fn attn_out(
-        &self,
-        wo_a: &Projection,
-        wo_b: &Projection,
-        o: &[f32],
-        o_groups: usize,
-        p: usize,
-        o_lora: usize,
-        dim: usize,
-    ) -> Option<Result<Vec<f32>>> {
-        let r = self
-            .inner
-            .as_ref()
-            .and_then(|x| x.attn_out(wo_a, wo_b, o, o_groups, p, o_lora, dim));
-        self.crossings.note(
-            "attention out",
-            r.is_some(),
-            f32_bytes(o),
-            r.as_ref().map_or(0, back_bytes),
-        );
-        r
-    }
-
-    fn record(&self, stage: &'static str, nanos: u64) {
-        if let Some(o) = &self.inner {
-            o.record(stage, nanos);
-        }
     }
 }
 
@@ -300,41 +116,14 @@ fn read_bytes() -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// A card that takes projections and declines everything else.
-    struct ProjectionsOnly;
-
-    impl Offload for ProjectionsOnly {
-        fn projection(&self, _p: &Projection, xs: &[f32]) -> Option<Result<Vec<f32>>> {
-            Some(Ok(vec![0.0; xs.len() / 2]))
-        }
-        fn sparse_attention(
-            &self,
-            _q: &[f32],
-            _kv: &[f32],
-            _sink: &[f32],
-            _idxs: &[i32],
-            _dims: (usize, usize, usize, usize),
-            _scale: f32,
-        ) -> Option<Result<Vec<f32>>> {
-            None
-        }
-    }
-
-    fn weight() -> Projection {
-        Projection::Dense(crate::tensor::Tensor::zeros((2, 4), crate::tensor::DType::F32).unwrap())
-    }
-
     /// A taken step counts its bytes each way; a declined one counts only that it was declined.
     #[test]
     fn taken_and_declined_steps_are_counted_with_their_bytes() {
-        let c = Counting::new(Some(Arc::new(ProjectionsOnly)));
-        let w = weight();
-        assert!(c.projection(&w, &[1.0; 8]).is_some());
-        assert!(c.projection(&w, &[1.0; 4]).is_some());
-        assert!(c
-            .sparse_attention(&[0.0; 6], &[0.0; 2], &[0.0], &[0], (1, 1, 1, 1), 1.0)
-            .is_none());
-        let snap: BTreeMap<&str, StepCount> = c.crossings.snapshot().into_iter().collect();
+        let c = Crossings::default();
+        c.note("projection", true, 32, 16);
+        c.note("projection", true, 16, 8);
+        c.note("sparse attention", false, 0, 0);
+        let snap: BTreeMap<&str, StepCount> = c.snapshot().into_iter().collect();
         assert_eq!(
             snap["projection"],
             StepCount {
@@ -353,23 +142,8 @@ mod tests {
                 bytes_back: 0,
             }
         );
-        c.crossings.reset();
-        assert!(c.crossings.snapshot().is_empty());
-    }
-
-    /// With no card behind it, every step is declined and nothing crosses.
-    #[test]
-    fn without_a_card_every_step_is_declined() {
-        let c = Counting::new(None);
-        let w = weight();
-        assert!(c.projection(&w, &[1.0; 8]).is_none());
-        assert!(c.attn_out(&w, &w, &[0.0; 4], 1, 4, 1, 2).is_none());
-        for (_, s) in c.crossings.snapshot() {
-            assert_eq!(
-                (s.taken, s.declined, s.bytes_out, s.bytes_back),
-                (0, 1, 0, 0)
-            );
-        }
+        c.reset();
+        assert!(c.snapshot().is_empty());
     }
 
     /// The process counters read and never go backwards.

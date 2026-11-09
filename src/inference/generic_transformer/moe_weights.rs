@@ -457,14 +457,35 @@ pub(crate) fn sqrt_softplus_choice(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let chosen: Vec<usize> = order[..k.min(row.len())].to_vec();
-    let mut w: Vec<f32> = chosen.iter().map(|&e| scores[e]).collect();
+    let w = chosen.iter().map(|&e| scores[e]).collect();
+    (chosen, normalised(w, k, normalize))
+}
+
+/// The weights of `chosen` for one row of gate logits, as [`sqrt_softplus_choice`] weighs its own
+/// choice of `chosen.len()` experts.
+pub(crate) fn sqrt_softplus_weigh(
+    row: &[f32],
+    chosen: Vec<usize>,
+    temperature: f32,
+    normalize: bool,
+) -> (Vec<usize>, Vec<f32>) {
+    let w = chosen
+        .iter()
+        .map(|&e| softplus(row[e] / temperature).sqrt())
+        .collect();
+    let k = chosen.len();
+    (chosen, normalised(w, k, normalize))
+}
+
+/// `w` divided by its sum plus [`SQRT_SOFTPLUS_SUM_EPS`], when asked and more than 1 expert is chosen.
+fn normalised(mut w: Vec<f32>, k: usize, normalize: bool) -> Vec<f32> {
     if normalize && k > 1 {
         let s: f32 = w.iter().sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
         for wi in w.iter_mut() {
             *wi /= s;
         }
     }
-    (chosen, w)
+    w
 }
 
 /// Routing that gives up some of a token's experts for speed.
