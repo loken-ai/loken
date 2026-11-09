@@ -165,6 +165,8 @@ mod wide_sparse_convert_tests;
 #[cfg(test)]
 mod wide_sparse_engram_tests;
 pub mod wide_sparse_layer;
+pub mod wide_sparse_llamacpp;
+pub mod wide_sparse_names;
 #[cfg(test)]
 mod wide_sparse_oracle_tests;
 pub mod wide_sparse_plan;
@@ -183,8 +185,11 @@ mod wide_sparse_routing;
 pub(crate) mod wide_sparse_routing_tests;
 #[cfg(test)]
 mod wide_sparse_serve_tests;
+pub mod wide_sparse_sibling;
 #[cfg(test)]
 mod wide_sparse_state_tests;
+#[cfg(test)]
+pub(crate) mod wide_sparse_toy;
 #[cfg(test)]
 pub(crate) mod wide_sparse_variant_tests;
 pub mod wide_sparse_variants;

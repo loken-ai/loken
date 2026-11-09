@@ -42,4 +42,5 @@ pub mod place;
 pub mod prompt_embeds;
 pub mod sample;
 pub mod serve;
+pub mod stage_prof;
 pub mod token;

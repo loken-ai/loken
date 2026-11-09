@@ -68,7 +68,7 @@ fn device_timed<T>(
     on: &Tensor,
     launch: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    if !crate::inference::offload::stage_prof_enabled() || !on.device().is_cuda() {
+    if !crate::inference::stage_prof::stage_prof_enabled() || !on.device().is_cuda() {
         return launch();
     }
     let Ok(dev) = on.device().as_cuda_device() else {
@@ -76,7 +76,7 @@ fn device_timed<T>(
     };
     let stream = dev.0.stream().clone();
     if crate::tensor::cuda_ext::capture_active(&on.device()) {
-        return crate::inference::offload::mark_stage_in_capture(name, &stream, launch);
+        return crate::inference::stage_prof::mark_stage_in_capture(name, &stream, launch);
     }
     let ctx = stream.context();
     let event = || {
@@ -93,7 +93,7 @@ fn device_timed<T>(
     let out = launch();
     if end.record(&stream).is_ok() && end.synchronize().is_ok() {
         if let Ok(ms) = start.elapsed_ms(&end) {
-            crate::inference::offload::prof_record(name, (ms as f64 * 1e6) as u64);
+            crate::inference::stage_prof::prof_record(name, (ms as f64 * 1e6) as u64);
         }
     }
     out
@@ -718,12 +718,12 @@ pub struct SharedExpert {
     pub down: QMatMul,
     /// `[hidden, 1]` F32.
     pub scalar_gate: Option<Tensor>,
-    /// The gate and up combine through `offload::experts::swiglu` bounded at this limit: the
+    /// The gate and up combine through `bounded_swiglu::swiglu` bounded at this limit: the
     /// gate clamped from above, the up value on both sides.
     pub swiglu_limit: Option<f32>,
 }
 
-/// `offload::experts::swiglu` of `g` and `u` value by value at `limit`, F32 on the device of `g`.
+/// `bounded_swiglu::swiglu` of `g` and `u` value by value at `limit`, F32 on the device of `g`.
 fn bounded_swiglu(g: &Tensor, u: &Tensor, limit: f32) -> Result<Tensor> {
     let host = Device::Cpu;
     let shape = g.shape().clone();
@@ -732,7 +732,7 @@ fn bounded_swiglu(g: &Tensor, u: &Tensor, limit: f32) -> Result<Tensor> {
     let h: Vec<f32> = gv
         .iter()
         .zip(&uv)
-        .map(|(&g, &u)| crate::inference::offload::experts::swiglu(g, u, limit))
+        .map(|(&g, &u)| crate::tensor::ops::bounded_swiglu::swiglu(g, u, limit))
         .collect();
     Tensor::from_vec(h, shape, &host)?.to_device(&g.device())
 }
@@ -1010,7 +1010,7 @@ pub struct MoeWeights {
     /// Gate and up combine through the bounded SwiGLU at this limit, reading the separate
     /// stacks: `silu(min(gate, limit)) . clamp(up, -limit, limit)`.
     ///
-    /// The steps are those of `offload::experts::swiglu`.
+    /// The steps are those of `bounded_swiglu::swiglu`.
     /// A layer holds this or `swiglu_clamp`, never both.
     pub swiglu_limit: Option<f32>,
     /// Stacked expert gate||up weights `[n_experts, 2*expert_ffn_dim, hidden]`
@@ -2934,7 +2934,7 @@ mod clamped_swiglu_tests {
     }
 
     /// A layer under the bounded SwiGLU gives the experts of the scalar reference whose SwiGLU is
-    /// `offload::experts::swiglu`, the gate clamped from above and the up value on both sides.
+    /// `bounded_swiglu::swiglu`, the gate clamped from above and the up value on both sides.
     #[test]
     fn bounded_experts_match_the_offload_swiglu() {
         let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
@@ -3029,7 +3029,7 @@ mod clamped_swiglu_tests {
                 let h: Vec<f32> = (0..ffn)
                     .map(|i| {
                         clamped += usize::from(g[i] > limit || u[i].abs() > limit);
-                        crate::inference::offload::experts::swiglu(g[i], u[i], limit)
+                        crate::tensor::ops::bounded_swiglu::swiglu(g[i], u[i], limit)
                     })
                     .collect();
                 let d = matvec(&dw[e * hidden * ffn..(e + 1) * hidden * ffn], &h, hidden);

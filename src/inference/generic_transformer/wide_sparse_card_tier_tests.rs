@@ -10,7 +10,7 @@ use super::wide_sparse_oracle_tests::{bit_difference, record_generic, RECORDS};
 use super::wide_sparse_variant_tests::{metadata, write_pair, Variant, CHOICES, LAYOUT};
 use super::wide_sparse_variants::open_checked;
 use super::GenericHeteroTransformer;
-use crate::inference::model::deepseek_v41::model::tests::real_entries_for;
+use crate::inference::generic_transformer::wide_sparse_toy::real_entries_for;
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::inference::model::deepseek_v41::source::VariantSource;
 use crate::inference::model::deepseek_v41::DeepseekV41Config;
@@ -388,7 +388,7 @@ fn exact_product(
 #[test]
 fn card_expert_products_are_no_farther_from_the_exact_product_than_the_hosts() {
     use super::card_packed::no_farther;
-    use crate::inference::offload::experts::swiglu;
+    use crate::tensor::ops::bounded_swiglu::swiglu;
     use crate::tensor::{Device, Tensor};
     if Device::new_cuda(0).is_err() {
         eprintln!("no card 0: skipped");

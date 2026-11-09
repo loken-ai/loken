@@ -87,7 +87,7 @@ pub(super) fn staged<R>(
     settle: bool,
     f: impl FnOnce() -> Result<R>,
 ) -> Result<R> {
-    if !crate::inference::offload::stage_prof_enabled() {
+    if !crate::inference::stage_prof::stage_prof_enabled() {
         let r = f();
         if settle && PREFILL_SETTLE.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = dev.synchronize();
@@ -98,14 +98,14 @@ pub(super) fn staged<R>(
     if crate::tensor::cuda_ext::capture_active(dev) {
         if let Ok(card) = dev.as_cuda_device() {
             let stream = card.0.stream().clone();
-            return crate::inference::offload::mark_stage_in_capture(name, &stream, f);
+            return crate::inference::stage_prof::mark_stage_in_capture(name, &stream, f);
         }
     }
     let _ = dev.synchronize();
     let started = std::time::Instant::now();
     let r = f();
     let _ = dev.synchronize();
-    crate::inference::offload::prof_record(name, started.elapsed().as_nanos() as u64);
+    crate::inference::stage_prof::prof_record(name, started.elapsed().as_nanos() as u64);
     r
 }
 

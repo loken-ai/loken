@@ -9,7 +9,7 @@ use super::state_cache::*;
 use super::wide_sparse_oracle_tests::{generic, LAYOUTS};
 use super::*;
 use crate::inference::cache::state_disk::StateStore;
-use crate::inference::model::deepseek_v41::model::tests::VOCAB;
+use crate::inference::generic_transformer::wide_sparse_toy::VOCAB;
 
 /// Tokens per block of the states under test, as the V4.1 snapshot tests cut them.
 const BLOCK: usize = 8;

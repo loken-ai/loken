@@ -80,6 +80,7 @@ impl NgramMeta {
 
 pub mod engram;
 pub mod engram_hash;
+pub mod token_map;
 
 /// The kind of n-gram layer a file declares.
 #[derive(Debug, Clone, PartialEq)]

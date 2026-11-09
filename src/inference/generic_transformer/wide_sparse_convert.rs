@@ -9,15 +9,16 @@
 //! A routed expert stack names the calibration records of its experts and its layer.
 //! The keys are the reference converter's, under the model name the caller gives.
 
+use super::ngram::engram::EngramMeta;
+use super::ngram::token_map;
+use super::wide_sparse_config::{NgramHashFields, WideSparseMeta};
+use super::wide_sparse_llamacpp as mainline;
+use super::wide_sparse_names::{llamacpp_name, ENGRAM_TABLE};
 use super::BlockScaledCheckpoint;
+use crate::inference::engine::llm_engine::EMBEDDED_TOKENIZER_KEY;
 use crate::inference::load::block_scaled_convert::{
     bytes_per, written_format, ConvertPlan, Formats, Produce, StackRecords,
 };
-use crate::inference::model::deepseek_v41::convert::{tokenizer_metadata, TokenizerFiles};
-use crate::inference::model::deepseek_v41::engram::EngramConfig;
-use crate::inference::model::deepseek_v41::mainline;
-use crate::inference::model::deepseek_v41::source::{llamacpp_name, ENGRAM_TABLE};
-use crate::inference::model::deepseek_v41::{token_map, DeepseekV41Config};
 use crate::tensor::gguf_write::PlannedEntry;
 use crate::tensor::quantized::gguf_file::Value;
 use crate::tensor::quantized::GgmlDType;
@@ -27,7 +28,7 @@ use std::path::Path;
 
 /// The record of what layer `layer`'s MoE block took in.
 ///
-/// The record names are those `deepseek_v41/convert.rs` `calibrate` writes.
+/// The record names are those a calibration of the checkpoint writes.
 pub fn moe_input(layer: usize) -> String {
     format!("blk.{layer}.ffn_inp")
 }
@@ -56,10 +57,122 @@ pub fn model_name(checkpoint: &str) -> &str {
 /// The configuration of the checkpoint in `dir`, its reference arguments read by `src`.
 ///
 /// The engram layers hash over the token map of the checkpoint's `tokenizer.json`.
-pub fn checkpoint_config(src: &BlockScaledCheckpoint, dir: &Path) -> Result<DeepseekV41Config> {
+pub fn checkpoint_config(src: &BlockScaledCheckpoint, dir: &Path) -> Result<WideSparseMeta> {
     let (map, _) = token_map::build_from_file(&dir.join("tokenizer.json"))?;
-    let engram = EngramConfig::derive(&src.reference, map);
-    DeepseekV41Config::from_reference_config(&src.reference, engram)
+    let engram = EngramMeta::derive(&src.reference, map);
+    WideSparseMeta::from_reference(&src.reference, engram.as_ref().map(NgramHashFields::from))
+}
+
+/// The checkpoint's chat format, as its `encoding/encoding.py` renders a conversation.
+///
+/// The sequence token comes first, then a system turn when one is given.
+/// Every turn follows its role token.
+/// The assistant header is closed by `</think>` for a plain answer.
+/// It is opened by `<think>` when `enable_thinking` is set.
+/// The encoder's default reasoning effort then leads the system turn.
+/// Tool turns are outside this template: the server flattens them.
+pub const CHAT_TEMPLATE: &str = concat!(
+    "{{ '<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>' }}",
+    "{% set thinking = enable_thinking is defined and enable_thinking %}",
+    "{% if thinking %}",
+    "<\u{ff5c}System\u{ff5c}>Reasoning Effort: 75 (range 1-100, the higher the value, ",
+    "the more thorough the reasoning)\n\n",
+    "{% endif %}",
+    "{% for m in messages %}",
+    "{% if m.role == 'system' %}",
+    "{% if not (thinking and loop.first) %}<\u{ff5c}System\u{ff5c}>{% endif %}",
+    "{% if m.content %}{{ m.content }}{% endif %}",
+    "{% elif m.role == 'user' %}",
+    "<\u{ff5c}User\u{ff5c}>{% if m.content %}{{ m.content }}{% endif %}",
+    "{% elif m.role == 'assistant' %}",
+    "{% if m.content %}{{ m.content }}{% endif %}<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>",
+    "{% endif %}",
+    "{% if m.role != 'assistant' and ((loop.last and add_generation_prompt) ",
+    "or (not loop.last and loop.nextitem.role == 'assistant')) %}",
+    "<\u{ff5c}Assistant\u{ff5c}>",
+    "{% if thinking and loop.last %}<think>{% else %}</think>{% endif %}",
+    "{% endif %}",
+    "{% endfor %}",
+);
+
+/// What the checkpoint says about its tokens: `tokenizer.json` whole, and the ids its
+/// `tokenizer_config.json` names for the sequence and end tokens.
+pub struct TokenizerFiles {
+    pub json: String,
+    pub bos: u32,
+    pub eos: u32,
+}
+
+impl TokenizerFiles {
+    pub fn read(dir: &Path) -> Result<Self> {
+        let json = std::fs::read_to_string(dir.join("tokenizer.json"))
+            .map_err(|e| Error::msg(format!("tokenizer.json: {e}")))?;
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("tokenizer_config.json"))
+                .map_err(|e| Error::msg(format!("tokenizer_config.json: {e}")))?,
+        )
+        .map_err(|e| Error::msg(format!("tokenizer_config.json: {e}")))?;
+        let tok: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| Error::msg(format!("tokenizer.json: {e}")))?;
+        let id = |key: &str| -> Result<u32> {
+            let name = match cfg.get(key) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) => v
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .ok_or_else(|| {
+                        Error::msg(format!("tokenizer_config.json: {key} has no content"))
+                    })?
+                    .to_string(),
+                None => return Err(Error::msg(format!("tokenizer_config.json: no {key}"))),
+            };
+            tok.get("added_tokens")
+                .and_then(|a| a.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|t| t.get("content").and_then(|c| c.as_str()) == Some(&name))
+                })
+                .and_then(|t| t.get("id"))
+                .and_then(|i| i.as_u64())
+                .map(|i| i as u32)
+                .ok_or_else(|| Error::msg(format!("tokenizer.json: {name} is not an added token")))
+        };
+        Ok(Self {
+            bos: id("bos_token")?,
+            eos: id("eos_token")?,
+            json,
+        })
+    }
+}
+
+/// The tokenizer's metadata: the file whole, the 2 token ids the loader stops and starts on,
+/// and the chat format.
+///
+/// The sequence token is written by the template, not by the tokenizer, as the checkpoint's
+/// configuration says.
+pub fn tokenizer_metadata(files: &TokenizerFiles) -> Vec<(String, Value)> {
+    vec![
+        (
+            EMBEDDED_TOKENIZER_KEY.to_string(),
+            Value::String(files.json.clone()),
+        ),
+        (
+            "tokenizer.ggml.bos_token_id".to_string(),
+            Value::U32(files.bos),
+        ),
+        (
+            "tokenizer.ggml.eos_token_id".to_string(),
+            Value::U32(files.eos),
+        ),
+        (
+            "tokenizer.ggml.add_bos_token".to_string(),
+            Value::Bool(false),
+        ),
+        (
+            "tokenizer.chat_template".to_string(),
+            Value::String(CHAT_TEMPLATE.to_string()),
+        ),
+    ]
 }
 
 /// The routed expert matrices of a layer in file order: gate, up, down, with their stack names.
@@ -73,7 +186,7 @@ const STACKS: [(&str, &str); 3] = [
 /// declares, and the tokenizer as the checkpoint ships it and as llama.cpp's vocabulary arrays.
 fn file_metadata(
     src: &BlockScaledCheckpoint,
-    cfg: &DeepseekV41Config,
+    cfg: &WideSparseMeta,
     n_layers: usize,
     engram_rows: &[usize],
     model_name: &str,
@@ -87,7 +200,7 @@ fn file_metadata(
     let mut keys = Vec::new();
     if let Some(files) = tokenizer {
         keys.extend(tokenizer_metadata(files));
-        keys.extend(mainline::vocab_metadata(&files.json, cfg.vocab_size)?);
+        keys.extend(mainline::vocab_metadata(&files.json, cfg.vocab)?);
     }
     let extras = mainline::Extras {
         name: model_name.to_string(),
@@ -104,7 +217,7 @@ fn file_metadata(
 /// A large matrix takes `formats.always_read`, any other tensor F32.
 pub fn plan(
     src: &BlockScaledCheckpoint,
-    cfg: &DeepseekV41Config,
+    cfg: &WideSparseMeta,
     formats: Formats,
     layers: Range<usize>,
     model_name: &str,
@@ -140,7 +253,7 @@ pub fn plan(
     let n_layers = layers.end.min(cfg.n_layers);
     let below: Vec<usize> = mainline::engram_layers(cfg, n_layers)
         .into_iter()
-        .filter_map(|i| cfg.engram.as_ref().map(|e| e.layer_ids[i]))
+        .filter_map(|i| cfg.ngram.as_ref().map(|e| e.layer_ids[i]))
         .collect();
     // The offsets the keys declare count the rows of every engram layer below `n_layers`.
     let engram_rows = below
@@ -187,7 +300,7 @@ pub fn plan(
             }
             dense(name, &shape_of(name)?, &mut tensors);
         }
-        let n = cfg.n_routed_experts;
+        let n = cfg.mixture.routed;
         for (w, stack) in STACKS {
             let one = src
                 .stored_shape(&format!("layers.{layer}.ffn.experts.0.{w}.weight"))
@@ -231,7 +344,7 @@ pub fn plan(
         }
     }
 
-    if let (Some(e), false) = (cfg.engram.as_ref(), tables.is_empty()) {
+    if let (Some(e), false) = (cfg.ngram.as_ref(), tables.is_empty()) {
         let mut rows = 0;
         for t in &tables {
             rows += shape_of(t)?[0];

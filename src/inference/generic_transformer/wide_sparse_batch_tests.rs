@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use super::wide_sparse_layer::SequenceMixers;
 use super::wide_sparse_oracle_tests::{generic, LAYOUTS};
 use super::*;
-use crate::inference::model::deepseek_v41::model::tests::VOCAB;
+use crate::inference::generic_transformer::wide_sparse_toy::VOCAB;
 use crate::inference::serve::continuous_batch::{ContinuousBatchEngine, GenReq, SamplingParams};
 use crate::inference::serve::continuous_serve::SequenceBatched;
 

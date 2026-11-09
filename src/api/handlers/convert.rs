@@ -380,7 +380,8 @@ pub(crate) async fn convert_model(
                 "convert: calibration record read in {:.2}s",
                 started.elapsed().as_secs_f64()
             );
-            let tokenizer = convert::TokenizerFiles::read(&dir).map_err(|e| e.to_string())?;
+            let tokenizer =
+                wide_sparse_convert::TokenizerFiles::read(&dir).map_err(|e| e.to_string())?;
             // The draft is written after the model, on the same disk: the model's room covers it.
             use crate::inference::model::deepseek_v41::complete;
             let layout = complete::Layout::for_paths(&[blobs.as_path()]);

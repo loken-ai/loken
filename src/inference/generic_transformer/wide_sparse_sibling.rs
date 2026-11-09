@@ -3,6 +3,7 @@
 //! Scanning reads only each candidate's key table, so a directory of large model files costs a
 //! few header reads, not their weights.
 
+use super::wide_sparse_names::ARCH;
 use crate::tensor::gguf_write::write_gguf_with_metadata;
 use crate::tensor::quantized::gguf_file::{open_mapped_unadvised, Value};
 use crate::tensor::{Error, Result};
@@ -114,14 +115,14 @@ pub fn find_beside(model: &Path, prefix: &str) -> Vec<PathBuf> {
 }
 
 fn prior_key(layer: usize) -> String {
-    format!("{}.hot_experts.{layer}", super::ARCH)
+    format!("{}.hot_experts.{layer}", ARCH)
 }
 
 /// The routing prior a companion file beside `model` declares: for each of `n_layers` layers its
 /// experts from the most routed-to down, every id below `n_routed`. `None` when no companion
 /// declares one that fits this model; a companion that does not fit is passed over.
 pub fn prior_beside(model: &Path, n_layers: usize, n_routed: usize) -> Option<Vec<Vec<usize>>> {
-    let key = format!("{}.hot_experts.", super::ARCH);
+    let key = format!("{}.hot_experts.", ARCH);
     for path in find_beside(model, &key) {
         let Ok(file) = open_mapped_unadvised(&path) else {
             continue;
@@ -154,13 +155,30 @@ pub fn prior_beside(model: &Path, n_layers: usize, n_routed: usize) -> Option<Ve
     None
 }
 
+/// The routing prior as metadata: for each layer, its experts from the most routed-to on the
+/// calibration corpus downwards.
+///
+/// A loader reads the head of each list to fill its cards before the first request.
+pub fn hot_experts_metadata(lists: &[Vec<u32>]) -> Vec<(String, Value)> {
+    lists
+        .iter()
+        .enumerate()
+        .map(|(l, ids)| {
+            (
+                format!("{ARCH}.hot_experts.{l}"),
+                Value::Array(ids.iter().map(|&x| Value::U32(x)).collect()),
+            )
+        })
+        .collect()
+}
+
 /// Write a companion file holding only a routing prior: `lists[l]` ranks layer `l`'s experts.
 pub fn write_prior(path: &Path, lists: &[Vec<u32>]) -> Result<()> {
     let mut md = vec![(
         "general.architecture".to_string(),
-        Value::String(super::ARCH.to_string()),
+        Value::String(ARCH.to_string()),
     )];
-    md.extend(super::convert::hot_experts_metadata(lists));
+    md.extend(hot_experts_metadata(lists));
     write_gguf_with_metadata(path, &md, &[]).map_err(|e| Error::msg(format!("{e}")))
 }
 

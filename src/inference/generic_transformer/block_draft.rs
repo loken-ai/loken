@@ -901,7 +901,7 @@ mod tests {
 
         let mut md = vec![(
             "general.architecture".to_string(),
-            Value::String(crate::inference::model::deepseek_v41::ARCH.into()),
+            Value::String(super::super::wide_sparse_names::ARCH.into()),
         )];
         md.extend(want.to_metadata());
         let entries = vec![GgufEntry {

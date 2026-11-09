@@ -2,11 +2,11 @@
 //! bf16, or any other storage a [`Projection`] holds.
 //!
 //! An expert is `down(swiglu(gate . x, up . x))`.
-//! Its SwiGLU is `offload::experts::swiglu`, bounded at the layer's limit when it has one.
+//! Its SwiGLU is `bounded_swiglu::swiglu`, bounded at the layer's limit when it has one.
 //! The experts run on the host's cores.
 
-use crate::inference::offload::experts::swiglu;
 use crate::tensor::blockscaled::projection::Projection;
+use crate::tensor::ops::bounded_swiglu::swiglu;
 use crate::tensor::{DType, Device, Result, Tensor};
 
 /// One routed expert: gate and up `[inter, dim]`, down `[dim, inter]`.

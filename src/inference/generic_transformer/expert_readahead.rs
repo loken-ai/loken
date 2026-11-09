@@ -20,12 +20,10 @@ pub(crate) type Span = (usize, usize);
 
 /// Requests queued per reader: a layer's guess is the experts one token needs, and a queue longer
 /// than a few such guesses holds reads that would start too late to help.
-/// Copied from `offload/readahead.rs`.
 const QUEUE_PER_READER: usize = 4;
 
 /// Windows the read-ahead depth runs on its winner between rounds of trying its neighbours: four
 /// times the three windows of a round, so a round is a fifth of the time.
-/// Copied from `READAHEAD_EXPLOIT_WINDOWS` in `deepseek_v41/model.rs`.
 const EXPLOIT_WINDOWS: usize = 12;
 
 /// Layers ahead a guess of the missing experts reaches: the layer served next
@@ -33,7 +31,7 @@ const EXPLOIT_WINDOWS: usize = 12;
 const LAYERS_A_GUESS_REACHES: usize = 1;
 
 /// `MADV_POPULATE_READ`: fault a range in as a read would, without mapping it for a caller to
-/// touch. Copied from `offload/experts.rs`.
+/// touch.
 #[cfg(unix)]
 const POPULATE_READ: libc::c_int = 22;
 

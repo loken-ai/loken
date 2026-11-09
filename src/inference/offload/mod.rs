@@ -29,131 +29,10 @@ pub mod tuner;
 pub mod weight_cache;
 pub mod weight_stream;
 
+pub use crate::inference::stage_prof::*;
 use crate::tensor::Result;
 use projection::Projection;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-/// A profile of the named stages a forward runs through, kept whole for a model that offloads its
-/// steps (its lanes discard the per-thread recorder). Off by default: a lock on every stage of
-/// every layer is a cost only a diagnostic wants, and what makes the shares readable is that they
-/// are summed across the lanes rather than lost with the thread that ran them.
-static STAGE_PROF: Mutex<BTreeMap<&'static str, (u64, u64)>> = Mutex::new(BTreeMap::new());
-static STAGE_PROF_ON: AtomicBool = AtomicBool::new(false);
-
-/// Switch the stage profile on (zeroing it) or off.
-pub fn stage_prof_enable(on: bool) {
-    if on {
-        STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-    STAGE_PROF_ON.store(on, Ordering::Relaxed);
-}
-
-pub fn stage_prof_enabled() -> bool {
-    STAGE_PROF_ON.load(Ordering::Relaxed)
-}
-
-/// Add `ns` to a stage the offload timed itself (its lanes' fetch and kernels, the host experts):
-/// these are summed on the caller after the lanes join rather than wrapped by `stage`, so they
-/// reach the profile through here. A no-op when the profile is off.
-pub fn prof_record(stage: &'static str, ns: u64) {
-    if STAGE_PROF_ON.load(Ordering::Relaxed) {
-        let mut m = STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner());
-        let e = m.entry(stage).or_default();
-        e.0 += ns;
-        e.1 += 1;
-    }
-}
-
-/// A stage recorded into a graph: the events at its two ends, which the card stamps each time
-/// the graph runs.
-#[cfg(feature = "gpu")]
-pub struct StageMark {
-    name: &'static str,
-    start: crate::tensor::gpu_runtime::driver::CudaEvent,
-    end: crate::tensor::gpu_runtime::driver::CudaEvent,
-}
-
-#[cfg(feature = "gpu")]
-thread_local! {
-    static CAPTURE_MARKS: std::cell::RefCell<Vec<StageMark>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// The name a stage is reported under when it ran inside a graph.
-#[cfg(feature = "gpu")]
-fn in_graph_name(name: &'static str) -> &'static str {
-    static NAMES: Mutex<BTreeMap<&'static str, &'static str>> = Mutex::new(BTreeMap::new());
-    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
-    names
-        .entry(name)
-        .or_insert_with(|| Box::leak(format!("in graph: {name}").into_boxed_str()))
-}
-
-/// Run `f`, a stage being recorded into a graph on `stream`, between two events when the stage
-/// profile is on. The marks are taken by [`take_capture_marks`] once the capture ends.
-#[cfg(feature = "gpu")]
-pub fn mark_stage_in_capture<R>(
-    name: &'static str,
-    stream: &std::sync::Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
-    f: impl FnOnce() -> R,
-) -> R {
-    let ctx = stream.context();
-    let flags = Some(crate::tensor::gpu_runtime::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
-    let (Ok(start), Ok(end)) = (ctx.new_event(flags), ctx.new_event(flags)) else {
-        return f();
-    };
-    // An external record keeps the event a node of the graph that the card stamps at each run.
-    let record = |e: &crate::tensor::gpu_runtime::driver::CudaEvent| unsafe {
-        crate::tensor::gpu_runtime::driver::sys::cuEventRecordWithFlags(
-            e.cu_event(),
-            stream.cu_stream(),
-            crate::tensor::gpu_runtime::driver::sys::CUevent_record_flags::CU_EVENT_RECORD_EXTERNAL
-                as u32,
-        )
-        .result()
-    };
-    if record(&start).is_err() {
-        return f();
-    }
-    let out = f();
-    if record(&end).is_ok() {
-        CAPTURE_MARKS.with(|m| m.borrow_mut().push(StageMark { name, start, end }));
-    }
-    out
-}
-
-/// The marks the capture just ended recorded, in the order they were made.
-#[cfg(feature = "gpu")]
-pub fn take_capture_marks() -> Vec<StageMark> {
-    CAPTURE_MARKS.with(|m| std::mem::take(&mut *m.borrow_mut()))
-}
-
-/// Add what the card stamped on each mark of a graph that has just run to the profile.
-#[cfg(feature = "gpu")]
-pub fn record_stage_marks(marks: &[StageMark]) {
-    for m in marks {
-        match m.start.elapsed_ms(&m.end) {
-            Ok(ms) => prof_record(in_graph_name(m.name), (ms as f64 * 1e6) as u64),
-            Err(e) => {
-                static SAID: AtomicBool = AtomicBool::new(false);
-                if !SAID.swap(true, Ordering::Relaxed) {
-                    tracing::warn!("a stage mark of a graph cannot be read ({}): {e:?}", m.name);
-                }
-            }
-        }
-    }
-}
-
-/// Each stage's total nanoseconds and call count since it was switched on.
-pub fn stage_prof_snapshot() -> Vec<(&'static str, u64, u64)> {
-    STAGE_PROF
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .map(|(k, v)| (*k, v.0, v.1))
-        .collect()
-}
+use std::sync::Arc;
 
 /// One ratio-0 attention block's weights and this token's inputs, for a card to run whole. The
 /// weights are the layer's kept projections and dense norms; `x` is the layer input row [dim],
@@ -182,9 +61,7 @@ pub struct AttnBlock<'a> {
     pub scale: f32,
 }
 
-/// Bytes of a quantised weight expanded to f32 on a card at a time: the tile a projection wider than
-/// that goes through in pieces, and what a card keeps free for each such step in flight.
-pub const WEIGHT_TILE_BYTES: usize = 96 << 20;
+pub use crate::tensor::quantized::WEIGHT_TILE_BYTES;
 
 /// A prompt's residual stream kept on a card for the whole prompt, with the hyper-connection steps
 /// that read and rewrite it. Only the sublayers' inputs and outputs, and a few values per token,
@@ -571,7 +448,7 @@ pub fn linear(
 /// Run `f` as stage `stage`: timed and recorded when this thread has an offload, run plainly
 /// otherwise.
 pub fn stage<R>(stage: &'static str, f: impl FnOnce() -> R) -> R {
-    let prof = STAGE_PROF_ON.load(Ordering::Relaxed);
+    let prof = stage_prof_enabled();
     match current() {
         Some(offload) => {
             let t = std::time::Instant::now();
@@ -579,21 +456,14 @@ pub fn stage<R>(stage: &'static str, f: impl FnOnce() -> R) -> R {
             let ns = t.elapsed().as_nanos() as u64;
             offload.record(stage, ns);
             if prof {
-                let mut m = STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner());
-                let e = m.entry(stage).or_default();
-                e.0 += ns;
-                e.1 += 1;
+                prof_record(stage, ns);
             }
             r
         }
         None if prof => {
             let t = std::time::Instant::now();
             let r = f();
-            let ns = t.elapsed().as_nanos() as u64;
-            let mut m = STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner());
-            let e = m.entry(stage).or_default();
-            e.0 += ns;
-            e.1 += 1;
+            prof_record(stage, t.elapsed().as_nanos() as u64);
             r
         }
         None => f(),

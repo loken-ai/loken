@@ -70,7 +70,9 @@ pub fn open(controls: &Controls) -> Result<Box<dyn Subject>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::model::deepseek_v41::model::tests::{real_entries_for, real_md_layout};
+    use crate::inference::generic_transformer::wide_sparse_toy::{
+        real_entries_for, real_md_layout,
+    };
     use crate::tensor::gguf_write::write_gguf_with_metadata;
     use crate::tensor::quantized::gguf_file::{open_mapped, Value};
 

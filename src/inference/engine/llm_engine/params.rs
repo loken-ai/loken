@@ -5,7 +5,7 @@
 use super::*;
 
 /// How much exactness a streamed model may give up for speed, as a policy the engine turns into
-/// a measured divergence budget (see `deepseek_v41::calibrate`).
+/// a measured divergence budget (see `routing_calibration`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QualityLevel {

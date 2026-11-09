@@ -11,7 +11,9 @@
 //! indexer and compressor fields, the stream mixing and the n-gram hash. Nothing here loads a
 //! weight.
 
-use crate::inference::model::deepseek_v41::{engram, mainline, release, ARCH};
+use super::ngram::engram::EngramMeta;
+use super::wide_sparse_llamacpp::scoring_func;
+use super::wide_sparse_names::{ARCH, HYPER_CONNECTION_MARKER};
 use crate::tensor::quantized::gguf_file::Value;
 use crate::tensor::quantized::gguf_source::GgufMeta;
 use crate::tensor::{Error, Result};
@@ -103,20 +105,33 @@ pub struct NgramHashFields {
     pub offsets: Vec<Vec<u64>>,
 }
 
-impl From<engram::EngramConfig> for NgramHashFields {
-    fn from(e: engram::EngramConfig) -> Self {
+impl From<&EngramMeta> for NgramHashFields {
+    fn from(m: &EngramMeta) -> Self {
         Self {
-            layer_ids: e.layer_ids,
-            heads: e.n_heads,
-            head_dim: e.head_dim,
-            max_ngram: e.max_ngram,
-            token_map: e.token_map,
-            pad_id: e.pad_id,
-            multipliers: e.multipliers,
-            primes: e.primes,
-            offsets: e.offsets,
+            layer_ids: m.layer_ids.clone(),
+            heads: m.heads,
+            head_dim: m.head_dim,
+            max_ngram: m.max_ngram,
+            token_map: m.token_map.clone(),
+            pad_id: m.pad_id,
+            multipliers: m.multipliers.clone(),
+            primes: m.primes.clone(),
+            offsets: m.offsets.clone(),
         }
     }
+}
+
+/// Values llama.cpp's `deepseek4` converter does not write into the file.
+///
+/// They are the V4.1-Flash release's, from the model's own inference config.
+/// They are read only when the key is absent from one of that converter's files.
+pub mod release {
+    pub const ROPE_HEAD_DIM: usize = 64;
+    pub const ROPE_FACTOR: f32 = 16.0;
+    pub const ORIGINAL_SEQ_LEN: usize = 65536;
+    pub const CANDIDATE_SOURCE_LAYER: i64 = 20;
+    pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
+    pub const CANDIDATE_BLOCK_SIZE: usize = 8;
 }
 
 /// The values a converter does not write, taken from the release it targets. `rope_dim` fills
@@ -186,6 +201,36 @@ impl WideSparseMeta {
             .any(|n| src.info(n).is_some());
         mix || ((has("hyper_connection.count") || has("hyper_connection_mult"))
             && !has("hyper_connection.low_rank"))
+    }
+
+    /// Whether a checkpoint directory holds released weights of this family.
+    ///
+    /// Its shard index names block 0's stream mix.
+    /// Without an index, the header of one of its shards names it.
+    pub fn claims_checkpoint(dir: &std::path::Path) -> bool {
+        if !dir.is_dir() {
+            return false;
+        }
+        if let Ok(txt) = std::fs::read_to_string(dir.join("model.safetensors.index.json")) {
+            return serde_json::from_str::<serde_json::Value>(&txt)
+                .ok()
+                .and_then(|v| {
+                    v.get("weight_map")
+                        .map(|m| m.get(HYPER_CONNECTION_MARKER).is_some())
+                })
+                .unwrap_or(false);
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .any(|p| {
+                super::dense::header_names(&p)
+                    .is_some_and(|n| n.iter().any(|t| t == HYPER_CONNECTION_MARKER))
+            })
     }
 
     /// Read the description from a file's header and tensor directory, as the family's own reader
@@ -340,7 +385,7 @@ impl WideSparseMeta {
             Some(v) => v.to_string().ok().cloned(),
             None => g(&["expert_gating_func"])
                 .and_then(|v| v.to_u32().ok())
-                .and_then(mainline::scoring_func)
+                .and_then(scoring_func)
                 .map(str::to_string),
         }
         .unwrap_or_else(|| "sqrtsoftplus".to_string());
@@ -452,7 +497,9 @@ impl WideSparseMeta {
                 ),
                 eps: opt_f(&["hyper_connection.epsilon"], 1e-6),
             },
-            ngram: engram::EngramConfig::read(md, &arch).map(Into::into),
+            ngram: EngramMeta::from_metadata(md, &arch)
+                .as_ref()
+                .map(NgramHashFields::from),
         };
         meta.check()?;
         Ok(meta)

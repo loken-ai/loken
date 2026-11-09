@@ -396,8 +396,8 @@ impl LlmEngine {
             let _published = load_report.map(crate::inference::serve::progress::scoped::publish);
             crate::inference::place::device_probe::debug_vram_by_card("closure-start");
 
-            // --- 0a. A checkpoint directory the deepseek_v41 source serves ---
-            if crate::inference::model::deepseek_v41::claims_checkpoint_dir(&model_file) {
+            // --- 0a. A checkpoint directory of a wide-residual family ---
+            if crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims_checkpoint(&model_file) {
                 let mut state = load_wide_checkpoint(
                     &model_file,
                     &model_id_clone,

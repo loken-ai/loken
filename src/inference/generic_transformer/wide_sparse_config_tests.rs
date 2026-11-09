@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 
-use super::wide_sparse_config::{LayerKind, ReleaseValues, WideSparseMeta};
-use crate::inference::model::deepseek_v41::model::tests::{real_entries_for, real_md_layout};
-use crate::inference::model::deepseek_v41::{release, DeepseekV41Config, ARCH};
+use super::wide_sparse_config::{release, LayerKind, ReleaseValues, WideSparseMeta};
+use super::wide_sparse_names::ARCH;
+use super::wide_sparse_toy::{real_entries_for, real_md_layout};
+use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::GgufEntry;
 use crate::tensor::quantized::gguf_file::{TensorInfo, Value};
 use crate::tensor::quantized::gguf_source::GgufMeta;

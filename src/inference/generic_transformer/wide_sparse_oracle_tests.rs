@@ -15,9 +15,10 @@ use safetensors::SafeTensors;
 
 use super::mixer::{layer_mixer_kind, MixerKind};
 use super::*;
+use crate::inference::generic_transformer::wide_sparse_toy::prompt;
+use crate::inference::generic_transformer::wide_sparse_toy::{real_entries_for, real_md_layout};
 use crate::inference::model::deepseek_v41::cache::DecodeState;
 use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
-use crate::inference::model::deepseek_v41::model::tests::{real_entries_for, real_md_layout};
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::tensor::gguf_write::write_gguf_with_metadata;
 use crate::tensor::quantized::gguf_file::{open_mapped, MappedGguf};
@@ -380,7 +381,7 @@ fn the_generic_route_reproduces_the_frozen_oracle() {
     let want = read_frozen();
     let mut got = BTreeMap::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
-        let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+        let tokens = prompt();
         let mut model = generic(ratios, kv_src, index_src);
         record_generic(&mut model, &tokens, n, &mut got);
     }

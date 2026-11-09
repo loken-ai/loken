@@ -15,7 +15,9 @@
 //! A dense read decodes the stored values to F32.
 
 use super::{fp8_block_of, read_header};
-use crate::inference::model::deepseek_v41::source::{expert_unit_name, gguf_names, EXPERT_STACKS};
+use crate::inference::generic_transformer::wide_sparse_names::{
+    expert_unit_name, gguf_names, EXPERT_STACKS,
+};
 use crate::tensor::blockscaled::bf16::Bf16Weight;
 use crate::tensor::blockscaled::dequant::{
     dequant_fp4_blocked, dequant_fp8_blocked, e4m3_to_f32, e8m0_to_f32,
@@ -28,6 +30,30 @@ use crate::tensor::{Device, Error, Result, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+/// The tensor names a shard's header lists, `None` when the header cannot be read.
+/// Only the header is read.
+pub fn header_names(shard: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(shard).ok()?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len).ok()?;
+    let len = usize::try_from(u64::from_le_bytes(len)).ok()?;
+    let limit = usize::try_from(f.metadata().ok()?.len()).ok()?;
+    if len > limit {
+        return None;
+    }
+    let mut header = vec![0u8; len];
+    f.read_exact(&mut header).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    Some(
+        v.as_object()?
+            .keys()
+            .filter(|k| *k != "__metadata__")
+            .cloned()
+            .collect(),
+    )
+}
 
 /// One mapped shard and the file it maps.
 struct Shard {

@@ -219,7 +219,7 @@ pub(super) fn capture_decode_graph(
         steps.push(DecodeStep::Graph(
             g,
             op_stream.clone(),
-            crate::inference::offload::take_capture_marks(),
+            crate::inference::stage_prof::take_capture_marks(),
         ));
         if out.is_some() {
             logits = out;
@@ -257,7 +257,7 @@ pub(super) fn capture_decode_graph(
         "node histogram: kernel={} memcpy={} memset={} empty={} MEM_ALLOC={} MEM_FREE={} other={}",
         nodes.kernel, nodes.memcpy, nodes.memset, nodes.empty, nodes.alloc, nodes.free, nodes.other
     );
-    if crate::inference::offload::stage_prof_enabled() {
+    if crate::inference::stage_prof::stage_prof_enabled() {
         for step in &steps {
             if let DecodeStep::Graph(g, s, marks) = step {
                 info!("stage marks recorded in the graph: {}", marks.len());
@@ -1067,7 +1067,7 @@ enum DecodeStep {
     Graph(
         crate::tensor::cuda_ext::CapturedGraph,
         std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
-        Vec<crate::inference::offload::StageMark>,
+        Vec<crate::inference::stage_prof::StageMark>,
     ),
     /// An op the model runs eagerly at every replay.
     Eager(usize),
@@ -1086,7 +1086,7 @@ impl DecodeGraph {
     pub(super) fn launch(&self, model: &mut BoxedModelBackend) -> crate::tensor::Result<()> {
         let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
         model.tier_check()?;
-        use crate::inference::offload::{prof_record, stage_prof_enabled};
+        use crate::inference::stage_prof::{prof_record, stage_prof_enabled};
         let prof = stage_prof_enabled();
         let started = prof.then(std::time::Instant::now);
         let mut last = None;
@@ -1145,7 +1145,7 @@ impl DecodeGraph {
         if prof {
             for step in &self.steps {
                 if let DecodeStep::Graph(_, _, marks) = step {
-                    crate::inference::offload::record_stage_marks(marks);
+                    crate::inference::stage_prof::record_stage_marks(marks);
                 }
             }
         }

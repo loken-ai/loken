@@ -37,9 +37,9 @@ use super::super::wide_sparse_config::{LayerKind, NgramHashFields, WideSparseMet
 use super::super::wide_sparse_layer::{
     ExpertVariants, LayerEngram, PreMixCarry, RoutedFfn, SinkhornBlock, TokenCarry, WideSparseHead,
 };
+use super::super::wide_sparse_names::{ARCH, ENGRAM_TABLE};
 use super::super::*;
 use super::TensorSource;
-use crate::inference::model::deepseek_v41::source::ENGRAM_TABLE;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::mapped::MappedBytes;
 use crate::tensor::quantized::GgmlDType;
@@ -249,7 +249,7 @@ fn checkpoint_engram(ck: &BlockScaledCheckpoint) -> Option<EngramMeta> {
         return None;
     }
     let path = ck.dir.join("tokenizer.json");
-    let engram = match crate::inference::model::deepseek_v41::token_map::build_from_file(&path) {
+    let engram = match super::super::ngram::token_map::build_from_file(&path) {
         Ok((map, _)) => EngramMeta::derive(&ck.reference, map),
         Err(e) => {
             tracing::warn!("no engram, the token map could not be built: {e}");
@@ -260,21 +260,6 @@ fn checkpoint_engram(ck: &BlockScaledCheckpoint) -> Option<EngramMeta> {
         tracing::warn!("running without the engram layers");
     }
     engram
-}
-
-/// The n-gram hash fields of the model description, from the engram layout `m`.
-fn ngram_fields(m: &EngramMeta) -> NgramHashFields {
-    NgramHashFields {
-        layer_ids: m.layer_ids.clone(),
-        heads: m.heads,
-        head_dim: m.head_dim,
-        max_ngram: m.max_ngram,
-        token_map: m.token_map.clone(),
-        pad_id: m.pad_id,
-        multipliers: m.multipliers.clone(),
-        primes: m.primes.clone(),
-        offsets: m.offsets.clone(),
-    }
 }
 
 /// The names block `il` may carry a tensor under: each stem bare, then with the `.weight`
@@ -489,8 +474,8 @@ impl GenericHeteroTransformer {
         if self.wide_sparse.is_none() {
             return false;
         }
-        let prefix = format!("{}.dspark.", crate::inference::model::deepseek_v41::ARCH);
-        for path in crate::inference::model::deepseek_v41::sibling::find_beside(model, &prefix) {
+        let prefix = format!("{ARCH}.dspark.");
+        for path in super::super::wide_sparse_sibling::find_beside(model, &prefix) {
             let loaded = companion_draft(&path)
                 .and_then(|d| d.map(|h| self.attach_block_draft(h)).transpose());
             match loaded {
@@ -584,11 +569,11 @@ impl GenericHeteroTransformer {
         let engram = checkpoint_engram(checkpoint);
         let meta = WideSparseMeta::from_reference(
             &checkpoint.reference,
-            engram.as_ref().map(ngram_fields),
+            engram.as_ref().map(NgramHashFields::from),
         )?;
         Self::build_wide_sparse(
             &meta,
-            crate::inference::model::deepseek_v41::ARCH,
+            ARCH,
             &Tensors::Checkpoint(checkpoint),
             engram,
             plan,
@@ -1347,7 +1332,7 @@ mod tests {
     #[test]
     fn the_checkpoint_engram_layout_is_the_v41_layout() {
         use super::super::super::block_scaled_engram_tests::engram_checkpoint;
-        use crate::inference::model::deepseek_v41::token_map;
+        use super::super::super::ngram::token_map;
         let dir = engram_checkpoint("layout");
         let ck = BlockScaledCheckpoint::open(&dir).unwrap();
         let got = checkpoint_engram(&ck).expect("a layout");

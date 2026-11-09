@@ -115,5 +115,11 @@ pub use qtensor::QTensor;
 pub use storage::{QStorage, QStorageWithHost};
 pub use varbuilder::QVarBuilder;
 
+/// Bytes of a quantised weight expanded to f32 on a card at a time.
+///
+/// A projection wider than that goes through in pieces of this size.
+/// A card keeps this much free for each such step in flight.
+pub const WEIGHT_TILE_BYTES: usize = 96 << 20;
+
 #[cfg(test)]
 mod tests;

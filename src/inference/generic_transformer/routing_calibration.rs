@@ -26,13 +26,10 @@ use std::collections::{HashMap, HashSet};
 /// What `fast` accepts, as a multiple of the model's own numerical noise.
 ///
 /// `balanced` accepts 1 times the noise.
-/// The value is the one `deepseek_v41::calibrate` gives the same level.
 pub const FAST_NOISE_MULTIPLE: f64 = 3.0;
 
 /// Shares of an average slot's weight under which a missed expert is replaced, 1 candidate
 /// each.
-///
-/// The values are the ones `deepseek_v41::calibrate` tries.
 const MISS_SHARES: [f32; 3] = [0.5, 0.75, 1.0];
 
 /// The logits of every position of a token sequence, one row each, from the model as it is
@@ -120,9 +117,6 @@ pub fn noise(
 }
 
 /// One candidate truncation and what running the calibration text under it measured.
-///
-/// The fields are the ones `deepseek_v41::calibrate` caches, so either reads the other's
-/// table.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Measured {
     pub keep: usize,
@@ -219,14 +213,12 @@ fn measure_each(
     Ok(table)
 }
 
-/// The file the noise of every model and plan is kept in, the one `deepseek_v41::calibrate`
-/// keeps it in.
+/// The file the noise of every model and plan is kept in.
 fn noise_file() -> Option<std::path::PathBuf> {
     Some(dirs::cache_dir()?.join("loken").join("quality-noise.json"))
 }
 
-/// The file the table of every model and plan is kept in, the one `deepseek_v41::calibrate`
-/// keeps it in.
+/// The file the table of every model and plan is kept in.
 fn table_file() -> Option<std::path::PathBuf> {
     Some(
         dirs::cache_dir()?
@@ -391,7 +383,7 @@ pub fn calibrate_loaded(
 
 /// The text the calibration runs: some code and some prose, long enough to route a few
 /// hundred tokens.
-pub const CALIBRATION_TEXT: &str = include_str!("../model/deepseek_v41/calibration_text.txt");
+pub const CALIBRATION_TEXT: &str = include_str!("calibration_text.txt");
 
 /// [`CALIBRATION_TEXT`] as token ids of `tokenizer`, after `bos` when the model has one.
 pub fn calibration_ids(tokenizer: &tokenizers::Tokenizer, bos: Option<u32>) -> Option<Vec<u32>> {

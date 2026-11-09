@@ -24,7 +24,7 @@ use super::wide_sparse_real_tests::{
     FORCED, PERTURB, RECORD, STEPS, TAG, TRACE,
 };
 use super::*;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
+use crate::inference::generic_transformer::wide_sparse_toy::prompt;
 use crate::inference::place::llm::offer;
 use crate::inference::place::runtime_demand::llm_work_reserve;
 use crate::inference::place::{ladder::Demand, layer_executor::DeviceKind};
@@ -533,7 +533,7 @@ fn the_real_card_harness_runs_on_the_toy() {
         return;
     }
     for (ratios, kv_src, index_src) in LAYOUTS {
-        let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+        let tokens = prompt();
         host_against_card(
             &tokens,
             || exact(ratios, kv_src, index_src),

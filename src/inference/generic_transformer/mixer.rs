@@ -1506,7 +1506,7 @@ impl GatedDeltaNet {
             .reshape((d.conv_dim(), d.conv_kernel - 1))?
             .contiguous()?;
         let prep = std::time::Instant::now();
-        let prepping = crate::inference::offload::stage_prof_enabled();
+        let prepping = crate::inference::stage_prof::stage_prof_enabled();
         if prepping {
             let _ = dev.synchronize();
         }
@@ -1590,7 +1590,7 @@ impl GatedDeltaNet {
         let scale = (1.0 / (kd as f64).sqrt()) as f32;
         if prepping {
             let _ = dev.synchronize();
-            crate::inference::offload::prof_record(
+            crate::inference::stage_prof::prof_record(
                 "gdn_conv_gate",
                 prep.elapsed().as_nanos() as u64,
             );

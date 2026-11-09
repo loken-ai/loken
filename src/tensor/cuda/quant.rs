@@ -836,7 +836,7 @@ pub fn expert_tables(dev: &CudaDevice, format: ExpertFormat) -> Result<ExpertTab
 /// `i` runs expert `instances[i].0` over row `instances[i].1` of `xq`, the q8_K32 rows of the
 /// inputs on the card; instances of one expert stand together. Returns, on the card, the rows
 /// entering the down projections [instances, inter] and the outputs [instances, dim], each the
-/// same bits `offload::cpu_experts` forms on the host.
+/// same bits the host forms for the same experts.
 #[allow(clippy::type_complexity)]
 pub fn gpu_experts_exact(
     dev: &CudaDevice,
@@ -1093,7 +1093,7 @@ pub fn gpu_expert_rows_grouped_multi(
 /// the expanded f32 weights of one tile of output rows and their products. A weight wider than
 /// this is multiplied one tile of rows after another, so a card with little room beside what it
 /// keeps still takes a prompt's projections.
-pub const QUANT_LINEAR_TILE_BYTES: usize = crate::inference::offload::WEIGHT_TILE_BYTES;
+pub const QUANT_LINEAR_TILE_BYTES: usize = crate::tensor::quantized::WEIGHT_TILE_BYTES;
 
 /// `x` [n, inp] through a quantised weight [out, inp] on the card, as `[n, out]`, one tile of
 /// output rows at a time (see `QUANT_LINEAR_TILE_BYTES`).
@@ -1267,13 +1267,13 @@ fn gpu_quant_linear_once(
     let xs = stream
         .clone_htod(x)
         .map_err(|e| alloc_err("quant linear upload", e))?;
-    crate::inference::offload::prof_record(
+    crate::inference::stage_prof::prof_record(
         "q linear upload",
         upload_started.elapsed().as_nanos() as u64,
     );
     let launch_started = std::time::Instant::now();
     let w = dequantise_f32(dev, dtype, &blob.as_view(), total)?;
-    crate::inference::offload::prof_record(
+    crate::inference::stage_prof::prof_record(
         "q linear dequant launch",
         launch_started.elapsed().as_nanos() as u64,
     );
@@ -1282,7 +1282,7 @@ fn gpu_quant_linear_once(
     let r = stream
         .clone_dtoh(&y)
         .map_err(|e| Error(format!("quant linear download: {e}")));
-    crate::inference::offload::prof_record(
+    crate::inference::stage_prof::prof_record(
         "q linear gemm and download",
         gemm_started.elapsed().as_nanos() as u64,
     );
@@ -1701,7 +1701,7 @@ fn staged_weight(addr: usize, len: usize) -> Option<usize> {
     let started = std::time::Instant::now();
     let found = slabs().iter().find_map(|slab| slab.staged(addr, len));
     if found.is_some() {
-        crate::inference::offload::prof_record("slab wait", started.elapsed().as_nanos() as u64);
+        crate::inference::stage_prof::prof_record("slab wait", started.elapsed().as_nanos() as u64);
     }
     found
 }
@@ -1797,7 +1797,10 @@ impl<'a> Staging<'a> {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), pin.ptr as *mut u8, bytes.len())
             };
         }
-        crate::inference::offload::prof_record("staged copy", t_copy.elapsed().as_nanos() as u64);
+        crate::inference::stage_prof::prof_record(
+            "staged copy",
+            t_copy.elapsed().as_nanos() as u64,
+        );
         let ptr = pin.ptr;
         self.held.push(pin);
         self.send(dev, ptr, bytes.len())
@@ -1937,7 +1940,10 @@ pub fn gpu_expert_tokens(
     let out_host = stream
         .clone_dtoh(&y)
         .map_err(|e| Error(format!("expert tokens download: {e}")))?;
-    crate::inference::offload::prof_record("staged card wait", t_wait.elapsed().as_nanos() as u64);
+    crate::inference::stage_prof::prof_record(
+        "staged card wait",
+        t_wait.elapsed().as_nanos() as u64,
+    );
     Ok((h_host, out_host))
 }
 
@@ -2028,7 +2034,7 @@ pub fn gpu_expert_layer_rows_held(
     let out = stream
         .clone_dtoh(&y)
         .map_err(|e| Error(format!("expert rows download: {e}")))?;
-    crate::inference::offload::prof_record(
+    crate::inference::stage_prof::prof_record(
         "expert card wait",
         sync_started.elapsed().as_nanos() as u64,
     );
@@ -4856,7 +4862,7 @@ mod iq2_xxs_gpu_tests {
     fn card_experts_match_the_host(format: ExpertFormat, gate: GgmlDType, down: GgmlDType) {
         use crate::inference::offload::cpu_experts;
         use crate::inference::offload::experts::Expert;
-        use crate::inference::offload::projection::Projection;
+        use crate::tensor::blockscaled::projection::Projection;
         use crate::tensor::quantized::QTensor;
         use crate::tensor::{Device, Tensor};
         let Ok(dev) = CudaDevice::new(0) else {

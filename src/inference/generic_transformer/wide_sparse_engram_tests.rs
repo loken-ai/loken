@@ -16,11 +16,12 @@ use super::wide_sparse_oracle_tests::{
 };
 use super::*;
 use crate::inference::cache::state_disk::StateStore;
-use crate::inference::model::deepseek_v41::engram as v41;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
-use crate::inference::model::deepseek_v41::model::tests::{
+use crate::inference::generic_transformer::wide_sparse_toy::prompt;
+use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
+use crate::inference::model::deepseek_v41::engram as v41;
+use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
@@ -302,7 +303,7 @@ fn four_engram_sequences_batched_give_the_bits_of_their_serial_runs() {
 #[test]
 fn a_restored_prefix_hashes_the_ids_of_its_own_sequence() {
     let (ratios, kv_src, index_src) = LAYOUTS[0];
-    let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+    let tokens = prompt();
     let half = tokens.len() / 2;
     let (prefix, other) = (&tokens[..half], &tokens[half..]);
     let next = tokens[0];

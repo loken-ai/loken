@@ -883,7 +883,7 @@ fn v41_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
     for pass in ["cold", "warm", "profiled"] {
         let profiled = pass == "profiled";
         if profiled {
-            crate::inference::offload::stage_prof_enable(true);
+            crate::inference::stage_prof::stage_prof_enable(true);
         }
         let mut state = model.new_decode_state();
         let (logits, s) = timed(|| row(&model.prefill_into(ids, &mut state).unwrap()));
@@ -897,7 +897,7 @@ fn v41_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
         } else {
             assert_eq!(first, logits, "the repeated prefill changed the logits");
         }
-        let after_prefill = crate::inference::offload::stage_prof_snapshot();
+        let after_prefill = crate::inference::stage_prof::stage_prof_snapshot();
         let mut last = logits;
         let mut total = 0.0;
         for _ in 0..STEPS {
@@ -917,7 +917,7 @@ fn v41_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
                     *ns as f64 / 1e9
                 );
             }
-            for (name, ns, n) in crate::inference::offload::stage_prof_snapshot() {
+            for (name, ns, n) in crate::inference::stage_prof::stage_prof_snapshot() {
                 let (ns0, n0) = after_prefill
                     .iter()
                     .find(|(k, _, _)| *k == name)
@@ -928,7 +928,7 @@ fn v41_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
                     n - n0
                 );
             }
-            crate::inference::offload::stage_prof_enable(false);
+            crate::inference::stage_prof::stage_prof_enable(false);
         }
     }
     first

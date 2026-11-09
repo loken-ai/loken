@@ -9,11 +9,12 @@
 
 use super::block_draft_tests::generic_of;
 use super::expert_profile::ExpertProfile;
-use crate::inference::model::deepseek_v41::model::tests::{
+use super::wide_sparse_sibling as sibling;
+use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::{sibling, DeepseekV41Config};
+use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::inference::offload::streamed::StreamedModel;
 use crate::inference::place::expert_variants::{ranks_from_counts, VariantChoice};
 use crate::tensor::gguf_write::write_gguf_with_metadata;

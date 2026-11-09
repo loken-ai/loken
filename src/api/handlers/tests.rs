@@ -847,7 +847,11 @@ fn a_checkpoint_a_model_source_serves_is_advertised() {
     let path = crate::inference::load::huggingface_manager::HuggingFaceManager::new(hf.clone())
         .get_model_path(&entry.id)
         .expect("the repository resolves");
-    assert!(crate::inference::model::deepseek_v41::claims_checkpoint_dir(&path));
+    assert!(
+        crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims_checkpoint(
+            &path
+        )
+    );
     assert!(super::text_loader_can_open(&hf.to_string_lossy(), &entry));
     let _ = std::fs::remove_dir_all(&hf);
 }

@@ -12,7 +12,7 @@ use crate::inference::engine::model_backend::{DeepseekV41Backend, ModelBackend};
 use crate::inference::generic_transformer::block_draft_tests::{
     draft_config, draft_entries, generic_of, prompt, toy_files, v41_of,
 };
-use crate::inference::model::deepseek_v41::model::tests::{
+use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
 use crate::tensor::gguf_write::write_gguf_with_metadata;
@@ -167,7 +167,7 @@ async fn a_wide_file_loaded_by_the_engine_answers_as_the_oracle_models() {
 async fn a_loaded_wide_file_gives_the_cluster_the_inputs_of_the_v41_backend() {
     use crate::inference::generic_transformer::wide_sparse_cluster_tests::v41_with_prior;
     use crate::inference::generic_transformer::wide_sparse_routing_tests::{turning, ROUTED};
-    use crate::inference::model::deepseek_v41::sibling;
+    use crate::inference::generic_transformer::wide_sparse_sibling as sibling;
     for layout in LAYOUTS {
         let label = format!("layout {:?}", layout.0);
         let path = toy_on_disk(layout, false);

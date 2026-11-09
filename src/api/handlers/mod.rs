@@ -1225,7 +1225,8 @@ pub(crate) fn text_loader_can_open(
         return true;
     }
     // A checkpoint a model's own source reads in place, as the loader routes it.
-    if crate::inference::model::deepseek_v41::claims_checkpoint_dir(&path) {
+    use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
+    if WideSparseMeta::claims_checkpoint(&path) {
         return true;
     }
     let Ok(config) = std::fs::read_to_string(path.join("config.json")) else {

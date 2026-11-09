@@ -14,6 +14,7 @@ use super::model::DeepseekV41Model;
 use super::moe::Truncation;
 use super::quality::{log_softmax, score, top, Reference, TOP};
 use crate::inference::engine::llm_engine::QualityLevel;
+pub use crate::inference::generic_transformer::routing_calibration::CALIBRATION_TEXT;
 use crate::tensor::Result;
 use serde::{Deserialize, Serialize};
 
@@ -124,10 +125,6 @@ pub fn apply_level(
     );
     apply_budget(model, budget, key, ids, resident, run)
 }
-
-/// The text the calibration runs, bundled with the engine: some code and some prose, long enough
-/// to route a few hundred tokens and short enough to run in the time a model takes to load.
-pub const CALIBRATION_TEXT: &str = include_str!("calibration_text.txt");
 
 /// The bundled text as token ids, with the file's own tokenizer and start token; `None` when the
 /// file carries no tokenizer.

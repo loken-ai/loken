@@ -4,7 +4,7 @@
 
 use super::stats::run_for;
 use super::{Context, Measured};
-use crate::inference::offload::cpu_experts::bench_miss_ms;
+use crate::distributed::auto_tune::bench_miss_ms;
 use crate::tensor::quantized::GgmlDType;
 use std::time::Duration;
 
@@ -267,7 +267,7 @@ fn through_the_decode_path(
 ) -> Vec<Measured> {
     use crate::inference::offload::cpu_experts::batched;
     use crate::inference::offload::experts::Expert;
-    use crate::inference::offload::projection::Projection;
+    use crate::tensor::blockscaled::projection::Projection;
     use crate::tensor::quantized::QTensor;
     use crate::tensor::Device;
     use std::sync::Arc;

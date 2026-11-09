@@ -1168,7 +1168,7 @@ pub fn moe_gemm_gguf_gate_up_swiglu_oai(
 }
 
 /// The bounded SwiGLU of the fused gate+up path: gate and up products by the format's dot,
-/// then `offload::experts::swiglu` of the pair at `limit`.
+/// then `bounded_swiglu::swiglu` of the pair at `limit`.
 #[allow(clippy::too_many_arguments)]
 fn fused_gate_up_limited_t<T: crate::tensor::quant_cpu::BlockFormat>(
     input: &Tensor,
@@ -1216,13 +1216,13 @@ fn fused_gate_up_limited_t<T: crate::tensor::quant_cpu::BlockFormat>(
         let x = &xq[t];
         let g = T::dot(&gw[row..row + blocks_per_row], x);
         let u = T::dot(&uw[row..row + blocks_per_row], x);
-        *out = crate::inference::offload::experts::swiglu(g, u, limit);
+        *out = crate::tensor::ops::bounded_swiglu::swiglu(g, u, limit);
     });
     Ok(Some(Tensor::from_vec(h, (m, n), &input.device())?))
 }
 
 /// gate/up expert GEMM + the bounded SwiGLU: for each sorted slot j,
-/// `h[j] = offload::experts::swiglu(gate[e].x, up[e].x, limit)`, the gate clamped from above and
+/// `h[j] = bounded_swiglu::swiglu(gate[e].x, up[e].x, limit)`, the gate clamped from above and
 /// the up value on both sides.
 pub fn moe_gemm_gguf_gate_up_swiglu_limited(
     input: &Tensor,              // [n_tok, hidden] F32
@@ -1280,7 +1280,7 @@ pub fn moe_gemm_gguf_gate_up_swiglu_limited(
         let g: Vec<f32> = g.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let u: Vec<f32> = u.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         for (o, (&gv, &uv)) in h[j0 * n..j1 * n].iter_mut().zip(g.iter().zip(&u)) {
-            *o = crate::inference::offload::experts::swiglu(gv, uv, limit);
+            *o = crate::tensor::ops::bounded_swiglu::swiglu(gv, uv, limit);
         }
     }
     Tensor::from_vec(h, (m, n), &dev)

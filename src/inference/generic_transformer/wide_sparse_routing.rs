@@ -9,8 +9,8 @@
 //! A model file that carries none takes the one a companion file beside it declares.
 
 use super::expert_profile::ExpertProfile;
+use super::wide_sparse_sibling as sibling;
 use super::GenericHeteroTransformer;
-use crate::inference::model::deepseek_v41::sibling;
 use crate::inference::place::expert_variants::ranks_from_counts;
 use crate::tensor::Result;
 

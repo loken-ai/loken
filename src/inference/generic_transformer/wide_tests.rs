@@ -375,13 +375,11 @@ fn the_selected_attention_matches_the_reference_block() {
 }
 
 #[test]
-fn a_low_rank_wide_residual_is_not_the_deepseek_port() {
+fn a_low_rank_wide_residual_is_not_the_deepseek_v41_family() {
     let file = std::fs::File::open(dir().join("toy.gguf")).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     let content = gguf_file::Content::read(&mut std::io::Cursor::new(&mmap[..])).unwrap();
-    assert!(!crate::inference::model::deepseek_v41::claims_gguf(
-        &content
-    ));
+    assert!(!super::wide_sparse_config::WideSparseMeta::claims(&content));
 }
 
 #[test]

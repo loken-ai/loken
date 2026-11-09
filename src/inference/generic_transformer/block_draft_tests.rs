@@ -9,10 +9,10 @@
 use super::wide_sparse_oracle_tests::LAYOUTS;
 use super::*;
 use crate::inference::engine::model_backend::{DeepseekV41Backend, GenericBackend, ModelBackend};
-use crate::inference::model::deepseek_v41::dspark::{Dspark, DsparkConfig};
-use crate::inference::model::deepseek_v41::model::tests::{
+use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
+use crate::inference::model::deepseek_v41::dspark::{Dspark, DsparkConfig};
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};

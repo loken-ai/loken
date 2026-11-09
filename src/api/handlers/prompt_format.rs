@@ -2135,7 +2135,7 @@ mod go_template_tests {
     /// last assistant turn instead of closing it.
     #[test]
     fn the_deepseek_v41_template_renders_as_the_checkpoint_encoder_does() {
-        use crate::inference::model::deepseek_v41::convert::CHAT_TEMPLATE;
+        use crate::inference::generic_transformer::wide_sparse_convert::CHAT_TEMPLATE;
         let msg = |role: &str, content: &str| {
             crate::api::types::Message::new(role.to_string(), content.to_string())
         };

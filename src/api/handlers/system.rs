@@ -396,8 +396,8 @@ pub(crate) async fn layer_performance_endpoint(
 pub(crate) async fn stage_performance_endpoint(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    use crate::inference::offload::{stage_prof_enable, stage_prof_snapshot};
     use crate::inference::place::layer_perf::stages;
+    use crate::inference::stage_prof::{stage_prof_enable, stage_prof_snapshot};
     match params.get("enable").map(String::as_str) {
         Some("1") => {
             stages::reset();

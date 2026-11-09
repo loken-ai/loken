@@ -18,6 +18,10 @@ use super::model::DeepseekV41Model;
 use super::safetensors_source::SafeTensorsSource;
 use super::source::{llamacpp_name, WeightSource, ENGRAM_TABLE};
 use super::DeepseekV41Config;
+use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
+pub use crate::inference::generic_transformer::wide_sparse_convert::{
+    tokenizer_metadata, TokenizerFiles, CHAT_TEMPLATE,
+};
 use crate::inference::load::calibrated::{quantize_projection_on, Kernels, Recipe, Records};
 use crate::inference::load::calibration::Calibration;
 use crate::inference::load::compensate::stage::{self, time, Stage};
@@ -233,126 +237,6 @@ enum Source {
 /// The metadata key under which the file carries the checkpoint's `tokenizer.json`, whole.
 pub const TOKENIZER_KEY: &str = "tokenizer.huggingface.json";
 
-/// The checkpoint's chat format, as its `encoding/encoding.py` renders a conversation: the
-/// sequence token first, a system turn when one is given, every turn behind its role token,
-/// the assistant header closed by `</think>` for a plain answer and opened by `<think>` when
-/// `enable_thinking` is set, in which case the encoder's default reasoning effort leads the
-/// system turn. Tool turns are outside this template; the server flattens them.
-pub const CHAT_TEMPLATE: &str = concat!(
-    "{{ '<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>' }}",
-    "{% set thinking = enable_thinking is defined and enable_thinking %}",
-    "{% if thinking %}",
-    "<\u{ff5c}System\u{ff5c}>Reasoning Effort: 75 (range 1-100, the higher the value, ",
-    "the more thorough the reasoning)\n\n",
-    "{% endif %}",
-    "{% for m in messages %}",
-    "{% if m.role == 'system' %}",
-    "{% if not (thinking and loop.first) %}<\u{ff5c}System\u{ff5c}>{% endif %}",
-    "{% if m.content %}{{ m.content }}{% endif %}",
-    "{% elif m.role == 'user' %}",
-    "<\u{ff5c}User\u{ff5c}>{% if m.content %}{{ m.content }}{% endif %}",
-    "{% elif m.role == 'assistant' %}",
-    "{% if m.content %}{{ m.content }}{% endif %}<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>",
-    "{% endif %}",
-    "{% if m.role != 'assistant' and ((loop.last and add_generation_prompt) ",
-    "or (not loop.last and loop.nextitem.role == 'assistant')) %}",
-    "<\u{ff5c}Assistant\u{ff5c}>",
-    "{% if thinking and loop.last %}<think>{% else %}</think>{% endif %}",
-    "{% endif %}",
-    "{% endfor %}",
-);
-
-/// What the checkpoint says about its tokens: `tokenizer.json` whole, and the ids its
-/// `tokenizer_config.json` names for the sequence and end tokens.
-pub struct TokenizerFiles {
-    pub json: String,
-    pub bos: u32,
-    pub eos: u32,
-}
-
-impl TokenizerFiles {
-    pub fn read(dir: &Path) -> Result<Self> {
-        let json = std::fs::read_to_string(dir.join("tokenizer.json"))
-            .map_err(|e| Error::msg(format!("tokenizer.json: {e}")))?;
-        let cfg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("tokenizer_config.json"))
-                .map_err(|e| Error::msg(format!("tokenizer_config.json: {e}")))?,
-        )
-        .map_err(|e| Error::msg(format!("tokenizer_config.json: {e}")))?;
-        let tok: serde_json::Value =
-            serde_json::from_str(&json).map_err(|e| Error::msg(format!("tokenizer.json: {e}")))?;
-        let id = |key: &str| -> Result<u32> {
-            let name = match cfg.get(key) {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(v) => v
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .ok_or_else(|| {
-                        Error::msg(format!("tokenizer_config.json: {key} has no content"))
-                    })?
-                    .to_string(),
-                None => return Err(Error::msg(format!("tokenizer_config.json: no {key}"))),
-            };
-            tok.get("added_tokens")
-                .and_then(|a| a.as_array())
-                .and_then(|a| {
-                    a.iter()
-                        .find(|t| t.get("content").and_then(|c| c.as_str()) == Some(&name))
-                })
-                .and_then(|t| t.get("id"))
-                .and_then(|i| i.as_u64())
-                .map(|i| i as u32)
-                .ok_or_else(|| Error::msg(format!("tokenizer.json: {name} is not an added token")))
-        };
-        Ok(Self {
-            bos: id("bos_token")?,
-            eos: id("eos_token")?,
-            json,
-        })
-    }
-}
-
-/// The tokenizer's metadata: the file whole, the two token ids the loader stops and starts
-/// on, and the chat format. The sequence token is written by the template, not by the
-/// tokenizer, as the checkpoint's configuration says.
-/// The routing prior as metadata: for each layer, its experts from the most routed-to on the
-/// calibration corpus downwards. A loader reads the head of each list to fill its cards before
-/// the first request, where they would otherwise fill over that request's first tokens.
-pub fn hot_experts_metadata(lists: &[Vec<u32>]) -> Vec<(String, Value)> {
-    lists
-        .iter()
-        .enumerate()
-        .map(|(l, ids)| {
-            (
-                format!("{}.hot_experts.{l}", super::ARCH),
-                Value::Array(ids.iter().map(|&x| Value::U32(x)).collect()),
-            )
-        })
-        .collect()
-}
-
-pub fn tokenizer_metadata(files: &TokenizerFiles) -> Vec<(String, Value)> {
-    vec![
-        (TOKENIZER_KEY.to_string(), Value::String(files.json.clone())),
-        (
-            "tokenizer.ggml.bos_token_id".to_string(),
-            Value::U32(files.bos),
-        ),
-        (
-            "tokenizer.ggml.eos_token_id".to_string(),
-            Value::U32(files.eos),
-        ),
-        (
-            "tokenizer.ggml.add_bos_token".to_string(),
-            Value::Bool(false),
-        ),
-        (
-            "tokenizer.chat_template".to_string(),
-            Value::String(CHAT_TEMPLATE.to_string()),
-        ),
-    ]
-}
-
 /// The file's keys, in llama.cpp's layout: the configuration of its first `n_layers` layers, the
 /// context the checkpoint declares, and the tokenizer both as the checkpoint ships it and as
 /// llama.cpp's vocabulary arrays. `engram_rows` holds each engram table's rows, as
@@ -368,7 +252,10 @@ fn file_metadata(
     let context_length = hf
         .get("max_position_embeddings")
         .and_then(|v| v.as_u64())
-        .map_or_else(|| mainline::trained_context(cfg), |v| v as usize);
+        .map_or_else(
+            || mainline::trained_context(&WideSparseMeta::from(cfg)),
+            |v| v as usize,
+        );
     let mut keys = Vec::new();
     if let Some(files) = tokenizer {
         keys.extend(tokenizer_metadata(files));
@@ -379,7 +266,7 @@ fn file_metadata(
         context_length,
         tokenizer: keys,
     };
-    mainline::metadata(cfg, n_layers, engram_rows, &extras)
+    mainline::metadata(&WideSparseMeta::from(cfg), n_layers, engram_rows, &extras)
 }
 
 /// The format a tensor outside the routed experts is written in: a large matrix whose rows tile
@@ -878,7 +765,7 @@ pub fn convert(
     names.sort();
     // The file holds its first `n_layers` layers, which llama.cpp loads as a model of that many.
     let n_layers = layers.end.min(cfg.n_layers);
-    let below: Vec<usize> = mainline::engram_layers(cfg, n_layers)
+    let below: Vec<usize> = mainline::engram_layers(&WideSparseMeta::from(cfg), n_layers)
         .into_iter()
         .filter_map(|i| cfg.engram.as_ref().map(|e| e.layer_ids[i]))
         .collect();

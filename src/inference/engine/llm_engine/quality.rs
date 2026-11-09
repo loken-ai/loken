@@ -732,7 +732,8 @@ mod real_models {
     const CHARS_PER_TOKEN_READ: usize = 6;
 
     /// The held-out calibration text any calibration of this repository used.
-    const CALIBRATION: &str = include_str!("../../model/deepseek_v41/calibration_text.txt");
+    const CALIBRATION: &str =
+        crate::inference::generic_transformer::routing_calibration::CALIBRATION_TEXT;
 
     /// `(relative path, content)` of every file under `root/dir` with the extension `ext`.
     fn read_candidates(root: &Path, dir: &str, ext: &str) -> Vec<(String, String)> {

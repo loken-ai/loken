@@ -16,13 +16,14 @@ use super::block_scaled_oracle_tests::{
     STREAMS, VOCAB,
 };
 use super::ngram::engram_hash::primes_and_offsets;
+use super::ngram::token_map;
 use super::wide_sparse_oracle_tests::{
     bit_difference, record_generic, record_v41, Record, RECORDS,
 };
 use crate::inference::model::deepseek_v41::engram::EngramConfig;
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
-use crate::inference::model::deepseek_v41::{token_map, DeepseekV41Config};
+use crate::inference::model::deepseek_v41::DeepseekV41Config;
 
 /// The engram layers: a window layer and the band layer of the checkpoint.
 pub(super) const ENGRAM_LAYERS: [usize; 2] = [0, 1];

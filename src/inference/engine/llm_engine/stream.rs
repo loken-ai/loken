@@ -1491,7 +1491,7 @@ impl LlmEngine {
             // sees them.
             let ends = |t: u32| end_tokens.contains(&t);
             // The stage profile's view of a token: the whole iteration, and its parts below.
-            use crate::inference::offload::prof_record;
+            use crate::inference::stage_prof::prof_record;
             let mut last_top: Option<Instant> = None;
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
                 crate::request_metrics::note_decoded(token_count);

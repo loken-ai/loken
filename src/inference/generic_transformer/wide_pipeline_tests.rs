@@ -9,6 +9,7 @@ use super::wide_pipeline::{WideBoundary, WideSettle, HEADER_BYTES};
 use super::wide_sparse_engram_tests::{generic_engram, v41_engram};
 use super::wide_sparse_oracle_tests::{generic, LAYOUTS};
 use super::*;
+use crate::inference::generic_transformer::wide_sparse_toy::prompt;
 use crate::inference::model::deepseek_v41::band::SharedAttn;
 use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
 use crate::inference::model::deepseek_v41::model::{
@@ -200,7 +201,7 @@ fn assert_cut_runs_as_whole(
 fn every_cut_gives_the_bits_of_the_whole_model() {
     for (name, make, _) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
-            let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens = prompt();
             let n = ratios.len();
             let build = || make(ratios, kv_src, index_src);
             for at in 1..n {
@@ -221,7 +222,7 @@ fn every_cut_gives_the_bits_of_the_whole_model() {
 fn a_decode_boundary_is_the_v41_boundary_byte_for_byte() {
     for (name, make, make_v41) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
-            let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens = prompt();
             let v41 = make_v41(ratios, kv_src, index_src);
             let n = ratios.len();
             assert_eq!(v41.n_layers(), n);
@@ -350,7 +351,7 @@ fn the_v41_encoder_and_the_generic_encoder_write_the_same_bytes() {
 fn interleaved_sequences_on_a_cut_give_the_bits_of_their_runs_alone() {
     for (name, make, _) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
-            let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens = prompt();
             let n = ratios.len();
             let build = || make(ratios, kv_src, index_src);
             let prompts: [&[u32]; 2] = [&tokens[..5], &tokens[7..10]];
@@ -442,7 +443,7 @@ fn wire_chain(
 fn segments_on_the_wire_give_the_bits_of_the_whole_model() {
     for (name, make, _) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
-            let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens = prompt();
             let n = ratios.len();
             let build = || make(ratios, kv_src, index_src);
             let mut chains: Vec<Vec<usize>> = (1..n).map(|at| vec![0, at, n]).collect();

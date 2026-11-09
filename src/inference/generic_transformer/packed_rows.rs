@@ -33,8 +33,6 @@ const FP4_INDEX: u8 = 7;
 
 /// Neighbours, in units in the last place, of a candidate f32 scale that a compressed block is
 /// tried at, nearest first.
-///
-/// The values are the ones `deepseek_v41::packed` tries.
 const SCALE_ULPS: [i32; 5] = [0, 1, -1, 2, -2];
 
 /// The finite non-negative e4m3 values by code.

@@ -259,7 +259,7 @@ fn both_write_the_same_file(
     )
     .unwrap();
     let new_out = dir.join(format!("{tag}-generic.gguf"));
-    let p = plan(&ours, cfg, formats, layers, NAME, None).unwrap();
+    let p = plan(&ours, &cfg.into(), formats, layers, NAME, None).unwrap();
     let new_digest =
         block_scaled_convert::convert(&ours, &p, &records, RECIPE, &new_out, 0, &|_, _, _| {})
             .unwrap();
@@ -391,8 +391,8 @@ fn the_convert_request_writes_the_bytes_of_the_v41_converter() {
     let old_cfg = v41::released_config(&old_src, &dir).unwrap();
     let cfg = checkpoint_config(&ours, &dir).unwrap();
     assert_eq!(
-        format!("{cfg:?}"),
-        format!("{old_cfg:?}"),
+        cfg,
+        super::wide_sparse_config::WideSparseMeta::from(&old_cfg),
         "the configurations"
     );
     let tokenizer = v41::TokenizerFiles::read(&dir).unwrap();

@@ -12,6 +12,7 @@ use super::routing_calibration as calibration;
 use super::wide_sparse_oracle_tests::{generic, LAYOUTS};
 use super::*;
 use crate::inference::engine::llm_engine::QualityLevel;
+use crate::inference::generic_transformer::wide_sparse_toy::prompt;
 use crate::inference::model::deepseek_v41::calibrate;
 use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
@@ -205,7 +206,7 @@ fn both_calibrations_choose_the_same_truncation_per_level() {
 #[test]
 fn a_zero_budget_runs_nothing_and_measuring_leaves_routing_exact() {
     let (ratios, kv_src, index_src) = LAYOUTS[0];
-    let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+    let tokens = prompt();
     let mut model = generic(ratios, kv_src, index_src);
     let resident = even_experts(&model);
     let plain = generic_prefill(&mut model, &tokens).unwrap();

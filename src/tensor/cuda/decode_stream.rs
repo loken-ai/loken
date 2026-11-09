@@ -1051,7 +1051,7 @@ mod tests {
     /// The card's SwiGLU gives the host's value, with the clamp and without it.
     #[test]
     fn the_card_applies_the_hosts_swiglu() {
-        use crate::inference::offload::experts::swiglu;
+        use crate::tensor::ops::bounded_swiglu::swiglu;
         let Ok(dev) = CudaDevice::new(0) else {
             eprintln!("no CUDA device; the card SwiGLU is NOT covered by this run");
             return;

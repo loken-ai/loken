@@ -571,11 +571,11 @@ impl GenericHeteroTransformer {
         };
         // Under the stage profile, what the pairs, each guess's layer, its logits and its odds
         // cost, with the card drained at each mark.
-        let prof = crate::inference::offload::stage_prof_enabled();
+        let prof = crate::inference::stage_prof::stage_prof_enabled();
         let mark = |name: &'static str, since: &mut std::time::Instant, dev: &Device| {
             if prof {
                 let _ = dev.synchronize();
-                crate::inference::offload::prof_record(name, since.elapsed().as_nanos() as u64);
+                crate::inference::stage_prof::prof_record(name, since.elapsed().as_nanos() as u64);
                 *since = std::time::Instant::now();
             }
         };

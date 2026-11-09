@@ -4,7 +4,7 @@
 //! request to the next; with this, the answer does not change with it.
 //!
 //! A pair's row is `w * down(swiglu(gate . x, up . x))`: the input row as q8_K blocks, the gate
-//! and up products, the SwiGLU of `offload::experts`, its row as q8_K blocks, the down product,
+//! and up products, the SwiGLU of `bounded_swiglu`, its row as q8_K blocks, the down product,
 //! the weight. The card's kernels are `tx_*` in `requant.cu`.
 use super::*;
 use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
@@ -45,7 +45,7 @@ pub(super) struct Exact {
     pub(super) down: Fmt,
     pub(super) dim: usize,
     pub(super) inter: usize,
-    /// The bound of the SwiGLU, `0` for none: the `limit` of `offload::experts::swiglu`.
+    /// The bound of the SwiGLU, `0` for none: the `limit` of `bounded_swiglu::swiglu`.
     pub(super) limit: f32,
 }
 
@@ -389,7 +389,7 @@ fn host_rows<G: ExactDot, D: ExactDot>(
                 for &p in &order[lo..hi] {
                     let row = pairs[p].0;
                     let a = &xq[row * nb..(row + 1) * nb];
-                    let v = crate::inference::offload::experts::swiglu(
+                    let v = crate::tensor::ops::bounded_swiglu::swiglu(
                         G::dot_exact(gw, a),
                         G::dot_exact(uw, a),
                         limit,
@@ -845,7 +845,7 @@ mod tests {
     }
 
     /// The pairs of one row worked out one value at a time: the gate and up products of
-    /// `ExactDot`, the clamp and SwiGLU of `offload::experts::swiglu` at `limit`, the row as
+    /// `ExactDot`, the clamp and SwiGLU of `bounded_swiglu::swiglu` at `limit`, the row as
     /// q8_K blocks, the down product, the weight.
     fn pairs_one_value_at_a_time<G: ExactDot, D: ExactDot>(
         host: &[Arc<QTensor>; 3],
@@ -883,7 +883,7 @@ mod tests {
                     let g = G::dot_exact(&gate[at..at + nb], &xq);
                     let u = G::dot_exact(&up[at..at + nb], &xq);
                     bound += usize::from(g > limit || u.abs() > limit);
-                    crate::inference::offload::experts::swiglu(g, u, limit)
+                    crate::tensor::ops::bounded_swiglu::swiglu(g, u, limit)
                 })
                 .collect();
             let mut hq = vec![BlockQ8K::zeros(); nbi];
@@ -897,7 +897,7 @@ mod tests {
     }
 
     /// Under a SwiGLU bound the host's pairs are the bits of the bounded SwiGLU of
-    /// `offload::experts::swiglu` taken one value at a time, and differ from the unbounded ones.
+    /// `bounded_swiglu::swiglu` taken one value at a time, and differ from the unbounded ones.
     #[test]
     fn a_bounded_swiglu_gives_the_bits_of_the_offload_swiglu() {
         let (experts, dim, inter, rows) = (4usize, 512usize, 256usize, 3usize);

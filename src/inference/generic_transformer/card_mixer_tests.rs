@@ -18,7 +18,7 @@ use super::mixer::Mixer;
 use super::wide_sparse_engram_tests::engram_file;
 use super::wide_sparse_oracle_tests::{generic, record_generic, toy_file, Record, LAYOUTS};
 use super::*;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
+use crate::inference::generic_transformer::wide_sparse_toy::prompt;
 use crate::inference::place::layer_executor::HeteroSegment;
 use crate::tensor::quantized::gguf_file::MappedGguf;
 
@@ -196,7 +196,7 @@ fn the_card_mixers_stay_as_close_to_the_exact_reference_as_the_host() {
     let (mut worst_host, mut worst_card) = (0f64, 0f64);
     let mut failed = Vec::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
-        let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+        let tokens = prompt();
         let (mut truth, mut want, mut got) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let mut reference = exact(ratios, kv_src, index_src);
         let terms = reference.config.embedding_length;
@@ -242,7 +242,7 @@ fn the_card_mixers_with_engram_layers_stay_as_close_to_the_exact_reference_as_th
     }
     let mut failed = Vec::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
-        let (_, tokens) = synthetic(ratios, kv_src, index_src, 0);
+        let tokens = prompt();
         let (mut truth, mut want, mut got) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let mut reference = engram_model(ratios, kv_src, index_src, false);
         dequantise_mixers(&mut reference);

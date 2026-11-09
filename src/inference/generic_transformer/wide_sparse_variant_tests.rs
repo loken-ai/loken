@@ -14,10 +14,10 @@ use super::block_draft_tests::{generic_of, prompt};
 use super::wide_sparse_oracle_tests::{bit_difference, record_generic, record_v41, RECORDS};
 use super::wide_sparse_variants::open_checked;
 use super::GenericHeteroTransformer;
-use crate::inference::load::variant_files::check_variant;
-use crate::inference::model::deepseek_v41::model::tests::{
+use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
+use crate::inference::load::variant_files::check_variant;
 use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::inference::model::deepseek_v41::source::VariantSource;
 use crate::inference::model::deepseek_v41::DeepseekV41Config;

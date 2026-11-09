@@ -132,7 +132,7 @@ impl Controls {
 /// Run the bench under `controls`: load, place, replay, and answer the record. The table is
 /// printed by the caller.
 pub fn run(controls: &Controls) -> Result<report::Record, String> {
-    use crate::inference::offload::{stage_prof_enable, stage_prof_snapshot};
+    use crate::inference::stage_prof::{stage_prof_enable, stage_prof_snapshot};
     if controls.tokens == 0 {
         return Err("no token to time".to_string());
     }

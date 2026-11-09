@@ -34,7 +34,7 @@ pub struct Formats {
     pub always_read: GgmlDType,
 }
 
-/// The formats of `deepseek_v41/convert.rs` `Formats::default`, copied.
+/// The formats a conversion takes when the request names none.
 impl Default for Formats {
     fn default() -> Self {
         Self {
@@ -46,13 +46,9 @@ impl Default for Formats {
 }
 
 /// Values a matrix holds at least to be written in the always-read format.
-///
-/// Copied from `deepseek_v41/convert.rs` `written_format`.
 pub const LARGE_MATRIX: usize = 1 << 20;
 
 /// Experts quantised at once.
-///
-/// Copied from `deepseek_v41/convert.rs` `WORKERS`.
 const WORKERS: usize = 8;
 
 /// The format a tensor outside the routed experts is written in.

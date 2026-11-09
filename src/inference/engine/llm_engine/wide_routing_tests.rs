@@ -6,7 +6,7 @@ use super::*;
 use crate::inference::generic_transformer::wide_sparse_routing_tests::{
     layers, profile_file, toy_dir, turning, v41_heat, ROUTED,
 };
-use crate::inference::model::deepseek_v41::sibling;
+use crate::inference::generic_transformer::wide_sparse_sibling as sibling;
 
 /// The heat of the generic model the engine holds.
 async fn engine_heat(engine: &LlmEngine) -> Vec<Vec<usize>> {

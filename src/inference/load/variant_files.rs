@@ -188,7 +188,7 @@ pub fn check_variant<A: GgufSource, B: GgufSource>(
         .map_or(1, |n| n.get())
         .min(whole.len().max(1));
     // One tile of reading in flight over all the workers.
-    let piece = crate::inference::offload::WEIGHT_TILE_BYTES / workers;
+    let piece = crate::tensor::quantized::WEIGHT_TILE_BYTES / workers;
     let found: std::sync::Mutex<Option<Result<String>>> = std::sync::Mutex::new(None);
     std::thread::scope(|scope| {
         for _ in 0..workers {

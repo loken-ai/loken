@@ -15,6 +15,7 @@ use super::{DType, Device, Result, Tensor, D};
 
 mod activation;
 mod attention;
+pub mod bounded_swiglu;
 mod host;
 mod norm;
 mod softmax;

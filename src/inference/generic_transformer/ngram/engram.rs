@@ -27,16 +27,16 @@ use std::sync::Arc;
 const GATE_DOT_FLOOR: f32 = 1e-6;
 
 /// The metadata keys of one engram layout, each under the architecture prefix.
-struct EngramKeys {
-    layer_ids: &'static str,
-    heads: &'static str,
-    head_dim: &'static str,
-    max_ngram: &'static str,
-    multipliers: &'static str,
-    primes: &'static str,
-    offsets: &'static str,
-    token_map: &'static str,
-    pad_id: &'static str,
+pub(crate) struct EngramKeys {
+    pub layer_ids: &'static str,
+    pub heads: &'static str,
+    pub head_dim: &'static str,
+    pub max_ngram: &'static str,
+    pub multipliers: &'static str,
+    pub primes: &'static str,
+    pub offsets: &'static str,
+    pub token_map: &'static str,
+    pub pad_id: &'static str,
 }
 
 /// The `engram.*` layout: the offsets of a layer count from its own table's first row.
@@ -53,7 +53,7 @@ const ENGRAM_KEYS: EngramKeys = EngramKeys {
 };
 
 /// The `ple.*` layout: every layer's offsets count from the first row of 1 shared table.
-const PLE_KEYS: EngramKeys = EngramKeys {
+pub(crate) const PLE_KEYS: EngramKeys = EngramKeys {
     layer_ids: "ple.layers",
     heads: "ple.heads_per_ngram",
     head_dim: "embedding_length_per_layer_input",
@@ -92,12 +92,22 @@ impl EngramMeta {
     /// The layout of `arch` under the `engram.*` keys or the `ple.*` ones.
     /// `None` when the file has no engram layer or omits a hash parameter or the token map.
     pub fn from_gguf(content: &gguf_file::Content, arch: &str) -> Option<Self> {
-        Self::read_keys(content, arch, &ENGRAM_KEYS)
-            .or_else(|| Self::read_keys(content, arch, &PLE_KEYS))
+        Self::from_metadata(&content.metadata, arch)
     }
 
-    fn read_keys(content: &gguf_file::Content, arch: &str, keys: &EngramKeys) -> Option<Self> {
-        let md = &content.metadata;
+    /// The layout of `arch` read from the key table `md` of a file.
+    pub fn from_metadata(
+        md: &std::collections::HashMap<String, gguf_file::Value>,
+        arch: &str,
+    ) -> Option<Self> {
+        Self::read_keys(md, arch, &ENGRAM_KEYS).or_else(|| Self::read_keys(md, arch, &PLE_KEYS))
+    }
+
+    fn read_keys(
+        md: &std::collections::HashMap<String, gguf_file::Value>,
+        arch: &str,
+        keys: &EngramKeys,
+    ) -> Option<Self> {
         let g = |k: &str| md.get(&format!("{arch}.{k}"));
         let u = |k: &str| g(k).and_then(|v| v.to_u32().ok()).map(|v| v as usize);
         let arr_u64 = |k: &str| -> Option<Vec<u64>> {

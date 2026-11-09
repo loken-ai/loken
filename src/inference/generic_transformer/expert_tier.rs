@@ -345,13 +345,13 @@ struct Laps(Option<std::time::Instant>);
 
 impl Laps {
     fn new() -> Self {
-        Self(crate::inference::offload::stage_prof_enabled().then(std::time::Instant::now))
+        Self(crate::inference::stage_prof::stage_prof_enabled().then(std::time::Instant::now))
     }
 
     /// The time since the last mark is the stage `name`'s.
     fn mark(&mut self, name: &'static str) {
         if let Some(t) = self.0 {
-            crate::inference::offload::prof_record(name, t.elapsed().as_nanos() as u64);
+            crate::inference::stage_prof::prof_record(name, t.elapsed().as_nanos() as u64);
             self.0 = Some(std::time::Instant::now());
         }
     }
@@ -1874,13 +1874,13 @@ impl LayerTier {
                 )
             })?;
         }
-        let prof = crate::inference::offload::stage_prof_enabled();
+        let prof = crate::inference::stage_prof::stage_prof_enabled();
         let t_wait = prof.then(std::time::Instant::now);
         stream
             .synchronize()
             .map_err(|e| crate::tensor::Error::msg(format!("choice to host: {e:?}")))?;
         if let Some(t) = t_wait {
-            crate::inference::offload::prof_record(
+            crate::inference::stage_prof::prof_record(
                 "tier wait for the choice",
                 t.elapsed().as_nanos() as u64,
             );
@@ -2060,7 +2060,7 @@ impl LayerTier {
             true
         };
         if prof && host_out {
-            crate::inference::offload::prof_record(
+            crate::inference::stage_prof::prof_record(
                 "tier host experts",
                 t_host.elapsed().as_nanos() as u64,
             );
@@ -2890,7 +2890,7 @@ impl LayerTier {
                 })();
                 // The job copied its experts one after the other: each took its share.
                 let upload_ns = started.elapsed().as_nanos() as u64 / chosen.len() as u64;
-                crate::inference::offload::prof_record("tier slot upload", upload_ns);
+                crate::inference::stage_prof::prof_record("tier slot upload", upload_ns);
                 let mut st = tier.state.lock().unwrap_or_else(|e| e.into_inner());
                 for &(expert, slot) in &chosen {
                     match &landed {

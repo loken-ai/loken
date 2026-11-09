@@ -11,7 +11,7 @@ use crate::inference::generic_transformer::block_draft::ScriptedDraft;
 use crate::inference::generic_transformer::block_draft_tests::{
     generic_of, prompt, toy_files, toy_with_companion,
 };
-use crate::inference::model::deepseek_v41::model::tests::VOCAB;
+use crate::inference::generic_transformer::wide_sparse_toy::VOCAB;
 use crate::tensor::quantized::gguf_file::open_mapped;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokenizers::models::wordlevel::WordLevel;

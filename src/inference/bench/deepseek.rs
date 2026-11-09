@@ -357,7 +357,9 @@ impl super::subject::Subject for WideSubject {
 mod tests {
     use super::super::subject::Subject;
     use super::*;
-    use crate::inference::model::deepseek_v41::model::tests::{real_entries_for, real_md_layout};
+    use crate::inference::generic_transformer::wide_sparse_toy::{
+        real_entries_for, real_md_layout,
+    };
     use crate::tensor::gguf_write::write_gguf_with_metadata;
 
     /// A synthetic model file in the given band layout, written where the test runs.

@@ -34,75 +34,20 @@ mod oracle_freeze;
 pub mod packed;
 pub mod quality;
 pub mod safetensors_source;
-pub mod sibling;
 pub mod snapshot;
 pub mod source;
 pub mod state_cache;
-pub mod token_map;
 
+pub use crate::inference::generic_transformer::ngram::token_map;
+pub use crate::inference::generic_transformer::wide_sparse_config::release;
+use crate::inference::generic_transformer::wide_sparse_config::{
+    IndexerFields, MixtureFields, NgramHashFields, RopeFields, StreamFields, WideSparseMeta,
+};
+pub use crate::inference::generic_transformer::wide_sparse_names::ARCH;
+pub use crate::inference::generic_transformer::wide_sparse_sibling as sibling;
 use crate::tensor::quantized::gguf_file::{self, Value};
 use crate::tensor::quantized::gguf_source::GgufMeta;
 use crate::tensor::{Error, Result};
-
-/// The GGUF metadata prefix for this architecture's keys.
-pub const ARCH: &str = "deepseek_v41";
-
-/// Reference name of block 0's hyper-connection mix: residual hyper-connections are what sets
-/// this model apart from every architecture the generic transformer builds.
-const HYPER_CONNECTION_MARKER: &str = "layers.0.hc_attn_fn";
-
-/// Whether a GGUF file is this model: block 0 carries the hyper-connection mix under one of its
-/// GGUF spellings, or the metadata counts hyper-connections, whatever architecture tag the
-/// converter wrote. A file whose mixers carry a low-rank gate (`hyper_connection.low_rank`) is a
-/// different wide residual, which the generic route serves.
-pub fn claims_gguf(content: &gguf_file::Content) -> bool {
-    let tensor = source::gguf_names(HYPER_CONNECTION_MARKER)
-        .iter()
-        .any(|n| content.tensor_infos.contains_key(n));
-    let arch = content
-        .metadata
-        .get("general.architecture")
-        .and_then(|v| v.to_string().ok());
-    let counted = arch.as_ref().is_some_and(|a| {
-        ["hyper_connection.count", "hyper_connection_mult"]
-            .iter()
-            .any(|k| content.metadata.contains_key(&format!("{a}.{k}")))
-    });
-    let low_rank = arch.as_ref().is_some_and(|a| {
-        content
-            .metadata
-            .contains_key(&format!("{a}.hyper_connection.low_rank"))
-    });
-    tensor || (counted && !low_rank)
-}
-
-/// Whether a checkpoint directory holds this model's released weights: its shard index, or a
-/// shard's header when there is no index, names the hyper-connection mix.
-pub fn claims_checkpoint_dir(dir: &std::path::Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    if let Ok(txt) = std::fs::read_to_string(dir.join("model.safetensors.index.json")) {
-        return serde_json::from_str::<serde_json::Value>(&txt)
-            .ok()
-            .and_then(|v| {
-                v.get("weight_map")
-                    .map(|m| m.get(HYPER_CONNECTION_MARKER).is_some())
-            })
-            .unwrap_or(false);
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .any(|p| {
-            safetensors_source::header_names(&p)
-                .is_some_and(|n| n.iter().any(|t| t == HYPER_CONNECTION_MARKER))
-        })
-}
 
 /// Every shape the port needs, read from GGUF metadata. Scalars follow llama.cpp's deepseek keys
 /// (`attention.head_count`, `attention.key_length`, ...); the novel per-layer and CSA2 fields take
@@ -174,16 +119,70 @@ pub struct DeepseekV41Config {
 /// The architecture tag llama.cpp's converter writes.
 pub const ARCH_LLAMACPP: &str = "deepseek4";
 
-/// Values llama.cpp's `deepseek4` converter does not write into the file. They are the
-/// V4.1-Flash release's, from the model's own inference config at the revision the converter
-/// names, and are read only when the key is absent from one of that converter's files.
-pub(crate) mod release {
-    pub const ROPE_HEAD_DIM: usize = 64;
-    pub const ROPE_FACTOR: f32 = 16.0;
-    pub const ORIGINAL_SEQ_LEN: usize = 65536;
-    pub const CANDIDATE_SOURCE_LAYER: i64 = 20;
-    pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
-    pub const CANDIDATE_BLOCK_SIZE: usize = 8;
+/// The same facts in the description the generic route reads.
+impl From<&DeepseekV41Config> for WideSparseMeta {
+    fn from(c: &DeepseekV41Config) -> Self {
+        Self {
+            n_layers: c.n_layers,
+            n_extra_layers: c.n_mtp_layers,
+            d_model: c.d_model,
+            vocab: c.vocab_size,
+            rms_eps: c.rms_eps,
+            heads: c.n_head,
+            head_dim: c.head_dim,
+            rope_dim: c.rope_head_dim,
+            q_lora_rank: c.q_lora_rank,
+            o_lora_rank: c.o_lora_rank,
+            o_groups: c.o_groups,
+            window: c.window_size,
+            compress_ratios: c.compress_ratios.clone(),
+            kv_source_layers: c.kv_source_layers.clone(),
+            index_source_layers: c.index_source_layers.clone(),
+            indexer: IndexerFields {
+                heads: c.index_n_heads,
+                head_dim: c.index_head_dim,
+                top_k: c.index_topk,
+                candidate_source_layer: c.candidate_source_layer,
+                candidate_top_k_blocks: c.candidate_topk_blocks,
+                candidate_block_size: c.candidate_block_size,
+            },
+            mixture: MixtureFields {
+                routed: c.n_routed_experts,
+                shared: c.n_shared_experts,
+                used: c.n_activated_experts,
+                inter_dim: c.moe_inter_dim,
+                score_func: c.score_func.clone(),
+                route_scale: c.route_scale,
+                gate_temp: c.gate_temp,
+                swiglu_limits: c.swiglu_limits.clone(),
+                norm_topk: c.norm_topk,
+                cache_count: c.expert_cache_count,
+                hot: c.hot_experts.clone(),
+            },
+            rope: RopeFields {
+                theta: c.rope_theta,
+                scaling_factor: c.rope_factor,
+                original_context: c.original_seq_len,
+                compress_theta: c.compress_rope_theta,
+            },
+            streams: StreamFields {
+                streams: c.hc_mult,
+                sinkhorn_iters: c.hc_sinkhorn_iters,
+                eps: c.hc_eps,
+            },
+            ngram: c.engram.as_ref().map(|e| NgramHashFields {
+                layer_ids: e.layer_ids.clone(),
+                heads: e.n_heads,
+                head_dim: e.head_dim,
+                max_ngram: e.max_ngram,
+                token_map: e.token_map.clone(),
+                pad_id: e.pad_id,
+                multipliers: e.multipliers.clone(),
+                primes: e.primes.clone(),
+                offsets: e.offsets.clone(),
+            }),
+        }
+    }
 }
 
 impl DeepseekV41Config {
