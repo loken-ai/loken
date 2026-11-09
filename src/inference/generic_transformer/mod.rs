@@ -150,12 +150,18 @@ pub mod wide_pipeline;
 mod wide_pipeline_tests;
 #[cfg(test)]
 mod wide_sparse_batch_tests;
+pub mod wide_sparse_calibrate;
+#[cfg(all(test, not(feature = "gpu")))]
+mod wide_sparse_calibrate_tests;
 pub mod wide_sparse_card_tier;
 #[cfg(test)]
 mod wide_sparse_card_tier_tests;
 mod wide_sparse_cluster;
 #[cfg(test)]
 pub(crate) mod wide_sparse_cluster_tests;
+pub mod wide_sparse_complete;
+#[cfg(all(test, not(feature = "gpu")))]
+mod wide_sparse_complete_tests;
 pub mod wide_sparse_config;
 #[cfg(test)]
 mod wide_sparse_config_tests;

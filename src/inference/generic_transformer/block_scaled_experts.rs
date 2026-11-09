@@ -30,6 +30,17 @@ impl BlockScaledExpert {
     /// Each projection runs once over all `n` rows.
     /// The SwiGLU runs value by value between the up and the down projections.
     pub fn forward(&self, x: &Tensor, limit: f32) -> Result<Tensor> {
+        self.forward_seen(x, limit, None)
+    }
+
+    /// [`Self::forward`], handing `seen` the rows the down projection takes, `[n, inter]`
+    /// row-major, before it runs.
+    pub fn forward_seen(
+        &self,
+        x: &Tensor,
+        limit: f32,
+        seen: Option<&dyn Fn(&[f32])>,
+    ) -> Result<Tensor> {
         let gate = self.gate.apply_here(x)?.to_vec2::<f32>()?;
         let up = self.up.apply_here(x)?.to_vec2::<f32>()?;
         let (n, inter) = (gate.len(), gate.first().map_or(0, Vec::len));
@@ -38,6 +49,9 @@ impl BlockScaledExpert {
             for k in 0..inter {
                 h[t * inter + k] = swiglu(gate[t][k], up[t][k], limit);
             }
+        }
+        if let Some(seen) = seen {
+            seen(&h);
         }
         let h = Tensor::from_vec(h, (n, inter), &Device::Cpu)?;
         self.down.apply_here(&h)

@@ -68,6 +68,10 @@ pub struct BlockDraftMeta {
     pub rms_eps: f32,
     /// The base the stages turn at, unstretched.
     pub rope_theta: f32,
+    /// The stretch of positions the checkpoint declares, `1` for none.
+    pub rope_factor: f32,
+    /// The context the positions were trained at before the stretch, `0` when none is declared.
+    pub original_context: usize,
     pub sinkhorn_iters: usize,
     pub hc_eps: f32,
     pub vocab: usize,
@@ -133,6 +137,16 @@ impl BlockDraftMeta {
                 .unwrap_or(true),
             rms_eps: f("rms_norm_eps", 1e-6),
             rope_theta: f("rope_theta", 10000.0),
+            rope_factor: t
+                .get("rope_scaling")
+                .and_then(|r| r.get("factor"))
+                .and_then(|x| x.as_f64())
+                .map_or(1.0, |x| x as f32),
+            original_context: t
+                .get("rope_scaling")
+                .and_then(|r| r.get("original_max_position_embeddings"))
+                .and_then(|x| x.as_u64())
+                .map_or(0, |x| x as usize),
             sinkhorn_iters: u("hc_sinkhorn_iters").unwrap_or(20),
             hc_eps: f("hc_eps", 1e-6),
             vocab: u("vocab_size")?,
@@ -183,11 +197,107 @@ impl BlockDraftMeta {
             norm_topk: get("expert_weights_norm")?.to_bool()?,
             rms_eps: f("attention.layer_norm_rms_epsilon")?,
             rope_theta: f("rope.freq_base")?,
+            rope_factor: f("rope.scaling.factor")?,
+            original_context: u("rope.scaling.original_context_length")?,
             sinkhorn_iters: u("hyper_connection.sinkhorn_iterations")?,
             hc_eps: f("hyper_connection.epsilon")?,
             vocab: u("vocab_size")?,
         }))
     }
+
+    /// The shape as the keys [`Self::from_metadata`] reads, under `{arch}.dspark.`.
+    ///
+    /// A file that carries them needs no `config.json` beside it.
+    pub fn to_metadata(&self, arch: &str) -> Vec<(String, Value)> {
+        let key = |name: &str| format!("{arch}.dspark.{name}");
+        let u = |name: &str, v: usize| (key(name), Value::U32(v as u32));
+        let f = |name: &str, v: f32| (key(name), Value::F32(v));
+        vec![
+            u("stage_count", self.stages),
+            u("block_size", self.block),
+            u("noise_token_id", self.noise_token as usize),
+            (
+                key("target_layers"),
+                Value::Array(
+                    self.target_layers
+                        .iter()
+                        .map(|&l| Value::U32(l as u32))
+                        .collect(),
+                ),
+            ),
+            u("markov_rank", self.markov_rank),
+            u("expert_count", self.routed),
+            u("expert_used_count", self.used),
+            u("sliding_window", self.window),
+            u("embedding_length", self.dim),
+            u("hyper_connection.count", self.streams),
+            u("attention.head_count", self.heads),
+            u("attention.key_length", self.head_dim),
+            u("rope.dimension_count", self.rope_dim),
+            u("attention.o_groups", self.o_groups),
+            u("attention.o_lora_rank", self.o_lora_rank),
+            f("expert_gating_temperature", self.gate_temp),
+            f("expert_weights_scale", self.route_scale),
+            f("expert_swiglu_limit", self.swiglu_limit),
+            (key("expert_weights_norm"), Value::Bool(self.norm_topk)),
+            f("attention.layer_norm_rms_epsilon", self.rms_eps),
+            f("rope.freq_base", self.rope_theta),
+            f("rope.scaling.factor", self.rope_factor),
+            u(
+                "rope.scaling.original_context_length",
+                self.original_context,
+            ),
+            u("hyper_connection.sinkhorn_iterations", self.sinkhorn_iters),
+            f("hyper_connection.epsilon", self.hc_eps),
+            u("vocab_size", self.vocab),
+        ]
+    }
+}
+
+/// The prefix of the routed experts of stage `s`: `{prefix}.{e}.{w}.weight` names 1 projection.
+pub fn expert_prefix(s: usize) -> String {
+    format!("mtp.{s}.ffn.experts")
+}
+
+/// Every tensor of a draft of `stages` stages but its routed experts, by the checkpoint's names.
+pub fn dense_names(stages: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    for s in 0..stages {
+        for rest in [
+            "attn.wq_a.weight",
+            "attn.q_norm.weight",
+            "attn.wq_b.weight",
+            "attn.wkv.weight",
+            "attn.kv_norm.weight",
+            "attn.attn_sink",
+            "attn.wo_a.weight",
+            "attn.wo_b.weight",
+            "attn_norm.weight",
+            "ffn_norm.weight",
+            "ffn.gate.weight",
+            "ffn.gate.bias",
+            "ffn.shared_experts.w1.weight",
+            "ffn.shared_experts.w2.weight",
+            "ffn.shared_experts.w3.weight",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_attn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_ffn_base",
+        ] {
+            names.push(format!("mtp.{s}.{rest}"));
+        }
+    }
+    let last = stages.saturating_sub(1);
+    names.extend([
+        "mtp.0.main_proj.weight".to_string(),
+        "mtp.0.main_norm.weight".to_string(),
+        format!("mtp.{last}.norm.weight"),
+        format!("mtp.{last}.markov_head.embed.weight"),
+        format!("mtp.{last}.markov_head.head.weight"),
+    ]);
+    names
 }
 
 /// One stage: latent attention over the ring and the block, then routed experts.

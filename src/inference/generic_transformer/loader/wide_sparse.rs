@@ -773,6 +773,7 @@ impl GenericHeteroTransformer {
                 lossy: Default::default(),
                 variants: Default::default(),
                 card: Default::default(),
+                watch: Default::default(),
             };
             // An engram layer: its table, under its own name or as the table every layer shares,
             // its fused key and value projection, and its gate.
@@ -1155,6 +1156,7 @@ fn build_block_draft(tensors: &Tensors<'_, '_>, meta: BlockDraftMeta) -> Result<
             lossy: Default::default(),
             variants: Default::default(),
             card: Default::default(),
+            watch: Default::default(),
         };
         stages.push(DraftStage {
             attn,

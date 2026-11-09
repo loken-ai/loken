@@ -542,8 +542,7 @@ pub(super) fn load_wide_checkpoint(
     state_cache: Option<std::sync::Arc<crate::inference::cache::state_disk::StateStore>>,
 ) -> AnyResult<LoadedModelState> {
     use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
-    use crate::inference::generic_transformer::{BlockScaledCheckpoint, GenericHeteroTransformer};
-    use crate::inference::place::ladder::load_placed;
+    use crate::inference::generic_transformer::BlockScaledCheckpoint;
 
     let t0 = std::time::Instant::now();
     let checkpoint =
@@ -553,19 +552,7 @@ pub(super) fn load_wide_checkpoint(
         .map_err(|e| anyhow!("{}: {e}", tokenizer_path.display()))?;
     let meta = WideSparseMeta::from_reference(&checkpoint.reference, None)
         .map_err(|e| anyhow!("{}: {e}", dir.display()))?;
-    let shards: Vec<std::path::PathBuf> = {
-        let mut found: Vec<_> = std::fs::read_dir(dir)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        found.sort();
-        found
-    };
-    let file_size: u64 = shards
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
+    let file_size = checkpoint_bytes(dir)?;
     let eos_token_id = super::gguf::sidecar_token_id(&dir.join("config.json"), "eos_token")
         .ok_or_else(|| anyhow!("{}: no eos_token in tokenizer_config.json", dir.display()))?;
     let context_length = if user_context_length > 0 {
@@ -573,33 +560,7 @@ pub(super) fn load_wide_checkpoint(
     } else {
         declared_context(dir)
     };
-    let planned_ctx = context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
-    let reserve = crate::inference::place::runtime_demand::llm_work_reserve(
-        meta.d_model,
-        PREFILL_CHUNK_TOKENS,
-    );
-    let demand =
-        crate::inference::place::llm::wide_sparse_demand(&meta, file_size, 0, planned_ctx, reserve);
-    let offer = if crate::gpu::cards_allowed() {
-        crate::inference::place::llm::offer(None, file_size.saturating_add(reserve), 0)
-    } else {
-        crate::inference::place::llm::Offer::default()
-    };
-    let mut model = load_placed(
-        "wide-residual checkpoint",
-        &demand,
-        &offer.cards,
-        || false,
-        |plan| {
-            GenericHeteroTransformer::from_block_scaled(
-                &checkpoint,
-                plan,
-                kv_quant,
-                Some(context_length),
-            )
-        },
-    )
-    .map_err(|e| anyhow!("Failed to load {}: {e}", dir.display()))?;
+    let mut model = place_wide_checkpoint(&checkpoint, &meta, file_size, context_length, kv_quant)?;
     if quality != QualityLevel::Exact {
         let ids = crate::inference::generic_transformer::routing_calibration::calibration_ids(
             &tokenizer,
@@ -686,6 +647,64 @@ pub(super) fn load_wide_checkpoint(
         grammar_factory: std::sync::OnceLock::new(),
         generation_defaults: Default::default(),
     })
+}
+
+/// Bytes of the safetensors shards of the checkpoint in `dir`.
+pub(crate) fn checkpoint_bytes(dir: &std::path::Path) -> AnyResult<u64> {
+    let mut shards: Vec<_> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    shards.sort();
+    Ok(shards
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum())
+}
+
+/// The generic model of the block-scaled checkpoint `checkpoint`, placed by the plan and the
+/// ladder for a context of `context_length` tokens.
+///
+/// `meta` describes the checkpoint.
+/// `file_size` is the bytes of its shards.
+pub(crate) fn place_wide_checkpoint(
+    checkpoint: &crate::inference::generic_transformer::BlockScaledCheckpoint,
+    meta: &crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta,
+    file_size: u64,
+    context_length: usize,
+    kv_quant: KvQuant,
+) -> AnyResult<crate::inference::generic_transformer::GenericHeteroTransformer> {
+    use crate::inference::generic_transformer::GenericHeteroTransformer;
+    use crate::inference::place::ladder::load_placed;
+
+    let planned_ctx = context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+    let reserve = crate::inference::place::runtime_demand::llm_work_reserve(
+        meta.d_model,
+        PREFILL_CHUNK_TOKENS,
+    );
+    let demand =
+        crate::inference::place::llm::wide_sparse_demand(meta, file_size, 0, planned_ctx, reserve);
+    let offer = if crate::gpu::cards_allowed() {
+        crate::inference::place::llm::offer(None, file_size.saturating_add(reserve), 0)
+    } else {
+        crate::inference::place::llm::Offer::default()
+    };
+    load_placed(
+        "wide-residual checkpoint",
+        &demand,
+        &offer.cards,
+        || false,
+        |plan| {
+            GenericHeteroTransformer::from_block_scaled(
+                checkpoint,
+                plan,
+                kv_quant,
+                Some(context_length),
+            )
+        },
+    )
+    .map_err(|e| anyhow!("Failed to load {}: {e}", checkpoint.dir.display()))
 }
 
 /// The context a checkpoint directory declares (`max_position_embeddings` of its

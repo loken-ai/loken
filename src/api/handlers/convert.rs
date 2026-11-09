@@ -11,13 +11,15 @@
 //! and names it as a model in the store, servable at once.
 
 use super::*;
-use crate::inference::generic_transformer::{wide_sparse_convert, BlockScaledCheckpoint};
+use crate::inference::engine::llm_engine as engine;
+use crate::inference::generic_transformer::wide_sparse_complete::{self as complete, Layout};
+use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
+use crate::inference::generic_transformer::{
+    wide_sparse_calibrate, wide_sparse_convert, BlockScaledCheckpoint,
+};
 use crate::inference::load::block_scaled_convert::{self, Formats};
 use crate::inference::load::calibrated::Recipe;
 use crate::inference::load::{calibration, requantize::parse_dtype};
-use crate::inference::model::deepseek_v41::{
-    convert, safetensors_source::SafeTensorsSource, source::WeightSource,
-};
 use crate::tensor::quantized::GgmlDType;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -179,42 +181,23 @@ pub(crate) async fn calibrate_model(
     let out = records.join(format!("{}.gguf", request.name.replace([':', '/'], "_")));
     let first = format!("calibrating {} as '{}'", request.model, request.name);
     Ok(detached(request.stream, first, move |progress| {
-        let src = SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?;
-        let cfg = convert::released_config(&src, &dir).map_err(|e| e.to_string())?;
-        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| e.to_string())?;
-        let streams = request
-            .texts
-            .iter()
-            .map(|t| {
-                tok.encode(t.as_str(), false)
-                    .map(|ids| ids.get_ids().to_vec())
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let length = request.excerpt.unwrap_or(200);
-        let chosen = convert::excerpts(&streams, length, request.tokens.unwrap_or(2200));
-        if chosen.is_empty() {
-            return Err(format!(
-                "calibrate: no text holds an excerpt of {length} tokens"
-            ));
-        }
-        let inter = src
-            .shape("layers.0.ffn.experts.0.w2.weight")
-            .map(|s| s[1])
-            .ok_or("calibrate: the checkpoint has no routed expert")?;
-        let tokens: usize = chosen.iter().map(Vec::len).sum();
-        let rows = convert::rows_to_keep(&cfg, inter, tokens, request.rows);
-        let record = convert::calibrate(&src, &cfg, &chosen, rows, &|done, total| {
+        let asked = wide_sparse_calibrate::Request {
+            texts: &request.texts,
+            excerpt: request.excerpt.unwrap_or(200),
+            tokens: request.tokens.unwrap_or(2200),
+            rows: request.rows,
+        };
+        // The model is placed by the plan and the ladder, as the engine places it to serve.
+        let place = |ckpt: &BlockScaledCheckpoint, meta: &WideSparseMeta, context: usize| {
+            let bytes = engine::checkpoint_bytes(&ckpt.dir)
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+            engine::place_wide_checkpoint(ckpt, meta, bytes, context, engine::KvQuant::Off)
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))
+        };
+        wide_sparse_calibrate::calibrate_checkpoint(&dir, &asked, &out, place, &|done, total| {
             progress(done, total, "calibrating layers")
         })
         .map_err(|e| e.to_string())?;
-        let note = format!(
-            "{} excerpts of {length} tokens from {} texts",
-            chosen.len(),
-            request.texts.len()
-        );
-        record.write(&out, &note).map_err(|e| e.to_string())?;
         Ok("success".to_string())
     }))
 }
@@ -260,12 +243,11 @@ async fn complete_model(
     let first = format!("completing {existing} into '{}'", request.name);
     let name = request.name.clone();
     Ok(detached(request.stream, first, move |progress| {
-        use crate::inference::model::deepseek_v41::complete;
         let run = || -> std::result::Result<(), String> {
-            let ckpt = SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?;
+            let ckpt = BlockScaledCheckpoint::open(&dir).map_err(|e| e.to_string())?;
             let src = crate::tensor::quantized::gguf_file::open_mapped_unadvised(&source)
                 .map_err(|e| e.to_string())?;
-            let layout = complete::Layout::for_paths(&[source.as_path()]);
+            let layout = Layout::for_paths(&[source.as_path()]);
             tracing::info!(
                 "completing {}: tensors on {} bytes, expert units on {}",
                 source.display(),
@@ -274,7 +256,7 @@ async fn complete_model(
             );
             let digest = complete::complete(
                 &src,
-                Some((&ckpt, dir.as_path())),
+                Some(&ckpt),
                 &work,
                 layout,
                 format,
@@ -383,19 +365,14 @@ pub(crate) async fn convert_model(
             let tokenizer =
                 wide_sparse_convert::TokenizerFiles::read(&dir).map_err(|e| e.to_string())?;
             // The draft is written after the model, on the same disk: the model's room covers it.
-            use crate::inference::model::deepseek_v41::complete;
-            let layout = complete::Layout::for_paths(&[blobs.as_path()]);
-            // The draft writer reads the stored draft through its own reader.
-            let draft_src = match src.stored_shape("mtp.0.main_proj.weight") {
-                Some(_) => Some(SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?),
-                None => None,
-            };
-            let draft_bytes = match &draft_src {
-                Some(d) => {
-                    complete::draft_bytes_planned(d, &dir, &draft_work, layout, formats.always_read)
+            let layout = Layout::for_paths(&[blobs.as_path()]);
+            let with_draft = complete::has_draft(&src);
+            let draft_bytes = match with_draft {
+                true => {
+                    complete::draft_bytes_planned(&src, &draft_work, layout, formats.always_read)
                         .map_err(|e| e.to_string())?
                 }
-                None => 0,
+                false => 0,
             };
             let plan = wide_sparse_convert::plan(
                 &src,
@@ -419,10 +396,9 @@ pub(crate) async fn convert_model(
             progress(0, 0, "writing manifest");
             ollama::store_gguf_with_digest(manager.ollama(), &work, &digest, &name, [None; 4])?;
             // The draft is a companion of its own, which the loader finds beside the model.
-            if let Some(draft_src) = &draft_src {
+            if with_draft {
                 let digest = complete::write_draft(
-                    draft_src,
-                    &dir,
+                    &src,
                     &draft_work,
                     layout,
                     formats.always_read,

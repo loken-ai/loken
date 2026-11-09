@@ -325,6 +325,29 @@ pub struct ExpertVariants {
     pub chosen: Vec<usize>,
 }
 
+/// What a routed feed-forward tells its watcher at each forward.
+///
+/// `None` with the block's input rows, `[rows, hidden]` row-major, once per forward.
+/// `Some(e)` once per expert `e` the forward routed to, in id order.
+/// The 2nd argument is then the rows routed to `e`, in row order.
+/// The 3rd is the rows its down projection took, each times its route weight.
+pub type ExpertObserver = dyn Fn(Option<usize>, &[f32], &[f32]) + Send + Sync;
+
+/// The watcher of a routed feed-forward, `None` in service.
+#[derive(Default)]
+pub struct ExpertWatch(std::sync::RwLock<Option<Arc<ExpertObserver>>>);
+
+impl ExpertWatch {
+    /// Sets the watcher, `None` removes it.
+    pub fn set(&self, observer: Option<Arc<ExpertObserver>>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = observer;
+    }
+
+    fn get(&self) -> Option<Arc<ExpertObserver>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// The feed-forward of a layer: a sqrt-softplus router over routed experts, beside a shared
 /// expert.
 pub struct RoutedFfn {
@@ -350,6 +373,8 @@ pub struct RoutedFfn {
     pub variants: ExpertVariants,
     /// The experts the cards keep, each the variant `variants` chose.
     pub card: CardExperts,
+    /// A watched forward runs every routed expert on the host.
+    pub watch: ExpertWatch,
 }
 
 impl RoutedFfn {
@@ -464,9 +489,11 @@ impl RoutedFfn {
         let active: Vec<usize> = (0..assign.len())
             .filter(|&e| !assign[e].is_empty())
             .collect();
+        let watch = self.watch.get();
         // The experts a card keeps run there, the others on the host's cores.
-        let (on_card, on_host): (Vec<usize>, Vec<usize>) =
-            active.iter().partition(|&&e| self.card.holds(e));
+        let (on_card, on_host): (Vec<usize>, Vec<usize>) = active
+            .iter()
+            .partition(|&&e| watch.is_none() && self.card.holds(e));
         // Every host expert's bytes are asked for at once, so the reads overlap the compute.
         on_host
             .par_iter()
@@ -476,18 +503,32 @@ impl RoutedFfn {
             None => vec![vec![0f32; dim]; n],
         };
         let rows = x2.flatten_all()?.to_vec1::<f32>()?;
-        let host_run = |ids: &[usize]| -> Result<Vec<Vec<f32>>> {
+        if let Some(w) = &watch {
+            w(None, &rows, &[]);
+        }
+        let picked = |e: usize| -> Vec<f32> {
+            assign[e]
+                .iter()
+                .flat_map(|&(t, _)| rows[t * dim..(t + 1) * dim].iter().copied())
+                .collect()
+        };
+        // Per expert, its output rows and, in a watched forward, the rows its down projection
+        // took.
+        let host_run = |ids: &[usize]| -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
             ids.par_iter()
-                .map(|&e| -> Result<Vec<f32>> {
-                    let picked: Vec<f32> = assign[e]
-                        .iter()
-                        .flat_map(|&(t, _)| rows[t * dim..(t + 1) * dim].iter().copied())
-                        .collect();
-                    let xe = Tensor::from_vec(picked, (assign[e].len(), dim), &Device::Cpu)?;
-                    self.experts[e]
-                        .forward(&xe, self.limit)?
+                .map(|&e| -> Result<(Vec<f32>, Vec<f32>)> {
+                    let xe = Tensor::from_vec(picked(e), (assign[e].len(), dim), &Device::Cpu)?;
+                    let seen = std::cell::RefCell::new(Vec::new());
+                    let keep = |h: &[f32]| *seen.borrow_mut() = h.to_vec();
+                    let out = self.experts[e]
+                        .forward_seen(
+                            &xe,
+                            self.limit,
+                            watch.as_ref().map(|_| &keep as &dyn Fn(&[f32])),
+                        )?
                         .flatten_all()?
-                        .to_vec1::<f32>()
+                        .to_vec1::<f32>()?;
+                    Ok((out, seen.into_inner()))
                 })
                 .collect()
         };
@@ -508,12 +549,31 @@ impl RoutedFfn {
         // A card that failed leaves its experts to the host, which gives the same bits.
         let card_outs = match card_outs {
             Some(outs) => outs,
-            None => host_run(&on_card)?,
+            None => host_run(&on_card)?
+                .into_iter()
+                .map(|(out, _)| out)
+                .collect(),
         };
         // Each active expert's outputs, in the order of `active`.
         let mut by_id: std::collections::HashMap<usize, Vec<f32>> =
             on_card.into_iter().zip(card_outs).collect();
-        by_id.extend(on_host.into_iter().zip(host_outs));
+        let mut seen: std::collections::HashMap<usize, Vec<f32>> = Default::default();
+        for (e, (out, h)) in on_host.into_iter().zip(host_outs) {
+            by_id.insert(e, out);
+            seen.insert(e, h);
+        }
+        if let Some(w) = &watch {
+            for &e in &active {
+                let h = seen.remove(&e).unwrap_or_default();
+                let inter = h.len() / assign[e].len().max(1);
+                let weighted: Vec<f32> = h
+                    .chunks(inter.max(1))
+                    .zip(&assign[e])
+                    .flat_map(|(row, &(_, wt))| row.iter().map(move |v| v * wt))
+                    .collect();
+                w(Some(e), &picked(e), &weighted);
+            }
+        }
         let outs: Vec<Vec<f32>> = active
             .iter()
             .map(|e| by_id.remove(e).unwrap_or_default())
@@ -1021,6 +1081,119 @@ impl GenericHeteroTransformer {
             logits.push(self.output_stage(row, false, 1, false)?);
         }
         Tensor::cat(&logits.iter().collect::<Vec<_>>(), 0)
+    }
+
+    /// The prompts `prompts`, each from position 0, run layer after layer: every prompt crosses a
+    /// layer before any prompt goes on to the next.
+    ///
+    /// The token mixer runs per prompt, over the prompt's own mixer state and band cell.
+    /// The feed-forward of a layer runs once over the rows of every prompt, in prompt order.
+    /// `progress` is told the layers done and the layers in all after each layer.
+    /// No logits are computed.
+    pub fn prefill_by_layer(
+        &mut self,
+        prompts: &[Vec<u32>],
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<()> {
+        let streams = match self.wide_sparse.as_ref() {
+            Some(ws) => ws.streams,
+            None => crate::tensor::bail!("a prefill by layer needs a Sinkhorn wide residual"),
+        };
+        let cell = self.shared_cell()?;
+        let hashed = self.shared_tokens().is_some();
+        let mut seqs = prompts
+            .iter()
+            .map(|_| self.sequence_mixers())
+            .collect::<Result<Vec<_>>>()?;
+
+        // Each prompt's residual as the embedding stage of its forward starts it.
+        let emb_device = self.embeddings.embeddings().device().clone();
+        let mut rows = Vec::with_capacity(prompts.len());
+        let mut pres: Vec<Vec<Vec<f32>>> = Vec::with_capacity(prompts.len());
+        for (seq, prompt) in seqs.iter_mut().zip(prompts) {
+            if hashed {
+                seq.tokens.open(0, prompt)?;
+            }
+            let ids = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &emb_device)?;
+            let hidden = self.add_positions(self.embeddings.forward(&ids)?, 0)?;
+            let hidden = match self.config.embed_scale {
+                Some(scale) => (hidden * scale)?,
+                None => hidden,
+            };
+            rows.push(super::wide::widen_embedding(&hidden, streams)?);
+            seq.cell.open(0, prompt.len());
+            pres.push((0..prompt.len()).map(|_| onto_first(streams)).collect());
+        }
+
+        let n_layers = self.layers.len();
+        for il in 0..n_layers {
+            let layer = &mut self.layers[il];
+            let mut mids = Vec::with_capacity(prompts.len());
+            let mut attn_pre = Vec::new();
+            for (j, seq) in seqs.iter_mut().enumerate() {
+                let r = rows[j]
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?
+                    .contiguous()?;
+                let block = layer.sinkhorn.as_ref().ok_or_else(|| {
+                    crate::tensor::Error::msg("a Sinkhorn layer without its block")
+                })?;
+                let r = match block.engram.as_ref() {
+                    Some(e) => e.add(&r, &seq.tokens, 0)?,
+                    None => r,
+                };
+                exchange_state(&mut layer.mixer, &mut seq.states[il])?;
+                cell.exchange(&seq.cell);
+                let half = attention_half(block, &mut layer.mixer, &r, &pres[j], 0);
+                cell.exchange(&seq.cell);
+                exchange_state(&mut layer.mixer, &mut seq.states[il])?;
+                let (mid, pre, _) = half?;
+                mids.push(mid);
+                attn_pre.extend(pre);
+            }
+            let block = layer
+                .sinkhorn
+                .as_ref()
+                .ok_or_else(|| crate::tensor::Error::msg("a Sinkhorn layer without its block"))?;
+            let mid = Tensor::cat(&mids.iter().collect::<Vec<_>>(), 1)?;
+            let mixes = block.ffn_mix.mixes(&mid)?;
+            let input = rms_norm(
+                &block.ffn_mix.pre(&mid, &attn_pre)?,
+                &block.ffn_norm,
+                block.eps,
+            )?;
+            let out = staged("experts", &Device::Cpu, false, || block.ffn.forward(&input))?;
+            let next = block.ffn_mix.post(&out, &mid, &mixes.post, &mixes.comb)?;
+            let mut at = 0;
+            for (j, prompt) in prompts.iter().enumerate() {
+                let s = prompt.len();
+                rows[j] = next.narrow(1, at, s)?.contiguous()?;
+                pres[j] = mixes.pre[at..at + s].to_vec();
+                at += s;
+            }
+            progress(il + 1, n_layers);
+        }
+        Ok(())
+    }
+
+    /// Sets the watcher of every routed feed-forward: `observe` is told the layer's index
+    /// first, then what [`ExpertObserver`] is told.
+    ///
+    /// `None` removes every watcher.
+    pub fn observe_experts(
+        &self,
+        observe: Option<Arc<dyn Fn(usize, Option<usize>, &[f32], &[f32]) + Send + Sync>>,
+    ) {
+        for (il, layer) in self.layers.iter().enumerate() {
+            let Some(block) = layer.sinkhorn.as_ref() else {
+                continue;
+            };
+            let at = self.first_layer + il;
+            block.ffn.watch.set(observe.clone().map(|f| {
+                Arc::new(move |e: Option<usize>, x: &[f32], h: &[f32]| f(at, e, x, h))
+                    as Arc<ExpertObserver>
+            }));
+        }
     }
 }
 
