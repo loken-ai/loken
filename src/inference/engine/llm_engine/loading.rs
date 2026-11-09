@@ -459,6 +459,9 @@ impl LlmEngine {
                     // `advise_pages_by_placement` below: WillNeed for what the host will read every
                     // token, DontNeed for what the cards already hold.
                     let mmap = std::sync::Arc::new(mmap);
+                    // The mapping is known with its file: page-cache advice on a range of it
+                    // reaches the file's pages.
+                    crate::tensor::mapped::register_file(&mmap, &std::sync::Arc::new(file));
                     crate::inference::place::device_probe::debug_vram_by_card("after-mmap-parse");
                     debug!("✓ GGUF file mmap'd: {} bytes", mmap.len());
 
