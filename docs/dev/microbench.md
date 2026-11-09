@@ -53,7 +53,7 @@ Arguments after `--`:
 | `--kv-heads` | Key-value heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's, else the heads for `prefill-layer`, 8 for `marlin-rows` |
 | `--head-dim` | Elements of one head, without a file. It sizes the rope rows of `schedule-host` and `decode-inputs`, and the heads of `decode-layer`. | the file's, else the hidden size over the heads for `prefill-layer`, 128 for the others |
 | `--pack` | Rows the packed variants of `crossing` move in one copy. | 8 |
-| `--file` | The file `expert-read` reads. | the shapes file |
+| `--file` | The file `expert-read` reads, or the recorded trace `cache-policy` replays. | the shapes file for `expert-read` |
 | `--offset` | Where the first expert read starts, when the file is not the shapes file. | 0 |
 | `--threads` | Threads of the threaded variants. | the processors the host reports |
 | `--card` | The card the card benches run on. | 0 |
@@ -335,6 +335,22 @@ Each token's routing is drawn from the counts alone.
 The routing carries heat and no order, so a recency policy is judged without the locality a real answer adds.
 
 The time per token is the misses read at `--disk-gbs`.
+
+With `--file`, `cache-policy` replays a recorded trace in place of draws from a profile.
+The trace is the list of events `/api/stage_perf` returns under `host_tier_trace` while the measure runs, gathered over the reads.
+It holds what each layer kept when its trace began, then every forward in order with the experts the cards served and those the host computed.
+A request starts at a prompt that follows a decode.
+Its variants are the bound the trace recorded and each of `--slots`, under 5 rankings of the kept experts:
+
+- recency, as the host tier ranks them,
+- frequency, the rows routed to an expert since the trace began,
+- decoded frequency, the decoded rows routed to it since the trace began,
+- decoded first, an expert a prompt used last before one a decoded row used last,
+- farthest next use, which reads the future: the floor no ranking passes.
+
+Every expert a forward computes is admitted, then the lowest ranked give way, never one of a decoded row's own.
+Each variant reports per request the decoded rows' misses a token, their time at `--disk-gbs` and the prompt's misses.
+A first row reports what the trace recorded: the misses a token and the bytes not in memory when a decoded row asked for its experts.
 
 ### schedule-host
 

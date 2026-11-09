@@ -250,7 +250,7 @@ pub struct LayerEngram {
 impl LayerEngram {
     /// The residual rows `r` `[1, rows, streams * hidden]` at the positions `first..` with the
     /// engram added, hashed from the ids `log` holds.
-    fn add(&self, r: &Tensor, log: &TokenLog, first: usize) -> Result<Tensor> {
+    pub(super) fn add(&self, r: &Tensor, log: &TokenLog, first: usize) -> Result<Tensor> {
         let rows = r.dims3()?.1;
         let hashes = log.engram_hashes(&self.meta, self.which, first, rows)?;
         self.block.forward(r, &hashes)
@@ -375,6 +375,8 @@ pub struct RoutedFfn {
     pub card: CardExperts,
     /// A watched forward runs every routed expert on the host.
     pub watch: ExpertWatch,
+    /// The layer's share of the host tier, `None` when the host keeps no tier.
+    pub host: Option<Arc<super::wide_sparse_host_tier::LayerKeep>>,
 }
 
 impl RoutedFfn {
@@ -465,13 +467,17 @@ impl RoutedFfn {
     }
 
     /// Notes in the process's expert counters the pairs of `assign`: those of the experts in
-    /// `on_card` served by the card, those of `on_host` computed from the file mapping, and the
-    /// experts a single decoded row routed to.
+    /// `on_card` served by the card, those of `on_host` computed by the host, and the experts a
+    /// single decoded row routed to.
+    ///
+    /// `kept[i]` says whether the host tier keeps `on_host[i]`.
+    /// The bytes of the experts it does not keep are read from the file mapping.
     fn note_served(
         &self,
         assign: &[Vec<(usize, f32)>],
         on_card: &[usize],
         on_host: &[usize],
+        kept: &[bool],
         n: usize,
     ) {
         let counters = crate::inference::expert_counters::global();
@@ -486,14 +492,35 @@ impl RoutedFfn {
             routed.flat_map(|&e| std::iter::repeat_n(e, assign[e].len())),
         );
         counters.served(pairs(on_card), pairs(on_host));
-        let bytes: usize = on_host
-            .iter()
-            .map(|&e| {
-                let x = &self.experts[e];
-                x.gate.bytes() + x.up.bytes() + x.down.bytes()
-            })
+        let mut by_card: Vec<(usize, u64)> = Vec::new();
+        for &e in on_card {
+            let Some(ordinal) = self.card.card_of(e) else {
+                continue;
+            };
+            let p = assign[e].len() as u64;
+            match by_card.iter_mut().find(|(o, _)| *o == ordinal) {
+                Some((_, n)) => *n += p,
+                None => by_card.push((ordinal, p)),
+            }
+        }
+        for (ordinal, p) in by_card {
+            counters.card(ordinal, p);
+        }
+        let bytes = |e: usize| {
+            let x = &self.experts[e];
+            (x.gate.bytes() + x.up.bytes() + x.down.bytes()) as u64
+        };
+        let kept_at = |i: usize| kept.get(i).copied().unwrap_or(false);
+        let tier: Vec<usize> = (0..on_host.len()).filter(|&i| kept_at(i)).collect();
+        counters.host(
+            on_host.iter().map(|&e| bytes(e)).sum(),
+            tier.iter().map(|&i| assign[on_host[i]].len() as u64).sum(),
+        );
+        let read: u64 = (0..on_host.len())
+            .filter(|&i| !kept_at(i))
+            .map(|i| bytes(on_host[i]))
             .sum();
-        counters.read(false, bytes as u64);
+        counters.read(false, read);
         if n == 1 {
             let mut now: Vec<usize> = on_card.iter().chain(on_host).copied().collect();
             now.sort_unstable();
@@ -506,12 +533,35 @@ impl RoutedFfn {
     /// Each row starts from its shared expert's output.
     /// The routed experts run by id, each once over the rows routed to it, in row order.
     /// A row adds the outputs of its experts in that order, each times its weight.
+    ///
+    /// A card that keeps the router takes a single row's logits, with the host's bits.
+    /// A card that keeps the shared expert runs it beside the host's experts.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_routed(x, None)
+    }
+
+    /// [`Self::forward`] over a single row whose router logits `logits` the card gave, with the
+    /// host's bits.
+    ///
+    /// `None` runs the router as [`Self::forward`] does.
+    pub(super) fn forward_routed(&self, x: &Tensor, logits: Option<Vec<f32>>) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         let dim = dims.last().copied().unwrap_or(0);
         let n = x.elem_count() / dim.max(1);
         let x2 = x.reshape((n, dim))?;
-        let logits = self.router.apply_here(&x2)?.to_vec2::<f32>()?;
+        let rows = x2.flatten_all()?.to_vec1::<f32>()?;
+        let host = Device::Cpu;
+        let logits = match logits.filter(|_| n == 1) {
+            Some(row) => vec![row],
+            None => staged("experts: router", &host, false, || {
+                Ok(
+                    match (n == 1).then(|| self.card.router_logits(&rows)).flatten() {
+                        Some(row) => vec![row],
+                        None => self.router.apply_here(&x2)?.to_vec2::<f32>()?,
+                    },
+                )
+            })?,
+        };
         let picks = self.route(&logits);
         // Per expert, the rows routed to it in row order, with their weights.
         let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
@@ -531,16 +581,62 @@ impl RoutedFfn {
         let (on_card, on_host): (Vec<usize>, Vec<usize>) = active
             .iter()
             .partition(|&&e| watch.is_none() && self.card.holds(e));
-        self.note_served(&assign, &on_card, &on_host, n);
-        // Every host expert's bytes are asked for at once, so the reads overlap the compute.
-        on_host
-            .par_iter()
-            .for_each(|&e| self.experts[e].will_need());
-        let mut y: Vec<Vec<f32>> = match &self.shared {
-            Some(s) => s.forward(&x2, self.limit)?.to_vec2::<f32>()?,
-            None => vec![vec![0f32; dim]; n],
+        let tier = self.host.as_deref();
+        // Every host expert's bytes are asked for at once, on the tier's reader threads where it
+        // has them, so the reads overlap the bookkeeping and the compute.
+        let asked = std::time::Instant::now();
+        let reads = tier.and_then(|t| t.read_now(&on_host));
+        if reads.is_none() {
+            on_host
+                .par_iter()
+                .for_each(|&e| self.experts[e].will_need());
+        }
+        let mut asked_ns = asked.elapsed().as_nanos() as u64;
+        // The host tier scores the guess the layer before made and says what it keeps.
+        let prepared = std::time::Instant::now();
+        if let Some(t) = tier {
+            t.opens(&active, n);
+        }
+        // Per host expert, the last row routed to it.
+        let last: Vec<usize> = on_host
+            .iter()
+            .map(|&e| assign[e].last().map_or(0, |&(t, _)| t))
+            .collect();
+        let kept = tier.map_or_else(
+            || vec![false; on_host.len()],
+            |t| {
+                let routes: Vec<(usize, usize)> = on_host
+                    .iter()
+                    .zip(&last)
+                    .map(|(&e, &l)| (l, assign[e].len()))
+                    .collect();
+                t.kept(&on_host, &routes, &on_card, n)
+            },
+        );
+        self.note_served(&assign, &on_card, &on_host, &kept, n);
+        crate::inference::stage_prof::prof_record(
+            "experts: tier",
+            prepared.elapsed().as_nanos() as u64,
+        );
+        let ahead = std::time::Instant::now();
+        // A decoded row reads ahead what the next layer is expected to route to.
+        if let Some(t) = tier.filter(|_| n == 1) {
+            t.read_ahead(&x2);
+        }
+        asked_ns += ahead.elapsed().as_nanos() as u64;
+        crate::inference::stage_prof::prof_record("experts: reads asked", asked_ns);
+        let shared_on_card = self.shared.is_some() && self.card.keeps_shared();
+        let host_shared = |s: &BlockScaledExpert| -> Result<Vec<Vec<f32>>> {
+            s.forward(&x2, self.limit)?.to_vec2::<f32>()
         };
-        let rows = x2.flatten_all()?.to_vec1::<f32>()?;
+        let mut y: Vec<Vec<f32>> = match &self.shared {
+            Some(s) if !shared_on_card => {
+                staged("experts: shared on the host", &host, false, || {
+                    host_shared(s)
+                })?
+            }
+            _ => vec![vec![0f32; dim]; n],
+        };
         if let Some(w) = &watch {
             w(None, &rows, &[]);
         }
@@ -570,28 +666,63 @@ impl RoutedFfn {
                 })
                 .collect()
         };
-        // The cards and the cores run at once: a scoped thread drives the cards.
+        // The cards and the cores run at once: a scoped thread drives the cards, 1 thread a card.
+        // The card that keeps the shared expert runs it first, then its experts.
         let card_rows: Vec<Vec<usize>> = on_card
             .iter()
             .map(|&e| assign[e].iter().map(|&(t, _)| t).collect())
             .collect();
-        let (card_outs, host_outs) = std::thread::scope(|scope| {
-            let card = (!on_card.is_empty()).then(|| {
-                scope.spawn(|| self.card.run(&on_card, &card_rows, &rows, dim, self.limit))
+        let (shared_out, card_outs, host_outs) = std::thread::scope(|scope| {
+            let card = (!on_card.is_empty() || shared_on_card).then(|| {
+                scope.spawn(|| {
+                    self.card.run_cards(
+                        &on_card,
+                        &card_rows,
+                        &rows,
+                        dim,
+                        self.limit,
+                        shared_on_card,
+                    )
+                })
             });
+            let started = std::time::Instant::now();
             let host = host_run(&on_host);
-            let card = card.and_then(|h| h.join().ok().flatten());
-            (card, host)
+            let ran = started.elapsed();
+            let (shared, experts) = card
+                .and_then(|h| h.join().ok())
+                .unwrap_or_else(|| (None, vec![None; on_card.len()]));
+            crate::inference::stage_prof::prof_record("experts: host", ran.as_nanos() as u64);
+            crate::inference::stage_prof::prof_record(
+                "experts: card wait",
+                (started.elapsed() - ran).as_nanos() as u64,
+            );
+            (shared, experts, host)
         });
+        // The reads of this forward not yet made are no longer asked.
+        drop(reads);
         let host_outs = host_outs?;
+        // The tier admits or lets go what the host computed, by the kind of rows.
+        if let Some(t) = tier {
+            t.computed(&on_host, &last, n);
+        }
+        // A card that failed leaves the shared expert to the host.
+        if let Some(s) = self.shared.as_ref().filter(|_| shared_on_card) {
+            y = match shared_out {
+                Some(flat) => flat.chunks(dim.max(1)).map(<[f32]>::to_vec).collect(),
+                None => host_shared(s)?,
+            };
+        }
         // A card that failed leaves its experts to the host, which gives the same bits.
-        let card_outs = match card_outs {
-            Some(outs) => outs,
-            None => host_run(&on_card)?
-                .into_iter()
-                .map(|(out, _)| out)
-                .collect(),
-        };
+        let failed: Vec<usize> = (0..on_card.len())
+            .filter(|&i| card_outs[i].is_none())
+            .collect();
+        let mut again = host_run(&failed.iter().map(|&i| on_card[i]).collect::<Vec<_>>())?
+            .into_iter()
+            .map(|(out, _)| out);
+        let card_outs: Vec<Vec<f32>> = card_outs
+            .into_iter()
+            .map(|out| out.or_else(|| again.next()).unwrap_or_default())
+            .collect();
         // Each active expert's outputs, in the order of `active`.
         let mut by_id: std::collections::HashMap<usize, Vec<f32>> =
             on_card.into_iter().zip(card_outs).collect();
@@ -645,6 +776,8 @@ pub struct SinkhornBlock {
     pub carry: Arc<PreMixCarry>,
     /// What an engram layer adds to the residual before the token mixer reads it.
     pub engram: Option<LayerEngram>,
+    /// The 2 mixers and the 2 norms on a card, when the load keeps them there.
+    pub card_mix: super::wide_sparse_card_stream::CardSinkhorn,
     /// Where a layer a block draft reads adds its input.
     pub capture: Option<LayerCapture>,
 }
@@ -654,25 +787,110 @@ pub struct SinkhornBlock {
 ///
 /// Returns the residual after the half, the pre mix the feed-forward collapses with, and the
 /// token mixer's input.
-fn attention_half(
+pub(super) fn attention_half(
     block: &SinkhornBlock,
     mixer: &mut mixer::Mixer,
     r: &Tensor,
     pre: &[Vec<f32>],
     pos: usize,
 ) -> Result<(Tensor, Vec<Vec<f32>>, Tensor)> {
-    let mixes = block.attn_mix.mixes(r)?;
-    let input = rms_norm(&block.attn_mix.pre(r, pre)?, &block.attn_norm, block.eps)?;
-    let mixed = staged("token mixer", &Device::Cpu, false, || {
-        mixer.forward(&input, pos)
+    let host = Device::Cpu;
+    let (mixes, input) = staged("mix_token", &host, false, || {
+        let mixes = block.attn_mix.mixes(r)?;
+        let input = rms_norm(&block.attn_mix.pre(r, pre)?, &block.attn_norm, block.eps)?;
+        Ok((mixes, input))
     })?;
-    let (b, seq, width) = mixed.dims3()?;
-    let out = block
-        .output
-        .apply_here(&mixed.reshape((b * seq, width))?)?
-        .reshape((b, seq, block.attn_mix.dim()))?;
-    let next = block.attn_mix.post(&out, r, &mixes.post, &mixes.comb)?;
+    let out = token_mixer_out(block, mixer, &input, pos)?;
+    let next = staged("combine", &host, false, || {
+        block.attn_mix.post(&out, r, &mixes.post, &mixes.comb)
+    })?;
     Ok((next, mixes.pre, input))
+}
+
+/// The token mixer's output `[1, seq, hidden]` for its input rows `input` at positions `pos..`,
+/// through the layer's output projection.
+pub(super) fn token_mixer_out(
+    block: &SinkhornBlock,
+    mixer: &mut mixer::Mixer,
+    input: &Tensor,
+    pos: usize,
+) -> Result<Tensor> {
+    let host = Device::Cpu;
+    let mixed = staged("token mixer", &host, false, || mixer.forward(input, pos))?;
+    let (b, seq, width) = mixed.dims3()?;
+    // A card that runs the output projection after the mixer gives its rows already projected.
+    match mixer.projects_output() {
+        true => Ok(mixed),
+        false => staged("output projection", &host, false, || {
+            block
+                .output
+                .apply_here(&mixed.reshape((b * seq, width))?)?
+                .reshape((b, seq, block.attn_mix.dim()))
+        }),
+    }
+}
+
+/// The residual `r` of the row of sequence `seq` at `pos` with the layer's engram added, `r`
+/// itself for a layer without an engram.
+pub(super) fn engram_row(
+    block: &SinkhornBlock,
+    r: Tensor,
+    seq: &SequenceMixers,
+    pos: usize,
+) -> Result<Tensor> {
+    match block.engram.as_ref() {
+        Some(e) => staged("engram", &Device::Cpu, false, || {
+            e.add(&r, &seq.tokens, pos)
+        }),
+        None => Ok(r),
+    }
+}
+
+/// `run` over the mixer of layer `il` holding the state of sequence `seq` and its band cell.
+///
+/// The mixer and the cell hold their own states again once `run` returns.
+pub(super) fn in_sequence<R>(
+    mixer: &mut mixer::Mixer,
+    il: usize,
+    seq: &mut SequenceMixers,
+    cell: &BandCell,
+    run: impl FnOnce(&mut mixer::Mixer) -> Result<R>,
+) -> Result<R> {
+    staged("exchange", &Device::Cpu, false, || {
+        exchange_state(mixer, &mut seq.states[il])?;
+        cell.exchange(&seq.cell);
+        Ok(())
+    })?;
+    let out = run(mixer);
+    staged("exchange", &Device::Cpu, false, || {
+        cell.exchange(&seq.cell);
+        exchange_state(mixer, &mut seq.states[il])
+    })?;
+    out
+}
+
+/// The feed-forward's half of a layer over the residual rows `mid` `[1, seq, streams * hidden]`,
+/// collapsed by `attn_pre`: the residual after the half and the pre mix the next layer collapses
+/// with.
+pub(super) fn ffn_half(
+    block: &SinkhornBlock,
+    mid: &Tensor,
+    attn_pre: &[Vec<f32>],
+) -> Result<(Tensor, Vec<Vec<f32>>)> {
+    let (mixes, input) = staged("mix_ffn", &Device::Cpu, false, || {
+        let mixes = block.ffn_mix.mixes(mid)?;
+        let input = rms_norm(
+            &block.ffn_mix.pre(mid, attn_pre)?,
+            &block.ffn_norm,
+            block.eps,
+        )?;
+        Ok((mixes, input))
+    })?;
+    let out = staged("experts", &Device::Cpu, false, || block.ffn.forward(&input))?;
+    let next = staged("combine", &Device::Cpu, false, || {
+        block.ffn_mix.post(&out, mid, &mixes.post, &mixes.comb)
+    })?;
+    Ok((next, mixes.pre))
 }
 
 impl GenericTransformerLayer {
@@ -768,6 +986,20 @@ pub struct WideSparseHead {
     ///
     /// Empty when no card keeps routed experts.
     pub card_rooms: Vec<(usize, u64)>,
+    /// Per card the plan keeps a cache on, the part of the cache's room the routed experts
+    /// borrow until a sequence needs it.
+    pub lent: Vec<super::wide_sparse_card_tier::LentRoom>,
+    /// Per card the load placed weights on, what a byte of each kept there saves.
+    pub savings: Vec<super::wide_always_read::CardSaving>,
+    /// Per layer of the stack, per expert, the share of the tokens a routing profile routed to
+    /// it.
+    ///
+    /// `None` without a profile that counted a route, and for a layer it never counted.
+    pub shares: Option<Vec<Option<Vec<f64>>>>,
+    /// The head on a card, when the load keeps it there.
+    pub card_head: super::wide_always_read::CardProjection,
+    /// Whether a decoded row's final collapse runs on the card that keeps the head.
+    pub head_collapse: super::wide_sparse_card_stream::HeadCollapse,
 }
 
 impl WideSparseHead {
@@ -818,7 +1050,12 @@ impl WideSparseHead {
         };
         let n = rows.dim(1)?;
         let h = rms_norm(&collapse.pre(&rows, &pre)?, &self.norm, self.eps)?;
-        let logits = self.head.apply_here(&h.reshape((b * n, collapse.dim()))?)?;
+        let h = h.reshape((b * n, collapse.dim()))?;
+        // A card that keeps the head runs it, else the host.
+        let logits = match self.card_head.apply(&h) {
+            Some(logits) => logits,
+            None => self.head.apply_here(&h)?,
+        };
         match all_positions {
             true => {
                 let vocab = logits.dim(1)?;
@@ -853,7 +1090,12 @@ impl GenericHeteroTransformer {
                 .map_or(0, |s| s.gate.bytes() + s.up.bytes() + s.down.bytes());
             let bias = ffn.bias.len() * std::mem::size_of::<f32>();
             let engram = block.engram.as_ref().map_or(0, |e| e.block.wkv_bytes());
-            bytes += block.output.bytes() + ffn.router.bytes() + bias + shared + engram;
+            // A mixer on a card that runs the output projection counts it among its own.
+            let output = match layer.mixer.projects_output() {
+                true => 0,
+                false => block.output.bytes(),
+            };
+            bytes += output + ffn.router.bytes() + bias + shared + engram;
         }
         Some(bytes as u64)
     }
@@ -1045,6 +1287,7 @@ impl GenericHeteroTransformer {
             crate::tensor::bail!("a sequence keeps states for another model");
         }
         crate::tensor::quant_cpu::set_small_model_prefill(false);
+        self.take_back_card_room(positions.iter().map(|p| p + 1).max().unwrap_or(0));
 
         // Each row's residual as the embedding stage of its decode starts it.
         // A sequence's own token log takes the row's token where an engram layer reads it.
@@ -1066,6 +1309,29 @@ impl GenericHeteroTransformer {
         let mut pres: Vec<Vec<Vec<f32>>> =
             (0..rows_in).map(|_| vec![onto_first(streams)]).collect();
 
+        // A single row keeps its residual on the cards through the layers that keep their
+        // Sinkhorn mixers there.
+        #[cfg(feature = "gpu")]
+        if rows_in == 1 && self.layers_keep_sinkhorn_on_cards() {
+            let row = rows
+                .pop()
+                .ok_or_else(|| crate::tensor::Error::msg("no row to decode"))?;
+            use super::wide_sparse_card_stream::gpu::Decoded;
+            let decoded = self.decode_row_on_cards(row, positions[0], &mut *seqs[0], &cell)?;
+            return match decoded {
+                Decoded::Rows(row, pre) => {
+                    carry.put(positions[0], 1, vec![pre]);
+                    staged("head", &Device::Cpu, false, || {
+                        self.output_stage(row, false, 1, false)
+                    })
+                }
+                Decoded::Logits(logits, pre) => {
+                    carry.put(positions[0], 1, vec![pre]);
+                    self.finish_logits(logits)
+                }
+            };
+        }
+
         for il in 0..self.layers.len() {
             let layer = &mut self.layers[il];
             let mut mids = Vec::with_capacity(rows_in);
@@ -1078,16 +1344,10 @@ impl GenericHeteroTransformer {
                 let block = layer.sinkhorn.as_ref().ok_or_else(|| {
                     crate::tensor::Error::msg("a Sinkhorn layer without its block")
                 })?;
-                let r = match block.engram.as_ref() {
-                    Some(e) => e.add(&r, &seq.tokens, positions[j])?,
-                    None => r,
-                };
-                exchange_state(&mut layer.mixer, &mut seq.states[il])?;
-                cell.exchange(&seq.cell);
-                let half = attention_half(block, &mut layer.mixer, &r, &pres[j], positions[j]);
-                cell.exchange(&seq.cell);
-                exchange_state(&mut layer.mixer, &mut seq.states[il])?;
-                let (mid, pre, _) = half?;
+                let r = engram_row(block, r, seq, positions[j])?;
+                let (mid, pre, _) = in_sequence(&mut layer.mixer, il, seq, &cell, |mixer| {
+                    attention_half(block, mixer, &r, &pres[j], positions[j])
+                })?;
                 mids.push(mid);
                 attn_pres.push(pre);
             }
@@ -1100,15 +1360,7 @@ impl GenericHeteroTransformer {
                 .zip(pres.iter_mut())
                 .zip(mids.iter().zip(&attn_pres));
             for ((row, pre), (mid, attn_pre)) in each {
-                let mixes = block.ffn_mix.mixes(mid)?;
-                let input = rms_norm(
-                    &block.ffn_mix.pre(mid, attn_pre)?,
-                    &block.ffn_norm,
-                    block.eps,
-                )?;
-                let out = block.ffn.forward(&input)?;
-                *row = block.ffn_mix.post(&out, mid, &mixes.post, &mixes.comb)?;
-                *pre = mixes.pre;
+                (*row, *pre) = ffn_half(block, mid, attn_pre)?;
             }
         }
 
@@ -1116,7 +1368,9 @@ impl GenericHeteroTransformer {
         let mut logits = Vec::with_capacity(rows_in);
         for (j, row) in rows.into_iter().enumerate() {
             carry.put(positions[j], 1, std::mem::take(&mut pres[j]));
-            logits.push(self.output_stage(row, false, 1, false)?);
+            logits.push(staged("head", &Device::Cpu, false, || {
+                self.output_stage(row, false, 1, false)
+            })?);
         }
         Tensor::cat(&logits.iter().collect::<Vec<_>>(), 0)
     }
@@ -1139,6 +1393,9 @@ impl GenericHeteroTransformer {
         };
         let cell = self.shared_cell()?;
         let hashed = self.shared_tokens().is_some();
+        let longest = prompts.iter().map(Vec::len).max().unwrap_or(0);
+        self.give_back_for_prompt(0, longest);
+        self.take_back_card_room(longest);
         let mut seqs = prompts
             .iter()
             .map(|_| self.sequence_mixers())
@@ -1251,10 +1508,10 @@ pub struct SequenceMixers {
 /// Exchanges the state `mixer` holds with `held`.
 ///
 /// The exchange counts as a replaced state.
-/// A buffer a card built from the state before it is then rebuilt from the host state.
+/// A card buffer stays while the state it copies comes back under the same name.
 ///
 /// Refused, with nothing exchanged, when `held` is not a state of `mixer`'s kind.
-fn exchange_state(mixer: &mut mixer::Mixer, held: &mut mixer::MixerState) -> Result<()> {
+pub(super) fn exchange_state(mixer: &mut mixer::Mixer, held: &mut mixer::MixerState) -> Result<()> {
     match (mixer, held) {
         (mixer::Mixer::LatentMqa(m), mixer::MixerState::LatentMqa(s)) => {
             std::mem::swap(&mut m.state, s);

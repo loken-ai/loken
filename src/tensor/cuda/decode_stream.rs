@@ -287,12 +287,53 @@ impl DecodeStreamDev {
             .map_err(|e| launch_err("hc_add_f32", e))
     }
 
+    /// The `(2 + hc) hc` dot products of the stream with the rows of `func`, then the stream's dot
+    /// product with itself, read back: what [`Self::mixes`] computes its coefficients from.
+    pub fn mixed_dots(&self, dev: &CudaDevice, func: &CudaView<'_, f32>) -> Result<Vec<f32>> {
+        let flat = self.hc * self.d;
+        let mix_hc = (2 + self.hc) * self.hc;
+        if func.len() != mix_hc * flat {
+            return Err(Error(format!(
+                "decode stream dots: {} projection values for {mix_hc} x {flat}",
+                func.len()
+            )));
+        }
+        let mut mixed = alloc_f32(dev, "decode stream mixed", mix_hc + 1)?;
+        launch_dots(dev, &self.x, flat, mix_hc, func, &mut mixed)?;
+        let mut host = dev
+            .stream()
+            .clone_dtoh(&mixed)
+            .map_err(|e| Error(format!("decode stream dots download: {e}")))?;
+        host.truncate(mix_hc + 1);
+        Ok(host)
+    }
+
+    /// Sets the post `[hc]` and comb `[hc, hc]` coefficients the next [`Self::post`] folds with.
+    pub fn set_post_comb(&mut self, dev: &CudaDevice, post: &[f32], comb: &[f32]) -> Result<()> {
+        if post.len() != self.hc || comb.len() != self.hc * self.hc {
+            return Err(Error(format!(
+                "decode stream coefficients: {} post and {} comb values for {} copies",
+                post.len(),
+                comb.len(),
+                self.hc
+            )));
+        }
+        self.post = upload_f32(dev, "decode stream post", post)?;
+        self.comb = upload_f32(dev, "decode stream comb", comb)?;
+        Ok(())
+    }
+
     /// The post and comb coefficients in hand, `[hc]` then `[hc, hc]`, as device views.
     pub fn post_comb(&self) -> (CudaView<'_, f32>, CudaView<'_, f32>) {
         (
             self.post.slice(0..self.hc),
             self.comb.slice(0..self.hc * self.hc),
         )
+    }
+
+    /// The collapse weights in hand, on the device.
+    pub fn pre_view(&self) -> CudaView<'_, f32> {
+        self.pre.slice(0..self.hc)
     }
 
     /// The collapse weights in hand, on the host.
@@ -324,6 +365,34 @@ impl DecodeStreamDev {
     }
 }
 
+/// The `mix_hc` dot products of the stream `x` with the rows of `func`, then `x` with itself, into
+/// `mixed`: 1 block a product.
+fn launch_dots(
+    dev: &CudaDevice,
+    x: &CudaSlice<f32>,
+    flat: usize,
+    mix_hc: usize,
+    func: &CudaView<'_, f32>,
+    mixed: &mut CudaSlice<f32>,
+) -> Result<()> {
+    let dots = dev.quantized_fn("hc_mixed_dots_f32")?;
+    let (flat_i, mix_i) = (flat as i64, mix_hc as i32);
+    let mut b = dev.stream().launch_builder(&dots);
+    b.arg(x);
+    b.arg(func);
+    b.arg(mixed);
+    b.arg(&flat_i);
+    b.arg(&mix_i);
+    let cfg = LaunchConfig {
+        grid_dim: (mix_hc as u32 + 1, 1, 1),
+        block_dim: (THREADS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { b.launch(cfg) }
+        .map(|_| ())
+        .map_err(|e| launch_err("hc_mixed_dots_f32", e))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_mixes(
     dev: &CudaDevice,
@@ -351,22 +420,10 @@ fn launch_mixes(
         )));
     }
     let stream = dev.stream();
-    let dots = dev.quantized_fn("hc_mixed_dots_f32")?;
     let gates = dev.quantized_fn("hc_mixed_gates_f32")?;
     let mut mixed = alloc_f32(dev, "decode stream mixed", mix_hc + 1)?;
     let (flat_i, hc_i, mix_i, it_i) = (flat as i64, hc as i32, mix_hc as i32, iters as i32);
-    let mut b = stream.launch_builder(&dots);
-    b.arg(x);
-    b.arg(func);
-    b.arg(&mut mixed);
-    b.arg(&flat_i);
-    b.arg(&mix_i);
-    let cfg = LaunchConfig {
-        grid_dim: (mix_hc as u32 + 1, 1, 1),
-        block_dim: (THREADS as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe { b.launch(cfg) }.map_err(|e| launch_err("hc_mixed_dots_f32", e))?;
+    launch_dots(dev, x, flat, mix_hc, func, &mut mixed)?;
     let mut b = stream.launch_builder(&gates);
     b.arg(&mixed);
     b.arg(scale);
@@ -476,6 +533,9 @@ impl RingDev {
     }
 }
 
+/// The factor a `GrowDev` multiplies its capacity by when it is full.
+pub const GROWTH: usize = 2;
+
 /// Rows of `d` values appended one at a time on the device, the buffer doubling as they come.
 pub struct GrowDev {
     rows: CudaSlice<f32>,
@@ -513,7 +573,7 @@ impl GrowDev {
         }
         let stream = dev.stream();
         if self.len == self.cap {
-            let cap = self.cap * 2;
+            let cap = self.cap * GROWTH;
             let mut bigger = alloc_f32(dev, "device rows", cap * self.d)?;
             stream
                 .memcpy_dtod(

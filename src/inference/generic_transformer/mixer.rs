@@ -360,6 +360,120 @@ impl Mixer {
         }
     }
 
+    /// Keeps `output`, the layer's output projection, on the card the mixer runs on, in its unit
+    /// of `choices`.
+    ///
+    /// False, with nothing kept, for a mixer without a card form or on the host.
+    #[cfg(feature = "gpu")]
+    pub(super) fn keep_output_on_card(
+        &mut self,
+        output: &crate::tensor::blockscaled::projection::Projection,
+        choices: &super::card_packed::Choices,
+    ) -> Result<bool> {
+        match self {
+            Mixer::LatentMqa(m) => m.keep_output_on_card(output, choices),
+            Mixer::CompressedBand(m) => m.base.keep_output_on_card(output, choices),
+            _ => Ok(false),
+        }
+    }
+
+    /// Drops the card's copies of the decode state: the next decode rebuilds them from the host
+    /// state.
+    pub(super) fn drop_card_copies(&self) {
+        #[cfg(feature = "gpu")]
+        match self {
+            Mixer::LatentMqa(m) => m.drop_card_copies(),
+            Mixer::CompressedBand(m) => m.drop_card_copies(),
+            _ => {}
+        }
+    }
+
+    /// Drops the layer's output projection from the mixer's card: the bytes it held.
+    ///
+    /// `None` when the card does not run it or a forward in flight shares the card.
+    /// The host runs it from then on.
+    pub(super) fn release_output_on_card(&mut self) -> Option<u64> {
+        #[cfg(feature = "gpu")]
+        return match self {
+            Mixer::LatentMqa(m) => m.release_output_on_card(),
+            Mixer::CompressedBand(m) => m.base.release_output_on_card(),
+            _ => None,
+        };
+        #[cfg(not(feature = "gpu"))]
+        None
+    }
+
+    /// Whether the mixer's card runs the layer's output projection after the mixer, so the
+    /// mixer gives rows of the hidden width.
+    pub fn projects_output(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return match self {
+            Mixer::LatentMqa(m) => m.projects_output(),
+            Mixer::CompressedBand(m) => m.base.projects_output(),
+            _ => false,
+        };
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
+    /// The ordinal of the card the mixer runs on, `None` on the host.
+    pub fn card_ordinal(&self) -> Option<usize> {
+        #[cfg(feature = "gpu")]
+        return match self {
+            Mixer::LatentMqa(m) => m.card_ordinal(),
+            Mixer::CompressedBand(m) => m.card_ordinal(),
+            _ => None,
+        };
+        #[cfg(not(feature = "gpu"))]
+        None
+    }
+
+    /// Whether a decoded row on card `ordinal` runs the mixer there and finds its output of the
+    /// hidden width there.
+    #[cfg(feature = "gpu")]
+    pub(super) fn decodes_on(&self, ordinal: usize) -> bool {
+        self.card_ordinal() == Some(ordinal)
+            && match self {
+                Mixer::LatentMqa(m) => m.projects_output(),
+                Mixer::CompressedBand(m) => m.decodes_on_card(),
+                _ => false,
+            }
+    }
+
+    /// The decode step of the row `row` on the mixer's card at `index_pos`: the output row of the
+    /// hidden width, left on the card, and the rows the state keeps, left on the card.
+    ///
+    /// The state is unchanged until [`Self::keep_decoded`] reads those rows into it.
+    #[cfg(feature = "gpu")]
+    pub(super) fn decode_dev(
+        &mut self,
+        row: crate::tensor::gpu_runtime::driver::CudaView<'_, f32>,
+        index_pos: usize,
+    ) -> Result<(
+        crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
+        super::card_mixers::Pending,
+    )> {
+        match self {
+            Mixer::LatentMqa(m) => m.decode_dev(row, index_pos),
+            Mixer::CompressedBand(m) => m.decode_dev(row, index_pos),
+            _ => crate::tensor::bail!("the mixer does not decode on a card"),
+        }
+    }
+
+    /// The rows `rows` a decode step on the card left for the state, read in as `keep` says.
+    #[cfg(feature = "gpu")]
+    pub(super) fn keep_decoded(
+        &mut self,
+        keep: &super::card_mixers::Keep,
+        rows: &[f32],
+    ) -> Result<()> {
+        match self {
+            Mixer::LatentMqa(m) => m.keep_decoded(keep, rows),
+            Mixer::CompressedBand(m) => m.keep_decoded(keep, rows),
+            _ => crate::tensor::bail!("the mixer does not decode on a card"),
+        }
+    }
+
     /// True for a mixer whose decode step advances its state where it lies, so a step run
     /// again reads and writes the same buffers, and that is worth recording: the delta rule
     /// through its fused recurrence, and the short convolution, on a card.

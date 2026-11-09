@@ -321,6 +321,14 @@ impl QMatMul {
         }
     }
 
+    /// The kernel matmul `forward` runs, `None` for a dense weight.
+    pub(crate) fn kernel(&self) -> Option<&super::QKernelMatMul> {
+        match self {
+            Self::QTensor(qt) => qt.native_qmm().ok(),
+            _ => None,
+        }
+    }
+
     /// Raw CPU quantized weight `(dtype, k, n, bytes)` for fused multi-weight
     /// regions (MoE flat `matmul_bytes_multi`). Forwards to the kernel matmul
     /// (the borrow lives as long as `self` - `native_qmm` caches a reference).

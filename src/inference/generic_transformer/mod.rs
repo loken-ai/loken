@@ -88,6 +88,8 @@ pub use hetero::CachedPrompt;
 #[cfg(feature = "gpu")]
 mod card_band;
 #[cfg(all(test, feature = "gpu"))]
+mod card_band_keep_tests;
+#[cfg(all(test, feature = "gpu"))]
 pub(crate) mod card_mixer_tests;
 #[cfg(feature = "gpu")]
 mod card_mixers;
@@ -144,6 +146,11 @@ mod vulkan_layers;
 #[cfg(all(test, feature = "vulkan"))]
 mod vulkan_parity;
 mod wide;
+pub mod wide_always_read;
+#[cfg(all(test, feature = "gpu"))]
+mod wide_always_read_card_tests;
+#[cfg(test)]
+mod wide_always_read_tests;
 pub mod wide_expert_card;
 pub mod wide_pipeline;
 #[cfg(test)]
@@ -153,6 +160,9 @@ mod wide_sparse_batch_tests;
 pub mod wide_sparse_calibrate;
 #[cfg(all(test, not(feature = "gpu")))]
 mod wide_sparse_calibrate_tests;
+pub mod wide_sparse_card_stream;
+#[cfg(all(test, feature = "gpu"))]
+mod wide_sparse_card_stream_tests;
 pub mod wide_sparse_card_tier;
 #[cfg(test)]
 mod wide_sparse_card_tier_tests;
@@ -172,6 +182,9 @@ mod wide_sparse_convert_tests;
 mod wide_sparse_engram_tests;
 #[cfg(test)]
 pub(crate) mod wide_sparse_frozen;
+pub mod wide_sparse_host_tier;
+#[cfg(test)]
+mod wide_sparse_host_tier_tests;
 pub mod wide_sparse_layer;
 pub mod wide_sparse_llamacpp;
 pub mod wide_sparse_names;

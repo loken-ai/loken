@@ -468,3 +468,443 @@ fn the_load_keeps_experts_on_a_card_only_when_it_measures_faster() {
     assert_eq!(kept > 0, !model.wide_card_rooms().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A lent room's need follows the tokens up to the reservation, and its shortfall is what the
+/// need takes beyond the part the experts do not hold.
+#[test]
+fn a_lent_room_falls_short_by_what_the_tokens_need_beyond_the_unlent_part() {
+    use super::wide_sparse_card_tier::LentRoom;
+    let room = LentRoom {
+        ordinal: 0,
+        layers: 4,
+        reserved: 1000,
+        lent: 0,
+        work: 0,
+    };
+    let growth = room.need(1) / 4;
+    assert!(growth >= 1);
+    assert_eq!(room.need(10), 40 * growth);
+    assert_eq!(room.need(1000), 1000, "the need stops at the reservation");
+    assert_eq!(
+        room.shortfall(1000),
+        0,
+        "nothing lent, nothing to take back"
+    );
+    let lent = LentRoom { lent: 900, ..room };
+    assert_eq!(lent.shortfall(10), (40 * growth).saturating_sub(100));
+    assert_eq!(lent.shortfall(1000), 900);
+    assert_eq!(lent.shortfall(0), 0);
+}
+
+/// A card that lends its cache room to routed experts drops its coldest experts when a forward
+/// needs the room, from the layers that keep the most, the fewest that cover the shortfall.
+/// The model then gives the host's bits on every record, and a forward within the room drops
+/// nothing more.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_card_takes_back_its_lent_room_from_the_coldest_experts_and_keeps_the_hosts_bits() {
+    use super::wide_sparse_card_tier::LentRoom;
+    use std::collections::BTreeMap;
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let dir = scratch("lent");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let tokens = prompt();
+    let mut want = BTreeMap::new();
+    record_generic(
+        &mut generic_of(open_mapped(&path).unwrap()),
+        &tokens,
+        0,
+        &mut want,
+    );
+    let mut model = with_card_experts(&path, 64);
+    let per_card = |m: &GenericHeteroTransformer| -> Vec<usize> {
+        m.layers
+            .iter()
+            .filter_map(|l| l.sinkhorn.as_ref())
+            .map(|b| b.ffn.card.count_on(0))
+            .collect()
+    };
+    let before = per_card(&model);
+    let held: usize = before.iter().sum();
+    assert_eq!(held, model.wide_card_expert_count());
+    let routed_bytes: u64 = model
+        .layers
+        .iter()
+        .filter_map(|l| l.sinkhorn.as_ref())
+        .flat_map(|b| b.ffn.card.bytes_by_card())
+        .map(|(_, b)| b)
+        .sum();
+    let each = routed_bytes / held as u64;
+    // A shortfall of 2 experts and a half drops 3 at a forward of `at` tokens.
+    let at = 4096usize;
+    let probe = LentRoom {
+        ordinal: 0,
+        layers: model.layers.len() as u64,
+        reserved: u64::MAX / 4,
+        lent: 0,
+        work: 0,
+    };
+    let per_layer = model
+        .wide_sparse
+        .as_ref()
+        .unwrap()
+        .meta
+        .kv_bytes_per_layer(at);
+    let lent = probe.reserved - probe.need(per_layer) + 3 * each - each / 2;
+    model.wide_sparse.as_mut().unwrap().lent = vec![LentRoom { lent, ..probe }];
+    model.take_back_card_room(at);
+    let after = per_card(&model);
+    assert_eq!(
+        after.iter().sum::<usize>(),
+        held - 3,
+        "{before:?} to {after:?}"
+    );
+    // The drops come from the layers that kept the most.
+    let most = before.iter().copied().max().unwrap();
+    for (l, (&b, &a)) in before.iter().zip(&after).enumerate() {
+        assert!(
+            a == b || b + 1 >= most,
+            "layer {l}: {b} to {a}, the fullest held {most}"
+        );
+    }
+    // Each layer keeps a prefix of its heat.
+    for (l, ids) in model.held_heat().iter().enumerate() {
+        let card = &model.layers[l].sinkhorn.as_ref().unwrap().ffn.card;
+        let n = after[l];
+        assert!(ids[..n].iter().all(|&e| card.holds(e)), "layer {l}");
+        assert!(ids[n..].iter().all(|&e| !card.holds(e)), "layer {l}");
+    }
+    let left = model.wide_sparse.as_ref().unwrap().lent[0].lent;
+    assert!(
+        left < lent && left + 3 * each >= lent,
+        "{lent} lent, {left} left"
+    );
+    let mut got = BTreeMap::new();
+    record_generic(&mut model, &tokens, 0, &mut got);
+    for record in RECORDS {
+        let name = format!("l0_{record}");
+        assert_eq!(
+            record_digest(&got[&name]),
+            record_digest(&want[&name]),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        model.wide_card_expert_count(),
+        held - 3,
+        "a forward within the room drops nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cache's take-back ranks the weights every token reads with the routed experts by the
+/// load's saving per byte: the cheapest weight goes first, then the coldest experts, and a
+/// weight that saves more than every expert stays.
+/// The model then gives the host's bits on every record.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_take_back_drops_weights_and_experts_by_their_saving_per_byte() {
+    use super::wide_always_read::{AlwaysRead, CardSaving};
+    use super::wide_sparse_card_tier::LentRoom;
+    use std::collections::BTreeMap;
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let dir = scratch("lent_weights");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let tokens = prompt();
+    let mut want = BTreeMap::new();
+    record_generic(
+        &mut generic_of(open_mapped(&path).unwrap()),
+        &tokens,
+        0,
+        &mut want,
+    );
+    let mut model = with_card_experts(&path, 64);
+    let held = model.wide_card_expert_count();
+    let routed_bytes: u64 = model
+        .layers
+        .iter()
+        .filter_map(|l| l.sinkhorn.as_ref())
+        .flat_map(|b| b.ffn.card.bytes_by_card())
+        .map(|(_, b)| b)
+        .sum();
+    let each = routed_bytes / held as u64;
+    let layers = model.layers.len();
+    let choices = super::card_packed::Choices::default();
+    for il in 0..layers {
+        model
+            .keep_always_read(0, AlwaysRead::Router, il, &choices)
+            .unwrap();
+    }
+    let head = model
+        .keep_always_read(0, AlwaysRead::Head, layers - 1, &choices)
+        .unwrap();
+    model.wide_sparse.as_mut().unwrap().savings = vec![CardSaving {
+        ordinal: 0,
+        kinds: vec![(AlwaysRead::Head, 0.0), (AlwaysRead::Router, 1.0)],
+        per_expert: 1e-3,
+    }];
+    // A shortfall of the head and 1 expert and a half drops the head and 2 experts.
+    let at = 4096usize;
+    let probe = LentRoom {
+        ordinal: 0,
+        layers: layers as u64,
+        reserved: u64::MAX / 4,
+        lent: 0,
+        work: 0,
+    };
+    let per_layer = model
+        .wide_sparse
+        .as_ref()
+        .unwrap()
+        .meta
+        .kv_bytes_per_layer(at);
+    let lent = probe.reserved - probe.need(per_layer) + head + 2 * each - each / 2;
+    model.wide_sparse.as_mut().unwrap().lent = vec![LentRoom { lent, ..probe }];
+    model.take_back_card_room(at);
+    let left = model.always_read_on(0);
+    assert_eq!(model.wide_card_expert_count(), held - 2);
+    assert!(left.iter().all(|(k, _)| *k == AlwaysRead::Router));
+    assert_eq!(left.len(), layers, "every router stays");
+    let mut got = BTreeMap::new();
+    record_generic(&mut model, &tokens, 0, &mut got);
+    for record in RECORDS {
+        let name = format!("l0_{record}");
+        assert_eq!(
+            record_digest(&got[&name]),
+            record_digest(&want[&name]),
+            "{name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A prompt that finds the card short of free memory for the request's work gives back the
+/// lent room first: the card drops its coldest experts, at most what it borrows, and the model
+/// keeps the host's bits.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_prompt_short_of_card_memory_gives_the_lent_room_back_first() {
+    use super::wide_sparse_card_tier::LentRoom;
+    use std::collections::BTreeMap;
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let dir = scratch("lent_prompt");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let tokens = prompt();
+    let mut want = BTreeMap::new();
+    record_generic(
+        &mut generic_of(open_mapped(&path).unwrap()),
+        &tokens,
+        0,
+        &mut want,
+    );
+    let mut model = with_card_experts(&path, 64);
+    let held = model.wide_card_expert_count();
+    let routed_bytes: u64 = model
+        .layers
+        .iter()
+        .filter_map(|l| l.sinkhorn.as_ref())
+        .flat_map(|b| b.ffn.card.bytes_by_card())
+        .map(|(_, b)| b)
+        .sum();
+    let each = routed_bytes / held as u64;
+    // A work larger than any card leaves every lent byte to give back: 3 experts' worth.
+    let lent = 3 * each - each / 2;
+    model.wide_sparse.as_mut().unwrap().lent = vec![LentRoom {
+        ordinal: 0,
+        layers: model.layers.len() as u64,
+        reserved: u64::MAX / 4,
+        lent,
+        work: u64::MAX / 8,
+    }];
+    let mut got = BTreeMap::new();
+    record_generic(&mut model, &tokens, 0, &mut got);
+    assert_eq!(model.wide_card_expert_count(), held - 3);
+    assert_eq!(model.wide_sparse.as_ref().unwrap().lent[0].lent, 0);
+    for record in RECORDS {
+        let name = format!("l0_{record}");
+        assert_eq!(
+            record_digest(&got[&name]),
+            record_digest(&want[&name]),
+            "{name}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether the machine shows a second card.
+#[cfg(feature = "gpu")]
+fn second_card() -> bool {
+    crate::tensor::Device::new_cuda(1).is_ok()
+}
+
+/// Experts card `ordinal` keeps over every layer of `model`.
+#[cfg(feature = "gpu")]
+fn kept_on(model: &GenericHeteroTransformer, ordinal: usize) -> usize {
+    model
+        .layers
+        .iter()
+        .filter_map(|l| l.sinkhorn.as_ref())
+        .map(|b| b.ffn.card.count_on(ordinal))
+        .sum()
+}
+
+/// The generic model of the card-format file with the cards keeping the experts `rooms` give,
+/// each a card ordinal and a room in experts.
+#[cfg(feature = "gpu")]
+fn with_rooms(path: &Path, rooms: &[(usize, u64)]) -> GenericHeteroTransformer {
+    let mut model = generic_of(open_mapped(path).unwrap());
+    let (_, bytes) = expert_facts(&model, 0);
+    model.set_wide_card_rooms(rooms.iter().map(|&(o, n)| (o, n * bytes)).collect());
+    let plan = model
+        .plan_wide_experts(VariantChoice::Plan)
+        .expect("a wide model");
+    model.keep_wide_card_experts(&plan);
+    model
+}
+
+/// The routed feed-forward of layer 0 of `model` over 3 rows: the bits of its outputs.
+#[cfg(feature = "gpu")]
+fn first_layer_bits(model: &GenericHeteroTransformer) -> Vec<u32> {
+    let block = model.layers[0].sinkhorn.as_ref().unwrap();
+    let dim = block.ffn_norm.elem_count();
+    let rows = 3;
+    let x: Vec<f32> = (0..rows * dim)
+        .map(|i| ((i * 13 + 5) as f32 * 0.21).sin())
+        .collect();
+    let x = crate::tensor::Tensor::from_vec(x, (rows, dim), &crate::tensor::Device::Cpu).unwrap();
+    let y = block.ffn.forward(&x).unwrap();
+    y.flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// A layer's routed experts give the same bits on the host, on the first card, on the second
+/// card and over both: its feed-forward over 3 rows and every record of the oracle, the
+/// prefill, the decode, the verifies and the greedy tokens.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_experts_give_the_same_bits_on_the_host_and_on_either_card() {
+    use std::collections::BTreeMap;
+    if !second_card() {
+        eprintln!("no card 1: skipped");
+        return;
+    }
+    let dir = scratch("two-cards");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let tokens = prompt();
+    let mut host = generic_of(open_mapped(&path).unwrap());
+    let layer = first_layer_bits(&host);
+    let mut want = BTreeMap::new();
+    record_generic(&mut host, &tokens, 0, &mut want);
+    for rooms in [vec![(0, 64)], vec![(1, 64)], vec![(0, 3), (1, 64)]] {
+        let mut model = with_rooms(&path, &rooms);
+        for &(ordinal, _) in &rooms {
+            assert!(kept_on(&model, ordinal) > 0, "{rooms:?}: card {ordinal}");
+        }
+        assert_eq!(first_layer_bits(&model), layer, "{rooms:?}: layer 0");
+        let mut got = BTreeMap::new();
+        record_generic(&mut model, &tokens, 0, &mut got);
+        for record in RECORDS {
+            let name = format!("l0_{record}");
+            assert_eq!(
+                record_digest(&got[&name]),
+                record_digest(&want[&name]),
+                "{rooms:?}: {name}"
+            );
+        }
+        assert!(pairs_run(&model) > 0, "{rooms:?}: the cards ran no expert");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A card the load was offered outside the plan gets a room for routed experts and lends
+/// nothing: only the plan's card keeps a cache.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_card_outside_the_plan_gets_a_room_and_lends_nothing() {
+    use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan, HeteroSegment};
+    if !second_card() {
+        eprintln!("no card 1: skipped");
+        return;
+    }
+    let dir = scratch("outside");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let mut model = generic_of(open_mapped(&path).unwrap());
+    let layers = model.layers.len();
+    let plan = HeteroPlan {
+        segments: vec![HeteroSegment {
+            kind: DeviceKind::Cuda(0),
+            layer_start: 0,
+            layer_end: layers,
+            free_memory_bytes: 1 << 30,
+        }],
+        tp_cards: None,
+        total_layers: layers,
+        host_experts_from: None,
+    };
+    let cache = model
+        .wide_sparse
+        .as_ref()
+        .unwrap()
+        .meta
+        .kv_bytes_per_layer(8 * crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+    model.note_wide_card_rooms(&plan, &[0, 1], cache, 0);
+    let ordinals: Vec<usize> = model.wide_card_rooms().iter().map(|r| r.0).collect();
+    assert_eq!(ordinals, vec![0, 1]);
+    let lent = |model: &GenericHeteroTransformer| -> Vec<usize> {
+        let ws = model.wide_sparse.as_ref().unwrap();
+        ws.lent.iter().map(|l| l.ordinal).collect()
+    };
+    assert_eq!(lent(&model), vec![0]);
+    model.lend_card_room();
+    assert_eq!(lent(&model), vec![0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The load measures the second card as it measures the first, and each card keeps experts
+/// exactly when it was measured faster than the host.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_load_measures_each_card_and_keeps_experts_where_it_pays() {
+    if !second_card() {
+        eprintln!("no card 1: skipped");
+        return;
+    }
+    let dir = scratch("measure-two");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let mut model = generic_of(open_mapped(&path).unwrap());
+    for o in [0, 1] {
+        let m = model
+            .measure_wide_card(o, VariantChoice::Plan)
+            .expect("the card gives the host's bits");
+        println!("card {o}: {m:?}");
+    }
+    let (_, bytes) = expert_facts(&model, 0);
+    model.set_wide_card_rooms(vec![(0, 3 * bytes), (1, 64 * bytes)]);
+    model.place_wide_experts(VariantChoice::Plan);
+    let rooms: Vec<usize> = model.wide_card_rooms().iter().map(|r| r.0).collect();
+    println!("rooms {rooms:?}");
+    for o in [0, 1] {
+        assert_eq!(kept_on(&model, o) > 0, rooms.contains(&o), "card {o}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

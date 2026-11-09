@@ -6,7 +6,7 @@ use tracing::{info, warn};
 /// what a fresh allocation can realistically claim without forcing
 /// swap. Mirrors the two-step pattern used in
 /// `distributed::device_manager::available_memory_for_model`.
-fn available_host_ram_bytes() -> u64 {
+pub(crate) fn available_host_ram_bytes() -> u64 {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();

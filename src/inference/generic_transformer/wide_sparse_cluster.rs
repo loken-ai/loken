@@ -5,7 +5,8 @@
 //! bytes the model gives here.
 //! The bytes are each held layer's token mixer with its output projection as stored, 1 routed
 //! expert as stored, the experts the prior names per layer, and the experts a token routes to.
-//! The model also gives the bytes its token mixers and routed experts hold on each card.
+//! The model also gives the bytes its token mixers, routed experts and always-read weights hold
+//! on each card.
 
 use super::mixer::Mixer;
 use super::wide_sparse_layer::SinkhornBlock;
@@ -88,7 +89,8 @@ impl GenericHeteroTransformer {
         ))
     }
 
-    /// Per card, the bytes the token mixers and the routed experts held there take, by ordinal.
+    /// Per card, the bytes the token mixers, the routed experts and the weights every token
+    /// reads held there take, by ordinal.
     ///
     /// `None` for a model of another kind, or one that holds nothing on a card.
     pub fn wide_card_residency(&self) -> Option<Vec<(usize, u64)>> {
@@ -104,6 +106,19 @@ impl GenericHeteroTransformer {
             }
             for (ordinal, bytes) in block.ffn.card.bytes_by_card() {
                 add(ordinal, bytes);
+            }
+            if let Some((ordinal, bytes)) =
+                block.engram.as_ref().and_then(|e| e.block.wkv_on_card())
+            {
+                add(ordinal, bytes as u64);
+            }
+            if let Some(ordinal) = block.card_mix.ordinal() {
+                add(ordinal, block.card_mix.bytes() as u64);
+            }
+        }
+        if let Some(ws) = self.wide_sparse.as_ref() {
+            if let Some(ordinal) = ws.card_head.ordinal() {
+                add(ordinal, ws.card_head.bytes() as u64);
             }
         }
         cards.sort_unstable();

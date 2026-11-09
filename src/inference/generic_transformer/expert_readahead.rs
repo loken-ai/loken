@@ -11,6 +11,7 @@
 //! How many readers run is measured on the file the experts are read from.
 
 use super::expert_tuner::Tuner;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -106,6 +107,141 @@ fn drop_span(span: Span) {
     let _ = (file, offset);
 }
 
+/// Drops the whole pages inside `spans` from this process and from the page cache, now.
+pub(crate) fn drop_now(spans: &[Span]) {
+    spans.iter().for_each(|&s| drop_span(s));
+}
+
+/// One expert's spans a forward computes from, and whether that forward still waits for them.
+struct Wanted {
+    spans: Vec<Span>,
+    open: Arc<AtomicBool>,
+}
+
+/// The threads that ask for the bytes of the experts a forward computes now, and their queue.
+struct NowPool {
+    tx: std::sync::mpsc::Sender<Wanted>,
+    rx: Arc<Mutex<std::sync::mpsc::Receiver<Wanted>>>,
+    threads: usize,
+}
+
+impl NowPool {
+    /// Starts threads until `threads` serve the queue, fewer when the system refuses one.
+    fn grow(&mut self, threads: usize) {
+        while self.threads < threads {
+            let rx = self.rx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("expert reads now".into())
+                .spawn(move || loop {
+                    let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    match next {
+                        Ok(w) if w.open.load(Ordering::Relaxed) => {
+                            w.spans.iter().for_each(|&s| will_need(s))
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                });
+            if spawned.is_err() {
+                return;
+            }
+            self.threads += 1;
+        }
+    }
+}
+
+static NOW: OnceLock<Mutex<NowPool>> = OnceLock::new();
+
+/// The reads a forward asked for its experts.
+///
+/// The reads still queued when it drops are not made.
+pub(crate) struct Asked {
+    open: Arc<AtomicBool>,
+}
+
+impl Drop for Asked {
+    fn drop(&mut self) {
+        self.open.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Asks the kernel to read in the bytes of `experts`, each an expert's spans, on reader threads,
+/// in the order given.
+///
+/// At least `threads` threads serve the queue.
+/// The queue has no bound.
+/// An expert whose forward dropped the returned [`Asked`] before a thread took it is not asked.
+/// The reads run here when no thread can be had.
+pub(crate) fn read_now(experts: Vec<Vec<Span>>, threads: usize) -> Asked {
+    let open = Arc::new(AtomicBool::new(true));
+    let pool = NOW.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Wanted>();
+        Mutex::new(NowPool {
+            tx,
+            rx: Arc::new(Mutex::new(rx)),
+            threads: 0,
+        })
+    });
+    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+    pool.grow(threads.max(1));
+    for spans in experts {
+        let job = Wanted {
+            spans,
+            open: open.clone(),
+        };
+        let sent = match pool.threads {
+            0 => Err(std::sync::mpsc::SendError(job)),
+            _ => pool.tx.send(job),
+        };
+        if let Err(std::sync::mpsc::SendError(job)) = sent {
+            job.spans.iter().for_each(|&s| will_need(s));
+        }
+    }
+    Asked { open }
+}
+
+/// Asks the kernel to start reading `span` in, without waiting for it.
+fn will_need(span: Span) {
+    #[cfg(unix)]
+    crate::tensor::mapped::advise_span(span.0, span.1, libc::MADV_WILLNEED, false);
+    #[cfg(not(unix))]
+    let _ = span;
+}
+
+/// A batch of spans waiting for the dropper thread.
+type DropJob = Vec<Span>;
+
+static DROPPER: OnceLock<Mutex<std::sync::mpsc::Sender<DropJob>>> = OnceLock::new();
+
+/// Drops the whole pages inside `spans` from this process and from the page cache, on a thread
+/// of its own, in the order asked.
+///
+/// The queue has no bound: a drop is never lost.
+/// The drops run here when the thread cannot be had.
+pub(crate) fn drop_later(spans: Vec<Span>) {
+    if spans.is_empty() {
+        return;
+    }
+    let tx = DROPPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<DropJob>();
+        let spawned = std::thread::Builder::new()
+            .name("expert page drops".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job.iter().for_each(|&s| drop_span(s));
+                }
+            });
+        if spawned.is_err() {
+            tracing::warn!("no thread for the expert page drops: they run inline");
+        }
+        Mutex::new(tx)
+    });
+    let sent = tx.lock().unwrap_or_else(|e| e.into_inner()).send(spans);
+    if let Err(std::sync::mpsc::SendError(job)) = sent {
+        job.iter().for_each(|&s| drop_span(s));
+    }
+}
+
 /// The read-ahead of one card's cached layers: its reader count and the controller that decides
 /// whether the reads run.
 pub(crate) struct ReadAhead {
@@ -128,6 +264,16 @@ impl ReadAhead {
                 layers,
                 EXPLOIT_WINDOWS,
             ),
+            started: Mutex::new(None),
+        }
+    }
+
+    /// `readers` threads whose reads run from the first token and stay on.
+    #[cfg(test)]
+    pub(crate) fn reading(readers: usize) -> Self {
+        Self {
+            readers: readers.max(1),
+            depth: Tuner::new("expert read-ahead depth", 1, 1, usize::MAX, EXPLOIT_WINDOWS),
             started: Mutex::new(None),
         }
     }
@@ -309,6 +455,19 @@ mod tests {
         assert!(ra.started.lock().unwrap().is_some());
         ra.token_ends(t0 + std::time::Duration::from_millis(5));
         assert!(ra.started.lock().unwrap().is_none());
+    }
+
+    /// The reads asked now change no byte, on threads or inline.
+    #[test]
+    fn reads_asked_now_are_advice() {
+        let bytes: Vec<u8> = (0..1 << 16).map(|i| (i % 251) as u8).collect();
+        let span = (bytes.as_ptr() as usize, bytes.len());
+        for threads in [0, 2] {
+            let asked = read_now(vec![vec![span], vec![span]], threads);
+            drop(asked);
+        }
+        will_need(span);
+        assert!(bytes.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
     }
 
     /// A read changes no byte, and a drop of memory outside any file mapping does nothing.

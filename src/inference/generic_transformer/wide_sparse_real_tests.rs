@@ -493,7 +493,8 @@ fn mixer_front(
         |v: Vec<f32>, cols: usize| Tensor::from_vec(v, (1, seq, cols), &Device::Cpu).unwrap();
     match &base.card {
         Some(card) => {
-            let f = card.front_dev(base, &x2, &cos, &sin).unwrap();
+            let rows = super::card_mixers::FrontRows::Host(&x2);
+            let f = card.front_dev(base, rows, &cos, &sin).unwrap();
             let dev = card.dev();
             let dl = |s: &crate::tensor::gpu_runtime::driver::CudaSlice<f32>, n: usize| {
                 super::card_mixers::download(dev, s, n).unwrap()

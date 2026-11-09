@@ -13,6 +13,7 @@ pub mod shapes;
 pub mod stats;
 
 pub mod cache_policy;
+pub mod cache_replay;
 #[cfg(feature = "gpu")]
 pub mod card;
 #[cfg(feature = "gpu")]
@@ -105,7 +106,8 @@ pub struct Options {
     #[arg(long, default_value_t = 8)]
     pub pack: usize,
 
-    /// The file `expert-read` reads; without it the shapes file
+    /// The file `expert-read` reads; without it the shapes file.
+    /// For `cache-policy`, a host tier's recorded trace, replayed in place of draws from a profile
     #[arg(long)]
     pub file: Option<PathBuf>,
 

@@ -1352,8 +1352,15 @@ impl LlmEngine {
                                     )?;
                                     // A wide residual's routed experts may take what the cards have
                                     // left beside the plan's cache and a request's work.
+                                    // A card the load was offered outside the plan keeps routed
+                                    // experts only, unless it takes a range of the cache below.
+                                    let offered: Vec<usize> = match context_parallel {
+                                        true => Vec::new(),
+                                        false => cuda_devices.iter().map(|&(i, _)| i).collect(),
+                                    };
                                     m.note_wide_card_rooms(
                                         &placed,
+                                        &offered,
                                         demand.kv_bytes_per_layer,
                                         demand.runtime_reserve,
                                     );

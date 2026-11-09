@@ -266,7 +266,7 @@ fn the_card_mixers_with_engram_layers_stay_as_close_to_the_exact_reference_as_th
 }
 
 /// Rows of a test input: deterministic values of order 1.
-fn rows(seed: u64, n: usize, width: usize) -> Tensor {
+pub(super) fn rows(seed: u64, n: usize, width: usize) -> Tensor {
     let mut s = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);

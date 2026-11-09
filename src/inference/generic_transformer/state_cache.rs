@@ -1314,9 +1314,11 @@ impl GenericHeteroTransformer {
                     slot += 1;
                     rows_snapshot(l, &k, &v, tail.dtype)?
                 }
+                // A state read back has the name 0: no card holds its rows.
                 Held::Latent(h) => with_mixer(MixerState::LatentMqa(Some(LatentMqaState {
                     len: h.len,
                     window: h.window.clone(),
+                    stamp: 0,
                 }))),
                 Held::Band(h) => {
                     let tail = (h.compressed.as_slice(), h.index.as_slice());
@@ -1326,10 +1328,11 @@ impl GenericHeteroTransformer {
                         window: LatentMqaState {
                             len: h.window.len,
                             window: h.window.window.clone(),
+                            stamp: 0,
                         },
                         groups: h.groups,
-                        compressed,
-                        index_keys,
+                        compressed: Arc::new(compressed),
+                        index_keys: Arc::new(index_keys),
                         filling: h.filling.clone(),
                     })))
                 }

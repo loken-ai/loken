@@ -23,6 +23,8 @@ pub struct WideFacts {
     pub expert_bytes: u64,
     /// Per held layer, the routed experts the cards keep.
     pub card_experts: Vec<usize>,
+    /// Per held layer, the routed experts the host tier keeps at most, 0 without a tier.
+    pub host_slots: Vec<usize>,
 }
 
 /// What 1 decode step starts from.
@@ -104,7 +106,19 @@ impl GenericHeteroTransformer {
                 .and_then(|f| f.variant_bytes(0, 0))
                 .unwrap_or(0),
             card_experts: ffns.iter().map(|f| f.card.count()).collect(),
+            host_slots: ffns
+                .iter()
+                .map(|f| f.host.as_ref().map_or(0, |k| k.tier().capacity()))
+                .collect(),
         })
+    }
+
+    /// The host tier's hits, misses and experts let go since the load, over the held layers.
+    pub fn host_tier_stats(&self) -> (u64, u64, u64) {
+        self.held_ffns()
+            .iter()
+            .filter_map(|f| f.host.as_ref().map(|k| k.stats()))
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
     }
 
     /// Values of the residual a step that starts inside the stack is given.

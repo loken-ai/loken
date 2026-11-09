@@ -2647,6 +2647,12 @@ impl GenericHeteroTransformer {
         // A Sinkhorn wide residual starts the same way, and the state its layers pass to each
         // other opens for the rows of this forward, the token ids its engram layers hash
         // included.
+        if self.wide_sparse.is_some() {
+            if seq_len > 1 {
+                self.give_back_for_prompt(index_pos, index_pos + seq_len);
+            }
+            self.take_back_card_room(index_pos + seq_len);
+        }
         let hidden = match self.wide_sparse.as_ref() {
             Some(ws) => ws.widen(&hidden, input_ids, index_pos)?,
             None => hidden,
@@ -3139,7 +3145,7 @@ impl GenericHeteroTransformer {
             };
             self.last_feature = Some(f.to_dtype(crate::tensor::DType::F32)?);
         }
-        let mut logits = if let Some(ws) = self.wide_sparse.as_ref() {
+        let logits = if let Some(ws) = self.wide_sparse.as_ref() {
             // The streams collapse with the last layer's pre mix, then the final norm and the
             // head run on the host.
             let last = self
@@ -3243,7 +3249,13 @@ impl GenericHeteroTransformer {
             };
             self.host_head()?.forward(&src)?
         };
-        logits = self.apply_output_bias(logits)?;
+        self.finish_logits(logits)
+    }
+
+    /// The head's output `logits` with the output bias, the logit scale and the softcap applied,
+    /// as F32.
+    pub(super) fn finish_logits(&self, logits: Tensor) -> Result<Tensor> {
+        let mut logits = self.apply_output_bias(logits)?;
 
         // Ensure F32 dtype before scaling operations (GPU F16 matmul may produce mixed types)
         logits = logits.to_dtype(crate::tensor::DType::F32)?;

@@ -51,6 +51,37 @@ pub fn advise_span(start: usize, len: usize, advice: libc::c_int, inward: bool) 
     }
 }
 
+/// Bytes of the pages `len` bytes at address `start` touch that are not in memory, `0` where the
+/// system does not say.
+///
+/// The range must lie within one mapping.
+pub fn absent_bytes(start: usize, len: usize) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(page) = page_size() else {
+            return 0;
+        };
+        let lo = start / page * page;
+        let hi = (start + len).div_ceil(page) * page;
+        if hi <= lo {
+            return 0;
+        }
+        let mut vec = vec![0u8; (hi - lo) / page];
+        // Safety: [lo, hi) holds the pages of the range, which are mapped, and the vector holds
+        // 1 byte per page as mincore requires.
+        let rc = unsafe { libc::mincore(lo as *mut libc::c_void, hi - lo, vec.as_mut_ptr()) };
+        if rc != 0 {
+            return 0;
+        }
+        (vec.iter().filter(|&&v| v & 1 == 0).count() * page) as u64
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (start, len);
+        0
+    }
+}
+
 /// A live mapping and the file behind it.
 struct MappedFile {
     map: std::sync::Weak<memmap2::Mmap>,
@@ -134,6 +165,17 @@ pub fn file_span(start: usize, len: usize) -> Option<(Arc<std::fs::File>, u64)> 
     let g = FILES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter()
         .find_map(|f| f.offset_of(start, len).map(|off| (f.file.clone(), off)))
+}
+
+/// The address and length of the live mapping registered with `register_file` that holds `len`
+/// bytes at `start`.
+pub fn mapping_span(start: usize, len: usize) -> Option<(usize, usize)> {
+    let g = FILES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find_map(|f| {
+        f.offset_of(start, len)?;
+        let m = f.map.upgrade()?;
+        Some((m.as_ptr() as usize, m.len()))
+    })
 }
 
 /// A byte range of a mapped file, pinned by the mapping.

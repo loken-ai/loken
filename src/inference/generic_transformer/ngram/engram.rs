@@ -20,6 +20,7 @@ use crate::tensor::quant_view::rows_view;
 use crate::tensor::quantized::gguf_file;
 use crate::tensor::quantized::{QTensor, BLOCK_ALIGN};
 use crate::tensor::{DType, Device, Error, Result, Tensor};
+use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -431,6 +432,8 @@ pub struct EngramBlock {
     dim: usize,
     streams: usize,
     eps: f32,
+    /// `wkv` on a card, when the load keeps it there.
+    card_wkv: crate::inference::generic_transformer::wide_always_read::CardProjection,
 }
 
 impl EngramBlock {
@@ -464,7 +467,36 @@ impl EngramBlock {
             dim,
             streams,
             eps,
+            card_wkv: Default::default(),
         })
+    }
+
+    /// The fused key and value projection as the host holds it.
+    pub fn wkv(&self) -> &Projection {
+        &self.wkv
+    }
+
+    /// Keeps the fused key and value projection on card `ordinal`, its product in its unit of
+    /// `choices`.
+    #[cfg(feature = "gpu")]
+    pub(in crate::inference::generic_transformer) fn keep_wkv_on_card(
+        &mut self,
+        ordinal: usize,
+        choices: &crate::inference::generic_transformer::card_packed::Choices,
+    ) -> Result<()> {
+        self.card_wkv.keep(ordinal, &self.wkv, choices)
+    }
+
+    /// Drops the fused key and value projection from its card: the bytes it held, `None` on the
+    /// host.
+    pub fn release_wkv_on_card(&mut self) -> Option<u64> {
+        self.card_wkv.release()
+    }
+
+    /// The card that keeps the fused key and value projection and its bytes there, `None` on
+    /// the host.
+    pub fn wkv_on_card(&self) -> Option<(usize, usize)> {
+        self.card_wkv.ordinal().map(|o| (o, self.card_wkv.bytes()))
     }
 
     /// Bytes of the fused key and value projection as held: what every token of the layer reads.
@@ -478,15 +510,17 @@ impl EngramBlock {
         let (dim, hc) = (self.dim, self.streams);
         let s = hashes.len();
         let width = self.wkv.dims()[1];
-        let mut gathered = Vec::with_capacity(s * width);
+        let started = std::time::Instant::now();
         for ids in hashes {
             self.table.will_need(ids);
         }
-        for ids in hashes {
-            for &row in ids {
-                gathered.extend(self.table.row(row)?);
-            }
-        }
+        // The rows are read at once on the pool's threads, in the order of `hashes`.
+        let ids: Vec<u64> = hashes.iter().flatten().copied().collect();
+        let rows = ids
+            .par_iter()
+            .map(|&row| self.table.row(row))
+            .collect::<Result<Vec<_>>>()?;
+        let gathered = rows.concat();
         if gathered.len() != s * width {
             return Err(Error::msg(format!(
                 "engram: {} row values gathered for {s} positions of width {width}",
@@ -494,8 +528,20 @@ impl EngramBlock {
             )));
         }
         let e = Tensor::from_vec(gathered, (s, width), &Device::Cpu)?;
+        let gathered_at = std::time::Instant::now();
+        let prof = crate::inference::stage_prof::prof_record;
+        prof("engram: rows", (gathered_at - started).as_nanos() as u64);
         // [s, dim * (streams + 1)]
-        let kv = self.wkv.apply_here(&e)?.to_vec2::<f32>()?;
+        // A card that keeps the projection runs it, else the host.
+        let kv = match self.card_wkv.apply(&e) {
+            Some(kv) => kv,
+            None => self.wkv.apply_here(&e)?,
+        }
+        .to_vec2::<f32>()?;
+        prof(
+            "engram: projection",
+            gathered_at.elapsed().as_nanos() as u64,
+        );
         // [s * streams * dim]
         let mut h = r.flatten_all()?.to_vec1::<f32>()?;
         if h.len() != s * hc * dim {

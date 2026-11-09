@@ -2842,6 +2842,24 @@ extern "C" __global__ void px_matvec_##name(                                    
 PX_ENTRY(q4_k, TX_Q4K)
 PX_ENTRY(q6_k, TX_Q6K)
 
+// A dense F32 projection of 1 row as the host takes 1 row (blockscaled::projection): output o is
+// the fold from -0, in input order, of the products w[o][k] * x[k], each rounded once. A warp per
+// output: each lane forms 1 product of a run of 32, and every lane folds the run in order.
+extern "C" __global__ void seq_row_f32(
+        const float * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int inp) {
+    const int o = blockIdx.x, lane = threadIdx.x;
+    const float * wr = w + (long) o * inp;
+    float acc = -0.0f;
+    for (int k0 = 0; k0 < inp; k0 += 32) {
+        const int k = k0 + lane;
+        const float p = k < inp ? __fmul_rn(wr[k], x[k]) : 0.0f;
+        const int run = min(32, inp - k0);
+        for (int j = 0; j < run; ++j) acc = __fadd_rn(acc, __shfl_sync(0xffffffffu, p, j));
+    }
+    if (lane == 0) y[o] = acc;
+}
+
 // After a recorded decode's answer: which pairs the transit room runs (late_slots, the expert's
 // place there, all ones for the others) and where each pair's row is read from (src: -1 for the
 // card's rows, the pair for the host's). The late pairs are read from the mailbox only when the

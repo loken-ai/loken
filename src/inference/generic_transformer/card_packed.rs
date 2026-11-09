@@ -15,7 +15,10 @@
 //! - the rows in q8_1 blocks and the card's quantised matmul,
 //! - the rows in F32 and tiles of the blocks expanded to F32.
 //!
-//! A unit is a block type and a shape on one card, shared by every weight of a model that has it.
+//! A unit is a block type, a shape and a group count on one card, shared by every weight of a
+//! model that has them.
+//! The weights of a group run their products of 1 row in q8_1 blocks in one launch, so the unit
+//! of a group times that launch.
 //! The first product of a unit measures, on its own rows, the error of the host and of each
 //! product against the exact one: the blocks decoded to F32 times the F32 rows.
 //! A product is admissible when it is no farther from the exact product than the host, up to the
@@ -30,11 +33,11 @@
 use crate::tensor::blockscaled::fp8::ScaleFormat;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::cuda::{
-    alloc_f32, cast_bf16_to_f32, copy_f32, matmul_nt_f32, put_cols, upload_f32, CudaDevice,
-    CudaStorage, QUANT_LINEAR_TILE_BYTES,
+    alloc_f32, cast_bf16_to_f32, copy_f32, matmul_nt_f32, put_cols, quantize_q8_1_rows_f32_view,
+    upload_f32, CudaDevice, CudaStorage, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::gpu_runtime::driver::{CudaEvent, CudaSlice, LaunchConfig, PushKernelArg};
-use crate::tensor::quantized::{GgmlDType, QMatMul};
+use crate::tensor::quantized::{GgmlDType, QKernelMatMul, QMatMul};
 use crate::tensor::{Device, Error, Result, Tensor};
 
 use std::collections::{BTreeMap, HashMap};
@@ -77,6 +80,8 @@ pub(super) struct PackedDev {
     tile_bytes: usize,
     /// The unit whose measured product a Q4_K or Q6_K weight runs.
     unit: Option<Arc<Unit>>,
+    /// Weights of the group whose products of 1 row run in one launch, 1 for a weight alone.
+    groups: usize,
     /// The host weight, which gives the host's product and the exact one of a measurement.
     host: Option<Projection>,
 }
@@ -332,15 +337,21 @@ impl Unit {
 /// The units of the card weights of one model.
 #[derive(Default)]
 pub(super) struct Choices {
-    units: Mutex<HashMap<(usize, GgmlDType, usize, usize), Arc<Unit>>>,
+    units: Mutex<HashMap<(usize, GgmlDType, usize, usize, usize), Arc<Unit>>>,
 }
 
 impl Choices {
-    /// The unit of `dtype` blocks `[out, inp]` on card `ordinal`.
-    fn unit(&self, ordinal: usize, dtype: GgmlDType, out: usize, inp: usize) -> Arc<Unit> {
+    /// The unit of `dtype` blocks `[out, inp]` in groups of `groups` weights on card `ordinal`.
+    fn unit(
+        &self,
+        ordinal: usize,
+        dtype: GgmlDType,
+        (out, inp): (usize, usize),
+        groups: usize,
+    ) -> Arc<Unit> {
         let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
         units
-            .entry((ordinal, dtype, out, inp))
+            .entry((ordinal, dtype, out, inp, groups))
             .or_insert_with(|| {
                 Arc::new(Unit {
                     dtype,
@@ -451,9 +462,47 @@ fn grid(total: usize) -> LaunchConfig {
     }
 }
 
+/// The products of 1 row of a group of weights in one launch, as the decode runs them.
+struct GroupLaunch<'a> {
+    /// The group's first weight.
+    kernel: &'a QKernelMatMul,
+    /// One row a weight, in order.
+    rows: CudaSlice<f32>,
+    /// The card addresses of the weights' blocks.
+    table: CudaSlice<u64>,
+    groups: usize,
+    /// Values of a weight's product.
+    out: usize,
+}
+
+impl GroupLaunch<'_> {
+    /// The rows quantised to q8_1 once and every weight's product in one launch.
+    fn run(&self, dev: &CudaDevice) -> Result<()> {
+        let q81 = quantize_q8_1_rows_f32_view(dev, &self.rows.slice(..), self.rows.len(), 1)?;
+        let mut y = alloc_f32(dev, "mixer product", self.groups * self.out)?;
+        self.kernel.matvec_group_rows(
+            &self.table,
+            self.groups,
+            &q81.slice(..),
+            &mut y.slice_mut(..),
+        )
+    }
+}
+
 impl PackedDev {
     /// `p` uploaded as stored, a Q4_K or Q6_K weight in its unit of `choices`.
     pub(super) fn new(dev: &Arc<CudaDevice>, p: &Projection, choices: &Choices) -> Result<Self> {
+        Self::in_group(dev, p, choices, 1)
+    }
+
+    /// [`Self::new`] for a weight of a group of `groups` weights of one shape whose products of 1
+    /// row run in one launch.
+    pub(super) fn in_group(
+        dev: &Arc<CudaDevice>,
+        p: &Projection,
+        choices: &Choices,
+        groups: usize,
+    ) -> Result<Self> {
         let (out, inp) = match p.dims().as_slice() {
             [out, inp] => (*out, *inp),
             _ => return Err(Error::msg("a card mixer weight is a matrix")),
@@ -468,7 +517,7 @@ impl PackedDev {
                         dev.quantized_fn("cx_quantize_q8_k")?;
                         dev.quantized_fn(kernel)?;
                         dev.quantized_fn(expand)?;
-                        unit = Some(choices.unit(dev.ordinal(), q.dtype(), out, inp));
+                        unit = Some(choices.unit(dev.ordinal(), q.dtype(), (out, inp), groups));
                         Form::Exact(qmm, kernel)
                     }
                     _ => Form::Blocks(qmm),
@@ -530,6 +579,7 @@ impl PackedDev {
             bytes,
             tile_bytes: QUANT_LINEAR_TILE_BYTES,
             unit,
+            groups,
             host,
         })
     }
@@ -714,6 +764,40 @@ impl PackedDev {
         let (Form::Blocks(qmm) | Form::Exact(qmm, _)) = &self.form else {
             return Err(Error::msg("this form has no quantised matmul"));
         };
+        // One row is quantised and multiplied in place, with the kernels of the matmul's forward.
+        if let Some(kernel) = qmm.kernel().filter(|k| rows == 1 && k.takes_one_row()) {
+            if let Some(q81) = kernel.quantize_row(&x.slice(0..inp))? {
+                let mut y = alloc_f32(dev, "mixer product", out)?;
+                if kernel.matvec_row_into(&q81.slice(..), &mut y.slice_mut(..))? {
+                    return Ok(y);
+                }
+            }
+        }
+        self.apply_q8_1_forward(qmm, x, rows)
+    }
+
+    /// [`Self::apply_q8_1_forward`] of a weight in GGUF blocks.
+    #[cfg(test)]
+    pub(super) fn apply_through_forward(
+        &self,
+        x: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>> {
+        let (Form::Blocks(qmm) | Form::Exact(qmm, _)) = &self.form else {
+            return Err(Error::msg("this form has no quantised matmul"));
+        };
+        self.apply_q8_1_forward(qmm, x, rows)
+    }
+
+    /// The product of the card's quantised matmul through its forward over a copy of the rows.
+    fn apply_q8_1_forward(
+        &self,
+        qmm: &QMatMul,
+        x: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>> {
+        let dev: &CudaDevice = &self.dev;
+        let (out, inp) = (self.out, self.inp);
         let xt = Tensor::from_cuda_storage(
             CudaStorage::F32(copy_f32(dev, "mixer input", &x.slice(0..rows * inp))?),
             self.dev.clone(),
@@ -843,12 +927,21 @@ impl PackedDev {
         let mut samples: Vec<Vec<f64>> = vec![Vec::new(); routes.len()];
         let mut before: Option<Vec<f64>> = None;
         let mut round = 1usize;
+        let grouped = match rows {
+            1 => self.group_launch(qmm, x)?,
+            _ => None,
+        };
         loop {
             for _ in 0..round {
                 for (k, &route) in routes.iter().enumerate() {
-                    let t = timed(dev, events, || {
-                        self.product(route, qmm, kernel, x, rows).map(drop)
-                    })?;
+                    let t = match (&grouped, route) {
+                        (Some(g), Route::Q81) => {
+                            timed(dev, events, || g.run(dev))? / g.groups as f64
+                        }
+                        _ => timed(dev, events, || {
+                            self.product(route, qmm, kernel, x, rows).map(drop)
+                        })?,
+                    };
                     samples[k].push(t);
                 }
             }
@@ -864,6 +957,41 @@ impl PackedDev {
             before = Some(now);
             round = samples[0].len();
         }
+    }
+
+    /// The launch the products of 1 row of this weight's group run in q8_1 blocks, over the row
+    /// `x` once a weight and this weight's blocks once a weight.
+    ///
+    /// `None` for a weight alone.
+    /// `None` where the group's products run one launch a weight.
+    fn group_launch<'a>(
+        &self,
+        qmm: &'a QMatMul,
+        x: &CudaSlice<f32>,
+    ) -> Result<Option<GroupLaunch<'a>>> {
+        let Some(kernel) = qmm
+            .kernel()
+            .filter(|k| self.groups > 1 && k.takes_one_row())
+        else {
+            return Ok(None);
+        };
+        let group = vec![kernel; self.groups];
+        let Some(addresses) = QKernelMatMul::group_addresses(&group) else {
+            return Ok(None);
+        };
+        let row = super::card_mixers::download(&self.dev, x, self.inp)?;
+        let table = self
+            .dev
+            .stream()
+            .clone_htod(&addresses)
+            .map_err(|e| Error::msg(format!("group addresses upload: {e}")))?;
+        Ok(Some(GroupLaunch {
+            kernel,
+            rows: upload_f32(&self.dev, "measured rows", &row.repeat(self.groups))?,
+            table,
+            groups: self.groups,
+            out: self.out,
+        }))
     }
 
     /// The route of `rows` rows of a Q4_K or Q6_K weight: the unit's decision for their size,
@@ -937,6 +1065,35 @@ impl PackedDev {
         );
         measured.sizes.insert(size, decision);
         Ok(route)
+    }
+
+    /// The route of 1 row of a Q4_K or Q6_K weight, `None` before it is measured.
+    fn row_route(&self) -> Option<Route> {
+        #[cfg(test)]
+        if let Some(r) = route::forced() {
+            return Some(r);
+        }
+        let Some(unit) = &self.unit else {
+            return Some(Route::HostSteps);
+        };
+        let measured = unit.measured();
+        measured.sizes.get(&1).map(|d| d.route)
+    }
+
+    /// The kernel matmul a product of 1 row runs through [`Self::apply_q8_1`].
+    ///
+    /// `None` for another product, or before the product of 1 row is measured.
+    pub(super) fn row_kernel(&self) -> Option<&crate::tensor::quantized::QKernelMatMul> {
+        match &self.form {
+            Form::Blocks(qmm) => qmm.kernel(),
+            Form::Exact(qmm, _) if self.row_route() == Some(Route::Q81) => qmm.kernel(),
+            _ => None,
+        }
+    }
+
+    /// Values of a row this weight reads.
+    pub(super) fn inp(&self) -> usize {
+        self.inp
     }
 
     /// The errors and the decision of the unit for `rows` rows, `None` before they are measured.

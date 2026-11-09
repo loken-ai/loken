@@ -103,6 +103,31 @@ pub fn pool_mark(ordinal: usize) -> u64 {
     used
 }
 
+/// What the default pool on `ordinal` reserves from the card and what of it is in use.
+///
+/// The reserved bytes not in use serve the pool's next allocations.
+/// The driver's free count does not include them.
+pub fn pool_use(ordinal: usize) -> (u64, u64) {
+    use crate::tensor::gpu_runtime::driver::sys::{cuMemPoolGetAttribute, CUmemPool_attribute};
+    let Some(pool) = default_pool(ordinal) else {
+        return (0, 0);
+    };
+    let (mut reserved, mut used): (u64, u64) = (0, 0);
+    unsafe {
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            &mut reserved as *mut u64 as *mut std::ffi::c_void,
+        );
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut used as *mut u64 as *mut std::ffi::c_void,
+        );
+    }
+    (reserved, used)
+}
+
 /// The memory the recorded graphs of `ordinal` hold: in use, reserved, and their peaks since the
 /// device last reset them.
 pub fn graph_mem(ordinal: usize) -> [u64; 4] {

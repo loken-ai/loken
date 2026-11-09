@@ -350,6 +350,278 @@ fn wide_sparse_real_exact_card() {
         table(name, &runs, &lens, &host_l2);
     }
     route::clear();
+    // The load's split puts the weights every token reads on the card, by measurement.
+    let demand = card_demand(&facts, &meta, longest + STEPS);
+    let plan = card_plan(&facts, &meta, longest + STEPS);
+    card.note_wide_card_rooms(
+        &plan,
+        &[],
+        demand.kv_bytes_per_layer,
+        demand.runtime_reserve,
+    );
+    card.place_always_read(crate::inference::place::expert_variants::VariantChoice::Plan);
+    println!(
+        "always-read: residency {:?}, rooms left {:?}",
+        card.wide_card_residency(),
+        card.wide_card_rooms()
+    );
+    let runs = both_runs(&mut card, &prompts);
+    table("card_always", &runs, &lens, &host_l2);
+    route::set(Route::HostSteps);
+    let runs = both_runs(&mut card, &prompts);
+    table("always_q8k", &runs, &lens, &host_l2);
+    route::clear();
+}
+
+/// Greedy steps a free decode of the batched path runs to find where 2 paths part.
+const FREE_STEPS: usize = 48;
+
+/// The logits of a prompt through the batched decode: the prefill's last row, then 1 single-row
+/// step per token.
+///
+/// `feed` gives the token of each step, else the step takes the greedy token of the last
+/// logits.
+fn batched(
+    model: &mut GenericHeteroTransformer,
+    ids: &[u32],
+    steps: usize,
+    feed: Option<&[u32]>,
+) -> Vec<Vec<f32>> {
+    let mut seq = model.sequence_mixers().expect("a sequence");
+    let mut out = vec![row(&model
+        .prefill_sequence(ids, &mut seq)
+        .expect("the prefill"))];
+    for i in 0..steps {
+        let t = match feed {
+            Some(f) => f[i],
+            None => argmax(out.last().unwrap()),
+        };
+        let l = model
+            .decode_sequences(&[t], &[ids.len() + i], &mut [&mut seq])
+            .expect("a decode step");
+        out.push(row(&l));
+    }
+    out
+}
+
+/// The gap between the 2 largest logits of `v`.
+fn margin(v: &[f32]) -> f32 {
+    let top = argmax(v) as usize;
+    let second = (0..v.len())
+        .filter(|&k| k != top)
+        .map(|k| v[k])
+        .fold(f32::MIN, f32::max);
+    v[top] - second
+}
+
+/// What one path gives on one prompt against the reference.
+struct GatePath {
+    /// The relative L2 distance of the prefill's last logits to the reference's.
+    l2: f64,
+    /// Per step fed the reference's tokens, whether the greedy token is the reference's next.
+    forced: Vec<bool>,
+    /// The greedy tokens of a free decode, the prefill's first.
+    free: Vec<u32>,
+}
+
+/// `path` on `ids`: the prefill's distance, the steps fed the reference's tokens `greedy`, and a
+/// free decode of `free_steps` steps.
+fn gate_path(
+    model: &mut GenericHeteroTransformer,
+    ids: &[u32],
+    (greedy, last): (&[u32], &[f32]),
+    free_steps: usize,
+) -> (GatePath, Vec<Vec<f32>>) {
+    let forced_logits = batched(model, ids, STEPS - 1, Some(greedy));
+    let forced = forced_logits[1..]
+        .iter()
+        .zip(&greedy[1..])
+        .map(|(l, &want)| argmax(l) == want)
+        .collect();
+    let l2 = closeness(last, &forced_logits[0]).1;
+    let free_logits = batched(model, ids, free_steps, None);
+    let free = free_logits.iter().map(|l| argmax(l)).collect();
+    (GatePath { l2, forced, free }, free_logits)
+}
+
+/// The index of the first token where `a` and `b` part, their length when they never do.
+fn parting(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The single decoded row over the card stream against the host's batched decode, both against
+/// the reference kept by `wide_sparse_real_exact_reference`, in 1 process.
+///
+/// The model loads its mixers on the card by the plan and places the weights every token reads
+/// as the load does.
+/// Every layer whose mixer is on a card then keeps its Sinkhorn mixers there.
+/// The host path runs with the Sinkhorn mixers taken off the layers, the card stream with them
+/// back, unmeasured, so each layer is admitted or refused at its first decoded row.
+///
+/// The card stream passes when:
+/// - on every prompt its prefill is no farther from the reference than the host path's,
+/// - fed the reference's tokens, it gives at least as many of the reference's next tokens as the
+///   host path, counted over every prompt.
+///
+/// The tokens of the free decodes that match the reference's are counted beside them.
+/// Where the free decodes of the 2 paths part, the card stream is fed the host path's tokens and
+/// the steps where its greedy token differs are printed with both margins.
+#[test]
+#[ignore]
+fn wide_sparse_real_exact_card_stream() {
+    use crate::inference::place::expert_variants::VariantChoice;
+    assert!(
+        Device::new_cuda(0).is_ok(),
+        "no CUDA device: this test runs the card stream"
+    );
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+    let path = blob(TAG);
+    let (meta, prompts) = prompts_of(&path);
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    let longest = *lens.iter().max().unwrap();
+    let content = SplitGguf::open(&path)
+        .expect("the file opens")
+        .merged_content();
+    let facts = Facts {
+        mixer_bytes: super::wide_sparse_plan::card_mixer_bytes(&content)
+            .expect("a wide residual")
+            .per_layer,
+        width: meta.d_model,
+    };
+    let ids = longest + FREE_STEPS;
+    let demand = card_demand(&facts, &meta, ids);
+    let plan = card_plan(&facts, &meta, ids);
+    let (mut model, ordinal) = load(&path, &|_, _| plan.clone());
+    model.note_wide_card_rooms(
+        &plan,
+        &[],
+        demand.kv_bytes_per_layer,
+        demand.runtime_reserve,
+    );
+    model.place_always_read(VariantChoice::Plan);
+    let choices = super::card_packed::Choices::default();
+    for il in 0..model.layers.len() {
+        let held = model.layers[il]
+            .sinkhorn
+            .as_ref()
+            .is_some_and(|b| b.card_mix.ordinal().is_some());
+        if let (false, Some(o)) = (held, model.layers[il].mixer.card_ordinal()) {
+            model
+                .keep_always_read(
+                    o,
+                    super::wide_always_read::AlwaysRead::Sinkhorn,
+                    il,
+                    &choices,
+                )
+                .expect("the Sinkhorn mixers fit on the card");
+        }
+    }
+    let on_card = model
+        .layers
+        .iter()
+        .filter(|l| {
+            l.sinkhorn
+                .as_ref()
+                .is_some_and(|b| b.card_mix.ordinal().is_some())
+        })
+        .count();
+    println!(
+        "card stream: ordinal {ordinal}, {on_card} of {} layers keep their Sinkhorn mixers on a card, resident {} MB",
+        model.layers.len(),
+        resident_mb()
+    );
+    let reference = load_reference();
+
+    // The host path: every layer's Sinkhorn mixers off the card.
+    let mut kept: Vec<_> = model
+        .layers
+        .iter_mut()
+        .map(|l| l.sinkhorn.as_mut().map(|b| std::mem::take(&mut b.card_mix)))
+        .collect();
+    let host: Vec<(GatePath, Vec<Vec<f32>>)> = prompts
+        .iter()
+        .zip(&reference)
+        .map(|(ids, (g, l))| gate_path(&mut model, ids, (g, l), FREE_STEPS))
+        .collect();
+
+    // The card stream: the mixers back, each layer measured at its first decoded row.
+    for (l, k) in model.layers.iter_mut().zip(kept.iter_mut()) {
+        if let (Some(b), Some(k)) = (l.sinkhorn.as_mut(), k.take()) {
+            b.card_mix = k;
+        }
+    }
+    let mut prefill_ok = true;
+    // Reference tokens found over every prompt, host then card: fed, then free.
+    let (mut forced, mut free, mut steps) = ([0usize; 2], [0usize; 2], [0usize; 2]);
+    for (p, ids) in prompts.iter().enumerate() {
+        let (greedy, last) = (&reference[p].0, &reference[p].1);
+        let (card, _) = gate_path(&mut model, ids, (greedy, last), STEPS - 1);
+        let h = &host[p].0;
+        let host_part = parting(&h.free, greedy);
+        let card_part = parting(&card.free, greedy);
+        let count = |v: &[bool]| v.iter().filter(|&&b| b).count();
+        forced[0] += count(&h.forced);
+        forced[1] += count(&card.forced);
+        free[0] += host_part;
+        free[1] += card_part;
+        steps[0] += h.forced.len();
+        steps[1] += greedy.len();
+        prefill_ok &= card.l2 <= h.l2;
+        println!(
+            "GATE {:<6} len {:>4}: prefill l2 host {:.6} card {:.6}, fed the reference's tokens host {:?} card {:?}, free decode parts from the reference at host {host_part} card {card_part} of {STEPS}",
+            PROMPTS[p].0,
+            lens[p],
+            h.l2,
+            card.l2,
+            h.forced.iter().map(|&b| b as u8).collect::<Vec<_>>(),
+            card.forced.iter().map(|&b| b as u8).collect::<Vec<_>>(),
+        );
+        // The card stream over the host path's free decode.
+        let fed = &h.free;
+        let card_logits = batched(&mut model, ids, FREE_STEPS, Some(fed));
+        let host_logits = &host[p].1;
+        for (k, (c, hl)) in card_logits.iter().zip(host_logits).enumerate() {
+            if argmax(c) != argmax(hl) {
+                println!(
+                    "PART {:<6} step {k}: host {} margin {:.4}, card {} margin {:.4}, card's logit of the host's token {:.4}, logits apart {:.3e}",
+                    PROMPTS[p].0,
+                    argmax(hl),
+                    margin(hl),
+                    argmax(c),
+                    margin(c),
+                    c[argmax(hl) as usize],
+                    closeness(hl, c).1
+                );
+            }
+        }
+    }
+    let admitted = model
+        .layers
+        .iter()
+        .filter(|l| {
+            l.sinkhorn
+                .as_ref()
+                .is_some_and(|b| b.card_mix.verdict() == Some(true))
+        })
+        .count();
+    let pass = prefill_ok && forced[1] >= forced[0];
+    println!(
+        "VERDICT card_stream: {admitted} layers admitted, reference tokens fed host {} card {} of {}, free host {} card {} of {}, prefill no farther {prefill_ok}: {}",
+        forced[0],
+        forced[1],
+        steps[0],
+        free[0],
+        free[1],
+        steps[1],
+        if pass { "pass" } else { "FAIL" }
+    );
+    assert!(
+        pass,
+        "the card stream finds fewer reference tokens than the host path"
+    );
 }
 
 /// The card model with and without the routed experts the load gives the card, against the
@@ -391,7 +663,12 @@ fn wide_sparse_real_exact_card_tier() {
     println!("card: resident {} MB, ordinal {ordinal}", resident_mb());
     let bare = both_runs(&mut card, &prompts);
     let bare_l2 = table("card_bare", &bare, &lens, &[]);
-    card.note_wide_card_rooms(&plan, demand.kv_bytes_per_layer, demand.runtime_reserve);
+    card.note_wide_card_rooms(
+        &plan,
+        &[],
+        demand.kv_bytes_per_layer,
+        demand.runtime_reserve,
+    );
     println!("rooms for routed experts: {:?}", card.wide_card_rooms());
     let (_, secs) = timed(|| card.place_wide_experts(VariantChoice::Plan));
     let kept = card.wide_card_expert_count();

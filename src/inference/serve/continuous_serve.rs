@@ -623,7 +623,16 @@ impl BatchedModel for SequenceBatched {
         let mut out = vec![0u32; items.len()];
         for (i, it) in items.iter().enumerate().filter(|(_, it)| it.is_prefill) {
             let mut mixers = self.model.sequence_mixers()?;
-            let (logits, covered) = self.prefill(&it.tokens, &mut mixers)?;
+            // A prompt that runs out of card memory runs again once the lent card room is given
+            // back.
+            let (logits, covered) = match self.prefill(&it.tokens, &mut mixers) {
+                Err(e) if e.is_oom() => {
+                    self.model.give_back_all_lent_room();
+                    mixers = self.model.sequence_mixers()?;
+                    self.prefill(&it.tokens, &mut mixers)?
+                }
+                done => done?,
+            };
             out[i] = sample_row(&logits, 0, &it.sampling, &it.recent_tokens)?;
             let seq = Sequence {
                 mixers,

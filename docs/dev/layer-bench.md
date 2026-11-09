@@ -24,7 +24,7 @@ cargo bench --features cuda,microbench --bench layerbench -- /models/large.gguf 
 | `--layers` | The layers held, `from..to` with the end excluded, or 1 index. | required |
 | `--tokens` | Decode steps timed. | 32 |
 | `--warm` | Decode steps run before the timed ones. | 4 |
-| `--placement` | `auto` as served, `host` with no card. `cards` is refused: the generic route keeps no host tier for the experts. | `auto` |
+| `--placement` | `auto` as served, `host` with no card. `cards` is refused: the generic route keeps the host tier a served load keeps. | `auto` |
 | `--page-cache` | `warm` reads the held layers' experts in first, `cold` drops them first. | `warm` |
 | `--readahead` | Refused: the generic route has no read-ahead depth to pin for the experts. | none |
 | `--card-experts` | Routed experts per held layer the first card keeps, as the room it gives them. | what the card has free |
@@ -71,7 +71,7 @@ The table starts with the run:
 
 - the layers held
 - the placement obtained
-- the experts the cards hold per layer (the host tier's slots are 0 on the generic route)
+- the experts the cards hold per layer, and the host tier's slots (0 when the host holds every expert)
 - where the routing heat came from
 
 Then it gives the time per token over the timed steps.
@@ -86,7 +86,7 @@ The generic route has no such seam, so the section is empty.
 The counters, over the timed steps:
 
 - the expert uploads to the cards (a stage the generic route does not record)
-- the host tier's hits, misses and evictions (0 on the generic route)
+- the host tier's hits, misses and experts let go
 - the major page faults
 - the bytes the process read from disk
 

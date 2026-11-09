@@ -78,6 +78,11 @@ impl GenericHeteroTransformer {
             );
         }
         ws.heat = ranks_from_counts(&profile.counts, layers, experts, &ws.prior);
+        let used = ws.meta.mixture.used;
+        let shares: Vec<Option<Vec<f64>>> = (0..layers)
+            .map(|l| super::wide_always_read::count_shares(profile.layer(l), used))
+            .collect();
+        ws.shares = shares.iter().any(Option::is_some).then_some(shares);
         Ok(())
     }
 }

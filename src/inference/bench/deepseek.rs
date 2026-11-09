@@ -63,8 +63,8 @@ impl WideSubject {
         let (from, to) = controls.layers;
         if controls.placement == Placement::Cards {
             return Err(
-                "placement cards: the generic route keeps no host tier for the experts of a \
-                 wide residual, so it places as auto does; ask for auto"
+                "placement cards: the generic route keeps the host tier a served load keeps \
+                 for the experts of a wide residual, so it places as auto does; ask for auto"
                     .to_string(),
             );
         }
@@ -214,7 +214,7 @@ impl WideSubject {
                 false,
             )?;
             if let Some(d) = demand {
-                m.note_wide_card_rooms(&placed, d.kv_bytes_per_layer, d.runtime_reserve);
+                m.note_wide_card_rooms(&placed, &[], d.kv_bytes_per_layer, d.runtime_reserve);
             }
             Ok::<_, crate::tensor::Error>((m, placed))
         };
@@ -267,6 +267,7 @@ impl WideSubject {
             vocab: 0,
             expert_bytes: 0,
             card_experts: Vec::new(),
+            host_slots: Vec::new(),
         })
     }
 }
@@ -282,7 +283,7 @@ impl super::subject::Subject for WideSubject {
             activated: facts.activated,
             expert_bytes: facts.expert_bytes,
             cards_opened: self.cards_opened,
-            host_slots_per_layer: vec![0; facts.card_experts.len()],
+            host_slots_per_layer: facts.host_slots,
             card_experts_per_layer: facts.card_experts,
             heat_source: self.heat.name().to_string(),
         }
@@ -348,8 +349,7 @@ impl super::subject::Subject for WideSubject {
     }
 
     fn tier_stats(&self) -> (u64, u64, u64) {
-        // The generic route keeps no host tier for the experts of a wide residual.
-        (0, 0, 0)
+        self.model.host_tier_stats()
     }
 }
 

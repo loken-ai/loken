@@ -3314,6 +3314,37 @@ pub fn mmvq_f32_bias(
     Ok(dst)
 }
 
+/// One-row F32 mat-vec written to `dst`, `n` values: the bits of [`mmvq_f32`] over one row.
+///
+/// `q8_1` and `dst` may be views into larger buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn mmvq_f32_into(
+    dev: &CudaDevice,
+    tag: &str,
+    weight_blob: &CudaSlice<u8>,
+    q8_1: &CudaView<'_, u8>,
+    dst: &mut crate::tensor::gpu_runtime::driver::CudaViewMut<'_, f32>,
+    k: usize,
+    n: usize,
+    smallk: bool,
+) -> Result<()> {
+    require_len("mmvq output", dst.len(), n)?;
+    launch_mmvq(
+        dev,
+        tag,
+        "f32",
+        weight_blob,
+        q8_1,
+        dst,
+        k,
+        n,
+        1,
+        smallk,
+        None,
+        None,
+    )
+}
+
 /// Two one-row F32 mat-vecs of one format over the same activation, in one launch: `n0` rows
 /// of the first weight, then `n1` of the second. Every row has the bits of the one-row launch
 /// of its own matrix.
@@ -3360,6 +3391,57 @@ pub fn mmvq_f32_dual(
     b.arg(&blocks0);
     unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
     Ok((dst0, dst1))
+}
+
+/// One-row F32 mat-vecs of `groups` weights of one format and shape `[n, k]`, in one launch.
+///
+/// `table` holds the address of each weight's blob on the card.
+/// Weight `g` reads the q8_1 blocks of `q8_1` from `g * k / 32`.
+/// Weight `g` writes the `n` values of `dst` from `g * n`.
+/// Every output row has the bits of [`mmvq_f32_into`] over its own weight and blocks.
+/// `k` is a multiple of the row padding of the q8_1 blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn mmvq_f32_grouped(
+    dev: &CudaDevice,
+    tag: &str,
+    table: &CudaSlice<u64>,
+    groups: usize,
+    q8_1: &CudaView<'_, u8>,
+    dst: &mut crate::tensor::gpu_runtime::driver::CudaViewMut<'_, f32>,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    use crate::tensor::quantized::MATRIX_ROW_PADDING;
+    if !k.is_multiple_of(MATRIX_ROW_PADDING) || table.len() < groups {
+        return Err(Error(format!(
+            "mmvq grouped: k {k}, {} addresses for {groups} weights",
+            table.len()
+        )));
+    }
+    require_len("mmvq grouped output", dst.len(), groups * n)?;
+    require_len(
+        "mmvq grouped q8_1 input",
+        q8_1.len(),
+        groups * (k / 32 * 36),
+    )?;
+    let kernel = format!("mmvq_gguf_{tag}_f32_plain_grouped_cuda1");
+    let func = dev.mmvq_fn(&kernel)?;
+    let (k_i, n_i, stride_i) = (kernel_int(k)?, kernel_int(n)?, kernel_int(k / 32)?);
+    let cfg = LaunchConfig {
+        grid_dim: (kernel_int(groups * n)? as u32, 1, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let stream = dev.stream();
+    let mut b = stream.launch_builder(&func);
+    b.arg(table);
+    b.arg(q8_1);
+    b.arg(dst);
+    b.arg(&k_i);
+    b.arg(&n_i);
+    b.arg(&stride_i);
+    unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
+    Ok(())
 }
 
 /// The largest batch the plain mat-vec kernels run with the warp count of a single column

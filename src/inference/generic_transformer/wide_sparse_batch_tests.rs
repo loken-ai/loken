@@ -17,7 +17,7 @@ use crate::inference::serve::continuous_batch::{ContinuousBatchEngine, GenReq, S
 use crate::inference::serve::continuous_serve::SequenceBatched;
 
 /// Tokens each sequence decodes after the one its prompt gives.
-const STEPS: usize = 8;
+pub(super) const STEPS: usize = 8;
 
 /// Steps the first 3 sequences take before the 4th joins.
 const LATE: usize = 2;
@@ -39,7 +39,7 @@ fn ids(tokens: &[u32]) -> Tensor {
 }
 
 /// The greedy choice of the continuous-batch server's sampler, on logits `[1, vocab]`.
-fn greedy(logits: &Tensor) -> u32 {
+pub(super) fn greedy(logits: &Tensor) -> u32 {
     logits
         .flatten_all()
         .unwrap()
@@ -53,7 +53,7 @@ fn greedy(logits: &Tensor) -> u32 {
         .unwrap()
 }
 
-fn bits(logits: &Tensor) -> Vec<u32> {
+pub(super) fn bits(logits: &Tensor) -> Vec<u32> {
     logits
         .flatten_all()
         .unwrap()

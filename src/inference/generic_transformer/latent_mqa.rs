@@ -102,6 +102,18 @@ pub struct LatentMqaState {
     /// The last `min(len, window)` key rows, oldest first, `head_dim` values each, rotated and
     /// rounded to the fp8 grid.
     pub window: Vec<f32>,
+    /// The name of the rows the state holds.
+    ///
+    /// Every forward gives the state a name no other state had, see [`fresh_stamp`].
+    /// A copy keeps the name with the rows.
+    /// 0 names no rows a card holds.
+    pub stamp: u64,
+}
+
+/// A name no state had before, never 0.
+pub(super) fn fresh_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A latent attention layer over 1 shared key head.
@@ -338,10 +350,10 @@ impl LatentMqa {
         let x2 = host_rows(x, seq, hidden)?;
         let d = self.dims;
         #[cfg(feature = "gpu")]
-        if self.card.is_some() {
+        if let Some(card) = self.card.clone() {
             return self
                 .forward_card(&x2, index_pos)?
-                .reshape((1, seq, d.out_width()))?
+                .reshape((1, seq, card.width(&d)))?
                 .to_device(&device)?
                 .to_dtype(dtype);
         }
@@ -352,6 +364,7 @@ impl LatentMqa {
 
         // The kept rows come before the new ones. Row `old + i` is query `i`'s own.
         let mut state = self.state.take().unwrap_or_default();
+        state.stamp = fresh_stamp();
         let old = state.window.len() / hd;
         let mut keys = std::mem::take(&mut state.window);
         keys.extend_from_slice(&kv);
@@ -776,6 +789,21 @@ mod tests {
         mixer.restore(&mark).unwrap();
         let again = flat(&mixer.forward(&x, 4).unwrap());
         assert_eq!(bits(&first), bits(&again));
+    }
+
+    /// Every forward names the state anew, never 0, and a copy keeps the name.
+    #[test]
+    fn every_forward_names_the_state_anew_and_a_copy_keeps_the_name() {
+        let (_, mut new) = pair(81);
+        let mut seen = vec![0];
+        for (pos, seq) in [(0, 3), (3, 1), (4, 1), (5, 2), (0, 2)] {
+            new.forward(&input(seq, 1 + pos as u64), pos).unwrap();
+            let stamp = new.state.as_ref().unwrap().stamp;
+            assert!(!seen.contains(&stamp), "a forward kept a name: {stamp}");
+            seen.push(stamp);
+        }
+        let copy = new.state.clone().unwrap();
+        assert_eq!(copy.stamp, *seen.last().unwrap());
     }
 
     #[test]

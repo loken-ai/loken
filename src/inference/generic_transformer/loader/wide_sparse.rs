@@ -774,6 +774,7 @@ impl GenericHeteroTransformer {
                 variants: Default::default(),
                 card: Default::default(),
                 watch: Default::default(),
+                host: None,
             };
             // An engram layer: its table, under its own name or as the table every layer shares,
             // its fused key and value projection, and its gate.
@@ -831,6 +832,7 @@ impl GenericHeteroTransformer {
                 ffn,
                 carry: carry.clone(),
                 engram: layer_engram,
+                card_mix: Default::default(),
                 capture: None,
             };
 
@@ -998,6 +1000,11 @@ impl GenericHeteroTransformer {
             prior: meta.mixture.hot.clone(),
             heat: None,
             card_rooms: Vec::new(),
+            lent: Vec::new(),
+            savings: Vec::new(),
+            shares: None,
+            card_head: Default::default(),
+            head_collapse: Default::default(),
         };
         tensors.finish();
         let mut model = Self {
@@ -1157,6 +1164,7 @@ fn build_block_draft(tensors: &Tensors<'_, '_>, meta: BlockDraftMeta) -> Result<
             variants: Default::default(),
             card: Default::default(),
             watch: Default::default(),
+            host: None,
         };
         stages.push(DraftStage {
             attn,

@@ -100,7 +100,16 @@ The heat is the model's routing profile in `profiles/` of the store.
 The routing prior orders the experts the profile never counted, and every expert when there is no profile.
 The prior is the one the file records, else the one a companion GGUF beside it declares.
 A wide-residual model keeps its hottest routed experts on a card when the load measures the card faster than the host's cores on a token's experts.
+The host then keeps, per layer, the experts its rows routed to most recently, as many as its memory holds beside a request's needs.
+Every other routed expert is read from the file at its use and leaves the page cache after it.
 The card keeps them in the room it has left after the token mixers, the cache and a request's work.
+Every card the load was offered takes part, the cards the plan leaves out included.
+A card outside the plan keeps routed experts only: its room is its free memory less a request's work.
+The cards take the experts in heat order, the first card by ordinal the hottest, the next card the next ones.
+Each card runs its experts on a thread of its own, beside the host's cores.
+The weights every token reads take their part of the room of the plan's card first: the output projections, the shared experts, the routers and the head.
+The load times each kind on the host and on the card, and keeps it on the card when a byte of it saves more host time than a byte of routed experts.
+The load log names what it measured and kept.
 An expert on a card gives the bits it gives on the host.
 The other routed experts run on the host's cores, read from their file.
 The `fidelity` level in [Configuration](CONFIGURATION.md) picks the file:
@@ -207,6 +216,19 @@ The hyper-connection tensors of the file or the checkpoint directory select its 
 The routed experts stay in the file, which may be split, and are read as routing asks for them.
 The placement plan decides which layers sit on the cards.
 The card tier keeps the busiest routed experts on a card when the card measures faster than the host.
+A card the plan leaves out keeps routed experts too, the next ones in heat order, and no cache.
+It takes a layer's feed-forward input and gives back the outputs of its experts.
+A run on it that fails leaves those experts to the host for the step.
+The card then drops its coldest experts before the next forward until the run's bytes are free.
+The card of a layer's token mixer also keeps the layer's output projection, shared expert and router when the load measures that they save more there than routed experts.
+Until a sequence passes the working window, these weights and experts also take the card room kept for a larger cache.
+They share it in 1 ranking, by the host time a byte saves on the card.
+A forward that needs that room takes it back first: the card drops what saves the least per byte, coldest experts and cheapest weights alike.
+A prompt also reads the card's free memory first and takes back what the request's work and the prompt's cache would lack.
+A prompt that still runs out of card memory gives back all the lent room and runs again.
+The host runs each dropped weight from then on, as it runs a weight the load leaves on the host.
+The next load places them again.
+A decoded row's router runs on the card with the host's bits, so the card never changes the experts a row routes to.
 A packed weight on the card runs the fastest of its products that is no farther from the exact product than the host.
 Products whose measured times differ by less than their measured noise are tied.
 A tie falls to the product nearest the exact one, so the timing noise of a load does not change the text.

@@ -24,7 +24,7 @@
 //! does.
 
 use super::latent_mqa::{
-    host_rows, phases, pow2_ceil, rotate_tails, LatentMqa, LatentMqaState, SCALE_FLOOR,
+    fresh_stamp, host_rows, phases, pow2_ceil, rotate_tails, LatentMqa, LatentMqaState, SCALE_FLOOR,
 };
 use super::wide_sparse_config::{LayerKind, WideSparseMeta};
 use crate::tensor::blockscaled::projection::Projection;
@@ -119,14 +119,16 @@ pub struct BandIndexerWeights {
 /// What a band layer keeps of the tokens it has seen.
 #[derive(Clone, Debug, Default)]
 pub struct BandState {
-    /// Tokens seen and the window of key rows.
+    /// Tokens seen, the window of key rows and the name of the whole state.
     pub window: LatentMqaState,
     /// Compressed rows built, on a kv-source.
     pub groups: usize,
     /// `groups` rows of `head_dim`, rotated and rounded to fp4, on a kv-source.
-    pub compressed: Vec<f32>,
+    ///
+    /// The cell of the band shares them with the layers that read them.
+    pub compressed: Arc<Vec<f32>>,
     /// `groups` index keys of `index_head_dim`, on a kv-source that is an index-source.
-    pub index_keys: Vec<f32>,
+    pub index_keys: Arc<Vec<f32>>,
     /// The input rows of the group still filling, `hidden` values each, on a kv-source.
     pub filling: Vec<f32>,
 }
@@ -138,11 +140,32 @@ pub(super) struct Stamped<T> {
     value: T,
 }
 
+/// The rows a source holds after a forward, with the names of its state around the forward.
+#[derive(Clone)]
+pub(super) struct SharedRows {
+    pub(super) rows: Arc<Vec<f32>>,
+    /// The name of the source's state before the forward, whose rows `rows` starts with.
+    pub(super) before: u64,
+    /// The name of the source's state after the forward, which holds `rows`.
+    pub(super) after: u64,
+}
+
+impl SharedRows {
+    /// Rows that no name stands for.
+    fn unnamed(rows: Vec<f32>) -> Self {
+        Self {
+            rows: Arc::new(rows),
+            before: 0,
+            after: 0,
+        }
+    }
+}
+
 /// What the sources of a band left, one value per forward over its rows.
 #[derive(Default)]
 pub(super) struct Published {
-    pub(super) compressed: Vec<Stamped<Vec<f32>>>,
-    pub(super) index_keys: Vec<Stamped<Vec<f32>>>,
+    pub(super) compressed: Vec<Stamped<SharedRows>>,
+    pub(super) index_keys: Vec<Stamped<SharedRows>>,
     pub(super) picks: Vec<Stamped<Vec<i32>>>,
     pub(super) candidates: Vec<Stamped<Vec<bool>>>,
 }
@@ -187,9 +210,10 @@ impl BandCell {
 
     /// What the sources left for the forward over the rows `first..first + rows`.
     pub fn left_at(&self, at: (usize, usize)) -> BandLeft {
+        let rows = |r: SharedRows| r.rows.to_vec();
         self.with(|p| BandLeft {
-            compressed: read(&p.compressed, at, "compressed rows").ok(),
-            index_keys: read(&p.index_keys, at, "index keys").ok(),
+            compressed: read(&p.compressed, at, "compressed rows").ok().map(rows),
+            index_keys: read(&p.index_keys, at, "index keys").ok().map(rows),
             picks: read(&p.picks, at, "compressed picks").ok(),
             candidates: read(&p.candidates, at, "candidate blocks").ok(),
         })
@@ -207,8 +231,9 @@ impl BandCell {
             }
         }
         self.with(|p| {
-            hold(&mut p.compressed, at, left.compressed);
-            hold(&mut p.index_keys, at, left.index_keys);
+            let (compressed, index_keys) = (left.compressed, left.index_keys);
+            hold(&mut p.compressed, at, compressed.map(SharedRows::unnamed));
+            hold(&mut p.index_keys, at, index_keys.map(SharedRows::unnamed));
             hold(&mut p.picks, at, left.picks);
             hold(&mut p.candidates, at, left.candidates);
         });
@@ -396,6 +421,70 @@ impl CompressedBand {
         self.base.card_bytes() + self.card_band.as_ref().map_or(0, |c| c.weight_bytes())
     }
 
+    /// Whether a decoded row on the layer's card gives its output of the hidden width there.
+    #[cfg(feature = "gpu")]
+    pub(super) fn decodes_on_card(&self) -> bool {
+        self.card_band.is_some() && self.base.projects_output()
+    }
+
+    /// The decode step of the row `row`, on the layer's card, at `index_pos`: the output row of
+    /// the hidden width, left on the card, and the rows the host state keeps, left on the card
+    /// for a later download.
+    ///
+    /// The state is unchanged until [`Self::keep_decoded`] reads those rows into it.
+    /// Refused when the layer does not decode on its card or the step does not continue the
+    /// state.
+    /// A failed step leaves no state, as a failed forward does.
+    #[cfg(feature = "gpu")]
+    pub(super) fn decode_dev(
+        &mut self,
+        row: crate::tensor::gpu_runtime::driver::CudaView<'_, f32>,
+        index_pos: usize,
+    ) -> Result<(
+        crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
+        super::card_mixers::Pending,
+    )> {
+        let Some(card_band) = self.card_band.clone() else {
+            crate::tensor::bail!("the band layer does not decode on a card");
+        };
+        if !self.base.projects_output() || index_pos == 0 || self.len() != index_pos {
+            crate::tensor::bail!(
+                "the band layer holds {} tokens and cannot decode position {index_pos} on its card",
+                self.len()
+            );
+        }
+        let Some(dev) = self.base.card.as_ref().map(|c| c.dev().clone()) else {
+            crate::tensor::bail!("the band layer is not on a card");
+        };
+        let state = self.state.take().unwrap_or_default();
+        let names = (state.window.stamp, fresh_stamp());
+        let (out, rows, keep) = card_band.decode_dev(self, row, index_pos, &state, names)?;
+        self.state = Some(state);
+        let keep = super::card_mixers::Keep::Band(keep);
+        Ok((out, super::card_mixers::Pending::new(dev, rows, keep)))
+    }
+
+    /// The rows `rows` of the last decode step on the card read into the host state, which takes
+    /// the step's name.
+    #[cfg(feature = "gpu")]
+    pub(super) fn keep_decoded(
+        &mut self,
+        keep: &super::card_mixers::Keep,
+        rows: &[f32],
+    ) -> Result<()> {
+        let super::card_mixers::Keep::Band(k) = keep else {
+            crate::tensor::bail!("a band layer keeps a band step's rows");
+        };
+        let Some(card_band) = self.card_band.clone() else {
+            crate::tensor::bail!("the band layer does not decode on a card");
+        };
+        let mut state = self.state.take().unwrap_or_default();
+        card_band.keep(self, &mut state, k, rows)?;
+        state.window.stamp = k.after();
+        self.state = Some(state);
+        Ok(())
+    }
+
     /// The ordinal of the card the layer runs on, `None` on the host.
     #[cfg(feature = "gpu")]
     pub fn card_ordinal(&self) -> Option<usize> {
@@ -406,6 +495,32 @@ impl CompressedBand {
     #[cfg(feature = "gpu")]
     pub fn card_ring_tokens(&self) -> usize {
         self.base.card_ring_tokens()
+    }
+
+    /// Drops the card's copies of the decode state: the next decode rebuilds them from the host
+    /// state and the cell.
+    #[cfg(feature = "gpu")]
+    pub(super) fn drop_card_copies(&self) {
+        self.base.drop_card_copies();
+        if let Some(c) = &self.card_band {
+            c.drop_copies();
+        }
+    }
+
+    /// Drops the names of the card's buffers, so the next decode rebuilds them from the host
+    /// state and the cell.
+    #[cfg(all(test, feature = "gpu"))]
+    pub(super) fn forget_card_copies(&self) {
+        self.base.forget_card_copies();
+        if let Some(c) = &self.card_band {
+            c.forget();
+        }
+    }
+
+    /// Times the card's buffers were rebuilt from the host state or the cell.
+    #[cfg(all(test, feature = "gpu"))]
+    pub(super) fn card_rebuilds(&self) -> u64 {
+        self.base.card_rebuilds() + self.card_band.as_ref().map_or(0, |c| c.rebuilt())
     }
 
     /// Tokens seen.
@@ -462,18 +577,36 @@ impl CompressedBand {
         let x2 = host_rows(x, seq, hidden)?;
         // A failed forward leaves no state, so the next one must start at position 0.
         let mut state = self.state.take().unwrap_or_default();
+        // The state before the forward and the state after it each have a name.
+        let names = (state.window.stamp, fresh_stamp());
         let out = match seq == 1 && index_pos > 0 {
-            true => self.decode(&x2, index_pos, &mut state)?,
-            false => self.prefill(&x2, index_pos, &mut state)?,
+            true => self.decode(&x2, index_pos, &mut state, names)?,
+            false => self.prefill(&x2, index_pos, &mut state, names)?,
         };
+        state.window.stamp = names.1;
         self.state = Some(state);
-        out.reshape((1, seq, self.base.dims.out_width()))?
+        // A card that runs the layer's output projection gives rows of the hidden width.
+        let width = out.elem_count() / seq.max(1);
+        out.reshape((1, seq, width))?
             .to_device(&device)?
             .to_dtype(dtype)
     }
 
     /// The rows `x2` `[seq, hidden]` at positions `base..base + seq` at once.
-    fn prefill(&self, x2: &Tensor, base: usize, state: &mut BandState) -> Result<Tensor> {
+    ///
+    /// `(before, after)` names the state before and after the forward.
+    fn prefill(
+        &self,
+        x2: &Tensor,
+        base: usize,
+        state: &mut BandState,
+        (before, after): (u64, u64),
+    ) -> Result<Tensor> {
+        let shared = |rows: &Arc<Vec<f32>>| SharedRows {
+            rows: Arc::clone(rows),
+            before,
+            after,
+        };
         let (seq, hidden) = x2.dims2()?;
         let m = &self.base;
         let (d, band) = (m.dims, self.band);
@@ -510,9 +643,10 @@ impl CompressedBand {
             (Some(ix), true) => {
                 let mut all = std::mem::take(&mut state.index_keys);
                 if let Some(latent) = &latent {
-                    all.extend(self.index_keys_of(ix, latent, groups, &gcos, &gsin, false)?);
+                    let fresh = self.index_keys_of(ix, latent, groups, &gcos, &gsin, false)?;
+                    Arc::make_mut(&mut all).extend(fresh);
                 }
-                let published = all.clone();
+                let published = shared(&all);
                 self.cell.with(|p| put(&mut p.index_keys, at, published));
                 Some(all)
             }
@@ -521,8 +655,12 @@ impl CompressedBand {
         let picks = match &self.indexer {
             Some(ix) => {
                 let index_keys = match &own_keys {
-                    Some(k) => k.clone(),
-                    None => self.cell.with(|p| read(&p.index_keys, at, "index keys"))?,
+                    Some(k) => Arc::clone(k),
+                    None => {
+                        self.cell
+                            .with(|p| read(&p.index_keys, at, "index keys"))?
+                            .rows
+                    }
                 };
                 let offset = old_rows + seq;
                 self.pick_prefill(ix, x2, qr, &index_keys, base, offset, &cos, &sin)?
@@ -539,11 +677,11 @@ impl CompressedBand {
                     let mut fresh = latent.clone();
                     rotate_tails(&mut fresh, 1, hd, d.rope_dim, &gcos, &gsin);
                     fp4_round_trip(&mut fresh, COMPRESSED_BLOCK, false);
-                    all.extend_from_slice(&fresh);
+                    Arc::make_mut(&mut all).extend_from_slice(&fresh);
                 }
-                let published = all.clone();
+                let published = shared(&all);
                 self.cell.with(|p| put(&mut p.compressed, at, published));
-                state.compressed = all.clone();
+                state.compressed = Arc::clone(&all);
                 state.groups = held_groups + groups;
                 if let Some(k) = own_keys {
                     state.index_keys = k;
@@ -551,9 +689,11 @@ impl CompressedBand {
                 state.filling = pooled_x.split_off(groups * ratio * hidden);
                 all
             }
-            None => self
-                .cell
-                .with(|p| read(&p.compressed, at, "compressed rows"))?,
+            None => {
+                self.cell
+                    .with(|p| read(&p.compressed, at, "compressed rows"))?
+                    .rows
+            }
         };
 
         // Per query, the window rows it sees, then its picked compressed rows.
@@ -595,11 +735,24 @@ impl CompressedBand {
     }
 
     /// The row `x2` `[1, hidden]` at position `pos`, after the rows the state holds.
-    fn decode(&self, x2: &Tensor, pos: usize, state: &mut BandState) -> Result<Tensor> {
+    ///
+    /// `(before, after)` names the state before and after the step.
+    fn decode(
+        &self,
+        x2: &Tensor,
+        pos: usize,
+        state: &mut BandState,
+        (before, after): (u64, u64),
+    ) -> Result<Tensor> {
         #[cfg(feature = "gpu")]
         if let Some(card_band) = &self.card_band {
-            return card_band.decode(self, x2, pos, state);
+            return card_band.decode(self, x2, pos, state, (before, after));
         }
+        let shared = |rows: &Arc<Vec<f32>>| SharedRows {
+            rows: Arc::clone(rows),
+            before,
+            after,
+        };
         let hidden = x2.dim(1)?;
         let m = &self.base;
         let (d, band) = (m.dims, self.band);
@@ -629,18 +782,18 @@ impl CompressedBand {
                 let mut row = latent.clone();
                 rotate_tails(&mut row, 1, hd, d.rope_dim, &gcos, &gsin);
                 fp4_round_trip(&mut row, COMPRESSED_BLOCK, false);
-                state.compressed.extend_from_slice(&row);
+                Arc::make_mut(&mut state.compressed).extend_from_slice(&row);
                 if let (Some(ix), true) = (&self.indexer, self.owns_keys()) {
                     let k = self.index_keys_of(ix, &latent, 1, &gcos, &gsin, true)?;
-                    state.index_keys.extend(k);
+                    Arc::make_mut(&mut state.index_keys).extend(k);
                 }
                 state.filling.clear();
                 state.groups += 1;
             }
-            let compressed = state.compressed.clone();
+            let compressed = shared(&state.compressed);
             self.cell.with(|p| put(&mut p.compressed, at, compressed));
             if self.owns_keys() {
-                let index_keys = state.index_keys.clone();
+                let index_keys = shared(&state.index_keys);
                 self.cell.with(|p| put(&mut p.index_keys, at, index_keys));
             }
         }
@@ -650,10 +803,12 @@ impl CompressedBand {
             None => self.cell.with(|p| read(&p.picks, at, "compressed picks"))?,
         };
         let compressed = match &self.compressor {
-            Some(_) => state.compressed.clone(),
-            None => self
-                .cell
-                .with(|p| read(&p.compressed, at, "compressed rows"))?,
+            Some(_) => Arc::clone(&state.compressed),
+            None => {
+                self.cell
+                    .with(|p| read(&p.compressed, at, "compressed rows"))?
+                    .rows
+            }
         };
         let itopk = band.index_topk;
         if picks.len() != itopk {
@@ -836,8 +991,12 @@ impl CompressedBand {
         );
         let at = (pos, 1);
         let index_keys = match self.owns_keys() {
-            true => state.index_keys.clone(),
-            false => self.cell.with(|p| read(&p.index_keys, at, "index keys"))?,
+            true => Arc::clone(&state.index_keys),
+            false => {
+                self.cell
+                    .with(|p| read(&p.index_keys, at, "index keys"))?
+                    .rows
+            }
         };
         let gtot = index_keys.len() / ihd;
         let (cos, sin) = phases(&self.base.inv_freq, pos..pos + 1);
@@ -1322,6 +1481,53 @@ mod tests {
             m.restore(mark).unwrap();
         }
         assert_eq!(run(&mut mixers), first);
+    }
+
+    /// Every forward names the source's state anew.
+    /// The cell shares the source's rows without a copy, under the names of the state before
+    /// and after the forward.
+    /// A restored copy keeps its name, and the next forward starts from it.
+    #[test]
+    fn a_source_shares_its_rows_under_the_names_of_its_state_around_each_forward() {
+        let (_, mut news) = pair();
+        let mut held = 0;
+        let mut mark = None;
+        let ops = [(0, 5), (5, 1), (6, 1), (7, 3), (10, 1), (11, 1)];
+        for (n, &(pos, seq)) in ops.iter().enumerate() {
+            news[0].cell.open(pos, seq);
+            for (i, m) in news.iter_mut().enumerate() {
+                m.forward(&input(seq, 50 + (pos + i) as u64), pos).unwrap();
+            }
+            let s = news[0].state.as_ref().unwrap();
+            let at = (pos, seq);
+            let cell = &news[0].cell;
+            let rows = cell.with(|p| read(&p.compressed, at, "rows")).unwrap();
+            let keys = cell.with(|p| read(&p.index_keys, at, "keys")).unwrap();
+            for (shared, own) in [(&rows, &s.compressed), (&keys, &s.index_keys)] {
+                assert_eq!(shared.before, held, "forward {n}: the name before");
+                assert_eq!(shared.after, s.window.stamp, "forward {n}: the name after");
+                assert!(
+                    Arc::ptr_eq(&shared.rows, own),
+                    "forward {n}: the cell copied the rows"
+                );
+            }
+            assert!(s.window.stamp != 0 && s.window.stamp != held);
+            held = s.window.stamp;
+            if n == 3 {
+                mark = news[0].state.clone();
+            }
+        }
+        // Back to the mark: the next forward starts from the mark's name.
+        let mark: BandState = mark.unwrap();
+        let named = mark.window.stamp;
+        news[0].state = Some(mark);
+        news[0].cell.open(10, 1);
+        news[0].forward(&input(1, 70), 10).unwrap();
+        let rows = news[0]
+            .cell
+            .with(|p| read(&p.compressed, (10, 1), "rows"))
+            .unwrap();
+        assert_eq!(rows.before, named);
     }
 
     #[test]

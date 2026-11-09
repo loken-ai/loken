@@ -830,6 +830,150 @@ impl QKernelMatMul {
         Ok(Some((t0, t1)))
     }
 
+    /// Whether `forward` serves one F32 row on this weight's card with the one-row mat-vec.
+    #[cfg(feature = "gpu")]
+    fn serves_one_row(&self) -> Option<&crate::tensor::cuda::CudaDevice> {
+        let crate::tensor::Device::Cuda(qdev) = &self.device else {
+            return None;
+        };
+        (self.takes_matvec(qdev, 1) && self.lora_fused.is_none()).then_some(&**qdev)
+    }
+
+    /// Whether `forward` serves one F32 row with the one-row mat-vec, which
+    /// [`Self::matvec_row_into`] runs.
+    #[cfg(feature = "gpu")]
+    pub fn takes_one_row(&self) -> bool {
+        self.serves_one_row().is_some()
+    }
+
+    /// Values of a row the weight reads and values of a row it gives.
+    pub fn shape_kn(&self) -> (usize, usize) {
+        (self.k, self.n)
+    }
+
+    /// The q8_1 blocks `forward` quantises one F32 row `x` of `k` values into.
+    ///
+    /// `None` where `forward` serves one row another way.
+    #[cfg(feature = "gpu")]
+    pub fn quantize_row(
+        &self,
+        x: &crate::tensor::gpu_runtime::driver::CudaView<'_, f32>,
+    ) -> Result<Option<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>> {
+        let Some(qdev) = self.serves_one_row() else {
+            return Ok(None);
+        };
+        if x.len() != self.k {
+            return Ok(None);
+        }
+        crate::tensor::cuda::quantize_q8_1_rows_f32_view(qdev, x, self.k, 1).map(Some)
+    }
+
+    /// `forward` of one F32 row whose q8_1 blocks are `q81`, written to the `n` values of `dst`.
+    ///
+    /// Each value has the bits `forward` gives.
+    /// False, with nothing written, where `forward` serves one row another way.
+    #[cfg(feature = "gpu")]
+    pub fn matvec_row_into(
+        &self,
+        q81: &crate::tensor::gpu_runtime::driver::CudaView<'_, u8>,
+        dst: &mut crate::tensor::gpu_runtime::driver::CudaViewMut<'_, f32>,
+    ) -> Result<bool> {
+        let (Some(qdev), Some(blob)) = (self.serves_one_row(), self.blob.as_ref()) else {
+            return Ok(false);
+        };
+        let tag = self.kernel_tag()?;
+        let smallk = self.smallk_single(self.k);
+        crate::tensor::cuda::mmvq_f32_into(qdev, tag, blob, q81, dst, self.k, self.n, smallk)?;
+        Ok(true)
+    }
+
+    /// `forward` of one F32 row through this weight and `other`, whose q8_1 blocks are `q81`, in
+    /// one launch.
+    ///
+    /// Each output has the bits of its own `forward`.
+    /// `None` where the pair is not two weights of one format the one-row kernel serves.
+    #[cfg(feature = "gpu")]
+    pub fn matvec_pair_row(
+        &self,
+        other: &Self,
+        q81: &crate::tensor::gpu_runtime::driver::CudaSlice<u8>,
+    ) -> Result<
+        Option<(
+            crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
+            crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
+        )>,
+    > {
+        let (Some(qdev), Some(odev), Some(blob0), Some(blob1)) = (
+            self.serves_one_row(),
+            other.serves_one_row(),
+            self.blob.as_ref(),
+            other.blob.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if other.k != self.k
+            || self.dtype != other.dtype
+            || qdev.ordinal() != odev.ordinal()
+            || self.smallk_single(self.k)
+            || other.smallk_single(self.k)
+        {
+            return Ok(None);
+        }
+        let tag = self.kernel_tag()?;
+        crate::tensor::cuda::mmvq_f32_dual(qdev, tag, blob0, blob1, q81, self.k, self.n, other.n)
+            .map(Some)
+    }
+
+    /// The card addresses of the blobs of `group`, in order, for [`Self::matvec_group_rows`].
+    ///
+    /// `None` unless every weight serves one row with the one-row mat-vec.
+    /// `None` unless the weights share a card, a format and a shape.
+    /// `None` when a row takes the small-K kernels.
+    /// `None` unless `k` is a multiple of the row padding of the q8_1 blocks.
+    #[cfg(feature = "gpu")]
+    pub fn group_addresses(group: &[&Self]) -> Option<Vec<u64>> {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        let first = group.first()?;
+        let qdev = first.serves_one_row()?;
+        if !first.k.is_multiple_of(super::MATRIX_ROW_PADDING) || first.smallk_single(first.k) {
+            return None;
+        }
+        let stream = qdev.stream();
+        group
+            .iter()
+            .map(|w| {
+                let same = w.serves_one_row()?.ordinal() == qdev.ordinal()
+                    && w.dtype == first.dtype
+                    && (w.k, w.n) == (first.k, first.n);
+                let blob = w.blob.as_ref().filter(|_| same)?;
+                let (address, _) = blob.device_ptr(stream);
+                Some(address)
+            })
+            .collect()
+    }
+
+    /// `forward` of one F32 row through each weight of a group, in one launch.
+    ///
+    /// `self` is the group's first weight.
+    /// `table` holds on the card the `groups` addresses [`Self::group_addresses`] gives.
+    /// Weight `g` reads the blocks of `q81` that cover values `g * k..(g + 1) * k` of the row.
+    /// Weight `g` writes values `g * n..(g + 1) * n` of `dst`.
+    /// Each output has the bits of its own weight's `forward`.
+    #[cfg(feature = "gpu")]
+    pub fn matvec_group_rows(
+        &self,
+        table: &crate::tensor::gpu_runtime::driver::CudaSlice<u64>,
+        groups: usize,
+        q81: &crate::tensor::gpu_runtime::driver::CudaView<'_, u8>,
+        dst: &mut crate::tensor::gpu_runtime::driver::CudaViewMut<'_, f32>,
+    ) -> Result<()> {
+        let qdev = self
+            .serves_one_row()
+            .ok_or_else(|| Error("a grouped mat-vec over a weight it does not serve".into()))?;
+        let tag = self.kernel_tag()?;
+        crate::tensor::cuda::mmvq_f32_grouped(qdev, tag, table, groups, q81, dst, self.k, self.n)
+    }
+
     /// [`Self::forward_quantized`] over one F32 row with `bias` (`[n]` F32 on the same card)
     /// added to each output in the kernel's store: the same bits as the product followed by a
     /// bias add, one launch fewer. `None` where another path serves the row.

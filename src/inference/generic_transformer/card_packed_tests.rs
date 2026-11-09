@@ -841,3 +841,229 @@ fn the_weights_of_a_unit_share_one_measurement() {
     );
     assert!(wider.decision(rows).is_none());
 }
+
+/// The bits of `v`.
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// `n` values of `y` read back.
+fn read(
+    dev: &crate::tensor::cuda::CudaDevice,
+    y: &crate::tensor::gpu_runtime::driver::CudaSlice<f32>,
+    n: usize,
+) -> Vec<f32> {
+    let mut v = dev.stream().clone_dtoh(y).unwrap();
+    v.truncate(n);
+    v
+}
+
+/// The shapes of a large latent attention layer's projections: the query factor, the queries,
+/// the key row, a group of the output projection and the layer's output projection.
+const LARGE: [(usize, usize); 5] = [
+    (1280, 5120),
+    (32768, 1280),
+    (512, 5120),
+    (1024, 4096),
+    (5120, 8192),
+];
+
+/// A product of 1 row on the q8_1 route has the bits of the quantised matmul's forward over a
+/// copy of the row, for every block type the route serves, on small shapes and on large ones.
+#[test]
+fn a_one_row_product_keeps_the_bits_of_the_matmul_forward() {
+    let Some(dev) = card() else {
+        return;
+    };
+    let small = [(96usize, 512usize), (40, 1024), (8, 2 * WIDE)];
+    let mut cases: Vec<(GgmlDType, (usize, usize))> = Vec::new();
+    for dtype in [GgmlDType::Q6K, GgmlDType::Q4K, GgmlDType::Q8_0] {
+        cases.extend(small.iter().map(|&s| (dtype, s)));
+    }
+    cases.extend(LARGE.iter().map(|&s| (GgmlDType::Q6K, s)));
+    for (k, &(dtype, (out, inp))) in cases.iter().enumerate() {
+        let p = blocks(out, inp, 40 + k as u64, dtype);
+        let packed = PackedDev::new(&dev, &p, &Choices::default()).unwrap();
+        let xs = values(inp, 90 + k as u64, 1.0);
+        let up = upload_f32(&dev, "x", &xs).unwrap();
+        route::set(Route::Q81);
+        let fused = packed.apply(&up, 1);
+        let chain = packed.apply_through_forward(&up, 1);
+        route::clear();
+        let (fused, chain) = (fused.unwrap(), chain.unwrap());
+        assert_eq!(
+            bits(&read(&dev, &fused, out)),
+            bits(&read(&dev, &chain, out)),
+            "{dtype:?} [{out}, {inp}]"
+        );
+    }
+}
+
+/// A window layer of `d` over Q6_K weights on card 0, with a hidden width and a query rank.
+fn q6_layer(d: LatentMqaDims, hidden: usize, q_rank: usize) -> LatentMqa {
+    layer_of(GgmlDType::Q6K, d, hidden, q_rank)
+}
+
+/// A window layer of `d` over `dtype` weights on card 0, with a hidden width and a query rank.
+fn layer_of(dtype: GgmlDType, d: LatentMqaDims, hidden: usize, q_rank: usize) -> LatentMqa {
+    let make = |o, i, s| blocks(o, i, s, dtype);
+    let group = d.heads * d.head_dim / d.o_groups;
+    let w = LatentMqaWeights {
+        wq_a: make(q_rank, hidden, 1),
+        q_norm: norm(q_rank, 2),
+        wq_b: make(d.heads * d.head_dim, q_rank, 3),
+        wkv: make(d.head_dim, hidden, 4),
+        kv_norm: norm(d.head_dim, 5),
+        sink: values(d.heads, 6, 1.0),
+        wo_a: make(d.out_width(), group, 7),
+    };
+    let inv_freq = frequencies(d.rope_dim, 0, 10_000.0, 1.0);
+    let mut m = LatentMqa::new(d, w, inv_freq).unwrap();
+    m.on_card(0, &Choices::default()).unwrap();
+    m
+}
+
+/// The fused steps of a decoded row on the q8_1 route have the bits of the steps they replace:
+/// the query factor and the key row from one quantisation and one launch, and the grouped output
+/// projection from one quantisation of the heads' outputs.
+#[test]
+fn the_fused_steps_of_a_decoded_row_keep_the_bits_of_the_chain() {
+    if card().is_none() {
+        return;
+    }
+    let large = LatentMqaDims {
+        heads: 64,
+        head_dim: 512,
+        rope_dim: 64,
+        o_groups: 8,
+        o_lora_rank: 1024,
+        window: 128,
+        eps: 1e-6,
+    };
+    let small = LatentMqaDims {
+        heads: 8,
+        head_dim: 128,
+        rope_dim: 16,
+        o_groups: 2,
+        o_lora_rank: 64,
+        window: 4,
+        eps: 1e-6,
+    };
+    // A hidden width past the small-K mat-vec, which the pair's launch does not serve.
+    for (d, hidden, q_rank) in [(small, 8 * WIDE, WIDE), (large, 5120, 1280)] {
+        let m = q6_layer(d, hidden, q_rank);
+        let card = m.card.clone().unwrap();
+        let dev = card.dev().clone();
+        let x = upload_f32(&dev, "x", &values(hidden, 7, 1.0)).unwrap();
+        let width = d.heads * d.head_dim;
+        let o = upload_f32(&dev, "o", &values(width, 8, 1.0)).unwrap();
+        let p = width / d.o_groups;
+        route::set(Route::Q81);
+        let pair = card.factor_and_key_row(&x, 1);
+        let chain = card.factor_and_key_by_forward(&x, 1);
+        let mut wide = crate::tensor::cuda::alloc_f32(&dev, "wide", d.out_width()).unwrap();
+        let grouped = card.grouped_row(&o, (p, d.o_lora_rank), &mut wide);
+        let by_columns = card.grouped_by_forward(&o, 1, (width, p, d.o_lora_rank));
+        route::clear();
+        let (qa, kv) = pair.unwrap().expect("the pair takes the one-row mat-vec");
+        let (qa_chain, kv_chain) = chain.unwrap();
+        assert_eq!(
+            bits(&read(&dev, &qa, q_rank)),
+            bits(&read(&dev, &qa_chain, q_rank)),
+            "query factor, hidden {hidden}"
+        );
+        assert_eq!(
+            bits(&read(&dev, &kv, d.head_dim)),
+            bits(&read(&dev, &kv_chain, d.head_dim)),
+            "key row, hidden {hidden}"
+        );
+        assert!(grouped.unwrap(), "the groups take the one-row mat-vec");
+        assert_eq!(
+            bits(&read(&dev, &wide, d.out_width())),
+            bits(&read(&dev, &by_columns.unwrap(), d.out_width())),
+            "grouped output, hidden {hidden}"
+        );
+    }
+}
+
+/// The groups of the output projection in one launch have the bits of a launch a group, and of
+/// the quantised matmul's forward over each group's columns.
+#[test]
+fn the_grouped_output_projection_in_one_launch_keeps_the_bits_of_a_launch_a_group() {
+    if card().is_none() {
+        return;
+    }
+    let dims = |heads, head_dim, o_groups, o_lora_rank| LatentMqaDims {
+        heads,
+        head_dim,
+        rope_dim: 64,
+        o_groups,
+        o_lora_rank,
+        window: 4,
+        eps: 1e-6,
+    };
+    // Row counts that no small-K mat-vec serves, so every group takes the one-row kernel.
+    let mut cases = Vec::new();
+    for dtype in [GgmlDType::Q6K, GgmlDType::Q4K, GgmlDType::Q8_0] {
+        cases.push((dtype, dims(16, 512, 2, 98), 8 * WIDE, WIDE));
+        cases.push((dtype, dims(24, 256, 3, 98), 8 * WIDE, WIDE));
+    }
+    cases.push((GgmlDType::Q6K, dims(64, 512, 8, 1024), 5120, 1280));
+    for (dtype, d, hidden, q_rank) in cases {
+        let m = layer_of(dtype, d, hidden, q_rank);
+        let card = m.card.clone().unwrap();
+        let dev = card.dev().clone();
+        let width = d.heads * d.head_dim;
+        let o = upload_f32(&dev, "o", &values(width, 8, 1.0)).unwrap();
+        let p = width / d.o_groups;
+        let shape = format!("{dtype:?} {} groups [{}, {p}]", d.o_groups, d.o_lora_rank);
+        let wide = || crate::tensor::cuda::alloc_f32(&dev, "wide", d.out_width()).unwrap();
+        let (mut one, mut each) = (wide(), wide());
+        route::set(Route::Q81);
+        let in_one = card.groups_in_one_launch();
+        let grouped = card.grouped_row(&o, (p, d.o_lora_rank), &mut one);
+        let grouped_each = card.grouped_row_each(&o, (p, d.o_lora_rank), &mut each);
+        let by_columns = card.grouped_by_forward(&o, 1, (width, p, d.o_lora_rank));
+        route::clear();
+        assert!(in_one, "{shape}: the groups take one launch");
+        assert!(grouped.unwrap() && grouped_each.unwrap(), "{shape}");
+        let one = bits(&read(&dev, &one, d.out_width()));
+        assert_eq!(one, bits(&read(&dev, &each, d.out_width())), "{shape}");
+        assert_eq!(
+            one,
+            bits(&read(&dev, &by_columns.unwrap(), d.out_width())),
+            "{shape}"
+        );
+    }
+}
+
+/// The unit of the groups of an output projection measures its product of 1 row, the groups'
+/// launch included, at the first product.
+#[test]
+fn the_groups_of_an_output_projection_measure_their_launch() {
+    if card().is_none() {
+        return;
+    }
+    route::clear();
+    let d = LatentMqaDims {
+        heads: 16,
+        head_dim: 512,
+        rope_dim: 64,
+        o_groups: 2,
+        o_lora_rank: 98,
+        window: 4,
+        eps: 1e-6,
+    };
+    let m = q6_layer(d, 8 * WIDE, WIDE);
+    let card = m.card.clone().unwrap();
+    let dev = card.dev().clone();
+    let width = d.heads * d.head_dim;
+    let o = upload_f32(&dev, "o", &values(width, 8, 1.0)).unwrap();
+    let p = width / d.o_groups;
+    assert!(card.group_decision().is_none());
+    let mut wide = crate::tensor::cuda::alloc_f32(&dev, "wide", d.out_width()).unwrap();
+    card.grouped_by_columns(&o, 1, (width, p, d.o_lora_rank), &mut wide)
+        .unwrap();
+    let decision = card.group_decision().expect("the first product measures");
+    assert!(decision.times.iter().all(|t| t.median > 0.0));
+}

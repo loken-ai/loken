@@ -531,6 +531,28 @@ MMVQ_FORMATS(MMVQ_PLAIN_SMALLK_BATCH_SET)
 
 MMVQ_FORMATS(MMVQ_PLAIN_DUAL_SET)
 
+/// One-row F32 mat-vecs of `groups` weights of one shape in one launch, each over its own
+/// stretch of one quantised row.
+///
+/// `vxs` holds the address of each weight.
+/// Blocks `g * nrows_x..(g + 1) * nrows_x` run weight `g` as the one-row kernel runs it.
+/// Weight `g` reads the q8_1 blocks of `vy` from `g * stride_group_y`.
+/// Weight `g` writes the `nrows_x` values of `dst` from `g * nrows_x`.
+/// So every output row has the bits of its own weight's one-row launch.
+#define MMVQ_PLAIN_GROUPED_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)  \
+  extern "C" __global__ void mmvq_gguf_##tag##_f32_plain_grouped_cuda1(          \
+      const void *const *__restrict__ vxs, const void *__restrict__ vy,         \
+      float *__restrict__ dst, const int ncols_x, const int nrows_x,            \
+      const int stride_group_y) {                                               \
+    const int g = (int)blockIdx.x / nrows_x;                                    \
+    mmvq_core_plain<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot, 1>(     \
+        vxs[g], (const block_q8_1 *)vy + (size_t)g * stride_group_y,            \
+        dst + (size_t)g * nrows_x, ncols_x, nrows_x, stride_group_y, nrows_x,   \
+        nullptr, g * nrows_x);                                                  \
+  }
+
+MMVQ_FORMATS(MMVQ_PLAIN_GROUPED_SET)
+
 /// The one-row F32 kernels with a bias: each output row gets `bias[row]` added to its sum, the
 /// addition a separate bias kernel would make. `gw` 0 is the one-row kernel, 4, 2 and 1 the
 /// small-K widths.

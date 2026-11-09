@@ -127,6 +127,42 @@ impl SinkhornMixer {
         self.dim
     }
 
+    /// The coefficient projection `[mix_rows, streams * dim]` F32 on the host, its 3 scales and
+    /// its biases.
+    pub fn weights(&self) -> (&Tensor, &[f32], &[f32]) {
+        (&self.func, &self.scale, &self.base)
+    }
+
+    /// The Sinkhorn passes, the floor of the pre mix and of every normalisation, and the epsilon
+    /// of the RMS statistic.
+    pub fn epsilons(&self) -> (usize, f32, f32) {
+        (self.meta.iterations, self.meta.eps, self.norm_eps)
+    }
+
+    /// The dot products of 1 residual row `[streams * dim]` with each row of the projection, then
+    /// of the row with itself, each in the running sum [`Self::mixes`] takes for a single token.
+    pub fn single_dots(&self, row: &[f32]) -> Result<Vec<f32>> {
+        let flat = self.meta.streams * self.dim;
+        if row.len() != flat {
+            return Err(Error::msg(format!(
+                "Sinkhorn mixer: a row of {} values for {flat}",
+                row.len()
+            )));
+        }
+        let w = dense_f32(&self.func)?;
+        let mut out: Vec<f32> = (0..self.meta.mix_rows())
+            .map(|m| {
+                w[m * flat..(m + 1) * flat]
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+            })
+            .collect();
+        out.push(row.iter().map(|v| v * v).sum());
+        Ok(out)
+    }
+
     /// The coefficients for every row of `r` `[b, seq, streams * dim]`.
     ///
     /// Each token takes one RMS statistic over its whole residual.

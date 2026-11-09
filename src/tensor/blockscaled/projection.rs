@@ -149,6 +149,20 @@ impl Projection {
         }
     }
 
+    /// The address and length of every byte range the storage reads in place.
+    ///
+    /// Empty for a dense weight, which holds its own values.
+    pub fn mapped_spans(&self) -> Vec<(usize, usize)> {
+        let of = |b: &crate::tensor::mapped::MappedBytes| (b.as_slice().as_ptr() as usize, b.len());
+        match self {
+            Self::Quant(_) => self.storage_span().into_iter().collect(),
+            Self::Fp4(f) => vec![of(&f.nibbles), of(&f.scales)],
+            Self::Fp8(f) => vec![of(&f.bytes), of(&f.scales)],
+            Self::Bf16(f) => vec![of(&f.bytes)],
+            Self::Dense(_) => Vec::new(),
+        }
+    }
+
     /// How many of the storage's pages are resident in memory, and how many pages there are:
     /// the fact behind a slow token, read from the kernel rather than inferred.
     #[cfg(target_os = "linux")]

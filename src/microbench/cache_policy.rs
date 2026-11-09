@@ -136,11 +136,13 @@ fn draw(weights: &[f64], rng: &mut Rng) -> Vec<usize> {
 }
 
 pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
-    let path = cx
-        .options
-        .profile
-        .as_ref()
-        .ok_or("cache-policy needs --profile, an expert profile")?;
+    if let Some(path) = &cx.options.file {
+        return super::cache_replay::run(cx, path);
+    }
+    let path =
+        cx.options.profile.as_ref().ok_or(
+            "cache-policy needs --profile, an expert profile, or --file, a recorded trace",
+        )?;
     let profile = ExpertProfile::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let expert_bytes = cx.shapes.expert_bytes();
     if expert_bytes == 0 {
