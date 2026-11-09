@@ -1215,14 +1215,13 @@ impl BlockDraftHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::model::deepseek_v41::engram as v41;
-    use crate::inference::model::deepseek_v41::source::WeightSource;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
     use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
     use crate::tensor::quantized::gguf_file::{open_mapped, Value};
 
     /// Port of the V4.1 test of the same name: a table the file carries as fp8 rows beside their
     /// ue8m0 scales, both byte tensors, is read in place as those rows.
-    /// The geometry and the bytes are the ones the V4.1 reader gives the same file.
+    /// The geometry and the bytes are the ones the file stores.
     #[test]
     fn engram_rows_are_read_as_released_fp8() {
         let (rows, row_len, per_row) = (7usize, 64usize, 2usize);
@@ -1255,82 +1254,57 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let source = TensorSource::one(&g.content, &g.mmap[..]);
         let got = engram_table(&source, "blk.1.engram_embd.weight").unwrap();
-        let want = g.engram_table("layers.1.engram.embed.weight").unwrap();
-        match (got, want) {
-            (
-                EngramTable::Fp8Rows {
-                    bytes,
-                    scales: sc,
-                    rows: r,
-                    row_len: rl,
-                    block,
-                },
-                v41::EngramTable::Fp8Rows {
-                    bytes: v41_bytes,
-                    scales: v41_scales,
-                    rows: v41_rows,
-                    row_len: v41_row_len,
-                    block: v41_block,
-                },
-            ) => {
+        match got {
+            EngramTable::Fp8Rows {
+                bytes,
+                scales: sc,
+                rows: r,
+                row_len: rl,
+                block,
+            } => {
                 assert_eq!((r, rl, block), (rows, row_len, row_len / per_row));
-                assert_eq!((r, rl, block), (v41_rows, v41_row_len, v41_block));
                 assert_eq!(bytes.as_slice(), weight.as_slice());
                 assert_eq!(sc.as_slice(), scales.as_slice());
-                assert_eq!(bytes.as_slice(), v41_bytes.as_slice());
-                assert_eq!(sc.as_slice(), v41_scales.as_slice());
             }
-            _ => {
-                panic!("the pair of byte tensors was not read as released fp8 rows by both readers")
-            }
+            _ => panic!("the pair of byte tensors was not read as released fp8 rows"),
         }
     }
 
     /// The engram tables of a block-scaled checkpoint are read in place as e4m3 rows beside their
-    /// scales, with the geometry and bytes the V4.1 checkpoint source gives.
+    /// scales, with the geometry and bytes the V4.1 checkpoint source gave.
     #[test]
     fn checkpoint_engram_rows_are_read_as_the_v41_source_reads_them() {
         use super::super::super::block_scaled_engram_tests::{engram_checkpoint, ENGRAM_LAYERS};
-        use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
         let dir = engram_checkpoint("tables");
         let ck = BlockScaledCheckpoint::open(&dir).unwrap();
-        let v41_src = SafeTensorsSource::open(&dir).unwrap();
         for l in ENGRAM_LAYERS {
             let got = checkpoint_engram_table(&ck, &format!("blk.{l}.engram_embd")).unwrap();
-            let want = v41_src
-                .engram_table(&format!("layers.{l}.engram.embed.weight"))
-                .unwrap();
-            match (&got, &want) {
-                (
-                    EngramTable::Fp8Rows {
-                        bytes,
-                        scales,
-                        rows,
-                        row_len,
-                        block,
-                    },
-                    v41::EngramTable::Fp8Rows {
-                        bytes: v41_bytes,
-                        scales: v41_scales,
-                        rows: v41_rows,
-                        row_len: v41_row_len,
-                        block: v41_block,
-                    },
-                ) => {
-                    assert_eq!((rows, row_len, block), (v41_rows, v41_row_len, v41_block));
-                    assert_eq!(bytes.as_slice(), v41_bytes.as_slice());
-                    assert_eq!(scales.as_slice(), v41_scales.as_slice());
+            match &got {
+                EngramTable::Fp8Rows {
+                    bytes,
+                    scales,
+                    rows,
+                    row_len,
+                    block,
+                } => {
+                    let read = format!(
+                        "{:?} {} {}",
+                        (rows, row_len, block),
+                        frozen::digest(bytes.as_slice()),
+                        frozen::digest(scales.as_slice())
+                    );
+                    frozen::expect("units", &format!("checkpoint table {l}"), &read);
                 }
-                _ => panic!("layer {l}: the table is not read as fp8 rows by both readers"),
+                _ => panic!("layer {l}: the table is not read as fp8 rows"),
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The hash layout of a block-scaled checkpoint, its token map built from the shipped
-    /// tokenizer, is the layout the V4.1 checkpoint loader derives from the same directory.
-    /// A checkpoint whose token map cannot be built keeps no layout, as the V4.1 loader keeps
-    /// none when its token map builder fails.
+    /// tokenizer, is the layout the V4.1 checkpoint loader derived from the same directory.
+    /// A checkpoint whose token map cannot be built keeps no layout, as the V4.1 loader kept
+    /// none when its token map builder failed.
     #[test]
     fn the_checkpoint_engram_layout_is_the_v41_layout() {
         use super::super::super::block_scaled_engram_tests::engram_checkpoint;
@@ -1338,17 +1312,18 @@ mod tests {
         let dir = engram_checkpoint("layout");
         let ck = BlockScaledCheckpoint::open(&dir).unwrap();
         let got = checkpoint_engram(&ck).expect("a layout");
-        let (map, _) = token_map::build_from_file(&dir.join("tokenizer.json")).unwrap();
-        let want = v41::EngramConfig::derive(&ck.reference, map).expect("a V4.1 layout");
-        assert_eq!(got.layer_ids, want.layer_ids);
-        assert_eq!(got.heads, want.n_heads);
-        assert_eq!(got.head_dim, want.head_dim);
-        assert_eq!(got.max_ngram, want.max_ngram);
-        assert_eq!(got.token_map, want.token_map);
-        assert_eq!(got.pad_id, want.pad_id);
-        assert_eq!(got.multipliers, want.multipliers);
-        assert_eq!(got.primes, want.primes);
-        assert_eq!(got.offsets, want.offsets);
+        let fields = (
+            &got.layer_ids,
+            got.heads,
+            got.head_dim,
+            got.max_ngram,
+            &got.token_map,
+            got.pad_id,
+            &got.multipliers,
+            &got.primes,
+            &got.offsets,
+        );
+        frozen::expect_debug("units", "checkpoint layout", &fields);
         std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
         assert!(checkpoint_engram(&ck).is_none());
         assert!(token_map::build_from_file(&dir.join("tokenizer.json")).is_err());

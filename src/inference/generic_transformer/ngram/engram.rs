@@ -536,7 +536,7 @@ impl EngramBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::model::deepseek_v41::engram as v41;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
     use crate::tensor::quantized::gguf_file::{Content, Value, VersionedMagic};
     use crate::tensor::quantized::GgmlDType;
     use std::collections::HashMap;
@@ -555,19 +555,21 @@ mod tests {
         }
     }
 
-    /// The V4.1 configuration with the same fields.
-    fn v41_cfg(m: &EngramMeta) -> v41::EngramConfig {
-        v41::EngramConfig {
-            layer_ids: m.layer_ids.clone(),
-            n_heads: m.heads,
-            head_dim: m.head_dim,
-            max_ngram: m.max_ngram,
-            token_map: m.token_map.clone(),
-            pad_id: m.pad_id,
-            multipliers: m.multipliers.clone(),
-            primes: m.primes.clone(),
-            offsets: m.offsets.clone(),
-        }
+    /// The fields of `m` in the order the V4.1 configuration held them, as the records hold
+    /// them.
+    fn fields(m: &EngramMeta) -> String {
+        let all = (
+            &m.layer_ids,
+            m.heads,
+            m.head_dim,
+            m.max_ngram,
+            &m.token_map,
+            m.pad_id,
+            &m.multipliers,
+            &m.primes,
+            &m.offsets,
+        );
+        format!("{all:?}")
     }
 
     /// Every column lands in its own bucket range, and the first position hashes the pad for
@@ -616,7 +618,7 @@ mod tests {
     }
 
     /// 2 layers with their own multipliers: the hashes, the compressed ids past the map and
-    /// a continued history equal the V4.1 ones.
+    /// a continued history equal the recorded V4.1 ones.
     #[test]
     fn the_hashes_equal_the_v41_hashes() {
         let mut m = meta();
@@ -624,19 +626,19 @@ mod tests {
         m.multipliers.push(vec![11, 13, 17]);
         m.primes.push(vec![23, 29, 31, 37]);
         m.offsets.push(vec![0, 23, 52, 83]);
-        let cfg = v41_cfg(&m);
         // Token 9 lies past the map and hashes as the pad.
         let tokens = [4u32, 0, 9, 5, 3, 1, 2, 2];
         for which in 0..2 {
-            assert_eq!(
-                EngramHistory::default().hashes(&m, which, &tokens),
-                v41::prefill_hashes(&cfg, which, &tokens)
+            frozen::expect_debug(
+                "units",
+                &format!("engram hashes {which}"),
+                &EngramHistory::default().hashes(&m, which, &tokens),
             );
             let start = EngramHistory::from_recent([3, 1]);
-            let v41_start = v41::EngramState::from_recent([3, 1]);
-            assert_eq!(
-                start.hashes(&m, which, &tokens),
-                v41::prefill_hashes_from(&cfg, which, &tokens, v41_start)
+            frozen::expect_debug(
+                "units",
+                &format!("engram hashes from {which}"),
+                &start.hashes(&m, which, &tokens),
             );
         }
     }
@@ -658,7 +660,7 @@ mod tests {
         Value::Array(v.iter().map(|&x| Value::U64(x)).collect())
     }
 
-    /// The layout of 2 layers under both key sets, read as the V4.1 reader reads it.
+    /// The layout of 2 layers under both key sets, read as the V4.1 reader read it.
     #[test]
     fn both_key_sets_read_as_the_v41_reader_reads_them() {
         let common = |keys: [&'static str; 9]| {
@@ -698,8 +700,8 @@ mod tests {
         ]);
         for c in [&engram, &ple] {
             let got = EngramMeta::from_gguf(c, "a").expect("a layout");
-            let want = v41::EngramConfig::read(&c.metadata, "a").expect("a V4.1 layout");
-            assert_eq!(v41_cfg(&got), want);
+            let key = format!("engram read {}", c.metadata.len());
+            frozen::expect("units", &key, &fields(&got));
             assert_eq!((got.pad_id, got.which(4), got.which(2)), (3, Some(1), None));
         }
         // Without the token map the layout is not read.
@@ -708,8 +710,8 @@ mod tests {
         assert_eq!(EngramMeta::from_gguf(&bare, "a"), None);
     }
 
-    /// The layout derived from reference arguments equals the V4.1 derivation, and a map of
-    /// the wrong size is refused.
+    /// The layout derived from reference arguments equals the recorded V4.1 derivation, and a
+    /// map of the wrong size is refused.
     #[test]
     fn the_derived_layout_equals_the_v41_derivation() {
         let args = serde_json::json!({
@@ -722,9 +724,8 @@ mod tests {
             "engram_pad_id": 2,
         });
         let map = vec![0u32, 1, 2, 3, 3, 4];
-        let got = EngramMeta::derive(&args, map.clone()).expect("a layout");
-        let want = v41::EngramConfig::derive(&args, map).expect("a V4.1 layout");
-        assert_eq!(v41_cfg(&got), want);
+        let got = EngramMeta::derive(&args, map).expect("a layout");
+        frozen::expect("units", "engram derive", &fields(&got));
         assert_eq!(EngramMeta::derive(&args, vec![0, 1, 2]), None);
     }
 
@@ -765,25 +766,16 @@ mod tests {
         m
     }
 
-    /// The same table in the generic and in the V4.1 enum: `kind` 0 resident, 1 Q8_0 blocks,
-    /// 2 fp8 rows.
-    fn tables(kind: usize, rows: usize) -> (EngramTable, v41::EngramTable) {
+    /// The table of storage `kind`: 0 resident, 1 Q8_0 blocks, 2 fp8 rows.
+    fn tables(kind: usize, rows: usize) -> EngramTable {
         let values = noise(rows * HEAD_DIM, 77);
         match kind {
-            0 => {
-                let t = Tensor::from_vec(values, (rows, HEAD_DIM), &Device::Cpu).unwrap();
-                (
-                    EngramTable::Resident(t.clone()),
-                    v41::EngramTable::Resident(t),
-                )
-            }
+            0 => EngramTable::Resident(
+                Tensor::from_vec(values, (rows, HEAD_DIM), &Device::Cpu).unwrap(),
+            ),
             1 => {
                 let t = Tensor::from_vec(values, (rows, HEAD_DIM), &Device::Cpu).unwrap();
-                let q = Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap());
-                (
-                    EngramTable::Streamed(q.clone()),
-                    v41::EngramTable::Streamed(q),
-                )
+                EngramTable::Streamed(Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap()))
             }
             _ => {
                 let bytes: Vec<u8> = (0..rows * HEAD_DIM)
@@ -792,34 +784,23 @@ mod tests {
                 let scales: Vec<u8> = (0..rows * HEAD_DIM / FP8_BLOCK)
                     .map(|i| (120 + i % 9) as u8)
                     .collect();
-                let (b, s) = (mapped(&bytes), mapped(&scales));
-                (
-                    EngramTable::Fp8Rows {
-                        bytes: b.clone(),
-                        scales: s.clone(),
-                        rows,
-                        row_len: HEAD_DIM,
-                        block: FP8_BLOCK,
-                    },
-                    v41::EngramTable::Fp8Rows {
-                        bytes: b,
-                        scales: s,
-                        rows,
-                        row_len: HEAD_DIM,
-                        block: FP8_BLOCK,
-                    },
-                )
+                EngramTable::Fp8Rows {
+                    bytes: mapped(&bytes),
+                    scales: mapped(&scales),
+                    rows,
+                    row_len: HEAD_DIM,
+                    block: FP8_BLOCK,
+                }
             }
         }
     }
 
-    /// The layer adds the bits the V4.1 engram adds, from each table storage, for a prompt
-    /// and for a single decoded token after it.
+    /// The layer adds the recorded bits the V4.1 engram added, from each table storage, for a
+    /// prompt and for a single decoded token after it.
     #[test]
     fn the_block_gives_the_bits_of_the_v41_engram() {
         let rows = 64usize;
         let m = wide_meta(rows as u64);
-        let cfg = v41_cfg(&m);
         let width = m.n_cols() * HEAD_DIM;
         let wkv = Tensor::from_vec(
             noise(DIM * (HC + 1) * width, 5),
@@ -830,8 +811,9 @@ mod tests {
         let gate = Tensor::from_vec(noise(HC * DIM, 6), (HC, DIM), &Device::Cpu).unwrap();
         let tokens = [1u32, 5, 0, 3, 2, 4, 1];
         for kind in 0..3 {
-            let (table, v41_table) = tables(kind, rows);
-            assert_eq!(table.n_rows(), v41_table.n_rows());
+            let table = tables(kind, rows);
+            let n_rows = format!("{}", table.n_rows());
+            frozen::expect("units", &format!("engram table {kind} rows"), &n_rows);
             let block = EngramBlock::new(
                 table,
                 Projection::Dense(wkv.clone()),
@@ -842,31 +824,17 @@ mod tests {
                 EPS,
             )
             .unwrap();
-            let old = v41::Engram {
-                table: v41_table,
-                wkv: Projection::Dense(wkv.clone()),
-                qk_weight: gate.to_vec2::<f32>().unwrap(),
-                dim: DIM,
-                hc_mult: HC,
-                eps: EPS,
-            };
             // The prompt, then 1 decoded token from the history the prompt left.
             let mut history = EngramHistory::default();
             for (part, seed) in [(&tokens[..6], 8u64), (&tokens[6..], 9)] {
                 let s = part.len();
                 let values = noise(s * HC * DIM, seed);
-                let r = Tensor::from_vec(values.clone(), (1, s, HC * DIM), &Device::Cpu).unwrap();
-                let x = Tensor::from_vec(values, (1, s, HC, DIM), &Device::Cpu).unwrap();
+                let r = Tensor::from_vec(values, (1, s, HC * DIM), &Device::Cpu).unwrap();
                 let hashes = history.hashes(&m, 0, part);
-                let v41_start = v41::EngramState::from_recent(history.recent());
-                assert_eq!(
-                    hashes,
-                    v41::prefill_hashes_from(&cfg, 0, part, v41_start),
-                    "storage {kind}"
-                );
+                let key = |what: &str| format!("engram block {kind} {s} {what}");
+                frozen::expect_debug("units", &key("hashes"), &hashes);
                 let got = block.forward(&r, &hashes).unwrap();
                 assert_eq!(got.dims(), [1, s, HC * DIM]);
-                let want = old.forward(&x, &hashes).unwrap();
                 let bits = |t: &Tensor| -> Vec<u32> {
                     t.flatten_all()
                         .unwrap()
@@ -876,7 +844,8 @@ mod tests {
                         .map(|v| v.to_bits())
                         .collect()
                 };
-                assert_eq!(bits(&got), bits(&want), "storage {kind}, {s} positions");
+                let out = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                frozen::expect_f32("units", &key("out"), &out);
                 assert_ne!(bits(&got), bits(&r), "the layer adds nothing");
                 history.advance(&m, part);
             }
@@ -891,7 +860,7 @@ mod tests {
         let short =
             Tensor::from_vec(noise(DIM * HC * width, 1), (DIM * HC, width), &Device::Cpu).unwrap();
         let gate = Tensor::from_vec(noise(HC * DIM, 2), (HC, DIM), &Device::Cpu).unwrap();
-        let (table, _) = tables(0, 64);
+        let table = tables(0, 64);
         let wkv = Projection::Dense(short);
         assert!(EngramBlock::new(table, wkv, &gate, &m, HC, DIM, EPS).is_err());
     }

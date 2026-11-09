@@ -357,23 +357,9 @@ Each candidate either keeps the `K-1` or `K-2` heaviest experts, or replaces a l
 The measured table and the noise are cached per model file and plan, under `loken/` in the user cache directory.
 A later load of the same file and plan reuses them.
 
-The offload derives these quantities from measurement and logs them:
-
-| Quantity | Derived from |
-|---|---|
-| Read-ahead depth | A controller that times decode tokens in windows and tries each neighbouring depth for 1 window. It keeps a depth only when its mean token time beats the incumbent's by more than the noise, judged against the incumbent's windows on both sides. Bounded by the hardware and the plan. |
-| Reader threads | The smallest count that reaches the device's read rate, from a probe at load. |
-| Sightings before a card takes an expert | The measured upload cost against what a use saves. |
-| Experts kept per layer | What the host memory allows. |
-| Where a prompt's expert runs | The measured time of a copy to the card per byte against the measured time of a host row, per expert of the layer. |
-
-During a prompt's prefill, each layer reads only the experts the prompt routes to, once its router has named them:
-
-- The cards' copies are read from the file into a page-locked slab in runs of adjacent experts, around the page cache.
-- Meanwhile the cards run the experts they keep and the host runs its own.
-- A copy made for the layer is let go after it unless the card has the room free to keep it.
-  It never takes a kept expert's place.
-- When no card has room for the prompt's rows, the whole next layer is read ahead into the slab while the current layer runs.
+The routed experts of a wide-residual model stay in the file's mapping, read as routing asks for them.
+The card tier keeps the busiest of them on a card when the card measures faster than the host.
+A mixture of another family keeps its experts in the cache below.
 
 ### Expert cache of a mixture held in the file's mapping
 

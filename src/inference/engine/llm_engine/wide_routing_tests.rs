@@ -1,10 +1,10 @@
-//! The routing heat of a Sinkhorn wide-residual file the engine loads, against the steps the V4.1
-//! engine arm took, on the small file of the frozen V4.1 oracle.
+//! The routing heat of a Sinkhorn wide-residual file the engine loads, against the records of the
+//! steps the V4.1 engine arm took, on the small file of the frozen V4.1 oracle.
 
 use super::block_draft_tests::tokenizer;
 use super::*;
 use crate::inference::generic_transformer::wide_sparse_routing_tests::{
-    layers, profile_file, toy_dir, turning, v41_heat, ROUTED,
+    is_v41_heat, layers, profile_file, toy_dir, turning, ROUTED,
 };
 use crate::inference::generic_transformer::wide_sparse_sibling as sibling;
 
@@ -57,8 +57,8 @@ async fn the_engine_ranks_a_wide_files_experts_as_the_v41_arm_did() {
             .load_model()
             .await
             .expect("the engine loads the file");
-        let want = v41_heat(&model, given);
-        assert_eq!(engine_heat(&engine).await, want, "profile {given:?}");
+        let got = engine_heat(&engine).await;
+        is_v41_heat(&format!("engine {}", given.is_some()), &got);
     }
     let _ = std::fs::remove_dir_all(model.parent().unwrap());
 }

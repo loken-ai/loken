@@ -8,7 +8,7 @@
 //! - bf16 keeps its 16-bit values and expands a tile the same way,
 //! - a dense weight keeps its F32 values, which are its stored form.
 //!
-//! The scratch of an expansion is bounded by the offload's weight tile.
+//! The scratch of an expansion is bounded by the weight tile of the quantised tensors.
 //!
 //! The 3 products of Q4_K and Q6_K blocks (`Route`):
 //! - the rows in q8_K blocks and the host's dot steps,

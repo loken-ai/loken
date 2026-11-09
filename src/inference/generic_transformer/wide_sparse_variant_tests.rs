@@ -1,26 +1,25 @@
 //! The routed experts of a wide-residual model read from 2 files of its checkpoint, on the
-//! generic route against the V4.1 path, on the small file of the frozen V4.1 oracle.
+//! generic route against the records of the V4.1 path, on the small file of the frozen V4.1
+//! oracle.
 //!
 //! The model's own file stores its experts as F32 stacks.
 //! The variant file stores the same experts as Q4_K, 1 tensor per expert, and every other tensor
 //! as the model's file does.
-//! The V4.1 side follows the steps its engine arm took: the check, the load through its variant
-//! source, the policy, the host tier, and the plan with no card.
+//! The V4.1 records followed the steps its engine arm took: the check, the load through its
+//! variant source, the policy, the host tier, and the plan with no card.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::block_draft_tests::{generic_of, prompt};
-use super::wide_sparse_oracle_tests::{bit_difference, record_generic, record_v41, RECORDS};
+use super::wide_sparse_frozen as frozen;
+use super::wide_sparse_oracle_tests::{expect_records, record_digest, record_generic, RECORDS};
 use super::wide_sparse_variants::open_checked;
 use super::GenericHeteroTransformer;
 use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
 use crate::inference::load::variant_files::check_variant;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::source::VariantSource;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::inference::place::expert_variants::{VariantChoice, VariantPlan};
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
 use crate::tensor::quantized::gguf_file::{open_mapped, Value};
@@ -158,29 +157,10 @@ pub(crate) fn v41_refusal(model: &Path, variant: &Path, model_id: &str) -> Optio
         .map(|e| format!("{} cannot serve {model_id}: {e}", variant.display()))
 }
 
-/// The V4.1 model of the 2 files under `choice`, by the steps of its engine arm, and its plan.
-pub(crate) fn v41_with_variant(
-    model: &Path,
-    variant: &Path,
-    choice: VariantChoice,
-) -> (DeepseekV41Model, VariantPlan) {
-    assert_eq!(v41_refusal(model, variant, "toy"), None);
-    let primary = SplitGguf::open(model).unwrap();
-    let variants = [SplitGguf::open(variant).unwrap()];
-    let cfg = DeepseekV41Config::from_meta(&primary).unwrap();
-    let v41 = DeepseekV41Model::load(
-        &VariantSource {
-            primary: &primary,
-            variants: &variants,
-        },
-        &cfg,
-    )
-    .unwrap();
-    v41.set_variant_policy(choice, None);
-    v41.size_expert_cache_to_memory(&cfg).unwrap();
-    // No card took experts: the placement plans with none.
-    let plan = v41.place_variants(0).expect("2 variants");
-    (v41, plan)
+/// Asserts `chosen` is the variant of each expert the V4.1 arm chose under `choice`, its plan
+/// made with no card to keep experts.
+pub(crate) fn is_v41_choice(choice: VariantChoice, chosen: &[Vec<usize>]) {
+    frozen::expect_debug("variant", &format!("chosen {choice:?}"), &chosen);
 }
 
 /// The generic model of the 2 files under `choice`, by the steps of the generic engine arm, and
@@ -208,16 +188,15 @@ fn remove(model: &Path) {
 fn every_policy_picks_the_v41_variant_of_each_expert() {
     let (model, variant) = pair_dir("pick", Variant::Q4);
     for choice in CHOICES {
-        let (_, want) = v41_with_variant(&model, &variant, choice);
         let (generic, got) = generic_with_variant(&model, &variant, choice);
-        assert_eq!(got.chosen, want.chosen, "{choice:?}");
-        assert_eq!(generic.expert_variant_choice(), want.chosen, "{choice:?}");
+        is_v41_choice(choice, &got.chosen);
+        assert_eq!(generic.expert_variant_choice(), got.chosen, "{choice:?}");
         let expected = match choice {
             VariantChoice::Largest => 0,
             _ => 1,
         };
         assert!(
-            want.chosen.iter().flatten().all(|&v| v == expected),
+            got.chosen.iter().flatten().all(|&v| v == expected),
             "{choice:?}: the V4.1 path read variant {expected}"
         );
         assert_eq!(generic.expert_variants(), 2);
@@ -225,8 +204,8 @@ fn every_policy_picks_the_v41_variant_of_each_expert() {
     remove(&model);
 }
 
-/// Under every policy, the generic route gives the bits of the V4.1 path on every record of the
-/// oracle: the 2 read the same variant bytes.
+/// Under every policy, the generic route gives the recorded bits of the V4.1 path on every record
+/// of the oracle: the 2 read the same variant bytes.
 /// The largest variant gives the bits of the model's own file, the smallest those of the Q4_K
 /// file alone, and the 2 differ.
 #[test]
@@ -235,19 +214,11 @@ fn every_policy_gives_the_bits_of_the_v41_path() {
     let tokens = prompt();
     let mut by_choice = Vec::new();
     for choice in CHOICES {
-        let (v41, _) = v41_with_variant(&model, &variant, choice);
         let (mut generic, _) = generic_with_variant(&model, &variant, choice);
-        let (mut want, mut got) = (BTreeMap::new(), BTreeMap::new());
-        record_v41(&v41, &tokens, 0, &mut want);
+        let mut got = BTreeMap::new();
         record_generic(&mut generic, &tokens, 0, &mut got);
-        for record in RECORDS {
-            let name = format!("l0_{record}");
-            assert_eq!(
-                bit_difference(&want[&name], &got[&name]),
-                None,
-                "{choice:?} {name}"
-            );
-        }
+        assert_eq!(got.len(), RECORDS.len());
+        expect_records("variant", &format!("{choice:?} "), &got);
         by_choice.push(got);
     }
     let alone = |file: &Path| {
@@ -263,19 +234,13 @@ fn every_policy_gives_the_bits_of_the_v41_path() {
     let (own, q4) = (alone(&model), alone(&variant));
     for record in RECORDS {
         let name = format!("l0_{record}");
-        assert_eq!(
-            bit_difference(&own[&name], &by_choice[0][&name]),
-            None,
-            "{name}"
-        );
-        assert_eq!(
-            bit_difference(&q4[&name], &by_choice[1][&name]),
-            None,
-            "{name}"
-        );
+        let bits = |records: &BTreeMap<String, _>| record_digest(&records[&name]);
+        assert_eq!(bits(&own), bits(&by_choice[0]), "{name}");
+        assert_eq!(bits(&q4), bits(&by_choice[1]), "{name}");
     }
-    assert!(
-        bit_difference(&own["l0_prefill"], &q4["l0_prefill"]).is_some(),
+    assert_ne!(
+        record_digest(&own["l0_prefill"]),
+        record_digest(&q4["l0_prefill"]),
         "the 2 files compute the same experts"
     );
     remove(&model);

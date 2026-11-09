@@ -214,7 +214,7 @@ pub fn primes_and_offsets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::model::deepseek_v41::engram_hash as v41;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
 
     /// numpy's own numbers for `SeedSequence(10007)` and `PCG64` seeded from it.
     #[test]
@@ -282,26 +282,25 @@ mod tests {
         assert_eq!(p[1].iter().sum::<u64>(), 384016682);
     }
 
-    /// The derivation equals the V4.1 one on several layouts.
+    /// The derivation equals the recorded V4.1 one on several layouts.
     #[test]
     fn the_derivation_equals_the_v41_one() {
+        let digest = |v: &dyn std::fmt::Debug| frozen::digest(format!("{v:?}").as_bytes());
         for (layers, max_ngram, vocab) in [
             (vec![1usize, 14], 4usize, 99092usize),
             (vec![0, 3, 7], 3, 517),
             (vec![2], 5, 1),
         ] {
-            assert_eq!(
-                multipliers(&layers, max_ngram, vocab),
-                v41::multipliers(&layers, max_ngram, vocab)
-            );
+            let key = format!("multipliers {layers:?} {max_ngram} {vocab}");
+            let got = multipliers(&layers, max_ngram, vocab);
+            frozen::expect("units", &key, &digest(&got));
         }
         for (n_layers, max_ngram, heads, vocab) in
             [(2usize, 4usize, 8usize, 16_000_000u64), (3, 3, 2, 101)]
         {
-            assert_eq!(
-                primes_and_offsets(n_layers, max_ngram, heads, vocab),
-                v41::primes_and_offsets(n_layers, max_ngram, heads, vocab)
-            );
+            let key = format!("primes {n_layers} {max_ngram} {heads} {vocab}");
+            let got = primes_and_offsets(n_layers, max_ngram, heads, vocab);
+            frozen::expect("units", &key, &digest(&got));
         }
     }
 }

@@ -1,9 +1,9 @@
-//! The block-scaled checkpoint reader of the generic route against the V4.1 source, on a small
-//! checkpoint written with the official naming.
+//! The block-scaled checkpoint reader of the generic route against the records of the V4.1
+//! source, on a small checkpoint written with the official naming.
 //!
 //! The checkpoint holds fp8 matrices with ue8m0 tile scales, fp4 routed experts with ue8m0 row
 //! scales, bf16 and f32 tensors, in 2 shards.
-//! Both readers open the same directory.
+//! The records hold what the V4.1 source and model gave on the same directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,16 +11,13 @@ use std::path::{Path, PathBuf};
 use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 
-use super::wide_sparse_oracle_tests::{
-    bit_difference, record_generic, record_v41, Record, RECORDS,
-};
+use super::wide_sparse_frozen as frozen;
+use super::wide_sparse_oracle_tests::{expect_records, record_generic, Record, RECORDS};
 use super::*;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
-use crate::inference::model::deepseek_v41::source::WeightSource;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
-use crate::inference::offload::store::ExpertLoader;
 use crate::tensor::blockscaled::projection::Projection;
+
+/// The record file of these tests.
+const FROZEN: &str = "block_scaled";
 
 pub(super) const LAYERS: usize = 3;
 pub(super) const DIM: usize = 256;
@@ -430,81 +427,59 @@ fn layout(p: &Projection) -> (String, Vec<usize>, Vec<u8>, Vec<u8>, usize) {
     }
 }
 
-/// The projection the V4.1 loader builds of `name`: in place when the source offers it, dense
-/// F32 otherwise.
-fn v41_projection(src: &SafeTensorsSource, name: &str) -> Projection {
-    match src.projection(name).unwrap() {
-        Some(p) => p,
-        None => Projection::Dense(src.dense_f32(name).unwrap()),
-    }
+/// A projection's layout as the frozen records hold it: its kind, its shape, the digests of its
+/// bytes and of its scale bytes, and its block.
+fn layout_record(p: &Projection) -> String {
+    let (kind, shape, bytes, scales, block) = layout(p);
+    format!(
+        "{kind} {shape:?} {} {} {block}",
+        frozen::digest(&bytes),
+        frozen::digest(&scales)
+    )
 }
 
-/// Every tensor of the checkpoint reads to the same bytes through both readers: its dense F32
-/// values, its projection in place with the same values, scales and block, and each routed
-/// expert's 3 matrices as the V4.1 expert loader builds them.
+/// A dense tensor as the frozen records hold it: its shape and the digest of its bits.
+fn dense_record(t: &Tensor) -> String {
+    let bytes: Vec<u8> = bits(t).iter().flat_map(|b| b.to_le_bytes()).collect();
+    format!("{:?} {}", t.dims(), frozen::digest(&bytes))
+}
+
+/// Every tensor of the checkpoint reads to the bytes the V4.1 source gave: its dense F32 values,
+/// its projection in place with the same values, scales and block, and each routed expert's 3
+/// matrices as fp4 views, as the V4.1 expert loader built them.
 #[test]
 fn the_block_scaled_reader_hands_out_the_bytes_of_the_v41_source() {
     let dir = checkpoint("reads");
-    let v41 = SafeTensorsSource::open(&dir).unwrap();
     let ours = BlockScaledCheckpoint::open(&dir).unwrap();
-    let mut differ = Vec::new();
     for e in entries() {
         assert!(ours.has(&e.loader), "{} is not listed", e.loader);
-        let want = WeightSource::dense_f32(&v41, &e.reference).unwrap();
         let got = ours.dense_f32(&e.loader).unwrap();
-        if want.dims() != got.dims() || bits(&want) != bits(&got) {
-            differ.push(format!("{}: dense values", e.reference));
-        }
+        frozen::expect(
+            FROZEN,
+            &format!("dense {}", e.reference),
+            &dense_record(&got),
+        );
         if e.shape.len() == 2 {
-            let want = layout(&v41_projection(&v41, &e.reference));
-            let got = layout(&ours.projection(&e.loader).unwrap());
-            if want != got {
-                differ.push(format!(
-                    "{}: projection {} != {}",
-                    e.reference, got.0, want.0
-                ));
-            }
+            let got = layout_record(&ours.projection(&e.loader).unwrap());
+            frozen::expect(FROZEN, &format!("projection {}", e.reference), &got);
         }
     }
     for l in 0..LAYERS {
-        let loader = v41.experts(l, EXPERTS).unwrap();
         for x in 0..EXPERTS {
-            let built = loader.build(x).unwrap();
-            let matrices = [
-                (&built.w1, "ffn_gate_exps"),
-                (&built.w3, "ffn_up_exps"),
-                (&built.w2, "ffn_down_exps"),
-            ];
-            for (w, stack) in matrices {
+            for stack in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
                 let name = format!("blk.{l}.{stack}.{x}");
-                if layout(w) != layout(&ours.projection(&name).unwrap()) {
-                    differ.push(format!("{name}: expert matrix"));
-                }
-                if !matches!(w, Projection::Fp4(_)) {
-                    differ.push(format!("{name}: the V4.1 expert is not an fp4 view"));
-                }
+                let got = layout_record(&ours.projection(&name).unwrap());
+                frozen::expect(FROZEN, &format!("expert {name}"), &got);
             }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        differ.is_empty(),
-        "the generic reader differs from the V4.1 source:\n{}",
-        differ.join("\n")
-    );
 }
 
 /// The tokens of the checkpoint test: a prompt longer than the verified block and the greedy
 /// prompt.
 pub(crate) fn tokens() -> Vec<u32> {
     (0..12).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect()
-}
-
-/// The V4.1 model of the checkpoint, read through its own source.
-pub(super) fn v41_model(dir: &Path) -> DeepseekV41Model {
-    let src = SafeTensorsSource::open(dir).unwrap();
-    let cfg = DeepseekV41Config::from_reference_config(&src.inference_config, None).unwrap();
-    DeepseekV41Model::load(&src, &cfg).unwrap()
 }
 
 /// The generic model of the checkpoint, every layer on the host.
@@ -520,35 +495,16 @@ pub(super) fn generic_model(dir: &Path) -> GenericHeteroTransformer {
     .unwrap()
 }
 
-/// The generic model built from the block-scaled reader gives the bits of the V4.1 model read
-/// from the same checkpoint: the prefill, the decode, the verify, the rewound verify and the
-/// decode after it, and the greedy run.
+/// The generic model built from the block-scaled reader gives the recorded bits of the V4.1
+/// model read from the same checkpoint: the prefill, the decode, the verify, the rewound verify
+/// and the decode after it, and the greedy run.
 #[test]
 fn a_model_read_from_the_block_scaled_checkpoint_gives_the_bits_of_the_v41_path() {
     let dir = checkpoint("model");
-    let v41 = v41_model(&dir);
     let mut generic = generic_model(&dir);
-    let tokens = tokens();
-    let (mut want, mut got): (BTreeMap<String, Record>, BTreeMap<String, Record>) =
-        (BTreeMap::new(), BTreeMap::new());
-    record_v41(&v41, &tokens, 0, &mut want);
-    record_generic(&mut generic, &tokens, 0, &mut got);
+    let mut got: BTreeMap<String, Record> = BTreeMap::new();
+    record_generic(&mut generic, &tokens(), 0, &mut got);
     let _ = std::fs::remove_dir_all(&dir);
-    let mut differ = Vec::new();
-    for record in RECORDS {
-        let name = format!("l0_{record}");
-        match (want.get(&name), got.get(&name)) {
-            (Some(w), Some(g)) => {
-                if let Some(d) = bit_difference(w, g) {
-                    differ.push(format!("{name}: {d}"));
-                }
-            }
-            _ => differ.push(format!("{name}: missing")),
-        }
-    }
-    assert!(
-        differ.is_empty(),
-        "the generic model of the checkpoint differs from the V4.1 path:\n{}",
-        differ.join("\n")
-    );
+    assert_eq!(got.len(), RECORDS.len());
+    expect_records(FROZEN, "", &got);
 }

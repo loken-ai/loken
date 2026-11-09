@@ -1,0 +1,15 @@
+engram None file@Avx2	649792 7471b28428c11408e4d7625181796772ebb2122a0be30c2e985cb02700893ff0
+engram None file@Avx512	649792 3be0cd347aec177fc22d8dcbcfb9274b67a2de167dbbf58e120b6f08cc6938af
+engram Some(3) file@Avx2	112192 674e01c79f94f5f42d69867f1821865e2d0170b7a7bffc697565307e95bf7f80
+engram Some(3) file@Avx512	112192 81d9f1347764bbb571f37d3d708aa98f1211fd8cfec0b606982486f280af69c8
+excerpts 1 7	[[0], [0], [0], [1], [1], [1], [2]]
+excerpts 30 100	[]
+excerpts 4 40	[[0, 1, 2, 3], [0, 1, 2, 3], [4, 5, 6, 7], [4, 5, 6, 7], [8, 9, 10, 11], [8, 9, 10, 11], [12, 13, 14, 15], [12, 13, 14, 15], [16, 17, 18, 19], [20, 21, 22, 23]]
+excerpts 5 3	[]
+excerpts 8 20	[[0, 1, 2, 3, 4, 5, 6, 7], [0, 1, 2, 3, 4, 5, 6, 7]]
+plain None file@Avx2	649792 d0d6c262061cf850e5d8ee9edc523708de7589522e05ea994c11eaa0e8040956
+plain None file@Avx512	649792 7354bad03cc339a27c1ab152836d47db84e43ae486032878ac0ceb4533cb70db
+plain Some(3) file@Avx2	114240 3687d99e77c9d2cbfd9457ec7452900f91ddba233eb0e9b72f3c68d24daf43f5
+plain Some(3) file@Avx512	114240 2519942051198ee89c457fd75e61c9fd18e0e11c285bcf894eb141e3bc073a8b
+rows 40 None	18446744073709551615
+rows 40 Some(5)	5

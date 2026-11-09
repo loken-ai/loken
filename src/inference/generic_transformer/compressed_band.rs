@@ -1071,13 +1071,11 @@ pub fn apply_candidate_mask(score: &[f32], mask: &[bool]) -> Vec<f32> {
 mod tests {
     use super::super::latent_mqa::{frequencies, LatentMqaDims, LatentMqaWeights};
     use super::super::mixer::Mixer;
+    use super::super::wide_sparse_frozen as frozen;
     use super::*;
-    use crate::inference::model::deepseek_v41::band::{
-        fp4_act_quant, BandAttention, Compressor, Indexer, SharedAttn,
-    };
-    use crate::inference::model::deepseek_v41::cache::AttnCache;
-    use crate::inference::model::deepseek_v41::candidates;
-    use crate::inference::model::deepseek_v41::model::rope_table;
+
+    /// The record file of the mixers' unit tests.
+    const FROZEN: &str = "units";
 
     const HIDDEN: usize = 48;
     const Q_RANK: usize = 24;
@@ -1166,228 +1164,141 @@ mod tests {
         v.iter().map(|x| x.to_bits()).collect()
     }
 
-    fn v41_layer(seed: u64, b: BandDims) -> BandAttention {
+    /// The window mixer and the role weights of a layer of role `b`, drawn from `seed`, and the
+    /// output projection the V4.1 band applied after the mixer.
+    fn parts(
+        seed: u64,
+        b: BandDims,
+    ) -> (
+        LatentMqa,
+        Option<CompressorWeights>,
+        Option<BandIndexerWeights>,
+        Projection,
+    ) {
         let d = dims();
         let (hd, ihd) = (d.head_dim, b.index_head_dim);
-        let compressor = b.kv_source.then(|| Compressor {
-            norm: norm(hd, seed + 10),
-            wkv: mat(hd, HIDDEN, seed + 11),
-            wgate: Some(mat(hd, HIDDEN, seed + 12)),
-            ratio: b.ratio,
-            head_dim: hd,
-            eps: d.eps,
-        });
-        let indexer = b.index_source.then(|| Indexer {
-            wq_b: dense(b.index_heads * ihd, Q_RANK, seed + 13),
-            weights_proj: mat(b.index_heads, HIDDEN, seed + 14),
-            wk: b.kv_source.then(|| mat(ihd, hd, seed + 15)),
-            k_norm: b.kv_source.then(|| norm(ihd, seed + 16)),
-            n_heads: b.index_heads,
-            index_head_dim: ihd,
-            rope_head_dim: d.rope_dim,
-            index_topk: b.index_topk,
-            eps: d.eps,
-            owns_k: b.kv_source,
-            is_candidate_source: b.candidate_source,
-            uses_candidates: b.uses_candidates,
-            candidate_topk_blocks: b.candidate_blocks,
-            candidate_block_size: b.candidate_block_size,
-        });
-        let sink = Tensor::from_vec(values(d.heads, seed + 5, 1.0), d.heads, &Device::Cpu).unwrap();
-        BandAttention {
+        let weights = LatentMqaWeights {
             wq_a: dense(Q_RANK, HIDDEN, seed),
             q_norm: norm(Q_RANK, seed + 1),
             wq_b: dense(d.heads * hd, Q_RANK, seed + 2),
             wkv: dense(hd, HIDDEN, seed + 3),
             kv_norm: norm(hd, seed + 4),
-            attn_sink: sink,
+            sink: values(d.heads, seed + 5, 1.0),
             wo_a: dense(d.out_width(), d.heads * hd / d.o_groups, seed + 6),
-            wo_b: dense(HIDDEN, d.out_width(), seed + 7),
-            compressor,
-            indexer,
-            n_heads: d.heads,
-            head_dim: hd,
-            rope_head_dim: d.rope_dim,
-            o_groups: d.o_groups,
-            o_lora_rank: d.o_lora_rank,
-            window_size: d.window,
-            ratio: b.ratio,
-            index_topk: b.index_topk,
-            eps: d.eps,
-        }
-    }
-
-    /// The window mixer and the role weights over the V4.1 layer's weights.
-    fn parts(
-        old: &BandAttention,
-    ) -> (
-        LatentMqa,
-        Option<CompressorWeights>,
-        Option<BandIndexerWeights>,
-    ) {
-        let weights = LatentMqaWeights {
-            wq_a: old.wq_a.clone(),
-            q_norm: old.q_norm.clone(),
-            wq_b: old.wq_b.clone(),
-            wkv: old.wkv.clone(),
-            kv_norm: old.kv_norm.clone(),
-            sink: flat(&old.attn_sink),
-            wo_a: old.wo_a.clone(),
         };
-        let freqs = frequencies(dims().rope_dim, ORIGINAL, THETA, FACTOR);
-        let base = LatentMqa::new(dims(), weights, freqs).unwrap();
-        let compressor = old.compressor.as_ref().map(|c| CompressorWeights {
-            wkv: c.wkv.clone(),
-            wgate: c.wgate.clone(),
-            norm: c.norm.clone(),
+        let freqs = frequencies(d.rope_dim, ORIGINAL, THETA, FACTOR);
+        let base = LatentMqa::new(d, weights, freqs).unwrap();
+        let compressor = b.kv_source.then(|| CompressorWeights {
+            wkv: mat(hd, HIDDEN, seed + 11),
+            wgate: Some(mat(hd, HIDDEN, seed + 12)),
+            norm: norm(hd, seed + 10),
         });
-        let indexer = old.indexer.as_ref().map(|ix| BandIndexerWeights {
-            wq_b: ix.wq_b.clone(),
-            weights_proj: ix.weights_proj.clone(),
-            wk: ix.wk.clone(),
-            k_norm: ix.k_norm.clone(),
+        let indexer = b.index_source.then(|| BandIndexerWeights {
+            wq_b: dense(b.index_heads * ihd, Q_RANK, seed + 13),
+            weights_proj: mat(b.index_heads, HIDDEN, seed + 14),
+            wk: b.kv_source.then(|| mat(ihd, hd, seed + 15)),
+            k_norm: b.kv_source.then(|| norm(ihd, seed + 16)),
         });
-        (base, compressor, indexer)
+        let wo_b = dense(HIDDEN, d.out_width(), seed + 7);
+        (base, compressor, indexer, wo_b)
     }
 
-    /// The V4.1 band and the mixers over the same weights, the mixers sharing 1 cell.
-    fn pair() -> (Vec<BandAttention>, Vec<CompressedBand>) {
+    /// The seed of layer `i`'s weights.
+    fn seed(i: usize) -> u64 {
+        100 * (i as u64 + 1)
+    }
+
+    /// The mixers of the 3 roles sharing 1 cell, and the output projection after each.
+    fn pair() -> (Vec<Projection>, Vec<CompressedBand>) {
         let cell = Arc::new(BandCell::default());
-        let olds: Vec<BandAttention> = roles()
-            .iter()
-            .zip(1u64..)
-            .map(|(&b, i)| v41_layer(100 * i, b))
-            .collect();
-        let news = olds
-            .iter()
-            .zip(roles())
-            .map(|(old, b)| {
-                let (base, compressor, indexer) = parts(old);
-                CompressedBand::new(base, b, compressor, indexer, cell.clone()).unwrap()
+        roles()
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let (base, compressor, indexer, wo_b) = parts(seed(i), b);
+                let band = CompressedBand::new(base, b, compressor, indexer, cell.clone());
+                (wo_b, band.unwrap())
             })
-            .collect();
-        (olds, news)
+            .unzip()
     }
 
-    fn caches() -> Vec<AttnCache> {
-        (0..roles().len()).map(|_| AttnCache::default()).collect()
-    }
-
-    fn tables(n: usize) -> (Tensor, Tensor) {
-        rope_table(dims().rope_dim, n, ORIGINAL, THETA, FACTOR).unwrap()
-    }
-
-    /// The mixer's rows through `wo_b` as the V4.1 band applies it, `[seq * hidden]`.
-    fn full(old: &BandAttention, mixed: &Tensor) -> Vec<f32> {
+    /// The mixer's rows through `wo_b` as the V4.1 band applied it, `[seq * hidden]`.
+    fn full(wo_b: &Projection, mixed: &Tensor) -> Vec<f32> {
         let (_, seq, width) = mixed.dims3().unwrap();
         flat(
-            &old.wo_b
+            &wo_b
                 .apply_here(&mixed.reshape((seq, width)).unwrap())
                 .unwrap(),
         )
     }
 
-    /// The rows from `base` through every layer of both, each layer on its own input, every
-    /// layer's output compared.
+    /// The rows from `base` through every layer, each layer on its own input, every layer's
+    /// output compared with the V4.1 band's.
     fn prompt(
-        olds: &[BandAttention],
+        wo_bs: &[Projection],
         news: &mut [CompressedBand],
-        caches: &mut [AttnCache],
         (base, seq): (usize, usize),
         seed: u64,
     ) {
-        let (cos, sin) = tables(base + seq);
-        let mut shared = SharedAttn::default();
-        let layers = olds.iter().zip(news.iter_mut()).zip(caches.iter_mut());
-        for (i, ((old, new), cache)) in layers.enumerate() {
+        for (i, (wo_b, new)) in wo_bs.iter().zip(news.iter_mut()).enumerate() {
             let x = input(seq, seed + i as u64);
-            cache.base = base;
-            let want = old
-                .forward_prefill_cached(&x, &cos, &sin, &mut shared, Some(cache))
-                .unwrap();
             let got = new.forward(&x, base).unwrap();
-            assert_eq!(
-                bits(&full(old, &got)),
-                bits(&flat(&want)),
-                "layer {i} from {base}"
-            );
+            let key = format!("band prompt {base} {seq} layer {i}");
+            frozen::expect_f32(FROZEN, &key, &full(wo_b, &got));
         }
     }
 
-    /// The token at `pos` through every layer of both, every layer's output compared.
-    fn step(
-        olds: &[BandAttention],
-        news: &mut [CompressedBand],
-        caches: &mut [AttnCache],
-        pos: usize,
-        seed: u64,
-    ) {
-        let (cos, sin) = tables(pos + 1);
-        let mut shared = SharedAttn::default();
-        let layers = olds.iter().zip(news.iter_mut()).zip(caches.iter_mut());
-        for (i, ((old, new), cache)) in layers.enumerate() {
+    /// The token at `pos` through every layer, every layer's output compared with the V4.1
+    /// band's.
+    fn step(wo_bs: &[Projection], news: &mut [CompressedBand], pos: usize, seed: u64) {
+        for (i, (wo_b, new)) in wo_bs.iter().zip(news.iter_mut()).enumerate() {
             let x = input(1, seed + i as u64);
-            let want = old
-                .forward_decode(&x, &cos, &sin, pos, cache, &mut shared)
-                .unwrap();
             let got = new.forward(&x, pos).unwrap();
-            assert_eq!(
-                bits(&full(old, &got)),
-                bits(&flat(&want)),
-                "layer {i} at {pos}"
-            );
+            let key = format!("band step {pos} layer {i}");
+            frozen::expect_f32(FROZEN, &key, &full(wo_b, &got));
         }
     }
 
-    /// The kv-source's state equals its V4.1 cache, bit for bit.
-    fn same_state(new: &CompressedBand, cache: &AttnCache, when: &str) {
+    /// The kv-source's state equals the V4.1 cache recorded `when`, bit for bit.
+    fn same_state(new: &CompressedBand, when: &str) {
         let s = new.state.as_ref().unwrap();
-        let window: Vec<f32> = cache.win.iter().flatten().copied().collect();
-        let filling: Vec<f32> = cache.group_x.iter().flatten().copied().collect();
-        assert_eq!(bits(&s.window.window), bits(&window), "window {when}");
-        assert_eq!(s.groups, cache.n_groups, "groups {when}");
-        assert_eq!(
-            bits(&s.compressed),
-            bits(&cache.comp_kv),
-            "compressed rows {when}"
+        let got = format!(
+            "{} {} {} {} {}",
+            frozen::digest_f32(&s.window.window),
+            s.groups,
+            frozen::digest_f32(&s.compressed),
+            frozen::digest_f32(&s.index_keys),
+            frozen::digest_f32(&s.filling)
         );
-        assert_eq!(
-            bits(&s.index_keys),
-            bits(&cache.index_k),
-            "index keys {when}"
-        );
-        assert_eq!(bits(&s.filling), bits(&filling), "filling group {when}");
+        frozen::expect(FROZEN, &format!("band state {when}"), &got);
     }
 
     #[test]
     fn a_prompt_through_the_band_gives_the_bits_of_the_v41_band() {
-        let (olds, mut news) = pair();
-        let mut caches = caches();
+        let (wo_bs, mut news) = pair();
         // 5 compressed rows, more than the index keeps, and a group left filling.
-        prompt(&olds, &mut news, &mut caches, (0, 11), 7);
-        same_state(&news[0], &caches[0], "after the prompt");
+        prompt(&wo_bs, &mut news, (0, 11), 7);
+        same_state(&news[0], "after the prompt");
     }
 
     #[test]
     fn decoding_through_the_band_gives_the_bits_of_the_v41_decode() {
-        let (olds, mut news) = pair();
-        let mut caches = caches();
-        prompt(&olds, &mut news, &mut caches, (0, 5), 7);
+        let (wo_bs, mut news) = pair();
+        prompt(&wo_bs, &mut news, (0, 5), 7);
         // 3 more groups complete, and the window turns over.
         for pos in 5..11 {
-            step(&olds, &mut news, &mut caches, pos, 100 + 10 * pos as u64);
-            same_state(&news[0], &caches[0], &format!("at {pos}"));
+            step(&wo_bs, &mut news, pos, 100 + 10 * pos as u64);
+            same_state(&news[0], &format!("at {pos}"));
         }
     }
 
     #[test]
     fn a_prompt_that_continues_the_band_gives_the_bits_of_the_v41_continuation() {
-        let (olds, mut news) = pair();
-        let mut caches = caches();
-        prompt(&olds, &mut news, &mut caches, (0, 5), 7);
+        let (wo_bs, mut news) = pair();
+        prompt(&wo_bs, &mut news, (0, 5), 7);
         // The continuation completes the group the first prompt left filling.
-        prompt(&olds, &mut news, &mut caches, (5, 6), 17);
-        same_state(&news[0], &caches[0], "after the continuation");
+        prompt(&wo_bs, &mut news, (5, 6), 17);
+        same_state(&news[0], "after the continuation");
     }
 
     #[test]
@@ -1415,8 +1326,7 @@ mod tests {
 
     #[test]
     fn a_reader_before_its_sources_is_refused_and_keeps_no_state() {
-        let (olds, _) = pair();
-        let (base, compressor, indexer) = parts(&olds[2]);
+        let (base, compressor, indexer, _) = parts(seed(2), roles()[2]);
         let cell = Arc::new(BandCell::default());
         let mut reader = CompressedBand::new(base, roles()[2], compressor, indexer, cell).unwrap();
         assert!(reader.forward(&input(3, 1), 0).is_err());
@@ -1425,17 +1335,16 @@ mod tests {
 
     #[test]
     fn weights_that_do_not_match_the_roles_are_refused() {
-        let (olds, _) = pair();
         let source = roles()[0];
         let cell = || Arc::new(BandCell::default());
-        let (base, compressor, indexer) = parts(&olds[0]);
+        let (base, compressor, indexer, _) = parts(seed(0), source);
         assert!(CompressedBand::new(base, source, compressor, indexer, cell()).is_ok());
-        let (base, _, indexer) = parts(&olds[0]);
+        let (base, _, indexer, _) = parts(seed(0), source);
         assert!(CompressedBand::new(base, source, None, indexer, cell()).is_err());
-        let (base, compressor, indexer) = parts(&olds[0]);
+        let (base, compressor, indexer, _) = parts(seed(0), source);
         let gateless = compressor.map(|c| CompressorWeights { wgate: None, ..c });
         assert!(CompressedBand::new(base, source, gateless, indexer, cell()).is_err());
-        let (base, compressor, indexer) = parts(&olds[0]);
+        let (base, compressor, indexer, _) = parts(seed(0), source);
         let narrow = BandDims {
             index_head_dim: 24,
             ..source
@@ -1456,15 +1365,10 @@ mod tests {
             (COMPRESSED_BLOCK, false),
             (COMPRESSED_BLOCK, true),
         ] {
-            let t = Tensor::from_vec(v.clone(), (n / block, block), &Device::Cpu).unwrap();
-            let want = flat(&fp4_act_quant(&t, block, pow2).unwrap());
+            assert_eq!(n % block, 0);
             let mut got = v.clone();
             fp4_round_trip(&mut got, block, pow2);
-            assert_eq!(
-                bits(&got),
-                bits(&want),
-                "blocks of {block}, power of two {pow2}"
-            );
+            frozen::expect_f32(FROZEN, &format!("band fp4 {block} {pow2}"), &got);
         }
     }
 
@@ -1488,9 +1392,9 @@ mod tests {
         }
         let scores = values(n * width, 10, 1.0);
         for (blocks, size) in [(1, 2), (2, 3), (5, 2)] {
-            let want = candidates::select_candidate_blocks(&logits, n, width, &lens, blocks, size);
             let got = select_candidate_blocks(&logits, n, width, &lens, blocks, size);
-            assert_eq!(got, want, "{blocks} blocks of {size}");
+            let key = format!("candidates {blocks} {size}");
+            frozen::expect_debug(FROZEN, &key, &got);
             // The block of each query's newest reachable row is kept.
             for (q, &len) in lens.iter().enumerate().filter(|&(_, &len)| len > 0) {
                 assert!(
@@ -1498,8 +1402,8 @@ mod tests {
                     "query {q}, {blocks} blocks of {size}"
                 );
             }
-            let masked = candidates::apply_candidate_mask(&scores, &want);
-            assert_eq!(bits(&apply_candidate_mask(&scores, &got)), bits(&masked));
+            let masked = apply_candidate_mask(&scores, &got);
+            frozen::expect_f32(FROZEN, &format!("{key} masked"), &masked);
         }
     }
 }

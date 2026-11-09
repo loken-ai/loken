@@ -254,7 +254,7 @@ mod tests {
     use super::*;
     use crate::inference::generic_transformer::compressed_band::fp4_round_trip;
     use crate::inference::generic_transformer::latent_mqa::fp8_round_trip;
-    use crate::inference::model::deepseek_v41::packed as v41;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
 
     /// Values with a spread of magnitudes, zeros of both signs and a few exact grid points.
     fn data(n: usize, seed: u32) -> Vec<f32> {
@@ -275,7 +275,7 @@ mod tests {
     }
 
     /// The rows the mixers round, packed, come back to the bit, in the bytes the V4.1 packing
-    /// writes.
+    /// wrote.
     #[test]
     fn the_quantisers_outputs_pack_and_come_back_to_the_bit() {
         for seed in 0..40 {
@@ -285,7 +285,7 @@ mod tests {
             let p = pack_fp8(&q8).expect("fp8 rows are on the grid");
             assert_eq!(p.len(), fp8_len(q8.len()));
             assert!(same_bits(&unpack_fp8(&p, q8.len()), &q8), "fp8 seed {seed}");
-            assert_eq!(Some(&p), v41::pack_fp8(&q8).as_ref(), "fp8 seed {seed}");
+            frozen::expect_bytes("units", &format!("pack fp8 {seed}"), &p);
             for (block, pow2) in [(COMPRESSED_BLOCK, false), (INDEX_BLOCK, true)] {
                 let mut q4 = raw.clone();
                 fp4_round_trip(&mut q4, block, pow2);
@@ -293,7 +293,8 @@ mod tests {
                     .unwrap_or_else(|| panic!("fp4 block {block} pow2 {pow2} seed {seed}"));
                 assert_eq!(p.len(), fp4_len(q4.len(), block, pow2));
                 assert!(same_bits(&unpack_fp4(&p, q4.len(), block, pow2), &q4));
-                assert_eq!(Some(&p), v41::pack_fp4(&q4, block, pow2).as_ref());
+                let key = format!("pack fp4 {seed} {block} {pow2}");
+                frozen::expect_bytes("units", &key, &p);
             }
         }
     }
@@ -314,9 +315,8 @@ mod tests {
         assert_eq!(fp4_len(512, 16, false), 384);
         assert_eq!(fp4_len(128, 32, true), 68);
         for n in [0, 32, 512] {
-            assert_eq!(fp8_len(n), v41::fp8_len(n));
-            assert_eq!(fp4_len(n, 16, false), v41::fp4_len(n, 16, false));
-            assert_eq!(fp4_len(n, 32, true), v41::fp4_len(n, 32, true));
+            let lens = (fp8_len(n), fp4_len(n, 16, false), fp4_len(n, 32, true));
+            frozen::expect_debug("units", &format!("pack lens {n}"), &lens);
         }
     }
 

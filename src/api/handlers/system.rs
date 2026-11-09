@@ -398,27 +398,26 @@ pub(crate) async fn stage_performance_endpoint(
 ) -> Json<serde_json::Value> {
     use crate::inference::place::layer_perf::stages;
     use crate::inference::stage_prof::{stage_prof_enable, stage_prof_snapshot};
+    let experts = crate::inference::expert_counters::global();
     match params.get("enable").map(String::as_str) {
         Some("1") => {
             stages::reset();
             stages::set_enabled(true);
             stage_prof_enable(true);
-            crate::inference::offload::store::ws_enable();
-            crate::inference::offload::store::ws_reset();
+            experts.enable(true);
         }
         Some("0") => {
             stages::set_enabled(false);
             stage_prof_enable(false);
+            experts.enable(false);
         }
         _ => {}
     }
-    let working_set = crate::inference::offload::store::ws_report();
-    let ws_cover_71 = crate::inference::offload::store::ws_coverage(71);
-    let (expert_hits, expert_misses) = crate::inference::offload::store::hitmiss_report();
-    let ws_cover_120 = crate::inference::offload::store::ws_coverage(120);
-    // The offloaded models (deepseek streamed) name their own stages and their lanes drop the
-    // per-thread recorder, so the generic tracker above stays empty for them; their profile comes
-    // from the offload's own accumulator.
+    let counted = experts.report();
+    let ws_cover_71 = experts.coverage(71);
+    let (expert_hits, expert_misses) = (counted.hits, counted.misses);
+    let ws_cover_120 = experts.coverage(120);
+    // The stages a model names through the stage profile, beside the generic tracker.
     let offload_total: u64 = stage_prof_snapshot().iter().map(|(_, ns, _)| *ns).sum();
     let offload_stages: Vec<serde_json::Value> = stage_prof_snapshot()
         .iter()
@@ -431,14 +430,11 @@ pub(crate) async fn stage_performance_endpoint(
             })
         })
         .collect();
-    let (routed, named, unkept, unkept_named) =
-        crate::inference::offload::store::prediction_report();
-    let (read_compute, read_ahead) = crate::inference::offload::store::read_report();
-    let (again, decoded) = crate::inference::offload::store::repeat_report();
     let prediction = serde_json::json!({
-        "routed_again": again, "decoded_routed": decoded,
-        "read_for_compute": read_compute, "read_for_ahead": read_ahead,
-        "routed": routed, "named": named, "unkept": unkept, "unkept_named": unkept_named,
+        "routed_again": counted.routed_again, "decoded_routed": counted.decoded_routed,
+        "read_for_compute": counted.read_for_compute, "read_for_ahead": counted.read_for_ahead,
+        "routed": counted.guess_routed, "named": counted.guess_named,
+        "unkept": counted.guess_unkept, "unkept_named": counted.guess_unkept_named,
     });
     let (sums, calls) = stages::snapshot();
     // The share is against the stages that partition a layer-call; the two nested inside
@@ -450,7 +446,7 @@ pub(crate) async fn stage_performance_endpoint(
         "total_us": total,
         "offload_total_us": offload_total / 1000,
         "offload_stages": offload_stages,
-        "working_set_per_layer": working_set,
+        "working_set_per_layer": counted.working_set,
         "ws_coverage_top71": ws_cover_71,
         "expert_hits": expert_hits,
         "expert_misses": expert_misses,

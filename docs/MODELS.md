@@ -150,7 +150,7 @@ Another model's further files are left unread, and the log says so.
 A partial conversion of layers `0:N` is a model of N + 1 layers that llama.cpp loads as such.
 
 The model file is read and written by the generic block-scaled reader and its streaming driver.
-The calibration, the DSpark draft and `--complete` still run on the DeepSeek V4.1 path.
+The calibration, the DSpark draft and `--complete` run on the generic route too.
 
 The route still reads the files loken wrote before, under `deepseek_v41` and its own names.  
 A file that `--complete` lays out is loken's own layout, not llama.cpp's.
@@ -204,10 +204,9 @@ Reasoning models return their thinking apart from the answer on every surface.
 
 DeepSeek V4.1 loads through the generic route as a wide-residual model.
 The hyper-connection tensors of the file or the checkpoint directory select its layers.
-The routed experts stay in the file, which may be split, and the placement plan decides which sit on the cards.
-
 The routed experts stay in the file, which may be split, and are read as routing asks for them.
-The always-read weights and the busiest experts sit on the cards.
+The placement plan decides which layers sit on the cards.
+The card tier keeps the busiest routed experts on a card when the card measures faster than the host.
 A packed weight on the card runs the fastest of its products that is no farther from the exact product than the host.
 Products whose measured times differ by less than their measured noise are tied.
 A tie falls to the product nearest the exact one, so the timing noise of a load does not change the text.

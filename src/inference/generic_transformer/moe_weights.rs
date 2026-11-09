@@ -3049,8 +3049,8 @@ mod clamped_swiglu_tests {
         assert!(worst <= 2e-2 * scale, "max diff {worst} of {scale}");
     }
 
-    /// A bounded shared expert gives what the offload's `Expert` gives over the same dense
-    /// weights at the same bound, and differs from the unbounded one.
+    /// A bounded shared expert gives what the V4.1 host expert gave over the same dense weights
+    /// at the same bound, as recorded, and differs from the unbounded one.
     #[test]
     fn a_bounded_shared_expert_matches_the_offload_expert() {
         let (hidden, ffn, tokens) = (32usize, 16usize, 3usize);
@@ -3083,12 +3083,14 @@ mod clamped_swiglu_tests {
         let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let got = flat(shared(Some(limit)).forward(&xs).unwrap());
         let free = flat(shared(None).forward(&xs).unwrap());
-        let old = crate::inference::offload::experts::Expert::dense(
-            gate.clone(),
-            down.clone(),
-            up.clone(),
+        let want = crate::inference::generic_transformer::wide_sparse_frozen::recorded(
+            "units",
+            "bounded shared expert values",
         );
-        let want = flat(old.forward(&xs, limit).unwrap());
+        let want: Vec<f32> = want
+            .split(' ')
+            .map(|b| f32::from_bits(b.parse().unwrap()))
+            .collect();
         let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
         let worst = got
             .iter()
@@ -3354,9 +3356,8 @@ mod sigmoid_router_tests {
 #[cfg(test)]
 mod sqrt_softplus_router_tests {
     use super::*;
-    use crate::inference::model::deepseek_v41::moe::Moe;
-    use crate::inference::offload::experts::Expert;
-    use crate::inference::offload::store::ExpertSet;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
+    use crate::tensor::blockscaled::projection::Projection;
 
     const DIM: usize = 16;
     const INTER: usize = 8;
@@ -3381,15 +3382,7 @@ mod sqrt_softplus_router_tests {
         Tensor::from_vec(values(dims.iter().product(), seed, amp), dims, &Device::Cpu).unwrap()
     }
 
-    fn expert(seed: u64) -> Expert {
-        Expert::dense(
-            drawn(seed, &[INTER, DIM], 0.05),
-            drawn(seed + 1, &[DIM, INTER], 0.05),
-            drawn(seed + 2, &[INTER, DIM], 0.05),
-        )
-    }
-
-    /// The block whose gate the generic router must equal.
+    /// The block whose gate the generic router must equal, as the V4.1 block recorded it.
     ///
     /// `gate_amp` and `bias_amp` set the spread of the logits and of the selection bias.
     struct Case {
@@ -3401,57 +3394,37 @@ mod sqrt_softplus_router_tests {
         bias_amp: f32,
     }
 
-    fn reference(case: &Case) -> Moe {
-        Moe {
-            gate_weight: drawn(1, &[ROUTED, DIM], case.gate_amp),
-            gate_bias: drawn(2, &[ROUTED], case.bias_amp),
-            experts: ExpertSet::Resident(
-                (0..ROUTED)
-                    .map(|i| std::sync::Arc::new(expert(100 + 3 * i as u64)))
-                    .collect(),
-            ),
-            shared: expert(10),
-            has_shared: true,
-            n_routed: ROUTED,
-            n_activated: case.used,
-            dim: DIM,
-            gate_temp: case.temperature,
-            route_scale: case.route_scale,
-            swiglu_limit: 10.0,
-            norm_topk: case.norm_topk,
-            last_routing: std::sync::Mutex::new(Vec::new()),
-            predicted: std::sync::Mutex::new(Vec::new()),
-            last_routed: std::sync::Mutex::new(Vec::new()),
-            decode_routes: Default::default(),
-            saved: Default::default(),
-            truncation: Default::default(),
-            resident_override: Default::default(),
-            observer: std::sync::RwLock::new(None),
-            offload: std::sync::RwLock::new(None),
-            scripted: Default::default(),
-        }
+    /// The gate logits of the drawn tokens and the selection bias of `case`.
+    fn gate(case: &Case) -> (Tensor, Tensor) {
+        let weight = drawn(1, &[ROUTED, DIM], case.gate_amp);
+        let bias = drawn(2, &[ROUTED], case.bias_amp);
+        let x = drawn(7, &[1, TOKENS, DIM], 1.0);
+        let rows = x.reshape((TOKENS, DIM)).unwrap();
+        (Projection::Dense(weight).apply(&rows).unwrap(), bias)
     }
 
-    /// Run the block's own gate and the generic router on the same logits.
-    ///
-    /// Returns, per token, the experts and the bits of their weights from each, and the logits.
-    #[allow(clippy::type_complexity)]
-    fn both(case: &Case) -> (Vec<Vec<(usize, u32)>>, Vec<Vec<(usize, u32)>>, Vec<f32>) {
-        let moe = reference(case);
-        let x = drawn(7, &[1, TOKENS, DIM], 1.0);
-        moe.forward(&x).unwrap();
-        let old: Vec<Vec<(usize, u32)>> = moe
-            .last_routing
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|row| row.iter().map(|&(e, w)| (e, w.to_bits())).collect())
-            .collect();
+    /// Asserts `got` is the routing the block's own gate gave under `case`.
+    fn is_the_blocks_routing(case: &Case, got: &[Vec<(usize, u32)>]) {
+        let key = format!(
+            "router {} {} {} {} {} {}",
+            case.used,
+            case.temperature,
+            case.route_scale,
+            case.norm_topk,
+            case.gate_amp,
+            case.bias_amp
+        );
+        frozen::expect_debug("units", &key, &got);
+    }
 
-        let rows = x.reshape((TOKENS, DIM)).unwrap();
-        let logits = crate::inference::offload::linear(&rows, &moe.gate_weight).unwrap();
+    /// Run the generic router on the gate's logits and assert it routes as the block's own gate.
+    ///
+    /// Returns, per token, the experts and the bits of their weights, and the logits.
+    #[allow(clippy::type_complexity)]
+    fn both(case: &Case) -> (Vec<Vec<(usize, u32)>>, Vec<f32>) {
+        let (logits, gate_bias) = gate(case);
         let routing = SigmoidRouting {
-            selection_bias: Some(moe.gate_bias.clone()),
+            selection_bias: Some(gate_bias),
             normalize: case.norm_topk,
             scale: case.route_scale as f64,
             score: RouterScore::SqrtSoftplus {
@@ -3472,7 +3445,8 @@ mod sqrt_softplus_router_tests {
             })
             .collect();
         let logits = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        (old, new, logits)
+        is_the_blocks_routing(case, &new);
+        (new, logits)
     }
 
     /// The generic router chooses the experts the block's own gate chooses, in its order, with
@@ -3487,9 +3461,8 @@ mod sqrt_softplus_router_tests {
             gate_amp: 0.2,
             bias_amp: 0.1,
         };
-        let (old, new, _) = both(&case);
-        assert_eq!(old.len(), TOKENS);
-        assert_eq!(new, old);
+        let (new, _) = both(&case);
+        assert_eq!(new.len(), TOKENS);
     }
 
     /// The same without renormalising, at another temperature and scale.
@@ -3503,8 +3476,7 @@ mod sqrt_softplus_router_tests {
             gate_amp: 0.3,
             bias_amp: 0.2,
         };
-        let (old, new, _) = both(&case);
-        assert_eq!(new, old);
+        both(&case);
     }
 
     /// 1 chosen expert keeps its score whether or not the router renormalises.
@@ -3518,8 +3490,7 @@ mod sqrt_softplus_router_tests {
             gate_amp: 0.2,
             bias_amp: 0.1,
         };
-        let (old, new, logits) = both(&case);
-        assert_eq!(new, old);
+        let (new, logits) = both(&case);
         for (t, row) in new.iter().enumerate() {
             let (e, w) = row[0];
             let z = logits[t * ROUTED + e];
@@ -3538,14 +3509,13 @@ mod sqrt_softplus_router_tests {
             gate_amp: 1.0,
             bias_amp: 0.1,
         };
-        let (old, new, logits) = both(&case);
+        let (_, logits) = both(&case);
         assert!(
             logits
                 .iter()
                 .any(|&z| z / case.temperature > SOFTPLUS_LINEAR_ABOVE),
             "no logit reaches the linear branch"
         );
-        assert_eq!(new, old);
     }
 
     /// The bias moves the choice and never the weights: a chosen expert weighs by its
@@ -3571,15 +3541,16 @@ mod sqrt_softplus_router_tests {
     }
 
     /// The routing of the 4-expert case under `truncation`, with `resident` the experts in
-    /// memory, from the block's own gate and from the generic truncated choice.
+    /// memory, from the generic truncated choice, asserted to be the one the block's own gate
+    /// gave.
     ///
-    /// Returns, per token, the experts and the bits of their scaled weights from each, then
-    /// the slots each saved.
+    /// Returns, per token, the experts and the bits of their scaled weights, then the slots
+    /// saved.
     #[allow(clippy::type_complexity)]
     fn truncated_both(
         truncation: Truncation,
         resident: &std::collections::HashSet<usize>,
-    ) -> (Vec<Vec<(usize, u32)>>, Vec<Vec<(usize, u32)>>, u64, u64) {
+    ) -> (Vec<Vec<(usize, u32)>>, u64) {
         let case = Case {
             used: 4,
             temperature: 1.0,
@@ -3588,37 +3559,9 @@ mod sqrt_softplus_router_tests {
             gate_amp: 0.2,
             bias_amp: 0.1,
         };
-        use crate::inference::model::deepseek_v41::moe::Truncation as V41Truncation;
-        let moe = reference(&case);
-        *moe.truncation.write().unwrap() = V41Truncation {
-            keep: truncation.keep,
-            drop_mass: truncation.drop_mass,
-            miss_below: truncation.miss_below,
-            miss_drops: truncation.miss_drops,
-        };
-        *moe.resident_override.write().unwrap() = Some(resident.clone());
-        let x = drawn(7, &[1, TOKENS, DIM], 1.0);
-        moe.forward(&x).unwrap();
-        let old: Vec<Vec<(usize, u32)>> = moe
-            .last_routing
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|row| row.iter().map(|&(e, w)| (e, w.to_bits())).collect())
-            .collect();
-        let old_saved = moe.saved.load(std::sync::atomic::Ordering::Relaxed);
-
-        let rows = x.reshape((TOKENS, DIM)).unwrap();
-        let logits = crate::inference::offload::linear(&rows, &moe.gate_weight)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-        let bias = moe
-            .gate_bias
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
+        let (logits, bias) = gate(&case);
+        let logits = logits.to_vec2::<f32>().unwrap();
+        let bias = bias.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let in_memory = |e: usize| resident.contains(&e);
         let mut new_saved = 0;
         // As the routed feed-forward routes: the truncated choice only when a field is on.
@@ -3653,7 +3596,9 @@ mod sqrt_softplus_router_tests {
                     .collect()
             })
             .collect();
-        (old, new, old_saved, new_saved)
+        let key = format!("truncated {truncation:?} {}", resident.len());
+        frozen::expect_debug("units", &key, &(&new, new_saved));
+        (new, new_saved)
     }
 
     /// Off, the truncated choice routes as the plain one does. Keeping 1 expert leaves each
@@ -3662,8 +3607,8 @@ mod sqrt_softplus_router_tests {
     #[test]
     fn truncation_keeps_the_heaviest_and_weights_it_whole() {
         let none = std::collections::HashSet::new();
-        let (_, exact, _, _) = truncated_both(Truncation::default(), &none);
-        let (plain, _, _) = both(&Case {
+        let (exact, _) = truncated_both(Truncation::default(), &none);
+        let (plain, _) = both(&Case {
             used: 4,
             temperature: 1.0,
             route_scale: 1.5,
@@ -3678,15 +3623,13 @@ mod sqrt_softplus_router_tests {
                 keep,
                 ..Default::default()
             };
-            let (old, new, old_saved, new_saved) = truncated_both(t, &none);
-            assert_eq!(new, old, "keep {keep}");
-            assert_eq!(new_saved, old_saved, "keep {keep}");
+            truncated_both(t, &none);
         }
         let one = Truncation {
             keep: 1,
             ..Default::default()
         };
-        let (_, kept, _, saved) = truncated_both(one, &none);
+        let (kept, saved) = truncated_both(one, &none);
         assert_eq!(saved, (TOKENS * 3) as u64, "every cut slot was a read");
         for (kept, full) in kept.iter().zip(&exact) {
             assert_eq!(kept.len(), 1);
@@ -3705,15 +3648,13 @@ mod sqrt_softplus_router_tests {
     #[test]
     fn a_missed_light_expert_is_replaced_by_a_resident_one() {
         let none = std::collections::HashSet::new();
-        let (_, exact, _, _) = truncated_both(Truncation::default(), &none);
+        let (exact, _) = truncated_both(Truncation::default(), &none);
         let resident: std::collections::HashSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
         let miss = Truncation {
             miss_below: 1.1,
             ..Default::default()
         };
-        let (old, got, old_saved, new_saved) = truncated_both(miss, &resident);
-        assert_eq!(got, old);
-        assert_eq!(new_saved, old_saved);
+        let (got, _) = truncated_both(miss, &resident);
         for (got, full) in got.iter().zip(&exact) {
             assert_eq!(got.len(), full.len());
             let heaviest = full
@@ -3730,9 +3671,7 @@ mod sqrt_softplus_router_tests {
             miss_drops: true,
             ..miss
         };
-        let (old, got, old_saved, new_saved) = truncated_both(drops, &resident);
-        assert_eq!(got, old);
-        assert_eq!(new_saved, old_saved);
+        let (got, _) = truncated_both(drops, &resident);
         for got in got {
             assert!(!got.is_empty() && got.len() <= 4);
         }
@@ -3764,9 +3703,7 @@ mod sqrt_softplus_router_tests {
             },
         ];
         for t in cases {
-            let (old, new, old_saved, new_saved) = truncated_both(t, &resident);
-            assert_eq!(new, old, "{t:?}");
-            assert_eq!(new_saved, old_saved, "{t:?}");
+            truncated_both(t, &resident);
         }
     }
 }

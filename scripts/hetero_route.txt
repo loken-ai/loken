@@ -13,9 +13,7 @@ backend GenericBackend
 backend GenericVisionBackend
 backend PipelineHeadBackend
 backend ContinuousBackend
-backend BatchedBackend
 backend TakenBackend
-debt-backend DeepseekV41Backend
 debt-backend MoondreamBackend
 family acestep
 family audio_in
@@ -47,10 +45,7 @@ family voxtral
 family wan
 family whisper
 family zimage
-debt-family deepseek_v41
 debt-family mixformer
 debt-family moondream
-debt-path src/inference/model/deepseek_v41/
-debt-path src/inference/offload/
 debt-path src/inference/model/mixformer/
 debt-path src/inference/model/moondream/

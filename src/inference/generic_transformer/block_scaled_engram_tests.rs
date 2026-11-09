@@ -1,12 +1,13 @@
-//! Engram layers of a block-scaled checkpoint on the generic route against the V4.1 path.
+//! Engram layers of a block-scaled checkpoint on the generic route against the records of the
+//! V4.1 path.
 //!
 //! The checkpoint is the one of `block_scaled_oracle_tests` with 2 engram layers.
 //! It ships a word-level `tokenizer.json` in which some tokens normalise alike.
 //! Each engram table is stored as e4m3 rows beside ue8m0 scales, as the release stores it.
-//! Both paths open the same directory and build the token map from its tokenizer.
+//! The generic route builds the token map from its tokenizer, as the V4.1 path did.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
@@ -17,13 +18,8 @@ use super::block_scaled_oracle_tests::{
 };
 use super::ngram::engram_hash::primes_and_offsets;
 use super::ngram::token_map;
-use super::wide_sparse_oracle_tests::{
-    bit_difference, record_generic, record_v41, Record, RECORDS,
-};
-use crate::inference::model::deepseek_v41::engram::EngramConfig;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
+use super::wide_sparse_frozen as frozen;
+use super::wide_sparse_oracle_tests::{expect_records, record_generic, Record, RECORDS};
 
 /// The engram layers: a window layer and the band layer of the checkpoint.
 pub(super) const ENGRAM_LAYERS: [usize; 2] = [0, 1];
@@ -132,62 +128,26 @@ pub(crate) fn engram_checkpoint(tag: &str) -> PathBuf {
     dir
 }
 
-/// The V4.1 model of the checkpoint as its checkpoint loader builds it.
-///
-/// With `engram`, the hash layout comes from the shipped tokenizer, else the model runs without
-/// its engram layers.
-fn v41_model(dir: &Path, engram: bool) -> DeepseekV41Model {
-    let src = SafeTensorsSource::open(dir).unwrap();
-    let layout = engram.then(|| {
-        let (map, _) = token_map::build_from_file(&dir.join("tokenizer.json")).unwrap();
-        EngramConfig::derive(&src.inference_config, map).expect("a V4.1 engram layout")
-    });
-    let cfg = DeepseekV41Config::from_reference_config(&src.inference_config, layout).unwrap();
-    DeepseekV41Model::load(&src, &cfg).unwrap()
-}
-
-fn prefill_bits(model: &DeepseekV41Model, tokens: &[u32]) -> Vec<u32> {
-    let logits = model.forward_prefill(tokens).unwrap();
-    let v = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    v.iter().map(|x| x.to_bits()).collect()
-}
-
-/// The generic model read from the checkpoint with engram layers gives the bits of the V4.1 path
-/// read from the same directory: the prefill, the decode, the verify, the rewound verify and the
-/// decode after it, and the greedy run.
-/// The engram layers change the V4.1 prefill, so the records cover them.
+/// The generic model read from the checkpoint with engram layers gives the recorded bits of the
+/// V4.1 path read from the same directory: the prefill, the decode, the verify, the rewound
+/// verify and the decode after it, and the greedy run.
+/// The engram layers change the prefill the V4.1 path gave without them, so the records cover
+/// them.
 #[test]
 fn a_checkpoint_with_engram_layers_gives_the_bits_of_the_v41_path() {
     let dir = engram_checkpoint("engram");
-    let v41 = v41_model(&dir, true);
-    let plain = v41_model(&dir, false);
     let mut generic = generic_model(&dir);
-    let tokens = tokens();
-    assert_ne!(
-        prefill_bits(&v41, &tokens),
-        prefill_bits(&plain, &tokens),
-        "the engram layers leave the V4.1 prefill unchanged"
-    );
-    let (mut want, mut got): (BTreeMap<String, Record>, BTreeMap<String, Record>) =
-        (BTreeMap::new(), BTreeMap::new());
-    record_v41(&v41, &tokens, 0, &mut want);
-    record_generic(&mut generic, &tokens, 0, &mut got);
+    let mut got: BTreeMap<String, Record> = BTreeMap::new();
+    record_generic(&mut generic, &tokens(), 0, &mut got);
     let _ = std::fs::remove_dir_all(&dir);
-    let mut differ = Vec::new();
-    for record in RECORDS {
-        let name = format!("l0_{record}");
-        match (want.get(&name), got.get(&name)) {
-            (Some(w), Some(g)) => {
-                if let Some(d) = bit_difference(w, g) {
-                    differ.push(format!("{name}: {d}"));
-                }
-            }
-            _ => differ.push(format!("{name}: missing")),
-        }
-    }
-    assert!(
-        differ.is_empty(),
-        "the generic model of the engram checkpoint differs from the V4.1 path:\n{}",
-        differ.join("\n")
+    let Some(Record::Logits(_, _, prefill)) = got.get("l0_prefill") else {
+        panic!("no prefill record");
+    };
+    assert_ne!(
+        format!("{:?}", frozen::digest_f32(prefill)),
+        frozen::recorded("block_scaled", "engram plain prefill"),
+        "the engram layers leave the prefill unchanged"
     );
+    assert_eq!(got.len(), RECORDS.len());
+    expect_records("block_scaled", "engram ", &got);
 }

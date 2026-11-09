@@ -1,25 +1,21 @@
-//! The routing heat of a wide-residual model on the generic route against the V4.1 path, on the
-//! small file of the frozen V4.1 oracle.
+//! The routing heat of a wide-residual model on the generic route against the records of the
+//! V4.1 path, on the small file of the frozen V4.1 oracle.
 //!
 //! The file lies in a directory of its own, beside a companion file that declares a routing
 //! prior.
 //! A routing profile is a file as a run writes it.
-//! The V4.1 side follows the steps its engine arm took: the prior beside the file when the file
-//! carries none, then the profile seeded into the model, then its ranks.
+//! The V4.1 records followed the steps its engine arm took: the prior beside the file when the
+//! file carries none, then the profile seeded into the model, then its ranks.
 
 use super::block_draft_tests::generic_of;
 use super::expert_profile::ExpertProfile;
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_sibling as sibling;
 use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
-use crate::inference::offload::streamed::StreamedModel;
-use crate::inference::place::expert_variants::{ranks_from_counts, VariantChoice};
 use crate::tensor::gguf_write::write_gguf_with_metadata;
 use crate::tensor::quantized::gguf_file::{open_mapped, Value};
-use crate::tensor::quantized::gguf_source::SplitGguf;
 use std::path::{Path, PathBuf};
 
 /// The oracle's first band layout: compress ratios, kv source layers, index source layers.
@@ -109,28 +105,10 @@ pub(crate) fn profile_file(
     path
 }
 
-/// The heat of the V4.1 path, by the steps of its engine arm.
-pub(crate) fn v41_heat(model: &Path, profile: Option<&Path>) -> Vec<Vec<usize>> {
-    let source = SplitGguf::open(model).unwrap();
-    let mut cfg = DeepseekV41Config::from_meta(&source).unwrap();
-    if cfg.hot_experts.iter().all(Vec::is_empty) {
-        if let Some(prior) = sibling::prior_beside(model, cfg.n_layers, cfg.n_routed_experts) {
-            cfg.hot_experts = prior;
-        }
-    }
-    let v41 = DeepseekV41Model::load(&source, &cfg).unwrap();
-    let ranks = profile.and_then(|path| {
-        let profile = ExpertProfile::read_if_present(path).ok()??;
-        v41.seed_routing_profile(&profile).ok()?;
-        ranks_from_counts(
-            &profile.counts,
-            profile.layers,
-            profile.experts,
-            &cfg.hot_experts,
-        )
-    });
-    v41.set_variant_policy(VariantChoice::Plan, ranks);
-    StreamedModel::routing_prior(&v41).to_vec()
+/// Asserts `heat` is the heat the V4.1 path gave, by the steps of its engine arm, in the case
+/// recorded under `key`.
+pub(crate) fn is_v41_heat(key: &str, heat: &[Vec<usize>]) {
+    frozen::expect_debug("routing", key, &heat);
 }
 
 /// The heat of the generic route, by the steps of the generic engine arm, and the refusal of the
@@ -155,10 +133,9 @@ fn a_companion_prior_ranks_the_experts_of_both_routes() {
     let model = toy_dir("companion", None);
     let prior = turning(layers(), ROUTED as u32);
     sibling::write_prior(&model.with_file_name("side"), &prior).unwrap();
-    let want = v41_heat(&model, None);
-    assert_eq!(want, as_ids(&prior), "the V4.1 path took the companion");
     let (got, refused) = generic_heat(&model, None);
-    assert_eq!(got, want);
+    assert_eq!(got, as_ids(&prior), "the companion is taken");
+    is_v41_heat("companion", &got);
     assert_eq!(refused, None);
     remove(&model);
 }
@@ -178,15 +155,14 @@ fn a_profile_ranks_over_the_companion_prior_on_both_routes() {
     counts[7] = 1;
     counts[ROUTED + 3] = 2;
     let profile = profile_file(&model, layers(), ROUTED, counts);
-    let want = v41_heat(&model, Some(&profile));
-    assert_eq!(want[0][..4], [2, 5, 6, 7], "counted first, ties by id");
+    let (got, refused) = generic_heat(&model, Some(&profile));
+    assert_eq!(got[0][..4], [2, 5, 6, 7], "counted first, ties by id");
     assert_eq!(
-        want[2],
+        got[2],
         as_ids(&prior)[2],
         "an uncounted layer keeps the prior"
     );
-    let (got, refused) = generic_heat(&model, Some(&profile));
-    assert_eq!(got, want);
+    is_v41_heat("profile", &got);
     assert_eq!(refused, None);
     remove(&model);
 }
@@ -204,18 +180,17 @@ fn a_profile_that_does_not_fit_or_counted_nothing_leaves_the_prior() {
         ROUTED,
         vec![1; (layers() + 1) * ROUTED],
     );
-    let want = v41_heat(&model, Some(&wide));
-    assert_eq!(want, as_ids(&prior));
     let (got, refused) = generic_heat(&model, Some(&wide));
-    assert_eq!(got, want);
+    assert_eq!(got, as_ids(&prior));
+    is_v41_heat("unfit wide", &got);
     assert!(
         refused.is_some_and(|e| e.contains("the profile counts 4 layers of 8 experts")),
         "the shapes are named"
     );
     let zero = profile_file(&model, layers(), ROUTED, vec![0; layers() * ROUTED]);
-    let want = v41_heat(&model, Some(&zero));
-    assert_eq!(want, as_ids(&prior));
-    assert_eq!(generic_heat(&model, Some(&zero)), (want, None));
+    let (got, refused) = generic_heat(&model, Some(&zero));
+    assert_eq!((&got, refused), (&as_ids(&prior), None));
+    is_v41_heat("unfit zero", &got);
     remove(&model);
 }
 
@@ -230,9 +205,9 @@ fn the_files_own_prior_wins_and_an_unfit_companion_is_passed_over() {
         &turning(layers(), ROUTED as u32),
     )
     .unwrap();
-    let want = v41_heat(&model, None);
-    assert_eq!(want, as_ids(&own));
-    assert_eq!(generic_heat(&model, None).0, want);
+    let got = generic_heat(&model, None).0;
+    assert_eq!(got, as_ids(&own));
+    is_v41_heat("own", &got);
     remove(&model);
 
     let model = toy_dir("unfit-side", None);
@@ -241,8 +216,8 @@ fn the_files_own_prior_wins_and_an_unfit_companion_is_passed_over() {
         &turning(layers(), ROUTED as u32 + 2),
     )
     .unwrap();
-    let want = v41_heat(&model, None);
-    assert!(want.iter().all(Vec::is_empty), "no prior on the V4.1 path");
-    assert_eq!(generic_heat(&model, None).0, want);
+    let got = generic_heat(&model, None).0;
+    assert!(got.iter().all(Vec::is_empty), "no prior");
+    is_v41_heat("unfit side", &got);
     remove(&model);
 }

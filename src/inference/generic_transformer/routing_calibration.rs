@@ -445,32 +445,27 @@ mod tests {
         assert!(pick(&table, 0.01).is_none());
     }
 
-    /// A table survives the cache, and reads as the V4.1 calibration's table.
+    /// A table survives the cache, and is written as the V4.1 calibration wrote its table.
     #[test]
     fn the_table_round_trips_and_reads_as_the_v41_table() {
-        use crate::inference::model::deepseek_v41::calibrate;
+        use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
         let t = vec![m(5, 0.0, 0.015, 4.0)];
         let text = serde_json::to_string(&t).unwrap();
         let back: Vec<Measured> = serde_json::from_str(&text).unwrap();
         assert_eq!(back, t);
-        let theirs: Vec<calibrate::Measured> = serde_json::from_str(&text).unwrap();
-        assert_eq!(serde_json::to_string(&theirs).unwrap(), text);
+        frozen::expect("units", "calibration table json", &text);
     }
 
     /// The candidates and the budgets are the V4.1 calibration's for every expert count.
     #[test]
     fn the_candidates_and_budgets_are_the_v41_ones() {
-        use crate::inference::model::deepseek_v41::calibrate;
+        use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
         for k in 0..10 {
             let ours: Vec<(usize, u32)> = candidates(k)
                 .iter()
                 .map(|t| (t.keep, t.miss_below.to_bits()))
                 .collect();
-            let theirs: Vec<(usize, u32)> = calibrate::candidates(k)
-                .iter()
-                .map(|t| (t.keep, t.miss_below.to_bits()))
-                .collect();
-            assert_eq!(ours, theirs, "{k} experts");
+            frozen::expect_debug("units", &format!("calibration candidates {k}"), &ours);
         }
         for level in [
             QualityLevel::Exact,
@@ -478,11 +473,8 @@ mod tests {
             QualityLevel::Fast,
         ] {
             for noise in [None, Some(0.0), Some(0.013), Some(f64::INFINITY)] {
-                assert_eq!(
-                    budget_for(level, noise),
-                    calibrate::budget_for(level, noise),
-                    "{level:?} {noise:?}"
-                );
+                let key = format!("calibration budget {level:?} {noise:?}");
+                frozen::expect_debug("units", &key, &budget_for(level, noise));
             }
         }
     }

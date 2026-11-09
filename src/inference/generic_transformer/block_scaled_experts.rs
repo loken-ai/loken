@@ -136,7 +136,7 @@ impl BlockScaledExperts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::offload::experts::Expert;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
     use crate::tensor::blockscaled::fp4::Fp4Weight;
     use crate::tensor::blockscaled::fp8::Fp8Weight;
     use crate::tensor::mapped::MappedBytes;
@@ -211,60 +211,6 @@ mod tests {
         (ids, weights)
     }
 
-    /// The layer's experts as the offload's `Expert` runs them, over the same rows grouped the same
-    /// way, summed in the router's order.
-    fn by_the_offload(
-        experts: &[BlockScaledExpert],
-        limit: f32,
-        x: &Tensor,
-        ids: &[u32],
-        weights: &[f32],
-    ) -> Vec<f32> {
-        let mut pair_rows = vec![0f32; ROWS * K * DIM];
-        for (e, ex) in experts.iter().enumerate() {
-            let pairs: Vec<usize> = (0..ROWS * K).filter(|&p| ids[p] as usize == e).collect();
-            if pairs.is_empty() {
-                continue;
-            }
-            let old = Expert {
-                w1: ex.gate.clone(),
-                w2: ex.down.clone(),
-                w3: ex.up.clone(),
-            };
-            let picked: Vec<u32> = pairs.iter().map(|&p| (p / K) as u32).collect();
-            let x_e = x
-                .index_select(
-                    &Tensor::from_vec(picked, pairs.len(), &Device::Cpu).unwrap(),
-                    0,
-                )
-                .unwrap()
-                .contiguous()
-                .unwrap();
-            let y: Vec<f32> = old
-                .forward(&x_e, limit)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1()
-                .unwrap();
-            for (j, &p) in pairs.iter().enumerate() {
-                pair_rows[p * DIM..(p + 1) * DIM].copy_from_slice(&y[j * DIM..(j + 1) * DIM]);
-            }
-        }
-        let mut out = vec![-0.0f32; ROWS * DIM];
-        for p in 0..ROWS * K {
-            let r = p / K;
-            for c in 0..DIM {
-                out[r * DIM + c] += weights[p] * pair_rows[p * DIM + c];
-            }
-        }
-        out
-    }
-
-    fn bits(v: &[f32]) -> Vec<u32> {
-        v.iter().map(|f| f.to_bits()).collect()
-    }
-
     fn same_as_the_offload(make: &dyn Fn(usize, usize, usize) -> Projection, limit: f32) {
         if !crate::cpu::hardware_has_avx2() {
             return;
@@ -282,24 +228,28 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        let want = by_the_offload(&set.experts, limit, &x, &ids, &weights);
         assert!(got.iter().any(|v| *v != 0.0), "the experts give nothing");
-        assert_eq!(bits(&got), bits(&want));
+        let kind = match set.experts[0].gate {
+            Projection::Fp4(_) => "fp4",
+            _ => "fp8",
+        };
+        let key = format!("block-scaled experts {kind} {limit}");
+        frozen::expect_f32("units", &key, &got);
     }
 
-    /// fp4 experts give the bits of the offload's experts over the same projections.
+    /// fp4 experts give the recorded bits of the V4.1 host experts over the same projections.
     #[test]
     fn fp4_experts_give_the_bits_of_the_offload_experts() {
         same_as_the_offload(&fp4, 0.0);
     }
 
-    /// fp8 experts give the bits of the offload's experts over the same projections.
+    /// fp8 experts give the recorded bits of the V4.1 host experts over the same projections.
     #[test]
     fn fp8_experts_give_the_bits_of_the_offload_experts() {
         same_as_the_offload(&fp8, 0.0);
     }
 
-    /// Under a SwiGLU bound the experts still give the bits of the offload's experts.
+    /// Under a SwiGLU bound the experts still give the recorded bits of the V4.1 host experts.
     #[test]
     fn bounded_block_scaled_experts_give_the_bits_of_the_offload_experts() {
         same_as_the_offload(&fp8, 0.5);

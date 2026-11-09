@@ -1,0 +1,46 @@
+[0, 2, 0] Engram	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 720896], 786432, 3, 2)))
+[0, 2, 0] Stacks	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 720896], 786432, 3, 2)))
+[0, 2, 0] Units	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 720896], 786432, 3, 2)))
+[0, 2, 2, 0] Engram	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 720896, 720896], 786432, 3, 2)))
+[0, 2, 2, 0] Stacks	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 720896, 720896], 786432, 3, 2)))
+[0, 2, 2, 0] Units	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 720896, 720896], 786432, 3, 2)))
+[0, 2, 2, 2, 0] Engram	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 1085440, 1085440, 720896], 786432, 3, 2)))
+[0, 2, 2, 2, 0] Stacks	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 1085440, 1085440, 720896], 786432, 3, 2)))
+[0, 2, 2, 2, 0] Units	(Some((256, 256, F32, F32)), Some(([720896, 1085440, 1085440, 1085440, 720896], 786432, 3, 2)))
+no prior	(Some((256, 256, F32, F32)), None)
+plan [0, 2, 0] Engram 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 1 }, Segment { node: "n1", start: 1, end: 3 }], total_ms: 4.2 }
+plan [0, 2, 0] Engram 1	TimePlan { segments: [Segment { node: "n1", start: 0, end: 1 }, Segment { node: "n0", start: 1, end: 3 }], total_ms: 3.533333333333333 }
+plan [0, 2, 0] Engram 2	TimePlan { segments: [Segment { node: "n2", start: 0, end: 1 }, Segment { node: "n0", start: 1, end: 2 }, Segment { node: "n1", start: 2, end: 3 }], total_ms: 4.066666666666666 }
+plan [0, 2, 0] Engram 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 3 }], total_ms: 3.0 }
+plan [0, 2, 0] Stacks 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 1 }, Segment { node: "n1", start: 1, end: 3 }], total_ms: 4.2 }
+plan [0, 2, 0] Stacks 1	TimePlan { segments: [Segment { node: "n1", start: 0, end: 1 }, Segment { node: "n0", start: 1, end: 3 }], total_ms: 3.533333333333333 }
+plan [0, 2, 0] Stacks 2	TimePlan { segments: [Segment { node: "n2", start: 0, end: 1 }, Segment { node: "n0", start: 1, end: 2 }, Segment { node: "n1", start: 2, end: 3 }], total_ms: 4.066666666666666 }
+plan [0, 2, 0] Stacks 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 3 }], total_ms: 3.0 }
+plan [0, 2, 0] Units 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 1 }, Segment { node: "n1", start: 1, end: 3 }], total_ms: 4.2 }
+plan [0, 2, 0] Units 1	TimePlan { segments: [Segment { node: "n1", start: 0, end: 1 }, Segment { node: "n0", start: 1, end: 3 }], total_ms: 3.533333333333333 }
+plan [0, 2, 0] Units 2	TimePlan { segments: [Segment { node: "n2", start: 0, end: 1 }, Segment { node: "n0", start: 1, end: 2 }, Segment { node: "n1", start: 2, end: 3 }], total_ms: 4.066666666666666 }
+plan [0, 2, 0] Units 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 3 }], total_ms: 3.0 }
+plan [0, 2, 2, 0] Engram 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 4 }], total_ms: 4.533333333333333 }
+plan [0, 2, 2, 0] Engram 1	TimePlan { segments: [Segment { node: "n0", start: 0, end: 3 }, Segment { node: "n1", start: 3, end: 4 }], total_ms: 4.533333333333333 }
+plan [0, 2, 2, 0] Engram 2	TimePlan { segments: [Segment { node: "n1", start: 0, end: 1 }, Segment { node: "n2", start: 1, end: 2 }, Segment { node: "n0", start: 2, end: 4 }], total_ms: 5.066666666666666 }
+plan [0, 2, 2, 0] Engram 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 4 }], total_ms: 4.0 }
+plan [0, 2, 2, 0] Stacks 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 4 }], total_ms: 4.533333333333333 }
+plan [0, 2, 2, 0] Stacks 1	TimePlan { segments: [Segment { node: "n0", start: 0, end: 3 }, Segment { node: "n1", start: 3, end: 4 }], total_ms: 4.533333333333333 }
+plan [0, 2, 2, 0] Stacks 2	TimePlan { segments: [Segment { node: "n1", start: 0, end: 1 }, Segment { node: "n2", start: 1, end: 2 }, Segment { node: "n0", start: 2, end: 4 }], total_ms: 5.066666666666666 }
+plan [0, 2, 2, 0] Stacks 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 4 }], total_ms: 4.0 }
+plan [0, 2, 2, 0] Units 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 4 }], total_ms: 4.533333333333333 }
+plan [0, 2, 2, 0] Units 1	TimePlan { segments: [Segment { node: "n0", start: 0, end: 3 }, Segment { node: "n1", start: 3, end: 4 }], total_ms: 4.533333333333333 }
+plan [0, 2, 2, 0] Units 2	TimePlan { segments: [Segment { node: "n1", start: 0, end: 1 }, Segment { node: "n2", start: 1, end: 2 }, Segment { node: "n0", start: 2, end: 4 }], total_ms: 5.066666666666666 }
+plan [0, 2, 2, 0] Units 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 4 }], total_ms: 4.0 }
+plan [0, 2, 2, 2, 0] Engram 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 5 }], total_ms: 6.2 }
+plan [0, 2, 2, 2, 0] Engram 1	TimePlan { segments: [Segment { node: "n0", start: 0, end: 4 }, Segment { node: "n1", start: 4, end: 5 }], total_ms: 5.866666666666666 }
+plan [0, 2, 2, 2, 0] Engram 2	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 4 }, Segment { node: "n2", start: 4, end: 5 }], total_ms: 6.4 }
+plan [0, 2, 2, 2, 0] Engram 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 5 }], total_ms: 5.0 }
+plan [0, 2, 2, 2, 0] Stacks 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 5 }], total_ms: 6.2 }
+plan [0, 2, 2, 2, 0] Stacks 1	TimePlan { segments: [Segment { node: "n0", start: 0, end: 4 }, Segment { node: "n1", start: 4, end: 5 }], total_ms: 5.866666666666666 }
+plan [0, 2, 2, 2, 0] Stacks 2	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 4 }, Segment { node: "n2", start: 4, end: 5 }], total_ms: 6.4 }
+plan [0, 2, 2, 2, 0] Stacks 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 5 }], total_ms: 5.0 }
+plan [0, 2, 2, 2, 0] Units 0	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 5 }], total_ms: 6.2 }
+plan [0, 2, 2, 2, 0] Units 1	TimePlan { segments: [Segment { node: "n0", start: 0, end: 4 }, Segment { node: "n1", start: 4, end: 5 }], total_ms: 5.866666666666666 }
+plan [0, 2, 2, 2, 0] Units 2	TimePlan { segments: [Segment { node: "n0", start: 0, end: 2 }, Segment { node: "n1", start: 2, end: 4 }, Segment { node: "n2", start: 4, end: 5 }], total_ms: 6.4 }
+plan [0, 2, 2, 2, 0] Units 3	TimePlan { segments: [Segment { node: "n0", start: 0, end: 5 }], total_ms: 5.0 }

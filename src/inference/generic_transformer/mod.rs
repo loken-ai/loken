@@ -170,6 +170,8 @@ pub mod wide_sparse_convert;
 mod wide_sparse_convert_tests;
 #[cfg(test)]
 mod wide_sparse_engram_tests;
+#[cfg(test)]
+pub(crate) mod wide_sparse_frozen;
 pub mod wide_sparse_layer;
 pub mod wide_sparse_llamacpp;
 pub mod wide_sparse_names;

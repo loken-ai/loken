@@ -280,7 +280,7 @@ Its variants:
 
 `host-expert` computes routed experts on the host cores.
 
-`host-expert` measures what a missing expert costs once its pages are in memory, and what the decode's host path adds to the bare products.  
+`host-expert` measures what a missing expert costs once its pages are in memory.  
 It runs at the dimensions of the shapes file, or of `--hidden` and `--inter`, in the formats `--gate-format` and `--down-format`.
 
 `host-expert` touches no disk and no card.
@@ -290,7 +290,6 @@ Its variants:
 - 4 experts per call out of 96 distinct ones, far more than the caches hold, so the weights come from memory.
   Each runs through the thread pool in 3 regions, 1 thread per expert, and one after the other on 1 thread.
 - The same 4 experts on weights in the page cache of a mapped file, where a served model keeps them.
-- 4 and 6 experts per call through the function a decode calls for its host experts, on experts built as the store builds them.
 
 ### prefill-layer
 

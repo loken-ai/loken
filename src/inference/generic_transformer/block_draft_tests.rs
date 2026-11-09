@@ -1,20 +1,20 @@
-//! The block draft of the generic route against the V4.1 draft, on the synthetic model of the
-//! frozen V4.1 oracle.
+//! The block draft of the generic route against the records of the V4.1 draft, on the synthetic
+//! model of the frozen V4.1 oracle.
 //!
 //! The oracle's file carries a draft of 2 stages beside its layers.
 //! The draft's keys are the V4.1 writer's, its tensors keep the checkpoint's names.
-//! Both paths load from that file: the V4.1 model with its backend and draft, the generic model
-//! by the generic loader, which finds the draft in the file.
+//! The generic loader finds the draft in that file.
+//! The records hold what the V4.1 model, backend and draft gave on the same file.
 
+use super::block_draft::BlockDraftMeta;
+use super::wide_sparse_frozen as frozen;
+use super::wide_sparse_names::ARCH;
 use super::wide_sparse_oracle_tests::LAYOUTS;
 use super::*;
-use crate::inference::engine::model_backend::{DeepseekV41Backend, GenericBackend, ModelBackend};
+use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
 use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
-use crate::inference::model::deepseek_v41::dspark::{Dspark, DsparkConfig};
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
 use crate::tensor::quantized::gguf_file::{open_mapped, MappedGguf};
 use crate::tensor::quantized::GgmlDType;
@@ -28,21 +28,21 @@ const INTER: usize = 64;
 /// The draft the synthetic file carries for a model of hidden width `dim`.
 ///
 /// Its ring is shorter than the prompt, so the prompt wraps it.
-pub(crate) fn draft_config(dim: usize) -> DsparkConfig {
-    DsparkConfig {
-        n_stages: 2,
-        block_size: 4,
+pub(crate) fn draft_config(dim: usize) -> BlockDraftMeta {
+    BlockDraftMeta {
+        stages: 2,
+        block: 4,
         noise_token: VOCAB as u32 - 1,
         target_layers: vec![1, 2],
         markov_rank: 8,
-        n_routed: 4,
-        n_activated: 2,
-        window_size: 6,
+        routed: 4,
+        used: 2,
+        window: 6,
         dim,
-        hc_mult: 4,
-        n_heads: 2,
+        streams: 4,
+        heads: 2,
         head_dim: 64,
-        rope_head_dim: 16,
+        rope_dim: 16,
         o_groups: 2,
         o_lora_rank: 32,
         gate_temp: 1.0,
@@ -52,8 +52,8 @@ pub(crate) fn draft_config(dim: usize) -> DsparkConfig {
         rms_eps: 1e-6,
         rope_theta: 10_000.0,
         rope_factor: 1.0,
-        original_seq_len: 0,
-        hc_sinkhorn_iters: 20,
+        original_context: 0,
+        sinkhorn_iters: 20,
         hc_eps: 1e-6,
         vocab: VOCAB,
     }
@@ -101,12 +101,12 @@ fn norm(name: String, n: usize) -> GgufEntry {
 }
 
 /// The tensors of the draft `c`, under the checkpoint's names.
-pub(crate) fn draft_entries(c: &DsparkConfig) -> Vec<GgufEntry> {
-    let (dim, hc) = (c.dim, c.hc_mult);
+pub(crate) fn draft_entries(c: &BlockDraftMeta) -> Vec<GgufEntry> {
+    let (dim, hc) = (c.dim, c.streams);
     let mix = (2 + hc) * hc;
-    let heads = c.n_heads * c.head_dim;
+    let heads = c.heads * c.head_dim;
     let mut entries = Vec::new();
-    for s in 0..c.n_stages {
+    for s in 0..c.stages {
         let p = |rest: &str| format!("mtp.{s}.{rest}");
         entries.extend([
             matrix(p("attn.wq_a.weight"), Q_RANK, dim),
@@ -114,7 +114,7 @@ pub(crate) fn draft_entries(c: &DsparkConfig) -> Vec<GgufEntry> {
             matrix(p("attn.wq_b.weight"), heads, Q_RANK),
             matrix(p("attn.wkv.weight"), c.head_dim, dim),
             norm(p("attn.kv_norm.weight"), c.head_dim),
-            entry(p("attn.attn_sink"), vec![c.n_heads], 0.0, 0.5),
+            entry(p("attn.attn_sink"), vec![c.heads], 0.0, 0.5),
             matrix(
                 p("attn.wo_a.weight"),
                 c.o_groups * c.o_lora_rank,
@@ -123,8 +123,8 @@ pub(crate) fn draft_entries(c: &DsparkConfig) -> Vec<GgufEntry> {
             matrix(p("attn.wo_b.weight"), dim, c.o_groups * c.o_lora_rank),
             norm(p("attn_norm.weight"), dim),
             norm(p("ffn_norm.weight"), dim),
-            matrix(p("ffn.gate.weight"), c.n_routed, dim),
-            entry(p("ffn.gate.bias"), vec![c.n_routed], 0.0, 0.1),
+            matrix(p("ffn.gate.weight"), c.routed, dim),
+            entry(p("ffn.gate.bias"), vec![c.routed], 0.0, 0.1),
         ]);
         let mut expert = |stem: String| {
             entries.extend([
@@ -134,7 +134,7 @@ pub(crate) fn draft_entries(c: &DsparkConfig) -> Vec<GgufEntry> {
             ]);
         };
         expert(p("ffn.shared_experts"));
-        for e in 0..c.n_routed {
+        for e in 0..c.routed {
             expert(p(&format!("ffn.experts.{e}")));
         }
         for part in ["attn", "ffn"] {
@@ -145,7 +145,7 @@ pub(crate) fn draft_entries(c: &DsparkConfig) -> Vec<GgufEntry> {
             ]);
         }
     }
-    let last = c.n_stages - 1;
+    let last = c.stages - 1;
     entries.extend([
         matrix(
             "mtp.0.main_proj.weight".to_string(),
@@ -189,7 +189,7 @@ pub(crate) fn toy_files(
     let mut entries = real_entries_for(&bands);
     if with_draft {
         let c = draft_config(dim);
-        md.extend(c.to_metadata());
+        md.extend(c.to_metadata(ARCH));
         entries.extend(draft_entries(&c));
     }
     // Unique per call: cargo runs the tests in parallel.
@@ -235,7 +235,7 @@ pub(crate) fn toy_with_companion(
     write_gguf_with_metadata(&model, &md, &real_entries_for(&bands)).unwrap();
     write_gguf_with_metadata(
         &dir.join("draft.gguf"),
-        &c.to_metadata(),
+        &c.to_metadata(ARCH),
         &draft_entries(&c),
     )
     .unwrap();
@@ -253,13 +253,6 @@ pub(crate) fn generic_of(file: MappedGguf) -> GenericHeteroTransformer {
         .unwrap();
     let plan = HeteroPlan::calculate_with_kv(layers, 1 << 20, &[], &[], 1.0, 0);
     GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
-}
-
-/// The V4.1 model of `file`, every expert resident.
-pub(crate) fn v41_of(file: &MappedGguf) -> DeepseekV41Model {
-    let mut cfg = DeepseekV41Config::from_gguf(&file.content).unwrap();
-    cfg.expert_cache_count = 0;
-    DeepseekV41Model::load(file, &cfg).unwrap()
 }
 
 /// The prompt of the oracle's synthetic model.
@@ -284,10 +277,6 @@ fn argmax(row: &[f32]) -> u32 {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i as u32)
         .unwrap()
-}
-
-fn bits(v: &[f32]) -> Vec<u32> {
-    v.iter().map(|x| x.to_bits()).collect()
 }
 
 /// The rows the capture of `model`'s block draft holds, by position.
@@ -317,88 +306,80 @@ fn the_generic_model_takes_the_draft_its_file_carries() {
     }
 }
 
-/// The rows the generic capture holds have the bits of the rows the V4.1 state captures at the
-/// draft's target layers: the last window of a prompt, then each decoded token's.
+/// The rows the generic capture holds have the recorded bits of the rows the V4.1 state
+/// captured at the draft's target layers: the last window of a prompt, then each decoded token's.
 #[test]
 fn the_capture_holds_the_bits_the_v41_state_captures() {
-    for layout in LAYOUTS {
-        let (v41_file, generic_file) = toy_files(layout, true);
-        let v41 = v41_of(&v41_file);
-        let mut model = generic_of(generic_file);
-        let c = DsparkConfig::from_metadata(&v41_file.content.metadata)
+    for (n, layout) in LAYOUTS.into_iter().enumerate() {
+        let (file, _) = toy_files(layout, true);
+        let c = BlockDraftMeta::from_metadata(&file.content.metadata)
             .unwrap()
             .unwrap();
-        let mut state = v41.new_decode_state();
-        state.capture_layers = c.target_layers.clone();
-        state.capture_window = c.window_size;
+        let mut model = generic_of(file);
 
         let prompt = prompt();
-        v41.prefill_into(&prompt, &mut state).unwrap();
         model.forward(&ids(&prompt), 0).unwrap();
         let got = captured(&model);
-        let first = prompt.len() - c.window_size;
+        let first = prompt.len() - c.window;
         assert_eq!(
             got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
             (first..prompt.len()).collect::<Vec<_>>()
         );
-        assert_eq!(state.block_hidden.len(), got.len());
-        for ((pos, row), want) in got.iter().zip(&state.block_hidden) {
-            assert_eq!(bits(row), bits(want), "prompt row {pos}");
-        }
+        let rows: Vec<f32> = got.iter().flat_map(|(_, row)| row.clone()).collect();
+        frozen::expect(
+            "draft",
+            &format!("l{n} prompt rows"),
+            &format!("{} {}", got.len(), frozen::digest_f32(&rows)),
+        );
 
         for (j, &t) in [5u32, 9, 13].iter().enumerate() {
             let pos = prompt.len() + j;
-            v41.forward_decode(t, &mut state).unwrap();
             model.forward(&ids(&[t]), pos).unwrap();
             let got = captured(&model);
             let (last, row) = got.last().unwrap();
             assert_eq!(*last, pos);
-            assert_eq!(
-                bits(row),
-                bits(&state.captured.concat()),
-                "decoded row {pos}"
-            );
+            frozen::expect_f32("draft", &format!("l{n} decoded {pos}"), row);
         }
     }
 }
 
-/// The generic draft guesses what the V4.1 draft guesses, round after round, from the same file:
+/// The generic draft guesses what the V4.1 draft guessed, round after round, from the same file:
 /// after the prompt, after each verify kept whole or cut back, and after a decoded token.
 ///
-/// The verified blocks hold the V4.1 draft's guesses, or tokens the model rejects when it has
-/// none.
-/// The greedy choice of every verified row is the same on both paths.
+/// The verified blocks hold the draft's guesses, or tokens the model rejects when it has none.
+/// The greedy choice of every verified row is the one the V4.1 path made.
 #[test]
 fn the_generic_draft_guesses_as_the_v41_draft() {
-    for layout in LAYOUTS {
-        let (v41_file, generic_file) = toy_files(layout, true);
-        let draft = Dspark::from_file(&v41_file).unwrap().unwrap();
-        let k = draft.cfg.block_size - 1;
-        let mut v41 = DeepseekV41Backend::with_draft(v41_of(&v41_file), 0, 128, Some(draft));
-        let mut generic = GenericBackend(generic_of(generic_file));
+    for (n, layout) in LAYOUTS.into_iter().enumerate() {
+        let (file, _) = toy_files(layout, true);
+        let k = BlockDraftMeta::from_metadata(&file.content.metadata)
+            .unwrap()
+            .unwrap()
+            .block
+            - 1;
+        let mut generic = GenericBackend(generic_of(file));
         let vocab = VOCAB as u32;
+        let key = |what: String| format!("l{n} {what}");
 
         let prompt = prompt();
-        let want = rows(&v41.forward(&ids(&prompt), 0).unwrap());
         let got = rows(&generic.forward(&ids(&prompt), 0).unwrap());
-        let mut next = argmax(want.last().unwrap());
-        assert_eq!(argmax(got.last().unwrap()), next);
+        let mut next = argmax(got.last().unwrap());
+        frozen::expect("draft", &key("first".into()), &format!("{next}"));
         let mut pos = prompt.len();
         let (mut asked, mut kept_whole, mut cut) = (0, 0, 0);
         for round in 0..12 {
-            let want = v41.native_draft_tokens(next, k);
-            let got = generic.native_draft_tokens(next, k);
-            assert_eq!(got, want, "round {round}: the guesses");
+            let want = generic.native_draft_tokens(next, k);
+            frozen::expect_debug("draft", &key(format!("round{round} guesses")), &want);
             asked += usize::from(!want.is_empty());
             assert!(
                 generic.native_draft_tokens(next, k).is_empty(),
                 "round {round}: a second ask before the cache moves"
             );
             if round % 4 == 3 {
-                let want = rows(&v41.forward(&ids(&[next]), pos).unwrap());
                 let got = rows(&generic.forward(&ids(&[next]), pos).unwrap());
-                let chosen = argmax(want.last().unwrap());
-                assert_eq!(argmax(got.last().unwrap()), chosen, "round {round}: decode");
+                let chosen = argmax(got.last().unwrap());
+                let chose = key(format!("round{round} chosen"));
+                frozen::expect("draft", &chose, &format!("{chosen}"));
                 next = chosen;
                 pos += 1;
                 continue;
@@ -415,15 +396,11 @@ fn the_generic_draft_guesses_as_the_v41_draft() {
             }
             let mut block = vec![next];
             block.extend(&guess);
-            let want: Vec<u32> = rows(&v41.forward_all(&ids(&block), pos).unwrap())
+            let want: Vec<u32> = rows(&generic.forward_all(&ids(&block), pos).unwrap())
                 .iter()
                 .map(|r| argmax(r))
                 .collect();
-            let got: Vec<u32> = rows(&generic.forward_all(&ids(&block), pos).unwrap())
-                .iter()
-                .map(|r| argmax(r))
-                .collect();
-            assert_eq!(got, want, "round {round}: the verified rows");
+            frozen::expect_debug("draft", &key(format!("round{round} verified")), &want);
             let accepted = guess.iter().zip(&want).take_while(|(g, c)| g == c).count();
             let keep = accepted + 1;
             if keep == block.len() {
@@ -431,7 +408,6 @@ fn the_generic_draft_guesses_as_the_v41_draft() {
             } else {
                 cut += 1;
             }
-            v41.trim_kv(pos + keep);
             generic.trim_kv(pos + keep);
             next = want[accepted];
             pos += keep;

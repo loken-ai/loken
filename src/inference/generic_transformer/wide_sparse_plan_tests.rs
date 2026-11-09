@@ -1,18 +1,16 @@
 //! What the plan reserves for a Sinkhorn wide-residual model with latent attention, against what
-//! the V4.1 path holds, on the synthetic model of the frozen V4.1 oracle.
+//! the V4.1 path held, on the synthetic model of the frozen V4.1 oracle.
 //!
-//! The V4.1 path keeps its caches as host vectors of f32 and sizes none of them ahead.
-//! The proof is what both paths hold after the same tokens.
+//! The V4.1 path kept its caches as host vectors of f32 and sized none of them ahead.
+//! The proof is what the generic path holds after the tokens the V4.1 path was recorded with.
 
-use super::block_scaled_oracle_tests::{checkpoint, generic_model, v41_model};
+use super::block_scaled_oracle_tests::{checkpoint, generic_model};
 use super::wide_sparse_config::WideSparseMeta;
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_oracle_tests::{generic, toy_file, LAYOUTS};
 use super::wide_sparse_plan::card_mixer_bytes;
 use super::*;
 use crate::inference::generic_transformer::wide_sparse_toy::VOCAB;
-use crate::inference::model::deepseek_v41::cache::DecodeState;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::inference::place::ladder::Demand;
 use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
 use crate::inference::place::llm::wide_sparse_demand;
@@ -30,19 +28,13 @@ fn tokens(n: usize) -> Vec<u32> {
     (0..n).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect()
 }
 
-/// Bytes each V4.1 layer holds: its window rows, compressed rows, index keys and filling group.
-fn v41_bytes(state: &DecodeState) -> Vec<u64> {
-    state
-        .layers
-        .iter()
-        .map(|c| {
-            let values = c.win.iter().map(Vec::len).sum::<usize>()
-                + c.comp_kv.len()
-                + c.index_k.len()
-                + c.group_x.iter().map(Vec::len).sum::<usize>();
-            (values * std::mem::size_of::<f32>()) as u64
-        })
-        .collect()
+/// The record file of these tests.
+const FROZEN: &str = "plan";
+
+/// Bytes each V4.1 layer held after `held` tokens of layout `lay`: its window rows, compressed
+/// rows, index keys and filling group.
+fn v41_bytes(lay: usize, held: usize) -> String {
+    frozen::recorded(FROZEN, &format!("l{lay} held {held}"))
 }
 
 /// Bytes each generic layer's token mixer holds.
@@ -66,41 +58,39 @@ fn generic_bytes(model: &GenericHeteroTransformer) -> Vec<u64> {
         .collect()
 }
 
-/// After every prompt, and after each token decoded after it, each layer of both paths holds
-/// the bytes `cache_bytes` gives, and the plan reserves the largest layer's for every layer.
+/// After every prompt, and after each token decoded after it, each layer of the generic path
+/// holds the bytes the V4.1 path held and `cache_bytes` gives, and the plan reserves the largest
+/// layer's for every layer.
 #[test]
 fn every_layer_holds_the_cache_bytes_the_v41_path_holds() {
     let mut differ = Vec::new();
-    for (ratios, kv_src, index_src) in LAYOUTS {
+    for (lay, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
         let meta = WideSparseMeta::from_file(&toy_file(ratios, kv_src, index_src).content).unwrap();
-        let (v41, _) = synthetic(ratios, kv_src, index_src, 0);
         for n in PROMPTS {
             let toks = tokens(n + DECODED);
-            let mut state = v41.new_decode_state();
-            v41.prefill_into(&toks[..n], &mut state).unwrap();
             let mut model = generic(ratios, kv_src, index_src);
             let prompt = Tensor::from_vec(toks[..n].to_vec(), (1, n), &Device::Cpu).unwrap();
             model.forward(&prompt, 0).unwrap();
-            let mut check = |held: usize, want: Vec<u64>, got: Vec<u64>| {
+            let mut check = |held: usize, got: Vec<u64>| {
+                let want = v41_bytes(lay, held);
                 let planned: Vec<u64> = (0..meta.n_layers)
                     .map(|il| meta.cache_bytes(il, held))
                     .collect();
                 let at = format!("{ratios:?} at {held} tokens");
-                if want != got || want != planned {
+                if want != format!("{got:?}") || want != format!("{planned:?}") {
                     differ.push(format!(
-                        "{at}: V4.1 {want:?}, generic {got:?}, planned {planned:?}"
+                        "{at}: V4.1 {want}, generic {got:?}, planned {planned:?}"
                     ));
                 }
-                if meta.kv_bytes_per_layer(held) != want.iter().copied().max().unwrap_or(0) {
+                if meta.kv_bytes_per_layer(held) != got.iter().copied().max().unwrap_or(0) {
                     differ.push(format!("{at}: the plan's layer is not the largest"));
                 }
             };
-            check(n, v41_bytes(&state), generic_bytes(&model));
+            check(n, generic_bytes(&model));
             for (i, &t) in toks[n..].iter().enumerate() {
-                v41.forward_decode(t, &mut state).unwrap();
                 let step = Tensor::from_vec(vec![t], (1, 1), &Device::Cpu).unwrap();
                 model.forward(&step, n + i).unwrap();
-                check(n + i + 1, v41_bytes(&state), generic_bytes(&model));
+                check(n + i + 1, generic_bytes(&model));
             }
         }
     }
@@ -111,17 +101,16 @@ fn every_layer_holds_the_cache_bytes_the_v41_path_holds() {
     );
 }
 
-/// A stored state takes the bytes per token the V4.1 configuration gives, for every layout.
+/// A stored state takes the bytes per token the V4.1 configuration gave, for every layout.
 #[test]
 fn a_stored_state_takes_the_v41_bytes_per_token() {
-    for (ratios, kv_src, index_src) in LAYOUTS {
+    for (lay, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
         let file = toy_file(ratios, kv_src, index_src);
         let meta = WideSparseMeta::from_file(&file.content).unwrap();
-        let cfg = DeepseekV41Config::from_gguf(&file.content).unwrap();
-        assert_eq!(
-            meta.state_bytes_per_token(),
-            cfg.state_bytes_per_token(),
-            "{ratios:?}"
+        frozen::expect(
+            FROZEN,
+            &format!("l{lay} state bytes per token"),
+            &format!("{}", meta.state_bytes_per_token()),
         );
     }
 }
@@ -130,14 +119,10 @@ fn a_stored_state_takes_the_v41_bytes_per_token() {
 /// the same file, for every layout.
 #[test]
 fn the_generic_model_reads_the_bytes_of_the_v41_resident_path() {
-    for (ratios, kv_src, index_src) in LAYOUTS {
-        let (v41, _) = synthetic(ratios, kv_src, index_src, 0);
+    for (lay, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
         let model = generic(ratios, kv_src, index_src);
-        assert_eq!(
-            model.resident_path_bytes(),
-            Some(v41.resident_path_bytes() as u64),
-            "{ratios:?}"
-        );
+        let got = model.resident_path_bytes().expect("a resident path");
+        frozen::expect(FROZEN, &format!("l{lay} resident"), &format!("{got}"));
     }
 }
 
@@ -146,13 +131,10 @@ fn the_generic_model_reads_the_bytes_of_the_v41_resident_path() {
 #[test]
 fn the_checkpoint_model_reads_the_bytes_of_the_v41_resident_path() {
     let dir = checkpoint("resident");
-    let v41 = v41_model(&dir);
     let model = generic_model(&dir);
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(
-        model.resident_path_bytes(),
-        Some(v41.resident_path_bytes() as u64)
-    );
+    let got = model.resident_path_bytes().expect("a resident path");
+    frozen::expect(FROZEN, "checkpoint resident", &format!("{got}"));
 }
 
 /// The demand of a wide-residual header reserves its largest layer's cache for every block, and

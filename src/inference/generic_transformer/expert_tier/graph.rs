@@ -1182,6 +1182,8 @@ impl LayerTier {
         self.routed.fetch_add(pairs as u64, Ordering::Relaxed);
         self.hits
             .fetch_add((pairs - miss_pairs.len()) as u64, Ordering::Relaxed);
+        let missed: Vec<u32> = miss_pairs.iter().map(|&(_, e, _)| e).collect();
+        self.note_served(&req.ids[..pairs], pairs - miss_pairs.len(), &missed);
         {
             let mut ahead = self.ahead.lock().unwrap_or_else(|e| e.into_inner());
             ahead.lead_ends(started);
@@ -1194,6 +1196,12 @@ impl LayerTier {
                 add(&WORKER.ahead_shared, seen.shared);
                 add(&WORKER.ahead_guessed, seen.guessed);
                 add(&WORKER.ahead_right, seen.right);
+                // The guess names only experts no slot holds: a named expert that was routed
+                // is one the tier did not keep.
+                let counters = crate::inference::expert_counters::global();
+                counters.repeat(seen.shared as u64, seen.routed as u64);
+                let (routed, right) = (seen.routed as u64, seen.right as u64);
+                counters.guess(routed, right, missing.len() as u64, right);
             } else {
                 ahead.forget();
             }

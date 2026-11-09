@@ -6,15 +6,11 @@
 
 use super::compressed_band::BandLeft;
 use super::wide_pipeline::{WideBoundary, WideSettle, HEADER_BYTES};
-use super::wide_sparse_engram_tests::{generic_engram, v41_engram};
+use super::wide_sparse_engram_tests::generic_engram;
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_oracle_tests::{generic, LAYOUTS};
 use super::*;
 use crate::inference::generic_transformer::wide_sparse_toy::prompt;
-use crate::inference::model::deepseek_v41::band::SharedAttn;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
-use crate::inference::model::deepseek_v41::model::{
-    DecodeBoundary, DecodeRangeIn, DecodeRangeOut, DeepseekV41Model,
-};
 use crate::inference::serve::pipeline_segment::{serve_segment, SegmentLink};
 
 /// The oracle's 2 layouts, then the 5-layer band of the V4.1 test
@@ -35,18 +31,8 @@ const KEPT: usize = 3;
 /// The generic model of a layout's file: `(ratios, kv sources, index sources)`.
 type Make = fn(&[u32], &[u32], &[u32]) -> GenericHeteroTransformer;
 
-/// The V4.1 model of a layout's file.
-type MakeV41 = fn(&[u32], &[u32], &[u32]) -> DeepseekV41Model;
-
-fn plain_v41(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> DeepseekV41Model {
-    synthetic(ratios, kv_src, index_src, 0).0
-}
-
 /// The 2 files of every layout: the oracle's, and the oracle's with engram layers.
-const FILES: [(&str, Make, MakeV41); 2] = [
-    ("plain", generic, plain_v41),
-    ("engram", generic_engram, v41_engram),
-];
+const FILES: [(&str, Make); 2] = [("plain", generic), ("engram", generic_engram)];
 
 fn ids(tokens: &[u32]) -> Tensor {
     Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu).unwrap()
@@ -60,14 +46,6 @@ fn bits(t: &Tensor) -> Vec<u32> {
         .iter()
         .map(|v| v.to_bits())
         .collect()
-}
-
-/// The first offset where `got` and `want` differ, or their common length when one ends first.
-fn first_difference(got: &[u8], want: &[u8]) -> Option<usize> {
-    match got.iter().zip(want).position(|(a, b)| a != b) {
-        Some(i) => Some(i),
-        None => (got.len() != want.len()).then(|| got.len().min(want.len())),
-    }
 }
 
 /// The ranges `[0, cut)` and `[cut, n)` of the model `make` builds.
@@ -199,7 +177,7 @@ fn assert_cut_runs_as_whole(
 /// the rewound verify, the verifies cut back inside their rows and every decode after them.
 #[test]
 fn every_cut_gives_the_bits_of_the_whole_model() {
-    for (name, make, _) in FILES {
+    for (name, make) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
             let tokens = prompt();
             let n = ratios.len();
@@ -215,65 +193,41 @@ fn every_cut_gives_the_bits_of_the_whole_model() {
 }
 
 /// For every layout, with and without engram layers, at every layer boundary, the body of each
-/// decode step's boundary is the byte format of the V4.1 path's boundary for the same cut, after
-/// the same prompt.
-/// The V4.1 tail and the generic tail then answer with the same bits.
+/// decode step's boundary is the recorded byte format of the V4.1 path's boundary for the same
+/// cut, after the same prompt.
+/// The generic tail then answers with the bits the V4.1 tail answered.
 #[test]
 fn a_decode_boundary_is_the_v41_boundary_byte_for_byte() {
-    for (name, make, make_v41) in FILES {
+    for (name, make) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
             let tokens = prompt();
-            let v41 = make_v41(ratios, kv_src, index_src);
             let n = ratios.len();
-            assert_eq!(v41.n_layers(), n);
             let s = tokens.len() - BLOCK;
             let build = || make(ratios, kv_src, index_src);
             for at in 1..n {
                 let label = format!("{name} layout {ratios:?}, cut at {at}");
                 let mut cut = ranges(&build, at, n);
-                let mut state = v41.new_decode_state();
-                v41.prefill_into(&tokens[..s], &mut state).unwrap();
                 split(&mut cut, &tokens[..s], 0, false);
                 for (i, &t) in tokens[s..].iter().enumerate() {
                     let pos = s + i;
-                    let want = match v41
-                        .forward_decode_range(DecodeRangeIn::Token(t), 0, at, &mut state)
-                        .unwrap()
-                    {
-                        DecodeRangeOut::Boundary(b) => b.to_bytes().unwrap(),
-                        DecodeRangeOut::Logits(_) => panic!("{label}: the V4.1 head answered"),
-                    };
                     let [head, tail] = &mut cut;
                     let sent = head.wide_head_forward(&ids(&[t]), pos, false).unwrap();
                     let bytes = sent.to_bytes().unwrap();
                     let body = sent.body_bytes().unwrap();
                     assert_eq!(&bytes[HEADER_BYTES..], body.as_slice());
-                    assert_eq!(
-                        first_difference(&body, &want),
-                        None,
-                        "{label}: the boundary at {pos}, {} bytes for {}",
-                        body.len(),
-                        want.len()
-                    );
-                    let resumed = DecodeRangeIn::Resume(DecodeBoundary::from_bytes(&body).unwrap());
-                    let v41_logits = match v41.forward_decode_range(resumed, at, n, &mut state) {
-                        Ok(DecodeRangeOut::Logits(l)) => l,
-                        _ => panic!("{label}: the V4.1 tail did not answer"),
-                    };
+                    let key = |part: &str| format!("{label} pos {pos} {part}");
+                    frozen::expect_bytes("pipeline", &key("boundary"), &body);
                     let got = tail.wide_tail_forward(&sent, false).unwrap();
-                    assert_eq!(
-                        bits(&got),
-                        bits(&v41_logits),
-                        "{label}: the logits at {pos}"
-                    );
+                    let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    frozen::expect_f32("pipeline", &key("logits"), &got);
                 }
             }
         }
     }
 }
 
-/// The V4.1 encoder and the generic encoder write the same bytes for the same values, a band
-/// value of each kind present.
+/// The generic encoder writes the bytes the V4.1 encoder wrote for the same values, a band value
+/// of each kind present.
 /// The bytes rebuild the boundary, which neither a byte less nor a byte more does.
 #[test]
 fn the_v41_encoder_and_the_generic_encoder_write_the_same_bytes() {
@@ -295,39 +249,14 @@ fn the_v41_encoder_and_the_generic_encoder_write_the_same_bytes() {
         widths: (row, key),
         band: vec![left.clone()],
     };
-    let tensor = |v: &[f32], dims: (usize, usize, usize)| {
-        Tensor::from_vec(v.to_vec(), dims, &Device::Cpu).unwrap()
-    };
-    let v41 = DecodeBoundary {
-        x: Tensor::from_vec(wide.residual.clone(), (1, 1, streams, hidden), &Device::Cpu).unwrap(),
-        pre_mix: wide.pre.clone(),
-        shared: SharedAttn {
-            compress_kv: left
-                .compressed
-                .as_deref()
-                .map(|v| tensor(v, (1, groups, row))),
-            index_k: left
-                .index_keys
-                .as_deref()
-                .map(|v| tensor(v, (1, groups, key))),
-            topk_idxs: left.picks.clone(),
-            candidates: left.candidates.clone(),
-        },
-        recent: wide.recent.clone(),
-    };
-    assert_eq!(wide.body_bytes().unwrap(), v41.to_bytes().unwrap());
+    frozen::expect_bytes("pipeline", "encoder full", &wide.body_bytes().unwrap());
 
     let empty = WideBoundary {
         recent: None,
         band: vec![BandLeft::default()],
         ..wide.clone()
     };
-    let v41_empty = DecodeBoundary {
-        shared: SharedAttn::default(),
-        recent: None,
-        ..v41
-    };
-    assert_eq!(empty.body_bytes().unwrap(), v41_empty.to_bytes().unwrap());
+    frozen::expect_bytes("pipeline", "encoder empty", &empty.body_bytes().unwrap());
 
     // 2 rows of a verify, each with its own band value.
     let verify = WideBoundary {
@@ -349,7 +278,7 @@ fn the_v41_encoder_and_the_generic_encoder_write_the_same_bytes() {
 /// model.
 #[test]
 fn interleaved_sequences_on_a_cut_give_the_bits_of_their_runs_alone() {
-    for (name, make, _) in FILES {
+    for (name, make) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
             let tokens = prompt();
             let n = ratios.len();
@@ -441,7 +370,7 @@ fn wire_chain(
 /// prompt.
 #[test]
 fn segments_on_the_wire_give_the_bits_of_the_whole_model() {
-    for (name, make, _) in FILES {
+    for (name, make) in FILES {
         for (ratios, kv_src, index_src) in CUT_LAYOUTS {
             let tokens = prompt();
             let n = ratios.len();

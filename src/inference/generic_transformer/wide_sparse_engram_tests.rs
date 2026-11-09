@@ -1,29 +1,25 @@
-//! The engram layers of the Sinkhorn wide-residual model on the generic route, against the V4.1
-//! path, on the synthetic model of the frozen V4.1 oracle with engram rows added.
+//! The engram layers of the Sinkhorn wide-residual model on the generic route, against the
+//! records of the V4.1 path, on the synthetic model of the frozen V4.1 oracle with engram rows
+//! added.
 //!
-//! The file is the oracle's, written by the helpers the V4.1 tests write it with.
+//! The file is the oracle's, written by the toy writers of `wide_sparse_toy`.
 //! The keys and tensors of 2 engram layers are added to it, in the layout the V4.1 engram test
-//! writes: 2 heads, 3-grams, tables of 48 rows of 8 values, tokens 3 and 4 sharing 1 id.
-//! The V4.1 model and the generic model are both loaded from that file.
+//! wrote: 2 heads, 3-grams, tables of 48 rows of 8 values, tokens 3 and 4 sharing 1 id.
+//! The records hold what the V4.1 model loaded from that file gave.
 
 use std::collections::BTreeMap;
 
 use super::ngram::engram::EngramMeta;
 use super::wide_sparse_batch_tests::{batched, prompts, serial};
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_layer::TokenLog;
-use super::wide_sparse_oracle_tests::{
-    bit_difference, generic, record_generic, record_v41, LAYOUTS,
-};
+use super::wide_sparse_oracle_tests::{expect_records, generic, record_generic, Record, LAYOUTS};
 use super::*;
 use crate::inference::cache::state_disk::StateStore;
 use crate::inference::generic_transformer::wide_sparse_toy::prompt;
 use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
-use crate::inference::model::deepseek_v41::engram as v41;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
 use crate::tensor::quantized::gguf_file::{open_mapped, MappedGguf, Value};
 use crate::tensor::quantized::GgmlDType;
@@ -150,18 +146,6 @@ pub(super) fn generic_engram(
     GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
 }
 
-/// The V4.1 model of the engram file in a band layout.
-pub(super) fn v41_engram(ratios: &[u32], kv_src: &[u32], index_src: &[u32]) -> DeepseekV41Model {
-    let g = engram_file(ratios, kv_src, index_src);
-    let cfg = DeepseekV41Config::from_gguf(&g.content).unwrap();
-    assert_eq!(
-        cfg.engram.as_ref().map(|e| e.layer_ids.clone()),
-        Some(ENGRAM_LAYERS.to_vec()),
-        "the V4.1 reader found no engram layout"
-    );
-    DeepseekV41Model::load(&g, &cfg).unwrap()
-}
-
 fn ids(tokens: &[u32]) -> Tensor {
     Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu).unwrap()
 }
@@ -176,50 +160,36 @@ fn bits(t: &Tensor) -> Vec<u32> {
         .collect()
 }
 
-/// For both layouts, the generic model of the engram file gives the bits of the V4.1 model of
-/// the same file on every record of the oracle: the prefill, the decode, the verify, the rewound
-/// verify and the decode after it, and the greedy run.
-/// The engram layers change the V4.1 logits, so the comparison covers them.
+/// For both layouts, the generic model of the engram file gives the recorded bits of the V4.1
+/// model of the same file on every record of the oracle: the prefill, the decode, the verify, the
+/// rewound verify and the decode after it, and the greedy run.
+/// The engram layers changed the V4.1 logits, so the comparison covers them.
 /// Both count the same bytes on the path every token reads, the engram projections included.
 #[test]
 fn the_generic_route_gives_the_bits_of_the_v41_path_with_engram_layers() {
-    let mut differ = Vec::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
-        let (plain, tokens) = synthetic(ratios, kv_src, index_src, 0);
-        let v41 = v41_engram(ratios, kv_src, index_src);
-        assert_ne!(
-            bits(&v41.forward_prefill(&tokens).unwrap()),
-            bits(&plain.forward_prefill(&tokens).unwrap()),
-            "layout {ratios:?}: the engram layers left the V4.1 logits unchanged"
-        );
-        let (mut want, mut got) = (BTreeMap::new(), BTreeMap::new());
-        record_v41(&v41, &tokens, n, &mut want);
+        let tokens = prompt();
+        let mut got = BTreeMap::new();
         let mut model = generic_engram(ratios, kv_src, index_src);
-        assert_eq!(
-            model.resident_path_bytes(),
-            Some(v41.resident_path_bytes() as u64),
-            "layout {ratios:?}: the always-read bytes differ"
+        frozen::expect(
+            "engram",
+            &format!("l{n} resident"),
+            &format!("{}", model.resident_path_bytes().unwrap_or(0)),
         );
         record_generic(&mut model, &tokens, n, &mut got);
-        for (name, w) in &want {
-            match got.get(name) {
-                Some(g) => {
-                    if let Some(d) = bit_difference(w, g) {
-                        differ.push(format!("{name}: {d}"));
-                    }
-                }
-                None => differ.push(format!("{name}: missing")),
-            }
-        }
+        let Some(Record::Logits(_, _, prefill)) = got.get(&format!("l{n}_prefill")) else {
+            panic!("layout {ratios:?}: no prefill record");
+        };
+        assert_ne!(
+            frozen::digest_f32(prefill),
+            frozen::recorded("engram", &format!("l{n} plain prefill")),
+            "layout {ratios:?}: the engram layers left the logits unchanged"
+        );
+        expect_records("engram", "", &got);
     }
-    assert!(
-        differ.is_empty(),
-        "the generic route differs from the V4.1 path with engram layers:\n{}",
-        differ.join("\n")
-    );
 }
 
-/// The token log hashes the rows the V4.1 engram state hashes: a whole prompt, a forward that
+/// The token log hashes the rows the V4.1 engram state hashed: a whole prompt, a forward that
 /// continues it, and a forward from an earlier position that replaces the positions after it.
 /// A forward past the end of the log, and rows past it, are refused.
 #[test]
@@ -235,17 +205,6 @@ fn the_token_log_hashes_the_rows_of_the_v41_engram_state() {
         primes: vec![vec![11, 13, 17, 19], vec![23, 29, 31, 37]],
         offsets: vec![vec![0, 11, 24, 41], vec![0, 23, 52, 83]],
     };
-    let cfg = v41::EngramConfig {
-        layer_ids: meta.layer_ids.clone(),
-        n_heads: meta.heads,
-        head_dim: meta.head_dim,
-        max_ngram: meta.max_ngram,
-        token_map: meta.token_map.clone(),
-        pad_id: meta.pad_id,
-        multipliers: meta.multipliers.clone(),
-        primes: meta.primes.clone(),
-        offsets: meta.offsets.clone(),
-    };
     // Token 9 lies past the map and hashes as the pad.
     let tokens = [4u32, 0, 9, 5, 3, 1, 2, 2];
     let split = 5;
@@ -253,25 +212,24 @@ fn the_token_log_hashes_the_rows_of_the_v41_engram_state() {
     log.open(0, &tokens[..split]).unwrap();
     log.open(split, &tokens[split..]).unwrap();
     for which in 0..meta.layer_ids.len() {
-        assert_eq!(
-            log.engram_hashes(&meta, which, 0, tokens.len()).unwrap(),
-            v41::prefill_hashes(&cfg, which, &tokens)
+        frozen::expect_debug(
+            "engram",
+            &format!("hashes {which}"),
+            &log.engram_hashes(&meta, which, 0, tokens.len()).unwrap(),
         );
-        let mut state = v41::EngramState::default();
-        for &t in &tokens[..split] {
-            state.push(&cfg, t);
-        }
-        assert_eq!(
-            log.engram_hashes(&meta, which, split, tokens.len() - split)
+        frozen::expect_debug(
+            "engram",
+            &format!("hashes from {which}"),
+            &log.engram_hashes(&meta, which, split, tokens.len() - split)
                 .unwrap(),
-            v41::prefill_hashes_from(&cfg, which, &tokens[split..], state)
         );
     }
     let rewound = [4u32, 0, 9, 1, 1];
     log.open(3, &rewound[3..]).unwrap();
-    assert_eq!(
-        log.engram_hashes(&meta, 0, 0, rewound.len()).unwrap(),
-        v41::prefill_hashes(&cfg, 0, &rewound)
+    frozen::expect_debug(
+        "engram",
+        "hashes rewound",
+        &log.engram_hashes(&meta, 0, 0, rewound.len()).unwrap(),
     );
     assert!(log.engram_hashes(&meta, 0, 4, 2).is_err());
     assert!(log.open(rewound.len() + 1, &[1]).is_err());

@@ -1,15 +1,16 @@
-//! The generic description of a wide-residual mixture model against the configuration the
-//! dedicated module reads from the same header, field by field.
+//! The generic description of a wide-residual mixture model against the records of the
+//! configuration the retired V4.1 module read from the same header, field by field.
 //!
-//! The headers are the synthetic ones of the dedicated module's tests, in each spelling a file
-//! has had: the converter's, the mainline conversion's and the in-tree scheme's.
+//! The headers are the synthetic ones of the V4.1 module's tests, in each spelling a file has
+//! had: the converter's, the mainline conversion's and the in-tree scheme's.
+//! A record holds the V4.1 configuration in the generic description's fields.
 
 use std::collections::HashMap;
 
 use super::wide_sparse_config::{release, LayerKind, ReleaseValues, WideSparseMeta};
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_names::ARCH;
 use super::wide_sparse_toy::{real_entries_for, real_md_layout};
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::GgufEntry;
 use crate::tensor::quantized::gguf_file::{TensorInfo, Value};
 use crate::tensor::quantized::gguf_source::GgufMeta;
@@ -73,80 +74,16 @@ fn generic(h: &Header) -> WideSparseMeta {
     WideSparseMeta::from_meta(h, ARCH, &release_values(), converted).unwrap()
 }
 
-/// Every field of `want` and the one of `got` that holds it.
-fn assert_same(got: &WideSparseMeta, want: &DeepseekV41Config) {
-    assert_eq!(got.n_layers, want.n_layers);
-    assert_eq!(got.n_extra_layers, want.n_mtp_layers);
-    assert_eq!(got.d_model, want.d_model);
-    assert_eq!(got.vocab, want.vocab_size);
-    assert_eq!(got.rms_eps, want.rms_eps);
-    assert_eq!(got.heads, want.n_head);
-    assert_eq!(got.head_dim, want.head_dim);
-    assert_eq!(got.rope_dim, want.rope_head_dim);
-    assert_eq!(got.q_lora_rank, want.q_lora_rank);
-    assert_eq!(got.o_lora_rank, want.o_lora_rank);
-    assert_eq!(got.o_groups, want.o_groups);
-    assert_eq!(got.window, want.window_size);
-    assert_eq!(got.compress_ratios, want.compress_ratios);
-    assert_eq!(got.kv_source_layers, want.kv_source_layers);
-    assert_eq!(got.index_source_layers, want.index_source_layers);
-
-    assert_eq!(got.indexer.heads, want.index_n_heads);
-    assert_eq!(got.indexer.head_dim, want.index_head_dim);
-    assert_eq!(got.indexer.top_k, want.index_topk);
-    assert_eq!(
-        got.indexer.candidate_source_layer,
-        want.candidate_source_layer
-    );
-    assert_eq!(
-        got.indexer.candidate_top_k_blocks,
-        want.candidate_topk_blocks
-    );
-    assert_eq!(got.indexer.candidate_block_size, want.candidate_block_size);
-
-    let m = &got.mixture;
-    assert_eq!(m.routed, want.n_routed_experts);
-    assert_eq!(m.shared, want.n_shared_experts);
-    assert_eq!(m.used, want.n_activated_experts);
-    assert_eq!(m.inter_dim, want.moe_inter_dim);
-    assert_eq!(m.score_func, want.score_func);
-    assert_eq!(m.route_scale, want.route_scale);
-    assert_eq!(m.gate_temp, want.gate_temp);
-    assert_eq!(m.swiglu_limits, want.swiglu_limits);
-    assert_eq!(m.norm_topk, want.norm_topk);
-    assert_eq!(m.cache_count, want.expert_cache_count);
-    assert_eq!(m.hot, want.hot_experts);
-
-    assert_eq!(got.rope.theta, want.rope_theta);
-    assert_eq!(got.rope.scaling_factor, want.rope_factor);
-    assert_eq!(got.rope.original_context, want.original_seq_len);
-    assert_eq!(got.rope.compress_theta, want.compress_rope_theta);
-
-    assert_eq!(got.streams.streams, want.hc_mult);
-    assert_eq!(got.streams.sinkhorn_iters, want.hc_sinkhorn_iters);
-    assert_eq!(got.streams.eps, want.hc_eps);
-
-    match (&got.ngram, &want.engram) {
-        (None, None) => {}
-        (Some(g), Some(w)) => {
-            assert_eq!(g.layer_ids, w.layer_ids);
-            assert_eq!(g.heads, w.n_heads);
-            assert_eq!(g.head_dim, w.head_dim);
-            assert_eq!(g.max_ngram, w.max_ngram);
-            assert_eq!(g.token_map, w.token_map);
-            assert_eq!(g.pad_id, w.pad_id);
-            assert_eq!(g.multipliers, w.multipliers);
-            assert_eq!(g.primes, w.primes);
-            assert_eq!(g.offsets, w.offsets);
-        }
-        (g, w) => panic!("n-gram hash {g:?} against {w:?}"),
-    }
+/// Asserts every field of `got` holds the value the V4.1 configuration recorded under `key`
+/// held.
+fn assert_same(got: &WideSparseMeta, key: &str) {
+    frozen::expect_debug("config", key, got);
 }
 
-fn check(h: &Header) -> WideSparseMeta {
-    let want = DeepseekV41Config::from_meta(h).unwrap();
+/// The generic description of `h`, checked against the V4.1 configuration recorded under `key`.
+fn check(h: &Header, key: &str) -> WideSparseMeta {
     let got = generic(h);
-    assert_same(&got, &want);
+    assert_same(&got, key);
     got
 }
 
@@ -163,7 +100,7 @@ fn the_converters_header_gives_the_same_description() {
         real_md_layout(&ratios, &[], &[]),
         &real_entries_for(&bands(&ratios)),
     );
-    let got = check(&h);
+    let got = check(&h, "converter");
     assert_eq!(
         (got.q_lora_rank, got.o_groups, got.o_lora_rank),
         (64, 4, 64)
@@ -186,7 +123,7 @@ fn listed_source_layers_give_the_same_description() {
         real_md_layout(&ratios, &[1], &[1, 3]),
         &real_entries_for(&bands(&ratios)),
     );
-    let got = check(&h);
+    let got = check(&h, "listed");
     assert_eq!(got.layer_kind(0), LayerKind::Window);
     assert_eq!(
         got.layer_kind(1),
@@ -250,7 +187,7 @@ fn the_mainline_header_gives_the_same_description() {
         md.push((format!("deepseek41.{k}"), Value::U32(v)));
     }
     let h = Header::new(md, &entries);
-    let got = check(&h);
+    let got = check(&h, "mainline");
     assert_eq!(
         (got.q_lora_rank, got.o_groups, got.o_lora_rank),
         (64, 4, 64)
@@ -298,7 +235,7 @@ fn the_in_tree_header_gives_the_same_description() {
         u("rope.scaling.original_context_length", 128),
     ];
     let h = Header::new(md, &real_entries_for(&[false, true, false]));
-    let got = check(&h);
+    let got = check(&h, "in-tree");
     assert_eq!(got.indexer.candidate_source_layer, -1);
     assert_eq!(got.mixture.swiglu_limits, vec![10.0; 3]);
     assert_eq!(got.streams.streams, 4);
@@ -329,7 +266,7 @@ fn the_hash_and_the_expert_prior_are_read_alike() {
         u64s("hot_experts.1", &[3, 1, 0]),
     ]);
     let h = Header::new(md, &real_entries_for(&bands(&ratios)));
-    let got = check(&h);
+    let got = check(&h, "hash");
     let hash = got.ngram.expect("the hash layout");
     assert_eq!(hash.layer_ids, vec![1]);
     assert_eq!(hash.pad_id, 2);
@@ -353,14 +290,13 @@ fn the_reference_arguments_give_the_same_description() {
         "rope_theta": 10000.0, "rope_factor": 16.0, "original_seq_len": 128,
         "compress_rope_theta": 160000.0
     });
-    let want = DeepseekV41Config::from_reference_config(&v, None).unwrap();
     let got = WideSparseMeta::from_reference(&v, None).unwrap();
-    assert_same(&got, &want);
+    assert_same(&got, "reference");
     assert_eq!(got.mixture.swiglu_limits, vec![10.0; 4]);
 }
 
-/// A header without routed experts, or without a width, is refused as the dedicated module
-/// refuses it; a low-rank gate is not this family.
+/// A header without routed experts, or without a width, is refused as the V4.1 module refused
+/// it; a low-rank gate is not this family.
 #[test]
 fn a_header_of_another_family_is_refused() {
     let ratios = [0, 2, 0];
@@ -370,7 +306,6 @@ fn a_header_of_another_family_is_refused() {
         .filter(|(k, _)| !k.ends_with(".expert_count"))
         .collect();
     let h = Header::new(md, &entries);
-    assert!(DeepseekV41Config::from_meta(&h).is_err());
     assert!(WideSparseMeta::from_meta(&h, ARCH, &release_values(), true).is_err());
 
     let md: Vec<_> = real_md_layout(&ratios, &[], &[])

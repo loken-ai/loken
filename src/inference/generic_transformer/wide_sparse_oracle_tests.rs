@@ -1,12 +1,14 @@
 //! The generic route against the V4.1 path, on the synthetic model of the frozen V4.1 oracle.
 //!
-//! The model is the one `deepseek_v41::oracle_freeze` froze, in its 2 band layouts.
-//! Its file is written by the helpers the V4.1 tests write it with.
+//! The model is the one the V4.1 oracle froze, in its 2 band layouts.
+//! Its file is written by the toy writers of `wide_sparse_toy`.
 //! The generic model is built from that file by the generic loader and runs on the host.
 //!
 //! The records are the oracle's: a prefill, the same tokens decoded 1 at a time, a verify onto a
 //! prefilled prefix, a shorter verify after the first is rewound, the tokens after it decoded,
 //! and 64 greedy tokens after a short prompt.
+//! They are compared with the oracle's vectors within its tolerance, and with the bits the V4.1
+//! path gave, recorded in `deepseek_v41_frozen`.
 
 use std::collections::BTreeMap;
 
@@ -17,9 +19,6 @@ use super::mixer::{layer_mixer_kind, MixerKind};
 use super::*;
 use crate::inference::generic_transformer::wide_sparse_toy::prompt;
 use crate::inference::generic_transformer::wide_sparse_toy::{real_entries_for, real_md_layout};
-use crate::inference::model::deepseek_v41::cache::DecodeState;
-use crate::inference::model::deepseek_v41::model::oracle_gate::synthetic;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
 use crate::tensor::gguf_write::write_gguf_with_metadata;
 use crate::tensor::quantized::gguf_file::{open_mapped, MappedGguf};
 
@@ -117,72 +116,6 @@ pub(super) fn generic(
     GenericHeteroTransformer::from_gguf(content, &mmap[..], &HashMap::new(), &plan).unwrap()
 }
 
-fn v41_decode(model: &DeepseekV41Model, tokens: &[u32], state: &mut DecodeState) -> Record {
-    let mut rows = Vec::new();
-    let mut cols = 0;
-    for &t in tokens {
-        let row = flat(&model.forward_decode(t, state).unwrap());
-        cols = row.len();
-        rows.extend(row);
-    }
-    Record::Logits(tokens.len(), cols, rows)
-}
-
-/// What the V4.1 path computes for layout `n`, as the oracle records it.
-pub(super) fn record_v41(
-    model: &DeepseekV41Model,
-    tokens: &[u32],
-    n: usize,
-    out: &mut BTreeMap<String, Record>,
-) {
-    let mut put = |name: &str, r: Record| {
-        out.insert(format!("l{n}_{name}"), r);
-    };
-    put("prefill", logits(&model.forward_prefill(tokens).unwrap()));
-    let mut stepped = model.new_decode_state();
-    put("decode", v41_decode(model, tokens, &mut stepped));
-
-    let split = tokens.len() - BLOCK;
-    let mut state = model.new_decode_state();
-    model.prefill_into(&tokens[..split], &mut state).unwrap();
-    let mark = state.checkpoint();
-    let block = &tokens[split..];
-    put(
-        "verify",
-        logits(&model.forward_verify_batch(block, &mut state).unwrap()),
-    );
-    state.rewind(&mark);
-    put(
-        "rollback_verify",
-        logits(
-            &model
-                .forward_verify_batch(&block[..KEPT], &mut state)
-                .unwrap(),
-        ),
-    );
-    put(
-        "rollback_decode",
-        v41_decode(model, &block[KEPT..], &mut state),
-    );
-
-    let mut state = model.new_decode_state();
-    let mut last = flat(
-        &model
-            .prefill_into(&tokens[..GREEDY_PROMPT], &mut state)
-            .unwrap(),
-    );
-    let (mut chosen, mut rows) = (Vec::new(), Vec::new());
-    for _ in 0..GREEDY_TOKENS {
-        let id = argmax(&last);
-        chosen.push(id);
-        rows.extend_from_slice(&last);
-        last = flat(&model.forward_decode(id as u32, &mut state).unwrap());
-    }
-    let cols = last.len();
-    put("greedy_ids", Record::Ids(chosen));
-    put("greedy_logits", Record::Logits(GREEDY_TOKENS, cols, rows));
-}
-
 /// `tokens` decoded 1 at a time by the generic model from position `pos`.
 fn generic_decode(model: &mut GenericHeteroTransformer, tokens: &[u32], pos: usize) -> Record {
     let mut rows = Vec::new();
@@ -249,20 +182,23 @@ pub(super) fn record_generic(
     put("greedy_logits", Record::Logits(GREEDY_TOKENS, cols, rows));
 }
 
-/// The first value of `got` whose bits differ from `want`'s, or `None` when every bit agrees.
-pub(super) fn bit_difference(want: &Record, got: &Record) -> Option<String> {
-    match (want, got) {
-        (Record::Ids(w), Record::Ids(g)) => (w != g).then(|| format!("ids {g:?} != {w:?}")),
-        (Record::Logits(wr, wc, w), Record::Logits(gr, gc, g)) => {
-            if (wr, wc) != (gr, gc) {
-                return Some(format!("shape [{gr}, {gc}] != [{wr}, {wc}]"));
-            }
-            w.iter()
-                .zip(g)
-                .position(|(a, b)| a.to_bits() != b.to_bits())
-                .map(|i| format!("row {} column {}: {} != {}", i / wc, i % wc, g[i], w[i]))
+/// A record's shape and the digest of its bits, as the frozen records hold it.
+pub(super) fn record_digest(r: &Record) -> String {
+    match r {
+        Record::Logits(rows, cols, v) => {
+            format!(
+                "logits {rows}x{cols} {}",
+                super::wide_sparse_frozen::digest_f32(v)
+            )
         }
-        _ => Some("kind changed".to_string()),
+        Record::Ids(ids) => format!("ids {ids:?}"),
+    }
+}
+
+/// Asserts every record of `got` has the bits recorded under `prefix` and its name in `file`.
+pub(super) fn expect_records(file: &str, prefix: &str, got: &BTreeMap<String, Record>) {
+    for (name, r) in got {
+        super::wide_sparse_frozen::expect(file, &format!("{prefix}{name}"), &record_digest(r));
     }
 }
 
@@ -288,20 +224,16 @@ fn frozen_difference(want: &Record, got: &Record) -> Option<String> {
     }
 }
 
-/// Every record of `want` that `got` does not reproduce, by `differs`, in the order the
-/// records build on each other.
-fn differences(
-    want: &BTreeMap<String, Record>,
-    got: &BTreeMap<String, Record>,
-    differs: fn(&Record, &Record) -> Option<String>,
-) -> Vec<String> {
+/// Every record of `want` that `got` does not reproduce within the oracle's tolerance, in the
+/// order the records build on each other.
+fn differences(want: &BTreeMap<String, Record>, got: &BTreeMap<String, Record>) -> Vec<String> {
     let mut out = Vec::new();
     for n in 0..LAYOUTS.len() {
         for record in RECORDS {
             let name = format!("l{n}_{record}");
             match (want.get(&name), got.get(&name)) {
                 (Some(w), Some(g)) => {
-                    if let Some(d) = differs(w, g) {
+                    if let Some(d) = frozen_difference(w, g) {
                         out.push(format!("{name}: {d}"));
                     }
                 }
@@ -354,24 +286,18 @@ fn every_block_of_the_synthetic_file_is_latent_attention_over_one_key_head() {
     }
 }
 
-/// The generic route gives the bits of the V4.1 path on every record of both layouts: the
-/// prefill, the decode, the verify, the rewound verify and the decode after it, and the greedy
-/// run.
+/// The generic route gives the recorded bits of the V4.1 path on every record of both layouts:
+/// the prefill, the decode, the verify, the rewound verify and the decode after it, and the
+/// greedy run.
 #[test]
 fn the_generic_route_gives_the_bits_of_the_v41_path() {
-    let (mut want, mut got) = (BTreeMap::new(), BTreeMap::new());
+    let mut got = BTreeMap::new();
     for (n, (ratios, kv_src, index_src)) in LAYOUTS.into_iter().enumerate() {
-        let (v41, tokens) = synthetic(ratios, kv_src, index_src, 0);
-        record_v41(&v41, &tokens, n, &mut want);
         let mut model = generic(ratios, kv_src, index_src);
-        record_generic(&mut model, &tokens, n, &mut got);
+        record_generic(&mut model, &prompt(), n, &mut got);
     }
-    let differ = differences(&want, &got, bit_difference);
-    assert!(
-        differ.is_empty(),
-        "the generic route differs from the V4.1 path:\n{}",
-        differ.join("\n")
-    );
+    assert_eq!(got.len(), LAYOUTS.len() * RECORDS.len());
+    expect_records("oracle", "", &got);
 }
 
 /// The generic route reproduces the frozen V4.1 logits and greedy tokens, within the oracle's
@@ -385,7 +311,7 @@ fn the_generic_route_reproduces_the_frozen_oracle() {
         let mut model = generic(ratios, kv_src, index_src);
         record_generic(&mut model, &tokens, n, &mut got);
     }
-    let differ = differences(&want, &got, frozen_difference);
+    let differ = differences(&want, &got);
     assert!(
         differ.is_empty(),
         "the generic route does not reproduce the frozen oracle:\n{}",

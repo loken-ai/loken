@@ -1,11 +1,11 @@
-//! The generic converter of block-scaled checkpoints against the V4.1 converter.
+//! The generic converter of block-scaled checkpoints against the records of the V4.1 converter.
 //!
-//! Both converters read the small checkpoint of the block-scaled reader tests, its head grown so
+//! The converter reads the small checkpoint of the block-scaled reader tests, its head grown so
 //! the always-read format applies.
-//! Both take the same calibration records and the same formats.
-//! The 2 files they write are compared byte for byte.
+//! It takes the calibration records and the formats the V4.1 converter took when it was recorded.
+//! The file it writes is compared byte for byte with the recorded digest.
 //!
-//! Only a host build is compared: a card build of the V4.1 converter quantises on the cards.
+//! Only a host build is compared: a card build of the V4.1 converter quantised on the cards.
 
 use std::path::{Path, PathBuf};
 
@@ -13,15 +13,16 @@ use safetensors::tensor::TensorView;
 use safetensors::Dtype;
 
 use super::block_scaled_oracle_tests::{checkpoint_of, entries};
-use super::wide_sparse_convert::{checkpoint_config, model_name, plan};
+use super::wide_sparse_config::{NgramHashFields, WideSparseMeta};
+use super::wide_sparse_convert::{checkpoint_config, model_name, plan, TokenizerFiles};
+use super::wide_sparse_frozen as frozen;
 use super::BlockScaledCheckpoint;
 use crate::inference::load::block_scaled_convert::{self, ConvertPlan, Formats, Produce};
 use crate::inference::load::calibrated::{Recipe, Records};
-use crate::inference::model::deepseek_v41::convert as v41;
-use crate::inference::model::deepseek_v41::engram::EngramConfig;
-use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::quantized::GgmlDType;
+
+/// The record file of these tests.
+const FROZEN: &str = "convert";
 
 /// Rows of the head: with the checkpoint's width, enough values for the always-read format.
 const HEAD_ROWS: usize = 4096;
@@ -160,10 +161,10 @@ fn add_engram(dir: &Path, dim: usize) {
 }
 
 /// The hash layout of the engram shard's layers.
-fn engram_config(vocab: usize) -> EngramConfig {
-    EngramConfig {
+fn engram_config(vocab: usize) -> NgramHashFields {
+    NgramHashFields {
         layer_ids: ENGRAM_LAYERS.to_vec(),
-        n_heads: 1,
+        heads: 1,
         head_dim: ENGRAM_DIM,
         max_ngram: 2,
         token_map: (0..vocab).map(|t| (t % 5) as u32).collect(),
@@ -227,62 +228,44 @@ fn planned(plan: &ConvertPlan, name: &str) -> GgmlDType {
         .dtype
 }
 
-/// Converts `dir` with both converters into `{tag}-v41.gguf` and `{tag}-generic.gguf`, and
-/// asserts the 2 files and their digests are equal.
-fn both_write_the_same_file(
+/// Converts `dir` into `{tag}-generic.gguf`, and asserts the file and its digest are the ones
+/// the V4.1 converter wrote.
+fn writes_the_recorded_file(
     dir: &Path,
-    cfg: &DeepseekV41Config,
+    cfg: &WideSparseMeta,
     formats: Formats,
     layers: std::ops::Range<usize>,
     tag: &str,
 ) -> ConvertPlan {
-    let old_src = SafeTensorsSource::open(dir).unwrap();
     let ours = BlockScaledCheckpoint::open(dir).unwrap();
     let records = records(&ours);
-    let old_out = dir.join(format!("{tag}-v41.gguf"));
-    let old_formats = v41::Formats {
-        gate_up: formats.gate_up,
-        down: formats.down,
-        always_read: formats.always_read,
-    };
-    let old_digest = v41::convert(
-        &old_src,
-        cfg,
-        &records,
-        &old_out,
-        old_formats,
-        RECIPE,
-        layers.clone(),
-        None,
-        0,
-        &|_, _, _| {},
-    )
-    .unwrap();
     let new_out = dir.join(format!("{tag}-generic.gguf"));
-    let p = plan(&ours, &cfg.into(), formats, layers, NAME, None).unwrap();
+    let p = plan(&ours, cfg, formats, layers, NAME, None).unwrap();
     let new_digest =
         block_scaled_convert::convert(&ours, &p, &records, RECIPE, &new_out, 0, &|_, _, _| {})
             .unwrap();
-    let (a, b) = (
-        std::fs::read(&old_out).unwrap(),
-        std::fs::read(&new_out).unwrap(),
+    frozen::expect(
+        FROZEN,
+        &format!("{tag} file"),
+        &frozen::digest_file(&new_out),
     );
-    assert_eq!(a.len(), b.len(), "{tag}: file lengths");
-    if let Some(at) = a.iter().zip(&b).position(|(x, y)| x != y) {
-        panic!("{tag}: the files first differ at byte {at}");
-    }
-    assert_eq!(old_digest, new_digest, "{tag}: digests");
+    frozen::expect(FROZEN, &format!("{tag} digest"), &format!("{new_digest:?}"));
     p
+}
+
+/// The description of the checkpoint in `dir` without engram layers.
+fn reference_meta(dir: &Path) -> WideSparseMeta {
+    let ours = BlockScaledCheckpoint::open(dir).unwrap();
+    WideSparseMeta::from_reference(&ours.reference, None).unwrap()
 }
 
 /// For each mix, the generic converter writes the bytes of the V4.1 converter, every layer.
 #[test]
 fn every_mix_writes_the_bytes_of_the_v41_converter() {
     let dir = fixture("convert-mixes");
-    let src = SafeTensorsSource::open(&dir).unwrap();
-    let cfg = DeepseekV41Config::from_reference_config(&src.inference_config, None).unwrap();
+    let cfg = reference_meta(&dir);
     for (tag, formats) in mixes() {
-        let p = both_write_the_same_file(&dir, &cfg, formats, 0..cfg.n_layers, tag);
+        let p = writes_the_recorded_file(&dir, &cfg, formats, 0..cfg.n_layers, tag);
         // The fixture reaches every format of the mix.
         assert_eq!(planned(&p, "output.weight"), formats.always_read, "{tag}");
         assert_eq!(planned(&p, "output_norm.weight"), GgmlDType::F32, "{tag}");
@@ -313,12 +296,11 @@ fn every_mix_writes_the_bytes_of_the_v41_converter() {
 #[test]
 fn engram_layers_and_a_partial_file_write_the_bytes_of_the_v41_converter() {
     let dir = fixture("convert-engram");
-    let src = SafeTensorsSource::open(&dir).unwrap();
-    let mut cfg = DeepseekV41Config::from_reference_config(&src.inference_config, None).unwrap();
+    let mut cfg = reference_meta(&dir);
     add_engram(&dir, cfg.d_model);
-    cfg.engram = Some(engram_config(cfg.vocab_size));
+    cfg.ngram = Some(engram_config(cfg.vocab));
     let layers = 0..cfg.n_layers;
-    let whole = both_write_the_same_file(&dir, &cfg, Formats::default(), layers, "whole");
+    let whole = writes_the_recorded_file(&dir, &cfg, Formats::default(), layers, "whole");
     // The whole file carries both engram layers' gates and 1 table of both tables' rows.
     for l in ENGRAM_LAYERS {
         assert_eq!(
@@ -332,7 +314,7 @@ fn engram_layers_and_a_partial_file_write_the_bytes_of_the_v41_converter() {
         .find(|(_, p)| matches!(p, Produce::Table { .. }))
         .expect("an engram table");
     assert_eq!(table.0.dims, vec![ENGRAM_ROWS.iter().sum(), ENGRAM_DIM]);
-    let part = both_write_the_same_file(&dir, &cfg, Formats::default(), 1..2, "middle");
+    let part = writes_the_recorded_file(&dir, &cfg, Formats::default(), 1..2, "middle");
     // The partial file holds layer 1 alone, its engram table among its tensors.
     assert!(part
         .tensors
@@ -383,40 +365,17 @@ fn the_model_name_is_the_last_segment_of_the_checkpoint_id() {
 fn the_convert_request_writes_the_bytes_of_the_v41_converter() {
     let dir = fixture("convert-request");
     let ours = BlockScaledCheckpoint::open(&dir).unwrap();
-    let vocab = DeepseekV41Config::from_reference_config(&ours.reference, None)
-        .unwrap()
-        .vocab_size;
+    let vocab = reference_meta(&dir).vocab;
     add_tokenizer(&dir, vocab);
-    let old_src = SafeTensorsSource::open(&dir).unwrap();
-    let old_cfg = v41::released_config(&old_src, &dir).unwrap();
     let cfg = checkpoint_config(&ours, &dir).unwrap();
-    assert_eq!(
-        cfg,
-        super::wide_sparse_config::WideSparseMeta::from(&old_cfg),
-        "the configurations"
+    frozen::expect(
+        FROZEN,
+        "request config",
+        &frozen::digest(format!("{cfg:?}").as_bytes()),
     );
-    let tokenizer = v41::TokenizerFiles::read(&dir).unwrap();
+    let tokenizer = TokenizerFiles::read(&dir).unwrap();
     let records = records(&ours);
     let formats = Formats::default();
-    let old_formats = v41::Formats {
-        gate_up: formats.gate_up,
-        down: formats.down,
-        always_read: formats.always_read,
-    };
-    let old_out = dir.join("request-v41.gguf");
-    let old_digest = v41::convert(
-        &old_src,
-        &old_cfg,
-        &records,
-        &old_out,
-        old_formats,
-        RECIPE,
-        0..old_cfg.n_layers,
-        Some(&tokenizer),
-        0,
-        &|_, _, _| {},
-    )
-    .unwrap();
     let new_out = dir.join("request-generic.gguf");
     let p = plan(
         &ours,
@@ -430,14 +389,7 @@ fn the_convert_request_writes_the_bytes_of_the_v41_converter() {
     let new_digest =
         block_scaled_convert::convert(&ours, &p, &records, RECIPE, &new_out, 0, &|_, _, _| {})
             .unwrap();
-    let (a, b) = (
-        std::fs::read(&old_out).unwrap(),
-        std::fs::read(&new_out).unwrap(),
-    );
-    assert_eq!(a.len(), b.len(), "file lengths");
-    if let Some(at) = a.iter().zip(&b).position(|(x, y)| x != y) {
-        panic!("the files first differ at byte {at}");
-    }
-    assert_eq!(old_digest, new_digest, "digests");
+    frozen::expect(FROZEN, "request file", &frozen::digest_file(&new_out));
+    frozen::expect(FROZEN, "request digest", &format!("{new_digest:?}"));
     let _ = std::fs::remove_dir_all(&dir);
 }

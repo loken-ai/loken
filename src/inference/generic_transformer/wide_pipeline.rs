@@ -14,7 +14,7 @@
 //! Any other forward leaves 1 value for all its rows.
 //!
 //! The bytes of a boundary are a header of 3 numbers, then a body.
-//! The body of a decode step's boundary is the byte format of the V4.1 path's `DecodeBoundary`.
+//! The body of a decode step's boundary keeps the byte format the V4.1 path's boundary had.
 //!
 //! A verify cut back inside its rows runs the kept rows again through each range.
 //! The band's sources then leave 1 value for the kept rows, which the cut carries on.

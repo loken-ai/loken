@@ -55,6 +55,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Inference: run the host attention of a long prompt over tiles of keys and rows.
 - Inference: read each weight and each row's activation once for all the rows of a small batch.
 - Speculative decoding: record the draft verify and the drafter step as graphs, and cost a cycle by its replays.
+- DeepSeek V4.1: serve it through the generic route, on the host and the cards.
+- API: count the experts of the generic tiers on the stage endpoint.
 
 ### Fixed
 

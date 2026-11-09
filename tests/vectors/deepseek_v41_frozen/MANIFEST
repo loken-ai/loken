@@ -1,0 +1,31 @@
+Records of the retired DeepSeek V4.1 path, read by the tests of the generic route.
+
+Written by the V4.1 code of commit 208378d4, the last commit that holds it.
+Each record is a value that code gave: the old side of a comparison the tests made before.
+The same run asserted the generic route gave the same value.
+`src/inference/generic_transformer/wide_sparse_frozen.rs` reads the files.
+
+A line is a key, a tab and a value.
+A value is the length and the SHA-256 of bytes, or a small value written by `Debug`.
+Floats are compared by their bits.
+
+| File | Read by |
+|---|---|
+| block_scaled.txt | generic_transformer/block_scaled_oracle_tests.rs, block_scaled_engram_tests.rs |
+| calibrate.txt | generic_transformer/wide_sparse_calibrate_tests.rs |
+| card_tier.txt | generic_transformer/wide_sparse_card_tier_tests.rs |
+| cluster.txt | generic_transformer/wide_sparse_cluster_tests.rs |
+| complete.txt | generic_transformer/wide_sparse_complete_tests.rs |
+| config.txt | generic_transformer/wide_sparse_config_tests.rs |
+| convert.txt | generic_transformer/wide_sparse_convert_tests.rs |
+| draft.txt | generic_transformer/block_draft_tests.rs, block_draft.rs |
+| engine.txt | engine/llm_engine/wide_load_tests.rs, wide_variant_tests.rs |
+| engram.txt | generic_transformer/wide_sparse_engram_tests.rs |
+| oracle.txt | generic_transformer/wide_sparse_oracle_tests.rs |
+| pipeline.txt | generic_transformer/wide_pipeline_tests.rs |
+| plan.txt | generic_transformer/wide_sparse_plan_tests.rs |
+| quality.txt | generic_transformer/wide_sparse_quality_tests.rs |
+| routing.txt | generic_transformer/wide_sparse_routing_tests.rs, engine/llm_engine/wide_routing_tests.rs |
+| units.txt | generic_transformer/latent_mqa.rs, compressed_band.rs, hyper/sinkhorn.rs, ngram/engram.rs, ngram/engram_hash.rs, packed_rows.rs, moe_weights.rs, block_scaled_experts.rs, loader/wide_sparse.rs, routing_calibration.rs |
+| variant.txt | generic_transformer/wide_sparse_variant_tests.rs, engine/llm_engine/wide_variant_tests.rs |
+| real.txt, real_last_logits.f32 | generic_transformer/wide_sparse_real_tests.rs, ignored tests on the released file |

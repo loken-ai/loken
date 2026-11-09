@@ -1,9 +1,10 @@
-//! The completion and the draft companion of the generic route against the V4.1 writers.
+//! The completion and the draft companion of the generic route against the records of the V4.1
+//! writers.
 //!
 //! The checkpoint is the one of the block-scaled reader tests with a block draft of 2 stages.
 //! Its draft holds fp8, fp4, bf16 and f32 tensors under the official names.
-//! Both writers read the same directory and write with the same layout and format.
-//! The files they write are compared byte for byte.
+//! The generic writers read it with the layouts and formats the V4.1 writers were recorded with.
+//! The files they write are compared byte for byte with the recorded digests.
 //!
 //! Only a host build is compared, as for the converter.
 
@@ -16,10 +17,9 @@ use super::block_scaled_oracle_tests::{
 use super::wide_sparse_complete::{
     complete, draft_bytes_planned, has_draft, verify_carried, write_draft, Layout,
 };
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_names::{ARCH, EXPERT_STACKS};
 use super::BlockScaledCheckpoint;
-use crate::inference::model::deepseek_v41::complete as v41;
-use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
 use crate::tensor::quantized::gguf_file::{open_mapped, Value};
 use crate::tensor::quantized::GgmlDType;
@@ -185,22 +185,8 @@ fn converted(path: &Path) {
     write_gguf_with_metadata(path, &md, &entries).unwrap();
 }
 
-/// The V4.1 layout of the same boundaries.
-fn v41_layout(l: Layout) -> v41::Layout {
-    v41::Layout {
-        alignment: l.alignment,
-        unit: l.unit,
-    }
-}
-
-/// Asserts the files at `a` and `b` hold the same bytes.
-fn same_file(a: &Path, b: &Path, what: &str) {
-    let (x, y) = (std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
-    assert_eq!(x.len(), y.len(), "{what}: file lengths");
-    if let Some(at) = x.iter().zip(&y).position(|(p, q)| p != q) {
-        panic!("{what}: the files first differ at byte {at}");
-    }
-}
+/// The record file of these tests.
+const FROZEN: &str = "complete";
 
 /// For each format and layout, the generic writer of the draft companion writes the bytes of the
 /// V4.1 writer, and plans the length it writes.
@@ -209,30 +195,18 @@ fn same_file(a: &Path, b: &Path, what: &str) {
 fn the_draft_companion_is_the_bytes_of_the_v41_writer() {
     let dir = draft_checkpoint("draft-companion");
     let ours = BlockScaledCheckpoint::open(&dir).unwrap();
-    let old = SafeTensorsSource::open(&dir).unwrap();
     assert!(has_draft(&ours));
     for format in [GgmlDType::Q8_0, GgmlDType::Q6K] {
         for (alignment, unit) in LAYOUTS {
             let layout = Layout { alignment, unit };
             let what = format!("{format:?} {alignment}/{unit}");
-            let old_out = dir.join("draft-v41.gguf");
             let new_out = dir.join("draft-generic.gguf");
-            let old_digest = v41::write_draft(
-                &old,
-                &dir,
-                &old_out,
-                v41_layout(layout),
-                format,
-                &|_, _, _| {},
-            )
-            .unwrap();
             let new_digest = write_draft(&ours, &new_out, layout, format, &|_, _, _| {}).unwrap();
-            same_file(&old_out, &new_out, &what);
-            assert_eq!(old_digest, new_digest, "{what}: digests");
+            let key = |part: &str| format!("draft {what} {part}");
+            frozen::expect(FROZEN, &key("file"), &frozen::digest_file(&new_out));
+            frozen::expect(FROZEN, &key("digest"), &format!("{new_digest:?}"));
             let planned = draft_bytes_planned(&ours, &new_out, layout, format).unwrap();
-            let old_planned =
-                v41::draft_bytes_planned(&old, &dir, &old_out, v41_layout(layout), format).unwrap();
-            assert_eq!(planned, old_planned, "{what}: planned lengths");
+            frozen::expect(FROZEN, &key("planned"), &format!("{planned:?}"));
             assert_eq!(
                 planned,
                 std::fs::metadata(&new_out).unwrap().len(),
@@ -265,9 +239,9 @@ fn the_draft_companion_is_the_bytes_of_the_v41_writer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Completes `src` with both writers into `{tag}-v41.gguf` and `{tag}-generic.gguf`, asserts
-/// the 2 files, their digests and their carry checks are equal, and returns the generic file.
-fn both_complete(
+/// Completes `src` into `{tag}-generic.gguf`, asserts the file, its digest and its carry check
+/// are the recorded ones, and returns it.
+fn completes_as_recorded(
     dir: &Path,
     src: &Path,
     with_draft: bool,
@@ -276,40 +250,21 @@ fn both_complete(
     tag: &str,
 ) -> PathBuf {
     let ours = BlockScaledCheckpoint::open(dir).unwrap();
-    let old = SafeTensorsSource::open(dir).unwrap();
     let g = open_mapped(src).unwrap();
-    let old_out = dir.join(format!("{tag}-v41.gguf"));
     let new_out = dir.join(format!("{tag}-generic.gguf"));
-    let old_draft = with_draft.then_some((&old, dir));
-    let old_digest = v41::complete(
-        &g,
-        old_draft,
-        &old_out,
-        v41_layout(layout),
-        format,
-        &|_, _, _| {},
-    )
-    .unwrap();
     let new_draft = with_draft.then_some(&ours);
     let new_digest = complete(&g, new_draft, &new_out, layout, format, &|_, _, _| {}).unwrap();
-    same_file(&old_out, &new_out, tag);
-    assert_eq!(old_digest, new_digest, "{tag}: digests");
-    let old_check = v41::verify_carried(src, &old_out, &|_, _, _| {}).unwrap();
-    let new_check = verify_carried(src, &new_out, &|_, _, _| {}).unwrap();
-    assert_eq!(
-        (
-            old_check.keys,
-            old_check.whole,
-            old_check.split,
-            old_check.bytes
-        ),
-        (
-            new_check.keys,
-            new_check.whole,
-            new_check.split,
-            new_check.bytes
-        ),
-        "{tag}: carry checks"
+    frozen::expect(
+        FROZEN,
+        &format!("{tag} file"),
+        &frozen::digest_file(&new_out),
+    );
+    frozen::expect(FROZEN, &format!("{tag} digest"), &format!("{new_digest:?}"));
+    let check = verify_carried(src, &new_out, &|_, _, _| {}).unwrap();
+    frozen::expect_debug(
+        FROZEN,
+        &format!("{tag} check"),
+        &(check.keys, check.whole, check.split, check.bytes),
     );
     new_out
 }
@@ -324,10 +279,10 @@ fn completing_writes_the_bytes_of_the_v41_completion() {
     let src = dir.join("src.gguf");
     converted(&src);
     let [small, large] = LAYOUTS.map(|(alignment, unit)| Layout { alignment, unit });
-    let once = both_complete(&dir, &src, true, Some(GgmlDType::Q8_0), small, "named");
-    both_complete(&dir, &src, true, None, large, "own-format");
-    both_complete(&dir, &src, false, None, small, "no-draft");
-    let twice = both_complete(&dir, &once, true, None, small, "twice");
+    let once = completes_as_recorded(&dir, &src, true, Some(GgmlDType::Q8_0), small, "named");
+    completes_as_recorded(&dir, &src, true, None, large, "own-format");
+    completes_as_recorded(&dir, &src, false, None, small, "no-draft");
+    let twice = completes_as_recorded(&dir, &once, true, None, small, "twice");
 
     // Completing again carries the units and the draft the first completion wrote.
     let check = verify_carried(&once, &twice, &|_, _, _| {}).unwrap();

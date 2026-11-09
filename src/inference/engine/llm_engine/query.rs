@@ -303,8 +303,8 @@ impl LlmEngine {
         let s = state
             .as_mut()
             .ok_or_else(|| "no model loaded".to_string())?;
-        // A generic transformer keeps layers `[0, cut)` and the rest leaves with the link; any
-        // other backend forms the pipeline its own way, or declines.
+        // A generic transformer keeps layers `[0, cut)` and the rest leaves with the link.
+        // Any other backend declines.
         // The graphs kept between requests are for the serial decode of this model as it stands.
         #[cfg(feature = "gpu")]
         if !s.kept_graphs.is_empty() {
@@ -330,9 +330,7 @@ impl LlmEngine {
             }
             Err(other) => {
                 s.model = other;
-                s.model
-                    .connect_pipeline_tail(addr, cut)
-                    .map_err(|e| e.to_string())
+                Err("this model cannot be a pipeline head".to_string())
             }
         }
     }

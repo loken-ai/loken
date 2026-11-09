@@ -2226,39 +2226,17 @@ impl APIServer {
         window: Option<usize>,
     ) -> Result<u16, String> {
         let engine = LlmEngine::with_config(self.config_for_model(model_id));
-        let gguf = engine
+        engine
             .resolve_model_file(model_id)
-            .ok_or_else(|| format!("pipeline tail: model {model_id} not found on this node"))?
-            .to_string_lossy()
-            .to_string();
+            .ok_or_else(|| format!("pipeline tail: model {model_id} not found on this node"))?;
         let listener = std::net::TcpListener::bind(("0.0.0.0", 0))
             .map_err(|e| format!("pipeline tail: bind: {e}"))?;
         let port = listener
             .local_addr()
             .map_err(|e| format!("pipeline tail: addr: {e}"))?
             .port();
-        // A model with its own tail mechanism serves it from the file; any other is a generic
-        // transformer whose share is placed by the engine's own ladder and served from there.
-        let claimed = {
-            let gguf = gguf.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::inference::serve::pipeline_serve::claims_tail(&gguf)
-            })
-            .await
-            .map_err(|e| format!("pipeline tail: {e}"))?
-        };
-        if claimed {
-            std::thread::Builder::new()
-                .name(format!("pipeline-tail-{model_id}"))
-                .spawn(move || {
-                    if let Err(e) = crate::inference::serve::pipeline_serve::run_tail_local(
-                        &gguf, from, to, next, listener,
-                    ) {
-                        tracing::warn!("pipeline tail exited: {e}");
-                    }
-                })
-                .map_err(|e| format!("pipeline tail: spawn: {e}"))?;
-        } else {
+        // The share is placed by the engine's own ladder and served from there.
+        {
             // Held while the share loads, so no request loads the whole model beside it.
             let lock = self.loading_lock(model_id).await;
             let _loading = lock.lock().await;

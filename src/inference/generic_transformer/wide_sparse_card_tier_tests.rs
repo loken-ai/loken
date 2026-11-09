@@ -1,23 +1,21 @@
-//! The card tier of the routed experts of a wide-residual model, against the V4.1 path.
+//! The card tier of the routed experts of a wide-residual model, against the records of the
+//! V4.1 path.
 //!
 //! The small files are those of the frozen V4.1 oracle.
 //! The card tests store the routed experts in a format the card kernels read: gate and up in
 //! `IQ2_XXS`, down in `Q2_K`, 1 tensor per expert.
 
-use super::block_draft_tests::{generic_of, prompt, v41_of};
+use super::block_draft_tests::{generic_of, prompt};
 use super::expert_profile::ExpertProfile;
-use super::wide_sparse_oracle_tests::{bit_difference, record_generic, RECORDS};
+use super::wide_sparse_frozen as frozen;
+use super::wide_sparse_oracle_tests::{record_digest, record_generic, RECORDS};
 use super::wide_sparse_variant_tests::{metadata, write_pair, Variant, CHOICES, LAYOUT};
 use super::wide_sparse_variants::open_checked;
 use super::GenericHeteroTransformer;
 use crate::inference::generic_transformer::wide_sparse_toy::real_entries_for;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::source::VariantSource;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
-use crate::inference::place::expert_variants::{ranks_from_counts, VariantChoice};
+use crate::inference::place::expert_variants::VariantChoice;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
 use crate::tensor::quantized::gguf_file::{open_mapped, Value};
-use crate::tensor::quantized::gguf_source::SplitGguf;
 use crate::tensor::quantized::GgmlDType;
 use std::path::{Path, PathBuf};
 
@@ -68,35 +66,6 @@ fn expert_facts(model: &GenericHeteroTransformer, v: usize) -> (usize, u64) {
     (ffn.experts.len(), ffn.variant_bytes(0, v).unwrap())
 }
 
-/// The V4.1 model of the 2 files, its policy `choice` over the heat `profile` ranks.
-fn v41_ranked(
-    model: &Path,
-    variant: &Path,
-    choice: VariantChoice,
-    profile: &ExpertProfile,
-) -> DeepseekV41Model {
-    let primary = SplitGguf::open(model).unwrap();
-    let variants = [SplitGguf::open(variant).unwrap()];
-    let cfg = DeepseekV41Config::from_meta(&primary).unwrap();
-    let v41 = DeepseekV41Model::load(
-        &VariantSource {
-            primary: &primary,
-            variants: &variants,
-        },
-        &cfg,
-    )
-    .unwrap();
-    let ranks = ranks_from_counts(
-        &profile.counts,
-        profile.layers,
-        profile.experts,
-        &cfg.hot_experts,
-    );
-    v41.set_variant_policy(choice, ranks);
-    v41.size_expert_cache_to_memory(&cfg).unwrap();
-    v41
-}
-
 /// The generic model of the 2 files, its heat from `profile`.
 fn generic_ranked(
     model: &Path,
@@ -112,7 +81,7 @@ fn generic_ranked(
 }
 
 /// Under every policy and every room, a card gives each expert the variant the V4.1 placement
-/// gives it, and keeps as many experts per layer, under the same heat.
+/// gave it, and keeps as many experts per layer, under the same heat.
 #[test]
 fn a_card_room_gives_each_expert_the_v41_variant() {
     let dir = scratch("variants");
@@ -123,24 +92,23 @@ fn a_card_room_gives_each_expert_the_v41_variant() {
         let mut generic = generic_ranked(&model, &variant, &counts(layers, 8));
         let (experts, big) = expert_facts(&generic, 0);
         let (_, small) = expert_facts(&generic, 1);
-        let profile = counts(layers, experts);
-        let v41 = v41_ranked(&model, &variant, choice, &profile);
         let all = (layers * experts) as u64;
-        for room in [
+        let rooms = [
             0,
             big,
             3 * big + small,
             5 * big - 1,
             all * big,
             all * big + small,
-        ] {
-            let want = v41.place_variants(room).expect("2 variants");
+        ];
+        for (k, room) in rooms.into_iter().enumerate() {
             generic.set_wide_card_rooms(vec![(0, room)]);
             let got = generic.place_expert_variants(choice).expect("2 variants");
-            assert_eq!(got.chosen, want.chosen, "{choice:?} room {room}");
+            let key = |part: &str| format!("{choice:?} room{k} {part}");
+            frozen::expect_debug("card_tier", &key("chosen"), &got.chosen);
             let card = got.kept.first().cloned().unwrap_or(vec![0; layers]);
-            assert_eq!(card, want.kept[0], "{choice:?} room {room}");
-            assert_eq!(generic.expert_variant_choice(), want.chosen);
+            frozen::expect_debug("card_tier", &key("kept"), &card);
+            assert_eq!(generic.expert_variant_choice(), got.chosen);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -327,8 +295,8 @@ fn card_experts_give_the_hosts_bits_on_every_record() {
         for record in RECORDS {
             let name = format!("l0_{record}");
             assert_eq!(
-                bit_difference(&want[&name], &got[&name]),
-                None,
+                record_digest(&got[&name]),
+                record_digest(&want[&name]),
                 "room of {room} experts: {name}"
             );
         }
@@ -448,13 +416,11 @@ fn card_expert_products_are_no_farther_from_the_exact_product_than_the_hosts() {
 }
 
 /// With every prior expert on the card, the card residency, the cost shape and the placement
-/// inputs equal those of the V4.1 backend, whose card warms the same experts from the prior.
+/// inputs equal those of the V4.1 backend, whose card warmed the same experts from the prior.
 #[cfg(feature = "gpu")]
 #[test]
 fn the_card_residency_and_the_planner_inputs_are_the_v41_backends() {
-    use crate::inference::engine::model_backend::{
-        DeepseekV41Backend, GenericBackend, ModelBackend,
-    };
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
     if crate::tensor::Device::new_cuda(0).is_err() {
         eprintln!("no card 0: skipped");
         return;
@@ -462,26 +428,18 @@ fn the_card_residency_and_the_planner_inputs_are_the_v41_backends() {
     let dir = scratch("residency");
     let path = dir.join("model.gguf");
     card_format_file(&path);
-    let v41 = DeepseekV41Backend::new(v41_of(&open_mapped(&path).unwrap()), 0, 128);
-    let want = (
-        v41.card_residency(),
-        v41.expert_cost_shape(),
-        v41.placement_model_inputs(),
-    );
-    drop(v41);
     let generic = GenericBackend(with_card_experts(&path, 64));
     let got = (
         generic.card_residency(),
         generic.expert_cost_shape(),
         generic.placement_model_inputs(),
     );
-    println!("V4.1 {want:?}");
     println!("generic {got:?}");
     assert!(
         got.0.as_ref().is_some_and(|c| c[0].1 > 0),
         "experts on the card"
     );
-    assert_eq!(got, want);
+    frozen::expect_debug("card_tier", "residency", &got);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

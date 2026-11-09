@@ -44,7 +44,6 @@ pub fn run(cx: &Context) -> Result<Vec<Measured>, String> {
         note: Some("the same weights every call, so they stay in the caches".to_string()),
     }];
     rows.extend(distinct(cx, gate, down, bytes, target));
-    rows.extend(through_the_decode_path(cx, gate, down, bytes, target));
     Ok(rows)
 }
 
@@ -254,62 +253,4 @@ fn format_of(name: &str) -> Result<GgmlDType, String> {
         "q8_0" => Ok(GgmlDType::Q8_0),
         other => Err(format!("format {other} is not one the bench knows")),
     }
-}
-
-/// Experts built as the store builds them, run by the function a decode calls for its host
-/// experts, `k` of them per call out of a set far larger than the caches.
-fn through_the_decode_path(
-    cx: &Context,
-    gate: GgmlDType,
-    down: GgmlDType,
-    bytes: usize,
-    target: Duration,
-) -> Vec<Measured> {
-    use crate::inference::offload::cpu_experts::batched;
-    use crate::inference::offload::experts::Expert;
-    use crate::tensor::blockscaled::projection::Projection;
-    use crate::tensor::quantized::QTensor;
-    use crate::tensor::Device;
-    use std::sync::Arc;
-    const SET: usize = 48;
-    let (dim, inter) = (cx.shapes.hidden, cx.options.expert_inter());
-    let gate_len = inter * (dim / gate.block_size()) * gate.type_size();
-    let down_len = dim * (inter / down.block_size()) * down.type_size();
-    let quant = |fill: u8, len: usize, dtype: GgmlDType, dims: Vec<usize>| {
-        QTensor::from_ggml_bytes(dtype, &vec![fill; len], dims, &Device::Cpu)
-            .ok()
-            .map(|q| Projection::Quant(Arc::new(q)))
-    };
-    let mut experts: Vec<Arc<Expert>> = Vec::new();
-    for i in 0..SET {
-        let (a, b, c) = (
-            quant((i % 251) as u8, gate_len, gate, vec![inter, dim]),
-            quant((i % 241) as u8, gate_len, gate, vec![inter, dim]),
-            quant((i % 239) as u8, down_len, down, vec![dim, inter]),
-        );
-        match (a, b, c) {
-            (Some(w1), Some(w3), Some(w2)) => experts.push(Arc::new(Expert { w1, w2, w3 })),
-            _ => return Vec::new(),
-        }
-    }
-    let x = vec![0.05f32; dim];
-    let mut rows = Vec::new();
-    for k in [4usize, 6] {
-        let mut next = 0usize;
-        let samples = run_for(target, || {
-            let at = next;
-            next = (next + k) % SET;
-            let pick: Vec<Arc<Expert>> = (0..k).map(|j| experts[(at + j) % SET].clone()).collect();
-            let t = std::time::Instant::now();
-            let _ = batched(&pick, &x, 7.0);
-            t.elapsed().as_secs_f64() * 1e6
-        });
-        rows.push(Measured {
-            variant: format!("{k} experts through the decode's host path"),
-            bytes: Some((k * bytes) as u64),
-            samples_us: samples,
-            note: Some(format!("{k} experts per call out of {SET} distinct ones")),
-        });
-    }
-    rows
 }

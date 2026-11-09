@@ -369,7 +369,7 @@ fn normalise_cols(cm: &mut [Vec<f32>], hc: usize, eps: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::model::deepseek_v41::hyper_connections as v41;
+    use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
     use crate::tensor::quantized::gguf_file::{Content, Value, VersionedMagic};
     use std::collections::HashMap;
 
@@ -417,60 +417,36 @@ mod tests {
         SinkhornMixer::new(&func, &scale, &base, meta(), DIM, NORM_EPS).unwrap()
     }
 
-    fn bits(v: &[f32]) -> Vec<u32> {
-        v.iter().map(|x| x.to_bits()).collect()
-    }
-
     fn flat(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
-    /// The coefficients, the collapsed input and the new residual have the bits of the V4.1
-    /// hyper-connections on the same residual and weights, for a batch and for a single token.
+    /// The coefficients, the collapsed input and the new residual have the recorded bits of the
+    /// V4.1 hyper-connections on the same residual and weights, for a batch and for a single
+    /// token.
     #[test]
     fn the_mixes_pre_and_post_give_the_bits_of_the_v41_hyper_connections() {
         for (seq, seed) in [(7usize, 11u64), (1, 23)] {
             let (func, scale, base) = weights(seed);
             let m = SinkhornMixer::new(&func, &scale, &base, meta(), DIM, NORM_EPS).unwrap();
             let values = noise(seq * HC * DIM, seed + 2);
-            let r = Tensor::from_vec(values.clone(), (1, seq, HC * DIM), &Device::Cpu).unwrap();
-            let x = Tensor::from_vec(values, (1, seq, HC, DIM), &Device::Cpu).unwrap();
+            let r = Tensor::from_vec(values, (1, seq, HC * DIM), &Device::Cpu).unwrap();
+            let key = |part: &str| format!("sinkhorn {seq} {part}");
 
             let got = m.mixes(&r).unwrap();
-            let want = v41::hc_mixes(
-                &x,
-                &func,
-                &flat(&scale),
-                &flat(&base),
-                HC,
-                ITERS,
-                NORM_EPS,
-                HC_EPS,
-            )
-            .unwrap();
-            for t in 0..seq {
-                assert_eq!(bits(&got.pre[t]), bits(&want.pre[t]), "pre, token {t}");
-                assert_eq!(bits(&got.post[t]), bits(&want.post[t]), "post, token {t}");
-                for i in 0..HC {
-                    assert_eq!(
-                        bits(&got.comb[t][i]),
-                        bits(&want.comb[t][i]),
-                        "comb row {i}, token {t}"
-                    );
-                }
-            }
+            frozen::expect_f32("units", &key("pre"), &got.pre.concat());
+            frozen::expect_f32("units", &key("post"), &got.post.concat());
+            frozen::expect_f32("units", &key("comb"), &got.comb.concat().concat());
 
             let collapsed = m.pre(&r, &got.pre).unwrap();
             assert_eq!(collapsed.dims(), [1, seq, DIM]);
-            let want_collapsed = v41::hc_pre(&x, &want.pre).unwrap();
-            assert_eq!(bits(&flat(&collapsed)), bits(&flat(&want_collapsed)));
+            frozen::expect_f32("units", &key("collapsed"), &flat(&collapsed));
 
             let out =
                 Tensor::from_vec(noise(seq * DIM, seed + 3), (1, seq, DIM), &Device::Cpu).unwrap();
             let next = m.post(&out, &r, &got.post, &got.comb).unwrap();
             assert_eq!(next.dims(), [1, seq, HC * DIM]);
-            let want_next = v41::hc_post(&out, &x, &want.post, &want.comb, HC).unwrap();
-            assert_eq!(bits(&flat(&next)), bits(&flat(&want_next)));
+            frozen::expect_f32("units", &key("next"), &flat(&next));
         }
     }
 
@@ -535,10 +511,8 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "{g} vs {w}");
         }
-        // The same share added by the V4.1 hyper-connections gives the same bits.
-        let plain4 = plain.reshape((1, 1, HC, DIM)).unwrap();
-        let v41_added = flat(&v41::hc_add(&plain4, &post[0], &delta).unwrap());
-        assert_eq!(bits(&got), bits(&v41_added));
+        // The same share added by the V4.1 hyper-connections gave the same bits.
+        frozen::expect_f32("units", "sinkhorn added", &got);
     }
 
     fn content(meta: &[(&str, Value)]) -> Content {

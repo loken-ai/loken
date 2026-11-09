@@ -21,7 +21,6 @@ const ENV_READS: &[(&str, usize)] = &[
     ("inference/load/huggingface_manager.rs", 1),
     ("inference/model/boogu/dit.rs", 2),
     ("inference/model/clip/vision.rs", 1),
-    ("inference/model/deepseek_v41/dspark.rs", 4),
     ("inference/model/sdxl/pipeline.rs", 1),
     ("inference/model/sdxl/vae.rs", 1),
     ("inference/model/stable_audio/tests.rs", 6),

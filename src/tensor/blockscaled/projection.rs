@@ -1,9 +1,8 @@
 //! A weight in whatever storage the file gives it, applied in place.
 //!
 //! A projection is `[out, in]`: dense f32, GGUF blocks the CPU dot engine reads in place, or
-//! block-scaled fp8/fp4 and bf16 read in place from the mapping. Its product goes to the
-//! thread's offload when one takes it, and runs here otherwise. A mapped weight is never
-//! dequantised or copied: its bytes are the working set.
+//! block-scaled fp8/fp4 and bf16 read in place from the mapping. Its product runs on the host
+//! cores. A mapped weight is never dequantised or copied: its bytes are the working set.
 
 use super::bf16::Bf16Weight;
 use super::fp4::Fp4Weight;
@@ -70,6 +69,7 @@ impl Projection {
                 .contiguous()?
                 .flatten_all()?
                 .to_vec1::<f32>()?,
+            // CONVERSION: the caller asks for the decoded values.
             Self::Quant(q) => q
                 .dequantize(&Device::Cpu)?
                 .to_dtype(DType::F32)?
@@ -199,22 +199,12 @@ impl Projection {
         }
     }
 
-    /// `x` [n, in] -> [n, out]: on the thread's offload when it takes the product, else here.
+    /// `x` [n, in] -> [n, out] on this thread's cores.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        if let Some(offload) = crate::inference::offload::current() {
-            let xs = x.flatten_all()?.to_vec1::<f32>()?;
-            if let Some(y) = offload.projection(self, &xs) {
-                let mut dims = x.dims().to_vec();
-                if let Some(last) = dims.last_mut() {
-                    *last = self.dims()[0];
-                }
-                return Tensor::from_vec(y?, dims, &Device::Cpu);
-            }
-        }
         self.apply_here(x)
     }
 
-    /// `x` [n, in] -> [n, out] on this thread's cores, whatever offload the thread has.
+    /// `x` [n, in] -> [n, out] on this thread's cores.
     pub fn apply_here(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             // A single row is a matrix-vector product: each weight row against the input, across

@@ -219,17 +219,6 @@ impl ModelBackend for PipelineHeadBackend {
         Err(self)
     }
 
-    fn into_batched(
-        self: Box<Self>,
-        _eos: u32,
-        _max_batch: usize,
-    ) -> Result<
-        std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
-        BoxedModelBackend,
-    > {
-        Err(self)
-    }
-
     fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
         Err(self)
     }

@@ -909,90 +909,48 @@ impl GenericHeteroTransformer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::wide_sparse_frozen as frozen;
+    use super::super::wide_sparse_names::ARCH;
     use super::*;
-    use crate::inference::model::deepseek_v41::dspark::{Dspark, DsparkConfig, DsparkState};
-    use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
-    use crate::inference::model::deepseek_v41::source::WeightSource;
     use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
     use crate::tensor::quantized::gguf_file::open_mapped;
     use crate::tensor::quantized::GgmlDType;
     use safetensors::SafeTensors;
 
-    /// The fields both readers give, side by side.
-    fn same_shape(got: &BlockDraftMeta, want: &DsparkConfig) {
-        assert_eq!(
+    /// Asserts the fields the V4.1 reader gave are the recorded ones.
+    fn same_shape(got: &BlockDraftMeta) {
+        let fields = (
             (got.stages, got.block, got.noise_token, &got.target_layers),
-            (
-                want.n_stages,
-                want.block_size,
-                want.noise_token,
-                &want.target_layers
-            )
-        );
-        assert_eq!(
             (
                 got.markov_rank,
                 got.routed,
                 got.used,
                 got.window,
                 got.dim,
-                got.streams
+                got.streams,
             ),
-            (
-                want.markov_rank,
-                want.n_routed,
-                want.n_activated,
-                want.window_size,
-                want.dim,
-                want.hc_mult
-            )
-        );
-        assert_eq!(
             (
                 got.heads,
                 got.head_dim,
                 got.rope_dim,
                 got.o_groups,
-                got.o_lora_rank
+                got.o_lora_rank,
             ),
-            (
-                want.n_heads,
-                want.head_dim,
-                want.rope_head_dim,
-                want.o_groups,
-                want.o_lora_rank
-            )
-        );
-        assert_eq!(
             (
                 got.gate_temp,
                 got.route_scale,
                 got.swiglu_limit,
-                got.norm_topk
+                got.norm_topk,
             ),
-            (
-                want.gate_temp,
-                want.route_scale,
-                want.swiglu_limit,
-                want.norm_topk
-            )
-        );
-        assert_eq!(
             (
                 got.rms_eps,
                 got.rope_theta,
                 got.sinkhorn_iters,
                 got.hc_eps,
-                got.vocab
+                got.vocab,
             ),
-            (
-                want.rms_eps,
-                want.rope_theta,
-                want.hc_sinkhorn_iters,
-                want.hc_eps,
-                want.vocab
-            )
         );
+        frozen::expect_debug("draft", "shape", &fields);
     }
 
     fn vectors_dir() -> std::path::PathBuf {
@@ -1000,20 +958,20 @@ mod tests {
     }
 
     /// Port of the V4.1 test `the_draft_config_survives_the_file`: the configuration and the
-    /// keys the V4.1 writer puts in a file read as the V4.1 reader reads them, and a file without
+    /// keys the V4.1 writer put in a file read as the V4.1 reader read them, and a file without
     /// the keys declares no draft.
     #[test]
     fn the_draft_shape_reads_as_the_v41_reader_reads_it() {
         let dir = vectors_dir();
-        let want = DsparkConfig::from_config_json(&dir).unwrap();
         let got = BlockDraftMeta::from_config_json(&dir).unwrap();
-        same_shape(&got, &want);
+        same_shape(&got);
+        frozen::expect_debug("draft", "shape keys", &got.to_metadata(ARCH));
 
         let mut md = vec![(
             "general.architecture".to_string(),
-            Value::String(super::super::wide_sparse_names::ARCH.into()),
+            Value::String(ARCH.into()),
         )];
-        md.extend(want.to_metadata());
+        md.extend(got.to_metadata(ARCH));
         let entries = vec![GgufEntry {
             name: "output_norm".into(),
             dims: vec![4],
@@ -1030,7 +988,7 @@ mod tests {
         let from_file = BlockDraftMeta::from_metadata(&g.content.metadata)
             .unwrap()
             .unwrap();
-        same_shape(&from_file, &want);
+        same_shape(&from_file);
         assert_eq!(from_file, got);
 
         write_gguf_with_metadata(&path, &md[..1], &entries).unwrap();
@@ -1048,7 +1006,7 @@ mod tests {
     /// at a small size beside its block logits.
     /// The ring is seeded by a prompt longer than the window, then each step drafts.
     /// The generic head's block logits stay within the V4.1 test's bounds of the reference's.
-    /// Each step's guesses are those of the V4.1 head on the same inputs.
+    /// Each step's guesses are those the V4.1 head gave on the same inputs, as recorded.
     #[test]
     fn the_generic_draft_matches_the_reference_and_guesses_as_the_v41_draft() {
         let dir = vectors_dir();
@@ -1076,25 +1034,16 @@ mod tests {
         let embed = ck.dense_f32("token_embd").unwrap();
         let output = Projection::Dense(ck.dense_f32("output").unwrap());
 
-        let cfg = DsparkConfig::from_config_json(&dir).unwrap();
-        let src = SafeTensorsSource::open(&dir).unwrap();
-        let v41 = Dspark::load(&src, cfg.clone()).unwrap();
-        let v41_embed = src.dense_f32("embed.weight").unwrap();
-        let v41_head = Projection::Dense(src.dense_f32("head.weight").unwrap());
-
         let width = meta.dim * meta.target_layers.len();
         let prefill = f32s("prefill_main_hidden");
         let mut ring = head.ring();
-        let mut v41_state = DsparkState::new(v41.stages.len(), cfg.window_size, cfg.head_dim);
         for (pos, row) in prefill.chunks_exact(width).enumerate() {
             head.write_row(&mut ring, row, pos).unwrap();
-            v41.update_window_from_hidden(&mut v41_state, row, pos)
-                .unwrap();
         }
         let (tokens, poss) = (i32s("token"), i32s("pos"));
         let (hidden, logits) = (f32s("main_hidden"), f32s("draft_logits"));
         let (bs, vocab) = (meta.block, meta.vocab);
-        let (mut worst_cos, mut worst_rel, mut worst_apart) = (1f32, 0f32, 0f32);
+        let (mut worst_cos, mut worst_rel) = (1f32, 0f32);
         for step in 0..tokens.len() {
             let row = &hidden[step * width..(step + 1) * width];
             let (token, pos) = (tokens[step] as u32, poss[step] as usize);
@@ -1107,13 +1056,8 @@ mod tests {
             let (got_ids, got) = head
                 .draft(&mut ring, row, token, pos, &emb, &output)
                 .unwrap();
-            let (want_ids, v41_logits) = v41
-                .forward_draft_logits(&mut v41_state, row, token, pos, &v41_embed, &v41_head)
-                .unwrap();
-            assert_eq!(
-                got_ids, want_ids,
-                "step {step}: the guesses of the V4.1 draft"
-            );
+            let key = format!("reference step{step} ids");
+            frozen::expect_debug("draft", &key, &got_ids);
             for i in 0..bs {
                 let want = &logits[(step * bs + i) * vocab..(step * bs + i + 1) * vocab];
                 let g = &got[i];
@@ -1123,16 +1067,10 @@ mod tests {
                 let num: f32 = g.iter().zip(want).map(|(a, b)| (a - b) * (a - b)).sum();
                 worst_cos = worst_cos.min(dot / (na * nb));
                 worst_rel = worst_rel.max(num.sqrt() / nb);
-                let apart = g
-                    .iter()
-                    .zip(&v41_logits[i])
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
-                worst_apart = worst_apart.max(apart);
             }
         }
         eprintln!(
-            "generic draft against reference: worst cosine {worst_cos}, worst relative L2 {worst_rel}; against V4.1: {worst_apart} apart at most"
+            "generic draft against reference: worst cosine {worst_cos}, worst relative L2 {worst_rel}"
         );
         assert!(worst_cos > 0.999, "block logits turned: cosine {worst_cos}");
         assert!(

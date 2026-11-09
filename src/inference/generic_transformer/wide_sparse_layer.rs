@@ -464,6 +464,43 @@ impl RoutedFfn {
         picks.into_iter().map(|(ids, w, _)| (ids, w)).collect()
     }
 
+    /// Notes in the process's expert counters the pairs of `assign`: those of the experts in
+    /// `on_card` served by the card, those of `on_host` computed from the file mapping, and the
+    /// experts a single decoded row routed to.
+    fn note_served(
+        &self,
+        assign: &[Vec<(usize, f32)>],
+        on_card: &[usize],
+        on_host: &[usize],
+        n: usize,
+    ) {
+        let counters = crate::inference::expert_counters::global();
+        if !counters.on() {
+            return;
+        }
+        let layer = self as *const Self as usize;
+        let pairs = |ids: &[usize]| ids.iter().map(|&e| assign[e].len() as u64).sum::<u64>();
+        let routed = on_card.iter().chain(on_host);
+        counters.routed(
+            layer,
+            routed.flat_map(|&e| std::iter::repeat_n(e, assign[e].len())),
+        );
+        counters.served(pairs(on_card), pairs(on_host));
+        let bytes: usize = on_host
+            .iter()
+            .map(|&e| {
+                let x = &self.experts[e];
+                x.gate.bytes() + x.up.bytes() + x.down.bytes()
+            })
+            .sum();
+        counters.read(false, bytes as u64);
+        if n == 1 {
+            let mut now: Vec<usize> = on_card.iter().chain(on_host).copied().collect();
+            now.sort_unstable();
+            counters.decoded(layer, &now);
+        }
+    }
+
     /// The block over the rows of `x` `[.., hidden]` F32 on the host, in `x`'s shape.
     ///
     /// Each row starts from its shared expert's output.
@@ -494,6 +531,7 @@ impl RoutedFfn {
         let (on_card, on_host): (Vec<usize>, Vec<usize>) = active
             .iter()
             .partition(|&&e| watch.is_none() && self.card.holds(e));
+        self.note_served(&assign, &on_card, &on_host, n);
         // Every host expert's bytes are asked for at once, so the reads overlap the compute.
         on_host
             .par_iter()

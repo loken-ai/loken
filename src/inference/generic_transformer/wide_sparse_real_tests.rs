@@ -1,18 +1,19 @@
-//! The generic route against the V4.1 path, on the released V4.1 Flash file in the store.
+//! The generic route against the records of the V4.1 path, on the released V4.1 Flash file in
+//! the store.
 //!
 //! Ignored by default: it maps a file of hundreds of GB and runs on the host.
 //! Run with
 //!   cargo test --release --no-default-features --features cpu --lib -- --ignored wide_sparse_real --nocapture
 //!
-//! The file is read through mapped views on both routes, never copied whole into memory.
-//! Each route prefills the same prompt and decodes a few greedy tokens.
-//! The generic route runs first and is dropped before the V4.1 path loads.
+//! The file is read through mapped views, never copied whole into memory.
+//! The generic route prefills the prompt and decodes a few greedy tokens.
+//! The records hold the last position's logits and the greedy tokens of the V4.1 path on the
+//! same prompt.
 
 use std::time::Instant;
 
+use super::wide_sparse_frozen as frozen;
 use super::*;
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::quantized::gguf_source::SplitGguf;
 
 /// The store tag of the file the test reads.
@@ -183,44 +184,36 @@ fn generic_run(split: &SplitGguf, ids: &[u32]) -> Run {
     }
 }
 
-fn v41_run(split: &SplitGguf, ids: &[u32]) -> Run {
-    let t = Instant::now();
-    let cfg = DeepseekV41Config::from_meta(split).expect("the V4.1 config");
-    let model = DeepseekV41Model::load(split, &cfg).expect("the V4.1 loader");
-    println!(
-        "v41: loaded in {:.1}s, resident {} MB",
-        t.elapsed().as_secs_f32(),
-        resident_mb()
-    );
-    let mut state = model.new_decode_state();
-    let t = Instant::now();
-    let mut last = row(&model.prefill_into(ids, &mut state).unwrap());
-    println!(
-        "v41: prefill in {:.1}s, resident {} MB",
-        t.elapsed().as_secs_f32(),
-        resident_mb()
-    );
-    let first = last.clone();
-    let mut greedy = Vec::new();
-    for _ in 0..STEPS {
-        let id = argmax(&last);
-        greedy.push(id);
-        let t = Instant::now();
-        last = row(&model.forward_decode(id, &mut state).unwrap());
-        println!(
-            "v41: decode step in {:.1}s, resident {} MB",
-            t.elapsed().as_secs_f32(),
-            resident_mb()
-        );
-    }
+/// The last position's logits of the V4.1 path on the prompt, as recorded.
+fn v41_last() -> Vec<f32> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors/deepseek_v41_frozen/real_last_logits.f32");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let last: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    frozen::expect_f32("real", "last logits", &last);
+    last
+}
+
+/// What the V4.1 path gave on the prompt `ids`, as recorded.
+fn v41_run(ids: &[u32]) -> Run {
+    frozen::expect_debug("real", "prompt ids", &ids);
+    let greedy = frozen::recorded("real", "greedy");
+    let greedy = greedy
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(", ")
+        .map(|id| id.parse().unwrap())
+        .collect();
     Run {
-        last: first,
+        last: v41_last(),
         greedy,
     }
 }
 
-/// The generic route and the V4.1 path on the released file: the last position's logits and
-/// the greedy tokens.
+/// The generic route on the released file against the records of the V4.1 path: the last
+/// position's logits and the greedy tokens.
 #[test]
 #[ignore]
 fn wide_sparse_real_generic_against_v41() {
@@ -230,7 +223,7 @@ fn wide_sparse_real_generic_against_v41() {
     println!("prompt ids: {ids:?}");
     let generic = generic_run(&split, &ids);
     report("generic", &generic);
-    let v41 = v41_run(&split, &ids);
+    let v41 = v41_run(&ids);
     report("v41", &v41);
 
     let (mut dot, mut na, mut nb, mut num) = (0f64, 0f64, 0f64, 0f64);
@@ -870,71 +863,8 @@ fn generic_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
     first
 }
 
-/// The same on the V4.1 path, its own stage profile on for the third pass.
-fn v41_cold_warm(path: &std::path::Path, ids: &[u32]) -> Vec<f32> {
-    evict(path);
-    let split = SplitGguf::open(path).expect("the file opens");
-    let (model, s) = timed(|| {
-        let cfg = DeepseekV41Config::from_meta(&split).expect("the V4.1 config");
-        DeepseekV41Model::load(&split, &cfg).expect("the V4.1 loader")
-    });
-    println!("v41: loaded in {s:.1}s, resident {} MB", resident_mb());
-    let mut first: Vec<f32> = Vec::new();
-    for pass in ["cold", "warm", "profiled"] {
-        let profiled = pass == "profiled";
-        if profiled {
-            crate::inference::stage_prof::stage_prof_enable(true);
-        }
-        let mut state = model.new_decode_state();
-        let (logits, s) = timed(|| row(&model.prefill_into(ids, &mut state).unwrap()));
-        println!(
-            "v41 {pass}: prefill {} tokens {s:.2}s, resident {} MB",
-            ids.len(),
-            resident_mb()
-        );
-        if first.is_empty() {
-            first = logits.clone();
-        } else {
-            assert_eq!(first, logits, "the repeated prefill changed the logits");
-        }
-        let after_prefill = crate::inference::stage_prof::stage_prof_snapshot();
-        let mut last = logits;
-        let mut total = 0.0;
-        for _ in 0..STEPS {
-            let id = argmax(&last);
-            let (l, s) = timed(|| row(&model.forward_decode(id, &mut state).unwrap()));
-            total += s;
-            last = l;
-        }
-        println!(
-            "v41 {pass}: {STEPS} decode steps {total:.2}s ({:.3}s each)",
-            total / STEPS as f64
-        );
-        if profiled {
-            for (name, ns, n) in &after_prefill {
-                println!(
-                    "v41 prefill stage {name:<22} {:8.3}s over {n} calls",
-                    *ns as f64 / 1e9
-                );
-            }
-            for (name, ns, n) in crate::inference::stage_prof::stage_prof_snapshot() {
-                let (ns0, n0) = after_prefill
-                    .iter()
-                    .find(|(k, _, _)| *k == name)
-                    .map_or((0, 0), |(_, a, b)| (*a, *b));
-                println!(
-                    "v41 decode stage {name:<22} {:8.3}s over {} calls",
-                    (ns - ns0) as f64 / 1e9,
-                    n - n0
-                );
-            }
-            crate::inference::stage_prof::stage_prof_enable(false);
-        }
-    }
-    first
-}
-
-/// Each route cold, warm and stage by stage, the page cache emptied before each load.
+/// The generic route cold, warm and stage by stage, the page cache emptied before the load, and
+/// its logits against the recorded logits of the V4.1 path.
 #[test]
 #[ignore]
 fn wide_sparse_real_cold_and_warm() {
@@ -945,7 +875,7 @@ fn wide_sparse_real_cold_and_warm() {
     };
     println!("prompt ids: {ids:?}");
     let generic = generic_cold_warm(&path, &ids);
-    let v41 = v41_cold_warm(&path, &ids);
+    let v41 = v41_run(&ids).last;
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (a, b) in generic.iter().zip(&v41) {
         let (a, b) = (*a as f64, *b as f64);

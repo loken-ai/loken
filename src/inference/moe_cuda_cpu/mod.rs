@@ -963,6 +963,7 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_fused(
         return Ok(h);
     }
     // Fallback: dequantize the fused stack and run per-expert F32 matmul.
+    // CONVERSION: a stack no host kernel reads in place runs as F32 matrices.
     let gu = gate_up_weights.dequantize(&dev)?; // [E, 2N, K]
     let two_n = gu.dim(1)?;
     let n = two_n / 2;
@@ -1060,6 +1061,7 @@ pub fn moe_gemm_gguf_gate_up_silu_mul(
     let qg = expert_qmms(gate_weights);
     let qu = expert_qmms(up_weights);
     let (gate_all, up_all) = if qg.is_none() || qu.is_none() {
+        // CONVERSION: a stack no host kernel reads in place runs as F32 matrices.
         (
             Some(gate_weights.dequantize(&dev)?),
             Some(up_weights.dequantize(&dev)?),
@@ -1128,6 +1130,7 @@ pub fn moe_gemm_gguf_gate_up_swiglu_oai(
     let qg = expert_qmms(gate_weights);
     let qu = expert_qmms(up_weights);
     let (gate_all, up_all) = if qg.is_none() || qu.is_none() {
+        // CONVERSION: a stack no host kernel reads in place runs as F32 matrices.
         (
             Some(gate_weights.dequantize(&dev)?),
             Some(up_weights.dequantize(&dev)?),
@@ -1255,6 +1258,7 @@ pub fn moe_gemm_gguf_gate_up_swiglu_limited(
     let qg = expert_qmms(gate_weights);
     let qu = expert_qmms(up_weights);
     let (gate_all, up_all) = if qg.is_none() || qu.is_none() {
+        // CONVERSION: a stack no host kernel reads in place runs as F32 matrices.
         (
             Some(gate_weights.dequantize(&dev)?),
             Some(up_weights.dequantize(&dev)?),
@@ -1412,6 +1416,7 @@ pub fn moe_gemm_gguf(
     let dev = input.device();
     let qw = expert_qmms(weights);
     let w_all = if qw.is_none() {
+        // CONVERSION: a stack no host kernel reads in place runs as F32 matrices.
         Some(weights.dequantize(&dev)?)
     } else {
         None
@@ -2041,6 +2046,7 @@ pub fn moe_gemm_gguf_down_reduce(
     }
     let qd = expert_qmms(weights);
     let down_all = if qd.is_none() {
+        // CONVERSION: a stack no host kernel reads in place runs as F32 matrices.
         Some(weights.dequantize(&dev)?)
     } else {
         None

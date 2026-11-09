@@ -1,0 +1,24 @@
+Largest l0_decode	logits 24x48 4608 11426007c998cd9c613e4bc3b543ce7bfeb287a9e0df5867612cdefcb6c40804
+Largest l0_greedy_ids	ids [45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44]
+Largest l0_greedy_logits	logits 64x48 12288 f9844ecfe02c5b6fae9a0fce2318f2ae86d2ec427be2c38a9d2bf5bc77e50756
+Largest l0_prefill	logits 24x48 4608 fcc5b4a4a8a528498c81ea77940a024cfd321c614657112493be409f7c87ed86
+Largest l0_rollback_decode	logits 3x48 576 5ceff543b41312db882555b0a27e098647dd29fa66fe43a72a012197ba862042
+Largest l0_rollback_verify	logits 3x48 576 5b896b1b1105d7a232a8dcef56321cb129b942c0c77691a05be375a8e3e8b436
+Largest l0_verify	logits 6x48 1152 397100cf05517e8ba37378f8a5d619ada856fc9f9bb290914a822e605fdaa918
+Plan l0_decode	logits 24x48 4608 93ef73011a82dfe325be14893d91f6a2de5feaf62717a14bde2da998ddebe472
+Plan l0_greedy_ids	ids [45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44]
+Plan l0_greedy_logits	logits 64x48 12288 cc7943f468dccbe376864a096ad46b92b2e52cecb695cb11b87fdf67a14547f5
+Plan l0_prefill	logits 24x48 4608 dc67ad6f72b1f9a02610bf64e3e6e5c2c4f0ad68eaa175bcf8487d65a651262c
+Plan l0_rollback_decode	logits 3x48 576 4c1cdae41ae1d8d689b7f1081bf8a1d99b8d7ed35d94b4d4c5e71907b4584304
+Plan l0_rollback_verify	logits 3x48 576 69e92211a965aa152288c3ecf2f163e5e40193bcd6bb15a7d957b34635a4ca49
+Plan l0_verify	logits 6x48 1152 728c36da67eb06f122fbebff9e8c2ba708e28c66d98c5d1fefc4f4d6925b9d05
+Smallest l0_decode	logits 24x48 4608 93ef73011a82dfe325be14893d91f6a2de5feaf62717a14bde2da998ddebe472
+Smallest l0_greedy_ids	ids [45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44, 47, 31, 34, 37, 40, 43, 46, 30, 33, 36, 39, 42, 45, 29, 32, 35, 38, 41, 44]
+Smallest l0_greedy_logits	logits 64x48 12288 cc7943f468dccbe376864a096ad46b92b2e52cecb695cb11b87fdf67a14547f5
+Smallest l0_prefill	logits 24x48 4608 dc67ad6f72b1f9a02610bf64e3e6e5c2c4f0ad68eaa175bcf8487d65a651262c
+Smallest l0_rollback_decode	logits 3x48 576 4c1cdae41ae1d8d689b7f1081bf8a1d99b8d7ed35d94b4d4c5e71907b4584304
+Smallest l0_rollback_verify	logits 3x48 576 69e92211a965aa152288c3ecf2f163e5e40193bcd6bb15a7d957b34635a4ca49
+Smallest l0_verify	logits 6x48 1152 728c36da67eb06f122fbebff9e8c2ba708e28c66d98c5d1fefc4f4d6925b9d05
+chosen Largest	[[0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0]]
+chosen Plan	[[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1]]
+chosen Smallest	[[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1]]

@@ -12,7 +12,6 @@ pub mod eagle;
 pub mod gather;
 pub mod pipeline;
 pub mod pipeline_segment;
-pub mod pipeline_serve;
 pub mod progress;
 pub mod prompt_lookup;
 pub mod scheduler;

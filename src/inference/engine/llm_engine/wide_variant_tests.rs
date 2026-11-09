@@ -1,14 +1,16 @@
 //! A Sinkhorn wide-residual model whose manifest names a variant file, loaded by the engine from
 //! a model store as the server loads it, on the small file of the frozen V4.1 oracle.
 //!
-//! The answers are compared with the V4.1 backend holding the same 2 files under the same policy.
+//! The answers are compared with the records of the V4.1 backend holding the same 2 files under
+//! the same policy.
 
-use super::block_draft_tests::{engine_holding, run, tokenizer};
+use super::block_draft_tests::{run, tokenizer};
 use super::*;
-use crate::inference::engine::model_backend::{DeepseekV41Backend, GenericBackend, TakenBackend};
+use crate::inference::engine::model_backend::{GenericBackend, TakenBackend};
 use crate::inference::generic_transformer::block_draft_tests::prompt;
+use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
 use crate::inference::generic_transformer::wide_sparse_variant_tests::{
-    v41_refusal, v41_with_variant, write_pair, Variant, CHOICES, LAYOUT,
+    is_v41_choice, v41_refusal, write_pair, Variant, CHOICES,
 };
 use crate::inference::place::expert_variants::VariantChoice;
 
@@ -89,35 +91,26 @@ fn words() -> String {
 }
 
 /// Under every policy, the engine loads a file whose manifest names a variant through the generic
-/// arm, reads each expert from the file the V4.1 backend reads it from, and answers with its
-/// tokens and text.
+/// arm, reads each expert from the file the V4.1 backend read it from, and answers with its
+/// recorded tokens and text.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_engine_serves_a_variant_file_through_the_generic_arm_as_the_v41_backend() {
-    let (root, model, variant) = store("serve", Variant::Q4);
+    let (root, _, _) = store("serve", Variant::Q4);
     for choice in CHOICES {
         let engine = LlmEngine::with_config(config(&root, choice));
         engine
             .load_model()
             .await
             .expect("the engine loads the 2 files");
-        let (v41, plan) = v41_with_variant(&model, &variant, choice);
-        assert_eq!(engine_choice(&engine).await, plan.chosen, "{choice:?}");
+        is_v41_choice(choice, &engine_choice(&engine).await);
         let got = run(&engine, &words(), NEW).await;
         assert!(
             got.tokens.len() > NEW,
             "{choice:?}: the answer has its tokens"
         );
-        let (old, prompt) = engine_holding(
-            Box::new(DeepseekV41Backend::new(v41, 0, 128)),
-            LAYOUT.0.len(),
-        )
-        .await;
-        let want = run(&old, &prompt, NEW).await;
-        assert_eq!(
-            got.tokens, want.tokens,
-            "{choice:?}: tokens of the V4.1 backend"
-        );
-        assert_eq!(got.text, want.text, "{choice:?}: text of the V4.1 backend");
+        let key = |part: &str| format!("variant {choice:?} {part}");
+        frozen::expect_debug("engine", &key("tokens"), &got.tokens);
+        frozen::expect_debug("engine", &key("text"), &got.text);
     }
     let _ = std::fs::remove_dir_all(&root);
 }

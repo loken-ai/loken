@@ -574,10 +574,11 @@ fn round_half_to_even(y: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::wide_sparse_frozen as frozen;
     use super::*;
-    use crate::inference::model::deepseek_v41::attention::{act_quant_fp8_e4m3, Ratio0Attention};
-    use crate::inference::model::deepseek_v41::cache::AttnCache;
-    use crate::inference::model::deepseek_v41::model::rope_table;
+
+    /// The record file of the mixers' unit tests.
+    const FROZEN: &str = "units";
 
     const HIDDEN: usize = 48;
     const Q_RANK: usize = 24;
@@ -636,19 +637,17 @@ mod tests {
         v.iter().map(|x| x.to_bits()).collect()
     }
 
-    fn window_of(cache: &AttnCache) -> Vec<f32> {
-        cache.win.iter().flatten().copied().collect()
-    }
-
-    fn weights(old: &Ratio0Attention, sink: Vec<f32>) -> LatentMqaWeights {
+    /// The mixer's weights drawn from `seed`, with `sink`.
+    fn weights(seed: u64, sink: Vec<f32>) -> LatentMqaWeights {
+        let d = dims();
         LatentMqaWeights {
-            wq_a: old.wq_a.clone(),
-            q_norm: old.q_norm.clone(),
-            wq_b: old.wq_b.clone(),
-            wkv: old.wkv.clone(),
-            kv_norm: old.kv_norm.clone(),
+            wq_a: dense(Q_RANK, HIDDEN, seed),
+            q_norm: norm(Q_RANK, seed + 1),
+            wq_b: dense(d.heads * d.head_dim, Q_RANK, seed + 2),
+            wkv: dense(d.head_dim, HIDDEN, seed + 3),
+            kv_norm: norm(d.head_dim, seed + 4),
             sink,
-            wo_a: old.wo_a.clone(),
+            wo_a: dense(d.out_width(), d.group_width(), seed + 6),
         }
     }
 
@@ -657,36 +656,21 @@ mod tests {
         frequencies(dims().rope_dim, 0, THETA, 1.0)
     }
 
-    /// The V4.1 attention and the mixer over the same weights.
-    fn pair(seed: u64) -> (Ratio0Attention, LatentMqa) {
+    /// The mixer drawn from `seed`, and the output projection the V4.1 attention applied after
+    /// it.
+    fn pair(seed: u64) -> (Projection, LatentMqa) {
         let d = dims();
         let sink = values(d.heads, seed + 5, 1.0);
-        let old = Ratio0Attention {
-            wq_a: dense(Q_RANK, HIDDEN, seed),
-            q_norm: norm(Q_RANK, seed + 1),
-            wq_b: dense(d.heads * d.head_dim, Q_RANK, seed + 2),
-            wkv: dense(d.head_dim, HIDDEN, seed + 3),
-            kv_norm: norm(d.head_dim, seed + 4),
-            attn_sink: Tensor::from_vec(sink.clone(), d.heads, &Device::Cpu).unwrap(),
-            wo_a: dense(d.out_width(), d.group_width(), seed + 6),
-            wo_b: dense(HIDDEN, d.out_width(), seed + 7),
-            n_heads: d.heads,
-            head_dim: d.head_dim,
-            rope_head_dim: d.rope_dim,
-            o_groups: d.o_groups,
-            o_lora_rank: d.o_lora_rank,
-            window_size: d.window,
-            eps: d.eps,
-        };
-        let new = LatentMqa::new(d, weights(&old, sink), plain()).unwrap();
-        (old, new)
+        let wo_b = dense(HIDDEN, d.out_width(), seed + 7);
+        let new = LatentMqa::new(d, weights(seed, sink), plain()).unwrap();
+        (wo_b, new)
     }
 
-    /// The mixer's rows through `wo_b` as the V4.1 attention applies it, `[seq * hidden]`.
-    fn full(old: &Ratio0Attention, mixed: &Tensor) -> Vec<f32> {
+    /// The mixer's rows through `wo_b` as the V4.1 attention applied it, `[seq * hidden]`.
+    fn full(wo_b: &Projection, mixed: &Tensor) -> Vec<f32> {
         let (_, seq, width) = mixed.dims3().unwrap();
         flat(
-            &old.wo_b
+            &wo_b
                 .apply_here(&mixed.reshape((seq, width)).unwrap())
                 .unwrap(),
         )
@@ -694,72 +678,48 @@ mod tests {
 
     #[test]
     fn a_prompt_gives_the_bits_of_the_v41_window_attention() {
-        let (old, mut new) = pair(11);
+        let (wo_b, mut new) = pair(11);
         let d = dims();
         // More tokens than the window holds.
         let seq = 2 * d.window - 1;
         let x = input(seq, 3);
-        let (cos, sin) = rope_table(d.rope_dim, seq, 0, THETA, 1.0).unwrap();
-        let mut cache = AttnCache::default();
-        let want = old
-            .forward_prefill_cached(&x, &cos, &sin, Some(&mut cache))
-            .unwrap();
         let got = new.forward(&x, 0).unwrap();
         assert_eq!(got.dims(), [1, seq, d.out_width()]);
-        assert_eq!(bits(&full(&old, &got)), bits(&flat(&want)));
+        frozen::expect_f32(FROZEN, "latent prompt out", &full(&wo_b, &got));
         let state = new.state.as_ref().unwrap();
         assert_eq!(state.len, seq);
         assert_eq!(state.window.len(), d.window * d.head_dim);
-        assert_eq!(bits(&state.window), bits(&window_of(&cache)));
+        frozen::expect_f32(FROZEN, "latent prompt window", &state.window);
     }
 
     #[test]
     fn decoding_gives_the_bits_of_the_v41_decode() {
-        let (old, mut new) = pair(23);
+        let (wo_b, mut new) = pair(23);
         let d = dims();
         let prompt = input(3, 5);
-        let (cos, sin) = rope_table(d.rope_dim, 3, 0, THETA, 1.0).unwrap();
-        let mut cache = AttnCache::default();
-        old.forward_prefill_cached(&prompt, &cos, &sin, Some(&mut cache))
-            .unwrap();
         new.forward(&prompt, 0).unwrap();
         // Past the window, so the oldest rows leave it.
         for pos in 3..3 + 2 * d.window {
             let x = input(1, 100 + pos as u64);
-            let (cos, sin) = rope_table(d.rope_dim, pos + 1, 0, THETA, 1.0).unwrap();
-            let want = old.forward_decode(&x, &cos, &sin, pos, &mut cache).unwrap();
             let got = new.forward(&x, pos).unwrap();
-            assert_eq!(
-                bits(&full(&old, &got)),
-                bits(&flat(&want)),
-                "token at {pos}"
-            );
+            let key = |part: &str| format!("latent decode {pos} {part}");
+            frozen::expect_f32(FROZEN, &key("out"), &full(&wo_b, &got));
             let window = &new.state.as_ref().unwrap().window;
-            assert_eq!(bits(window), bits(&window_of(&cache)), "window at {pos}");
+            frozen::expect_f32(FROZEN, &key("window"), window);
         }
     }
 
     #[test]
     fn a_prompt_that_continues_the_state_gives_the_bits_of_the_v41_continuation() {
-        let (old, mut new) = pair(37);
+        let (wo_b, mut new) = pair(37);
         let d = dims();
         let (first, second) = (d.window - 1, d.window + 1);
-        let (cos, sin) = rope_table(d.rope_dim, first + second, 0, THETA, 1.0).unwrap();
-        let mut cache = AttnCache::default();
-        let x = input(first, 7);
-        old.forward_prefill_cached(&x, &cos, &sin, Some(&mut cache))
-            .unwrap();
-        new.forward(&x, 0).unwrap();
-        cache.base = first;
-        let x = input(second, 8);
-        let want = old
-            .forward_prefill_cached(&x, &cos, &sin, Some(&mut cache))
-            .unwrap();
-        let got = new.forward(&x, first).unwrap();
-        assert_eq!(bits(&full(&old, &got)), bits(&flat(&want)));
+        new.forward(&input(first, 7), 0).unwrap();
+        let got = new.forward(&input(second, 8), first).unwrap();
+        frozen::expect_f32(FROZEN, "latent continue out", &full(&wo_b, &got));
         let state = new.state.as_ref().unwrap();
         assert_eq!(state.len, first + second);
-        assert_eq!(bits(&state.window), bits(&window_of(&cache)));
+        frozen::expect_f32(FROZEN, "latent continue window", &state.window);
     }
 
     #[test]
@@ -770,10 +730,8 @@ mod tests {
         v.extend(values(FP8_BLOCK, 43, 1.0e-6));
         v.extend(vec![0f32; FP8_BLOCK]);
         let n = v.len();
-        let t = Tensor::from_vec(v.clone(), (n / FP8_BLOCK, FP8_BLOCK), &Device::Cpu).unwrap();
-        let want = flat(&act_quant_fp8_e4m3(&t, FP8_BLOCK).unwrap());
         fp8_round_trip(&mut v, FP8_BLOCK);
-        assert_eq!(bits(&v), bits(&want));
+        frozen::expect_f32(FROZEN, "latent fp8", &v);
         assert!(v[n - FP8_BLOCK..].iter().all(|&x| x == 0.0));
     }
 
@@ -822,18 +780,17 @@ mod tests {
 
     #[test]
     fn a_wrong_width_is_refused() {
-        let (old, _) = pair(71);
         let d = dims();
         let sink = || vec![0f32; d.heads];
-        assert!(LatentMqa::new(d, weights(&old, sink()), plain()).is_ok());
+        assert!(LatentMqa::new(d, weights(71, sink()), plain()).is_ok());
         let short = vec![0f32; d.heads - 1];
-        assert!(LatentMqa::new(d, weights(&old, short), plain()).is_err());
+        assert!(LatentMqa::new(d, weights(71, short), plain()).is_err());
         let no_window = LatentMqaDims { window: 0, ..d };
-        assert!(LatentMqa::new(no_window, weights(&old, sink()), plain()).is_err());
+        assert!(LatentMqa::new(no_window, weights(71, sink()), plain()).is_err());
         let fewer = plain()[1..].to_vec();
-        assert!(LatentMqa::new(d, weights(&old, sink()), fewer).is_err());
+        assert!(LatentMqa::new(d, weights(71, sink()), fewer).is_err());
         let groups = LatentMqaDims { o_groups: 3, ..d };
-        assert!(LatentMqa::new(groups, weights(&old, sink()), plain()).is_err());
+        assert!(LatentMqa::new(groups, weights(71, sink()), plain()).is_err());
     }
 
     #[test]
@@ -842,18 +799,9 @@ mod tests {
         let n = 300;
         // Unstretched, then stretched past an original context shorter than the positions.
         for (original, factor) in [(0, 1.0), (64, 4.0)] {
-            let (cos, sin) = rope_table(rd, n, original, THETA, factor).unwrap();
             let (c, s) = phases(&frequencies(rd, original, THETA, factor), 0..n);
-            assert_eq!(
-                bits(&c),
-                bits(&flat(&cos)),
-                "cos, original context {original}"
-            );
-            assert_eq!(
-                bits(&s),
-                bits(&flat(&sin)),
-                "sin, original context {original}"
-            );
+            frozen::expect_f32(FROZEN, &format!("rope {original} cos"), &c);
+            frozen::expect_f32(FROZEN, &format!("rope {original} sin"), &s);
         }
     }
 }

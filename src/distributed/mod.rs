@@ -35,8 +35,8 @@ pub use protocol::{DeviceInfo, LayerRequest, LayerResponse, ServerRegistration, 
 
 /// Which of these modules anything outside itself actually reaches.
 ///
-/// Nine of them are reachable only from their own tests: nothing in the serving path
-/// constructs a `LinkMatrix`, asks `cut_plan` for a plan, or opens a `WireLink`. A test suite
+/// Some of them are reachable only from their own tests: nothing in the serving path
+/// constructs a `LinkMatrix`, asks `cut_plan` for a `CutPlan`, or opens a `MuxLink`. A test suite
 /// makes a module look alive - `link_matrix` has four tests and its `derive_costs` is called
 /// by two of them, so `cost()` returns `Some` there and `None` everywhere else.
 ///
@@ -60,7 +60,7 @@ mod wiring_gate {
         ("auto_tune", "auto_distribution", true),
         ("cluster", "distributed::cluster::", true),
         ("cluster_runtime", "cluster_runtime::", true),
-        ("cut_plan", "CutPlan", true),
+        ("cut_plan", "CutPlan", false),
         ("device_manager", "DeviceManager", true),
         ("discovery", "discovery::bind_discovery", true),
         ("evidence", "RequestEvidence", false),
@@ -76,7 +76,7 @@ mod wiring_gate {
         ("routing", "routing::", true),
         ("wire", "write_frame", true),
         ("wire_link", "WireLink", true),
-        ("wire_mux", "MuxLink", true),
+        ("wire_mux", "MuxLink", false),
         ("mod", "", true),
     ];
 

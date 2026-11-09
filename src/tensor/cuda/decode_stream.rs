@@ -990,24 +990,17 @@ mod tests {
                     + if i % 97 == 0 { 400.0 } else { 0.0 }
             })
             .collect();
-        let t = Tensor::from_vec(v.clone(), (rows, 128), &Device::Cpu).unwrap();
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
-        let want8 = crate::inference::model::deepseek_v41::attention::act_quant_fp8_e4m3(&t, 32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
+        let mut want8 = v.clone();
+        crate::inference::generic_transformer::latent_mqa::fp8_round_trip(&mut want8, 32);
         let mut x = upload_f32(&dev, "t", &v).unwrap();
         fp8_round(&dev, &mut x, 32).unwrap();
         assert_eq!(bits(&download(&dev, &x)), bits(&want8), "fp8");
         for (block, pow2) in [(16usize, false), (32, true)] {
-            let want4 = crate::inference::model::deepseek_v41::band::fp4_act_quant(&t, block, pow2)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
+            let mut want4 = v.clone();
+            crate::inference::generic_transformer::compressed_band::fp4_round_trip(
+                &mut want4, block, pow2,
+            );
             let mut x = upload_f32(&dev, "t", &v).unwrap();
             fp4_round(&dev, &mut x, block, pow2).unwrap();
             assert_eq!(bits(&download(&dev, &x)), bits(&want4), "fp4 block {block}");
@@ -1141,7 +1134,7 @@ mod tests {
     /// become -inf, for scores with ties and a reach short of the width.
     #[test]
     fn the_card_keeps_the_hosts_candidate_blocks() {
-        use crate::inference::model::deepseek_v41::candidates::{
+        use crate::inference::generic_transformer::compressed_band::{
             apply_candidate_mask as host_apply, select_candidate_blocks,
         };
         let Ok(dev) = CudaDevice::new(0) else {

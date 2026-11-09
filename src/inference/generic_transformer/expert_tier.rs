@@ -1916,6 +1916,7 @@ impl LayerTier {
         let hits = k - miss_ids.len();
         let routed = self.routed.fetch_add(k as u64, Ordering::Relaxed) + k as u64;
         self.hits.fetch_add(hits as u64, Ordering::Relaxed);
+        self.note_served(&ids_h, hits, &miss_ids);
         // The leader says how the cache is doing, once per window of tokens as wide as the
         // experts it chooses among.
         let window = (self.n_experts * k) as u64;
@@ -2217,6 +2218,11 @@ impl LayerTier {
         let hits = is_hit.iter().filter(|&&h| h).count();
         self.routed.fetch_add(pairs as u64, Ordering::Relaxed);
         self.hits.fetch_add(hits as u64, Ordering::Relaxed);
+        let missed: Vec<u32> = (0..pairs)
+            .filter(|&p| !is_hit[p])
+            .map(|p| ids_h[p])
+            .collect();
+        self.note_served(&ids_h, hits, &missed);
         // The experts some pair misses, the most used first: the transit room takes as many as
         // the copy keeps pace with, the host computes the pairs of the others.
         let mut users: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
@@ -2757,6 +2763,29 @@ impl LayerTier {
         }
     }
 
+    /// Notes in the process's expert counters the pairs of `ids` this tier served: `hits` from
+    /// its slots, and the host's reads of the experts of the pairs in `missed`.
+    /// An expert locked in host memory is not a read from the file.
+    pub(super) fn note_served(&self, ids: &[u32], hits: usize, missed: &[u32]) {
+        let counters = crate::inference::expert_counters::global();
+        if !counters.on() {
+            return;
+        }
+        let layer = self as *const Self as usize;
+        counters.routed(layer, ids.iter().map(|&e| e as usize));
+        counters.served(hits as u64, missed.len() as u64);
+        let mut read: Vec<u32> = missed.to_vec();
+        read.sort_unstable();
+        read.dedup();
+        let bytes: usize = read
+            .iter()
+            .flat_map(|&e| self.expert_spans(e as usize))
+            .filter(|&(at, len)| !hot::overlaps_registered(at, at + len))
+            .map(|(_, len)| len)
+            .sum();
+        counters.read(false, bytes as u64);
+    }
+
     /// Queue the disk reads of the experts the next layer is expected to miss, while the
     /// read-ahead runs: its guess from its last request, of the experts one row routes to.
     /// An expert locked in host memory is not read.
@@ -2780,6 +2809,8 @@ impl LayerTier {
                 .iter()
                 .any(|&(at, len)| hot::overlaps_registered(at, at + len))
             {
+                let bytes: usize = spans.iter().map(|&(_, len)| len).sum();
+                crate::inference::expert_counters::global().read(true, bytes as u64);
                 ra.read(spans);
             }
         }

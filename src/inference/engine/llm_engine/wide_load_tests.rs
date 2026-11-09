@@ -3,15 +3,16 @@
 //!
 //! The engine finds the file through its models path, parses it, places it through the plan and
 //! the ladder, and wraps the model in the generic backend.
-//! The answers are compared with the 2 models the oracle tests proved equal: the generic model
-//! built from the file directly, and the V4.1 backend.
+//! The answers are compared with the generic model built from the file directly, and with the
+//! records of the V4.1 backend the oracle tests proved equal to it.
 
-use super::block_draft_tests::{engine_holding, engine_of, params, run, tokenizer};
+use super::block_draft_tests::{engine_of, params, run, tokenizer};
 use super::*;
-use crate::inference::engine::model_backend::{DeepseekV41Backend, ModelBackend};
 use crate::inference::generic_transformer::block_draft_tests::{
-    draft_config, draft_entries, generic_of, prompt, toy_files, v41_of,
+    draft_config, draft_entries, generic_of, prompt, toy_files,
 };
+use crate::inference::generic_transformer::wide_sparse_frozen as frozen;
+use crate::inference::generic_transformer::wide_sparse_names::ARCH;
 use crate::inference::generic_transformer::wide_sparse_toy::{
     real_entries_for, real_md_layout, VOCAB,
 };
@@ -42,7 +43,7 @@ fn toy_on_disk((ratios, kv_src, index_src): (&[u32], &[u32], &[u32]), with_draft
     let mut entries = real_entries_for(&bands);
     if with_draft {
         let c = draft_config(dim);
-        md.extend(c.to_metadata());
+        md.extend(c.to_metadata(ARCH));
         entries.extend(draft_entries(&c));
     }
     // A token no request produces ends nothing early.
@@ -109,8 +110,8 @@ async fn is_wide_generic(engine: &LlmEngine) -> (bool, bool) {
 }
 
 /// An engine that loads the file answers with the tokens and the text of the generic model
-/// built from the same file, and of the V4.1 backend: with and without the draft the file
-/// carries, on both band layouts.
+/// built from the same file, and of the V4.1 backend as recorded: with and without the draft the
+/// file carries, on both band layouts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wide_file_loaded_by_the_engine_answers_as_the_oracle_models() {
     for layout in LAYOUTS {
@@ -134,14 +135,8 @@ async fn a_wide_file_loaded_by_the_engine_answers_as_the_oracle_models() {
             );
             assert_eq!(got.text, want.text, "{label}: text of the direct model");
 
-            let v41 = DeepseekV41Backend::new(v41_of(&toy_files(layout, with_draft).0), 0, 128);
-            let (old, prompt) = engine_holding(Box::new(v41), layout.0.len()).await;
-            let old = run(&old, &prompt, NEW).await;
-            assert_eq!(
-                got.tokens, old.tokens,
-                "{label}: tokens of the V4.1 backend"
-            );
-            assert_eq!(got.text, old.text, "{label}: text of the V4.1 backend");
+            frozen::expect_debug("engine", &format!("{label} tokens"), &got.tokens);
+            frozen::expect_debug("engine", &format!("{label} text"), &got.text);
 
             // A second request and a streamed one give the same answer again.
             assert_eq!(
@@ -161,11 +156,10 @@ async fn a_wide_file_loaded_by_the_engine_answers_as_the_oracle_models() {
 }
 
 /// An engine that loads a wide file whose prior lies beside it gives the cluster the cost shape
-/// and the placement inputs of the V4.1 backend of the file, and says its experts run on the
+/// and the placement inputs the V4.1 backend of the file gave, and says its experts run on the
 /// host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_loaded_wide_file_gives_the_cluster_the_inputs_of_the_v41_backend() {
-    use crate::inference::generic_transformer::wide_sparse_cluster_tests::v41_with_prior;
     use crate::inference::generic_transformer::wide_sparse_routing_tests::{turning, ROUTED};
     use crate::inference::generic_transformer::wide_sparse_sibling as sibling;
     for layout in LAYOUTS {
@@ -178,21 +172,18 @@ async fn a_loaded_wide_file_gives_the_cluster_the_inputs_of_the_v41_backend() {
         .unwrap();
         let engine = loaded(&path, InferenceConfig::default()).await;
         assert_eq!(is_wide_generic(&engine).await, (true, false), "{label}");
-        let v41 = DeepseekV41Backend::new(v41_with_prior(&path), 0, 128);
-        let (old, _) = engine_holding(Box::new(v41), layout.0.len()).await;
-
         let shape = engine.expert_cost_shape().await;
         assert!(
             shape.is_some(),
             "{label}: a clustered node prices a missed expert"
         );
-        assert_eq!(shape, old.expert_cost_shape().await, "{label}");
+        frozen::expect_debug("engine", &format!("{label} cost shape"), &shape);
         let inputs = engine.placement_model_inputs().await;
         assert!(
             inputs.is_some(),
             "{label}: the prior beside the file sizes the working set"
         );
-        assert_eq!(inputs, old.placement_model_inputs().await, "{label}");
+        frozen::expect_debug("engine", &format!("{label} placement inputs"), &inputs);
         let (host, cards) = engine.layers_on_host_and_cards().await.unwrap();
         assert!(host, "{label}: the experts are read on the host");
         if !cfg!(feature = "gpu") {
@@ -390,8 +381,8 @@ async fn a_damaged_state_store_is_ignored_and_its_files_hold_no_tokens() {
 }
 
 /// A block-scaled checkpoint directory with engram layers, found in a hub snapshot layout by
-/// its repository id and loaded by the engine, answers with the tokens of the V4.1 checkpoint
-/// path loaded through the same engine.
+/// its repository id and loaded by the engine, answers with the recorded tokens of the V4.1
+/// checkpoint path loaded through the same engine.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wide_checkpoint_loaded_by_the_engine_answers_as_the_v41_checkpoint_path() {
     use crate::inference::generic_transformer::block_scaled_engram_tests::{
@@ -434,19 +425,8 @@ async fn a_wide_checkpoint_loaded_by_the_engine_answers_as_the_v41_checkpoint_pa
     let got = run(&engine, &text, NEW).await;
     assert!(got.tokens.len() > NEW, "the answer has its tokens");
 
-    let old = LlmEngine::with_config(InferenceConfig {
-        context_length: 128,
-        ..InferenceConfig::default()
-    });
-    let state = super::load::load_deepseek_v41_checkpoint(&snapshot, "org/toy", 128, None)
-        .expect("the V4.1 checkpoint path loads");
-    *old.model_state.lock().await = Some(state);
-    let want = run(&old, &text, NEW).await;
-    assert_eq!(
-        got.tokens, want.tokens,
-        "tokens of the V4.1 checkpoint path"
-    );
-    assert_eq!(got.text, want.text, "text of the V4.1 checkpoint path");
+    frozen::expect_debug("engine", "checkpoint tokens", &got.tokens);
+    frozen::expect_debug("engine", "checkpoint text", &got.text);
     let _ = std::fs::remove_dir_all(&root);
 }
 

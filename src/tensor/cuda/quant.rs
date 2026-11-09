@@ -4860,8 +4860,7 @@ mod iq2_xxs_gpu_tests {
 
     /// The bit-for-bit check of experts with `gate` gate and up and a `down` down.
     fn card_experts_match_the_host(format: ExpertFormat, gate: GgmlDType, down: GgmlDType) {
-        use crate::inference::offload::cpu_experts;
-        use crate::inference::offload::experts::Expert;
+        use crate::inference::generic_transformer::block_scaled_experts::BlockScaledExpert;
         use crate::tensor::blockscaled::projection::Projection;
         use crate::tensor::quantized::QTensor;
         use crate::tensor::{Device, Tensor};
@@ -4888,13 +4887,11 @@ mod iq2_xxs_gpu_tests {
             let t = Tensor::from_vec(w, (rows, cols), &Device::Cpu).unwrap();
             Projection::Quant(std::sync::Arc::new(QTensor::quantize(&t, dtype).unwrap()))
         };
-        let experts: Vec<std::sync::Arc<Expert>> = (0..3u32)
-            .map(|j| {
-                std::sync::Arc::new(Expert {
-                    w1: quant(draw(10 * j + 1, inter * dim, 0.08), inter, dim, gate),
-                    w3: quant(draw(10 * j + 2, inter * dim, 0.08), inter, dim, gate),
-                    w2: quant(draw(10 * j + 3, dim * inter, 0.08), dim, inter, down),
-                })
+        let experts: Vec<BlockScaledExpert> = (0..3u32)
+            .map(|j| BlockScaledExpert {
+                gate: quant(draw(10 * j + 1, inter * dim, 0.08), inter, dim, gate),
+                up: quant(draw(10 * j + 2, inter * dim, 0.08), inter, dim, gate),
+                down: quant(draw(10 * j + 3, dim * inter, 0.08), dim, inter, down),
             })
             .collect();
         // Rows large enough for the clamps to bite, one of zeros, one with a lone extreme.
@@ -4913,42 +4910,18 @@ mod iq2_xxs_gpu_tests {
                         let xe = Tensor::from_vec(row(t).to_vec(), (1, dim), &Device::Cpu).unwrap();
                         let h = std::cell::RefCell::new(Vec::new());
                         let seen = |r: &[f32]| *h.borrow_mut() = r.to_vec();
-                        let out = crate::inference::offload::on_host(|| {
-                            e.forward_seen(&xe, limit, Some(&seen))
-                        })
-                        .unwrap()
-                        .flatten_all()
-                        .unwrap()
-                        .to_vec1::<f32>()
-                        .unwrap();
+                        let out = e
+                            .forward_seen(&xe, limit, Some(&seen))
+                            .unwrap()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
                         (h.into_inner(), out)
                     })
                     .collect()
             })
             .collect();
-        // The host's own paths agree with each other first.
-        for t in 0..n {
-            let outs = cpu_experts::batched(&experts, row(t), limit).unwrap();
-            for (j, o) in outs.iter().enumerate() {
-                assert_eq!(
-                    bits(o),
-                    bits(&host[j][t].1),
-                    "{format:?} host block, expert {j} row {t}"
-                );
-            }
-        }
-        let all: Vec<Vec<f32>> = (0..experts.len()).map(|_| x.clone()).collect();
-        let multi = cpu_experts::multirow(&experts, &all, dim, limit).unwrap();
-        for (j, o) in multi.iter().enumerate() {
-            for t in 0..n {
-                assert_eq!(
-                    bits(&o[t * dim..(t + 1) * dim]),
-                    bits(&host[j][t].1),
-                    "{format:?} host rows, expert {j} row {t}"
-                );
-            }
-        }
-
         let stream = dev.stream();
         let bytes = |p: &Projection| match p {
             Projection::Quant(q) => q.data().unwrap().into_owned(),
@@ -4956,7 +4929,7 @@ mod iq2_xxs_gpu_tests {
         };
         let host_bytes: Vec<[Vec<u8>; 3]> = experts
             .iter()
-            .map(|e| [bytes(&e.w1), bytes(&e.w3), bytes(&e.w2)])
+            .map(|e| [bytes(&e.gate), bytes(&e.up), bytes(&e.down)])
             .collect();
         let on_card: Vec<[std::sync::Arc<CudaSlice<u8>>; 3]> = host_bytes
             .iter()
@@ -5285,7 +5258,7 @@ mod iq2_xxs_gpu_tests {
     /// The stream's mixes, collapse and update on the card equal the host's, to rounding.
     #[test]
     fn gpu_hc_stream_matches_the_cpu() {
-        use crate::inference::model::deepseek_v41::hyper_connections::{hc_mixes, hc_post, hc_pre};
+        use crate::inference::generic_transformer::hyper::sinkhorn::{SinkhornMeta, SinkhornMixer};
         use crate::tensor::{Device, Tensor};
         let Ok(dev) = CudaDevice::new(0) else {
             eprintln!("no CUDA device; the card stream is NOT covered by this run");
@@ -5303,9 +5276,17 @@ mod iq2_xxs_gpu_tests {
         let scale = [0.7f32, 1.1, 0.9];
         let base = wave(mix_hc, 0.9, 0.5, 0.0);
         let (iters, norm_eps, hc_eps) = (20usize, 1e-6f32, 1e-6f32);
-        let xt = Tensor::from_vec(x.clone(), (1, n, hc, d), &Device::Cpu).unwrap();
+        let rt = Tensor::from_vec(x.clone(), (1, n, hc * d), &Device::Cpu).unwrap();
         let ft = Tensor::from_vec(func.clone(), (mix_hc, hc * d), &Device::Cpu).unwrap();
-        let want = hc_mixes(&xt, &ft, &scale, &base, hc, iters, norm_eps, hc_eps).unwrap();
+        let st = Tensor::from_vec(scale.to_vec(), 3, &Device::Cpu).unwrap();
+        let bt = Tensor::from_vec(base.clone(), mix_hc, &Device::Cpu).unwrap();
+        let meta = SinkhornMeta {
+            streams: hc,
+            iterations: iters,
+            eps: hc_eps,
+        };
+        let mixer = SinkhornMixer::new(&ft, &st, &bt, meta, d, norm_eps).unwrap();
+        let want = mixer.mixes(&rt).unwrap();
         let mut s = HcStreamDev::open(&dev, &x, hc, d).unwrap();
         let (pre, post, comb) = s
             .mixes(&dev, &func, &scale, &base, iters, norm_eps, hc_eps)
@@ -5339,7 +5320,7 @@ mod iq2_xxs_gpu_tests {
         let w = wave(d, 0.37, 0.3, 1.0);
         let wt = Tensor::from_vec(w.clone(), d, &Device::Cpu).unwrap();
         let collapsed =
-            crate::tensor::ops::rms_norm(&hc_pre(&xt, &want.pre).unwrap(), &wt, 1e-6).unwrap();
+            crate::tensor::ops::rms_norm(&mixer.pre(&rt, &want.pre).unwrap(), &wt, 1e-6).unwrap();
         let got = s.pre_norm(&dev, &want.pre.concat(), &w, 1e-6).unwrap();
         close(
             &got,
@@ -5348,7 +5329,7 @@ mod iq2_xxs_gpu_tests {
         );
         let xo = wave(n * d, 0.53, 0.8, 0.0);
         let xot = Tensor::from_vec(xo.clone(), (1, n, d), &Device::Cpu).unwrap();
-        let after = hc_post(&xot, &xt, &want.post, &want.comb, hc).unwrap();
+        let after = mixer.post(&xot, &rt, &want.post, &want.comb).unwrap();
         s.post(
             &dev,
             &xo,

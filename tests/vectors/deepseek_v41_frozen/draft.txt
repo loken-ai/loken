@@ -1,0 +1,66 @@
+l0 decoded 24	2048 d0b20bf56e182da69eb86aa1d88f87fad5c82cedfcd40d025d65e1719dd43cb8
+l0 decoded 25	2048 e6228e8206654019f85349f536ff197ca4f4940c40de5cf691489f5a68ff06cd
+l0 decoded 26	2048 1ac6ef2bd79db9dbce71d5daa9f953fa61e05b37b3671884331f27f56fb78592
+l0 first	47
+l0 prompt rows	6 12288 36c676008884168543e4a0b7bc39b98804f00692f5058d181a993db3a7e27c35
+l0 round0 guesses	[47, 47, 47]
+l0 round0 verified	[47, 47, 47, 47]
+l0 round1 guesses	[47, 47, 47]
+l0 round1 verified	[47, 47, 47, 47]
+l0 round10 guesses	[47, 47, 47]
+l0 round10 verified	[47, 47, 47, 47]
+l0 round11 chosen	47
+l0 round11 guesses	[47, 47, 47]
+l0 round2 guesses	[47, 47, 47]
+l0 round2 verified	[47, 47, 47, 47]
+l0 round3 chosen	47
+l0 round3 guesses	[47, 47, 47]
+l0 round4 guesses	[47, 47, 47]
+l0 round4 verified	[47, 47, 47, 47]
+l0 round5 guesses	[47, 47, 47]
+l0 round5 verified	[47, 47, 47, 47]
+l0 round6 guesses	[47, 47, 47]
+l0 round6 verified	[47, 47, 47, 47]
+l0 round7 chosen	47
+l0 round7 guesses	[47, 47, 47]
+l0 round8 guesses	[47, 47, 47]
+l0 round8 verified	[47, 47, 47, 47]
+l0 round9 guesses	[47, 47, 47]
+l0 round9 verified	[47, 47, 47, 47]
+l1 decoded 24	2048 d0b20bf56e182da69eb86aa1d88f87fad5c82cedfcd40d025d65e1719dd43cb8
+l1 decoded 25	2048 e6228e8206654019f85349f536ff197ca4f4940c40de5cf691489f5a68ff06cd
+l1 decoded 26	2048 1ac6ef2bd79db9dbce71d5daa9f953fa61e05b37b3671884331f27f56fb78592
+l1 first	47
+l1 prompt rows	6 12288 36c676008884168543e4a0b7bc39b98804f00692f5058d181a993db3a7e27c35
+l1 round0 guesses	[47, 47, 47]
+l1 round0 verified	[47, 47, 47, 47]
+l1 round1 guesses	[47, 47, 47]
+l1 round1 verified	[47, 47, 47, 47]
+l1 round10 guesses	[47, 47, 47]
+l1 round10 verified	[47, 47, 47, 47]
+l1 round11 chosen	47
+l1 round11 guesses	[47, 47, 47]
+l1 round2 guesses	[47, 47, 47]
+l1 round2 verified	[47, 47, 47, 47]
+l1 round3 chosen	47
+l1 round3 guesses	[47, 47, 47]
+l1 round4 guesses	[47, 47, 47]
+l1 round4 verified	[47, 47, 47, 47]
+l1 round5 guesses	[47, 47, 47]
+l1 round5 verified	[47, 47, 47, 47]
+l1 round6 guesses	[47, 47, 47]
+l1 round6 verified	[47, 47, 47, 47]
+l1 round7 chosen	47
+l1 round7 guesses	[47, 47, 47]
+l1 round8 guesses	[47, 47, 47]
+l1 round8 verified	[47, 47, 47, 47]
+l1 round9 guesses	[47, 47, 47]
+l1 round9 verified	[47, 47, 47, 47]
+reference step0 ids	[11, 9, 9, 9, 9]
+reference step1 ids	[31, 9, 9, 9, 9]
+reference step2 ids	[15, 9, 9, 9, 9]
+reference step3 ids	[15, 9, 9, 9, 9]
+reference step4 ids	[15, 9, 9, 9, 9]
+reference step5 ids	[44, 9, 9, 9, 9]
+shape	((1, 5, 63, [1, 2]), (8, 4, 2, 32, 64, 4), (2, 64, 16, 2, 32), (1.0, 1.5, 10.0, true), (1e-20, 10000.0, 20, 1e-6, 64))
+shape keys	[("deepseek_v41.dspark.stage_count", U32(1)), ("deepseek_v41.dspark.block_size", U32(5)), ("deepseek_v41.dspark.noise_token_id", U32(63)), ("deepseek_v41.dspark.target_layers", Array([U32(1), U32(2)])), ("deepseek_v41.dspark.markov_rank", U32(8)), ("deepseek_v41.dspark.expert_count", U32(4)), ("deepseek_v41.dspark.expert_used_count", U32(2)), ("deepseek_v41.dspark.sliding_window", U32(32)), ("deepseek_v41.dspark.embedding_length", U32(64)), ("deepseek_v41.dspark.hyper_connection.count", U32(4)), ("deepseek_v41.dspark.attention.head_count", U32(2)), ("deepseek_v41.dspark.attention.key_length", U32(64)), ("deepseek_v41.dspark.rope.dimension_count", U32(16)), ("deepseek_v41.dspark.attention.o_groups", U32(2)), ("deepseek_v41.dspark.attention.o_lora_rank", U32(32)), ("deepseek_v41.dspark.expert_gating_temperature", F32(1.0)), ("deepseek_v41.dspark.expert_weights_scale", F32(1.5)), ("deepseek_v41.dspark.expert_swiglu_limit", F32(10.0)), ("deepseek_v41.dspark.expert_weights_norm", Bool(true)), ("deepseek_v41.dspark.attention.layer_norm_rms_epsilon", F32(1e-20)), ("deepseek_v41.dspark.rope.freq_base", F32(10000.0)), ("deepseek_v41.dspark.rope.scaling.factor", F32(16.0)), ("deepseek_v41.dspark.rope.scaling.original_context_length", U32(128)), ("deepseek_v41.dspark.hyper_connection.sinkhorn_iterations", U32(20)), ("deepseek_v41.dspark.hyper_connection.epsilon", F32(1e-6)), ("deepseek_v41.dspark.vocab_size", U32(64))]

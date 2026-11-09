@@ -1,28 +1,24 @@
 //! What the cluster's planner reads of a wide-residual model on the generic route against the
-//! V4.1 backend, and the cuts the planner makes from both.
+//! records of the V4.1 backend, and the cuts the planner makes from both.
 //!
 //! The small files are the frozen V4.1 oracle's, with a routing prior written into their
 //! metadata.
 //! The released file is read through its header only.
 
-use super::block_draft_tests::{generic_of, v41_of};
+use super::block_draft_tests::generic_of;
 use super::compressed_band::BandDims;
 use super::wide_sparse_config::WideSparseMeta;
 use super::wide_sparse_engram_tests::engram_file;
+use super::wide_sparse_frozen as frozen;
 use super::wide_sparse_oracle_tests::toy_file;
 use super::wide_sparse_routing_tests::{turning, ROUTED};
-use super::wide_sparse_sibling as sibling;
 use crate::distributed::auto_tune::auto_distribution;
 use crate::distributed::cut_plan::{NodeProfile, TimePlan};
-use crate::inference::engine::model_backend::{DeepseekV41Backend, GenericBackend, ModelBackend};
+use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
 use crate::inference::generic_transformer::wide_sparse_toy::{real_entries_for, real_md_layout};
-use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-use crate::inference::model::deepseek_v41::DeepseekV41Config;
 use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
 use crate::tensor::quantized::gguf_file::{open_mapped, Content, MappedGguf, TensorInfo, Value};
-use crate::tensor::quantized::gguf_source::SplitGguf;
 use crate::tensor::quantized::GgmlDType;
-use std::path::Path;
 
 /// The shape a node times a missed expert against.
 type CostShape = (usize, usize, GgmlDType, GgmlDType);
@@ -134,19 +130,6 @@ fn toy(
     with_prior(file, lists)
 }
 
-/// The V4.1 model of `model`, with the prior beside it when the file carries none, as the V4.1
-/// engine arm loads it.
-pub(crate) fn v41_with_prior(model: &Path) -> DeepseekV41Model {
-    let source = SplitGguf::open(model).unwrap();
-    let mut cfg = DeepseekV41Config::from_meta(&source).unwrap();
-    if cfg.hot_experts.iter().all(Vec::is_empty) {
-        if let Some(prior) = sibling::prior_beside(model, cfg.n_layers, cfg.n_routed_experts) {
-            cfg.hot_experts = prior;
-        }
-    }
-    DeepseekV41Model::load(&source, &cfg).unwrap()
-}
-
 /// What the 3 hooks of a backend answer.
 type Hooks = (
     Option<CostShape>,
@@ -166,17 +149,21 @@ fn hooks(backend: &dyn ModelBackend) -> Hooks {
 /// What the planner reads of `hooks`: the cost shape and the placement inputs.
 ///
 /// The card residency is left out.
-/// On a build with cards, the V4.1 backend reports 0 bytes on card 0 for a small file on the
+/// On a build with cards, the V4.1 backend reported 0 bytes on card 0 for a small file on the
 /// host.
 fn planner(hooks: &Hooks) -> (Option<CostShape>, Option<PlanInputs>) {
     (hooks.0, hooks.1.clone())
 }
 
-/// The hooks of the generic backend and of the V4.1 backend over the same small file.
-fn both(layout: (&[u32], &[u32], &[u32]), form: Form, lists: &[Vec<u32>]) -> [Hooks; 2] {
-    let v41 = DeepseekV41Backend::new(v41_of(&toy(layout, form, lists)), 0, 128);
-    let generic = GenericBackend(generic_of(toy(layout, form, lists)));
-    [hooks(&generic), hooks(&v41)]
+/// The hooks of the generic backend over the small file.
+fn generic_hooks(layout: (&[u32], &[u32], &[u32]), form: Form, lists: &[Vec<u32>]) -> Hooks {
+    hooks(&GenericBackend(generic_of(toy(layout, form, lists))))
+}
+
+/// Asserts `hooks` give the planner what the V4.1 backend gave over the same small file.
+fn gives_the_v41_numbers(layout: (&[u32], &[u32], &[u32]), form: Form, hooks: &Hooks) {
+    let key = format!("{:?} {form:?}", layout.0);
+    frozen::expect_debug("cluster", &key, &planner(hooks));
 }
 
 /// The node sets a test places a model on, sized from the model's own bytes.
@@ -264,11 +251,11 @@ fn the_generic_hooks_give_the_v41_numbers() {
         for form in FORMS {
             let label = format!("layout {:?}, {form:?}", layout.0);
             let lists = prior(layout.0.len());
-            let [generic, v41] = both(layout, form, &lists);
+            let generic = generic_hooks(layout, form, &lists);
             assert!(generic.0.is_some(), "{label}: a cost shape");
             assert!(generic.1.is_some(), "{label}: placement inputs");
             assert_eq!(generic.2, None, "{label}: nothing on a card");
-            assert_eq!(planner(&generic), planner(&v41), "{label}");
+            gives_the_v41_numbers(layout, form, &generic);
             let (attn, _, working_set, activated) = generic.1.unwrap();
             assert_eq!(attn.len(), layout.0.len(), "{label}: 1 entry per layer");
             let lens: Vec<usize> = lists.iter().map(Vec::len).collect();
@@ -288,10 +275,10 @@ fn the_generic_hooks_give_the_v41_numbers() {
 /// A file without a prior gives the planner no inputs on either route, and still a cost shape.
 #[test]
 fn a_file_without_a_prior_gives_no_placement_inputs_on_either_route() {
-    let [generic, v41] = both(LAYOUTS[0], Form::Stacks, &[]);
+    let generic = generic_hooks(LAYOUTS[0], Form::Stacks, &[]);
     assert!(generic.0.is_some());
     assert_eq!(generic.1, None);
-    assert_eq!(planner(&generic), planner(&v41));
+    frozen::expect_debug("cluster", "no prior", &planner(&generic));
 }
 
 /// A mixture model that is not a wide residual declares nothing to the cluster.
@@ -304,7 +291,7 @@ fn a_model_of_another_kind_declares_nothing() {
     tiny_model::remove(&path);
 }
 
-/// The planner cuts a generic node's model where it cuts the V4.1 node's, on every node set,
+/// The planner cuts a generic node's model where it cut the V4.1 node's, on every node set,
 /// and at least 1 set splits the stack.
 #[test]
 fn the_planner_cuts_a_generic_node_as_it_cuts_a_v41_node() {
@@ -312,13 +299,12 @@ fn the_planner_cuts_a_generic_node_as_it_cuts_a_v41_node() {
         for form in FORMS {
             let label = format!("layout {:?}, {form:?}", layout.0);
             let lists = prior(layout.0.len());
-            let [generic, v41] = both(layout, form, &lists);
-            let (generic, v41) = (generic.1.unwrap(), v41.1.unwrap());
+            let generic = generic_hooks(layout, form, &lists).1.unwrap();
             let mut split = false;
-            for (nodes, rtt) in node_sets(&generic) {
+            for (k, (nodes, rtt)) in node_sets(&generic).into_iter().enumerate() {
                 let got = plan(&generic, &nodes, &rtt).expect("a plan");
-                let want = plan(&v41, &nodes, &rtt).expect("a plan");
-                assert_eq!(got, want, "{label}: nodes {nodes:?}");
+                let key = format!("plan {:?} {form:?} {k}", layout.0);
+                frozen::expect_debug("cluster", &key, &got);
                 assert!(covers(&got, layout.0.len()), "{label}: {got:?}");
                 split |= got.segments.len() > 1;
             }
@@ -372,10 +358,10 @@ fn a_model_with_its_mixers_on_a_card_reports_the_bytes_they_hold_there() {
     assert!(held > 0, "the mixers are on the card");
     let card = GenericBackend(model);
     assert_eq!(card.card_residency(), Some(vec![(0, held)]));
-    let [host, v41] = both(layout, Form::Stacks, &lists);
+    let host = generic_hooks(layout, Form::Stacks, &lists);
     assert_eq!(card.expert_cost_shape(), host.0);
     assert_eq!(card.placement_model_inputs(), host.1);
-    assert_eq!(planner(&host), planner(&v41));
+    gives_the_v41_numbers(layout, Form::Stacks, &host);
 }
 
 /// The inputs the header of `content` gives, by the rules the generic route holds its weights
@@ -471,10 +457,10 @@ fn the_header_gives_the_numbers_of_both_routes() {
             let label = format!("layout {:?}, {form:?}", layout.0);
             let lists = prior(layout.0.len());
             let (shape, inputs) = header_inputs(&toy(layout, form, &lists).content);
-            let [generic, v41] = both(layout, form, &lists);
+            let generic = generic_hooks(layout, form, &lists);
             assert_eq!(Some(shape), generic.0, "{label}");
             assert_eq!(Some(&inputs), generic.1.as_ref(), "{label}");
-            assert_eq!(planner(&generic), planner(&v41), "{label}");
+            gives_the_v41_numbers(layout, form, &generic);
         }
     }
 }

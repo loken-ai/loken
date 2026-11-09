@@ -393,140 +393,6 @@ pub(super) fn resolve_awq_repo(model_id: &str, roots: &[PathBuf]) -> Option<Stri
     None
 }
 
-/// The released DeepSeek V4.1 checkpoint - safetensors shards, `config.json`,
-/// `inference/config.json`, `tokenizer.json` - loaded on the CPU through the deepseek_v41
-/// source: the always-resident path dequantised to f32, the routed experts read in place, the
-/// engram layers on when the tokenizer lets their hash layout be derived.
-#[allow(dead_code)] // The old path stays until its equality tests are read; no claim reaches it.
-pub(super) fn load_deepseek_v41_checkpoint(
-    dir: &std::path::Path,
-    model_id: &str,
-    user_context_length: usize,
-    state_cache: Option<std::sync::Arc<crate::inference::cache::state_disk::StateStore>>,
-) -> AnyResult<LoadedModelState> {
-    use crate::inference::model::deepseek_v41::engram::EngramConfig;
-    use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
-    use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
-    use crate::inference::model::deepseek_v41::{token_map, DeepseekV41Config};
-
-    let t0 = std::time::Instant::now();
-    let source = SafeTensorsSource::open(dir).map_err(|e| anyhow!("deepseek_v41: {e}"))?;
-    let tokenizer_path = dir.join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow!("{}: {e}", tokenizer_path.display()))?;
-    let engram = match token_map::build_from_file(&tokenizer_path) {
-        Ok((map, _)) => EngramConfig::derive(&source.inference_config, map),
-        Err(e) => {
-            warn!("deepseek_v41: no engram, the token map could not be built: {e}");
-            None
-        }
-    };
-    if engram.is_none() {
-        warn!("deepseek_v41: running without the engram layers");
-    }
-    let cfg = DeepseekV41Config::from_reference_config(&source.inference_config, engram)
-        .map_err(|e| anyhow!("deepseek_v41: {e}"))?;
-    let model = DeepseekV41Model::load(&source, &cfg)
-        .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
-    // The pinned expert tier takes what memory is left once the page cache can hold the
-    // always-read path and one token's worth of routed experts beside it.
-    let slots = model
-        .size_expert_cache_to_memory(&cfg)
-        .map_err(|e| anyhow!("deepseek_v41: {e}"))?;
-    let expert_bytes = model
-        .expert_bytes()
-        .map_err(|e| anyhow!("deepseek_v41: {e}"))? as u64;
-    let file_size: u64 = std::fs::read_dir(dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
-    let eos_token_id = super::gguf::sidecar_token_id(&dir.join("config.json"), "eos_token")
-        .ok_or_else(|| anyhow!("deepseek_v41: no eos_token in tokenizer_config.json"))?;
-    let context_length = if user_context_length > 0 {
-        user_context_length
-    } else {
-        declared_context(dir)
-    };
-    info!(
-        "✅ deepseek_v41 loaded on CPU from {} in {:.1}s ({} layers, {} routed + {} shared experts, engram {}, {} experts pinned per layer of {} MB)",
-        dir.display(),
-        t0.elapsed().as_secs_f32(),
-        cfg.n_layers,
-        cfg.n_routed_experts,
-        cfg.n_shared_experts,
-        if cfg.engram.is_some() { "on" } else { "off" },
-        slots,
-        expert_bytes / 1_000_000,
-    );
-    let mut backend = crate::inference::engine::model_backend::DeepseekV41Backend::new(
-        model,
-        cfg.moe_inter_dim,
-        context_length,
-    );
-    // The states of a prompt are stored under the shards and the configuration they were
-    // computed with.
-    if let Some(store) = state_cache {
-        let mut files = crate::inference::cache::state_disk::FilesDigest::new();
-        let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|x| x == "safetensors" || x == "json")
-            })
-            .collect();
-        shards.sort();
-        match shards.iter().try_for_each(|p| files.path(p)) {
-            Ok(()) => {
-                backend = backend.with_state_cache(
-                    store,
-                    crate::inference::model::deepseek_v41::snapshot::identity(&[
-                        &files.finish(),
-                        &(cfg.n_layers as u64).to_le_bytes(),
-                    ]),
-                    cfg.state_bytes_per_token(),
-                );
-            }
-            Err(e) => warn!("state cache off: {e}"),
-        }
-    }
-    let backend: BoxedModelBackend = Box::new(backend);
-    Ok(LoadedModelState {
-        name: model_id.to_string(),
-        num_layers: cfg.n_layers,
-        hidden_size: cfg.d_model,
-        num_heads: cfg.n_head,
-        vocab_size: cfg.vocab_size,
-        context_length,
-        eos_token_id,
-        #[cfg(feature = "gpu")]
-        moondream_graph: None,
-        moondream_decode_count: 0,
-        #[cfg(feature = "gpu")]
-        kept_graphs: Default::default(),
-        #[cfg(feature = "gpu")]
-        draft_graph: Default::default(),
-        #[cfg(feature = "gpu")]
-        draft_step: Default::default(),
-        draft_primed: false,
-        draft_mark: None,
-        exact_prefill: None,
-        eos_token_ids_extra: Vec::new(),
-        file_size,
-        model: backend,
-        tokenizer: std::sync::Arc::new(tokenizer),
-        device: Device::Cpu,
-        image_embeds: None,
-        audio: None,
-        qwen35_vision: Vec::new(),
-        image_embed_cache: None,
-        grammar_factory: std::sync::OnceLock::new(),
-        generation_defaults: Default::default(),
-    })
-}
-
 /// A block-scaled checkpoint directory of a Sinkhorn wide residual, loaded through the generic
 /// route: placed by the plan and the ladder, served by `GenericBackend`.
 ///
@@ -1101,10 +967,9 @@ pub(super) fn try_spawn_continuous(
     }
 }
 
-/// Moves the served model into its batch worker: DeepSeek V4.1 into its own, a
-/// `cb_eligible` GPU `GenericHetero` into a paged `ContinuousServer` (batched decode, with
-/// automatic prefix caching). Returns whether the model now serves batched; a model that
-/// cannot batch stays as it was.
+/// Moves the served model into its batch worker: a `cb_eligible` GPU `GenericHetero` into a
+/// paged `ContinuousServer` (batched decode, with automatic prefix caching). Returns whether the
+/// model now serves batched; a model that cannot batch stays as it was.
 pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
     #[cfg(feature = "gpu")]
     {
@@ -1112,10 +977,6 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
             return true;
         }
         let (eos, ctx) = (state.eos_token_id, state.context_length);
-        // The concurrent-decode batch-width cap. The V4.1 bench saturates aggregate throughput
-        // by a batch of a few, so a handful is the useful width; a larger prompt set simply
-        // queues behind it.
-        const V41_MAX_BATCH: usize = 8;
         // The graphs kept between requests are for the serial decode of this model as it stands.
         #[cfg(feature = "gpu")]
         if !state.kept_graphs.is_empty() {
@@ -1124,15 +985,6 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
             state.model.invalidate_graph_state();
         }
         let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));
-        // DeepSeek V4.1: move a card-placed model into its batch worker. A host-only load has
-        // no lanes to batch and hands itself back.
-        let taken = match taken.into_batched(eos, V41_MAX_BATCH) {
-            Ok(server) => {
-                state.model = Box::new(BatchedBackend(server));
-                return true;
-            }
-            Err(back) => back,
-        };
         // Generic dense (Qwen2/3): the paged continuous server, when the GPU is eligible.
         if !taken.cb_eligible_gpu() {
             state.model = taken;

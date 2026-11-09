@@ -321,7 +321,7 @@ cargo test --lib oracle_parity
 | `src/inference/model/rope.rs` | Rotary table and YaRN: high-frequency dimensions kept, low-frequency ones interpolated. |
 | `src/tensor/ops/attention.rs` | Attention op: scaled dot product, grouped-query repeat, the 2 rotary pairings, fused prefill. |
 | `src/inference/generic_transformer/moe_weights.rs` | Routes a mixture and runs the batched expert projections. |
-| `src/inference/model/deepseek_v41/attention.rs` | Latent attention with 1 shared key head, an fp8 round trip and a learned attention sink. `src/inference/model/` holds 1 directory per family. |
+| `src/inference/generic_transformer/latent_mqa.rs` | Latent attention with 1 shared key head, an fp8 round trip and a learned attention sink. |
 | `src/inference/engine/model_backend.rs` | The trait each architecture implements. |
 
 - [`REFERENCES.md`](REFERENCES.md) lists the papers behind each family.
@@ -332,14 +332,14 @@ cargo test --lib oracle_parity
 ls tests/vectors/
 cargo test --lib the_rope_frequencies_are_the_references
 cargo test --lib the_selected_attention_matches_the_reference_block
-cargo test --lib deepseek_v41::moe
+cargo test --lib wide_sparse_oracle_tests
 ```
 
 | Test | Checks |
 |---|---|
 | `the_rope_frequencies_are_the_references` | Rotary frequencies against the reference's `inv_freq`. |
 | `the_selected_attention_matches_the_reference_block` | An attention block against the reference's block output. |
-| `deepseek_v41::moe` | The streamed experts against the resident ones. |
+| `wide_sparse_oracle_tests` | The generic route against the frozen V4.1 oracle, and against the bits the V4.1 path gave. |
 
 Exercise: divide the tolerance of the second test by 10 and run it again.
 The assertion names the measured difference.
@@ -420,8 +420,8 @@ The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment
 | `src/tensor/dry.rs`, `src/tensor/heap.rs`, `src/inference/place/dry_plan.rs` | Break the circularity. They measure a request's peak by running the forward on a device that allocates nothing, then replay the allocator's chunk and hole behaviour on it. |
 | `src/inference/place/placement_invariants.rs` | The fleet rule as tests. The cards decide, not the budgets. No placement decides on a name or an index. Every hot component can span n cards. |
 | `src/inference/place/layer_executor.rs` | Sets the host budget as a share of the machine. |
-| `src/inference/offload/streamed.rs`, `room.rs`, `cuda.rs` | Streamed placement for a model larger than the cards and host together. Keeps the weights every token reads and as many routed experts as the room allows on the cards, fastest first. |
-| `src/inference/offload/store.rs` | Hot tier over streamed experts: views into the mapping, least-recently-routed eviction. Drops cold experts from the page cache after they run, while the host's memory is short. |
+| `src/inference/generic_transformer/wide_sparse_card_tier.rs`, `wide_expert_card.rs` | The card tier of a model larger than the cards and host together. Keeps the hottest routed experts on the cards when a card measures faster than the host. |
+| `src/inference/generic_transformer/expert_tier.rs`, `expert_readahead.rs` | Expert tiers over streamed experts: views into the mapping, a cache on the cards by use, reads ahead of the layer. Drops used experts from the page cache while the host's memory is short. |
 | `src/distributed/routing.rs` | Picks the node that answers by predicted completion. [`CLUSTER.md`](CLUSTER.md) describes the routing. |
 
 ### Lesson 10: Measuring an engine without fooling yourself
