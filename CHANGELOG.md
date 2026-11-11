@@ -38,6 +38,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Cluster: read a prompt here when that is faster than taking its cache from a peer.
 - API: answer speech in FLAC, Opus and AAC.
 - Speech: speak with Qwen3-TTS in a voice described in words or named by the checkpoint.
+- Speech: create a voice from a clip or a description and reuse it.
 
 ### Changed
 

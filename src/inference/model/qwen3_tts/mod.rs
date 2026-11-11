@@ -14,11 +14,12 @@ mod glue;
 pub mod predictor;
 pub mod prompt;
 pub mod sampling;
+pub mod speaker;
 #[cfg(test)]
 mod tests;
 pub mod text;
 
-pub use config::{Generation, Sampling, SpeechIds};
+pub use config::{Generation, Sampling, SpeechIds, Variant};
 
 use crate::inference::generic_transformer::class_load::{self, Rows};
 use crate::inference::generic_transformer::{EmbeddingStep, GenericHeteroTransformer};
@@ -26,6 +27,11 @@ use crate::inference::serve::progress::placement::Placed;
 use crate::tensor::{DType, Device, Error, Result, Tensor};
 use glue::{HostTable, Linear, Shard};
 use rand::SeedableRng;
+
+/// The refusal of a request without a clone prompt on a Base checkpoint.
+pub const BASE_NEEDS_A_CLONE: &str = "the Base variant speaks a voice cloned from a clip: a \
+     request needs a speaker embedding, and a reference text with its codes for the in-context \
+     mode";
 
 /// What a request asks of the talker.
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +44,33 @@ pub struct Request<'a> {
     pub language: Option<&'a str>,
     /// The seed of every draw.
     pub seed: u64,
+    /// The voice a Base checkpoint clones.
+    pub clone: Option<&'a ClonePrompt>,
+}
+
+/// The voice a Base checkpoint clones: a speaker embedding, and a reference for the in-context
+/// mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClonePrompt {
+    /// The speaker embedding of the clip, as wide as a talker row.
+    pub speaker: Vec<f32>,
+    /// The clip's text and its codes, `None` for the speaker embedding only.
+    pub reference: Option<Reference>,
+}
+
+/// The text a clip speaks and the codec frames of the clip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reference {
+    pub text: String,
+    /// Frames of a code per group.
+    pub frames: Vec<Vec<u32>>,
+}
+
+impl ClonePrompt {
+    /// The reference frames, empty for the speaker embedding only.
+    pub fn reference_frames(&self) -> &[Vec<u32>] {
+        self.reference.as_ref().map_or(&[], |r| &r.frames)
+    }
 }
 
 /// Values a request sets in place of the checkpoint's sampling values, each left `None` to keep
@@ -122,6 +155,7 @@ pub struct Talker {
     tokenizer: tokenizers::Tokenizer,
     ids: SpeechIds,
     generation: Generation,
+    variant: Variant,
     /// The text table, read by row.
     text_table: HostTable,
     /// The text projection: `fc2(silu(fc1(row)))`.
@@ -168,6 +202,7 @@ impl Talker {
     fn load_beside(dir: &std::path::Path, rows: Rows, glue: Option<&Device>) -> Result<Self> {
         let root = read_json(&dir.join("config.json"))?;
         let ids = SpeechIds::read(&root)?;
+        let variant = config::served_variant(&root)?;
         let generation = Generation::read(&read_json(&dir.join("generation_config.json"))?)?;
         let class = root
             .get("architectures")
@@ -206,6 +241,7 @@ impl Talker {
             pad_row: Vec::new(),
             ids,
             generation,
+            variant,
             context: loaded.context,
         };
         talker.pad_row = host(&talker.text_rows(&[talker.ids.tts_pad])?)?;
@@ -233,6 +269,11 @@ impl Talker {
     /// The sampling values of the checkpoint.
     pub fn generation(&self) -> &Generation {
         &self.generation
+    }
+
+    /// The variant of the checkpoint.
+    pub fn variant(&self) -> Variant {
+        self.variant
     }
 
     /// The text rows of `ids` through the text projection, `[ids.len(), hidden]` F32.
@@ -298,11 +339,88 @@ impl Talker {
         self.model.forward_embedding_step(input, pos, true)
     }
 
+    /// The prompt of the clone rows `rows`, `[rows.len(), hidden]` F32 on the host.
+    ///
+    /// A speaker row is the pad text row and `speaker`.
+    /// A frame row is the row that follows the reference frame of its index.
+    pub fn clone_prompt_rows(
+        &self,
+        rows: &[prompt::CloneRow],
+        speaker: &[f32],
+        frames: &[Vec<u32>],
+    ) -> Result<Tensor> {
+        let width = self.text_table.width();
+        if speaker.len() != width {
+            return Err(Error::msg(format!(
+                "a speaker embedding of {} values is given to a talker row of {width}",
+                speaker.len()
+            )));
+        }
+        let pad = prompt::Row {
+            text: Some(self.ids.tts_pad),
+            codec: None,
+        };
+        let empty = prompt::Row {
+            text: None,
+            codec: None,
+        };
+        let plain: Vec<prompt::Row> = rows
+            .iter()
+            .map(|r| match r {
+                prompt::CloneRow::Ids(row) => *row,
+                prompt::CloneRow::Speaker => pad,
+                prompt::CloneRow::Frame(_) => empty,
+            })
+            .collect();
+        let mut out = host(&self.prompt_rows(&plain)?)?;
+        for (row, o) in rows.iter().zip(out.chunks_exact_mut(width)) {
+            let add = match row {
+                prompt::CloneRow::Ids(_) => continue,
+                prompt::CloneRow::Speaker => speaker.to_vec(),
+                prompt::CloneRow::Frame(i) => {
+                    let codes = frames
+                        .get(*i)
+                        .ok_or_else(|| Error::msg(format!("the reference has no frame {i}")))?;
+                    host(&self.frame_input(codes)?)?
+                }
+            };
+            o.iter_mut().zip(&add).for_each(|(a, b)| *a += b);
+        }
+        Tensor::from_vec(out, (rows.len(), width), &Device::Cpu)
+    }
+
     /// The prompt rows of `request`.
+    ///
+    /// A voice design checkpoint takes a design text and no clone prompt.
+    /// A Base checkpoint takes a clone prompt and no design text.
     pub fn request_rows(&self, request: &Request<'_>) -> Result<Tensor> {
-        let turns = prompt::Turns::of(&self.tokenizer, request.text, request.design)?;
         let language = self.ids.language(request.language)?;
-        self.prompt_rows(&prompt::rows(&self.ids, &turns, language))
+        match (self.variant, request.clone) {
+            (Variant::VoiceDesign, None) => {
+                let turns = prompt::Turns::of(&self.tokenizer, request.text, request.design)?;
+                self.prompt_rows(&prompt::rows(&self.ids, &turns, language))
+            }
+            (Variant::VoiceDesign, Some(_)) => Err(Error::msg(
+                "the voice design variant speaks a described voice: it takes no clone prompt",
+            )),
+            (Variant::Base, None) => Err(Error::msg(BASE_NEEDS_A_CLONE)),
+            (Variant::Base, Some(_)) if request.design.is_some() => Err(Error::msg(
+                "the Base variant speaks a cloned voice: it takes no voice description",
+            )),
+            (Variant::Base, Some(clone)) => {
+                let turns = prompt::Turns::of(&self.tokenizer, request.text, None)?;
+                let reference_ids = match &clone.reference {
+                    Some(r) => prompt::reference_ids(&self.tokenizer, &r.text)?,
+                    None => Vec::new(),
+                };
+                let reference = clone
+                    .reference
+                    .as_ref()
+                    .map(|r| (reference_ids.as_slice(), r.frames.len()));
+                let rows = prompt::clone_rows(&self.ids, &turns, language, reference);
+                self.clone_prompt_rows(&rows, &clone.speaker, clone.reference_frames())
+            }
+        }
     }
 
     /// The frames of the utterance of `request`, each of a code per group.
@@ -415,15 +533,18 @@ impl Talker {
 /// The prefix of the code predictor's tensors.
 const PREDICTOR_PREFIX: &str = "talker.code_predictor.";
 
-/// Bytes of the 3 blocks of a checkpoint, as stored.
+/// Bytes of the blocks of a checkpoint, as stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Blocks {
-    /// Every tensor of the checkpoint's weights outside the code predictor.
+    /// Every tensor of the checkpoint's weights outside the code predictor and the speaker
+    /// encoder.
     pub talker: u64,
     /// The tensors under the code predictor's prefix.
     pub predictor: u64,
     /// The decoder's tensors in the codec's file.
     pub decoder: u64,
+    /// The tensors under the speaker encoder's prefix, 0 for a checkpoint without one.
+    pub speaker: u64,
 }
 
 impl Blocks {
@@ -434,6 +555,9 @@ impl Blocks {
         let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards)? };
         let (mut talker, mut predictor) = (0u64, 0u64);
         for (name, bytes) in st.byte_sizes() {
+            if name.starts_with(speaker::SPEAKER_PREFIX) {
+                continue;
+            }
             match name.starts_with(PREDICTOR_PREFIX) {
                 true => predictor += bytes as u64,
                 false => talker += bytes as u64,
@@ -443,19 +567,21 @@ impl Blocks {
             talker,
             predictor,
             decoder: decoder::decoder_bytes(&decoder::weights_of(dir))?,
+            speaker: speaker::speaker_bytes(&st),
         })
     }
 
-    /// Bytes of the 3 blocks together.
+    /// Bytes of the blocks together.
     pub fn total(&self) -> u64 {
-        self.talker + self.predictor + self.decoder
+        self.talker + self.predictor + self.decoder + self.speaker
     }
 }
 
-/// The talker and its code predictor.
+/// The talker, its code predictor, and the speaker encoder of a Base checkpoint.
 pub struct Qwen3Tts {
     pub talker: Talker,
     pub predictor: predictor::CodePredictor,
+    pub speaker: Option<speaker::SpeakerEncoder>,
 }
 
 impl Qwen3Tts {
@@ -467,6 +593,7 @@ impl Qwen3Tts {
     /// Its demand holds its input projection, its heads and the talker's text projection,
     /// beside its last layer.
     /// The talker then loads through `HeteroPlan` and the ladder.
+    /// The speaker encoder of a checkpoint whose configuration names one is placed whole last.
     pub fn load(dir: &std::path::Path, rows: Rows) -> Result<Self> {
         let root = read_json(&dir.join("config.json"))?;
         let ids = SpeechIds::read(&root)?;
@@ -486,7 +613,15 @@ impl Qwen3Tts {
             generation.predictor,
             &loaded.last_device,
         )?;
-        Ok(Self { talker, predictor })
+        let speaker = match config::speaker_rate(&root)? {
+            Some(rate) => Some(speaker::SpeakerEncoder::load(dir, rate)?),
+            None => None,
+        };
+        Ok(Self {
+            talker,
+            predictor,
+            speaker,
+        })
     }
 
     /// The device the code predictor's projection and heads run on.
@@ -599,6 +734,16 @@ impl Qwen3Tts {
             frames.extend(self.speak(&part, overrides)?);
         }
         Ok(frames)
+    }
+
+    /// The speaker embedding of the mono clip `samples` at `rate` hertz.
+    ///
+    /// A checkpoint without a speaker encoder refuses it.
+    pub fn speaker_embedding(&self, samples: &[f32], rate: u32) -> Result<Vec<f32>> {
+        self.speaker
+            .as_ref()
+            .ok_or_else(|| Error::msg("the checkpoint has no speaker encoder"))?
+            .embed(samples, rate)
     }
 
     /// Where the layers of the talker and of the code predictor sit, by device.

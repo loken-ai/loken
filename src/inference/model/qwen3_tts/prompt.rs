@@ -17,6 +17,11 @@ pub const SPEECH_TURN: (&str, &str) = (
     "<|im_end|>\n<|im_start|>assistant\n",
 );
 
+/// The turn that carries the reference text of a clone prompt, around it.
+///
+/// The reference wrapper writes this turn, and no file of the checkpoint states it.
+pub const REFERENCE_TURN: (&str, &str) = ("<|im_start|>assistant\n", "<|im_end|>\n");
+
 /// One row of the prompt: a text id and a codec id, each read when present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
@@ -57,6 +62,12 @@ fn turn_ids(
         return Err(Error::msg("the turn's text merges with its markers"));
     }
     Ok((whole, open.len(), close.len()))
+}
+
+/// The ids of the body of `text` in the reference turn.
+pub fn reference_ids(tokenizer: &tokenizers::Tokenizer, text: &str) -> Result<Vec<u32>> {
+    let (whole, open, close) = turn_ids(tokenizer, REFERENCE_TURN, text)?;
+    Ok(whole[open..whole.len() - close].to_vec())
 }
 
 impl Turns {
@@ -119,5 +130,76 @@ pub fn rows(ids: &SpeechIds, turns: &Turns, language: Option<u32>) -> Vec<Row> {
         out.push(both(id, ids.codec_pad));
     }
     out.push(both(ids.tts_pad, ids.codec_bos));
+    out
+}
+
+/// One row of a clone prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneRow {
+    /// A row of ids.
+    Ids(Row),
+    /// The pad text row and the speaker embedding.
+    Speaker,
+    /// The pad text row and the code rows of the reference frame of this index, summed.
+    Frame(usize),
+}
+
+/// The rows of a clone prompt of `turns` in `language`.
+///
+/// The opening of the speech turn, each id a text row.
+/// Then the control codes and the speaker embedding, each beside the pad text row.
+/// Then the codec pad beside the start of text.
+///
+/// Without a reference, each text id then the end of text beside the codec pad, and the pad
+/// text row beside the start of codes.
+///
+/// With a reference of `reference.0` text ids and `reference.1` frames, the reference text ids,
+/// the text ids and the end of text, each beside the codec pad.
+/// Then the start of codes and each reference frame, each beside the pad text row.
+/// The frames drawn follow the last reference frame.
+pub fn clone_rows(
+    ids: &SpeechIds,
+    turns: &Turns,
+    language: Option<u32>,
+    reference: Option<(&[u32], usize)>,
+) -> Vec<CloneRow> {
+    let both = |t: u32, c: u32| {
+        CloneRow::Ids(Row {
+            text: Some(t),
+            codec: Some(c),
+        })
+    };
+    let mut out: Vec<CloneRow> = turns
+        .role
+        .iter()
+        .map(|&id| {
+            CloneRow::Ids(Row {
+                text: Some(id),
+                codec: None,
+            })
+        })
+        .collect();
+    let control: Vec<u32> = match language {
+        Some(lang) => vec![
+            ids.codec_think,
+            ids.codec_think_bos,
+            lang,
+            ids.codec_think_eos,
+        ],
+        None => vec![ids.codec_nothink, ids.codec_think_bos, ids.codec_think_eos],
+    };
+    out.extend(control.iter().map(|&c| both(ids.tts_pad, c)));
+    out.push(CloneRow::Speaker);
+    out.push(both(ids.tts_bos, ids.codec_pad));
+    let (reference_text, frames): (&[u32], usize) = reference.unwrap_or((&[], 0));
+    for &id in reference_text
+        .iter()
+        .chain(&turns.text)
+        .chain(std::iter::once(&ids.tts_eos))
+    {
+        out.push(both(id, ids.codec_pad));
+    }
+    out.push(both(ids.tts_pad, ids.codec_bos));
+    out.extend((0..frames).map(CloneRow::Frame));
     out
 }

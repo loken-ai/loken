@@ -71,6 +71,10 @@ The card kernels for these formats in `src/inference/cuda/quantized/requant.cu` 
 
 The speech talker in `src/inference/model/qwen3_tts/` follows the prompt layout, the frame loop and the sampling of `modeling_qwen3_tts.py` and `qwen3_tts_model.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). The code is written for loken.
 
+The speaker encoder in `src/inference/model/qwen3_tts/speaker.rs` follows the layers of `Qwen3TTSSpeakerEncoder` and the mel front end of `mel_spectrogram` and `extract_speaker_embedding` in `modeling_qwen3_tts.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). Its frame size, hop, window, lowest frequency, magnitude and log floors, dilations and pooling floor are the values of that code. The code is written for loken.
+
+The clone prompt in `src/inference/model/qwen3_tts/prompt.rs` follows the layout `generate` and `generate_icl_prompt` build in `modeling_qwen3_tts.py`, in the non-streaming layout, and the reference turn of `qwen3_tts_model.py`. The code is written for loken.
+
 The codec decoder in `src/inference/model/qwen3_tts/decoder/` follows the layers of the decoder in `modeling_qwen3_tts_tokenizer_v2.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). The code is written for loken.
 
 ## Model weights

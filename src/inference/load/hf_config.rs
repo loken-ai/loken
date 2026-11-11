@@ -791,11 +791,14 @@ pub(crate) mod tests {
     /// The snapshot of the published checkpoint in the test store, `None` when the store lacks
     /// it.
     pub(crate) fn speech_snapshot() -> Option<std::path::PathBuf> {
+        speech_snapshot_of("models--Qwen--Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+    }
+
+    /// The snapshot of the published repository `repo` in the test store, `None` when the
+    /// store lacks it.
+    pub(crate) fn speech_snapshot_of(repo: &str) -> Option<std::path::PathBuf> {
         let store = crate::config::Config::load_test().get_hf_models_dir();
-        let snapshots = store
-            .join("hub")
-            .join("models--Qwen--Qwen3-TTS-12Hz-1.7B-VoiceDesign")
-            .join("snapshots");
+        let snapshots = store.join("hub").join(repo).join("snapshots");
         std::fs::read_dir(snapshots)
             .ok()?
             .flatten()

@@ -366,6 +366,36 @@ The tests check:
 - the published checkpoint's tokenizer wrapping both turns
 - the blocks of the published checkpoint summing to the tensors they load
 
+### The Base variant
+
+`tts_model_type` names the variant: `voice_design` speaks a described voice, `base` a voice cloned from a clip.
+A Base checkpoint loads the same talker and code predictor, then its speaker encoder (`speaker.rs`).
+A Base request carries a clone prompt and no design text.
+A request without a clone prompt is refused with what the variant needs.
+
+The speaker encoder turns a mono clip into the speaker embedding, as wide as a talker row:
+
+- a clip at another rate than `speaker_encoder_config.sample_rate` is resampled first
+- the mel front end mirrors the clip, windows it, and pools the magnitudes by a Slaney filter bank to their log
+- the bands are the input channels of the first convolution
+- an ECAPA network of convolutions, squeeze-excitation Res2Net blocks and an attentive statistics pooling follows
+- its widths and kernels are read from the tensors, its dilations and the front end's sizes are constants of the reference code
+
+The encoder has no layers and is placed whole through `ladder::load_whole`, its tensors in F32.
+
+The clone prompt has 2 modes (`prompt::clone_rows`):
+
+- the opening of the speech turn, each id a text row
+- the control codes and the speaker embedding, each beside the pad text row
+- the codec pad beside the start of text
+- with the speaker embedding only: each text id and the end of text beside the codec pad, then the pad text row beside the start of codes
+- in context: the reference text ids, the text ids and the end of text beside the codec pad, then the start of codes and each reference frame beside the pad text row
+
+A reference frame row sums the frame's code rows and the pad text row, as the row after a drawn frame does.
+The decoder takes the reference frames before the frames drawn, and their samples are cut from the waveform.
+The engine entries `qwen3_speaker_embedding`, `qwen3_clone_blocking` and `qwen3_clone_streamed` in `tts_engine.rs` take a clone prompt.
+No request field carries one yet.
+
 ## Speech codec decoder
 
 `src/inference/model/qwen3_tts/decoder/` turns frames of codes into the waveform of a Qwen3-TTS checkpoint.

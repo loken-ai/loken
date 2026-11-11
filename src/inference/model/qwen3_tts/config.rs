@@ -105,21 +105,55 @@ impl SpeechIds {
     }
 }
 
-/// The variant this build serves: a voice described in words.
-pub const SERVED_VARIANT: &str = "voice_design";
+/// A variant of the checkpoint this build serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// A voice described in words.
+    VoiceDesign,
+    /// A voice cloned from a clip: a speaker embedding, and a reference text and its codes.
+    Base,
+}
 
-/// The variant the configuration `root` declares in `tts_model_type`, refused unless it is
-/// the one this build serves.
-pub fn served_variant(root: &Json) -> Result<&str> {
+/// The names `tts_model_type` gives the variants this build serves.
+pub const SERVED_VARIANTS: [(&str, Variant); 2] = [
+    ("voice_design", Variant::VoiceDesign),
+    ("base", Variant::Base),
+];
+
+/// The variant the configuration `root` declares in `tts_model_type`, refused unless this
+/// build serves it.
+pub fn served_variant(root: &Json) -> Result<Variant> {
     let variant = field(root, &["tts_model_type"])?
         .as_str()
         .ok_or_else(|| Error::msg("config.json tts_model_type is not a name"))?;
-    if variant != SERVED_VARIANT {
-        return Err(Error::msg(format!(
-            "the checkpoint is of the variant {variant:?}: only {SERVED_VARIANT:?} is served"
-        )));
+    SERVED_VARIANTS
+        .iter()
+        .find(|(name, _)| *name == variant)
+        .map(|(_, v)| *v)
+        .ok_or_else(|| {
+            let names: Vec<String> = SERVED_VARIANTS
+                .iter()
+                .map(|(n, _)| format!("{n:?}"))
+                .collect();
+            Error::msg(format!(
+                "the checkpoint is of the variant {variant:?}: only {} are served",
+                names.join(" and ")
+            ))
+        })
+}
+
+/// The sample rate the speaker encoder of the configuration `root` takes, `None` when the
+/// configuration has no speaker encoder.
+pub fn speaker_rate(root: &Json) -> Result<Option<usize>> {
+    match root.get("speaker_encoder_config").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(_) => size(root, &["speaker_encoder_config", "sample_rate"]).map(Some),
     }
-    Ok(variant)
+}
+
+/// The width of a talker row of the configuration `root`, which a speaker embedding matches.
+pub fn talker_width(root: &Json) -> Result<usize> {
+    size(root, &["talker_config", "hidden_size"])
 }
 
 /// How a code is drawn from a row of logits.

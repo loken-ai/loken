@@ -3056,7 +3056,30 @@ impl APIServer {
             // List the supported TTS voice presets and the description
             // each one maps to. Helps clients discover voices without
             // reading source.
-            .route("/v1/audio/voices", axum::routing::get(audio_voices))
+            // A POST creates a custom voice from a description or from a clip.
+            .route(
+                "/v1/audio/voices",
+                axum::routing::get(audio_voices)
+                    .post(audio_voices_create)
+                    .layer(upload_body_limit()),
+            )
+            .route(
+                "/v1/audio/voices/{id}",
+                axum::routing::get(audio_voice_get).delete(audio_voice_delete),
+            )
+            // Consent recordings a voice from a clip rests on.
+            .route(
+                "/v1/audio/voice_consents",
+                axum::routing::get(audio_consent_list)
+                    .post(audio_consent_create)
+                    .layer(upload_body_limit()),
+            )
+            .route(
+                "/v1/audio/voice_consents/{id}",
+                axum::routing::get(audio_consent_get)
+                    .post(audio_consent_update)
+                    .delete(audio_consent_delete),
+            )
             // Generative audio (text->sound). JSON body:
             //   { "model": "ezaudio", "prompt": "...", "seconds": 5,
             //     "steps": 50, "cfg": 3.0, "seed": 0 }

@@ -320,6 +320,7 @@ fn published_request() -> Request<'static> {
         design: Some("A calm young woman with a warm, clear voice."),
         language: Some("english"),
         seed: 0,
+        clone: None,
     }
 }
 
@@ -477,6 +478,7 @@ fn a_streamed_long_text_is_spoken_to_its_end() {
         design: None,
         language: None,
         seed: 21,
+        clone: None,
     };
     let probe = Qwen3Tts::load(&dir, Rows::Exactly(64)).unwrap();
     let n = probe.talker.request_rows(&request).unwrap().dim(0).unwrap();
@@ -513,6 +515,7 @@ fn a_streamed_text_the_cache_holds_is_spoken_in_one_call() {
         design: None,
         language: None,
         seed: 21,
+        clone: None,
     };
     let probe = Qwen3Tts::load(&dir, Rows::Exactly(64)).unwrap();
     let n = probe.talker.request_rows(&request).unwrap().dim(0).unwrap();
@@ -539,9 +542,11 @@ fn a_streamed_text_the_cache_holds_is_spoken_in_one_call() {
 }
 
 #[test]
-fn a_variant_other_than_the_voice_design_is_refused_by_name() {
+fn a_variant_other_than_the_voice_design_and_the_base_is_refused_by_name() {
     let mut root = speech_config();
-    assert_eq!(config::served_variant(&root).unwrap(), "voice_design");
+    assert_eq!(config::served_variant(&root).unwrap(), Variant::VoiceDesign);
+    root["tts_model_type"] = json!("base");
+    assert_eq!(config::served_variant(&root).unwrap(), Variant::Base);
     root["tts_model_type"] = json!("custom_voice");
     let err = config::served_variant(&root).unwrap_err().to_string();
     assert!(err.contains("custom_voice"), "{err}");
@@ -558,6 +563,7 @@ fn the_blocks_split_the_tensors_of_the_checkpoint() {
             "talker.model.norm.weight",
             "talker.codec_head.weight",
             "talker.code_predictor.model.norm.weight",
+            "speaker_encoder.fc.weight",
         ],
         None,
     );
@@ -572,7 +578,8 @@ fn the_blocks_split_the_tensors_of_the_checkpoint() {
         Blocks {
             talker: 8,
             predictor: 4,
-            decoder: 4
+            decoder: 4,
+            speaker: 4
         }
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -606,4 +613,264 @@ fn the_published_blocks_sum_to_the_tensors_they_load() {
     eprintln!("blocks of the published checkpoint: {blocks:?}");
     assert_eq!(blocks.total(), weights + decoder);
     assert!(blocks.talker > blocks.predictor && blocks.predictor > 0);
+}
+
+/// A clone prompt without a reference: the role, the controls and the speaker row beside the
+/// pad text row, the start of text, the text and its end, then the start of codes.
+#[test]
+fn the_speaker_only_clone_prompt_puts_the_speaker_row_before_the_start_of_text() {
+    use prompt::CloneRow::{Frame, Ids, Speaker};
+    let ids = ids();
+    let turns = prompt::Turns {
+        design: vec![],
+        role: vec![3],
+        text: vec![4, 5],
+    };
+    let both = |t, c| {
+        Ids(prompt::Row {
+            text: Some(t),
+            codec: Some(c),
+        })
+    };
+    let (pad, bos, eos) = (ids.tts_pad, ids.tts_bos, ids.tts_eos);
+    let role = Ids(prompt::Row {
+        text: Some(3),
+        codec: None,
+    });
+    let want = vec![
+        role,
+        both(pad, ids.codec_think),
+        both(pad, ids.codec_think_bos),
+        both(pad, 37),
+        both(pad, ids.codec_think_eos),
+        Speaker,
+        both(bos, ids.codec_pad),
+        both(4, ids.codec_pad),
+        both(5, ids.codec_pad),
+        both(eos, ids.codec_pad),
+        both(pad, ids.codec_bos),
+    ];
+    assert_eq!(prompt::clone_rows(&ids, &turns, Some(37), None), want);
+    let got = prompt::clone_rows(&ids, &turns, None, None);
+    assert_eq!(got[1], both(pad, ids.codec_nothink));
+    assert_eq!(got[4], Speaker);
+    assert!(!got.iter().any(|r| matches!(r, Frame(_))));
+}
+
+/// A clone prompt with a reference: the reference text before the text, then the start of
+/// codes and each reference frame beside the pad text row.
+#[test]
+fn the_in_context_clone_prompt_puts_the_reference_text_then_its_frames() {
+    use prompt::CloneRow::{Frame, Ids, Speaker};
+    let ids = ids();
+    let turns = prompt::Turns {
+        design: vec![],
+        role: vec![3],
+        text: vec![4, 5],
+    };
+    let both = |t, c| {
+        Ids(prompt::Row {
+            text: Some(t),
+            codec: Some(c),
+        })
+    };
+    let (pad, bos, eos) = (ids.tts_pad, ids.tts_bos, ids.tts_eos);
+    let got = prompt::clone_rows(&ids, &turns, None, Some((&[8, 9], 3)));
+    let mut want = vec![Ids(prompt::Row {
+        text: Some(3),
+        codec: None,
+    })];
+    want.extend([
+        both(pad, ids.codec_nothink),
+        both(pad, ids.codec_think_bos),
+        both(pad, ids.codec_think_eos),
+        Speaker,
+        both(bos, ids.codec_pad),
+    ]);
+    for t in [8, 9, 4, 5, eos] {
+        want.push(both(t, ids.codec_pad));
+    }
+    want.push(both(pad, ids.codec_bos));
+    want.extend([Frame(0), Frame(1), Frame(2)]);
+    assert_eq!(got, want);
+}
+
+/// The toy checkpoint written as a Base checkpoint.
+fn toy_base_dir(tag: &str) -> std::path::PathBuf {
+    let dir = toy_dir(tag);
+    let mut root: Json =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    root["tts_model_type"] = json!("base");
+    std::fs::write(dir.join("config.json"), root.to_string()).unwrap();
+    dir
+}
+
+/// A speaker row sums the pad text row and the embedding.
+/// A frame row is the row that follows the reference frame.
+/// A Base checkpoint refuses a request without a clone prompt or with a design text.
+#[test]
+fn a_clone_prompt_row_sums_the_pad_row_and_the_speaker_or_the_frame() {
+    let dir = toy_base_dir("clone_rows");
+    let tts = Qwen3Tts::load(&dir, Rows::Exactly(64)).unwrap();
+    let talker = &tts.talker;
+    assert_eq!(talker.variant(), Variant::Base);
+    let ids = talker.ids().clone();
+    let width = talker.text_table.width();
+    let speaker: Vec<f32> = (0..width).map(|i| i as f32 / width as f32).collect();
+    let frame: Vec<u32> = (0..ids.groups as u32)
+        .map(|g| (g + 1) % ids.codebook as u32)
+        .collect();
+    let rows = [prompt::CloneRow::Speaker, prompt::CloneRow::Frame(0)];
+    let got = host(
+        &talker
+            .clone_prompt_rows(&rows, &speaker, std::slice::from_ref(&frame))
+            .unwrap(),
+    )
+    .unwrap();
+    let pad = host(&talker.text_rows(&[ids.tts_pad]).unwrap()).unwrap();
+    let next = host(&talker.frame_input(&frame).unwrap()).unwrap();
+    for i in 0..width {
+        assert_eq!(got[i], pad[i] + speaker[i]);
+        assert_eq!(got[width + i], next[i]);
+    }
+    assert!(talker
+        .clone_prompt_rows(&rows, &speaker[1..], std::slice::from_ref(&frame))
+        .is_err());
+    assert!(talker.clone_prompt_rows(&rows, &speaker, &[]).is_err());
+    let clone = ClonePrompt {
+        speaker,
+        reference: None,
+    };
+    let request = Request {
+        text: "ab",
+        design: None,
+        language: None,
+        seed: 0,
+        clone: None,
+    };
+    let refused = talker.request_rows(&request).unwrap_err().to_string();
+    assert_eq!(refused, BASE_NEEDS_A_CLONE);
+    let designed = Request {
+        design: Some("a"),
+        clone: Some(&clone),
+        ..request
+    };
+    assert!(talker.request_rows(&designed).is_err());
+    let cloned = Request {
+        clone: Some(&clone),
+        ..request
+    };
+    assert!(talker.request_rows(&cloned).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A voice design checkpoint refuses a clone prompt.
+#[test]
+fn a_voice_design_checkpoint_refuses_a_clone_prompt() {
+    let dir = toy_dir("design_refuses_clone");
+    let talker = Talker::load(&dir, Rows::Exactly(64)).unwrap();
+    let clone = ClonePrompt {
+        speaker: vec![0.0; talker.text_table.width()],
+        reference: None,
+    };
+    let request = Request {
+        text: "ab",
+        design: None,
+        language: None,
+        seed: 0,
+        clone: Some(&clone),
+    };
+    assert!(talker.request_rows(&request).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The log-mel spectrogram of `samples` by the definition of each step, in f64.
+fn plain_log_mel(samples: &[f32], rate: usize, bands: usize) -> Vec<f64> {
+    use speaker::*;
+    let pad = (MEL_N_FFT - MEL_HOP) / 2;
+    let n = samples.len();
+    let x: Vec<f64> = (0..n + 2 * pad)
+        .map(|i| {
+            let j = i as isize - pad as isize;
+            let j = match j {
+                j if j < 0 => -j,
+                j if j >= n as isize => 2 * (n as isize - 1) - j,
+                j => j,
+            };
+            samples[j as usize] as f64
+        })
+        .collect();
+    let frames = 1 + (x.len() - MEL_N_FFT) / MEL_HOP;
+    let bins = MEL_N_FFT / 2 + 1;
+    let bank = filter_bank(bands, rate);
+    let tau = 2.0 * std::f64::consts::PI;
+    let mut out = vec![0f64; bands * frames];
+    for f in 0..frames {
+        let mag: Vec<f64> = (0..bins)
+            .map(|k| {
+                let (mut re, mut im) = (0f64, 0f64);
+                for t in 0..MEL_N_FFT {
+                    let w = 0.5 - 0.5 * (tau * t as f64 / MEL_WINDOW as f64).cos();
+                    let v = x[f * MEL_HOP + t] * w;
+                    let a = tau * (k * t) as f64 / MEL_N_FFT as f64;
+                    re += v * a.cos();
+                    im -= v * a.sin();
+                }
+                (re * re + im * im + MEL_MAGNITUDE_EPS).sqrt()
+            })
+            .collect();
+        for b in 0..bands {
+            let sum: f64 = (0..bins).map(|k| bank[b * bins + k] * mag[k]).sum();
+            out[b * frames + f] = sum.max(MEL_LOG_FLOOR).ln();
+        }
+    }
+    out
+}
+
+/// The mel front end gives the plain f64 computation of each step.
+#[test]
+fn the_mel_front_end_matches_a_plain_computation() {
+    let rate = 24_000;
+    let bands = 16;
+    let samples: Vec<f32> = (0..3000)
+        .map(|i| {
+            let t = i as f32 / rate as f32;
+            0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                + 0.2 * (2.0 * std::f32::consts::PI * 3100.0 * t).sin()
+        })
+        .collect();
+    let (got, frames) = speaker::log_mel(&samples, rate, bands).unwrap();
+    let want = plain_log_mel(&samples, rate, bands);
+    assert_eq!(
+        frames,
+        1 + (samples.len() + speaker::MEL_N_FFT - speaker::MEL_HOP - speaker::MEL_N_FFT)
+            / speaker::MEL_HOP
+    );
+    assert_eq!(got.len(), want.len());
+    for (a, b) in got.iter().zip(&want) {
+        assert!((*a as f64 - b).abs() <= 1e-4 * b.abs().max(1.0), "{a} {b}");
+    }
+    assert!(speaker::log_mel(&samples[..100], rate, bands).is_err());
+}
+
+/// Each band of the filter bank is a triangle of area 1 in hertz, and the bands cover the
+/// spectrum in order.
+#[test]
+fn the_filter_bank_bands_are_normalised_triangles() {
+    let rate = 24_000;
+    let bands = 32;
+    let bank = speaker::filter_bank(bands, rate);
+    let bins = speaker::MEL_N_FFT / 2 + 1;
+    let hz = rate as f64 / 2.0 / (bins - 1) as f64;
+    let mut last_peak = 0;
+    for b in 0..bands {
+        let row = &bank[b * bins..(b + 1) * bins];
+        let peak = (0..bins)
+            .max_by(|i, j| row[*i].total_cmp(&row[*j]))
+            .unwrap();
+        assert!(peak >= last_peak, "band {b}");
+        last_peak = peak;
+        let area: f64 = row.iter().sum::<f64>() * hz;
+        assert!((area - 1.0).abs() < 0.25, "band {b}: {area}");
+    }
 }

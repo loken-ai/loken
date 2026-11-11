@@ -36,7 +36,8 @@ use crate::inference::model::pocket_tts::{
 };
 use crate::inference::model::qwen3_tts::decoder::CodecDecoder;
 use crate::inference::model::qwen3_tts::{
-    Blocks as Qwen3Blocks, Overrides as Qwen3Overrides, Qwen3Tts, Request as Qwen3Request,
+    Blocks as Qwen3Blocks, ClonePrompt, Overrides as Qwen3Overrides, Qwen3Tts,
+    Request as Qwen3Request,
 };
 use crate::inference::token::sentencepiece::SentencePiece;
 use hf_hub::api::sync::ApiBuilder;
@@ -74,6 +75,8 @@ pub struct TtsSynthParams {
     /// The language a checkpoint that names its languages speaks, by the name it gives it.
     /// `None` leaves the language to the model.
     pub language: Option<String>,
+    /// The speaker embedding a Base checkpoint clones, `None` for every other voice.
+    pub speaker: Option<Vec<f32>>,
 }
 
 impl Default for TtsSynthParams {
@@ -87,6 +90,7 @@ impl Default for TtsSynthParams {
             seed: 0,
             max_steps: None,
             language: None,
+            speaker: None,
         }
     }
 }
@@ -505,7 +509,10 @@ impl TtsEngine {
                     .as_mut()
                     .ok_or_else(|| anyhow!("tts unloaded mid-synthesize"))?;
                 match &mut s.backend {
-                    Backend::Qwen3Tts(inner) => stream_qwen3_tts(inner, &text, &params, &out),
+                    Backend::Qwen3Tts(inner) => {
+                        let clone = speaker_prompt(&params);
+                        stream_qwen3_tts(inner, &text, &params, clone.as_ref(), &out)
+                    }
                     _ => {
                         let r = synthesize_blocking(s, &text, &params)?;
                         out.send(r.pcm)
@@ -519,6 +526,24 @@ impl TtsEngine {
         .inspect_err(|e| crate::inference::engine::log_engine_error("tts", "synthesize", e));
         guard.disarm();
         done
+    }
+
+    /// The speaker embedding of the mono clip `samples` at `rate` hertz, by the speaker
+    /// encoder of the loaded checkpoint.
+    ///
+    /// A checkpoint without a speaker encoder refuses it.
+    pub async fn speaker_embedding(&self, samples: Vec<f32>, rate: u32) -> AnyResult<Vec<f32>> {
+        crate::inference::place::vram_manager::touch("tts");
+        let state = self.model_state.clone();
+        tokio::task::spawn_blocking(move || -> AnyResult<Vec<f32>> {
+            let mut guard = state.blocking_lock();
+            let s = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("no speech checkpoint is loaded"))?;
+            qwen3_speaker_embedding(s, &samples, rate)
+        })
+        .await
+        .map_err(|e| anyhow!("speaker encoder join: {e}"))?
     }
 
     /// Synthesise `text` and return raw f32 mono PCM at the loaded
@@ -897,11 +922,12 @@ fn load_qwen3_tts_blocking(dir: &std::path::Path) -> AnyResult<TtsModelState> {
     let gb = |b: u64| b as f64 / 1e9;
     info!(
         "TTS loaded: qwen3-tts ({sample_rate} Hz, talker {:.2} GB, code predictor {:.2} GB, \
-         decoder {:.2} GB on {:?}, cache of {context} rows)",
+         decoder {:.2} GB on {:?}, speaker encoder {:.2} GB, cache of {context} rows)",
         gb(blocks.talker),
         gb(blocks.predictor),
         gb(blocks.decoder),
-        decoder.device().location()
+        decoder.device().location(),
+        gb(blocks.speaker)
     );
     Ok(TtsModelState {
         backend: Backend::Qwen3Tts(Box::new(Qwen3TtsInner {
@@ -974,15 +1000,15 @@ fn synthesize_qwen3_tts(
     sample_rate: u32,
     text: &str,
     params: &TtsSynthParams,
+    clone: Option<&ClonePrompt>,
 ) -> AnyResult<TtsResult> {
-    let (request, overrides) = qwen3_request(text, params);
+    let (request, overrides) = qwen3_request(text, params, clone);
     let frames = inner
         .tts
         .speak(&request, &overrides)
         .map_err(|e| anyhow!("qwen3-tts synth: {e}"))?;
-    let pcm = inner
-        .decoder
-        .decode(&frames)
+    let reference = clone.map_or(&[][..], |c| c.reference_frames());
+    let pcm = decode_after(&inner.decoder, reference, &frames)
         .map_err(|e| anyhow!("qwen3-tts decode: {e}"))?;
     tracing::debug!(
         "qwen3-tts: {} frames, {} samples, blocks {} bytes",
@@ -993,18 +1019,39 @@ fn synthesize_qwen3_tts(
     Ok(TtsResult { pcm, sample_rate })
 }
 
-/// The talker's request and overrides of `text` with `params`.
+/// The samples of `frames` decoded after the reference frames `reference`.
+///
+/// The decoder takes the reference frames and the frames drawn as one utterance.
+/// The samples of the reference frames are cut from the waveform.
+fn decode_after(
+    decoder: &CodecDecoder,
+    reference: &[Vec<u32>],
+    frames: &[Vec<u32>],
+) -> crate::tensor::Result<Vec<f32>> {
+    if reference.is_empty() {
+        return decoder.decode(frames);
+    }
+    let all: Vec<Vec<u32>> = reference.iter().chain(frames).cloned().collect();
+    let pcm = decoder.decode(&all)?;
+    let cut = (reference.len() * decoder.config().frame_samples).min(pcm.len());
+    Ok(pcm[cut..].to_vec())
+}
+
+/// The talker's request and overrides of `text` with `params`, in the voice `clone` clones
+/// when given.
 ///
 /// The voice description is the design text, absent when empty.
 fn qwen3_request<'a>(
     text: &'a str,
     params: &'a TtsSynthParams,
+    clone: Option<&'a ClonePrompt>,
 ) -> (Qwen3Request<'a>, Qwen3Overrides) {
     let request = Qwen3Request {
         text,
         design: Some(params.voice_description.as_str()).filter(|d| !d.trim().is_empty()),
         language: params.language.as_deref(),
         seed: params.seed,
+        clone,
     };
     let overrides = Qwen3Overrides {
         temperature: params.temperature.map(|t| t as f32),
@@ -1023,19 +1070,27 @@ fn qwen3_request<'a>(
 /// Each time it is free, it takes every frame drawn since its last decode and sends their
 /// samples.
 /// A piece `out` no longer takes stops the decoder, and the frame loop at its next frame.
+/// The reference frames of `clone` go through the decoder first, their samples not sent.
 fn stream_qwen3_tts(
     inner: &mut Qwen3TtsInner,
     text: &str,
     params: &TtsSynthParams,
+    clone: Option<&ClonePrompt>,
     out: &tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
 ) -> AnyResult<()> {
-    let (request, overrides) = qwen3_request(text, params);
+    let (request, overrides) = qwen3_request(text, params, clone);
+    let reference = clone.map_or(&[][..], |c| c.reference_frames());
     let Qwen3TtsInner { tts, decoder, .. } = inner;
     let decoder: &CodecDecoder = decoder;
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u32>>();
         let worker = scope.spawn(move || -> AnyResult<()> {
             let mut stream = decoder.stream();
+            if !reference.is_empty() {
+                stream
+                    .push(reference)
+                    .map_err(|e| anyhow!("qwen3-tts decode: {e}"))?;
+            }
             while let Ok(first) = rx.recv() {
                 let mut frames = vec![first];
                 frames.extend(rx.try_iter());
@@ -1060,6 +1115,88 @@ fn stream_qwen3_tts(
         tracing::debug!("qwen3-tts: {} frames streamed", utterance.frames.len());
         Ok(())
     })
+}
+
+/// The speech talker of `state`, refused for another backend.
+fn qwen3_inner(state: &mut TtsModelState) -> AnyResult<&mut Qwen3TtsInner> {
+    match &mut state.backend {
+        Backend::Qwen3Tts(inner) => Ok(inner),
+        _ => Err(anyhow!("the model is not a speech talker")),
+    }
+}
+
+/// The clone prompt of the speaker embedding `params` carries, `None` when it carries none.
+fn speaker_prompt(params: &TtsSynthParams) -> Option<ClonePrompt> {
+    params.speaker.clone().map(|speaker| ClonePrompt {
+        speaker,
+        reference: None,
+    })
+}
+
+/// What a speech talker checkpoint offers a stored voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TalkerVoice {
+    /// The checkpoint speaks a voice cloned from a speaker embedding.
+    pub clones: bool,
+    /// The checkpoint turns a clip into a speaker embedding.
+    pub encodes: bool,
+    /// The width of a speaker embedding the checkpoint takes.
+    pub width: usize,
+}
+
+/// What the speech talker checkpoint at `dir` offers a stored voice, read from its
+/// configuration.
+pub fn speech_talker_voice(dir: &std::path::Path) -> Result<TalkerVoice, String> {
+    use crate::inference::model::qwen3_tts::config::{served_variant, speaker_rate, talker_width};
+    use crate::inference::model::qwen3_tts::Variant;
+    let path = dir.join("config.json");
+    let root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .ok_or_else(|| format!("{} cannot be read", path.display()))?;
+    let variant = served_variant(&root).map_err(|e| e.to_string())?;
+    Ok(TalkerVoice {
+        clones: variant == Variant::Base,
+        encodes: speaker_rate(&root).map_err(|e| e.to_string())?.is_some(),
+        width: talker_width(&root).map_err(|e| e.to_string())?,
+    })
+}
+
+/// The speaker embedding of the mono clip `samples` at `rate` hertz, by the speaker encoder
+/// of the Base checkpoint of `state`.
+pub fn qwen3_speaker_embedding(
+    state: &mut TtsModelState,
+    samples: &[f32],
+    rate: u32,
+) -> AnyResult<Vec<f32>> {
+    qwen3_inner(state)?
+        .tts
+        .speaker_embedding(samples, rate)
+        .map_err(|e| anyhow!("qwen3-tts speaker encoder: {e}"))
+}
+
+/// The waveform of `text` spoken in the voice `clone` by the Base checkpoint of `state`.
+///
+/// The language, the seed and the sampling values come from `params`.
+pub fn qwen3_clone_blocking(
+    state: &mut TtsModelState,
+    text: &str,
+    params: &TtsSynthParams,
+    clone: &ClonePrompt,
+) -> AnyResult<TtsResult> {
+    let sample_rate = state.sample_rate;
+    synthesize_qwen3_tts(qwen3_inner(state)?, sample_rate, text, params, Some(clone))
+}
+
+/// [`qwen3_clone_blocking`] sent to `out` in pieces while the talker draws its frames.
+pub fn qwen3_clone_streamed(
+    state: &mut TtsModelState,
+    text: &str,
+    params: &TtsSynthParams,
+    clone: &ClonePrompt,
+    out: &tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+) -> AnyResult<()> {
+    stream_qwen3_tts(qwen3_inner(state)?, text, params, Some(clone), out)
 }
 
 // ------------------------------------------------------------
@@ -1119,7 +1256,10 @@ fn synthesize_blocking(
             .map_err(|e| anyhow!("kyutai synth: {e}"))?;
             Ok(TtsResult { pcm, sample_rate })
         }
-        Backend::Qwen3Tts(inner) => synthesize_qwen3_tts(inner, sample_rate, text, params),
+        Backend::Qwen3Tts(inner) => {
+            let clone = speaker_prompt(params);
+            synthesize_qwen3_tts(inner, sample_rate, text, params, clone.as_ref())
+        }
     }
 }
 
@@ -1459,6 +1599,123 @@ mod qwen3_tts_tests {
         assert_eq!(a.pcm, b.pcm);
         let other = speak(&mut state, text, "An old man with a deep, rough voice.", 7);
         assert_ne!(a.pcm, other.pcm);
+    }
+
+    #[test]
+    fn a_base_checkpoint_without_a_speaker_encoder_config_is_served() {
+        let dir = talker_config_dir("base_variant", "base");
+        assert_eq!(
+            speech_talker_language(&dir, Some("fr")),
+            Ok(Some("french".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The voice design checkpoint speaks a sentence from a description.
+    /// The Base checkpoint then speaks 3 other sentences in that voice in the in-context mode,
+    /// and the same 3 from its speaker embedding only.
+    /// The 7 waveforms are written as WAV files with an index, for the ear.
+    #[test]
+    #[ignore = "needs both published checkpoints in the test store"]
+    fn a_designed_voice_is_cloned_by_the_base_checkpoint() {
+        use crate::inference::load::hf_config::tests::{speech_snapshot, speech_snapshot_of};
+        use crate::inference::model::qwen3_tts::Reference;
+        let (Some(design_dir), Some(base_dir)) = (
+            speech_snapshot(),
+            speech_snapshot_of("models--Qwen--Qwen3-TTS-12Hz-1.7B-Base"),
+        ) else {
+            eprintln!("a published checkpoint is not in the test store");
+            return;
+        };
+        let out =
+            crate::inference::generic_transformer::class_load::tests::scratch("clone-renders");
+        let design = "A calm young woman with a warm, clear voice.";
+        let spoken = "Good morning, I will read you the news of the day.";
+        let texts = [
+            "The weather stays mild until the end of the week.",
+            "Please close the door quietly when you leave the room.",
+            "Numbers like twelve and forty two are easy to say.",
+        ];
+        let params = TtsSynthParams {
+            voice_description: design.to_string(),
+            seed: 7,
+            language: Some("english".to_string()),
+            ..TtsSynthParams::default()
+        };
+        let mut index = Vec::new();
+        let mut write = |name: &str, pcm: &[f32], rate: u32, line: String| {
+            std::fs::write(
+                out.join(name),
+                crate::inference::media::audio_io::write_wav(pcm, rate),
+            )
+            .unwrap();
+            index.push(format!("{name}\t{line}"));
+        };
+        let t0 = std::time::Instant::now();
+        let (frames, pcm, rate, design_blocks) = {
+            let mut state = load_qwen3_tts_blocking(&design_dir).unwrap();
+            let rate = state.sample_rate;
+            let inner = qwen3_inner(&mut state).unwrap();
+            let (request, overrides) = qwen3_request(spoken, &params, None);
+            let frames = inner.tts.speak(&request, &overrides).unwrap();
+            let pcm = inner.decoder.decode(&frames).unwrap();
+            (frames, pcm, rate, inner.blocks)
+        };
+        eprintln!(
+            "designed {} frames in {:.1} s, blocks {design_blocks:?}",
+            frames.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        write(
+            "0-design.wav",
+            &pcm,
+            rate,
+            format!("voice design\tdescription: {design}\ttext: {spoken}"),
+        );
+        let mut state = load_qwen3_tts_blocking(&base_dir).unwrap();
+        let base_blocks = qwen3_inner(&mut state).unwrap().blocks;
+        eprintln!("base blocks {base_blocks:?}");
+        let speaker = qwen3_speaker_embedding(&mut state, &pcm, rate).unwrap();
+        eprintln!(
+            "speaker embedding of {} values, norm {:.3}",
+            speaker.len(),
+            speaker.iter().map(|x| x * x).sum::<f32>().sqrt()
+        );
+        let in_context = ClonePrompt {
+            speaker: speaker.clone(),
+            reference: Some(Reference {
+                text: spoken.to_string(),
+                frames: frames.clone(),
+            }),
+        };
+        let speaker_only = ClonePrompt {
+            speaker,
+            reference: None,
+        };
+        let clone_params = TtsSynthParams {
+            voice_description: String::new(),
+            ..params.clone()
+        };
+        for (mode, clone) in [("in-context", &in_context), ("speaker-only", &speaker_only)] {
+            for (i, text) in texts.iter().enumerate() {
+                let t = std::time::Instant::now();
+                let got = qwen3_clone_blocking(&mut state, text, &clone_params, clone).unwrap();
+                let seconds = got.pcm.len() as f64 / got.sample_rate as f64;
+                eprintln!(
+                    "{mode} {i}: {seconds:.2} s of speech in {:.1} s",
+                    t.elapsed().as_secs_f64()
+                );
+                assert!((1.0..20.0).contains(&seconds), "{seconds} s");
+                write(
+                    &format!("{}-{mode}.wav", i + 1),
+                    &got.pcm,
+                    got.sample_rate,
+                    format!("clone {mode}\tfrom 0-design.wav\ttext: {text}"),
+                );
+            }
+        }
+        std::fs::write(out.join("index.txt"), index.join("\n") + "\n").unwrap();
+        eprintln!("renders in {}", out.display());
     }
 }
 

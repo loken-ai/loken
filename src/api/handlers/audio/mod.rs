@@ -38,6 +38,9 @@ mod transcribe;
 use transcribe::*;
 mod decode;
 pub use decode::*;
+mod custom_voices;
+mod voice_store;
+pub(crate) use custom_voices::*;
 
 #[cfg(test)]
 mod tests;

@@ -1543,7 +1543,8 @@ pub(super) struct OpenAISpeechRequest {
     pub(super) input: String,
     /// OpenAI voice preset name. Maps to a Parler `voice_description`
     /// internally; users can also pass `voice_description` directly.
-    #[serde(default)]
+    /// A stored voice is named by its id, as a string or as an object with an `id`.
+    #[serde(default, deserialize_with = "deserialize_voice")]
     pub(super) voice: Option<String>,
     #[serde(default)]
     pub(super) voice_description: Option<String>,
@@ -1599,6 +1600,49 @@ pub(super) struct OpenAISpeechRequest {
     /// See [`speech_delivery`] for why this is a field of its own rather than `stream`.
     #[serde(default)]
     pub(super) stream_format: Option<String>,
+}
+
+/// A `voice` given as a name, or as an object whose `id` names a stored voice.
+fn deserialize_voice<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Voice {
+        Name(String),
+        Object { id: String },
+    }
+    Ok(
+        <Option<Voice> as serde::Deserialize>::deserialize(d)?.map(|v| match v {
+            Voice::Name(n) => n,
+            Voice::Object { id } => id,
+        }),
+    )
+}
+
+/// The stored voice `voice` names, `None` when it names no stored voice, and a 404 refusal
+/// when it has the form of a voice id the store does not hold.
+pub(super) fn stored_voice_of(
+    store: &super::voice_store::VoiceStore,
+    voice: Option<&str>,
+) -> Result<Option<super::voice_store::StoredVoice>, String> {
+    let Some(id) = voice.filter(|v| v.starts_with(super::voice_store::VOICE_PREFIX)) else {
+        return Ok(None);
+    };
+    store
+        .voice(id)
+        .map(Some)
+        .ok_or_else(|| format!("voice '{id}' not found: create one with POST /v1/audio/voices"))
+}
+
+/// The refusal of a speech talker that clones asked for a voice the store does not hold.
+pub(super) fn clone_needs_a_stored_voice(checkpoint: &str) -> String {
+    format!(
+        "'{checkpoint}' speaks a stored voice: create one with POST /v1/audio/voices, from a \
+         `prompt` that describes it or from an `audio_sample` with a `consent`, and pass its id \
+         as `voice`"
+    )
 }
 
 /// How a `/v1/audio/speech` response reaches the caller.
@@ -1799,6 +1843,11 @@ pub(crate) async fn audio_speech(
     if let Err(e) = validate_tts_input(&req.input) {
         return err_resp(axum::http::StatusCode::BAD_REQUEST, e);
     }
+    let voice_store = super::voice_store::VoiceStore::of(&state.huggingface_models_dir);
+    let stored = match stored_voice_of(&voice_store, req.voice.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return err_resp(axum::http::StatusCode::NOT_FOUND, e),
+    };
 
     // WHICH BACKEND CAN SPEAK THIS. A named model is an instruction and wins; a language
     // with no model picks an engine that can say it. Neither silently substitutes: a
@@ -1807,6 +1856,8 @@ pub(crate) async fn audio_speech(
     // failure to diagnose.
     let requested_model = match (req.model.as_deref(), req.language.as_deref()) {
         (Some(m), _) if !m.trim().is_empty() => Some(m.to_string()),
+        // A stored voice is spoken by the checkpoint that made it.
+        _ if stored.is_some() => stored.as_ref().map(|v| v.checkpoint.clone()),
         (_, Some(lang)) if !lang.trim().is_empty() => {
             let code = lang.trim().to_lowercase();
             let bare = code.split('-').next().unwrap_or(&code);
@@ -1894,7 +1945,7 @@ pub(crate) async fn audio_speech(
     // silently routes to the "alloy" default in openai_voice_to_description,
     // so callers expecting a specific voice get the wrong one with no
     // warning.
-    if req.voice_description.is_none() {
+    if req.voice_description.is_none() && stored.is_none() {
         if let Some(v) = req.voice.as_deref() {
             let lower = v.to_lowercase();
             if !KNOWN_VOICES.contains(&lower.as_str()) {
@@ -1996,7 +2047,62 @@ pub(crate) async fn audio_speech(
         },
         None => None,
     };
-    let design = talker.as_ref().map(|_| {
+    // A talker that clones speaks a stored voice, and only one.
+    let talker_voice = match &talker {
+        Some(s) => match crate::inference::engine::tts_engine::speech_talker_voice(&s.path) {
+            Ok(v) => Some(Talker {
+                id: s.id.clone(),
+                voice: v,
+            }),
+            Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
+        },
+        None => None,
+    };
+    let clones = talker_voice.as_ref().filter(|t| t.voice.clones);
+    let speaker = match (&stored, clones) {
+        (Some(v), _) => {
+            let Some(t) = talker_voice.as_ref() else {
+                return err_resp(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "the voice '{}' is spoken by a checkpoint that clones, such as '{}', \
+                         which made it",
+                        v.id, v.checkpoint
+                    ),
+                );
+            };
+            if let Err(e) = voice_fits(v, t) {
+                return err_resp(axum::http::StatusCode::BAD_REQUEST, e);
+            }
+            if req.voice_description.is_some() || req.instructions.is_some() {
+                return err_resp(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "the voice '{}' is a stored voice: `voice_description` and \
+                         `instructions` cannot change it",
+                        v.id
+                    ),
+                );
+            }
+            match voice_store.speaker(&v.id) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    return err_resp(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("voice store: {e:#}"),
+                    )
+                }
+            }
+        }
+        (None, Some(t)) => {
+            return err_resp(
+                axum::http::StatusCode::BAD_REQUEST,
+                clone_needs_a_stored_voice(&t.id),
+            )
+        }
+        (None, None) => None,
+    };
+    let design = talker.as_ref().filter(|_| speaker.is_none()).map(|_| {
         speech_design(
             capped(&req.voice_description).as_deref(),
             req.voice.as_deref(),
@@ -2020,10 +2126,15 @@ pub(crate) async fn audio_speech(
 
     // A speech talker without a seed draws from a hash of its timbre text, so the same
     // description gives the same draw.
-    let derived_seed = design.as_ref().map(|d| seed_of_text(d.seed_text()));
+    // A stored voice without a seed draws from a hash of its id.
+    let derived_seed = match &stored {
+        Some(v) => Some(seed_of_text(&v.id)),
+        None => design.as_ref().map(|d| seed_of_text(d.seed_text())),
+    };
     let params = TtsSynthParams {
         voice_description: match design {
             Some(d) => d.text,
+            None if speaker.is_some() => String::new(),
             None => description,
         },
         // Clamp via the finite-aware helper so NaN/Infinity in top_p
@@ -2048,6 +2159,7 @@ pub(crate) async fn audio_speech(
         // model's limit applies.
         max_steps: req.max_steps.map(|v| v as usize),
         language,
+        speaker,
     };
 
     // The event stream owns its load: it has to START before the checkpoint is read, or
@@ -2797,9 +2909,17 @@ pub(crate) async fn audio_voices(
     let loaded_name = state.tts_engine.loaded_name().await;
     let loaded_sr = state.tts_engine.loaded_sample_rate().await;
     let loaded = loaded_name.is_some();
+    let custom: Vec<serde_json::Value> =
+        super::voice_store::VoiceStore::of(&state.huggingface_models_dir)
+            .voices()
+            .iter()
+            .map(voice_object)
+            .collect();
     Json(serde_json::json!({
         "object": "list",
         "data": voices,
+        // The stored voices, as Voice objects, oldest first.
+        "custom_voices": custom,
         // Surface the actual loaded model vs the default fallback so
         // clients can tell warm-cache state from cold.
         "loaded": loaded,
