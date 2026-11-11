@@ -505,8 +505,8 @@ Each later frame runs 1 step fed the previous frame's row, on the cache.
 The frames stop where the cache is full, its size bounded by the cards' memory.
 The text table, the frame projection, the end-of-speech head and the flow head stay in `src/inference/model/pocket_tts/mod.rs`.
 
-The tests feed the generic layers and the model's own layer code the same rows, a prompt longer than a prefill chunk and then a row per frame, on a toy and on the published checkpoint when the test store holds it, on the host and on a card.
-Each frame's row agrees within the rounding of F32 through the layers and of the rotary angles at the last position.
+`generic_transformer::mimi_class_tests` holds the layers to a plain host run in F64 on a toy, as a prefill and as single steps after it, within the rounding of F32, on the host and on a card.
+The tests of the flow model feed the published checkpoint, when the test store holds it, a prompt longer than a prefill chunk and then a row per frame, on the host and on a card: each frame's row is finite and the same on a second run.
 
 ## Drafter verification
 

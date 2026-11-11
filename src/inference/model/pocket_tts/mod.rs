@@ -10,7 +10,7 @@
 //! causal (left-pad) and conv-transposes trim the right tail, matching the streaming model.
 //!
 //! Net-new vs existing VAEs: ELU activation, LayerScale, fused-qkv codec transformer
-//! with RoPE. Reuses `tensor` conv1d/conv_transpose1d, `sdpa`, `rope_tables`.
+//! with RoPE. Reuses `tensor` conv1d/conv_transpose1d.
 //!
 //! The codec's transformers, in its decoder and its encoder, are transformers of the generic
 //! route, placed by `HeteroPlan` and the ladder with their own demand.
@@ -21,14 +21,10 @@
 
 use crate::inference::generic_transformer::class_load::{self, Holding, Rows};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
-#[cfg(test)]
-use crate::inference::model::acestep::fsq::rope_tables;
 use crate::inference::model::adaln::modulate;
 use crate::inference::model::kyutai::mimi::{
     ATTENTION_HEADS as MIMI_HEADS, ATTENTION_WINDOW, TRANSFORMER_CLASS as CODEC_CLASS,
 };
-#[cfg(test)]
-use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Error, Result, Tensor};
 
@@ -147,88 +143,6 @@ impl ResBlock {
         let h = causal_conv1d(&h, &self.conv1.w, self.conv1.b.as_ref(), 1, 1, 1)?;
         let h = elu(&h)?;
         let h = causal_conv1d(&h, &self.conv2.w, self.conv2.b.as_ref(), 1, 1, 1)?;
-        x.add(&h)
-    }
-}
-
-/// One flow_lm transformer layer (pre-norm, fused-qkv MHA + RoPE, full causal, GELU MLP).
-///
-/// The tests hold the generic layers to it.
-#[cfg(test)]
-struct XfLayer {
-    norm1_w: Tensor,
-    norm1_b: Tensor,
-    norm2_w: Tensor,
-    norm2_b: Tensor,
-    in_proj: Tensor,  // [3*dim, dim]
-    out_proj: Tensor, // [dim, dim]
-    linear1: Tensor,  // [ffn, dim]
-    linear2: Tensor,  // [dim, ffn]
-    dim: usize,
-    heads: usize,
-}
-#[cfg(test)]
-impl XfLayer {
-    fn load(vb: &VarBuilder, idx: usize, heads: usize) -> Result<Self> {
-        let p = vb.pp(format!("layers.{idx}"));
-        let dim = p.shape_of("norm1.weight")?[0];
-        let ffn = p.shape_of("linear1.weight")?[0];
-        Ok(Self {
-            norm1_w: p.get(dim, "norm1.weight")?,
-            norm1_b: p.get(dim, "norm1.bias")?,
-            norm2_w: p.get(dim, "norm2.weight")?,
-            norm2_b: p.get(dim, "norm2.bias")?,
-            in_proj: p.get((3 * dim, dim), "self_attn.in_proj.weight")?,
-            out_proj: p.get((dim, dim), "self_attn.out_proj.weight")?,
-            linear1: p.get((ffn, dim), "linear1.weight")?,
-            linear2: p.get((dim, ffn), "linear2.weight")?,
-            dim,
-            heads,
-        })
-    }
-
-    /// Every layer of the stack under `vb`.
-    fn stack(vb: &VarBuilder, heads: usize) -> Result<Vec<Self>> {
-        (0..vb.count_children("layers"))
-            .map(|i| Self::load(vb, i, heads))
-            .collect()
-    }
-
-    /// `x: [S, dim]` (single batch). Causal RoPE attention.
-    fn forward(&self, x: &Tensor, dev: &Device) -> Result<Tensor> {
-        let (dim, n_head) = (self.dim, self.heads);
-        let s = x.shape().dims2()?.0;
-        let hd = dim / n_head;
-        // --- attention ---
-        let h = x.layer_norm(&self.norm1_w, Some(&self.norm1_b), LN_EPS)?;
-        let qkv = h.matmul_t(&self.in_proj)?; // [S, 3*dim]
-        let q = qkv.narrow(1, 0, dim)?;
-        let k = qkv.narrow(1, dim, dim)?;
-        let v = qkv.narrow(1, 2 * dim, dim)?;
-        let shp = |t: &Tensor| -> Result<Tensor> {
-            t.reshape((s, n_head, hd))?
-                .transpose(0, 1)?
-                .unsqueeze(0)?
-                .contiguous()
-        }; // [1, H, S, hd]
-        let (cosv, sinv) = rope_tables(s, hd, ROPE_THETA);
-        let cos = Tensor::from_vec_f32(cosv, (s, hd / 2))?.to_device(dev)?;
-        let sin = Tensor::from_vec_f32(sinv, (s, hd / 2))?.to_device(dev)?;
-        // Interleaved RoPE (pocket-tts packs rotation pairs as adjacent dims).
-        let q = shp(&q)?.rope_i(&cos, &sin)?;
-        let k = shp(&k)?.rope_i(&cos, &sin)?;
-        let v = shp(&v)?;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let att = sdpa(&q, &k, &v, None, true, scale, 1.0)?; // [1,H,S,hd]
-        let att = att.transpose(1, 2)?.contiguous()?.reshape((s, dim))?;
-        let att = att.matmul_t(&self.out_proj)?;
-        let x = x.add(&att)?;
-        // --- mlp ---
-        let h = x.layer_norm(&self.norm2_w, Some(&self.norm2_b), LN_EPS)?;
-        let h = h
-            .matmul_t(&self.linear1)?
-            .gelu_erf()?
-            .matmul_t(&self.linear2)?;
         x.add(&h)
     }
 }
@@ -1230,12 +1144,6 @@ mod tests {
         resolve_paths().1
     }
 
-    /// The flow model's own layers in the checkpoint `path`, on the host.
-    fn own_flow_layers(path: &str) -> Vec<XfLayer> {
-        let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu).unwrap() };
-        XfLayer::stack(&vb.pp(FLOW_PREFIX).pp("transformer"), FLOW_LM_HEADS).unwrap()
-    }
-
     #[test]
     fn preprocess_text_frames_and_punct() {
         // <=4 words -> 3 frames_after_eos + leading pad; capitalized; period added.
@@ -1292,7 +1200,6 @@ mod tests {
         let m =
             PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu, 64, 72_000).unwrap();
         let enc = MimiEncoder::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu).unwrap();
-        let own = own_flow_layers(ckpt().to_str().unwrap());
         let dog = format!(
             "{}/results/ezaudio/a_dog_barking.wav",
             env!("CARGO_MANIFEST_DIR")
@@ -1332,40 +1239,6 @@ mod tests {
         let sv = seq.flatten_all().unwrap().to_vec1_f32().unwrap();
         let (ref_seq, _) = load_bin("/tmp/ref_seq.bin");
         println!("SEQ     cosine={:.5}", cosine(&sv, &ref_seq));
-        // raw transformer output (pre out_norm), last row
-        let mut h = seq.clone();
-        for l in &own {
-            h = l.forward(&h, &m.device).unwrap();
-        }
-        let s = h.shape().dims2().unwrap().0;
-        let tr_last = h
-            .narrow(0, s - 1, 1)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1_f32()
-            .unwrap();
-        let (ref_tr, _) = load_bin("/tmp/ref_tr_raw_last.bin");
-        println!("TR_RAW  cosine={:.5}", cosine(&tr_last, &ref_tr));
-        // CONTROLLED: feed the EXACT reference seq into my transformer -> isolate transformer bug.
-        let (ref_seq_f, ref_seq_s) = load_bin("/tmp/ref_seq.bin"); // [S,1024]
-        let rseq = Tensor::from_vec_f32(ref_seq_f, (ref_seq_s[0], ref_seq_s[1]))
-            .unwrap()
-            .to_device(&m.device)
-            .unwrap();
-        let mut h2 = rseq;
-        for l in &own {
-            h2 = l.forward(&h2, &m.device).unwrap();
-        }
-        let s2 = h2.shape().dims2().unwrap().0;
-        let tr2 = h2
-            .narrow(0, s2 - 1, 1)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1_f32()
-            .unwrap();
-        println!("TR_RAW(ref_seq in) cosine={:.5}", cosine(&tr2, &ref_tr));
         let c = flow_prefill(&mut m.xf.lock().unwrap(), &seq, &m.device).unwrap();
         let cv = c.flatten_all().unwrap().to_vec1_f32().unwrap();
         let (ref_c, _) = load_bin("/tmp/ref_c.bin");
@@ -1614,15 +1487,14 @@ mod codec_tests {
 
 #[cfg(test)]
 mod flow_tests {
-    //! The flow model's transformer on the generic layers against its own layer code, on a toy
-    //! and on the published checkpoint, on the host and on a card.
+    //! The flow model's transformer of the published checkpoint, on the host and on a card.
     //!
-    //! Both are teacher forced: they are fed the same rows, a prompt then a row per frame.
-    //! The own layers rerun every row before a frame.
-    //! The generic layers prefill the prompt and run a step per frame on their cache.
+    //! It prefills a prompt and runs a step per frame on its cache.
+    //! `generic_transformer::mimi_class_tests` holds its layers to a plain host run in F64, as a
+    //! prefill and as single steps.
 
     use super::*;
-    use crate::inference::generic_transformer::class_load::tests::{scratch, values};
+    use crate::inference::generic_transformer::class_load::tests::values;
 
     /// Rows of a prompt longer than a prefill chunk.
     fn long_prompt() -> usize {
@@ -1649,29 +1521,7 @@ mod flow_tests {
         unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu).unwrap() }
     }
 
-    /// The own layers' frames over `rows [n, dim]`: for each end from `prompt` to `n`, the last
-    /// row of the rows before it, after the output norm.
-    fn own_frames(path: &str, rows: &Tensor, prompt: usize) -> Vec<f32> {
-        let vb = view(path);
-        let f = vb.pp(FLOW_PREFIX);
-        let own = XfLayer::stack(&f.pp("transformer"), FLOW_LM_HEADS).unwrap();
-        let (n, dim) = rows.dims2().unwrap();
-        let w = f.get(dim, "out_norm.weight").unwrap();
-        let b = f.get(dim, "out_norm.bias").unwrap();
-        let rows = rows.to_device(&Device::Cpu).unwrap();
-        let mut out = Vec::new();
-        for end in prompt..=n {
-            let mut h = rows.narrow(0, 0, end).unwrap();
-            for l in &own {
-                h = l.forward(&h, &Device::Cpu).unwrap();
-            }
-            let last = h.narrow(0, end - 1, 1).unwrap();
-            out.extend(host(&last.layer_norm(&w, Some(&b), LN_EPS).unwrap()));
-        }
-        out
-    }
-
-    /// The generic layers' frames over `rows [n, dim]`, placed on `cards`: the prompt
+    /// The frames of the layers of `path` over `rows [n, dim]`, placed on `cards`: the prompt
     /// prefilled, then a step for each row after it.
     fn generic_frames(
         path: &str,
@@ -1692,147 +1542,6 @@ mod flow_tests {
             ));
         }
         out
-    }
-
-    /// The tolerance on a value of magnitude `scale` out of `layers` layers whose widest product
-    /// sums `width` terms, in F32, over `rows` positions.
-    ///
-    /// A product of `n` terms rounds to about `eps * sqrt(n)` of its scale.
-    /// A layer chains 4 products: the Q, K and V projection, the attention output, the up and
-    /// the down projections.
-    /// The output norm adds one more rounding.
-    /// A rotary angle of position `p` rounds to about `eps * p` of a radian in F32, which each
-    /// layer adds once.
-    fn tolerance(layers: usize, width: usize, rows: usize, scale: f32) -> f32 {
-        let eps = f32::EPSILON;
-        let products = eps * (width as f32).sqrt() * (4 * layers + 1) as f32;
-        let angles = eps * rows as f32 * layers as f32;
-        (products + angles) * scale
-    }
-
-    /// The frames of both paths over `rows`, the first `prompt` rows prefilled, agree within
-    /// the tolerance.
-    fn frames_agree(path: &str, rows: &Tensor, prompt: usize, cards: &[(usize, u64)]) {
-        let vb = view(path);
-        let xt = vb.pp(FLOW_PREFIX).pp("transformer");
-        let first = xt.pp("layers.0");
-        let dim = first.shape_of("norm1.weight").unwrap()[0];
-        let ffn = first.shape_of("linear1.weight").unwrap()[0];
-        let layers = xt.count_children("layers");
-        let n = rows.dims2().unwrap().0;
-        let want = own_frames(path, rows, prompt);
-        let got = generic_frames(path, rows, prompt, cards);
-        assert_eq!(got.len(), want.len());
-        assert!(got.iter().all(|v| v.is_finite()));
-        let mut worst = (0f32, 0usize);
-        for (frame, (g, w)) in got.chunks(dim).zip(want.chunks(dim)).enumerate() {
-            let err = g
-                .iter()
-                .zip(w)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
-            if err > worst.0 {
-                worst = (err, frame);
-            }
-        }
-        let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-        let tol = tolerance(layers, ffn.max(3 * dim), n, scale);
-        eprintln!(
-            "{} frames: {} away at frame {} at a scale of {scale}, tolerance {tol}",
-            n + 1 - prompt,
-            worst.0,
-            worst.1
-        );
-        assert!(worst.0 <= tol, "{} away, tolerance {tol}", worst.0);
-    }
-
-    /// A flow model of `layers` layers `hidden` wide, its feed-forward `ffn` wide, in F32.
-    fn toy_file(tag: &str, hidden: usize, ffn: usize, layers: usize) -> std::path::PathBuf {
-        let dir = scratch(tag);
-        let mut seed = 29u32;
-        let mut stored = Vec::new();
-        let xt = format!("{FLOW_PREFIX}.transformer.layers");
-        for il in 0..layers {
-            for (part, dims, centre, scale) in [
-                ("norm1.weight", vec![hidden], 1.0, 0.2),
-                ("norm1.bias", vec![hidden], 0.0, 0.2),
-                ("norm2.weight", vec![hidden], 1.0, 0.2),
-                ("norm2.bias", vec![hidden], 0.0, 0.2),
-                (
-                    "self_attn.in_proj.weight",
-                    vec![3 * hidden, hidden],
-                    0.0,
-                    0.2,
-                ),
-                ("self_attn.out_proj.weight", vec![hidden, hidden], 0.0, 0.2),
-                ("linear1.weight", vec![ffn, hidden], 0.0, 0.2),
-                ("linear2.weight", vec![hidden, ffn], 0.0, 0.2),
-            ] {
-                stored.push((format!("{xt}.{il}.{part}"), dims, centre, scale));
-            }
-        }
-        for (part, centre) in [("weight", 1.0), ("bias", 0.0)] {
-            stored.push((
-                format!("{FLOW_PREFIX}.out_norm.{part}"),
-                vec![hidden],
-                centre,
-                0.2,
-            ));
-        }
-        let bytes: Vec<(String, Vec<usize>, Vec<u8>)> = stored
-            .into_iter()
-            .map(|(name, dims, centre, scale)| {
-                let v = values(&mut seed, dims.iter().product(), centre, scale);
-                (name, dims, v.iter().flat_map(|x| x.to_le_bytes()).collect())
-            })
-            .collect();
-        let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = bytes
-            .iter()
-            .map(|(name, dims, b)| {
-                let view =
-                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, dims.clone(), b)
-                        .unwrap();
-                (name.clone(), view)
-            })
-            .collect();
-        let file = dir.join("model.safetensors");
-        safetensors::serialize_to_file(views, None, &file).unwrap();
-        file
-    }
-
-    /// The toy's frames agree on `cards`.
-    fn toy_agrees(tag: &str, cards: &[(usize, u64)]) {
-        let hidden = 8 * FLOW_LM_HEADS;
-        let file = toy_file(tag, hidden, 2 * hidden, 2);
-        let path = file.to_string_lossy().to_string();
-        let n = long_prompt() + FRAMES;
-        let mut seed = 5u32;
-        let rows = Tensor::from_vec(
-            values(&mut seed, n * hidden, 0.0, 1.0),
-            (n, hidden),
-            &Device::Cpu,
-        )
-        .unwrap();
-        frames_agree(&path, &rows, long_prompt(), cards);
-        let _ = std::fs::remove_dir_all(file.parent().unwrap());
-    }
-
-    /// On the host.
-    #[test]
-    fn the_toy_flow_transformer_on_generic_layers_matches_its_own_layers() {
-        toy_agrees("pocket-flow-toy", &[]);
-    }
-
-    /// With the layers on the cards.
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn the_card_toy_flow_transformer_on_generic_layers_matches_its_own_layers() {
-        let cards = crate::inference::place::ladder::cards(0);
-        if cards.is_empty() {
-            eprintln!("no card");
-            return;
-        }
-        toy_agrees("pocket-flow-toy-card", &cards);
     }
 
     /// The rows the cache of the published flow model holds on `cards` when asked for `rows`,
@@ -1934,25 +1643,31 @@ mod flow_tests {
         file.map(|f| f.to_string_lossy().to_string())
     }
 
-    /// On the host.
-    #[test]
-    fn the_published_flow_transformer_on_generic_layers_matches_its_own_layers() {
+    /// The published flow model's frames on `cards` are finite, the same on a second run.
+    fn published_runs(cards: &[(usize, u64)]) {
         let Some(path) = published() else { return };
         let (rows, prompt) = published_rows(&path);
-        frames_agree(&path, &rows, prompt, &[]);
+        let frames = generic_frames(&path, &rows, prompt, cards);
+        assert_eq!(frames.len(), (FRAMES + 1) * rows.dims2().unwrap().1);
+        assert!(frames.iter().all(|v| v.is_finite()));
+        assert_eq!(generic_frames(&path, &rows, prompt, cards), frames);
+    }
+
+    /// On the host.
+    #[test]
+    fn the_published_flow_transformer_prefills_and_steps() {
+        published_runs(&[]);
     }
 
     /// With the layers on the cards.
     #[cfg(feature = "gpu")]
     #[test]
-    fn the_card_published_flow_transformer_on_generic_layers_matches_its_own_layers() {
+    fn the_card_published_flow_transformer_prefills_and_steps() {
         let cards = crate::inference::place::ladder::cards(0);
         if cards.is_empty() {
             eprintln!("no card");
             return;
         }
-        let Some(path) = published() else { return };
-        let (rows, prompt) = published_rows(&path);
-        frames_agree(&path, &rows, prompt, &cards);
+        published_runs(&cards);
     }
 }
