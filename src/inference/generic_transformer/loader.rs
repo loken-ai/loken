@@ -197,6 +197,8 @@ struct TensorSource<'a> {
     hf_rows: bool,
     /// The checkpoint's rows are already in the adjacent-pair order of a GGUF file.
     adjacent_rope: bool,
+    /// A card holds the stored 16-bit float weights at F32, as the host does.
+    wide_floats: bool,
     /// The split set, which says which tensors are stored one less than they are read.
     split: Option<&'a crate::tensor::quantized::gguf_source::SplitGguf>,
     /// The checkpoint that makes some of the tensors from stored ones.
@@ -355,6 +357,7 @@ impl<'a> TensorSource<'a> {
         Self {
             hf_rows: false,
             adjacent_rope: false,
+            wide_floats: false,
             split: None,
             dense: None,
             owner: HashMap::new(),
@@ -386,6 +389,7 @@ impl<'a> TensorSource<'a> {
             owner,
             hf_rows: false,
             adjacent_rope: false,
+            wide_floats: false,
             split: Some(split),
             dense: None,
         }
@@ -422,6 +426,7 @@ impl<'a> TensorSource<'a> {
             owner,
             hf_rows: true,
             adjacent_rope: ck.adjacent_rope,
+            wide_floats: ck.wide_floats,
             split: None,
             dense: Some(ck),
         }
@@ -596,7 +601,7 @@ impl<'a> TensorSource<'a> {
             )?;
             // CONVERSION: widened to F32 on the host first (declared below).
             let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
-            let width = if device.is_cpu() {
+            let width = if device.is_cpu() || self.wide_floats {
                 crate::tensor::quantized::GgmlDType::F32
             } else {
                 crate::tensor::quantized::GgmlDType::F16
@@ -6410,6 +6415,7 @@ mod host_layer_bytes_tests {
             owner: HashMap::new(),
             hf_rows: false,
             adjacent_rope: false,
+            wide_floats: false,
             split: None,
             dense: None,
             count: LoadCount::none(),

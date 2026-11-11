@@ -918,6 +918,7 @@ const QWEN3_TTS_CODEC: Layout = Layout {
 /// It has no token table, no final norm and no head.
 /// Its blocks norm with a bias, project Q, K and V as one matrix, and feed forward through 2
 /// linears.
+/// A codec's file names the Q, K and V matrix as a parameter or as the weight of a linear.
 const MIMI: Layout = Layout {
     embed: &[],
     layers: "decoder_transformer.transformer.layers",
@@ -929,6 +930,7 @@ const MIMI: Layout = Layout {
         ("norm2.weight", Same("ffn_norm.weight")),
         ("norm2.bias", Same("ffn_norm.bias")),
         ("self_attn.in_proj_weight", Same("attn_qkv.weight")),
+        ("self_attn.in_proj.weight", Same("attn_qkv.weight")),
         ("self_attn.out_proj.weight", Same("attn_output.weight")),
         ("linear1.weight", Same("ffn_up.weight")),
         ("linear2.weight", Same("ffn_down.weight")),

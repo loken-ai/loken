@@ -90,6 +90,15 @@ impl ClassDemand {
     }
 }
 
+/// How a caller has a class's transformer read and held.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Holding<'a> {
+    /// The path of the blocks under the model's prefix, in place of the layout's own.
+    pub blocks: Option<&'a str>,
+    /// A card holds the stored 16-bit float weights at F32, as the host does.
+    pub wide_floats: bool,
+}
+
 /// The transformer of `class` in the checkpoint at `dir`, its cache holding `rows`, placed on
 /// the cards the ladder sees.
 ///
@@ -122,8 +131,19 @@ pub fn class_demand(
     class: &str,
     beside: u64,
 ) -> Result<ClassDemand> {
+    class_demand_held(root, shards, class, beside, Holding::default())
+}
+
+/// [`class_demand`] of the transformer read and held as `holding` says.
+pub fn class_demand_held(
+    root: &serde_json::Value,
+    shards: &[String],
+    class: &str,
+    beside: u64,
+    holding: Holding<'_>,
+) -> Result<ClassDemand> {
     let (cfg, st) = class_config(root, shards, class)?;
-    demand_of(&cfg, &st, class, beside)
+    demand_of(&cfg, &st, class, beside, holding)
 }
 
 /// The configuration of `class` read from `root`, and the mapped `shards`.
@@ -146,9 +166,11 @@ fn demand_of(
     st: &MmapedSafetensors,
     class: &str,
     beside: u64,
+    holding: Holding<'_>,
 ) -> Result<ClassDemand> {
-    let (block_bytes, head_bytes) = super::text_bytes(st, cfg)
-        .ok_or_else(|| Error::msg(format!("{class}: no tensor layout reads the checkpoint")))?;
+    let (block_bytes, head_bytes) =
+        super::dense::text_bytes_under(st, cfg, holding.blocks, holding.wide_floats)
+            .ok_or_else(|| Error::msg(format!("{class}: no tensor layout reads the checkpoint")))?;
     let head_dim = cfg.head_dim.unwrap_or(cfg.hidden_size / cfg.n_head.max(1));
     // An unquantised cache holds F16 keys and values on a card for an architecture that
     // keeps its cache unquantised, and F32 otherwise.
@@ -186,8 +208,21 @@ pub fn load_class_from(
     beside: u64,
     cards: &[(usize, u64)],
 ) -> Result<LoadedClass> {
+    load_class_held(root, shards, class, rows, beside, cards, Holding::default())
+}
+
+/// [`load_class_from`] with the transformer read and held as `holding` says.
+pub fn load_class_held(
+    root: &serde_json::Value,
+    shards: &[String],
+    class: &str,
+    rows: Rows,
+    beside: u64,
+    cards: &[(usize, u64)],
+    holding: Holding<'_>,
+) -> Result<LoadedClass> {
     let (cfg, st) = class_config(root, shards, class)?;
-    let priced = demand_of(&cfg, &st, class, beside)?;
+    let priced = demand_of(&cfg, &st, class, beside, holding)?;
     let context = priced.rows_on(rows, cards, ladder::card_bandwidth);
     if let Rows::UpTo(full) = rows {
         tracing::info!("{class}: a cache of {context} rows of {full}");
@@ -207,7 +242,8 @@ pub fn load_class_from(
         format!("{arch}.vocab_size"),
         Value::U32(cfg.vocab_size as u32),
     );
-    let ck = super::DenseCheckpoint::open(&header, shards, &cfg)?;
+    let mut ck = super::DenseCheckpoint::open_under(&header, shards, &cfg, holding.blocks)?;
+    ck.wide_floats = holding.wide_floats;
     let layers = cfg.n_layers;
     ladder::load_on(
         class,
@@ -247,11 +283,16 @@ pub(crate) mod tests {
     use serde_json::Value as Json;
 
     /// A scratch directory of its own for `tag`.
+    ///
+    /// It sits beside the test binary, under the build's target directory.
     pub(crate) fn scratch(tag: &str) -> std::path::PathBuf {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("loken-class-{tag}-{}-{call}", std::process::id()));
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe
+            .parent()
+            .unwrap()
+            .join(format!("loken-class-{tag}-{}-{call}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

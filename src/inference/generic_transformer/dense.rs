@@ -94,6 +94,8 @@ pub struct DenseCheckpoint {
     pub has_final_norm: bool,
     /// The ungated feed-forward runs the error-function GELU.
     pub erf_gelu: bool,
+    /// A card holds the stored 16-bit float weights at F32.
+    pub wide_floats: bool,
 }
 
 /// One tensor of a shard: its name, the shard, stored type, dimensions and start in the data.
@@ -614,6 +616,16 @@ fn blocks_prefix(items: &[Listed], layers: &str) -> Result<String> {
 
 /// What a layout makes of the tensors listed, or why it cannot.
 fn translate(items: &[Listed], layout: &Layout, cfg: &AwqConfigJson) -> Result<Translation> {
+    translate_under(items, layout, layout.layers, cfg)
+}
+
+/// [`translate`] with the blocks under `layers` in place of the layout's own path.
+fn translate_under(
+    items: &[Listed],
+    layout: &Layout,
+    layers: &str,
+    cfg: &AwqConfigJson,
+) -> Result<Translation> {
     let by_name: HashMap<&str, &Listed> = items.iter().map(|l| (l.name.as_str(), l)).collect();
     let shapes = Shapes::of(cfg);
     // The model's prefix is where its embedding table is, or where its blocks are when it has
@@ -642,7 +654,7 @@ fn translate(items: &[Listed], layout: &Layout, cfg: &AwqConfigJson) -> Result<T
     let model = match (layout.rooted, table) {
         (true, _) => String::new(),
         (false, Some((l, e))) => l.name.trim_end_matches(e).to_string(),
-        (false, None) => blocks_prefix(items, layout.layers)?,
+        (false, None) => blocks_prefix(items, layers)?,
     };
     let wrapper = model
         .trim_end_matches('.')
@@ -666,7 +678,7 @@ fn translate(items: &[Listed], layout: &Layout, cfg: &AwqConfigJson) -> Result<T
             out.apply(*rule, l, &by_name, &shapes, &plain)?;
         }
     }
-    let root = format!("{model}{}.", layout.layers);
+    let root = format!("{model}{layers}.");
     // Experts stored one tensor each, gathered by the tensor they stack into.
     let mut stacks: BTreeMap<String, BTreeMap<usize, &Listed>> = BTreeMap::new();
     for l in items {
@@ -775,6 +787,17 @@ pub fn text_bytes(
     st: &crate::tensor::safetensors::MmapedSafetensors,
     cfg: &AwqConfigJson,
 ) -> Option<(u64, u64)> {
+    text_bytes_under(st, cfg, None, false)
+}
+
+/// [`text_bytes`] with the blocks under `layers` when it is given, and the blocks' 16-bit
+/// floats counted at F32 when `wide_floats`.
+pub fn text_bytes_under(
+    st: &crate::tensor::safetensors::MmapedSafetensors,
+    cfg: &AwqConfigJson,
+    layers: Option<&str>,
+    wide_floats: bool,
+) -> Option<(u64, u64)> {
     let sizes: HashMap<String, usize> = st.byte_sizes().into_iter().collect();
     let items: Vec<Listed> = st
         .names()
@@ -798,8 +821,12 @@ pub fn text_bytes(
         })
         .collect();
     let layout = layout_of(cfg).ok()?;
-    let t = translate(&items, layout, cfg).ok()?;
+    let t = translate_under(&items, layout, layers.unwrap_or(layout.layers), cfg).ok()?;
     let size = |dtype: GgmlDType, dims: &[usize]| {
+        let dtype = match (wide_floats, dtype) {
+            (true, GgmlDType::F16 | GgmlDType::BF16) => GgmlDType::F32,
+            _ => dtype,
+        };
         (dims.iter().product::<usize>() / dtype.block_size() * dtype.type_size()) as u64
     };
     let block_bytes: u64 = t
@@ -975,6 +1002,17 @@ impl DenseCheckpoint {
     /// Map `shards` and list their tensors under the loader's names. `base` carries the
     /// metadata the model is configured from; `cfg` the rope scaling the table is computed for.
     pub fn open(base: &Content, shards: &[String], cfg: &AwqConfigJson) -> Result<Self> {
+        Self::open_under(base, shards, cfg, None)
+    }
+
+    /// [`Self::open`] with the blocks under `layers` when it is given, in place of the layout's
+    /// own path.
+    pub fn open_under(
+        base: &Content,
+        shards: &[String],
+        cfg: &AwqConfigJson,
+        layers: Option<&str>,
+    ) -> Result<Self> {
         let mut mapped = Vec::new();
         for path in shards {
             let file = std::fs::File::open(path).map_err(|e| Error(format!("{path}: {e}")))?;
@@ -985,7 +1023,7 @@ impl DenseCheckpoint {
         }
         let items = listing_of(&mapped);
         let layout = layout_of(cfg)?;
-        let translation = translate(&items, layout, cfg)?;
+        let translation = translate_under(&items, layout, layers.unwrap_or(layout.layers), cfg)?;
         let mut parts = Vec::new();
         let mut union: HashMap<String, TensorInfo> = HashMap::new();
         for (index, (mmap, _, data_start)) in mapped.into_iter().enumerate() {
@@ -1066,6 +1104,7 @@ impl DenseCheckpoint {
             has_token_table: !layout.embed.is_empty(),
             has_final_norm: !layout.top.is_empty(),
             erf_gelu,
+            wide_floats: false,
         })
     }
 }
