@@ -140,10 +140,12 @@ pub const CB_GRAPH_BUCKET: usize = 256;
 pub const CB_BLOCK_SIZE: usize = 16;
 
 fn argmax_row(logits: &Tensor, row: usize) -> crate::tensor::Result<u32> {
-    logits
-        .narrow(0, row, 1)?
-        .flatten_all()?
-        .to_dtype(DType::F32)?
+    let row = logits.narrow(0, row, 1)?.flatten_all()?;
+    // An f32 row on a card is reduced by the card sampler, which allocates nothing per token.
+    if row.device().is_cuda() && row.dtype() == DType::F32 {
+        return crate::inference::kernel::fused::fused_penalty_argmax(&row, &[], 1.0);
+    }
+    row.to_dtype(DType::F32)?
         .argmax(D::Minus1)?
         .to_dtype(DType::U32)?
         .to_scalar::<u32>()

@@ -513,6 +513,134 @@ pub fn fused_dual_rmsnorm_add(
     Ok(out)
 }
 
+use crate::tensor::cuda_ext::{CudaSlice, CudaStream};
+use crate::tensor::gpu_runtime::driver::{DeviceRepr, ValidAsZeroBits};
+
+/// The device buffers a thread reuses for every token it samples on a card.
+/// Each one grows to the largest request seen and is never released while the thread lives,
+/// so a sampled token allocates nothing on the card.
+struct SamplerScratch {
+    block_vals: CudaSlice<f32>,
+    block_idxs: CudaSlice<i32>,
+    penalty: CudaSlice<i32>,
+    token: CudaSlice<u32>,
+    cand_vals: CudaSlice<f32>,
+    cand_idxs: CudaSlice<i32>,
+    block_max: CudaSlice<f32>,
+    block_sum: CudaSlice<f32>,
+    /// The `[1, 1]` token tensor the u32 path hands out as the next forward's input.
+    /// Each call writes the new token into it, so a holder reads the latest token.
+    token_out: Option<Tensor>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CARD_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PENALTY_UPLOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The card buffers and the penalty uploads the sampler made on this thread, in that order.
+#[cfg(test)]
+pub(crate) fn sampler_card_traffic() -> (usize, usize) {
+    (
+        CARD_ALLOCS.with(|c| c.get()),
+        PENALTY_UPLOADS.with(|c| c.get()),
+    )
+}
+
+/// Allocates a zeroed card buffer of `n` elements of `T`.
+/// Every card buffer of the sampler comes from here.
+fn alloc<T: DeviceRepr + ValidAsZeroBits>(
+    n: usize,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<CudaSlice<T>> {
+    #[cfg(test)]
+    CARD_ALLOCS.with(|c| c.set(c.get() + 1));
+    stream
+        .alloc_zeros::<T>(n)
+        .map_err(|e| crate::tensor::Error::msg(format!("alloc sampler scratch: {e}")))
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<std::collections::HashMap<usize, SamplerScratch>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Grows `slot` to hold `n` elements of `T`.
+fn fit<T: DeviceRepr + ValidAsZeroBits>(
+    slot: &mut CudaSlice<T>,
+    n: usize,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<()> {
+    if slot.len() < n {
+        *slot = alloc::<T>(n, stream)?;
+    }
+    Ok(())
+}
+
+impl SamplerScratch {
+    fn new(stream: &std::sync::Arc<CudaStream>) -> Result<Self> {
+        Ok(Self {
+            block_vals: alloc(1, stream)?,
+            block_idxs: alloc(1, stream)?,
+            penalty: alloc(1, stream)?,
+            token: alloc(1, stream)?,
+            cand_vals: alloc(1, stream)?,
+            cand_idxs: alloc(1, stream)?,
+            block_max: alloc(1, stream)?,
+            block_sum: alloc(1, stream)?,
+            token_out: None,
+        })
+    }
+
+    /// The token tensor of this card, created on first use and shared with every caller.
+    fn token_out(
+        &mut self,
+        device: &crate::tensor::Device,
+        stream: &std::sync::Arc<CudaStream>,
+    ) -> Result<Tensor> {
+        if let Some(t) = &self.token_out {
+            return Ok(t.clone());
+        }
+        let slice = alloc::<u32>(1, stream)?;
+        let t = crate::tensor::cuda_ext::tensor_from_u32_slice(slice, (1, 1), device)?;
+        self.token_out = Some(t.clone());
+        Ok(t)
+    }
+
+    /// Copies the penalised token ids to the card; an empty list copies nothing.
+    fn upload_penalty(&mut self, ids: &[u32], stream: &std::sync::Arc<CudaStream>) -> Result<i32> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        fit(&mut self.penalty, ids.len(), stream)?;
+        #[cfg(test)]
+        PENALTY_UPLOADS.with(|c| c.set(c.get() + 1));
+        let host: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+        let mut view = self.penalty.slice_mut(..host.len());
+        stream
+            .memcpy_htod(&host, &mut view)
+            .map_err(|e| crate::tensor::Error::msg(format!("htod: {e}")))?;
+        Ok(host.len() as i32)
+    }
+}
+
+/// Runs `f` with this thread's scratch for the card of `dev`, creating it on first use.
+fn with_scratch<R>(
+    dev: &crate::tensor::kernel_ffi::CudaDevice,
+    f: impl FnOnce(&mut SamplerScratch, &std::sync::Arc<CudaStream>) -> Result<R>,
+) -> Result<R> {
+    let stream = dev.cuda_stream();
+    SCRATCH.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let entry = match map.entry(dev.ordinal()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => v.insert(SamplerScratch::new(&stream)?),
+        };
+        f(entry, &stream)
+    })
+}
+
 /// Fused repeat penalty + argmax - replaces 6+ kernel launches with 1.
 /// Applies penalty to specified token indices, then finds argmax.
 /// Returns the sampled token ID (with host-blocking sync).
@@ -521,92 +649,51 @@ pub fn fused_penalty_argmax(
     penalty_token_ids: &[u32],
     repeat_penalty: f32,
 ) -> Result<u32> {
-    let (u, _slice) = fused_penalty_argmax_with_device(logits, penalty_token_ids, repeat_penalty)?;
-    Ok(u)
-}
-
-/// Same kernel as `fused_penalty_argmax` but also returns the device-side
-/// CudaSlice<i32> holding the sampled token. The host u32 is synced for
-/// stop-check/EOS logic; the device buffer can be used to launch the next
-/// forward's embedding lookup WITHOUT waiting for the sync - /// Path B's pipelining hook.
-///
-/// The slice lifetime ends when the caller drops the returned tuple, so
-/// callers must extract whatever they need (wrap as Tensor, store as
-/// session field) before dropping.
-pub fn fused_penalty_argmax_with_device(
-    logits: &Tensor,
-    penalty_token_ids: &[u32],
-    repeat_penalty: f32,
-) -> Result<(u32, crate::tensor::cuda_ext::CudaSlice<i32>)> {
     if !logits.device().is_cuda() {
         crate::tensor::bail!("fused_penalty_argmax requires CUDA");
     }
-
     let logits = logits.contiguous()?;
     let vocab_size = logits.elem_count();
-
     let cuda_dev = logits.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;
-
-    // Two-kernel chain: block_argmax over many blocks (one per SM) +
-    // final_reduce over the block candidates.
-    // Replaces the single-block scan that nsys showed at 417 µs/call
-    // (5.6% of gemma4 decode time at vocab=262144).
     let block_func =
         cuda_dev.get_or_load_custom_func("fused_penalty_argmax_block_f32", "loken_fused", ptx)?;
-    let final_func =
-        cuda_dev.get_or_load_custom_func("fused_penalty_argmax_final_f32", "loken_fused", ptx)?;
-
-    let penalty_ids: Vec<i32> = penalty_token_ids.iter().map(|&t| t as i32).collect();
-    let n_penalty = penalty_ids.len() as i32;
-    let penalty_gpu = cuda_dev
-        .cuda_stream()
-        .clone_htod(&penalty_ids)
-        .map_err(|e| crate::tensor::Error::msg(format!("htod: {e}")))?;
-
-    // Pick block count to give each block ~1024 elements (one thread per
-    // element after stride). Cap at 256 so the final-reduce stays trivial.
+    let final_func = cuda_dev.get_or_load_custom_func(
+        "fused_penalty_argmax_final_f32_u32_out",
+        "loken_fused",
+        ptx,
+    )?;
     let block_threads: u32 = 1024;
     let n_blocks: u32 = ((vocab_size as u32).div_ceil(block_threads))
         .min(256)
         .max(1);
-
-    let block_vals = cuda_dev
-        .cuda_stream()
-        .alloc_zeros::<f32>(n_blocks as usize)
-        .map_err(|e| crate::tensor::Error::msg(format!("alloc block_vals: {e}")))?;
-    let block_idxs = cuda_dev
-        .cuda_stream()
-        .alloc_zeros::<i32>(n_blocks as usize)
-        .map_err(|e| crate::tensor::Error::msg(format!("alloc block_idxs: {e}")))?;
-    let out_token = cuda_dev
-        .cuda_stream()
-        .alloc_zeros::<i32>(1)
-        .map_err(|e| crate::tensor::Error::msg(format!("alloc out: {e}")))?;
-
-    let (logits_store, logits_layout) = logits.storage_and_layout();
-    if let crate::tensor::StorageView::Cuda(ls) = &*logits_store {
-        let logits_slice = ls.as_cuda_slice::<f32>()?;
-        let logits_view = logits_slice.slice(logits_layout.start_offset()..);
-
+    with_scratch(&cuda_dev, |s, stream| {
+        fit(&mut s.block_vals, n_blocks as usize, stream)?;
+        fit(&mut s.block_idxs, n_blocks as usize, stream)?;
+        let n_penalty = s.upload_penalty(penalty_token_ids, stream)?;
+        let (logits_store, logits_layout) = logits.storage_and_layout();
+        let crate::tensor::StorageView::Cuda(ls) = &*logits_store else {
+            crate::tensor::bail!("fused_penalty_argmax: logits not on CUDA");
+        };
+        let logits_view = ls
+            .as_cuda_slice::<f32>()?
+            .slice(logits_layout.start_offset()..);
         let block_cfg = crate::tensor::cuda_ext::LaunchConfig {
             grid_dim: (n_blocks, 1, 1),
             block_dim: (block_threads, 1, 1),
             shared_mem_bytes: block_threads * 8,
         };
         let vocab_i32 = vocab_size as i32;
-        let mut builder = block_func.builder();
-        builder.arg(&logits_view);
-        builder.arg(&penalty_gpu);
-        builder.arg(&n_penalty);
-        builder.arg(&repeat_penalty);
-        builder.arg(&vocab_i32);
-        builder.arg(&block_vals);
-        builder.arg(&block_idxs);
-        unsafe { builder.launch(block_cfg) }
+        let mut b = block_func.builder();
+        b.arg(&logits_view);
+        b.arg(&s.penalty);
+        b.arg(&n_penalty);
+        b.arg(&repeat_penalty);
+        b.arg(&vocab_i32);
+        b.arg(&s.block_vals);
+        b.arg(&s.block_idxs);
+        unsafe { b.launch(block_cfg) }
             .map_err(|e| crate::tensor::Error::msg(format!("fused_penalty_argmax_block: {e}")))?;
-
-        // Final reduce: 256-thread block matches n_blocks cap.
         let final_threads: u32 = n_blocks.next_power_of_two().max(32);
         let final_cfg = crate::tensor::cuda_ext::LaunchConfig {
             grid_dim: (1, 1, 1),
@@ -615,22 +702,19 @@ pub fn fused_penalty_argmax_with_device(
         };
         let n_blocks_i32 = n_blocks as i32;
         let mut b2 = final_func.builder();
-        b2.arg(&block_vals);
-        b2.arg(&block_idxs);
+        b2.arg(&s.block_vals);
+        b2.arg(&s.block_idxs);
         b2.arg(&n_blocks_i32);
-        b2.arg(&out_token);
+        b2.arg(&s.token);
         unsafe { b2.launch(final_cfg) }
             .map_err(|e| crate::tensor::Error::msg(format!("fused_penalty_argmax_final: {e}")))?;
-    }
-    drop(logits_store);
-
-    let mut result = vec![0i32];
-    cuda_dev
-        .cuda_stream()
-        .memcpy_dtoh(&out_token, &mut result)
-        .map_err(|e| crate::tensor::Error::msg(format!("dtoh: {e}")))?;
-
-    Ok((result[0] as u32, out_token))
+        drop(logits_store);
+        let mut result = [0u32];
+        stream
+            .memcpy_dtoh(&s.token, &mut result)
+            .map_err(|e| crate::tensor::Error::msg(format!("dtoh: {e}")))?;
+        Ok(result[0])
+    })
 }
 
 /// Largest `k` the card-side sampler serves; a wider top-k samples on the host. It bounds the
@@ -668,108 +752,86 @@ pub fn sample_topk(
         cuda_dev.get_or_load_custom_func("sample_topk_block_f32", "loken_fused", ptx)?;
     let final_func =
         cuda_dev.get_or_load_custom_func("sample_topk_final_f32", "loken_fused", ptx)?;
-    let stream = cuda_dev.cuda_stream();
     let err =
         |what: &str, e: &dyn std::fmt::Display| crate::tensor::Error::msg(format!("{what}: {e}"));
-
-    let penalty_ids: Vec<i32> = penalty_token_ids.iter().map(|&t| t as i32).collect();
-    let n_penalty = penalty_ids.len() as i32;
-    let penalty_gpu = if penalty_ids.is_empty() {
-        stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| err("alloc penalty", &e))?
-    } else {
-        stream
-            .clone_htod(&penalty_ids)
-            .map_err(|e| err("htod penalty", &e))?
-    };
 
     // One element per thread in stage 1, so every block holds a full warp set of candidates.
     const THREADS: u32 = 1024;
     let n_blocks = (vocab_size as u32).div_ceil(THREADS).max(1);
     let n_cand = n_blocks as usize * k;
-    let cand_vals = stream
-        .alloc_zeros::<f32>(n_cand)
-        .map_err(|e| err("alloc cand", &e))?;
-    let cand_idxs = stream
-        .alloc_zeros::<i32>(n_cand)
-        .map_err(|e| err("alloc cand", &e))?;
-    let block_max = stream
-        .alloc_zeros::<f32>(n_blocks as usize)
-        .map_err(|e| err("alloc max", &e))?;
-    let block_sum = stream
-        .alloc_zeros::<f32>(n_blocks as usize)
-        .map_err(|e| err("alloc sum", &e))?;
-    let out_token = stream
-        .alloc_zeros::<u32>(1)
-        .map_err(|e| err("alloc out", &e))?;
 
-    let (logits_store, logits_layout) = logits.storage_and_layout();
-    let crate::tensor::StorageView::Cuda(ls) = &*logits_store else {
-        crate::tensor::bail!("sample_topk: logits not on CUDA");
-    };
-    let logits_view = ls
-        .as_cuda_slice::<f32>()?
-        .slice(logits_layout.start_offset()..);
-    let (vocab_i32, inv_temp, k_i32) = (vocab_size as i32, 1.0f32 / temperature, k as i32);
-    let mut b1 = block_func.builder();
-    b1.arg(&logits_view);
-    b1.arg(&penalty_gpu);
-    b1.arg(&n_penalty);
-    b1.arg(&repeat_penalty);
-    b1.arg(&vocab_i32);
-    b1.arg(&inv_temp);
-    b1.arg(&k_i32);
-    b1.arg(&cand_vals);
-    b1.arg(&cand_idxs);
-    b1.arg(&block_max);
-    b1.arg(&block_sum);
-    let cfg1 = crate::tensor::cuda_ext::LaunchConfig {
-        grid_dim: (n_blocks, 1, 1),
-        block_dim: (THREADS, 1, 1),
-        shared_mem_bytes: THREADS * 8,
-    };
-    unsafe { b1.launch(cfg1) }.map_err(|e| err("sample_topk_block", &e))?;
+    with_scratch(&cuda_dev, |s, stream| {
+        fit(&mut s.cand_vals, n_cand, stream)?;
+        fit(&mut s.cand_idxs, n_cand, stream)?;
+        fit(&mut s.block_max, n_blocks as usize, stream)?;
+        fit(&mut s.block_sum, n_blocks as usize, stream)?;
+        let n_penalty = s.upload_penalty(penalty_token_ids, stream)?;
 
-    let (n_cand_i32, n_blocks_i32) = (n_cand as i32, n_blocks as i32);
-    let mut b2 = final_func.builder();
-    b2.arg(&cand_vals);
-    b2.arg(&cand_idxs);
-    b2.arg(&n_cand_i32);
-    b2.arg(&block_max);
-    b2.arg(&block_sum);
-    b2.arg(&n_blocks_i32);
-    b2.arg(&k_i32);
-    b2.arg(&top_p);
-    b2.arg(&u);
-    b2.arg(&out_token);
-    let cfg2 = crate::tensor::cuda_ext::LaunchConfig {
-        grid_dim: (1, 1, 1),
-        block_dim: (THREADS, 1, 1),
-        shared_mem_bytes: THREADS * 8 + (k as u32) * 8,
-    };
-    unsafe { b2.launch(cfg2) }.map_err(|e| err("sample_topk_final", &e))?;
-    drop(logits_store);
+        let (logits_store, logits_layout) = logits.storage_and_layout();
+        let crate::tensor::StorageView::Cuda(ls) = &*logits_store else {
+            crate::tensor::bail!("sample_topk: logits not on CUDA");
+        };
+        let logits_view = ls
+            .as_cuda_slice::<f32>()?
+            .slice(logits_layout.start_offset()..);
+        let (vocab_i32, inv_temp, k_i32) = (vocab_size as i32, 1.0f32 / temperature, k as i32);
+        let mut b1 = block_func.builder();
+        b1.arg(&logits_view);
+        b1.arg(&s.penalty);
+        b1.arg(&n_penalty);
+        b1.arg(&repeat_penalty);
+        b1.arg(&vocab_i32);
+        b1.arg(&inv_temp);
+        b1.arg(&k_i32);
+        b1.arg(&s.cand_vals);
+        b1.arg(&s.cand_idxs);
+        b1.arg(&s.block_max);
+        b1.arg(&s.block_sum);
+        let cfg1 = crate::tensor::cuda_ext::LaunchConfig {
+            grid_dim: (n_blocks, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: THREADS * 8,
+        };
+        unsafe { b1.launch(cfg1) }.map_err(|e| err("sample_topk_block", &e))?;
 
-    let mut out = vec![0u32];
-    stream
-        .memcpy_dtoh(&out_token, &mut out)
-        .map_err(|e| err("dtoh", &e))?;
-    Ok(out[0])
+        let (n_cand_i32, n_blocks_i32) = (n_cand as i32, n_blocks as i32);
+        let mut b2 = final_func.builder();
+        b2.arg(&s.cand_vals);
+        b2.arg(&s.cand_idxs);
+        b2.arg(&n_cand_i32);
+        b2.arg(&s.block_max);
+        b2.arg(&s.block_sum);
+        b2.arg(&n_blocks_i32);
+        b2.arg(&k_i32);
+        b2.arg(&top_p);
+        b2.arg(&u);
+        b2.arg(&s.token);
+        let cfg2 = crate::tensor::cuda_ext::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: THREADS * 8 + (k as u32) * 8,
+        };
+        unsafe { b2.launch(cfg2) }.map_err(|e| err("sample_topk_final", &e))?;
+        drop(logits_store);
+
+        let mut out = [0u32];
+        stream
+            .memcpy_dtoh(&s.token, &mut out)
+            .map_err(|e| err("dtoh", &e))?;
+        Ok(out[0])
+    })
 }
 
-/// Path B step 2: u32-output sister of
-/// `fused_penalty_argmax_with_device`. The kernel writes the argmax index
-/// directly into an owned `CudaSlice<u32>` - same memory layout as the
-/// i32 variant (bit-identical for non-negative vocab indices), but the
-/// Rust type matches the reference `DType::U32` so we can wrap as a Tensor via
-/// `CudaStorage::wrap_cuda_slice` without an i32->u32 copy kernel and use
-/// it as the next forward's embedding-lookup input - no host sync.
+/// The kernels of `fused_penalty_argmax`, with the token also left on the card.
+/// Returns the token and a `[1, 1]` U32 tensor holding it, ready as the next forward's input.
+///
+/// The tensor is the calling thread's one token buffer for this card.
+/// The next call on the same thread and card overwrites it in stream order.
 pub fn fused_penalty_argmax_u32_with_device(
     logits: &Tensor,
     penalty_token_ids: &[u32],
     repeat_penalty: f32,
-) -> Result<(u32, crate::tensor::cuda_ext::CudaSlice<u32>)> {
+) -> Result<(u32, Tensor)> {
     if !logits.device().is_cuda() {
         crate::tensor::bail!("fused_penalty_argmax_u32 requires CUDA");
     }
@@ -780,8 +842,7 @@ pub fn fused_penalty_argmax_u32_with_device(
     let cuda_dev = logits.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;
 
-    // Multi-block argmax (mirror of the i32 path). Saves ~5% of decode for
-    // gemma4 by using 256 blocks instead of 1.
+    // Multi-block argmax, as in `fused_penalty_argmax`.
     let block_func =
         cuda_dev.get_or_load_custom_func("fused_penalty_argmax_block_f32", "loken_fused", ptx)?;
     let final_func = cuda_dev.get_or_load_custom_func(
@@ -790,35 +851,22 @@ pub fn fused_penalty_argmax_u32_with_device(
         ptx,
     )?;
 
-    let penalty_ids: Vec<i32> = penalty_token_ids.iter().map(|&t| t as i32).collect();
-    let n_penalty = penalty_ids.len() as i32;
-    let penalty_gpu = cuda_dev
-        .cuda_stream()
-        .clone_htod(&penalty_ids)
-        .map_err(|e| crate::tensor::Error::msg(format!("htod: {e}")))?;
-
     let block_threads: u32 = 1024;
     let n_blocks: u32 = ((vocab_size as u32).div_ceil(block_threads))
         .min(256)
         .max(1);
-    let block_vals = cuda_dev
-        .cuda_stream()
-        .alloc_zeros::<f32>(n_blocks as usize)
-        .map_err(|e| crate::tensor::Error::msg(format!("alloc block_vals: {e}")))?;
-    let block_idxs = cuda_dev
-        .cuda_stream()
-        .alloc_zeros::<i32>(n_blocks as usize)
-        .map_err(|e| crate::tensor::Error::msg(format!("alloc block_idxs: {e}")))?;
-    let out_token = cuda_dev
-        .cuda_stream()
-        .alloc_zeros::<u32>(1)
-        .map_err(|e| crate::tensor::Error::msg(format!("alloc out: {e}")))?;
-
-    let (logits_store, logits_layout) = logits.storage_and_layout();
-    if let crate::tensor::StorageView::Cuda(ls) = &*logits_store {
-        let logits_slice = ls.as_cuda_slice::<f32>()?;
-        let logits_view = logits_slice.slice(logits_layout.start_offset()..);
-
+    with_scratch(&cuda_dev, |s, stream| {
+        let out = s.token_out(&logits.device(), stream)?;
+        fit(&mut s.block_vals, n_blocks as usize, stream)?;
+        fit(&mut s.block_idxs, n_blocks as usize, stream)?;
+        let n_penalty = s.upload_penalty(penalty_token_ids, stream)?;
+        let (logits_store, logits_layout) = logits.storage_and_layout();
+        let crate::tensor::StorageView::Cuda(ls) = &*logits_store else {
+            crate::tensor::bail!("fused_penalty_argmax_u32: logits not on CUDA");
+        };
+        let logits_view = ls
+            .as_cuda_slice::<f32>()?
+            .slice(logits_layout.start_offset()..);
         let block_cfg = crate::tensor::cuda_ext::LaunchConfig {
             grid_dim: (n_blocks, 1, 1),
             block_dim: (block_threads, 1, 1),
@@ -827,16 +875,15 @@ pub fn fused_penalty_argmax_u32_with_device(
         let vocab_i32 = vocab_size as i32;
         let mut b = block_func.builder();
         b.arg(&logits_view);
-        b.arg(&penalty_gpu);
+        b.arg(&s.penalty);
         b.arg(&n_penalty);
         b.arg(&repeat_penalty);
         b.arg(&vocab_i32);
-        b.arg(&block_vals);
-        b.arg(&block_idxs);
+        b.arg(&s.block_vals);
+        b.arg(&s.block_idxs);
         unsafe { b.launch(block_cfg) }.map_err(|e| {
             crate::tensor::Error::msg(format!("fused_penalty_argmax_block (u32): {e}"))
         })?;
-
         let final_threads: u32 = n_blocks.next_power_of_two().max(32);
         let final_cfg = crate::tensor::cuda_ext::LaunchConfig {
             grid_dim: (1, 1, 1),
@@ -845,23 +892,26 @@ pub fn fused_penalty_argmax_u32_with_device(
         };
         let n_blocks_i32 = n_blocks as i32;
         let mut b2 = final_func.builder();
-        b2.arg(&block_vals);
-        b2.arg(&block_idxs);
+        b2.arg(&s.block_vals);
+        b2.arg(&s.block_idxs);
         b2.arg(&n_blocks_i32);
-        b2.arg(&out_token);
+        let (out_store, _) = out.storage_and_layout();
+        let crate::tensor::StorageView::Cuda(os) = &*out_store else {
+            crate::tensor::bail!("fused_penalty_argmax_u32: token not on CUDA");
+        };
+        let out_slice = os.as_cuda_slice::<u32>()?;
+        b2.arg(out_slice);
         unsafe { b2.launch(final_cfg) }.map_err(|e| {
             crate::tensor::Error::msg(format!("fused_penalty_argmax_final (u32): {e}"))
         })?;
-    }
-    drop(logits_store);
-
-    let mut result = vec![0u32];
-    cuda_dev
-        .cuda_stream()
-        .memcpy_dtoh(&out_token, &mut result)
-        .map_err(|e| crate::tensor::Error::msg(format!("dtoh: {e}")))?;
-
-    Ok((result[0], out_token))
+        drop(logits_store);
+        let mut result = [0u32];
+        stream
+            .memcpy_dtoh(out_slice, &mut result)
+            .map_err(|e| crate::tensor::Error::msg(format!("dtoh: {e}")))?;
+        drop(out_store);
+        Ok((result[0], out))
+    })
 }
 
 /// F32 single-query attention for HD=512 graph-mode bypass.

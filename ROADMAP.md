@@ -82,7 +82,7 @@ Fixes, by state then by priority:
 | Measured settings recorded | Bench | The image size, seed, duration, voice and keep-alive of a cell appear in the record, and so does the request timeout. | Done |
 | A memory fallback that does not stay | Performance | A matrix product that runs out of card memory falls back for that call only, and the fallback copy is not kept. | Done |
 | Stream errors reach the client as errors | API | An engine failure during a stream on the OpenAI chat and Responses routes ends the stream with an error and no finish chunk, as the Ollama and Messages routes do. | Done |
-| Sampling without per-token allocation | Performance | A sampled token allocates no buffer on the card, and uploads no penalty list when the penalty is off. | Partial |
+| Sampling without per-token allocation | Performance | A sampled token allocates no buffer on the card, and uploads no penalty list when the penalty is off. | Done |
 | Honest back-pressure | API | A refused request carries a Retry-After computed from the queue and the measured rate, and a request waiting on a model load reports the load as it goes. | Done |
 
 ## 0.6.0

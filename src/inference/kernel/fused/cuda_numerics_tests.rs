@@ -464,16 +464,13 @@ fn fused_penalty_argmax_u32_drives_embedding_forward() {
     let emb_weight = Tensor::from_slice(&emb_table_data, (VOCAB, HIDDEN), &dev).unwrap();
     let embedding = crate::tensor::layer::Embedding::new(emb_weight);
 
-    let (host_tok, dev_slice) = fused_penalty_argmax_u32_with_device(&logits, &[], 1.0).unwrap();
+    let (host_tok, dev_tensor) = fused_penalty_argmax_u32_with_device(&logits, &[], 1.0).unwrap();
 
     // Reference path: host token -> Tensor::new on device -> forward.
     let host_idx = Tensor::new(&[host_tok], &dev).unwrap();
     let host_row = embedding.forward(&host_idx).unwrap();
 
-    // Device path: wrap kernel's CudaSlice<u32> directly as a Tensor.
-    let cuda_dev = dev.as_cuda_device().unwrap().clone();
-    let dev_storage = crate::tensor::cuda_ext::CudaStorage::wrap_cuda_slice(dev_slice, cuda_dev);
-    let dev_tensor = crate::tensor::cuda_ext::tensor_from_cuda_storage(dev_storage, (1,)).unwrap();
+    // Device path: the returned token tensor is the lookup's input.
     assert_eq!(dev_tensor.dtype(), DType::U32);
     let dev_row = embedding.forward(&dev_tensor).unwrap();
 
@@ -488,13 +485,10 @@ fn fused_penalty_argmax_u32_drives_embedding_forward() {
     }
 }
 
-/// `fused_penalty_argmax_u32_with_device` must return the same token
-/// as the i32-output variant. The penalty
-/// application and reduction are bit-identical; only the output type
-/// differs. A divergence here would mean the kernel macro hash was
-/// off (cached PTX served the wrong fn).
+/// `fused_penalty_argmax_u32_with_device` returns the token of `fused_penalty_argmax`.
+/// Both run the same kernels and differ only in where the token is left.
 #[test]
-fn fused_penalty_argmax_u32_matches_i32_variant() {
+fn fused_penalty_argmax_u32_matches_the_host_returning_path() {
     let dev = match try_open_cuda() {
         Some(d) => d,
         None => {
@@ -510,12 +504,79 @@ fn fused_penalty_argmax_u32_matches_i32_variant() {
     let logits = Tensor::from_slice(&logits_data, (1, 1, VOCAB), &dev).unwrap();
     let penalties: Vec<u32> = vec![100, 101, 102, 7777, 12345];
 
-    let (tok_i32, _) = fused_penalty_argmax_with_device(&logits, &penalties, 1.1).unwrap();
+    let tok_host = fused_penalty_argmax(&logits, &penalties, 1.1).unwrap();
     let (tok_u32, _) = fused_penalty_argmax_u32_with_device(&logits, &penalties, 1.1).unwrap();
-    assert_eq!(
-        tok_i32, tok_u32,
-        "u32 variant returned different token than i32 variant"
-    );
+    assert_eq!(tok_host, tok_u32, "the u32 path returned another token");
+}
+
+/// The greedy token of a host scan: the repeat penalty on `pen`, then the first largest logit.
+fn host_greedy(v: &[f32], pen: &[u32], penalty: f32) -> u32 {
+    let mut v = v.to_vec();
+    for &t in pen {
+        let l = &mut v[t as usize];
+        *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
+    }
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// After its first token, every card sampling path draws a token with no card buffer allocated.
+/// A penalty list is uploaded once per token when the penalty is on, and never when it is off.
+/// The greedy tokens equal those of a host scan, ties included.
+/// The token tensor the u32 path hands out holds the latest token.
+#[test]
+fn a_sampled_token_allocates_nothing_on_the_card() {
+    let dev = match try_open_cuda() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    // A vocabulary of several stage-1 blocks, with a tie between the two leaders.
+    const VOCAB: usize = 32_000;
+    let mut v: Vec<f32> = (0..VOCAB)
+        .map(|i| ((i as f32) * 0.00073).sin() * 5.0 + ((i % 137) as f32) * 0.01)
+        .collect();
+    v[20_000] = 9.0;
+    v[9_000] = 9.0;
+    let rows = Tensor::from_slice(&[v.clone(), v.clone()].concat(), (2, VOCAB), &dev).unwrap();
+    let logits = rows.narrow(0, 1, 1).unwrap().flatten_all().unwrap();
+    let pen = [9_000u32, 77, 901];
+    let draw = |pen: &[u32], penalty: f32, u: f32| {
+        let greedy = fused_penalty_argmax(&logits, pen, penalty).unwrap();
+        let (on_card, t) = fused_penalty_argmax_u32_with_device(&logits, pen, penalty).unwrap();
+        let topk = sample_topk(&logits, pen, penalty, 0.8, 40, 0.9, u).unwrap();
+        (greedy, on_card, t, topk)
+    };
+    // The first token of a thread sizes its buffers.
+    draw(&pen, 1.1, 0.5);
+    let before = sampler_card_traffic();
+    let mut held = Vec::new();
+    for i in 0..8 {
+        let (greedy, on_card, t, _) = draw(&[], 1.0, i as f32 / 8.0);
+        assert_eq!(greedy, host_greedy(&v, &[], 1.0));
+        assert_eq!(greedy, 9_000, "the lowest index wins a tie");
+        assert_eq!(on_card, greedy);
+        held.push(t);
+    }
+    assert_eq!(sampler_card_traffic(), before, "the penalty off moved data");
+    for i in 0..8 {
+        let (greedy, on_card, _, _) = draw(&pen, 1.1, i as f32 / 8.0);
+        assert_eq!(greedy, host_greedy(&v, &pen, 1.1));
+        assert_eq!(greedy, 20_000);
+        assert_eq!(on_card, greedy);
+    }
+    let after = sampler_card_traffic();
+    assert_eq!(after.0, before.0, "a sampled token allocated a card buffer");
+    assert_eq!(after.1, before.1 + 3 * 8, "one upload per token and path");
+    let read = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<u32>().unwrap()[0];
+    assert!(held.iter().all(|t| read(t) == 20_000));
 }
 
 #[test]

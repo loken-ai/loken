@@ -61,6 +61,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Speech: speak faster with pocket-tts by keeping its cache across frames.
 - DeepSeek V4.1: serve it through the generic route, on the host and the cards.
 - API: count the experts of the generic tiers on the stage endpoint.
+- Sampling: allocate nothing on the card for a sampled token.
 
 ### Fixed
 

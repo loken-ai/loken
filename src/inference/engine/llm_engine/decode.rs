@@ -162,13 +162,11 @@ pub(super) fn gpu_sample_returning_tensor(
     }
 
     let unique = penalty_ids(recent_tokens, repeat_penalty, repeat_last_n);
-    let (tok, dev_slice) = crate::inference::kernel::fused::fused_penalty_argmax_u32_with_device(
+    let (tok, dev_tensor) = crate::inference::kernel::fused::fused_penalty_argmax_u32_with_device(
         logits,
         &unique,
         repeat_penalty,
     )?;
-    let dev_tensor =
-        crate::tensor::cuda_ext::tensor_from_u32_slice(dev_slice, (1, 1), &logits.device())?;
     Ok((tok, Some(dev_tensor)))
 }
 
