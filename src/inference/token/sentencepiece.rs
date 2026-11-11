@@ -139,8 +139,21 @@ impl SentencePiece {
         })
     }
 
+    /// The id of the piece `piece`, when the vocabulary holds it.
+    pub fn piece_id(&self, piece: &str) -> Option<u32> {
+        self.map.get(piece).map(|&(id, _)| id)
+    }
+
     /// Encode text -> token ids (unigram Viterbi + byte-fallback).
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_spans(text)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The token ids of `text`, each with the count of `text`'s chars its piece ends after.
+    pub fn encode_spans(&self, text: &str) -> Vec<(u32, usize)> {
         // Preprocess: add a leading meta-space and map spaces to `▁`.
         let pre: String = format!(" {text}").replace(' ', &SPACE.to_string());
         let chars: Vec<char> = pre.chars().collect();
@@ -178,12 +191,14 @@ impl SentencePiece {
             }
         }
         // Backtrack.
-        let mut out_rev: Vec<u32> = Vec::new();
+        // A piece ending at char `pos` of the prefixed text ends after `pos - 1` chars of `text`.
+        let mut out_rev: Vec<(u32, usize)> = Vec::new();
         let mut pos = n;
         while pos > 0 {
             let (_, prev, pid) = best[pos];
+            let end = pos - 1;
             match pid {
-                Some(id) => out_rev.push(id),
+                Some(id) => out_rev.push((id, end)),
                 None => {
                     // byte-fallback: emit the char's UTF-8 bytes as <0xHH> ids (reversed).
                     let c = chars[prev];
@@ -191,7 +206,7 @@ impl SentencePiece {
                     let bytes = c.encode_utf8(&mut buf).as_bytes();
                     if let Some(base) = self.byte_base {
                         for &byte in bytes.iter().rev() {
-                            out_rev.push(base + byte as u32);
+                            out_rev.push((base + byte as u32, end));
                         }
                     }
                 }

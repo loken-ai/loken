@@ -523,6 +523,15 @@ Each later frame runs 1 step fed the previous frame's row, on the cache.
 The frames stop where the cache is full, its size bounded by the cards' memory.
 The text table, the frame projection, the end-of-speech head and the flow head stay in `src/inference/model/pocket_tts/mod.rs`.
 
+A long text is spoken in the chunks the reference generates apart, the same for a whole clip and a stream:
+
+- The prepared text is cut after each run of sentence ends, never on a decimal point.
+- A sentence longer than the reference's chunk of tokens is cut again after each run of clause ends.
+- The pieces are grouped in order while a group holds at most a chunk of tokens.
+- Each chunk is 1 generation from the voice, with the request's seed, as the reference keeps no other state between chunks.
+- Each chunk's waveform fades in over its first milliseconds, as the reference's does.
+- Each chunk after the first is prompted by the voice clip followed by the end of the previous chunk's audio, so the voice holds from one chunk to the next. The reference prompts every chunk with the clip alone.
+
 `generic_transformer::mimi_class_tests` holds the layers to a plain host run in F64 on a toy, as a prefill and as single steps after it, within the rounding of F32, on the host and on a card.
 The tests of the flow model feed the published checkpoint, when the test store holds it, a prompt longer than a prefill chunk and then a row per frame, on the host and on a card: each frame's row is finite and the same on a second run.
 

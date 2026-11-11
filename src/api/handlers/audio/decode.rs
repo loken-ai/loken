@@ -2508,15 +2508,15 @@ pub(super) fn seed_of_text(text: &str) -> u64 {
     crate::inference::cache::kv_disk::fnv1a(0, text.as_bytes())
 }
 
-/// The texts `input` is synthesised in, one engine call each: the whole input for an engine
-/// that splits a text itself, its sentences otherwise.
+/// The texts `input` is synthesised in, one engine call each: the chunks of a model whose
+/// family splits a text itself, the sentences otherwise.
 pub(super) async fn speech_chunks(
     engine: &crate::inference::engine::TtsEngine,
     input: &str,
 ) -> Vec<String> {
-    match engine.speaks_whole_text().await {
-        true => vec![input.trim().to_string()],
-        false => split_into_sentences(input),
+    match engine.own_chunks(input).await {
+        Some(chunks) => chunks,
+        None => split_into_sentences(input),
     }
 }
 
@@ -2573,7 +2573,7 @@ pub(super) async fn tts_stream_response(
     use axum::body::Body;
     use axum::response::IntoResponse;
 
-    let sentences = split_into_sentences(&input);
+    let sentences = speech_chunks(&engine, &input).await;
     let format = response_format.to_string();
     // Engine is loaded by the time we get here (caller calls
     // ensure_tts_model_loaded first), so we can size the WAV header to

@@ -845,6 +845,126 @@ fn frame_budget(tokens: usize, frame_rate: f32) -> usize {
     (((tokens as f32 / 3.0) + 2.0) * frame_rate).ceil() as usize
 }
 
+/// The most tokens the reference gives one generation.
+const CHUNK_TOKENS: usize = 50;
+
+/// The pieces after which the reference ends a sentence.
+const SENTENCE_ENDS: [&str; 4] = [".", "!", "...", "?"];
+
+/// The pieces after which the reference cuts a sentence longer than a chunk.
+const CLAUSE_ENDS: [&str; 3] = [",", ";", ":"];
+
+/// The seconds of the linear fade-in the reference puts at the start of each generation's
+/// waveform.
+const FADE_IN_SECONDS: f32 = 0.005;
+
+/// The texts the reference speaks `text` in, one generation each, in order.
+///
+/// The prepared text is cut after each run of sentence ends, never on a decimal point.
+/// A sentence longer than a chunk is cut again after each run of clause ends.
+/// The pieces are then grouped in order while a group holds at most a chunk of tokens.
+pub fn speech_chunks(
+    sp: &crate::inference::token::sentencepiece::SentencePiece,
+    text: &str,
+) -> Vec<String> {
+    let (clean, _) = preprocess_text(text);
+    let tokens = sp.encode_spans(&clean);
+    let ids =
+        |pieces: &[&str]| -> Vec<u32> { pieces.iter().filter_map(|p| sp.piece_id(p)).collect() };
+    split_chunks(
+        &clean,
+        &tokens,
+        &ids(&SENTENCE_ENDS),
+        &ids(&CLAUSE_ENDS),
+        CHUNK_TOKENS,
+    )
+}
+
+/// The chunks of `text` whose tokens are `tokens`, each id with the count of chars its piece
+/// ends after.
+///
+/// A cut falls after a run of `sentence_ends`, unless it splits a decimal number.
+/// A sentence of more than `max_tokens` tokens is cut after each run of `clause_ends`.
+/// Consecutive pieces join while the chunk holds at most `max_tokens` tokens.
+/// A piece longer than `max_tokens` stays one chunk.
+fn split_chunks(
+    text: &str,
+    tokens: &[(u32, usize)],
+    sentence_ends: &[u32],
+    clause_ends: &[u32],
+    max_tokens: usize,
+) -> Vec<String> {
+    use std::ops::Range;
+    let chars: Vec<char> = text.chars().collect();
+    // Whether the cut after `end` chars falls between the digits of a decimal number.
+    let decimal_point = |end: usize| {
+        end >= 2
+            && chars[end - 1] == '.'
+            && chars[end - 2].is_numeric()
+            && chars.get(end).is_some_and(|c| c.is_numeric())
+    };
+    // The token ranges of `range` cut after each run of `marks`.
+    let split_after = |range: Range<usize>, marks: &[u32], skip_decimal: bool| {
+        let mut out: Vec<Range<usize>> = Vec::new();
+        let mut start = range.start;
+        for i in range.start + 1..range.end {
+            let cut = marks.contains(&tokens[i - 1].0)
+                && !marks.contains(&tokens[i].0)
+                && !(skip_decimal && decimal_point(tokens[i - 1].1));
+            if cut {
+                out.push(start..i);
+                start = i;
+            }
+        }
+        if start < range.end {
+            out.push(start..range.end);
+        }
+        out
+    };
+    let mut pieces: Vec<Range<usize>> = Vec::new();
+    for sentence in split_after(0..tokens.len(), sentence_ends, true) {
+        if sentence.len() > max_tokens {
+            pieces.extend(split_after(sentence, clause_ends, false));
+        } else {
+            pieces.push(sentence);
+        }
+    }
+    let mut groups: Vec<Range<usize>> = Vec::new();
+    for piece in pieces {
+        match groups.last_mut() {
+            Some(group) if group.len() + piece.len() <= max_tokens => group.end = piece.end,
+            _ => groups.push(piece),
+        }
+    }
+    // A group's text runs from the end of the token before it to the end of its last token.
+    let start = |i: usize| if i == 0 { 0 } else { tokens[i - 1].1 };
+    groups
+        .into_iter()
+        .map(|g| {
+            chars[start(g.start)..tokens[g.end - 1].1]
+                .iter()
+                .collect::<String>()
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The last `samples` samples of `pcm`, all of it when it is shorter.
+fn tail(pcm: &[f32], samples: usize) -> &[f32] {
+    &pcm[pcm.len().saturating_sub(samples)..]
+}
+
+/// Fades the start of `pcm`, sampled at `sample_rate`, in linearly as the reference does.
+fn fade_in(pcm: &mut [f32], sample_rate: u32) {
+    let n = (FADE_IN_SECONDS * sample_rate as f32) as usize;
+    // The ramp runs from 0 on the first sample to 1 on the `n`th.
+    let step = 1.0 / n.saturating_sub(1).max(1) as f32;
+    for (i, s) in pcm.iter_mut().take(n).enumerate() {
+        *s *= i as f32 * step;
+    }
+}
+
 /// Whether the tensor `name` belongs to a transformer the generic route places: the flow
 /// model's, with its output norm, or one of the codec's.
 pub fn placed_by_the_route(name: &str) -> bool {
@@ -925,8 +1045,9 @@ impl PocketTts {
     /// The model in the checkpoint `path` on `device`.
     ///
     /// The flow model's cache is sized for a call on a text of `text_chars` characters with a
-    /// voice clip of `voice_samples` samples: the voice's frames, a token per character and the
-    /// short text's padding, the start frame, and the frames the reference allows the text.
+    /// voice clip of `voice_samples` samples: the voice's frames twice, as a later chunk follows
+    /// the clip and the end of the chunk before it, a token per character and the short text's
+    /// padding, the start frame, and the frames the reference allows the text.
     pub fn from_safetensors(
         path: &str,
         device: Device,
@@ -938,7 +1059,7 @@ impl PocketTts {
         let mimi = MimiDecoder::from_safetensors(path, device.clone())?;
         let frame = mimi.frame_samples()?;
         let tokens = text_chars + SHORT_TEXT_PAD + 1;
-        let rows = voice_samples.div_ceil(frame)
+        let rows = 2 * voice_samples.div_ceil(frame)
             + tokens
             + frame_budget(tokens, SAMPLE_RATE as f32 / frame as f32);
         let xf = FlowTransformer::load(path, &vb, &device, rows)?;
@@ -1125,7 +1246,44 @@ impl PocketTts {
             }
         }
         let lat = Tensor::from_vec_f32(data, (self.latent, n))?.to_device(&self.device)?;
-        self.mimi.decode(&lat)
+        // Each generation starts the decoder afresh.
+        let mut pcm = self.mimi.decode(&lat)?;
+        fade_in(&mut pcm, SAMPLE_RATE);
+        Ok(pcm)
+    }
+
+    /// Speaks `chunks` in order, one generation each, and gives each chunk's waveform to `emit`
+    /// as soon as it is drawn.
+    ///
+    /// The first chunk is spoken in `voice`, the rows of a clip of `clip_samples` samples.
+    /// A later chunk is spoken in `voice` followed by the rows of the last `clip_samples`
+    /// samples of the chunk before it, encoded by `enc`.
+    /// Every chunk draws its noise from `seed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speak_chunks(
+        &self,
+        enc: &MimiEncoder,
+        sp: &crate::inference::token::sentencepiece::SentencePiece,
+        chunks: &[String],
+        voice: &Tensor,
+        clip_samples: usize,
+        seed: u64,
+        mut emit: impl FnMut(Vec<f32>) -> Result<()>,
+    ) -> Result<()> {
+        let mut previous: Vec<f32> = Vec::new();
+        for chunk in chunks {
+            let carried = match previous.is_empty() {
+                true => voice.clone(),
+                false => {
+                    let end = self.voice_from_audio(enc, tail(&previous, clip_samples))?;
+                    Tensor::cat(&[voice, &end], 0)?
+                }
+            };
+            let pcm = self.synthesize_text(sp, chunk, Some(&carried), None, seed)?;
+            emit(pcm.clone())?;
+            previous = pcm;
+        }
+        Ok(())
     }
 }
 
@@ -1157,6 +1315,91 @@ mod tests {
         assert!(!t2.starts_with(' ') && t2.ends_with('.'));
         // Existing punctuation preserved.
         assert!(preprocess_text("Done!").0.ends_with('!'));
+    }
+
+    /// Toy marks: the ids of `.`, `!`, `?`, `,`, `;`, `:`.
+    const TOY_MARKS: &str = ".!?,;:";
+
+    /// A toy tokenisation of `text`: a token per mark, a token per word with the spaces before it.
+    fn toy_tokens(text: &str) -> Vec<(u32, usize)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if let Some(m) = TOY_MARKS.find(chars[i]) {
+                out.push((m as u32 + 1, i + 1));
+                i += 1;
+                continue;
+            }
+            while i < chars.len() && chars[i] == ' ' {
+                i += 1;
+            }
+            let word = i;
+            while i < chars.len() && chars[i] != ' ' && !TOY_MARKS.contains(chars[i]) {
+                i += 1;
+            }
+            if i > word {
+                out.push((100, i));
+            }
+        }
+        out
+    }
+
+    fn toy_chunks(text: &str, max_tokens: usize) -> Vec<String> {
+        split_chunks(text, &toy_tokens(text), &[1, 2, 3], &[4, 5, 6], max_tokens)
+    }
+
+    #[test]
+    fn short_sentences_join_while_a_chunk_holds_them() {
+        assert_eq!(toy_chunks("A b. C d. E f.", 6), ["A b. C d.", "E f."]);
+        assert_eq!(toy_chunks("A b. C d. E f.", 50), ["A b. C d. E f."]);
+    }
+
+    #[test]
+    fn a_decimal_point_ends_no_sentence() {
+        assert_eq!(
+            toy_chunks("It costs 3.5 now. Ok.", 4),
+            ["It costs 3.5 now.", "Ok."]
+        );
+    }
+
+    #[test]
+    fn a_sentence_longer_than_a_chunk_is_cut_after_its_clauses() {
+        assert_eq!(
+            toy_chunks("One two, three four; five six.", 4),
+            ["One two,", "three four;", "five six."]
+        );
+        // A sentence that fits keeps its clauses together.
+        assert_eq!(
+            toy_chunks("One two, three four.", 6),
+            ["One two, three four."]
+        );
+    }
+
+    #[test]
+    fn a_run_of_sentence_ends_cuts_once() {
+        assert_eq!(toy_chunks("Wait?! Yes.", 3), ["Wait?!", "Yes."]);
+        assert!(toy_chunks("", 3).is_empty());
+    }
+
+    #[test]
+    fn a_later_chunk_hears_the_end_of_the_previous_one() {
+        let pcm: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        assert_eq!(tail(&pcm, 3), &pcm[7..]);
+        assert_eq!(tail(&pcm, 10), &pcm[..]);
+        assert_eq!(tail(&pcm, 40), &pcm[..]);
+        assert_eq!(tail(&[], 4), &[] as &[f32]);
+    }
+
+    #[test]
+    fn each_generation_fades_in_as_the_reference() {
+        let mut pcm = vec![1.0f32; 200];
+        fade_in(&mut pcm, SAMPLE_RATE);
+        let n = (FADE_IN_SECONDS * SAMPLE_RATE as f32) as usize;
+        assert_eq!(pcm[0], 0.0);
+        assert!((pcm[n - 1] - 1.0).abs() < 1e-6);
+        assert!(pcm[1] > 0.0 && pcm[1] < pcm[2]);
+        assert!(pcm[n..].iter().all(|&s| s == 1.0));
     }
 
     fn read_wav16_mono(path: &str) -> Vec<f32> {

@@ -64,6 +64,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Speech: speak a long text with pocket-tts in its reference's chunks, the voice held across them.
 - API: open the window a load request's num_ctx asks for.
 - Speech: decode Parler with its checkpoint's sampling, length limit, end rule and 1 seed.
 - Delete: unload a model after releasing the table of loaded models.

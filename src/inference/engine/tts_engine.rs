@@ -32,7 +32,8 @@ use crate::inference::model::kyutai::mimi::KyutaiMimiDecoder;
 use crate::inference::model::parler::{Config, Generation, Model as ParlerModel};
 use crate::inference::model::piper::{PiperVoice, SynthOpts};
 use crate::inference::model::pocket_tts::{
-    load_wav_mono_24k, placed_by_the_route, resolve_paths, MimiEncoder, PocketTts,
+    load_wav_mono_24k, placed_by_the_route, resolve_paths, speech_chunks as pocket_speech_chunks,
+    MimiEncoder, PocketTts,
 };
 use crate::inference::model::qwen3_tts::decoder::CodecDecoder;
 use crate::inference::model::qwen3_tts::{
@@ -170,6 +171,33 @@ struct PocketTtsInner {
     tokenizer: SentencePiece,
     /// `[T_spk, 1024]` voice conditioning (native tensor).
     voice: crate::tensor::Tensor,
+    /// The codec's encoder, which turns the end of a chunk into voice rows.
+    encoder: MimiEncoder,
+    /// Samples of the voice clip.
+    clip_samples: usize,
+}
+
+/// Speaks `text` by pocket-tts in its reference's chunks, each waveform given to `emit` as soon
+/// as it is drawn.
+fn pocket_speak(
+    inner: &PocketTtsInner,
+    text: &str,
+    seed: u64,
+    mut emit: impl FnMut(Vec<f32>) -> AnyResult<()>,
+) -> AnyResult<()> {
+    let chunks = pocket_speech_chunks(&inner.tokenizer, text);
+    inner
+        .model
+        .speak_chunks(
+            &inner.encoder,
+            &inner.tokenizer,
+            &chunks,
+            &inner.voice,
+            inner.clip_samples,
+            seed,
+            |pcm| emit(pcm).map_err(|e| crate::tensor::Error::msg(format!("{e:#}"))),
+        )
+        .map_err(|e| anyhow!("pocket-tts synth: {e}"))
 }
 
 /// Kyutai `tts-1.6b-en_fr` backend: Moshi/Delayed-Streams TTS (Helium LM + Depformer +
@@ -314,20 +342,29 @@ impl TtsEngine {
     }
 
     /// Whether the resident model streams its speech while it draws it.
+    ///
+    /// pocket-tts sends each chunk as soon as it is drawn.
     pub async fn streams_frames(&self) -> bool {
         matches!(
             self.model_state.lock().await.as_ref().map(|s| &s.backend),
-            Some(Backend::Qwen3Tts(_))
+            Some(Backend::Qwen3Tts(_) | Backend::PocketTts(_))
         )
     }
 
-    /// Whether the resident model speaks a whole text in one call, splitting it itself when
-    /// the call cannot hold its speech.
-    pub async fn speaks_whole_text(&self) -> bool {
-        matches!(
-            self.model_state.lock().await.as_ref().map(|s| &s.backend),
-            Some(Backend::Qwen3Tts(_))
-        )
+    /// The texts the resident model speaks `text` in, one call each, when its family splits a
+    /// text itself.
+    ///
+    /// A model that splits a text within the call takes the whole text.
+    /// pocket-tts cuts the text into its reference's chunks within the call, as each chunk hears
+    /// the end of the one before it.
+    /// None when the route cuts the text into sentences.
+    pub async fn own_chunks(&self, text: &str) -> Option<Vec<String>> {
+        match self.model_state.lock().await.as_ref().map(|s| &s.backend) {
+            Some(Backend::Qwen3Tts(_) | Backend::PocketTts(_)) => {
+                Some(vec![text.trim().to_string()])
+            }
+            _ => None,
+        }
     }
 
     pub async fn unload(&self) {
@@ -519,6 +556,10 @@ impl TtsEngine {
                         let clone = speaker_prompt(&params);
                         stream_qwen3_tts(inner, &text, &params, clone.as_ref(), &out)
                     }
+                    Backend::PocketTts(inner) => pocket_speak(inner, &text, params.seed, |pcm| {
+                        out.send(pcm)
+                            .map_err(|_| anyhow!("tts: the listener is gone"))
+                    }),
                     _ => {
                         let r = synthesize_blocking(s, &text, &params)?;
                         out.send(r.pcm)
@@ -807,6 +848,8 @@ fn load_pocket_tts_blocking(voice_wav: &std::path::Path) -> AnyResult<TtsModelSt
             model,
             tokenizer,
             voice,
+            encoder,
+            clip_samples: vsamp.len(),
         }),
         device,
         sample_rate: 24_000,
@@ -1260,16 +1303,11 @@ fn synthesize_blocking(
         }
         Backend::PocketTts(inner) => {
             // Flow-matching TTS; honour `seed` for reproducible noise.
-            let pcm = inner
-                .model
-                .synthesize_text(
-                    &inner.tokenizer,
-                    text,
-                    Some(&inner.voice),
-                    None,
-                    params.seed,
-                )
-                .map_err(|e| anyhow!("pocket-tts synth: {e}"))?;
+            let mut pcm = Vec::new();
+            pocket_speak(inner, text, params.seed, |p| {
+                pcm.extend(p);
+                Ok(())
+            })?;
             Ok(TtsResult { pcm, sample_rate })
         }
         Backend::Kyutai(inner) => {
