@@ -32,7 +32,7 @@ use crate::inference::model::kyutai::mimi::KyutaiMimiDecoder;
 use crate::inference::model::parler::{Config, Generation, Model as ParlerModel};
 use crate::inference::model::piper::{PiperVoice, SynthOpts};
 use crate::inference::model::pocket_tts::{
-    load_wav_mono_24k, resolve_paths, MimiEncoder, PocketTts,
+    load_wav_mono_24k, placed_by_the_route, resolve_paths, MimiEncoder, PocketTts,
 };
 use crate::inference::model::qwen3_tts::decoder::CodecDecoder;
 use crate::inference::model::qwen3_tts::{
@@ -767,15 +767,24 @@ fn load_pocket_tts_blocking(voice_wav: &std::path::Path) -> AnyResult<TtsModelSt
             "pocket-tts reference voice not found: {voice_wav:?}"
         ));
     }
-    // The flow-matching synth is dominated by per-frame transformer forwards, and every op
-    // threads `device`. Placed through the ladder in `place` on the checkpoint's F32 size.
-    let (ckpt_bytes, _) =
-        crate::inference::place::runtime_demand::safetensors_f32_split(&[ckpt], |_| true)
-            .map_err(|e| anyhow!("size pocket-tts: {e}"))?;
+    // The block placed whole is sized at F32 without the transformers the generic route places
+    // with their own demand.
+    let (layer_bytes, ckpt_bytes) = crate::inference::place::runtime_demand::safetensors_f32_split(
+        &[ckpt],
+        placed_by_the_route,
+    )
+    .map_err(|e| anyhow!("size pocket-tts: {e}"))?;
+    info!(
+        "pocket-tts: {ckpt_bytes} bytes placed whole, {layer_bytes} bytes of layers placed apart"
+    );
     let reserve = crate::inference::place::runtime_demand::load_runtime_floor(ckpt_bytes);
+    let mut vsamp = load_wav_mono_24k(voice_wav.to_str().unwrap())
+        .map_err(|e| anyhow!("read voice wav: {e}"))?;
+    vsamp.truncate(144_000); // up to ~6 s of reference
+    let text_chars = crate::api::handlers::audio::TTS_INPUT_MAX_CHARS;
     let (device, model, encoder) =
         crate::inference::place::ladder::load_whole("pocket-tts", ckpt_bytes, reserve, |device| {
-            let model = PocketTts::from_safetensors(ckpt, device.clone())?;
+            let model = PocketTts::from_safetensors(ckpt, device.clone(), text_chars, vsamp.len())?;
             let encoder = MimiEncoder::from_safetensors(ckpt, device.clone())?;
             Ok::<_, crate::tensor::Error>((device.clone(), model, encoder))
         })
@@ -783,9 +792,6 @@ fn load_pocket_tts_blocking(voice_wav: &std::path::Path) -> AnyResult<TtsModelSt
     info!("pocket-tts device: {:?}", device.location());
     let tokenizer = SentencePiece::from_file(tok.to_str().unwrap())
         .map_err(|e| anyhow!("load sentencepiece: {e}"))?;
-    let mut vsamp = load_wav_mono_24k(voice_wav.to_str().unwrap())
-        .map_err(|e| anyhow!("read voice wav: {e}"))?;
-    vsamp.truncate(144_000); // up to ~6 s of reference
     let voice = model
         .voice_from_audio(&encoder, &vsamp)
         .map_err(|e| anyhow!("encode voice: {e}"))?;

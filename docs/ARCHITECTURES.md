@@ -489,6 +489,25 @@ The tests of the codec check, on the published checkpoint when the test store ho
 - the waveform of a fixed latent longer than the window and a prefill chunk: its sample count, its finite values and its repeat
 - the embedding of a fixed clip: its finite values and its repeat
 
+## Pocket-TTS flow model
+
+The flow model's transformer and the norm after it are a transformer of the generic route, class `FlowLMModel`.
+Its configuration is made from the shapes of its tensors and the head count pocket-tts's published model fixes.
+`class_load::load_class_held` loads it with its own demand, its weights held at F32 on a card as on the host.
+It sits on the cards the ladder sees when the model sits on a card, on the host otherwise.
+Its cache is sized for a call on the longest text the speech routes accept, with the voice clip: the voice's frames, a token per character, the start frame and the frames the reference allows the text.
+The route's sizing keeps as many of those rows as the cards hold with every layer on them, and all of them on the host.
+The cache grows as a generation fills it.
+The rest of the model is placed whole, sized without the transformers the route places.
+
+A generation prefills the voice, the text and the start frame's row once.
+Each later frame runs 1 step fed the previous frame's row, on the cache.
+The frames stop where the cache is full, its size bounded by the cards' memory.
+The text table, the frame projection, the end-of-speech head and the flow head stay in `src/inference/model/pocket_tts/mod.rs`.
+
+The tests feed the generic layers and the model's own layer code the same rows, a prompt longer than a prefill chunk and then a row per frame, on a toy and on the published checkpoint when the test store holds it, on the host and on a card.
+Each frame's row agrees within the rounding of F32 through the layers and of the rotary angles at the last position.
+
 ## Drafter verification
 
 A verify step runs several rows at once (`src/inference/generic_transformer/verify_window.rs`).

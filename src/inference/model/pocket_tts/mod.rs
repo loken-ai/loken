@@ -15,14 +15,19 @@
 //! The codec's transformers, in its decoder and its encoder, are transformers of the generic
 //! route, placed by `HeteroPlan` and the ladder with their own demand.
 //! The rest of the codec sits on the device it is given.
+//!
+//! The flow model's transformer is a transformer of the generic route too, with its own demand.
+//! A generation prefills the voice and the text once, then runs a step per frame on its cache.
 
 use crate::inference::generic_transformer::class_load::{self, Holding, Rows};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
+#[cfg(test)]
 use crate::inference::model::acestep::fsq::rope_tables;
 use crate::inference::model::adaln::modulate;
 use crate::inference::model::kyutai::mimi::{
     ATTENTION_HEADS as MIMI_HEADS, ATTENTION_WINDOW, TRANSFORMER_CLASS as CODEC_CLASS,
 };
+#[cfg(test)]
 use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Error, Result, Tensor};
@@ -147,6 +152,9 @@ impl ResBlock {
 }
 
 /// One flow_lm transformer layer (pre-norm, fused-qkv MHA + RoPE, full causal, GELU MLP).
+///
+/// The tests hold the generic layers to it.
+#[cfg(test)]
 struct XfLayer {
     norm1_w: Tensor,
     norm1_b: Tensor,
@@ -159,6 +167,7 @@ struct XfLayer {
     dim: usize,
     heads: usize,
 }
+#[cfg(test)]
 impl XfLayer {
     fn load(vb: &VarBuilder, idx: usize, heads: usize) -> Result<Self> {
         let p = vb.pp(format!("layers.{idx}"));
@@ -622,6 +631,122 @@ const FLOW_LM_HEADS: usize = 16;
 const EOS_THRESHOLD: f32 = -4.0;
 const TEMP: f32 = 0.7;
 
+/// Where the flow model is in the checkpoint.
+const FLOW_PREFIX: &str = "flow_lm";
+
+/// The class of the flow model, whose transformer and output norm run on the generic layers.
+const FLOW_CLASS: &str = "FlowLMModel";
+
+/// The flow model's transformer and the norm after it, on the generic layers.
+struct FlowTransformer {
+    layers: std::sync::Mutex<GenericHeteroTransformer>,
+    /// Rows the cache holds.
+    context: usize,
+}
+
+impl FlowTransformer {
+    /// The flow model's transformer in the checkpoint `path`.
+    ///
+    /// Its layers are placed on the cards the ladder sees when `device` is a card, on the host
+    /// otherwise.
+    /// Its cache holds up to `rows` rows.
+    fn load(path: &str, vb: &VarBuilder, device: &Device, rows: usize) -> Result<Self> {
+        let cards = match device.is_cuda() {
+            true => crate::inference::place::ladder::cards(0),
+            false => Vec::new(),
+        };
+        let (layers, context) = flow_layers(path, vb, &cards, rows)?;
+        Ok(Self {
+            layers: std::sync::Mutex::new(layers),
+            context,
+        })
+    }
+
+    /// The layers, held for the whole of a generation: their cache is its state.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, GenericHeteroTransformer>> {
+        self.layers
+            .lock()
+            .map_err(|_| Error::msg("the flow model's transformer is poisoned"))
+    }
+
+    /// Where the layers sit, by device.
+    fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        match self.layers.lock() {
+            Ok(layers) => layers.placed_runs(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// `rows [S, dim]` prefilled from position 0, the cache emptied first.
+/// Gives the last row after the output norm, `[1, dim]` F32 on `device`.
+fn flow_prefill(
+    layers: &mut GenericHeteroTransformer,
+    rows: &Tensor,
+    device: &Device,
+) -> Result<Tensor> {
+    let out = layers.forward_embeddings_prefill(rows, false)?;
+    out.normed.to_device(device)
+}
+
+/// The row `row [1, dim]` at position `pos` after the cached rows.
+/// Gives it after the output norm, `[1, dim]` F32 on `device`.
+fn flow_step(
+    layers: &mut GenericHeteroTransformer,
+    row: &Tensor,
+    pos: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let out = layers.forward_embedding_step(row, pos, false)?;
+    out.normed.to_device(device)
+}
+
+/// The configuration of the flow model's transformer: the shapes its tensors have and the
+/// settings pocket-tts's published model fixes.
+fn flow_config(vb: &VarBuilder) -> Result<serde_json::Value> {
+    let xt = vb.pp(FLOW_PREFIX).pp("transformer");
+    let first = xt.pp("layers.0");
+    Ok(serde_json::json!({
+        "architectures": [FLOW_CLASS],
+        "hidden_size": first.shape_of("norm1.weight")?[0],
+        "num_attention_heads": FLOW_LM_HEADS,
+        "num_key_value_heads": FLOW_LM_HEADS,
+        "intermediate_size": first.shape_of("linear1.weight")?[0],
+        "num_hidden_layers": xt.count_children("layers"),
+        "rope_theta": ROPE_THETA,
+        "layer_norm_eps": LN_EPS,
+    }))
+}
+
+/// The layers of the flow model's transformer in the checkpoint `path`, placed on `cards`, and
+/// the rows their cache holds.
+///
+/// A card holds the stored 16-bit float weights at F32, as the host does.
+/// The cache holds up to `rows` rows: as many as the cards hold with every layer on them, and
+/// `rows` on the host.
+/// It grows as a generation fills it.
+fn flow_layers(
+    path: &str,
+    vb: &VarBuilder,
+    cards: &[(usize, u64)],
+    rows: usize,
+) -> Result<(GenericHeteroTransformer, usize)> {
+    let root = flow_config(vb)?;
+    let loaded = class_load::load_class_held(
+        &root,
+        &[path.to_string()],
+        FLOW_CLASS,
+        Rows::UpTo(rows),
+        0,
+        cards,
+        Holding {
+            blocks: None,
+            wide_floats: true,
+        },
+    )?;
+    Ok((loaded.model, loaded.context))
+}
+
 /// `y = x @ wᵀ + b` for a 2-D `x [N, in]`, `w [out, in]`, `b [out]`.
 fn linear_b(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
     let out = w.shape().dims2()?.0;
@@ -798,6 +923,26 @@ impl FlowNet {
     }
 }
 
+/// Leading spaces the reference puts before a text of fewer than 5 words.
+const SHORT_TEXT_PAD: usize = 8;
+
+/// The frames the reference allows a text of `tokens` tokens at `frame_rate` frames a second.
+fn frame_budget(tokens: usize, frame_rate: f32) -> usize {
+    (((tokens as f32 / 3.0) + 2.0) * frame_rate).ceil() as usize
+}
+
+/// Whether the tensor `name` belongs to a transformer the generic route places: the flow
+/// model's, with its output norm, or one of the codec's.
+pub fn placed_by_the_route(name: &str) -> bool {
+    let flow_layers = format!("{FLOW_PREFIX}.transformer.layers.");
+    let flow_norm = format!("{FLOW_PREFIX}.out_norm.");
+    [DECODER_PREFIX, ENCODER_PREFIX]
+        .iter()
+        .any(|p| name.starts_with(&format!("{p}.layers.")))
+        || name.starts_with(&flow_layers)
+        || name.starts_with(&flow_norm)
+}
+
 /// Reference text preprocessing: trim, normalize whitespace, capitalize the first
 /// letter, ensure a trailing punctuation, and pad very short inputs with leading
 /// spaces (the model is unreliable on too-few tokens). Returns `(text, frames_after_eos)`.
@@ -820,7 +965,7 @@ fn preprocess_text(text: &str) -> (String, usize) {
     }
     // Pad very short inputs.
     if n_words < 5 {
-        t = " ".repeat(8) + &t;
+        t = " ".repeat(SHORT_TEXT_PAD) + &t;
     }
     (t, frames_after_eos)
 }
@@ -847,9 +992,8 @@ pub struct PocketTts {
     // flow_lm
     embed: Tensor,        // [vocab,dim] text token embedding
     input_linear: Tensor, // [dim,latent]
-    xf: Vec<XfLayer>,     // transformer layers (no LayerScale)
-    out_norm_w: Tensor,
-    out_norm_b: Tensor,
+    /// The transformer and its output norm, placed with their own demand.
+    xf: FlowTransformer,
     out_eos_w: Tensor,
     out_eos_b: Tensor,    // [1,dim],[1]
     bos_emb: Tensor,      // [latent]
@@ -864,12 +1008,27 @@ pub struct PocketTts {
 }
 
 impl PocketTts {
-    pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
+    /// The model in the checkpoint `path` on `device`.
+    ///
+    /// The flow model's cache is sized for a call on a text of `text_chars` characters with a
+    /// voice clip of `voice_samples` samples: the voice's frames, a token per character and the
+    /// short text's padding, the start frame, and the frames the reference allows the text.
+    pub fn from_safetensors(
+        path: &str,
+        device: Device,
+        text_chars: usize,
+        voice_samples: usize,
+    ) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
-        let f = vb.pp("flow_lm");
-        let xf = XfLayer::stack(&f.pp("transformer"), FLOW_LM_HEADS)?;
-        let flow = FlowNet::load(&f.pp("flow_net"), device.clone())?;
+        let f = vb.pp(FLOW_PREFIX);
         let mimi = MimiDecoder::from_safetensors(path, device.clone())?;
+        let frame = mimi.frame_samples()?;
+        let tokens = text_chars + SHORT_TEXT_PAD + 1;
+        let rows = voice_samples.div_ceil(frame)
+            + tokens
+            + frame_budget(tokens, SAMPLE_RATE as f32 / frame as f32);
+        let xf = FlowTransformer::load(path, &vb, &device, rows)?;
+        let flow = FlowNet::load(&f.pp("flow_net"), device.clone())?;
         let [dim, latent] = f.shape_of("input_linear.weight")?[..] else {
             return Err(crate::tensor::Error(
                 "pocket-tts: input_linear is not a matrix".into(),
@@ -881,8 +1040,6 @@ impl PocketTts {
             embed: f.get((vocab, dim), "conditioner.embed.weight")?,
             input_linear: f.get((dim, latent), "input_linear.weight")?,
             xf,
-            out_norm_w: f.get(dim, "out_norm.weight")?,
-            out_norm_b: f.get(dim, "out_norm.bias")?,
             out_eos_w: f.get((1, dim), "out_eos.weight")?,
             out_eos_b: f.get(1, "out_eos.bias")?,
             bos_emb: f.get(latent, "bos_emb")?,
@@ -915,20 +1072,33 @@ impl PocketTts {
         Tensor::cat(&refs, 0)
     }
 
-    /// Run the transformer over `seq [S,dim]`, return out_norm of the last row `[1,dim]`.
-    fn backbone_last(&self, seq: &Tensor) -> Result<Tensor> {
-        let mut h = seq.clone();
-        for l in &self.xf {
-            h = l.forward(&h, &self.device)?;
+    /// The rows a generation prefills, `[S, dim]`: the voice when given, then the text, then
+    /// the start frame's row.
+    /// The voice comes first, as the reference caches it before the text.
+    fn prompt_rows(&self, text_ids: &[u32], voice: Option<&Tensor>) -> Result<Tensor> {
+        let text_emb = self.embed_text(text_ids)?; // [T,dim]
+        let bos = self.frame_row(&self.bos_emb.reshape((1, self.latent))?)?;
+        let mut parts: Vec<&Tensor> = Vec::new();
+        if let Some(v) = voice {
+            parts.push(v);
         }
-        let s = h.shape().dims2()?.0;
-        let last = h.narrow(0, s - 1, 1)?; // [1,dim]
-        last.layer_norm(&self.out_norm_w, Some(&self.out_norm_b), LN_EPS)
+        parts.push(&text_emb);
+        parts.push(&bos);
+        Tensor::cat(&parts, 0)
+    }
+
+    /// The transformer's row of a latent frame `[1, latent]`, `[1, dim]`.
+    fn frame_row(&self, latent: &Tensor) -> Result<Tensor> {
+        latent.matmul_t(&self.input_linear)
     }
 
     /// Generate normalized latent frames for `text_ids`, up to `max_frames`,
     /// stopping `frames_after_eos` frames past the EOS logit crossing.
     /// `seed` makes the flow-matching noise reproducible.
+    ///
+    /// The prompt is prefilled once.
+    /// Each frame after the first runs 1 step fed the previous frame's row, on the cache.
+    /// The frames stop where the cache is full, its size bounded by the cards' memory.
     pub fn generate_latents(
         &self,
         text_ids: &[u32],
@@ -939,32 +1109,31 @@ impl PocketTts {
     ) -> Result<Vec<Vec<f32>>> {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let text_emb = self.embed_text(text_ids)?; // [T,dim]
-                                                   // audio token rows projected to transformer space; first = input_linear(bos).
-        let mut audio_rows: Vec<Tensor> = vec![self
-            .bos_emb
-            .reshape((1, self.latent))?
-            .matmul_t(&self.input_linear)?];
+        let prompt = self.prompt_rows(text_ids, voice)?;
+        let rows = prompt.dims2()?.0;
+        let room = (self.xf.context + 1).saturating_sub(rows);
+        if room == 0 {
+            return Err(Error::msg(format!(
+                "a prompt of {rows} rows leaves no frame in the flow model's cache of {} rows, the most the cards' memory holds",
+                self.xf.context
+            )));
+        }
+        if max_frames > room {
+            tracing::warn!(
+                "pocket-tts: {max_frames} frames asked, the flow model's cache of {} rows, the most the cards' memory holds, takes {room}",
+                self.xf.context
+            );
+        }
+        let frames = max_frames.min(room);
+        let mut layers = self.xf.lock()?;
+        let mut c = flow_prefill(&mut layers, &prompt, &self.device)?; // [1,dim]
         let mut latents: Vec<Vec<f32>> = Vec::new();
         let mut eos_step: Option<usize> = None;
-        for step in 0..max_frames {
+        for step in 0..frames {
             // Autoregressive decode runs in spawn_blocking, so a dropped request can
             // only be observed here. See `cancel::scoped` for why this loop reads a
             // thread-published token instead of taking one.
             crate::inference::serve::cancel::scoped::bail()?;
-            // seq = [voice? ; text_emb ; audio_rows...] - voice is conditioned FIRST
-            // (the reference caches it before the text prefix).
-            let mut parts: Vec<&Tensor> = Vec::new();
-            if let Some(v) = voice {
-                parts.push(v);
-            }
-            parts.push(&text_emb);
-            for r in &audio_rows {
-                parts.push(r);
-            }
-            let seq = Tensor::cat(&parts, 0)?;
-            let c = self.backbone_last(&seq)?; // [1,dim]
-                                               // EOS
             let eos = linear_b(&c, &self.out_eos_w, &self.out_eos_b)?
                 .flatten_all()?
                 .to_vec1_f32()?[0];
@@ -977,12 +1146,15 @@ impl PocketTts {
             let v = self.flow.velocity(&c, 0.0, 1.0, &x0)?;
             let latent = x0.add(&v)?; // normalized latent [1,latent]
             latents.push(latent.reshape((self.latent,))?.to_vec1_f32()?);
-            // next input
-            audio_rows.push(latent.matmul_t(&self.input_linear)?);
             if let Some(es) = eos_step {
                 if step >= es + frames_after_eos {
                     break;
                 }
+            }
+            if step + 1 < frames {
+                // The next frame's condition: this frame's row after the cached ones.
+                let row = self.frame_row(&latent)?;
+                c = flow_step(&mut layers, &row, rows + step, &self.device)?;
             }
         }
         Ok(latents)
@@ -1007,7 +1179,7 @@ impl PocketTts {
         let ids = sp.encode(&clean);
         // Reference cap: ceil((n_tokens/3 + 2) * frames/s).
         let frame_rate = SAMPLE_RATE as f32 / self.mimi.frame_samples()? as f32;
-        let max_frames = (((ids.len() as f32 / 3.0) + 2.0) * frame_rate).ceil() as usize;
+        let max_frames = frame_budget(ids.len(), frame_rate);
         self.synthesize(
             &ids,
             voice,
@@ -1056,6 +1228,12 @@ mod tests {
 
     fn tokenizer_model() -> std::path::PathBuf {
         resolve_paths().1
+    }
+
+    /// The flow model's own layers in the checkpoint `path`, on the host.
+    fn own_flow_layers(path: &str) -> Vec<XfLayer> {
+        let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu).unwrap() };
+        XfLayer::stack(&vb.pp(FLOW_PREFIX).pp("transformer"), FLOW_LM_HEADS).unwrap()
     }
 
     #[test]
@@ -1111,8 +1289,10 @@ mod tests {
     #[test]
     #[ignore = "parity: compare flow_lm c/velocity against /tmp/ref_*.bin from ref_flowlm.py - NOTE: the script that produces these dumps is NOT in this repository, so this cannot be run as written; it is kept because the Rust half of the harness is reusable once the oracle is rebuilt"]
     fn flowlm_parity_vs_ref() {
-        let m = PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu).unwrap();
+        let m =
+            PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu, 64, 72_000).unwrap();
         let enc = MimiEncoder::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu).unwrap();
+        let own = own_flow_layers(ckpt().to_str().unwrap());
         let dog = format!(
             "{}/results/ezaudio/a_dog_barking.wav",
             env!("CARGO_MANIFEST_DIR")
@@ -1154,7 +1334,7 @@ mod tests {
         println!("SEQ     cosine={:.5}", cosine(&sv, &ref_seq));
         // raw transformer output (pre out_norm), last row
         let mut h = seq.clone();
-        for l in &m.xf {
+        for l in &own {
             h = l.forward(&h, &m.device).unwrap();
         }
         let s = h.shape().dims2().unwrap().0;
@@ -1174,7 +1354,7 @@ mod tests {
             .to_device(&m.device)
             .unwrap();
         let mut h2 = rseq;
-        for l in &m.xf {
+        for l in &own {
             h2 = l.forward(&h2, &m.device).unwrap();
         }
         let s2 = h2.shape().dims2().unwrap().0;
@@ -1186,7 +1366,7 @@ mod tests {
             .to_vec1_f32()
             .unwrap();
         println!("TR_RAW(ref_seq in) cosine={:.5}", cosine(&tr2, &ref_tr));
-        let c = m.backbone_last(&seq).unwrap();
+        let c = flow_prefill(&mut m.xf.lock().unwrap(), &seq, &m.device).unwrap();
         let cv = c.flatten_all().unwrap().to_vec1_f32().unwrap();
         let (ref_c, _) = load_bin("/tmp/ref_c.bin");
         println!("C       cosine={:.5}", cosine(&cv, &ref_c));
@@ -1239,7 +1419,8 @@ mod tests {
     #[ignore = "needs kyutai/pocket-tts checkpoint + tokenizer (config huggingface_models_dir)"]
     fn pocket_tts_text_to_speech() {
         use crate::inference::token::sentencepiece::SentencePiece;
-        let m = PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu).unwrap();
+        let m =
+            PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu, 64, 72_000).unwrap();
         let sp = SentencePiece::from_file(tokenizer_model().to_str().unwrap()).unwrap();
         let enc = MimiEncoder::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu).unwrap();
         let voice_path = format!(
@@ -1276,7 +1457,8 @@ mod tests {
     fn pocket_tts_generates_audio() {
         // Full text->audio with dummy token ids (the sentencepiece tokenizer is
         // Stage 4; here we exercise flow_lm generation + Mimi decode end-to-end).
-        let m = PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu).unwrap();
+        let m =
+            PocketTts::from_safetensors(ckpt().to_str().unwrap(), Device::Cpu, 64, 72_000).unwrap();
         let ids: Vec<u32> = vec![10, 42, 7, 100, 3, 55, 8];
         let wav = m.synthesize(&ids, None, 20, 2, 1234).unwrap();
         assert!(!wav.is_empty(), "produced some audio");
@@ -1307,9 +1489,9 @@ mod tests {
 }
 
 impl PocketTts {
-    /// Where this model's layers sit, by device.
+    /// Where the flow model's transformer's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(&self.device, self.xf.len())
+        self.xf.placement()
     }
 }
 
@@ -1427,5 +1609,350 @@ mod codec_tests {
             return;
         }
         published_runs(Device::new_cuda(0).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    //! The flow model's transformer on the generic layers against its own layer code, on a toy
+    //! and on the published checkpoint, on the host and on a card.
+    //!
+    //! Both are teacher forced: they are fed the same rows, a prompt then a row per frame.
+    //! The own layers rerun every row before a frame.
+    //! The generic layers prefill the prompt and run a step per frame on their cache.
+
+    use super::*;
+    use crate::inference::generic_transformer::class_load::tests::{scratch, values};
+
+    /// Rows of a prompt longer than a prefill chunk.
+    fn long_prompt() -> usize {
+        crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS + 3
+    }
+
+    /// The frames each run gives after the prompt's.
+    const FRAMES: usize = 24;
+
+    /// `t` as F32 values on the host.
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// The host view of the file `path` at F32.
+    fn view(path: &str) -> VarBuilder {
+        unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu).unwrap() }
+    }
+
+    /// The own layers' frames over `rows [n, dim]`: for each end from `prompt` to `n`, the last
+    /// row of the rows before it, after the output norm.
+    fn own_frames(path: &str, rows: &Tensor, prompt: usize) -> Vec<f32> {
+        let vb = view(path);
+        let f = vb.pp(FLOW_PREFIX);
+        let own = XfLayer::stack(&f.pp("transformer"), FLOW_LM_HEADS).unwrap();
+        let (n, dim) = rows.dims2().unwrap();
+        let w = f.get(dim, "out_norm.weight").unwrap();
+        let b = f.get(dim, "out_norm.bias").unwrap();
+        let rows = rows.to_device(&Device::Cpu).unwrap();
+        let mut out = Vec::new();
+        for end in prompt..=n {
+            let mut h = rows.narrow(0, 0, end).unwrap();
+            for l in &own {
+                h = l.forward(&h, &Device::Cpu).unwrap();
+            }
+            let last = h.narrow(0, end - 1, 1).unwrap();
+            out.extend(host(&last.layer_norm(&w, Some(&b), LN_EPS).unwrap()));
+        }
+        out
+    }
+
+    /// The generic layers' frames over `rows [n, dim]`, placed on `cards`: the prompt
+    /// prefilled, then a step for each row after it.
+    fn generic_frames(
+        path: &str,
+        rows: &Tensor,
+        prompt: usize,
+        cards: &[(usize, u64)],
+    ) -> Vec<f32> {
+        let n = rows.dims2().unwrap().0;
+        let (mut layers, context) = flow_layers(path, &view(path), cards, n).unwrap();
+        assert!(context >= n);
+        assert_eq!(layers.layer_cuda_ordinals().is_empty(), cards.is_empty());
+        let first = rows.narrow(0, 0, prompt).unwrap();
+        let mut out = host(&flow_prefill(&mut layers, &first, &Device::Cpu).unwrap());
+        for pos in prompt..n {
+            let row = rows.narrow(0, pos, 1).unwrap();
+            out.extend(host(
+                &flow_step(&mut layers, &row, pos, &Device::Cpu).unwrap(),
+            ));
+        }
+        out
+    }
+
+    /// The tolerance on a value of magnitude `scale` out of `layers` layers whose widest product
+    /// sums `width` terms, in F32, over `rows` positions.
+    ///
+    /// A product of `n` terms rounds to about `eps * sqrt(n)` of its scale.
+    /// A layer chains 4 products: the Q, K and V projection, the attention output, the up and
+    /// the down projections.
+    /// The output norm adds one more rounding.
+    /// A rotary angle of position `p` rounds to about `eps * p` of a radian in F32, which each
+    /// layer adds once.
+    fn tolerance(layers: usize, width: usize, rows: usize, scale: f32) -> f32 {
+        let eps = f32::EPSILON;
+        let products = eps * (width as f32).sqrt() * (4 * layers + 1) as f32;
+        let angles = eps * rows as f32 * layers as f32;
+        (products + angles) * scale
+    }
+
+    /// The frames of both paths over `rows`, the first `prompt` rows prefilled, agree within
+    /// the tolerance.
+    fn frames_agree(path: &str, rows: &Tensor, prompt: usize, cards: &[(usize, u64)]) {
+        let vb = view(path);
+        let xt = vb.pp(FLOW_PREFIX).pp("transformer");
+        let first = xt.pp("layers.0");
+        let dim = first.shape_of("norm1.weight").unwrap()[0];
+        let ffn = first.shape_of("linear1.weight").unwrap()[0];
+        let layers = xt.count_children("layers");
+        let n = rows.dims2().unwrap().0;
+        let want = own_frames(path, rows, prompt);
+        let got = generic_frames(path, rows, prompt, cards);
+        assert_eq!(got.len(), want.len());
+        assert!(got.iter().all(|v| v.is_finite()));
+        let mut worst = (0f32, 0usize);
+        for (frame, (g, w)) in got.chunks(dim).zip(want.chunks(dim)).enumerate() {
+            let err = g
+                .iter()
+                .zip(w)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            if err > worst.0 {
+                worst = (err, frame);
+            }
+        }
+        let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let tol = tolerance(layers, ffn.max(3 * dim), n, scale);
+        eprintln!(
+            "{} frames: {} away at frame {} at a scale of {scale}, tolerance {tol}",
+            n + 1 - prompt,
+            worst.0,
+            worst.1
+        );
+        assert!(worst.0 <= tol, "{} away, tolerance {tol}", worst.0);
+    }
+
+    /// A flow model of `layers` layers `hidden` wide, its feed-forward `ffn` wide, in F32.
+    fn toy_file(tag: &str, hidden: usize, ffn: usize, layers: usize) -> std::path::PathBuf {
+        let dir = scratch(tag);
+        let mut seed = 29u32;
+        let mut stored = Vec::new();
+        let xt = format!("{FLOW_PREFIX}.transformer.layers");
+        for il in 0..layers {
+            for (part, dims, centre, scale) in [
+                ("norm1.weight", vec![hidden], 1.0, 0.2),
+                ("norm1.bias", vec![hidden], 0.0, 0.2),
+                ("norm2.weight", vec![hidden], 1.0, 0.2),
+                ("norm2.bias", vec![hidden], 0.0, 0.2),
+                (
+                    "self_attn.in_proj.weight",
+                    vec![3 * hidden, hidden],
+                    0.0,
+                    0.2,
+                ),
+                ("self_attn.out_proj.weight", vec![hidden, hidden], 0.0, 0.2),
+                ("linear1.weight", vec![ffn, hidden], 0.0, 0.2),
+                ("linear2.weight", vec![hidden, ffn], 0.0, 0.2),
+            ] {
+                stored.push((format!("{xt}.{il}.{part}"), dims, centre, scale));
+            }
+        }
+        for (part, centre) in [("weight", 1.0), ("bias", 0.0)] {
+            stored.push((
+                format!("{FLOW_PREFIX}.out_norm.{part}"),
+                vec![hidden],
+                centre,
+                0.2,
+            ));
+        }
+        let bytes: Vec<(String, Vec<usize>, Vec<u8>)> = stored
+            .into_iter()
+            .map(|(name, dims, centre, scale)| {
+                let v = values(&mut seed, dims.iter().product(), centre, scale);
+                (name, dims, v.iter().flat_map(|x| x.to_le_bytes()).collect())
+            })
+            .collect();
+        let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = bytes
+            .iter()
+            .map(|(name, dims, b)| {
+                let view =
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, dims.clone(), b)
+                        .unwrap();
+                (name.clone(), view)
+            })
+            .collect();
+        let file = dir.join("model.safetensors");
+        safetensors::serialize_to_file(views, None, &file).unwrap();
+        file
+    }
+
+    /// The toy's frames agree on `cards`.
+    fn toy_agrees(tag: &str, cards: &[(usize, u64)]) {
+        let hidden = 8 * FLOW_LM_HEADS;
+        let file = toy_file(tag, hidden, 2 * hidden, 2);
+        let path = file.to_string_lossy().to_string();
+        let n = long_prompt() + FRAMES;
+        let mut seed = 5u32;
+        let rows = Tensor::from_vec(
+            values(&mut seed, n * hidden, 0.0, 1.0),
+            (n, hidden),
+            &Device::Cpu,
+        )
+        .unwrap();
+        frames_agree(&path, &rows, long_prompt(), cards);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// On the host.
+    #[test]
+    fn the_toy_flow_transformer_on_generic_layers_matches_its_own_layers() {
+        toy_agrees("pocket-flow-toy", &[]);
+    }
+
+    /// With the layers on the cards.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_card_toy_flow_transformer_on_generic_layers_matches_its_own_layers() {
+        let cards = crate::inference::place::ladder::cards(0);
+        if cards.is_empty() {
+            eprintln!("no card");
+            return;
+        }
+        toy_agrees("pocket-flow-toy-card", &cards);
+    }
+
+    /// The rows the cache of the published flow model holds on `cards` when asked for `rows`,
+    /// and the layers that plan sends to the host.
+    fn planned(path: &str, cards: &[(usize, u64)], rows: usize) -> (usize, usize) {
+        let root = flow_config(&view(path)).unwrap();
+        let shards = [path.to_string()];
+        let holding = Holding {
+            blocks: None,
+            wide_floats: true,
+        };
+        let demand = class_load::class_demand_held(&root, &shards, FLOW_CLASS, 0, holding).unwrap();
+        let held = demand.rows_on(Rows::UpTo(rows), cards, |_| None);
+        let plan = demand.at(held as u64).plan(cards);
+        let host = plan
+            .segments
+            .iter()
+            .filter(|s| {
+                !matches!(
+                    s.kind,
+                    crate::inference::place::layer_executor::DeviceKind::Cuda(_)
+                )
+            })
+            .map(|s| s.num_layers())
+            .sum();
+        (held, host)
+    }
+
+    /// A dry plan of the cache a call on the longest text asks: a large card holds every row, a
+    /// small card holds fewer rows with every layer on it, the host holds every row.
+    #[test]
+    fn the_flow_cache_is_sized_by_the_cards() {
+        let Some(path) = published() else { return };
+        const GB: u64 = 1 << 30;
+        let rows = 1 << 18;
+        assert_eq!(planned(&path, &[(0, 80 * GB)], rows), (rows, 0));
+        let (small, host) = planned(&path, &[(0, 4 * GB)], rows);
+        assert!(small < rows && small >= crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+        assert_eq!(host, 0);
+        assert_eq!(planned(&path, &[], rows).0, rows);
+    }
+
+    /// A call past the route's working window runs on the host: its last frames are finite.
+    #[test]
+    fn a_long_call_runs_past_the_working_window_on_the_host() {
+        let Some(path) = published() else { return };
+        let (rows, _) = published_rows(&path);
+        let parts: Vec<&Tensor> = std::iter::repeat_n(&rows, 8).collect();
+        let rows = Tensor::cat(&parts, 0).unwrap();
+        let n = rows.dims2().unwrap().0;
+        let prompt = n - FRAMES;
+        assert!(prompt > crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+        let frames = generic_frames(&path, &rows, prompt, &[]);
+        assert!(frames.iter().all(|v| v.is_finite()));
+    }
+
+    /// The rows a generation feeds the published flow model: text rows for a prompt longer
+    /// than a prefill chunk, the start frame's row, then the rows of fixed latent frames.
+    fn published_rows(path: &str) -> (Tensor, usize) {
+        let vb = view(path);
+        let f = vb.pp(FLOW_PREFIX);
+        let [vocab, dim] = f.shape_of("conditioner.embed.weight").unwrap()[..] else {
+            panic!("the text table is not a matrix")
+        };
+        let latent = f.shape_of("input_linear.weight").unwrap()[1];
+        let table = f.get((vocab, dim), "conditioner.embed.weight").unwrap();
+        let input = f.get((dim, latent), "input_linear.weight").unwrap();
+        let ids: Vec<u32> = (0..long_prompt() - 1)
+            .map(|i| (i * 37 % vocab) as u32)
+            .collect();
+        let count = ids.len();
+        let ids = Tensor::from_vec(ids, count, &Device::Cpu).unwrap();
+        let text = table.index_select(&ids, 0).unwrap();
+        let bos = f
+            .get(latent, "bos_emb")
+            .unwrap()
+            .reshape((1, latent))
+            .unwrap();
+        let mut seed = 13u32;
+        let frames = Tensor::from_vec(
+            values(&mut seed, FRAMES * latent, 0.0, 1.0),
+            (FRAMES, latent),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let audio = Tensor::cat(&[&bos, &frames], 0)
+            .unwrap()
+            .matmul_t(&input)
+            .unwrap();
+        (Tensor::cat(&[&text, &audio], 0).unwrap(), long_prompt())
+    }
+
+    /// The published checkpoint, `None` when the test store lacks it.
+    fn published() -> Option<String> {
+        let file = Some(resolve_paths().0).filter(|f| f.exists());
+        if file.is_none() {
+            eprintln!("the published checkpoint is not in the test store");
+        }
+        file.map(|f| f.to_string_lossy().to_string())
+    }
+
+    /// On the host.
+    #[test]
+    fn the_published_flow_transformer_on_generic_layers_matches_its_own_layers() {
+        let Some(path) = published() else { return };
+        let (rows, prompt) = published_rows(&path);
+        frames_agree(&path, &rows, prompt, &[]);
+    }
+
+    /// With the layers on the cards.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_card_published_flow_transformer_on_generic_layers_matches_its_own_layers() {
+        let cards = crate::inference::place::ladder::cards(0);
+        if cards.is_empty() {
+            eprintln!("no card");
+            return;
+        }
+        let Some(path) = published() else { return };
+        let (rows, prompt) = published_rows(&path);
+        frames_agree(&path, &rows, prompt, &cards);
     }
 }

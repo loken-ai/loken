@@ -59,7 +59,7 @@ macro_rules! to_json_string {
 mod admission;
 mod anthropic_api;
 #[cfg(feature = "audio")]
-mod audio;
+pub(crate) mod audio;
 mod catalogue;
 mod chat_prompt;
 mod media_catalogue;
