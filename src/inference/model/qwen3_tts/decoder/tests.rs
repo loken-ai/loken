@@ -3,6 +3,7 @@
 //! The comparison to the reference runs outside the test suite.
 
 use super::*;
+use crate::inference::generic_transformer::codec_class_tests;
 use crate::inference::load::hf_config::tests::speech_snapshot;
 use serde_json::json;
 
@@ -350,9 +351,9 @@ fn the_time_of_a_streamed_call_past_the_left_context() {
         for n in [1, 4, 12, 24] {
             let frames = sample_frames(&dec, c.front_context + n);
             let codes = dec.codes(&frames).unwrap();
-            let _ = host(&dec.front(&codes, 0).unwrap());
+            let _ = host(&dec.front(&codes).unwrap());
             let t0 = std::time::Instant::now();
-            let rows = dec.front(&codes, 0).unwrap();
+            let rows = dec.front(&codes).unwrap();
             let _ = host(&rows);
             let front = t0.elapsed().as_secs_f64();
             let rows = rows.narrow(
@@ -393,4 +394,157 @@ fn the_decode_time_of_8_and_300_frames() {
             );
         }
     }
+}
+
+/// The front of the transformer as the codec's reference runs it, in F64: the input projection,
+/// the layers and their final norm, the output projection.
+fn reference_front(
+    w: &std::collections::HashMap<String, Vec<f32>>,
+    g: &codec_class_tests::Geometry,
+    x: &[f32],
+) -> Vec<f64> {
+    let p = |n: &str| format!("{}{n}", transformer::PREFIX);
+    let linear = |name: &str, x: &[f64], width: usize| -> Vec<f64> {
+        let wt = &w[&p(&format!("{name}.weight"))];
+        let b = &w[&p(&format!("{name}.bias"))];
+        x.chunks(width)
+            .flat_map(|row| {
+                wt.chunks(width)
+                    .zip(b)
+                    .map(|(r, b)| {
+                        r.iter().zip(row).map(|(a, v)| *a as f64 * v).sum::<f64>() + *b as f64
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let x: Vec<f64> = x.iter().map(|v| *v as f64).collect();
+    let h = linear("input_proj", &x, g.latent);
+    let rows = codec_class_tests::reference_rows(w, g, &h);
+    linear("output_proj", &rows, g.hidden)
+}
+
+/// The transformer's tensors of the codec's file `file`, as F32 values by name.
+fn transformer_weights(file: &std::path::Path) -> std::collections::HashMap<String, Vec<f32>> {
+    let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::new(file).unwrap() };
+    st.byte_sizes()
+        .iter()
+        .filter(|(n, _)| n.starts_with(transformer::PREFIX))
+        .map(|(n, _)| (n.to_string(), host(&st.load(n, &Device::Cpu).unwrap())))
+        .collect()
+}
+
+/// The transformer `t` over `frames` rows of the latent width, against the reference of `w`,
+/// within the rounding of `eps` through the projections, the layers and the final norm.
+fn the_transformer_matches_the_reference(
+    t: &Transformer,
+    w: &std::collections::HashMap<String, Vec<f32>>,
+    g: &codec_class_tests::Geometry,
+    frames: usize,
+    eps: f64,
+    place: &str,
+) {
+    let mut seed = 9u32;
+    let x = crate::inference::generic_transformer::class_load::tests::values(
+        &mut seed,
+        frames * g.latent,
+        0.0,
+        1.0,
+    );
+    let want = reference_front(w, g, &x);
+    let xs = Tensor::from_vec(x, (frames, g.latent), &Device::Cpu).unwrap();
+    let got = host(&t.forward(&xs).unwrap());
+    let (err, scale) = codec_class_tests::error(&got, &want);
+    let widest = g.ffn.max(g.heads * g.head_dim).max(g.latent);
+    let tol = eps * (widest as f64).sqrt() * (4 * g.layers + 3) as f64 * scale;
+    eprintln!("{place}: transformer {err} away at a scale of {scale}, tolerance {tol}");
+    assert!(
+        err <= tol,
+        "{place}: transformer {err} away, tolerance {tol}"
+    );
+}
+
+/// The host alone, then the cards the ladder sees, each with the machine epsilon of F32: the
+/// codec's layers keep the stored F32 on a card.
+fn placements() -> Vec<(Vec<(usize, u64)>, f64, &'static str)> {
+    let mut out = vec![(Vec::new(), f32::EPSILON as f64, "host")];
+    let cards = crate::inference::place::ladder::cards(0);
+    if !cards.is_empty() {
+        out.push((cards, f32::EPSILON as f64, "cards"));
+    }
+    out
+}
+
+/// The toy's transformer on the generic layers, its projections around them, gives the
+/// reference's rows past the window.
+#[test]
+fn the_toy_transformer_on_the_generic_layers_matches_the_reference() {
+    let toy = codec_class_tests::Toy::write("codec-glue", 2, 6);
+    let g = codec_class_tests::Geometry::of(&toy.root);
+    let file = std::path::PathBuf::from(toy.file());
+    let vb = unsafe { VarBuilder::from_files(&[&file], DType::F32, &Device::Cpu).unwrap() };
+    let vb = vb.pp(transformer::PREFIX.trim_end_matches('.'));
+    for (cards, eps, place) in placements() {
+        let layers = Transformer::layers(&toy.root, &file, 64, &cards).unwrap();
+        let t = Transformer::new(&vb, layers).unwrap();
+        the_transformer_matches_the_reference(&t, &toy.weights, &g, 3 * g.window + 1, eps, place);
+    }
+}
+
+/// The published transformer on the generic layers gives the reference's rows over more frames
+/// than its window, on the host and on the cards.
+#[test]
+fn the_published_transformer_matches_the_reference() {
+    let Some(dir) = published() else { return };
+    let file = weights_of(&dir);
+    let w = transformer_weights(&file);
+    let (root, config) = read_config(&dir.join(CODEC_DIR)).unwrap();
+    let g = codec_class_tests::Geometry::of(&root);
+    let vb = unsafe { VarBuilder::from_files(&[&file], DType::F32, &Device::Cpu).unwrap() };
+    let vb = vb.pp(transformer::PREFIX.trim_end_matches('.'));
+    for (cards, eps, place) in placements() {
+        let layers = Transformer::layers(&root, &file, config.max_positions, &cards).unwrap();
+        let t = Transformer::new(&vb, layers).unwrap();
+        eprintln!("{place}: layers on {:?}", t.placement());
+        the_transformer_matches_the_reference(&t, &w, &g, g.window + 28, eps, place);
+    }
+}
+
+/// The dry plans of the published transformer's layers by their own demand: a card that holds
+/// half of their weights, a card that holds all of the demand, the host alone.
+#[test]
+fn the_published_transformer_places_by_its_own_demand() {
+    use crate::inference::place::layer_executor::DeviceKind;
+    let Some(dir) = published() else { return };
+    let (root, config) = read_config(&dir.join(CODEC_DIR)).unwrap();
+    let shards = [weights_of(&dir).to_string_lossy().to_string()];
+    let c = crate::inference::generic_transformer::class_load::class_demand(
+        &root,
+        &shards,
+        transformer::CODEC_TRANSFORMER_CLASS,
+        0,
+    )
+    .unwrap();
+    let d = c.at(config.max_positions as u64);
+    let whole =
+        d.block_bytes + d.head_bytes + d.layers as u64 * d.kv_bytes_per_layer + d.runtime_reserve;
+    eprintln!("demand {d:?}, {whole} bytes in all");
+    let on_card = |cards: &[(usize, u64)]| -> usize {
+        d.plan(cards)
+            .segments
+            .iter()
+            .filter(|s| matches!(s.kind, DeviceKind::Cuda(_)))
+            .map(|s| s.num_layers())
+            .sum()
+    };
+    let small = on_card(&[(0, d.block_bytes / 2)]);
+    let large = on_card(&[(0, 4 * whole)]);
+    let host = on_card(&[]);
+    eprintln!(
+        "layers on the card of {}: small card {small}, large card {large}, host {host}",
+        d.layers
+    );
+    assert!(small < d.layers);
+    assert_eq!(large, d.layers);
+    assert_eq!(host, 0);
 }

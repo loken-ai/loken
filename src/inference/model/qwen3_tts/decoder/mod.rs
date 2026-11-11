@@ -2,6 +2,7 @@
 //!
 //! The decode runs in 2 parts.
 //! The front dequantises the codes, runs a causal conv and the transformer at the frame rate.
+//! The transformer's layers are a transformer of the generic route, placed apart from the rest.
 //! The back runs the upsample stages and the snake stack up to the sample rate.
 //! Each part decodes in chunks whose left context covers its receptive field, so a chunked
 //! decode gives the samples of a whole one.
@@ -69,7 +70,8 @@ pub struct BlockWidth {
     pub units: usize,
 }
 
-/// The codec decoder, placed whole on one device.
+/// The codec decoder: its transformer's layers placed by their own demand, the rest placed
+/// whole on one device.
 pub struct CodecDecoder {
     config: CodecConfig,
     rvq_first: Rvq,
@@ -103,33 +105,40 @@ fn passes(start: usize, total: usize, span: usize, context: usize) -> Vec<(usize
 }
 
 impl CodecDecoder {
-    /// The decoder of the checkpoint at `dir`, placed through the ladder with the reserve
-    /// its load needs.
+    /// The decoder of the checkpoint at `dir`.
     ///
+    /// The transformer's layers are placed through `HeteroPlan` and the ladder with their own
+    /// demand.
+    /// The rest is placed whole through the ladder with the reserve its load needs.
     /// The chunks of the decode derive from that reserve.
     pub fn load(dir: &std::path::Path) -> Result<Self> {
         let codec = dir.join(CODEC_DIR);
-        let config = read_config(&codec)?;
+        let (root, config) = read_config(&codec)?;
         let weights = weights_of(dir);
-        let bytes = decoder_bytes(&weights)?;
+        let cards = crate::inference::place::ladder::cards(0);
+        let layers = Transformer::layers(&root, &weights, config.max_positions, &cards)?;
+        let bytes = whole_bytes(&weights)?;
         let reserve = crate::inference::place::runtime_demand::load_runtime_floor(bytes);
+        let mut layers = Some(layers);
         crate::inference::place::ladder::load_whole(
             "Qwen3-TTS codec decoder",
             bytes,
             reserve,
-            |device| Self::build(&weights, config.clone(), device, reserve),
+            |device| Self::build(&weights, config.clone(), device, reserve, &mut layers),
         )
     }
 
-    /// The decoder of the checkpoint at `dir` built on the host, with the reserve its load needs.
+    /// The decoder of the checkpoint at `dir` built on the host, its transformer's layers
+    /// included, with the reserve its load needs.
     ///
-    /// It skips the ladder, so it runs on the host whatever the cards hold.
+    /// It skips the cards, so it runs on the host whatever the cards hold.
     pub fn on_host(dir: &std::path::Path) -> Result<Self> {
-        let config = read_config(&dir.join(CODEC_DIR))?;
+        let (root, config) = read_config(&dir.join(CODEC_DIR))?;
         let weights = weights_of(dir);
+        let layers = Transformer::layers(&root, &weights, config.max_positions, &[])?;
         let reserve =
-            crate::inference::place::runtime_demand::load_runtime_floor(decoder_bytes(&weights)?);
-        Self::build(&weights, config, &Device::Cpu, reserve)
+            crate::inference::place::runtime_demand::load_runtime_floor(whole_bytes(&weights)?);
+        Self::build(&weights, config, &Device::Cpu, reserve, &mut Some(layers))
     }
 
     /// The sizes of the stages that set the rounding of a product chain through them.
@@ -156,12 +165,16 @@ impl CodecDecoder {
         }
     }
 
-    /// The decoder of the file `weights` on `device`, its chunks fitted to `reserve` bytes.
+    /// The decoder of the file `weights` on `device` around the transformer's `layers`, its
+    /// chunks fitted to `reserve` bytes.
+    ///
+    /// The layers are taken once every part on `device` is built.
     fn build(
         weights: &std::path::Path,
         config: CodecConfig,
         device: &Device,
         reserve: u64,
+        layers: &mut Option<crate::inference::generic_transformer::GenericHeteroTransformer>,
     ) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[weights], DType::F32, device)? };
         let vb = vb.pp(DECODER_PREFIX.trim_end_matches('.'));
@@ -194,16 +207,33 @@ impl CodecDecoder {
             .map(|(i, &s)| SnakeBlock::load(&dec.pp((i + 1).to_string()), s))
             .collect::<Result<Vec<_>>>()?;
         let last = blocks.len() + 1;
+        let pre_conv = Conv::load_conv(&vb, "pre_conv.conv")?;
+        let conv_in = Conv::load_conv(&dec, "0.conv")?;
+        let act_out = Snake::load(&dec, &last.to_string())?;
+        let conv_out = Conv::load_conv(&dec, &format!("{}.conv", last + 1))?;
+        let projections = vb.pp(transformer::PREFIX
+            .trim_start_matches(DECODER_PREFIX)
+            .trim_end_matches('.'));
+        let layers = layers
+            .take()
+            .ok_or_else(|| Error::msg("the codec's transformer was taken by an earlier build"))?;
+        if layers.layers().len() != config.layers {
+            return Err(Error::msg(format!(
+                "the codec stores {} transformer layers, its config names {}",
+                layers.layers().len(),
+                config.layers
+            )));
+        }
         let mut decoder = Self {
             rvq_first,
             rvq_rest,
-            pre_conv: Conv::load_conv(&vb, "pre_conv.conv")?,
-            transformer: Transformer::load(&vb.pp("pre_transformer"), &config)?,
+            pre_conv,
+            transformer: Transformer::new(&projections, layers)?,
             upsample,
-            conv_in: Conv::load_conv(&dec, "0.conv")?,
+            conv_in,
             blocks,
-            act_out: Snake::load(&dec, &last.to_string())?,
-            conv_out: Conv::load_conv(&dec, &format!("{}.conv", last + 1))?,
+            act_out,
+            conv_out,
             device: device.clone(),
             config,
             chunking: Chunking {
@@ -222,9 +252,16 @@ impl CodecDecoder {
         &self.config
     }
 
-    /// The device the decoder sits on.
+    /// The device the decoder sits on, its transformer's layers aside.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Where the transformer's layers sit, by device.
+    pub fn transformer_placement(
+        &self,
+    ) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        self.transformer.placement()
     }
 
     /// The chunks the decode runs in.
@@ -261,22 +298,16 @@ impl CodecDecoder {
         r
     }
 
-    /// The bytes of F32 values a front pass over `frames` holds at once.
+    /// The bytes of F32 values a front pass over `frames` holds at once on the decoder's device.
     ///
-    /// The window mask, the scores and the probabilities of every head grow with the square.
     /// The rows of the widest step of every stage grow with the frames.
+    /// The attention of the transformer's layers works within their own reserve, a prefill
+    /// chunk at a time.
     fn front_bytes(&self, frames: usize) -> u64 {
         let c = &self.config;
-        let attn = c.heads * c.head_dim;
-        let square = (2 * c.heads + 1) * frames * frames;
         let k = self.pre_conv.kernel();
-        let rows = frames
-            * (self.pre_conv.conv_in(1) * (k + 2)
-                + 2 * c.latent
-                + 3 * c.hidden
-                + 3 * attn
-                + 2 * c.intermediate);
-        ((square + rows) * std::mem::size_of::<f32>()) as u64
+        let rows = frames * (self.pre_conv.conv_in(1) * (k + 2) + 2 * c.latent + 3 * c.hidden);
+        (rows * std::mem::size_of::<f32>()) as u64
     }
 
     /// The bytes a back pass holds at once, per frame: its widest stage.
@@ -364,12 +395,14 @@ impl CodecDecoder {
         self.pre_conv.forward(q, 1, 1)
     }
 
-    /// `codes [quantizers, T]` of positions `first..first + T` through the front, `[T, latent]`.
-    pub fn front(&self, codes: &Tensor, first: usize) -> Result<Tensor> {
+    /// `codes [quantizers, T]` of a pass that starts afresh through the front, `[T, latent]`.
+    ///
+    /// The transformer sees the pass's frames at positions `0..T`.
+    pub fn front(&self, codes: &Tensor) -> Result<Tensor> {
         let x = self.pre_conv(&self.dequantize(codes)?)?;
         let (_, c, t) = x.shape().dims3()?;
         let rows = x.reshape((c, t))?.transpose(0, 1)?.contiguous()?;
-        self.transformer.forward(&rows, first, &self.config)
+        self.transformer.forward(&rows)
     }
 
     /// `x [1, latent, T]` through the upsample stages, `[1, latent, T * ratios]`.
@@ -429,7 +462,7 @@ impl CodecDecoder {
         let total = codes.dims()[1];
         let mut rows = Vec::new();
         for (from, start, end) in passes(0, total, chunking.front_frames, chunking.front_context) {
-            let out = self.front(&codes.narrow(1, from, end - from)?, from)?;
+            let out = self.front(&codes.narrow(1, from, end - from)?)?;
             rows.push(out.narrow(0, start - from, end - start)?);
         }
         let rows: Vec<&Tensor> = rows.iter().collect();
@@ -495,7 +528,7 @@ impl<'a> DecodeStream<'a> {
         for (from, s, end) in passes(start, total, c.front_frames, c.front_context) {
             let out = self
                 .decoder
-                .front(&codes.narrow(1, from - first, end - from)?, from)?;
+                .front(&codes.narrow(1, from - first, end - from)?)?;
             rows.push(out.narrow(0, s - from, end - s)?);
         }
         let rows = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?;
@@ -533,14 +566,15 @@ fn clamp(x: &Tensor, bound: f32) -> Result<Tensor> {
     max_scalar(&low.affine(-1.0, 0.0)?, -bound)?.affine(-1.0, 0.0)
 }
 
-/// The codec's configuration in the directory `codec`.
-fn read_config(codec: &std::path::Path) -> Result<CodecConfig> {
+/// The codec's configuration in the directory `codec`, as read and as the decoder's sizes.
+fn read_config(codec: &std::path::Path) -> Result<(serde_json::Value, CodecConfig)> {
     let path = codec.join("config.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| Error::msg(format!("read {}: {e}", path.display())))?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| Error::msg(format!("parse {}: {e}", path.display())))?;
-    CodecConfig::read(&json)
+    let config = CodecConfig::read(&json)?;
+    Ok((json, config))
 }
 
 /// The codec's file under the checkpoint at `dir`.
@@ -557,4 +591,10 @@ pub(crate) fn decoder_bytes(weights: &std::path::Path) -> Result<u64> {
         .filter(|(n, _)| n.starts_with(DECODER_PREFIX))
         .map(|(_, b)| *b as u64)
         .sum())
+}
+
+/// The bytes of the decoder's tensors placed whole: its transformer's layers aside.
+fn whole_bytes(weights: &std::path::Path) -> Result<u64> {
+    let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::new(weights)? };
+    Ok(decoder_bytes(weights)? - transformer::layer_bytes(&st))
 }

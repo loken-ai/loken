@@ -295,6 +295,7 @@ impl TtsEngine {
                 vec![
                     part("talker", talker),
                     part("code-predictor", predictor),
+                    part("codec-transformer", q.decoder.transformer_placement()),
                     part("codec-decoder", whole(q.decoder.device(), 1)),
                 ]
             }

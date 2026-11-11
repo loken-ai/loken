@@ -364,7 +364,9 @@ The tests check:
 
 `src/inference/model/qwen3_tts/decoder/` turns frames of codes into the waveform of a Qwen3-TTS checkpoint.
 It reads `speech_tokenizer/config.json` and the `decoder.` tensors of `speech_tokenizer/model.safetensors`.
-It is 1 block placed whole by `ladder::load_whole`, in F32 as stored.
+The transformer's layers and final norm are a transformer of the generic route, class `Qwen3TTSTokenizerV2DecoderTransformerModel`, loaded by `class_load::load_class_from` with its own demand.
+The rest is 1 block placed whole by `ladder::load_whole`, in F32 as stored.
+The rest holds the transformer's input and output projections, which run on its device.
 
 The decode runs in 2 parts:
 
@@ -372,6 +374,8 @@ The decode runs in 2 parts:
 - the back: the upsample stages, the first conv, the snake blocks, the last snake and conv, at the rates up to the sample rate
 
 The transformer layer is pre-norm with RMSNorm, separate q k v, a rotary embedding over the 2 halves of each head, a sliding causal window, SwiGLU and LayerScale.
+Each pass of the front runs the layers afresh, its frames at positions from 0.
+The layers give every normed row (`forward_embeddings_rows`).
 An upsample stage is a causal transposed conv and a ConvNeXt block.
 A snake block is SnakeBeta, a causal transposed conv and residual units of growing dilation.
 SnakeBeta runs on `snake1d`, its 2 inputs computed at load from `alpha` and `beta`.
@@ -385,6 +389,7 @@ Each part decodes in chunks whose left context is its receptive field, so a chun
 - the front reaches back through the first conv and the window of every layer
 - the back reaches back through every kernel, stride and dilation
 - a chunk holds the most frames whose working set fits the reserve the block is placed with
+- the layers run a front pass in prefill chunks, their cache held to the window
 
 A streamed decode (`DecodeStream`) takes frames as the talker draws them:
 
@@ -403,6 +408,7 @@ On a card, the depthwise conv of the ConvNeXt blocks runs on the card: a grouped
 The comparison to the reference runs outside the test suite.
 The tests check, on the host and on a card when the ladder places it there:
 
+- the transformer on the generic layers against a plain host run in F64 of the reference's layer, on a toy and on the published checkpoint, within the rounding of the residual's float type
 - the waveform of 8 frames: its sample count, its bound and its repeat
 - a decode in small chunks against a whole decode, for each part, within the rounding of F32 through the part
 - a decode fed frames in uneven groups against a whole decode, within the rounding of F32 through the decoder
