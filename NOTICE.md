@@ -75,6 +75,8 @@ The speaker encoder in `src/inference/model/qwen3_tts/speaker.rs` follows the la
 
 The clone prompt in `src/inference/model/qwen3_tts/prompt.rs` follows the layout `generate` and `generate_icl_prompt` build in `modeling_qwen3_tts.py`, in the non-streaming layout, and the reference turn of `qwen3_tts_model.py`. The code is written for loken.
 
+The named-voice prompt in `src/inference/model/qwen3_tts/prompt.rs` and `config.rs` follows how `generate` in `modeling_qwen3_tts.py` places a named speaker's codec row and the instruct turn of `generate_custom_voice` in `qwen3_tts_model.py`. `DIALECT_OF`, the language a dialect speaker replaces by its dialect, is the value of that code. The code is written for loken.
+
 The codec decoder in `src/inference/model/qwen3_tts/decoder/` follows the layers of the decoder in `modeling_qwen3_tts_tokenizer_v2.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). The code is written for loken.
 
 ## Model weights

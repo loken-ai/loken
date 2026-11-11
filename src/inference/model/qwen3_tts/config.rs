@@ -21,6 +21,8 @@ pub struct SpeechIds {
     pub codec_think_eos: u32,
     /// The codec id of each language the checkpoint names.
     pub languages: Vec<(String, u32)>,
+    /// The speakers the checkpoint names, empty for a checkpoint that names none.
+    pub speakers: Vec<NamedSpeaker>,
     /// Rows of the talker's codec table and head.
     pub talker_vocab: usize,
     /// Rows of each code predictor table and head: the codebook of every group.
@@ -30,6 +32,23 @@ pub struct SpeechIds {
     /// Positions the talker's rotary table covers.
     pub talker_positions: usize,
 }
+
+/// A speaker the checkpoint names: a row of the talker's codec table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedSpeaker {
+    /// The name, in the case the configuration writes it.
+    pub name: String,
+    /// The codec id of the speaker's row.
+    pub codec: u32,
+    /// The language the speaker speaks a dialect of, by the name `codec_language_id` gives it.
+    pub dialect: Option<String>,
+}
+
+/// The language whose codec id a dialect speaker replaces by the id of its dialect, as when
+/// the request leaves the language to the model.
+///
+/// The reference generation states it, and no file of the checkpoint does.
+pub const DIALECT_OF: &str = "chinese";
 
 fn field<'a>(v: &'a Json, path: &[&str]) -> Result<&'a Json> {
     path.iter()
@@ -47,6 +66,38 @@ fn id(v: &Json, path: &[&str]) -> Result<u32> {
 
 fn size(v: &Json, path: &[&str]) -> Result<usize> {
     id(v, path).map(|x| x as usize)
+}
+
+/// The speakers `talker_config.spk_id` of the configuration `root` names, sorted by name, each
+/// with the dialect `talker_config.spk_is_dialect` gives it.
+///
+/// A configuration without `spk_id` names none.
+pub fn named_speakers(root: &Json) -> Vec<NamedSpeaker> {
+    let talker = root.get("talker_config");
+    let dialects = talker
+        .and_then(|c| c.get("spk_is_dialect"))
+        .and_then(Json::as_object);
+    let dialect = |name: &str| {
+        dialects
+            .and_then(|d| d.get(name))
+            .and_then(Json::as_str)
+            .map(str::to_string)
+    };
+    let mut speakers: Vec<NamedSpeaker> = talker
+        .and_then(|c| c.get("spk_id"))
+        .and_then(Json::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, v)| {
+            Some(NamedSpeaker {
+                name: name.clone(),
+                codec: v.as_u64()? as u32,
+                dialect: dialect(name),
+            })
+        })
+        .collect();
+    speakers.sort_by(|a, b| a.name.cmp(&b.name));
+    speakers
 }
 
 impl SpeechIds {
@@ -72,6 +123,7 @@ impl SpeechIds {
             codec_think_bos: id(root, &[t, "codec_think_bos_id"])?,
             codec_think_eos: id(root, &[t, "codec_think_eos_id"])?,
             languages,
+            speakers: named_speakers(root),
             talker_vocab: size(root, &[t, "vocab_size"])?,
             codebook: size(root, &[t, p, "vocab_size"])?,
             groups: size(root, &[t, "num_code_groups"])?,
@@ -97,6 +149,44 @@ impl SpeechIds {
             })
     }
 
+    /// The speaker the checkpoint names `name`, matched without case, refused with the names
+    /// the checkpoint has.
+    pub fn speaker(&self, name: &str) -> Result<&NamedSpeaker> {
+        let wanted = name.trim().to_lowercase();
+        self.speakers
+            .iter()
+            .find(|s| s.name.to_lowercase() == wanted)
+            .ok_or_else(|| {
+                let names: Vec<&str> = self.speakers.iter().map(|s| s.name.as_str()).collect();
+                Error::msg(format!(
+                    "the checkpoint names no speaker {name:?}: it names {}",
+                    names.join(", ")
+                ))
+            })
+    }
+
+    /// The codec id of the language `name` spoken by `speaker`, `None` for a language the
+    /// prompt leaves to the model.
+    ///
+    /// A dialect speaker asked for no language, or for the language its dialect belongs to,
+    /// speaks its dialect.
+    /// Asked for another language, it speaks that language.
+    pub fn speaker_language(
+        &self,
+        name: Option<&str>,
+        speaker: &NamedSpeaker,
+    ) -> Result<Option<u32>> {
+        let given = self.language(name)?;
+        let Some(dialect) = &speaker.dialect else {
+            return Ok(given);
+        };
+        let of_dialect = name.is_none_or(|n| n.to_lowercase() == DIALECT_OF);
+        match of_dialect {
+            true => self.language(Some(dialect)),
+            false => Ok(given),
+        }
+    }
+
     /// The talker ids that can end no frame: every id past the codebook but the end of speech.
     pub fn suppressed(&self) -> Vec<u32> {
         (self.codebook as u32..self.talker_vocab as u32)
@@ -112,12 +202,15 @@ pub enum Variant {
     VoiceDesign,
     /// A voice cloned from a clip: a speaker embedding, and a reference text and its codes.
     Base,
+    /// A voice the checkpoint names: a row of its codec table, and an optional style text.
+    CustomVoice,
 }
 
 /// The names `tts_model_type` gives the variants this build serves.
-pub const SERVED_VARIANTS: [(&str, Variant); 2] = [
+pub const SERVED_VARIANTS: [(&str, Variant); 3] = [
     ("voice_design", Variant::VoiceDesign),
     ("base", Variant::Base),
+    ("custom_voice", Variant::CustomVoice),
 ];
 
 /// The variant the configuration `root` declares in `tts_model_type`, refused unless this
@@ -137,7 +230,7 @@ pub fn served_variant(root: &Json) -> Result<Variant> {
                 .collect();
             Error::msg(format!(
                 "the checkpoint is of the variant {variant:?}: only {} are served",
-                names.join(" and ")
+                names.join(", ")
             ))
         })
 }

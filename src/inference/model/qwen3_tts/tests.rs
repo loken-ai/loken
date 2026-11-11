@@ -318,6 +318,7 @@ fn published_request() -> Request<'static> {
     Request {
         text: "Hello, this is a short test.",
         design: Some("A calm young woman with a warm, clear voice."),
+        speaker: None,
         language: Some("english"),
         seed: 0,
         clone: None,
@@ -476,6 +477,7 @@ fn a_streamed_long_text_is_spoken_to_its_end() {
     let request = Request {
         text: "ab ab. ab ab. ab ab.",
         design: None,
+        speaker: None,
         language: None,
         seed: 21,
         clone: None,
@@ -513,6 +515,7 @@ fn a_streamed_text_the_cache_holds_is_spoken_in_one_call() {
     let request = Request {
         text: "ab ab. ab ab. ab ab.",
         design: None,
+        speaker: None,
         language: None,
         seed: 21,
         clone: None,
@@ -542,14 +545,172 @@ fn a_streamed_text_the_cache_holds_is_spoken_in_one_call() {
 }
 
 #[test]
-fn a_variant_other_than_the_voice_design_and_the_base_is_refused_by_name() {
+fn a_variant_this_build_does_not_serve_is_refused_by_name() {
     let mut root = speech_config();
     assert_eq!(config::served_variant(&root).unwrap(), Variant::VoiceDesign);
     root["tts_model_type"] = json!("base");
     assert_eq!(config::served_variant(&root).unwrap(), Variant::Base);
     root["tts_model_type"] = json!("custom_voice");
+    assert_eq!(config::served_variant(&root).unwrap(), Variant::CustomVoice);
+    root["tts_model_type"] = json!("other");
     let err = config::served_variant(&root).unwrap_err().to_string();
-    assert!(err.contains("custom_voice"), "{err}");
+    assert!(
+        err.contains("other") && err.contains("custom_voice"),
+        "{err}"
+    );
+}
+
+/// The toy configuration of a CustomVoice checkpoint: 2 named speakers, one of a dialect.
+fn named_config() -> Json {
+    let mut root = toy_config();
+    root["tts_model_type"] = json!("custom_voice");
+    let t = &mut root["talker_config"];
+    t["codec_language_id"] = json!({"english": 37, "chinese": 28, "toy_dialect": 29});
+    t["spk_id"] = json!({"Alice": 38, "bob": 39});
+    t["spk_is_dialect"] = json!({"Alice": false, "bob": "toy_dialect"});
+    root
+}
+
+/// The speakers are read from the configuration, found without case, and an unknown name is
+/// refused with the names the checkpoint has.
+/// A dialect speaker speaks its dialect when the language is left to the model or is the one
+/// its dialect belongs to, and another language when asked.
+#[test]
+fn a_named_speaker_and_its_dialect_come_from_the_configuration() {
+    let ids = SpeechIds::read(&named_config()).unwrap();
+    let names: Vec<&str> = ids.speakers.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["Alice", "bob"]);
+    let alice = ids.speaker("alice").unwrap();
+    assert_eq!((alice.codec, alice.dialect.as_deref()), (38, None));
+    let bob = ids.speaker(" BOB ").unwrap();
+    assert_eq!(
+        (bob.codec, bob.dialect.as_deref()),
+        (39, Some("toy_dialect"))
+    );
+    let err = ids.speaker("carol").unwrap_err().to_string();
+    assert!(err.contains("carol") && err.contains("Alice, bob"), "{err}");
+    let language = |name: Option<&str>, speaker: &config::NamedSpeaker| {
+        ids.speaker_language(name, speaker).unwrap()
+    };
+    assert_eq!(language(None, alice), None);
+    assert_eq!(language(Some("chinese"), alice), Some(28));
+    assert_eq!(language(None, bob), Some(29));
+    assert_eq!(language(Some("chinese"), bob), Some(29));
+    assert_eq!(language(Some("english"), bob), Some(37));
+    assert!(ids.speaker_language(Some("klingon"), bob).is_err());
+    assert!(SpeechIds::read(&toy_config()).unwrap().speakers.is_empty());
+}
+
+/// A named prompt: the style turn, the role, the controls and the speaker's codec row beside
+/// the pad text row, the start of text, the text and its end, then the start of codes.
+#[test]
+fn the_named_prompt_puts_the_style_then_the_speaker_row_before_the_start_of_text() {
+    let ids = SpeechIds::read(&named_config()).unwrap();
+    let text = |t| prompt::Row {
+        text: Some(t),
+        codec: None,
+    };
+    let both = |t, c| prompt::Row {
+        text: Some(t),
+        codec: Some(c),
+    };
+    let (pad, bos, eos) = (ids.tts_pad, ids.tts_bos, ids.tts_eos);
+    let plain = prompt::Turns {
+        design: vec![],
+        role: vec![3],
+        text: vec![4, 5],
+    };
+    let tail = [
+        both(bos, ids.codec_pad),
+        both(4, ids.codec_pad),
+        both(5, ids.codec_pad),
+        both(eos, ids.codec_pad),
+        both(pad, ids.codec_bos),
+    ];
+    let mut want = vec![
+        text(3),
+        both(pad, ids.codec_nothink),
+        both(pad, ids.codec_think_bos),
+        both(pad, ids.codec_think_eos),
+        both(pad, 38),
+    ];
+    want.extend(tail);
+    assert_eq!(prompt::named_rows(&ids, &plain, None, 38), want);
+    let mut want = vec![
+        text(3),
+        both(pad, ids.codec_think),
+        both(pad, ids.codec_think_bos),
+        both(pad, 29),
+        both(pad, ids.codec_think_eos),
+        both(pad, 39),
+    ];
+    want.extend(tail);
+    assert_eq!(prompt::named_rows(&ids, &plain, Some(29), 39), want);
+    let styled = prompt::Turns {
+        design: vec![1, 2],
+        ..plain.clone()
+    };
+    let got = prompt::named_rows(&ids, &styled, None, 38);
+    assert_eq!(got[..2], [text(1), text(2)]);
+    assert_eq!(got[2..], prompt::named_rows(&ids, &plain, None, 38)[..]);
+}
+
+/// A CustomVoice checkpoint speaks a speaker it names, with or without a style.
+/// It refuses a request without a speaker, with an unknown one, or with a clone prompt.
+/// Another variant refuses a named speaker.
+#[test]
+fn a_custom_voice_checkpoint_speaks_a_speaker_it_names() {
+    let dir = toy_dir("named");
+    std::fs::write(dir.join("config.json"), named_config().to_string()).unwrap();
+    let talker = Talker::load(&dir, Rows::Exactly(64)).unwrap();
+    assert_eq!(talker.variant(), Variant::CustomVoice);
+    let request = Request {
+        text: "ab",
+        design: None,
+        speaker: Some("BOB"),
+        language: None,
+        seed: 0,
+        clone: None,
+    };
+    let rows = talker.request_rows(&request).unwrap();
+    let ids = talker.ids().clone();
+    let turns = prompt::Turns::of(&talker.tokenizer, "ab", None).unwrap();
+    let want = talker
+        .prompt_rows(&prompt::named_rows(&ids, &turns, Some(29), 39))
+        .unwrap();
+    assert_eq!(host(&rows).unwrap(), host(&want).unwrap());
+    let styled = Request {
+        design: Some("ab"),
+        ..request
+    };
+    let styled_rows = talker.request_rows(&styled).unwrap();
+    assert!(styled_rows.dim(0).unwrap() > rows.dim(0).unwrap());
+    let nameless = Request {
+        speaker: None,
+        ..request
+    };
+    let err = talker.request_rows(&nameless).unwrap_err().to_string();
+    assert!(err.contains("Alice, bob"), "{err}");
+    let unknown = Request {
+        speaker: Some("carol"),
+        ..request
+    };
+    assert!(talker.request_rows(&unknown).is_err());
+    let clone = ClonePrompt {
+        speaker: vec![0.0; talker.text_table.width()],
+        reference: None,
+    };
+    let cloned = Request {
+        clone: Some(&clone),
+        ..request
+    };
+    let err = talker.request_rows(&cloned).unwrap_err().to_string();
+    assert_eq!(err, CUSTOM_VOICE_TAKES_NO_CLONE);
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir = toy_dir("named_on_design");
+    let design = Talker::load(&dir, Rows::Exactly(64)).unwrap();
+    assert!(design.request_rows(&request).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -744,6 +905,7 @@ fn a_clone_prompt_row_sums_the_pad_row_and_the_speaker_or_the_frame() {
     let request = Request {
         text: "ab",
         design: None,
+        speaker: None,
         language: None,
         seed: 0,
         clone: None,
@@ -776,6 +938,7 @@ fn a_voice_design_checkpoint_refuses_a_clone_prompt() {
     let request = Request {
         text: "ab",
         design: None,
+        speaker: None,
         language: None,
         seed: 0,
         clone: Some(&clone),

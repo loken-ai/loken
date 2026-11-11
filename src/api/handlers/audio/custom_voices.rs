@@ -82,7 +82,7 @@ pub(super) fn talker_named(hf: &str, requested: &str) -> Option<Result<Talker, S
 }
 
 /// Every speech talker checkpoint of the Hugging Face store, by catalogue id.
-fn store_talkers(hf: &str) -> Vec<Talker> {
+pub(super) fn store_talkers(hf: &str) -> Vec<Talker> {
     let base = std::path::PathBuf::from(hf);
     let mut ids: Vec<String> = [base.clone(), base.join("hub")]
         .iter()
@@ -127,6 +127,14 @@ fn pick_talker(
 
 /// Whether the stored voice `voice` fits the talker `talker`, with the refusal when not.
 pub(super) fn voice_fits(voice: &StoredVoice, talker: &Talker) -> Result<(), String> {
+    if talker.voice.names {
+        return Err(format!(
+            "'{}' speaks the voices its checkpoint names: pass one of those names as `voice`, \
+             or speak the stored voice '{}' by a checkpoint that clones, such as '{}', which \
+             made it",
+            talker.id, voice.id, voice.checkpoint
+        ));
+    }
     if !talker.voice.clones {
         return Err(format!(
             "'{}' speaks a voice described in words: a stored voice is spoken by a checkpoint \
@@ -375,7 +383,7 @@ async fn create_from_prompt(
     let design = pick_talker(
         hf,
         model,
-        |v| !v.clones,
+        |v| v.describes,
         "a speech talker that speaks a described voice",
     )
     .map_err(bad_request)?;
@@ -656,6 +664,8 @@ mod tests {
                 clones,
                 encodes: clones,
                 width,
+                describes: !clones,
+                names: false,
             },
         }
     }
@@ -671,6 +681,14 @@ mod tests {
         );
         let design = voice_fits(&v, &talker(false, 8)).unwrap_err();
         assert!(design.contains("described in words"), "{design}");
+        let mut named = talker(false, 8);
+        named.voice.describes = false;
+        named.voice.names = true;
+        let named = voice_fits(&v, &named).unwrap_err();
+        assert!(
+            named.contains("its checkpoint names") && named.contains("org/base"),
+            "{named}"
+        );
     }
 
     #[test]

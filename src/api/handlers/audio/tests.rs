@@ -1506,6 +1506,74 @@ fn a_described_voice_joins_its_timbre_and_its_style() {
     assert!(speech_design(None, None, None, 1.0).text.is_empty());
 }
 
+/// A store of 2 speech talker checkpoints: `org/named` names 2 speakers, 1 of a dialect, and
+/// `org/design` speaks a described voice.
+fn named_store() -> crate::inference::media_facts::fixture::Scratch {
+    use crate::inference::media_facts::fixture::{json, safetensors, Scratch};
+    let s = Scratch::new("speech-named");
+    let snapshot = |id: &str, config: serde_json::Value| {
+        let dir =
+            s.0.join("hub")
+                .join(format!("models--{}", id.replace('/', "--")));
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs/main"), "r").unwrap();
+        let snap = dir.join("snapshots/r");
+        json(&snap.join("config.json"), config);
+        safetensors(
+            &snap.join("model.safetensors"),
+            &["talker.codec_head.weight", "talker.model.norm.weight"],
+            None,
+        );
+    };
+    let design = crate::inference::load::hf_config::tests::speech_config();
+    let mut named = design.clone();
+    named["tts_model_type"] = serde_json::json!("custom_voice");
+    named["talker_config"]["codec_language_id"]["toy_dialect"] = serde_json::json!(29);
+    named["talker_config"]["spk_id"] = serde_json::json!({"Alice": 38, "bob": 39});
+    named["talker_config"]["spk_is_dialect"] =
+        serde_json::json!({"Alice": false, "bob": "toy_dialect"});
+    snapshot("org/named", named);
+    snapshot("org/design", design);
+    s
+}
+
+/// The voices list gains the speakers of the store's checkpoints that name them.
+/// `voice` is matched without case, and a description, no voice or an unknown name is refused.
+#[test]
+fn a_named_voice_is_listed_and_found_without_case() {
+    let s = named_store();
+    let hf = s.0.to_string_lossy().to_string();
+    let listed = named_voices(&hf);
+    let names: Vec<&str> = listed.iter().filter_map(|v| v["voice"].as_str()).collect();
+    assert_eq!(names, ["Alice", "bob"]);
+    assert_eq!(listed[0]["model"], "org/named");
+    assert_eq!(listed[0]["family"], "org/named");
+    assert!(listed[0]["accent"].is_null());
+    assert_eq!(listed[1]["accent"], "toy_dialect");
+    let dir = speech_request(&hf, "org/named").unwrap().path;
+    let speak =
+        |voice: Option<&str>, described: bool| named_speaker(&dir, "org/named", voice, described);
+    assert_eq!(speak(Some("ALICE"), false), Ok("Alice".to_string()));
+    assert_eq!(speak(Some(" bob "), false), Ok("bob".to_string()));
+    let unknown = speak(Some("carol"), false).unwrap_err();
+    assert!(
+        unknown.contains("carol") && unknown.contains("Alice, bob"),
+        "{unknown}"
+    );
+    let none = speak(None, false).unwrap_err();
+    assert!(none.contains("Alice, bob"), "{none}");
+    let described = speak(Some("Alice"), true).unwrap_err();
+    assert!(described.contains("VoiceDesign"), "{described}");
+}
+
+/// A named voice without a seed draws from its name, and from its style when given.
+#[test]
+fn a_named_voice_seed_derives_from_its_name_and_its_style() {
+    assert_eq!(named_seed_text("bob", None), "bob");
+    assert_eq!(named_seed_text("bob", Some("  ")), "bob");
+    assert_eq!(named_seed_text("bob", Some("Sadly.")), "bob\nSadly.");
+}
+
 #[test]
 fn a_seed_derives_from_the_timbre_text() {
     assert_eq!(seed_of_text("A deep voice."), seed_of_text("A deep voice."));

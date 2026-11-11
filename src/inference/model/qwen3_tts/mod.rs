@@ -33,13 +33,19 @@ pub const BASE_NEEDS_A_CLONE: &str = "the Base variant speaks a voice cloned fro
      request needs a speaker embedding, and a reference text with its codes for the in-context \
      mode";
 
+/// The refusal of a clone prompt on a CustomVoice checkpoint.
+pub const CUSTOM_VOICE_TAKES_NO_CLONE: &str =
+    "the CustomVoice variant speaks a voice it names: it takes no clone prompt";
+
 /// What a request asks of the talker.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
     /// The text to speak.
     pub text: &'a str,
-    /// The words that describe the voice.
+    /// The words that describe the voice, or the style of a named speaker.
     pub design: Option<&'a str>,
+    /// The name of a speaker a CustomVoice checkpoint names.
+    pub speaker: Option<&'a str>,
     /// A language the checkpoint names, `None` leaving it to the model.
     pub language: Option<&'a str>,
     /// The seed of every draw.
@@ -393,7 +399,18 @@ impl Talker {
     ///
     /// A voice design checkpoint takes a design text and no clone prompt.
     /// A Base checkpoint takes a clone prompt and no design text.
+    /// A CustomVoice checkpoint takes a speaker it names, an optional style text and no clone
+    /// prompt.
+    /// Only a CustomVoice checkpoint takes a speaker.
     pub fn request_rows(&self, request: &Request<'_>) -> Result<Tensor> {
+        if self.variant == Variant::CustomVoice {
+            return self.named_request_rows(request);
+        }
+        if request.speaker.is_some() {
+            return Err(Error::msg(
+                "only the CustomVoice variant speaks a speaker it names",
+            ));
+        }
         let language = self.ids.language(request.language)?;
         match (self.variant, request.clone) {
             (Variant::VoiceDesign, None) => {
@@ -420,7 +437,30 @@ impl Talker {
                 let rows = prompt::clone_rows(&self.ids, &turns, language, reference);
                 self.clone_prompt_rows(&rows, &clone.speaker, clone.reference_frames())
             }
+            (Variant::CustomVoice, _) => self.named_request_rows(request),
         }
+    }
+
+    /// The prompt rows of `request` on a CustomVoice checkpoint.
+    ///
+    /// The speaker's language follows [`SpeechIds::speaker_language`].
+    /// The design text is the style.
+    fn named_request_rows(&self, request: &Request<'_>) -> Result<Tensor> {
+        if request.clone.is_some() {
+            return Err(Error::msg(CUSTOM_VOICE_TAKES_NO_CLONE));
+        }
+        let name = request.speaker.ok_or_else(|| {
+            let names: Vec<&str> = self.ids.speakers.iter().map(|s| s.name.as_str()).collect();
+            Error::msg(format!(
+                "the CustomVoice variant speaks a voice it names: a request names one of {}",
+                names.join(", ")
+            ))
+        })?;
+        let speaker = self.ids.speaker(name)?;
+        let language = self.ids.speaker_language(request.language, speaker)?;
+        let turns = prompt::Turns::of(&self.tokenizer, request.text, request.design)?;
+        let rows = prompt::named_rows(&self.ids, &turns, language, speaker.codec);
+        self.prompt_rows(&rows)
     }
 
     /// The frames of the utterance of `request`, each of a code per group.

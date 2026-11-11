@@ -77,6 +77,8 @@ pub struct TtsSynthParams {
     pub language: Option<String>,
     /// The speaker embedding a Base checkpoint clones, `None` for every other voice.
     pub speaker: Option<Vec<f32>>,
+    /// The name of the speaker a CustomVoice checkpoint names, `None` for every other voice.
+    pub named: Option<String>,
 }
 
 impl Default for TtsSynthParams {
@@ -91,6 +93,7 @@ impl Default for TtsSynthParams {
             max_steps: None,
             language: None,
             speaker: None,
+            named: None,
         }
     }
 }
@@ -1050,6 +1053,7 @@ fn decode_after(
 /// when given.
 ///
 /// The voice description is the design text, absent when empty.
+/// It is the style of a named speaker.
 fn qwen3_request<'a>(
     text: &'a str,
     params: &'a TtsSynthParams,
@@ -1058,6 +1062,7 @@ fn qwen3_request<'a>(
     let request = Qwen3Request {
         text,
         design: Some(params.voice_description.as_str()).filter(|d| !d.trim().is_empty()),
+        speaker: params.named.as_deref(),
         language: params.language.as_deref(),
         seed: params.seed,
         clone,
@@ -1151,6 +1156,10 @@ pub struct TalkerVoice {
     pub encodes: bool,
     /// The width of a speaker embedding the checkpoint takes.
     pub width: usize,
+    /// The checkpoint speaks a voice described in words.
+    pub describes: bool,
+    /// The checkpoint speaks the speakers its configuration names.
+    pub names: bool,
 }
 
 /// What the speech talker checkpoint at `dir` offers a stored voice, read from its
@@ -1168,7 +1177,23 @@ pub fn speech_talker_voice(dir: &std::path::Path) -> Result<TalkerVoice, String>
         clones: variant == Variant::Base,
         encodes: speaker_rate(&root).map_err(|e| e.to_string())?.is_some(),
         width: talker_width(&root).map_err(|e| e.to_string())?,
+        describes: variant == Variant::VoiceDesign,
+        names: variant == Variant::CustomVoice,
     })
+}
+
+/// The speakers the speech talker checkpoint at `dir` names, sorted by name, empty for a
+/// checkpoint that names none.
+pub fn speech_talker_speakers(
+    dir: &std::path::Path,
+) -> Result<Vec<crate::inference::model::qwen3_tts::config::NamedSpeaker>, String> {
+    use crate::inference::model::qwen3_tts::config::named_speakers;
+    let path = dir.join("config.json");
+    let root: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .ok_or_else(|| format!("{} cannot be read", path.display()))?;
+    Ok(named_speakers(&root))
 }
 
 /// The speaker embedding of the mono clip `samples` at `rate` hertz, by the speaker encoder
@@ -1554,9 +1579,32 @@ mod qwen3_tts_tests {
 
     #[test]
     fn a_checkpoint_of_another_variant_is_refused_by_name() {
-        let dir = talker_config_dir("variant", "custom_voice");
+        let dir = talker_config_dir("variant", "other_variant");
         let refused = speech_talker_language(&dir, None).unwrap_err();
-        assert!(refused.contains("custom_voice"), "{refused}");
+        assert!(refused.contains("other_variant"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CustomVoice checkpoint names its speakers, and no other variant does.
+    #[test]
+    fn a_custom_voice_checkpoint_names_its_speakers() {
+        let dir = talker_config_dir("named_voices", "custom_voice");
+        let path = dir.join("config.json");
+        let mut root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        root["talker_config"]["spk_id"] = serde_json::json!({"bob": 39, "Alice": 29});
+        std::fs::write(&path, root.to_string()).unwrap();
+        let voice = speech_talker_voice(&dir).unwrap();
+        assert!(voice.names && !voice.describes && !voice.clones);
+        let speakers = speech_talker_speakers(&dir).unwrap();
+        let names: Vec<&str> = speakers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Alice", "bob"]);
+        assert!(speakers.iter().all(|s| s.dialect.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = talker_config_dir("described_voices", "voice_design");
+        let voice = speech_talker_voice(&dir).unwrap();
+        assert!(voice.describes && !voice.names);
+        assert!(speech_talker_speakers(&dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

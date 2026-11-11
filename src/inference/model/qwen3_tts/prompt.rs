@@ -203,3 +203,27 @@ pub fn clone_rows(
     out.extend((0..frames).map(CloneRow::Frame));
     out
 }
+
+/// The rows of the prompt of `turns` in `language`, spoken by the named speaker whose codec id
+/// is `speaker`.
+///
+/// The design turn, which carries the style text, each id a text row.
+/// Then the rows of a clone prompt without a reference.
+/// Its speaker row is the pad text row beside the speaker's codec id.
+pub fn named_rows(ids: &SpeechIds, turns: &Turns, language: Option<u32>, speaker: u32) -> Vec<Row> {
+    let style = turns.design.iter().map(|&id| Row {
+        text: Some(id),
+        codec: None,
+    });
+    let rows = clone_rows(ids, turns, language, None)
+        .into_iter()
+        .filter_map(|r| match r {
+            CloneRow::Ids(row) => Some(row),
+            CloneRow::Speaker => Some(Row {
+                text: Some(ids.tts_pad),
+                codec: Some(speaker),
+            }),
+            CloneRow::Frame(_) => None,
+        });
+    style.chain(rows).collect()
+}

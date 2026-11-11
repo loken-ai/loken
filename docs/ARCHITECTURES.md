@@ -399,6 +399,24 @@ The decoder takes the reference frames before the frames drawn, and their sample
 The engine entries `qwen3_speaker_embedding`, `qwen3_clone_blocking` and `qwen3_clone_streamed` in `tts_engine.rs` take a clone prompt.
 No request field carries one yet.
 
+### The CustomVoice variant
+
+`custom_voice` speaks a voice the checkpoint names.
+`talker_config.spk_id` maps each name to a row of the talker's codec table.
+`talker_config.spk_is_dialect` maps each name to `false` or to a language of `codec_language_id`.
+A CustomVoice request names a speaker, matched without case, and may carry a style text.
+A request without a speaker, with a name the checkpoint lacks or with a clone prompt is refused.
+
+The prompt (`prompt::named_rows`):
+
+- the style turn, each id a text row, when the request carries a style
+- the rows of a clone prompt with the speaker embedding only
+- the speaker row is the pad text row beside the speaker's codec row
+
+A dialect speaker speaks its dialect when the request leaves the language to the model or asks for `DIALECT_OF`.
+Its control codes then carry the id of the dialect.
+Asked for another language, it speaks that language.
+
 ## Speech codec decoder
 
 `src/inference/model/qwen3_tts/decoder/` turns frames of codes into the waveform of a Qwen3-TTS checkpoint.

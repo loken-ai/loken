@@ -1945,7 +1945,14 @@ pub(crate) async fn audio_speech(
     // silently routes to the "alloy" default in openai_voice_to_description,
     // so callers expecting a specific voice get the wrong one with no
     // warning.
-    if req.voice_description.is_none() && stored.is_none() {
+    // A speech talker whose checkpoint names its voices reads `voice` as one of those names.
+    let names_voices = requested_model
+        .as_deref()
+        .and_then(|m| speech_request(state.huggingface_models_dir.as_str(), m))
+        .filter(|s| s.model == crate::inference::media_facts::SpeechModel::Qwen3Tts)
+        .and_then(|s| crate::inference::engine::tts_engine::speech_talker_voice(&s.path).ok())
+        .is_some_and(|v| v.names);
+    if req.voice_description.is_none() && stored.is_none() && !names_voices {
         if let Some(v) = req.voice.as_deref() {
             let lower = v.to_lowercase();
             if !KNOWN_VOICES.contains(&lower.as_str()) {
@@ -2102,14 +2109,32 @@ pub(crate) async fn audio_speech(
         }
         (None, None) => None,
     };
-    let design = talker.as_ref().filter(|_| speaker.is_none()).map(|_| {
-        speech_design(
-            capped(&req.voice_description).as_deref(),
-            req.voice.as_deref(),
-            capped(&req.instructions).as_deref(),
-            speed,
-        )
-    });
+    // A talker that names its voices speaks the one `voice` names, in the style
+    // `instructions` gives.
+    let named = match (talker.as_ref(), talker_voice.as_ref()) {
+        (Some(s), Some(t)) if t.voice.names => {
+            let described = req.voice_description.is_some();
+            match named_speaker(&s.path, &t.id, req.voice.as_deref(), described) {
+                Ok(name) => Some(name),
+                Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
+            }
+        }
+        _ => None,
+    };
+    let style = capped(&req.instructions)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let design = talker
+        .as_ref()
+        .filter(|_| speaker.is_none() && named.is_none())
+        .map(|_| {
+            speech_design(
+                capped(&req.voice_description).as_deref(),
+                req.voice.as_deref(),
+                capped(&req.instructions).as_deref(),
+                speed,
+            )
+        });
 
     // The backend resolved above: the caller's model when they named one, otherwise the
     // one that can speak the language they asked for.
@@ -2127,13 +2152,16 @@ pub(crate) async fn audio_speech(
     // A speech talker without a seed draws from a hash of its timbre text, so the same
     // description gives the same draw.
     // A stored voice without a seed draws from a hash of its id.
-    let derived_seed = match &stored {
-        Some(v) => Some(seed_of_text(&v.id)),
-        None => design.as_ref().map(|d| seed_of_text(d.seed_text())),
+    // A named voice without a seed draws from a hash of its name and its style.
+    let derived_seed = match (&stored, &named) {
+        (Some(v), _) => Some(seed_of_text(&v.id)),
+        (None, Some(name)) => Some(seed_of_text(&named_seed_text(name, style.as_deref()))),
+        (None, None) => design.as_ref().map(|d| seed_of_text(d.seed_text())),
     };
     let params = TtsSynthParams {
         voice_description: match design {
             Some(d) => d.text,
+            None if named.is_some() => style.unwrap_or_default(),
             None if speaker.is_some() => String::new(),
             None => description,
         },
@@ -2160,6 +2188,7 @@ pub(crate) async fn audio_speech(
         max_steps: req.max_steps.map(|v| v as usize),
         language,
         speaker,
+        named,
     };
 
     // The event stream owns its load: it has to START before the checkpoint is read, or
@@ -2424,6 +2453,54 @@ pub(super) fn speech_design(
         None => timbre.clone(),
     };
     Design { text, timbre }
+}
+
+/// The name of the speaker the checkpoint at `dir`, of catalogue id `id`, names `voice`, in
+/// the case its configuration writes it.
+///
+/// A `voice_description` is refused with the variant that takes one.
+/// No voice, or a name the checkpoint lacks, is refused with the names it has.
+pub(super) fn named_speaker(
+    dir: &std::path::Path,
+    id: &str,
+    voice: Option<&str>,
+    described: bool,
+) -> Result<String, String> {
+    if described {
+        return Err(format!(
+            "'{id}' speaks the voices its checkpoint names: a voice described in \
+             `voice_description` is spoken by the VoiceDesign variant. Name the voice in `voice` \
+             and give its style in `instructions`"
+        ));
+    }
+    let speakers = crate::inference::engine::tts_engine::speech_talker_speakers(dir)?;
+    let names: Vec<&str> = speakers.iter().map(|s| s.name.as_str()).collect();
+    let Some(voice) = voice.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Err(format!(
+            "'{id}' speaks the voices its checkpoint names: pass one of {} as `voice`",
+            names.join(", ")
+        ));
+    };
+    let wanted = voice.to_lowercase();
+    speakers
+        .iter()
+        .find(|s| s.name.to_lowercase() == wanted)
+        .map(|s| s.name.clone())
+        .ok_or_else(|| {
+            format!(
+                "'{id}' names no voice '{voice}': it names {}",
+                names.join(", ")
+            )
+        })
+}
+
+/// The text a named voice without a seed draws its seed from: its name, and its style when
+/// given.
+pub(super) fn named_seed_text(name: &str, style: Option<&str>) -> String {
+    match style.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(style) => format!("{name}\n{style}"),
+        None => name.to_string(),
+    }
 }
 
 /// The seed of `text`: the same text gives the same seed on any machine.
@@ -2866,6 +2943,38 @@ pub(super) fn tts_events_response(
         .into_response()
 }
 
+/// The speakers each speech talker checkpoint of the store `hf` names, as entries of the
+/// voices list.
+///
+/// `family` and `model` are the checkpoint's id, which a request names as its `model`.
+/// `accent` is the speaker's dialect, `null` when it speaks none.
+/// `gender` is `null`: the checkpoint does not state it.
+pub(super) fn named_voices(hf: &str) -> Vec<serde_json::Value> {
+    super::custom_voices::store_talkers(hf)
+        .iter()
+        .filter(|t| t.voice.names)
+        .filter_map(|t| {
+            let speech = speech_request(hf, &t.id)?;
+            let speakers =
+                crate::inference::engine::tts_engine::speech_talker_speakers(&speech.path).ok()?;
+            Some((t.id.clone(), speakers))
+        })
+        .flat_map(|(id, speakers)| {
+            speakers.into_iter().map(move |s| {
+                serde_json::json!({
+                    "voice": s.name,
+                    "description": format!("a voice the checkpoint '{id}' names"),
+                    "gender": null,
+                    "family": id,
+                    "accent": s.dialect,
+                    "is_default": false,
+                    "model": id,
+                })
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn audio_voices(
     state: axum::extract::State<APIServer>,
 ) -> axum::response::Response {
@@ -2902,6 +3011,10 @@ pub(crate) async fn audio_voices(
                 "is_default": *v == "alloy",
             })
         })
+        .collect();
+    let voices: Vec<serde_json::Value> = voices
+        .into_iter()
+        .chain(named_voices(&state.huggingface_models_dir))
         .collect();
     // Report the *loaded* checkpoint's name + sample_rate when a model
     // is warm; fall back to the default mini-v1 / 44.1 kHz otherwise so
