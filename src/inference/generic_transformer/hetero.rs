@@ -464,6 +464,15 @@ impl GenericHeteroTransformer {
         out
     }
 
+    /// The runs of consecutive layers on one device, as the placement of a part is reported.
+    pub fn placed_runs(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        let runs = self.layer_devs.iter().map(|ld| match ld {
+            LayerDevice::Cuda(idx) => crate::tensor::DeviceLocation::Cuda { gpu_id: *idx },
+            LayerDevice::Cpu => crate::tensor::DeviceLocation::Cpu,
+        });
+        crate::inference::serve::progress::placement::runs(runs, 0)
+    }
+
     /// Forward pass: embed -> layers (CUDA+CPU segments) -> norm -> logits.
     /// Standard forward: returns logits for the LAST position only
     /// (shape `[batch, vocab]`). Equivalent to `forward_inner(x, pos, false)`.

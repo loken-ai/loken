@@ -288,6 +288,7 @@ impl TtsEngine {
             Backend::Kyutai(k) => vec![
                 part("lm", k.lm.placement()),
                 part("depformer", k.depformer.placement()),
+                part("mimi-transformer", k.mimi.transformer_placement()),
                 part("mimi", k.mimi.placement()),
             ],
             Backend::Qwen3Tts(q) => {

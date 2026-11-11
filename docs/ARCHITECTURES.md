@@ -420,6 +420,23 @@ The tests check, on the host and on a card when the ladder places it there:
 - a decode fed frames in uneven groups against a whole decode, within the rounding of F32 through the decoder
 - the left context of toy chains of stages
 
+## Mimi decoder
+
+`src/inference/model/kyutai/mimi.rs` turns the codes of Kyutai's TTS into the waveform.
+It reads the codec's own file, which holds no configuration.
+The decoder-transformer's configuration is made from the shapes of its tensors and the settings Mimi's reference fixes: `ATTENTION_HEADS`, `ATTENTION_WINDOW`, `ROPE_THETA` and `LN_EPS`.
+Its layers are a transformer of the generic route, class `ProjectedTransformer`, loaded by `class_load::load_class_from` with their own demand.
+They sit on the cards the ladder sees when the decoder sits on a card, on the host otherwise.
+The rest of the decoder sits on the device it is given: the dequantisation, the upsample and the SEANet decoder.
+
+A decode runs every frame at once, from position 0, and keeps no state between calls.
+The layers run the rows in prefill chunks, their cache held to the window and a chunk.
+
+The tests check the layers on the generic route against the decoder's own layer code, on a toy and on the published checkpoint when the test store holds it, on the host and on a card:
+
+- the rows, within the rounding of the residual's float type through the layers and of the rotary angles at the last position
+- the waveform of a fixed code list, within the same share of its peak
+
 ## Drafter verification
 
 A verify step runs several rows at once (`src/inference/generic_transformer/verify_window.rs`).
