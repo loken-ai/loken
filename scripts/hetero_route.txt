@@ -32,6 +32,7 @@ family pocket_tts
 family qwen25
 family qwen3
 family qwen35
+family qwen3_tts
 family qwen3vl
 family qwen_image
 family reranker

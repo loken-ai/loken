@@ -329,6 +329,15 @@ impl LlmEngine {
             }
         };
 
+        // A checkpoint another route serves is refused with the route that serves it.
+        if let Some(why) =
+            crate::inference::load::awq_loader::text_route_refusal(&model_file.to_string_lossy())
+        {
+            error!("❌ {why}");
+            *self.last_error.lock().await = Some(why.clone());
+            return Err(why.into());
+        }
+
         debug!("📂 Found model file: {}", model_file.display());
 
         let metadata = std::fs::metadata(&model_file)?;

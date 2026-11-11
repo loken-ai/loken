@@ -93,7 +93,8 @@ pub struct KvDiskStore {
     index: Mutex<Vec<Manifest>>,
 }
 
-fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+/// The FNV-1a hash of `bytes` from `seed`: the same bytes give the same hash on any machine.
+pub(crate) fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
     let mut h = seed ^ 0xcbf29ce484222325;
     for b in bytes {
         h ^= *b as u64;

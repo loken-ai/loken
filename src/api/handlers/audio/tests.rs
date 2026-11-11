@@ -1486,3 +1486,31 @@ fn audio_header_seconds_reads_a_wav_length() {
     assert!((seconds - 1.5).abs() < 1e-9, "{seconds}");
     assert!(audio_header_seconds(b"not audio").is_none());
 }
+
+/// The timbre comes from `voice_description`, else from the preset, the style from
+/// `instructions`, and both join timbre first.
+#[test]
+fn a_described_voice_joins_its_timbre_and_its_style() {
+    let preset = openai_voice_to_description("nova", 1.0);
+    let both = speech_design(None, Some("nova"), Some("Whisper it."), 1.0);
+    assert_eq!(both.text, format!("{preset} Whisper it."));
+    assert_eq!(both.timbre, preset);
+    let described = speech_design(Some("A deep voice."), Some("nova"), Some("Slowly."), 1.0);
+    assert_eq!(described.text, "A deep voice. Slowly.");
+    assert_eq!(described.seed_text(), "A deep voice.");
+    let style = speech_design(None, None, Some("Cheerful."), 1.0);
+    assert_eq!(style.text, "Cheerful.");
+    assert_eq!(style.seed_text(), "Cheerful.");
+    let timbre = speech_design(Some("A deep voice."), None, Some("  "), 1.0);
+    assert_eq!(timbre.text, "A deep voice.");
+    assert!(speech_design(None, None, None, 1.0).text.is_empty());
+}
+
+#[test]
+fn a_seed_derives_from_the_timbre_text() {
+    assert_eq!(seed_of_text("A deep voice."), seed_of_text("A deep voice."));
+    assert_ne!(
+        seed_of_text("A deep voice."),
+        seed_of_text("A bright voice.")
+    );
+}

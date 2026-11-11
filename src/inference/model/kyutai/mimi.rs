@@ -9,9 +9,10 @@
 //! checkpoint stores. Codebook = `embedding_sum / max(cluster_usage, eps)` (Mimi EMA).
 
 use crate::inference::model::acestep::fsq::rope_tables;
+use crate::inference::model::codec_blocks::{causal_conv1d, causal_convtr1d, Rvq};
 use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
-use crate::tensor::{Device, Error, Result, Tensor};
+use crate::tensor::{Device, Result, Tensor};
 
 /// Mimi's transformer settings, which its reference code fixes and its checkpoint does not
 /// store: the head count its attention splits the width into, and the positions the
@@ -24,52 +25,11 @@ const VQ_EPS: f32 = 1e-5;
 /// Mimi's output sample rate, fixed by the codec.
 pub const SAMPLE_RATE: u32 = 24_000;
 
-// -- shared conv/act helpers (same math as native_pocket_tts) -----------------
-fn add_bias(y: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    match bias {
-        None => Ok(y),
-        Some(b) => {
-            let out = b.dims()[0];
-            y.broadcast_add(&b.reshape((1, out, 1))?)
-        }
-    }
-}
-/// Causal Conv1d: left-pad `(k-1)*dilation+1-stride`, then conv with no pad.
-fn causal_conv1d(
-    x: &Tensor,
-    w: &Tensor,
-    bias: Option<&Tensor>,
-    stride: usize,
-    dilation: usize,
-    groups: usize,
-) -> Result<Tensor> {
-    let k = w.shape().dims3()?.2;
-    let pad = (k - 1) * dilation + 1 - stride;
-    let xp = x.pad_with_zeros(2, pad, 0)?;
-    add_bias(xp.conv1d(w, 0, stride, dilation, groups)?, bias)
-}
-/// Causal ConvTranspose1d: transpose then trim `(k-stride)` from the right.
-fn causal_convtr1d(
-    x: &Tensor,
-    w: &Tensor,
-    bias: Option<&Tensor>,
-    stride: usize,
-    groups: usize,
-) -> Result<Tensor> {
-    let k = w.shape().dims3()?.2;
-    let y = x.conv_transpose1d(w, 0, 0, stride, 1, groups)?;
-    let l = y.shape().dims3()?.2;
-    add_bias(y.narrow(2, 0, l.saturating_sub(k - stride))?, bias)
-}
 /// ELU(1.0) = relu(x) + (exp(min(x,0)) - 1).
 fn elu(x: &Tensor) -> Result<Tensor> {
     let pos = x.relu()?;
     let min_x0 = x.affine(-1.0, 0.0)?.relu()?.affine(-1.0, 0.0)?;
     pos.add(&min_x0.exp()?.affine(1.0, -1.0)?)
-}
-/// max(x, c) = relu(x - c) + c - no native clamp, built from relu/affine.
-fn max_scalar(x: &Tensor, c: f32) -> Result<Tensor> {
-    x.affine(1.0, -c)?.relu()?.affine(1.0, c)
 }
 
 struct Conv {
@@ -120,55 +80,6 @@ impl ResBlock {
         let h = elu(&h)?;
         let h = causal_conv1d(&h, &self.conv2.w, self.conv2.b.as_ref(), 1, 1, 1)?;
         x.add(&h)
-    }
-}
-
-// -- RVQ dequant (NEW for tts-1.6b) -------------------------------------------
-/// One ResidualVectorQuantizer's decode: Σ_k codebook_k[codes_k] -> output_proj.
-struct Rvq {
-    codebooks: Vec<Tensor>, // each [entries, vq_dim], EMA-normalized
-    output_proj: Tensor,    // [dim, vq_dim, 1] conv1x1
-}
-impl Rvq {
-    fn load(vb: &VarBuilder) -> Result<Self> {
-        let n_cb = vb.count_children("vq.layers");
-        let mut codebooks = Vec::with_capacity(n_cb);
-        for k in 0..n_cb {
-            let sum = format!("vq.layers.{k}._codebook.embedding_sum");
-            let es = vb.get(vb.shape_of(&sum)?, &sum)?;
-            let (entries, _) = es.shape().dims2()?;
-            let cu = vb.get(entries, &format!("vq.layers.{k}._codebook.cluster_usage"))?;
-            // codebook = embedding_sum / max(cluster_usage, eps)  (broadcast over vq_dim)
-            let denom = max_scalar(&cu, VQ_EPS)?.reshape((entries, 1))?;
-            codebooks.push(es.broadcast_div(&denom)?);
-        }
-        Ok(Self {
-            codebooks,
-            output_proj: vb.get(vb.shape_of("output_proj.weight")?, "output_proj.weight")?,
-        })
-    }
-    fn len(&self) -> usize {
-        self.codebooks.len()
-    }
-    /// `codes`: `[n_cb, T]` (u32 indices) -> `[dim, T]`.
-    fn decode(&self, codes: &Tensor) -> Result<Tensor> {
-        let t = codes.shape().dims2()?.1;
-        // Σ over codebooks of embedding[code]  -> [T, vq_dim]
-        let mut acc: Option<Tensor> = None;
-        for (k, cb) in self.codebooks.iter().enumerate() {
-            let idx = codes.narrow(0, k, 1)?.reshape(t)?; // [T]
-            let e = cb.index_select(&idx, 0)?; // [T, vq_dim]
-            acc = Some(match acc {
-                None => e,
-                Some(a) => a.add(&e)?,
-            });
-        }
-        let acc = acc.ok_or_else(|| Error("mimi: a quantizer with no codebooks".into()))?;
-        let vq_dim = acc.shape().dims2()?.1;
-        let q = acc.transpose(0, 1)?.reshape((1, vq_dim, t))?;
-        // output_proj is a conv1x1 -> [1,dim,T] -> [dim,T]
-        let dim = self.output_proj.shape().dims3()?.0;
-        causal_conv1d(&q, &self.output_proj, None, 1, 1, 1)?.reshape((dim, t))
     }
 }
 
@@ -269,8 +180,8 @@ impl KyutaiMimiDecoder {
     pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
         let q = vb.pp("quantizer");
-        let rvq_first = Rvq::load(&q.pp("rvq_first"))?;
-        let rvq_rest = Rvq::load(&q.pp("rvq_rest"))?;
+        let rvq_first = Rvq::load(&q.pp("rvq_first"), VQ_EPS)?;
+        let rvq_rest = Rvq::load(&q.pp("rvq_rest"), VQ_EPS)?;
         let up_name = "upsample.convtr.convtr.convtr.weight";
         let upsample = vb.get(vb.shape_of(up_name)?, up_name)?;
         let xt = vb.pp("decoder_transformer.transformer");

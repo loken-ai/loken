@@ -85,6 +85,8 @@ pub struct DenseCheckpoint {
     /// Rotary lanes are paired as a GGUF file pairs them (adjacent), which a vendor's native
     /// layout does; the framework's layout pairs each lane with the one half a head away.
     pub adjacent_rope: bool,
+    /// The layout reads an output head: false for a model whose class has none.
+    pub has_head: bool,
 }
 
 /// One tensor of a shard: its name, the shard, stored type, dimensions and start in the data.
@@ -766,7 +768,8 @@ pub fn text_bytes(
             })
         })
         .collect();
-    let t = translate(&items, layout_of(cfg).ok()?, cfg).ok()?;
+    let layout = layout_of(cfg).ok()?;
+    let t = translate(&items, layout, cfg).ok()?;
     let size = |dtype: GgmlDType, dims: &[usize]| {
         (dims.iter().product::<usize>() / dtype.block_size() * dtype.type_size()) as u64
     };
@@ -778,6 +781,10 @@ pub fn text_bytes(
         .filter(|(n, _)| n.starts_with("blk."))
         .map(|(_, b)| b)
         .sum();
+    // A layout with no head gives the model none.
+    if layout.head.is_empty() {
+        return Some((block_bytes, 0));
+    }
     let head = t
         .direct
         .get("output.weight")
@@ -948,7 +955,8 @@ impl DenseCheckpoint {
             mapped.push((Arc::new(mmap), listing, data_start));
         }
         let items = listing_of(&mapped);
-        let translation = translate(&items, layout_of(cfg)?, cfg)?;
+        let layout = layout_of(cfg)?;
+        let translation = translate(&items, layout, cfg)?;
         let mut parts = Vec::new();
         let mut union: HashMap<String, TensorInfo> = HashMap::new();
         for (index, (mmap, _, data_start)) in mapped.into_iter().enumerate() {
@@ -1024,6 +1032,7 @@ impl DenseCheckpoint {
             assembled: translation.assembled,
             content,
             adjacent_rope,
+            has_head: !layout.head.is_empty(),
         })
     }
 }
@@ -1165,6 +1174,180 @@ mod tests {
         .unwrap();
         assert!(t.direct.contains_key("output.weight"));
         assert!(t.direct.contains_key("output_norm.weight"));
+    }
+
+    /// The talker and the code predictor of a speech checkpoint, read from `root`.
+    fn speech_configs(root: serde_json::Value) -> (AwqConfigJson, AwqConfigJson) {
+        use crate::inference::load::awq_loader::config_from_value;
+        use crate::inference::load::hf_config::nested_config;
+        use crate::inference::load::hf_config::tests::{PREDICTOR_CLASS, SPEECH_CLASS};
+        let predictor = config_from_value(
+            nested_config(&root, PREDICTOR_CLASS),
+            PREDICTOR_CLASS.into(),
+            "qwen3".into(),
+        )
+        .unwrap();
+        let talker = config_from_value(root, SPEECH_CLASS.into(), "qwen3".into()).unwrap();
+        (talker, predictor)
+    }
+
+    /// The loader's tensors of a model of `cfg` and their shapes, its token table `embed_width`
+    /// wide, with a head when `head`.
+    fn loader_shapes(
+        cfg: &AwqConfigJson,
+        embed_width: usize,
+        head: bool,
+    ) -> BTreeMap<String, Vec<usize>> {
+        let (h, f, v) = (cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size);
+        let hd = cfg.head_dim.unwrap();
+        let (q, kv) = (cfg.n_head * hd, cfg.n_kv_head * hd);
+        let mut out = BTreeMap::new();
+        out.insert("token_embd.weight".to_string(), vec![v, embed_width]);
+        out.insert("output_norm.weight".to_string(), vec![h]);
+        if head {
+            out.insert("output.weight".to_string(), vec![v, h]);
+        }
+        for il in 0..cfg.n_layers {
+            for (part, dims) in [
+                ("attn_norm", vec![h]),
+                ("ffn_norm", vec![h]),
+                ("attn_q", vec![q, h]),
+                ("attn_k", vec![kv, h]),
+                ("attn_v", vec![kv, h]),
+                ("attn_output", vec![h, q]),
+                ("attn_q_norm", vec![hd]),
+                ("attn_k_norm", vec![hd]),
+                ("ffn_gate", vec![f, h]),
+                ("ffn_up", vec![f, h]),
+                ("ffn_down", vec![h, f]),
+            ] {
+                out.insert(format!("blk.{il}.{part}.weight"), dims);
+            }
+        }
+        out
+    }
+
+    /// The tensors a layout reads from `items`, with their shapes; none is assembled.
+    fn read_shapes(items: &[Listed], cfg: &AwqConfigJson) -> BTreeMap<String, Vec<usize>> {
+        let t = translate(items, layout_of(cfg).unwrap(), cfg).unwrap();
+        assert!(t.assembled.is_empty());
+        t.direct
+            .into_iter()
+            .map(|(n, (_, info))| (n, info.shape.dims().to_vec()))
+            .collect()
+    }
+
+    /// The stored names of a speech checkpoint of the talker `t` and the code predictor `p`:
+    /// the tensors both layouts read, and the ones they leave to the speech model.
+    fn speech_listing(t: &AwqConfigJson, p: &AwqConfigJson, groups: usize) -> Vec<Listed> {
+        let mut names: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut model = |prefix: &str, cfg: &AwqConfigJson| {
+            let shapes = loader_shapes(cfg, 0, false);
+            for il in 0..cfg.n_layers {
+                for (part, stored) in [
+                    ("attn_norm", "input_layernorm"),
+                    ("ffn_norm", "post_attention_layernorm"),
+                    ("attn_q", "self_attn.q_proj"),
+                    ("attn_k", "self_attn.k_proj"),
+                    ("attn_v", "self_attn.v_proj"),
+                    ("attn_output", "self_attn.o_proj"),
+                    ("attn_q_norm", "self_attn.q_norm"),
+                    ("attn_k_norm", "self_attn.k_norm"),
+                    ("ffn_gate", "mlp.gate_proj"),
+                    ("ffn_up", "mlp.up_proj"),
+                    ("ffn_down", "mlp.down_proj"),
+                ] {
+                    let dims = shapes[&format!("blk.{il}.{part}.weight")].clone();
+                    names.push((format!("{prefix}layers.{il}.{stored}.weight"), dims));
+                }
+            }
+            names.push((format!("{prefix}norm.weight"), vec![cfg.hidden_size]));
+        };
+        model("talker.model.", t);
+        model("talker.code_predictor.model.", p);
+        let (h, ph) = (t.hidden_size, p.hidden_size);
+        names.push((
+            "talker.model.codec_embedding.weight".into(),
+            vec![t.vocab_size, h],
+        ));
+        names.push(("talker.model.text_embedding.weight".into(), vec![97, h]));
+        names.push(("talker.codec_head.weight".into(), vec![t.vocab_size, h]));
+        for fc in ["linear_fc1", "linear_fc2"] {
+            names.push((format!("talker.text_projection.{fc}.weight"), vec![h, h]));
+            names.push((format!("talker.text_projection.{fc}.bias"), vec![h]));
+        }
+        names.push((
+            "talker.code_predictor.small_to_mtp_projection.weight".into(),
+            vec![ph, h],
+        ));
+        names.push((
+            "talker.code_predictor.small_to_mtp_projection.bias".into(),
+            vec![ph],
+        ));
+        for g in 0..groups - 1 {
+            names.push((
+                format!("talker.code_predictor.model.codec_embedding.{g}.weight"),
+                vec![p.vocab_size, h],
+            ));
+            names.push((
+                format!("talker.code_predictor.lm_head.{g}.weight"),
+                vec![p.vocab_size, ph],
+            ));
+        }
+        names
+            .into_iter()
+            .map(|(name, shape)| Listed {
+                name,
+                part: 0,
+                dtype: "BF16".into(),
+                shape,
+                start: 0,
+            })
+            .collect()
+    }
+
+    /// A speech checkpoint is read as 2 models: the talker under its prefix with the codec
+    /// table and head, the code predictor under its own prefix with no head.
+    #[test]
+    fn a_speech_checkpoint_reads_as_a_talker_and_a_code_predictor() {
+        let root = crate::inference::load::hf_config::tests::speech_config();
+        let groups = root["talker_config"]["num_code_groups"].as_u64().unwrap() as usize;
+        let (talker, predictor) = speech_configs(root);
+        let items = speech_listing(&talker, &predictor, groups);
+        assert_eq!(
+            read_shapes(&items, &talker),
+            loader_shapes(&talker, talker.hidden_size, true)
+        );
+        assert_eq!(
+            read_shapes(&items, &predictor),
+            loader_shapes(&predictor, talker.hidden_size, false)
+        );
+    }
+
+    /// The published checkpoint's header, and only its header, maps to the same loader names
+    /// and shapes.
+    #[test]
+    fn the_published_speech_header_reads_as_a_talker_and_a_code_predictor() {
+        let Some(dir) = crate::inference::load::hf_config::tests::speech_snapshot() else {
+            eprintln!("the published checkpoint is not in the test store");
+            return;
+        };
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let (talker, predictor) = speech_configs(root);
+        let path = dir.join("model.safetensors");
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let (listing, start) = read_header(&mmap, &path.to_string_lossy()).unwrap();
+        let items = listing_of(&[(Arc::new(mmap), listing, start)]);
+        assert_eq!(
+            read_shapes(&items, &talker),
+            loader_shapes(&talker, talker.hidden_size, true)
+        );
+        assert_eq!(
+            read_shapes(&items, &predictor),
+            loader_shapes(&predictor, talker.hidden_size, false)
+        );
     }
 
     /// A fused projection is read in place unless the configuration says its rows are grouped by

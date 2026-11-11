@@ -54,6 +54,7 @@ pub mod block_scaled_experts;
 pub(crate) mod block_scaled_oracle_tests;
 #[cfg(test)]
 mod cb_variant_tests;
+pub mod class_load;
 pub mod compressed_band;
 mod config;
 #[cfg(test)]
@@ -84,7 +85,7 @@ pub mod expert_tier;
 mod expert_tuner;
 mod graph;
 pub mod hetero;
-pub use hetero::CachedPrompt;
+pub use hetero::{CachedPrompt, EmbeddingStep};
 #[cfg(feature = "gpu")]
 mod card_band;
 #[cfg(all(test, feature = "gpu"))]
@@ -98,6 +99,8 @@ mod card_packed;
 #[cfg(all(test, feature = "gpu"))]
 mod card_packed_tests;
 pub mod dsa;
+#[cfg(test)]
+mod embedding_step_tests;
 #[cfg(test)]
 mod hf_reference_tests;
 pub mod hyper;

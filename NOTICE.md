@@ -69,6 +69,10 @@ The encoders below follow the same file's searches in the same way, written for 
 
 The card kernels for these formats in `src/inference/cuda/quantized/requant.cu` run the same searches as the host encoders above.
 
+The speech talker in `src/inference/model/qwen3_tts/` follows the prompt layout, the frame loop and the sampling of `modeling_qwen3_tts.py` and `qwen3_tts_model.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). The code is written for loken.
+
+The codec decoder in `src/inference/model/qwen3_tts/decoder/` follows the layers of the decoder in `modeling_qwen3_tts_tokenizer_v2.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). The code is written for loken.
+
 ## Model weights
 
 Model *weights* are not distributed with this repository. Downloading and using a model is subject to that model's own license and terms of use.

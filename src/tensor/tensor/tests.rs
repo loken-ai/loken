@@ -1019,6 +1019,76 @@ fn conv_transpose1d_matches_oracle() {
     }
 }
 
+/// A depthwise conv and a conv wide enough for the threaded GEMM, against the oracle.
+#[test]
+fn a_depthwise_and_a_wide_conv1d_match_the_oracle() {
+    for (ci, l, co, k, groups) in [
+        (8usize, 37usize, 8usize, 7usize, 8usize),
+        (32, 2048, 24, 7, 1),
+    ] {
+        let x = data(ci * l, 54);
+        let w = data(co * (ci / groups) * k, 55);
+        let n = Tensor::from_vec_f32(x.clone(), vec![1, ci, l])
+            .unwrap()
+            .conv1d(
+                &Tensor::from_vec_f32(w.clone(), vec![co, ci / groups, k]).unwrap(),
+                3,
+                1,
+                1,
+                groups,
+            )
+            .unwrap();
+        let (lo, want) = ref_conv1d(&x, &w, 1, ci, l, co, k, 3, 1, groups);
+        assert_eq!(n.dims(), &[1, co, lo], "c{ci} l{l} g{groups}");
+        close(&n.to_vec_f32(), &want, 1e-4);
+    }
+}
+
+/// A transposed conv of 2 batch rows wide enough for the threaded GEMM, against the oracle.
+#[test]
+fn a_wide_conv_transpose1d_matches_the_oracle() {
+    let (b, ci, l, co, k, stride) = (2usize, 48usize, 700usize, 16usize, 8usize, 4usize);
+    let x = data(b * ci * l, 62);
+    let w = data(ci * co * k, 63);
+    let n = Tensor::from_vec_f32(x.clone(), vec![b, ci, l])
+        .unwrap()
+        .conv_transpose1d(
+            &Tensor::from_vec_f32(w.clone(), vec![ci, co, k]).unwrap(),
+            0,
+            0,
+            stride,
+            1,
+            1,
+        )
+        .unwrap();
+    let (lo, want) = ref_conv_transpose1d(&x, &w, b, ci, l, co, k, 0, 0, stride);
+    assert_eq!(n.dims(), &[b, co, lo]);
+    close(&n.to_vec_f32(), &want, 1e-4);
+}
+
+/// A grouped conv on a card gives the host's result.
+#[cfg(feature = "gpu")]
+#[test]
+fn card_grouped_conv1d_matches_the_host() -> Result<()> {
+    let Ok(dev) = crate::tensor::cuda::CudaDevice::get(0) else {
+        return Ok(());
+    };
+    let gpu = crate::tensor::Device::Cuda(dev);
+    for (ci, co, groups) in [(16usize, 16usize, 16usize), (12, 6, 3)] {
+        let (b, l, k) = (2usize, 300usize, 7usize);
+        let x = Tensor::from_vec_f32(data(b * ci * l, 56), vec![b, ci, l])?;
+        let w = Tensor::from_vec_f32(data(co * (ci / groups) * k, 57), vec![co, ci / groups, k])?;
+        let want = x.conv1d(&w, 6, 1, 2, groups)?;
+        let got = x
+            .to_device(&gpu)?
+            .conv1d(&w.to_device(&gpu)?, 6, 1, 2, groups)?;
+        assert!(got.is_on_cuda(), "c{ci} g{groups} left the card");
+        assert_eq!(got.dims(), want.dims());
+        close(&got.to_vec_f32(), &want.to_vec_f32(), 1e-4);
+    }
+    Ok(())
+}
+
 #[test]
 fn group_norm_matches_oracle() {
     let (b, c, h, w2, g) = (2usize, 8usize, 3usize, 4usize, 4usize);

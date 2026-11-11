@@ -872,6 +872,24 @@ const NEMOTRON_H: Layout = Layout {
     ..LLAMA
 };
 
+/// A talker over the codes of a speech codec: the codec's table and head stand where a text
+/// model has its token table and head.
+const QWEN3_TTS: Layout = Layout {
+    embed: &["codec_embedding.weight"],
+    head: &[("codec_head.weight", Same("output.weight"))],
+    ..LLAMA
+};
+
+/// The code predictor nested in the talker's checkpoint.
+///
+/// Its first codec table names its prefix and stands as its token table.
+/// It has no head of its own.
+const QWEN3_TTS_CODE_PREDICTOR: Layout = Layout {
+    embed: &["codec_embedding.0.weight"],
+    head: &[],
+    ..LLAMA
+};
+
 /// The layout of a class's tensors.
 pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
     match kind {
@@ -903,5 +921,7 @@ pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
         LayoutKind::Qwen35Moe => &QWEN35MOE,
         LayoutKind::NemotronH => &NEMOTRON_H,
         LayoutKind::GlmMoeDsa => &LATENT_MOE,
+        LayoutKind::Qwen3Tts => &QWEN3_TTS,
+        LayoutKind::Qwen3TtsCodePredictor => &QWEN3_TTS_CODE_PREDICTOR,
     }
 }

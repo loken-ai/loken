@@ -212,7 +212,11 @@ pub(crate) fn media_capabilities(facts: &crate::inference::media_facts::MediaFac
         MediaKind::Video => &["video"],
         MediaKind::Transcription(TranscriptionModel::Whisper) => &["asr"],
         MediaKind::Speech(
-            SpeechModel::Parler | SpeechModel::Kyutai | SpeechModel::PocketTts | SpeechModel::Piper,
+            SpeechModel::Parler
+            | SpeechModel::Kyutai
+            | SpeechModel::PocketTts
+            | SpeechModel::Piper
+            | SpeechModel::Qwen3Tts,
         ) => &["tts"],
         // A model this build runs no engine for can do nothing here.
         MediaKind::Transcription(TranscriptionModel::Converted)

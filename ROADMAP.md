@@ -33,7 +33,7 @@ Major, by state then by priority:
 | Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Planned |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
-| Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Planned |
+| Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Started |
 
 Smaller, by state then by priority:
 

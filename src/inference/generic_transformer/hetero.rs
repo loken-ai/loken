@@ -193,6 +193,25 @@ pub struct CachedPrompt<'a> {
     pub block_table: &'a [u32],
 }
 
+/// What the output stage of a forward gives back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Outputs {
+    /// The head's logits.
+    Logits,
+    /// The logits and the last row after the final norm.
+    LogitsAndNormed,
+    /// The last row after the final norm, with no head run.
+    Normed,
+}
+
+/// What a decode step fed by an embedding gives back.
+pub struct EmbeddingStep {
+    /// The head's logits `[1, vocab]`, F32, `None` when the step ran no head.
+    pub logits: Option<Tensor>,
+    /// The row after the final norm, `[1, hidden]`, F32, as the head reads it.
+    pub normed: Tensor,
+}
+
 impl GenericHeteroTransformer {
     /// Read-only view of the layers, which is how anything outside this module reaches a
     /// layer's KV cache after a forward.
@@ -695,7 +714,7 @@ impl GenericHeteroTransformer {
     pub(crate) fn host_head(&self) -> Result<&crate::tensor::quantized::QMatMul> {
         self.output_proj.as_ref().ok_or_else(|| {
             crate::tensor::Error::msg(
-                "the output head lives on a card and has no host copy".to_string(),
+                "the model has no host copy of an output head: it lives on a card, or the model has none".to_string(),
             )
         })
     }
@@ -3091,11 +3110,35 @@ impl GenericHeteroTransformer {
     /// every position's logits when `all_positions`, else the last one's.
     pub(super) fn output_stage(
         &mut self,
+        hidden: Tensor,
+        on_cuda: bool,
+        seq_len: usize,
+        all_positions: bool,
+    ) -> Result<Tensor> {
+        let (logits, _) =
+            self.output_stage_with(hidden, on_cuda, seq_len, all_positions, Outputs::Logits)?;
+        logits.ok_or_else(|| crate::tensor::Error::msg("the output stage gave no logits"))
+    }
+
+    /// [`Self::output_stage`] giving back what `outputs` asks: the logits, the last row after
+    /// the final norm as the head reads it, or both.
+    ///
+    /// The normed row is F32 `[batch, hidden]`, on the device the final norm ran on.
+    /// It is given for the last position only, so `all_positions` asks for logits alone.
+    pub(super) fn output_stage_with(
+        &mut self,
         mut hidden: Tensor,
         mut on_cuda: bool,
         seq_len: usize,
         all_positions: bool,
-    ) -> Result<Tensor> {
+        outputs: Outputs,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        if all_positions && outputs != Outputs::Logits {
+            crate::tensor::bail!("the normed row is given for the last position only");
+        }
+        let keep = outputs != Outputs::Logits;
+        let head = outputs != Outputs::Normed;
+        let mut kept: Option<Tensor> = None;
         // -- Final norm + output projection --------------------------
         // The output stage must not read the hidden state while the last layer's GPU is
         // still writing it: the copy would take partially-written data off a running
@@ -3146,6 +3189,9 @@ impl GenericHeteroTransformer {
             self.last_feature = Some(f.to_dtype(crate::tensor::DType::F32)?);
         }
         let logits = if let Some(ws) = self.wide_sparse.as_ref() {
+            if keep {
+                crate::tensor::bail!("a Sinkhorn wide residual gives no normed row");
+            }
             // The streams collapse with the last layer's pre mix, then the final norm and the
             // head run on the host.
             let last = self
@@ -3169,6 +3215,12 @@ impl GenericHeteroTransformer {
             let (normed, _) = oh.mix(&rows)?;
             let n = normed.dim(1)?;
             let normed = normed.reshape((b * n, self.config.embedding_length))?;
+            if keep {
+                kept = Some(normed.to_dtype(crate::tensor::DType::F32)?);
+            }
+            if !head {
+                return Ok((None, kept));
+            }
             let out = match (&self.output_proj_cuda_qmm, &self.output_proj_dev) {
                 (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?)?,
                 _ => self
@@ -3200,6 +3252,12 @@ impl GenericHeteroTransformer {
                 let last = hidden.i((.., seq_len - 1, ..))?;
                 let last_f32 = last.to_dtype(crate::tensor::DType::F32)?;
                 let normed = self.final_norm_on_device(&last_f32)?;
+                if keep {
+                    kept = Some(normed.clone());
+                }
+                if !head {
+                    return Ok((None, kept));
+                }
                 proj.forward(&normed)?
             }
         } else if on_cuda && self.output_proj_cuda.is_some() {
@@ -3225,13 +3283,27 @@ impl GenericHeteroTransformer {
                     norm_w,
                     self.config.rms_norm_eps as f32,
                 )?;
+                if keep {
+                    kept = Some(normed.clone());
+                }
+                if !head {
+                    return Ok((None, kept));
+                }
                 let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
                 normed_f16.matmul_t(proj)?
             }
-        } else if let Some(logits) = self.vulkan.take_logits().filter(|_| !all_positions) {
+        } else if let Some(logits) = self
+            .vulkan
+            .take_logits()
+            .filter(|_| !all_positions && !keep)
+        {
             // The output head ran on the Vulkan device of the last layer.
             logits
-        } else if let Some(logits) = self.opencl.take_logits().filter(|_| !all_positions) {
+        } else if let Some(logits) = self
+            .opencl
+            .take_logits()
+            .filter(|_| !all_positions && !keep)
+        {
             // The output head ran on the OpenCL device of the last layer.
             logits
         } else {
@@ -3247,9 +3319,15 @@ impl GenericHeteroTransformer {
             } else {
                 normed.i((.., seq_len - 1, ..))?
             };
+            if keep {
+                kept = Some(src.to_dtype(crate::tensor::DType::F32)?);
+            }
+            if !head {
+                return Ok((None, kept));
+            }
             self.host_head()?.forward(&src)?
         };
-        self.finish_logits(logits)
+        Ok((Some(self.finish_logits(logits)?), kept))
     }
 
     /// The head's output `logits` with the output bias, the logit scale and the softcap applied,
@@ -3357,17 +3435,30 @@ impl GenericHeteroTransformer {
     /// later chunks append); the last chunk's logits are the next-token
     /// prediction, identical to the monolithic result.
     fn forward_spliced_prefill_chunked(&mut self, hidden: Tensor) -> Result<Tensor> {
+        let (logits, _) = self.spliced_prefill_with(hidden, Outputs::Logits)?;
+        logits.ok_or_else(|| crate::tensor::Error::msg("the output stage gave no logits"))
+    }
+
+    /// [`Self::forward_spliced_prefill_chunked`] giving back what `outputs` asks of its last
+    /// chunk.
+    fn spliced_prefill_with(
+        &mut self,
+        hidden: Tensor,
+        outputs: Outputs,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         const CHUNK: usize = crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS;
         let seq_len = hidden.dim(1)?;
         if seq_len <= CHUNK {
-            return self.forward_layers_and_output(hidden, None, 0, seq_len, false);
+            let (hidden, on_cuda) = self.run_layers(hidden, None, 0, seq_len)?;
+            return self.output_stage_with(hidden, on_cuda, seq_len, false, outputs);
         }
         let mut off = 0usize;
-        let mut last: Option<Tensor> = None;
+        let mut last = None;
         while off < seq_len {
             let n = CHUNK.min(seq_len - off);
             let chunk = hidden.narrow(1, off, n)?;
-            last = Some(self.forward_layers_and_output(chunk, None, off, n, false)?);
+            let (chunk, on_cuda) = self.run_layers(chunk, None, off, n)?;
+            last = Some(self.output_stage_with(chunk, on_cuda, n, false, outputs)?);
             off += n;
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty spliced prefill".to_string()))
@@ -3442,6 +3533,116 @@ impl GenericHeteroTransformer {
             .collect();
         let hidden = Tensor::cat(&parts, 1)?;
         self.forward_spliced_prefill_chunked(hidden)
+    }
+
+    /// The decode step of the row at `index_pos` fed by `embedding` instead of a token's table
+    /// row.
+    ///
+    /// `embedding` holds `hidden` values in any shape, on any device, in any float type.
+    /// It enters the layers as a token's row does, with no embedding scale and no position row.
+    /// The layers' caches advance as for a token step, and `index_pos` 0 empties them first.
+    /// The head runs when `logits` asks for it.
+    /// A model whose layers take more than the embedding row is refused.
+    pub fn forward_embedding_step(
+        &mut self,
+        embedding: &Tensor,
+        index_pos: usize,
+        logits: bool,
+    ) -> Result<EmbeddingStep> {
+        let width = self.config.embedding_length;
+        if embedding.elem_count() != width {
+            crate::tensor::bail!(
+                "an embedding step takes {width} values, {} given",
+                embedding.elem_count()
+            );
+        }
+        let hidden = self.embedding_rows(embedding, 1)?;
+        crate::tensor::quant_cpu::set_small_model_prefill(false);
+        self.spec_clear();
+        let (hidden, on_cuda) = self.run_layers(hidden, None, index_pos, 1)?;
+        let (logits, normed) =
+            self.output_stage_with(hidden, on_cuda, 1, false, Self::asked(logits))?;
+        Self::embedding_step(logits, normed, width)
+    }
+
+    /// The prefill from position 0 of `embeddings`, rows fed instead of tokens' table rows.
+    ///
+    /// `embeddings` holds whole rows of `hidden` values in any shape, on any device, in any
+    /// float type.
+    /// The rows enter the layers as in [`Self::forward_embedding_step`].
+    /// The caches are emptied first.
+    /// The step gives back the last row after the final norm, and its logits when `logits`
+    /// asks for them.
+    pub fn forward_embeddings_prefill(
+        &mut self,
+        embeddings: &Tensor,
+        logits: bool,
+    ) -> Result<EmbeddingStep> {
+        let width = self.config.embedding_length;
+        let rows = embeddings.elem_count() / width;
+        if rows == 0 || rows * width != embeddings.elem_count() {
+            crate::tensor::bail!(
+                "an embedding prefill takes whole rows of {width} values, {} given",
+                embeddings.elem_count()
+            );
+        }
+        let hidden = self.embedding_rows(embeddings, rows)?;
+        self.spec_clear();
+        let (logits, normed) = self.spliced_prefill_with(hidden, Self::asked(logits))?;
+        Self::embedding_step(logits, normed, width)
+    }
+
+    /// The token table's rows of `ids`, `[ids.len(), hidden]`, as a token step reads them before
+    /// any embedding scale.
+    pub fn token_rows(&self, ids: &[u32]) -> Result<Tensor> {
+        let device = self.embeddings.embeddings().device().clone();
+        let ids = Tensor::from_vec(ids.to_vec(), ids.len(), &device)?;
+        self.embeddings.forward(&ids)
+    }
+
+    /// The output stage's outputs for an embedding step: the normed row, and the logits when
+    /// `logits` asks for them.
+    fn asked(logits: bool) -> Outputs {
+        match logits {
+            true => Outputs::LogitsAndNormed,
+            false => Outputs::Normed,
+        }
+    }
+
+    /// `rows` rows of `embedding` as the layers take them: `[1, rows, hidden]` on the token
+    /// table's device in its type.
+    ///
+    /// A model whose layers take more than the embedding row is refused.
+    fn embedding_rows(&self, embedding: &Tensor, rows: usize) -> Result<Tensor> {
+        if self.config.hyper.is_some()
+            || self.wide_sparse.is_some()
+            || self.ple_dim > 0
+            || self.ngram.is_some()
+            || self.config.learned_positions
+        {
+            crate::tensor::bail!(
+                "an embedding step needs a model whose layers take the embedding row alone"
+            );
+        }
+        let table = self.embeddings.embeddings();
+        embedding
+            .to_device(&table.device())?
+            .to_dtype(table.dtype())?
+            .reshape((1, rows, self.config.embedding_length))
+    }
+
+    /// An embedding step of the output stage's `logits` and `normed` row.
+    fn embedding_step(
+        logits: Option<Tensor>,
+        normed: Option<Tensor>,
+        width: usize,
+    ) -> Result<EmbeddingStep> {
+        let normed = normed
+            .ok_or_else(|| crate::tensor::Error::msg("the output stage gave no normed row"))?;
+        Ok(EmbeddingStep {
+            logits,
+            normed: normed.reshape((1, width))?,
+        })
     }
 
     /// Set of CUDA device ordinals the engine should pre-warm custom

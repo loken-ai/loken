@@ -3839,17 +3839,27 @@ impl GenericHeteroTransformer {
             .flatten()
             // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
-        let (output_qt, output_weight_name) = match source.read("output.weight", &Device::Cpu) {
-            Ok(qt) => (qt, "output.weight"),
-            Err(_) => {
-                // Tied embeddings (weight sharing)
-                (
-                    source.read("token_embd.weight", &Device::Cpu)?,
-                    "token_embd.weight",
-                )
-            }
+        // A checkpoint whose layout reads no head gives the model none.
+        // Its forward gives the normed rows and no logits.
+        let headless = source.dense.is_some_and(|ck| !ck.has_head);
+        let (output_proj, output_weight_name) = if headless {
+            (None, None)
+        } else {
+            let (output_qt, name) = match source.read("output.weight", &Device::Cpu) {
+                Ok(qt) => (qt, "output.weight"),
+                Err(_) => {
+                    // Tied embeddings (weight sharing)
+                    (
+                        source.read("token_embd.weight", &Device::Cpu)?,
+                        "token_embd.weight",
+                    )
+                }
+            };
+            (
+                Some(crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?),
+                Some(name),
+            )
         };
-        let output_proj = Some(crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?);
         info!("✅ Loaded output norm and projection on CPU");
 
         // -- 2b. Load PLE globals (Gemma4) - optional ---------------------
@@ -4949,8 +4959,8 @@ impl GenericHeteroTransformer {
         let mut output_norm_cuda_weight: Option<Tensor> = None;
         let mut output_proj_cuda_qmm: Option<crate::tensor::quantized::QMatMul> = None;
         let mut output_proj_dev: Option<Device> = None;
-        if let Some((idx, cuda_dev)) =
-            last_cuda_idx.and_then(|idx| cuda_devices.get(&idx).map(|d| (idx, d)))
+        if let Some((idx, cuda_dev, output_weight_name)) =
+            last_cuda_idx.and_then(|idx| Some((idx, cuda_devices.get(&idx)?, output_weight_name?)))
         {
             let t_q = std::time::Instant::now();
             // A quantised head runs as a quantised matmul; a float head (F32, F16, BF16) is
@@ -5003,7 +5013,7 @@ impl GenericHeteroTransformer {
             let (mut head, mut dense, mut experts) = (0u64, 0u64, 0u64);
             for (name, info) in content.tensor_infos.iter() {
                 let bytes = info.size_in_bytes() as u64;
-                if name == output_weight_name {
+                if Some(name.as_str()) == output_weight_name {
                     head = bytes;
                 }
                 if name.contains("_exps") {

@@ -40,6 +40,35 @@ pub enum LayoutKind {
     Qwen35Moe,
     NemotronH,
     GlmMoeDsa,
+    Qwen3Tts,
+    Qwen3TtsCodePredictor,
+}
+
+/// The route that serves a class's checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// The text route: chat and completion requests.
+    Text,
+    /// A component of a speech model, served by the speech route.
+    Speech,
+}
+
+impl Route {
+    /// The kind of model the route serves.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Route::Text => "text",
+            Route::Speech => "speech",
+        }
+    }
+
+    /// The endpoint of the route.
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Route::Text => "/v1/chat/completions",
+            Route::Speech => "/v1/audio/speech",
+        }
+    }
 }
 
 /// One class a checkpoint's configuration can name.
@@ -61,6 +90,10 @@ pub struct HfClass {
     pub window_period: Option<usize>,
     /// The router scores experts by sigmoid, which the configuration does not say.
     pub sigmoid_router: bool,
+    /// The dotted path of the object that holds the text model's fields.
+    pub text_config: &'static str,
+    /// The route that serves a checkpoint of the class.
+    pub route: Route,
 }
 
 const fn class(class: &'static str, arch: &'static str, layout: LayoutKind) -> HfClass {
@@ -73,6 +106,8 @@ const fn class(class: &'static str, arch: &'static str, layout: LayoutKind) -> H
         partial_rotary: None,
         window_period: None,
         sigmoid_router: false,
+        text_config: "text_config",
+        route: Route::Text,
     }
 }
 
@@ -104,6 +139,17 @@ const fn sigmoid(c: HfClass) -> HfClass {
 const fn partial(c: HfClass, share: f32) -> HfClass {
     HfClass {
         partial_rotary: Some(share),
+        ..c
+    }
+}
+
+const fn fields_under(c: HfClass, text_config: &'static str) -> HfClass {
+    HfClass { text_config, ..c }
+}
+
+const fn speech(c: HfClass) -> HfClass {
+    HfClass {
+        route: Route::Speech,
         ..c
     }
 }
@@ -220,6 +266,22 @@ pub const CLASSES: &[HfClass] = &[
         "glm_moe_dsa",
         LayoutKind::GlmMoeDsa,
     )),
+    speech(fields_under(
+        class(
+            "Qwen3TTSForConditionalGeneration",
+            "qwen3",
+            LayoutKind::Qwen3Tts,
+        ),
+        "talker_config",
+    )),
+    speech(fields_under(
+        class(
+            "Qwen3TTSTalkerCodePredictorModelForConditionalGeneration",
+            "qwen3",
+            LayoutKind::Qwen3TtsCodePredictor,
+        ),
+        "talker_config.code_predictor_config",
+    )),
 ];
 
 /// The row of `name`, `None` for a class the loader does not read.
@@ -239,12 +301,34 @@ fn path<'a>(v: &'a Json, key: &str) -> Option<&'a Json> {
         .filter(|x| !x.is_null())
 }
 
+/// The object of the text model's fields: under the key the class of `architectures[0]`
+/// names, `text_config` for a class the table does not hold.
+fn text_fields(root: &Json) -> Option<&Json> {
+    let class = root
+        .get("architectures")
+        .and_then(|a| a.get(0))
+        .and_then(Json::as_str)
+        .and_then(hf_class);
+    let key = class.map_or("text_config", |c| c.text_config);
+    path(root, key).filter(|t| t.is_object())
+}
+
 /// The first of `keys` the configuration holds: the text model's fields of a composite
 /// checkpoint first, then the file's own.
 pub fn lookup<'a>(root: &'a Json, keys: &[&str]) -> Option<&'a Json> {
-    let text = root.get("text_config").filter(|t| t.is_object());
+    let text = text_fields(root);
     keys.iter()
         .find_map(|k| text.and_then(|t| path(t, k)).or_else(|| path(root, k)))
+}
+
+/// The configuration of a model nested in a checkpoint, read as a checkpoint of `class`: the
+/// checkpoint's own, its `architectures` naming `class`.
+pub fn nested_config(root: &Json, class: &str) -> Json {
+    let mut v = root.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("architectures".into(), Json::from(vec![class]));
+    }
+    v
 }
 
 pub fn lookup_u(root: &Json, keys: &[&str]) -> Option<usize> {
@@ -597,4 +681,157 @@ fn latent_attention_metadata(
         "attention.indexer.types",
         Value::Array(full.into_iter().map(Value::Bool).collect()),
     );
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::inference::load::awq_loader::{config_from_value, parse_config_json, AwqConfigJson};
+
+    /// The class a speech checkpoint's configuration declares.
+    pub(crate) const SPEECH_CLASS: &str = "Qwen3TTSForConditionalGeneration";
+    /// The class of the code predictor nested in that checkpoint.
+    pub(crate) const PREDICTOR_CLASS: &str =
+        "Qwen3TTSTalkerCodePredictorModelForConditionalGeneration";
+
+    /// A configuration of the published checkpoint's structure at small widths: the talker's
+    /// fields under `talker_config`, the code predictor's under its `code_predictor_config`.
+    pub(crate) fn speech_config() -> Json {
+        serde_json::json!({
+            "architectures": [SPEECH_CLASS],
+            "model_type": "qwen3_tts",
+            "tts_model_type": "voice_design",
+            "talker_config": {
+                "code_predictor_config": {
+                    "architectures": null,
+                    "head_dim": 16,
+                    "hidden_size": 32,
+                    "intermediate_size": 48,
+                    "layer_types": ["full_attention", "full_attention"],
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 2,
+                    "num_key_value_heads": 2,
+                    "rms_norm_eps": 1e-6,
+                    "rope_scaling": null,
+                    "rope_theta": 1000000,
+                    "sliding_window": null,
+                    "tie_word_embeddings": false,
+                    "use_sliding_window": false,
+                    "vocab_size": 24
+                },
+                "head_dim": 32,
+                "hidden_size": 64,
+                "intermediate_size": 96,
+                "num_attention_heads": 4,
+                "num_code_groups": 3,
+                "num_hidden_layers": 3,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-6,
+                "rope_scaling": {
+                    "interleaved": true,
+                    "mrope_section": [8, 4, 4],
+                    "rope_type": "default",
+                    "type": "default"
+                },
+                "rope_theta": 1000000,
+                "sliding_window": null,
+                "use_sliding_window": false,
+                "vocab_size": 40
+            }
+        })
+    }
+
+    /// The snapshot of the published checkpoint in the test store, `None` when the store lacks
+    /// it.
+    pub(crate) fn speech_snapshot() -> Option<std::path::PathBuf> {
+        let store = crate::config::Config::load_test().get_hf_models_dir();
+        let snapshots = store
+            .join("hub")
+            .join("models--Qwen--Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+            .join("snapshots");
+        std::fs::read_dir(snapshots)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.join("config.json").is_file())
+    }
+
+    /// The talker read from `root`, and the code predictor read from the same configuration.
+    fn talker_and_predictor(root: Json) -> (AwqConfigJson, AwqConfigJson) {
+        let predictor = config_from_value(
+            nested_config(&root, PREDICTOR_CLASS),
+            PREDICTOR_CLASS.into(),
+            "qwen3".into(),
+        )
+        .unwrap();
+        let talker = config_from_value(root, SPEECH_CLASS.into(), "qwen3".into()).unwrap();
+        (talker, predictor)
+    }
+
+    /// Hidden size, layers, heads, key-value heads, head width, feed-forward width, vocabulary.
+    fn geometry(c: &AwqConfigJson) -> [usize; 7] {
+        [
+            c.hidden_size,
+            c.n_layers,
+            c.n_head,
+            c.n_kv_head,
+            c.head_dim.unwrap_or(0),
+            c.intermediate_size,
+            c.vocab_size,
+        ]
+    }
+
+    /// The conventions both transformers of the checkpoint share.
+    fn plain_rope_and_no_extra_keys(c: &AwqConfigJson) {
+        assert_eq!(c.rope_theta, 1e6);
+        assert_eq!(c.rms_norm_eps, 1e-6);
+        assert!(c.yarn.is_none() && c.frequency_scaling.is_none());
+        assert!(!c.tie_word_embeddings && !c.quantized);
+        assert!(c.sliding_window.is_none());
+        assert!(hf_metadata(c).is_empty(), "{:?}", hf_metadata(c));
+    }
+
+    #[test]
+    fn a_class_reads_its_text_model_under_its_own_key() {
+        let (talker, predictor) = talker_and_predictor(speech_config());
+        assert_eq!(geometry(&talker), [64, 3, 4, 2, 32, 96, 40]);
+        assert_eq!(geometry(&predictor), [32, 2, 4, 2, 16, 48, 24]);
+        plain_rope_and_no_extra_keys(&talker);
+        plain_rope_and_no_extra_keys(&predictor);
+        assert_eq!(
+            hf_class(SPEECH_CLASS).map(|c| c.text_config),
+            Some("talker_config")
+        );
+    }
+
+    #[test]
+    fn a_class_without_its_own_key_reads_text_config() {
+        let root = serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 8,
+            "text_config": {"hidden_size": 16},
+            "talker_config": {"hidden_size": 32}
+        });
+        assert_eq!(lookup_u(&root, &["hidden_size"]), Some(16));
+        let unknown = serde_json::json!({
+            "architectures": ["NoSuchClass"],
+            "text_config": {"hidden_size": 16}
+        });
+        assert_eq!(lookup_u(&unknown, &["hidden_size"]), Some(16));
+    }
+
+    #[test]
+    fn the_published_configuration_gives_both_transformers_geometry() {
+        let Some(dir) = speech_snapshot() else {
+            eprintln!("the published checkpoint is not in the test store");
+            return;
+        };
+        let read = parse_config_json(dir.to_str().unwrap()).unwrap();
+        assert_eq!(read.gguf_arch, "qwen3");
+        let (talker, predictor) = talker_and_predictor(read.root);
+        assert_eq!(geometry(&talker), [2048, 28, 16, 8, 128, 6144, 3072]);
+        assert_eq!(geometry(&predictor), [1024, 5, 16, 8, 128, 3072, 2048]);
+        plain_rope_and_no_extra_keys(&talker);
+        plain_rope_and_no_extra_keys(&predictor);
+    }
 }

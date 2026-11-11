@@ -18,6 +18,8 @@ pub mod boogu;
 /// The patched time series encoder with a quantile head.
 pub mod chronos2;
 pub mod clip;
+/// Residual vector quantizers and causal convolutions shared by the speech codecs.
+pub mod codec_blocks;
 pub mod embedding;
 pub mod ezaudio;
 /// What every flow-matching sampler does to its time axis.
@@ -44,6 +46,7 @@ pub mod pocket_tts;
 pub mod qwen25;
 pub mod qwen3;
 pub mod qwen35;
+pub mod qwen3_tts;
 pub mod qwen3vl;
 pub mod qwen_image;
 pub mod reranker;

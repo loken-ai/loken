@@ -1821,7 +1821,8 @@ pub(crate) async fn audio_speech(
                         format!(
                             "no voice here speaks '{lang}'. Speakable: en, fr (Kyutai); \
                              any language with a Piper voice installed, by naming it as \
-                             the model (e.g. \"piper/de_DE-thorsten-medium\")"
+                             the model (e.g. \"piper/de_DE-thorsten-medium\"); any \
+                             language a speech checkpoint lists, by naming it as the model"
                         ),
                     )
                 }
@@ -1964,6 +1965,45 @@ pub(crate) async fn audio_speech(
         let voice = req.voice.clone().unwrap_or_else(|| "alloy".to_string());
         openai_voice_to_description(&voice, speed)
     };
+    let capped = |s: &Option<String>| -> Option<String> {
+        s.as_deref()
+            .map(|s| s.chars().take(DESC_MAX_CHARS).collect::<String>())
+    };
+
+    // A speech talker speaks a voice described in words, in a language its checkpoint
+    // lists.
+    let talker = requested_model
+        .as_deref()
+        .and_then(|m| speech_request(state.huggingface_models_dir.as_str(), m))
+        .filter(|s| s.model == crate::inference::media_facts::SpeechModel::Qwen3Tts);
+    if let Some(s) = talker.as_ref().filter(|s| s.voice.is_some()) {
+        return err_resp(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "'{}': this checkpoint's voice is described in words; name the checkpoint \
+                 alone and send the description as `voice_description` or `instructions`",
+                s.canonical()
+            ),
+        );
+    }
+    let language = match &talker {
+        Some(s) => match crate::inference::engine::tts_engine::speech_talker_language(
+            &s.path,
+            req.language.as_deref(),
+        ) {
+            Ok(language) => language,
+            Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
+        },
+        None => None,
+    };
+    let design = talker.as_ref().map(|_| {
+        speech_design(
+            capped(&req.voice_description).as_deref(),
+            req.voice.as_deref(),
+            capped(&req.instructions).as_deref(),
+            speed,
+        )
+    });
 
     // The backend resolved above: the caller's model when they named one, otherwise the
     // one that can speak the language they asked for.
@@ -1978,8 +2018,14 @@ pub(crate) async fn audio_speech(
         Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
     };
 
+    // A speech talker without a seed draws from a hash of its timbre text, so the same
+    // description gives the same draw.
+    let derived_seed = design.as_ref().map(|d| seed_of_text(d.seed_text()));
     let params = TtsSynthParams {
-        voice_description: description,
+        voice_description: match design {
+            Some(d) => d.text,
+            None => description,
+        },
         // Clamp via the finite-aware helper so NaN/Infinity in top_p
         // (e.g. `{"top_p": "NaN"}`) doesn't propagate into the sampler.
         // A value the caller leaves out is the model's own.
@@ -1991,7 +2037,7 @@ pub(crate) async fn audio_speech(
         // produce varied output instead of all using seed=0.
         // `temperature = 0` keeps the path deterministic regardless
         // (argmax ignores the RNG).
-        seed: req.seed.unwrap_or_else(|| {
+        seed: req.seed.or(derived_seed).unwrap_or_else(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2001,6 +2047,7 @@ pub(crate) async fn audio_speech(
         // A caller's cap is honoured up to the model's own limit; left out, the
         // model's limit applies.
         max_steps: req.max_steps.map(|v| v as usize),
+        language,
     };
 
     // The event stream owns its load: it has to START before the checkpoint is read, or
@@ -2039,7 +2086,7 @@ pub(crate) async fn audio_speech(
     // description cache so this is essentially free.
     let synth_start = std::time::Instant::now();
     let energy = crate::energy_report::begin();
-    let sentences = split_into_sentences(&req.input);
+    let sentences = speech_chunks(&state.tts_engine, &req.input).await;
     let mut all_pcm: Vec<f32> = Vec::new();
     let mut sample_rate = crate::inference::engine::tts_engine::TTS_SAMPLE_RATE;
     for (idx, sentence) in sentences.into_iter().enumerate() {
@@ -2206,9 +2253,81 @@ pub(super) async fn ensure_tts_model_loaded_reporting(
             .load_parler_reporting(Some(&speech.id), watch)
             .await
             .map_err(|e| format!("tts load: {e:#}")),
+        // A voice described in words: nothing follows the checkpoint's name.
+        SpeechModel::Qwen3Tts if speech.voice.is_some() => Err(format!(
+            "'{requested}': this checkpoint's voice is described in words; send the \
+             description as `voice_description` or `instructions`"
+        )),
+        SpeechModel::Qwen3Tts => state
+            .tts_engine
+            .load_qwen3_tts_reporting(speech.path.clone(), canonical, watch)
+            .await
+            .map_err(|e| format!("qwen3-tts load: {e:#}")),
         SpeechModel::Unserved => Err(format!(
             "'{requested}' is a speech model this build runs no engine for"
         )),
+    }
+}
+
+/// The design text of a voice described in words, and the timbre it opens with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Design {
+    pub(super) text: String,
+    /// The timbre part, empty when the request gives no timbre.
+    pub(super) timbre: String,
+}
+
+impl Design {
+    /// The text a request without a seed draws its seed from: the timbre, else the design.
+    pub(super) fn seed_text(&self) -> &str {
+        match self.timbre.is_empty() {
+            true => &self.text,
+            false => &self.timbre,
+        }
+    }
+}
+
+/// The design of a voice described in words.
+///
+/// The timbre is `voice_description`, else the description of the `voice` preset.
+/// The style is `instructions`.
+/// Both present, the design joins them, timbre first.
+/// Either alone is the design, and neither leaves the design empty.
+pub(super) fn speech_design(
+    voice_description: Option<&str>,
+    voice: Option<&str>,
+    instructions: Option<&str>,
+    speed: f32,
+) -> Design {
+    fn given(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let timbre = given(voice_description)
+        .map(str::to_string)
+        .or_else(|| given(voice).map(|v| openai_voice_to_description(v, speed)))
+        .unwrap_or_default();
+    let text = match given(instructions) {
+        Some(style) if !timbre.is_empty() => format!("{timbre} {style}"),
+        Some(style) => style.to_string(),
+        None => timbre.clone(),
+    };
+    Design { text, timbre }
+}
+
+/// The seed of `text`: the same text gives the same seed on any machine.
+pub(super) fn seed_of_text(text: &str) -> u64 {
+    crate::inference::cache::kv_disk::fnv1a(0, text.as_bytes())
+}
+
+/// The texts `input` is synthesised in, one engine call each: the whole input for an engine
+/// that splits a text itself, its sentences otherwise.
+pub(super) async fn speech_chunks(
+    engine: &crate::inference::engine::TtsEngine,
+    input: &str,
+) -> Vec<String> {
+    match engine.speaks_whole_text().await {
+        true => vec![input.trim().to_string()],
+        false => split_into_sentences(input),
     }
 }
 
@@ -2281,6 +2400,24 @@ pub(super) async fn tts_stream_response(
 
     let sentence_count = sentences.len();
     let stream_started = std::time::Instant::now();
+    if engine.streams_frames().await {
+        let body = Body::from_stream(frame_stream(
+            engine,
+            input,
+            base_params,
+            speech_format,
+            sample_rate,
+            speed,
+        ));
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (axum::http::header::CONTENT_DISPOSITION, cd),
+            ],
+            body,
+        )
+            .into_response();
+    }
     let body_stream = stream! {
         // Emit the streaming WAV header up front for the wav format so
         // the client can start playback before the first sentence is
@@ -2352,6 +2489,72 @@ pub(super) async fn tts_stream_response(
         body,
     )
         .into_response()
+}
+
+/// The bytes of `input` spoken by a model that streams its speech while it draws it, in
+/// `format`.
+///
+/// The whole input is one engine call.
+/// Each piece the decoder gives leaves at once.
+/// A raw format leaves as one stream: the WAV header first, then the samples.
+/// A chained format leaves each piece as a complete stream of its own.
+/// Dropping the stream cancels the synthesis.
+fn frame_stream(
+    engine: std::sync::Arc<crate::inference::engine::TtsEngine>,
+    input: String,
+    params: TtsSynthParams,
+    format: &'static SpeechFormat,
+    sample_rate: u32,
+    speed: f32,
+) -> impl futures::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    async_stream::stream! {
+        let started = std::time::Instant::now();
+        if format.name == "wav" {
+            yield Ok(wav_header(sample_rate, 1, None));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+        let synth = engine.synthesize_streamed(input.trim().to_string(), params, tx);
+        tokio::pin!(synth);
+        let mut synth_done = false;
+        let (mut samples, mut first_ms) = (0usize, None);
+        loop {
+            let piece = tokio::select! {
+                piece = rx.recv() => piece,
+                done = &mut synth, if !synth_done => {
+                    synth_done = true;
+                    if let Err(e) = done {
+                        tracing::error!("TTS streaming: {e}");
+                    }
+                    continue;
+                }
+            };
+            let Some(pcm) = piece else { break };
+            let pcm = if (speed - 1.0).abs() < 1e-3 {
+                pcm
+            } else {
+                apply_speed_linear(&pcm, speed)
+            };
+            let bytes = match format.streaming {
+                Streaming::Chained => match format.encode(&pcm, 1, sample_rate) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!("TTS streaming: {} encode: {e}", format.name);
+                        break;
+                    }
+                },
+                _ => pcm_to_raw_le_bytes(&pcm),
+            };
+            samples += pcm.len();
+            first_ms.get_or_insert(started.elapsed().as_millis());
+            yield Ok(bytes);
+        }
+        tracing::info!(
+            "Audio speech stream: frames streamed, audio_duration={:.1}s first_audio={}ms total={}ms",
+            samples as f64 / sample_rate as f64,
+            first_ms.unwrap_or_default(),
+            started.elapsed().as_millis()
+        );
+    }
 }
 
 /// The event-stream variant of `/v1/audio/speech`.
@@ -2450,7 +2653,7 @@ pub(super) fn tts_events_response(
         // Phase 2: the speech. Chunked by sentence for the same reason the non-stream path
         // is - a single synth call is capped - and counted in those chunks, which is a unit
         // the caller can relate to the text it sent.
-        let sentences = split_into_sentences(&input);
+        let sentences = speech_chunks(&state.tts_engine, &input).await;
         let total = sentences.len();
         let mut rate = state
             .tts_engine
@@ -2609,6 +2812,11 @@ pub(crate) async fn audio_voices(
         "max_input_chars": 4096,
         "supports_streaming": true,
         "supports_instructions": true,
+        // How a checkpoint whose voice is described in words reads the voice fields.
+        "voice_design": "A checkpoint whose voice is described in words takes the timbre from \
+                         `voice_description`, else from the description of the `voice` preset, \
+                         and the style from `instructions`. Both given, the timbre comes first. \
+                         A request without a seed draws from a hash of the timbre.",
     }))
     .into_response()
 }

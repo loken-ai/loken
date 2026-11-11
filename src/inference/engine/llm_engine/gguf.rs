@@ -196,6 +196,93 @@ pub(super) fn byte_level_split_sequence(
     Ok(PreTokenizerWrapper::Sequence(PreSequence::new(steps)))
 }
 
+/// The byte-level BPE tokenizer a checkpoint ships as `vocab.json`, `merges.txt` and
+/// `tokenizer_config.json`, with no `tokenizer.json`.
+///
+/// The files are read into the tokenizer keys a GGUF file carries, then built as a GGUF file's.
+/// The added tokens of `tokenizer_config.json` keep their ids.
+/// A special one is a control token, the others are text the model writes.
+/// The tokenizer class of `tokenizer_config.json` names the pre-tokenizer.
+pub fn build_tokenizer_from_bpe_files(dir: &std::path::Path) -> AnyResult<Tokenizer> {
+    use gguf_file::Value;
+    let read = |name: &str| -> AnyResult<String> {
+        std::fs::read_to_string(dir.join(name))
+            .map_err(|e| anyhow!("{}: {e}", dir.join(name).display()))
+    };
+    let vocab: std::collections::HashMap<String, u32> = serde_json::from_str(&read("vocab.json")?)?;
+    let config: serde_json::Value = serde_json::from_str(&read("tokenizer_config.json")?)?;
+    // ARCH-NAME-EXEMPT: translates the tokenizer class a checkpoint names, a tokenizer format
+    // name, to the pre-tokenizer identifier a GGUF file carries.
+    let pre = match config.get("tokenizer_class").and_then(|c| c.as_str()) {
+        Some("Qwen2Tokenizer") => "qwen2",
+        Some("GPT2Tokenizer") => "default",
+        other => {
+            return Err(anyhow!(
+                "no byte-level pre-tokenizer for the class {other:?}"
+            ))
+        }
+    };
+    // Each id's piece and type: 1 normal, 3 control, 4 user-defined, 5 unused.
+    let mut pieces: Vec<Option<(String, i32)>> = Vec::new();
+    let mut put = |id: usize, piece: String, kind: i32| {
+        if pieces.len() <= id {
+            pieces.resize(id + 1, None);
+        }
+        pieces[id] = Some((piece, kind));
+    };
+    for (piece, id) in vocab {
+        put(id as usize, piece, 1);
+    }
+    let added = config
+        .get("added_tokens_decoder")
+        .and_then(|a| a.as_object())
+        .into_iter()
+        .flatten();
+    for (id, token) in added {
+        let id: usize = id
+            .parse()
+            .map_err(|e| anyhow!("added token id {id}: {e}"))?;
+        let piece = token
+            .get("content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| anyhow!("added token {id} has no content"))?;
+        let special = token.get("special").and_then(|s| s.as_bool()) == Some(true);
+        put(id, piece.to_string(), if special { 3 } else { 4 });
+    }
+    let (tokens, types): (Vec<Value>, Vec<Value>) = pieces
+        .into_iter()
+        .enumerate()
+        .map(|(id, p)| {
+            let (piece, kind) = p.unwrap_or_else(|| (format!("[PAD{id}]"), 5));
+            (Value::String(piece), Value::I32(kind))
+        })
+        .unzip();
+    let merges: Vec<Value> = read("merges.txt")?
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with("#version"))
+        .map(|l| Value::String(l.to_string()))
+        .collect();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "tokenizer.ggml.model".to_string(),
+        Value::String("gpt2".into()),
+    );
+    metadata.insert("tokenizer.ggml.pre".to_string(), Value::String(pre.into()));
+    metadata.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens));
+    metadata.insert("tokenizer.ggml.token_type".to_string(), Value::Array(types));
+    metadata.insert("tokenizer.ggml.merges".to_string(), Value::Array(merges));
+    if let Some(add) = config.get("add_bos_token").and_then(|b| b.as_bool()) {
+        metadata.insert("tokenizer.ggml.add_bos_token".to_string(), Value::Bool(add));
+    }
+    build_tokenizer_from_gguf(&gguf_file::Content {
+        magic: gguf_file::VersionedMagic::GgufV3,
+        metadata,
+        tensor_infos: std::collections::HashMap::new(),
+        tensor_data_offset: 0,
+        mmap_owner: None,
+    })
+}
+
 pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Tokenizer> {
     use ahash::AHashMap;
     use tokenizers::models::bpe::BPE;

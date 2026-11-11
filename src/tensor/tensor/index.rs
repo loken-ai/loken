@@ -607,8 +607,11 @@ impl Tensor {
     }
 
     /// 1-D convolution `[b, c_in, l] * [c_out, c_in/groups, k] -> [b, c_out, l_out]`
-    /// via im2col + matmul (CPU; CUDA tensors host-bounce until a kernel is
-    /// warranted - the conv consumers run once per request).
+    /// via im2col + matmul.
+    ///
+    /// On a card the groups are the batch of one strided GEMM over the im2col columns.
+    /// On the host each group of each batch row is one threaded GEMM over its own im2col.
+    /// The host sum over a group's patch runs in patch order.
     pub fn conv1d(
         &self,
         kernel: &Self,
@@ -619,9 +622,9 @@ impl Tensor {
     ) -> Result<Self> {
         #[cfg(feature = "gpu")]
         if self.is_on_cuda() {
-            // device path: im2col + cuBLAS per batch (groups==1, f32; the
-            // general cases host-bounce)
-            if groups == 1 && self.dtype() == DType::F32 && kernel.dtype() == DType::F32 {
+            // device path: im2col + cuBLAS per batch row, the groups as the GEMM batch (f32;
+            // the other types host-bounce)
+            if self.dtype() == DType::F32 && kernel.dtype() == DType::F32 {
                 if let (
                     Storage::Cuda { data, dev },
                     Storage::Cuda {
@@ -633,9 +636,12 @@ impl Tensor {
                     if dev.ordinal() == kdev.ordinal() {
                         let (b, c_in, l) = self.shape.dims3()?;
                         let (c_out, c_in_g, k) = kernel.shape().dims3()?;
-                        if c_in_g != c_in {
-                            return Err(Error("conv1d: kernel/input c_in mismatch".into()));
+                        if c_in_g * groups != c_in || c_out % groups != 0 {
+                            return Err(Error(format!(
+                                "conv1d: kernel c_in {c_in_g}x{groups} != input c_in {c_in}"
+                            )));
                         }
+                        let co_g = c_out / groups;
                         let l_out = (l + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
                         let x = data.as_f32_slice()?;
                         let w = kd.as_f32_slice()?;
@@ -662,13 +668,14 @@ impl Tensor {
                                         dev, &xv, c_in, l, k, l_out, lo0, lt, padding, stride,
                                         dilation,
                                     )?;
+                                    // [groups, co_g, c_in_g*k] x [groups, c_in_g*k, lt]
                                     let y = crate::tensor::cuda::matmul_f32(
                                         dev,
                                         w,
                                         &col,
-                                        1,
-                                        c_out,
-                                        c_in * k,
+                                        groups,
+                                        co_g,
+                                        c_in_g * k,
                                         lt,
                                     )?;
                                     if lt == l_out {
@@ -730,41 +737,37 @@ impl Tensor {
         let x = self.f32_data()?;
         let w = kernel.f32_data()?;
         let co_g = c_out / groups;
+        let patch = c_in_g * k;
         let mut out = vec![0f32; b * c_out * l_out];
-        for bi in 0..b {
-            for g in 0..groups {
-                // im2col for this group: [c_in_g * k, l_out]
-                let mut col = vec![0f32; c_in_g * k * l_out];
-                for ci in 0..c_in_g {
-                    let src = &x[(bi * c_in + g * c_in_g + ci) * l..][..l];
-                    for kk in 0..k {
-                        for lo in 0..l_out {
-                            let pos = lo * stride + kk * dilation;
-                            let v = if pos < padding || pos - padding >= l {
-                                0.0
-                            } else {
-                                src[pos - padding]
-                            };
-                            col[(ci * k + kk) * l_out + lo] = v;
-                        }
-                    }
-                }
-                // [co_g, c_in_g*k] x [c_in_g*k, l_out]
-                let wg = &w[g * co_g * c_in_g * k..][..co_g * c_in_g * k];
-                for co in 0..co_g {
-                    let orow = &mut out[(bi * c_out + g * co_g + co) * l_out..][..l_out];
-                    let wrow = &wg[co * c_in_g * k..][..c_in_g * k];
-                    for (ki, &wv) in wrow.iter().enumerate() {
-                        if wv == 0.0 {
-                            continue;
-                        }
-                        let crow = &col[ki * l_out..][..l_out];
-                        for lo in 0..l_out {
-                            orow[lo] += wv * crow[lo];
-                        }
-                    }
-                }
-            }
+        {
+            use rayon::prelude::*;
+            // One slab per (batch row, group): `[co_g, l_out]`.
+            out.par_chunks_mut((co_g * l_out).max(1))
+                .enumerate()
+                .for_each(|(slab, o)| {
+                    let (bi, g) = (slab / groups, slab % groups);
+                    // im2col of the group: `[c_in_g * k, l_out]`.
+                    let mut col = vec![0f32; patch * l_out];
+                    col.par_chunks_mut((k * l_out).max(1))
+                        .enumerate()
+                        .for_each(|(ci, cslab)| {
+                            let src = &x[(bi * c_in + g * c_in_g + ci) * l..][..l];
+                            for kk in 0..k {
+                                for lo in 0..l_out {
+                                    let pos = lo * stride + kk * dilation;
+                                    cslab[kk * l_out + lo] = if pos < padding || pos - padding >= l
+                                    {
+                                        0.0
+                                    } else {
+                                        src[pos - padding]
+                                    };
+                                }
+                            }
+                        });
+                    // `[co_g, patch] x [patch, l_out]` on the threaded GEMM.
+                    let wg = &w[g * co_g * patch..][..co_g * patch];
+                    gemm_f32_cpu(wg, &col, co_g, patch, l_out, o);
+                });
         }
         Ok(Self::from_packed(
             Arc::new(Storage::Cpu(CpuStorage::F32(out))),
@@ -959,9 +962,11 @@ impl Tensor {
     }
 
     /// 1-D transposed convolution `[b, c_in, l] * [c_in, c_out/groups, k]`
-    /// (stride upsampling). CUDA: direct gather kernel (dilation 1, groups 1
-    /// - the audio-codec shape); CPU: scatter-accumulate, rayon over output
-    /// channels.
+    /// (stride upsampling).
+    ///
+    /// On a card a direct gather kernel runs dilation 1 and 1 group.
+    /// On the host each group of each batch row is one threaded GEMM `[c_out/groups * k, l]`.
+    /// Its rows are then added at their strided positions, in parallel over output channels.
     pub fn conv_transpose1d(
         &self,
         kernel: &Self,
@@ -1070,28 +1075,42 @@ impl Tensor {
         let l_out = l_out - 2 * padding;
         let x = self.f32_data()?;
         let w = kernel.f32_data()?;
+        let taps = co_g * k;
         let mut out = vec![0f32; b * c_out * l_out];
-        for bi in 0..b {
-            for g in 0..groups {
-                for ci in 0..ci_g {
-                    let src = &x[(bi * c_in + g * ci_g + ci) * l..][..l];
-                    for co in 0..co_g {
-                        let wrow = &w[((g * ci_g + ci) * co_g + co) * k..][..k];
-                        let orow = &mut out[(bi * c_out + g * co_g + co) * l_out..][..l_out];
-                        for (li, &xv) in src.iter().enumerate() {
-                            if xv == 0.0 {
-                                continue;
-                            }
-                            for (kk, &wv) in wrow.iter().enumerate() {
-                                let pos = li * stride + kk * dilation;
-                                if pos >= padding && pos - padding < l_out {
-                                    orow[pos - padding] += xv * wv;
-                                }
-                            }
+        {
+            use rayon::prelude::*;
+            // One slab per (batch row, group): `[co_g, l_out]`.
+            out.par_chunks_mut((co_g * l_out).max(1))
+                .enumerate()
+                .for_each(|(slab, o)| {
+                    let (bi, g) = (slab / groups, slab % groups);
+                    // The group's kernel transposed: `[co_g * k, ci_g]`.
+                    let wg = &w[g * ci_g * taps..][..ci_g * taps];
+                    let mut wt = vec![0f32; taps * ci_g];
+                    for (ci, wrow) in wg.chunks_exact(taps).enumerate() {
+                        for (t, &v) in wrow.iter().enumerate() {
+                            wt[t * ci_g + ci] = v;
                         }
                     }
-                }
-            }
+                    // Every tap of every input position: `[co_g * k, ci_g] x [ci_g, l]`.
+                    let xg = &x[(bi * c_in + g * ci_g) * l..][..ci_g * l];
+                    let mut y = vec![0f32; taps * l];
+                    gemm_f32_cpu(&wt, xg, taps, ci_g, l, &mut y);
+                    // Each output channel adds its taps at their strided positions, in tap order.
+                    o.par_chunks_mut(l_out.max(1))
+                        .enumerate()
+                        .for_each(|(co, orow)| {
+                            for kk in 0..k {
+                                let yrow = &y[(co * k + kk) * l..][..l];
+                                for (li, &v) in yrow.iter().enumerate() {
+                                    let pos = li * stride + kk * dilation;
+                                    if pos >= padding && pos - padding < l_out {
+                                        orow[pos - padding] += v;
+                                    }
+                                }
+                            }
+                        });
+                });
         }
         Ok(Self::from_packed(
             Arc::new(Storage::Cpu(CpuStorage::F32(out))),

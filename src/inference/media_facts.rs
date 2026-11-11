@@ -79,6 +79,9 @@ pub enum SpeechModel {
     PocketTts,
     /// A VITS voice driven by a phoneme table.
     Piper,
+    /// A talker over the codes of a speech codec, with its code predictor and its codec
+    /// decoder (`qwen3_tts`).
+    Qwen3Tts,
     /// A speech model this build runs no engine for: a cloning synthesiser, a converter.
     Unserved,
 }
@@ -528,10 +531,30 @@ fn weights_declare(dir: &Path) -> Option<MediaFacts> {
     tensor_signature(&names.join("\n"))
 }
 
+/// The `model_type` a speech talker's configuration declares.
+const SPEECH_TALKER_TYPE: &str = "qwen3_tts";
+/// The tensor a speech talker's weights hold: its head over the codes of group 0.
+const SPEECH_TALKER_HEAD: &str = "talker.codec_head.weight";
+
+/// A speech talker: the `model_type` of its `config.json`, and its head of codec codes among
+/// the tensors of its safetensors.
+fn speech_talker(dir: &Path) -> Option<MediaFacts> {
+    let config = read_json(&dir.join("config.json"))?;
+    if config.get("model_type").and_then(|v| v.as_str()) != Some(SPEECH_TALKER_TYPE) {
+        return None;
+    }
+    weights_in(dir)
+        .iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .filter_map(|p| safetensors_names(p))
+        .any(|names| names.lines().any(|n| n == SPEECH_TALKER_HEAD))
+        .then(|| MediaFacts::of(MediaKind::Speech(SpeechModel::Qwen3Tts)))
+}
+
 /// What a directory holding a pipeline declares: its configuration first, then its weights,
 /// then the configuration and weights of its components.
 fn from_dir(dir: &Path) -> Option<MediaFacts> {
-    let mut facts = configs_in(dir);
+    let mut facts = speech_talker(dir).or_else(|| configs_in(dir));
     // A repository whose configuration declares another kind of model is that model.
     let declared = read_json(&dir.join("config.json"))
         .is_some_and(|c| c.get("architectures").is_some() || c.get("model_type").is_some());
@@ -915,6 +938,46 @@ mod tests {
             serde_json::json!({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}),
         );
         assert_eq!(read(&text), None);
+    }
+
+    #[test]
+    fn a_speech_talker_is_known_by_its_type_and_its_codec_head() {
+        let s = Scratch::new("talker");
+        let config = serde_json::json!({
+            "model_type": "qwen3_tts",
+            "architectures": ["Qwen3TTSForConditionalGeneration"],
+        });
+        let talker = s.0.join("talker");
+        json(&talker.join("config.json"), config.clone());
+        safetensors(
+            &talker.join("model.safetensors"),
+            &["talker.codec_head.weight", "talker.model.norm.weight"],
+            None,
+        );
+        assert_eq!(
+            read(&talker).map(|f| f.kind),
+            Some(MediaKind::Speech(SpeechModel::Qwen3Tts))
+        );
+        let headless = s.0.join("headless");
+        json(&headless.join("config.json"), config);
+        safetensors(
+            &headless.join("model.safetensors"),
+            &["talker.model.norm.weight"],
+            None,
+        );
+        assert_eq!(read(&headless), None);
+    }
+
+    #[test]
+    fn the_published_speech_talker_is_known() {
+        let Some(dir) = crate::inference::load::hf_config::tests::speech_snapshot() else {
+            eprintln!("the published checkpoint is not in the test store");
+            return;
+        };
+        assert_eq!(
+            read(&dir).map(|f| f.kind),
+            Some(MediaKind::Speech(SpeechModel::Qwen3Tts))
+        );
     }
 
     #[test]

@@ -118,6 +118,7 @@ The `Verified` column says how the safetensors layout is checked:
 | `lfm2moe` | `Lfm2MoeForCausalLM` | GGUF, HF safetensors | `lfm2moe_loads_from_gguf`, `lfm2moe_loads_from_safetensors` | reference, synthetic |
 | `nemotron_h_moe` | `NemotronHForCausalLM` | GGUF, HF safetensors | `nemotron_h_moe_loads_from_gguf`, `nemotron_h_moe_loads_from_safetensors` | reference, synthetic |
 | `glm_moe_dsa` | `GlmMoeDsaForCausalLM` (latent attention, sparse indexer shared across layers, sigmoid router with a selection bias, shared expert, dense first blocks, fp8 weights with 128 by 128 tile scales) | GGUF, HF safetensors | `glm_moe_dsa_loads_from_gguf`, `glm_moe_dsa_matches_reference`, `glm_moe_dsa_dense_matches_reference`, `glm_moe_dsa_sparse_matches_reference`, `glm_moe_dsa_fp8_matches_reference`, `glm_moe_dsa_layers_match_reference` | reference (`glm_moe_dsa`, `glm_moe_dsa_dense`, `glm_moe_dsa_sparse`, `glm_moe_dsa_fp8`), synthetic |
+| `qwen3` talker and code predictor of a speech release | `Qwen3TTSForConditionalGeneration` with its fields under `talker_config`, `Qwen3TTSTalkerCodePredictorModelForConditionalGeneration` for the code predictor nested in the same checkpoint with its fields under `talker_config.code_predictor_config` | HF safetensors composite | `a_class_reads_its_text_model_under_its_own_key`, `the_published_configuration_gives_both_transformers_geometry`, `a_speech_checkpoint_reads_as_a_talker_and_a_code_predictor`, `the_published_speech_header_reads_as_a_talker_and_a_code_predictor`, `a_nested_class_loads_and_a_layout_without_a_head_gives_none` | synthetic, real checkpoint configuration and header |
 | `llama` text model of a speech release | `VoxtralForConditionalGeneration`, native layout with the table in the tower's namespace | HF safetensors composite, native layout | `voxtral_loads_from_safetensors`, `voxtral_loads_from_native_layout`, `voxtral_matches_reference`, `voxtral_native_matches_reference`, `voxtral_native_matches_composite` | reference (`voxtral`), synthetic |
 
 ## Notes
@@ -150,6 +151,19 @@ A rule per part of a block says how a stored tensor is read:
 - repacked (MXFP4)
 
 `hf_config.rs` reads the config keys under the names each publisher uses.
+A class reads its text model's fields under the key its row names, `text_config` unless the row says otherwise.
+A model nested in a checkpoint has a class row of its own.
+It is read from the checkpoint's configuration with `architectures` set to that class (`nested_config`).
+A class row names the route that serves its checkpoints, the text route unless the row says otherwise.
+The text route resolves no checkpoint of a class it does not serve.
+A request for one fails with the kind of model and the route that serves it.
+
+The embedding table a layout names gives the model's prefix.
+The talker of `Qwen3TTSForConditionalGeneration` reads its codec table as the token table and its codec head as the head.
+Its code predictor reads the tensors under its own prefix, its first codec table as the token table, and has no head.
+A layout with no head gives the model none: its forward gives the normed rows and no logits.
+`class_load::load_class` loads the transformer of one class of a dense checkpoint, the checkpoint's own or a class nested in it.
+It places the blocks, the head, the cache and the work reserve through `HeteroPlan` and the ladder, as any dense load.
 The tensors state some widths, and the loader reads those from the tensors: the dense and the expert feed-forward, the short convolution, and which blocks attend.
 
 ### Rotary rows
@@ -247,6 +261,136 @@ A text-image checkpoint is served as such when it holds:
 - A text longer than the position table is cut, keeping the end-of-text token.
 - Images are resized, cropped, rescaled and normalised as `preprocessor_config.json` states, with the Pillow resampling filter of the same number (`src/inference/model/clip/preprocess.rs`).
 - The model runs on the host in f32.
+
+## Decode step from an embedding
+
+`GenericHeteroTransformer::forward_embedding_step` runs the decode step of 1 row fed by an embedding instead of a token id.
+
+- The row enters the layers as a token's table row does, with no embedding scale and no position row.
+- The layers' caches advance as for a token step. Position 0 empties them first.
+- The step gives back the row after the final norm, as the head reads it, and the logits when asked.
+- A model whose layers take more than the embedding row is refused: a wide residual, per-layer inputs, learned positions.
+
+`forward_embeddings_prefill` runs the prefill of several rows fed by embeddings from position 0.
+It gives back the last row after the final norm, and its logits when asked.
+Its logits are those of a splice of the same rows with no text around them.
+`token_rows` gives the token table's rows of some ids, as a token step reads them before any embedding scale.
+
+`embedding_step_tests.rs` holds the step to 3 references, on the host and on a card:
+
+- a plain host run of the same layers in f64 sums, within a tolerance derived from the float type and the depth
+- the token step fed the same table row, bit for bit
+- a fresh model after position 0, bit for bit
+- for the prefill, the last row of the plain host run, and the splice of the same rows bit for bit
+
+## Speech talker
+
+`src/inference/model/qwen3_tts/` drives the talker of a Qwen3-TTS checkpoint frame by frame.
+The talker is a transformer of the generic route, loaded by `class_load::load_class`.
+
+The talker's cache holds the context a language model takes for a window nobody asked for, through `llm::context_the_cards_hold`:
+
+- it starts at the positions of the talker's configuration
+- it halves while its plan sends a layer to the host, spreads over more cards or reads a token's weights more slowly
+- it stops at the working window
+- with no card it keeps the positions of the configuration
+
+The cards are read under the fleet's pressure, so a higher pressure level shrinks the cache.
+The cache is unquantised, of the width the route gives an unquantised cache of the architecture.
+The frames of a call are bounded by the rows the cache holds and by the checkpoint's frame limit.
+
+The prompt holds rows fed as embeddings (`prompt.rs`):
+
+- the design turn and the opening of the speech turn, each id a text row
+- the control codes, each beside the pad text row, the last beside the start of text
+- each text id beside the codec pad, and the end of text beside it
+- the pad text row beside the start of codes
+
+A text row is a row of the text table through the text projection.
+A codec row is a row of the talker's token table.
+The control codes name the language when the request gives one.
+
+Each frame, the talker draws the code of group 0 from its last logits (`sampling.rs`):
+
+- a code already drawn is penalised once
+- the ids past the codebook are banned, but the end of speech
+- the end of speech is banned before `MIN_FRAMES_BEFORE_EOS` frames
+- the temperature, the top-k and the top-p apply, then the draw
+
+The other codes of the frame come from a source of sub-codes, the code predictor (`predictor.rs`).
+The next talker row sums the frame's code rows and the pad text row.
+
+The code predictor is a second transformer of the generic route with no head, loaded by `class_load::load_class` with its own demand.
+Its cache restarts at position 0 every frame.
+It holds the 2 rows of the first pass and a row for each later pass, read from the group count of the configuration.
+Its first pass takes 2 rows: the talker's normed row and the talker's codec row of group 0.
+Each later pass takes the code predictor's row of the code the pass before drew.
+Every row it takes goes through its input projection first.
+The head of pass `s` gives the logits of group `s + 1`, drawn with the code predictor's own sampling values.
+The input projection, the heads and the talker's text projection sit beside its last layer, counted in its demand.
+The loop stops at the end of speech, at the frame limit of `generation_config.json`, or when the cache is full.
+Every id comes from `config.json`, and every sampling value from `generation_config.json`.
+The tokenizer is built from the `vocab.json`, `merges.txt` and `tokenizer_config.json` the checkpoint ships.
+The tables stay mapped on the host and are read by row.
+
+`src/inference/model/qwen3_tts/tests.rs` tests the talker on a toy checkpoint, and on the published checkpoint when the test store holds it.
+The comparison to the reference runs outside the test suite, so no reference file lives in the repository.
+The tests check:
+
+- the layout of the prompt, the suppressed ids, the end of speech and the repetition penalty
+- a prompt row as the sum of its text and codec parts, and the row after a frame as the sum of its code rows and the pad row
+- a seeded run giving the same frames twice, on the toy and on the published checkpoint
+- the loop stopping where the cache is full, and a streamed text spoken to its end
+- the published checkpoint's tokenizer wrapping both turns
+- the blocks of the published checkpoint summing to the tensors they load
+
+## Speech codec decoder
+
+`src/inference/model/qwen3_tts/decoder/` turns frames of codes into the waveform of a Qwen3-TTS checkpoint.
+It reads `speech_tokenizer/config.json` and the `decoder.` tensors of `speech_tokenizer/model.safetensors`.
+It is 1 block placed whole by `ladder::load_whole`, in F32 as stored.
+
+The decode runs in 2 parts:
+
+- the front: the dequantisation of the 2 quantizers, a causal conv and the transformer, at the frame rate
+- the back: the upsample stages, the first conv, the snake blocks, the last snake and conv, at the rates up to the sample rate
+
+The transformer layer is pre-norm with RMSNorm, separate q k v, a rotary embedding over the 2 halves of each head, a sliding causal window, SwiGLU and LayerScale.
+An upsample stage is a causal transposed conv and a ConvNeXt block.
+A snake block is SnakeBeta, a causal transposed conv and residual units of growing dilation.
+SnakeBeta runs on `snake1d`, its 2 inputs computed at load from `alpha` and `beta`.
+The waveform is clamped to the reference's bound.
+
+The RVQ dequantisation and the causal convs are shared with Kyutai's Mimi in `src/inference/model/codec_blocks.rs`.
+
+Each part decodes in chunks whose left context is its receptive field, so a chunked decode gives the samples of a whole one:
+
+- `config::left_context` sums the reach of every stage in samples, then rounds up to whole frames
+- the front reaches back through the first conv and the window of every layer
+- the back reaches back through every kernel, stride and dilation
+- a chunk holds the most frames whose working set fits the reserve the block is placed with
+
+A streamed decode (`DecodeStream`) takes frames as the talker draws them:
+
+- the decoder runs on a thread of its own, beside the frame loop
+- each time it is free, it takes every frame drawn since its last call
+- the front of a call runs over the new frames and the front's left context before them
+- the back reads the front rows of its left context, kept from the calls before
+- the samples equal those of a whole decode within the rounding of F32
+- a listener that is gone stops the decoder, and the frame loop at its next frame
+
+The values that only the reference code holds are named in the code: `RVQ_EPS`, `CONVNEXT_LN_EPS`, `SNAKE_EPS`, `RESIDUAL_DILATION_BASE` and `WAVEFORM_BOUND`.
+
+On a card, the depthwise conv of the ConvNeXt blocks runs on the card: a grouped conv is 1 strided GEMM whose batch is the groups.
+
+`src/inference/model/qwen3_tts/decoder/tests.rs` tests the decoder on toy chains, and on the published checkpoint when the test store holds it.
+The comparison to the reference runs outside the test suite.
+The tests check, on the host and on a card when the ladder places it there:
+
+- the waveform of 8 frames: its sample count, its bound and its repeat
+- a decode in small chunks against a whole decode, for each part, within the rounding of F32 through the part
+- a decode fed frames in uneven groups against a whole decode, within the rounding of F32 through the decoder
+- the left context of toy chains of stages
 
 ## Drafter verification
 

@@ -14,7 +14,7 @@
 //! Target arches: dense Qwen2 / Qwen3 / Mistral (deepcoder, qwen3-8b, deepseek-r1,
 //! devstral). MoE AWQ (qwen3-coder) is out of scope for the first cut.
 
-use super::hf_config::{hf_class, lookup, lookup_b, lookup_f, lookup_u, rope_block};
+use super::hf_config::{hf_class, lookup, lookup_b, lookup_f, lookup_u, rope_block, Route};
 use crate::tensor::quantized::gguf_file::{Content, TensorInfo, Value};
 use crate::tensor::quantized::GgmlDType;
 use anyhow::{anyhow, Result};
@@ -592,7 +592,26 @@ pub fn find_dense_model_dir(candidate: &str) -> Option<String> {
     }
     let arch = v.get("architectures")?.get(0)?.as_str()?;
     map_hf_arch(arch).ok()?;
+    if text_route_refusal(candidate).is_some() {
+        return None;
+    }
     Some(candidate.to_string())
+}
+
+/// Why the text route does not serve the checkpoint in `dir`: its class is a component of a
+/// model another route serves. `None` for a checkpoint the text route serves or does not know.
+pub fn text_route_refusal(dir: &str) -> Option<String> {
+    let txt = std::fs::read_to_string(std::path::Path::new(dir).join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let class = hf_class(v.get("architectures")?.get(0)?.as_str()?)?;
+    let route = class.route;
+    (route != Route::Text).then(|| {
+        format!(
+            "{dir} holds a {} model: {} serves it, the text route does not",
+            route.kind(),
+            route.endpoint()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -676,6 +695,45 @@ mod layout_tests {
         assert!(native && shards.len() == 1);
         assert!(find_dense_model_dir(only.to_str().unwrap()).is_some());
         let _ = std::fs::remove_dir_all(&only);
+    }
+
+    /// The text route does not resolve a checkpoint of a speech model's class, and says which
+    /// route serves it. A text class still resolves.
+    #[test]
+    fn the_text_route_skips_a_speech_checkpoint() {
+        use crate::inference::load::hf_config::tests::{speech_config, SPEECH_CLASS};
+        let speech = speech_config().to_string();
+        let files = [("config.json", speech.as_str()), ("model.safetensors", "")];
+        let dir = directory("speech-route", &files);
+        let path = dir.to_str().unwrap();
+        assert!(find_dense_model_dir(path).is_none());
+        let why = text_route_refusal(path).unwrap();
+        assert!(
+            why.contains("speech model") && why.contains("/v1/audio/speech"),
+            "{why}"
+        );
+        assert_eq!(parse_config_json(path).unwrap().hf_arch, SPEECH_CLASS);
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = r#"{"architectures": ["Qwen3ForCausalLM"], "hidden_size": 8,
+            "num_hidden_layers": 2, "num_attention_heads": 2}"#;
+        let files = [("config.json", text), ("model.safetensors", "")];
+        let dir = directory("text-route", &files);
+        let path = dir.to_str().unwrap();
+        assert_eq!(find_dense_model_dir(path).as_deref(), Some(path));
+        assert!(text_route_refusal(path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The text route does not resolve the published speech checkpoint.
+    #[test]
+    fn the_text_route_skips_the_published_speech_checkpoint() {
+        let Some(dir) = crate::inference::load::hf_config::tests::speech_snapshot() else {
+            eprintln!("the published checkpoint is not in the test store");
+            return;
+        };
+        let path = dir.to_str().unwrap();
+        assert!(find_dense_model_dir(path).is_none());
+        assert!(text_route_refusal(path).is_some_and(|w| w.contains("/v1/audio/speech")));
     }
 
     /// A directory that is neither layout is refused with what each layout lacks.

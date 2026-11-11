@@ -1281,57 +1281,76 @@ fn normalize_language_code(raw: &str) -> String {
     if lower.len() == 2 || lower.contains('-') {
         return lower;
     }
-    // Common English language names -> BCP-47 (subset; covers the
-    // top ~30 most-used). Unknown names fall through.
-    let map: &[(&str, &str)] = &[
-        ("english", "en"),
-        ("chinese", "zh"),
-        ("german", "de"),
-        ("spanish", "es"),
-        ("russian", "ru"),
-        ("korean", "ko"),
-        ("french", "fr"),
-        ("japanese", "ja"),
-        ("portuguese", "pt"),
-        ("turkish", "tr"),
-        ("polish", "pl"),
-        ("catalan", "ca"),
-        ("dutch", "nl"),
-        ("arabic", "ar"),
-        ("swedish", "sv"),
-        ("italian", "it"),
-        ("indonesian", "id"),
-        ("hindi", "hi"),
-        ("finnish", "fi"),
-        ("vietnamese", "vi"),
-        ("hebrew", "he"),
-        ("ukrainian", "uk"),
-        ("greek", "el"),
-        ("malay", "ms"),
-        ("czech", "cs"),
-        ("romanian", "ro"),
-        ("danish", "da"),
-        ("hungarian", "hu"),
-        ("tamil", "ta"),
-        ("norwegian", "no"),
-        ("thai", "th"),
-        ("urdu", "ur"),
-        ("croatian", "hr"),
-        ("bulgarian", "bg"),
-        ("lithuanian", "lt"),
-        ("latin", "la"),
-        ("welsh", "cy"),
-        ("slovak", "sk"),
-        ("telugu", "te"),
-        ("persian", "fa"),
-    ];
-    for (name, code) in map {
+    // Unknown names fall through.
+    for (name, code) in LANGUAGE_NAMES {
         if lower == *name {
             return (*code).to_string();
         }
     }
     lower
 }
+
+/// The English name of the language of the BCP-47 primary code `code`, lower case.
+pub(crate) fn language_name(code: &str) -> Option<&'static str> {
+    let code = code.to_lowercase();
+    LANGUAGE_NAMES
+        .iter()
+        .find(|(_, c)| *c == code)
+        .map(|(name, _)| *name)
+}
+
+/// The BCP-47 primary code of the language of the English name `name`, any case.
+pub(crate) fn code_of(name: &str) -> Option<&'static str> {
+    let name = name.to_lowercase();
+    LANGUAGE_NAMES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, code)| *code)
+}
+
+/// Common English language names, lower case, and their BCP-47 primary codes.
+const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("english", "en"),
+    ("chinese", "zh"),
+    ("german", "de"),
+    ("spanish", "es"),
+    ("russian", "ru"),
+    ("korean", "ko"),
+    ("french", "fr"),
+    ("japanese", "ja"),
+    ("portuguese", "pt"),
+    ("turkish", "tr"),
+    ("polish", "pl"),
+    ("catalan", "ca"),
+    ("dutch", "nl"),
+    ("arabic", "ar"),
+    ("swedish", "sv"),
+    ("italian", "it"),
+    ("indonesian", "id"),
+    ("hindi", "hi"),
+    ("finnish", "fi"),
+    ("vietnamese", "vi"),
+    ("hebrew", "he"),
+    ("ukrainian", "uk"),
+    ("greek", "el"),
+    ("malay", "ms"),
+    ("czech", "cs"),
+    ("romanian", "ro"),
+    ("danish", "da"),
+    ("hungarian", "hu"),
+    ("tamil", "ta"),
+    ("norwegian", "no"),
+    ("thai", "th"),
+    ("urdu", "ur"),
+    ("croatian", "hr"),
+    ("bulgarian", "bg"),
+    ("lithuanian", "lt"),
+    ("latin", "la"),
+    ("welsh", "cy"),
+    ("slovak", "sk"),
+    ("telugu", "te"),
+    ("persian", "fa"),
+];
 
 /// Reverse lookup: lang_token_id -> BCP-47 code (e.g. "en"). Returns None
 /// for English-only models or unrecognized ids.

@@ -1097,7 +1097,18 @@ pub fn load<T, E: std::fmt::Display + Refusal>(
     demand: &Demand,
     build: impl FnMut(&HeteroPlan) -> Result<T, E>,
 ) -> Result<T, E> {
-    load_placed(what, demand, &cards(0), scoped_cancelled, build)
+    load_on(what, demand, &cards(0), build)
+}
+
+/// Build `what` through the ladder on `cards`, as [`cards`] read them for its demand.
+/// A cancelled load stops.
+pub fn load_on<T, E: std::fmt::Display + Refusal>(
+    what: &str,
+    demand: &Demand,
+    cards: &[(usize, u64)],
+    build: impl FnMut(&HeteroPlan) -> Result<T, E>,
+) -> Result<T, E> {
+    load_placed(what, demand, cards, scoped_cancelled, build)
 }
 
 /// The demand of a component that runs whole on one device: `bytes` resident and
