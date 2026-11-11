@@ -3681,6 +3681,8 @@ impl GenericHeteroTransformer {
         if source.hf_rows {
             cfg.flags.use_rope_i = source.adjacent_rope;
         }
+        // The class of a dense checkpoint says the GELU of its ungated feed-forward.
+        cfg.flags.erf_gelu = source.dense.is_some_and(|ck| ck.erf_gelu);
         // Cap the per-layer Q8/Q4 KV allocation at the user's configured
         // context_length when supplied - otherwise GGUF's native
         // (often 128K/256K) eagerly allocates gigabytes that may OOM.
@@ -3735,7 +3737,17 @@ impl GenericHeteroTransformer {
             DeviceKind::Cuda(idx) => cuda_devices.get(&idx).cloned(),
             _ => None,
         });
-        let emb_qt = source.read("token_embd.weight", &Device::Cpu)?;
+        // A dense checkpoint whose layout reads no token table is fed by embeddings alone.
+        // It gets a table of 1 zero row, which no lookup reads.
+        let emb_qt = match source.dense.is_some_and(|ck| !ck.has_token_table) {
+            true => QTensor::from_ggml_bytes(
+                crate::tensor::quantized::GgmlDType::F32,
+                &vec![0u8; config.embedding_length * std::mem::size_of::<f32>()],
+                vec![1, config.embedding_length],
+                &Device::Cpu,
+            )?,
+            false => source.read("token_embd.weight", &Device::Cpu)?,
+        };
         // The table stays in the file's format and each lookup decodes the rows it needs:
         // resident cost is the mapping, and the residual stream is still F32.
         let emb_table_bytes = emb_qt.shape().elem_count() as u64
@@ -3805,24 +3817,28 @@ impl GenericHeteroTransformer {
         // when the file carries no `output_norm`.
         // A wide-residual file has none: its final mixer is the output norm, so the plain one
         // is a placeholder the forward never reads.
-        let norm_weight_cpu =
-            if config.hyper.is_some() && !content.tensor_infos.contains_key("output_norm.weight") {
-                Tensor::ones(
-                    config.embedding_length,
-                    crate::tensor::DType::F32,
-                    &Device::Cpu,
-                )?
-            } else {
-                let norm_qt = match source.read("output_norm.weight", &Device::Cpu) {
-                    Ok(qt) => qt,
-                    Err(e) => match content.tensor_infos.contains_key("token_embd_norm.weight") {
-                        true => source.read("token_embd_norm.weight", &Device::Cpu)?,
-                        false => return Err(e),
-                    },
-                };
-                // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
-                norm_qt.dequantize(&Device::Cpu)?
+        // A dense checkpoint whose layout reads no final norm has none: its output is its last
+        // block's.
+        let no_final_norm = source.dense.is_some_and(|ck| !ck.has_final_norm);
+        let norm_weight_cpu = if (config.hyper.is_some() || no_final_norm)
+            && !content.tensor_infos.contains_key("output_norm.weight")
+        {
+            Tensor::ones(
+                config.embedding_length,
+                crate::tensor::DType::F32,
+                &Device::Cpu,
+            )?
+        } else {
+            let norm_qt = match source.read("output_norm.weight", &Device::Cpu) {
+                Ok(qt) => qt,
+                Err(e) => match content.tensor_infos.contains_key("token_embd_norm.weight") {
+                    true => source.read("token_embd_norm.weight", &Device::Cpu)?,
+                    false => return Err(e),
+                },
             };
+            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
+            norm_qt.dequantize(&Device::Cpu)?
+        };
         // Phi2/GPT-NeoX use full LayerNorm: `output_norm.bias` exists.
         let output_norm_bias_cpu = source
             .read_opt("output_norm.bias", &Device::Cpu)
@@ -3830,6 +3846,7 @@ impl GenericHeteroTransformer {
             .flatten()
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
         let output_norm = match &output_norm_bias_cpu {
+            None if no_final_norm => WeightedNorm::Identity(norm_weight_cpu.clone()),
             Some(bias) => WeightedNorm::Layer(LayerNorm::new(
                 norm_weight_cpu.clone(),
                 Some(bias.clone()),

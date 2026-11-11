@@ -60,6 +60,7 @@ pub(super) type Table = &'static [(&'static str, Rule)];
 /// A class's tensors.
 pub(super) struct Layout {
     /// Names of the embedding table, under the model's prefix.
+    /// None for a model fed by embeddings alone, whose prefix is where its blocks are.
     pub embed: &'static [&'static str],
     /// Where the blocks are, under the model's prefix (`layers`).
     pub layers: &'static str,
@@ -912,6 +913,31 @@ const QWEN3_TTS_CODEC: Layout = Layout {
     rooted: false,
 };
 
+/// The transformer of Mimi's decoder, in the codec's own file.
+///
+/// It has no token table, no final norm and no head.
+/// Its blocks norm with a bias, project Q, K and V as one matrix, and feed forward through 2
+/// linears.
+const MIMI: Layout = Layout {
+    embed: &[],
+    layers: "decoder_transformer.transformer.layers",
+    top: &[],
+    head: &[],
+    layer: &[&[
+        ("norm1.weight", Same("attn_norm.weight")),
+        ("norm1.bias", Same("attn_norm.bias")),
+        ("norm2.weight", Same("ffn_norm.weight")),
+        ("norm2.bias", Same("ffn_norm.bias")),
+        ("self_attn.in_proj_weight", Same("attn_qkv.weight")),
+        ("self_attn.out_proj.weight", Same("attn_output.weight")),
+        ("linear1.weight", Same("ffn_up.weight")),
+        ("linear2.weight", Same("ffn_down.weight")),
+        ("layer_scale_1.scale", Same("attn_layer_scale.weight")),
+        ("layer_scale_2.scale", Same("ffn_layer_scale.weight")),
+    ]],
+    rooted: false,
+};
+
 /// The layout of a class's tensors.
 pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
     match kind {
@@ -946,5 +972,6 @@ pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
         LayoutKind::Qwen3Tts => &QWEN3_TTS,
         LayoutKind::Qwen3TtsCodePredictor => &QWEN3_TTS_CODE_PREDICTOR,
         LayoutKind::Qwen3TtsCodec => &QWEN3_TTS_CODEC,
+        LayoutKind::Mimi => &MIMI,
     }
 }

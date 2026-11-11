@@ -12,6 +12,14 @@ impl GenericTransformerLayer {
     #[inline]
     pub(super) fn forward_ffn_phi2_pre_bias(&self, x: &Tensor) -> Result<Tensor> {
         let up = self.ffn_up.forward(x)?;
+        // The error-function GELU, after the up bias when there is one.
+        if self.flags.erf_gelu {
+            let up = match &self.ffn_up_bias {
+                Some(b) => up.broadcast_add(b)?,
+                None => up,
+            };
+            return self.ffn_down.forward(&up.gelu_erf()?);
+        }
         let activated = match &self.ffn_up_bias {
             Some(b) => {
                 #[cfg(feature = "gpu")]

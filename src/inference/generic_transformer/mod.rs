@@ -119,6 +119,8 @@ mod layer_rows_cpu;
 mod loader;
 #[cfg(test)]
 mod loading_tests;
+#[cfg(test)]
+pub(crate) mod mimi_class_tests;
 pub mod mixer;
 pub mod mla;
 pub mod mla_config;

@@ -393,6 +393,7 @@ fn generic_config(
             fused_ffn_gate_up: false,
             is_phi2_simple_ffn: false,
             use_gelu: false,
+            erf_gelu: false,
             value_rms_norm: false,
             // The rotated lanes of a head pair up adjacent.
             use_rope_i: true,

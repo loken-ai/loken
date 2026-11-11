@@ -94,6 +94,8 @@ pub struct GenericLayerFlags {
     pub is_phi2_simple_ffn: bool,
     /// The FFN gates through GELU instead of SiLU.
     pub use_gelu: bool,
+    /// The ungated feed-forward runs the error-function GELU instead of its tanh form.
+    pub erf_gelu: bool,
     /// The attention values are RMS-normalised without a weight before caching.
     pub value_rms_norm: bool,
     /// Llama/Mistral: use interleaved RoPE (rope_i) vs non-interleaved (rope)
@@ -200,6 +202,8 @@ impl GenericLayerFlags {
             // A GGUF does not record the activation: it follows the architecture's facts, and
             // a per-layer output scale marks a GELU-gated build under any architecture key.
             use_gelu: facts.gelu_ffn || has("blk.0.layer_output_scale.weight"),
+            // A GGUF file's ungated feed-forward runs the tanh form.
+            erf_gelu: false,
             // The same marker stands for the value norm of that build.
             value_rms_norm: facts.value_rms_norm || has("blk.0.layer_output_scale.weight"),
             // parallel-attn (phi2/gpt-neox): one input norm feeds both attn+ffn, so

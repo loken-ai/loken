@@ -87,6 +87,13 @@ pub struct DenseCheckpoint {
     pub adjacent_rope: bool,
     /// The layout reads an output head: false for a model whose class has none.
     pub has_head: bool,
+    /// The layout reads a token table: false for a model fed by embeddings alone.
+    pub has_token_table: bool,
+    /// The layout reads tensors outside the blocks: false for a model whose last block gives
+    /// its output, with no final norm.
+    pub has_final_norm: bool,
+    /// The ungated feed-forward runs the error-function GELU.
+    pub erf_gelu: bool,
 }
 
 /// One tensor of a shard: its name, the shard, stored type, dimensions and start in the data.
@@ -591,38 +598,60 @@ impl Translation {
     }
 }
 
+/// The shortest prefix the first block of `layers` is listed under.
+fn blocks_prefix(items: &[Listed], layers: &str) -> Result<String> {
+    let first = format!("{layers}.0.");
+    items
+        .iter()
+        .filter_map(|l| {
+            let at = l.name.find(&first)?;
+            let prefix = &l.name[..at];
+            (prefix.is_empty() || prefix.ends_with('.')).then(|| prefix.to_string())
+        })
+        .min_by_key(|p| p.len())
+        .ok_or_else(|| Error(format!("the checkpoint has no {first}")))
+}
+
 /// What a layout makes of the tensors listed, or why it cannot.
 fn translate(items: &[Listed], layout: &Layout, cfg: &AwqConfigJson) -> Result<Translation> {
     let by_name: HashMap<&str, &Listed> = items.iter().map(|l| (l.name.as_str(), l)).collect();
     let shapes = Shapes::of(cfg);
-    // The model's prefix is where its embedding table is.
-    let table = layout
-        .embed
-        .iter()
-        .flat_map(|e| {
-            items
+    // The model's prefix is where its embedding table is, or where its blocks are when it has
+    // no table.
+    let table = match layout.embed.is_empty() {
+        true => None,
+        false => Some(
+            layout
+                .embed
                 .iter()
-                .filter(move |l| l.name.ends_with(e) && (!layout.rooted || l.name == *e))
-                .map(move |l| (l, *e))
-        })
-        .min_by_key(|(l, _)| l.name.len())
-        .ok_or_else(|| {
-            Error(format!(
-                "the checkpoint has no {}",
-                layout.embed.first().copied().unwrap_or("embedding table")
-            ))
-        })?;
-    let model = if layout.rooted {
-        String::new()
-    } else {
-        table.0.name.trim_end_matches(table.1).to_string()
+                .flat_map(|e| {
+                    items
+                        .iter()
+                        .filter(move |l| l.name.ends_with(e) && (!layout.rooted || l.name == *e))
+                        .map(move |l| (l, *e))
+                })
+                .min_by_key(|(l, _)| l.name.len())
+                .ok_or_else(|| {
+                    Error(format!(
+                        "the checkpoint has no {}",
+                        layout.embed.first().copied().unwrap_or("embedding table")
+                    ))
+                })?,
+        ),
+    };
+    let model = match (layout.rooted, table) {
+        (true, _) => String::new(),
+        (false, Some((l, e))) => l.name.trim_end_matches(e).to_string(),
+        (false, None) => blocks_prefix(items, layout.layers)?,
     };
     let wrapper = model
         .trim_end_matches('.')
         .rsplit_once('.')
         .map_or(String::new(), |(w, _)| format!("{w}."));
     let mut out = Translation::default();
-    out.put_view("token_embd.weight".into(), table.0, table.0.shape.clone())?;
+    if let Some((l, _)) = table {
+        out.put_view("token_embd.weight".into(), l, l.shape.clone())?;
+    }
     let plain = |t: &str| t.to_string();
     for (part, rule) in layout.top {
         if let Some(l) = by_name.get(format!("{model}{part}").as_str()) {
@@ -1026,6 +1055,7 @@ impl DenseCheckpoint {
         };
         fix_metadata(&mut content, cfg);
         let adjacent_rope = cfg.native || hf_class(&cfg.hf_arch).is_some_and(|c| c.adjacent_rope);
+        let erf_gelu = !cfg.native && hf_class(&cfg.hf_arch).is_some_and(|c| c.erf_gelu);
         Ok(Self {
             parts,
             computed: (computed, bytes),
@@ -1033,6 +1063,9 @@ impl DenseCheckpoint {
             content,
             adjacent_rope,
             has_head: !layout.head.is_empty(),
+            has_token_table: !layout.embed.is_empty(),
+            has_final_norm: !layout.top.is_empty(),
+            erf_gelu,
         })
     }
 }

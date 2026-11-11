@@ -54,7 +54,7 @@ const MAX_ITERATIONS: usize = 1000;
 /// The Lloyd-Max boundaries all sit below `|x| = 2`, so the series is what actually runs  -
 /// the tail branch is here so that the function is a function rather than a special case,
 /// and a test pins the two against each other where they meet.
-fn erf(x: f64) -> f64 {
+pub(crate) fn erf(x: f64) -> f64 {
     const SWITCH: f64 = 3.0;
     if x.abs() < SWITCH {
         erf_series(x)

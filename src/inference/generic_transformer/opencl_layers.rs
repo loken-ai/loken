@@ -264,6 +264,7 @@ fn refusal(
                 l.attn_layer_scale.is_some() || l.ffn_layer_scale.is_some(),
                 "a scale per channel on a residual branch",
             ),
+            (l.flags.erf_gelu, "the error-function GELU"),
             (
                 !matches!(l.attn_norm, super::config::WeightedNorm::Rms(_)),
                 "a norm other than RMS",

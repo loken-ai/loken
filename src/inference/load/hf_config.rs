@@ -43,6 +43,7 @@ pub enum LayoutKind {
     Qwen3Tts,
     Qwen3TtsCodePredictor,
     Qwen3TtsCodec,
+    Mimi,
 }
 
 /// The route that serves a class's checkpoint.
@@ -83,6 +84,9 @@ pub struct HfClass {
     /// The class rotates adjacent lanes of a head, which the loader's pairing then follows
     /// whatever the tag's GGUF files hold.
     pub adjacent_rope: bool,
+    /// The ungated feed-forward runs the error-function GELU, which the tag's GGUF files run
+    /// in its tanh form.
+    pub erf_gelu: bool,
     /// An AWQ checkpoint of the class is read.
     pub awq: bool,
     /// The share of a head the class rotates when its configuration does not say.
@@ -105,6 +109,7 @@ const fn class(class: &'static str, arch: &'static str, layout: LayoutKind) -> H
         arch,
         layout,
         adjacent_rope: false,
+        erf_gelu: false,
         awq: false,
         partial_rotary: None,
         window_period: None,
@@ -122,6 +127,13 @@ const fn awq(c: HfClass) -> HfClass {
 const fn adjacent(c: HfClass) -> HfClass {
     HfClass {
         adjacent_rope: true,
+        ..c
+    }
+}
+
+const fn erf_gelu(c: HfClass) -> HfClass {
+    HfClass {
+        erf_gelu: true,
         ..c
     }
 }
@@ -301,6 +313,11 @@ pub const CLASSES: &[HfClass] = &[
         ),
         "decoder_config",
     ))),
+    speech(windowed_everywhere(erf_gelu(adjacent(class(
+        "ProjectedTransformer",
+        "llama",
+        LayoutKind::Mimi,
+    ))))),
 ];
 
 /// The row of `name`, `None` for a class the loader does not read.
