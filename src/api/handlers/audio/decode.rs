@@ -1696,7 +1696,7 @@ pub(super) fn openai_voice_to_description(voice: &str, speed: f32) -> String {
 
 /// Constant bitrate of one channel of the MP3 the audio endpoints return; the encoder
 /// snaps the total to the nearest value the MPEG version of the sample rate allows.
-const MP3_BITRATE_KBPS: u32 = 96;
+pub(super) const MP3_BITRATE_KBPS: u32 = 96;
 
 /// Interleaved f32 samples of `channels` channels as one MP3 stream: the whole tail
 /// padded, the info header in front. A sample rate no MPEG version carries (anything but
@@ -1908,24 +1908,16 @@ pub(crate) async fn audio_speech(
         }
     }
 
-    let response_format = req
-        .response_format
-        .as_deref()
-        .map(str::to_lowercase)
-        .unwrap_or_else(|| "wav".to_string());
-    match response_format.as_str() {
-        "wav" | "pcm" | "mp3" => {}
-        // opus/aac/flac would each need an encoder of their own; a clear error
-        // beats the wrong content-type.
-        other => {
-            return err_resp(
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "response_format '{other}' not supported; use 'wav', 'pcm' or 'mp3' (rate follows the loaded checkpoint - mini-v1 ships 44.1 kHz, large-v1 24 kHz)"
-                ),
-            );
-        }
+    let format = match SpeechFormat::parse(req.response_format.as_deref()) {
+        Ok(f) => f,
+        Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
     };
+    if req.stream.unwrap_or(false) {
+        if let Some(e) = format.stream_refusal() {
+            return err_resp(axum::http::StatusCode::BAD_REQUEST, e);
+        }
+    }
+    let response_format = format.name.to_string();
 
     // Speed validation - OpenAI rejects out-of-range with 400. Was
     // silently clamping (lenient but surprising). Now explicit error
@@ -2087,26 +2079,16 @@ pub(crate) async fn audio_speech(
         sample_rate,
     };
 
-    let (body, content_type, ext): (Vec<u8>, String, &str) = match response_format.as_str() {
-        "pcm" => (
-            pcm_to_raw_le_bytes(&result.pcm),
-            format!("audio/L16; rate={}; channels=1", result.sample_rate),
-            "pcm",
-        ),
-        "mp3" => match pcm_to_mp3_bytes(&result.pcm, 1, result.sample_rate) {
-            Ok(bytes) => (bytes, "audio/mpeg".to_string(), "mp3"),
-            Err(e) => {
-                return err_resp(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    format!("mp3 encode: {e}"),
-                )
-            }
-        },
-        _ => (
-            pcm_to_wav_ch(&result.pcm, result.sample_rate, 1),
-            "audio/wav".to_string(),
-            "wav",
-        ),
+    let ext = format.name;
+    let content_type = format.content_type_for(result.sample_rate, 1);
+    let body = match format.encode(&result.pcm, 1, result.sample_rate) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return err_resp(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("{ext} encode: {e}"),
+            )
+        }
     };
 
     let synth_ms = synth_start.elapsed().as_secs_f64() * 1000.0;
@@ -2292,18 +2274,9 @@ pub(super) async fn tts_stream_response(
         .loaded_sample_rate()
         .await
         .unwrap_or(crate::inference::engine::tts_engine::TTS_SAMPLE_RATE);
-    let content_type = if format == "mp3" {
-        "audio/mpeg".to_string()
-    } else if format == "pcm" {
-        format!("audio/L16; rate={sample_rate}; channels=1")
-    } else {
-        "audio/wav".to_string()
-    };
-    let ext = match format.as_str() {
-        "pcm" => "pcm",
-        "mp3" => "mp3",
-        _ => "wav",
-    };
+    let speech_format = SpeechFormat::parse(Some(response_format)).unwrap_or(&SPEECH_FORMATS[0]);
+    let content_type = speech_format.content_type_for(sample_rate, 1);
+    let ext = speech_format.name;
     let cd = format!("inline; filename=\"speech.{ext}\"");
 
     let sentence_count = sentences.len();
@@ -2334,13 +2307,14 @@ pub(super) async fn tts_stream_response(
                     } else {
                         apply_speed_linear(&r.pcm, speed)
                     };
-                    // One MP3 stream per sentence: its frames leave as soon as the
-                    // sentence is synthesised, and decoders take the streams back to back.
-                    let bytes = if format == "mp3" {
-                        match pcm_to_mp3_bytes(&pcm, 1, sample_rate) {
+                    // A chained format leaves as one complete stream per sentence, as soon
+                    // as the sentence is synthesised, and decoders take the streams back to
+                    // back. A raw format leaves as samples.
+                    let bytes = if speech_format.streaming == Streaming::Chained {
+                        match speech_format.encode(&pcm, 1, sample_rate) {
                             Ok(b) => b,
                             Err(e) => {
-                                tracing::error!("TTS streaming: mp3 encode: {e}");
+                                tracing::error!("TTS streaming: {ext} encode: {e}");
                                 break;
                             }
                         }
@@ -2535,12 +2509,16 @@ pub(super) fn tts_events_response(
         } else {
             apply_speed_linear(&all_pcm, speed)
         };
-        let (bytes, content_type) = match response_format.as_str() {
-            "pcm" => (
-                pcm_to_raw_le_bytes(&pcm),
-                format!("audio/L16; rate={rate}; channels=1"),
-            ),
-            _ => (pcm_to_wav_ch(&pcm, rate, 1), "audio/wav".to_string()),
+        let speech_format =
+            SpeechFormat::parse(Some(&response_format)).unwrap_or(&SPEECH_FORMATS[0]);
+        let content_type = speech_format.content_type_for(rate, 1);
+        let bytes = match speech_format.encode(&pcm, 1, rate) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let error = format!("{} encode: {e}", speech_format.name);
+                yield ev(serde_json::json!({"status": "error", "error": error}));
+                return;
+            }
         };
         let audio_s = pcm.len() as f64 / rate.max(1) as f64;
         let b64 = {
@@ -2627,7 +2605,7 @@ pub(crate) async fn audio_voices(
         "channels": 1,
         // Self-describing hints so clients don't need to read source
         // to know what's supported on this server.
-        "supported_response_formats": ["wav", "pcm"],
+        "supported_response_formats": SPEECH_FORMATS.iter().map(|f| f.name).collect::<Vec<_>>(),
         "max_input_chars": 4096,
         "supports_streaming": true,
         "supports_instructions": true,

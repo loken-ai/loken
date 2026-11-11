@@ -76,7 +76,7 @@ The references each model implementation was written against are architecture at
 
 ## Notable dependencies and their licenses
 
-Permissive (MIT, Apache-2.0, BSD), among others: `tokio`, `axum`, `serde`, `reqwest`, `tokenizers`, `hf-hub`, `nvml-wrapper`, `opencl3`, `llguidance`, `toktrie_hf_tokenizers`, `image`, `rayon`, `half`, `safetensors`, `bytemuck`.
+Permissive (MIT, Apache-2.0, BSD), among others: `tokio`, `axum`, `serde`, `reqwest`, `tokenizers`, `hf-hub`, `nvml-wrapper`, `opencl3`, `llguidance`, `toktrie_hf_tokenizers`, `image`, `rayon`, `half`, `safetensors`, `bytemuck`, `opus-pure` (Opus encoder, BSD-3-Clause), `oxideav-aac` (AAC encoder, MIT).
 
 Weak copyleft (file-level), used unmodified as a dependency:
 

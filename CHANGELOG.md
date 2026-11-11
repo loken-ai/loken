@@ -36,6 +36,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Config: choose fidelity to the published model or speed with one setting.
 - API: show the progress of a model load in the process list.
 - Cluster: read a prompt here when that is faster than taking its cache from a peer.
+- API: answer speech in FLAC, Opus and AAC.
 
 ### Changed
 

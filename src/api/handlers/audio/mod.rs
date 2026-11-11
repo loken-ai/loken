@@ -32,6 +32,8 @@ mod wav;
 pub(crate) use wav::*;
 mod clip;
 pub(crate) use clip::*;
+mod speech_format;
+use speech_format::*;
 mod transcribe;
 use transcribe::*;
 mod decode;

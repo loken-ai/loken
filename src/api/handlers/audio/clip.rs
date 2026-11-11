@@ -1,5 +1,5 @@
-//! The container a rendered clip is answered in: WAV as rendered, MP3 through the speech
-//! route's encoder, or FLAC through the lossless encoder below.
+//! The container a rendered clip is answered in: WAV as rendered, FLAC through the lossless
+//! encoder below, or any other format of the speech route through its encoder.
 
 use super::*;
 
@@ -9,32 +9,65 @@ pub(crate) enum ClipFormat {
     Wav,
     Mp3,
     Flac,
+    Opus,
+    Aac,
 }
 
 impl ClipFormat {
     /// The format a request names, WAV when it names none; an unknown name is refused with a
     /// message naming it.
     pub(crate) fn parse(name: Option<&str>) -> Result<Self, String> {
-        match name.map(str::to_ascii_lowercase).as_deref() {
-            None | Some("wav") => Ok(Self::Wav),
-            Some("mp3") => Ok(Self::Mp3),
-            Some("flac") => Ok(Self::Flac),
-            Some(other) => Err(format!(
-                "response_format '{other}' not supported; use 'wav', 'mp3' or 'flac'"
-            )),
+        let refusal = |name: &str| {
+            format!(
+                "response_format '{name}' not supported; use {}",
+                Self::list()
+            )
+        };
+        let format = SpeechFormat::parse(name)
+            .map_err(|_| refusal(&name.unwrap_or_default().to_ascii_lowercase()))?;
+        Self::ALL
+            .into_iter()
+            .find(|f| f.speech().name == format.name)
+            .ok_or_else(|| refusal(format.name))
+    }
+
+    /// Every format a clip is answered in; the speech formats without a clip form (raw
+    /// samples) are absent.
+    const ALL: [Self; 5] = [Self::Wav, Self::Mp3, Self::Flac, Self::Opus, Self::Aac];
+
+    /// The entry of the speech table this format is.
+    fn speech(self) -> &'static SpeechFormat {
+        let name = match self {
+            Self::Wav => "wav",
+            Self::Mp3 => "mp3",
+            Self::Flac => "flac",
+            Self::Opus => "opus",
+            Self::Aac => "aac",
+        };
+        SPEECH_FORMATS
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or(&SPEECH_FORMATS[0])
+    }
+
+    /// The names a clip is answered in, quoted and joined for a message.
+    fn list() -> String {
+        let quoted: Vec<String> = Self::ALL
+            .iter()
+            .map(|f| format!("'{}'", f.speech().name))
+            .collect();
+        match quoted.split_last() {
+            Some((last, head)) => format!("{} or {last}", head.join(", ")),
+            None => String::new(),
         }
     }
 
     pub(crate) fn content_type(self) -> &'static str {
-        match self {
-            Self::Wav => "audio/wav",
-            Self::Mp3 => "audio/mpeg",
-            Self::Flac => "audio/flac",
-        }
+        self.speech().content_type
     }
 }
 
-/// A rendered WAV clip in `format`: WAV passes through untouched, MP3 and FLAC are encoded
+/// A rendered WAV clip in `format`: WAV passes through untouched, every other format is encoded
 /// from its samples at its rate and channel count. A 16-bit clip reaches FLAC sample for
 /// sample; any other depth is quantised to 16 bits the way the WAV writer does.
 pub(crate) fn encode_wav_clip(wav: Vec<u8>, format: ClipFormat) -> Result<Vec<u8>, String> {
@@ -46,11 +79,13 @@ pub(crate) fn encode_wav_clip(wav: Vec<u8>, format: ClipFormat) -> Result<Vec<u8
     let spec = reader.spec();
     match format {
         ClipFormat::Wav => Ok(wav),
-        ClipFormat::Mp3 => {
+        ClipFormat::Mp3 | ClipFormat::Opus | ClipFormat::Aac => {
             let (pcm, _, _) =
                 read_wav_interleaved(&wav).map_err(|e| format!("read rendered wav: {e}"))?;
-            pcm_to_mp3_bytes(&pcm, spec.channels, spec.sample_rate)
-                .map_err(|e| format!("mp3 encode: {e}"))
+            let speech = format.speech();
+            speech
+                .encode(&pcm, spec.channels, spec.sample_rate)
+                .map_err(|e| format!("{} encode: {e}", speech.name))
         }
         ClipFormat::Flac => {
             let ints: Vec<i16> =
@@ -323,8 +358,15 @@ mod tests {
         assert_eq!(ClipFormat::parse(None), Ok(ClipFormat::Wav));
         assert_eq!(ClipFormat::parse(Some("MP3")), Ok(ClipFormat::Mp3));
         assert_eq!(ClipFormat::parse(Some("flac")), Ok(ClipFormat::Flac));
-        let err = ClipFormat::parse(Some("opus")).unwrap_err();
-        assert!(err.contains("'opus'"), "{err}");
+        assert_eq!(ClipFormat::parse(Some("opus")), Ok(ClipFormat::Opus));
+        assert_eq!(ClipFormat::parse(Some("aac")), Ok(ClipFormat::Aac));
+        for refused in ["pcm", "ogg"] {
+            let err = ClipFormat::parse(Some(refused)).unwrap_err();
+            assert!(err.contains(&format!("'{refused}'")), "{err}");
+            for served in ["wav", "mp3", "flac", "opus", "aac"] {
+                assert!(err.contains(&format!("'{served}'")), "{err}");
+            }
+        }
     }
 
     #[test]
@@ -338,8 +380,16 @@ mod tests {
             "mp3 starts {:02x?}",
             &mp3[..4]
         );
-        let flac = encode_wav_clip(wav, ClipFormat::Flac).unwrap();
+        let flac = encode_wav_clip(wav.clone(), ClipFormat::Flac).unwrap();
         assert_eq!(&flac[..4], b"fLaC");
+        let opus = encode_wav_clip(wav.clone(), ClipFormat::Opus).unwrap();
+        assert_eq!(&opus[..4], b"OggS");
+        let aac = encode_wav_clip(wav, ClipFormat::Aac).unwrap();
+        assert!(
+            aac[0] == 0xFF && aac[1] & 0xF0 == 0xF0,
+            "aac starts {:02x?}",
+            &aac[..2]
+        );
     }
 
     #[test]
