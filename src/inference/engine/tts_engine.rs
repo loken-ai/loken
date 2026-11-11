@@ -288,7 +288,10 @@ impl TtsEngine {
                 part("decoder", whole(&state.device, p.model.decoder.n_layers())),
             ],
             Backend::Piper(voice) => vec![part("", voice.placement())],
-            Backend::PocketTts(p) => vec![part("flow-lm", p.model.placement())],
+            Backend::PocketTts(p) => vec![
+                part("flow-lm", p.model.placement()),
+                part("mimi-transformer", p.model.codec_transformer_placement()),
+            ],
             Backend::Kyutai(k) => vec![
                 part("lm", k.lm.placement()),
                 part("depformer", k.depformer.placement()),

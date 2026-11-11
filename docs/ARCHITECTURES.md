@@ -470,6 +470,23 @@ The tests of the decoder check, on the published checkpoint when the test store 
 - the dry plan of the layers' own demand on a card that holds them, a card smaller than their blocks, and the host
 - the waveform of a fixed code list: its sample count, its finite values and its repeat, on the host and on a card
 
+## Pocket-TTS codec
+
+`src/inference/model/pocket_tts/mod.rs` holds a copy of Mimi with a decoder and an encoder transformer.
+Each transformer's configuration is made from the shapes of its tensors and the settings Mimi's reference fixes.
+Both are transformers of the generic route, class `ProjectedTransformer`, each read under its own path.
+`class_load::load_class_held` loads each with its own demand, its weights held at F32 on a card as on the host.
+They sit on the cards the ladder sees when the model sits on a card, on the host otherwise.
+The rest of the codec sits on the device it is given.
+
+A decode or an encode runs every row at once, from position 0, and keeps no state between calls.
+The layers run the rows in prefill chunks, their cache held to the window and a chunk.
+
+The tests check each transformer on the generic route against the model's own layer code, on a toy and on the published checkpoint when the test store holds it, on the host and on a card:
+
+- the rows of a run longer than the window and a prefill chunk, within the rounding of the residual's float type through the layers and of the rotary angles at the last position
+- the waveform of a fixed latent and the embedding of a fixed clip, within the same share of their peak
+
 ## Drafter verification
 
 A verify step runs several rows at once (`src/inference/generic_transformer/verify_window.rs`).

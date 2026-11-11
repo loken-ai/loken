@@ -11,15 +11,30 @@
 //!
 //! Net-new vs existing VAEs: ELU activation, LayerScale, fused-qkv codec transformer
 //! with RoPE. Reuses `tensor` conv1d/conv_transpose1d, `sdpa`, `rope_tables`.
+//!
+//! The codec's transformers, in its decoder and its encoder, are transformers of the generic
+//! route, placed by `HeteroPlan` and the ladder with their own demand.
+//! The rest of the codec sits on the device it is given.
 
+use crate::inference::generic_transformer::class_load::{self, Holding, Rows};
+use crate::inference::generic_transformer::GenericHeteroTransformer;
 use crate::inference::model::acestep::fsq::rope_tables;
 use crate::inference::model::adaln::modulate;
 use crate::inference::model::kyutai::mimi::{
-    ATTENTION_HEADS as MIMI_HEADS, ATTENTION_WINDOW as MIMI_WINDOW,
+    ATTENTION_HEADS as MIMI_HEADS, ATTENTION_WINDOW, TRANSFORMER_CLASS as CODEC_CLASS,
 };
 use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
-use crate::tensor::{Device, Result, Tensor};
+use crate::tensor::{DType, Device, Error, Result, Tensor};
+
+/// Where the codec is in the checkpoint.
+const CODEC_PREFIX: &str = "mimi";
+
+/// Where the codec's decoder transformer is in the checkpoint.
+const DECODER_PREFIX: &str = "mimi.decoder_transformer.transformer";
+
+/// Where the codec's encoder transformer is in the checkpoint.
+const ENCODER_PREFIX: &str = "mimi.encoder_transformer.transformer";
 
 pub const SAMPLE_RATE: u32 = 24_000;
 const ROPE_THETA: f32 = 10_000.0;
@@ -260,10 +275,13 @@ impl XfLayer {
 }
 
 /// Mimi decoder: latent frames -> 24 kHz mono waveform.
+///
+/// The decoder transformer's layers sit where their placement put them.
+/// The rest sits on the decoder's device.
 pub struct MimiDecoder {
-    output_proj: Tensor,       // [codec, latent, 1] conv1d latent->codec
-    upsample: Tensor,          // [codec, 1, k] depthwise convtr, stride k/2
-    xf: Vec<XfLayer>,          // decoder-transformer layers
+    output_proj: Tensor, // [codec, latent, 1] conv1d latent->codec
+    upsample: Tensor,    // [codec, 1, k] depthwise convtr, stride k/2
+    layers: CodecTransformer,
     conv_in: Conv,             // model.0
     up: Vec<(Conv, ResBlock)>, // (convtr, resblock) per SEANet stage
     conv_out: Conv,
@@ -278,12 +296,7 @@ impl MimiDecoder {
         let output_proj = q.get(q.shape_of("output_proj.weight")?, "output_proj.weight")?;
         let up_name = "upsample.convtr.convtr.weight";
         let upsample = mimi.get(mimi.shape_of(up_name)?, up_name)?;
-        let xf = XfLayer::stack(
-            &mimi.pp("decoder_transformer.transformer"),
-            MIMI_HEADS,
-            true,
-            Some(MIMI_WINDOW),
-        )?;
+        let layers = CodecTransformer::load(path, &vb, DECODER_PREFIX, CODEC_CLASS, &device)?;
         // SEANet decoder: `model.0` is the input conv, then each stage is an ELU, a
         // transposed conv and a residual block (three entries), and the output conv
         // follows the last stage's ELU.
@@ -302,7 +315,7 @@ impl MimiDecoder {
         Ok(Self {
             output_proj,
             upsample,
-            xf,
+            layers,
             conv_in,
             up,
             conv_out,
@@ -337,17 +350,27 @@ impl MimiDecoder {
     /// Decode from the codec embedding `[1, codec, T]` (post-quantizer):
     /// depthwise upsample -> decoder transformer -> SEANet -> 24 kHz waveform.
     pub fn decode_from_codec(&self, emb: &Tensor) -> Result<Vec<f32>> {
+        let rows = self.upsampled_rows(emb)?;
+        let rows = self.layers.transform(&rows, &self.device)?;
+        self.seanet(&rows)
+    }
+
+    /// The codec embedding `[1, codec, T]` upsampled to the transformer's rate, `[S, codec]`.
+    fn upsampled_rows(&self, emb: &Tensor) -> Result<Tensor> {
         let (codec, up_k) = {
             let (c, _, k) = self.upsample.shape().dims3()?;
             (c, k)
         };
-        let mut x = causal_convtr1d(emb, &self.upsample, None, up_k / 2, codec)?;
+        let x = causal_convtr1d(emb, &self.upsample, None, up_k / 2, codec)?;
         let s = x.shape().dims3()?.2;
-        let mut h = x.reshape((codec, s))?.transpose(0, 1)?.contiguous()?; // [S,codec]
-        for l in &self.xf {
-            h = l.forward(&h, &self.device)?;
-        }
-        x = h.transpose(0, 1)?.contiguous()?.reshape((1, codec, s))?;
+        x.reshape((codec, s))?.transpose(0, 1)?.contiguous() // [S,codec]
+    }
+
+    /// `rows [S, codec]` through the SEANet decoder: the input conv, then per stage an ELU, a
+    /// transposed conv and a residual block, then an ELU and the output conv.
+    fn seanet(&self, rows: &Tensor) -> Result<Vec<f32>> {
+        let (s, codec) = rows.shape().dims2()?;
+        let mut x = rows.transpose(0, 1)?.contiguous()?.reshape((1, codec, s))?;
         x = causal_conv1d(&x, &self.conv_in.w, self.conv_in.b.as_ref(), 1, 1, 1)?;
         for (convtr, res) in &self.up {
             x = elu(&x)?;
@@ -369,7 +392,7 @@ pub struct MimiEncoder {
     /// Per SEANet stage: a residual block, then a strided downsample conv.
     stages: Vec<(ResBlock, Conv)>,
     conv_final: Conv,
-    xf: Vec<XfLayer>,   // encoder-transformer layers
+    layers: CodecTransformer,
     downsample: Tensor, // [codec, codec, k] stride k/2
     device: Device,
 }
@@ -391,19 +414,14 @@ impl MimiEncoder {
             idx += 3;
         }
         let conv_final = Conv::load(&enc, &format!("{}.conv", idx + 1), true)?;
-        let xf = XfLayer::stack(
-            &mimi.pp("encoder_transformer.transformer"),
-            MIMI_HEADS,
-            true,
-            Some(MIMI_WINDOW),
-        )?;
+        let layers = CodecTransformer::load(path, &vb, ENCODER_PREFIX, CODEC_CLASS, &device)?;
         let down_name = "downsample.conv.conv.weight";
         let downsample = mimi.get(mimi.shape_of(down_name)?, down_name)?;
         Ok(Self {
             conv0,
             stages,
             conv_final,
-            xf,
+            layers,
             downsample,
             device,
         })
@@ -411,6 +429,13 @@ impl MimiEncoder {
 
     /// `samples`: mono f32 @24 kHz -> codec embedding `[1, codec, T]` at the frame rate.
     pub fn encode(&self, samples: &[f32]) -> Result<Tensor> {
+        let rows = self.seanet_rows(samples)?;
+        let rows = self.layers.transform(&rows, &self.device)?;
+        self.downsampled(&rows)
+    }
+
+    /// `samples` through the SEANet encoder, `[S, codec]` at the transformer's rate.
+    fn seanet_rows(&self, samples: &[f32]) -> Result<Tensor> {
         // Pad to a whole number of frames (the product of every stride) so the last conv
         // window is full - mirrors `pad_for_conv1d` in encode_to_latent.
         let down_stride = self.downsample.shape().dims3()?.2 / 2;
@@ -431,6 +456,15 @@ impl MimiEncoder {
         }
         x = elu(&x)?;
         x = causal_conv1d(&x, &self.conv_final.w, self.conv_final.b.as_ref(), 1, 1, 1)?;
+        let (_, codec, s) = x.shape().dims3()?;
+        x.reshape((codec, s))?.transpose(0, 1)?.contiguous()
+    }
+
+    /// `rows [S, codec]` downsampled to the frame rate, `[1, codec, T]`.
+    fn downsampled(&self, rows: &Tensor) -> Result<Tensor> {
+        let down_stride = self.downsample.shape().dims3()?.2 / 2;
+        let (s, codec) = rows.shape().dims2()?;
+        let x = rows.transpose(0, 1)?.contiguous()?.reshape((1, codec, s))?;
         let downsample_replicate = |x: &Tensor, w: &Tensor| -> Result<Tensor> {
             // ConvDownsample1d uses pad_mode="replicate": left-pad with the first
             // frame repeated (not zeros), then strided conv.
@@ -443,16 +477,119 @@ impl MimiEncoder {
             let xp = Tensor::cat(&parts, 2)?;
             xp.conv1d(w, 0, down_stride, 1, 1)
         };
-        // encoder transformer
-        let (_, codec, s) = x.shape().dims3()?;
-        let mut h = x.reshape((codec, s))?.transpose(0, 1)?.contiguous()?;
-        for l in &self.xf {
-            h = l.forward(&h, &self.device)?;
-        }
-        x = h.transpose(0, 1)?.contiguous()?.reshape((1, codec, s))?;
         // downsample to the frame rate (replicate padding)
         downsample_replicate(&x, &self.downsample)
     }
+}
+
+/// A transformer of the codec on the generic layers.
+struct CodecTransformer {
+    layers: std::sync::Mutex<GenericHeteroTransformer>,
+}
+
+impl CodecTransformer {
+    /// The transformer under `prefix` in the checkpoint `path`, of class `class`.
+    ///
+    /// Its layers are placed on the cards the ladder sees when `device` is a card, on the host
+    /// otherwise.
+    fn load(
+        path: &str,
+        vb: &VarBuilder,
+        prefix: &str,
+        class: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        let cards = match device.is_cuda() {
+            true => crate::inference::place::ladder::cards(0),
+            false => Vec::new(),
+        };
+        let layers = codec_layers(path, vb, prefix, class, &cards)?;
+        Ok(Self {
+            layers: std::sync::Mutex::new(layers),
+        })
+    }
+
+    /// `rows [S, codec]` at positions `0..S` through the layers, `[S, codec]` F32 on `device`.
+    fn transform(&self, rows: &Tensor, device: &Device) -> Result<Tensor> {
+        let out = {
+            let mut layers = self
+                .layers
+                .lock()
+                .map_err(|_| Error::msg("the codec's transformer is poisoned"))?;
+            layers.forward_embeddings_rows(rows)?
+        };
+        let out = match out.dtype() {
+            DType::F32 => out,
+            _ => out.to_dtype(DType::F32)?,
+        };
+        out.to_device(device)
+    }
+
+    /// Where the layers sit, by device.
+    fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        match self.layers.lock() {
+            Ok(layers) => layers.placed_runs(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// The configuration of the codec's transformer under `prefix`, of class `class`: the shapes
+/// its tensors have and the settings Mimi's reference fixes.
+fn codec_config(vb: &VarBuilder, prefix: &str, class: &str) -> Result<serde_json::Value> {
+    let xt = vb.pp(prefix);
+    let first = xt.pp("layers.0");
+    Ok(serde_json::json!({
+        "architectures": [class],
+        "hidden_size": first.shape_of("norm1.weight")?[0],
+        "num_attention_heads": MIMI_HEADS,
+        "num_key_value_heads": MIMI_HEADS,
+        "intermediate_size": first.shape_of("linear1.weight")?[0],
+        "num_hidden_layers": xt.count_children("layers"),
+        "sliding_window": ATTENTION_WINDOW,
+        "rope_theta": ROPE_THETA,
+        "layer_norm_eps": LN_EPS,
+    }))
+}
+
+/// The layers of the codec's transformer under `prefix` in the checkpoint `path`, placed on
+/// `cards`.
+///
+/// The blocks are read under `prefix` in the codec.
+/// A card holds the stored 16-bit float weights at F32, as the host does.
+/// The cache holds the rows a layer windowed in every layer keeps.
+/// A run takes every row from position 0, whatever its length.
+fn codec_layers(
+    path: &str,
+    vb: &VarBuilder,
+    prefix: &str,
+    class: &str,
+    cards: &[(usize, u64)],
+) -> Result<GenericHeteroTransformer> {
+    let root = codec_config(vb, prefix, class)?;
+    let shards = [path.to_string()];
+    let in_codec = prefix
+        .strip_prefix(CODEC_PREFIX)
+        .and_then(|p| p.strip_prefix('.'))
+        .unwrap_or(prefix);
+    let blocks = format!("{in_codec}.layers");
+    let holding = Holding {
+        blocks: Some(&blocks),
+        wide_floats: true,
+    };
+    let held = class_load::class_demand_held(&root, &shards, class, 0, holding)?
+        .held_rows
+        .ok_or_else(|| Error::msg("the codec's transformer is windowed in every layer"))?;
+    let loaded = class_load::load_class_held(
+        &root,
+        &shards,
+        class,
+        Rows::Exactly(held as usize),
+        0,
+        cards,
+        holding,
+    )?;
+    Ok(loaded.model)
 }
 
 /// The pocket-tts checkpoint and the SentencePiece tokenizer that goes with it.
@@ -1226,16 +1363,313 @@ impl PocketTts {
     }
 }
 
+impl PocketTts {
+    /// Where the codec's decoder transformer's layers sit, by device.
+    pub fn codec_transformer_placement(
+        &self,
+    ) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        self.mimi.layers.placement()
+    }
+}
+
 impl MimiDecoder {
-    /// Where this model's layers sit, by device.
+    /// Where the decoder sits: 1 block on its device, the transformer's layers aside.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(&self.device, self.xf.len())
+        crate::inference::serve::progress::placement::whole(&self.device, 1)
     }
 }
 
 impl MimiEncoder {
-    /// Where this model's layers sit, by device.
+    /// Where the encoder sits: 1 block on its device, the transformer's layers aside.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
-        crate::inference::serve::progress::placement::whole(&self.device, self.xf.len())
+        crate::inference::serve::progress::placement::whole(&self.device, 1)
+    }
+
+    /// Where the encoder transformer's layers sit, by device.
+    pub fn transformer_placement(
+        &self,
+    ) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        self.layers.placement()
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    //! The codec's transformers on the generic layers against their own layer code, on a toy
+    //! and on the published checkpoint, on the host and on a card.
+
+    use super::*;
+    use crate::inference::generic_transformer::class_load::tests::{scratch, values};
+
+    /// The rows of a long run: beyond the window and a prefill chunk.
+    fn long_rows() -> usize {
+        crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS + 2 * ATTENTION_WINDOW + 3
+    }
+
+    /// A checkpoint holding a decoder and an encoder transformer of `layers` layers `hidden`
+    /// wide, their feed-forward `ffn` wide.
+    fn toy_file(tag: &str, hidden: usize, ffn: usize, layers: usize) -> std::path::PathBuf {
+        let dir = scratch(tag);
+        let mut seed = 23u32;
+        let mut stored = Vec::new();
+        for prefix in [DECODER_PREFIX, ENCODER_PREFIX] {
+            for il in 0..layers {
+                for (part, dims, centre, scale) in [
+                    ("norm1.weight", vec![hidden], 1.0, 0.2),
+                    ("norm1.bias", vec![hidden], 0.0, 0.2),
+                    ("norm2.weight", vec![hidden], 1.0, 0.2),
+                    ("norm2.bias", vec![hidden], 0.0, 0.2),
+                    (
+                        "self_attn.in_proj.weight",
+                        vec![3 * hidden, hidden],
+                        0.0,
+                        0.2,
+                    ),
+                    ("self_attn.out_proj.weight", vec![hidden, hidden], 0.0, 0.2),
+                    ("linear1.weight", vec![ffn, hidden], 0.0, 0.2),
+                    ("linear2.weight", vec![hidden, ffn], 0.0, 0.2),
+                    ("layer_scale_1.scale", vec![hidden], 0.5, 0.4),
+                    ("layer_scale_2.scale", vec![hidden], 0.5, 0.4),
+                ] {
+                    let v = values(&mut seed, dims.iter().product(), centre, scale);
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    stored.push((format!("{prefix}.layers.{il}.{part}"), dims, bytes));
+                }
+            }
+        }
+        let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = stored
+            .iter()
+            .map(|(name, dims, bytes)| {
+                let view = safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    dims.clone(),
+                    bytes,
+                )
+                .unwrap();
+                (name.clone(), view)
+            })
+            .collect();
+        let file = dir.join("model.safetensors");
+        safetensors::serialize_to_file(views, None, &file).unwrap();
+        file
+    }
+
+    /// The own layers under `prefix` in the file `path`, on the host.
+    fn own_layers(path: &str, prefix: &str) -> Vec<XfLayer> {
+        let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu).unwrap() };
+        XfLayer::stack(&vb.pp(prefix), MIMI_HEADS, true, Some(ATTENTION_WINDOW)).unwrap()
+    }
+
+    /// `rows [S, dim]` through the own layers on the host.
+    fn own_run(layers: &[XfLayer], rows: &Tensor) -> Tensor {
+        let mut h = rows.to_device(&Device::Cpu).unwrap();
+        for l in layers {
+            h = l.forward(&h, &Device::Cpu).unwrap();
+        }
+        h
+    }
+
+    /// The generic layers under `prefix` of class `class` in the file `path`, placed on `cards`.
+    fn generic_layers(
+        path: &str,
+        prefix: &str,
+        class: &str,
+        cards: &[(usize, u64)],
+    ) -> GenericHeteroTransformer {
+        let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu).unwrap() };
+        codec_layers(path, &vb, prefix, class, cards).unwrap()
+    }
+
+    /// `t` as F32 values on the host.
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// The largest difference of `got` from `want`, and the largest magnitude of `want`.
+    fn error(got: &[f32], want: &[f32]) -> (f32, f32) {
+        assert_eq!(got.len(), want.len());
+        assert!(got.iter().all(|v| v.is_finite()));
+        let err = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        (err, want.iter().map(|v| v.abs()).fold(0f32, f32::max))
+    }
+
+    /// The tolerance on a value of magnitude `scale` out of `layers` layers whose widest product
+    /// sums `width` terms, in a float type of machine epsilon `eps`, over `rows` positions.
+    ///
+    /// A product of `n` terms rounds to about `eps * sqrt(n)` of its scale.
+    /// A layer chains 4 products: the Q, K and V projection, the attention output, the up and
+    /// the down projections.
+    /// A rotary angle of position `p` rounds to about `eps * p` of a radian in F32, which each
+    /// layer adds once.
+    fn tolerance(layers: usize, width: usize, rows: usize, eps: f32, scale: f32) -> f32 {
+        let products = eps * (width as f32).sqrt() * (4 * layers + 1) as f32;
+        let angles = f32::EPSILON * rows as f32 * layers as f32;
+        (products + angles) * scale
+    }
+
+    /// The width of the widest product of `own`'s layers over rows `dim` wide.
+    fn widest(own: &[XfLayer], dim: usize) -> usize {
+        own[0].linear1.dims()[0].max(3 * dim)
+    }
+
+    /// `got` against `want`, rows of `own`'s layers, within the tolerance of `eps`.
+    /// Returns the tolerance as a share of the scale.
+    fn rows_agree(own: &[XfLayer], got: &Tensor, want: &Tensor, eps: f32) -> f32 {
+        let (s, dim) = want.dims2().unwrap();
+        let (err, scale) = error(&host(got), &host(want));
+        let tol = tolerance(own.len(), widest(own, dim), s, eps, scale);
+        eprintln!("{s} rows: {err} away at a scale of {scale}, tolerance {tol}");
+        assert!(err <= tol, "{err} away, tolerance {tol}");
+        tol / scale
+    }
+
+    /// Deterministic rows `[n, hidden]` on `device`.
+    fn input(n: usize, hidden: usize, device: &Device) -> Tensor {
+        let mut seed = 5u32;
+        Tensor::from_vec(
+            values(&mut seed, n * hidden, 0.0, 1.0),
+            (n, hidden),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_device(device)
+        .unwrap()
+    }
+
+    /// Both transformers of the toy on the generic layers placed on `cards` give the rows of
+    /// their own layers.
+    fn toy_agrees(tag: &str, cards: &[(usize, u64)]) {
+        let (hidden, ffn) = (8 * MIMI_HEADS, 16 * MIMI_HEADS);
+        let file = toy_file(tag, hidden, ffn, 2);
+        let path = file.to_string_lossy().to_string();
+        let rows = input(long_rows(), hidden, &Device::Cpu);
+        for (prefix, class) in [(DECODER_PREFIX, CODEC_CLASS), (ENCODER_PREFIX, CODEC_CLASS)] {
+            let own = own_layers(&path, prefix);
+            let want = own_run(&own, &rows);
+            let mut model = generic_layers(&path, prefix, class, cards);
+            assert_eq!(model.layer_cuda_ordinals().is_empty(), cards.is_empty());
+            let got = model.forward_embeddings_rows(&rows).unwrap();
+            rows_agree(&own, &got, &want, f32::EPSILON);
+        }
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// On the host.
+    #[test]
+    fn the_toy_codec_transformers_on_generic_layers_match_their_own_layers() {
+        toy_agrees("pocket-toy", &[]);
+    }
+
+    /// With the layers on the cards, within the rounding of F32.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_card_toy_codec_transformers_on_generic_layers_match_their_own_layers() {
+        let cards = crate::inference::place::ladder::cards(0);
+        if cards.is_empty() {
+            eprintln!("no card");
+            return;
+        }
+        toy_agrees("pocket-toy-card", &cards);
+    }
+
+    /// The published checkpoint, `None` when the test store lacks it.
+    fn published() -> Option<String> {
+        let file = Some(resolve_paths().0).filter(|f| f.exists());
+        if file.is_none() {
+            eprintln!("the published checkpoint is not in the test store");
+        }
+        file.map(|f| f.to_string_lossy().to_string())
+    }
+
+    /// The published codec on `device`: each transformer on the generic layers gives the rows
+    /// of its own layers over a long run, within the tolerance of `eps`.
+    /// The waveform of a fixed latent and the embedding of a fixed clip stay within the same
+    /// share of their peak.
+    fn published_agrees(device: Device, eps: f32) {
+        let Some(path) = published() else { return };
+        let dec = MimiDecoder::from_safetensors(&path, device.clone()).unwrap();
+        // A fixed latent whose rows pass the window and a prefill chunk.
+        let frames = long_rows().div_ceil(2);
+        let latent_dim = dec.latent_dim().unwrap();
+        let mut seed = 11u32;
+        let latent = Tensor::from_vec(
+            values(&mut seed, latent_dim * frames, 0.0, 1.0),
+            (1, latent_dim, frames),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_device(&device)
+        .unwrap();
+        let emb = causal_conv1d(&latent, &dec.output_proj, None, 1, 1, 1).unwrap();
+        let rows = dec.upsampled_rows(&emb).unwrap();
+        let own = own_layers(&path, DECODER_PREFIX);
+        let own_rows = own_run(&own, &rows).to_device(&device).unwrap();
+        let new_rows = dec.layers.transform(&rows, &device).unwrap();
+        let share = rows_agree(&own, &new_rows, &own_rows, eps);
+        let own_wave = dec.seanet(&own_rows).unwrap();
+        let new_wave = dec.seanet(&new_rows).unwrap();
+        let (werr, peak) = error(&new_wave, &own_wave);
+        let same = own_wave
+            .iter()
+            .zip(&new_wave)
+            .filter(|(a, b)| a == b)
+            .count();
+        eprintln!(
+            "waveform of {} samples: {werr} away at a peak of {peak}, {same} samples equal",
+            own_wave.len()
+        );
+        assert!(werr <= share * peak, "waveform {werr} away");
+        drop(dec);
+        let enc = MimiEncoder::from_safetensors(&path, device.clone()).unwrap();
+        let own = own_layers(&path, ENCODER_PREFIX);
+        let codec = own[0].dim;
+        let rows = input(long_rows(), codec, &device);
+        let own_rows = own_run(&own, &rows).to_device(&device).unwrap();
+        let new_rows = enc.layers.transform(&rows, &device).unwrap();
+        rows_agree(&own, &new_rows, &own_rows, eps);
+        // A fixed clip of the reference length the engine keeps.
+        let clip: Vec<f32> = (0..144_000)
+            .map(|i| 0.3 * (i as f32 * 0.0137).sin() + 0.1 * (i as f32 * 0.271).sin())
+            .collect();
+        let rows = enc.seanet_rows(&clip).unwrap();
+        let own_rows = own_run(&own, &rows).to_device(&device).unwrap();
+        let new_rows = enc.layers.transform(&rows, &device).unwrap();
+        let share = rows_agree(&own, &new_rows, &own_rows, eps);
+        let own_emb = host(&enc.downsampled(&own_rows).unwrap());
+        let new_emb = host(&enc.downsampled(&new_rows).unwrap());
+        let (eerr, epeak) = error(&new_emb, &own_emb);
+        eprintln!(
+            "embedding of {} values: {eerr} away at a peak of {epeak}",
+            own_emb.len()
+        );
+        assert!(eerr <= share * epeak, "embedding {eerr} away");
+    }
+
+    /// On the host, within the rounding of F32.
+    #[test]
+    fn the_published_codec_transformers_on_generic_layers_match_their_own_layers() {
+        published_agrees(Device::Cpu, f32::EPSILON);
+    }
+
+    /// With the codec and the transformers' layers on the cards, within the rounding of F32.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_card_published_codec_transformers_on_generic_layers_match_their_own_layers() {
+        if crate::inference::place::ladder::cards(0).is_empty() {
+            eprintln!("no card");
+            return;
+        }
+        published_agrees(Device::new_cuda(0).unwrap(), f32::EPSILON);
     }
 }
