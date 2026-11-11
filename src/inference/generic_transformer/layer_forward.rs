@@ -1584,6 +1584,8 @@ impl GenericTransformerLayer {
         let phi2_residual_fast = self.flags.parallel_attn
             && self.flags.is_phi2_simple_ffn
             && rs.is_none()
+            && self.attn_layer_scale.is_none()
+            && self.ffn_layer_scale.is_none()
             && self.attn_output_bias.is_some()
             && self.ffn_down_bias.is_some()
             && attn_out.device().is_cuda()
@@ -1598,6 +1600,7 @@ impl GenericTransformerLayer {
         if let Some(s) = rs {
             attn_out = (attn_out * s)?;
         }
+        attn_out = scaled_by(attn_out, self.attn_layer_scale.as_ref())?;
         let prof_t_attn = prof_t_attn_norm.map(|_| {
             let _ = attn_out.device().synchronize();
             std::time::Instant::now()
@@ -1656,6 +1659,7 @@ impl GenericTransformerLayer {
                 if let Some(s) = rs {
                     ffn_out = (ffn_out * s)?;
                 }
+                let ffn_out = scaled_by(ffn_out, self.ffn_layer_scale.as_ref())?;
                 crate::inference::kernel::fused::fused_add_three(residual, &attn_out, &ffn_out)?
             };
             #[cfg(not(feature = "gpu"))]
@@ -1664,6 +1668,7 @@ impl GenericTransformerLayer {
                 if let Some(s) = rs {
                     ffn_out = (ffn_out * s)?;
                 }
+                let ffn_out = scaled_by(ffn_out, self.ffn_layer_scale.as_ref())?;
                 ((residual + &attn_out)? + ffn_out)?
             };
             let prof_t_attn_res = prof_t_attn.map(|_| {
@@ -1803,6 +1808,7 @@ impl GenericTransformerLayer {
                     // Standard MoE (granitemoe): router + experts both read the single
                     // ffn_norm'd hidden; no dense shared FFN, no gemma4 sandwich norms.
                     residual_folded = rs.is_none()
+                        && self.ffn_layer_scale.is_none()
                         && self.post_ffn_norm.is_none()
                         && moe_ref.can_fold_residual(&x_norm_ffn, residual_ffn);
                     let mut m = if residual_folded {
@@ -1868,6 +1874,10 @@ impl GenericTransformerLayer {
                     ffn_out = (ffn_out * s)?;
                 }
                 ffn_out
+            };
+            let combined = match residual_folded {
+                true => combined,
+                false => scaled_by(combined, self.ffn_layer_scale.as_ref())?,
             };
             let prof_t_ffn = prof_t_attn_res.map(|_| {
                 let _ = combined.device().synchronize();
@@ -2167,6 +2177,9 @@ impl GenericTransformerLayer {
             || self.rope_freq_factors.is_some()
             // Nor does it add a position bias to the scores.
             || self.alibi_slopes.is_some()
+            // Nor does it scale a residual branch by channel.
+            || self.attn_layer_scale.is_some()
+            || self.ffn_layer_scale.is_some()
             || self.attn_v.is_none() && self.attn_qkv.is_none()
             || self.flags.is_phi2_simple_ffn
             || self.rope_dim != 0 && self.rope_dim != hd
@@ -2267,5 +2280,16 @@ impl GenericTransformerLayer {
                 });
         }
         Ok(())
+    }
+}
+
+/// `x` multiplied by the scale per channel `scale` along its last axis, `x` itself without one.
+///
+/// The scale takes the type of `x`.
+pub(super) fn scaled_by(x: Tensor, scale: Option<&Tensor>) -> Result<Tensor> {
+    match scale {
+        None => Ok(x),
+        Some(g) if g.dtype() == x.dtype() => x.broadcast_mul(g),
+        Some(g) => x.broadcast_mul(&g.to_dtype(x.dtype())?),
     }
 }

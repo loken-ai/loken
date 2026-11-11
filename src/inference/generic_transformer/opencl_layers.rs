@@ -261,6 +261,10 @@ fn refusal(
             (l.rope_freq_factors.is_some(), "RoPE frequency factors"),
             (l.attn_v_norm_ones.is_some(), "normalised values"),
             (
+                l.attn_layer_scale.is_some() || l.ffn_layer_scale.is_some(),
+                "a scale per channel on a residual branch",
+            ),
+            (
                 !matches!(l.attn_norm, super::config::WeightedNorm::Rms(_)),
                 "a norm other than RMS",
             ),

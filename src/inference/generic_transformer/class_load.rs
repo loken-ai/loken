@@ -7,9 +7,10 @@
 use super::GenericHeteroTransformer;
 use crate::inference::engine::llm_engine::KvQuant;
 use crate::inference::load::awq_loader as awql;
-use crate::inference::load::hf_config::{hf_class, nested_config};
+use crate::inference::load::hf_config::{every_layer_window, hf_class, nested_config};
 use crate::inference::place::ladder;
 use crate::inference::place::layer_executor::HeteroPlan;
+use crate::tensor::safetensors::MmapedSafetensors;
 use crate::tensor::{Device, Error, Result};
 use std::collections::HashMap;
 
@@ -40,12 +41,18 @@ pub struct ClassDemand {
     pub head_bytes: u64,
     /// Cache bytes a row adds to a layer.
     pub row_bytes: u64,
+    /// The most rows a layer's cache holds whatever the context, for a class whose every layer
+    /// sees a window of its past.
+    pub held_rows: Option<u64>,
     pub runtime_reserve: u64,
 }
 
 impl ClassDemand {
     /// The demand at a cache of `rows` rows.
+    ///
+    /// A windowed cache holds no more than its window's rows.
     pub fn at(&self, rows: u64) -> ladder::Demand {
+        let rows = self.held_rows.map_or(rows, |held| rows.min(held));
         ladder::Demand {
             layers: self.layers,
             block_bytes: self.block_bytes,
@@ -83,13 +90,10 @@ impl ClassDemand {
     }
 }
 
-/// The transformer of `class` in the checkpoint at `dir`, its cache holding `rows`.
+/// The transformer of `class` in the checkpoint at `dir`, its cache holding `rows`, placed on
+/// the cards the ladder sees.
 ///
-/// `class` is the checkpoint's own class or a class nested in it.
-/// The demand the ladder places holds the blocks, the head, the cache and the work reserve.
-/// `beside` bytes the caller places on the device of the last layer count with the head.
-/// The cache is unquantised, of the width the route gives an unquantised cache of the class's
-/// architecture.
+/// The configuration is the directory's `config.json`, the weights its safetensors files.
 pub fn load_class(
     dir: &std::path::Path,
     class: &str,
@@ -102,12 +106,48 @@ pub fn load_class(
         .map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
     let root: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
-    let row = hf_class(class).ok_or_else(|| Error::msg(format!("no class row for {class}")))?;
-    let cfg = awql::config_from_value(nested_config(&root, class), class.into(), row.arch.into())
-        .map_err(msg)?;
     let (_, shards) = awql::checkpoint_shards(dir).map_err(msg)?;
-    let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards)? };
-    let (block_bytes, head_bytes) = super::text_bytes(&st, &cfg)
+    load_class_from(&root, &shards, class, rows, beside, &ladder::cards(0))
+}
+
+/// What `class` read from the configuration `root` and the safetensors files `shards` asks of
+/// the cards, with `beside` bytes counted with its head.
+///
+/// The cache is unquantised, of the width the route gives an unquantised cache of the class's
+/// architecture.
+/// The cache of a class windowed in every layer holds its window and a prefill chunk at most.
+pub fn class_demand(
+    root: &serde_json::Value,
+    shards: &[String],
+    class: &str,
+    beside: u64,
+) -> Result<ClassDemand> {
+    let (cfg, st) = class_config(root, shards, class)?;
+    demand_of(&cfg, &st, class, beside)
+}
+
+/// The configuration of `class` read from `root`, and the mapped `shards`.
+fn class_config(
+    root: &serde_json::Value,
+    shards: &[String],
+    class: &str,
+) -> Result<(awql::AwqConfigJson, MmapedSafetensors)> {
+    let msg = |e: anyhow::Error| Error::msg(e.to_string());
+    let row = hf_class(class).ok_or_else(|| Error::msg(format!("no class row for {class}")))?;
+    let cfg = awql::config_from_value(nested_config(root, class), class.into(), row.arch.into())
+        .map_err(msg)?;
+    let st = unsafe { MmapedSafetensors::multi(shards)? };
+    Ok((cfg, st))
+}
+
+/// [`class_demand`] of the configuration `cfg` and the mapped tensors `st`.
+fn demand_of(
+    cfg: &awql::AwqConfigJson,
+    st: &MmapedSafetensors,
+    class: &str,
+    beside: u64,
+) -> Result<ClassDemand> {
+    let (block_bytes, head_bytes) = super::text_bytes(st, cfg)
         .ok_or_else(|| Error::msg(format!("{class}: no tensor layout reads the checkpoint")))?;
     let head_dim = cfg.head_dim.unwrap_or(cfg.hidden_size / cfg.n_head.max(1));
     // An unquantised cache holds F16 keys and values on a card for an architecture that
@@ -118,18 +158,37 @@ pub fn load_class(
         true => std::mem::size_of::<half::f16>(),
         false => std::mem::size_of::<f32>(),
     };
-    let priced = ClassDemand {
+    Ok(ClassDemand {
         layers: cfg.n_layers,
         block_bytes,
         head_bytes: head_bytes + beside,
         row_bytes: (2 * cfg.n_kv_head * head_dim * width) as u64,
+        held_rows: every_layer_window(cfg)
+            .map(|w| (w + crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS) as u64),
         runtime_reserve: crate::inference::place::runtime_demand::llm_work_reserve(
             cfg.hidden_size.max(cfg.n_kv_head * head_dim),
             crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS,
         ),
-    };
-    let cards = ladder::cards(0);
-    let context = priced.rows_on(rows, &cards, ladder::card_bandwidth);
+    })
+}
+
+/// The transformer of `class` read from the configuration `root` and the safetensors files
+/// `shards`, its cache holding `rows`, placed on `cards`.
+///
+/// `class` is the class of `root` or a class nested in it.
+/// The ladder places [`class_demand`]: the blocks, the head, the cache and the work reserve.
+/// An empty `cards` places every layer on the host.
+pub fn load_class_from(
+    root: &serde_json::Value,
+    shards: &[String],
+    class: &str,
+    rows: Rows,
+    beside: u64,
+    cards: &[(usize, u64)],
+) -> Result<LoadedClass> {
+    let (cfg, st) = class_config(root, shards, class)?;
+    let priced = demand_of(&cfg, &st, class, beside)?;
+    let context = priced.rows_on(rows, cards, ladder::card_bandwidth);
     if let Rows::UpTo(full) = rows {
         tracing::info!("{class}: a cache of {context} rows of {full}");
     }
@@ -148,12 +207,12 @@ pub fn load_class(
         format!("{arch}.vocab_size"),
         Value::U32(cfg.vocab_size as u32),
     );
-    let ck = super::DenseCheckpoint::open(&header, &shards, &cfg)?;
+    let ck = super::DenseCheckpoint::open(&header, shards, &cfg)?;
     let layers = cfg.n_layers;
     ladder::load_on(
         class,
         &priced.at(context as u64),
-        &cards,
+        cards,
         |plan: &HeteroPlan| {
             let mut cards = HashMap::new();
             for idx in ladder::cards_of(plan) {
@@ -372,6 +431,7 @@ pub(crate) mod tests {
             block_bytes: 3 * GB,
             head_bytes: GB / 2,
             row_bytes: 8192,
+            held_rows: None,
             runtime_reserve: GB,
         }
     }

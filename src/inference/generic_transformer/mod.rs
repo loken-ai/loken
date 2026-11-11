@@ -98,6 +98,8 @@ mod card_mixers;
 mod card_packed;
 #[cfg(all(test, feature = "gpu"))]
 mod card_packed_tests;
+#[cfg(test)]
+pub(crate) mod codec_class_tests;
 pub mod dsa;
 #[cfg(test)]
 mod embedding_step_tests;
@@ -276,6 +278,12 @@ pub struct GenericTransformerLayer {
     pub attn_sinks: Option<Tensor>,
     /// The same logits on the host, read by the host attention kernels.
     pub attn_sinks_host: Option<Vec<f32>>,
+    /// A scale per channel `[hidden]` F32 on the layer's device, multiplying the attention
+    /// output before the residual add.
+    pub attn_layer_scale: Option<Tensor>,
+    /// A scale per channel `[hidden]` F32 on the layer's device, multiplying the feed-forward
+    /// output before the residual add.
+    pub ffn_layer_scale: Option<Tensor>,
     pub attn_norm: WeightedNorm,
     /// Phase B: F32-cast of attn_norm.weight, pre-built
     /// at load time when fused_qkv_norm_eligible. Avoids the per-

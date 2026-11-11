@@ -890,6 +890,28 @@ const QWEN3_TTS_CODE_PREDICTOR: Layout = Layout {
     ..LLAMA
 };
 
+/// A scale per channel on each residual branch of a block.
+const LAYER_SCALES: Table = &[
+    (
+        "self_attn_layer_scale.scale",
+        Same("attn_layer_scale.weight"),
+    ),
+    ("mlp_layer_scale.scale", Same("ffn_layer_scale.weight")),
+];
+
+/// The transformer of the codec's decoder, in the codec's own file.
+///
+/// Its output projection names the decoder's prefix and stands as its token table.
+/// It has no head of its own.
+const QWEN3_TTS_CODEC: Layout = Layout {
+    embed: &["pre_transformer.output_proj.weight"],
+    layers: "pre_transformer.layers",
+    top: &[("pre_transformer.norm.weight", Same("output_norm.weight"))],
+    head: &[],
+    layer: &[NORMS_AND_ATTENTION, GATED_MLP, LAYER_SCALES],
+    rooted: false,
+};
+
 /// The layout of a class's tensors.
 pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
     match kind {
@@ -923,5 +945,6 @@ pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
         LayoutKind::GlmMoeDsa => &LATENT_MOE,
         LayoutKind::Qwen3Tts => &QWEN3_TTS,
         LayoutKind::Qwen3TtsCodePredictor => &QWEN3_TTS_CODE_PREDICTOR,
+        LayoutKind::Qwen3TtsCodec => &QWEN3_TTS_CODEC,
     }
 }

@@ -41,6 +41,9 @@ struct RawGenericLayer {
     attn_output_bias_qt: Option<QTensor>,
     /// Per-head attention-sink logits `[n_head]`.
     attn_sinks_qt: Option<QTensor>,
+    /// Scales per channel of the attention and the feed-forward outputs.
+    attn_layer_scale_qt: Option<QTensor>,
+    ffn_layer_scale_qt: Option<QTensor>,
     // Norm weights - always CPU
     attn_norm_qt: Option<QTensor>, // None for post-norm-only archs (OLMo2) -> Identity pre-norm
     /// Phi2/GPT-NeoX: full LayerNorm - bias on attn_norm
@@ -948,6 +951,7 @@ pub(crate) fn tp_file_refusal(
         ("shortconv", "a recurrent mixer"),
         ("attn_gate", "an attention output gate"),
         ("attn_sinks", "attention sinks"),
+        ("layer_scale", "a scale per channel on a residual branch"),
         ("ffn_up.bias", "a feed-forward up bias"),
         ("inp_gate", "per-layer inputs"),
         ("hc_", "a wide residual"),
@@ -1117,6 +1121,10 @@ fn tp_refusal(
         ),
         (raw.attn_gate.is_some(), "an attention output gate"),
         (raw.attn_sinks_qt.is_some(), "attention sinks"),
+        (
+            raw.attn_layer_scale_qt.is_some() || raw.ffn_layer_scale_qt.is_some(),
+            "a scale per channel on a residual branch",
+        ),
         (raw.ffn_up_bias_qt.is_some(), "a feed-forward up bias"),
     ];
     if let Some((_, why)) = reasons.iter().find(|(refused, _)| *refused) {
@@ -1250,6 +1258,8 @@ fn tp_share(
         attn_output: columns(&raw.attn_output, q_per)?,
         attn_output_bias_qt: first(&raw.attn_output_bias_qt)?,
         attn_sinks_qt: None,
+        attn_layer_scale_qt: None,
+        ffn_layer_scale_qt: None,
         attn_norm_qt: whole(&raw.attn_norm_qt)?,
         attn_norm_bias_qt: whole(&raw.attn_norm_bias_qt)?,
         post_attn_norm_qt: whole(&raw.post_attn_norm_qt)?,
@@ -1990,6 +2000,8 @@ fn build_generic_layer(
         .map(|qt| qt.dequantize(&Device::Cpu)?.to_vec1::<f32>())
         .transpose()?;
     let attn_sinks = bias_to_device(raw.attn_sinks_qt)?;
+    let attn_layer_scale = bias_to_device(raw.attn_layer_scale_qt)?;
+    let ffn_layer_scale = bias_to_device(raw.ffn_layer_scale_qt)?;
     let ffn_up_bias = bias_to_device(raw.ffn_up_bias_qt)?;
     let ffn_down_bias = bias_to_device(raw.ffn_down_bias_qt)?;
     // Extract raw weight for fused add+rmsnorm kernel before build_norm consumes QTensor
@@ -2682,6 +2694,8 @@ fn build_generic_layer(
         attn_output_bias,
         attn_sinks,
         attn_sinks_host,
+        attn_layer_scale,
+        ffn_layer_scale,
         // Positions come from learned embeddings or an ALiBi bias, or the layer skips them.
         no_rope: config.learned_positions
             || config.max_alibi_bias.is_some()
@@ -3306,6 +3320,8 @@ fn build_awq_layer(
         attn_output_bias: None,
         attn_sinks: None,
         attn_sinks_host: None,
+        attn_layer_scale: None,
+        ffn_layer_scale: None,
         attn_norm,
         attn_norm_weight_f32: None,
         post_attn_norm: None,
@@ -4387,6 +4403,8 @@ impl GenericHeteroTransformer {
             } else {
                 None
             };
+            let attn_layer_scale_qt = opt_cpu!(&format!("{prefix}.attn_layer_scale.weight"))?;
+            let ffn_layer_scale_qt = opt_cpu!(&format!("{prefix}.ffn_layer_scale.weight"))?;
             let attn_sinks_qt = if attends && f.has_attn_sinks {
                 let name = attn_sinks_name(content, idx).ok_or_else(|| {
                     crate::tensor::Error::msg(format!("missing tensor: {prefix}.attn_sinks"))
@@ -4666,6 +4684,8 @@ impl GenericHeteroTransformer {
                 attn_output,
                 attn_output_bias_qt,
                 attn_sinks_qt,
+                attn_layer_scale_qt,
+                ffn_layer_scale_qt,
                 attn_norm_qt,
                 attn_norm_bias_qt,
                 post_attn_norm_qt,

@@ -42,6 +42,7 @@ pub enum LayoutKind {
     GlmMoeDsa,
     Qwen3Tts,
     Qwen3TtsCodePredictor,
+    Qwen3TtsCodec,
 }
 
 /// The route that serves a class's checkpoint.
@@ -88,6 +89,8 @@ pub struct HfClass {
     pub partial_rotary: Option<f32>,
     /// Period of the sliding-window layers when the configuration gives a window and no list.
     pub window_period: Option<usize>,
+    /// Every layer is windowed when the configuration gives a window and no list.
+    pub window_every_layer: bool,
     /// The router scores experts by sigmoid, which the configuration does not say.
     pub sigmoid_router: bool,
     /// The dotted path of the object that holds the text model's fields.
@@ -105,6 +108,7 @@ const fn class(class: &'static str, arch: &'static str, layout: LayoutKind) -> H
         awq: false,
         partial_rotary: None,
         window_period: None,
+        window_every_layer: false,
         sigmoid_router: false,
         text_config: "text_config",
         route: Route::Text,
@@ -125,6 +129,13 @@ const fn adjacent(c: HfClass) -> HfClass {
 const fn windowed(c: HfClass, period: usize) -> HfClass {
     HfClass {
         window_period: Some(period),
+        ..c
+    }
+}
+
+const fn windowed_everywhere(c: HfClass) -> HfClass {
+    HfClass {
+        window_every_layer: true,
         ..c
     }
 }
@@ -282,6 +293,14 @@ pub const CLASSES: &[HfClass] = &[
         ),
         "talker_config.code_predictor_config",
     )),
+    speech(windowed_everywhere(fields_under(
+        class(
+            "Qwen3TTSTokenizerV2DecoderTransformerModel",
+            "llama",
+            LayoutKind::Qwen3TtsCodec,
+        ),
+        "decoder_config",
+    ))),
 ];
 
 /// The row of `name`, `None` for a class the loader does not read.
@@ -418,7 +437,8 @@ fn yarn_attention_factor(block: &Json) -> Option<f32> {
 }
 
 /// The sliding-window layers of a model, `true` for a windowed one: its own list of layer
-/// types, else the class's period. `None` when no layer is windowed.
+/// types, else every layer for a class windowed everywhere, else the class's period.
+/// `None` when no layer is windowed.
 fn window_pattern(cfg: &AwqConfigJson, class: Option<&HfClass>) -> Option<Vec<bool>> {
     let root = &cfg.root;
     let types = lookup(root, &["layer_types"]).and_then(Json::as_array);
@@ -427,6 +447,7 @@ fn window_pattern(cfg: &AwqConfigJson, class: Option<&HfClass>) -> Option<Vec<bo
             .iter()
             .map(|t| t.as_str().is_some_and(|s| s.starts_with("sliding")))
             .collect(),
+        None if class.is_some_and(|c| c.window_every_layer) => vec![true; cfg.n_layers],
         None => {
             let period = lookup_u(root, &["sliding_window_pattern"])
                 .or(class.and_then(|c| c.window_period))?;
@@ -436,6 +457,15 @@ fn window_pattern(cfg: &AwqConfigJson, class: Option<&HfClass>) -> Option<Vec<bo
         }
     };
     pattern.iter().any(|w| *w).then_some(pattern)
+}
+
+/// The window of a model windowed in every layer, `None` when a layer sees its whole past.
+pub fn every_layer_window(cfg: &AwqConfigJson) -> Option<usize> {
+    let pattern = window_pattern(cfg, hf_class(&cfg.hf_arch))?;
+    match pattern.iter().all(|w| *w) {
+        true => lookup_u(&cfg.root, &["sliding_window"]),
+        false => None,
+    }
 }
 
 /// The header keys the configuration gives beyond the core ones, under `{arch}.`.

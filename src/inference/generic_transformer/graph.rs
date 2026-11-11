@@ -295,6 +295,10 @@ impl GenericHeteroTransformer {
         if l.context.is_some() {
             return Some("its cache is cut over several cards, whose parts it combines");
         }
+        // The recorded layer adds its branches unscaled.
+        if l.attn_layer_scale.is_some() || l.ffn_layer_scale.is_some() {
+            return Some("a scale per channel on a residual branch: the captured layer has none");
+        }
         // A recurrent mixer is recorded only where its step advances the state in place: a
         // recorded step writes the addresses it read.
         if !l.mixer.decodes_in_place(&l.cos.device()) {

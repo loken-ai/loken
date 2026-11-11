@@ -119,6 +119,7 @@ The `Verified` column says how the safetensors layout is checked:
 | `nemotron_h_moe` | `NemotronHForCausalLM` | GGUF, HF safetensors | `nemotron_h_moe_loads_from_gguf`, `nemotron_h_moe_loads_from_safetensors` | reference, synthetic |
 | `glm_moe_dsa` | `GlmMoeDsaForCausalLM` (latent attention, sparse indexer shared across layers, sigmoid router with a selection bias, shared expert, dense first blocks, fp8 weights with 128 by 128 tile scales) | GGUF, HF safetensors | `glm_moe_dsa_loads_from_gguf`, `glm_moe_dsa_matches_reference`, `glm_moe_dsa_dense_matches_reference`, `glm_moe_dsa_sparse_matches_reference`, `glm_moe_dsa_fp8_matches_reference`, `glm_moe_dsa_layers_match_reference` | reference (`glm_moe_dsa`, `glm_moe_dsa_dense`, `glm_moe_dsa_sparse`, `glm_moe_dsa_fp8`), synthetic |
 | `qwen3` talker and code predictor of a speech release | `Qwen3TTSForConditionalGeneration` with its fields under `talker_config`, `Qwen3TTSTalkerCodePredictorModelForConditionalGeneration` for the code predictor nested in the same checkpoint with its fields under `talker_config.code_predictor_config` | HF safetensors composite | `a_class_reads_its_text_model_under_its_own_key`, `the_published_configuration_gives_both_transformers_geometry`, `a_speech_checkpoint_reads_as_a_talker_and_a_code_predictor`, `the_published_speech_header_reads_as_a_talker_and_a_code_predictor`, `a_nested_class_loads_and_a_layout_without_a_head_gives_none` | synthetic, real checkpoint configuration and header |
+| `llama` transformer of a speech codec's decoder | `Qwen3TTSTokenizerV2DecoderTransformerModel` nested in the codec's own configuration with its fields under `decoder_config`, every layer windowed, a scale per channel on both residual branches | HF safetensors, the codec's file | `a_windowed_scaled_class_matches_a_plain_host_run`, `a_window_wider_than_the_rows_is_the_causal_run`, `the_card_windowed_scaled_class_matches_a_plain_host_run` | synthetic |
 | `llama` text model of a speech release | `VoxtralForConditionalGeneration`, native layout with the table in the tower's namespace | HF safetensors composite, native layout | `voxtral_loads_from_safetensors`, `voxtral_loads_from_native_layout`, `voxtral_matches_reference`, `voxtral_native_matches_reference`, `voxtral_native_matches_composite` | reference (`voxtral`), synthetic |
 
 ## Notes
@@ -161,9 +162,23 @@ A request for one fails with the kind of model and the route that serves it.
 The embedding table a layout names gives the model's prefix.
 The talker of `Qwen3TTSForConditionalGeneration` reads its codec table as the token table and its codec head as the head.
 Its code predictor reads the tensors under its own prefix, its first codec table as the token table, and has no head.
+The transformer of the codec's decoder reads the tensors under `decoder.pre_transformer.`, its output projection as the token table, and has no head.
 A layout with no head gives the model none: its forward gives the normed rows and no logits.
 `class_load::load_class` loads the transformer of one class of a dense checkpoint, the checkpoint's own or a class nested in it.
+`class_load::load_class_from` loads it from a configuration and weights files given apart, on the cards it is given.
 It places the blocks, the head, the cache and the work reserve through `HeteroPlan` and the ladder, as any dense load.
+The cache of a class windowed in every layer is priced at the window and a prefill chunk, whatever the context.
+
+### Windows and scales
+
+A class row can window every layer when the configuration gives a `sliding_window` and no list of layer kinds.
+Each windowed layer keeps the last keys of its window and a prefill chunk, and drops the older ones.
+A row attends to itself and the keys of the window before it.
+
+A layer can scale each residual branch by channel: `attn_layer_scale` multiplies the attention output, `ffn_layer_scale` the feed-forward output, before the residual add.
+The scales are read when the layer's tensors hold them.
+A layer with a scale runs the layer's forward on the host and on a card.
+The paths that do not apply a scale step aside for it: the host decode executors, the recorded decode step, the continuous batch, tensor parallel splits, Vulkan and OpenCL.
 The tensors state some widths, and the loader reads those from the tensors: the dense and the expert feed-forward, the short convolution, and which blocks attend.
 
 ### Rotary rows
@@ -273,6 +288,7 @@ A text-image checkpoint is served as such when it holds:
 
 `forward_embeddings_prefill` runs the prefill of several rows fed by embeddings from position 0.
 It gives back the last row after the final norm, and its logits when asked.
+`forward_embeddings_rows` runs the same prefill and gives back every row after the final norm, in order, with no head.
 Its logits are those of a splice of the same rows with no text around them.
 `token_rows` gives the token table's rows of some ids, as a token step reads them before any embedding scale.
 

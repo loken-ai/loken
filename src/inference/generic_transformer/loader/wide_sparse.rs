@@ -859,6 +859,8 @@ impl GenericHeteroTransformer {
                 attn_output_bias: None,
                 attn_sinks: None,
                 attn_sinks_host: None,
+                attn_layer_scale: None,
+                ffn_layer_scale: None,
                 attn_norm: WeightedNorm::Rms(RmsNorm::from_tensor(attn_norm, meta.rms_eps)),
                 attn_norm_weight_f32: None,
                 post_attn_norm: None,

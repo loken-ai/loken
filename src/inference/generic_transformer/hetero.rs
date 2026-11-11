@@ -202,6 +202,8 @@ pub(super) enum Outputs {
     LogitsAndNormed,
     /// The last row after the final norm, with no head run.
     Normed,
+    /// Every row after the final norm, with no head run.
+    NormedRows,
 }
 
 /// What a decode step fed by an embedding gives back.
@@ -814,6 +816,9 @@ impl GenericHeteroTransformer {
             return Some("partial rope on a card");
         }
         for l in &self.layers {
+            if l.attn_layer_scale.is_some() || l.ffn_layer_scale.is_some() {
+                return Some("a scale per channel on a residual branch");
+            }
             let split = l.attn_q.is_some() && l.attn_k.is_some() && l.attn_v.is_some();
             if !split && l.attn_qkv.is_none() {
                 return Some("no Q/K/V");
@@ -3158,6 +3163,16 @@ impl GenericHeteroTransformer {
                 }
             }
         }
+        if outputs == Outputs::NormedRows {
+            // Every row after the final norm on the host, F32 `[rows, hidden]`: the arithmetic
+            // of the last row a headless model's prefill gives.
+            let (b, s, h) = hidden.dims3()?;
+            let normed = self.output_norm.forward(&hidden.to_device(&Device::Cpu)?)?;
+            let rows = normed
+                .reshape((b * s, h))?
+                .to_dtype(crate::tensor::DType::F32)?;
+            return Ok((None, Some(rows)));
+        }
         // Transfer to the GPU that holds the output projection (if available)
         // Move the hidden state to whichever device holds the output projection.
         // This may be a DIFFERENT GPU than the last layer's (the lm_head can be
@@ -3441,6 +3456,8 @@ impl GenericHeteroTransformer {
 
     /// [`Self::forward_spliced_prefill_chunked`] giving back what `outputs` asks of its last
     /// chunk.
+    ///
+    /// [`Outputs::NormedRows`] gives the normed rows of every chunk, in order.
     fn spliced_prefill_with(
         &mut self,
         hidden: Tensor,
@@ -3454,12 +3471,24 @@ impl GenericHeteroTransformer {
         }
         let mut off = 0usize;
         let mut last = None;
+        // The normed rows of every chunk, when every row is asked for.
+        let mut rows = Vec::new();
         while off < seq_len {
             let n = CHUNK.min(seq_len - off);
             let chunk = hidden.narrow(1, off, n)?;
             let (chunk, on_cuda) = self.run_layers(chunk, None, off, n)?;
-            last = Some(self.output_stage_with(chunk, on_cuda, n, false, outputs)?);
+            let out = self.output_stage_with(chunk, on_cuda, n, false, outputs)?;
+            if outputs == Outputs::NormedRows {
+                rows.extend(out.1.clone());
+            }
+            last = Some(out);
             off += n;
+        }
+        if outputs == Outputs::NormedRows {
+            return Ok((
+                None,
+                Some(Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?),
+            ));
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty spliced prefill".to_string()))
     }
@@ -3590,6 +3619,28 @@ impl GenericHeteroTransformer {
         self.spec_clear();
         let (logits, normed) = self.spliced_prefill_with(hidden, Self::asked(logits))?;
         Self::embedding_step(logits, normed, width)
+    }
+
+    /// The prefill from position 0 of `embeddings`, every row after the final norm.
+    ///
+    /// `embeddings` holds whole rows of `hidden` values, as in
+    /// [`Self::forward_embeddings_prefill`].
+    /// The caches are emptied first.
+    /// The rows come back F32 `[rows, hidden]`, in order, on the host.
+    /// No head runs.
+    pub fn forward_embeddings_rows(&mut self, embeddings: &Tensor) -> Result<Tensor> {
+        let width = self.config.embedding_length;
+        let rows = embeddings.elem_count() / width;
+        if rows == 0 || rows * width != embeddings.elem_count() {
+            crate::tensor::bail!(
+                "an embedding prefill takes whole rows of {width} values, {} given",
+                embeddings.elem_count()
+            );
+        }
+        let hidden = self.embedding_rows(embeddings, rows)?;
+        self.spec_clear();
+        let (_, normed) = self.spliced_prefill_with(hidden, Outputs::NormedRows)?;
+        normed.ok_or_else(|| crate::tensor::Error::msg("the output stage gave no normed rows"))
     }
 
     /// The token table's rows of `ids`, `[ids.len(), hidden]`, as a token step reads them before
