@@ -44,6 +44,7 @@ pub enum LayoutKind {
     Qwen3TtsCodePredictor,
     Qwen3TtsCodec,
     Mimi,
+    FlowLm,
 }
 
 /// The route that serves a class's checkpoint.
@@ -318,6 +319,11 @@ pub const CLASSES: &[HfClass] = &[
         "llama",
         LayoutKind::Mimi,
     ))))),
+    speech(erf_gelu(adjacent(class(
+        "FlowLMModel",
+        "llama",
+        LayoutKind::FlowLm,
+    )))),
 ];
 
 /// The row of `name`, `None` for a class the loader does not read.

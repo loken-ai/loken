@@ -5,6 +5,10 @@
 //!
 //! The toys are the transformers of Mimi's decoder and encoder, under both names a codec's
 //! file gives their Q, K and V matrix.
+//!
+//! The same blocks unwindowed and unscaled, followed by a norm with a bias, are the
+//! transformer of pocket-tts's flow model.
+//! Its toy is held to the plain run as a prefill and as a prefill followed by single steps.
 
 use super::class_load::{load_class_held, Holding, Rows};
 use super::codec_class_tests::{error, host};
@@ -24,6 +28,10 @@ struct Spelling {
     /// The path of the blocks under the model's prefix the caller gives, when it is not the
     /// layout's own.
     under: Option<&'static str>,
+    /// Each block scales both residual branches.
+    scaled: bool,
+    /// The prefix of the norm with a bias that follows the last block, when there is one.
+    norm: Option<&'static str>,
 }
 
 /// The decoder's transformer, its Q, K and V matrix a parameter.
@@ -32,6 +40,8 @@ const DECODER: Spelling = Spelling {
     blocks: "decoder_transformer.transformer.layers",
     qkv: "self_attn.in_proj_weight",
     under: None,
+    scaled: true,
+    norm: None,
 };
 
 /// The encoder's transformer under a model's prefix, its Q, K and V matrix a linear's weight.
@@ -40,6 +50,18 @@ const ENCODER: Spelling = Spelling {
     blocks: "mimi.encoder_transformer.transformer.layers",
     qkv: "self_attn.in_proj.weight",
     under: Some("encoder_transformer.transformer.layers"),
+    scaled: true,
+    norm: None,
+};
+
+/// The transformer of pocket-tts's flow model and the norm that follows it.
+const FLOW: Spelling = Spelling {
+    class: "FlowLMModel",
+    blocks: "flow_lm.transformer.layers",
+    qkv: "self_attn.in_proj.weight",
+    under: None,
+    scaled: false,
+    norm: Some("flow_lm.out_norm"),
 };
 
 /// The sizes of the toy's transformer.
@@ -49,6 +71,7 @@ struct Geometry {
     heads: usize,
     ffn: usize,
     layers: usize,
+    /// The rows a row attends to, itself included: every row before it when unwindowed.
     window: usize,
     theta: f64,
     eps: f64,
@@ -63,7 +86,9 @@ impl Geometry {
             heads: u("num_attention_heads"),
             ffn: u("intermediate_size"),
             layers: u("num_hidden_layers"),
-            window: u("sliding_window"),
+            window: root["sliding_window"]
+                .as_u64()
+                .map_or(usize::MAX, |w| w as usize),
             theta: f("rope_theta"),
             eps: f("layer_norm_eps"),
         }
@@ -75,18 +100,22 @@ impl Geometry {
 }
 
 /// A configuration of `layers` layers of a window of `window`, of the class of `sp`.
+/// A window of 0 leaves the layers unwindowed.
 fn toy_root(sp: Spelling, layers: usize, window: usize) -> Json {
-    json!({
+    let mut root = json!({
         "architectures": [sp.class],
         "hidden_size": 32,
         "num_attention_heads": 4,
         "num_key_value_heads": 4,
         "intermediate_size": 64,
         "num_hidden_layers": layers,
-        "sliding_window": window,
         "rope_theta": 10000.0,
         "layer_norm_eps": 1e-5
-    })
+    });
+    if window > 0 {
+        root["sliding_window"] = json!(window);
+    }
+    root
 }
 
 /// The tensors of geometry `g` spelled as `sp`, by name: shape, centre and spread of the
@@ -114,8 +143,15 @@ fn tensors(g: &Geometry, sp: Spelling) -> Vec<(String, Vec<usize>, f32, f32)> {
             ("layer_scale_1.scale", vec![h], 0.5, 0.4),
             ("layer_scale_2.scale", vec![h], 0.5, 0.4),
         ] {
+            if part.starts_with("layer_scale") && !sp.scaled {
+                continue;
+            }
             out.push((format!("{}.{il}.{part}", sp.blocks), dims, centre, scale));
         }
+    }
+    if let Some(norm) = sp.norm {
+        out.push((format!("{norm}.weight"), vec![h], 1.0, 0.2));
+        out.push((format!("{norm}.bias"), vec![h], 0.0, 0.2));
     }
     out
 }
@@ -234,8 +270,8 @@ fn gelu(x: f64) -> f64 {
 /// The layers spelled as `sp` over `x`, rows of `hidden` values at positions `0..`, as F64.
 ///
 /// A row attends to itself and the `window - 1` rows before it.
-/// Each branch is scaled by channel before the residual add.
-/// No norm follows the last layer.
+/// Each branch of a scaled spelling is scaled by channel before the residual add.
+/// The spelling's norm follows the last layer when it has one.
 fn reference_rows(
     w: &HashMap<String, Vec<f32>>,
     g: &Geometry,
@@ -245,8 +281,13 @@ fn reference_rows(
     let (h, d) = (g.hidden, g.head_dim());
     let s = x.len() / h;
     let mut rows: Vec<Vec<f64>> = x.chunks(h).map(|r| r.to_vec()).collect();
+    let unscaled = vec![1f32; h];
     for il in 0..g.layers {
         let l = |n: &str| &w[&format!("{}.{il}.{n}", sp.blocks)];
+        let scale = |n: &str| match sp.scaled {
+            true => l(n),
+            false => &unscaled,
+        };
         let mut q = Vec::with_capacity(s);
         let mut k = Vec::with_capacity(s);
         let mut v = Vec::with_capacity(s);
@@ -286,7 +327,11 @@ fn reference_rows(
                 }
             }
             let att = mm(l("self_attn.out_proj.weight"), &out);
-            for ((r, a), g) in rows[i].iter_mut().zip(&att).zip(l("layer_scale_1.scale")) {
+            for ((r, a), g) in rows[i]
+                .iter_mut()
+                .zip(&att)
+                .zip(scale("layer_scale_1.scale"))
+            {
                 *r += a * *g as f64;
             }
         }
@@ -294,9 +339,15 @@ fn reference_rows(
             let n = layer_norm(row, l("norm2.weight"), l("norm2.bias"), g.eps);
             let up: Vec<f64> = mm(l("linear1.weight"), &n).into_iter().map(gelu).collect();
             let down = mm(l("linear2.weight"), &up);
-            for ((r, a), g) in row.iter_mut().zip(&down).zip(l("layer_scale_2.scale")) {
+            for ((r, a), g) in row.iter_mut().zip(&down).zip(scale("layer_scale_2.scale")) {
                 *r += a * *g as f64;
             }
+        }
+    }
+    if let Some(norm) = sp.norm {
+        let (gain, bias) = (&w[&format!("{norm}.weight")], &w[&format!("{norm}.bias")]);
+        for row in rows.iter_mut() {
+            *row = layer_norm(row, gain, bias, g.eps);
         }
     }
     rows.concat()
@@ -417,4 +468,81 @@ fn the_card_encoder_spelled_class_matches_a_plain_host_run() {
     let toy = Toy::write("mimi-encoder-card", ENCODER, 2, 5);
     let g = Geometry::of(&toy.root);
     every_row_matches(&toy, long(&g), long(&g), &cards, f32::EPSILON as f64);
+}
+
+/// The rows of an unwindowed prefill longer than a prefill chunk.
+fn long_unwindowed() -> usize {
+    crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS + 3
+}
+
+/// A prefill of `p` rows, then a step for each of the `n - p` rows after it, the layers' cache
+/// holding `n` rows.
+/// Each step's normed row is within the tolerance of the plain host run's row at its position.
+fn every_step_matches(toy: &Toy, p: usize, n: usize, cards: &[(usize, u64)], eps: f64) {
+    let g = Geometry::of(&toy.root);
+    let mut seed = 9u32;
+    let x = values(&mut seed, n * g.hidden, 0.0, 1.0);
+    let want = reference_rows(
+        &toy.weights,
+        &g,
+        toy.sp,
+        &x.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+    );
+    let mut model = toy.load(n, cards);
+    let xs = Tensor::from_vec(x, (n, g.hidden), &Device::Cpu).unwrap();
+    let first = model
+        .forward_embeddings_prefill(&xs.narrow(0, 0, p).unwrap(), false)
+        .unwrap();
+    let mut got = host(&first.normed);
+    for pos in p..n {
+        let row = xs.narrow(0, pos, 1).unwrap();
+        let step = model.forward_embedding_step(&row, pos, false).unwrap();
+        assert_eq!(step.normed.dims(), [1, g.hidden]);
+        got.extend(host(&step.normed));
+    }
+    let (err, scale) = error(&got, &want[(p - 1) * g.hidden..]);
+    let tol = tolerance(&g, eps, scale);
+    eprintln!("every step {err} away at a scale of {scale}, tolerance {tol}");
+    assert!(err <= tol, "every step {err} away, tolerance {tol}");
+}
+
+/// The flow model's transformer places on the host: unwindowed and unscaled blocks, and its
+/// norm with a bias after the last one.
+/// A prefill gives every row, and a prefill followed by single steps gives every last row.
+#[test]
+fn an_unwindowed_class_with_a_final_layer_norm_matches_a_plain_host_run() {
+    let toy = Toy::write("flow-host", FLOW, 2, 0);
+    let n = long_unwindowed();
+    let model = toy.load(n, &[]);
+    assert!(model.config.flags.use_rope_i && model.config.flags.erf_gelu);
+    assert!(model.config.flags.layer_norm_with_bias);
+    assert!(matches!(model.output_norm, WeightedNorm::Layer(_)));
+    for l in model.layers() {
+        assert_eq!(l.sliding_window, None);
+        assert!(l.attn_layer_scale.is_none() && l.ffn_layer_scale.is_none());
+    }
+    drop(model);
+    every_row_matches(&toy, n, n, &[], f32::EPSILON as f64);
+    every_step_matches(&toy, 7, n, &[], f32::EPSILON as f64);
+}
+
+/// The same runs with the layers on the cards, within the rounding of F32.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_card_unwindowed_class_with_a_final_layer_norm_matches_a_plain_host_run() {
+    let cards = crate::inference::place::ladder::cards(0);
+    if cards.is_empty() {
+        eprintln!("no card");
+        return;
+    }
+    let toy = Toy::write("flow-card", FLOW, 2, 0);
+    let n = long_unwindowed();
+    let model = toy.load(n, &cards);
+    assert!(
+        !model.layer_cuda_ordinals().is_empty(),
+        "the toy sits on a card"
+    );
+    drop(model);
+    every_row_matches(&toy, n, n, &cards, f32::EPSILON as f64);
+    every_step_matches(&toy, 7, n, &cards, f32::EPSILON as f64);
 }

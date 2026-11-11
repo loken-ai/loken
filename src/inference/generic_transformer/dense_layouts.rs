@@ -913,30 +913,51 @@ const QWEN3_TTS_CODEC: Layout = Layout {
     rooted: false,
 };
 
+/// A block of Kyutai's streaming transformer.
+///
+/// It norms with a bias, projects Q, K and V as one matrix, and feeds forward through 2
+/// linears.
+/// A file names the Q, K and V matrix as a parameter or as the weight of a linear.
+/// A block with layer scales scales both residual branches.
+const STREAMING_BLOCK: Table = &[
+    ("norm1.weight", Same("attn_norm.weight")),
+    ("norm1.bias", Same("attn_norm.bias")),
+    ("norm2.weight", Same("ffn_norm.weight")),
+    ("norm2.bias", Same("ffn_norm.bias")),
+    ("self_attn.in_proj_weight", Same("attn_qkv.weight")),
+    ("self_attn.in_proj.weight", Same("attn_qkv.weight")),
+    ("self_attn.out_proj.weight", Same("attn_output.weight")),
+    ("linear1.weight", Same("ffn_up.weight")),
+    ("linear2.weight", Same("ffn_down.weight")),
+    ("layer_scale_1.scale", Same("attn_layer_scale.weight")),
+    ("layer_scale_2.scale", Same("ffn_layer_scale.weight")),
+];
+
 /// The transformer of Mimi's decoder, in the codec's own file.
 ///
 /// It has no token table, no final norm and no head.
-/// Its blocks norm with a bias, project Q, K and V as one matrix, and feed forward through 2
-/// linears.
-/// A codec's file names the Q, K and V matrix as a parameter or as the weight of a linear.
 const MIMI: Layout = Layout {
     embed: &[],
     layers: "decoder_transformer.transformer.layers",
     top: &[],
     head: &[],
-    layer: &[&[
-        ("norm1.weight", Same("attn_norm.weight")),
-        ("norm1.bias", Same("attn_norm.bias")),
-        ("norm2.weight", Same("ffn_norm.weight")),
-        ("norm2.bias", Same("ffn_norm.bias")),
-        ("self_attn.in_proj_weight", Same("attn_qkv.weight")),
-        ("self_attn.in_proj.weight", Same("attn_qkv.weight")),
-        ("self_attn.out_proj.weight", Same("attn_output.weight")),
-        ("linear1.weight", Same("ffn_up.weight")),
-        ("linear2.weight", Same("ffn_down.weight")),
-        ("layer_scale_1.scale", Same("attn_layer_scale.weight")),
-        ("layer_scale_2.scale", Same("ffn_layer_scale.weight")),
-    ]],
+    layer: &[STREAMING_BLOCK],
+    rooted: false,
+};
+
+/// The transformer of pocket-tts's flow model, under the flow model's prefix.
+///
+/// It has no token table and no head.
+/// The flow model's norm with a bias follows its last block.
+const FLOW_LM: Layout = Layout {
+    embed: &[],
+    layers: "transformer.layers",
+    top: &[
+        ("out_norm.weight", Same("output_norm.weight")),
+        ("out_norm.bias", Same("output_norm.bias")),
+    ],
+    head: &[],
+    layer: &[STREAMING_BLOCK],
     rooted: false,
 };
 
@@ -975,5 +996,6 @@ pub(super) fn layout(kind: LayoutKind) -> &'static Layout {
         LayoutKind::Qwen3TtsCodePredictor => &QWEN3_TTS_CODE_PREDICTOR,
         LayoutKind::Qwen3TtsCodec => &QWEN3_TTS_CODEC,
         LayoutKind::Mimi => &MIMI,
+        LayoutKind::FlowLm => &FLOW_LM,
     }
 }
