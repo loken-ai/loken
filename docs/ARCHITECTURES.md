@@ -482,10 +482,11 @@ The rest of the codec sits on the device it is given.
 A decode or an encode runs every row at once, from position 0, and keeps no state between calls.
 The layers run the rows in prefill chunks, their cache held to the window and a chunk.
 
-The tests check each transformer on the generic route against the model's own layer code, on a toy and on the published checkpoint when the test store holds it, on the host and on a card:
+`generic_transformer::mimi_class_tests` holds the layers of both classes to a plain host run in F64 of Mimi's layer on a toy, within the rounding of F32, on the host and on a card.
+The tests of the codec check, on the published checkpoint when the test store holds it, on the host and on a card:
 
-- the rows of a run longer than the window and a prefill chunk, within the rounding of the residual's float type through the layers and of the rotary angles at the last position
-- the waveform of a fixed latent and the embedding of a fixed clip, within the same share of their peak
+- the waveform of a fixed latent longer than the window and a prefill chunk: its sample count, its finite values and its repeat
+- the embedding of a fixed clip: its finite values and its repeat
 
 ## Drafter verification
 
