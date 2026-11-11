@@ -432,10 +432,11 @@ The rest of the decoder sits on the device it is given: the dequantisation, the 
 A decode runs every frame at once, from position 0, and keeps no state between calls.
 The layers run the rows in prefill chunks, their cache held to the window and a chunk.
 
-The tests check the layers on the generic route against the decoder's own layer code, on a toy and on the published checkpoint when the test store holds it, on the host and on a card:
+`generic_transformer::mimi_class_tests` holds the layers to a plain host run in F64 of Mimi's layer on a toy, within the rounding of F32, on the host and on a card.
+The tests of the decoder check, on the published checkpoint when the test store holds it:
 
-- the rows, within the rounding of the residual's float type through the layers and of the rotary angles at the last position
-- the waveform of a fixed code list, within the same share of its peak
+- the dry plan of the layers' own demand on a card that holds them, a card smaller than their blocks, and the host
+- the waveform of a fixed code list: its sample count, its finite values and its repeat, on the host and on a card
 
 ## Drafter verification
 
