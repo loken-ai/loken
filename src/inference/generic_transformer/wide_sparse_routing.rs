@@ -35,8 +35,7 @@ impl GenericHeteroTransformer {
         }
     }
 
-    /// Takes the prior a companion file beside `model` declares, when the model file carries
-    /// none.
+    /// Takes the prior a companion file of `model` declares, when the model file carries none.
     ///
     /// A companion is found by its metadata keys, whatever its name.
     /// A companion whose prior does not fit the model's layers and experts is passed over.

@@ -98,7 +98,7 @@ The placement reads the routed experts expert by expert, from 1 file or another.
 The placement fills the tiers that keep routed experts in routing-heat order: the cards, then the host tier.
 The heat is the model's routing profile in `profiles/` of the store.
 The routing prior orders the experts the profile never counted, and every expert when there is no profile.
-The prior is the one the file records, else the one a companion GGUF beside it declares.
+The prior is the one the file records, else the one a companion GGUF of the model declares.
 A wide-residual model keeps its hottest routed experts on a card when the load measures the card faster than the host's cores on a token's experts.
 The host then keeps, per layer, the experts its rows routed to most recently, as many as its memory holds beside a request's needs.
 Every other routed expert is read from the file at its use and leaves the page cache after it.
@@ -154,7 +154,7 @@ Another model's further files are left unread, and the log says so.
 | Engram tables | 1 `per_layer_token_embd` table in `Q8_0`. ggml has no fp8 type, and `Q8_0` holds the released values in about the same bytes |
 | Engram layer weights | Each layer's query and key weights, stored as their product |
 | Routed experts | The formats asked for |
-| DSpark draft | Stored apart as `<name>:<tag>-dspark`, a companion the loader finds beside the model |
+| DSpark draft | Stored apart as `<name>:<tag>-dspark`, the companion the loader reads for `<name>:<tag>` |
 
 A partial conversion of layers `0:N` is a model of N + 1 layers that llama.cpp loads as such.
 
@@ -233,7 +233,12 @@ A packed weight on the card runs the fastest of its products that is no farther 
 Products whose measured times differ by less than their measured noise are tied.
 A tie falls to the product nearest the exact one, so the timing noise of a load does not change the text.
 
-A routing prior that the file lacks is borrowed from a companion GGUF beside it, found by the metadata it declares.
+A routing prior that the file lacks is borrowed from a companion GGUF, found by the metadata it declares.
+
+The companions of a model in an Ollama store are the files its manifest names.
+They are the further layers of its manifest and the model of its `<tag>-dspark` manifest.
+Another model's blob in the same `blobs/` directory is never one.
+A model file outside a store takes its companions from its directory.
 
 Across machines, the model splits into runs of layers as a dense stack does, see [Cluster](CLUSTER.md#planning-a-cut).
 

@@ -464,19 +464,21 @@ impl GenericHeteroTransformer {
         Ok(model)
     }
 
-    /// Takes the block draft the first file beside `model` declares, in place of the one the
-    /// model file carried.
+    /// Takes the block draft the first companion file of `model` declares, in place of the one
+    /// the model file carried.
     ///
-    /// A file is one whose metadata holds a key under the draft's prefix.
+    /// A companion is one whose metadata holds a key under the draft's prefix.
+    /// A blob of a store takes it from the manifests that name the blob, a plain file from its
+    /// directory.
     /// A file that does not load is passed over for the next.
     /// A model that is not a Sinkhorn wide residual reads no file.
-    /// Returns whether a file beside `model` gave the draft.
+    /// Returns whether a companion file gave the draft.
     pub fn locate_block_draft(&mut self, model: &std::path::Path) -> bool {
         if self.wide_sparse.is_none() {
             return false;
         }
         let prefix = format!("{ARCH}.dspark.");
-        for path in super::super::wide_sparse_sibling::find_beside(model, &prefix) {
+        for path in super::super::wide_sparse_sibling::find_companions(model, &prefix) {
             let loaded = companion_draft(&path)
                 .and_then(|d| d.map(|h| self.attach_block_draft(h)).transpose());
             match loaded {

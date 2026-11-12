@@ -395,7 +395,7 @@ pub(crate) async fn convert_model(
             .map_err(|e| e.to_string())?;
             progress(0, 0, "writing manifest");
             ollama::store_gguf_with_digest(manager.ollama(), &work, &digest, &name, [None; 4])?;
-            // The draft is a companion of its own, which the loader finds beside the model.
+            // The draft is a companion of its own, which the loader finds through the model's tag.
             if with_draft {
                 let digest = complete::write_draft(
                     &src,
@@ -426,10 +426,14 @@ pub(crate) async fn convert_model(
     }))
 }
 
-/// The name a conversion's draft companion is stored under: the model's tag with `-dspark`.
+/// The name a conversion's draft companion is stored under: the model's tag with the companion
+/// suffix the loader reads.
 fn draft_name(name: &str) -> String {
     let (model, tag) = name.split_once(':').unwrap_or((name, "latest"));
-    format!("{model}:{tag}-dspark")
+    format!(
+        "{model}:{tag}{}",
+        crate::inference::generic_transformer::wide_sparse_sibling::COMPANION_TAG_SUFFIX
+    )
 }
 
 #[cfg(test)]

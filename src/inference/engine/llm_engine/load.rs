@@ -647,8 +647,8 @@ enum Placed {
     Spliced(crate::inference::model::qwen35::vision::Qwen35Vision),
 }
 
-/// `model` with the block draft a file beside `model_file` declares, in place of the one the
-/// model file carried.
+/// `model` with the block draft a companion file of `model_file` declares, in place of the one
+/// the model file carried.
 ///
 /// A share of the layers takes none: a block draft reads the layers of every range of the stack.
 pub(super) fn with_companion_draft(
