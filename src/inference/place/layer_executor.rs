@@ -271,10 +271,11 @@ impl HeteroPlan {
     /// Plans the blocks of a model whose output projection is uploaded after them to the
     /// card running its last card block. That card's free memory is held back by
     /// `head_bytes` before the blocks are divided; when holding it back moves the last card
-    /// block to another card, the projection follows it and the plan is redone, so the
-    /// projection always has room where the loader puts it. The loader also keeps the
-    /// runtime reserve free on that card after the projection, so the reserve is held there
-    /// too instead of being given to blocks. `block_bytes` counts the blocks alone.
+    /// block to another card, the projection follows it and the plan is redone with the room
+    /// held on both cards, so the projection always has room where the loader puts it.
+    /// The loader also keeps the runtime reserve free on that card after the projection, so
+    /// the reserve is held there too instead of being given to blocks. `block_bytes` counts
+    /// the blocks alone.
     pub fn calculate_holding_head(
         total_layers: usize,
         block_bytes: u64,
@@ -305,20 +306,20 @@ impl HeteroPlan {
         } else {
             0
         };
+        // Every card that was the last card of a plan keeps the projection's room held back.
+        // The set of those cards only grows, so the loop ends after 1 turn per card at most.
+        // The plan it returns has the room held on its last card.
         let mut plan = plan_with(cuda_devices);
-        let mut holder = None;
-        for _ in 0..cuda_devices.len() {
-            let Some(card) = last_card(&plan) else {
-                break;
-            };
-            if holder == Some(card) {
+        let mut holders: Vec<usize> = Vec::new();
+        while let Some(card) = last_card(&plan) {
+            if holders.contains(&card) {
                 break;
             }
-            holder = Some(card);
+            holders.push(card);
             let devs: Vec<(usize, u64)> = cuda_devices
                 .iter()
                 .map(|&(i, free)| {
-                    if i == card {
+                    if holders.contains(&i) {
                         (i, free.saturating_sub(held))
                     } else {
                         (i, free)
@@ -1310,6 +1311,41 @@ mod tests {
         assert_eq!(on(&held, 0), 16);
         let total: usize = held.segments.iter().map(|s| s.num_layers()).sum();
         assert_eq!(total, 80);
+    }
+
+    /// A model whose last block moves to the other card once the head is held back, and back
+    /// again once the other card holds it: the last card of the plan still holds the head
+    /// beside its blocks and their cache.
+    #[test]
+    fn the_head_keeps_room_on_the_last_card_when_its_holder_alternates() {
+        const GB: u64 = 1_000_000_000;
+        let cards = [(0, 15_270 * GB / 1000), (1, 15_340 * GB / 1000)];
+        let (layers, blocks, head) = (24usize, 11_463 * GB / 1000, 1_158 * GB / 1000);
+        let (kv, reserve) = (134_200_000u64, 549 * GB / 1000);
+        let plan = HeteroPlan::calculate_holding_head(layers, blocks, head, &cards, kv, reserve);
+        let last = plan
+            .segments
+            .iter()
+            .rev()
+            .find_map(|s| match s.kind {
+                DeviceKind::Cuda(i) => Some(i),
+                _ => None,
+            })
+            .unwrap();
+        let on_last: u64 = plan
+            .segments
+            .iter()
+            .filter(|s| s.kind == DeviceKind::Cuda(last))
+            .map(|s| s.num_layers() as u64)
+            .sum();
+        let given = on_last * (blocks / layers as u64 + kv);
+        let free = cards.iter().find(|c| c.0 == last).unwrap().1;
+        assert!(
+            given + head <= free,
+            "card {last} holds {given} bytes of blocks and cache, no room for the head"
+        );
+        let total: usize = plan.segments.iter().map(|s| s.num_layers()).sum();
+        assert_eq!(total, layers);
     }
 
     #[test]

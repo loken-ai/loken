@@ -334,6 +334,26 @@ mod tests {
         );
     }
 
+    /// A model with a head that 1 card holds at a smaller context is not spread over 2 cards
+    /// when the head's holder alternates between them at a larger one.
+    #[test]
+    fn the_context_halves_until_one_card_holds_the_model_and_its_head() {
+        const MB: u64 = 1_000_000;
+        let cards = [(0, 15_270 * MB), (1, 15_340 * MB)];
+        // 24 blocks, a head, a cache of 2048 bytes a key in each block.
+        let at = |ctx: u64| Demand {
+            layers: 24,
+            block_bytes: 11_463 * MB,
+            head_bytes: 1_158 * MB,
+            kv_bytes_per_layer: ctx * 2048,
+            runtime_reserve: 549 * MB,
+        };
+        assert_eq!(cards_used(&at(65536), &cards), 2);
+        let held = context_the_cards_hold(131072, 4096, &cards, |_| None, false, false, at);
+        assert_eq!(held, 32768);
+        assert_eq!(cards_used(&at(held), &cards), 1);
+    }
+
     /// Two cards hold the model at any context, but the larger one leaves fewer blocks on the
     /// faster card: the context gives way until the fast card holds as many as it can.
     #[test]

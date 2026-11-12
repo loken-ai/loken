@@ -433,6 +433,44 @@ fn the_plan_places_every_block_exactly_once() {
     }
 }
 
+/// The card of the last block keeps room for the output head beside its blocks.
+///
+/// The loader uploads the head to that card after the blocks.
+/// Checked over the same sweep, with 2 sizes of head.
+#[test]
+fn the_last_card_keeps_room_for_the_head() {
+    const GB: u64 = 1_000_000_000;
+    for t in sweep() {
+        let bpl = t.bytes_per_layer();
+        for head in [GB / 2, 2 * GB] {
+            let plan = HeteroPlan::calculate_holding_head(
+                t.total_layers,
+                t.model_bytes,
+                head,
+                &t.cards,
+                t.kv_per_layer,
+                t.reserve,
+            );
+            let last = plan.segments.iter().rev().find_map(|s| match s.kind {
+                DeviceKind::Cuda(i) => Some(i),
+                _ => None,
+            });
+            let Some(last) = last else { continue };
+            let capacity = t.cards.iter().find(|c| c.0 == last).map_or(0, |c| c.1);
+            let held = blocks_on(&plan, DeviceKind::Cuda(last)) as u64 * bpl;
+            assert!(
+                held + head <= capacity,
+                "CUDA({last}) holds {:.2} GB of blocks on a {:.2} GB card, no room for a \
+                 {:.2} GB head. Topology: {t:?}, plan: {:?}",
+                held as f64 / 1e9,
+                capacity as f64 / 1e9,
+                head as f64 / 1e9,
+                blocks_by_kind(&plan),
+            );
+        }
+    }
+}
+
 /// The rule is about DEVICES, not about CUDA. A slower accelerator is still a card.
 ///
 /// The whole placement path is written over a CUDA list with a second list beside it, and

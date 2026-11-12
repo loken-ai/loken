@@ -1098,7 +1098,8 @@ impl LlmEngine {
                     let demand = demand_at(ctx_for_planning);
                     // A model the cards hold whole with room for a full prefill chunk beside each
                     // card's layers keeps that room: its prompts then cross every layer in whole
-                    // chunks. One the room would push onto the host keeps the smaller reserve.
+                    // chunks. One the room would push onto the host or onto more cards keeps the
+                    // smaller reserve.
                     let demand = {
                         let roomy = crate::inference::place::ladder::Demand {
                             runtime_reserve: dims.full_chunk_reserve(),
@@ -1109,7 +1110,13 @@ impl LlmEngine {
                             !plan.segments.is_empty()
                                 && plan.segments.iter().all(|s| matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cuda(_)))
                         };
-                        if roomy.runtime_reserve > demand.runtime_reserve && on_cards(&roomy) {
+                        let cards = |d: &crate::inference::place::ladder::Demand| {
+                            crate::inference::place::ladder::cards_of(&d.plan(&cuda_devices)).len()
+                        };
+                        if roomy.runtime_reserve > demand.runtime_reserve
+                            && on_cards(&roomy)
+                            && cards(&roomy) <= cards(&demand)
+                        {
                             info!(
                                 "placement keeps {:.2} GB a card for whole prefill chunks",
                                 roomy.runtime_reserve as f64 / 1e9
