@@ -909,7 +909,7 @@ pub(super) fn in_layer_format(
         let qm = match rest.strip_suffix(".weight")? {
             "attn_q" | "attn_k" | "attn_v" => l.attn_q.as_ref().or(l.attn_qkv.as_ref()),
             "attn_qkv" => l.attn_qkv.as_ref(),
-            "attn_output" => Some(&l.attn_output),
+            "attn_output" | "attn_out" => Some(&l.attn_output),
             "ffn_gate" => l.ffn_gate.as_ref().or(Some(&l.ffn_up)),
             "ffn_up" => Some(&l.ffn_up),
             "ffn_down" => Some(&l.ffn_down),
@@ -6067,7 +6067,7 @@ mod split_tests {
         let gib = 1u64 << 30;
         // Sixteen GiB, three of weights, a 136 KiB token over the whole stack.
         let fit = cache_tokens_that_fit(16 * gib, 3 * gib, 136 * 1024);
-        assert!(fit % 256 == 0);
+        assert!(fit.is_multiple_of(256));
         let held = fit as u64 * 136 * 1024 + 3 * gib;
         assert!(
             held < 14 * gib,

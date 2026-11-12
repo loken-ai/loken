@@ -93,6 +93,10 @@ pub struct DenseSpec {
     pub norm_topk: bool,
     /// The factor a block's output is scaled by before it joins the residual.
     pub residual_scale: Option<f32>,
+    /// The cap the attention scores are squashed under by `cap * tanh(score / cap)`.
+    pub attn_softcap: Option<f32>,
+    /// The experts' gate and up combine through the clamped SwiGLU, `(alpha, limit)`.
+    pub swiglu_clamp: Option<(f32, f32)>,
 }
 
 /// A weight as the file stores it.
@@ -113,11 +117,16 @@ pub enum FfnTensors<'a> {
     },
     /// A routed FFN: the router's weights, and each projection's experts stacked, rows of one
     /// expert after the other.
+    /// The biases are the router's, one a logit, and each projection's, one row an expert.
     Experts {
         router: Vec<f32>,
         gate: RawTensor<'a>,
         up: RawTensor<'a>,
         down: RawTensor<'a>,
+        router_bias: Option<Vec<f32>>,
+        gate_bias: Option<Vec<f32>>,
+        up_bias: Option<Vec<f32>>,
+        down_bias: Option<Vec<f32>>,
     },
 }
 
@@ -134,6 +143,9 @@ pub struct LayerTensors<'a> {
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     pub o: RawTensor<'a>,
+    pub o_bias: Option<Vec<f32>>,
+    /// Each head's sink logit, which joins its softmax denominator and adds no value.
+    pub sinks: Option<Vec<f32>>,
     /// The RMS norm that opens the FFN, or none when the FFN reads the residual.
     pub ffn_norm: Option<Vec<f32>>,
     pub ffn: FfnTensors<'a>,
@@ -155,6 +167,8 @@ pub fn runs_format(dtype: GgmlDType) -> bool {
         GgmlDType::Q4K
             | GgmlDType::Q6K
             | GgmlDType::Q8_0
+            | GgmlDType::Q5_0
+            | GgmlDType::MxFp4
             | GgmlDType::F16
             | GgmlDType::BF16
             | GgmlDType::F32
@@ -205,6 +219,12 @@ impl Matrix {
                     Some("mm_q8_0"),
                     Cow::Owned(repack_q8_0(&t.bytes)),
                 ),
+                GgmlDType::Q5_0 => (
+                    "mv_q5_0",
+                    Some("mm_q5_0"),
+                    Cow::Owned(repack_q5_0(&t.bytes)),
+                ),
+                GgmlDType::MxFp4 => ("mv_mxfp4", None, Cow::Owned(repack_mxfp4(&t.bytes))),
                 other => anyhow::bail!("vulkan: no mat-vec for {}", other.gguf_name()),
             };
         let coop_mat = mat_mat.filter(|_| coop && COOP_MIN_TOKENS.is_some());
@@ -240,6 +260,34 @@ fn repack_q8_0(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Q5_0 blocks (the f16 scale, 4 bytes of fifth bits, then 16 bytes of nibbles) written with
+/// the scale and the fifth bits in a word each.
+fn repack_q5_0(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bytes.len() / 22 * 24];
+    for (src, dst) in bytes.chunks_exact(22).zip(out.chunks_exact_mut(24)) {
+        dst[..2].copy_from_slice(&src[..2]);
+        dst[4..].copy_from_slice(&src[2..]);
+    }
+    out
+}
+
+/// MXFP4 blocks (the E8M0 exponent, then 16 bytes of nibbles) written with the block's scale as
+/// an f32 word: half the exponent's power of two, as the kernel reads each code at twice its value.
+fn repack_mxfp4(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bytes.len() / 17 * 20];
+    for (src, dst) in bytes.chunks_exact(17).zip(out.chunks_exact_mut(20)) {
+        let e = u32::from(src[0]);
+        let bits = if e < 2 {
+            0x0020_0000 << e
+        } else {
+            (e - 1) << 23
+        };
+        dst[..4].copy_from_slice(&bits.to_le_bytes());
+        dst[4..].copy_from_slice(&src[1..]);
+    }
+    out
+}
+
 /// A layer's FFN on the device.
 enum Ffn {
     Dense {
@@ -252,6 +300,10 @@ enum Ffn {
         gate: Matrix,
         up: Matrix,
         down: Matrix,
+        router_bias: Option<Buffer>,
+        gate_bias: Option<Buffer>,
+        up_bias: Option<Buffer>,
+        down_bias: Option<Buffer>,
     },
 }
 
@@ -266,6 +318,8 @@ struct Layer {
     q_norm: Option<Buffer>,
     k_norm: Option<Buffer>,
     o: Matrix,
+    o_bias: Option<Buffer>,
+    sinks: Option<Buffer>,
     ffn_norm: Option<Buffer>,
     ffn: Ffn,
     qk_full: bool,
@@ -369,7 +423,7 @@ impl VulkanStack {
             || !s.head_dim.is_multiple_of(8)
             || s.n_kv == 0
             || !s.n_head.is_multiple_of(s.n_kv)
-            || !(super::shaders::ATTN_ROWS as usize).is_multiple_of(s.n_head / s.n_kv)
+            || s.n_head / s.n_kv > super::shaders::ATTN_ROWS as usize
         {
             anyhow::bail!(
                 "vulkan: heads of {} lanes in {}/{} groups",
@@ -404,6 +458,8 @@ impl VulkanStack {
                 q_norm: opt(&l.q_norm)?,
                 k_norm: opt(&l.k_norm)?,
                 o: Matrix::upload(&ctx, &l.o, ctx.coop())?,
+                o_bias: opt(&l.o_bias)?,
+                sinks: opt(&l.sinks)?,
                 ffn_norm: opt(&l.ffn_norm)?,
                 ffn: match &l.ffn {
                     FfnTensors::Dense { gate, up, down } => Ffn::Dense {
@@ -416,11 +472,19 @@ impl VulkanStack {
                         gate,
                         up,
                         down,
+                        router_bias,
+                        gate_bias,
+                        up_bias,
+                        down_bias,
                     } => Ffn::Experts {
                         router: f32buf(router)?,
                         gate: Matrix::upload(&ctx, gate, false)?,
                         up: Matrix::upload(&ctx, up, false)?,
                         down: Matrix::upload(&ctx, down, false)?,
+                        router_bias: opt(router_bias)?,
+                        gate_bias: opt(gate_bias)?,
+                        up_bias: opt(up_bias)?,
+                        down_bias: opt(down_bias)?,
                     },
                 },
                 qk_full: s.n_head * s.head_dim != s.head_dim
@@ -654,38 +718,53 @@ impl VulkanStack {
 
     /// The routed FFN of a layer: route each token, run the chosen experts' gate and up, the
     /// activation, their down, and weigh the results into the residual.
-    fn expert_ops(
-        &self,
-        ops: &mut Vec<Op>,
-        tokens: usize,
-        l: &Layer,
-        router: &Buffer,
-        gate: &Matrix,
-        up: &Matrix,
-        down: &Matrix,
-    ) {
+    fn expert_ops(&self, ops: &mut Vec<Op>, tokens: usize, l: &Layer) {
+        let Ffn::Experts {
+            router,
+            gate,
+            up,
+            down,
+            router_bias,
+            gate_bias,
+            up_bias,
+            down_bias,
+        } = &l.ffn
+        else {
+            return;
+        };
         let s = &self.spec;
         let pairs = (tokens * s.used) as u32;
         // The router reads the f32 copy.
         // The experts run mat-vecs, which read a scale to each block.
         ops.push(self.opening_quant(l.ffn_norm.as_ref(), tokens, 1));
         let mut a = [0u32; 16];
-        a[..5].copy_from_slice(&[
+        a[..6].copy_from_slice(&[
             tokens as u32,
             s.hidden as u32,
             s.experts as u32,
             s.used as u32,
             u32::from(s.norm_topk),
+            u32::from(router_bias.is_some()),
         ]);
         ops.push(self.op(
             super::shaders::router_kernel(s.experts),
-            &[&self.xn, router, &self.route],
+            &[
+                &self.xn,
+                router,
+                &self.route,
+                router_bias.as_ref().unwrap_or(&self.dummy),
+            ],
             a,
             [tokens as u32, 1, 1],
             true,
         ));
         let rows_per = s.expert_ffn;
-        let product = |w: &Matrix, y: &Buffer, xmode: u32, rows: usize, barrier: bool| {
+        let product = |w: &Matrix,
+                       y: &Buffer,
+                       bias: Option<&Buffer>,
+                       xmode: u32,
+                       rows: usize,
+                       barrier: bool| {
             let mut a = [0u32; 16];
             a[..8].copy_from_slice(&[
                 rows as u32,
@@ -693,7 +772,7 @@ impl VulkanStack {
                 s.used as u32,
                 0,
                 0,
-                0,
+                u32::from(bias.is_some()) << 1,
                 xmode,
                 rows as u32,
             ]);
@@ -705,7 +784,7 @@ impl VulkanStack {
                     &w.buf,
                     &self.xq,
                     y,
-                    &self.dummy,
+                    bias.unwrap_or(&self.dummy),
                     &self.xm,
                     &self.xn,
                     &self.route,
@@ -715,18 +794,49 @@ impl VulkanStack {
                 barrier,
             )
         };
-        ops.push(product(gate, &self.moe_gate, 0, rows_per, true));
-        ops.push(product(up, &self.moe_up, 0, rows_per, false));
-        ops.push(self.quant(
-            if s.gelu { 3 } else { 2 },
+        ops.push(product(
+            gate,
+            &self.moe_gate,
+            gate_bias.as_ref(),
+            0,
+            rows_per,
+            true,
+        ));
+        ops.push(product(
+            up,
+            &self.moe_up,
+            up_bias.as_ref(),
+            0,
+            rows_per,
+            false,
+        ));
+        let mode = match (s.swiglu_clamp, s.gelu) {
+            (Some(_), _) => 4,
+            (None, true) => 3,
+            (None, false) => 2,
+        };
+        let mut act = self.quant(
+            mode,
             &self.moe_gate,
             &self.moe_up,
             pairs as usize,
             rows_per,
             0,
             quant_flags(&[down], 1),
+        );
+        if let Some((alpha, limit)) = s.swiglu_clamp {
+            act.args[6] = alpha.to_bits();
+            act.args[7] = limit.to_bits();
+        }
+        ops.push(act);
+        ops.push(product(
+            down,
+            &self.moe_down,
+            down_bias.as_ref(),
+            1,
+            s.hidden,
+            true,
         ));
-        ops.push(product(down, &self.moe_down, 1, s.hidden, true));
         let mut a = [0u32; 16];
         a[..4].copy_from_slice(&[
             tokens as u32,
@@ -743,15 +853,22 @@ impl VulkanStack {
         ));
     }
 
-    /// The product that ends a block: scaled by the residual scale, then added to the residual,
-    /// or with a post norm, normed first.
-    fn closing_product(&self, ops: &mut Vec<Op>, tokens: usize, w: &Matrix, norm: Option<&Buffer>) {
+    /// The product that ends a block, with its bias when it has one: scaled by the residual
+    /// scale, then added to the residual, or with a post norm, normed first.
+    fn closing_product(
+        &self,
+        ops: &mut Vec<Op>,
+        tokens: usize,
+        w: &Matrix,
+        bias: Option<&Buffer>,
+        norm: Option<&Buffer>,
+    ) {
         let scale = self.spec.residual_scale;
         let Some(norm) = norm else {
-            self.matvec(ops, w, &self.x, None, true, scale, tokens, true);
+            self.matvec(ops, w, &self.x, bias, true, scale, tokens, true);
             return;
         };
-        self.matvec(ops, w, &self.block, None, false, scale, tokens, true);
+        self.matvec(ops, w, &self.block, bias, false, scale, tokens, true);
         let mut args = [0u32; 16];
         args[..4].copy_from_slice(&[
             tokens as u32,
@@ -943,6 +1060,9 @@ impl VulkanStack {
                 s.attn_scale.to_bits(),
                 s.ctx as u32,
             ]);
+            a[7] = s.attn_softcap.unwrap_or(0.0).to_bits();
+            a[8] = u32::from(l.sinks.is_some());
+            let sinks = l.sinks.as_ref().unwrap_or(&self.dummy);
             let wide = s.head_dim > 128;
             if tokens > MV_TOKENS {
                 a[5] = t;
@@ -954,12 +1074,7 @@ impl VulkanStack {
                         "attn_tiled"
                     },
                     &[
-                        &self.q,
-                        &l.k_cache,
-                        &l.v_cache,
-                        &self.attn,
-                        &self.dummy,
-                        &self.step,
+                        &self.q, &l.k_cache, &l.v_cache, &self.attn, sinks, &self.step,
                     ],
                     a,
                     [
@@ -990,7 +1105,7 @@ impl VulkanStack {
                 ));
                 ops.push(self.op(
                     "attention_join",
-                    &[&self.part, &self.dummy, &self.dummy, &self.attn],
+                    &[&self.part, &self.dummy, &self.dummy, &self.attn, sinks],
                     a,
                     [s.n_head as u32, t, 1],
                     true,
@@ -1005,7 +1120,13 @@ impl VulkanStack {
                 0,
                 quant_flags(&[&l.o], tokens),
             ));
-            self.closing_product(&mut ops, tokens, &l.o, l.post_attn_norm.as_ref());
+            self.closing_product(
+                &mut ops,
+                tokens,
+                &l.o,
+                l.o_bias.as_ref(),
+                l.post_attn_norm.as_ref(),
+            );
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
                     ops.push(self.opening_quant(
@@ -1027,16 +1148,9 @@ impl VulkanStack {
                         0,
                         quant_flags(&[down], tokens),
                     ));
-                    self.closing_product(&mut ops, tokens, down, l.post_ffn_norm.as_ref());
+                    self.closing_product(&mut ops, tokens, down, None, l.post_ffn_norm.as_ref());
                 }
-                Ffn::Experts {
-                    router,
-                    gate,
-                    up,
-                    down,
-                } => {
-                    self.expert_ops(&mut ops, tokens, l, router, gate, up, down);
-                }
+                Ffn::Experts { .. } => self.expert_ops(&mut ops, tokens, l),
             }
         }
         if let Some(hd) = self.head.as_ref().filter(|_| head) {

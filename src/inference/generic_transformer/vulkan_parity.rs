@@ -590,6 +590,84 @@ family!(granite, "granite3.1-dense:2b", super::TIE);
 // tie, is held by the other tests alone.
 family!(granite_moe, "granite3-moe:1b", super::TIE, {});
 family!(olmo2, "olmo2:7b", super::TIE, {});
+family!(gemma2, "shieldgemma:2b", super::TIE, {});
+
+/// Attention sinks, output and expert biases, and experts in MXFP4 behind the clamped SwiGLU: the
+/// first layer, the logit spread and the greedy text hold it.
+/// Its long prompt parts from the host's on a native card too, at margins above the tie.
+mod gpt_oss {
+    const TAG: &str = "gpt-oss:20b";
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn first_layer() {
+        super::first_layers_match(TAG, 1, 0.1);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn logit_noise() {
+        super::logit_noise(TAG, 1.5, false);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn greedy_text() {
+        super::greedy_text_matches(TAG, super::TIE);
+    }
+}
+
+/// Recurrent layers between layers that attend: the host runs the recurrent ones, Vulkan the
+/// others, and each is reported where it runs.
+/// Its greedy text parts from the host's on a native card too, at a margin above the tie.
+mod lfm2 {
+    const TAG: &str = "lfm2.5-thinking:latest";
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn long_prompt() {
+        super::long_prompt_matches(TAG, super::TIE, 14);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn first_layers() {
+        let fx = super::Fixture::open_tag(TAG);
+        let first = (0..fx.n_layers)
+            .find(|&i| fx.build(&fx.host()).layers[i].attends())
+            .unwrap();
+        super::first_layers_match(TAG, first + 1, 0.1);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn logit_noise() {
+        super::logit_noise(TAG, 1.5, false);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn layers_are_reported_where_they_run() {
+        let fx = super::Fixture::open_tag(TAG);
+        for d in crate::inference::kernel::vulkan::devices() {
+            let m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
+            let mut want: Vec<(String, usize, u32, u32)> = Vec::new();
+            for (i, l) in m.layers.iter().enumerate() {
+                let (kind, at) = if l.attends() {
+                    ("Vulkan".to_string(), d.index)
+                } else {
+                    ("CPU".to_string(), 0)
+                };
+                match want.last_mut() {
+                    Some(last) if last.0 == kind && last.1 == at => last.3 = i as u32,
+                    _ => want.push((kind, at, i as u32, i as u32)),
+                }
+            }
+            assert!(want.iter().any(|w| w.0 == "Vulkan"), "{}", d.name);
+            assert_eq!(m.device_layer_distribution(), want, "{}", d.name);
+        }
+    }
+}
 
 /// A mixture of experts: where the host's best experts for a token are within rounding of the
 /// next ones, the two pick other experts and the logits part by more than rounding. The
@@ -616,6 +694,31 @@ mod olmoe {
     #[ignore = "needs the model in the store and a Vulkan device"]
     fn logit_noise() {
         super::logit_noise(TAG, 2.5, false);
+    }
+}
+
+/// Weights in Q5_0, and query heads that share a key head in groups that do not divide a block of
+/// the prompt attention: the first layer, the logit spread and the greedy text hold it.
+/// Its long prompt parts from the host's on a native card too, at margins above the tie.
+mod qwen2 {
+    const TAG: &str = "qwen2.5:0.5b";
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn first_layer() {
+        super::first_layers_match(TAG, 1, 0.1);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn logit_noise() {
+        super::logit_noise(TAG, 1.5, false);
+    }
+
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn greedy_text() {
+        super::greedy_text_matches(TAG, super::TIE);
     }
 }
 

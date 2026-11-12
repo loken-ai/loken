@@ -34,6 +34,31 @@ fn argf(i: u32) -> f32 { return bitcast<f32>(arg(i)); }
 fn dot4(a: vec4<u32>, b: vec4<u32>) -> i32 {
     return dot4I8Packed(a.x, b.x) + dot4I8Packed(a.y, b.y) + dot4I8Packed(a.z, b.z) + dot4I8Packed(a.w, b.w);
 }
+// A score squashed under the cap of argument 7, or as it is when that is 0.
+fn capped(x: f32) -> f32 {
+    let cap = argf(7u);
+    return select(x, cap * tanh(x / cap), cap > 0.0);
+}
+// Four Q5_0 values as packed int8: the nibbles of half `hf` of word `j` of the block's low bits
+// `qs`, and their fifth bits from `qh`, less 16.
+fn q5w(qs: u32, qh: u32, hf: u32, j: u32) -> u32 {
+    let lo = (qs >> (4u * hf)) & 0x0F0F0F0Fu;
+    let hb = (qh >> (16u * hf + 4u * j)) & 15u;
+    let fifth = ((hb & 1u) << 4u) | ((hb & 2u) << 11u) | ((hb & 4u) << 18u) | ((hb & 8u) << 25u);
+    return lo | (0xF0F0F0F0u ^ (fifth * 15u));
+}
+// Four MXFP4 values as packed int8: the nibbles of half `hf` of word `qs`, each an E2M1 code
+// read as twice its value.
+fn mxw(qs: u32, hf: u32) -> u32 {
+    var r = 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let c = (qs >> (8u * i + 4u * hf)) & 15u;
+        let m = c & 7u;
+        let v = select(m, select(select(12u, 8u, m == 6u), 6u, m == 5u), m > 4u);
+        r = r | (select(v, (256u - v) & 255u, c > 7u) << (8u * i));
+    }
+    return r;
+}
 "#;
 
 /// Quantises rows of `n` values to int8 blocks (see the module comment), after an optional
@@ -41,7 +66,9 @@ fn dot4(a: vec4<u32>, b: vec4<u32>) -> i32 {
 /// With flag 2 and `n` a multiple of 128, the 4 blocks of each 128 values share one scale.
 /// Args: rows, n, src_off, eps, flags (1: also write the transformed values as f32 to `xn`,
 /// 2: share the scale across 128 values), mode (0 copy, 1 RMS norm with weight `b`,
-/// 2 `silu(a) * b`, 3 the same with GELU).
+/// 2 `silu(a) * b`, 3 the same with GELU, 4 the clamped SwiGLU), alpha, limit.
+/// The clamped SwiGLU is `g * sigmoid(alpha * g) * (1 + u)`.
+/// `g` is `a` capped at `limit`, `u` is `b` clamped to `[-limit, limit]`.
 /// One workgroup per row; eight values a lane, four lanes a block.
 const QUANT: &str = r#"
 @group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;
@@ -62,6 +89,12 @@ fn val(i: u32, base: u32, mode: u32, scale: f32) -> vec4<f32> {
         let u = 0.7978845608 * (v + 0.044715 * v * v * v);
         let e = exp(-2.0 * clamp(u, vec4<f32>(-20.0), vec4<f32>(20.0)));
         return 0.5 * v * (vec4<f32>(1.0) + (vec4<f32>(1.0) - e) / (vec4<f32>(1.0) + e)) * b[base + i];
+    }
+    if (mode == 4u) {
+        let lim = argf(7u);
+        let g = min(v, vec4<f32>(lim));
+        let u = clamp(b[base + i], vec4<f32>(-lim), vec4<f32>(lim));
+        return g / (vec4<f32>(1.0) + exp(-argf(6u) * g)) * (vec4<f32>(1.0) + u);
     }
     return v;
 }
@@ -163,11 +196,12 @@ fn main(
 /// normed activations, their softmax, and the `K` best with their weights, written to `route` as
 /// (expert, weight bits). One workgroup of 256 lanes a token; `256 / EP` lanes an expert, `EP`
 /// the experts rounded up to a power of two. Args: tokens, hidden, experts, K, flag (1: the
-/// chosen weights are renormalised).
+/// chosen weights are renormalised), flag (1: `bias` is added to the logits).
 const ROUTER: &str = r#"
 @group(0) @binding(0) var<storage, read> xnorm: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> rw: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> route: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
 var<workgroup> logit: array<f32, EP>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -181,7 +215,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         for (var i = part; i < h4; i = i + 256u / EP) { s = s + dot(xnorm[wid.x * h4 + i], rw[e * h4 + i]); }
     }
     SHUFFLE_SUM
-    if (part == 0u && e < ne) { logit[e] = s; }
+    if (part == 0u && e < ne) { logit[e] = s + select(0.0, bias[e], arg(5u) == 1u); }
     workgroupBarrier();
     if (li == 0u) {
         var m = -3.0e38;
@@ -376,6 +410,47 @@ const Q8_0_ITEM: (&str, &str, &str) = (
         let sb = (row * (k / 32u) + blk) * 9u;
         let d = unpack2x16float(w[sb]).x;
         let wv = vec4<u32>(w[sb + 1u + h * 4u], w[sb + 2u + h * 4u], w[sb + 3u + h * 4u], w[sb + 4u + h * 4u]);
+        for (var t = 0u; t < nt; t = t + 1u) {
+            acc[t] = acc[t] + d * xm[(tb + t) * (k / 32u) + blk].x * f32(dot4(wv, xq[(tb + t) * (k / 16u) + blk * 2u + h]));
+        }
+"#,
+);
+
+/// Q5_0, repacked to 6 words a block of 32: d, the fifth bits, then the 16 bytes of nibbles. An
+/// item is sixteen values, one nibble of each byte.
+const Q5_0_ITEM: (&str, &str, &str) = (
+    "u32",
+    "(k / 32u) * 2u",
+    r#"
+        let blk = it >> 1u;
+        let h = it & 1u;
+        let sb = (row * (k / 32u) + blk) * 6u;
+        let d = unpack2x16float(w[sb]).x;
+        let qh = w[sb + 1u];
+        let wv = vec4<u32>(
+            q5w(w[sb + 2u], qh, h, 0u),
+            q5w(w[sb + 3u], qh, h, 1u),
+            q5w(w[sb + 4u], qh, h, 2u),
+            q5w(w[sb + 5u], qh, h, 3u),
+        );
+        for (var t = 0u; t < nt; t = t + 1u) {
+            acc[t] = acc[t] + d * xm[(tb + t) * (k / 32u) + blk].x * f32(dot4(wv, xq[(tb + t) * (k / 16u) + blk * 2u + h]));
+        }
+"#,
+);
+
+/// MXFP4, repacked to 5 words a block of 32: the block's scale as an f32, then the 16 bytes of
+/// nibbles. The scale is half the E8M0 power of two, as the codes are read at twice their value.
+/// An item is sixteen values, one nibble of each byte.
+const MXFP4_ITEM: (&str, &str, &str) = (
+    "u32",
+    "(k / 32u) * 2u",
+    r#"
+        let blk = it >> 1u;
+        let h = it & 1u;
+        let sb = (row * (k / 32u) + blk) * 5u;
+        let d = bitcast<f32>(w[sb]);
+        let wv = vec4<u32>(mxw(w[sb + 1u], h), mxw(w[sb + 2u], h), mxw(w[sb + 3u], h), mxw(w[sb + 4u], h));
         for (var t = 0u; t < nt; t = t + 1u) {
             acc[t] = acc[t] + d * xm[(tb + t) * (k / 32u) + blk].x * f32(dot4(wv, xq[(tb + t) * (k / 16u) + blk * 2u + h]));
         }
@@ -714,6 +789,30 @@ const Q8_0_LOAD: (&str, u32, &str, &str) = (
 "#,
 );
 
+/// The staging of a Q5_0 step of 32 columns: a lane takes half a block.
+const Q5_0_LOAD: (&str, u32, &str, &str) = (
+    "u32",
+    32,
+    "BLOCKS",
+    r#"
+            let row = li >> 1u;
+            let hf = li & 1u;
+            let gr = min(row0 + row, m - 1u);
+            let sb = (gr * (k / 32u) + kk / 32u) * 6u;
+            let qh = w[sb + 1u];
+            sw[row * SV + hf] = vec4<u32>(
+                q5w(w[sb + 2u], qh, hf, 0u),
+                q5w(w[sb + 3u], qh, hf, 1u),
+                q5w(w[sb + 4u], qh, hf, 2u),
+                q5w(w[sb + 5u], qh, hf, 3u),
+            );
+            if (hf == 0u) {
+                let d = unpack2x16float(w[sb]).x;
+                ss[row] = vec4<f32>(d, d, 0.0, 0.0);
+            }
+"#,
+);
+
 /// The F16 mat-mat: 64 rows by 32 tokens a workgroup of 128 lanes, each lane 4 by 4, against
 /// the f32 activations; a step stages 32 columns. Args as the mat-vec's.
 const MATMAT_F16: &str = r#"
@@ -800,13 +899,17 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 /// the `n_head / n_kv` heads that share the head, `R` of them a workgroup of 128 lanes. The keys
 /// go through shared memory in tiles of `TK` for all rows, with a running softmax per row. The
 /// scores of a tile are `RR` rows by `KK` keys a lane; the weighted values are four rows by
-/// eight dimensions a lane. Args: n_head, n_kv, hd, scale, -, tokens, window (0 for none). One workgroup per (key-value
-/// head, block of `R / (n_head / n_kv)` tokens); `hd` is at most `HD` and a multiple of 8.
+/// eight dimensions a lane. Args: n_head, n_kv, hd, scale, -, tokens, window (0 for none), cap (0
+/// for none, else scores become `cap * tanh(score / cap)`), sinks (1: each head's logit in `sinks`
+/// joins its softmax denominator). One workgroup per (key-value
+/// head, block of `R / (n_head / n_kv)` tokens), the rows past the block's tokens idle; `hd` is at
+/// most `HD` and a multiple of 8.
 const ATTENTION_TILED: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> kc: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> vc: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> sinks: array<f32>;
 @group(0) @binding(5) var<storage, read> step: array<u32>;
 const R: u32 = RROWS;
 const TK: u32 = TKEYS;
@@ -840,6 +943,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let g = wid.x;
     let gs = nh / nkv;
     let per = R / gs;
+    let rows = per * gs;
     let tb = wid.y * per;
     let hv = hd / 8u;
     let p0 = step[0];
@@ -848,7 +952,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let i = e % (hv * 2u);
         let tt = tb + r / gs;
         var v = vec4<f32>(0.0);
-        if (tt < ntok) { v = q[((tt * nh + g * gs + r % gs) * hd) / 4u + i]; }
+        if (tt < ntok && r < rows) { v = q[((tt * nh + g * gs + r % gs) * hd) / 4u + i]; }
         qs[r * QS + i] = v;
     }
     if (li < R) { mrow[li] = -3.0e38; lrow[li] = 0.0; }
@@ -890,8 +994,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
             let tq = tb + r / gs;
             for (var kk = 0u; kk < KKEYS; kk = kk + 1u) {
                 let key = kg + KG * kk;
-                let live = (k0 + key) <= (p0 + tq) && tq < ntok && (win == 0u || (k0 + key) + win > p0 + tq);
-                pt[r * PS + key] = select(-3.0e38, s[rr * KKEYS + kk] * scale, live);
+                let live = (k0 + key) <= (p0 + tq) && tq < ntok && r < rows && (win == 0u || (k0 + key) + win > p0 + tq);
+                pt[r * PS + key] = select(-3.0e38, capped(s[rr * KKEYS + kk] * scale), live);
             }
         }
         workgroupBarrier();
@@ -938,8 +1042,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         for (var rr = 0u; rr < RP; rr = rr + 1u) {
             let r = rp * RP + rr;
             let tq = tb + r / gs;
-            if (tq < ntok) {
-                let inv = 1.0 / lrow[r];
+            if (tq < ntok && r < rows) {
+                var l = lrow[r];
+                if (arg(8u) == 1u) { l = l + exp(sinks[g * gs + r % gs] - mrow[r]); }
+                let inv = 1.0 / l;
                 let ob = (tq * nh + g * gs + r % gs) * hd + 8u * dg;
                 let a = o[2u * rr] * inv;
                 let b = o[2u * rr + 1u] * inv;
@@ -978,10 +1084,7 @@ fn attention_tiled(hd: u32) -> String {
             .collect()
     };
     ATTENTION_TILED
-        .replace(
-            "SHUFFLE_MAX",
-            &shuffles("max", "mt").replace("= max(mt,", "= max(mt,"),
-        )
+        .replace("SHUFFLE_MAX", &shuffles("max", "mt"))
         .replace(
             "SHUFFLE_SUM",
             &(0..lpr.ilog2())
@@ -1087,7 +1190,8 @@ const PREP_KV_DST: &str = r#"
 /// dot a key with the query by a butterfly and keep a running softmax and output of their own,
 /// which the groups then merge. Writes the slice's unnormalised output, its maximum score and
 /// its sum of exponentials to `part` (rows of `hd + 2`); [`ATTENTION_JOIN`] puts the slices
-/// together. Args: n_head, n_kv, hd, scale, -, splits, window (0 for none). `hd` is at most 128
+/// together. Args: n_head, n_kv, hd, scale, -, splits, window (0 for none), cap (0 for none, else
+/// scores become `cap * tanh(score / cap)`). `hd` is at most 128
 /// times `CPL` and a multiple of 8; a lane owns `CPL` chunks of eight dimensions.
 const ATTENTION: &str = r#"
 @group(0) @binding(0) var<storage, read> q: array<f32>;
@@ -1163,7 +1267,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
             x = x + subgroupShuffleXor(x, 4u);
             x = x + subgroupShuffleXor(x, 2u);
             x = x + subgroupShuffleXor(x, 1u);
-            s[u] = x * scale;
+            s[u] = capped(x * scale);
             mt = max(mt, select(-3.0e38, s[u], ok[u]));
         }
         let alpha = exp(m - mt);
@@ -1228,10 +1332,13 @@ fn attention(cpl: u32) -> String {
 }
 
 /// The slices of [`ATTENTION`] put together: `out = sum_s exp(m_s - M) o_s / sum_s exp(m_s - M)
-/// l_s`. Args: n_head, n_kv, hd, -, -, splits. One workgroup of 256 lanes per (head, token).
+/// l_s`, the denominator also taking `exp(sink - M)` with a sink. Args: n_head, n_kv, hd, -, -,
+/// splits, -, -, sinks (1: each head's logit in `sinks` joins its softmax denominator). One
+/// workgroup of 256 lanes per (head, token).
 const ATTENTION_JOIN: &str = r#"
 @group(0) @binding(0) var<storage, read> part: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read> sinks: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let nh = arg(0u);
@@ -1248,6 +1355,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         l = l + wgt * part[at + hd + 1u];
         if (li < hd) { o = o + wgt * part[at + li]; }
     }
+    if (arg(8u) == 1u) { l = l + exp(sinks[wid.x] - m); }
     if (li < hd) { out[(wid.y * nh + wid.x) * hd + li] = o / l; }
 }
 "#;
@@ -1269,6 +1377,8 @@ pub(super) fn expert_kernel(mv: &str) -> &'static str {
         "mv_q4k" => "mx_q4k",
         "mv_q6k" => "mx_q6k",
         "mv_q8_0" => "mx_q8_0",
+        "mv_q5_0" => "mx_q5_0",
+        "mv_mxfp4" => "mx_mxfp4",
         "mv_bf16" => "mx_bf16",
         "mv_f32" => "mx_f32",
         _ => "mx_f16",
@@ -1357,6 +1467,8 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
         "mv_q4k" | "mx_q4k" => matvec(Q4K_ITEM),
         "mv_q6k" | "mx_q6k" => matvec(Q6K_ITEM),
         "mv_q8_0" | "mx_q8_0" => matvec(Q8_0_ITEM),
+        "mv_q5_0" | "mx_q5_0" => matvec(Q5_0_ITEM),
+        "mv_mxfp4" | "mx_mxfp4" => matvec(MXFP4_ITEM),
         "mv_f16" | "mx_f16" => matvec(F16_ITEM),
         "mv_bf16" | "mx_bf16" => matvec(BF16_ITEM),
         "mv_f32" | "mx_f32" => matvec(F32_ITEM),
@@ -1364,6 +1476,7 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
         "mm_q4k" => matmat(Q4K_LOAD),
         "mm_q6k" => matmat(Q6K_LOAD),
         "mm_q8_0" => matmat(Q8_0_LOAD),
+        "mm_q5_0" => matmat(Q5_0_LOAD),
         "mm_f16" => MATMAT_F16.to_string(),
         "attn_tiled" => attention_tiled(128),
         "attn_tiled_wide" => attention_tiled(256),

@@ -93,7 +93,8 @@ Placement offers the Vulkan GPUs that no other runtime of the build drives.
 They come after the CUDA or HIP cards and before the host.  
 A build with `vulkan` alone has no other runtime, so every GPU is offered.
 
-The layers of a dense decoder in `Q4_K`, `Q6_K`, `Q8_0` or `F16` run on Vulkan, with the output head when the last layer does.
+The layers of a decoder in `Q4_K`, `Q6_K`, `Q8_0`, `Q5_0`, `MXFP4`, `BF16`, `F16` or `F32` run on Vulkan, with the output head when the last layer does.
+A recurrent layer of a hybrid model runs on the host between them.
 Their weights count in the `size_vram` that `/api/ps` reports.
 A model of another shape stays off Vulkan and loads on the host.
 The context reads the storage binding limit and the allocation limit of the device.

@@ -101,6 +101,21 @@ fn matvec_q8_0() {
 }
 
 #[test]
+fn matvec_q5_0() {
+    check(GgmlDType::Q5_0, 3, false);
+}
+
+#[test]
+fn matvec_mxfp4() {
+    check(GgmlDType::MxFp4, 3, false);
+}
+
+#[test]
+fn many_tokens_mxfp4() {
+    check(GgmlDType::MxFp4, 40, false);
+}
+
+#[test]
 fn matvec_f16() {
     check(GgmlDType::F16, 3, false);
 }
@@ -141,6 +156,11 @@ fn matmat_q8_0() {
 }
 
 #[test]
+fn matmat_q5_0() {
+    check(GgmlDType::Q5_0, 40, false);
+}
+
+#[test]
 fn coop_q4k() {
     check(GgmlDType::Q4K, 100, true);
 }
@@ -153,6 +173,11 @@ fn coop_q6k() {
 #[test]
 fn coop_q8_0() {
     check(GgmlDType::Q8_0, 100, true);
+}
+
+#[test]
+fn coop_q5_0() {
+    check(GgmlDType::Q5_0, 100, true);
 }
 
 #[test]

@@ -212,6 +212,18 @@ const STAGEW_Q8_0: (&str, &str) = (
 "#,
 );
 
+/// Two Q5_0 blocks (64 columns): a lane takes one.
+const STAGEW_Q5_0: (&str, &str) = (
+    "u32",
+    r#"
+            let sbk = (gr * (k / 32u) + kk / 32u + hv) * 6u;
+            let d = unpack2x16float(w[sbk]).x;
+            let qh = w[sbk + 1u];
+            let o = lr * AS + hv * 32u;
+            for (var j = 0u; j < 8u; j = j + 1u) { put4(o + 4u * j, q5w(w[sbk + 2u + j % 4u], qh, j / 4u, j % 4u), d); }
+"#,
+);
+
 /// F16 weights: a lane takes 32 columns.
 const STAGEW_F16: (&str, &str) = (
     "vec4<u32>",
@@ -241,6 +253,7 @@ pub(super) fn body(name: &str) -> Option<String> {
         "cm_q4k" => (STAGEW_Q4K, STAGEX_Q),
         "cm_q6k" => (STAGEW_Q6K, STAGEX_Q),
         "cm_q8_0" => (STAGEW_Q8_0, STAGEX_Q),
+        "cm_q5_0" => (STAGEW_Q5_0, STAGEX_Q),
         "cm_f16" => (STAGEW_F16, STAGEX_F),
         _ => return None,
     };
@@ -258,6 +271,7 @@ pub(super) fn kernel_for(mat_mat: &'static str) -> &'static str {
         "mm_q4k" => "cm_q4k",
         "mm_q6k" => "cm_q6k",
         "mm_q8_0" => "cm_q8_0",
+        "mm_q5_0" => "cm_q5_0",
         _ => "cm_f16",
     }
 }

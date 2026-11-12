@@ -1,8 +1,10 @@
 //! The layers a placement gives a Vulkan device.
 //!
-//! Each Vulkan segment of the plan holds its layers in a [`VulkanStack`] built from the file's
-//! blocks. The host keeps its own build of those layers, which no forward runs; the layer loop
-//! hands a Vulkan segment's rows to the stack and takes the rows it returns. The stack's caches
+//! Each Vulkan segment of the plan holds its layers in [`VulkanStack`]s built from the file's
+//! blocks, one stack for each run of layers that attend.
+//! A layer of the segment that does not attend, as a recurrent one, runs on the host.
+//! The host keeps its own build of the stacks' layers, which no forward runs; the layer loop
+//! hands a stack's rows to it and takes the rows it returns. The stack's caches
 //! are positional, so a forward from `index_pos` overwrites what a cut cache dropped.
 //!
 //! Without the `vulkan` feature the set is always empty.
@@ -158,10 +160,11 @@ impl VulkanLayers {
         }
     }
 
-    /// Builds a stack for every Vulkan segment of `plan`. `layers` are the host builds of the
-    /// model's layers, the first being layer `first` of the stack; `read` gives the file's
-    /// blocks; `cos` and `sin` are the host RoPE tables. `head_norm` is the final RMS norm's
-    /// weight when the output head may run on the device of the segment that ends the model.
+    /// Builds a stack for every run of layers that attend in a Vulkan segment of `plan`.
+    /// `layers` are the host builds of the model's layers, the first being layer `first` of the
+    /// stack; `read` gives the file's blocks; `cos` and `sin` are the host RoPE tables.
+    /// `head_norm` is the final RMS norm's weight when the output head may run on the device of
+    /// the segment that ends the model.
     #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
     pub(super) fn build(
         plan: &HeteroPlan,
@@ -181,37 +184,42 @@ impl VulkanLayers {
                 let DeviceKind::Vulkan(device) = seg.kind else {
                     continue;
                 };
-                let from = seg.layer_start - first;
-                let to = seg.layer_end - first;
-                let ends = seg.layer_end == plan.total_layers;
-                let head = head_norm.filter(|_| ends);
-                let stack = build_stack(
-                    device,
-                    config,
-                    &layers[from..to],
-                    seg.layer_start,
-                    read,
-                    cos,
-                    sin,
-                    head,
-                )
-                .map_err(|e| {
-                    crate::tensor::Error::msg(format!(
-                        "vulkan({device}): layers {}..{}: {e:#}",
-                        seg.layer_start, seg.layer_end
-                    ))
-                })?;
-                tracing::info!(
-                    "vulkan({device}): layers {}..{} resident",
-                    seg.layer_start,
-                    seg.layer_end
-                );
-                segments.push(Segment {
-                    from,
-                    to,
-                    device,
-                    stack,
-                });
+                let attends = |at: usize| layers[at - first].attends();
+                let mut start = seg.layer_start;
+                while start < seg.layer_end {
+                    if !attends(start) {
+                        start += 1;
+                        continue;
+                    }
+                    let end = (start..seg.layer_end)
+                        .find(|&at| !attends(at))
+                        .unwrap_or(seg.layer_end);
+                    let (from, to) = (start - first, end - first);
+                    let head = head_norm.filter(|_| end == plan.total_layers);
+                    let stack = build_stack(
+                        device,
+                        config,
+                        &layers[from..to],
+                        start,
+                        read,
+                        cos,
+                        sin,
+                        head,
+                    )
+                    .map_err(|e| {
+                        crate::tensor::Error::msg(format!(
+                            "vulkan({device}): layers {start}..{end}: {e:#}"
+                        ))
+                    })?;
+                    tracing::info!("vulkan({device}): layers {start}..{end} resident");
+                    segments.push(Segment {
+                        from,
+                        to,
+                        device,
+                        stack,
+                    });
+                    start = end;
+                }
             }
             Ok(Self {
                 segments,
@@ -223,19 +231,17 @@ impl VulkanLayers {
     }
 }
 
-/// Whether the experts of a layer need more than a softmax router over silu-gated experts
-/// held as one stack each of gate, up and down.
+/// Whether the experts of a layer need more than a softmax router over experts held as one
+/// stack each of gate, up and down, gated by silu or by the clamped SwiGLU, with biases or
+/// without.
 #[cfg(feature = "vulkan")]
 fn unsupported_experts(m: &super::moe_weights::MoeWeights) -> bool {
     m.sigmoid_routing.is_some()
         || m.shared_expert.is_some()
         || m.up_relu2
         || m.gelu
-        || m.swiglu_clamp.is_some()
         || m.swiglu_limit.is_some()
         || m.block_scaled.is_some()
-        || m.gate_inp_bias.is_some()
-        || m.gate_exps_bias.is_some()
         || m.down_exps_scale.is_some()
         || m.local.is_some()
         || !m.router_prenormed
@@ -251,7 +257,7 @@ fn refusal(
 ) -> Option<String> {
     let c = config;
     let f = &c.flags;
-    let checks: [(bool, &str); 14] = [
+    let checks: [(bool, &str); 11] = [
         (f.fused_qkv, "a fused QKV projection"),
         (
             f.fused_ffn_gate_up || f.is_phi2_simple_ffn,
@@ -259,15 +265,9 @@ fn refusal(
         ),
         (f.layer_norm, "LayerNorm"),
         (f.parallel_attn, "parallel attention"),
-        (f.has_attn_sinks, "attention sinks"),
         (f.value_rms_norm, "normalised values"),
-        (
-            f.has_attn_output_bias || f.has_ffn_bias,
-            "output or FFN biases",
-        ),
-        (c.attn_logit_softcapping.is_some(), "attention softcapping"),
+        (f.has_ffn_bias, "an FFN bias"),
         (c.shared_kv_layers > 0, "shared KV layers"),
-        (c.ssm.is_some(), "a recurrent mixer"),
         (
             c.hyper.is_some() || c.ngram.is_some(),
             "wide residual streams",
@@ -383,8 +383,16 @@ fn build_stack(
             .find_map(|l| l.moe.as_ref())
             .is_some_and(|m| m.norm_topk),
         residual_scale: config.residual_scale.map(|s| s as f32),
+        attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
+        swiglu_clamp: layers
+            .iter()
+            .find_map(|l| l.moe.as_ref())
+            .and_then(|m| m.swiglu_clamp)
+            .map(|(alpha, limit)| (alpha as f32, limit as f32)),
     };
     let mut tensors = Vec::with_capacity(layers.len());
+    // The width of a dense FFN is the rows of its gate, the same in every layer.
+    let mut dense_ffn = None;
     for (i, l) in layers.iter().enumerate() {
         let p = format!("blk.{}", first + i);
         let norm_of =
@@ -417,15 +425,19 @@ fn build_stack(
                     gate: raw(format!("{p}.ffn_gate_exps.weight"))?,
                     up: raw(format!("{p}.ffn_up_exps.weight"))?,
                     down: raw(format!("{p}.ffn_down_exps.weight"))?,
+                    router_bias: bias(&m.gate_inp_bias)?,
+                    gate_bias: bias(&m.gate_exps_bias)?,
+                    up_bias: bias(&m.up_exps_bias)?,
+                    down_bias: bias(&m.down_exps_bias)?,
                 }
             }
             None => {
                 let gate = raw(format!("{p}.ffn_gate.weight"))?;
-                if gate.rows != spec.ffn {
+                let width = *dense_ffn.get_or_insert(gate.rows);
+                if gate.rows != width {
                     anyhow::bail!(
-                        "{p}: an FFN of {} rows, the config says {}",
-                        gate.rows,
-                        spec.ffn
+                        "{p}: an FFN of {} rows where another layer has {width}",
+                        gate.rows
                     );
                 }
                 FfnTensors::Dense {
@@ -452,7 +464,13 @@ fn build_stack(
             v_bias: bias(&l.attn_v_bias)?,
             q_norm: norm_of(&l.attn_q_norm)?,
             k_norm: norm_of(&l.attn_k_norm)?,
-            o: raw(format!("{p}.attn_output.weight"))?,
+            // The output projection is stored under either stem.
+            o: match read(&format!("{p}.attn_output.weight"))? {
+                Some(_) => raw(format!("{p}.attn_output.weight"))?,
+                None => raw(format!("{p}.attn_out.weight"))?,
+            },
+            o_bias: bias(&l.attn_output_bias)?,
+            sinks: bias(&l.attn_sinks)?,
             ffn_norm: pre_norm(
                 l.ffn_norm
                     .as_ref()
@@ -466,6 +484,16 @@ fn build_stack(
             rope: 0,
         });
     }
+    if let Some(width) = dense_ffn {
+        spec.ffn = width;
+    }
+    // The key heads are the rows of the key projection, the same in every layer.
+    // A file may give a count for each layer, which the config does not read.
+    let kv_rows = tensors.first().map_or(0, |t| t.k.rows);
+    if tensors.iter().any(|t| t.k.rows != kv_rows) || !kv_rows.is_multiple_of(spec.head_dim) {
+        anyhow::bail!("key projections of different heads across the layers");
+    }
+    spec.n_kv = kv_rows / spec.head_dim;
     // The width of an expert is the columns of its down projection.
     spec.expert_ffn = tensors
         .iter()
