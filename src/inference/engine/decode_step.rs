@@ -616,6 +616,8 @@ pub(crate) struct PldCost {
     hold: u32,
     /// The run of plain steps the next losing round holds the lookup off for.
     backoff: u32,
+    /// A hold ran since the last round: the next round is the trial that ends it.
+    trial: bool,
 }
 
 /// Plain steps between the trials of a lookup whose rounds were losing, doubled at each trial
@@ -645,7 +647,14 @@ impl PldCost {
     }
 
     /// A verify round took `secs` and committed `tokens`.
+    ///
+    /// The trial after a hold is judged on its own cost.
+    /// The rounds before the hold ran against the caches as they were then.
+    /// The plain steps of the hold are the decode the trial is weighed against.
     pub(crate) fn round(&mut self, secs: f64, tokens: usize) {
+        if std::mem::take(&mut self.trial) {
+            self.round = None;
+        }
         let (s, t) = self.round.unwrap_or((secs, tokens as f64));
         self.round = Some((
             Self::blend(Some(s), secs),
@@ -656,6 +665,7 @@ impl PldCost {
             if t / s.max(f64::EPSILON) < plain.recip() {
                 self.hold = held;
                 self.backoff = (held * 2).min(PLD_RETRY_MAX);
+                self.trial = true;
             } else {
                 self.backoff = PLD_RETRY_STEPS;
             }
@@ -837,6 +847,30 @@ mod tests {
             !next.worth_trying(),
             "the wait grew: the earlier request lost too"
         );
+    }
+
+    /// Rounds that lost while the caches were cold do not weigh on the trial after the hold: a
+    /// trial that beats the plain steps of the hold keeps the lookup on.
+    #[test]
+    fn a_trial_that_wins_ends_the_hold_whatever_the_rounds_before_it() {
+        let mut c = PldCost::default();
+        c.plain_step(0.100);
+        for _ in 0..12 {
+            if c.worth_trying() {
+                c.round(1.200, 9);
+            }
+        }
+        assert!(!c.worth_trying(), "7.5 tokens a second against 10");
+        for _ in 0..PLD_RETRY_STEPS {
+            c.plain_step(0.100);
+        }
+        assert!(c.worth_trying());
+        c.round(0.600, 9);
+        assert!(c.worth_trying(), "15 tokens a second against 10");
+        for _ in 0..12 {
+            assert!(c.worth_trying());
+            c.round(0.600, 9);
+        }
     }
 
     /// A round whose rejected rows are replayed costs more than the same round that kept them:
