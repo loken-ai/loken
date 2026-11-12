@@ -583,16 +583,15 @@ impl<'a> TensorSource<'a> {
             // CONVERSION: held F32, declared above.
             return QTensor::quantize_onto(&wide, crate::tensor::quantized::GgmlDType::F32, device);
         }
+        // A 16-bit float weight is held as stored, as a GGUF file's is: the host and every card
+        // family read F16 and BF16.
+        // A class that reads its float weights wide holds them F32 instead.
         let host_f16 =
             device.is_cpu() && info.ggml_dtype == crate::tensor::quantized::GgmlDType::F16;
         if self.hf_rows
+            && self.wide_floats
             && (info.ggml_dtype == crate::tensor::quantized::GgmlDType::BF16 || host_f16)
         {
-            // CONVERSION: no kernel reads BF16 weights. On a card the narrowest width the kernels
-            // read is F16, the same size; a weight below F16's smallest normal loses precision,
-            // one past its range would overflow (none of a trained model's does). On the host
-            // the kernels read F32 or blocks, so a BF16 or F16 weight widens to F32, twice its
-            // size. Each weight passes through F32 on the host, one tensor at a time.
             let stored = info.read_slice_owned(
                 part.bytes,
                 part.content.tensor_data_offset,
@@ -601,22 +600,17 @@ impl<'a> TensorSource<'a> {
             )?;
             // CONVERSION: widened to F32 on the host first (declared below).
             let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
-            let width = if device.is_cpu() || self.wide_floats {
-                crate::tensor::quantized::GgmlDType::F32
-            } else {
-                crate::tensor::quantized::GgmlDType::F16
-            };
             let n = wide.elem_count() as u64;
             crate::tensor::conversion::record_kept(
                 "weight",
                 info.ggml_dtype.gguf_name(),
-                width.gguf_name(),
+                "f32",
                 n * 2,
-                n * width.type_size() as u64,
-                "no kernel reads BF16, the host's read F32: F16 on a card, F32 on the host",
+                n * 4,
+                "the class reads its float weights at F32",
             );
-            // CONVERSION: held at `width`, declared above.
-            return QTensor::quantize_onto(&wide, width, device);
+            // CONVERSION: held F32, declared above.
+            return QTensor::quantize_onto(&wide, crate::tensor::quantized::GgmlDType::F32, device);
         }
         let qt = info.read_slice_owned(
             part.bytes,
@@ -894,6 +888,75 @@ pub(super) fn requant_float_weight(
         "float projection rebuilt as a block format for the block-quant kernels and fused projections",
     );
     Ok(out)
+}
+
+/// The stored tensor `name` in the block format its layer's projection holds.
+///
+/// A Vulkan or OpenCL device reads a layer's projections from the file.
+/// A float projection then takes the format the fidelity level and the placement gave the layer.
+/// A tensor that is no float projection, or whose layer holds it as stored, is returned as read.
+pub(super) fn in_layer_format(
+    layers: &[GenericTransformerLayer],
+    name: &str,
+    stored: QTensor,
+) -> Result<QTensor> {
+    if !is_float_format(stored.dtype()) {
+        return Ok(stored);
+    }
+    let held = (|| {
+        let (il, rest) = name.strip_prefix("blk.")?.split_once('.')?;
+        let l = layers.get(il.parse::<usize>().ok()?)?;
+        let qm = match rest.strip_suffix(".weight")? {
+            "attn_q" | "attn_k" | "attn_v" => l.attn_q.as_ref().or(l.attn_qkv.as_ref()),
+            "attn_qkv" => l.attn_qkv.as_ref(),
+            "attn_output" => Some(&l.attn_output),
+            "ffn_gate" => l.ffn_gate.as_ref().or(Some(&l.ffn_up)),
+            "ffn_up" => Some(&l.ffn_up),
+            "ffn_down" => Some(&l.ffn_down),
+            _ => None,
+        }?;
+        qm.qtensor().map(|q| q.dtype())
+    })();
+    match held {
+        Some(format) if !is_float_format(format) => {
+            requant_float_weight(stored, format, &Device::Cpu, "projection")
+        }
+        _ => Ok(stored),
+    }
+}
+
+/// `stored` in a format the OpenCL mat-vec reads: a float format it does not read is widened to
+/// F32, which it reads, and the ledger and the log say so.
+fn opencl_float_format(stored: QTensor) -> Result<QTensor> {
+    use crate::tensor::quantized::GgmlDType;
+    let from = stored.dtype();
+    // A build without OpenCL builds no OpenCL layer.
+    #[cfg(feature = "opencl")]
+    let read = crate::inference::kernel::opencl_stack::runs_format(from);
+    #[cfg(not(feature = "opencl"))]
+    let read = true;
+    if !is_float_format(from) || read {
+        return Ok(stored);
+    }
+    let n = stored.shape().elem_count() as u64;
+    crate::tensor::conversion::record_kept(
+        "projection",
+        from.gguf_name(),
+        "f32",
+        n * from.type_size() as u64 / from.block_size() as u64,
+        n * 4,
+        "the OpenCL mat-vec does not read this float format",
+    );
+    static TOLD: std::sync::Once = std::sync::Once::new();
+    TOLD.call_once(|| {
+        info!(
+            "opencl: {} projections run as f32, which the OpenCL mat-vec reads",
+            from.gguf_name()
+        )
+    });
+    // CONVERSION: widened to F32 for the OpenCL mat-vec, declared above.
+    let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+    QTensor::quantize_onto(&wide, GgmlDType::F32, &Device::Cpu)
 }
 
 /// Whether the expert kernels of a device read a stack of `dtype` as the file stores it: the
@@ -3714,9 +3777,11 @@ impl GenericHeteroTransformer {
             &weights,
             crate::inference::place::layer_executor::host_spill_budget_bytes(),
         );
+        // A float checkpoint kept as stored names the format its built layers run in, once built.
+        let kept_float = weights.float.filter(|_| cfg.flags.float_format.is_none());
         if let Some(stored) = weights.float {
             match (cfg.flags.float_format, float_weights()) {
-                (None, _) => info!("float projections run as stored: {}", stored.gguf_name()),
+                (None, _) => {}
                 (Some(run), choice) => info!(
                     "float projections run as {} (feed-forward output {}): stored {} {}",
                     run.gguf_name(),
@@ -5022,6 +5087,22 @@ impl GenericHeteroTransformer {
                     });
                 let head = if dense {
                     let qt = source.read(output_weight_name, &Device::Cpu)?;
+                    let from = qt.dtype();
+                    if from != crate::tensor::quantized::GgmlDType::F16 {
+                        let n = qt.shape().elem_count() as u64;
+                        crate::tensor::conversion::record_kept(
+                            "output",
+                            from.gguf_name(),
+                            "f16",
+                            n * from.type_size() as u64 / from.block_size() as u64,
+                            n * 2,
+                            "the card paths read a float output head as F16",
+                        );
+                        info!(
+                            "  Output projection stored {} runs as f16 on the card",
+                            from.gguf_name()
+                        );
+                    }
                     // CONVERSION: a float head is held once, in F16, for the dense matmul the card paths take.
                     (None, Some(qt.dequantize_f16(cuda_dev)?))
                 } else {
@@ -5327,6 +5408,7 @@ impl GenericHeteroTransformer {
                 let Some(t) = source.read_opt(name, &Device::Cpu)? else {
                     return Ok(None);
                 };
+                let t = in_layer_format(&model.layers, name, t)?;
                 // A stack of experts is read as the rows of one after the other.
                 let dims = t.shape().dims().to_vec();
                 let cols = dims.last().copied().unwrap_or(1);
@@ -5361,6 +5443,8 @@ impl GenericHeteroTransformer {
                 let Some(t) = source.read_opt(name, &Device::Cpu)? else {
                     return Ok(None);
                 };
+                let t = in_layer_format(&model.layers, name, t)?;
+                let t = opencl_float_format(t)?;
                 let (rows, cols) = t.shape().dims2()?;
                 let bytes = t.data()?.into_owned();
                 Ok(Some((t.dtype(), rows, cols, bytes)))
@@ -5467,6 +5551,13 @@ impl GenericHeteroTransformer {
             });
         }
         source.count.finish();
+        if let Some(stored) = kept_float {
+            info!(
+                "float projections run as {}: stored {}",
+                model.running_format().as_deref().unwrap_or("none"),
+                stored.gguf_name()
+            );
+        }
         Ok(model)
     }
 

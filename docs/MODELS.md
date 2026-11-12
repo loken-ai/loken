@@ -292,12 +292,15 @@ A checkpoint that does not fit is rebuilt once at load, in the widest format tha
 | 3 | `Q4_K` | `Q6_K` |
 
 The load log says which rung runs, and `/api/ps` reports it as `details.running_format`.  
+A float output head on a card runs in `F16`, and the load log says so.
 A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, or in `Q4_K` when its stack spills to the host.
 
 | Backend | Float matrix behaviour |
 |---|---|
 | Vulkan | A `BF16` or `F32` matrix runs the mat-vec kernel at every token count. Only `F16` has a mat-mat kernel |
-| OpenCL | The kernels do not read `BF16` |
+| OpenCL | The kernels do not read `BF16`. A `BF16` matrix kept as stored runs there widened to `F32`, and the load log says so |
+
+A layer on Vulkan or OpenCL runs its projections in the format the rung and the fidelity level give every layer.
 
 The expert stacks of a mixture-of-experts checkpoint follow the kernels instead.
 A stack runs as stored where a kernel of its device reads that format.

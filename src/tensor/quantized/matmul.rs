@@ -178,7 +178,11 @@ impl QMatMul {
             // (the AWQ F16 lm_head = a ~19 ms 1.5 GB device copy per
             // decoded token, 59% of AWQ GPU time), and matmul_t
             // never read it.
-            Self::Tensor(w) => Self::dense_matmul_t(x, w, x.dtype()),
+            // An F32 weight takes the activation read as F32, a half one included.
+            // The output follows the activation's dtype.
+            Self::Tensor(w) => {
+                Self::dense_matmul_t(&x.to_dtype(crate::tensor::DType::F32)?, w, x.dtype())
+            }
             Self::TensorF16(w) if w.device().is_cpu() => Self::host_half(x, w),
             Self::Bf16(w) if w.device().is_cpu() => Self::host_half(x, w),
             Self::TensorF16(w) => {

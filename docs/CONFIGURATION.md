@@ -86,7 +86,7 @@ What each level chooses:
 <!-- site: widget table id=config-fidelity-levels -->
 | Choice | `reference` | `balanced` | `fast` |
 |---|---|---|---|
-| Float projections of an F32, F16 or BF16 checkpoint | As stored (BF16 held as F16 on a card) | Q8_0 when the stack sits on one kind of memory, Q4_K (Q6_K for the feed-forward output) when it is split between cards and host | Q4_K (Q6_K for the feed-forward output) |
+| Float projections of an F32, F16 or BF16 checkpoint | As stored | Q8_0 when the stack sits on one kind of memory, Q4_K (Q6_K for the feed-forward output) when it is split between cards and host | Q4_K (Q6_K for the feed-forward output) |
 | KV cache format | Full width | Q8 for a model the quantised kernels serve | Q8 for a model the quantised kernels serve |
 | Float GEMMs on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 | TF32 and fast BF16 |
 | Parler-TTS decoder on a CUDA card | F32, as stored | F16 | F16 |
@@ -110,6 +110,7 @@ The level does not choose these, which are the same at all 3:
 | A prompt longer than the window | Refused with an error on every route. A cut prompt could lose its system prompt or tool instructions and still read as a plausible answer. |
 | Batched serving of overlapping requests | Runs the residual stream in F16 on the cards. No level turns it off. |
 | Approximate kernels (fast exp, fused attention in F16 with F32 sums) | Built into the kernels, within float rounding of their precise forms. |
+| Float output head on a card | Held F16, whatever the file stores. The load log names it. |
 
 ### Decided by loken
 

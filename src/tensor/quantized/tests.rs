@@ -1984,3 +1984,75 @@ fn the_transient_dequantised_matmul_agrees_with_the_host() {
         }
     }
 }
+
+/// An F32 weight held as stored takes a half activation, as the batch worker's residual stream
+/// is on a card: the product is read in F32 and given back in the activation's dtype.
+///
+/// The values are small multiples of an eighth, exact in F16.
+/// Each output then differs from the exact product by its rounding to F16 alone.
+#[test]
+fn an_f32_weight_takes_a_half_activation() {
+    an_f32_weight_takes_a_half_activation_on(&crate::tensor::Device::Cpu);
+    #[cfg(feature = "gpu")]
+    {
+        let cards = crate::inference::place::device_probe::card_count();
+        if cards == 0 {
+            eprintln!(
+                "no card; an F32 weight against a half activation is checked on the host only"
+            );
+        }
+        for ordinal in 0..cards {
+            if let Ok(dev) = crate::tensor::cuda::CudaDevice::new(ordinal) {
+                an_f32_weight_takes_a_half_activation_on(&crate::tensor::Device::Cuda(dev));
+            }
+        }
+    }
+}
+
+/// [`an_f32_weight_takes_a_half_activation`] on `device`.
+fn an_f32_weight_takes_a_half_activation_on(device: &crate::tensor::Device) {
+    use crate::tensor::{DType, Device, Tensor};
+    let (n, k) = (8usize, 64usize);
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 7 % 17) as f32 - 8.0) / 8.0)
+        .collect();
+    let weight = Tensor::from_vec(w.clone(), (n, k), &Device::Cpu)
+        .unwrap()
+        .to_device(device)
+        .unwrap();
+    let qm = crate::tensor::quantized::QMatMul::Tensor(weight);
+    for rows in [1usize, 5] {
+        let x: Vec<f32> = (0..rows * k)
+            .map(|i| ((i * 5 % 13) as f32 - 6.0) / 8.0)
+            .collect();
+        let xh = Tensor::from_vec(x.clone(), (rows, k), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let y = qm.forward(&xh).unwrap();
+        assert_eq!(
+            y.dtype(),
+            DType::F16,
+            "{device:?}: the output follows the activation"
+        );
+        let got = y
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec_f32();
+        for r in 0..rows {
+            for o in 0..n {
+                let exact: f32 = (0..k).map(|j| x[r * k + j] * w[o * k + j]).sum();
+                let rounded = half::f16::from_f32(exact).to_f32();
+                assert_eq!(
+                    got[r * n + o],
+                    rounded,
+                    "{device:?} row {r} of {rows}, column {o}"
+                );
+            }
+        }
+    }
+}
