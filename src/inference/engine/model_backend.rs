@@ -1559,7 +1559,11 @@ impl GenericBackend {
         let rows = tokens.min(shape.target_chunk.max(2048));
         let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
             .saturating_mul(shape.share.max(1) as u64);
-        let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
+        // The tightest free memory of the model's own cards, read from the driver after the
+        // pools are handed back, without enumerating every card of the machine.
+        #[cfg(feature = "gpu")]
+        crate::inference::engine::llm_engine::trim_cuda_pools();
+        let free = self.0.free_device_memory().unwrap_or(0);
         tracing::debug!(
             "prefill of {tokens} rows: {} MB of kept states, {} MB free, {} MB wanted",
             held >> 20,
@@ -2584,8 +2588,17 @@ impl ModelBackend for ContinuousBackend {
             Ok(server) => server,
             Err(shared) => return Err(Box::new(ContinuousBackend(shared, format))),
         };
-        match server.stop() {
-            Ok(model) => Ok(Box::new(GenericBackend(model))),
+        match server.park() {
+            Ok((model, pool)) => {
+                // The model keeps the worker's paged pool for its next worker.
+                #[cfg(feature = "gpu")]
+                if let Some(pool) = pool {
+                    model.park_pool(pool);
+                }
+                #[cfg(not(feature = "gpu"))]
+                let _ = pool;
+                Ok(Box::new(GenericBackend(model)))
+            }
             Err(e) => {
                 tracing::warn!("continuous batching could not hand its model back: {e}");
                 Err(Box::new(TakenBackend))

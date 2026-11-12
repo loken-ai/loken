@@ -449,3 +449,41 @@ async fn a_wide_model_with_its_mixers_on_a_card_streams_through_the_batch_server
     );
     assert_eq!(collect(engine, prompt, NEW).await, want.text);
 }
+
+/// A lone request on the serial path moves into the batch worker when another request is
+/// admitted, and its answer is the one it gives alone.
+/// The other request then streams through the worker the same answer.
+#[cfg(feature = "gpu")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lone_serial_request_moves_into_the_worker_when_another_arrives() {
+    use crate::inference::generic_transformer::card_mixer_tests::generic_on_card;
+
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let (engine, prompt) = engine_of(generic_on_card(ratios, kv_src, index_src)).await;
+    let want = run(&engine, &prompt, NEW).await;
+    assert!(
+        !engine.is_continuous().await,
+        "the lone request decoded serially"
+    );
+    let first = engine.admit_request().await;
+    let second = engine.admit_request().await;
+    assert!(second.wants_batched(), "an overlap calls for the worker");
+    let mut rx = engine.generate_stream(&prompt, params(NEW)).await.unwrap();
+    let mut text = String::new();
+    while let Some(chunk) = rx.recv().await {
+        text.push_str(&chunk.unwrap());
+    }
+    assert!(
+        engine.is_continuous().await,
+        "the serial request moved into the worker"
+    );
+    assert_eq!(text, want.text, "the moved request kept its answer");
+    drop(first);
+    let mut rx = engine.generate_stream(&prompt, params(NEW)).await.unwrap();
+    let mut batched = String::new();
+    while let Some(chunk) = rx.recv().await {
+        batched.push_str(&chunk.unwrap());
+    }
+    drop(second);
+    assert_eq!(batched, want.text, "the worker gives the lone answer");
+}

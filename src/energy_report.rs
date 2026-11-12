@@ -515,9 +515,51 @@ impl Ledger {
 /// The meter read at every start and end of a metered request, open while one is active.
 #[derive(Default)]
 struct Meters {
-    meter: Option<crate::energy::EnergyMeter>,
     ledger: Ledger,
     next_id: u64,
+}
+
+/// The counter reader, open while a request is active, and when its last reading ended.
+struct Reader {
+    meter: crate::energy::EnergyMeter,
+    last_lap_end: std::time::Instant,
+}
+
+/// Whether a request that arrived at `arrived` needs a counter reading of its own. A reading
+/// that ended after it arrived already covers its start.
+fn lap_needed(last_lap_end: Option<std::time::Instant>, arrived: std::time::Instant) -> bool {
+    last_lap_end.is_none_or(|end| end < arrived)
+}
+
+static READER: Mutex<Option<Reader>> = Mutex::new(None);
+
+/// Reads the counters for a request that arrived at `arrived`, when no other thread is reading
+/// them and no reading that ended after it arrived covers it. A thread never waits for another
+/// thread's reading: a reading takes a few milliseconds in the driver, and a burst of requests
+/// would otherwise hold every thread of the server's runtime in turn. A request that does not
+/// read leaves the energy drawn since the last reading to the next one, which splits it among
+/// the requests active then.
+fn read_counters(arrived: std::time::Instant) -> Option<EnergyWindow> {
+    let mut slot = match READER.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    match slot.as_mut() {
+        Some(r) if lap_needed(Some(r.last_lap_end), arrived) => {
+            let window = r.meter.lap();
+            r.last_lap_end = std::time::Instant::now();
+            Some(window)
+        }
+        Some(_) => None,
+        None => {
+            *slot = Some(Reader {
+                meter: crate::energy::EnergyMeter::start(),
+                last_lap_end: std::time::Instant::now(),
+            });
+            None
+        }
+    }
 }
 
 static METERS: OnceLock<Mutex<Meters>> = OnceLock::new();
@@ -540,11 +582,11 @@ pub struct RequestEnergy {
 impl RequestEnergy {
     fn open(probe: Option<Arc<crate::request_metrics::RequestProbe>>) -> Self {
         let tdp = settings().cpu_tdp_w;
+        let window = read_counters(std::time::Instant::now());
         let mut guard = meters();
         let m = &mut *guard;
-        match m.meter.as_mut() {
-            Some(meter) => m.ledger.sample(&meter.lap(), tdp),
-            None => m.meter = Some(crate::energy::EnergyMeter::start()),
+        if let Some(w) = window {
+            m.ledger.sample(&w, tdp);
         }
         let id = m.next_id;
         m.next_id += 1;
@@ -585,10 +627,11 @@ impl Drop for RequestEnergy {
 /// last active request.
 fn close_entry(id: u64) -> EnergyShare {
     let tdp = settings().cpu_tdp_w;
+    let window = read_counters(std::time::Instant::now());
     let mut guard = meters();
     let m = &mut *guard;
-    if let Some(meter) = m.meter.as_mut() {
-        m.ledger.sample(&meter.lap(), tdp);
+    if let Some(w) = window {
+        m.ledger.sample(&w, tdp);
     }
     let share = m
         .ledger
@@ -597,7 +640,7 @@ fn close_entry(id: u64) -> EnergyShare {
         .map(|e| e.share)
         .unwrap_or_default();
     if m.ledger.active.is_empty() {
-        m.meter = None;
+        *READER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     share
 }
@@ -826,5 +869,18 @@ mod tests {
         let share = alone.close();
         assert!(!meters().ledger.active.contains_key(&id));
         assert!(share.duration_s >= 0.0);
+    }
+
+    #[test]
+    fn requests_that_arrive_together_share_one_counter_reading() {
+        let t0 = std::time::Instant::now();
+        let later = |ms| t0 + std::time::Duration::from_millis(ms);
+        // Nothing read yet: the first request reads.
+        assert!(lap_needed(None, later(0)));
+        // A reading that ended after the request arrived already covers its start.
+        assert!(!lap_needed(Some(later(10)), later(5)));
+        assert!(!lap_needed(Some(later(10)), later(10)));
+        // A reading that ended before it arrived does not.
+        assert!(lap_needed(Some(later(5)), later(10)));
     }
 }

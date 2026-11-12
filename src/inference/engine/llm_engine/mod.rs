@@ -254,8 +254,8 @@ pub struct LlmEngine {
         Arc<std::sync::Mutex<Option<Arc<crate::inference::model::clip::pair::DualEncoder>>>>,
     /// Requests admitted and not yet finished.
     active: Arc<std::sync::atomic::AtomicUsize>,
-    /// Whether requests have been overlapping, which decides serial or batched serving.
-    batching: Arc<std::sync::Mutex<batching::BatchingSignal>>,
+    /// What the requests so far say about serial or batched serving.
+    batching: Arc<batching::Batching>,
     /// The drafter chosen for the loaded target (`None` = not decided yet).
     drafter_choice: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// What the cycles with the current drafter taught about the best draft length.
@@ -1083,6 +1083,7 @@ impl LlmEngine {
         embeds: crate::inference::prompt_embeds::PromptEmbeds,
     ) -> Result<usize, String> {
         use std::hash::{Hash, Hasher};
+        self.serve_serially().await;
         let mut guard = self.model_state.lock().await;
         let state = guard.as_mut().ok_or("Model not loaded")?;
         if state.model.batched_server().is_some() {

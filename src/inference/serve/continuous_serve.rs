@@ -47,6 +47,29 @@ struct Submission {
     tx: Sender<CbToken>,
 }
 
+/// The paged KV pool of a stopped worker, kept for its next start.
+///
+/// A parked pool keeps its blocks on the card while the model serves serially.
+/// The next worker reuses them and takes no new card memory.
+pub struct ParkedPool {
+    stores: Vec<PagedKvStore>,
+    num_blocks: usize,
+    block_size: usize,
+    max_running: usize,
+    max_prefill_tokens: usize,
+}
+
+// The stores are touched by one thread at a time: the worker that owns them, or none while
+// parked.
+unsafe impl Send for ParkedPool {}
+
+impl ParkedPool {
+    /// The blocks of the pool and the sequences it runs at once.
+    pub fn size(&self) -> (usize, usize) {
+        (self.num_blocks, self.max_running)
+    }
+}
+
 /// Handle to the running continuous-batch worker. Cheap to clone-share via Arc.
 pub struct ContinuousServer {
     submit_tx: Sender<Submission>,
@@ -710,19 +733,23 @@ impl BatchedModel for SequenceBatched {
 
 /// What the adapter of a worker hands back once the worker ends.
 trait Served: BatchedModel {
-    /// The model the adapter owned, `None` when it shared it.
-    fn into_owned(self) -> Option<GenericHeteroTransformer>;
+    /// The model the adapter owned, `None` when it shared it, and its paged stores, `None`
+    /// when it keeps none.
+    fn into_parts(self) -> (Option<GenericHeteroTransformer>, Option<Vec<PagedKvStore>>);
 }
 
 impl Served for GhBatched {
-    fn into_owned(self) -> Option<GenericHeteroTransformer> {
-        None
+    fn into_parts(mut self) -> (Option<GenericHeteroTransformer>, Option<Vec<PagedKvStore>>) {
+        // The captured graphs go before the stores they read leave the adapter.
+        #[cfg(feature = "gpu")]
+        self.graphs.clear();
+        (None, Some(std::mem::take(&mut self.stores)))
     }
 }
 
 impl Served for SequenceBatched {
-    fn into_owned(self) -> Option<GenericHeteroTransformer> {
-        Some(self.model)
+    fn into_parts(self) -> (Option<GenericHeteroTransformer>, Option<Vec<PagedKvStore>>) {
+        (Some(self.model), None)
     }
 }
 
@@ -979,8 +1006,10 @@ impl GhBatched {
 struct SendWrap<T>(T);
 unsafe impl<T> Send for SendWrap<T> {}
 
-/// The worker thread a server joins: it ends with the model its adapter owned, if it owned one.
-type Worker = std::thread::JoinHandle<SendWrap<Option<GenericHeteroTransformer>>>;
+/// The worker thread a server joins: it ends with the model its adapter owned, if it owned one,
+/// and with its paged pool, if it kept one.
+type Worker =
+    std::thread::JoinHandle<SendWrap<(Option<GenericHeteroTransformer>, Option<ParkedPool>)>>;
 
 /// Starts the worker thread over `adapter`, and the channel requests reach it through.
 ///
@@ -1001,7 +1030,7 @@ fn launch<M: Served + 'static>(
         .name("cb-worker".into())
         .spawn(move || {
             let Ok(SendWrap(adapter)) = hand_rx.recv() else {
-                return SendWrap(None);
+                return SendWrap((None, None));
             };
             let ended = worker_loop(
                 adapter,
@@ -1012,7 +1041,17 @@ fn launch<M: Served + 'static>(
                 max_prefill_tokens,
                 submit_rx,
             );
-            SendWrap(ended.and_then(Served::into_owned))
+            let Some((model, stores)) = ended.map(Served::into_parts) else {
+                return SendWrap((None, None));
+            };
+            let parked = stores.map(|stores| ParkedPool {
+                stores,
+                num_blocks,
+                block_size,
+                max_running,
+                max_prefill_tokens,
+            });
+            SendWrap((model, parked))
         });
     let worker = match worker {
         Ok(w) => w,
@@ -1046,6 +1085,41 @@ impl ContinuousServer {
     ) -> crate::tensor::Result<Self> {
         let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
         let cdev = model.compute_device();
+        let store_dt = if cdev.is_cpu() {
+            DType::F32
+        } else {
+            DType::F16
+        };
+        let stores: Vec<PagedKvStore> = (0..n_layers)
+            .map(|_| PagedKvStore::new(num_blocks, block_size, n_kv, hd, store_dt, &cdev))
+            .collect::<crate::tensor::Result<_>>()?;
+        Self::spawn_over(
+            model,
+            eos,
+            ParkedPool {
+                stores,
+                num_blocks,
+                block_size,
+                max_running,
+                max_prefill_tokens,
+            },
+        )
+    }
+
+    /// Spawn the worker over the paged `pool` a stopped worker kept.
+    pub fn spawn_over(
+        model: Arc<GenericHeteroTransformer>,
+        eos: Vec<u32>,
+        pool: ParkedPool,
+    ) -> crate::tensor::Result<Self> {
+        let ParkedPool {
+            stores,
+            num_blocks,
+            block_size,
+            max_running,
+            max_prefill_tokens,
+        } = pool;
+        let cdev = model.compute_device();
         // Pin a cuBLAS workspace so the batched-decode GEMMs stop allocating a
         // workspace per call (per-call allocs are pure overhead in the hot loop,
         // and are also required to be absent before any future graph capture).
@@ -1062,14 +1136,6 @@ impl ContinuousServer {
                 }
             }
         }
-        let store_dt = if cdev.is_cpu() {
-            DType::F32
-        } else {
-            DType::F16
-        };
-        let stores: Vec<PagedKvStore> = (0..n_layers)
-            .map(|_| PagedKvStore::new(num_blocks, block_size, n_kv, hd, store_dt, &cdev))
-            .collect::<crate::tensor::Result<_>>()?;
         let served = Arc::clone(&model);
         let adapter = GhBatched {
             model,
@@ -1142,20 +1208,27 @@ impl ContinuousServer {
     /// serving. `Err` says why: another holder still shares the model, or the worker ended
     /// without it.
     pub fn stop(self) -> std::result::Result<GenericHeteroTransformer, String> {
+        self.park().map(|(model, _)| model)
+    }
+
+    /// Stops the worker as `stop` does, and keeps its paged pool for the next worker.
+    pub fn park(
+        self,
+    ) -> std::result::Result<(GenericHeteroTransformer, Option<ParkedPool>), String> {
         let Self {
             submit_tx,
             worker,
             model,
         } = self;
         drop(submit_tx);
-        let SendWrap(owned) = worker
+        let SendWrap((owned, parked)) = worker
             .join()
             .map_err(|_| "cb-worker panicked".to_string())?;
         match (owned, model) {
-            (Some(owned), _) => Ok(owned),
-            (None, Some(shared)) => {
-                Arc::try_unwrap(shared).map_err(|_| "the model is still shared".to_string())
-            }
+            (Some(owned), _) => Ok((owned, parked)),
+            (None, Some(shared)) => Arc::try_unwrap(shared)
+                .map(|model| (model, parked))
+                .map_err(|_| "the model is still shared".to_string()),
             (None, None) => Err("the worker ended without its model".to_string()),
         }
     }

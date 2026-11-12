@@ -150,10 +150,21 @@ impl APIServer {
         let arrived = std::time::Instant::now();
         let in_flight = crate::distributed::rate_meter::InFlight::enter();
         let active = engine.admit_request().await;
+        if active.wants_serial() {
+            engine.serve_alone_serially().await;
+        }
+        // A request that waits at the gate stops waiting when the model enters its batch
+        // worker: a lone request decoding serially moves there when another request arrives.
         let mut gate = if engine.is_continuous().await {
             None
         } else {
-            Some(acquire_gate(self, priority, model_name.to_string(), endpoint).await?)
+            tokio::select! {
+                gate = acquire_gate(self, priority, model_name.to_string(), endpoint) => Some(gate?),
+                _ = engine.until_continuous() => {
+                    engine.note_move_wait(arrived.elapsed().as_secs_f64());
+                    None
+                }
+            }
         };
         // The move into the batch worker is made under the serial gate, which every serial
         // generation holds to its end; the gate is not needed past it. A request that waited

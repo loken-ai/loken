@@ -820,6 +820,14 @@ impl CudaDevice {
         Ok(())
     }
 
+    /// The bytes of the cuBLAS workspace pinned on the card, 0 when none is.
+    pub fn pinned_blas_workspace(&self) -> usize {
+        self.blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map_or(0, |(_, bytes)| bytes)
+    }
+
     /// Gives every cuBLAS handle of the card the workspace of `bytes` at `ws`: cuBLAS then
     /// allocates no workspace of its own, which a graph capture forbids. Both handles share it,
     /// as everything they queue runs in the order of the card's stream.

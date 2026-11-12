@@ -605,6 +605,9 @@ pub struct GenericHeteroTransformer {
     hot_locks: Option<Arc<expert_tier::HotLocks>>,
     /// The graph generation of the graphs the engine keeps for the next request.
     kept_graphs_at: Option<u64>,
+    /// The paged pool of the batch worker, kept while the model serves serially.
+    #[cfg(feature = "gpu")]
+    parked_pool: std::sync::Mutex<Option<crate::inference::serve::continuous_serve::ParkedPool>>,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     /// The learned table of absolute positions `[positions, dim]`, F32 on the host, added to

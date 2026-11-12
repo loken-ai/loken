@@ -918,6 +918,24 @@ pub(super) fn try_spawn_continuous(
             model
         });
     }
+    // A model that served batched before starts its worker over the pool it kept: the same
+    // size, and no new card memory.
+    if let Some(pool) = model.take_parked_pool() {
+        let (num_blocks, max_running) = pool.size();
+        let arc = std::sync::Arc::new(model);
+        let started = std::time::Instant::now();
+        let spawned = ContinuousServer::spawn_over(std::sync::Arc::clone(&arc), eos, pool);
+        info!(
+            "CB serve: worker spawned over its kept pool of {num_blocks} blocks, max_running \
+             {max_running}, in {:.0} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        return spawned.map_err(|e| {
+            warn!("CB serve: spawn failed ({e}) - staying serial");
+            std::sync::Arc::try_unwrap(arc)
+                .unwrap_or_else(|_| unreachable!("spawn failed yet worker holds the model"))
+        });
+    }
     let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
     let block_size = crate::inference::serve::continuous_serve::CB_BLOCK_SIZE;
     // K and V, F16, every layer.
@@ -947,7 +965,8 @@ pub(super) fn try_spawn_continuous(
         (num_blocks as u64 * block_bytes) >> 20
     );
     let arc = std::sync::Arc::new(model);
-    match ContinuousServer::spawn(
+    let spawn_started = std::time::Instant::now();
+    let spawned = ContinuousServer::spawn(
         std::sync::Arc::clone(&arc),
         eos,
         num_blocks,
@@ -955,7 +974,12 @@ pub(super) fn try_spawn_continuous(
         max_running,
         // The prompt tokens one step prefills: the rows the work reserve was sized for.
         PREFILL_CHUNK_TOKENS,
-    ) {
+    );
+    info!(
+        "CB serve: worker spawned in {:.0} ms",
+        spawn_started.elapsed().as_secs_f64() * 1e3
+    );
+    match spawned {
         Ok(s) => Ok(s),
         Err(e) => {
             warn!("CB serve: spawn failed ({e}) - staying serial");

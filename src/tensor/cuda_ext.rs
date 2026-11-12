@@ -203,9 +203,13 @@ mod cuda {
     /// cuBLAS stops allocating per-call workspaces - required before graph
     /// capture (in-capture cuBLAS allocs invalidate the capture). Leaks the
     /// workspace by design (lives for the process).
+    /// A card that holds a pinned workspace of `bytes` or more keeps it.
     pub fn pin_cublas_workspace(device: &Device, bytes: usize) -> Result<()> {
         use crate::tensor::gpu_runtime::driver::result::malloc_sync;
         let cd = device.as_cuda_device()?;
+        if cd.native().pinned_blas_workspace() >= bytes {
+            return Ok(());
+        }
         let ws = unsafe { malloc_sync(bytes) }.map_err(msg("pin_cublas_workspace/malloc"))?;
         cd.native().pin_blas_workspace(ws, bytes)?;
         Ok(())

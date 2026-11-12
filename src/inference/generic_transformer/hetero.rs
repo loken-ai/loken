@@ -215,6 +215,23 @@ pub struct EmbeddingStep {
 }
 
 impl GenericHeteroTransformer {
+    /// Keeps the paged pool of the batch worker while the model serves serially.
+    #[cfg(feature = "gpu")]
+    pub fn park_pool(&self, pool: crate::inference::serve::continuous_serve::ParkedPool) {
+        *self.parked_pool.lock().unwrap_or_else(|e| e.into_inner()) = Some(pool);
+    }
+
+    /// The paged pool a batch worker left with the model, if one did.
+    #[cfg(feature = "gpu")]
+    pub fn take_parked_pool(
+        &self,
+    ) -> Option<crate::inference::serve::continuous_serve::ParkedPool> {
+        self.parked_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     /// Read-only view of the layers, which is how anything outside this module reaches a
     /// layer's KV cache after a forward.
     ///

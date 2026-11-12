@@ -1029,6 +1029,8 @@ impl GenericHeteroTransformer {
             #[cfg(feature = "gpu")]
             hot_locks: None,
             kept_graphs_at: None,
+            #[cfg(feature = "gpu")]
+            parked_pool: Default::default(),
             verify: Default::default(),
             graph_feature: None,
             last_feature: None,

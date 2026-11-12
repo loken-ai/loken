@@ -140,11 +140,15 @@ impl LlmEngine {
     ) -> Result<GenerationResult, Box<dyn std::error::Error>> {
         // A grammar or token rules take the sequential path, one forward per token.
         if params.grammar.is_some() || params.rules.decodes_sequentially() {
+            self.serve_serially().await;
             return self.generate_sequential(prompt.to_string(), params).await;
         }
         // CB-served models: drive the non-stream path through the same worker
         // delegation, collecting the streamed chunks into one result.
-        if self.is_continuous().await {
+        // An admitted request of a model that can batch takes the streamed path too, which
+        // moves it into the worker when another request is admitted.
+        let admitted = self.active.load(std::sync::atomic::Ordering::Acquire) > 0;
+        if self.is_continuous().await || (admitted && self.hands_over_to_worker().await) {
             let t0 = std::time::Instant::now();
             // Word-based prompt-token estimate (≈ the handler's estimate_token_count;
             // the precise count lives behind the tokenizer the worker owns).
@@ -167,12 +171,17 @@ impl LlmEngine {
                 }
             }
             let ttft = first.unwrap_or_default();
+            // The serial path leaves its counts for the request that streamed: taken here, they
+            // count this answer and no later request reads them.
+            let eval_count = self
+                .take_last_stream_stats()
+                .map_or(chunks, |s| s.eval_count);
             return Ok(GenerationResult {
                 text,
                 tokens: Vec::new(),
                 prompt_eval_count,
                 prompt_eval_duration: ttft.as_nanos() as u64,
-                eval_count: chunks,
+                eval_count,
                 eval_duration: t0.elapsed().saturating_sub(ttft).as_nanos() as u64,
                 cached_prompt_tokens: 0,
                 finish_reason: FinishReason::Eos,

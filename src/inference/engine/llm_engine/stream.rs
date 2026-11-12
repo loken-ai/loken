@@ -22,8 +22,7 @@ impl LlmEngine {
     /// whether it should move the model into its batch worker (see `batching`). That move is
     /// [`Self::serve_batched`], made by the request once it holds the serial gate: a serial
     /// generation takes the model lock a step at a time and holds the gate throughout, so only
-    /// the gate keeps the move off a running answer. The move back is made here: it follows
-    /// an arrival that found no other request admitted.
+    /// the gate keeps the move off a running answer.
     pub async fn admit_request(&self) -> super::ActiveRequest {
         let mut request = super::batching::ActiveRequest::enter(&self.active);
         let batched = self.is_continuous().await;
@@ -35,32 +34,107 @@ impl LlmEngine {
         match switch {
             super::batching::Switch::Stay => {}
             super::batching::Switch::ToBatched => request.want_batched(),
-            super::batching::Switch::ToSerial => {
-                let mut guard = self.model_state.lock().await;
-                if let Some(state) = guard.as_mut() {
-                    if super::load::demote_to_serial(state) {
-                        info!("{}: requests arrive alone - serving serially", state.name);
-                    }
-                }
-            }
+            super::batching::Switch::ToSerial => request.want_serial(),
         }
         request
     }
 
-    /// Moves the model into its batch worker. Called by a request that holds the serial gate,
-    /// so no serial generation is running.
-    pub async fn serve_batched(&self) {
+    /// Takes the model out of its batch worker for a lone request the serial path serves
+    /// faster. Does nothing when the worker still streams to another request.
+    pub async fn serve_alone_serially(&self) {
+        // A request admitted since the choice keeps the model in its worker.
+        if self.active.load(std::sync::atomic::Ordering::Acquire) > 1 {
+            return;
+        }
+        let started = std::time::Instant::now();
         let mut guard = self.model_state.lock().await;
         if let Some(state) = guard.as_mut() {
-            if super::load::promote_to_batched(state) {
-                info!("{}: requests overlap - serving batched", state.name);
-            } else {
-                self.batching
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .mark_cannot_batch();
+            if state.model.batched_server().is_some() && super::load::demote_to_serial(state) {
+                info!(
+                    "{}: a lone request decodes faster serially, moved out in {:.0} ms",
+                    state.name,
+                    started.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
+    }
+
+    /// Returns once the model serves from its batch worker.
+    pub async fn until_continuous(&self) {
+        self.batching.until(|| self.is_continuous()).await
+    }
+
+    /// Records `seconds` a request waited for a lone serial request to move into the worker.
+    pub fn note_move_wait(&self, seconds: f64) {
+        self.batching
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_move_wait(seconds);
+    }
+
+    /// Whether a lone request on the serial path may move into the batch worker when another
+    /// request arrives: the model can batch and no request holds it serial.
+    pub(super) async fn hands_over_to_worker(&self) -> bool {
+        let signal_allows = {
+            let s = self.batching.lock().unwrap_or_else(|e| e.into_inner());
+            !s.cannot_batch() && !s.serial_needed()
+        };
+        signal_allows
+            && self
+                .model_state
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|s| s.model.cb_eligible_gpu())
+    }
+
+    /// Takes the model out of its batch worker for a request that only the serial path
+    /// serves, and keeps an idle arrival from moving it back. Does nothing when the worker
+    /// still streams to another request.
+    pub async fn serve_serially(&self) {
+        self.batching
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_serial_needed();
+        let mut guard = self.model_state.lock().await;
+        if let Some(state) = guard.as_mut() {
+            if super::load::demote_to_serial(state) {
+                info!(
+                    "{}: a request needs serial decode - serving serially",
+                    state.name
+                );
+            }
+        }
+    }
+
+    /// Moves the model into its batch worker. Called by a request that holds the serial gate,
+    /// so no serial generation is running. Says whether the model serves from its worker.
+    pub async fn serve_batched(&self) -> bool {
+        let started = std::time::Instant::now();
+        let moved = {
+            let mut guard = self.model_state.lock().await;
+            let Some(state) = guard.as_mut() else {
+                return false;
+            };
+            let moved = super::load::promote_to_batched(state);
+            if moved {
+                info!(
+                    "{}: serving batched, moved in {:.0} ms",
+                    state.name,
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            moved
+        };
+        if moved {
+            self.batching.note_moved();
+        } else {
+            self.batching
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mark_cannot_batch();
+        }
+        moved
     }
 
     /// Stream a request through the continuous-batch worker: tokenize, submit
@@ -76,21 +150,109 @@ impl LlmEngine {
         ctx_len: usize,
         defaults: super::generation_defaults::GenerationDefaults,
         prompt: &str,
+        params: GenerationParams,
+    ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
+        let tokens: Vec<u32> = match super::encode_prompt(&tokenizer, prompt) {
+            Ok(e) => request_prompt_tokens(&params, e.get_ids()),
+            Err(e) => {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
+                let _ = tx.try_send(Err(format!("Tokenization: {e}")));
+                return rx;
+            }
+        };
+        self.stream_tokens_via_cb(
+            server, tokenizer, eos_set, ctx_len, defaults, tokens, params, None,
+        )
+    }
+
+    /// Writes in the batch worker the rest of a lone request that decoded serially until
+    /// another request arrived: `prior` generated tokens follow `prompt`, and `remaining` more
+    /// may come. The text goes to `tx`, after the text already sent for `prior`.
+    /// `serial` holds the figures of the serial part, recorded with the worker's part.
+    pub(super) fn continue_in_worker(
+        &self,
+        prompt: Vec<u32>,
+        prior: Vec<u32>,
+        remaining: usize,
+        params: GenerationParams,
+        serial: SerialPart,
+        tx: &tokio::sync::mpsc::Sender<Result<String, String>>,
+    ) {
+        self.batching
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_handover();
+        if remaining == 0 {
+            crate::request_metrics::record_outcome(
+                &self.config.model_id,
+                params.probe.as_deref(),
+                serial.outcome,
+            );
+            return;
+        }
+        let parts = self.model_state.blocking_lock().as_ref().and_then(|state| {
+            let server = state.model.batched_server()?;
+            Some((
+                server,
+                std::sync::Arc::clone(&state.tokenizer),
+                params
+                    .rules
+                    .end_tokens(state.eos_token_id, &state.eos_token_ids_extra),
+                state.context_length,
+                state.generation_defaults.clone(),
+            ))
+        });
+        let Some((server, tokenizer, eos_set, ctx_len, defaults)) = parts else {
+            let _ = tx.blocking_send(Err("the model left its batch worker".into()));
+            return;
+        };
+        let mut tokens = prompt;
+        tokens.extend_from_slice(&prior);
+        let mut rx = self.stream_tokens_via_cb(
+            server,
+            tokenizer,
+            eos_set,
+            ctx_len,
+            defaults,
+            tokens,
+            params,
+            Some(Resume {
+                prior,
+                max_new: remaining,
+                serial,
+            }),
+        );
+        while let Some(message) = rx.blocking_recv() {
+            if tx.blocking_send(message).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Streams `tokens` through the continuous-batch worker. A `resume` continues an answer
+    /// begun on the serial path: its tokens are part of `tokens`, its text was sent, and the
+    /// figures of the request are those the serial path recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stream_tokens_via_cb(
+        &self,
+        server: std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
+        tokenizer: std::sync::Arc<Tokenizer>,
+        eos_set: Vec<u32>,
+        ctx_len: usize,
+        defaults: super::generation_defaults::GenerationDefaults,
+        tokens: Vec<u32>,
         mut params: GenerationParams,
+        resume: Option<Resume>,
     ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
         use crate::inference::serve::continuous_batch::SamplingParams;
         use crate::inference::serve::continuous_serve::CbToken;
         params = params.with_default_stops(&defaults.stop);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(4096);
-        let tokens: Vec<u32> = match super::encode_prompt(&tokenizer, prompt) {
-            Ok(e) => request_prompt_tokens(&params, e.get_ids()),
-            Err(e) => {
-                let _ = tx.try_send(Err(format!("Tokenization: {e}")));
-                return rx;
-            }
-        };
         let resolved = resolve_gen_params(&params, &defaults, ctx_len, tokens.len());
-        let max_new = resolved.max_tokens.max(1);
+        let max_new = resume
+            .as_ref()
+            .map_or(resolved.max_tokens, |r| r.max_new)
+            .max(1);
         // Mirror build_sampling_from: top_k>0 gates TopK; top_p<1.0 gates TopP;
         // temperature==0 (penalty<=1) ⇒ exact argmax in the worker's sampler.
         let sampling = SamplingParams {
@@ -116,10 +278,21 @@ impl LlmEngine {
         let (model_id, prompt_len) = (self.config.model_id.clone(), tokens.len());
         let submitted = std::time::Instant::now();
         let probe = params.probe.clone();
+        let (active, batching) = (self.active.clone(), self.batching.clone());
+        let lone_at_submit = active.load(std::sync::atomic::Ordering::Acquire) == 1;
+        let (prior, serial, prompt_tokens) = match resume {
+            Some(r) => (Some(r.prior), Some(r.serial), Vec::new()),
+            None => (None, None, tokens.clone()),
+        };
         let cb_rx = server.submit_cb(tokens, max_new, sampling);
         std::thread::spawn(move || {
-            let mut gen: Vec<u32> = Vec::new();
-            let mut emitted = String::new();
+            let resumed = prior.is_some();
+            let mut gen: Vec<u32> = prior.unwrap_or_default();
+            let mut emitted = if resumed {
+                tokenizer.decode(&gen, true).unwrap_or_default()
+            } else {
+                String::new()
+            };
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
             // The markers the API parses are exempted when the vocabulary is loaded, so the
@@ -152,7 +325,7 @@ impl LlmEngine {
                         admitted = Some((at, cached_prompt_tokens));
                         // The worker read the prompt beyond the cached share before it
                         // sent this marker.
-                        if let Some(p) = probe.as_deref() {
+                        if let Some(p) = probe.as_deref().filter(|_| !resumed) {
                             let read = super::handover_rate::tokens_read(
                                 prompt_len,
                                 cached_prompt_tokens,
@@ -208,6 +381,30 @@ impl LlmEngine {
                 }
             }
             let done = std::time::Instant::now();
+            // A moved request reports its serial part and the worker's part together.
+            if let Some(SerialPart { moved, mut outcome }) = serial {
+                outcome.figures.decode_s += done.saturating_duration_since(moved).as_secs_f64();
+                outcome.figures.generated_tokens = gen.len() as u64;
+                crate::request_metrics::record_outcome(&model_id, probe.as_deref(), outcome);
+                return;
+            }
+            // A request alone in the worker from its submission to its end decoded alone.
+            if lone_at_submit && active.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                if let Some(rate) = first_token
+                    .and_then(|at| lone_rate(gen.len(), done.duration_since(at).as_secs_f64()))
+                {
+                    let decode = super::batching::LoneDecode {
+                        tokens: gen.len(),
+                        rate,
+                        drafted: 0.0,
+                        lookup: super::batching::lookup_share(&prompt_tokens, &gen),
+                    };
+                    batching
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record(super::batching::LonePath::Batched, decode);
+                }
+            }
             if let Some((at, cached)) = admitted {
                 let first = first_token.unwrap_or(done);
                 // The worker speculates and keeps the cache on its own: neither is reported.
@@ -283,9 +480,18 @@ impl LlmEngine {
         let arrived = std::time::Instant::now();
         // A grammar or token rules take the sequential path, one forward per token.
         if params.grammar.is_some() || params.rules.decodes_sequentially() {
+            self.serve_serially().await;
             return self
                 .generate_stream_sequential(prompt.to_string(), params)
                 .await;
+        }
+        // A lone request that finds another admitted before it starts moves the model into its
+        // worker and is served there.
+        if self.active.load(std::sync::atomic::Ordering::Acquire) > 1
+            && !self.is_continuous().await
+            && self.hands_over_to_worker().await
+        {
+            self.serve_batched().await;
         }
         // Continuous-batch delegation: a CB-served model bypasses the serial
         // lock+forward decode entirely - submit to the background worker and
@@ -344,6 +550,9 @@ impl LlmEngine {
         let spec_engine = self.clone_for_spec();
         let spec_rt = tokio::runtime::Handle::current();
         let probe = params.probe.clone();
+        // A lone request moves into the batch worker when another request arrives.
+        let mut hand_over = self.hands_over_to_worker().await;
+        let hand_over_params = params.clone();
 
         std::thread::spawn(move || {
             let _prefill = crate::request_metrics::bind_prefill(probe.clone());
@@ -1493,6 +1702,8 @@ impl LlmEngine {
             // The stage profile's view of a token: the whole iteration, and its parts below.
             use crate::inference::stage_prof::prof_record;
             let mut last_top: Option<Instant> = None;
+            // The request moved into the batch worker, which writes the rest of its answer.
+            let mut handed_over: Option<Instant> = None;
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
                 crate::request_metrics::note_decoded(token_count);
                 let step_start = Instant::now();
@@ -1545,6 +1756,21 @@ impl LlmEngine {
 
                 if token_count >= max_tokens {
                     break;
+                }
+                // Another request was admitted: this one moves into the batch worker with
+                // the model, so both decode at once.
+                if hand_over
+                    && spec_engine
+                        .active
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        > 1
+                {
+                    let moved_at = Instant::now();
+                    if spec_rt.block_on(spec_engine.serve_batched()) {
+                        handed_over = Some(moved_at);
+                        break;
+                    }
+                    hand_over = false;
                 }
 
                 // Determine mode
@@ -3130,7 +3356,7 @@ impl LlmEngine {
             if let Some(s) = model_state.blocking_lock().as_mut() {
                 let keep_at = graphs_at
                     .keepable(s.model.graph_generation())
-                    .filter(|_| !graph_disabled_this_request);
+                    .filter(|_| !graph_disabled_this_request && handed_over.is_none());
                 match (cuda_graph.take(), graph_logits.take(), keep_at) {
                     (Some(g), Some(l), Some(at)) => {
                         let graphs = super::decode::DecodeGraphs {
@@ -3207,6 +3433,10 @@ impl LlmEngine {
             let kv = model_state.blocking_lock().as_ref().and_then(|s| {
                 crate::request_metrics::KvPlace::of(s.model.kv_len(), s.model.kv_capacity())
             });
+            // The figures of a request moved into the worker are recorded with the worker's
+            // part.
+            let mut serial_part: Option<crate::request_metrics::RequestOutcome> = None;
+            let mut return_stats = true;
             if let Ok(mut slot) = stream_stats_slot.lock() {
                 if !logprob_buf.is_empty() {
                     if let Ok(mut q) = logprob_queue.lock() {
@@ -3222,26 +3452,58 @@ impl LlmEngine {
                 } else {
                     FinishReason::Disconnect
                 };
-                crate::request_metrics::record_outcome(
-                    &config.model_id,
-                    probe.as_deref(),
-                    crate::request_metrics::RequestOutcome {
-                        figures: crate::request_metrics::RequestFigures {
-                            queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
-                            prefill_s: prefill_end.map_or(0.0, |end| {
-                                end.saturating_duration_since(locked).as_secs_f64()
-                            }),
-                            decode_s: compute_ns as f64 / 1e9,
-                            prompt_tokens: prompt_tokens.len() as u64,
-                            cached_prompt_tokens: reused_prompt_tokens as u64,
-                            generated_tokens: token_count as u64,
-                        },
-                        drafted: spec_drafted + copy_drafted + pld_stats_drafted,
-                        accepted: spec_accepted + copy_accepted + pld_stats_accepted,
-                        kv,
+                let outcome = crate::request_metrics::RequestOutcome {
+                    figures: crate::request_metrics::RequestFigures {
+                        queue_s: locked.saturating_duration_since(arrived).as_secs_f64(),
+                        prefill_s: prefill_end.map_or(0.0, |end| {
+                            end.saturating_duration_since(locked).as_secs_f64()
+                        }),
+                        decode_s: compute_ns as f64 / 1e9,
+                        prompt_tokens: prompt_tokens.len() as u64,
+                        cached_prompt_tokens: reused_prompt_tokens as u64,
+                        generated_tokens: token_count as u64,
                     },
-                );
-                *slot = Some(StreamStats {
+                    drafted: spec_drafted + copy_drafted + pld_stats_drafted,
+                    accepted: spec_accepted + copy_accepted + pld_stats_accepted,
+                    kv,
+                };
+                if handed_over.is_some() {
+                    serial_part = Some(outcome);
+                } else {
+                    crate::request_metrics::record_outcome(
+                        &config.model_id,
+                        probe.as_deref(),
+                        outcome,
+                    );
+                }
+                // A request served serially to its end decoded alone.
+                if handed_over.is_none() {
+                    if let Some(rate) = prefill_end
+                        .and_then(|at| lone_rate(token_count, at.elapsed().as_secs_f64()))
+                    {
+                        let accepted = spec_accepted + copy_accepted + pld_stats_accepted;
+                        let decode = super::batching::LoneDecode {
+                            tokens: token_count,
+                            rate,
+                            drafted: accepted as f64 / token_count as f64,
+                            lookup: super::batching::lookup_share(
+                                &prompt_tokens,
+                                &generated_token_ids,
+                            ),
+                        };
+                        spec_engine
+                            .batching
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record(super::batching::LonePath::Serial, decode);
+                    }
+                }
+                // A moved request's answer is counted from what it streamed, as the worker's
+                // requests are.
+                if handed_over.is_some() {
+                    return_stats = false;
+                }
+                let stats = StreamStats {
                     eval_count: token_count as u64,
                     eval_duration_ns: compute_ns,
                     prompt_eval_count: prompt_eval_positions(
@@ -3262,9 +3524,27 @@ impl LlmEngine {
                         full.extend_from_slice(&generated_token_ids);
                         full
                     },
-                });
+                };
+                if return_stats {
+                    *slot = Some(stats);
+                }
             }
 
+            // The rest of a request moved into the batch worker comes from there.
+            if let Some(moved) = handed_over {
+                spec_engine.continue_in_worker(
+                    prompt_tokens,
+                    generated_token_ids,
+                    max_tokens.saturating_sub(token_count),
+                    hand_over_params,
+                    SerialPart {
+                        moved,
+                        outcome: serial_part.unwrap_or_default(),
+                    },
+                    &tx,
+                );
+                return;
+            }
             // -- Session state update + global resident-KV snapshot ----------
             // Snapshot the cache-representative token sequence so the next request
             // can skip redundant prefill: under the explicit session_id when present,
@@ -3424,6 +3704,28 @@ impl LlmEngine {
         let guard = self.model_state.lock().await;
         guard.as_ref().map(|s| s.vocab_size)
     }
+}
+
+/// An answer begun on the serial path that the batch worker continues.
+pub(super) struct Resume {
+    /// The tokens generated on the serial path.
+    pub(super) prior: Vec<u32>,
+    /// The tokens the worker may still generate.
+    pub(super) max_new: usize,
+    pub(super) serial: SerialPart,
+}
+
+/// The serial part of a request moved into the batch worker.
+pub(super) struct SerialPart {
+    /// When the model left the serial path.
+    pub(super) moved: std::time::Instant,
+    /// The figures and drafts of the tokens decoded serially.
+    pub(super) outcome: crate::request_metrics::RequestOutcome,
+}
+
+/// Tokens per second after the first of `tokens` generated tokens, which took `seconds`.
+fn lone_rate(tokens: usize, seconds: f64) -> Option<f64> {
+    (tokens >= 2 && seconds > 0.0).then(|| (tokens - 1) as f64 / seconds)
 }
 
 /// True when a stream's first message is an out-of-memory error: the attempt

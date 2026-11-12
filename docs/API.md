@@ -383,6 +383,9 @@ Each reading between 2 of them is split among the requests active over it, by th
 A reading over which no request computed a token is split evenly.  
 A request's energy is the sum of its parts.
 
+A request that arrives while another reads the meter does not wait for it.
+The energy drawn meanwhile goes to the next reading, so a request's figure can miss a few milliseconds of draw.
+
 A field loken does not measure is left out.  
 `energy` is absent when no domain is read.  
 `kv` is absent when the backend does not report its cache.
@@ -392,7 +395,9 @@ Times and energy are added, `share` is `work` when any generation shared its ene
 A beam search reports 1 set of figures for the whole search, and `decode_ms` covers every beam.
 
 `completion_tokens_details.accepted_prediction_tokens` counts the drafted tokens the model kept, and `rejected_prediction_tokens` the ones it refused.
-Both stay at 0 on a model served by continuous batching, whose worker does not report its speculation.
+Both stay at 0 for a request served by the batch worker, which does not draft.
+A lone request takes the serial path when its measured rate is the higher, and reports its drafts there.
+A request that serial decode began and the worker finished reports its whole answer and the drafts of its serial part.
 
 A streamed answer whose prompt is still being read after 250 ms reports the reading as an SSE comment line, about every 250 ms until the first token, on both routes:
 
