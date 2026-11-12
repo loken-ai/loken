@@ -294,6 +294,109 @@ fn smart_resize_video(
     (hbar, wbar)
 }
 
+/// The bicubic kernel of the antialiased resampling, `a = -0.5`.
+fn bicubic_aa(x: f64) -> f64 {
+    let a = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        (((x - 5.0) * x + 8.0) * x - 4.0) * a
+    } else {
+        0.0
+    }
+}
+
+/// The taps of an antialiased bicubic resampling of `input` samples to `output`: per output
+/// sample its first input sample and its integer weights, and the weights' fixed-point bits.
+///
+/// The kernel widens by the downscale ratio.
+/// The weights of a sample sum to one before they are scaled to 16-bit integers.
+/// The scale keeps the largest weight under `2^15`.
+fn bicubic_aa_taps(input: usize, output: usize) -> (Vec<(usize, Vec<i32>)>, u32) {
+    let scale = input as f64 / output as f64;
+    let support = if scale >= 1.0 { 2.0 * scale } else { 2.0 };
+    let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
+    let taps: Vec<(usize, Vec<f64>)> = (0..output)
+        .map(|i| {
+            let center = scale * (i as f64 + 0.5);
+            let lo = ((center - support + 0.5) as i64).max(0) as usize;
+            let hi = ((center + support + 0.5) as i64).min(input as i64) as usize;
+            let mut w: Vec<f64> = (lo..hi)
+                .map(|j| bicubic_aa((j as f64 - center + 0.5) * invscale))
+                .collect();
+            let total: f64 = w.iter().sum();
+            if total != 0.0 {
+                w.iter_mut().for_each(|v| *v /= total);
+            }
+            (lo, w)
+        })
+        .collect();
+    let w_max = taps
+        .iter()
+        .flat_map(|(_, w)| w.iter().copied())
+        .fold(0.0, f64::max);
+    let mut bits = 0u32;
+    while bits < 15 {
+        if (0.5 + w_max * (1u32 << (bits + 1)) as f64) as i64 >= 1 << 15 {
+            break;
+        }
+        bits += 1;
+    }
+    let one = (1u32 << bits) as f64;
+    let taps = taps
+        .into_iter()
+        .map(|(lo, w)| {
+            let w = w
+                .iter()
+                .map(|v| {
+                    let s = v * one;
+                    (if s < 0.0 { s - 0.5 } else { s + 0.5 }) as i32
+                })
+                .collect();
+            (lo, w)
+        })
+        .collect();
+    (taps, bits)
+}
+
+/// `img` resized to `w x h` by antialiased bicubic resampling in fixed point, the width first,
+/// each pass rounded to 8 bits.
+/// A side that keeps its size is not resampled.
+fn resize_bicubic_aa(img: &image::RgbImage, w: usize, h: usize) -> image::RgbImage {
+    let (w0, h0) = (img.width() as usize, img.height() as usize);
+    let mut buf = img.as_raw().clone();
+    let pass = |src: &[u8], (sw, sh): (usize, usize), along_x: bool, out: usize| -> Vec<u8> {
+        let (taps, bits) = bicubic_aa_taps(if along_x { sw } else { sh }, out);
+        let (dw, dh) = if along_x { (out, sh) } else { (sw, out) };
+        let half = 1i32 << bits.saturating_sub(1);
+        let mut dst = vec![0u8; dw * dh * 3];
+        for y in 0..dh {
+            for x in 0..dw {
+                let (lo, wts) = &taps[if along_x { x } else { y }];
+                for c in 0..3 {
+                    let mut acc = half;
+                    for (k, &wt) in wts.iter().enumerate() {
+                        let (sx, sy) = if along_x { (lo + k, y) } else { (x, lo + k) };
+                        acc += wt * src[(sy * sw + sx) * 3 + c] as i32;
+                    }
+                    dst[(y * dw + x) * 3 + c] = (acc >> bits).clamp(0, 255) as u8;
+                }
+            }
+        }
+        dst
+    };
+    let mut cur_w = w0;
+    if w != w0 {
+        buf = pass(&buf, (w0, h0), true, w);
+        cur_w = w;
+    }
+    if h != h0 {
+        buf = pass(&buf, (cur_w, h0), false, h);
+    }
+    image::RgbImage::from_raw(w as u32, h as u32, buf).expect("the resized frame's size")
+}
+
 /// The temporal patches of a clip's `frames` for a qwen35moe vision tower: every frame resized
 /// to one size, the clip's pixels within `[min_pixels, max_pixels]`, then grouped in runs of
 /// `p.temporal`, a short last run repeating the last frame. One `(pixel_values, (grid_h,
@@ -321,14 +424,7 @@ pub fn preprocess_qwen35vl_video(
     );
     let chws: Vec<Vec<f32>> = frames
         .iter()
-        .map(|f| {
-            normalized_chw(&image::imageops::resize(
-                f,
-                wbar as u32,
-                hbar as u32,
-                image::imageops::FilterType::CatmullRom,
-            ))
-        })
+        .map(|f| normalized_chw(&resize_bicubic_aa(f, wbar, hbar)))
         .collect();
     let grid = (hbar / p.patch_size, wbar / p.patch_size);
     let patch_dim = p.channels * p.temporal * p.patch_size * p.patch_size;
@@ -505,6 +601,47 @@ mod tests {
         let (h2, w2) = smart_resize(8000, 8000, 32, 64 << 10, 2 << 20);
         assert_eq!(h2 % 32, 0);
         assert!(h2 * w2 <= 2 << 20, "area {} above longest", h2 * w2);
+    }
+
+    /// A 5 x 7 frame whose channel `c` at `(y, x)` holds `(37 y + 11 x + 53 c) mod 256`.
+    fn synthetic_frame() -> image::RgbImage {
+        image::RgbImage::from_fn(7, 5, |x, y| {
+            image::Rgb([0u32, 1, 2].map(|c| ((37 * y + 11 * x + 53 * c) % 256) as u8))
+        })
+    }
+
+    /// A frame shrunk on both sides takes the reference video processor's values.
+    #[test]
+    fn a_shrunk_frame_takes_the_reference_values() {
+        let want: [u8; 48] = [
+            9, 62, 115, 28, 81, 134, 48, 101, 154, 67, 120, 173, 54, 107, 160, 73, 126, 179, 93,
+            146, 210, 112, 165, 234, 102, 155, 211, 121, 173, 242, 141, 195, 135, 160, 221, 102,
+            147, 200, 160, 166, 224, 59, 186, 204, 40, 205, 48, 39,
+        ];
+        assert_eq!(resize_bicubic_aa(&synthetic_frame(), 4, 4).as_raw(), &want);
+    }
+
+    /// A frame stretched in height and kept in width takes the reference values.
+    #[test]
+    fn a_stretched_frame_takes_the_reference_values() {
+        let out = resize_bicubic_aa(&synthetic_frame(), 7, 8);
+        let want_first_row: [u8; 21] = [
+            0, 50, 103, 8, 61, 114, 19, 72, 125, 30, 83, 136, 41, 94, 147, 52, 105, 158, 63, 116,
+            169,
+        ];
+        let want_last_row: [u8; 21] = [
+            151, 204, 255, 162, 215, 0, 173, 226, 4, 184, 237, 15, 195, 248, 45, 206, 0, 56, 217,
+            0, 67,
+        ];
+        assert_eq!(&out.as_raw()[..21], &want_first_row);
+        assert_eq!(&out.as_raw()[7 * 7 * 3..], &want_last_row);
+    }
+
+    /// A frame of the target size is left as it is.
+    #[test]
+    fn a_frame_of_the_target_size_is_kept() {
+        let f = synthetic_frame();
+        assert_eq!(resize_bicubic_aa(&f, 7, 5), f);
     }
 
     #[test]
