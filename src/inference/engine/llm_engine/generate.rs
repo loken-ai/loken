@@ -530,6 +530,10 @@ impl LlmEngine {
             // KV alongside the text tokens (moondream: +image_patches), or the
             // qwen35 mRoPE next-position (image compresses positions).
             let mut pos = qwen35_pos.unwrap_or_else(|| prompt_tokens.len() + vision_prefix_len.unwrap_or(0));
+            // A spliced vision prompt leaves the rotary position behind the cache length.
+            // The recorded step and every draft verify place a token at the cache length.
+            // Such a request decodes one eager step at a time, each step rotated at `pos`.
+            let rope_behind_cache = rope_runs_behind_cache(!qwen35_items.is_empty(), qwen35_pos, state.model.kv_len());
             // Explicit GPU->CPU transfer for logits before sampling
             logits = match logits.device() {
                 Device::Cpu => logits,
@@ -658,13 +662,13 @@ impl LlmEngine {
             // A drafter whose cycles lost to plain decoding is not prefilled; the plain steps
             // are then timed so the comparison stays current.
             let drafting = spec_drafter_on && spec_engine.draft_length() > 0;
-            let mut spec_on = drafting && spec_engine.draft_prefill(&prompt_tokens);
+            let mut spec_on = drafting && !rope_behind_cache && spec_engine.draft_prefill(&prompt_tokens);
             let mut time_plain = spec_drafter_on && !drafting;
             if spec_on { info!("🜂 spec-decode active: drafter proposing for '{}'", state.name); }
             // The model's own draft head drafts when no drafter model does and its cycles are
             // not known to lose to plain decoding; the tokens it reads next start as the one
             // the prefill sampled.
-            let mut head_on = head_capable && !spec_on;
+            let mut head_on = head_capable && !spec_on && !rope_behind_cache;
             if head_capable && !head_on {
                 state.model.draft_head_capture(false);
             }
@@ -726,7 +730,10 @@ impl LlmEngine {
             // buffers they read; stale ones are dropped with the graph state.
             #[cfg(feature = "gpu")]
             let kept = {
-                let kept = state.kept_graphs.take_current(state.model.graph_generation());
+                let kept = state
+                    .kept_graphs
+                    .take_current(state.model.graph_generation())
+                    .filter(|_| !rope_behind_cache);
                 if kept.is_none() && graphs_kept {
                     state.model.invalidate_graph_state();
                 }
@@ -810,11 +817,14 @@ impl LlmEngine {
             };
             // Each step replays the captured graph, unless the n-gram cache has a draft to
             // verify: that step runs eagerly over the draft, and the next one replays again.
-            let graph_auto_on_cached = graph_eligible && kv_safe_cached;
-            let pld_enabled = pld_capable;
+            let graph_auto_on_cached = graph_eligible && kv_safe_cached && !rope_behind_cache;
+            let pld_enabled = pld_capable && !rope_behind_cache;
             // A model that drafts from its own head without a recorded step drafts here, as long
             // as no drafter model or recorded head does.
-            let native_on = state.model.capabilities().native_draft && !spec_on && !head_on;
+            let native_on = state.model.capabilities().native_draft
+                && !spec_on
+                && !head_on
+                && !rope_behind_cache;
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
@@ -2242,5 +2252,38 @@ impl LlmEngine {
             Ok(Err(e)) => Err(e.into()),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Whether a prompt left the rotary position of its next token behind the cache length.
+///
+/// A spliced vision prefill returns `next_pos`, the position past every rotated one.
+/// An image run of `h x w` tokens advances that position by `max(h, w)` only.
+/// A cache length unknown to the model counts as behind.
+fn rope_runs_behind_cache(
+    spliced: bool,
+    next_pos: Option<usize>,
+    cache_len: Option<usize>,
+) -> bool {
+    spliced && cache_len != next_pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rope_runs_behind_cache;
+
+    /// A spliced grid larger than one row leaves the position behind the cache.
+    #[test]
+    fn a_spliced_grid_leaves_the_position_behind_the_cache() {
+        assert!(rope_runs_behind_cache(true, Some(60), Some(406)));
+        assert!(rope_runs_behind_cache(true, Some(60), None));
+    }
+
+    /// A prompt without a spliced grid, or one whose position met the cache, steps as text.
+    #[test]
+    fn a_position_at_the_cache_length_steps_as_text() {
+        assert!(!rope_runs_behind_cache(false, None, Some(406)));
+        assert!(!rope_runs_behind_cache(false, Some(406), Some(406)));
+        assert!(!rope_runs_behind_cache(true, Some(406), Some(406)));
     }
 }

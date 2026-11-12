@@ -244,6 +244,10 @@ Across machines, the model splits into runs of layers as a dense stack does, see
 | Vision | `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`, `qwen35`) | Base64 in the request, on all 3 surfaces |
 | Speech | `voxtral`, `ultravox` | Base64 clip in a chat turn |
 
+A Qwen vision prompt gives the tokens of an image or of a frame of a clip the positions of their grid.
+The position of the next token then runs behind the cache length.
+Such a request decodes one step at a time, without the recorded step and without drafts.
+
 A model whose files carry a speech tower lists `audio` among its capabilities.
 The tower comes from one of 2 sources:
 
