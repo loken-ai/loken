@@ -34,30 +34,6 @@ fn check(dtype: GgmlDType, tokens: usize, coop: bool) {
         .to_vec1::<f32>()
         .unwrap();
     let x = values(tokens * cols, 11);
-    // The kernels read int8 blocks of 32 for every format but the floats, as the quantiser makes
-    // them.
-    let seen = if matches!(dtype, GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32) {
-        x.clone()
-    } else {
-        x.chunks(if cols % 128 == 0 { 128 } else { 32 })
-            .flat_map(|b| {
-                let mx = b.iter().fold(0f32, |m, v| m.max(v.abs()));
-                let (d, inv) = (mx / 127.0, if mx > 0.0 { 127.0 / mx } else { 0.0 });
-                b.iter()
-                    .map(move |v| (v * inv).round_ties_even().clamp(-127.0, 127.0) * d)
-            })
-            .collect()
-    };
-    let want: Vec<f32> = (0..tokens)
-        .flat_map(|t| {
-            let (seen, dense) = (&seen, &dense);
-            (0..rows).map(move |r| {
-                (0..cols)
-                    .map(|c| dense[r * cols + c] as f64 * seen[t * cols + c] as f64)
-                    .sum::<f64>() as f32
-            })
-        })
-        .collect();
     let raw = RawTensor {
         dtype,
         rows,
@@ -65,7 +41,31 @@ fn check(dtype: GgmlDType, tokens: usize, coop: bool) {
         bytes: q.data().unwrap(),
     };
     for d in super::devices() {
-        let got = matvec_probe(d.index, &raw, &x, tokens, coop).unwrap();
+        let (got, shared) = matvec_probe(d.index, &raw, &x, tokens, coop).unwrap();
+        // The kernels read int8 blocks of 32 for every format but the floats, as the quantiser
+        // makes them, `shared` values to a scale.
+        let seen = if matches!(dtype, GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32) {
+            x.clone()
+        } else {
+            x.chunks(shared)
+                .flat_map(|b| {
+                    let mx = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let (d, inv) = (mx / 127.0, if mx > 0.0 { 127.0 / mx } else { 0.0 });
+                    b.iter()
+                        .map(move |v| (v * inv).round_ties_even().clamp(-127.0, 127.0) * d)
+                })
+                .collect()
+        };
+        let want: Vec<f32> = (0..tokens)
+            .flat_map(|t| {
+                let (seen, dense) = (&seen, &dense);
+                (0..rows).map(move |r| {
+                    (0..cols)
+                        .map(|c| dense[r * cols + c] as f64 * seen[t * cols + c] as f64)
+                        .sum::<f64>() as f32
+                })
+            })
+            .collect();
         let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         let err = got
             .iter()

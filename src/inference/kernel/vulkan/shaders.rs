@@ -36,10 +36,12 @@ fn dot4(a: vec4<u32>, b: vec4<u32>) -> i32 {
 }
 "#;
 
-/// Quantises rows of `n` values to int8 blocks (see the module comment), the scale shared by
-/// 128 values when `n` is a multiple of 128 and by 32 otherwise, after an optional
-/// transform of the source. Args: rows, n, src_off, eps, flags (1: also write the transformed
-/// values as f32 to `xn`), mode (0 copy, 1 RMS norm with weight `b`, 2 `silu(a) * b`, 3 the same with GELU).
+/// Quantises rows of `n` values to int8 blocks (see the module comment), after an optional
+/// transform of the source. Each block of 32 has a scale of its own.
+/// With flag 2 and `n` a multiple of 128, the 4 blocks of each 128 values share one scale.
+/// Args: rows, n, src_off, eps, flags (1: also write the transformed values as f32 to `xn`,
+/// 2: share the scale across 128 values), mode (0 copy, 1 RMS norm with weight `b`,
+/// 2 `silu(a) * b`, 3 the same with GELU).
 /// One workgroup per row; eight values a lane, four lanes a block.
 const QUANT: &str = r#"
 @group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;
@@ -87,7 +89,7 @@ fn main(
         for (var i = 0u; i < sgs; i = i + 1u) { tot = tot + red[i]; }
         scale = inverseSqrt(tot / f32(n) + argf(3u));
     }
-    let wide = (n % 128u) == 0u;
+    let wide = (n % 128u) == 0u && (arg(4u) & 2u) != 0u;
     let units = ((n / 8u) + 255u) / 256u * 256u;
     for (var u = li; u < units; u = u + 256u) {
         let valid = u * 8u < n;

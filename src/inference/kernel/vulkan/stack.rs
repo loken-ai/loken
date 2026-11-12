@@ -50,6 +50,22 @@ fn mat_mat_for(w: &Matrix, tokens: usize) -> Option<(&'static str, (u32, u32))> 
         .map(|k| (k, (MM_ROWS, MM_TOKENS)))
 }
 
+/// The quantiser's flags for activations the products of `ws` read on `tokens` rows.
+///
+/// Flag 1: one of them reads the f32 copy.
+/// Flag 2: one of them runs a K-quant integer mat-mat, which weighs each 128 columns by a
+/// single activation scale.
+/// Without flag 2 every block of 32 has its own scale.
+fn quant_flags(ws: &[&Matrix], tokens: usize) -> u32 {
+    let f32_copy = ws
+        .iter()
+        .any(|w| matches!(w.kernel, "mv_f16" | "mv_bf16" | "mv_f32"));
+    let wide = ws
+        .iter()
+        .any(|w| matches!(mat_mat_for(w, tokens), Some(("mm_q4k" | "mm_q6k", _))));
+    u32::from(f32_copy) | (u32::from(wide) << 1)
+}
+
 /// The shape of the decoder: what every layer of the stack shares.
 #[derive(Debug, Clone)]
 pub struct DenseSpec {
@@ -650,7 +666,9 @@ impl VulkanStack {
     ) {
         let s = &self.spec;
         let pairs = (tokens * s.used) as u32;
-        ops.push(self.opening_quant(l.ffn_norm.as_ref(), tokens, true));
+        // The router reads the f32 copy.
+        // The experts run mat-vecs, which read a scale to each block.
+        ops.push(self.opening_quant(l.ffn_norm.as_ref(), tokens, 1));
         let mut a = [0u32; 16];
         a[..5].copy_from_slice(&[
             tokens as u32,
@@ -706,7 +724,7 @@ impl VulkanStack {
             pairs as usize,
             rows_per,
             0,
-            Self::wants_f32(&[down]),
+            quant_flags(&[down], 1),
         ));
         ops.push(product(down, &self.moe_down, 1, s.hidden, true));
         let mut a = [0u32; 16];
@@ -785,8 +803,8 @@ impl VulkanStack {
     }
 
     /// Quantises `rows` rows of `n` values of `a`, from float `src_off`, into `xq` and `xm`:
-    /// as they are (mode 0), RMS normed with weight `b` (1), or as `silu(a) * b` (2). `f32_copy`
-    /// also leaves the values in `xn`.
+    /// as they are (mode 0), RMS normed with weight `b` (1), or as `silu(a) * b` (2). `flags`
+    /// are the quantiser's (see [`quant_flags`]).
     fn quant(
         &self,
         mode: u32,
@@ -795,7 +813,7 @@ impl VulkanStack {
         rows: usize,
         n: usize,
         src_off: usize,
-        f32_copy: bool,
+        flags: u32,
     ) -> Op {
         let mut args = [0u32; 16];
         args[..6].copy_from_slice(&[
@@ -803,7 +821,7 @@ impl VulkanStack {
             n as u32,
             src_off as u32,
             self.spec.eps.to_bits(),
-            u32::from(f32_copy),
+            flags,
             mode,
         ]);
         self.op(
@@ -817,18 +835,12 @@ impl VulkanStack {
 
     /// Quantises the residual's `tokens` rows for the block that opens: RMS normed with weight
     /// `norm`, or as they are without one.
-    fn opening_quant(&self, norm: Option<&Buffer>, tokens: usize, f32_copy: bool) -> Op {
+    fn opening_quant(&self, norm: Option<&Buffer>, tokens: usize, flags: u32) -> Op {
         let (mode, weight) = match norm {
             Some(norm) => (1, norm),
             None => (0, &self.dummy),
         };
-        self.quant(mode, &self.x, weight, tokens, self.spec.hidden, 0, f32_copy)
-    }
-
-    /// Whether any of `ws` reads the f32 copy of the activations.
-    fn wants_f32(ws: &[&Matrix]) -> bool {
-        ws.iter()
-            .any(|w| matches!(w.kernel, "mv_f16" | "mv_bf16" | "mv_f32"))
+        self.quant(mode, &self.x, weight, tokens, self.spec.hidden, 0, flags)
     }
 
     /// The dispatches of a step of `tokens` rows through layers `[from, to)`.
@@ -840,7 +852,7 @@ impl VulkanStack {
             ops.push(self.opening_quant(
                 l.attn_norm.as_ref(),
                 tokens,
-                Self::wants_f32(&[&l.q, &l.k, &l.v]),
+                quant_flags(&[&l.q, &l.k, &l.v], tokens),
             ));
             self.products(
                 &mut ops,
@@ -991,7 +1003,7 @@ impl VulkanStack {
                 tokens,
                 s.n_head * s.head_dim,
                 0,
-                Self::wants_f32(&[&l.o]),
+                quant_flags(&[&l.o], tokens),
             ));
             self.closing_product(&mut ops, tokens, &l.o, l.post_attn_norm.as_ref());
             match &l.ffn {
@@ -999,7 +1011,7 @@ impl VulkanStack {
                     ops.push(self.opening_quant(
                         l.ffn_norm.as_ref(),
                         tokens,
-                        Self::wants_f32(&[gate, up]),
+                        quant_flags(&[gate, up], tokens),
                     ));
                     self.products(
                         &mut ops,
@@ -1013,7 +1025,7 @@ impl VulkanStack {
                         tokens,
                         s.ffn,
                         0,
-                        Self::wants_f32(&[down]),
+                        quant_flags(&[down], tokens),
                     ));
                     self.closing_product(&mut ops, tokens, down, l.post_ffn_norm.as_ref());
                 }
@@ -1035,7 +1047,7 @@ impl VulkanStack {
                 1,
                 s.hidden,
                 (tokens - 1) * s.hidden,
-                Self::wants_f32(&[&hd.proj]),
+                quant_flags(&[&hd.proj], 1),
             ));
             self.products(&mut ops, 1, &[(&hd.proj, &hd.logits, None, false)]);
         }
@@ -1368,6 +1380,7 @@ impl Drop for VulkanStack {
 
 /// `W x` for `tokens` rows of `x` through the quantiser and the mat-vec kernel of `w`'s format,
 /// on device `device`: the kernels alone, for the checks against the host.
+/// Also returns how many values share an activation scale, as the stack quantises them.
 #[cfg(test)]
 pub(super) fn matvec_probe(
     device: usize,
@@ -1375,7 +1388,7 @@ pub(super) fn matvec_probe(
     x: &[f32],
     tokens: usize,
     coop: bool,
-) -> anyhow::Result<Vec<f32>> {
+) -> anyhow::Result<(Vec<f32>, usize)> {
     let ctx = super::context(device)?;
     let m = Matrix::upload(&ctx, w, coop && ctx.coop())?;
     let xb = ctx.upload(&f32_bytes(x))?;
@@ -1435,7 +1448,8 @@ pub(super) fn matvec_probe(
         all[..8].copy_from_slice(&a);
         all.iter().flat_map(|v| v.to_le_bytes()).collect()
     };
-    let quant = words([tokens as u32, m.cols as u32, 0, 0, 1, 0, 0, 0]);
+    let flags = 1 | quant_flags(&[&m], tokens);
+    let quant = words([tokens as u32, m.cols as u32, 0, 0, flags, 0, 0, 0]);
     let mv = |count: usize, first: usize| {
         words([
             rows,
@@ -1518,8 +1532,14 @@ pub(super) fn matvec_probe(
     unsafe { dev.destroy_descriptor_pool(pool, None) };
     let mut bytes = vec![0u8; tokens * m.rows * 4];
     out.read(0, &mut bytes);
-    Ok(bytes
+    let shared = if flags & 2 != 0 && m.cols.is_multiple_of(128) {
+        128
+    } else {
+        32
+    };
+    let ys = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect())
+        .collect();
+    Ok((ys, shared))
 }
