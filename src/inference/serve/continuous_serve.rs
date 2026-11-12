@@ -376,7 +376,8 @@ impl BatchedModel for GhBatched {
             #[cfg(feature = "gpu")]
             let graph_on = !self.graph_failed
                 && !self.model.compute_device().is_cpu()
-                && self.model.cb_eligible();
+                && self.model.cb_eligible()
+                && self.model.cb_graph_serves();
             #[cfg(not(feature = "gpu"))]
             let graph_on = false;
             let logits = if graph_on {

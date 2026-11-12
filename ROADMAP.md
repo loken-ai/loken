@@ -67,7 +67,7 @@ Smaller, by state then by priority:
 | Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Partial |
 | DeepSeek V4.1 through the hetero route | Models | DeepSeek V4.1 loads and is placed through HeteroPlan and the ladder, with no loader, backend, batch server or expert streamer of its own, and its tokens equal those of the frozen oracle. | Done |
 | Documents checked against the hetero route | Documentation | Every page, scene and exercise that names DeepSeek V4.1, in `docs/` and on the site, matches the hetero route, with no dedicated loader, engine or port left in the text. | Planned |
-| Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Started |
+| Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Done |
 
 Fixes, by state then by priority:
 

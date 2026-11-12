@@ -1,5 +1,5 @@
-//! The continuous-batch paths on the host for a mixture, a stretched rotation and a partial
-//! rotation.
+//! The continuous-batch paths on the host for a mixture, a stretched rotation, a partial
+//! rotation, attention sinks and a windowed layer.
 //!
 //! A sequence decoded inside a batch gives the tokens it gives decoded alone.
 //! The batched paths give the logits the serial forward gives for the same tokens.
@@ -83,6 +83,11 @@ fn run_batched(
 ) -> Vec<Run> {
     let (n_kv, hd, n_layers, _) = model.paged_geometry();
     let device = model.compute_device();
+    // The stores the server gives the device.
+    let held = match device.is_cpu() {
+        true => DType::F32,
+        false => DType::F16,
+    };
     let mut stores: Vec<PagedKvStore> = (0..n_layers)
         .map(|_| {
             PagedKvStore::new(
@@ -90,7 +95,7 @@ fn run_batched(
                 BLOCK,
                 n_kv,
                 hd,
-                DType::F32,
+                held,
                 &device,
             )
             .unwrap()
@@ -268,9 +273,21 @@ fn a_mixture_sequence_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
 #[test]
 fn the_server_gives_a_mixture_sequence_its_tokens_alone_and_beside_others() {
     let path = tiny_model::write_moe("cb-moe-server", LAYERS);
+    served_alone_and_beside_agree(&path);
+    tiny_model::remove(&path);
+}
+
+/// The continuous-batch server on the host gives each sequence of the model at `path` the
+/// tokens it gives that sequence served alone, whatever steps the 3 others share with it.
+fn served_alone_and_beside_agree(path: &std::path::Path) {
+    served_alone_and_beside_agree_on(&|| tiny_model::load(path, LAYERS));
+}
+
+/// [`served_alone_and_beside_agree`] for the model `load` gives.
+fn served_alone_and_beside_agree_on(load: &dyn Fn() -> GenericHeteroTransformer) {
     let prompts = prompts();
     let serve = |which: &[usize]| -> Vec<Vec<u32>> {
-        let model = Arc::new(tiny_model::load(&path, LAYERS));
+        let model = Arc::new(load());
         let server =
             ContinuousServer::spawn(model, Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096).unwrap();
         let receivers: Vec<_> = which
@@ -303,7 +320,6 @@ fn the_server_gives_a_mixture_sequence_its_tokens_alone_and_beside_others() {
             "sequence {s} was served other tokens beside the others"
         );
     }
-    tiny_model::remove(&path);
 }
 
 /// A stretched rotation is served by the batched paths on the host, from each layer's tables.
@@ -352,6 +368,139 @@ fn a_partial_rotation_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
     tiny_model::remove(&path);
 }
 
+/// The header keys that window the first layer to its last 4 keys and leave the second global.
+fn first_layer_windowed() -> Vec<(String, Value)> {
+    vec![
+        ("llama.attention.sliding_window".into(), Value::U32(4)),
+        (
+            "llama.attention.sliding_window_pattern".into(),
+            Value::Array(vec![Value::U32(1), Value::U32(0)]),
+        ),
+    ]
+}
+
+/// Attention sinks are served by the batched paths on the host: each head's sink stands in
+/// its softmax denominator, for every sequence of the batch.
+#[test]
+fn a_sink_sequence_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
+    let path = tiny_model::write_wide_sinks("cb-sinks", LAYERS, false, Vec::new());
+    let model = tiny_model::load(&path, LAYERS);
+    assert!(model.layers.iter().all(|l| l.attn_sinks.is_some()));
+    alone_and_batched_agree(&model);
+    batched_follows_serial(&path);
+    served_alone_and_beside_agree(&path);
+    tiny_model::remove(&path);
+}
+
+/// A windowed layer reads its last keys in the batched paths on the host, as the serial
+/// forward does, and its global neighbour reads them all.
+#[test]
+fn a_windowed_layer_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
+    let path = tiny_model::write_wide_with("cb-window", LAYERS, false, first_layer_windowed());
+    let model = tiny_model::load(&path, LAYERS);
+    assert_eq!(model.layers[0].sliding_window, Some(4));
+    assert_eq!(model.layers[1].sliding_window, None);
+    alone_and_batched_agree(&model);
+    batched_follows_serial(&path);
+    tiny_model::remove(&path);
+}
+
+/// A mixture with sinks, a windowed layer and a stretched rotation is served by the batched
+/// paths and by the server on the host.
+#[test]
+fn a_mixture_with_sinks_window_and_stretched_rotation_batches_on_the_host() {
+    let extra = first_layer_windowed()
+        .into_iter()
+        .chain([
+            (
+                "llama.rope.scaling.type".into(),
+                Value::String("yarn".into()),
+            ),
+            ("llama.rope.scaling.factor".into(), Value::F32(4.0)),
+            (
+                "llama.rope.scaling.original_context_length".into(),
+                Value::U32(8),
+            ),
+        ])
+        .collect();
+    let path = tiny_model::write_wide_sinks("cb-sinks-moe", LAYERS, true, extra);
+    let model = tiny_model::load(&path, LAYERS);
+    assert!(model.config.yarn.is_some());
+    assert!(model
+        .layers
+        .iter()
+        .all(|l| l.moe.is_some() && l.attn_sinks.is_some()));
+    alone_and_batched_agree(&model);
+    batched_follows_serial(&path);
+    served_alone_and_beside_agree(&path);
+    tiny_model::remove(&path);
+}
+
+/// The file of `tag` in the configured model store.
+fn store_blob(tag: &str) -> std::path::PathBuf {
+    let store = crate::config::Config::load_test().get_ollama_models_dir();
+    let (name, tag) = tag.split_once(':').unwrap_or((tag, "latest"));
+    let manager = crate::inference::load::ollama_manager::OllamaManager::new(store.clone());
+    let manifest = manager
+        .read_manifest_json(name, tag)
+        .expect("manifest in the store");
+    let digest = manifest["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["mediaType"] == "application/vnd.ollama.image.model")
+        .and_then(|l| l["digest"].as_str())
+        .expect("a model layer")
+        .replace(':', "-");
+    store.join("blobs").join(digest)
+}
+
+/// A real mixture with sinks, windowed layers, biases and a stretched rotation, whole on the
+/// host: a sequence keeps its tokens inside a batch, and the batch follows the serial forward.
+///
+/// Ignored by default: it needs the model in the store and its weights in host memory.
+#[test]
+#[ignore]
+fn a_real_sink_mixture_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
+    let path = store_blob("gpt-oss:20b");
+    let layers = {
+        let g = crate::tensor::quantized::gguf_file::open_mapped(&path).unwrap();
+        let arch = g.content.metadata["general.architecture"]
+            .to_string()
+            .unwrap()
+            .clone();
+        GenericTransformerConfig::from_gguf(&g.content, &arch)
+            .unwrap()
+            .n_layers
+    };
+    let model = tiny_model::load(&path, layers);
+    assert!(model.layers.iter().all(|l| l.attn_sinks.is_some()));
+    alone_and_batched_agree(&model);
+    let prompts = prompts();
+    let together = run_batched(&model, &prompts, &[0, 1, 2, 3]);
+    drop(model);
+    // The serial forward chooses the tokens the batch chose, step by step.
+    for (s, (prompt, (tokens, logits))) in prompts.iter().zip(&together).enumerate() {
+        let mut serial = tiny_model::load(&path, layers);
+        let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut want = vec![flat(serial.forward(&ids(prompt), 0).unwrap())];
+        for (i, &t) in tokens[..STEPS].iter().enumerate() {
+            want.push(flat(serial.forward(&ids(&[t]), prompt.len() + i).unwrap()));
+        }
+        let shares: Vec<String> = want
+            .iter()
+            .zip(logits)
+            .map(|(w, g)| format!("{:.2e}", share(w, g)))
+            .collect();
+        eprintln!("sequence {s}: serial against batched by step {shares:?}");
+        let chosen: Vec<u32> = want.iter().map(|w| argmax(w)).collect();
+        assert_eq!(
+            &chosen, tokens,
+            "sequence {s}: the serial forward chose other tokens"
+        );
+    }
+}
+
 /// A model moved into the continuous-batch server still names the format its projections run
 /// in, and names the same one once moved back out.
 #[test]
@@ -372,4 +521,221 @@ fn a_batched_model_names_the_format_it_runs_in() {
     };
     assert_eq!(serial.running_format(), format);
     tiny_model::remove(&path);
+}
+
+/// The variants a card batches: each sequence decodes to the tokens it gives alone in the
+/// batched paths and in the server, every layer on card 0.
+#[cfg(feature = "gpu")]
+mod on_a_card {
+    use super::*;
+
+    /// Whether card 0 opens. A run without a card says so on its error stream.
+    fn card() -> bool {
+        let present = Device::new_cuda(0).is_ok();
+        if !present {
+            eprintln!("no card: the card variants checked nothing");
+        }
+        present
+    }
+
+    /// Each sequence decodes to the tokens it gives alone, in the batched paths and in the
+    /// server, with the model at `path` on card 0.
+    fn alone_and_batched_agree_on_a_card(path: &std::path::Path) {
+        let model = tiny_model::load_on_card(path, LAYERS);
+        assert!(!model.compute_device().is_cpu());
+        assert!(model.cb_eligible(), "{:?}", model.cb_unsupported_reason());
+        let prompts = prompts();
+        let together = run_batched(&model, &prompts, &[0, 1, 2, 3]);
+        let mut worst = 0f32;
+        for (s, beside) in together.iter().enumerate() {
+            let alone = run_batched(&model, &prompts, &[s]);
+            assert_eq!(
+                alone[0].0, beside.0,
+                "sequence {s} decoded other tokens inside the batch"
+            );
+            for (a, b) in alone[0].1.iter().zip(&beside.1) {
+                worst = worst.max(share(a, b));
+            }
+        }
+        eprintln!(
+            "alone against batched on a card: largest logit difference {worst:.3e} of the range"
+        );
+        drop(model);
+        served_alone_and_beside_agree_on(&|| tiny_model::load_on_card(path, LAYERS));
+    }
+
+    /// The quantised toy written under `tag` with `extras`.
+    fn quant(tag: &str, extras: tiny_model::QuantExtras) -> std::path::PathBuf {
+        tiny_model::write_quant_with(tag, LAYERS, extras)
+    }
+
+    /// The header keys of a stretched rotation of the quantised toy.
+    fn stretched() -> Vec<(String, Value)> {
+        vec![
+            (
+                "qwen3.rope.scaling.type".into(),
+                Value::String("yarn".into()),
+            ),
+            ("qwen3.rope.scaling.factor".into(), Value::F32(4.0)),
+            (
+                "qwen3.rope.scaling.original_context_length".into(),
+                Value::U32(8),
+            ),
+        ]
+    }
+
+    /// The header keys that window the first layer of the quantised toy to its last 4 keys.
+    fn windowed() -> Vec<(String, Value)> {
+        vec![
+            ("qwen3.attention.sliding_window".into(), Value::U32(4)),
+            (
+                "qwen3.attention.sliding_window_pattern".into(),
+                Value::Array(vec![Value::U32(1), Value::U32(0)]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_stretched_rotation_batches_on_a_card() {
+        if !card() {
+            return;
+        }
+        let keys = stretched();
+        let path = quant(
+            "cb-card-yarn",
+            tiny_model::QuantExtras {
+                keys,
+                ..Default::default()
+            },
+        );
+        alone_and_batched_agree_on_a_card(&path);
+        tiny_model::remove(&path);
+    }
+
+    #[test]
+    fn a_partial_rotation_batches_on_a_card() {
+        if !card() {
+            return;
+        }
+        let rotated = tiny_model::QUANT_EMBD / tiny_model::QUANT_HEADS / 2;
+        let keys = vec![(
+            "qwen3.rope.dimension_count".into(),
+            Value::U32(rotated as u32),
+        )];
+        let path = quant(
+            "cb-card-partial",
+            tiny_model::QuantExtras {
+                keys,
+                ..Default::default()
+            },
+        );
+        alone_and_batched_agree_on_a_card(&path);
+        tiny_model::remove(&path);
+    }
+
+    #[test]
+    fn attention_sinks_and_a_window_batch_on_a_card() {
+        if !card() {
+            return;
+        }
+        let extras = tiny_model::QuantExtras {
+            keys: windowed(),
+            sinks: true,
+            ..Default::default()
+        };
+        let path = quant("cb-card-sinks", extras);
+        alone_and_batched_agree_on_a_card(&path);
+        tiny_model::remove(&path);
+    }
+
+    /// A prompt of a model with sinks whose attention scores take more than the card has free
+    /// answers, and chooses the token it chooses on a card with room.
+    ///
+    /// The tight card runs the attention in smaller query tiles.
+    /// Its logits differ from the roomy card's by the rounding of the half-precision products.
+    #[test]
+    fn a_sink_prompt_whose_scores_exceed_the_free_card_memory_answers() {
+        use crate::inference::place::room::free_now;
+        if !card() {
+            return;
+        }
+        let extras = tiny_model::QuantExtras {
+            sinks: true,
+            ..Default::default()
+        };
+        let path = quant("cb-card-sinks-room", extras);
+        let model = tiny_model::load_on_card(&path, LAYERS);
+        let device = model.compute_device();
+        let (n_kv, hd, n_layers, _) = model.paged_geometry();
+        let len = 4096usize;
+        let vocab = tiny_model::QUANT_VOCAB as u32;
+        let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 7 + 3) % vocab).collect();
+        let slots: Vec<usize> = (0..len).collect();
+        let prefill = || {
+            let mut stores: Vec<PagedKvStore> = (0..n_layers)
+                .map(|_| {
+                    PagedKvStore::new(len.div_ceil(BLOCK), BLOCK, n_kv, hd, DType::F16, &device)
+                        .unwrap()
+                })
+                .collect();
+            model.paged_prefill_batch(&[(prompt.as_slice(), slots.as_slice())], &mut stores)
+        };
+        let want = rows_of(&prefill().unwrap());
+        // The card keeps free half the scores the whole prompt holds at once.
+        let scores = model.prompt_attention_bytes(len, len);
+        crate::inference::engine::llm_engine::release_cuda_pools();
+        let free = free_now(&device).unwrap();
+        let filler = Tensor::zeros_on(
+            (free.saturating_sub(scores / 2) as usize,),
+            DType::U8,
+            &device,
+        )
+        .unwrap();
+        let left = free_now(&device).unwrap();
+        assert!(
+            left < scores,
+            "the card kept {left} bytes free for scores of {scores}"
+        );
+        let got = prefill().expect("the prompt ran out of card memory");
+        drop(filler);
+        let got = rows_of(&got);
+        let worst = share(&want[0], &got[0]);
+        eprintln!("tight against roomy card: largest logit difference {worst:.3e} of the range");
+        assert_eq!(
+            argmax(&want[0]),
+            argmax(&got[0]),
+            "the tight card chose another token"
+        );
+        tiny_model::remove(&path);
+    }
+
+    #[test]
+    fn a_mixture_batches_on_a_card() {
+        if !card() {
+            return;
+        }
+        let extras = tiny_model::QuantExtras {
+            routed: true,
+            ..Default::default()
+        };
+        let path = quant("cb-card-moe", extras);
+        alone_and_batched_agree_on_a_card(&path);
+        tiny_model::remove(&path);
+    }
+
+    /// A mixture with sinks, a windowed layer and a stretched rotation batches on a card.
+    #[test]
+    fn a_mixture_with_sinks_window_and_stretched_rotation_batches_on_a_card() {
+        if !card() {
+            return;
+        }
+        let extras = tiny_model::QuantExtras {
+            keys: windowed().into_iter().chain(stretched()).collect(),
+            sinks: true,
+            routed: true,
+        };
+        let path = quant("cb-card-all", extras);
+        alone_and_batched_agree_on_a_card(&path);
+        tiny_model::remove(&path);
+    }
 }

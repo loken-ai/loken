@@ -10,6 +10,20 @@ const SCORES_TILE_BYTES: usize = 256 << 20;
 /// the scores and the copy derived from them (scaled, masked, normalised) live two at a time,
 /// and the rest of the layer's step keeps the others.
 const SCORES_SHARES_OF_FREE: usize = 4;
+/// Copies of a query tile's scores the sink attention keeps alive at once: the scores and the
+/// copy derived from them.
+const SINK_SCORES_LIVE_COPIES: usize = 2;
+
+/// Card bytes the materialised sink attention keeps alive for a prompt of `rows` rows over
+/// `keys` keys with `n_head` query heads, at batch 1.
+///
+/// It is its widest query tile's F32 scores, [`SINK_SCORES_LIVE_COPIES`] times.
+/// The tile is the one the attention takes on a card with room to spare.
+pub(crate) fn sink_scores_bytes(n_head: usize, rows: usize, keys: usize) -> u64 {
+    let per_row = n_head.saturating_mul(keys).max(1) * std::mem::size_of::<f32>();
+    let tile = (SCORES_TILE_BYTES / per_row).clamp(1, rows.max(1));
+    (tile.saturating_mul(per_row) as u64).saturating_mul(SINK_SCORES_LIVE_COPIES as u64)
+}
 
 impl GenericTransformerLayer {
     /// Append the new token(s) `k`/`v` (`[1, n_kv, seq, hd]`, post-RoPE,
@@ -1124,40 +1138,40 @@ pub(super) fn sink_attention_matmul(
     let v = v.contiguous()?;
     let sinks = sinks.to_dtype(DType::F32)?;
     let neg_inf = Tensor::new(f32::NEG_INFINITY, &q.device())?;
+    // Each step drops the scores it read.
+    // At most `SINK_SCORES_LIVE_COPIES` copies of a tile's scores are alive at once.
     let attend = |qt: &Tensor, off: usize| -> Result<Tensor> {
         let t = qt.dims()[2];
         let qt = qt.to_dtype(kv_dt)?.contiguous()?;
-        let scores = qt
+        let mut scores = qt
             .reshape((b, n_kv_head, g * t, hd))?
             .matmul(&kt)?
             .to_dtype(DType::F32)?
             .reshape((b, n_head, t, kv_len))?;
-        let scores = match mask {
-            None => scores,
-            Some(m) => {
-                let qdim = m.dims().len() - 2;
-                let mt = if m.dims()[qdim] == 1 {
-                    m.clone()
-                } else {
-                    m.narrow(qdim, off, t)?
-                };
-                mt.broadcast_as(scores.shape())?
-                    .where_cond(&neg_inf.broadcast_as(scores.dims())?, &scores)?
-            }
-        };
-        let weights =
-            crate::tensor::ops::softmax_last_dim_with_sinks(&scores, None, &sinks, scale)?
-                .to_dtype(v.dtype())?;
+        if let Some(m) = mask {
+            let qdim = m.dims().len() - 2;
+            let mt = if m.dims()[qdim] == 1 {
+                m.clone()
+            } else {
+                m.narrow(qdim, off, t)?
+            };
+            scores = mt
+                .broadcast_as(scores.shape())?
+                .where_cond(&neg_inf.broadcast_as(scores.dims())?, &scores)?;
+        }
+        let probs = crate::tensor::ops::softmax_last_dim_with_sinks(&scores, None, &sinks, scale)?;
+        drop(scores);
+        let weights = probs.to_dtype(v.dtype())?;
+        drop(probs);
         weights
             .reshape((b, n_kv_head, g * t, kv_len))?
             .matmul(&v)?
             .reshape((b, n_head, t, hd))
     };
-    let per_row = (b * n_head * kv_len).max(1) * std::mem::size_of::<f32>();
-    let tile = (SCORES_TILE_BYTES / per_row).clamp(1, seq.max(1));
-    let out = if seq <= tile {
-        attend(q, 0)?
-    } else {
+    let tiled = |tile: usize| -> Result<Tensor> {
+        if seq <= tile {
+            return attend(q, 0);
+        }
         let mut outs = Vec::with_capacity(seq.div_ceil(tile));
         let mut off = 0;
         while off < seq {
@@ -1165,7 +1179,24 @@ pub(super) fn sink_attention_matmul(
             outs.push(attend(&q.narrow(2, off, t)?, off)?);
             off += t;
         }
-        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 2)?
+        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 2)
+    };
+    let per_row = (b * n_head * kv_len).max(1) * std::mem::size_of::<f32>();
+    // A decoded row is one tile.
+    // A prompt's tile holds the scores the card's free memory gives it.
+    let mut tile = match seq {
+        0 | 1 => 1,
+        _ => (GenericTransformerLayer::scores_budget(&q.device()) / per_row).clamp(1, seq),
+    };
+    // A tile that runs out of card memory runs again at half its rows, down to 1 row.
+    let out = loop {
+        match tiled(tile) {
+            Err(e) if e.is_oom() && tile > 1 => {
+                tile /= 2;
+                tracing::debug!("sink attention out of card memory: {tile} query rows a tile");
+            }
+            done => break done?,
+        }
     };
     out.to_dtype(q.dtype())
 }
@@ -1370,6 +1401,21 @@ mod sink_attention_tests {
             scale,
         );
         assert!(max_diff(&got, &want) < 1e-5);
+    }
+
+    /// A short prompt's scores are counted whole.
+    /// A long prompt's are counted at the widest tile the attention takes.
+    #[test]
+    fn the_sink_scores_count_the_widest_tile_twice() {
+        let f32_bytes = std::mem::size_of::<f32>();
+        let (heads, rows, keys) = (4usize, 6usize, 9usize);
+        let short = SINK_SCORES_LIVE_COPIES * heads * rows * keys * f32_bytes;
+        assert_eq!(sink_scores_bytes(heads, rows, keys), short as u64);
+        let (heads, keys) = (64usize, 32768usize);
+        let per_row = heads * keys * f32_bytes;
+        let widest = SINK_SCORES_LIVE_COPIES * (SCORES_TILE_BYTES / per_row) * per_row;
+        assert_eq!(sink_scores_bytes(heads, 512, keys), widest as u64);
+        assert_eq!(sink_scores_bytes(heads, 4096, keys), widest as u64);
     }
 
     /// The host prefill attention matches the reference across key tiles, query blocks and a

@@ -948,7 +948,10 @@ pub(super) fn try_spawn_continuous(
         // A lane is sure of one prompt chunk; longer contexts share the rest of the pool.
         window: context_length.min(PREFILL_CHUNK_TOKENS),
         lane_step_bytes: paged::lane_step_bytes(n_layers, hidden, ffn),
-        work_reserve: runtime_demand::llm_work_reserve(hidden.max(ffn), PREFILL_CHUNK_TOKENS),
+        // The activations of a prompt chunk, and the scores its attention keeps over the
+        // keys of the whole context.
+        work_reserve: runtime_demand::llm_work_reserve(hidden.max(ffn), PREFILL_CHUNK_TOKENS)
+            .saturating_add(model.prompt_attention_bytes(PREFILL_CHUNK_TOKENS, context_length)),
     };
     let Some(plan) = paged::plan(&model.compute_device(), &shape) else {
         warn!(

@@ -82,6 +82,71 @@ pub fn paged_attn_decode_seq(
     }
 }
 
+/// Shape of the host attention of one sequence's rows: heads, key-value heads, head width,
+/// score scale, the keys a windowed layer reads and the per-head sink logits.
+pub struct HostAttnShape<'a> {
+    pub n_head: usize,
+    pub n_kv_head: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+    /// A windowed layer reads the last `window` keys of each row, its own key included.
+    pub window: Option<usize>,
+    /// Per-head logits added to each row's softmax denominator, not scaled: `[n_head]`.
+    pub sinks: Option<&'a [f32]>,
+}
+
+/// Causal GQA attention on the host of query rows of one sequence over its keys.
+///
+/// `q` is `[rows, n_head, head_dim]` and `k`, `v` are `[keys, n_kv_head, head_dim]`.
+/// Row `i` reads keys `ends[i] - reach .. ends[i]`, `reach` being the window or every key.
+/// A sink adds `exp(sink)` to its head's denominator and nothing to the output.
+/// Returns `[rows, n_head, head_dim]`.
+pub fn host_attn_rows(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    ends: &[usize],
+    shape: &HostAttnShape<'_>,
+) -> Vec<f32> {
+    let (nh, nkv, hd) = (shape.n_head, shape.n_kv_head, shape.head_dim);
+    debug_assert_eq!(q.len(), ends.len() * nh * hd);
+    let group = nh / nkv;
+    let kv_stride = nkv * hd;
+    let mut out = vec![0f32; q.len()];
+    let mut scores = Vec::new();
+    for (row, &end) in ends.iter().enumerate() {
+        let start = shape.window.map_or(0, |w| end.saturating_sub(w));
+        for h in 0..nh {
+            let kvh = h / group;
+            let qh = &q[(row * nh + h) * hd..][..hd];
+            scores.clear();
+            let mut mx = shape.sinks.map_or(f32::NEG_INFINITY, |s| s[h]);
+            for t in start..end {
+                let kt = &k[t * kv_stride + kvh * hd..][..hd];
+                let dot: f32 = qh.iter().zip(kt).map(|(a, b)| a * b).sum();
+                let sc = dot * shape.scale;
+                mx = mx.max(sc);
+                scores.push(sc);
+            }
+            let mut sum = shape.sinks.map_or(0.0, |s| (s[h] - mx).exp());
+            for sc in scores.iter_mut() {
+                *sc = (*sc - mx).exp();
+                sum += *sc;
+            }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            let oh = &mut out[(row * nh + h) * hd..][..hd];
+            for (i, t) in (start..end).enumerate() {
+                let p = scores[i] * inv;
+                let vt = &v[t * kv_stride + kvh * hd..][..hd];
+                for (o, x) in oh.iter_mut().zip(vt) {
+                    *o += p * x;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// GPU-ready NEOX (split-half) RoPE on `x` `[B, n_heads, head_dim]`, each batch
 /// row rotated at its own `positions[b]`. Tensor ops -> runs on the input's device
 /// (no host round-trip). Returns the rotated tensor. Matches the scalar rope used

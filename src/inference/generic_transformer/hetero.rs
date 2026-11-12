@@ -63,6 +63,46 @@ fn rotate_rows_by_table(
         .contiguous()
 }
 
+/// The attention output projection of `layer` over the rows `a`, its bias added when it has
+/// one.
+fn attention_output(layer: &GenericTransformerLayer, a: &Tensor) -> Result<Tensor> {
+    let o = layer.attn_output.forward(a)?;
+    match layer.attn_output_bias.as_ref() {
+        Some(b) => o.broadcast_add(&b.to_dtype(o.dtype())?),
+        None => Ok(o),
+    }
+}
+
+/// The host attention shape of a layer whose softmax holds a sink or whose keys a window
+/// bounds.
+///
+/// `None` for a layer with neither: the plain host paths serve it.
+fn sink_or_window_shape(
+    layer: &GenericTransformerLayer,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Option<crate::inference::cache::paged_attention::HostAttnShape<'_>> {
+    let window = layer.sliding_window.filter(|&w| w > 0);
+    let sinks = layer.attn_sinks_host.as_deref();
+    (window.is_some() || sinks.is_some()).then_some(
+        crate::inference::cache::paged_attention::HostAttnShape {
+            n_head,
+            n_kv_head,
+            head_dim,
+            scale,
+            window,
+            sinks,
+        },
+    )
+}
+
+/// The rows of `t` as host F32.
+fn host_f32(t: &Tensor) -> Result<Vec<f32>> {
+    t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+}
+
 /// The mixture block of `layer` over the rows `hn` `[rows, hidden]` of several prompts.
 ///
 /// The rows `start..start + len` of each span go through the block as one forward of their
@@ -792,6 +832,20 @@ impl GenericHeteroTransformer {
         )
     }
 
+    /// Card bytes the attention of a prompt of `rows` rows over `keys` keys keeps alive beside
+    /// the activations of the step.
+    ///
+    /// A layer with sinks materialises its scores on a card.
+    /// Any other attention and the host keep no scores beyond the activations.
+    pub fn prompt_attention_bytes(&self, rows: usize, keys: usize) -> u64 {
+        let sinks_on_a_card =
+            !self.compute_device().is_cpu() && self.layers.iter().any(|l| l.attn_sinks.is_some());
+        match sinks_on_a_card {
+            true => super::layer_cpu_attn::sink_scores_bytes(self.config.n_head, rows, keys),
+            false => 0,
+        }
+    }
+
     /// Why this model can't use the continuous-batch paged path (None = eligible).
     /// Shared by `batched_paged_decode`/`paged_prefill_batch` (the gate) and the
     /// serving layer (to decide whether to route a model through ContinuousServer).
@@ -832,15 +886,9 @@ impl GenericHeteroTransformer {
         if c.final_logit_softcapping.is_some() {
             return Some("logit softcapping");
         }
-        // The host paths rotate with each layer's own tables.
-        // The card paths rotate with the plain base.
+        // A card runs the paths of a stretched or partial rotation, of sinks and of a mixture
+        // whose experts it holds, outside the captured decode graph.
         let host = self.cb_on_host();
-        if c.yarn.is_some() && !host {
-            return Some("yarn on a card");
-        }
-        if self.cb_partial_rope() && !host {
-            return Some("partial rope on a card");
-        }
         for l in &self.layers {
             if l.attn_layer_scale.is_some() || l.ffn_layer_scale.is_some() {
                 return Some("a scale per channel on a residual branch");
@@ -868,18 +916,20 @@ impl GenericHeteroTransformer {
             if l.attn_q_norm.is_some() != l.attn_k_norm.is_some() {
                 return Some("asymmetric QK-norm");
             }
-            // The host paths route each row of a mixture alone.
-            // The card paths carry no expert block.
+            // Each row of a mixture routes alone.
+            // A card serves a mixture whose routed experts it holds whole.
             if let Some(moe) = l.moe.as_ref() {
-                if !host {
-                    return Some("MoE on a card");
+                let resident = moe.tier.is_none()
+                    && moe.block_scaled.is_none()
+                    && moe.shards.is_empty()
+                    && moe.local.is_none()
+                    && !moe.experts_on_host();
+                if !host && !resident {
+                    return Some("a mixture whose experts the card does not hold");
                 }
                 if !moe.router_prenormed {
                     return Some("MoE beside a dense feed-forward");
                 }
-            }
-            if l.attn_sinks.is_some() {
-                return Some("attention sinks");
             }
             if l.ple_proj.is_some() {
                 return Some("PLE");
@@ -891,6 +941,18 @@ impl GenericHeteroTransformer {
     /// True if this model can be served through the continuous-batch worker.
     pub fn cb_eligible(&self) -> bool {
         self.cb_unsupported_reason().is_none()
+    }
+
+    /// Whether the captured decode graph serves this model.
+    ///
+    /// The graph rotates at the plain base, attends without a sink and runs a dense
+    /// feed-forward in every layer.
+    pub fn cb_graph_serves(&self) -> bool {
+        !self.cb_rope_from_tables()
+            && self
+                .layers
+                .iter()
+                .all(|l| l.attn_sinks.is_none() && l.moe.is_none())
     }
 
     /// Every layer and the batched forward's device are the host.
@@ -1354,6 +1416,57 @@ impl GenericHeteroTransformer {
                     Some(o) => o.reshape(&[b, nh * hd][..])?,
                     None => return Err(crate::tensor::Error::msg("paged_flash_decode declined")),
                 }
+            } else if let Some(shape) =
+                sink_or_window_shape(layer, nh, nkv, hd, scale).filter(|_| dev.is_cpu())
+            {
+                // Each sequence reads its own keys, its sinks in the denominator.
+                // A sink layer reads its keys and values in half precision, as the serial
+                // host decode stores them.
+                let qv = host_f32(&q_rot)?;
+                let held = |t: Tensor| -> Result<Vec<f32>> {
+                    match shape.sinks {
+                        Some(_) => host_f32(&t.to_dtype(DType::F16)?),
+                        None => host_f32(&t),
+                    }
+                };
+                let mut rows: Vec<f32> = Vec::with_capacity(b * nh * hd);
+                for bi in 0..b {
+                    let (kg, vg) = stores[li].gather_seq(&block_tables[bi], context_lens[bi])?;
+                    rows.extend(crate::inference::cache::paged_attention::host_attn_rows(
+                        &qv[bi * nh * hd..][..nh * hd],
+                        &held(kg)?,
+                        &held(vg)?,
+                        &[context_lens[bi]],
+                        &shape,
+                    ));
+                }
+                Tensor::from_vec(rows, &[b, nh * hd][..], &dev)?
+            } else if let Some(sinks) = layer.attn_sinks.as_ref().filter(|_| !dev.is_cpu()) {
+                // Each sequence reads its own keys, its sinks in the softmax.
+                let window = layer.sliding_window.filter(|&w| w > 0);
+                let mut rows = Vec::with_capacity(b);
+                for bi in 0..b {
+                    let ctx = context_lens[bi];
+                    let (kg, vg) = stores[li].gather_seq(&block_tables[bi], ctx)?;
+                    let heads = |t: Tensor| -> Result<Tensor> {
+                        t.reshape(&[1, ctx, nkv, hd][..])?
+                            .transpose(1, 2)?
+                            .contiguous()
+                    };
+                    let q1 = q_rot.narrow(0, bi, 1)?.reshape(&[1, nh, 1, hd][..])?;
+                    let o = super::layer_cpu_attn::sink_attention_matmul(
+                        &q1,
+                        heads(kg)?,
+                        heads(vg)?,
+                        None,
+                        sinks,
+                        scale as f64,
+                        nkv,
+                        window,
+                    )?;
+                    rows.push(o.reshape(&[1, nh * hd][..])?);
+                }
+                Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
             } else if dev.is_cpu() {
                 let qv = q_rot.to_vec2::<f32>()?;
                 let mut rows: Vec<f32> = Vec::with_capacity(b * nh * hd);
@@ -1428,7 +1541,7 @@ impl GenericHeteroTransformer {
             };
             let o = attn
                 .to_dtype(cdt)
-                .and_then(|a| layer.attn_output.forward(&a))?
+                .and_then(|a| attention_output(layer, &a))?
                 .to_dtype(cdt)?;
             x = residual.broadcast_add(&o)?;
             // FFN (SwiGLU) - tensor ops (device-agnostic: on-device on GPU, no host
@@ -1658,7 +1771,7 @@ impl GenericHeteroTransformer {
             .reshape(&[b, nh * hd][..])?;
             let o = a
                 .to_dtype(cdt)
-                .and_then(|a| layer.attn_output.forward(&a))?
+                .and_then(|a| attention_output(layer, &a))?
                 .to_dtype(cdt)?;
             let ffn_norm = layer.ffn_norm.as_ref().unwrap();
             let (sum, hn2) = fused_add_rmsnorm_f16_with(
@@ -2120,8 +2233,10 @@ impl GenericHeteroTransformer {
                 nkv,
             );
             let mut q_head_major = false;
+            // The fused stages rotate at the plain base and feed the attention without a sink.
+            let plain_stage = !table_rope && layer.attn_sinks.is_none();
             let staged = match slot_dev.as_ref().zip(slots_i32.as_deref()) {
-                Some((slot_dev, slots_i32)) if want_head_major => {
+                Some((slot_dev, slots_i32)) if want_head_major && plain_stage => {
                     let rows =
                         crate::inference::kernel::fused::prefill_rope_kv_write_head_major_f16(
                             projected.sources(qd, kvd),
@@ -2140,7 +2255,7 @@ impl GenericHeteroTransformer {
                     q_head_major = rows.is_some();
                     rows
                 }
-                Some((slot_dev, slots_i32)) if stage_fused => {
+                Some((slot_dev, slots_i32)) if stage_fused && plain_stage => {
                     crate::inference::kernel::fused::prefill_rope_kv_write_f16(
                         projected.sources(qd, kvd),
                         norms,
@@ -2224,7 +2339,93 @@ impl GenericHeteroTransformer {
                 }
             };
             let mut parts: Vec<Tensor> = Vec::new();
-            if q_head_major {
+            let host_shape =
+                sink_or_window_shape(layer, nh, nkv, hd, scale).filter(|_| dev.is_cpu());
+            if let Some(shape) = host_shape.as_ref() {
+                // Each prompt reads its own keys, its sinks in the denominator, and a prompt
+                // whose prefix the cache holds reads that prefix first.
+                let (qv, kv, vv) = (host_f32(&q_rot)?, host_f32(&k_rot)?, host_f32(&v_f)?);
+                let row = nh * hd;
+                let kv_row = nkv * hd;
+                let mut rows: Vec<f32> = Vec::with_capacity(t * row);
+                for (i, (&start, &n)) in starts.iter().zip(&lens).enumerate() {
+                    let fresh_k = &kv[start * kv_row..][..n * kv_row];
+                    let fresh_v = &vv[start * kv_row..][..n * kv_row];
+                    let (prefix, pk, pv) = match i.checked_sub(plain.len()) {
+                        None => (0, Vec::new(), Vec::new()),
+                        Some(ci) => {
+                            let cp = &cached[ci];
+                            let (pk, pv) = stores[li].gather_seq(cp.block_table, cp.cached_len)?;
+                            (cp.cached_len, host_f32(&pk)?, host_f32(&pv)?)
+                        }
+                    };
+                    let keys = [pk.as_slice(), fresh_k].concat();
+                    let values = [pv.as_slice(), fresh_v].concat();
+                    let ends: Vec<usize> = (prefix + 1..=prefix + n).collect();
+                    rows.extend(crate::inference::cache::paged_attention::host_attn_rows(
+                        &qv[start * row..][..n * row],
+                        &keys,
+                        &values,
+                        &ends,
+                        shape,
+                    ));
+                }
+                parts.push(Tensor::from_vec(rows, &[t, row][..], &dev)?.to_dtype(cdt)?);
+            } else if let Some(sinks) = layer.attn_sinks.as_ref() {
+                // On a card each prompt reads its own keys, its sinks in the softmax, and a
+                // prompt whose prefix the cache holds reads that prefix first.
+                let window = layer.sliding_window.filter(|&w| w > 0);
+                for (i, (&start, &n)) in starts.iter().zip(&lens).enumerate() {
+                    let fresh_k = k_rot.narrow(0, start, n)?;
+                    let fresh_v = v_f.narrow(0, start, n)?;
+                    let (prefix, keys, values) = match i.checked_sub(plain.len()) {
+                        None => (0, fresh_k, fresh_v),
+                        Some(ci) => {
+                            let cp = &cached[ci];
+                            let (pk, pv) = stores[li].gather_seq(cp.block_table, cp.cached_len)?;
+                            let held = |t: Tensor| -> Result<Tensor> {
+                                t.reshape(&[cp.cached_len, nkv, hd][..])?.to_dtype(cdt)
+                            };
+                            (
+                                cp.cached_len,
+                                Tensor::cat(&[&held(pk)?, &fresh_k], 0)?,
+                                Tensor::cat(&[&held(pv)?, &fresh_v], 0)?,
+                            )
+                        }
+                    };
+                    let ctx = prefix + n;
+                    // 1 hides a key: one past the row's own position, or before its window.
+                    let hidden: Vec<u8> = (0..n)
+                        .flat_map(|r| {
+                            let end = prefix + r + 1;
+                            let first = window.map_or(0, |w| end.saturating_sub(w));
+                            (0..ctx).map(move |j| u8::from(j >= end || j < first))
+                        })
+                        .collect();
+                    let mask = Tensor::from_vec(hidden, &[n, ctx][..], &dev)?;
+                    let heads = |t: Tensor, width: usize| -> Result<Tensor> {
+                        t.reshape(&[1, t.dims()[0], width, hd][..])?
+                            .transpose(1, 2)?
+                            .contiguous()
+                    };
+                    let o = super::layer_cpu_attn::sink_attention_matmul(
+                        &heads(q_rot.narrow(0, start, n)?, nh)?,
+                        heads(keys, nkv)?,
+                        heads(values, nkv)?,
+                        Some(&mask),
+                        sinks,
+                        scale as f64,
+                        nkv,
+                        window,
+                    )?;
+                    parts.push(
+                        o.transpose(1, 2)?
+                            .contiguous()?
+                            .reshape(&[n, nh * hd][..])?
+                            .to_dtype(cdt)?,
+                    );
+                }
+            } else if q_head_major {
                 parts.push(
                     crate::inference::cache::paged_attention::paged_prefill_attn_seqs_head_major(
                         &q_rot,
@@ -2256,7 +2457,11 @@ impl GenericHeteroTransformer {
             // A prompt whose prefix the cache holds attends over that prefix, gathered from the
             // store, then over its own suffix.
             let mut at = plain_rows;
-            for (cp, &n) in cached.iter().zip(&lens[plain.len()..]) {
+            let suffixes = match host_shape.is_some() || layer.attn_sinks.is_some() {
+                true => &[][..],
+                false => cached,
+            };
+            for (cp, &n) in suffixes.iter().zip(&lens[plain.len()..]) {
                 let (pk, pv) = stores[li].gather_seq(cp.block_table, cp.cached_len)?;
                 let pk = pk.reshape(&[cp.cached_len, nkv, hd][..])?.to_dtype(cdt)?;
                 let pv = pv.reshape(&[cp.cached_len, nkv, hd][..])?.to_dtype(cdt)?;
@@ -2284,7 +2489,7 @@ impl GenericHeteroTransformer {
             };
             let o = attn
                 .to_dtype(cdt)
-                .and_then(|a| layer.attn_output.forward(&a))?
+                .and_then(|a| attention_output(layer, &a))?
                 .to_dtype(cdt)?;
             let ffn_norm = layer.ffn_norm.as_ref().unwrap();
             let hn2 = if fused {
@@ -2392,10 +2597,17 @@ impl GenericHeteroTransformer {
         stores: &mut [crate::inference::cache::paged_kv::PagedKvStore],
     ) -> Result<Tensor> {
         use crate::tensor::Tensor;
-        if self.layers.iter().any(|l| l.moe.is_some()) || self.cb_rope_from_tables() {
+        let own_attention = self
+            .layers
+            .iter()
+            .any(|l| l.attn_sinks.is_some() || l.sliding_window.is_some_and(|w| w > 0));
+        if self.layers.iter().any(|l| l.moe.is_some())
+            || self.cb_rope_from_tables()
+            || own_attention
+        {
             return Err(crate::tensor::Error::msg(
-                "paged_prefill_seq_cached: a mixture or a table rotation prefills through \
-                 paged_prefill_mixed",
+                "paged_prefill_seq_cached: a mixture, a table rotation, a sink or a window \
+                 prefills through paged_prefill_mixed",
             ));
         }
         let c = &self.config;
@@ -2501,7 +2713,7 @@ impl GenericHeteroTransformer {
             .reshape(&[tsfx, nh * hd][..])?;
             let o = attn
                 .to_dtype(cdt)
-                .and_then(|a| layer.attn_output.forward(&a))?
+                .and_then(|a| attention_output(layer, &a))?
                 .to_dtype(cdt)?;
             x = residual.broadcast_add(&o)?;
             let residual2 = x.clone();

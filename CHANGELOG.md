@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Serving: batch mixtures, attention sinks and stretched rotations on a card.
 - Serving: keep an idle model in host memory instead of unloading it, and load it from there on the next request.
 - Speculation: try prompt lookup on models whose experts stream, kept while its rounds win.
 - Speculation: size the draft by the experts it adds that no card holds.

@@ -104,14 +104,38 @@ pub(crate) fn write_wide(tag: &str, layers: usize, routed: bool) -> std::path::P
     write_wide_with(tag, layers, routed, Vec::new())
 }
 
-/// Width of a head of the tiny mixture: its width over its 2 heads.
-pub(crate) const MOE_HEAD_DIM: usize = MOE_EMBD / 2;
+/// [`write_wide_with`] with a sink logit for each head of every layer.
+pub(crate) fn write_wide_sinks(
+    tag: &str,
+    layers: usize,
+    routed: bool,
+    extra: Vec<(String, Value)>,
+) -> std::path::PathBuf {
+    write_wide_full(tag, layers, routed, true, extra)
+}
+
+/// Heads of the tiny mixture.
+const MOE_HEADS: usize = 2;
+
+/// Width of a head of the tiny mixture: its width over its heads.
+pub(crate) const MOE_HEAD_DIM: usize = MOE_EMBD / MOE_HEADS;
 
 /// [`write_wide`] with `extra` keys added to the header.
 pub(crate) fn write_wide_with(
     tag: &str,
     layers: usize,
     routed: bool,
+    extra: Vec<(String, Value)>,
+) -> std::path::PathBuf {
+    write_wide_full(tag, layers, routed, false, extra)
+}
+
+/// [`write_wide_with`], each layer holding a sink logit per head when `sinks` is set.
+fn write_wide_full(
+    tag: &str,
+    layers: usize,
+    routed: bool,
+    sinks: bool,
     extra: Vec<(String, Value)>,
 ) -> std::path::PathBuf {
     let mut seed = 11u32;
@@ -169,6 +193,9 @@ pub(crate) fn write_wide_with(
         {
             entries.push(entry(format!("blk.{il}.{n}.weight"), d));
         }
+        if sinks {
+            entries.push(entry(format!("blk.{il}.attn_sinks"), vec![MOE_HEADS]));
+        }
     }
     let u = |k: &str, v: u32| (format!("llama.{k}"), Value::U32(v));
     let metadata = vec![
@@ -176,8 +203,8 @@ pub(crate) fn write_wide_with(
         u("block_count", layers as u32),
         u("embedding_length", MOE_EMBD as u32),
         u("feed_forward_length", MOE_FFN as u32),
-        u("attention.head_count", 2),
-        u("attention.head_count_kv", 2),
+        u("attention.head_count", MOE_HEADS as u32),
+        u("attention.head_count_kv", MOE_HEADS as u32),
         u("context_length", 64),
         (
             "llama.attention.layer_norm_rms_epsilon".into(),
@@ -224,6 +251,38 @@ pub(crate) fn load(path: &std::path::Path, layers: usize) -> super::GenericHeter
     )
 }
 
+/// The model at `path` loaded whole on card 0, its cache unquantised.
+#[cfg(feature = "gpu")]
+pub(crate) fn load_on_card(
+    path: &std::path::Path,
+    layers: usize,
+) -> super::GenericHeteroTransformer {
+    use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan, HeteroSegment};
+    let plan = HeteroPlan {
+        segments: vec![HeteroSegment {
+            kind: DeviceKind::Cuda(0),
+            layer_start: 0,
+            layer_end: layers,
+            free_memory_bytes: 1 << 30,
+        }],
+        tp_cards: None,
+        total_layers: layers,
+        host_experts_from: None,
+    };
+    let g = crate::tensor::quantized::gguf_file::open_mapped(path).unwrap();
+    let bytes = g.mmap.clone();
+    let cards = std::collections::HashMap::from([(0, crate::tensor::Device::new_cuda(0).unwrap())]);
+    super::GenericHeteroTransformer::from_gguf_with_kv_quant(
+        g.content,
+        &bytes[..],
+        &cards,
+        &plan,
+        crate::inference::engine::llm_engine::KvQuant::Off,
+        None,
+    )
+    .unwrap()
+}
+
 /// The model at `path` loaded whole on the host with the Q8 cache the server gives a model whose
 /// head shape the quantised kernels serve: the host decode attends over its Q8 store.
 pub(crate) fn load_q8_kv(path: &std::path::Path, layers: usize) -> super::GenericHeteroTransformer {
@@ -264,7 +323,7 @@ fn load_with_kv(
 /// whole K-quant blocks along every reduction, grouped-query attention.
 pub(crate) const QUANT_EMBD: usize = 256;
 const QUANT_FFN: usize = 512;
-const QUANT_HEADS: usize = 4;
+pub(crate) const QUANT_HEADS: usize = 4;
 const QUANT_KV_HEADS: usize = 2;
 pub(crate) const QUANT_VOCAB: usize = 64;
 
@@ -273,6 +332,30 @@ pub(crate) const QUANT_VOCAB: usize = 64;
 /// model.
 pub(crate) fn write_quant(tag: &str, layers: usize) -> std::path::PathBuf {
     let (metadata, entries) = quant_model(layers);
+    let path = scratch_dir(tag).join("m.gguf");
+    write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
+    path
+}
+
+/// What [`write_quant_with`] adds to the quantised model.
+#[derive(Default)]
+pub(crate) struct QuantExtras {
+    /// Header keys, after the model's own.
+    pub keys: Vec<(String, Value)>,
+    /// A sink logit for each head of every layer.
+    pub sinks: bool,
+    /// Quantised experts, routed 2 of 8, in place of each feed-forward.
+    pub routed: bool,
+}
+
+/// [`write_quant`] with `extras`.
+pub(crate) fn write_quant_with(
+    tag: &str,
+    layers: usize,
+    extras: QuantExtras,
+) -> std::path::PathBuf {
+    let (mut metadata, entries) = quant_model_with(layers, extras.sinks, extras.routed);
+    metadata.extend(extras.keys);
     let path = scratch_dir(tag).join("m.gguf");
     write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
     path
@@ -407,6 +490,16 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 
 /// The metadata and tensors of the model [`write_quant`] writes.
 fn quant_model(layers: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
+    quant_model_with(layers, false, false)
+}
+
+/// [`quant_model`], each layer with a sink logit per head when `sinks` is set, and with
+/// quantised experts in place of its feed-forward when `routed` is set.
+fn quant_model_with(
+    layers: usize,
+    sinks: bool,
+    routed: bool,
+) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
     let mut seed = 23u32;
     let mut values = |n: usize| -> Vec<f32> {
         (0..n)
@@ -461,11 +554,48 @@ fn quant_model(layers: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
             ("attn_k", [kv, QUANT_EMBD], GgmlDType::Q4K),
             ("attn_v", [kv, QUANT_EMBD], GgmlDType::Q6K),
             ("attn_output", [QUANT_EMBD, QUANT_EMBD], GgmlDType::Q4K),
-            ("ffn_gate", [QUANT_FFN, QUANT_EMBD], GgmlDType::Q4K),
-            ("ffn_up", [QUANT_FFN, QUANT_EMBD], GgmlDType::Q4K),
-            ("ffn_down", [QUANT_EMBD, QUANT_FFN], GgmlDType::Q6K),
         ] {
             entries.push(entry(format!("blk.{il}.{n}.weight"), d.to_vec(), t));
+        }
+        let ffn = if routed {
+            vec![
+                (
+                    "ffn_gate_inp",
+                    vec![MOE_EXPERTS, QUANT_EMBD],
+                    GgmlDType::F32,
+                ),
+                (
+                    "ffn_gate_exps",
+                    vec![MOE_EXPERTS, QUANT_FFN, QUANT_EMBD],
+                    GgmlDType::Q4K,
+                ),
+                (
+                    "ffn_up_exps",
+                    vec![MOE_EXPERTS, QUANT_FFN, QUANT_EMBD],
+                    GgmlDType::Q4K,
+                ),
+                (
+                    "ffn_down_exps",
+                    vec![MOE_EXPERTS, QUANT_EMBD, QUANT_FFN],
+                    GgmlDType::Q6K,
+                ),
+            ]
+        } else {
+            vec![
+                ("ffn_gate", vec![QUANT_FFN, QUANT_EMBD], GgmlDType::Q4K),
+                ("ffn_up", vec![QUANT_FFN, QUANT_EMBD], GgmlDType::Q4K),
+                ("ffn_down", vec![QUANT_EMBD, QUANT_FFN], GgmlDType::Q6K),
+            ]
+        };
+        for (n, d, t) in ffn {
+            entries.push(entry(format!("blk.{il}.{n}.weight"), d, t));
+        }
+        if sinks {
+            entries.push(entry(
+                format!("blk.{il}.attn_sinks"),
+                vec![QUANT_HEADS],
+                GgmlDType::F32,
+            ));
         }
     }
     let u = |k: &str, v: u32| (format!("qwen3.{k}"), Value::U32(v));
@@ -485,5 +615,16 @@ fn quant_model(layers: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
         ),
         ("qwen3.rope.freq_base".into(), Value::F32(1_000_000.0)),
     ];
+    let metadata = match routed {
+        false => metadata,
+        true => metadata
+            .into_iter()
+            .chain([
+                u("expert_feed_forward_length", QUANT_FFN as u32),
+                u("expert_count", MOE_EXPERTS as u32),
+                u("expert_used_count", MOE_USED as u32),
+            ])
+            .collect(),
+    };
     (metadata, entries)
 }
