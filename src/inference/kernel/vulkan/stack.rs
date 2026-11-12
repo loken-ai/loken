@@ -75,6 +75,8 @@ pub struct DenseSpec {
     pub expert_ffn: usize,
     /// The chosen experts' weights are scaled to sum to one.
     pub norm_topk: bool,
+    /// The factor a block's output is scaled by before it joins the residual.
+    pub residual_scale: Option<f32>,
 }
 
 /// A weight as the file stores it.
@@ -105,7 +107,8 @@ pub enum FfnTensors<'a> {
 
 /// One layer's tensors, read from the file.
 pub struct LayerTensors<'a> {
-    pub attn_norm: Vec<f32>,
+    /// The RMS norm that opens the attention, or none when the attention reads the residual.
+    pub attn_norm: Option<Vec<f32>>,
     pub q: RawTensor<'a>,
     pub k: RawTensor<'a>,
     pub v: RawTensor<'a>,
@@ -115,7 +118,8 @@ pub struct LayerTensors<'a> {
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     pub o: RawTensor<'a>,
-    pub ffn_norm: Vec<f32>,
+    /// The RMS norm that opens the FFN, or none when the FFN reads the residual.
+    pub ffn_norm: Option<Vec<f32>>,
     pub ffn: FfnTensors<'a>,
     /// Norms that close the attention and the FFN before their outputs join the residual.
     pub post_attn_norm: Option<Vec<f32>>,
@@ -236,7 +240,7 @@ enum Ffn {
 }
 
 struct Layer {
-    attn_norm: Buffer,
+    attn_norm: Option<Buffer>,
     q: Matrix,
     k: Matrix,
     v: Matrix,
@@ -246,7 +250,7 @@ struct Layer {
     q_norm: Option<Buffer>,
     k_norm: Option<Buffer>,
     o: Matrix,
-    ffn_norm: Buffer,
+    ffn_norm: Option<Buffer>,
     ffn: Ffn,
     qk_full: bool,
     post_attn_norm: Option<Buffer>,
@@ -374,7 +378,7 @@ impl VulkanStack {
         let mut built = Vec::with_capacity(layers.len());
         for l in &layers {
             built.push(Layer {
-                attn_norm: f32buf(&l.attn_norm)?,
+                attn_norm: opt(&l.attn_norm)?,
                 q: Matrix::upload(&ctx, &l.q, ctx.coop())?,
                 k: Matrix::upload(&ctx, &l.k, ctx.coop())?,
                 v: Matrix::upload(&ctx, &l.v, ctx.coop())?,
@@ -384,7 +388,7 @@ impl VulkanStack {
                 q_norm: opt(&l.q_norm)?,
                 k_norm: opt(&l.k_norm)?,
                 o: Matrix::upload(&ctx, &l.o, ctx.coop())?,
-                ffn_norm: f32buf(&l.ffn_norm)?,
+                ffn_norm: opt(&l.ffn_norm)?,
                 ffn: match &l.ffn {
                     FfnTensors::Dense { gate, up, down } => Ffn::Dense {
                         gate: Matrix::upload(&ctx, gate, ctx.coop())?,
@@ -589,11 +593,14 @@ impl VulkanStack {
         y: &Buffer,
         bias: Option<&Buffer>,
         accumulate: bool,
+        scale: Option<f32>,
         tokens: usize,
         barrier: bool,
     ) {
         let rows = w.rows as u32;
-        let flags = u32::from(accumulate) | (u32::from(bias.is_some()) << 1);
+        let flags = u32::from(accumulate)
+            | (u32::from(bias.is_some()) << 1)
+            | (u32::from(scale.is_some()) << 2);
         let bufs = [
             &w.buf,
             &self.xq,
@@ -603,7 +610,8 @@ impl VulkanStack {
             &self.xn,
         ];
         let mut args = [0u32; 16];
-        args[..8].copy_from_slice(&[rows, w.cols as u32, tokens as u32, 0, 0, flags, 0, rows]);
+        let scale = scale.unwrap_or(1.0).to_bits();
+        args[..8].copy_from_slice(&[rows, w.cols as u32, tokens as u32, 0, 0, flags, scale, rows]);
         match mat_mat_for(w, tokens) {
             Some((kernel, tile)) => ops.push(self.op(
                 kernel,
@@ -642,7 +650,7 @@ impl VulkanStack {
     ) {
         let s = &self.spec;
         let pairs = (tokens * s.used) as u32;
-        ops.push(self.quant(1, &self.x, &l.ffn_norm, tokens, s.hidden, 0, true));
+        ops.push(self.opening_quant(l.ffn_norm.as_ref(), tokens, true));
         let mut a = [0u32; 16];
         a[..5].copy_from_slice(&[
             tokens as u32,
@@ -702,7 +710,12 @@ impl VulkanStack {
         ));
         ops.push(product(down, &self.moe_down, 1, s.hidden, true));
         let mut a = [0u32; 16];
-        a[..4].copy_from_slice(&[tokens as u32, s.hidden as u32, 0, s.used as u32]);
+        a[..4].copy_from_slice(&[
+            tokens as u32,
+            s.hidden as u32,
+            s.residual_scale.unwrap_or(1.0).to_bits(),
+            s.used as u32,
+        ]);
         ops.push(self.op(
             "moe_combine",
             &[&self.moe_down, &self.route, &self.x],
@@ -712,13 +725,15 @@ impl VulkanStack {
         ));
     }
 
-    /// The product that ends a block: added to the residual, or with a post norm, normed first.
+    /// The product that ends a block: scaled by the residual scale, then added to the residual,
+    /// or with a post norm, normed first.
     fn closing_product(&self, ops: &mut Vec<Op>, tokens: usize, w: &Matrix, norm: Option<&Buffer>) {
+        let scale = self.spec.residual_scale;
         let Some(norm) = norm else {
-            self.products(ops, tokens, &[(w, &self.x, None, true)]);
+            self.matvec(ops, w, &self.x, None, true, scale, tokens, true);
             return;
         };
-        self.products(ops, tokens, &[(w, &self.block, None, false)]);
+        self.matvec(ops, w, &self.block, None, false, scale, tokens, true);
         let mut args = [0u32; 16];
         args[..4].copy_from_slice(&[
             tokens as u32,
@@ -744,7 +759,7 @@ impl VulkanStack {
         ws: &[(&Matrix, &Buffer, Option<&Buffer>, bool)],
     ) {
         for (i, (w, y, bias, accumulate)) in ws.iter().enumerate() {
-            self.matvec(ops, w, y, *bias, *accumulate, tokens, i == 0);
+            self.matvec(ops, w, y, *bias, *accumulate, None, tokens, i == 0);
         }
     }
 
@@ -800,6 +815,16 @@ impl VulkanStack {
         )
     }
 
+    /// Quantises the residual's `tokens` rows for the block that opens: RMS normed with weight
+    /// `norm`, or as they are without one.
+    fn opening_quant(&self, norm: Option<&Buffer>, tokens: usize, f32_copy: bool) -> Op {
+        let (mode, weight) = match norm {
+            Some(norm) => (1, norm),
+            None => (0, &self.dummy),
+        };
+        self.quant(mode, &self.x, weight, tokens, self.spec.hidden, 0, f32_copy)
+    }
+
     /// Whether any of `ws` reads the f32 copy of the activations.
     fn wants_f32(ws: &[&Matrix]) -> bool {
         ws.iter()
@@ -812,13 +837,9 @@ impl VulkanStack {
         let t = tokens as u32;
         let mut ops = Vec::new();
         for l in &self.layers[from..to] {
-            ops.push(self.quant(
-                1,
-                &self.x,
-                &l.attn_norm,
+            ops.push(self.opening_quant(
+                l.attn_norm.as_ref(),
                 tokens,
-                s.hidden,
-                0,
                 Self::wants_f32(&[&l.q, &l.k, &l.v]),
             ));
             self.products(
@@ -975,13 +996,9 @@ impl VulkanStack {
             self.closing_product(&mut ops, tokens, &l.o, l.post_attn_norm.as_ref());
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    ops.push(self.quant(
-                        1,
-                        &self.x,
-                        &l.ffn_norm,
+                    ops.push(self.opening_quant(
+                        l.ffn_norm.as_ref(),
                         tokens,
-                        s.hidden,
-                        0,
                         Self::wants_f32(&[gate, up]),
                     ));
                     self.products(

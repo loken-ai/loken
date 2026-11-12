@@ -212,8 +212,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 "#;
 
-/// The experts' outputs weighed into the residual: `x[t] += sum_c w[t, c] * y[t * K + c]`.
-/// Args: tokens, hidden, -, K. One workgroup of 256 lanes a token.
+/// The experts' outputs weighed into the residual: `x[t] += s * sum_c w[t, c] * y[t * K + c]`.
+/// Args: tokens, hidden, s, K. One workgroup of 256 lanes a token.
 const MOE_COMBINE: &str = r#"
 @group(0) @binding(0) var<storage, read> yd: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> route: array<vec2<u32>>;
@@ -223,17 +223,18 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let h4 = arg(1u) / 4u;
     let kk = arg(3u);
     for (var i = li; i < h4; i = i + 256u) {
-        var acc = x[wid.x * h4 + i];
+        var acc = vec4<f32>(0.0);
         for (var c = 0u; c < kk; c = c + 1u) {
             acc = acc + bitcast<f32>(route[wid.x * kk + c].y) * yd[(wid.x * kk + c) * h4 + i];
         }
-        x[wid.x * h4 + i] = acc;
+        x[wid.x * h4 + i] = x[wid.x * h4 + i] + argf(2u) * acc;
     }
 }
 "#;
 
-/// The mat-vec frame: `y[t, r] (+)= sum_k W[r, k] x[t, k] (+ bias[r])` for up to `MAXT` tokens.
-/// Args: m, k, tokens, first token, y_off, flags (1 accumulate, 2 bias), -, y_stride. A workgroup is one
+/// The mat-vec frame: `y[t, r] (+)= s * (sum_k W[r, k] x[t, k] (+ bias[r]))` for up to `MAXT`
+/// tokens, `s` being 1 without flag 4. Args: m, k, tokens, first token, y_off, flags
+/// (1 accumulate, 2 bias, 4 scale), s, y_stride. A workgroup is one
 /// workgroup of `WG` lanes; sixteen lanes run a row, so it runs `WG / 16` rows. `ITEMS` and
 /// `ITEM` are the format's: how many items a row has and what one item adds to `acc[t]`.
 const MATVEC: &str = r#"
@@ -278,6 +279,7 @@ fn main(
         if (raw < m && (lane & (LPRu - 1u)) == 0u) {
             let flags = arg(5u);
             if ((flags & 2u) != 0u) { v = v + bias[row]; }
+            if ((flags & 4u) != 0u) { v = v * argf(6u); }
             let at = arg(4u) + (tb + t) * arg(7u) + row;
             if ((flags & 1u) != 0u) { v = v + y[at]; }
             y[at] = v;
@@ -507,6 +509,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                 var v = acc[r * TTu + t];
                 let flags = arg(5u);
                 if ((flags & 2u) != 0u) { v = v + bias[row]; }
+                if ((flags & 4u) != 0u) { v = v * argf(6u); }
                 let at = arg(4u) + tk * arg(7u) + row;
                 if ((flags & 1u) != 0u) { v = v + y[at]; }
                 y[at] = v;
@@ -781,6 +784,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                 var v = acc[r * 4u + t];
                 let flags = arg(5u);
                 if ((flags & 2u) != 0u) { v = v + bias[row]; }
+                if ((flags & 4u) != 0u) { v = v * argf(6u); }
                 let at = arg(4u) + tk * arg(7u) + row;
                 if ((flags & 1u) != 0u) { v = v + y[at]; }
                 y[at] = v;

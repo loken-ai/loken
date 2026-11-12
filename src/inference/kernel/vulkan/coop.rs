@@ -101,6 +101,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         if (row < m && tk < nt) {
             var v = sc[e];
             if ((flags & 2u) != 0u) { v = v + bias[row]; }
+            if ((flags & 4u) != 0u) { v = v * argf(6u); }
             let at = arg(4u) + tk * arg(7u) + row;
             if ((flags & 1u) != 0u) { v = v + y[at]; }
             y[at] = v;

@@ -344,6 +344,24 @@ fn vulkan_greedy_text_matches_the_host() {
     greedy_text_matches(TAG, TIE);
 }
 
+/// The model with every layer on Vulkan device `d`, or `None` when the device cannot hold it:
+/// the placement would then split the model across devices and the host, which another test
+/// covers.
+fn whole_on(
+    fx: &Fixture,
+    tag: &str,
+    d: &crate::inference::kernel::vulkan::DeviceInfo,
+) -> Option<GenericHeteroTransformer> {
+    match fx.try_build(&fx.on_vulkan(d.index, fx.n_layers)) {
+        Ok(model) => Some(model),
+        Err(why) if why.contains("out of memory") => {
+            println!("{tag} vulkan {}: the model does not fit, skipped", d.name);
+            None
+        }
+        Err(why) => panic!("{tag} vulkan {}: {why}", d.name),
+    }
+}
+
 fn greedy_text_matches(tag: &str, tie: f32) {
     let fx = Fixture::open_tag(tag);
     let tokenizer =
@@ -354,8 +372,12 @@ fn greedy_text_matches(tag: &str, tie: f32) {
     let (want, host_rate) = greedy(&mut fx.build(&fx.host()), &prompt);
     println!("{tag}: host {host_rate:.1} tok/s {:?}", decode(&want));
     for d in crate::inference::kernel::vulkan::devices() {
+        let Some(mut whole) = whole_on(&fx, tag, &d) else {
+            continue;
+        };
+        let (got, rate) = greedy(&mut whole, &prompt);
+        drop(whole);
         let plan = fx.on_vulkan(d.index, fx.n_layers);
-        let (got, rate) = greedy(&mut fx.build(&plan), &prompt);
         println!(
             "{tag}: vulkan {}: {rate:.1} tok/s {:?}",
             d.name,
@@ -412,8 +434,10 @@ fn long_prompt_matches(tag: &str, tie: f32, repeats: usize) {
         .to_vec();
     assert!(prompt.len() > 2 * 128, "{} tokens", prompt.len());
     for d in crate::inference::kernel::vulkan::devices() {
+        let Some(mut m) = whole_on(&fx, tag, &d) else {
+            continue;
+        };
         let mut host = fx.build(&fx.host());
-        let mut m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
         let mut fed = prompt.clone();
         let mut h = host_vec(&host.forward(&ids(&prompt), 0).unwrap());
         let mut v = host_vec(&m.forward(&ids(&prompt), 0).unwrap());
@@ -525,12 +549,17 @@ fn experts_match(tag: &str) {
 /// apart than `tie` (a model whose logits spread wider has more noise to clear).
 macro_rules! family {
     ($name:ident, $tag:expr, $tie:expr) => {
-        mod $name {
+        family!($name, $tag, $tie, {
             #[test]
             #[ignore = "needs the model in the store and a Vulkan device"]
             fn greedy_text() {
                 super::greedy_text_matches($tag, $tie);
             }
+        });
+    };
+    ($name:ident, $tag:expr, $tie:expr, { $($greedy:item)* }) => {
+        mod $name {
+            $($greedy)*
 
             #[test]
             #[ignore = "needs the model in the store and a Vulkan device"]
@@ -556,6 +585,11 @@ macro_rules! family {
 family!(llama, "llama3.2:1b", super::TIE);
 family!(gemma, "gemma3:latest", 2.0);
 family!(smollm3, "smollm3:latest", 2.0);
+family!(granite, "granite3.1-dense:2b", super::TIE);
+// A model whose greedy answer parts from the host's on a native card too, at margins above the
+// tie, is held by the other tests alone.
+family!(granite_moe, "granite3-moe:1b", super::TIE, {});
+family!(olmo2, "olmo2:7b", super::TIE, {});
 
 /// A mixture of experts: where the host's best experts for a token are within rounding of the
 /// next ones, the two pick other experts and the logits part by more than rounding. The
@@ -652,14 +686,8 @@ fn logit_noise(tag: &str, limit: f64, with_cuda: bool) {
             assert!(rms < limit, "{tag} {name}: logit rms {rms} from the host");
         };
         for d in crate::inference::kernel::vulkan::devices() {
-            // A device that cannot hold every layer is skipped: the placement would split the
-            // model across devices and the host, which another test covers.
-            match fx.try_build(&fx.on_vulkan(d.index, fx.n_layers)) {
-                Ok(model) => run(format!("vulkan {}", d.name), model),
-                Err(why) if why.contains("out of memory") => {
-                    println!("{tag} vulkan {}: the model does not fit, skipped", d.name)
-                }
-                Err(why) => panic!("{tag} vulkan {}: {why}", d.name),
+            if let Some(model) = whole_on(&fx, tag, &d) {
+                run(format!("vulkan {}", d.name), model);
             }
         }
         #[cfg(feature = "cuda")]

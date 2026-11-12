@@ -251,7 +251,7 @@ fn refusal(
 ) -> Option<String> {
     let c = config;
     let f = &c.flags;
-    let checks: [(bool, &str); 15] = [
+    let checks: [(bool, &str); 14] = [
         (f.fused_qkv, "a fused QKV projection"),
         (
             f.fused_ffn_gate_up || f.is_phi2_simple_ffn,
@@ -266,7 +266,6 @@ fn refusal(
             "output or FFN biases",
         ),
         (c.attn_logit_softcapping.is_some(), "attention softcapping"),
-        (c.residual_scale.is_some(), "a residual scale"),
         (c.shared_kv_layers > 0, "shared KV layers"),
         (c.ssm.is_some(), "a recurrent mixer"),
         (
@@ -289,6 +288,13 @@ fn refusal(
             ),
             (l.ffn_norm.is_none(), "a layer without an FFN norm"),
             (
+                [Some(&l.attn_norm), l.ffn_norm.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|n| matches!(n, super::config::WeightedNorm::Layer(_))),
+                "a norm other than RMS",
+            ),
+            (
                 l.rope_freq_factors.is_some() != layers[0].rope_freq_factors.is_some(),
                 "RoPE frequency factors on some layers only",
             ),
@@ -298,10 +304,6 @@ fn refusal(
                 "a scale per channel on a residual branch",
             ),
             (l.flags.erf_gelu, "the error-function GELU"),
-            (
-                !matches!(l.attn_norm, super::config::WeightedNorm::Rms(_)),
-                "a norm other than RMS",
-            ),
         ];
         if let Some((_, why)) = shape.iter().find(|(on, _)| *on) {
             return Some(why.to_string());
@@ -380,6 +382,7 @@ fn build_stack(
             .iter()
             .find_map(|l| l.moe.as_ref())
             .is_some_and(|m| m.norm_topk),
+        residual_scale: config.residual_scale.map(|s| s as f32),
     };
     let mut tensors = Vec::with_capacity(layers.len());
     for (i, l) in layers.iter().enumerate() {
@@ -432,8 +435,15 @@ fn build_stack(
                 }
             }
         };
+        // A block without a norm before it reads the residual as it is.
+        let pre_norm = |n: &super::config::WeightedNorm| -> anyhow::Result<Option<Vec<f32>>> {
+            match n {
+                super::config::WeightedNorm::Identity(_) => Ok(None),
+                n => host(n.weight()).map(Some),
+            }
+        };
         tensors.push(LayerTensors {
-            attn_norm: host(l.attn_norm.weight())?,
+            attn_norm: pre_norm(&l.attn_norm)?,
             q: raw(format!("{p}.attn_q.weight"))?,
             k: raw(format!("{p}.attn_k.weight"))?,
             v: raw(format!("{p}.attn_v.weight"))?,
@@ -443,11 +453,10 @@ fn build_stack(
             q_norm: norm_of(&l.attn_q_norm)?,
             k_norm: norm_of(&l.attn_k_norm)?,
             o: raw(format!("{p}.attn_output.weight"))?,
-            ffn_norm: host(
+            ffn_norm: pre_norm(
                 l.ffn_norm
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("{p}: no FFN norm"))?
-                    .weight(),
+                    .ok_or_else(|| anyhow::anyhow!("{p}: no FFN norm"))?,
             )?,
             ffn,
             post_attn_norm: norm_of(&l.post_attn_norm)?,
