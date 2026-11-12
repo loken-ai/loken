@@ -659,14 +659,26 @@ fn later_rungs(
             rungs.push((format!("the cards at {pct}% with the host"), plan));
         }
     }
-    rungs.push((
-        "the host".to_string(),
-        HeteroPlan::calculate(demand.layers, demand.block_bytes, &[], &[], 1.0),
-    ));
-    rungs
+    let host = HeteroPlan::calculate(demand.layers, demand.block_bytes, &[], &[], 1.0);
+    rungs.push((HOST_RUNG.to_string(), host.clone()));
+    let mut rungs: Vec<(String, HeteroPlan)> = rungs
         .into_iter()
         .map(|(name, plan)| (name, beside_host(plan, demand, accelerators)))
-        .collect()
+        .collect();
+    // The host without the accelerators, for a model an accelerator refuses.
+    rungs.push((HOST_ALONE_RUNG.to_string(), host));
+    rungs
+}
+
+/// The rung that leaves the cards: the host, with the accelerators taking its blocks first.
+const HOST_RUNG: &str = "the host";
+
+/// The last rung: the host alone.
+const HOST_ALONE_RUNG: &str = "the host alone";
+
+/// Whether rung `name` leaves the cards, and so is tried after a failure that is not memory.
+fn leaves_the_cards(name: &str) -> bool {
+    name == HOST_RUNG || name == HOST_ALONE_RUNG
 }
 
 /// `plan` with the blocks it leaves on the host offered to `accelerators` first, each block
@@ -817,12 +829,12 @@ pub fn load_planned<T, E: std::fmt::Display + Refusal>(
     let mut rungs = later_rungs(demand, cards, accelerators);
     if !is_out_of_memory(&first) {
         tracing::warn!("{what}: placement failed ({first}); trying the host");
-        rungs.retain(|(name, _)| name == "the host");
+        rungs.retain(|(name, _)| leaves_the_cards(name));
     }
     let mut tried = vec![first_plan];
     let mut last_oom = is_out_of_memory(&first);
     for (name, plan) in rungs {
-        if !last_oom && name != "the host" {
+        if !last_oom && !leaves_the_cards(&name) {
             continue;
         }
         if tried.iter().any(|t| super::dry_plan::same_plan(t, &plan)) || host_refused(&plan) {
@@ -1569,6 +1581,38 @@ mod tests {
         assert_eq!(
             (plan.segments[2].layer_start, plan.segments[2].layer_end),
             (6, 10)
+        );
+    }
+
+    /// A model the accelerator refuses is placed on the host alone.
+    #[test]
+    fn a_model_an_accelerator_refuses_runs_on_the_host_alone() {
+        let d = demand(4, 1);
+        let mut seen = Vec::new();
+        let got: Result<Vec<String>, String> = load_planned(
+            "t",
+            HeteroPlan::forced_gpu(4, 0, 0),
+            &d,
+            &[],
+            &[(DeviceKind::Vulkan(0), 100 * GB)],
+            || false,
+            |plan| {
+                seen.push(kinds(plan));
+                if plan
+                    .segments
+                    .iter()
+                    .any(|s| matches!(s.kind, DeviceKind::Vulkan(_)))
+                {
+                    Err("the Vulkan layers do not run a recurrent mixer".to_string())
+                } else {
+                    Ok(kinds(plan))
+                }
+            },
+        );
+        assert_eq!(got, Ok(vec!["CPU".to_string()]));
+        assert_eq!(
+            seen,
+            vec![vec!["vulkan(0)".to_string()], vec!["CPU".to_string()]]
         );
     }
 
