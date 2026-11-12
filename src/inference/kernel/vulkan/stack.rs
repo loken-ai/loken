@@ -1492,6 +1492,125 @@ impl Drop for VulkanStack {
     }
 }
 
+/// The f16 words the cache store writes for keys `k` and values `v`, rows of `heads` heads of
+/// `hd` values, at position 0 with no norm and no rotation, on device `device`.
+#[cfg(test)]
+pub(super) fn cache_store_probe(
+    device: usize,
+    k: &[f32],
+    v: &[f32],
+    heads: usize,
+    hd: usize,
+) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
+    let ctx = super::context(device)?;
+    let n = heads * hd;
+    let kb = ctx.upload(&f32_bytes(k))?;
+    let vb = ctx.upload(&f32_bytes(v))?;
+    let step = ctx.upload(&0u32.to_le_bytes())?;
+    let table = ctx.upload(&f32_bytes(&[1.0; 4]))?;
+    let dummy = ctx.buffer(16, false)?;
+    let kc = ctx.buffer((n * 2) as u64, false)?;
+    let vc = ctx.buffer((n * 2) as u64, false)?;
+    let out = ctx.buffer((n * 4) as u64, true)?;
+    let dev = ctx.device();
+    let sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(super::BINDINGS)];
+    let pool = unsafe {
+        dev.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&sizes),
+            None,
+        )?
+    };
+    let layouts = [ctx.set_layout()];
+    let set = unsafe {
+        dev.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts),
+        )?
+    }[0];
+    let used: [&Buffer; 8] = [&kb, &dummy, &kc, &vb, &vc, &step, &table, &table];
+    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = used
+        .iter()
+        .map(|b| {
+            [vk::DescriptorBufferInfo::default()
+                .buffer(b.buf)
+                .range(vk::WHOLE_SIZE)]
+        })
+        .collect();
+    let writes: Vec<vk::WriteDescriptorSet> = infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(i as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(info)
+        })
+        .collect();
+    unsafe { dev.update_descriptor_sets(&writes, &[]) };
+    let mut args = [0u32; 16];
+    args[..8].copy_from_slice(&[heads as u32, hd as u32, 0, 0, 0, 0, heads as u32, 0]);
+    let imm: Vec<u8> = args.iter().flat_map(|a| a.to_le_bytes()).collect();
+    let pipeline = ctx.pipeline("prep_kv")?;
+    ctx.submit_once(|cmd| unsafe {
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        dev.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            ctx.pipeline_layout(),
+            0,
+            &[set],
+            &[],
+        );
+        dev.cmd_push_constants(
+            cmd,
+            ctx.pipeline_layout(),
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            &imm,
+        );
+        dev.cmd_dispatch(cmd, heads as u32, 1, 1);
+        let mb = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+        dev.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &mb,
+            &[],
+            &[],
+        );
+        let half = (n * 2) as u64;
+        dev.cmd_copy_buffer(
+            cmd,
+            kc.buf,
+            out.buf,
+            &[vk::BufferCopy::default().size(half)],
+        );
+        dev.cmd_copy_buffer(
+            cmd,
+            vc.buf,
+            out.buf,
+            &[vk::BufferCopy::default().dst_offset(half).size(half)],
+        );
+    })?;
+    unsafe { dev.destroy_descriptor_pool(pool, None) };
+    let mut bytes = vec![0u8; n * 4];
+    out.read(0, &mut bytes);
+    let words: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    Ok((words[..n].to_vec(), words[n..].to_vec()))
+}
+
 /// `W x` for `tokens` rows of `x` through the quantiser and the mat-vec kernel of `w`'s format,
 /// on device `device`: the kernels alone, for the checks against the host.
 /// Also returns how many values share an activation scale, as the stack quantises them.

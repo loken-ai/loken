@@ -189,3 +189,27 @@ fn coop_f16() {
 fn matmat_f16() {
     check(GgmlDType::F16, 40, false);
 }
+
+/// The cache store keeps each key and value at the f16 nearest to it, ties to even.
+#[test]
+fn cache_store_rounds_to_nearest() {
+    let (heads, hd) = (4, 128);
+    let k = values(heads * hd, 3);
+    let v = values(heads * hd, 5);
+    for d in super::devices() {
+        let (kc, vc) = super::stack::cache_store_probe(d.index, &k, &v, heads, hd).unwrap();
+        let off = |got: &[u16], want: &[f32]| {
+            got.iter()
+                .zip(want)
+                .filter(|(g, w)| **g != half::f16::from_f32(**w).to_bits())
+                .count()
+        };
+        let (bk, bv) = (off(&kc, &k), off(&vc, &v));
+        println!(
+            "cache store on {}: {bk} keys and {bv} values of {} off the nearest f16",
+            d.name,
+            k.len()
+        );
+        assert_eq!((bk, bv), (0, 0), "{}", d.name);
+    }
+}

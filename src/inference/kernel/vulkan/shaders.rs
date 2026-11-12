@@ -1174,9 +1174,22 @@ const PREP_Q_DST: &str = r#"
 const PREP_KV_STORE: &str = r#"
     let row = (pos * arg(6u) + h) * (hd / 2u);
     for (var i = li; i < hd / 2u; i = i + 64u) {
-        kc[row + i] = pack2x16float(vec2<f32>(o[2u * i], o[2u * i + 1u]));
-        vc[row + i] = pack2x16float(vec2<f32>(vsrc[sb + 2u * i], vsrc[sb + 2u * i + 1u]));
+        kc[row + i] = near16(o[2u * i]) | (near16(o[2u * i + 1u]) << 16u);
+        vc[row + i] = near16(vsrc[sb + 2u * i]) | (near16(vsrc[sb + 2u * i + 1u]) << 16u);
     }
+"#;
+
+/// The f16 bits nearest to `x`, ties to even, whatever rounding the driver's packing applies.
+/// The packed value is `x` rounded either way.
+/// The next f16 away from zero replaces it when it lies nearer, or as near with an even last bit.
+const NEAR16: &str = r#"
+fn near16(x: f32) -> u32 {
+    let lo = pack2x16float(vec2<f32>(x, 0.0)) & 0xFFFFu;
+    let up = lo + 1u;
+    let dl = abs(x - unpack2x16float(lo).x);
+    let du = abs(x - unpack2x16float(up).x);
+    return select(lo, up, du < dl || (du == dl && (lo & 1u) == 1u));
+}
 "#;
 
 const PREP_KV_DST: &str = r#"
@@ -1482,7 +1495,10 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
         "attn_tiled_wide" => attention_tiled(256),
         "attention_wide" => attention(2),
         "prep_q" => format!("{PREP_Q_DST}{}", PREP.replace("STORE", PREP_Q_STORE)),
-        "prep_kv" => format!("{PREP_KV_DST}{}", PREP.replace("STORE", PREP_KV_STORE)),
+        "prep_kv" => format!(
+            "{PREP_KV_DST}{NEAR16}{}",
+            PREP.replace("STORE", PREP_KV_STORE)
+        ),
         "attention" => attention(1),
         "attention_join" => ATTENTION_JOIN.to_string(),
         other => anyhow::bail!("vulkan: no kernel {other}"),
