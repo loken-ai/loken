@@ -94,6 +94,7 @@ They come after the CUDA or HIP cards and before the host.
 A build with `vulkan` alone has no other runtime, so every GPU is offered.
 
 The layers of a dense decoder in `Q4_K`, `Q6_K`, `Q8_0` or `F16` run on Vulkan, with the output head when the last layer does.
+Their weights count in the `size_vram` that `/api/ps` reports.
 A model of another shape stays off Vulkan.
 The context reads the storage binding limit and the allocation limit of the device.
 A buffer above either limit is refused with an error that names its size and both limits.

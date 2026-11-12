@@ -18,6 +18,8 @@ pub(super) type RawRead<'a> = dyn Fn(&str) -> Result<Option<(crate::tensor::quan
 struct Segment {
     from: usize,
     to: usize,
+    /// The OpenCL device that runs the segment.
+    device: usize,
     stack: crate::inference::kernel::opencl_stack::OpenClStack,
 }
 
@@ -39,6 +41,21 @@ impl OpenClLayers {
         return self.segments.is_empty();
         #[cfg(not(feature = "opencl"))]
         true
+    }
+
+    /// The OpenCL device that runs layer `layer`, when one does.
+    pub(crate) fn device_of(&self, layer: usize) -> Option<usize> {
+        #[cfg(feature = "opencl")]
+        return self
+            .segments
+            .iter()
+            .find(|s| (s.from..s.to).contains(&layer))
+            .map(|s| s.device);
+        #[cfg(not(feature = "opencl"))]
+        {
+            let _ = layer;
+            None
+        }
     }
 
     /// The end of the OpenCL segment that runs layer `layer`, when one does.
@@ -200,7 +217,12 @@ impl OpenClLayers {
                     seg.layer_start,
                     seg.layer_end
                 );
-                segments.push(Segment { from, to, stack });
+                segments.push(Segment {
+                    from,
+                    to,
+                    device,
+                    stack,
+                });
             }
             Ok(Self {
                 segments,

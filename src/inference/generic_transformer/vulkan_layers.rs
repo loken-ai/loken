@@ -20,6 +20,8 @@ pub(super) type RawRead<'a> = dyn Fn(&str) -> Result<Option<(crate::tensor::quan
 struct Segment {
     from: usize,
     to: usize,
+    /// The Vulkan device that runs the segment.
+    device: usize,
     stack: crate::inference::kernel::vulkan::VulkanStack,
 }
 
@@ -41,6 +43,21 @@ impl VulkanLayers {
         return self.segments.is_empty();
         #[cfg(not(feature = "vulkan"))]
         true
+    }
+
+    /// The Vulkan device that runs layer `layer`, when one does.
+    pub(crate) fn device_of(&self, layer: usize) -> Option<usize> {
+        #[cfg(feature = "vulkan")]
+        return self
+            .segments
+            .iter()
+            .find(|s| (s.from..s.to).contains(&layer))
+            .map(|s| s.device);
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = layer;
+            None
+        }
     }
 
     /// The end of the Vulkan segment that runs layer `layer`, when one does.
@@ -189,7 +206,12 @@ impl VulkanLayers {
                     seg.layer_start,
                     seg.layer_end
                 );
-                segments.push(Segment { from, to, stack });
+                segments.push(Segment {
+                    from,
+                    to,
+                    device,
+                    stack,
+                });
             }
             Ok(Self {
                 segments,

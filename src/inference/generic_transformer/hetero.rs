@@ -195,6 +195,21 @@ fn mlp_activation_fused(on_card: bool, activation: DType, ffn: usize, use_gelu: 
     on_card && activation == DType::F16 && !use_gelu && ffn > 0 && ffn.is_multiple_of(2)
 }
 
+/// The device kind and index a layer is reported on.
+/// A layer a Vulkan or OpenCL segment runs is on that device, whatever its host build says.
+fn layer_place(
+    ld: &LayerDevice,
+    vulkan: Option<usize>,
+    opencl: Option<usize>,
+) -> (&'static str, usize) {
+    match (vulkan, opencl, ld) {
+        (Some(d), _, _) => ("Vulkan", d),
+        (None, Some(d), _) => ("OpenCL", d),
+        (None, None, LayerDevice::Cuda(idx)) => ("CUDA", *idx),
+        (None, None, LayerDevice::Cpu) => ("CPU", 0),
+    }
+}
+
 /// What the projections of a prefill layer gave: one buffer holding q, k and v side by side,
 /// or one tensor for each.
 enum PrefillProjection {
@@ -507,10 +522,7 @@ impl GenericHeteroTransformer {
     pub fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
         let mut out: Vec<(String, usize, u32, u32)> = Vec::new();
         for (i, ld) in self.layer_devs.iter().enumerate() {
-            let (dtype, did) = match ld {
-                LayerDevice::Cuda(idx) => ("CUDA", *idx),
-                LayerDevice::Cpu => ("CPU", 0usize),
-            };
+            let (dtype, did) = layer_place(ld, self.vulkan.device_of(i), self.opencl.device_of(i));
             let i = i as u32;
             match out.last_mut() {
                 // Extend the current run when the same device continues.
@@ -3986,6 +3998,20 @@ fn swa_bounded_mask_data(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod layer_place_tests {
+    use super::{layer_place, LayerDevice};
+
+    /// A layer a Vulkan or OpenCL device runs is not reported on the host.
+    #[test]
+    fn a_layer_is_reported_on_the_device_that_runs_it() {
+        assert_eq!(layer_place(&LayerDevice::Cpu, None, None), ("CPU", 0));
+        assert_eq!(layer_place(&LayerDevice::Cuda(1), None, None), ("CUDA", 1));
+        assert_eq!(layer_place(&LayerDevice::Cpu, Some(2), None), ("Vulkan", 2));
+        assert_eq!(layer_place(&LayerDevice::Cpu, None, Some(0)), ("OpenCL", 0));
+    }
 }
 
 #[cfg(test)]

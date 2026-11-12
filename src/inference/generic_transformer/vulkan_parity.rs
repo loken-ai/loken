@@ -682,6 +682,23 @@ fn logit_noise(tag: &str, limit: f64, with_cuda: bool) {
     }
 }
 
+/// A model whose layers all run on a Vulkan device reports them on that device, not on the
+/// host.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_layers_are_reported_on_their_device() {
+    let fx = Fixture::open();
+    for d in crate::inference::kernel::vulkan::devices() {
+        let m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
+        assert_eq!(
+            m.device_layer_distribution(),
+            vec![("Vulkan".to_string(), d.index, 0, fx.n_layers as u32 - 1)],
+            "{}",
+            d.name
+        );
+    }
+}
+
 /// The same greedy answer on the first CUDA card, for the comparison of the two runtimes on one
 /// NVIDIA card.
 #[cfg(feature = "cuda")]
