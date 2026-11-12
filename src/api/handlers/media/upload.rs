@@ -27,11 +27,12 @@ fn form_error(code: axum::http::StatusCode, msg: impl Into<String>) -> axum::res
 async fn image_upload_where_the_model_is(
     state: &APIServer,
     headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
     body: axum::body::Bytes,
     path: &str,
 ) -> Result<(axum::extract::Multipart, String), axum::response::Response> {
     use crate::api::handlers::catalogue;
-    let model_name = catalogue::upload_model(headers, &body)
+    let model_name = catalogue::upload_model(headers, extensions, &body)
         .await
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
@@ -58,7 +59,7 @@ async fn image_upload_where_the_model_is(
     {
         return Err(relayed);
     }
-    let multipart = catalogue::upload_multipart(headers, body)
+    let multipart = catalogue::upload_multipart(headers, extensions, body)
         .await
         .map_err(|e| form_error(axum::http::StatusCode::BAD_REQUEST, e))?;
     Ok((multipart, model_name))
@@ -505,15 +506,23 @@ async fn render_upload_batch(
 pub(crate) async fn images_edits(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     // The job goes where the family is held and a card holds it whole.
-    let (mut multipart, upload_model) =
-        match image_upload_where_the_model_is(&state, &headers, body, "/v1/images/edits").await {
-            Ok(parsed) => parsed,
-            Err(answer) => return answer,
-        };
+    let (mut multipart, upload_model) = match image_upload_where_the_model_is(
+        &state,
+        &headers,
+        &extensions,
+        body,
+        "/v1/images/edits",
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(answer) => return answer,
+    };
     // One media job at a time: two diffusion engines cannot share these cards.
     let _media_guard = state.media_lock_for(&upload_model, "image edit").await;
     let form = match ImageFormFields::read(&mut multipart).await {
@@ -612,12 +621,14 @@ pub(crate) async fn images_edits(
 pub(crate) async fn images_variations(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     // The job goes where the family is held and a card holds it whole.
     let (mut multipart, upload_model) = match image_upload_where_the_model_is(
         &state,
         &headers,
+        &extensions,
         body,
         "/v1/images/variations",
     )

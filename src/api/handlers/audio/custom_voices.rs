@@ -206,7 +206,9 @@ pub(super) async fn read_form(
         }
         return Ok(form);
     }
-    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+    // The body is read under the limit of its route.
+    use axum::RequestExt;
+    let bytes = axum::body::to_bytes(request.with_limited_body().into_body(), usize::MAX)
         .await
         .map_err(|e| format!("body read: {e}"))?;
     let value: serde_json::Value =

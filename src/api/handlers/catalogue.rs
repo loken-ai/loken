@@ -122,9 +122,12 @@ pub(crate) async fn listed_size(
 /// parsed once here to decide where it goes, and again by the route that runs it.
 pub(crate) async fn upload_model(
     headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
     body: &axum::body::Bytes,
 ) -> Option<String> {
-    let mut multipart = upload_multipart(headers, body.clone()).await.ok()?;
+    let mut multipart = upload_multipart(headers, extensions, body.clone())
+        .await
+        .ok()?;
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some("model") {
             return field.text().await.ok().map(|m| m.trim().to_string());
@@ -134,8 +137,12 @@ pub(crate) async fn upload_model(
 }
 
 /// The multipart reader of an upload held as bytes.
+///
+/// `extensions` are those of the request the upload came in.
+/// They carry the body limit of its route, which the reader applies.
 pub(crate) async fn upload_multipart(
     headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
     body: axum::body::Bytes,
 ) -> Result<axum::extract::Multipart, String> {
     use axum::extract::FromRequest;
@@ -143,10 +150,11 @@ pub(crate) async fn upload_multipart(
         .get(axum::http::header::CONTENT_TYPE)
         .cloned()
         .ok_or("an upload names its content type")?;
-    let request = axum::http::Request::builder()
+    let mut request = axum::http::Request::builder()
         .header(axum::http::header::CONTENT_TYPE, content_type)
         .body(axum::body::Body::from(body))
         .map_err(|e| e.to_string())?;
+    *request.extensions_mut() = extensions.clone();
     axum::extract::Multipart::from_request(request, &())
         .await
         .map_err(|e| e.to_string())
@@ -248,5 +256,92 @@ mod tests {
         assert!(!serves_sound(&node, "ace-step-turbo"));
         node.serves = Some(vec!["ace-step-turbo".into()]);
         assert!(serves_sound(&node, "music"));
+    }
+
+    /// The form an upload test sends: a `file` part of `file_len` bytes, then a `model` part.
+    fn upload_form(file_len: usize) -> (String, Vec<u8>) {
+        let boundary = "upload-limit-boundary";
+        let mut body = Vec::with_capacity(file_len + 512);
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.resize(body.len() + file_len, 7);
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n\
+                 whisper\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+        (format!("multipart/form-data; boundary={boundary}"), body)
+    }
+
+    /// A route that reads an upload the way the upload routes do: its model, then every part.
+    /// It answers the model and the length of the longest part.
+    async fn read_upload(
+        headers: axum::http::HeaderMap,
+        extensions: axum::http::Extensions,
+        body: axum::body::Bytes,
+    ) -> Result<String, (axum::http::StatusCode, String)> {
+        let refuse = |e: String| (axum::http::StatusCode::BAD_REQUEST, e);
+        let model = upload_model(&headers, &extensions, &body)
+            .await
+            .unwrap_or_default();
+        let mut multipart = upload_multipart(&headers, &extensions, body)
+            .await
+            .map_err(refuse)?;
+        let mut file = 0;
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| refuse(format!("multipart parse: {e}")))?
+        {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| refuse(format!("multipart parse: {e}")))?;
+            file = file.max(bytes.len());
+        }
+        Ok(format!("{model} {file}"))
+    }
+
+    /// An upload over axum's own default and under its route's limit is read whole.
+    /// An upload over its route's limit is refused before it is read, with a message that says so.
+    #[tokio::test]
+    async fn an_upload_is_read_up_to_the_limit_of_its_route() {
+        use tower::ServiceExt;
+        const AXUM_DEFAULT_LIMIT: usize = 2 * 1024 * 1024;
+        let route_limit = 2 * AXUM_DEFAULT_LIMIT;
+        let send = |file_len: usize| async move {
+            let app = axum::Router::new().route(
+                "/upload",
+                axum::routing::post(read_upload)
+                    .layer(axum::extract::DefaultBodyLimit::max(route_limit)),
+            );
+            let (content_type, body) = upload_form(file_len);
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/upload")
+                .header(axum::http::header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        };
+        let over_default = AXUM_DEFAULT_LIMIT + AXUM_DEFAULT_LIMIT / 2;
+        let (status, text) = send(over_default).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{text}");
+        assert_eq!(text, format!("whisper {over_default}"));
+        let (status, text) = send(route_limit + 1).await;
+        assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{text}");
+        assert!(text.contains("length limit exceeded"), "{text}");
     }
 }

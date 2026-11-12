@@ -181,11 +181,13 @@ pub(crate) async fn handle_chat_asr(
 pub(crate) async fn audio_transcriptions(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     decode_where_the_model_is(
         state,
         headers,
+        extensions,
         body,
         WhisperTask::Transcribe,
         "/v1/audio/transcriptions",
@@ -204,12 +206,13 @@ fn needs_recogniser_room(resident_model: bool) -> bool {
 async fn decode_where_the_model_is(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     body: axum::body::Bytes,
     task: WhisperTask,
     path: &str,
 ) -> axum::response::Response {
     use crate::api::handlers::catalogue;
-    let requested = catalogue::upload_model(&headers, &body)
+    let requested = catalogue::upload_model(&headers, &extensions, &body)
         .await
         .unwrap_or_default();
     let holds = |n: &crate::distributed::membership::NodeState| {
@@ -282,7 +285,7 @@ async fn decode_where_the_model_is(
         },
         "transcription",
     );
-    match catalogue::upload_multipart(&headers, body).await {
+    match catalogue::upload_multipart(&headers, &extensions, body).await {
         Ok(multipart) => audio_decode_endpoint(state, headers, multipart, task).await,
         Err(e) => {
             use axum::response::IntoResponse;
@@ -302,11 +305,13 @@ async fn decode_where_the_model_is(
 pub(crate) async fn audio_translations(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
+    extensions: axum::http::Extensions,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     decode_where_the_model_is(
         state,
         headers,
+        extensions,
         body,
         WhisperTask::Translate,
         "/v1/audio/translations",
