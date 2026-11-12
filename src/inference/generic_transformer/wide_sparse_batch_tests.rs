@@ -341,3 +341,92 @@ fn a_model_without_latent_layers_keeps_no_sequence_state() {
     assert!(SequenceBatched::new(model).is_err());
     super::tiny_model::remove(&path);
 }
+
+/// What the routed experts of a model ran.
+///
+/// The first map holds, per layer, the values of the first input rows the layer took.
+/// The second holds, per layer and expert, the values of the rows of each run of the expert.
+type ExpertRuns = (HashMap<usize, usize>, HashMap<(usize, usize), Vec<usize>>);
+
+/// What the routed experts of `model` ran while `run` read.
+fn expert_runs(
+    model: &mut GenericHeteroTransformer,
+    run: impl FnOnce(&mut GenericHeteroTransformer),
+) -> ExpertRuns {
+    let seen: Arc<std::sync::Mutex<ExpertRuns>> = Arc::default();
+    let log = Arc::clone(&seen);
+    model.observe_experts(Some(Arc::new(
+        move |layer: usize, e: Option<usize>, x: &[f32], _: &[f32]| {
+            let mut log = log.lock().unwrap();
+            match e {
+                None => {
+                    log.0.entry(layer).or_insert(x.len());
+                }
+                Some(e) => log.1.entry((layer, e)).or_default().push(x.len()),
+            }
+        },
+    )));
+    run(model);
+    model.observe_experts(None);
+    let runs = std::mem::take(&mut *seen.lock().unwrap());
+    runs
+}
+
+/// For both layouts, a prompt read by the batch worker runs each routed expert of a layer once,
+/// over every row of the prompt routed to it.
+/// The same prompt read a token at a time runs an expert once per row routed to it.
+#[test]
+fn a_prompt_runs_each_routed_expert_once_for_all_the_rows_routed_to_it() {
+    let prompt = oracle_tokens();
+    for (ratios, kv_src, index_src) in LAYOUTS {
+        let mut model = generic(ratios, kv_src, index_src);
+        let used = model.routed_per_token();
+        assert!(
+            used > 1,
+            "layout {ratios:?}: a row routes to several experts"
+        );
+        let mut seq = model.sequence_mixers().unwrap();
+        let (inputs, by_prompt) = expert_runs(&mut model, |m| {
+            m.prefill_sequence(&prompt, &mut seq).unwrap();
+        });
+        let mut model = generic(ratios, kv_src, index_src);
+        let (_, by_token) = expert_runs(&mut model, |m| {
+            for (i, &t) in prompt.iter().enumerate() {
+                m.forward(&ids(&[t]), i).unwrap();
+            }
+        });
+        assert_eq!(inputs.len(), ratios.len(), "layout {ratios:?}");
+        for (&layer, &values) in &inputs {
+            let width = values / prompt.len();
+            let runs: Vec<&Vec<usize>> = by_prompt
+                .iter()
+                .filter(|(k, _)| k.0 == layer)
+                .map(|(_, v)| v)
+                .collect();
+            assert!(
+                runs.iter().all(|r| r.len() == 1),
+                "layout {ratios:?}, layer {layer}: an expert ran more than once in the prompt"
+            );
+            let rows: usize = runs.iter().map(|r| r[0] / width).sum();
+            assert_eq!(
+                rows,
+                prompt.len() * used,
+                "layout {ratios:?}, layer {layer}: every pair of the prompt ran in its expert's run"
+            );
+            let token_runs: usize = by_token
+                .iter()
+                .filter(|(k, _)| k.0 == layer)
+                .map(|(_, v)| v.len())
+                .sum();
+            assert_eq!(
+                token_runs,
+                prompt.len() * used,
+                "layout {ratios:?}, layer {layer}: a token at a time runs an expert per pair"
+            );
+            assert!(
+                runs.len() < token_runs,
+                "layout {ratios:?}, layer {layer}: the prompt shares experts between its rows"
+            );
+        }
+    }
+}
