@@ -65,7 +65,7 @@ keep = true
 eyebrow = "Scene 1 of 6"
 name = "Load"
 title = "Loading a model that does not fit"
-about = "A mixture of experts such as DeepSeek V4.1 can be larger than the RAM of the host and the VRAM of the card together. Loken maps its file, keeps on the card what every token reads, and fills the rest of the card with the experts used most."
+about = "A mixture of experts can be larger than the RAM of the host and the VRAM of the card together. Loken maps its file, keeps on the card what every token reads, and fills the rest of the card with the experts used most."
 steps = [
   "The file is larger than the RAM and the VRAM together, so it is not read whole. The host maps it, and a page is read from the disk only when something touches it.",
   "The weights every token reads cross to the card once and stay there. They are read from the disk through the RAM, and copied into the VRAM before any routed expert.",
@@ -176,6 +176,14 @@ deeper = [{ text = "The prompt in chunks", href = "generation.md#chunks" }]
 now = ["Naming the experts", "Choosing card or host", "Reading adjacent experts", "Everything at the same time", "Letting the copies go", "Reading the next layer ahead"]
 ```
 
-DeepSeek V4.1 is served this way: the host maps the file, and the cards keep what every token reads and as many routed experts as they have room for.
+A mixture whose experts stay in the file's mapping is served this way.
+The experts a card keeps, the room for copies and the number of experts the page cache keeps for each layer all come from measurement at load.
+See [Expert cache of a mixture held in the file's mapping](../CONFIGURATION.md#expert-cache-of-a-mixture-held-in-the-files-mapping) for how each quantity is derived.
 
-The experts a card keeps, the room for copies and the number of experts the page cache keeps for each layer all come from measurement at load. See [Streamed mixtures](../CONFIGURATION.md#streamed-mixtures-deepseek-v41) for how each quantity is derived and what the `fidelity` setting trades.
+DeepSeek V4.1 and the other wide-residual models take the same generic route, with their own tiers:
+
+- The host maps the file, and the cards keep what every token reads.
+- The card tier fills the rest of the cards with the experts the routing heat ranks first, at load. It takes no expert on while tokens decode.
+- The host tier keeps in the page cache the experts the decoded rows route to most or last, and drops the pages of every other expert once computed.
+
+See [Streamed mixtures](../CONFIGURATION.md#streamed-mixtures-deepseek-v41) for what the `fidelity` setting trades.

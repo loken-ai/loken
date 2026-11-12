@@ -122,18 +122,20 @@ It falls back to a cold prefill in these cases:
 
 ## Large mixtures streamed from disk
 
-DeepSeek V4.1 is served from its own GGUF, which may be split.  
-The routed experts are read from the file as routing asks for them.
+DeepSeek V4.1 is served through the generic route, from a GGUF that may be split or from its checkpoint directory.
+The routed experts the cards do not keep are read from the file as routing asks for them.
 
-DeepSeek V4.1's runs are on the [benchmarks site](https://loken-ai.github.io/benchmarks/).
-The other engines could not run it.
+DeepSeek V4.1's runs on the [benchmarks site](https://loken-ai.github.io/benchmarks/) were measured on the path the generic route replaced.
+They are not measured again yet.
+Ollama runs the file in llama.cpp's layout.
+vLLM could not run it.
 
 <!-- site: widget table id=status-streamed-pieces -->
 | Piece | State |
 |---|---|
-| Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards. Each layer reads only the experts the prompt routes to, in runs, into a page-locked slab, and sends them on a copy stream. See the benchmark rows of the model |
+| Prefill | A prompt's token mixers run on the card that keeps them. Its routed experts run on the card that keeps them, and on the host from the file's mapping otherwise. The host tier admits the experts the prompt routes to |
 | Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [Configuration](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
-| Decode-state cache | In host memory, or on disk when `state_cache_dir` is set. A stored prefix always pays. A short remainder still reads nearly every expert, which bounds how little it costs |
+| Decode-state cache | In host memory, or on disk when `state_cache_dir` is set. A stored state is restored only when reading it costs less than prefilling its tokens. A short remainder still reads nearly every expert, which bounds how little it costs |
 | Exactness of streamed experts | `exact` unless `fidelity = "fast"`. The other levels change the output. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
 | Sharding across nodes | Unmeasured at 2 nodes, see [The cluster](#the-cluster) |
 <!-- site: end -->
@@ -290,9 +292,9 @@ Limits:
 - **Multi-token prediction** runs as a draft head that `loken draft-head` writes beside the model from the checkpoint's `mtp.*` tensors.
   The decode drafts with it only when `fidelity = "fast"` is set and the decode graph is recorded.
 - **DeepSeek V4.1 native draft** is the DSpark head, the checkpoint's `mtp.*` tensors, read from the model file or a companion.
-  The decode loop drafts with it when it is loaded, verifies through the batched forward, and keeps the accepted prefix.
+  The generic route reads it as a block draft, and the decode drafts with it when it is loaded.
+  The decode verifies a block in 1 forward and keeps the accepted prefix.
   The prompt's last positions, the decoded tokens and the verified blocks feed its window.
-  The generic route reads the same head as a block draft and offers it to the same decode arm.
   Its load takes the head of a companion of the model first, then the model file's.
   Tests prove the same greedy text through the engine with a scripted guess. No speedup is measured on the real model.
 - A test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and passes alone.

@@ -220,7 +220,7 @@ Both keys unset keep nothing on disk.
 
 The cache lives in host memory for the life of the process, or on disk when `state_cache_dir` is set.
 
-A DeepSeek V4.1 prompt costs 1 pass over the routed experts, read from disk.
+A DeepSeek V4.1 prompt costs 1 pass over the routed experts the cards do not keep, read from the file's mapping.
 
 The cache stores the model's decode state after a prompt and after each finished turn.
 A later prompt that begins with the same tokens restores a stored state and prefills only the rest:
@@ -287,16 +287,16 @@ The cache works out these quantities from what the model, the disk and the engin
 | Whether to restore | A stored state is read only while its measured read-and-decode cost per byte, times its bytes, is below the measured prefill time of the tokens it covers. It is tried while either is unmeasured. |
 | Writes | 1 at a time. A write queues behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state. Otherwise it is skipped with a log line. |
 
-A DeepSeek V4.1 state costs:
+A DeepSeek V4.1 state is a manifest and blocks, as a hybrid's is:
 
-- about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the model keeps them)
-- about 1.1 KB per token of compressed KV, stored once in block files that every snapshot of a conversation shares
+- The manifest holds each latent layer's token count and window of key rows, and the part of each band layer's state past the last whole block.
+- Blocks hold the band layers' compressed rows and index keys, once per shared prefix.
+- Rows are written as the codes of the fp8 or fp4 grid they lie on, and as f32 where a value is off it, so a restore returns the stored bits.
 
-A DeepSeek V4.1 prompt prefills the rest in 1 layer-major pass onto the restored state.
-A prompt stored whole with its logits is answered from them, with nothing to prefill.
+The rest of the prompt is prefilled in chunks onto the restored state, and the states the prefill passes are kept.
+A prompt kept whole in host memory with its logits is answered from them, with nothing to prefill.
 
 A pass over a few 100 tokens still routes to nearly every expert of every layer, so it reads about as many expert bytes as a whole prompt.
-A remainder of 250 tokens costs a little over half a cold 2000-token prompt.
 
 The batch worker and the serial path use the cache.  
 A pipelined model does not, because half of its state is on the tail node.
@@ -318,8 +318,8 @@ The gain grows with the covered length and with how slow a prefill is on the mac
 
 The read speed of the cache directory against the state size bounds the gain.
 
-A hybrid restore leaves at least 1 token to prefill, to produce the logits.
-A hybrid with a draft head leaves 2.
+A restore from disk leaves at least 1 token to prefill, to produce the logits.
+A model with a draft head leaves 2.
 
 ### Streamed mixtures (DeepSeek V4.1)
 

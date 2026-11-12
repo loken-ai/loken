@@ -637,8 +637,9 @@ cargo test --lib oracle_parity
 | `src/inference/engine/model_backend.rs` | The trait each architecture implements. |
 
 - [`REFERENCES.md`](REFERENCES.md) lists the papers behind each family.
-- The DeepSeek V4.1 port is gated against the authors' `model.py`.
-  Each phase of the reference dumps its inputs and outputs into `tests/vectors/`, and a test replays the phase on the same inputs.
+- A reference dumps its inputs and outputs into `tests/vectors/`, and a test replays them on the same inputs.
+- DeepSeek V4.1 on the generic route is held to records of the path it replaced, in `tests/vectors/deepseek_v41_oracle` and `tests/vectors/deepseek_v41_frozen`.
+  Its block draft is held to a reference model's draft, in `tests/vectors/deepseek_v41_dspark`.
 
 ```sh
 ls tests/vectors/
@@ -651,7 +652,7 @@ cargo test --lib wide_sparse_oracle_tests
 |---|---|
 | `the_rope_frequencies_are_the_references` | Rotary frequencies against the reference's `inv_freq`. |
 | `the_selected_attention_matches_the_reference_block` | An attention block against the reference's block output. |
-| `wide_sparse_oracle_tests` | The generic route against the frozen V4.1 oracle, and against the bits the V4.1 path gave. |
+| `wide_sparse_oracle_tests` | The generic route against the logits the replaced V4.1 path recorded on a toy model, within a tolerance, and against its recorded bits. |
 
 Exercise: divide the tolerance of the second test by 10 and run it again.
 The assertion names the measured difference.
