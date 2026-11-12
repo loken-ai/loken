@@ -68,6 +68,11 @@ fn a_layer_split_across_two_cards_computes_the_whole_layer() {
         split.layers.iter().all(|l| l.tp_shards.len() == 1),
         "every layer split"
     );
+    // The batch worker runs every layer whole on one card: a split model decodes serially.
+    assert!(
+        !split.cb_eligible(),
+        "the batch worker took a model whose layers are split across cards"
+    );
     // Each share reads its weights on its own card.
     let card = |i: usize| Device::new_cuda(i).unwrap();
     for l in &split.layers {

@@ -738,4 +738,61 @@ mod on_a_card {
         alone_and_batched_agree_on_a_card(&path);
         tiny_model::remove(&path);
     }
+
+    /// Whether card 1 opens. A run without it says so on its error stream.
+    fn second_card() -> bool {
+        let present = Device::new_cuda(1).is_ok();
+        if !present {
+            eprintln!("no second card: the split variant checked nothing");
+        }
+        present
+    }
+
+    /// A mixture with sinks whose first layer sits on card 1 and second layer on card 0 stays
+    /// out of the batch worker.
+    /// Served serially, each prompt gives the tokens it gives with every layer on card 0.
+    #[test]
+    fn a_model_whose_first_layer_sits_on_the_second_card_serves_serially() {
+        use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+        if !card() || !second_card() {
+            return;
+        }
+        let extras = tiny_model::QuantExtras {
+            sinks: true,
+            routed: true,
+            ..Default::default()
+        };
+        let path = quant("cb-two-cards", extras);
+        let split = tiny_model::load_on_cards(&path, LAYERS, &[(1, 0), (0, 1)]);
+        let on = |l: usize| split.layers()[l].attn_norm.weight().device().location();
+        assert_eq!(on(0), crate::tensor::DeviceLocation::Cuda { gpu_id: 1 });
+        assert_eq!(on(1), crate::tensor::DeviceLocation::Cuda { gpu_id: 0 });
+        let split = GenericBackend(split);
+        assert!(
+            !split.cb_eligible_gpu(),
+            "the batch worker took a model whose layers sit on 2 cards"
+        );
+        let mut split = split.0;
+        let mut whole = tiny_model::load_on_card(&path, LAYERS);
+        let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut worst = 0f32;
+        for prompt in prompts() {
+            let mut want = flat(whole.forward(&ids(&prompt), 0).unwrap());
+            let mut got = flat(split.forward(&ids(&prompt), 0).unwrap());
+            for step in 0..STEPS {
+                worst = worst.max(share(&want, &got));
+                let (a, b) = (argmax(&want), argmax(&got));
+                assert_eq!(a, b, "step {step} of the split model chose another token");
+                let at = prompt.len() + step;
+                want = flat(whole.forward(&ids(&[a]), at).unwrap());
+                got = flat(split.forward(&ids(&[b]), at).unwrap());
+            }
+        }
+        eprintln!("split against one card: largest logit difference {worst:.3e} of the range");
+        assert!(
+            worst <= SHARE,
+            "the split logits moved by {worst} of their range"
+        );
+        tiny_model::remove(&path);
+    }
 }

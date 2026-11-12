@@ -898,6 +898,19 @@ impl GenericHeteroTransformer {
         if c.final_logit_softcapping.is_some() {
             return Some("logit softcapping");
         }
+        // The batched paths run every layer whole on the compute device.
+        // The worker holds the paged cache of every layer in one pool on that device.
+        let compute = self.compute_device();
+        if self
+            .layers
+            .iter()
+            .any(|l| !l.attn_norm.weight().device().same_device(&compute))
+        {
+            return Some("layers on several devices");
+        }
+        if self.layers.iter().any(|l| !l.tp_shards.is_empty()) {
+            return Some("layers split across cards");
+        }
         // A card runs the paths of a stretched or partial rotation, of sinks and of a mixture
         // whose experts it holds, outside the captured decode graph.
         let host = self.cb_on_host();

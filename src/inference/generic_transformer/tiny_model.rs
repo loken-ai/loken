@@ -257,21 +257,43 @@ pub(crate) fn load_on_card(
     path: &std::path::Path,
     layers: usize,
 ) -> super::GenericHeteroTransformer {
+    load_on_cards(path, layers, &[(0, 0)])
+}
+
+/// The model at `path` loaded on the cards of `runs`, its cache unquantised.
+///
+/// Each run is a card ordinal and the first layer it holds.
+/// A run holds the layers up to the first layer of the next run.
+#[cfg(feature = "gpu")]
+pub(crate) fn load_on_cards(
+    path: &std::path::Path,
+    layers: usize,
+    runs: &[(usize, usize)],
+) -> super::GenericHeteroTransformer {
     use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan, HeteroSegment};
-    let plan = HeteroPlan {
-        segments: vec![HeteroSegment {
-            kind: DeviceKind::Cuda(0),
-            layer_start: 0,
-            layer_end: layers,
+    let ends = runs.iter().skip(1).map(|r| r.1).chain([layers]);
+    let segments = runs
+        .iter()
+        .zip(ends)
+        .map(|(&(card, start), end)| HeteroSegment {
+            kind: DeviceKind::Cuda(card),
+            layer_start: start,
+            layer_end: end,
             free_memory_bytes: 1 << 30,
-        }],
+        })
+        .collect();
+    let plan = HeteroPlan {
+        segments,
         tp_cards: None,
         total_layers: layers,
         host_experts_from: None,
     };
     let g = crate::tensor::quantized::gguf_file::open_mapped(path).unwrap();
     let bytes = g.mmap.clone();
-    let cards = std::collections::HashMap::from([(0, crate::tensor::Device::new_cuda(0).unwrap())]);
+    let cards = runs
+        .iter()
+        .map(|&(card, _)| (card, crate::tensor::Device::new_cuda(card).unwrap()))
+        .collect::<std::collections::HashMap<_, _>>();
     super::GenericHeteroTransformer::from_gguf_with_kv_quant(
         g.content,
         &bytes[..],
