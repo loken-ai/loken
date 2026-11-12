@@ -366,6 +366,7 @@ The tests check:
 - a prompt row as the sum of its text and codec parts, and the row after a frame as the sum of its code rows and the pad row
 - a seeded run giving the same frames twice, on the toy and on the published checkpoint
 - the loop stopping where the cache is full, and a streamed text spoken to its end
+- an overrun drawn again the same way twice, and a streamed clip never drawn again
 - the published checkpoint's tokenizer wrapping both turns
 - the blocks of the published checkpoint summing to the tensors they load
 
@@ -416,6 +417,30 @@ The prompt (`prompt::named_rows`):
 A dialect speaker speaks its dialect when the request leaves the language to the model or asks for `DIALECT_OF`.
 Its control codes then carry the id of the dialect.
 Asked for another language, it speaks that language.
+
+### The redraw of an overrun
+
+The talker rarely speaks past its text before it draws the end of speech (`overrun.rs`).
+The pace of an utterance is its frames per token of its text, the turn's markers left out.
+Each loaded checkpoint keeps the paces of the whole clips it completed, with the token count of each text, by the language id of the prompt, auto being its own key.
+They live in memory for the life of the loaded engine.
+
+A short text speaks slower per token than a long one.
+A clip is therefore judged against the clips of its language whose text is near its own length.
+A near text holds from half to twice the token count of the clip's text.
+The window follows the token count, so it holds no class boundary.
+
+A whole clip overruns when its pace exceeds `TOKEN_PACE` and `MEDIAN_FACTOR` times the median pace of the near texts of its language:
+
+- with no completed clip of a near text in its language, it does not overrun
+- an overrun is drawn again once, with the next seed, wrapping
+- a second draw that overruns too keeps the shorter of the 2, the first on a tie
+- the kept draw enters the median when it drew the end of speech, the overrun does not
+- each part of a text split for the cache is judged on its own
+- a request with a seed is judged the same way
+
+The log names each redraw with the token count, the 2 paces and the median, without the text.
+A streamed clip has left before its end: it is never drawn again and its pace is not kept.
 
 ## Speech codec decoder
 

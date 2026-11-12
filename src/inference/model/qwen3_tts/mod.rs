@@ -11,6 +11,7 @@
 pub mod config;
 pub mod decoder;
 mod glue;
+pub mod overrun;
 pub mod predictor;
 pub mod prompt;
 pub mod sampling;
@@ -104,6 +105,17 @@ impl Overrides {
             top_p: self.top_p.unwrap_or(sampling.top_p),
         }
     }
+}
+
+/// The prompt of a request.
+#[derive(Debug, Clone)]
+pub struct Prompt {
+    /// The prompt rows, `[rows, hidden]` F32 on the host.
+    pub rows: Tensor,
+    /// The codec id of the language the prompt uses, `None` when it leaves it to the model.
+    pub language: Option<u32>,
+    /// The count of the tokens of the text to speak, without its turn's markers.
+    pub text_tokens: usize,
 }
 
 /// Why the frame loop stopped.
@@ -403,8 +415,13 @@ impl Talker {
     /// prompt.
     /// Only a CustomVoice checkpoint takes a speaker.
     pub fn request_rows(&self, request: &Request<'_>) -> Result<Tensor> {
+        Ok(self.request_prompt(request)?.rows)
+    }
+
+    /// The prompt of `request`, under the rules of [`Self::request_rows`].
+    pub fn request_prompt(&self, request: &Request<'_>) -> Result<Prompt> {
         if self.variant == Variant::CustomVoice {
-            return self.named_request_rows(request);
+            return self.named_request_prompt(request);
         }
         if request.speaker.is_some() {
             return Err(Error::msg(
@@ -415,7 +432,11 @@ impl Talker {
         match (self.variant, request.clone) {
             (Variant::VoiceDesign, None) => {
                 let turns = prompt::Turns::of(&self.tokenizer, request.text, request.design)?;
-                self.prompt_rows(&prompt::rows(&self.ids, &turns, language))
+                Ok(Prompt {
+                    rows: self.prompt_rows(&prompt::rows(&self.ids, &turns, language))?,
+                    language,
+                    text_tokens: turns.text.len(),
+                })
             }
             (Variant::VoiceDesign, Some(_)) => Err(Error::msg(
                 "the voice design variant speaks a described voice: it takes no clone prompt",
@@ -435,17 +456,25 @@ impl Talker {
                     .as_ref()
                     .map(|r| (reference_ids.as_slice(), r.frames.len()));
                 let rows = prompt::clone_rows(&self.ids, &turns, language, reference);
-                self.clone_prompt_rows(&rows, &clone.speaker, clone.reference_frames())
+                Ok(Prompt {
+                    rows: self.clone_prompt_rows(
+                        &rows,
+                        &clone.speaker,
+                        clone.reference_frames(),
+                    )?,
+                    language,
+                    text_tokens: turns.text.len(),
+                })
             }
-            (Variant::CustomVoice, _) => self.named_request_rows(request),
+            (Variant::CustomVoice, _) => self.named_request_prompt(request),
         }
     }
 
-    /// The prompt rows of `request` on a CustomVoice checkpoint.
+    /// The prompt of `request` on a CustomVoice checkpoint.
     ///
     /// The speaker's language follows [`SpeechIds::speaker_language`].
     /// The design text is the style.
-    fn named_request_rows(&self, request: &Request<'_>) -> Result<Tensor> {
+    fn named_request_prompt(&self, request: &Request<'_>) -> Result<Prompt> {
         if request.clone.is_some() {
             return Err(Error::msg(CUSTOM_VOICE_TAKES_NO_CLONE));
         }
@@ -460,7 +489,11 @@ impl Talker {
         let language = self.ids.speaker_language(request.language, speaker)?;
         let turns = prompt::Turns::of(&self.tokenizer, request.text, request.design)?;
         let rows = prompt::named_rows(&self.ids, &turns, language, speaker.codec);
-        self.prompt_rows(&rows)
+        Ok(Prompt {
+            rows: self.prompt_rows(&rows)?,
+            language,
+            text_tokens: turns.text.len(),
+        })
     }
 
     /// The frames of the utterance of `request`, each of a code per group.
@@ -622,6 +655,8 @@ pub struct Qwen3Tts {
     pub talker: Talker,
     pub predictor: predictor::CodePredictor,
     pub speaker: Option<speaker::SpeakerEncoder>,
+    /// The paces of the whole clips the checkpoint completed, by language and text length.
+    pub paces: overrun::Paces,
 }
 
 impl Qwen3Tts {
@@ -661,6 +696,7 @@ impl Qwen3Tts {
             talker,
             predictor,
             speaker,
+            paces: overrun::Paces::default(),
         })
     }
 
@@ -682,15 +718,45 @@ impl Qwen3Tts {
         overrides: &Overrides,
         sink: &mut dyn FnMut(&[u32]) -> Result<()>,
     ) -> Result<Utterance> {
+        let prompt = self.talker.request_prompt(request)?;
+        self.prompt_utterance(&prompt, request.seed, overrides, sink)
+    }
+
+    /// The utterance after `prompt`, every draw seeded by `seed`, with the values `overrides`
+    /// sets, each frame given to `sink` as soon as it is drawn.
+    fn prompt_utterance(
+        &mut self,
+        prompt: &Prompt,
+        seed: u64,
+        overrides: &Overrides,
+        sink: &mut dyn FnMut(&[u32]) -> Result<()>,
+    ) -> Result<Utterance> {
         let predictor = overrides.apply(self.talker.generation.predictor);
         self.predictor.set_sampling(predictor);
-        let rows = self.talker.request_rows(request)?;
         self.talker
-            .frames_with(&rows, request.seed, &mut self.predictor, overrides, sink)
+            .frames_with(&prompt.rows, seed, &mut self.predictor, overrides, sink)
+    }
+
+    /// `first`, the utterance after `prompt` drawn with `seed`, or its redraw with the next
+    /// seed when it overruns, under the rules of [`overrun::Paces::redraw`].
+    fn kept(
+        &mut self,
+        prompt: &Prompt,
+        seed: u64,
+        overrides: &Overrides,
+        first: Utterance,
+    ) -> Result<Utterance> {
+        let mut paces = std::mem::take(&mut self.paces);
+        let kept = paces.redraw(prompt.language, prompt.text_tokens, seed, first, |next| {
+            self.prompt_utterance(prompt, next, overrides, &mut |_| Ok(()))
+        });
+        self.paces = paces;
+        kept
     }
 
     /// The speech of `request`, each frame given to `sink` as soon as it is drawn.
     ///
+    /// A frame given cannot be taken back: no utterance is drawn again.
     /// A text is spoken in one call when the talker's cache holds its prompt rows and the
     /// checkpoint's frame limit.
     /// Otherwise a text of several parts is spoken a part per call: its paragraphs, else its
@@ -753,17 +819,20 @@ impl Qwen3Tts {
     /// sentences.
     /// Each part is spoken with the request's seed, its frames following the frames before.
     /// A text that splits no further keeps the frames its budget held.
+    /// The utterance of the text, or of each part, is drawn again when it overruns, under the
+    /// rules of [`overrun::Paces::redraw`].
     pub fn speak(&mut self, request: &Request<'_>, overrides: &Overrides) -> Result<Vec<Vec<u32>>> {
-        let whole = self.utterance(request, overrides, &mut |_| Ok(()))?;
+        let prompt = self.talker.request_prompt(request)?;
+        let whole = self.prompt_utterance(&prompt, request.seed, overrides, &mut |_| Ok(()))?;
         if whole.stop != Stop::Budget {
-            return Ok(whole.frames);
+            return Ok(self.kept(&prompt, request.seed, overrides, whole)?.frames);
         }
         let parts = text::parts(request.text);
         if parts.len() < 2 {
             if whole.frames.is_empty() {
                 return Err(self.no_room(request));
             }
-            return Ok(whole.frames);
+            return Ok(self.kept(&prompt, request.seed, overrides, whole)?.frames);
         }
         let mut frames = Vec::new();
         for part in &parts {

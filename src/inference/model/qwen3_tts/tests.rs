@@ -544,6 +544,99 @@ fn a_streamed_text_the_cache_holds_is_spoken_in_one_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The toy request of 1 text token with `seed`.
+fn one_token_request(seed: u64) -> Request<'static> {
+    Request {
+        text: "ab",
+        design: None,
+        speaker: None,
+        language: None,
+        seed,
+        clone: None,
+    }
+}
+
+/// The toy loaded, its median pace set to 1 frame per token for the language and the length
+/// of [`one_token_request`], so that an utterance of more than 5 frames overruns.
+/// The median holds enough paces to stay at 1 through the tests' own utterances.
+fn toy_with_a_slow_median(tag: &str) -> (std::path::PathBuf, Qwen3Tts, Prompt) {
+    let dir = toy_dir(tag);
+    let mut tts = Qwen3Tts::load(&dir, Rows::Exactly(64)).unwrap();
+    let prompt = tts.talker.request_prompt(&one_token_request(0)).unwrap();
+    assert_eq!(prompt.text_tokens, 1);
+    for _ in 0..64 {
+        tts.paces.record(prompt.language, 1, 1);
+    }
+    (dir, tts, prompt)
+}
+
+/// A whole clip that overruns is drawn again with the next seed.
+/// The second draw is kept when it does not overrun, else the shorter of the 2.
+/// The same request twice gives the same frames.
+#[test]
+fn a_whole_clip_that_overruns_is_drawn_again_the_same_way_twice() {
+    let (dir, mut tts, prompt) = toy_with_a_slow_median("overrun_whole");
+    let overrides = Overrides::default();
+    let raw = |tts: &mut Qwen3Tts, seed: u64| {
+        tts.utterance(&one_token_request(seed), &overrides, &mut |_| Ok(()))
+            .unwrap()
+    };
+    let overruns = |frames: usize| frames > 5 * prompt.text_tokens;
+    let flagged: Vec<u64> = (0..64)
+        .filter(|s| overruns(raw(&mut tts, *s).frames.len()))
+        .take(4)
+        .collect();
+    assert!(!flagged.is_empty(), "no seed of the toy overruns");
+    for seed in flagged {
+        let (first, second) = (raw(&mut tts, seed), raw(&mut tts, seed.wrapping_add(1)));
+        let want = match overruns(second.frames.len()) {
+            true if second.frames.len() >= first.frames.len() => first.frames,
+            _ => second.frames,
+        };
+        let median = tts.paces.median(prompt.language, prompt.text_tokens);
+        let once = tts.speak(&one_token_request(seed), &overrides).unwrap();
+        let twice = tts.speak(&one_token_request(seed), &overrides).unwrap();
+        assert_eq!(once, want, "seed {seed}");
+        assert_eq!(twice, once, "seed {seed}");
+        assert_eq!(
+            tts.paces.median(prompt.language, prompt.text_tokens),
+            median,
+            "the kept draws leave a median of 1"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A streamed clip that overruns is not drawn again and leaves the median as it was.
+#[test]
+fn a_streamed_clip_is_never_drawn_again() {
+    let (dir, mut tts, prompt) = toy_with_a_slow_median("overrun_streamed");
+    let overrides = Overrides::default();
+    let seed = (0..64)
+        .find(|s| {
+            tts.utterance(&one_token_request(*s), &overrides, &mut |_| Ok(()))
+                .unwrap()
+                .frames
+                .len()
+                > 5
+        })
+        .expect("a seed of the toy overruns");
+    let request = one_token_request(seed);
+    let one = tts
+        .utterance(&request, &overrides, &mut |_| Ok(()))
+        .unwrap();
+    let median = tts.paces.median(prompt.language, prompt.text_tokens);
+    let streamed = tts
+        .speak_streamed(&request, &overrides, &mut |_| Ok(()))
+        .unwrap();
+    assert_eq!(streamed, one);
+    assert_eq!(
+        tts.paces.median(prompt.language, prompt.text_tokens),
+        median
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_variant_this_build_does_not_serve_is_refused_by_name() {
     let mut root = speech_config();
