@@ -193,6 +193,8 @@ pub struct Accum {
     pub nll_sum: f64,
     pub top1_hits: usize,
     pub kl_sum: f64,
+    /// Sum of the log-probabilities the run gives the reference's best token.
+    pub exact_lp_sum: f64,
     pub compared: usize,
 }
 
@@ -214,6 +216,12 @@ impl Accum {
     /// Mean KL(reference || run) over the reference's top-20, when a reference was given.
     pub fn kl(&self) -> Option<f64> {
         (self.compared > 0).then(|| self.kl_sum / self.compared as f64)
+    }
+
+    /// Mean log-probability the run gives the reference's best token, when a reference was
+    /// given.
+    pub fn exact_lp(&self) -> Option<f64> {
+        (self.compared > 0).then(|| self.exact_lp_sum / self.compared as f64)
     }
 }
 
@@ -254,6 +262,7 @@ pub fn score_rows(
             acc.compared += 1;
             acc.top1_hits += (s.ids[0] == rids[0]) as usize;
             acc.kl_sum += kl_over_top(&p_ref, &at);
+            acc.exact_lp_sum += at[0];
         }
         dump.true_lp.push(true_lp.map_or(f32::NAN, |l| l as f32));
         dump.ids.push(s.ids);
@@ -759,6 +768,29 @@ mod real_models {
         found
     }
 
+    /// The BOS id the model file at `file` declares: a GGUF's key, else its checkpoint's
+    /// tokenizer files.
+    fn declared_bos(file: &Path) -> Option<u32> {
+        if file.is_dir() {
+            return super::super::gguf::sidecar_token_id(&file.join("config.json"), "bos_token");
+        }
+        let gguf = crate::tensor::quantized::gguf_file::open_mapped_unadvised(file).ok()?;
+        super::super::gguf::get_gguf_u32(&gguf.content, "tokenizer.ggml.bos_token_id")
+    }
+
+    /// `ids` after `bos`, as the load-time calibration runs its text and as a chat prompt
+    /// opens.
+    ///
+    /// `ids` that open with `bos` already are kept as they are.
+    fn after_bos(ids: &[u32], bos: Option<u32>) -> Vec<u32> {
+        match bos {
+            Some(b) if ids.first() != Some(&b) => {
+                std::iter::once(b).chain(ids.iter().copied()).collect()
+            }
+            _ => ids.to_vec(),
+        }
+    }
+
     /// The two held-out texts under the selection rule of the module comment.
     fn held_out_texts() -> Vec<(&'static str, usize, String)> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -791,6 +823,23 @@ mod real_models {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs real models listed in the cache directory and an idle machine"]
     async fn score_the_listed_models_on_held_out_texts() {
+        score_listed_models(QualityLevel::Exact).await;
+    }
+
+    /// [`score_the_listed_models_on_held_out_texts`] with the routing of the `fast` level.
+    ///
+    /// Its results go under `fast/` beside the model's results.
+    /// Without a reference dump, a text is scored against the dump of the exact run.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs real models listed in the cache directory, their exact runs and an idle machine"]
+    async fn score_the_listed_models_at_the_fast_level() {
+        score_listed_models(QualityLevel::Fast).await;
+    }
+
+    /// Scores each listed model with the routing of `level`.
+    ///
+    /// The exact level writes beside the list, another level under a directory named after it.
+    async fn score_listed_models(level: QualityLevel) {
         let Some(root) = dirs::cache_dir().map(|d| d.join("loken").join("quality")) else {
             eprintln!("QUALITY no user cache directory");
             return;
@@ -823,18 +872,27 @@ mod real_models {
                 [] => continue,
             };
             let excerpt: Option<usize> = fields.get(2).and_then(|t| t.parse().ok());
-            let out: PathBuf = root.join(&stem);
+            let exact_out: PathBuf = root.join(&stem);
+            let out: PathBuf = match level {
+                QualityLevel::Exact => exact_out.clone(),
+                other => exact_out.join(format!("{other:?}").to_lowercase()),
+            };
             std::fs::create_dir_all(&out).unwrap();
             let engine = LlmEngine::with_config(InferenceConfig {
-                model_id,
-                models_dir: Some(models_dir),
+                model_id: model_id.clone(),
+                models_dir: Some(models_dir.clone()),
                 context_length: excerpt.unwrap_or(widest) + 64,
+                quality: level,
                 ..InferenceConfig::default()
             });
             engine
                 .load_model()
                 .await
                 .expect("the model loads as the server loads it");
+            let bos = engine
+                .resolve_model_file(&model_id)
+                .or_else(|| models_dir.is_file().then(|| models_dir.clone()))
+                .and_then(|f| declared_bos(&f));
             let mut guard = engine.model_state.lock().await;
             let state = guard.as_mut().expect("a loaded model");
             let mut runs: Vec<(String, Vec<u32>)> = Vec::new();
@@ -850,16 +908,23 @@ mod real_models {
                             .chunks_exact(len)
                             .take(EXCERPTS_PER_TEXT)
                             .enumerate()
-                            .map(|(i, c)| (format!("{name}-{i}"), c.to_vec())),
+                            .map(|(i, c)| (format!("{name}-{i}"), after_bos(c, bos))),
                     ),
-                    None => runs.push((name.to_string(), tokens)),
+                    None => {
+                        let mut tokens = after_bos(&tokens, bos);
+                        tokens.truncate(*budget);
+                        runs.push((name.to_string(), tokens));
+                    }
                 }
             }
             for (name, tokens) in &runs {
-                let reference =
-                    std::fs::File::open(out.join("reference").join(format!("{name}.lkq")))
-                        .ok()
-                        .and_then(|f| Dump::read(f).ok());
+                let file = format!("{name}.lkq");
+                let exact_run = (level != QualityLevel::Exact).then(|| exact_out.join(&file));
+                let reference = [Some(exact_out.join("reference").join(&file)), exact_run]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|p| std::fs::File::open(p).ok())
+                    .and_then(|f| Dump::read(f).ok());
                 // Against a reference, the tokens it was made from: two tokenizers of one
                 // checkpoint may differ in the tokens they add around a text.
                 let tokens = reference.as_ref().map_or(tokens, |r| &r.tokens);
@@ -893,12 +958,13 @@ mod real_models {
                 let opt =
                     |v: Option<f64>, w: usize| v.map_or("-".to_string(), |x| format!("{x:.w$}"));
                 eprintln!(
-                    "QUALITY model={stem} text={name} tokens={} chunk={chunk} nll={:.4} ppl={:.3} top1={} kl={} secs={:.0}",
+                    "QUALITY model={stem} level={level:?} text={name} tokens={} chunk={chunk} nll={:.4} ppl={:.3} top1={} kl={} exact_lp={} secs={:.0}",
                     tokens.len(),
                     acc.nll(),
                     acc.perplexity(),
                     opt(acc.top1(), 4),
                     opt(acc.kl(), 5),
+                    opt(acc.exact_lp(), 5),
                     started.elapsed().as_secs_f64()
                 );
             }
