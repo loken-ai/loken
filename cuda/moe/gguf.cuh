@@ -1099,7 +1099,9 @@ static __device__ __forceinline__ void quantize_row_to_q8_1(
     const float sum = warp_sum(xi);
 
     const float d = amax / 127;
-    y[ib].qs[iqs] = amax == 0.0f ? 0 : roundf(xi / d);
+    // Each value is scaled by the reciprocal of `d`, as the host quantiser scales it.
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    y[ib].qs[iqs] = roundf(xi * id);
 
     // One lane of the block writes the pair the block shares. What that pair is and where it
     // sits is the activation format's business, so it goes out in the one move the field takes.

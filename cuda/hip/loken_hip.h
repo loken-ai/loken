@@ -71,6 +71,13 @@ __device__ static __forceinline__ float loken_fmul_rn(float a, float b) {
     return a * b;
 }
 __device__ static __forceinline__ float loken_fsqrt_rn(float a) { return __builtin_sqrtf(a); }
+// x as the f32 value it holds, opaque to the compiler.
+// A conversion of the result to f16 rounds that f32 value.
+// The operation that made x is then never fused into the conversion with a single rounding.
+__device__ static __forceinline__ float loken_f32_fence(float x) {
+    asm volatile("" : "+v"(x));
+    return x;
+}
 #define __fadd_rn loken_fadd_rn
 #define __fsub_rn loken_fsub_rn
 #define __fmul_rn loken_fmul_rn

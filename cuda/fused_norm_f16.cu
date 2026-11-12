@@ -13,6 +13,23 @@ __device__ __forceinline__ float ll_warp_sum(float v) {
     return v;
 }
 
+// x as the f32 value it holds.
+// A HIP build keeps the operation that made x out of the conversion to f16 that follows.
+__device__ __forceinline__ float ll_f32_fence(float x) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return loken_f32_fence(x);
+#else
+    return x;
+#endif
+}
+
+// The product a * b rounded to f16, widened back to f32.
+// The rounding intrinsics keep a rotation's products and sum out of any fused multiply-add.
+// Each rotated value then rounds the 2 products and their sum to f16 on every card.
+__device__ __forceinline__ float ll_f16_product(float a, float b) {
+    return __half2float(__float2half(__fmul_rn(a, b)));
+}
+
 extern "C" __global__ void loken_fused_rmsnorm_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ res,      // or nullptr
@@ -450,14 +467,14 @@ __global__ void loken_neox_rope_f16_kernel(
     const float sn = __half2float(sr[i]);
     if (d < half) {
         // y0 = x0*cos - x1*sin  (per-op f16 rounding to match the tensor-level path)
-        const float a = __half2float(__float2half(x0 * c));
-        const float b = __half2float(__float2half(x1 * sn));
-        out[idx] = __float2half(a - b);
+        const float a = ll_f16_product(x0, c);
+        const float b = ll_f16_product(x1, sn);
+        out[idx] = __float2half(__fsub_rn(a, b));
     } else {
         // y1 = x0*sin + x1*cos
-        const float a = __half2float(__float2half(x0 * sn));
-        const float b = __half2float(__float2half(x1 * c));
-        out[idx] = __float2half(a + b);
+        const float a = ll_f16_product(x0, sn);
+        const float b = ll_f16_product(x1, c);
+        out[idx] = __float2half(__fadd_rn(a, b));
     }
 }
 
@@ -499,13 +516,13 @@ extern "C" __global__ void loken_paged_rope_f16_kernel(
         const float c = __half2float(cr[i]);
         const float sn = __half2float(sr[i]);
         if ((d & 1) == 0) {                    // out[2i] = x0*cos - x1*sin
-            const float a = __half2float(__float2half(x0 * c));
-            const float e = __half2float(__float2half(x1 * sn));
-            out[idx] = __float2half(a - e);
+            const float a = ll_f16_product(x0, c);
+            const float e = ll_f16_product(x1, sn);
+            out[idx] = __float2half(__fsub_rn(a, e));
         } else {                               // out[2i+1] = x0*sin + x1*cos
-            const float a = __half2float(__float2half(x0 * sn));
-            const float e = __half2float(__float2half(x1 * c));
-            out[idx] = __float2half(a + e);
+            const float a = ll_f16_product(x0, sn);
+            const float e = ll_f16_product(x1, c);
+            out[idx] = __float2half(__fadd_rn(a, e));
         }
     } else {
         const int i = (d < half) ? d : (d - half);
@@ -514,13 +531,13 @@ extern "C" __global__ void loken_paged_rope_f16_kernel(
         const float c = __half2float(cr[i]);
         const float sn = __half2float(sr[i]);
         if (d < half) {                        // out[i] = x0*cos - x1*sin
-            const float a = __half2float(__float2half(x0 * c));
-            const float e = __half2float(__float2half(x1 * sn));
-            out[idx] = __float2half(a - e);
+            const float a = ll_f16_product(x0, c);
+            const float e = ll_f16_product(x1, sn);
+            out[idx] = __float2half(__fsub_rn(a, e));
         } else {                               // out[i+half] = x0*sin + x1*cos
-            const float a = __half2float(__float2half(x0 * sn));
-            const float e = __half2float(__float2half(x1 * c));
-            out[idx] = __float2half(a + e);
+            const float a = ll_f16_product(x0, sn);
+            const float e = ll_f16_product(x1, c);
+            out[idx] = __float2half(__fadd_rn(a, e));
         }
     }
 }
@@ -657,8 +674,9 @@ extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
             __syncthreads();
         }
         const float rms = rsqrtf(tree[0] / (float)hd + eps);
+        // The product is rounded to f32 and then to f16, as the f32 norm and its cast round it.
         for (int d = tid; d < hd; d += blockDim.x) {
-            row[d] = __half2float(__float2half(row[d] * rms * w[d]));
+            row[d] = __half2float(__float2half(ll_f32_fence(row[d] * rms * w[d])));
         }
     }
     __syncthreads();
@@ -678,13 +696,13 @@ extern "C" __global__ void loken_prefill_qk_rope_kv_f16_kernel(
             const float c = __half2float(cr[i]);
             const float sn = __half2float(sr[i]);
             if (first) {
-                const float a = __half2float(__float2half(x0 * c));
-                const float e = __half2float(__float2half(x1 * sn));
-                o = __float2half(a - e);
+                const float a = ll_f16_product(x0, c);
+                const float e = ll_f16_product(x1, sn);
+                o = __float2half(__fsub_rn(a, e));
             } else {
-                const float a = __half2float(__float2half(x0 * sn));
-                const float e = __half2float(__float2half(x1 * c));
-                o = __float2half(a + e);
+                const float a = ll_f16_product(x0, sn);
+                const float e = ll_f16_product(x1, c);
+                o = __float2half(__fadd_rn(a, e));
             }
         }
         if (dst_f32 != nullptr) {
@@ -828,10 +846,8 @@ __global__ void loken_decode_qkv_warp_f16_kernel(
             c[j] = __half2float(cr[j]);
             sn[j] = __half2float(sr[j]);
             const float x0 = x[2 * j], x1 = x[2 * j + 1];
-            out[2 * j] = __half2float(__float2half(x0 * c[j])) -
-                         __half2float(__float2half(x1 * sn[j]));
-            out[2 * j + 1] = __half2float(__float2half(x0 * sn[j])) +
-                             __half2float(__float2half(x1 * c[j]));
+            out[2 * j] = __fsub_rn(ll_f16_product(x0, c[j]), ll_f16_product(x1, sn[j]));
+            out[2 * j + 1] = __fadd_rn(ll_f16_product(x0, sn[j]), ll_f16_product(x1, c[j]));
         }
     } else {
         float c[E], sn[E], other[E];
@@ -844,11 +860,9 @@ __global__ void loken_decode_qkv_warp_f16_kernel(
         #pragma unroll
         for (int j = 0; j < E; ++j) {
             if (first) {
-                out[j] = __half2float(__float2half(x[j] * c[j])) -
-                         __half2float(__float2half(other[j] * sn[j]));
+                out[j] = __fsub_rn(ll_f16_product(x[j], c[j]), ll_f16_product(other[j], sn[j]));
             } else {
-                out[j] = __half2float(__float2half(other[j] * sn[j])) +
-                         __half2float(__float2half(x[j] * c[j]));
+                out[j] = __fadd_rn(ll_f16_product(other[j], sn[j]), ll_f16_product(x[j], c[j]));
             }
         }
     }
