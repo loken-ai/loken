@@ -48,5 +48,7 @@ family whisper
 family zimage
 debt-family mixformer
 debt-family moondream
+debt-path src/inference/model/kyutai/depformer.rs
+debt-path src/inference/model/kyutai/helium.rs
 debt-path src/inference/model/mixformer/
 debt-path src/inference/model/moondream/
