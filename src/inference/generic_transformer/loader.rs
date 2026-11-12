@@ -907,7 +907,9 @@ pub(super) fn in_layer_format(
         let (il, rest) = name.strip_prefix("blk.")?.split_once('.')?;
         let l = layers.get(il.parse::<usize>().ok()?)?;
         let qm = match rest.strip_suffix(".weight")? {
-            "attn_q" | "attn_k" | "attn_v" => l.attn_q.as_ref().or(l.attn_qkv.as_ref()),
+            "attn_q" => l.attn_q.as_ref().or(l.attn_qkv.as_ref()),
+            "attn_k" => l.attn_k.as_ref().or(l.attn_qkv.as_ref()),
+            "attn_v" => l.attn_v.as_ref().or(l.attn_qkv.as_ref()),
             "attn_qkv" => l.attn_qkv.as_ref(),
             "attn_output" | "attn_out" => Some(&l.attn_output),
             "ffn_gate" => l.ffn_gate.as_ref().or(Some(&l.ffn_up)),

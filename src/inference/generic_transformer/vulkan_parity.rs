@@ -328,6 +328,90 @@ fn vulkan_first_layer_matches_the_host() {
     }
 }
 
+/// The relative L2 distance of `got` from `want`.
+fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
+    let (e, w) = got.iter().zip(want).fold((0f64, 0f64), |(e, w), (g, r)| {
+        let (g, r) = (*g as f64, *r as f64);
+        (e + (g - r) * (g - r), w + r * r)
+    });
+    (e / w).sqrt()
+}
+
+/// Errors as they print.
+fn sci(errors: &[f64]) -> String {
+    errors
+        .iter()
+        .map(|e| format!("{e:.2e}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A decode step of one token through layer 0 of the model placed whole on each Vulkan device,
+/// at position 0 where the attention returns the values: the change the layer makes to the
+/// residual is no further from the f32 reference than the host's.
+/// Each placement reads the weights its loader gives it.
+/// The native card's error prints beside: it reads its activations as the Vulkan card does.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_decode_step_matches_the_host() {
+    let fx = Fixture::open();
+    let tokens = prompt();
+    let mut host = fx.build(&fx.host());
+    let (rows, _) = host.embed_stage(&ids(&tokens), 0).unwrap();
+    let rows = host_vec(&rows);
+    let h = rows.len() / tokens.len();
+    let picks = [3, 11, tokens.len() - 1];
+    let row = |p: usize| rows[p * h..(p + 1) * h].to_vec();
+    let one = |x: &[f32]| Tensor::from_vec(x.to_vec(), (1, 1, h), &Device::Cpu).unwrap();
+    let change =
+        |out: &[f32], x: &[f32]| -> Vec<f32> { out.iter().zip(x).map(|(o, i)| o - i).collect() };
+    let want: Vec<Vec<f32>> = picks
+        .iter()
+        .map(|&p| change(&reference_layer0(&fx, &row(p), 1), &row(p)))
+        .collect();
+    let errors = |m: &mut GenericHeteroTransformer| -> Vec<f64> {
+        picks
+            .iter()
+            .zip(&want)
+            .map(|(&p, w)| {
+                let (got, _) = m.run_layers_in(one(&row(p)), None, 0, 1, 0, 1).unwrap();
+                rel_l2(&change(&host_vec(&got), &row(p)), w)
+            })
+            .collect()
+    };
+    let host_err = errors(&mut host);
+    drop(host);
+    println!("{TAG} layer 0 at one token on the host: {}", sci(&host_err));
+    let mut vulkan = Vec::new();
+    for d in crate::inference::kernel::vulkan::devices() {
+        let Some(mut m) = whole_on(&fx, TAG, &d) else {
+            continue;
+        };
+        let err = errors(&mut m);
+        println!("{TAG} layer 0 at one token on {}: {}", d.name, sci(&err));
+        vulkan.push((d.name.clone(), err));
+    }
+    // The native copy loads once every Vulkan copy is freed.
+    if let Some(card) = native_card() {
+        let mut native = try_on_native(&fx, &card, fx.n_layers).unwrap();
+        let err = errors(&mut native);
+        drop(native);
+        release_native(&card);
+        println!(
+            "{TAG} layer 0 at one token on the native card: {}",
+            sci(&err)
+        );
+    }
+    for (name, err) in vulkan {
+        for ((e, b), p) in err.iter().zip(&host_err).zip(picks) {
+            assert!(
+                e <= b,
+                "{name}: row {p} is {e:.3e} from the f32 layer, beyond {b:.3e}"
+            );
+        }
+    }
+}
+
 /// The chat prompt the text tests answer.
 const TEXT: &str =
     "<|im_start|>user\nExplain in two sentences why the sky is blue.<|im_end|>\n<|im_start|>assistant\n";
@@ -489,9 +573,13 @@ fn top2(l: &[f32]) -> (usize, usize) {
     best
 }
 
-// The greedy text of the qwen3 model is left out.
-// On the Radeon RX 9070 and the GTX 1650 at step 26, Vulkan picks 8038 where the host and the
-// native card pick 2874.
+/// The host's greedy answer and, fed the same tokens, the Vulkan one: at every step the Vulkan
+/// argmax is the host's, or the native card's leaves the host's too.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_greedy_text_matches_the_host() {
+    greedy_text_matches(TAG);
+}
 
 /// The model with every layer on Vulkan device `d`, or `None` when the device cannot hold it:
 /// the placement would then split the model across devices and the host, which another test

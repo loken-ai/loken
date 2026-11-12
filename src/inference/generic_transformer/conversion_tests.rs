@@ -129,6 +129,15 @@ fn is_norm(name: &str) -> bool {
 
 /// A dense model of two blocks whose every weight is stored as `dtype`; the norms are F32.
 fn write_dense(path: &std::path::Path, dtype: GgmlDType) -> Result<()> {
+    write_dense_values_in(path, dtype, dtype)
+}
+
+/// [`write_dense`] with the values projections stored in `values`.
+fn write_dense_values_in(
+    path: &std::path::Path,
+    dtype: GgmlDType,
+    values: GgmlDType,
+) -> Result<()> {
     let meta = vec![
         (
             "general.architecture".to_string(),
@@ -161,6 +170,8 @@ fn write_dense(path: &std::path::Path, dtype: GgmlDType) -> Result<()> {
     for (name, dims, vals) in dense_tensors() {
         let stored = if is_norm(&name) {
             GgmlDType::F32
+        } else if name.ends_with("attn_v.weight") {
+            values
         } else {
             dtype
         };
@@ -819,5 +830,48 @@ fn a_projection_read_for_another_runtime_takes_its_layer_format() {
             assert_eq!(got.dtype(), GgmlDType::BF16, "{name} in a {held:?} model");
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Each of the query, key and value projections read for another runtime takes the format its
+/// own projection holds: values stored apart from the queries keep their own format.
+#[test]
+fn values_read_for_another_runtime_keep_their_own_format() {
+    use super::loader::in_layer_format;
+    let dir = std::env::temp_dir().join(format!("loken-conv-values-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mixed.gguf");
+    write_dense_values_in(&path, GgmlDType::Q4K, GgmlDType::F16).unwrap();
+    let m = load(&path).unwrap();
+    let w = Tensor::from_vec(
+        values(HIDDEN * HIDDEN, 5, 0.1),
+        (HIDDEN, HIDDEN),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let held = |q: &Option<QMatMul>| {
+        q.as_ref()
+            .and_then(|q| q.qtensor())
+            .map(|t| t.dtype())
+            .filter(|d| !matches!(d, GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32))
+    };
+    let l = &m.layers[0];
+    for (name, own) in [
+        ("blk.0.attn_q.weight", held(&l.attn_q)),
+        ("blk.0.attn_v.weight", held(&l.attn_v)),
+    ] {
+        let stored = QTensor::quantize(&w, GgmlDType::F16).unwrap();
+        let got = in_layer_format(&m.layers, name, stored).unwrap();
+        assert_eq!(
+            got.dtype(),
+            own.unwrap_or(GgmlDType::F16),
+            "{name} of a model whose values are stored in F16"
+        );
+    }
+    assert_ne!(
+        held(&l.attn_q),
+        held(&l.attn_v),
+        "the layer holds both alike"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
