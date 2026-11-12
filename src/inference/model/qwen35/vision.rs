@@ -398,11 +398,53 @@ impl Qwen35Vision {
         // patches are already in 2x2-merge-grouped order, so consecutive groups of 4 = one merged token.
         let hn = layernorm(&h, &self.merger_nw, &self.merger_nb, self.cfg.eps)?; // [n, hidden]
         let merged = hn.reshape((n / 4, self.cfg.hidden * 4))?; // [n_merged, 4608]
-        let out = lin(
-            &lin(&merged, &self.merger_fc1, &self.merger_fc1b)?.gelu()?,
+        let out = merger_mlp(
+            &merged,
+            &self.merger_fc1,
+            &self.merger_fc1b,
             &self.merger_fc2,
             &self.merger_fc2b,
         )?;
         Ok(out) // [n_merged, out_dim=2048]
+    }
+}
+
+/// The merger's projection of merged patches: `fc2(gelu(fc1(x)))`.
+///
+/// The merger's GELU is the exact erf form.
+/// The blocks' GELU is the tanh approximation.
+fn merger_mlp(
+    x: &Tensor,
+    fc1: &Tensor,
+    fc1b: &Tensor,
+    fc2: &Tensor,
+    fc2b: &Tensor,
+) -> Result<Tensor> {
+    lin(&lin(x, fc1, fc1b)?.gelu_erf()?, fc2, fc2b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The merger activates with the erf GELU, not its tanh approximation.
+    #[test]
+    fn the_merger_activates_with_the_erf_gelu() {
+        let dev = Device::Cpu;
+        let eye =
+            Tensor::from_vec(vec![1f32, 0., 0., 0., 1., 0., 0., 0., 1.], (3, 3), &dev).unwrap();
+        let zero = Tensor::from_vec(vec![0f32; 3], 3, &dev).unwrap();
+        let x = Tensor::from_vec(vec![-1f32, 0.5, 2.0], (1, 3), &dev).unwrap();
+        let out = merger_mlp(&x, &eye, &zero, &eye, &zero)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1_f32()
+            .unwrap();
+        // 0.5 x (1 + erf(x / sqrt 2)) at -1, 0.5 and 2.
+        let erf_gelu = [-0.158_655_25f32, 0.345_731_23, 1.954_499_7];
+        for (got, want) in out.iter().zip(erf_gelu) {
+            assert!((got - want).abs() < 1e-6, "{got} against {want}");
+        }
     }
 }
