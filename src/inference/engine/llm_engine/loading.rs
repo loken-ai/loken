@@ -269,6 +269,7 @@ impl LlmEngine {
         let loaded = self.load_model_only().await.map_err(|e| e.to_string());
         if loaded.is_ok() {
             self.load_planned_drafter(planned).await;
+            self.calibrate_between_requests().await;
         }
         // The cards the placement opened and the model did not take.
         release_idle_cards();

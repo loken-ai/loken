@@ -59,7 +59,7 @@ Smaller, by state then by priority:
 | DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Started |
 | Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Started |
 | Speculation sized by expert cost | Speculation | The draft length accounts for the experts a draft adds that are not in memory, and a streamed model decodes faster with it than with the length chosen by acceptance alone. | Started |
-| Routing toward resident experts | Performance | At the fast level the router favours experts already in memory, and the answers stay inside the bounds of the quality harness. | Planned |
+| Routing toward resident experts | Performance | At the fast level the router favours experts already in memory, and the answers stay inside the bounds of the quality harness. | Done |
 | Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
 | Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |

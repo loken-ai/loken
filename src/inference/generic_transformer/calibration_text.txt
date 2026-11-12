@@ -34,3 +34,56 @@ def moving_average(values, window):
 The report describes three phases. First the data is collected and checked for gaps. Then each
 series is smoothed and compared with the previous quarter. Finally the differences are summarised
 in a table, with the largest changes listed first and a short note on how each was measured.
+
+    if truncation.miss_below > 0.0 {
+        let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
+        let heaviest = slots.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+        // The next expert beyond the choice that may take a slot.
+        let mut next = chosen;
+        let mut out = Vec::with_capacity(chosen);
+        for &(e, s) in &slots {
+            let light = s / total < truncation.miss_below && s < heaviest;
+            if !light || resident(e) {
+                out.push((e, s));
+            } else if truncation.miss_drops {
+                saved += 1;
+            } else {
+                while next < order.len() && !resident(order[next]) {
+                    next += 1;
+                }
+                match order.get(next) {
+                    Some(&r) => {
+                        saved += 1;
+                        out.push((r, s));
+                        next += 1;
+                    }
+                    None => out.push((e, s)),
+                }
+            }
+        }
+        slots = out;
+    }
+    slots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if truncation.keep > 0 && truncation.keep < slots.len() {
+        saved += slots[truncation.keep..]
+            .iter()
+            .filter(|s| !resident(s.0))
+            .count() as u64;
+        slots.truncate(truncation.keep);
+    }
+
+Limits:
+
+- **Prefill is compute-bound** in the delta-rule projections, convolution, scan and the wide mixers.
+  The expert copy is hidden behind it.
+- **The first 128 decoded tokens run while the expert cache learns.** A decode rate over fewer tokens understates the steady state.
+- **The 512-expert file** holds 77 GB of experts against 56 GB of host memory in the scope measured, and that case is untried.
+  Only 3 quarters of the memory the kernel still has free is page-locked.
+  The rest copies through the driver's staging at a lower rate.
+- **2 cards** under the cache plan cut the layers by link.
+  The card on the slower link (x4 here) holds the layers it can hold whole.
+  The other card holds the rest with a cache.
+- The decode of a card with a cache is bound by the host launching its kernels 1 by 1, since the decode graph is off for these files.
+- **Multi-token prediction** runs as a draft head that `loken draft-head` writes beside the model from the checkpoint's `mtp.*` tensors.
+  The decode drafts with it only when `fidelity = "fast"` is set and the decode graph is recorded.
+- **DeepSeek V4.1 native draft** is the DSpark head, the checkpoint's `mtp.*` tensors, read from the model file or a companion.

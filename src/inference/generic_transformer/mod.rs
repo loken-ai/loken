@@ -758,6 +758,8 @@ pub struct GenericHeteroTransformer {
     /// The pre mix carry, the band cell and the head of a model whose layers mix their residual
     /// through Sinkhorn projections.
     wide_sparse: Option<wide_sparse_layer::WideSparseHead>,
+    /// The routing calibration the load left to run between requests, until its last step.
+    routing_pending: Option<routing_calibration::Pending>,
 }
 
 /// The model-level part of the n-gram embedding; the token history lives with its layer.

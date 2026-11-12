@@ -215,3 +215,301 @@ fn a_zero_budget_runs_nothing_and_measuring_leaves_routing_exact() {
     );
     assert_eq!(model.take_saved(), 0);
 }
+
+/// The routed feed-forward of the first layer of `model` that has one.
+fn first_ffn(model: &GenericHeteroTransformer) -> &super::wide_sparse_layer::RoutedFfn {
+    model
+        .layers
+        .iter()
+        .find_map(|l| l.sinkhorn.as_ref().map(|b| &b.ffn))
+        .unwrap()
+}
+
+/// Router logits of `experts` experts, spread so that the weights of a choice differ.
+fn spread_logits(experts: usize) -> Vec<f32> {
+    (0..experts)
+        .map(|e| ((e * 7 + 3) % experts) as f32 / experts as f32 * 4.0 - 2.0)
+        .collect()
+}
+
+/// With a noise and experts in memory, `fast` chooses a candidate that saves reads.
+/// The exact level chooses none.
+/// Under the choice, the toy's answers stay within the budget against the exact run.
+#[test]
+fn fast_chooses_a_trade_within_its_budget_and_exact_chooses_none() {
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let tokens = prompt();
+    let mut model = generic(ratios, kv_src, index_src);
+    let resident: Vec<HashSet<usize>> = even_experts(&model)
+        .iter()
+        .map(|set| set.iter().copied().filter(|&e| e == 0).collect())
+        .collect();
+    let table = calibration::measure(&mut model, &tokens, &resident, &mut generic_prefill).unwrap();
+    // The noise of a model whose smallest saving divergence is 2 times its noise.
+    let noise = table
+        .iter()
+        .filter(|m| m.saved_per_token > 0.0 && m.kl > 0.0)
+        .map(|m| m.kl)
+        .fold(f64::INFINITY, f64::min)
+        / 2.0;
+    assert!(noise.is_finite(), "no candidate saves a read on the toy");
+    assert!(calibration::budget_for(QualityLevel::Exact, Some(noise)).is_none());
+    let budget = calibration::budget_for(QualityLevel::Fast, Some(noise)).unwrap();
+    let chosen = calibration::pick(&table, budget).cloned().unwrap();
+    assert!(chosen.saved_per_token > 0.0);
+
+    // The chosen truncation run against the exact run, as the calibration scores a noise.
+    let truncation = chosen.truncation();
+    let mut under = |m: &mut GenericHeteroTransformer, ids: &[u32]| -> Result<Vec<Vec<f32>>> {
+        m.set_resident_override(Some(resident.as_slice()));
+        m.set_truncation(truncation);
+        let rows = generic_prefill(m, ids);
+        m.set_truncation(Truncation::default());
+        m.set_resident_override(None);
+        rows
+    };
+    let _ = model.take_saved();
+    let kl = calibration::noise(&mut model, &tokens, &mut generic_prefill, &mut under).unwrap();
+    assert!(model.take_saved() > 0, "the choice saved no read");
+    assert!(kl <= budget, "KL {kl} over the budget {budget}");
+}
+
+/// A light expert that is not in memory gives its slot to the best expert in memory beyond
+/// the choice, and the slot counts as a read saved.
+#[test]
+fn a_light_missed_expert_gives_its_slot_to_one_in_memory() {
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let mut model = generic(ratios, kv_src, index_src);
+    let ffn = first_ffn(&model);
+    let row = spread_logits(ffn.experts.len());
+    let exact = ffn.route(std::slice::from_ref(&row)).remove(0).0;
+    let k = ffn.used;
+    let outside = (0..ffn.experts.len()).find(|e| !exact.contains(e)).unwrap();
+    let layers = model.layers.len();
+    model.set_resident_override(Some(&vec![HashSet::from([outside]); layers]));
+    model.set_truncation(Truncation {
+        miss_below: 1.0 / k as f32,
+        ..Default::default()
+    });
+    let _ = model.take_saved();
+    let ffn = first_ffn(&model);
+    let got = ffn.route(std::slice::from_ref(&row)).remove(0).0;
+    assert_eq!(got.len(), exact.len(), "a replacement keeps every slot");
+    assert!(
+        got.contains(&outside),
+        "{exact:?} gave no slot to {outside}: {got:?}"
+    );
+    assert_eq!(model.take_saved(), 1);
+}
+
+/// At the exact level the router routes as the plain choice, whatever is in memory, and saves
+/// nothing.
+#[test]
+fn the_exact_level_neither_replaces_nor_skips() {
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let mut model = generic(ratios, kv_src, index_src);
+    let row = spread_logits(first_ffn(&model).experts.len());
+    let plain = first_ffn(&model).route(std::slice::from_ref(&row));
+    let layers = model.layers.len();
+    let all: HashSet<usize> = (0..first_ffn(&model).experts.len()).collect();
+    for resident in [None, Some(vec![all; layers])] {
+        model.set_resident_override(resident.as_deref());
+        model.set_truncation(Truncation::default());
+        let _ = model.take_saved();
+        assert_eq!(first_ffn(&model).route(std::slice::from_ref(&row)), plain);
+        assert_eq!(model.take_saved(), 0);
+    }
+}
+
+/// Without an override, the experts in memory are those the tiers keep, and the toy's tiers
+/// keep none: no light expert finds one to give its slot to.
+#[test]
+fn without_an_override_the_tiers_say_what_is_in_memory() {
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let mut model = generic(ratios, kv_src, index_src);
+    assert!(model.held_experts().iter().all(HashSet::is_empty));
+    let ffn = first_ffn(&model);
+    let row = spread_logits(ffn.experts.len());
+    let exact = ffn.route(std::slice::from_ref(&row)).remove(0).0;
+    let k = ffn.used;
+    model.set_resident_override(None);
+    model.set_truncation(Truncation {
+        miss_below: 1.0 / k as f32,
+        ..Default::default()
+    });
+    let _ = model.take_saved();
+    let got = first_ffn(&model)
+        .route(std::slice::from_ref(&row))
+        .remove(0)
+        .0;
+    assert_eq!(got, exact);
+    assert_eq!(model.take_saved(), 0);
+}
+
+/// A directory of its own under the system's temporary directory, empty.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("loken-routing-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+/// The calibration run between requests measures the noise and the table the blocking
+/// calibration measures, bit for bit, and installs the same pick.
+/// Between 2 steps, a prompt gets the exact logits.
+/// The decoded run gives way at once and keeps nothing.
+/// A new load resumes after the candidates measured, without running the earlier runs again.
+#[test]
+fn the_calibration_between_requests_resumes_and_picks_as_the_blocking_one() {
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let tokens = prompt();
+    let probe: Vec<u32> = tokens.iter().rev().copied().collect();
+    let resident: Vec<HashSet<usize>> = even_experts(&generic(ratios, kv_src, index_src))
+        .iter()
+        .map(|set| set.iter().copied().filter(|&e| e == 0).collect())
+        .collect();
+
+    let mut blocking = generic(ratios, kv_src, index_src);
+    let exact = generic_prefill(&mut blocking, &probe).unwrap();
+    let noise = calibration::noise(
+        &mut blocking,
+        &tokens,
+        &mut generic_prefill,
+        &mut generic_decode,
+    )
+    .unwrap();
+    let table =
+        calibration::measure(&mut blocking, &tokens, &resident, &mut generic_prefill).unwrap();
+    let budget = calibration::budget_for(QualityLevel::Fast, Some(noise)).unwrap();
+    let want = calibration::pick_held(&table, budget).cloned();
+
+    let dir = scratch("steps");
+    let level = QualityLevel::Fast;
+    let mut model = generic(ratios, kv_src, index_src);
+    let at_load = calibration::prepare(
+        &mut model,
+        level,
+        "toy",
+        &tokens,
+        &resident,
+        Some(&dir),
+        true,
+    )
+    .unwrap();
+    assert!(at_load.is_none(), "the load waited for the calibration");
+    let pending = model
+        .routing_pending()
+        .cloned()
+        .expect("a calibration is left");
+    let no = || false;
+    let yes = || true;
+    let mut decode = |m: &mut GenericHeteroTransformer, ids: &[u32]| {
+        calibration::decode_run_yielding(m, ids, &no)
+    };
+    let mut give_way = |m: &mut GenericHeteroTransformer, ids: &[u32]| {
+        calibration::decode_run_yielding(m, ids, &yes)
+    };
+    let answered_exactly = |model: &mut GenericHeteroTransformer| {
+        assert_eq!(
+            bits(&generic_prefill(model, &probe).unwrap()),
+            bits(&exact),
+            "a prompt between 2 steps was not answered exactly"
+        );
+    };
+    let steps = [
+        calibration::Step::Measured,
+        calibration::Step::Yielded,
+        calibration::Step::Measured,
+        calibration::Step::Measured,
+    ];
+    for (i, want_step) in steps.into_iter().enumerate() {
+        let stepped = match i {
+            1 => pending.step(
+                &mut model,
+                Some(&dir),
+                &mut generic_prefill,
+                &mut give_way,
+                &yes,
+            ),
+            _ => pending.step(
+                &mut model,
+                Some(&dir),
+                &mut generic_prefill,
+                &mut decode,
+                &no,
+            ),
+        };
+        assert_eq!(stepped.unwrap(), want_step, "step {i}");
+        answered_exactly(&mut model);
+    }
+
+    // A new load of the same file resumes after the first candidate.
+    let mut model = generic(ratios, kv_src, index_src);
+    calibration::prepare(
+        &mut model,
+        level,
+        "toy",
+        &tokens,
+        &resident,
+        Some(&dir),
+        true,
+    )
+    .unwrap();
+    let pending = model
+        .routing_pending()
+        .cloned()
+        .expect("the calibration resumes");
+    let mut runs = 0;
+    let mut counted = |m: &mut GenericHeteroTransformer, ids: &[u32]| {
+        runs += 1;
+        generic_prefill(m, ids)
+    };
+    let mut never = |_: &mut GenericHeteroTransformer, _: &[u32]| -> Result<Vec<Vec<f32>>> {
+        panic!("the noise was measured again")
+    };
+    let done = loop {
+        match pending
+            .step(&mut model, Some(&dir), &mut counted, &mut never, &no)
+            .unwrap()
+        {
+            calibration::Step::Done(pick) => break pick,
+            calibration::Step::Measured => {}
+            calibration::Step::Yielded => panic!("nothing asked the calibration to give way"),
+        }
+    };
+    assert_eq!(
+        runs,
+        table.len() - 1,
+        "the resumed calibration ran earlier runs again"
+    );
+    assert_eq!(
+        done, want,
+        "the pick differs from the blocking calibration's"
+    );
+
+    let kept = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap();
+    let tables: std::collections::HashMap<String, Vec<calibration::Measured>> =
+        serde_json::from_str(&kept("quality-calibration.json")).unwrap();
+    let noises: std::collections::HashMap<String, f64> =
+        serde_json::from_str(&kept("quality-noise.json")).unwrap();
+    assert_eq!(tables.values().collect::<Vec<_>>(), [&table]);
+    assert_eq!(
+        noises.values().map(|n| n.to_bits()).collect::<Vec<_>>(),
+        [noise.to_bits()]
+    );
+
+    // A third load finds the measure whole and sets the pick at once.
+    let mut model = generic(ratios, kv_src, index_src);
+    let at_load = calibration::prepare(
+        &mut model,
+        level,
+        "toy",
+        &tokens,
+        &resident,
+        Some(&dir),
+        true,
+    )
+    .unwrap();
+    assert!(model.routing_pending().is_none());
+    assert_eq!(at_load, want);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -889,6 +889,8 @@ mod real_models {
                 .load_model()
                 .await
                 .expect("the model loads as the server loads it");
+            // The scores are of the routing the level ends on.
+            engine.finish_routing_calibration().await;
             let bos = engine
                 .resolve_model_file(&model_id)
                 .or_else(|| models_dir.is_file().then(|| models_dir.clone()))

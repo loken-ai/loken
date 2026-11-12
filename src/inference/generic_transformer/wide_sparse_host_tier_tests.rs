@@ -4,7 +4,7 @@
 //! The model is the synthetic one of the frozen V4.1 oracle.
 
 use super::expert_readahead::ReadAhead;
-use super::moe_weights::sqrt_softplus_choice;
+use super::moe_weights::{sqrt_softplus_choice, sqrt_softplus_truncated_choice, Truncation};
 use super::wide_sparse_batch_tests::{batched, prompts, serial};
 use super::wide_sparse_host_tier::{
     host_slot, page_cost, score_guess, slots_for, Guess, GuessCount, HostTier, KeepSet, Ranking,
@@ -302,4 +302,61 @@ fn a_read_ahead_names_the_next_routers_choice_and_is_scored() {
     assert_eq!(gone, wasted);
     // A guess is scored once.
     assert!(next.opens(&routed, 1).is_none());
+}
+
+/// The read-ahead guesses with the next router's own choice.
+/// With no truncation it names the exact choice and reads its experts not in memory.
+/// Under a truncation it names the truncated choice and reads no expert that choice replaced.
+#[test]
+fn a_read_ahead_follows_the_truncation_of_the_next_router() {
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let mut model = generic(ratios, kv_src, index_src);
+    let keeps = model.attach_host_tier(&tier(1, Some(Arc::new(ReadAhead::reading(1)))));
+    let ffn = &model.layers[1].sinkhorn.as_ref().unwrap().ffn;
+    let dim = ffn.router.dims()[1];
+    let row: Vec<f32> = (0..dim)
+        .map(|i| ((i * 37) % 11) as f32 * 0.1 - 0.5)
+        .collect();
+    let x = Tensor::from_vec(row, (1, dim), &Device::Cpu).unwrap();
+    let logits = ffn.router.apply_here(&x).unwrap().to_vec2::<f32>().unwrap();
+    let (bias, used, temperature, normalize) =
+        (ffn.bias.clone(), ffn.used, ffn.temperature, ffn.normalize);
+    let (exact, _) = sqrt_softplus_choice(&logits[0], Some(&bias), used, temperature, normalize);
+    let next = &keeps[1];
+    // The next layer keeps 1 expert, outside the exact choice.
+    let outside = (0..8).find(|e| !exact.contains(e)).unwrap();
+    next.computed(&[outside], &[0], 1);
+    let held = |e: usize| next.keeps(e);
+    assert!(held(outside) && exact.iter().all(|&e| !held(e)));
+    keeps[0].read_ahead(&x);
+    let guess = next.guess().expect("a guess waits");
+    assert_eq!(guess.named, exact);
+    assert_eq!(guess.read, exact);
+    // Every light expert not in memory gives its slot to one in memory.
+    let t = Truncation {
+        miss_below: 1.0,
+        ..Default::default()
+    };
+    model.set_truncation(t);
+    let (lossy, _, saved) = sqrt_softplus_truncated_choice(
+        &logits[0],
+        Some(&bias),
+        used,
+        temperature,
+        normalize,
+        t,
+        &held,
+    );
+    let replaced: Vec<usize> = exact
+        .iter()
+        .copied()
+        .filter(|e| !lossy.contains(e))
+        .collect();
+    assert!(saved > 0 && !replaced.is_empty());
+    assert!(lossy.contains(&outside));
+    keeps[0].read_ahead(&x);
+    let guess = next.guess().expect("a guess waits");
+    assert_eq!(guess.named, lossy);
+    assert!(replaced.iter().all(|e| !guess.read.contains(e)));
+    assert!(!guess.read.contains(&outside));
 }

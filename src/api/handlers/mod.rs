@@ -2936,6 +2936,8 @@ impl APIServer {
             // An error on an Ollama route in Ollama's envelope, whichever handler or
             // extractor raised it.
             .layer(axum::middleware::from_fn(dialect_error_envelope))
+            // Work an engine runs between requests waits while a handler runs.
+            .layer(axum::middleware::from_fn(count_arrival))
             // Global request timeout. It bounds every non-streaming handler and the
             // time-to-first-byte of streaming ones - streaming BODIES are produced after
             // the response is returned, so a long SSE generation is not cut off by it.
@@ -3922,6 +3924,15 @@ fn ollama_error_body(bytes: &[u8]) -> Option<serde_json::Value> {
 
 /// Re-envelope an error answered on an Ollama route: the handlers and extractors raise
 /// the shared `ApiError`, whose body is OpenAI's.
+/// Counts the request while its handler runs, see [`Arrived`](crate::inference::engine::llm_engine::Arrived).
+async fn count_arrival(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let _arrived = crate::inference::engine::llm_engine::Arrived::enter();
+    next.run(req).await
+}
+
 async fn dialect_error_envelope(
     req: axum::extract::Request,
     next: axum::middleware::Next,

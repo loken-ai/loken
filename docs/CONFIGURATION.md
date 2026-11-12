@@ -329,18 +329,24 @@ The file names neither.
 At `reference` and `balanced`, the output is identical to the full model, the same tokens whichever experts the cards hold, because a routed expert on a card gives the bits the host gives.
 
 At `fast`, the output differs from the exact one by at most 3 times the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's.
+The host run prefills the bundled text.
+The card run decodes the same tokens 1 at a time, through the mixers a card keeps.
 
 For a model whose manifest names further files of its checkpoint, the level also chooses the file each routed expert is read from, see [Mixture variants](MODELS.md#mixture-variants).
 
-At load, the engine settles how far `fast` gives up exact routing:
+The engine settles how far `fast` gives up exact routing.
+A load that finds the measure in the cache applies it at once.
+Otherwise the load ends with exact routing, and the calibration runs between requests:
 
 ```mermaid
 flowchart TD
   A(["Load a mixture whose<br/>experts stream from disk"]) --> B{fidelity is fast?}
   B -->|no| E1(["Exact routing"])
-  B -->|yes| C{Card and host to compare,<br/>tokenizer in the file?}
+  B -->|yes| K{A cached measure<br/>covers the load?}
+  K -->|yes| H
+  K -->|no| C{A card keeps the mixers,<br/>tokenizer in the file?}
   C -->|no| E2(["Exact routing"])
-  C -->|yes| D[Run the bundled text<br/>on card and on host: the noise]
+  C -->|yes| R(["Serve with exact routing"]) --> D[Between requests: prefill the bundled text on the host,<br/>decode it on the card: the noise]
   D -->|calibration fails, warning| E3
   D --> G[Run the text under<br/>each candidate]
   G --> H{A candidate within<br/>3 times the noise?}
@@ -349,14 +355,33 @@ flowchart TD
 ```
 
 The bundled text runs teacher-forced.
-With no card and host to compare, `fast` runs exact and says why in the log.
+It mixes code and prose, the kinds the quality harness scores.
+A candidate fits when its divergence over the text and over each half of it stays within the budget.
+With no card that keeps the mixers, `fast` runs exact and says why in the log.
 When no candidate fits the budget, routing stays exact and the log says so.
 
 The candidates derive from `K`, the number of experts a token routes to.
-Each candidate either keeps the `K-1` or `K-2` heaviest experts, or replaces a light expert that sits in no card tier when its weight share is under `0.5/K`, `0.75/K` or `1/K`.
+Each candidate either keeps the `K-1` or `K-2` heaviest experts, or replaces a light expert that is not in memory when its weight share is under `0.5/K`, `0.75/K` or `1/K`.
+A replaced expert gives its slot to the best ranked expert in memory beyond the choice.
 
-The measured table and the noise are cached per model file and plan, under `loken/` in the user cache directory.
-A later load of the same file and plan reuses them.
+An expert is in memory when a card keeps it or the host tier keeps it.
+The calibration counts the experts the tiers keep when the load ends.
+In service, the router reads what the tiers keep at each forward, so the trade follows the tiers.
+The read-ahead of the next layer's experts guesses with the same choice, so it reads no expert the trade replaces.
+
+The measured table and the noise are cached per model file, bundled text and count of experts in memory, under `loken/` in the user cache directory.
+A later load reuses the measure of the largest count not above its own, without a time limit.
+The tiers start from the hottest experts, so a measure with fewer in memory replaced at least the experts the router replaces now.
+A load measures only when no cached measure covers its count, as at the first load of a file.
+
+The calibration runs while the server handles no request, 1 run of the text at a time.
+A run is the exact prefill, the decode of the noise or 1 candidate.
+A request that arrives during a run waits for the end of that run, and the decode of the noise gives way at its next token.
+Each run drops the KV it wrote, so the next prompt is prefilled whole.
+Until the last run ends, routing stays exact, and every answer is the exact one.
+Each run keeps its result in the cache, and a later load resumes the calibration where it stopped.
+The truncation applies from the request after the last run.
+A preload, a request with an empty prompt, lets the calibration run before the first prompt arrives.
 
 The routed experts of a wide-residual model stay in the file's mapping, read as routing asks for them.
 The card tier keeps the busiest of them on a card when the card measures faster than the host.

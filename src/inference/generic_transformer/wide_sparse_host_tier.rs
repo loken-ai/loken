@@ -44,7 +44,7 @@
 
 use super::expert_host_tune::TierTune;
 use super::expert_readahead::{drop_later, drop_now, read_now, Asked, ReadAhead, Span};
-use super::moe_weights::sqrt_softplus_choice;
+use super::moe_weights::{sqrt_softplus_routed_choice, Truncation};
 use super::wide_sparse_layer::RoutedFfn;
 use super::GenericHeteroTransformer;
 use crate::inference::expert_counters::{Found, HostExpert, TierEvent};
@@ -442,6 +442,8 @@ pub struct LayerKeep {
     used: usize,
     temperature: f32,
     normalize: bool,
+    /// The truncation this layer's router chooses under, which the layer before guesses with.
+    truncation: Mutex<Truncation>,
     /// The next wide layer's share.
     next: OnceLock<Arc<LayerKeep>>,
     /// Hits, misses and experts let go since the load.
@@ -485,6 +487,7 @@ impl LayerKeep {
             used: ffn.used,
             temperature: ffn.temperature,
             normalize: ffn.normalize,
+            truncation: Mutex::new(ffn.lossy.truncation),
             next: OnceLock::new(),
             stats: Default::default(),
             first: index == 0,
@@ -516,6 +519,23 @@ impl LayerKeep {
     /// Whether the layer keeps expert `e` now.
     pub fn keeps(&self, e: usize) -> bool {
         self.set().is_kept(e)
+    }
+
+    /// Per expert of the first `experts`, whether the layer keeps it now, read under 1 lock.
+    pub(crate) fn kept_mask(&self, experts: usize) -> Vec<bool> {
+        let set = self.set();
+        (0..experts).map(|e| set.is_kept(e)).collect()
+    }
+
+    /// The guess the layer before made for the row decoding now, `None` when none waits.
+    #[cfg(test)]
+    pub(crate) fn guess(&self) -> Option<Guess> {
+        self.guess.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Sets the truncation this layer's router chooses under.
+    pub(crate) fn set_truncation(&self, t: Truncation) {
+        *self.truncation.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
     /// Bytes of expert `e` in the mapping.
@@ -681,6 +701,9 @@ impl LayerKeep {
 
     /// Reads ahead, from the input `x` `[1, hidden]` of a decoded row, the experts the next layer
     /// is expected to route to and does not keep, while the reads run.
+    ///
+    /// The guess is the choice the next layer's router makes under its truncation.
+    /// The experts the cards and the next layer's share keep now count as in memory.
     pub(crate) fn read_ahead(&self, x: &Tensor) {
         let Some(ra) = self.tier.readahead.as_ref().filter(|ra| ra.reads()) else {
             return;
@@ -694,20 +717,22 @@ impl LayerKeep {
         let Some(row) = logits.first() else {
             return;
         };
-        let (named, _) = sqrt_softplus_choice(
-            row,
-            Some(next.bias.as_slice()),
-            next.used,
-            next.temperature,
-            next.normalize,
-        );
-        let read: Vec<usize> = {
+        let read: Vec<usize>;
+        let named = {
+            let t = *next.truncation.lock().unwrap_or_else(|e| e.into_inner());
             let set = next.set();
+            let held = |e: usize| set.is_kept(e) || next.on_card.get(e).copied().unwrap_or(true);
+            let (named, _, _) = sqrt_softplus_routed_choice(
+                row,
+                Some(next.bias.as_slice()),
+                next.used,
+                next.temperature,
+                next.normalize,
+                t,
+                &held,
+            );
+            read = named.iter().copied().filter(|&e| !held(e)).collect();
             named
-                .iter()
-                .copied()
-                .filter(|&e| !set.is_kept(e) && !next.on_card.get(e).copied().unwrap_or(true))
-                .collect()
         };
         let counters = crate::inference::expert_counters::global();
         for &e in &read {

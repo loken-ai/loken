@@ -311,7 +311,55 @@ impl ActiveRequest {
 
 impl Drop for ActiveRequest {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
+        if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            IDLE.notify_all();
+        }
+    }
+}
+
+/// Held by a thread that waits for an engine without requests, and by the last request that
+/// ends or is answered.
+static IDLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Woken when the last running request of an engine ends, and when the server has answered
+/// every request it handles.
+static IDLE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Requests the server is handling, from their arrival to their answer, whatever their engine.
+static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts a request the server is handling until it drops.
+///
+/// A request reads its engine before the engine admits it, so the count covers that part.
+pub struct Arrived;
+
+impl Arrived {
+    pub fn enter() -> Self {
+        ARRIVED.fetch_add(1, Ordering::AcqRel);
+        Arrived
+    }
+}
+
+impl Drop for Arrived {
+    fn drop(&mut self) {
+        if ARRIVED.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            IDLE.notify_all();
+        }
+    }
+}
+
+/// Whether a request runs on the engine counting `count`, or the server is handling one.
+pub(crate) fn busy(count: &AtomicUsize) -> bool {
+    count.load(Ordering::Acquire) > 0 || ARRIVED.load(Ordering::Acquire) > 0
+}
+
+/// Waits until [`busy`] is false.
+pub(crate) fn wait_idle(count: &AtomicUsize) {
+    let mut held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    while busy(count) {
+        held = IDLE.wait(held).unwrap_or_else(|e| e.into_inner());
     }
 }
 

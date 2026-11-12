@@ -98,6 +98,10 @@ pub struct Counters {
     absent_kept: AtomicU64,
     absent_missed: AtomicU64,
     absent_ahead: AtomicU64,
+    /// Routed slots a lossy routing gave to an expert outside the exact choice, and slots it
+    /// left empty.
+    replaced: AtomicU64,
+    skipped: AtomicU64,
     /// The host tier's trace since the last read.
     trace: Mutex<Vec<TierEvent>>,
     /// The layers whose trace started since the measure did.
@@ -139,12 +143,16 @@ pub struct Report {
     pub absent_missed: u64,
     /// Of those, the bytes of experts a guess read ahead.
     pub absent_ahead: u64,
+    /// Routed slots a lossy routing gave to an expert outside the exact choice.
+    pub replaced: u64,
+    /// Routed slots a lossy routing left empty.
+    pub skipped: u64,
     /// Per card ordinal, the pairs its routed experts served, by ordinal.
     pub card_pairs: Vec<(usize, u64)>,
 }
 
 impl Counters {
-    fn atomics(&self) -> [&AtomicU64; 19] {
+    fn atomics(&self) -> [&AtomicU64; 21] {
         [
             &self.never_kept,
             &self.left_at_prompt,
@@ -165,6 +173,8 @@ impl Counters {
             &self.guess_unkept_named,
             &self.host_bytes,
             &self.tier_pairs,
+            &self.replaced,
+            &self.skipped,
         ]
     }
 
@@ -330,6 +340,15 @@ impl Counters {
         }
     }
 
+    /// Routed slots a lossy routing gave to an expert outside the exact choice, and slots it
+    /// left empty.
+    pub fn truncated(&self, replaced: u64, skipped: u64) {
+        if self.on() {
+            self.replaced.fetch_add(replaced, Relaxed);
+            self.skipped.fetch_add(skipped, Relaxed);
+        }
+    }
+
     /// The counts since the measure started.
     pub fn report(&self) -> Report {
         let mut working_set: Vec<usize> = self
@@ -361,6 +380,8 @@ impl Counters {
             absent_kept: self.absent_kept.load(Relaxed),
             absent_missed: self.absent_missed.load(Relaxed),
             absent_ahead: self.absent_ahead.load(Relaxed),
+            replaced: self.replaced.load(Relaxed),
+            skipped: self.skipped.load(Relaxed),
             card_pairs: self
                 .cards
                 .lock()

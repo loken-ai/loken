@@ -604,6 +604,36 @@ pub(crate) fn sqrt_softplus_truncated_choice(
     (ids, w, saved)
 }
 
+/// The choice a router makes under `truncation`, with the slots it saved.
+///
+/// [`sqrt_softplus_truncated_choice`] when the truncation gives up exactness.
+/// [`sqrt_softplus_choice`] otherwise, which saves no slot and never asks `resident`.
+pub(crate) fn sqrt_softplus_routed_choice(
+    row: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    temperature: f32,
+    normalize: bool,
+    truncation: Truncation,
+    resident: &dyn Fn(usize) -> bool,
+) -> (Vec<usize>, Vec<f32>, u64) {
+    match truncation.active() {
+        true => sqrt_softplus_truncated_choice(
+            row,
+            bias,
+            k,
+            temperature,
+            normalize,
+            truncation,
+            resident,
+        ),
+        false => {
+            let (ids, w) = sqrt_softplus_choice(row, bias, k, temperature, normalize);
+            (ids, w, 0)
+        }
+    }
+}
+
 /// Biased-choice expert routing: every expert scores its logit by [`RouterScore`], the experts
 /// are chosen on the scores plus a selection bias, and each chosen expert weighs by its
 /// unbiased score, optionally renormalised over the chosen ones and scaled.

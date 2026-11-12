@@ -440,6 +440,7 @@ pub(crate) async fn stage_performance_endpoint(
         "left_at_decode": counted.left_at_decode, "missed_ahead": counted.missed_ahead,
         "absent_kept": counted.absent_kept, "absent_missed": counted.absent_missed,
         "absent_ahead": counted.absent_ahead,
+        "replaced": counted.replaced, "skipped": counted.skipped,
     });
     let (sums, calls) = stages::snapshot();
     // The share is against the stages that partition a layer-call; the two nested inside

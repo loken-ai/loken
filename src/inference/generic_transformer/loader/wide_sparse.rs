@@ -1028,6 +1028,7 @@ impl GenericHeteroTransformer {
             output_bias: None,
             capture_feature: false,
             tier_workers: Vec::new(),
+            routing_pending: None,
             #[cfg(feature = "gpu")]
             hot_locks: None,
             kept_graphs_at: None,

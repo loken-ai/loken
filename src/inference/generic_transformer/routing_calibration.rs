@@ -8,7 +8,14 @@
 //! A text is run teacher-forced once exactly and once under each candidate truncation.
 //! The engine's quality instrument scores each run against the exact one.
 //! The candidate that saves the most expert reads within the budget is chosen.
+//! Its divergence on each half of the text must also stay within the budget.
 //! The measurements are cached per model and plan, so a different budget reuses them.
+//!
+//! A load that finds no measure in the cache routes exactly and leaves a [`Pending`]
+//! calibration.
+//! The engine runs it between requests, 1 run at a time.
+//! Each run keeps what it measured in the cache, so a later load resumes where it stopped.
+//! The truncation is set when the last run ends.
 //!
 //! The candidates follow the number of experts a token routes to, `K`:
 //! - keeping `K-1` and `K-2` of them,
@@ -22,6 +29,8 @@ use crate::inference::engine::llm_engine::QualityLevel;
 use crate::tensor::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What `fast` accepts, as a multiple of the model's own numerical noise.
 ///
@@ -97,6 +106,27 @@ fn against(rows: &[Vec<f32>], ids: &[u32], reference: &Dump) -> Result<Accum> {
     Ok(acc)
 }
 
+/// The larger of the mean KLs of the 2 halves of `rows` against `reference`.
+fn worst_half(rows: &[Vec<f32>], ids: &[u32], reference: &Dump) -> Result<f64> {
+    let (flat, vocab) = flat_rows(rows, ids)?;
+    let half = ids.len() / 2;
+    let mut worst = 0f64;
+    for (first, last) in [(0, half), (half, ids.len())] {
+        let mut acc = Accum::default();
+        score_rows(
+            &flat[first * vocab..last * vocab],
+            vocab,
+            first,
+            ids,
+            Some(reference),
+            &mut acc,
+            &mut dump_of(ids),
+        );
+        worst = worst.max(acc.kl().unwrap_or(0.0));
+    }
+    Ok(worst)
+}
+
 /// The model's own numerical noise: the mean KL of the exact run `other` against the exact
 /// run `run`.
 ///
@@ -127,9 +157,20 @@ pub struct Measured {
     /// Expert reads saved per token: slots of experts not in memory that the setting removed
     /// or replaced.
     pub saved_per_token: f64,
+    /// The larger of the mean KLs of the 2 halves of the text, `None` when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kl_worst_half: Option<f64>,
 }
 
 impl Measured {
+    /// Whether the setting saves reads, and its divergence over the text and over each half
+    /// of it stays within `budget`.
+    pub fn fits(&self, budget: f64) -> bool {
+        self.kl <= budget
+            && self.kl_worst_half.is_none_or(|w| w <= budget)
+            && self.saved_per_token > 0.0
+    }
+
     pub fn truncation(&self) -> Truncation {
         Truncation {
             keep: self.keep,
@@ -167,6 +208,17 @@ pub fn pick(table: &[Measured], budget: f64) -> Option<&Measured> {
         .max_by(|a, b| a.saved_per_token.total_cmp(&b.saved_per_token))
 }
 
+/// [`pick`] among the candidates whose divergence on each half of the text also stays within
+/// `budget`.
+///
+/// The half that did not decide a candidate checks it.
+pub fn pick_held(table: &[Measured], budget: f64) -> Option<&Measured> {
+    table
+        .iter()
+        .filter(|m| m.fits(budget))
+        .max_by(|a, b| a.saved_per_token.total_cmp(&b.saved_per_token))
+}
+
 /// Runs `ids` exactly and under each candidate, and returns the table.
 ///
 /// `resident` holds, per layer, the experts the plan keeps in memory.
@@ -177,84 +229,177 @@ pub fn measure(
     resident: &[HashSet<usize>],
     run: &mut Run<'_>,
 ) -> Result<Vec<Measured>> {
+    let all = candidates(model.routed_per_token());
+    measure_these(model, ids, resident, run, &all)
+}
+
+/// [`measure`] under the truncations `these`.
+pub fn measure_these(
+    model: &mut GenericHeteroTransformer,
+    ids: &[u32],
+    resident: &[HashSet<usize>],
+    run: &mut Run<'_>,
+    these: &[Truncation],
+) -> Result<Vec<Measured>> {
     model.set_resident_override(None);
     model.set_truncation(Truncation::default());
-    let measured = measure_each(model, ids, resident, run);
+    let measured = measure_each(model, ids, resident, run, these);
     model.set_resident_override(None);
     model.set_truncation(Truncation::default());
     measured
 }
 
-/// The table of [`measure`], each candidate left set on the model after its run.
+/// The table of [`measure_these`], each truncation left set on the model after its run.
 fn measure_each(
     model: &mut GenericHeteroTransformer,
     ids: &[u32],
     resident: &[HashSet<usize>],
     run: &mut Run<'_>,
+    these: &[Truncation],
 ) -> Result<Vec<Measured>> {
     let exact = run(model, ids)?;
     let reference = reference(&exact, ids)?;
-    let mut table = Vec::new();
-    for t in candidates(model.routed_per_token()) {
-        model.set_resident_override(Some(resident));
-        model.set_truncation(t);
-        let _ = model.take_saved();
-        let rows = run(model, ids)?;
-        let saved = model.take_saved();
-        let scores = against(&rows, ids, &reference)?;
-        table.push(Measured {
-            keep: t.keep,
-            miss_below: t.miss_below,
-            kl: scores.kl().unwrap_or(0.0),
-            top1: scores.top1().unwrap_or(0.0),
-            saved_per_token: saved as f64 / ids.len().max(1) as f64,
-        });
-    }
-    Ok(table)
+    these
+        .iter()
+        .map(|&t| measure_one(model, ids, resident, run, t, &reference))
+        .collect()
 }
 
-/// The file the noise of every model and plan is kept in.
-fn noise_file() -> Option<std::path::PathBuf> {
-    Some(dirs::cache_dir()?.join("loken").join("quality-noise.json"))
+/// Runs `ids` under the truncation `t`, left set on the model, and scores it against
+/// `reference`.
+fn measure_one(
+    model: &mut GenericHeteroTransformer,
+    ids: &[u32],
+    resident: &[HashSet<usize>],
+    run: &mut Run<'_>,
+    t: Truncation,
+    reference: &Dump,
+) -> Result<Measured> {
+    model.set_resident_override(Some(resident));
+    model.set_truncation(t);
+    let _ = model.take_saved();
+    let rows = run(model, ids)?;
+    let saved = model.take_saved();
+    let scores = against(&rows, ids, reference)?;
+    Ok(Measured {
+        keep: t.keep,
+        miss_below: t.miss_below,
+        kl: scores.kl().unwrap_or(0.0),
+        top1: scores.top1().unwrap_or(0.0),
+        saved_per_token: saved as f64 / ids.len().max(1) as f64,
+        kl_worst_half: Some(worst_half(&rows, ids, reference)?),
+    })
 }
 
-/// The file the table of every model and plan is kept in.
-fn table_file() -> Option<std::path::PathBuf> {
+/// The directory the calibrations of this user are kept in.
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("loken"))
+}
+
+/// The file the noise of every model and plan is kept in, under `dir`.
+fn noise_file(dir: Option<&Path>) -> Option<PathBuf> {
+    Some(dir?.join("quality-noise.json"))
+}
+
+/// The file the table of every model and plan is kept in, under `dir`.
+fn table_file(dir: Option<&Path>) -> Option<PathBuf> {
+    Some(dir?.join("quality-calibration.json"))
+}
+
+/// The file the progress of every unfinished calibration is kept in, under `dir`.
+fn steps_file(dir: Option<&Path>) -> Option<PathBuf> {
+    Some(dir?.join("quality-calibration-steps.json"))
+}
+
+/// The file the exact run of the unfinished calibration `key` is kept in, under `dir`.
+fn reference_file(dir: Option<&Path>, key: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(key.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Some(
-        dirs::cache_dir()?
-            .join("loken")
-            .join("quality-calibration.json"),
+        dir?.join("quality-calibration-steps")
+            .join(format!("{digest}.lkq")),
     )
 }
 
 /// The value kept under `key` in the map of `path`.
-fn read_kept<T: serde::de::DeserializeOwned>(
-    path: Option<std::path::PathBuf>,
-    key: &str,
-) -> Option<T> {
+fn read_kept<T: serde::de::DeserializeOwned>(path: Option<PathBuf>, key: &str) -> Option<T> {
     let text = std::fs::read_to_string(path?).ok()?;
     let mut all: HashMap<String, T> = serde_json::from_str(&text).ok()?;
     all.remove(key)
 }
 
 /// Keeps `value` under `key` in the map of `path`, beside the values of other keys.
+///
+/// `None` removes `key`.
 fn keep<T: Serialize + serde::de::DeserializeOwned>(
-    path: Option<std::path::PathBuf>,
+    path: Option<PathBuf>,
     key: &str,
-    value: T,
+    value: Option<T>,
 ) {
     let Some(path) = path else { return };
     let mut all: HashMap<String, T> = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    all.insert(key.to_string(), value);
+    match value {
+        Some(value) => {
+            all.insert(key.to_string(), value);
+        }
+        None => {
+            all.remove(key);
+        }
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(text) = serde_json::to_string_pretty(&all) {
         let _ = std::fs::write(path, text);
     }
+}
+
+/// Sets on `model` the candidate of `table` that `budget` allows, and returns it.
+///
+/// Routing stays exact when none fits.
+fn install(
+    model: &mut GenericHeteroTransformer,
+    budget: f64,
+    table: &[Measured],
+) -> Option<Measured> {
+    let chosen = pick_held(table, budget).cloned();
+    match &chosen {
+        Some(m) => {
+            tracing::info!(
+                "quality budget {budget}: keep {} experts, replace a missed expert under share {:.3}; measured KL {:.4}, {:.4} on the worse half, top-1 {:.3}, {:.2} expert reads saved per token",
+                if m.keep == 0 { model.routed_per_token() } else { m.keep },
+                m.miss_below,
+                m.kl,
+                m.kl_worst_half.unwrap_or(m.kl),
+                m.top1,
+                m.saved_per_token
+            );
+            model.set_truncation(m.truncation());
+        }
+        None => tracing::info!("quality budget {budget}: no candidate fits; routing stays exact"),
+    }
+    chosen
+}
+
+/// [`install`] under the budget `level` gives a model whose noise is `noise`.
+fn install_level(
+    model: &mut GenericHeteroTransformer,
+    level: QualityLevel,
+    noise: Option<f64>,
+    table: &[Measured],
+) -> Option<Measured> {
+    let budget = budget_for(level, noise).filter(|b| *b > 0.0)?;
+    tracing::info!(
+        "quality {level:?}: the model's own run-to-run noise is {:.4} nats; budget {budget:.4}",
+        noise.unwrap_or(0.0)
+    );
+    install(model, budget, table)
 }
 
 /// Chooses and applies the truncation for `budget`: from the cached table of `key`, else
@@ -272,90 +417,68 @@ pub fn apply_budget(
     if budget <= 0.0 {
         return Ok(None);
     }
-    let table = match read_kept::<Vec<Measured>>(table_file(), key) {
-        Some(t) => {
-            tracing::info!(
-                "quality calibration: table for this model and plan read from the cache"
-            );
-            t
-        }
+    let dir = cache_dir();
+    let table = match read_kept::<Vec<Measured>>(table_file(dir.as_deref()), key) {
+        Some(t) => t,
         None => {
-            let started = std::time::Instant::now();
             let t = measure(model, ids, resident, run)?;
-            tracing::info!(
-                "quality calibration: {} candidates measured on {} tokens in {:.1}s",
-                t.len(),
-                ids.len(),
-                started.elapsed().as_secs_f32()
-            );
-            keep(table_file(), key, t.clone());
+            keep(table_file(dir.as_deref()), key, Some(t.clone()));
             t
         }
     };
-    let chosen = pick(&table, budget).cloned();
-    match &chosen {
-        Some(m) => {
-            tracing::info!(
-                "quality budget {budget}: keep {} experts, replace a missed expert under share {:.3}; measured KL {:.4}, top-1 {:.3}, {:.2} expert reads saved per token",
-                if m.keep == 0 { model.routed_per_token() } else { m.keep },
-                m.miss_below,
-                m.kl,
-                m.top1,
-                m.saved_per_token
-            );
-            model.set_truncation(m.truncation());
-        }
-        None => tracing::info!("quality budget {budget}: no candidate fits; routing stays exact"),
-    }
-    Ok(chosen)
+    Ok(install(model, budget, &table))
 }
 
-/// Applies `level`: the noise of this model and plan from the cache, else measured against
-/// `other` and cached, turned into a budget and spent by [`apply_budget`].
+/// The ids the loads of this process give their calibrations.
+static PENDING_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A routing calibration a load left to run between requests, 1 run at a time.
 ///
-/// Without a second run to compare, `other` `None`, the noise is unknown and routing stays
-/// exact.
-pub fn apply_level(
-    model: &mut GenericHeteroTransformer,
+/// The model routes exactly until its last run ends.
+/// Each run keeps what it measured under the cache directory, so a later load resumes it.
+#[derive(Clone, Debug)]
+pub struct Pending {
     level: QualityLevel,
-    key: &str,
-    ids: &[u32],
-    resident: &[HashSet<usize>],
-    run: &mut Run<'_>,
-    other: Option<&mut Run<'_>>,
-) -> Result<Option<Measured>> {
-    if level == QualityLevel::Exact {
-        return Ok(None);
-    }
-    let measured = match (read_kept::<f64>(noise_file(), key), other) {
-        (Some(n), _) => Some(n),
-        (None, Some(other)) => {
-            let n = noise(model, ids, run, other)?;
-            keep(noise_file(), key, n);
-            Some(n)
-        }
-        (None, None) => None,
-    };
-    let Some(budget) = budget_for(level, measured) else {
-        tracing::info!(
-            "quality {level:?}: the model's numerical noise cannot be measured here (no second \
-             run to compare); routing stays exact"
-        );
-        return Ok(None);
-    };
-    tracing::info!(
-        "quality {level:?}: the model's own run-to-run noise is {:.4} nats; budget {budget:.4}",
-        measured.unwrap_or(0.0)
-    );
-    apply_budget(model, budget, key, ids, resident, run)
+    key: String,
+    ids: Vec<u32>,
+    id: u64,
 }
 
-/// Sets the truncation `level` allows on a loaded model, measured on `ids`.
+/// What an unfinished calibration keeps: the experts it counts in memory and the candidates
+/// measured so far.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+struct Progress {
+    resident: Vec<Vec<usize>>,
+    measured: Vec<Measured>,
+}
+
+/// What a step of a [`Pending`] calibration did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Step {
+    /// A run measured and kept, and more remain.
+    Measured,
+    /// The run gave way to a request and kept nothing.
+    Yielded,
+    /// The last run ended, and the candidate it allows is set, if any.
+    Done(Option<Measured>),
+}
+
+/// Sets the truncation `level` allows on a loaded model, from a measure on `ids` the cache
+/// holds.
 ///
-/// `identity` names the model file, and the table is kept under it.
-/// No expert is counted in memory: the layers read every routed expert from its mapping.
-/// The noise needs a second run to compare with, which a model on 1 device kind does not have:
-/// routing then stays exact.
+/// Without such a measure, the model routes exactly and keeps a [`Pending`] calibration.
+///
+/// The experts in memory are those the cards and the host tier keep when the load ends.
+///
+/// `identity` names the model file.
+/// The table and the noise are kept under it with the digest of the tokens and the count of
+/// experts in memory.
+/// A load reuses the measure of the largest count not above its own, see [`covering`].
+/// An unfinished calibration resumes the same way, with the experts it counted.
+///
+/// The noise is the prefill of `ids` on the host against the same tokens decoded 1 at a time.
+/// A decoded row runs through the card's kernels where a card keeps the mixers.
+/// Without such a card the 2 runs share the host's kernels, and routing stays exact.
 /// A model without routed experts is left as loaded.
 pub fn calibrate_loaded(
     model: &mut GenericHeteroTransformer,
@@ -363,22 +486,287 @@ pub fn calibrate_loaded(
     identity: &str,
     ids: &[u32],
 ) -> Result<Option<Measured>> {
+    let second = model.mixes_on_cards();
+    let resident = model.held_experts();
+    let dir = cache_dir();
+    prepare(
+        model,
+        level,
+        identity,
+        ids,
+        &resident,
+        dir.as_deref(),
+        second,
+    )
+}
+
+/// [`calibrate_loaded`] with `resident` the experts in memory, and the measures kept under
+/// `dir`.
+///
+/// `second` says whether a second run can measure the noise.
+pub fn prepare(
+    model: &mut GenericHeteroTransformer,
+    level: QualityLevel,
+    identity: &str,
+    ids: &[u32],
+    resident: &[HashSet<usize>],
+    dir: Option<&Path>,
+    second: bool,
+) -> Result<Option<Measured>> {
+    model.set_routing_pending(None);
     if level == QualityLevel::Exact || model.routed_per_token() == 0 {
         return Ok(None);
     }
-    let resident = vec![HashSet::new(); model.segment_layers()];
-    let key = format!("{identity}|resident:0");
-    let mut prefill = |m: &mut GenericHeteroTransformer, toks: &[u32]| -> Result<Vec<Vec<f32>>> {
-        let x = crate::tensor::Tensor::from_vec(
-            toks.to_vec(),
-            (1, toks.len()),
-            &crate::tensor::Device::Cpu,
-        )?;
-        let all = m.forward_all(&x, 0)?.flatten_all()?.to_vec1::<f32>()?;
-        let vocab = all.len() / toks.len().max(1);
-        Ok(all.chunks(vocab.max(1)).map(<[f32]>::to_vec).collect())
+    let held_now = resident;
+    let held = held_now.iter().map(HashSet::len).sum::<usize>();
+    let base = format!("{identity}|text:{}", text_digest(ids));
+    let noises = kept_keys(noise_file(dir));
+    let complete = kept_keys(table_file(dir))
+        .into_iter()
+        .filter(|k| noises.contains(k));
+    if let Some((measured, key)) = covering(complete, &base, held) {
+        tracing::info!(
+            "quality calibration: {held} routed experts in memory, covered by the measure of {measured}"
+        );
+        let noise = read_kept::<f64>(noise_file(dir), &key);
+        let table = read_kept::<Vec<Measured>>(table_file(dir), &key).unwrap_or_default();
+        tracing::info!("quality calibration: table for this model and plan read from the cache");
+        return Ok(install_level(model, level, noise, &table));
+    }
+    let resumed = covering(kept_keys(steps_file(dir)).into_iter(), &base, held)
+        .and_then(|(_, key)| Some((read_kept::<Progress>(steps_file(dir), &key)?, key)));
+    let (progress, key) = match resumed {
+        Some((progress, key)) => {
+            tracing::info!(
+                "quality calibration: {held} routed experts in memory, resuming the calibration of {key} after {} candidates",
+                progress.measured.len()
+            );
+            (progress, key)
+        }
+        None => {
+            tracing::info!("quality calibration: {held} routed experts in memory");
+            let resident = held_now
+                .iter()
+                .map(|set| {
+                    let mut experts: Vec<usize> = set.iter().copied().collect();
+                    experts.sort_unstable();
+                    experts
+                })
+                .collect();
+            let progress = Progress {
+                resident,
+                measured: Vec::new(),
+            };
+            (progress, format!("{base}|held:{held}"))
+        }
     };
-    apply_level(model, level, &key, ids, &resident, &mut prefill, None)
+    if !second && read_kept::<f64>(noise_file(dir), &key).is_none() {
+        tracing::info!(
+            "quality {level:?}: the model's numerical noise cannot be measured here (no second \
+             run to compare); routing stays exact"
+        );
+        return Ok(None);
+    }
+    keep(steps_file(dir), &key, Some(progress));
+    tracing::info!(
+        "quality {level:?}: routing stays exact until the calibration ends between requests"
+    );
+    model.set_routing_pending(Some(Pending {
+        level,
+        key,
+        ids: ids.to_vec(),
+        id: PENDING_IDS.fetch_add(1, Ordering::Relaxed),
+    }));
+    Ok(None)
+}
+
+impl Pending {
+    /// Which load left this calibration.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Runs the next run of the calibration on `model`, and keeps what it measured under
+    /// `dir`.
+    ///
+    /// The runs are, in order: the exact prefill, the second run of the noise, then each
+    /// candidate.
+    /// `run` prefills the text, and `other` is the second run of the noise.
+    /// `other` gives way to a request by failing while `yielded` says so.
+    /// The model routes exactly when a step returns, but for the candidate the last one sets.
+    pub fn step(
+        &self,
+        model: &mut GenericHeteroTransformer,
+        dir: Option<&Path>,
+        run: &mut Run<'_>,
+        other: &mut Run<'_>,
+        yielded: &dyn Fn() -> bool,
+    ) -> Result<Step> {
+        model.set_resident_override(None);
+        model.set_truncation(Truncation::default());
+        let stepped = self.next_run(model, dir, run, other, yielded);
+        if !matches!(stepped, Ok(Step::Done(_))) {
+            model.set_resident_override(None);
+            model.set_truncation(Truncation::default());
+        }
+        stepped
+    }
+
+    /// The body of [`Self::step`], the model routing exactly when it starts.
+    fn next_run(
+        &self,
+        model: &mut GenericHeteroTransformer,
+        dir: Option<&Path>,
+        run: &mut Run<'_>,
+        other: &mut Run<'_>,
+        yielded: &dyn Fn() -> bool,
+    ) -> Result<Step> {
+        let ids = &self.ids;
+        let Some(mut progress) = read_kept::<Progress>(steps_file(dir), &self.key) else {
+            crate::tensor::bail!("the calibration {} is no longer in the cache", self.key);
+        };
+        let kept_run = reference_file(dir, &self.key);
+        let exact = kept_run
+            .as_ref()
+            .and_then(|p| std::fs::File::open(p).ok())
+            .and_then(|f| Dump::read(std::io::BufReader::new(f)).ok())
+            .filter(|d| d.tokens == *ids);
+        let Some(exact) = exact else {
+            let rows = run(model, ids)?;
+            let dump = reference(&rows, ids)?;
+            if let Some(path) = &kept_run {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let mut bytes = Vec::new();
+                dump.write(&mut bytes)?;
+                std::fs::write(path, bytes)?;
+            }
+            return Ok(Step::Measured);
+        };
+        let noise = match read_kept::<f64>(noise_file(dir), &self.key) {
+            Some(n) => n,
+            None => {
+                let rows = match other(model, ids) {
+                    Ok(rows) => rows,
+                    Err(_) if yielded() => return Ok(Step::Yielded),
+                    Err(e) => return Err(e),
+                };
+                let n = against(&rows, ids, &exact)?.kl().unwrap_or(0.0);
+                keep(noise_file(dir), &self.key, Some(n));
+                return Ok(Step::Measured);
+            }
+        };
+        let all = candidates(model.routed_per_token());
+        if let Some(&t) = all.get(progress.measured.len()) {
+            let resident: Vec<HashSet<usize>> = progress
+                .resident
+                .iter()
+                .map(|experts| experts.iter().copied().collect())
+                .collect();
+            progress
+                .measured
+                .push(measure_one(model, ids, &resident, run, t, &exact)?);
+            keep(steps_file(dir), &self.key, Some(progress.clone()));
+            if progress.measured.len() < all.len() {
+                return Ok(Step::Measured);
+            }
+        }
+        model.set_resident_override(None);
+        model.set_truncation(Truncation::default());
+        keep(table_file(dir), &self.key, Some(progress.measured.clone()));
+        keep::<Progress>(steps_file(dir), &self.key, None);
+        if let Some(path) = kept_run {
+            let _ = std::fs::remove_file(path);
+        }
+        tracing::info!(
+            "quality calibration: {} candidates measured on {} tokens between requests",
+            progress.measured.len(),
+            ids.len()
+        );
+        Ok(Step::Done(install_level(
+            model,
+            self.level,
+            Some(noise),
+            &progress.measured,
+        )))
+    }
+}
+
+/// [`decode_run`] that gives way between 2 tokens once `yielded` says so, by failing.
+pub fn decode_run_yielding(
+    m: &mut GenericHeteroTransformer,
+    toks: &[u32],
+    yielded: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<f32>>> {
+    toks.iter()
+        .enumerate()
+        .map(|(pos, &t)| {
+            if yielded() {
+                crate::tensor::bail!("the calibration gave way to a request");
+            }
+            let x = crate::tensor::Tensor::from_vec(vec![t], (1, 1), &crate::tensor::Device::Cpu)?;
+            m.forward(&x, pos)?.flatten_all()?.to_vec1::<f32>()
+        })
+        .collect()
+}
+
+/// The keys of the map of `path`, none when it cannot be read.
+fn kept_keys(path: Option<std::path::PathBuf>) -> HashSet<String> {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<HashMap<String, serde_json::Value>>(&t).ok())
+        .map(|all| all.into_keys().collect())
+        .unwrap_or_default()
+}
+
+/// Among `keys`, the one of `base` measured with the most experts in memory that is not
+/// above `held`, with that count.
+///
+/// The cards and the host tier start from the hottest experts of each layer.
+/// A measure with fewer in memory counted a part of what they keep now.
+/// Every expert it counted is in memory now, so it gave away at least the slots the router
+/// gives away now.
+fn covering(
+    keys: impl Iterator<Item = String>,
+    base: &str,
+    held: usize,
+) -> Option<(usize, String)> {
+    let prefix = format!("{base}|held:");
+    keys.filter_map(|k| {
+        let n = k.strip_prefix(&prefix)?.parse::<usize>().ok()?;
+        (n <= held).then_some((n, k))
+    })
+    .max_by_key(|(n, _)| *n)
+}
+
+/// The first 16 hex digits of the SHA-256 of `ids`, which names the calibration text in a key.
+fn text_digest(ids: &[u32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for id in ids {
+        h.update(id.to_le_bytes());
+    }
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The logits of every position of `toks`, prefilled from position 0.
+pub fn prefill_run(m: &mut GenericHeteroTransformer, toks: &[u32]) -> Result<Vec<Vec<f32>>> {
+    let x = crate::tensor::Tensor::from_vec(
+        toks.to_vec(),
+        (1, toks.len()),
+        &crate::tensor::Device::Cpu,
+    )?;
+    let all = m.forward_all(&x, 0)?.flatten_all()?.to_vec1::<f32>()?;
+    let vocab = all.len() / toks.len().max(1);
+    Ok(all.chunks(vocab.max(1)).map(<[f32]>::to_vec).collect())
+}
+
+/// The logits of every position of `toks`, decoded 1 at a time from position 0.
+pub fn decode_run(m: &mut GenericHeteroTransformer, toks: &[u32]) -> Result<Vec<Vec<f32>>> {
+    decode_run_yielding(m, toks, &|| false)
 }
 
 /// The text the calibration runs: some code and some prose, long enough to route a few
@@ -418,6 +806,7 @@ mod tests {
             kl,
             top1: 0.9,
             saved_per_token: saved,
+            kl_worst_half: None,
         }
     }
 
@@ -443,6 +832,42 @@ mod tests {
         assert_eq!(pick(&table, 0.02).unwrap().miss_below, 0.12);
         assert_eq!(pick(&table, 0.04).unwrap().saved_per_token, 9.0);
         assert!(pick(&table, 0.01).is_none());
+    }
+
+    /// A candidate whose divergence on a half of the text passes the budget is not picked,
+    /// whatever its mean over the text.
+    #[test]
+    fn a_candidate_must_fit_on_each_half_of_the_text() {
+        let mut uneven = m(0, 0.12, 0.015, 9.0);
+        uneven.kl_worst_half = Some(0.025);
+        let mut even = m(5, 0.0, 0.016, 4.0);
+        even.kl_worst_half = Some(0.019);
+        let table = vec![uneven.clone(), even.clone()];
+        assert_eq!(pick(&table, 0.02), Some(&uneven));
+        assert_eq!(pick_held(&table, 0.02), Some(&even));
+        assert_eq!(pick_held(&table, 0.018), None);
+        assert_eq!(pick_held(&table, 0.03), Some(&uneven));
+    }
+
+    /// A load takes the measure of the most experts in memory not above the count it holds,
+    /// under its own file and text only.
+    #[test]
+    fn a_load_takes_the_measure_its_cards_cover() {
+        let keys = [
+            "f|text:a|held:500",
+            "f|text:a|held:528",
+            "f|text:a|held:600",
+            "f|text:b|held:520",
+            "f|text:a|resident:5248",
+            "g|text:a|held:100",
+        ]
+        .map(String::from);
+        let at = |cards| covering(keys.iter().cloned(), "f|text:a", cards);
+        assert_eq!(at(528), Some((528, "f|text:a|held:528".into())));
+        assert_eq!(at(560), Some((528, "f|text:a|held:528".into())));
+        assert_eq!(at(700), Some((600, "f|text:a|held:600".into())));
+        assert_eq!(at(510), Some((500, "f|text:a|held:500".into())));
+        assert_eq!(at(499), None);
     }
 
     /// A table survives the cache, and is written as the V4.1 calibration wrote its table.

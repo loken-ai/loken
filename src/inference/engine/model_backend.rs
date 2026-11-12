@@ -1228,6 +1228,11 @@ pub(crate) trait ModelBackend: Send {
         false
     }
 
+    /// The generic model this backend serves serially, when it serves one.
+    fn generic_mut(&mut self) -> Option<&mut GenericHeteroTransformer> {
+        None
+    }
+
     /// Extract the inner `GenericHeteroTransformer` (CB-wrap stepping stone);
     /// every other backend returns itself unchanged.
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend>;
@@ -2289,6 +2294,10 @@ impl ModelBackend for GenericBackend {
         self.0.forward_spliced_vision(prompt_tokens, items)
     }
 
+    fn generic_mut(&mut self) -> Option<&mut GenericHeteroTransformer> {
+        Some(&mut self.0)
+    }
+
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Ok(self.0)
     }
@@ -2298,6 +2307,10 @@ impl ModelBackend for GenericBackend {
 }
 
 impl ModelBackend for GenericVisionBackend {
+    fn generic_mut(&mut self) -> Option<&mut GenericHeteroTransformer> {
+        Some(&mut self.text)
+    }
+
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.text.kv_capacity())
     }

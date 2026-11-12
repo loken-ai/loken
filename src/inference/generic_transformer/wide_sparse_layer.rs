@@ -27,7 +27,7 @@ use super::block_scaled_experts::BlockScaledExpert;
 use super::compressed_band::BandCell;
 use super::hyper::sinkhorn::SinkhornMixer;
 use super::moe_weights::{
-    sqrt_softplus_choice, sqrt_softplus_truncated_choice, sqrt_softplus_weigh, Truncation,
+    sqrt_softplus_choice, sqrt_softplus_routed_choice, sqrt_softplus_weigh, Truncation,
 };
 use super::ngram::engram::{EngramBlock, EngramMeta};
 use super::wide::staged;
@@ -279,9 +279,10 @@ fn with_engram(block: &SinkhornBlock, r: &Tensor, first: usize) -> Result<Tensor
 #[derive(Default)]
 pub struct LossyRouting {
     pub truncation: Truncation,
-    /// The experts counted as in memory.
+    /// The experts counted as in memory, set by a measurement.
     ///
-    /// `None` counts none: the layer reads every routed expert from its mapping on use.
+    /// `None` counts the experts in memory at each forward: those a card keeps and those the
+    /// host tier keeps.
     pub resident: Option<HashSet<usize>>,
     /// Slots of experts not in memory that the truncation removed or replaced, since last
     /// taken.
@@ -427,30 +428,18 @@ impl RoutedFfn {
             }
         }
         let t = self.lossy.truncation;
-        if !t.active() {
-            return logits
-                .par_iter()
-                .map(|row| {
-                    sqrt_softplus_choice(
-                        row,
-                        Some(self.bias.as_slice()),
-                        self.used,
-                        self.temperature,
-                        self.normalize,
-                    )
-                })
-                .collect();
-        }
-        let resident = |e: usize| {
-            self.lossy
-                .resident
-                .as_ref()
-                .is_some_and(|set| set.contains(&e))
+        let held = match (t.active(), &self.lossy.resident) {
+            (true, None) => self.held_now(),
+            _ => Vec::new(),
+        };
+        let resident = |e: usize| match &self.lossy.resident {
+            Some(set) => set.contains(&e),
+            None => held.get(e).copied().unwrap_or(false),
         };
         let picks: Vec<(Vec<usize>, Vec<f32>, u64)> = logits
             .par_iter()
             .map(|row| {
-                sqrt_softplus_truncated_choice(
+                sqrt_softplus_routed_choice(
                     row,
                     Some(self.bias.as_slice()),
                     self.used,
@@ -461,9 +450,50 @@ impl RoutedFfn {
                 )
             })
             .collect();
-        let saved: u64 = picks.iter().map(|p| p.2).sum();
-        self.lossy.saved.fetch_add(saved, Ordering::Relaxed);
+        if t.active() {
+            let saved: u64 = picks.iter().map(|p| p.2).sum();
+            self.lossy.saved.fetch_add(saved, Ordering::Relaxed);
+            self.note_truncated(logits, &picks);
+        }
         picks.into_iter().map(|(ids, w, _)| (ids, w)).collect()
+    }
+
+    /// Per expert, whether it is in memory now: a card keeps it or the host tier keeps it.
+    pub fn held_now(&self) -> Vec<bool> {
+        let kept = self.host.as_ref().map(|h| h.kept_mask(self.experts.len()));
+        (0..self.experts.len())
+            .map(|e| self.card.holds(e) || kept.as_ref().is_some_and(|k| k[e]))
+            .collect()
+    }
+
+    /// Sets the truncation, which the host tier's share of the layer guesses with too.
+    fn set_truncation(&mut self, t: Truncation) {
+        self.lossy.truncation = t;
+        if let Some(h) = &self.host {
+            h.set_truncation(t);
+        }
+    }
+
+    /// Notes in the process's expert counters, against the exact choice of each row of
+    /// `logits`, the experts `picks` put in place of an exact one and the slots it left empty.
+    fn note_truncated(&self, logits: &[Vec<f32>], picks: &[(Vec<usize>, Vec<f32>, u64)]) {
+        let counters = crate::inference::expert_counters::global();
+        if !counters.on() {
+            return;
+        }
+        let (mut replaced, mut skipped) = (0u64, 0u64);
+        for (row, (ids, _, _)) in logits.iter().zip(picks) {
+            let (exact, _) = sqrt_softplus_choice(
+                row,
+                Some(self.bias.as_slice()),
+                self.used,
+                self.temperature,
+                self.normalize,
+            );
+            replaced += ids.iter().filter(|e| !exact.contains(e)).count() as u64;
+            skipped += exact.len().saturating_sub(ids.len()) as u64;
+        }
+        counters.truncated(replaced, skipped);
     }
 
     /// Notes in the process's expert counters the pairs of `assign`: those of the experts in
@@ -1133,8 +1163,18 @@ impl GenericHeteroTransformer {
     /// Sets every routed feed-forward's truncation.
     pub fn set_truncation(&mut self, t: Truncation) {
         for (_, ffn) in self.routed_ffns() {
-            ffn.lossy.truncation = t;
+            ffn.set_truncation(t);
         }
+    }
+
+    /// Leaves `pending` to run between requests, or forgets the calibration left.
+    pub fn set_routing_pending(&mut self, pending: Option<super::routing_calibration::Pending>) {
+        self.routing_pending = pending;
+    }
+
+    /// The routing calibration left to run between requests, if any.
+    pub fn routing_pending(&self) -> Option<&super::routing_calibration::Pending> {
+        self.routing_pending.as_ref()
     }
 
     /// The slots the truncation saved since last asked, summed over the layers.
@@ -1146,12 +1186,40 @@ impl GenericHeteroTransformer {
             .sum()
     }
 
+    /// Per layer index, the routed experts in memory now: those a card keeps and those the host
+    /// tier keeps.
+    ///
+    /// A layer without a routed feed-forward holds none.
+    pub fn held_experts(&self) -> Vec<HashSet<usize>> {
+        self.layers
+            .iter()
+            .map(|l| {
+                l.sinkhorn.as_ref().map_or_else(HashSet::new, |b| {
+                    let held = b.ffn.held_now();
+                    (0..held.len()).filter(|&e| held[e]).collect()
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a layer keeps its Sinkhorn mixers on a card.
+    ///
+    /// A decoded row then runs through the card's kernels, and a prefill through the host's.
+    pub fn mixes_on_cards(&self) -> bool {
+        self.layers.iter().any(|l| {
+            l.sinkhorn
+                .as_ref()
+                .is_some_and(|b| b.card_mix.ordinal().is_some())
+        })
+    }
+
     /// Counts, per layer index, the given experts as the ones in memory.
     ///
-    /// `None`, or a layer past the end of `per_layer`, counts none.
+    /// `None` counts those the cards and the host tier keep at each forward.
+    /// A layer past the end of `per_layer` counts none.
     pub fn set_resident_override(&mut self, per_layer: Option<&[HashSet<usize>]>) {
         for (il, ffn) in self.routed_ffns() {
-            ffn.lossy.resident = per_layer.and_then(|p| p.get(il).cloned());
+            ffn.lossy.resident = per_layer.map(|p| p.get(il).cloned().unwrap_or_default());
         }
     }
 
