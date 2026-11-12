@@ -68,6 +68,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Speech: speak a long text with pocket-tts in its reference's chunks, the voice held across them.
+- Vulkan: run the layers that take no position rotation without one.
 - Vulkan: load a model whose layers Vulkan refuses on the host.
 - Vulkan: count the layers a Vulkan card runs as on that card, not on the host.
 - Models: take a stored model's draft and routing prior from its own manifest.

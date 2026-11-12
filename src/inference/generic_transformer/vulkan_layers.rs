@@ -471,7 +471,12 @@ fn build_stack(
     let mut table_of = Vec::with_capacity(layers.len());
     for l in layers {
         let (c, s) = l.rope_table().rows(0, cos.dim(0)?, &Device::Cpu)?;
-        let pair = (host(&c.contiguous()?)?, host(&s.contiguous()?)?);
+        let mut pair = (host(&c.contiguous()?)?, host(&s.contiguous()?)?);
+        // A layer without RoPE rotates by the identity: a cosine of 1 and a sine of 0.
+        if l.no_rope {
+            pair.0.fill(1.0);
+            pair.1.fill(0.0);
+        }
         let at = match tables.iter().position(|t| *t == pair) {
             Some(i) => i,
             None => {

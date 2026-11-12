@@ -555,6 +555,7 @@ macro_rules! family {
 
 family!(llama, "llama3.2:1b", super::TIE);
 family!(gemma, "gemma3:latest", 2.0);
+family!(smollm3, "smollm3:latest", 2.0);
 
 /// A mixture of experts: where the host's best experts for a token are within rounding of the
 /// next ones, the two pick other experts and the logits part by more than rounding. The
