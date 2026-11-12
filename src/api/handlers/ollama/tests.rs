@@ -685,3 +685,23 @@ fn ps_lists_a_loading_model_with_its_count() {
     let json = serde_json::to_value(&loaded).unwrap();
     assert!(json.get("loading").is_none());
 }
+
+/// A listed model carries the formats its projections run in under `details.running_format`,
+/// and a model that does not say leaves the field out.
+#[test]
+fn ps_carries_the_format_a_model_runs_in() {
+    let mut entry = loading_ps_entry(
+        "m:1",
+        "sha256:abc",
+        LoadProgress {
+            phase: "load-model".to_string(),
+            done: 0,
+            total: 1,
+        },
+    );
+    let json = serde_json::to_value(&entry).unwrap();
+    assert!(json["details"].get("running_format").is_none());
+    entry.details.running_format = Some("bf16".to_string());
+    let json = serde_json::to_value(&entry).unwrap();
+    assert_eq!(json["details"]["running_format"], "bf16");
+}

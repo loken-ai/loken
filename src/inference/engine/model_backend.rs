@@ -1289,6 +1289,8 @@ pub(crate) struct GenericVisionBackend {
 /// worker via `ContinuousServer::submit_sampled`.
 pub(crate) struct ContinuousBackend(
     pub std::sync::Arc<crate::inference::serve::continuous_serve::ContinuousServer>,
+    /// The formats the moved model's projections run in, read before the move.
+    pub Option<String>,
 );
 
 /// Transient sentinel used ONLY while swapping a loaded GenericHetero model
@@ -2569,13 +2571,18 @@ impl ModelBackend for ContinuousBackend {
         Some(self.0.clone())
     }
 
+    fn running_format(&self) -> Option<String> {
+        self.1.clone()
+    }
+
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Err(self)
     }
     fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
-        let server = match std::sync::Arc::try_unwrap(self.0) {
+        let ContinuousBackend(server, format) = *self;
+        let server = match std::sync::Arc::try_unwrap(server) {
             Ok(server) => server,
-            Err(shared) => return Err(Box::new(ContinuousBackend(shared))),
+            Err(shared) => return Err(Box::new(ContinuousBackend(shared, format))),
         };
         match server.stop() {
             Ok(model) => Ok(Box::new(GenericBackend(model))),

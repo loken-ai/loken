@@ -351,3 +351,25 @@ fn a_partial_rotation_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
     batched_follows_serial(&path);
     tiny_model::remove(&path);
 }
+
+/// A model moved into the continuous-batch server still names the format its projections run
+/// in, and names the same one once moved back out.
+#[test]
+fn a_batched_model_names_the_format_it_runs_in() {
+    use crate::inference::engine::model_backend::{
+        BoxedModelBackend, ContinuousBackend, ModelBackend,
+    };
+    let path = tiny_model::write("cb-format", LAYERS);
+    let model = tiny_model::load(&path, LAYERS);
+    let format = model.running_format();
+    assert!(format.is_some(), "the serial model names no format");
+    let server =
+        ContinuousServer::spawn(Arc::new(model), Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096).unwrap();
+    let batched: BoxedModelBackend = Box::new(ContinuousBackend(Arc::new(server), format.clone()));
+    assert_eq!(batched.running_format(), format);
+    let Ok(serial) = batched.into_serial() else {
+        panic!("the model did not leave its worker");
+    };
+    assert_eq!(serial.running_format(), format);
+    tiny_model::remove(&path);
+}

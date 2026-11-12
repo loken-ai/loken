@@ -999,8 +999,12 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         };
         let mut ends = state.eos_token_ids_extra.clone();
         ends.push(eos);
+        let format = m.running_format();
         let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, ends, ctx) {
-            Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
+            Ok(s) => (
+                Box::new(ContinuousBackend(std::sync::Arc::new(s), format)),
+                true,
+            ),
             Err(m) => (Box::new(GenericBackend(m)), false),
         };
         state.model = model;
