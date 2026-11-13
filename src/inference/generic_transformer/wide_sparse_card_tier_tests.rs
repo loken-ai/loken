@@ -160,6 +160,39 @@ fn the_cards_keep_the_hottest_experts_rank_by_rank() {
     }
 }
 
+/// The schedule gives a card the experts it finishes sooner than a host core, the most rows
+/// first, and leaves the host what moving up costs more than computing.
+#[test]
+fn the_transit_schedule_moves_only_what_a_card_finishes_sooner() {
+    use super::wide_expert_card::{schedule_transit, tile_rows, TransitCost};
+    let cost = TransitCost {
+        secs_per_byte: 1e-3,
+        secs_per_tile: 1e-3,
+        host_secs_per_pair: 1.0,
+    };
+    let tile = tile_rows();
+    // An expert of 1 row costs a core 1 s and the card 2 s: it stays on the host.
+    let (moving, left) = schedule_transit(&[(0, cost)], &[0.0], &[(5, 1, 2000)], 4);
+    assert!(moving.is_empty());
+    assert_eq!(left, vec![5]);
+    // Experts of many rows go to the card while it finishes them sooner than a core.
+    let many = 8 * tile;
+    let candidates: Vec<(usize, usize, u64)> = (0..6).map(|e| (e, many - e, 10)).collect();
+    let (moving, left) = schedule_transit(&[(0, cost)], &[0.0], &candidates, 1);
+    assert_eq!(moving.len(), 1);
+    assert_eq!(moving[0].0, 0);
+    assert_eq!(moving[0].1, vec![0, 1, 2, 3, 4, 5]);
+    assert!(left.is_empty());
+    // A card busy past what the host needs takes nothing.
+    let (moving, left) = schedule_transit(&[(1, cost)], &[1e9], &candidates, 1);
+    assert!(moving.is_empty());
+    assert_eq!(left.len(), candidates.len());
+    // Without a card everything stays on the host.
+    let (moving, left) = schedule_transit(&[], &[], &candidates, 2);
+    assert!(moving.is_empty());
+    assert_eq!(left.len(), candidates.len());
+}
+
 /// A build without cards measures no card: the rooms are dropped and no expert is kept.
 #[cfg(not(feature = "gpu"))]
 #[test]
@@ -301,6 +334,60 @@ fn card_experts_give_the_hosts_bits_on_every_record() {
             );
         }
         assert!(pairs_run(&model) > 0, "the card ran no expert");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With every expert the cards do not keep moved to card 0 in a forward of several rows, the
+/// model gives the host's bits on every record of the oracle, and the card ran pairs in transit.
+#[cfg(feature = "gpu")]
+#[test]
+fn experts_in_transit_give_the_hosts_bits_on_every_record() {
+    use super::wide_sparse_card_tier::CardMeasure;
+    use std::collections::BTreeMap;
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let dir = scratch("transit");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let tokens = prompt();
+    let mut want = BTreeMap::new();
+    record_generic(
+        &mut generic_of(open_mapped(&path).unwrap()),
+        &tokens,
+        0,
+        &mut want,
+    );
+    // A measure by which the card always finishes an expert first.
+    let fast = CardMeasure {
+        experts: 1,
+        host_secs: 1.0,
+        card_secs: 1e-9,
+        bytes: 1,
+        upload_secs: 1e-15,
+    };
+    for room in [0u64, 3] {
+        let mut model = with_card_experts(&path, room);
+        model.open_wide_transit(&[(0, fast.clone())]);
+        let mut got = BTreeMap::new();
+        record_generic(&mut model, &tokens, 0, &mut got);
+        for record in RECORDS {
+            let name = format!("l0_{record}");
+            assert_eq!(
+                record_digest(&got[&name]),
+                record_digest(&want[&name]),
+                "room of {room} experts: {name}"
+            );
+        }
+        let moved: u64 = model
+            .layers
+            .iter()
+            .filter_map(|l| l.sinkhorn.as_ref())
+            .map(|b| b.ffn.card.pairs_moved())
+            .sum();
+        assert!(moved > 0, "room of {room} experts: no pair ran in transit");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -906,5 +993,114 @@ fn the_load_measures_each_card_and_keeps_experts_where_it_pays() {
     for o in [0, 1] {
         assert_eq!(kept_on(&model, o) > 0, rooms.contains(&o), "card {o}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Card 0 ready to run the first wide layer's experts of `model` in transit, those experts, rows
+/// for them and the layer's bound.
+#[cfg(feature = "gpu")]
+fn transit_case(
+    model: &GenericHeteroTransformer,
+) -> (
+    super::wide_expert_card::gpu::Transit,
+    &[super::block_scaled_experts::BlockScaledExpert],
+    Vec<f32>,
+    f32,
+) {
+    use super::wide_expert_card::TransitCost;
+    let ffn = &model.layers[0].sinkhorn.as_ref().expect("a wide layer").ffn;
+    let cost = TransitCost {
+        secs_per_byte: 1e-12,
+        secs_per_tile: 1e-9,
+        host_secs_per_pair: 1.0,
+    };
+    let transit = super::wide_expert_card::gpu::Transit::new(0, &ffn.experts[0], cost)
+        .expect("card 0 runs these experts in transit");
+    let dim = model.config.embedding_length;
+    let n = 5;
+    let x: Vec<f32> = (0..n * dim)
+        .map(|i| ((i as f32) * 0.173).sin() * 0.5)
+        .collect();
+    (transit, &ffn.experts, x, ffn.limit)
+}
+
+/// The host's outputs of `experts` over the rows `x`, as bits.
+#[cfg(feature = "gpu")]
+fn host_bits(
+    experts: &[&super::block_scaled_experts::BlockScaledExpert],
+    x: &[f32],
+    dim: usize,
+    limit: f32,
+) -> Vec<Vec<u32>> {
+    let rows = crate::tensor::Tensor::from_vec(
+        x.to_vec(),
+        (x.len() / dim, dim),
+        &crate::tensor::Device::Cpu,
+    )
+    .unwrap();
+    super::wide_expert_card::host_outputs(experts, &rows, limit)
+        .unwrap()
+        .iter()
+        .map(|y| y.iter().map(|v| v.to_bits()).collect())
+        .collect()
+}
+
+/// The bits of each output a transit run gave, `None` for an expert it left to the host.
+#[cfg(feature = "gpu")]
+fn transit_bits(outs: &[Option<Vec<f32>>]) -> Vec<Option<Vec<u32>>> {
+    outs.iter()
+        .map(|o| o.as_ref().map(|y| y.iter().map(|v| v.to_bits()).collect()))
+        .collect()
+}
+
+/// A batch in transit takes only the room it is given.
+/// A room for 1 expert runs the experts 1 batch each with the host's bits.
+/// A room short of 1 expert leaves every expert to the host.
+/// The card's own room, which leaves out the pool's work room, runs them all with the host's
+/// bits.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_transit_batch_takes_only_its_room_and_keeps_the_hosts_bits() {
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let dir = scratch("transit-room");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let model = generic_of(open_mapped(&path).unwrap());
+    let (transit, experts, x, limit) = transit_case(&model);
+    let dim = model.config.embedding_length;
+    let n = x.len() / dim;
+    let rows: Vec<usize> = (0..n).collect();
+    let given: Vec<_> = experts
+        .iter()
+        .take(4)
+        .map(|e| (e, rows.as_slice()))
+        .collect();
+    let want = host_bits(
+        &given.iter().map(|g| g.0).collect::<Vec<_>>(),
+        &x,
+        dim,
+        limit,
+    );
+    let one = transit.need(given[0].0, n);
+    let batches = std::cell::Cell::new(0);
+    let outs = transit.run_within(&given, &x, dim, limit, || {
+        batches.set(batches.get() + 1);
+        one + one / 2
+    });
+    assert_eq!(batches.get(), given.len(), "1 batch an expert");
+    let got = transit_bits(&outs);
+    for (k, w) in want.iter().enumerate() {
+        assert_eq!(got[k].as_ref(), Some(w), "expert {k} in a room for 1");
+    }
+    let outs = transit.run_within(&given, &x, dim, limit, || one - 1);
+    assert!(outs.iter().all(Option::is_none), "a room short of 1 expert");
+    let got = transit_bits(&transit.run(&given, &x, dim, limit));
+    for (k, w) in want.iter().enumerate() {
+        assert_eq!(got[k].as_ref(), Some(w), "expert {k} in the card's room");
+    }
+    drop(model);
     let _ = std::fs::remove_dir_all(&dir);
 }

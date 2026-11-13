@@ -181,6 +181,55 @@ fn the_card_router_gives_the_hosts_bits() {
     }
 }
 
+/// The card's router gives, over several rows, the host's bits for each row alone.
+#[test]
+fn the_card_router_gives_the_hosts_bits_over_rows() {
+    if !card_present() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    for (out, inp, n) in [(37usize, 1000usize, 3usize), (384, 5120, 41), (8, 31, 16)] {
+        let values: Vec<f32> = (0..out * inp)
+            .map(|i| ((i as f32 * 0.731).sin() * (1.0 + (i % 17) as f32)) * 0.01)
+            .collect();
+        let router = Projection::Dense(Tensor::from_vec(values, (out, inp), &Device::Cpu).unwrap());
+        let card = RouterCard::new(0, &router).unwrap();
+        let x: Vec<f32> = (0..n * inp)
+            .map(|i| ((i * 13 + 7) as f32 * 0.29).cos() * (1 + i % 5) as f32)
+            .collect();
+        let bits = |v: Vec<f32>| v.iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+        let host = bits(router.apply_rows_alone(&x, n).unwrap());
+        let got = bits(card.logits_rows(&x, n).unwrap());
+        assert_eq!(got, host, "[{out}, {inp}] over {n} rows");
+    }
+}
+
+/// The card's router gives the same bits over a prompt's rows in several groups as in 1 group,
+/// a last group shorter than the others included.
+#[test]
+fn the_card_router_gives_the_same_bits_in_groups_of_rows() {
+    if !card_present() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let (out, inp, n) = (40usize, 300usize, 37usize);
+    let values: Vec<f32> = (0..out * inp)
+        .map(|i| ((i as f32 * 0.613).sin() * (1.0 + (i % 13) as f32)) * 0.01)
+        .collect();
+    let router = Projection::Dense(Tensor::from_vec(values, (out, inp), &Device::Cpu).unwrap());
+    let card = RouterCard::new(0, &router).unwrap();
+    let x: Vec<f32> = (0..n * inp)
+        .map(|i| ((i * 11 + 5) as f32 * 0.37).cos() * (1 + i % 7) as f32)
+        .collect();
+    let bits = |v: Vec<f32>| v.iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+    let whole = bits(card.logits_rows_in(&x, n, n).unwrap());
+    assert_eq!(whole, bits(router.apply_rows_alone(&x, n).unwrap()));
+    for group in [1, 5, 16, 36] {
+        let got = bits(card.logits_rows_in(&x, n, group).unwrap());
+        assert_eq!(got, whole, "groups of {group} rows");
+    }
+}
+
 /// The greedy tokens of `q6_file` with its weights every token reads on the host and on the
 /// card, by the q8_K route, and how far apart their logits are.
 ///

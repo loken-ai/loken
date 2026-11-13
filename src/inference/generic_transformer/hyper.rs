@@ -525,6 +525,9 @@ pub fn mixer_block_rows() -> usize {
 /// chunk would take stays with the experts' cache. `experts` is `(count, used)`, `None` for a
 /// model without a routed mixture; its experts run on a card for a batch of rows, and keep their
 /// own activations live per routed pair, `expert_ffn` wide.
+///
+/// The fixed bytes also hold a router's group of rows and their logits, which a card that keeps
+/// the router takes while it routes a prompt.
 pub fn prefill_footprint(
     streams: usize,
     dim: usize,
@@ -533,12 +536,15 @@ pub fn prefill_footprint(
 ) -> PrefillFootprint {
     let target_chunk = experts.map_or(0, |_| PLANNED_CHUNK_ROWS);
     let f = std::mem::size_of::<f32>();
+    let router = experts.map_or(0, |(count, _)| {
+        super::wide_expert_card::router_rows_bytes(dim, count, mixer_block_rows())
+    });
     PrefillFootprint {
         bytes_per_token: streams * dim * f * WIDE_LIVE_BUFFERS
             + experts.map_or(0, |(_, used)| {
                 super::expert_tier::prefill_bytes_per_token(used, dim, expert_ffn)
             }),
-        fixed_bytes: mixer_block_rows() * streams * dim * f * MIXER_LIVE_BUFFERS,
+        fixed_bytes: mixer_block_rows() * streams * dim * f * MIXER_LIVE_BUFFERS + router,
         target_chunk,
     }
 }

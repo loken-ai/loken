@@ -826,6 +826,11 @@ fn the_wide_prefill_footprint_follows_the_model() {
     );
     // The routed experts that run on the card add their own activations per routed pair.
     assert!(a.bytes_per_token > plain.bytes_per_token);
+    // The fixed bytes hold a router's group of rows and their logits, 1 logit per expert.
+    let router =
+        |count| super::wide_expert_card::router_rows_bytes(2560, count, hyper::mixer_block_rows());
+    assert_eq!(a.fixed_bytes, plain.fixed_bytes + router(160));
+    assert_eq!(b.fixed_bytes, plain.fixed_bytes + router(512));
 }
 
 /// A prefill pinned at the whole prompt, at a divisor of its length and at a size that leaves a

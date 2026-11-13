@@ -80,6 +80,10 @@ pub struct CardMeasure {
     pub host_secs: f64,
     /// Seconds the card took for them over 1 row: the row up, the kernels, the outputs down.
     pub card_secs: f64,
+    /// Bytes of their blocks.
+    pub bytes: u64,
+    /// Seconds their blocks took to go up to the card from the host's memory.
+    pub upload_secs: f64,
 }
 
 impl CardMeasure {
@@ -260,6 +264,13 @@ impl GenericHeteroTransformer {
                 });
             }
         }
+        let paid: Vec<(usize, CardMeasure)> = measured
+            .iter()
+            .filter_map(|(ordinal, _, m)| match m {
+                Ok(m) if m.pays() => Some((*ordinal, m.clone())),
+                _ => None,
+            })
+            .collect();
         let paying: Vec<(usize, u64)> = measured
             .into_iter()
             .filter(|(ordinal, bytes, m)| match m {
@@ -295,9 +306,53 @@ impl GenericHeteroTransformer {
             _ => self.place_expert_variants(choice)?,
         };
         self.keep_wide_card_experts(&plan);
+        self.open_wide_transit(&paid);
         // The host keeps the hottest of the experts the cards do not.
         self.keep_wide_host_experts();
         Some(plan)
+    }
+
+    /// Lets each card of `paid` run, in a forward of several rows, routed experts it does not
+    /// keep, at the costs its measure gives.
+    ///
+    /// Every held wide layer shares the same cards.
+    /// A card whose measure timed no upload, or that cannot be opened, takes no transit.
+    pub fn open_wide_transit(&mut self, paid: &[(usize, CardMeasure)]) {
+        #[cfg(feature = "gpu")]
+        {
+            use super::wide_expert_card::{gpu::Transit, TransitCost};
+            let Some(first) = self
+                .layers
+                .iter()
+                .find_map(|l| l.sinkhorn.as_ref())
+                .and_then(|b| b.ffn.experts.first())
+            else {
+                return;
+            };
+            let mut cards: Vec<std::sync::Arc<Transit>> = Vec::new();
+            for (ordinal, m) in paid {
+                let Some(cost) = TransitCost::of(m) else {
+                    continue;
+                };
+                match Transit::new(*ordinal, first, cost) {
+                    Ok(t) => {
+                        tracing::info!(
+                            "card {ordinal}: routed experts it does not keep may run there in a prompt: {:.2} GB/s up, {:.3} ms a tile of rows, {:.3} ms a pair on a host core",
+                            1e-9 / cost.secs_per_byte,
+                            cost.secs_per_tile * 1e3,
+                            cost.host_secs_per_pair * 1e3
+                        );
+                        cards.push(std::sync::Arc::new(t));
+                    }
+                    Err(e) => tracing::info!("card {ordinal}: no transit of routed experts: {e}"),
+                }
+            }
+            for block in self.layers.iter_mut().filter_map(|l| l.sinkhorn.as_mut()) {
+                block.ffn.card.set_transit(cards.clone());
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = paid;
     }
 
     /// Adds to each card's room for routed experts the part of its cache room that the working
@@ -747,10 +802,21 @@ impl GenericHeteroTransformer {
         if host.iter().zip(&on_card).any(|(h, c)| bits(h) != bits(c)) {
             return Err("the card's products differ from the host's bits".into());
         }
+        // The blocks go up again, the card and its tables ready, their bytes in memory.
+        let mut again = CardExperts::default();
+        let started = std::time::Instant::now();
+        again.keep(ordinal, &numbered).map_err(|e| e.to_string())?;
+        let upload_secs = started.elapsed().as_secs_f64();
+        let bytes = experts
+            .iter()
+            .map(|e| (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64)
+            .sum();
         Ok(CardMeasure {
             experts: experts.len(),
             host_secs,
             card_secs,
+            bytes,
+            upload_secs,
         })
     }
 

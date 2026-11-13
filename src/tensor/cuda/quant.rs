@@ -754,7 +754,10 @@ pub fn gpu_mmv_iq2_xxs(
 /// The instances of one expert a warp reads a weight row once for, in the exact expert kernels: a
 /// decode runs one instance per expert, a prompt's expert up to this many rows per read. The
 /// IQ3_XXS and Q3_K kernels hold an accumulator per instance of a tile (`CX_TILE`, the same).
-const EXACT_TILE: usize = 8;
+pub const EXACT_TILE: usize = 8;
+
+/// The lanes of a block of the exact expert kernels: 1 warp.
+const EXACT_LANES: usize = 32;
 
 /// The output rows one warp of the IQ3_XXS and Q3_K expert kernels holds (`CX_ROWS_PER_WARP`).
 const EXACT_ROWS_PER_WARP: usize = 4;
@@ -913,13 +916,35 @@ pub fn gpu_experts_exact(
     })?;
     let (dim_i, inter_i, tt_i) = (kernel_int(dim)?, kernel_int(inter)?, widest as i32);
     let (sbs, sbs2) = (dim / 256, inter / 256);
-    let (hname, dname) = tables.format.kernels();
-    // The IQ2_XXS kernels stage their sub-block terms in shared memory; the IQ3_XXS ones keep
-    // them in registers.
+    // The IQ2_XXS kernels stage the terms of a row's sub-blocks in shared memory, and each
+    // instance's block shares.
+    // A tile stages all its terms at once while they take no more room than a full tile's terms
+    // over a pass of the warp's lanes.
+    // A wider tile stages its terms a pass at a time, in the kernels named `_lanes`.
+    // The IQ3_XXS kernels keep the terms in registers.
+    // Per kernel: whether it stages a pass at a time, and the terms an instance stages at once.
+    let staged = |nsub: usize| match widest * nsub > EXACT_TILE * EXACT_LANES {
+        true => (true, EXACT_LANES),
+        false => (false, nsub),
+    };
+    let ((hlanes, hstaged), (dlanes, dstaged)) = (staged(sbs * 8), staged(sbs2 * 16));
+    let (hname, dname) = match tables.format {
+        ExpertFormat::Iq2XxsQ2K => (
+            match hlanes {
+                true => "cx_expert_h_iq2_xxs_lanes",
+                false => "cx_expert_h_iq2_xxs",
+            },
+            match dlanes {
+                true => "cx_expert_down_q2_k_lanes",
+                false => "cx_expert_down_q2_k",
+            },
+        ),
+        ExpertFormat::Iq3XxsQ3K => tables.format.kernels(),
+    };
     let (hshared, dshared) = match tables.format {
         ExpertFormat::Iq2XxsQ2K => (
-            (2 * widest * sbs * 8 + 2 * widest * sbs) * F32_BYTES,
-            (2 * widest * sbs2 * 16 + widest * sbs2) * F32_BYTES,
+            (2 * widest * hstaged + 2 * widest * sbs) * F32_BYTES,
+            (2 * widest * dstaged + widest * sbs2) * F32_BYTES,
         ),
         ExpertFormat::Iq3XxsQ3K => (0, 0),
     };
@@ -931,7 +956,7 @@ pub fn gpu_experts_exact(
     let hfun = dev.quantized_fn(hname)?;
     let hcfg = LaunchConfig {
         grid_dim: (inter.div_ceil(rows_per_warp) as u32, ntiles as u32, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (EXACT_LANES as u32, 1, 1),
         shared_mem_bytes: hshared as u32,
     };
     let mut b = stream.launch_builder(&hfun);
@@ -963,7 +988,7 @@ pub fn gpu_experts_exact(
     let dfun = dev.quantized_fn(dname)?;
     let dcfg = LaunchConfig {
         grid_dim: (dim.div_ceil(rows_per_warp) as u32, ntiles as u32, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (EXACT_LANES as u32, 1, 1),
         shared_mem_bytes: dshared as u32,
     };
     let mut b = stream.launch_builder(&dfun);
@@ -4936,12 +4961,30 @@ mod iq2_xxs_gpu_tests {
             (ExpertFormat::Iq2XxsQ2K, GgmlDType::Iq2Xxs, GgmlDType::Q2K),
             (ExpertFormat::Iq3XxsQ3K, GgmlDType::Iq3Xxs, GgmlDType::Q3K),
         ] {
-            card_experts_match_the_host(format, gate, down);
+            card_experts_match_the_host(format, gate, down, (1024, 512, 11));
         }
     }
 
-    /// The bit-for-bit check of experts with `gate` gate and up and a `down` down.
-    fn card_experts_match_the_host(format: ExpertFormat, gate: GgmlDType, down: GgmlDType) {
+    /// IQ2_XXS and Q2_K experts are the host's bit for bit when a warp takes the sub-blocks of a
+    /// row in several passes of its lanes, the last pass short, and over tiles of every length.
+    #[test]
+    fn card_experts_over_short_lane_passes_are_the_hosts_bit_for_bit() {
+        card_experts_match_the_host(
+            ExpertFormat::Iq2XxsQ2K,
+            GgmlDType::Iq2Xxs,
+            GgmlDType::Q2K,
+            (5 * 256, 3 * 256, 2 * EXACT_TILE + 1),
+        );
+    }
+
+    /// The bit-for-bit check of experts with `gate` gate and up and a `down` down, `dim` and
+    /// `inter` wide, over `n` rows.
+    fn card_experts_match_the_host(
+        format: ExpertFormat,
+        gate: GgmlDType,
+        down: GgmlDType,
+        (dim, inter, n): (usize, usize, usize),
+    ) {
         use crate::inference::generic_transformer::block_scaled_experts::BlockScaledExpert;
         use crate::tensor::blockscaled::projection::Projection;
         use crate::tensor::quantized::QTensor;
@@ -4950,7 +4993,7 @@ mod iq2_xxs_gpu_tests {
             eprintln!("no CUDA device; the card experts are NOT covered by this run");
             return;
         };
-        let (dim, inter, limit, n) = (1024usize, 512usize, 7.0f32, 11usize);
+        let limit = 7.0f32;
         let draw = |seed: u32, len: usize, scale: f32| -> Vec<f32> {
             (0..len)
                 .map(|i| {

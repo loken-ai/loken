@@ -31,7 +31,7 @@ use super::moe_weights::{
 };
 use super::ngram::engram::{EngramBlock, EngramMeta};
 use super::wide::staged;
-use super::wide_expert_card::CardExperts;
+use super::wide_expert_card::{schedule_transit, tile_rows, CardExperts};
 use super::*;
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
@@ -392,6 +392,12 @@ impl RoutedFfn {
         Some((expert.gate.bytes() + expert.up.bytes() + expert.down.bytes()) as u64)
     }
 
+    /// Bytes of expert `e` as the layer reads it now.
+    fn expert_bytes(&self, e: usize) -> u64 {
+        let x = &self.experts[e];
+        (x.gate.bytes() + x.up.bytes() + x.down.bytes()) as u64
+    }
+
     /// Reads expert `e` from variant `v` from now on.
     ///
     /// False when there is no such variant, and the layer reads what it read.
@@ -508,6 +514,7 @@ impl RoutedFfn {
         on_card: &[usize],
         on_host: &[usize],
         kept: &[bool],
+        moved: &[usize],
         n: usize,
     ) {
         let counters = crate::inference::expert_counters::global();
@@ -521,7 +528,10 @@ impl RoutedFfn {
             layer,
             routed.flat_map(|&e| std::iter::repeat_n(e, assign[e].len())),
         );
-        counters.served(pairs(on_card), pairs(on_host));
+        counters.served(
+            pairs(on_card) + pairs(moved),
+            pairs(on_host).saturating_sub(pairs(moved)),
+        );
         let mut by_card: Vec<(usize, u64)> = Vec::new();
         for &e in on_card {
             let Some(ordinal) = self.card.card_of(e) else {
@@ -564,7 +574,8 @@ impl RoutedFfn {
     /// The routed experts run by id, each once over the rows routed to it, in row order.
     /// A row adds the outputs of its experts in that order, each times its weight.
     ///
-    /// A card that keeps the router takes a single row's logits, with the host's bits.
+    /// Each row's router logits are the ones the row would get alone.
+    /// A card that keeps the router gives them, with the host's bits.
     /// A card that keeps the shared expert runs it beside the host's experts.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.forward_routed(x, None)
@@ -584,12 +595,22 @@ impl RoutedFfn {
         let logits = match logits.filter(|_| n == 1) {
             Some(row) => vec![row],
             None => staged("experts: router", &host, false, || {
-                Ok(
-                    match (n == 1).then(|| self.card.router_logits(&rows)).flatten() {
-                        Some(row) => vec![row],
-                        None => self.router.apply_here(&x2)?.to_vec2::<f32>()?,
-                    },
-                )
+                if n == 0 {
+                    return Ok(Vec::new());
+                }
+                let card = match n {
+                    1 => self.card.router_logits(&rows),
+                    _ => self.card.router_rows(&rows, n),
+                };
+                let flat = match card {
+                    Some(y) => y,
+                    None => self.router.apply_rows_alone(&rows, n)?,
+                };
+                let experts = flat.len() / n;
+                Ok(flat
+                    .chunks_exact(experts.max(1))
+                    .map(<[f32]>::to_vec)
+                    .collect())
             })?,
         };
         let picks = self.route(&logits);
@@ -612,12 +633,48 @@ impl RoutedFfn {
             .iter()
             .partition(|&&e| watch.is_none() && self.card.holds(e));
         let tier = self.host.as_deref();
+        // In a forward of several rows, the cards take in transit the experts they finish
+        // sooner than the host's cores, by the load's measures.
+        let costs = self.card.transit_costs();
+        let (moving, host_now): (Vec<(usize, Vec<usize>)>, Vec<usize>) =
+            match n > 1 && watch.is_none() && !costs.is_empty() {
+                true => {
+                    let busy: Vec<f64> = costs
+                        .iter()
+                        .map(|(o, c)| {
+                            on_card
+                                .iter()
+                                .filter(|&&e| self.card.card_of(e) == Some(*o))
+                                .map(|&e| assign[e].len().div_ceil(tile_rows()) as f64)
+                                .sum::<f64>()
+                                * c.secs_per_tile
+                        })
+                        .collect();
+                    let candidates: Vec<(usize, usize, u64)> = on_host
+                        .iter()
+                        .map(|&e| (e, assign[e].len(), self.expert_bytes(e)))
+                        .collect();
+                    schedule_transit(&costs, &busy, &candidates, rayon::current_num_threads())
+                }
+                false => (Vec::new(), on_host.clone()),
+            };
+        let moved: Vec<usize> = moving.iter().flat_map(|(_, ids)| ids.clone()).collect();
         // Every host expert's bytes are asked for at once, on the tier's reader threads where it
         // has them, so the reads overlap the bookkeeping and the compute.
+        // The experts in transit come first, in the order the cards take them.
         let asked = std::time::Instant::now();
-        let reads = tier.and_then(|t| t.read_now(&on_host));
+        let longest = moving.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
+        let read_order: Vec<usize> = (0..longest)
+            .flat_map(|i| {
+                moving
+                    .iter()
+                    .filter_map(move |(_, ids)| ids.get(i).copied())
+            })
+            .chain(host_now.iter().copied())
+            .collect();
+        let reads = tier.and_then(|t| t.read_now(&read_order));
         if reads.is_none() {
-            on_host
+            read_order
                 .par_iter()
                 .for_each(|&e| self.experts[e].will_need());
         }
@@ -643,7 +700,7 @@ impl RoutedFfn {
                 t.kept(&on_host, &routes, &on_card, n)
             },
         );
-        self.note_served(&assign, &on_card, &on_host, &kept, n);
+        self.note_served(&assign, &on_card, &on_host, &kept, &moved, n);
         crate::inference::stage_prof::prof_record(
             "experts: tier",
             prepared.elapsed().as_nanos() as u64,
@@ -702,31 +759,56 @@ impl RoutedFfn {
             .iter()
             .map(|&e| assign[e].iter().map(|&(t, _)| t).collect())
             .collect();
-        let (shared_out, card_outs, host_outs) = std::thread::scope(|scope| {
-            let card = (!on_card.is_empty() || shared_on_card).then(|| {
+        let given: Vec<(usize, Vec<(usize, Vec<usize>)>)> = moving
+            .iter()
+            .map(|(o, ids)| {
+                let with_rows = ids
+                    .iter()
+                    .map(|&e| (e, assign[e].iter().map(|&(t, _)| t).collect()))
+                    .collect();
+                (*o, with_rows)
+            })
+            .collect();
+        let none_moved = || -> Vec<Vec<Option<Vec<f32>>>> {
+            moving
+                .iter()
+                .map(|(_, ids)| vec![None; ids.len()])
+                .collect()
+        };
+        let (shared_out, card_outs, moved_outs, host_outs) = std::thread::scope(|scope| {
+            let card = (!on_card.is_empty() || shared_on_card || !moving.is_empty()).then(|| {
                 scope.spawn(|| {
-                    self.card.run_cards(
+                    self.card.run_cards_moving(
                         &on_card,
                         &card_rows,
                         &rows,
                         dim,
                         self.limit,
                         shared_on_card,
+                        &given,
+                        &self.experts,
                     )
                 })
             });
             let started = std::time::Instant::now();
-            let host = host_run(&on_host);
+            let host = host_run(&host_now);
             let ran = started.elapsed();
-            let (shared, experts) = card
+            // The cores' time on the rows of a forward of several rows feeds the schedule.
+            if n > 1 && !costs.is_empty() && !host_now.is_empty() {
+                let cores = rayon::current_num_threads().min(host_now.len()) as u64;
+                let pairs: usize = host_now.iter().map(|&e| assign[e].len()).sum();
+                self.card
+                    .note_host(ran.as_nanos() as u64 * cores, pairs as u64);
+            }
+            let (shared, experts, carried) = card
                 .and_then(|h| h.join().ok())
-                .unwrap_or_else(|| (None, vec![None; on_card.len()]));
+                .unwrap_or_else(|| (None, vec![None; on_card.len()], none_moved()));
             crate::inference::stage_prof::prof_record("experts: host", ran.as_nanos() as u64);
             crate::inference::stage_prof::prof_record(
                 "experts: card wait",
                 (started.elapsed() - ran).as_nanos() as u64,
             );
-            (shared, experts, host)
+            (shared, experts, carried, host)
         });
         // The reads of this forward not yet made are no longer asked.
         drop(reads);
@@ -743,12 +825,21 @@ impl RoutedFfn {
             };
         }
         // A card that failed leaves its experts to the host, which gives the same bits.
+        // So does an expert in transit that did not run.
         let failed: Vec<usize> = (0..on_card.len())
             .filter(|&i| card_outs[i].is_none())
             .collect();
-        let mut again = host_run(&failed.iter().map(|&i| on_card[i]).collect::<Vec<_>>())?
-            .into_iter()
-            .map(|(out, _)| out);
+        let carried: Vec<(usize, Option<Vec<f32>>)> = moving
+            .iter()
+            .zip(moved_outs)
+            .flat_map(|((_, ids), outs)| ids.iter().copied().zip(outs))
+            .collect();
+        let redo: Vec<usize> = failed
+            .iter()
+            .map(|&i| on_card[i])
+            .chain(carried.iter().filter(|(_, o)| o.is_none()).map(|&(e, _)| e))
+            .collect();
+        let mut again = host_run(&redo)?.into_iter().map(|(out, _)| out);
         let card_outs: Vec<Vec<f32>> = card_outs
             .into_iter()
             .map(|out| out.or_else(|| again.next()).unwrap_or_default())
@@ -756,8 +847,11 @@ impl RoutedFfn {
         // Each active expert's outputs, in the order of `active`.
         let mut by_id: std::collections::HashMap<usize, Vec<f32>> =
             on_card.into_iter().zip(card_outs).collect();
+        for (e, out) in carried {
+            by_id.insert(e, out.or_else(|| again.next()).unwrap_or_default());
+        }
         let mut seen: std::collections::HashMap<usize, Vec<f32>> = Default::default();
-        for (e, (out, h)) in on_host.into_iter().zip(host_outs) {
+        for (e, (out, h)) in host_now.into_iter().zip(host_outs) {
             by_id.insert(e, out);
             seen.insert(e, h);
         }

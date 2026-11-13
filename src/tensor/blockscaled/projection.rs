@@ -256,4 +256,123 @@ impl Projection {
             Self::Bf16(f) => f.apply(x),
         }
     }
+
+    /// The `n` rows `x` `[n, in]` row-major, each as [`Self::apply_here`] takes a single row:
+    /// `[n, out]` row-major, on this thread's cores.
+    ///
+    /// A dense output is the fold from -0, in input order, of the rounded products.
+    /// Other storages apply their product to the rows at once.
+    pub fn apply_rows_alone(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
+        let inp = self.dims().get(1).copied().unwrap_or(0);
+        if x.len() != n * inp {
+            return Err(crate::tensor::Error::msg(format!(
+                "{} values for {n} rows of {inp}",
+                x.len()
+            )));
+        }
+        match self {
+            Self::Dense(w) => {
+                let out = w.dim(0)?;
+                let contiguous;
+                let wv: &[f32] = match w.cpu_f32_data() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        contiguous = w.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                        &contiguous
+                    }
+                };
+                Ok(fold_rows(wv, out, inp, x, n))
+            }
+            _ => {
+                let xt = Tensor::from_vec(x.to_vec(), (n, inp), &Device::Cpu)?;
+                self.apply_here(&xt)?.flatten_all()?.to_vec1::<f32>()
+            }
+        }
+    }
+}
+
+/// Rows a task of [`fold_rows`] takes together, a lane each.
+const FOLD_LANES: usize = 16;
+
+/// `x` `[n, inp]` through `w` `[out, inp]`, both row-major: `[n, out]` row-major.
+///
+/// Each output is the fold from -0, in input order, of the rounded products of its weight row
+/// and its row.
+/// A task takes [`FOLD_LANES`] rows, input-major, so each lane's sum is its own row's fold.
+fn fold_rows(w: &[f32], out: usize, inp: usize, x: &[f32], n: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let mut y = vec![0f32; n * out];
+    if out == 0 {
+        return y;
+    }
+    y.par_chunks_mut(FOLD_LANES * out)
+        .enumerate()
+        .for_each(|(b, yb)| {
+            let r0 = b * FOLD_LANES;
+            let lanes = yb.len() / out;
+            // Lane `j` of input `k` at `k * FOLD_LANES + j`, the missing lanes zero.
+            let mut xt = vec![0f32; inp * FOLD_LANES];
+            for j in 0..lanes {
+                let row = &x[(r0 + j) * inp..(r0 + j + 1) * inp];
+                for (k, &v) in row.iter().enumerate() {
+                    xt[k * FOLD_LANES + j] = v;
+                }
+            }
+            let sums: Vec<[f32; FOLD_LANES]> = (0..out)
+                .into_par_iter()
+                .map(|o| {
+                    let mut acc = [-0.0f32; FOLD_LANES];
+                    let wr = &w[o * inp..(o + 1) * inp];
+                    for (xk, &wk) in xt.chunks_exact(FOLD_LANES).zip(wr) {
+                        for (a, &v) in acc.iter_mut().zip(xk) {
+                            *a += wk * v;
+                        }
+                    }
+                    acc
+                })
+                .collect();
+            for (o, acc) in sums.iter().enumerate() {
+                for (j, &v) in acc.iter().take(lanes).enumerate() {
+                    yb[j * out + o] = v;
+                }
+            }
+        });
+    y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows applied together give, bit for bit, each row applied alone.
+    #[test]
+    fn rows_applied_together_give_each_row_alone() {
+        for (out, inp, n) in [(37usize, 1000usize, 1usize), (384, 513, 35), (8, 31, 16)] {
+            let values: Vec<f32> = (0..out * inp)
+                .map(|i| ((i as f32 * 0.731).sin() * (1.0 + (i % 17) as f32)) * 0.01)
+                .collect();
+            let w = Projection::Dense(Tensor::from_vec(values, (out, inp), &Device::Cpu).unwrap());
+            let x: Vec<f32> = (0..n * inp)
+                .map(|i| ((i * 13 + 7) as f32 * 0.29).cos() * (1 + i % 5) as f32)
+                .collect();
+            let together = w.apply_rows_alone(&x, n).unwrap();
+            for r in 0..n {
+                let row =
+                    Tensor::from_vec(x[r * inp..(r + 1) * inp].to_vec(), (1, inp), &Device::Cpu)
+                        .unwrap();
+                let alone = w.apply_here(&row).unwrap().flatten_all().unwrap();
+                let alone: Vec<u32> = alone
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                let got: Vec<u32> = together[r * out..(r + 1) * out]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                assert_eq!(got, alone, "[{out}, {inp}] row {r} of {n}");
+            }
+        }
+    }
 }

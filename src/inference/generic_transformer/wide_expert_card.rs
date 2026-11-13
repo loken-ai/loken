@@ -14,9 +14,121 @@
 //! - the shared expert, in the blocks the file stores, its products measured per unit as the
 //!   mixers' are (`card_packed.rs`),
 //! - the router's F32 values, which a decoded row takes with the host's bits.
+//!
+//! In a forward of several rows, a card may also run experts it does not keep, in transit.
+//! Their blocks go up from the host's memory, run over their rows with the same kernels, and
+//! are dropped once their outputs are down.
+//! Each card runs its kept experts first, then its transit, in batches that fit what it has
+//! free at that moment.
+//! An expert that does not fit, or whose batch fails, answers `None`: the host runs it.
 
 use super::block_scaled_experts::BlockScaledExpert;
 use crate::tensor::Result;
+
+/// What a card's measure at the load gives a schedule of experts in transit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransitCost {
+    /// Seconds to move 1 byte of blocks from the host's memory to the card.
+    pub secs_per_byte: f64,
+    /// Seconds of the card for 1 expert over 1 tile of rows: the measured run over 1 row, per
+    /// expert.
+    pub secs_per_tile: f64,
+    /// Seconds of 1 host core for 1 expert over 1 row.
+    pub host_secs_per_pair: f64,
+}
+
+impl TransitCost {
+    /// The costs of `m`, `None` when it timed no upload or no product.
+    pub fn of(m: &super::wide_sparse_card_tier::CardMeasure) -> Option<Self> {
+        let per = m.experts as f64;
+        // The host ran the experts at once, each on a core while there are cores.
+        let cores = per.min(rayon::current_num_threads() as f64);
+        let cost = Self {
+            secs_per_byte: m.upload_secs / m.bytes as f64,
+            secs_per_tile: m.card_secs / per,
+            host_secs_per_pair: m.host_secs * cores / per,
+        };
+        let fine = |v: f64| v.is_finite() && v > 0.0;
+        (fine(cost.secs_per_byte) && fine(cost.secs_per_tile) && fine(cost.host_secs_per_pair))
+            .then_some(cost)
+    }
+
+    /// Seconds the card takes for an expert of `bytes` over `rows` rows, its blocks moved up.
+    pub fn card_secs(&self, bytes: u64, rows: usize) -> f64 {
+        bytes as f64 * self.secs_per_byte + rows.div_ceil(tile_rows()) as f64 * self.secs_per_tile
+    }
+}
+
+/// Rows of 1 expert that the card kernels run over 1 read of its blocks.
+pub fn tile_rows() -> usize {
+    #[cfg(feature = "gpu")]
+    {
+        crate::tensor::cuda::EXACT_TILE
+    }
+    #[cfg(not(feature = "gpu"))]
+    1
+}
+
+/// Bytes a card holds while it routes a prompt's rows `group` at a time: the rows of a group,
+/// `inp` wide, and their `out` logits, in F32.
+pub fn router_rows_bytes(inp: usize, out: usize, group: usize) -> usize {
+    group * (inp + out) * std::mem::size_of::<f32>()
+}
+
+/// Splits the experts no card keeps between the cards in transit and the host's cores.
+///
+/// `candidates` are (expert, rows, bytes).
+/// `busy[k]` is the seconds card `costs[k]` spends on its kept experts first.
+/// Each queue is a card or a host core.
+/// A card's expert costs [`TransitCost::card_secs`], a core's its rows times the host's seconds
+/// per pair: the least the cards measured.
+/// The experts go, the most rows first, each to the queue that finishes it soonest.
+/// Answers per card the experts it takes, in that order, and the experts left to the host.
+pub fn schedule_transit(
+    costs: &[(usize, TransitCost)],
+    busy: &[f64],
+    candidates: &[(usize, usize, u64)],
+    cores: usize,
+) -> (Vec<(usize, Vec<usize>)>, Vec<usize>) {
+    let mut order: Vec<&(usize, usize, u64)> = candidates.iter().collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let host_pair = costs
+        .iter()
+        .map(|(_, c)| c.host_secs_per_pair)
+        .fold(f64::INFINITY, f64::min);
+    let mut cards: Vec<(usize, f64, Vec<usize>)> = costs
+        .iter()
+        .enumerate()
+        .map(|(k, (o, _))| (*o, busy.get(k).copied().unwrap_or(0.0), Vec::new()))
+        .collect();
+    let mut host: Vec<f64> = vec![0.0; cores.max(1)];
+    let mut left = Vec::new();
+    for &&(e, rows, bytes) in &order {
+        let core = (0..host.len())
+            .min_by(|&a, &b| host[a].total_cmp(&host[b]))
+            .unwrap_or(0);
+        let on_core = host[core] + rows as f64 * host_pair;
+        let card = (0..cards.len())
+            .map(|k| (k, cards[k].1 + costs[k].1.card_secs(bytes, rows)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        match card {
+            Some((k, done)) if done < on_core => {
+                cards[k].1 = done;
+                cards[k].2.push(e);
+            }
+            _ => {
+                host[core] = on_core;
+                left.push(e);
+            }
+        }
+    }
+    let moving = cards
+        .into_iter()
+        .filter(|c| !c.2.is_empty())
+        .map(|(o, _, ids)| (o, ids))
+        .collect();
+    (moving, left)
+}
 
 /// The routed experts of 1 layer that the cards keep, by expert id, and the layer's shared
 /// expert and router when a card keeps them.
@@ -38,6 +150,11 @@ pub struct CardExperts {
     /// Per card whose run failed since the last take, the most bytes a failed run asked for.
     #[cfg(feature = "gpu")]
     short: std::sync::Mutex<Vec<(usize, u64)>>,
+    /// The cards that may run experts they do not keep, shared by the layers.
+    #[cfg(feature = "gpu")]
+    transit: Vec<std::sync::Arc<gpu::Transit>>,
+    /// (expert, row) pairs the cards ran in transit since the load.
+    moved: std::sync::atomic::AtomicU64,
 }
 
 impl CardExperts {
@@ -212,6 +329,36 @@ impl CardExperts {
         self.ran.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// (expert, row) pairs the cards ran in transit since the load.
+    pub fn pairs_moved(&self) -> u64 {
+        self.moved.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Lets `cards` run, in a forward of several rows, experts they do not keep.
+    #[cfg(feature = "gpu")]
+    pub(super) fn set_transit(&mut self, cards: Vec<std::sync::Arc<gpu::Transit>>) {
+        self.transit = cards;
+    }
+
+    /// Notes, on every card that may run experts it does not keep, `ns` nanoseconds of host
+    /// cores spent on `pairs` (expert, row) pairs.
+    pub fn note_host(&self, ns: u64, pairs: u64) {
+        #[cfg(feature = "gpu")]
+        self.transit.iter().for_each(|t| t.note_host(ns, pairs));
+        #[cfg(not(feature = "gpu"))]
+        let _ = (ns, pairs);
+    }
+
+    /// Per card that may run experts it does not keep, its ordinal and its costs now.
+    pub fn transit_costs(&self) -> Vec<(usize, TransitCost)> {
+        #[cfg(feature = "gpu")]
+        {
+            self.transit.iter().map(|t| (t.ordinal, t.cost())).collect()
+        }
+        #[cfg(not(feature = "gpu"))]
+        Vec::new()
+    }
+
     /// Per card ordinal, the bytes of experts kept there, with the shared expert and the router.
     pub fn bytes_by_card(&self) -> Vec<(usize, u64)> {
         #[cfg(feature = "gpu")]
@@ -307,6 +454,32 @@ impl CardExperts {
         }
     }
 
+    /// The router's logits of the `n` rows `x` `[n, dim]`, `[n, experts]` row-major, from the
+    /// card that keeps it, each row with the host's bits for that row alone.
+    ///
+    /// `None` without one, or when the card call fails: the caller runs it on the host.
+    pub fn router_rows(&self, x: &[f32], n: usize) -> Option<Vec<f32>> {
+        #[cfg(feature = "gpu")]
+        {
+            let router = self.router.as_ref()?;
+            match router.logits_rows(x, n) {
+                Ok(y) => Some(y),
+                Err(e) => {
+                    tracing::warn!(
+                        "card {}: router of {n} rows not run, the host runs it: {e}",
+                        router.ordinal()
+                    );
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (x, n);
+            None
+        }
+    }
+
     /// The router a card keeps, when it is card `ordinal`.
     #[cfg(feature = "gpu")]
     pub(super) fn router_on(&self, ordinal: usize) -> Option<&gpu::RouterCard> {
@@ -373,6 +546,31 @@ impl CardExperts {
         limit: f32,
         shared: bool,
     ) -> (Option<Vec<f32>>, Vec<Option<Vec<f32>>>) {
+        let (shared, kept, _) = self.run_cards_moving(ids, rows, x, dim, limit, shared, &[], &[]);
+        (shared, kept)
+    }
+
+    /// [`Self::run_cards`], and on each card of `moving`, after its kept experts, the experts
+    /// it takes in transit, read from `experts` by id.
+    ///
+    /// Answers per entry of `moving`, per expert it gives, its outputs `[rows, dim]` row-major.
+    /// An expert in transit that did not run answers `None`: the caller runs it on the host.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn run_cards_moving(
+        &self,
+        ids: &[usize],
+        rows: &[Vec<usize>],
+        x: &[f32],
+        dim: usize,
+        limit: f32,
+        shared: bool,
+        moving: &[(usize, Vec<(usize, Vec<usize>)>)],
+        experts: &[BlockScaledExpert],
+    ) -> (
+        Option<Vec<f32>>,
+        Vec<Option<Vec<f32>>>,
+        Vec<Vec<Option<Vec<f32>>>>,
+    ) {
         #[cfg(feature = "gpu")]
         {
             let n = x.len() / dim.max(1);
@@ -387,16 +585,60 @@ impl CardExperts {
                         .collect();
                     (set.ordinal, Some(set), mine)
                 })
-                .filter(|(_, _, mine)| !mine.is_empty())
+                .filter(|(ordinal, _, mine)| {
+                    !mine.is_empty() || moving.iter().any(|(o, m)| o == ordinal && !m.is_empty())
+                })
                 .collect();
             if let Some(s) = shared {
                 if !work.iter().any(|w| w.0 == s.ordinal()) {
                     work.push((s.ordinal(), None, Vec::new()));
                 }
             }
+            for (ordinal, m) in moving {
+                if !m.is_empty() && !work.iter().any(|w| w.0 == *ordinal) {
+                    work.push((*ordinal, None, Vec::new()));
+                }
+            }
             // The shared expert's card stands first.
             work.sort_by_key(|w| Some(w.0) != shared.map(|s| s.ordinal()));
-            let one = |(ordinal, set, mine): &(usize, Option<&gpu::CardSet>, Vec<usize>)| {
+            // A card's experts in transit, after its kept ones.
+            let transit = |ordinal: usize| -> Vec<(usize, Vec<Option<Vec<f32>>>)> {
+                let Some(t) = self.transit.iter().find(|t| t.ordinal == ordinal) else {
+                    return Vec::new();
+                };
+                moving
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (o, m))| *o == ordinal && !m.is_empty())
+                    .map(|(k, (_, m))| {
+                        let given: Vec<(&BlockScaledExpert, &[usize])> = m
+                            .iter()
+                            .filter_map(|(e, r)| experts.get(*e).map(|x| (x, r.as_slice())))
+                            .collect();
+                        let started = std::time::Instant::now();
+                        let outs = match given.len() == m.len() {
+                            true => t.run(&given, x, dim, limit),
+                            false => vec![None; m.len()],
+                        };
+                        crate::inference::stage_prof::prof_record(
+                            "experts: transit",
+                            started.elapsed().as_nanos() as u64,
+                        );
+                        let pairs: usize = m
+                            .iter()
+                            .zip(&outs)
+                            .filter(|(_, o)| o.is_some())
+                            .map(|((_, r), _)| r.len())
+                            .sum();
+                        self.moved
+                            .fetch_add(pairs as u64, std::sync::atomic::Ordering::Relaxed);
+                        crate::inference::expert_counters::global().card(ordinal, pairs as u64);
+                        (k, outs)
+                    })
+                    .collect()
+            };
+            let transit = &transit;
+            let kept_one = |(ordinal, set, mine): &(usize, Option<&gpu::CardSet>, Vec<usize>)| {
                 let shared_out = shared.filter(|s| s.ordinal() == *ordinal).and_then(|s| {
                     match s.run(x, n, limit) {
                         Ok(y) => Some(y),
@@ -430,8 +672,18 @@ impl CardExperts {
                 });
                 (shared_out, outs)
             };
+            let kept_one = &kept_one;
+            let one = |w: &(usize, Option<&gpu::CardSet>, Vec<usize>)| {
+                let (shared_out, outs) = kept_one(w);
+                (shared_out, outs, transit(w.0))
+            };
             let one = &one;
-            let ran: Vec<(Option<Vec<f32>>, Option<Vec<Vec<f32>>>)> = std::thread::scope(|scope| {
+            type Ran = (
+                Option<Vec<f32>>,
+                Option<Vec<Vec<f32>>>,
+                Vec<(usize, Vec<Option<Vec<f32>>>)>,
+            );
+            let ran: Vec<Ran> = std::thread::scope(|scope| {
                 let others: Vec<_> = work
                     .iter()
                     .skip(1)
@@ -440,23 +692,36 @@ impl CardExperts {
                 let first = work.first().map(one);
                 first
                     .into_iter()
-                    .chain(others.into_iter().map(|h| h.join().unwrap_or((None, None))))
+                    .chain(
+                        others
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or((None, None, Vec::new()))),
+                    )
                     .collect()
             });
             let mut out: Vec<Option<Vec<f32>>> = vec![None; ids.len()];
+            let mut moved: Vec<Vec<Option<Vec<f32>>>> =
+                moving.iter().map(|(_, m)| vec![None; m.len()]).collect();
             let mut shared_out = None;
-            for ((_, _, mine), (sh, outs)) in work.iter().zip(ran) {
+            for ((_, _, mine), (sh, outs, carried)) in work.iter().zip(ran) {
                 shared_out = shared_out.or(sh);
                 for (&i, y) in mine.iter().zip(outs.into_iter().flatten()) {
                     out[i] = Some(y);
                 }
+                for (k, ys) in carried {
+                    moved[k] = ys;
+                }
             }
-            (shared_out, out)
+            (shared_out, out, moved)
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (rows, x, dim, limit, shared);
-            (None, vec![None; ids.len()])
+            let _ = (rows, x, dim, limit, shared, experts);
+            (
+                None,
+                vec![None; ids.len()],
+                moving.iter().map(|(_, m)| vec![None; m.len()]).collect(),
+            )
         }
     }
 
@@ -692,6 +957,257 @@ pub(super) mod gpu {
         }
     }
 
+    /// A card that runs, in a forward, experts it does not keep.
+    pub(crate) struct Transit {
+        pub(crate) ordinal: usize,
+        device: Device,
+        dev: Arc<CudaDevice>,
+        tables: ExpertTables,
+        /// `(dim, inter)`.
+        dims: (usize, usize),
+        /// The costs the load measured.
+        measured: super::TransitCost,
+        /// Totals measured since the load: nanoseconds of uploads and their bytes, nanoseconds
+        /// of runs and their tiles, host core nanoseconds and their pairs.
+        totals: [std::sync::atomic::AtomicU64; 6],
+    }
+
+    impl Transit {
+        /// Card `ordinal` ready for experts of the format and shape of `like`.
+        pub(crate) fn new(
+            ordinal: usize,
+            like: &BlockScaledExpert,
+            cost: super::TransitCost,
+        ) -> Result<Self> {
+            let format = format_of(like)
+                .ok_or_else(|| Error::msg("no card kernel reads these experts' format"))?;
+            let device = Device::new_cuda(ordinal)?;
+            let Device::Cuda(dev) = device.clone() else {
+                return Err(Error::msg("experts in transit need a CUDA device"));
+            };
+            let tables = expert_tables(&dev, format)?;
+            let dims = like.gate.dims();
+            Ok(Self {
+                ordinal,
+                device,
+                dev,
+                tables,
+                dims: (dims[1], dims[0]),
+                measured: cost,
+                totals: Default::default(),
+            })
+        }
+
+        /// The costs now: each the ratio of its totals since the load once it has some, the
+        /// load's measure before.
+        pub(crate) fn cost(&self) -> super::TransitCost {
+            let at = |i: usize| self.totals[i].load(std::sync::atomic::Ordering::Relaxed);
+            let ratio = |ns: usize, of: usize, load: f64| match at(of) {
+                0 => load,
+                n => at(ns) as f64 * 1e-9 / n as f64,
+            };
+            super::TransitCost {
+                secs_per_byte: ratio(0, 1, self.measured.secs_per_byte),
+                secs_per_tile: ratio(2, 3, self.measured.secs_per_tile),
+                host_secs_per_pair: ratio(4, 5, self.measured.host_secs_per_pair),
+            }
+        }
+
+        /// Adds `ns` nanoseconds over `count` to the totals at `at` and the one after it.
+        fn add(&self, at: usize, ns: u64, count: u64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.totals[at].fetch_add(ns, Relaxed);
+            self.totals[at + 1].fetch_add(count, Relaxed);
+        }
+
+        /// Notes `ns` nanoseconds of host cores spent on `pairs` (expert, row) pairs.
+        pub(crate) fn note_host(&self, ns: u64, pairs: u64) {
+            self.add(4, ns, pairs);
+        }
+
+        /// Bytes a batch in transit may take now: what the driver has free.
+        ///
+        /// The bytes the card's memory pool reserves without using are the prompt's work room.
+        /// The prompt's next layers take them back, so a batch leaves them alone.
+        fn room_now(&self) -> u64 {
+            crate::inference::place::vram_manager::free_now(&self.device).unwrap_or(0)
+        }
+
+        /// Gives the driver back what the pool reserved beyond `kept` for a batch.
+        ///
+        /// The batch's frees run on the stream first.
+        fn give_back(&self, kept: u64) {
+            let _ = self.dev.stream().synchronize();
+            crate::tensor::cuda::trim_pool_to(self.ordinal, kept);
+        }
+
+        /// Bytes 1 (expert, row) pair takes on the card in a run: its rows entering the down
+        /// projection, as F32 and as q8_K blocks, its output and its row index.
+        fn pair_bytes(&self) -> u64 {
+            let (dim, inter) = self.dims;
+            let block = std::mem::size_of::<crate::tensor::quant_cpu::format::BlockQ8K>();
+            let f32s = std::mem::size_of::<f32>();
+            (inter * f32s + inter / QK_K * block + dim * f32s + std::mem::size_of::<i32>()) as u64
+        }
+
+        /// Bytes expert `e` takes on the card in a run over `rows` rows: its blocks and its pairs.
+        pub(crate) fn need(&self, e: &BlockScaledExpert, rows: usize) -> u64 {
+            expert_bytes(e) + rows as u64 * self.pair_bytes()
+        }
+
+        /// The outputs of each of `experts` over its rows of `x` `[n, dim]`, `[rows, dim]`
+        /// row-major, in the order given.
+        ///
+        /// The rows go up once.
+        /// The experts go up in batches, in the order given, each batch as large as what the
+        /// driver has free then holds.
+        /// The prompt's work room, which the pool reserves, is never part of a batch's room.
+        /// Each batch runs, its outputs come down, and its blocks are dropped.
+        /// The pool then gives the driver back what it reserved for the batch.
+        /// An expert of another format or shape, one that does not fit alone, and those of a
+        /// batch that fails answer `None`.
+        pub(crate) fn run(
+            &self,
+            experts: &[(&BlockScaledExpert, &[usize])],
+            x: &[f32],
+            dim: usize,
+            limit: f32,
+        ) -> Vec<Option<Vec<f32>>> {
+            self.run_within(experts, x, dim, limit, || self.room_now())
+        }
+
+        /// [`Self::run`] with each batch's room read from `room`.
+        pub(crate) fn run_within(
+            &self,
+            experts: &[(&BlockScaledExpert, &[usize])],
+            x: &[f32],
+            dim: usize,
+            limit: f32,
+            room: impl Fn() -> u64,
+        ) -> Vec<Option<Vec<f32>>> {
+            let mut out: Vec<Option<Vec<f32>>> = vec![None; experts.len()];
+            let format = Some(self.tables.format);
+            let fits = |e: &BlockScaledExpert| {
+                format_of(e) == format && (e.gate.dims()[1], e.gate.dims()[0]) == self.dims
+            };
+            if dim != self.dims.0 || experts.is_empty() {
+                return out;
+            }
+            let (kept, _) = crate::tensor::cuda::pool_use(self.ordinal);
+            let xq = match q8k32_rows_to_card(&self.dev, x) {
+                Ok(xq) => xq,
+                Err(e) => {
+                    tracing::warn!(
+                        "card {}: rows not moved up, the host runs the experts in transit: {e}",
+                        self.ordinal
+                    );
+                    return out;
+                }
+            };
+            let mut i = 0;
+            while i < experts.len() {
+                let room = room();
+                let mut taken = 0u64;
+                let mut end = i;
+                while end < experts.len() {
+                    let (e, rows) = experts[end];
+                    let need = self.need(e, rows.len());
+                    if !fits(e) || taken + need > room {
+                        break;
+                    }
+                    taken += need;
+                    end += 1;
+                }
+                if end == i {
+                    i += 1;
+                    continue;
+                }
+                match self.run_batch(&experts[i..end], &xq, limit) {
+                    Ok(ys) => {
+                        for (k, y) in ys.into_iter().enumerate() {
+                            out[i + k] = Some(y);
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "card {}: {} experts in transit not run, the host runs them: {e}",
+                        self.ordinal,
+                        end - i
+                    ),
+                }
+                self.give_back(kept);
+                i = end;
+            }
+            drop(xq);
+            self.give_back(kept);
+            out
+        }
+
+        /// The outputs of `experts` over their rows of `xq`, their blocks moved up for the run.
+        fn run_batch(
+            &self,
+            experts: &[(&BlockScaledExpert, &[usize])],
+            xq: &CudaSlice<u8>,
+            limit: f32,
+        ) -> Result<Vec<Vec<f32>>> {
+            let stream = self.dev.stream();
+            let up = |p: &Projection| -> Result<CudaSlice<u8>> {
+                let b = blocks(p)?;
+                stream
+                    .clone_htod(b.as_ref())
+                    .map_err(|err| Error::msg(format!("expert upload in transit: {err}")))
+            };
+            let started = std::time::Instant::now();
+            let held = experts
+                .iter()
+                .map(|(e, _)| Ok([up(&e.gate)?, up(&e.up)?, up(&e.down)?]))
+                .collect::<Result<Vec<[CudaSlice<u8>; 3]>>>()?;
+            let bytes: u64 = experts.iter().map(|(e, _)| expert_bytes(e)).sum();
+            self.add(0, started.elapsed().as_nanos() as u64, bytes);
+            let started = std::time::Instant::now();
+            let weights: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> =
+                held.iter().map(|[g, u, d]| (g, u, d)).collect();
+            // Instances of 1 expert stand together, its rows in row order.
+            let instances: Vec<(usize, usize)> = experts
+                .iter()
+                .enumerate()
+                .flat_map(|(i, (_, r))| r.iter().map(move |&t| (i, t)))
+                .collect();
+            let (_h, y) = gpu_experts_exact(
+                &self.dev,
+                &weights,
+                &self.tables,
+                self.dims,
+                xq,
+                &instances,
+                limit,
+            )?;
+            let flat = stream
+                .clone_dtoh(&y)
+                .map_err(|e| Error::msg(format!("expert outputs in transit: {e}")))?;
+            let tiles: usize = experts
+                .iter()
+                .map(|(_, r)| r.len().div_ceil(crate::tensor::cuda::EXACT_TILE))
+                .sum();
+            self.add(2, started.elapsed().as_nanos() as u64, tiles as u64);
+            let dim = self.dims.0;
+            let mut at = 0;
+            Ok(experts
+                .iter()
+                .map(|(_, r)| {
+                    let n = r.len() * dim;
+                    let part = flat[at..at + n].to_vec();
+                    at += n;
+                    part
+                })
+                .collect())
+        }
+    }
+
+    /// Bytes of the 3 weights of `e`.
+    fn expert_bytes(e: &BlockScaledExpert) -> u64 {
+        (e.gate.bytes() + e.up.bytes() + e.down.bytes()) as u64
+    }
+
     /// A layer's shared expert on the card that runs its token mixer.
     pub(crate) struct SharedCard {
         ordinal: usize,
@@ -768,6 +1284,7 @@ pub(super) mod gpu {
                 return Err(Error::msg("a card router needs a CUDA device"));
             };
             dev.quantized_fn("seq_row_f32")?;
+            dev.quantized_fn("seq_rows_f32")?;
             let values = upload_f32(&dev, "router", &router.dense_f32()?)?;
             Ok(Self {
                 ordinal,
@@ -824,6 +1341,64 @@ pub(super) mod gpu {
             };
             unsafe { b.launch(cfg) }.map_err(|e| Error::msg(format!("seq_row_f32 launch: {e}")))?;
             Ok(y)
+        }
+
+        /// The logits of the `n` rows `x` `[n, inp]` row-major: `[n, out]` row-major.
+        ///
+        /// Each row's logits take the steps of [`Self::logits`].
+        /// The rows go up in groups of the rows a mixer works on at once.
+        pub(crate) fn logits_rows(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
+            self.logits_rows_in(x, n, super::super::hyper::mixer_block_rows())
+        }
+
+        /// [`Self::logits_rows`] with the rows going up `group` at a time.
+        ///
+        /// 1 buffer of `group` rows and 1 of their logits serve every group.
+        /// Both go back to the card's pool when the call returns.
+        pub(crate) fn logits_rows_in(&self, x: &[f32], n: usize, group: usize) -> Result<Vec<f32>> {
+            if x.len() != n * self.inp || n == 0 {
+                return Err(Error::msg(format!(
+                    "{} values for {n} rows of a router of {}",
+                    x.len(),
+                    self.inp
+                )));
+            }
+            let group = group.clamp(1, n);
+            let dev: &CudaDevice = &self.dev;
+            let stream = dev.stream();
+            let mut rows = alloc_f32(dev, "router rows", group * self.inp)?;
+            let y = alloc_f32(dev, "router logits", group * self.out)?;
+            let func = dev.quantized_fn("seq_rows_f32")?;
+            let mut logits = vec![0f32; n * self.out];
+            for (part, at) in x
+                .chunks(group * self.inp)
+                .zip(logits.chunks_mut(group * self.out))
+            {
+                let count = part.len() / self.inp;
+                stream
+                    .memcpy_htod(part, &mut rows.slice_mut(0..part.len()))
+                    .map_err(|e| Error::msg(format!("router rows upload: {e}")))?;
+                let (inp, out, count_i) = (self.inp as i32, self.out as i32, count as i32);
+                let mut b = stream.launch_builder(&func);
+                b.arg(&self.values);
+                b.arg(&rows);
+                b.arg(&y);
+                b.arg(&inp);
+                b.arg(&out);
+                b.arg(&count_i);
+                // A thread per output, 16 rows by 16 outputs a block.
+                let cfg = LaunchConfig {
+                    grid_dim: (self.out.div_ceil(16) as u32, count.div_ceil(16) as u32, 1),
+                    block_dim: (16, 16, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { b.launch(cfg) }
+                    .map_err(|e| Error::msg(format!("seq_rows_f32 launch: {e}")))?;
+                stream
+                    .memcpy_dtoh(&y.slice(0..at.len()), at)
+                    .map_err(|e| Error::msg(format!("router logits download: {e}")))?;
+            }
+            Ok(logits)
         }
 
         /// The logits' count.

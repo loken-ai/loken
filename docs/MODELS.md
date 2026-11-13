@@ -107,6 +107,13 @@ Every card the load was offered takes part, the cards the plan leaves out includ
 A card outside the plan keeps routed experts only: its room is its free memory less a request's work.
 The cards take the experts in heat order, the first card by ordinal the hottest, the next card the next ones.
 Each card runs its experts on a thread of its own, beside the host's cores.
+In a forward of several rows, a card the load measured faster also runs experts it does not keep, after its own.
+Their blocks go up from the host's memory, run over all their rows and are dropped.
+The load's measure gives the cost of each side: the upload rate, the card's product and a host core's product.
+The experts go, the most rows first, to the card or the host core that finishes them soonest.
+A batch in transit takes what the card has free at that moment.
+An expert that does not fit, or whose batch fails, runs on the host.
+A decoded row moves no expert.
 The weights every token reads take their part of the room of the plan's card first: the output projections, the shared experts, the routers and the head.
 The load times each kind on the host and on the card, and keeps it on the card when a byte of it saves more host time than a byte of routed experts.
 The load log names what it measured and kept.

@@ -2419,6 +2419,144 @@ extern "C" __global__ void cx_expert_down_q2_k(
     }
 }
 
+// cx_expert_h_iq2_xxs with the terms staged a pass of the warp's lanes at a time.
+// A pass takes 32 sub-blocks: 4 whole blocks of 8.
+// Each instance's 8 terms of a block are added in order before the next pass.
+// Shared memory holds each instance's terms of a pass and its block shares:
+// (2 * tt * 32 + 2 * tt * (dim / 256)) floats.
+extern "C" __global__ void cx_expert_h_iq2_xxs_lanes(
+        const unsigned long long * __restrict__ gate_ptrs,
+        const unsigned long long * __restrict__ up_ptrs,
+        const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
+        const unsigned char * __restrict__ xq, const int * __restrict__ xrow,
+        const int * __restrict__ tiles, float * __restrict__ h,
+        const int dim, const int inter, const float limit, const int tt) {
+    extern __shared__ float cx_shared[];
+    const int row = blockIdx.x, tile = blockIdx.y, lane = threadIdx.x;
+    const int e = tiles[3 * tile], i0 = tiles[3 * tile + 1], c = tiles[3 * tile + 2];
+    const int sbs = dim / 256, nsub = sbs * 8;
+    float * tg = cx_shared;
+    float * tu = tg + tt * 32;
+    float * sg = tu + tt * 32;
+    float * su = sg + tt * sbs;
+    const unsigned char * gate0 = (const unsigned char *) gate_ptrs[e] + (long) row * sbs * CX_IQ2XXS_BYTES;
+    const unsigned char * up0 = (const unsigned char *) up_ptrs[e] + (long) row * sbs * CX_IQ2XXS_BYTES;
+    for (int u0 = 0; u0 < nsub; u0 += 32) {
+        const int u = u0 + lane;
+        if (u < nsub) {
+            const int ib = u / 8, sub = u % 8;
+            int wg[8], wu[8];
+            float scg, scu;
+            cx_iq2xxs_sub(gate0 + (long) ib * CX_IQ2XXS_BYTES + 2 + 8 * sub, grid, signs, wg, &scg);
+            cx_iq2xxs_sub(up0 + (long) ib * CX_IQ2XXS_BYTES + 2 + 8 * sub, grid, signs, wu, &scu);
+            for (int j = 0; j < c; ++j) {
+                const unsigned char * xb = xq + ((long) xrow[i0 + j] * sbs + ib) * CX_Q8K32_BYTES;
+                const int * a = reinterpret_cast<const int *>(xb + 16 + 32 * sub);
+                int ig = 0, iu = 0;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const int av = a[k];
+                    ig = __dp4a(wg[k], av, ig);
+                    iu = __dp4a(wu[k], av, iu);
+                }
+                const float yd = req_f16_at(xb + 2 * sub);
+                tg[j * 32 + lane] = __fmul_rn(__fmul_rn(scg, (float) ig), yd);
+                tu[j * 32 + lane] = __fmul_rn(__fmul_rn(scu, (float) iu), yd);
+            }
+        }
+        __syncwarp();
+        const int blocks = min(4, sbs - u0 / 8);
+        for (int p = lane; p < c * blocks; p += 32) {
+            const int j = p / blocks, b = p % blocks, ib = u0 / 8 + b;
+            float ag = 0.0f, au = 0.0f;
+            #pragma unroll
+            for (int sub = 0; sub < 8; ++sub) {
+                ag = __fadd_rn(ag, tg[j * 32 + b * 8 + sub]);
+                au = __fadd_rn(au, tu[j * 32 + b * 8 + sub]);
+            }
+            sg[j * sbs + ib] = __fmul_rn(req_f16_at(gate0 + (long) ib * CX_IQ2XXS_BYTES), ag);
+            su[j * sbs + ib] = __fmul_rn(req_f16_at(up0 + (long) ib * CX_IQ2XXS_BYTES), au);
+        }
+        __syncwarp();
+    }
+    if (lane < c) {
+        float g = -0.0f, u = -0.0f;
+        for (int ib = 0; ib < sbs; ++ib) {
+            g = __fadd_rn(g, sg[lane * sbs + ib]);
+            u = __fadd_rn(u, su[lane * sbs + ib]);
+        }
+        h[(long) (i0 + lane) * inter + row] = cx_swiglu(g, u, limit);
+    }
+}
+
+// cx_expert_down_q2_k with the sums staged a pass of the warp's lanes at a time.
+// A pass takes 32 sub-blocks: 2 whole blocks of 16.
+// Shared memory holds each instance's sums of a pass and its block shares:
+// (2 * tt * 32) ints and (tt * (inter / 256)) floats.
+extern "C" __global__ void cx_expert_down_q2_k_lanes(
+        const unsigned long long * __restrict__ down_ptrs,
+        const unsigned char * __restrict__ hq, const int * __restrict__ tiles,
+        float * __restrict__ y, const int inter, const int dim, const int tt) {
+    extern __shared__ int cx_shared_i[];
+    const int row = blockIdx.x, tile = blockIdx.y, lane = threadIdx.x;
+    const int e = tiles[3 * tile], i0 = tiles[3 * tile + 1], c = tiles[3 * tile + 2];
+    const int sbs = inter / 256, nsub = sbs * 16;
+    int * isc = cx_shared_i;
+    int * ioff = isc + tt * 32;
+    float * st = reinterpret_cast<float *>(ioff + tt * 32);
+    const unsigned char * row0 = (const unsigned char *) down_ptrs[e] + (long) row * sbs * CX_Q2K_BYTES;
+    for (int u0 = 0; u0 < nsub; u0 += 32) {
+        const int u = u0 + lane;
+        if (u < nsub) {
+            const int ib = u / 16, s = u % 16, t = s % 8;
+            const unsigned char * b = row0 + (long) ib * CX_Q2K_BYTES;
+            const int base = 32 * (s / 8) + 16 * (t % 2), shift = 2 * (t / 2);
+            int w[4];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                int packed = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    packed |= ((b[16 + base + 4 * k + j] >> shift) & 3) << (8 * j);
+                }
+                w[k] = packed;
+            }
+            const int sc = b[s] & 0x0F, mn = b[s] >> 4;
+            for (int j = 0; j < c; ++j) {
+                const unsigned char * hb = hq + ((long) (i0 + j) * sbs + ib) * CX_Q8K_BYTES;
+                const int * a = reinterpret_cast<const int *>(hb + 4 + 16 * s);
+                int dot = 0;
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) dot = __dp4a(w[k], a[k], dot);
+                isc[j * 32 + lane] = sc * dot;
+                ioff[j * 32 + lane] = mn * (int) reinterpret_cast<const short *>(hb + 260)[s];
+            }
+        }
+        __syncwarp();
+        const int blocks = min(2, sbs - u0 / 16);
+        for (int p = lane; p < c * blocks; p += 32) {
+            const int j = p / blocks, bk = p % blocks, ib = u0 / 16 + bk;
+            int scaled = 0, offset = 0;
+            #pragma unroll
+            for (int s = 0; s < 16; ++s) {
+                scaled += isc[j * 32 + bk * 16 + s];
+                offset += ioff[j * 32 + bk * 16 + s];
+            }
+            const unsigned char * b = row0 + (long) ib * CX_Q2K_BYTES;
+            const unsigned char * hb = hq + ((long) (i0 + j) * sbs + ib) * CX_Q8K_BYTES;
+            const float yd = *reinterpret_cast<const float *>(hb);
+            st[j * sbs + ib] = __fmul_rn(yd, __fsub_rn(__fmul_rn(req_f16_at(b + 80), (float) scaled),
+                                                      __fmul_rn(req_f16_at(b + 82), (float) offset)));
+        }
+        __syncwarp();
+    }
+    if (lane < c) {
+        float acc = -0.0f;
+        for (int ib = 0; ib < sbs; ++ib) acc = __fadd_rn(acc, st[lane * sbs + ib]);
+        y[(long) (i0 + lane) * dim + row] = acc;
+    }
+}
+
 // Routed experts with IQ3_XXS gate and up and a Q3_K down, computed as the host's 256-bit grid and
 // superblock kernels compute them. Those keep eight float accumulators, lane l summing the
 // products of the values whose place in each run of thirty-two is 4l to 4l + 3: per run (IQ3_XXS)
@@ -2858,6 +2996,29 @@ extern "C" __global__ void seq_row_f32(
         for (int j = 0; j < run; ++j) acc = __fadd_rn(acc, __shfl_sync(0xffffffffu, p, j));
     }
     if (lane == 0) y[o] = acc;
+}
+
+// A dense F32 projection of n rows, each as the host takes 1 row: output (r, o) is the fold from
+// -0, in input order, of the products w[o][k] * x[r][k], each rounded once. A thread per output,
+// a block per 16 rows by 16 outputs, the inputs staged 16 at a time in shared memory.
+extern "C" __global__ void seq_rows_f32(
+        const float * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        const int inp, const int out, const int n) {
+    __shared__ float ws[16][17];
+    __shared__ float xs[16][17];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int o0 = blockIdx.x * 16, r0 = blockIdx.y * 16;
+    float acc = -0.0f;
+    for (int k0 = 0; k0 < inp; k0 += 16) {
+        const int k = k0 + tx;
+        ws[ty][tx] = (o0 + ty < out && k < inp) ? w[(long) (o0 + ty) * inp + k] : 0.0f;
+        xs[ty][tx] = (r0 + ty < n && k < inp) ? x[(long) (r0 + ty) * inp + k] : 0.0f;
+        __syncthreads();
+        const int run = min(16, inp - k0);
+        for (int j = 0; j < run; ++j) acc = __fadd_rn(acc, __fmul_rn(ws[tx][j], xs[ty][j]));
+        __syncthreads();
+    }
+    if (o0 + tx < out && r0 + ty < n) y[(long) (r0 + ty) * out + o0 + tx] = acc;
 }
 
 // After a recorded decode's answer: which pairs the transit room runs (late_slots, the expert's

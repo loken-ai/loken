@@ -33,6 +33,12 @@ pub(super) fn emergency_reclaim(dev: &CudaDevice) {
 /// Gives the device's default memory pool back every block it holds free, so memory the pool
 /// cached for transients is available to a graph's allocations and to other allocators.
 pub fn trim_pool(ordinal: usize) {
+    trim_pool_to(ordinal, 0);
+}
+
+/// Gives the device's default memory pool back the blocks it holds free until it reserves `keep`
+/// bytes or holds no free block.
+pub fn trim_pool_to(ordinal: usize, keep: u64) {
     unsafe {
         use crate::tensor::gpu_runtime::driver::sys::{
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cuMemPoolSetAttribute,
@@ -57,7 +63,7 @@ pub fn trim_pool(ordinal: usize) {
             CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
             &zero as *const u64 as *mut std::ffi::c_void,
         );
-        let _ = cuMemPoolTrimTo(pool, 0);
+        let _ = cuMemPoolTrimTo(pool, keep as usize);
         let _ = cuMemPoolSetAttribute(
             pool,
             CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
