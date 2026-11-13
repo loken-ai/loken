@@ -12,6 +12,10 @@
 //! - a prompt admits its experts at the tick of the last row that routed to each,
 //! - an expert the tier does not keep leaves the page cache once computed.
 //!
+//! A card that reads its experts in transit past the page cache reads through it those the tier
+//! keeps after the forward.
+//! The tier admits those, and none of the others.
+//!
 //! The kept expert that gives way is ranked 1 of 2 ways:
 //! - by recency, the least recent first,
 //! - by decoded count, the one the fewest decoded rows routed to since the load first, then the
@@ -772,6 +776,26 @@ impl LayerKeep {
             }
         }
         gone
+    }
+
+    /// Per expert of `on_host`, whether the layer keeps it once a forward of `rows` rows that
+    /// computed `on_host` admits them, `last[i]` the last row routed to `on_host[i]`.
+    ///
+    /// The tier does not change.
+    pub(crate) fn would_keep(&self, on_host: &[usize], last: &[usize], rows: usize) -> Vec<bool> {
+        let capacity = self.tier.capacity();
+        let mut set = self.set().clone();
+        match decoded_rows(rows) {
+            true => {
+                set.decoded(on_host, capacity);
+            }
+            false => {
+                let routed: Vec<(usize, usize)> =
+                    on_host.iter().copied().zip(last.iter().copied()).collect();
+                set.prompted(&routed, rows, capacity);
+            }
+        }
+        on_host.iter().map(|&e| set.is_kept(e)).collect()
     }
 
     /// Drops the pages of `experts` from the page cache, off this thread.

@@ -662,8 +662,13 @@ impl RoutedFfn {
         // Every host expert's bytes are asked for at once, on the tier's reader threads where it
         // has them, so the reads overlap the bookkeeping and the compute.
         // The experts in transit come first, in the order the cards take them.
+        // Cards that read their experts in transit from the file themselves leave the queue to
+        // the host's experts.
         let asked = std::time::Instant::now();
-        let longest = moving.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
+        let longest = match self.card.transit_reads_direct() {
+            true => 0,
+            false => moving.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0),
+        };
         let read_order: Vec<usize> = (0..longest)
             .flat_map(|i| {
                 moving
@@ -700,6 +705,21 @@ impl RoutedFfn {
                 t.kept(&on_host, &routes, &on_card, n)
             },
         );
+        // Cards that read their experts in transit past the page cache read through it those the
+        // tier keeps after this forward.
+        // The others the host never holds.
+        let (through_cache, past_cache): (Vec<usize>, Vec<usize>) =
+            match (tier, self.card.transit_reads_direct()) {
+                (Some(t), true) => {
+                    let after = t.would_keep(&on_host, &last, n);
+                    moved
+                        .iter()
+                        .copied()
+                        .partition(|e| on_host.iter().zip(&after).any(|(h, &k)| k && h == e))
+                }
+                (None, true) => (Vec::new(), moved.clone()),
+                (_, false) => (Vec::new(), Vec::new()),
+            };
         self.note_served(&assign, &on_card, &on_host, &kept, &moved, n);
         crate::inference::stage_prof::prof_record(
             "experts: tier",
@@ -786,6 +806,7 @@ impl RoutedFfn {
                         self.limit,
                         shared_on_card,
                         &given,
+                        &through_cache,
                         &self.experts,
                     )
                 })
@@ -815,7 +836,8 @@ impl RoutedFfn {
         let host_outs = host_outs?;
         // The tier admits or lets go what the host computed, by the kind of rows.
         if let Some(t) = tier {
-            t.computed(&on_host, &last, n);
+            let (held, held_last) = host_held(&on_host, &last, &past_cache);
+            t.computed(&held, &held_last, n);
         }
         // A card that failed leaves the shared expert to the host.
         if let Some(s) = self.shared.as_ref().filter(|_| shared_on_card) {
@@ -904,6 +926,24 @@ pub struct SinkhornBlock {
     pub card_mix: super::wide_sparse_card_stream::CardSinkhorn,
     /// Where a layer a block draft reads adds its input.
     pub capture: Option<LayerCapture>,
+}
+
+/// The experts of `on_host` whose bytes a forward read into host memory, each with its entry of
+/// `last`.
+///
+/// An expert of `past_cache`, which a card read past the page cache in transit, is not in host
+/// memory: it leaves the list.
+pub(super) fn host_held(
+    on_host: &[usize],
+    last: &[usize],
+    past_cache: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    on_host
+        .iter()
+        .zip(last)
+        .filter(|(e, _)| !past_cache.contains(e))
+        .map(|(&e, &l)| (e, l))
+        .unzip()
 }
 
 /// The token mixer's half of a layer over the residual rows `r` `[1, seq, streams * hidden]` at

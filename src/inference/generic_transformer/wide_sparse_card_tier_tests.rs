@@ -371,6 +371,14 @@ fn experts_in_transit_give_the_hosts_bits_on_every_record() {
     for room in [0u64, 3] {
         let mut model = with_card_experts(&path, room);
         model.open_wide_transit(&[(0, fast.clone())]);
+        // The experts leave the page cache: the card reads those it moves from the file.
+        for b in model.layers.iter().filter_map(|l| l.sinkhorn.as_ref()) {
+            for e in &b.ffn.experts {
+                e.gate.dont_need();
+                e.up.dont_need();
+                e.down.dont_need();
+            }
+        }
         let mut got = BTreeMap::new();
         record_generic(&mut model, &tokens, 0, &mut got);
         for record in RECORDS {
@@ -388,6 +396,104 @@ fn experts_in_transit_give_the_hosts_bits_on_every_record() {
             .map(|b| b.ffn.card.pairs_moved())
             .sum();
         assert!(moved > 0, "room of {room} experts: no pair ran in transit");
+        // The layers share the cards in transit.
+        let card = model
+            .layers
+            .iter()
+            .filter_map(|l| l.sinkhorn.as_ref())
+            .map(|b| &b.ffn.card)
+            .next()
+            .expect("a wide layer");
+        let direct = card.transit_bytes_read_direct();
+        println!("room of {room} experts: {direct} bytes read past the page cache");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a prompt whose experts a card took in transit, the host tier keeps the experts it keeps
+/// after the same prompt on the host's cores.
+/// Each kept expert whose pages the host's prompt left in memory is in memory too.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_prompt_in_transit_leaves_the_host_tier_as_a_prompt_on_the_host_does() {
+    use super::wide_sparse_card_tier::CardMeasure;
+    use super::wide_sparse_host_tier::{expert_spans, HostTier};
+    use std::collections::BTreeMap;
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let dir = scratch("transit-tier");
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    let tokens = prompt();
+    // A measure by which the card always finishes an expert first.
+    let fast = CardMeasure {
+        experts: 1,
+        host_secs: 1.0,
+        card_secs: 1e-9,
+        bytes: 1,
+        upload_secs: 1e-15,
+    };
+    // Per wide layer, each expert the tier keeps and whether its pages are all in memory.
+    let held = |model: &GenericHeteroTransformer| -> Vec<Vec<(usize, bool)>> {
+        model
+            .layers
+            .iter()
+            .filter_map(|l| l.sinkhorn.as_ref())
+            .map(|b| {
+                let keep = b.ffn.host.as_ref().expect("a host tier");
+                (0..b.ffn.experts.len())
+                    .filter(|&e| keep.keeps(e))
+                    .map(|e| {
+                        let absent: u64 = expert_spans(&b.ffn.experts[e])
+                            .iter()
+                            .map(|&(at, len)| crate::tensor::mapped::absent_bytes(at, len))
+                            .sum();
+                        (e, absent == 0)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let mut runs = Vec::new();
+    for transit in [false, true] {
+        let mut model = with_card_experts(&path, 0);
+        if transit {
+            model.open_wide_transit(&[(0, fast.clone())]);
+        }
+        model.attach_host_tier(&std::sync::Arc::new(HostTier::new(2, 8, 0, 1, None)));
+        // The experts leave the page cache: the prompt reads those it computes.
+        for b in model.layers.iter().filter_map(|l| l.sinkhorn.as_ref()) {
+            for e in &b.ffn.experts {
+                e.gate.dont_need();
+                e.up.dont_need();
+                e.down.dont_need();
+            }
+        }
+        let mut got = BTreeMap::new();
+        record_generic(&mut model, &tokens, 0, &mut got);
+        if transit {
+            let moved: u64 = model
+                .layers
+                .iter()
+                .filter_map(|l| l.sinkhorn.as_ref())
+                .map(|b| b.ffn.card.pairs_moved())
+                .sum();
+            assert!(moved > 0, "no pair ran in transit");
+        }
+        runs.push(held(&model));
+    }
+    let ids = |run: &[Vec<(usize, bool)>]| -> Vec<Vec<usize>> {
+        run.iter()
+            .map(|l| l.iter().map(|&(e, _)| e).collect())
+            .collect()
+    };
+    assert_eq!(ids(&runs[1]), ids(&runs[0]));
+    for (l, (host, card)) in runs[0].iter().zip(&runs[1]).enumerate() {
+        for (&(e, there), &(_, here)) in host.iter().zip(card) {
+            assert!(!there || here, "layer {l}: kept expert {e} not in memory");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1086,7 +1192,7 @@ fn a_transit_batch_takes_only_its_room_and_keeps_the_hosts_bits() {
     );
     let one = transit.need(given[0].0, n);
     let batches = std::cell::Cell::new(0);
-    let outs = transit.run_within(&given, &x, dim, limit, || {
+    let outs = transit.run_within(&given, &[], &x, dim, limit, || {
         batches.set(batches.get() + 1);
         one + one / 2
     });
@@ -1095,11 +1201,81 @@ fn a_transit_batch_takes_only_its_room_and_keeps_the_hosts_bits() {
     for (k, w) in want.iter().enumerate() {
         assert_eq!(got[k].as_ref(), Some(w), "expert {k} in a room for 1");
     }
-    let outs = transit.run_within(&given, &x, dim, limit, || one - 1);
+    let outs = transit.run_within(&given, &[], &x, dim, limit, || one - 1);
     assert!(outs.iter().all(Option::is_none), "a room short of 1 expert");
-    let got = transit_bits(&transit.run(&given, &x, dim, limit));
+    let got = transit_bits(&transit.run(&given, &[], &x, dim, limit));
     for (k, w) in want.iter().enumerate() {
         assert_eq!(got[k].as_ref(), Some(w), "expert {k} in the card's room");
+    }
+    drop(model);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Experts in transit that the page cache does not hold are read past it, and give the bits of
+/// the same experts read from the mapping and of the host.
+///
+/// The file lies beside the test binary, on a file system that takes direct reads.
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+#[test]
+fn experts_read_past_the_page_cache_give_the_mapped_bits() {
+    use std::os::fd::AsRawFd;
+    if crate::tensor::Device::new_cuda(0).is_err() {
+        eprintln!("no card 0: skipped");
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe
+        .parent()
+        .unwrap()
+        .join(format!("loken-transit-direct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("model.gguf");
+    card_format_file(&path);
+    std::fs::File::open(&path).unwrap().sync_all().unwrap();
+    let model = generic_of(open_mapped(&path).unwrap());
+    let (transit, experts, x, limit) = transit_case(&model);
+    let dim = model.config.embedding_length;
+    let n = x.len() / dim;
+    let rows: Vec<usize> = (0..n).collect();
+    let given: Vec<_> = experts
+        .iter()
+        .take(4)
+        .map(|e| (e, rows.as_slice()))
+        .collect();
+    // The experts leave this process's mapping, then the page cache.
+    for (e, _) in &given {
+        e.gate.unmap_pages();
+        e.up.unmap_pages();
+        e.down.unmap_pages();
+    }
+    let file = std::fs::File::open(&path).unwrap();
+    // Safety: a valid descriptor; advice only.
+    let advised = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    assert_eq!(advised, 0, "the page cache drops the file");
+    let direct = transit_bits(&transit.run(&given, &[], &x, dim, limit));
+    let read = transit.bytes_read_direct();
+    assert!(read > 0, "no block was read past the page cache");
+    // The host reads the experts through the mapping: the page cache holds them again.
+    let want = host_bits(
+        &given.iter().map(|g| g.0).collect::<Vec<_>>(),
+        &x,
+        dim,
+        limit,
+    );
+    let mapped = transit_bits(&transit.run(&given, &[], &x, dim, limit));
+    assert_eq!(
+        transit.bytes_read_direct(),
+        read,
+        "the cached experts go up from the mapping"
+    );
+    for (k, w) in want.iter().enumerate() {
+        assert_eq!(
+            direct[k].as_ref(),
+            Some(w),
+            "expert {k} read past the cache"
+        );
+        assert_eq!(mapped[k].as_ref(), Some(w), "expert {k} from the mapping");
     }
     drop(model);
     let _ = std::fs::remove_dir_all(&dir);

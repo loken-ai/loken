@@ -112,6 +112,8 @@ Their blocks go up from the host's memory, run over all their rows and are dropp
 The load's measure gives the cost of each side: the upload rate, the card's product and a host core's product.
 The experts go, the most rows first, to the card or the host core that finishes them soonest.
 A batch in transit takes what the card has free at that moment.
+An expert a card read from the file past the page cache does not join the experts the host keeps.
+A card reads through the page cache the experts in transit the host keeps after the prompt.
 An expert that does not fit, or whose batch fails, runs on the host.
 A decoded row moves no expert.
 The weights every token reads take their part of the room of the plan's card first: the output projections, the shared experts, the routers and the head.

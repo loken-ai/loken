@@ -360,3 +360,67 @@ fn a_read_ahead_follows_the_truncation_of_the_next_router() {
     assert!(replaced.iter().all(|e| !guess.read.contains(e)));
     assert!(!guess.read.contains(&outside));
 }
+
+/// The tier admits after a prompt only the experts whose bytes the host read: an expert a card
+/// read past the page cache in transit stays out, one read through the page cache comes in.
+#[test]
+fn an_expert_read_past_the_page_cache_in_transit_is_not_admitted() {
+    use super::wide_sparse_layer::host_held;
+    let (on_host, last, moved) = ([1usize, 3, 5, 6], [10usize, 62, 20, 63], [3usize, 6]);
+    assert_eq!(
+        host_held(&on_host, &last, &moved),
+        (vec![1, 5], vec![10, 20])
+    );
+    assert_eq!(
+        host_held(&on_host, &last, &[]),
+        (on_host.to_vec(), last.to_vec())
+    );
+    for (past, want) in [(&moved[..], vec![1, 5]), (&[][..], vec![3, 6])] {
+        let (ratios, kv_src, index_src) = LAYOUTS[0];
+        let mut model = generic(ratios, kv_src, index_src);
+        let keeps = model.attach_host_tier(&tier(2, None));
+        let k = &keeps[0];
+        let (held, held_last) = host_held(&on_host, &last, past);
+        k.computed(&held, &held_last, 64);
+        assert_eq!((0..8).filter(|&e| k.keeps(e)).collect::<Vec<_>>(), want);
+    }
+}
+
+/// What the tier says it would keep after a forward is what it keeps once the forward's experts
+/// are admitted, and asking changes nothing.
+///
+/// Reading through the page cache the experts in transit it would keep, and past it the others,
+/// leaves the tier as reading every expert through the page cache does.
+#[test]
+fn the_experts_a_prompt_leaves_in_the_tier_are_those_it_would_keep() {
+    use super::wide_sparse_layer::host_held;
+    let (on_host, last, moved) = ([1usize, 3, 5, 6], [10usize, 62, 20, 63], [3usize, 5, 6]);
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    for rows in [64usize, 1] {
+        let mut model = generic(ratios, kv_src, index_src);
+        let keeps = model.attach_host_tier(&tier(2, None));
+        let all = &keeps[0];
+        let before: Vec<usize> = (0..8).filter(|&e| all.keeps(e)).collect();
+        let after = all.would_keep(&on_host, &last, rows);
+        assert_eq!((0..8).filter(|&e| all.keeps(e)).collect::<Vec<_>>(), before);
+        all.computed(&on_host, &last, rows);
+        let want: Vec<bool> = on_host.iter().map(|&e| all.keeps(e)).collect();
+        assert_eq!(after, want, "{rows} rows");
+        let mut model = generic(ratios, kv_src, index_src);
+        let keeps = model.attach_host_tier(&tier(2, None));
+        let some = &keeps[0];
+        let after = some.would_keep(&on_host, &last, rows);
+        let past: Vec<usize> = moved
+            .iter()
+            .copied()
+            .filter(|e| on_host.iter().zip(&after).any(|(h, &k)| !k && h == e))
+            .collect();
+        let (held, held_last) = host_held(&on_host, &last, &past);
+        some.computed(&held, &held_last, rows);
+        assert_eq!(
+            (0..8).filter(|&e| some.keeps(e)).collect::<Vec<_>>(),
+            (0..8).filter(|&e| all.keeps(e)).collect::<Vec<_>>(),
+            "{rows} rows"
+        );
+    }
+}

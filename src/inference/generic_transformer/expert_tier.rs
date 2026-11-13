@@ -65,7 +65,7 @@ impl TierState {
     }
 }
 
-mod direct;
+pub(crate) mod direct;
 mod exact;
 mod graph;
 mod hot;
@@ -3631,7 +3631,7 @@ impl LayerTier {
                 };
             }
             if let BounceState::Open(b) = &mut *state {
-                let (n, err) = b.upload(off, to - from, dst + (from - a) as u64, copy);
+                let (n, err) = b.upload(off, to - from, dst + (from - a) as u64, copy, false);
                 done = n;
                 if err.is_some() {
                     *state = BounceState::Off;

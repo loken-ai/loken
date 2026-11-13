@@ -349,6 +349,27 @@ impl CardExperts {
         let _ = (ns, pairs);
     }
 
+    /// Whether every card that may run experts it does not keep reads them from their file
+    /// itself, past the page cache.
+    pub fn transit_reads_direct(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            !self.transit.is_empty() && self.transit.iter().all(|t| t.reads_direct())
+        }
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
+    /// Bytes of experts in transit the cards read past the page cache since the load.
+    pub fn transit_bytes_read_direct(&self) -> u64 {
+        #[cfg(feature = "gpu")]
+        {
+            self.transit.iter().map(|t| t.bytes_read_direct()).sum()
+        }
+        #[cfg(not(feature = "gpu"))]
+        0
+    }
+
     /// Per card that may run experts it does not keep, its ordinal and its costs now.
     pub fn transit_costs(&self) -> Vec<(usize, TransitCost)> {
         #[cfg(feature = "gpu")]
@@ -546,13 +567,15 @@ impl CardExperts {
         limit: f32,
         shared: bool,
     ) -> (Option<Vec<f32>>, Vec<Option<Vec<f32>>>) {
-        let (shared, kept, _) = self.run_cards_moving(ids, rows, x, dim, limit, shared, &[], &[]);
+        let (shared, kept, _) =
+            self.run_cards_moving(ids, rows, x, dim, limit, shared, &[], &[], &[]);
         (shared, kept)
     }
 
     /// [`Self::run_cards`], and on each card of `moving`, after its kept experts, the experts
     /// it takes in transit, read from `experts` by id.
     ///
+    /// The blocks of an expert of `through_cache` go up through the page cache.
     /// Answers per entry of `moving`, per expert it gives, its outputs `[rows, dim]` row-major.
     /// An expert in transit that did not run answers `None`: the caller runs it on the host.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -565,6 +588,7 @@ impl CardExperts {
         limit: f32,
         shared: bool,
         moving: &[(usize, Vec<(usize, Vec<usize>)>)],
+        through_cache: &[usize],
         experts: &[BlockScaledExpert],
     ) -> (
         Option<Vec<f32>>,
@@ -615,9 +639,11 @@ impl CardExperts {
                             .iter()
                             .filter_map(|(e, r)| experts.get(*e).map(|x| (x, r.as_slice())))
                             .collect();
+                        let cached: Vec<bool> =
+                            m.iter().map(|(e, _)| through_cache.contains(e)).collect();
                         let started = std::time::Instant::now();
                         let outs = match given.len() == m.len() {
-                            true => t.run(&given, x, dim, limit),
+                            true => t.run(&given, &cached, x, dim, limit),
                             false => vec![None; m.len()],
                         };
                         crate::inference::stage_prof::prof_record(
@@ -716,7 +742,7 @@ impl CardExperts {
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (rows, x, dim, limit, shared, experts);
+            let _ = (rows, x, dim, limit, shared, through_cache, experts);
             (
                 None,
                 vec![None; ids.len()],
@@ -970,6 +996,23 @@ pub(super) mod gpu {
         /// Totals measured since the load: nanoseconds of uploads and their bytes, nanoseconds
         /// of runs and their tiles, host core nanoseconds and their pairs.
         totals: [std::sync::atomic::AtomicU64; 6],
+        /// Bytes of the largest weight of an expert: what 1 direct read carries.
+        unit: usize,
+        /// The direct reader of the experts' file.
+        bounce: std::sync::Mutex<Reader>,
+        /// Bytes read past the page cache since the load.
+        direct: std::sync::atomic::AtomicU64,
+    }
+
+    /// The state of a transit's direct reader.
+    enum Reader {
+        /// Not opened yet, or opened on another file.
+        Closed,
+        /// 1 direct reader a reader thread.
+        #[cfg(target_os = "linux")]
+        Open(Vec<super::super::expert_tier::direct::Bounce>),
+        /// Failed once: the experts go up from where they lie.
+        Off,
     }
 
     impl Transit {
@@ -987,6 +1030,11 @@ pub(super) mod gpu {
             };
             let tables = expert_tables(&dev, format)?;
             let dims = like.gate.dims();
+            let unit = like
+                .gate
+                .bytes()
+                .max(like.up.bytes())
+                .max(like.down.bytes());
             Ok(Self {
                 ordinal,
                 device,
@@ -995,7 +1043,168 @@ pub(super) mod gpu {
                 dims: (dims[1], dims[0]),
                 measured: cost,
                 totals: Default::default(),
+                unit,
+                bounce: std::sync::Mutex::new(Reader::Closed),
+                direct: Default::default(),
             })
+        }
+
+        /// Bytes read past the page cache since the load.
+        pub(crate) fn bytes_read_direct(&self) -> u64 {
+            self.direct.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Whether the experts go up through the direct reader, until a read fails.
+        pub(crate) fn reads_direct(&self) -> bool {
+            let state = self.bounce.lock().unwrap_or_else(|e| e.into_inner());
+            cfg!(target_os = "linux") && !matches!(*state, Reader::Off)
+        }
+
+        /// The blocks `parts` on the card, in their order.
+        ///
+        /// Blocks a mapped file holds and the page cache does not are read past the cache into
+        /// page-locked memory by the reader threads, each queueing its copies on the card's
+        /// stream while it reads the next ones.
+        /// The reader threads read a block of `through` through the page cache instead.
+        /// Other blocks, and those of a direct read that fails, go up from where they lie.
+        fn upload(&self, parts: &[&[u8]], through: &[bool]) -> Result<Vec<CudaSlice<u8>>> {
+            let mut on_card: Vec<Option<CudaSlice<u8>>> = parts.iter().map(|_| None).collect();
+            #[cfg(target_os = "linux")]
+            self.upload_direct(parts, through, &mut on_card);
+            #[cfg(not(target_os = "linux"))]
+            let _ = through;
+            parts
+                .iter()
+                .zip(on_card)
+                .map(|(b, up)| match up {
+                    Some(up) => Ok(up),
+                    None => self
+                        .dev
+                        .stream()
+                        .clone_htod(*b)
+                        .map_err(|err| Error::msg(format!("expert upload in transit: {err}"))),
+                })
+                .collect()
+        }
+
+        /// [`Self::upload`] through the direct readers: fills `on_card[i]` for each part of
+        /// `parts` they read whole.
+        ///
+        /// A part of `through` is read through the page cache.
+        #[cfg(target_os = "linux")]
+        fn upload_direct(
+            &self,
+            parts: &[&[u8]],
+            through: &[bool],
+            on_card: &mut [Option<CudaSlice<u8>>],
+        ) {
+            use super::super::expert_tier::direct::{residency, Bounce};
+            use crate::tensor::gpu_runtime::driver::DevicePtr;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            let warn = |e: &str| {
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("card {}: direct expert reads off: {e}", self.ordinal);
+                }
+            };
+            let Some(page) = crate::tensor::mapped::page_size() else {
+                return;
+            };
+            // Per part a mapped file holds and the page cache does not hold whole: its place,
+            // its file and its offset there.
+            let wanted: Vec<(usize, Arc<std::fs::File>, u64)> = parts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let start = b.as_ptr() as usize;
+                    let (file, off) = crate::tensor::mapped::file_span(start, b.len())?;
+                    let cached = residency(start, b.len(), page)
+                        .is_some_and(|runs| runs.iter().all(|r| r.2));
+                    (!cached).then_some((i, file, off))
+                })
+                .collect();
+            let Some(file) = wanted.first().map(|w| w.1.clone()) else {
+                return;
+            };
+            let mut state = self.bounce.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(&*state, Reader::Open(r) if r.first().is_some_and(|b| !b.reads(&file))) {
+                *state = Reader::Closed;
+            }
+            if matches!(*state, Reader::Closed) {
+                // As many readers as reach the disk's rate on reads of 1 weight.
+                let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+                let count = super::super::expert_readahead::probe_readers(&file, self.unit, cores)
+                    .unwrap_or(1);
+                *state = match (0..count)
+                    .map(|_| Bounce::open(&file, self.unit.max(page), page))
+                    .collect::<std::result::Result<Vec<Bounce>, String>>()
+                {
+                    Ok(r) => Reader::Open(r),
+                    Err(e) => {
+                        warn(&e);
+                        Reader::Off
+                    }
+                };
+            }
+            let Reader::Open(readers) = &mut *state else {
+                return;
+            };
+            let stream = self.dev.stream();
+            // Every byte is written by the copies the readers queue before a kernel reads it.
+            let jobs: Vec<(usize, u64, CudaSlice<u8>)> = wanted
+                .iter()
+                .filter(|w| Arc::ptr_eq(&w.1, &file))
+                .filter_map(|(i, _, off)| {
+                    let up = unsafe { stream.alloc::<u8>(parts[*i].len()) }.ok()?;
+                    Some((*i, *off, up))
+                })
+                .collect();
+            let next = AtomicUsize::new(0);
+            let failed: Vec<AtomicBool> = jobs.iter().map(|_| AtomicBool::new(false)).collect();
+            std::thread::scope(|scope| {
+                for reader in readers.iter_mut() {
+                    let (jobs, next, failed, warn) = (&jobs, &next, &failed, &warn);
+                    scope.spawn(move || {
+                        if self.dev.context().bind_to_thread().is_err() {
+                            return;
+                        }
+                        loop {
+                            let k = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((i, off, up)) = jobs.get(k) else {
+                                return;
+                            };
+                            let len = parts[*i].len();
+                            let at = {
+                                let (at, _sync) = up.device_ptr(stream);
+                                at
+                            };
+                            let cached = through.get(*i).copied().unwrap_or(false);
+                            let (done, err) = reader.upload(*off, len, at, stream, cached);
+                            if err.is_some() || done < len {
+                                failed[k].store(true, Ordering::Relaxed);
+                                warn(&err.unwrap_or_else(|| "a short read".to_string()));
+                            }
+                        }
+                    });
+                }
+            });
+            // A part no reader took, or one whose read failed, goes up from the mapping.
+            let taken = next.load(Ordering::Relaxed);
+            let mut off = false;
+            for (k, (i, _, up)) in jobs.into_iter().enumerate() {
+                if k >= taken || failed[k].load(Ordering::Relaxed) {
+                    off |= k < taken;
+                    continue;
+                }
+                if !through.get(i).copied().unwrap_or(false) {
+                    self.direct
+                        .fetch_add(parts[i].len() as u64, Ordering::Relaxed);
+                }
+                on_card[i] = Some(up);
+            }
+            if off {
+                *state = Reader::Off;
+            }
         }
 
         /// The costs now: each the ratio of its totals since the load once it has some, the
@@ -1066,20 +1275,23 @@ pub(super) mod gpu {
         /// The pool then gives the driver back what it reserved for the batch.
         /// An expert of another format or shape, one that does not fit alone, and those of a
         /// batch that fails answer `None`.
+        /// The blocks of `experts[i]` go up through the page cache when `cached[i]` holds.
         pub(crate) fn run(
             &self,
             experts: &[(&BlockScaledExpert, &[usize])],
+            cached: &[bool],
             x: &[f32],
             dim: usize,
             limit: f32,
         ) -> Vec<Option<Vec<f32>>> {
-            self.run_within(experts, x, dim, limit, || self.room_now())
+            self.run_within(experts, cached, x, dim, limit, || self.room_now())
         }
 
         /// [`Self::run`] with each batch's room read from `room`.
         pub(crate) fn run_within(
             &self,
             experts: &[(&BlockScaledExpert, &[usize])],
+            cached: &[bool],
             x: &[f32],
             dim: usize,
             limit: f32,
@@ -1122,7 +1334,8 @@ pub(super) mod gpu {
                     i += 1;
                     continue;
                 }
-                match self.run_batch(&experts[i..end], &xq, limit) {
+                let through = cached.get(i..end).unwrap_or(&[]);
+                match self.run_batch(&experts[i..end], through, &xq, limit) {
                     Ok(ys) => {
                         for (k, y) in ys.into_iter().enumerate() {
                             out[i + k] = Some(y);
@@ -1143,24 +1356,32 @@ pub(super) mod gpu {
         }
 
         /// The outputs of `experts` over their rows of `xq`, their blocks moved up for the run.
+        ///
+        /// The blocks of `experts[i]` go up through the page cache when `cached[i]` holds.
         fn run_batch(
             &self,
             experts: &[(&BlockScaledExpert, &[usize])],
+            cached: &[bool],
             xq: &CudaSlice<u8>,
             limit: f32,
         ) -> Result<Vec<Vec<f32>>> {
             let stream = self.dev.stream();
-            let up = |p: &Projection| -> Result<CudaSlice<u8>> {
-                let b = blocks(p)?;
-                stream
-                    .clone_htod(b.as_ref())
-                    .map_err(|err| Error::msg(format!("expert upload in transit: {err}")))
-            };
             let started = std::time::Instant::now();
-            let held = experts
+            let stored = experts
                 .iter()
-                .map(|(e, _)| Ok([up(&e.gate)?, up(&e.up)?, up(&e.down)?]))
-                .collect::<Result<Vec<[CudaSlice<u8>; 3]>>>()?;
+                .flat_map(|(e, _)| [&e.gate, &e.up, &e.down])
+                .map(blocks)
+                .collect::<Result<Vec<_>>>()?;
+            let parts: Vec<&[u8]> = stored.iter().map(|b| b.as_ref()).collect();
+            // 3 blocks an expert.
+            let through: Vec<bool> = (0..parts.len())
+                .map(|p| cached.get(p / 3).copied().unwrap_or(false))
+                .collect();
+            let mut up = self.upload(&parts, &through)?.into_iter();
+            let mut held: Vec<[CudaSlice<u8>; 3]> = Vec::with_capacity(experts.len());
+            while let (Some(g), Some(u), Some(d)) = (up.next(), up.next(), up.next()) {
+                held.push([g, u, d]);
+            }
             let bytes: u64 = experts.iter().map(|(e, _)| expert_bytes(e)).sum();
             self.add(0, started.elapsed().as_nanos() as u64, bytes);
             let started = std::time::Instant::now();

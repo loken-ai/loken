@@ -1,6 +1,8 @@
 //! Reads of expert bytes that bypass the page cache, for the parts of a prefill's upload whose
 //! pages the cache does not hold: a direct read into a page-locked bounce buffer, then a copy to
 //! the card, so a layer streamed once does not evict the experts the decode reads next.
+//!
+//! The experts a card runs in transit go up through the same reader.
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
@@ -44,7 +46,7 @@ pub(super) fn split_by_residency(
 
 /// Which bytes of `[start, start + len)` the page cache holds, or `None` when that is unknown.
 #[cfg(target_os = "linux")]
-pub(super) fn residency(
+pub(crate) fn residency(
     start: usize,
     len: usize,
     page: usize,
@@ -60,7 +62,7 @@ pub(super) fn residency(
 /// A stage's direct reader: an `O_DIRECT` handle on the weights' file and two page-locked bounce
 /// buffers used in turn, each guarded by the event of the last copy out of it.
 #[cfg(target_os = "linux")]
-pub(super) struct Bounce {
+pub(crate) struct Bounce {
     source: Arc<File>,
     direct: File,
     bufs: [*mut u8; 2],
@@ -78,7 +80,7 @@ unsafe impl Send for Bounce {}
 #[cfg(target_os = "linux")]
 impl Bounce {
     /// A reader for `source` whose chunks carry up to `payload` bytes (the largest run's unit).
-    pub(super) fn open(source: &Arc<File>, payload: usize, page: usize) -> Result<Self, String> {
+    pub(crate) fn open(source: &Arc<File>, payload: usize, page: usize) -> Result<Self, String> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         let direct = std::fs::OpenOptions::new()
@@ -115,20 +117,27 @@ impl Bounce {
     }
 
     /// Whether this reader reads `file`.
-    pub(super) fn reads(&self, file: &Arc<File>) -> bool {
+    pub(crate) fn reads(&self, file: &Arc<File>) -> bool {
         Arc::ptr_eq(&self.source, file)
     }
 
     /// Read `len` file bytes from `file_off` and queue their copy to `dst` on `stream`. Returns
     /// the bytes queued and the error that stopped the rest, if any.
-    pub(super) fn upload(
+    ///
+    /// With `cached` the bytes are read through the page cache, which keeps them.
+    pub(crate) fn upload(
         &mut self,
         file_off: u64,
         len: usize,
         dst: u64,
         stream: &crate::tensor::gpu_runtime::driver::CudaStream,
+        cached: bool,
     ) -> (usize, Option<String>) {
         use std::os::unix::fs::FileExt;
+        let file: &File = match cached {
+            true => &self.source,
+            false => &self.direct,
+        };
         let mut done = 0;
         while done < len {
             let n = (len - done).min(self.payload);
@@ -144,7 +153,7 @@ impl Bounce {
             let buf = unsafe { std::slice::from_raw_parts_mut(self.bufs[i], cover) };
             let mut got = 0;
             while got < skip + n {
-                match self.direct.read_at(&mut buf[got..], lo + got as u64) {
+                match file.read_at(&mut buf[got..], lo + got as u64) {
                     Ok(0) => return (done, Some("direct read past the end".to_string())),
                     Ok(k) => got += k,
                     Err(e) => return (done, Some(format!("direct read: {e}"))),
