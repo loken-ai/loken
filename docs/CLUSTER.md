@@ -44,7 +44,7 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 | `GET /api/cluster/peers` | none | `clustered` and `peers`. Each peer has `node_id`, `endpoint`, `alive`, `phi`, `rtt_ms`, `is_self` and `state`. |
 | `POST /api/cluster/prefix` | `model`, `prompt` | `cached_tokens`: how many tokens of the prompt this node holds in its prefix cache. A model that is not resident answers 0. |
 | `POST /api/cluster/measure` | `model` | `card_ms`, `host_ms`, `card_bytes`: what a layer of the model costs on this node. A head that plans the cut of a dense model asks it of a peer that has no cost for the model yet. |
-| `POST /api/cluster/prefill` | `model`, `prompt` | `application/octet-stream`: the KV cache after reading the prompt, which the asking node imports and decodes from. |
+| `POST /api/cluster/prefill` | `model`, `prompt` | `application/octet-stream`: the KV cache after reading the prompt, which the asking node imports and decodes from. A node whose `Accept` names `application/vnd.loken.prefill-stream` gets lines of JSON instead: `done` and `total` as the reading goes, then `handover` with the byte length of the KV cache that follows. A failed reading sends `error`. |
 | `POST /api/pipeline/tail` | `model`, `from`, `to`, `next`, `context` | `port`: the wire port. The node serves layers `[from, to)` and relays to `next`, a `host:port`, unless it holds the last segment. |
 
 `measure`, `prefill` and `pipeline/tail` are calls between nodes.  

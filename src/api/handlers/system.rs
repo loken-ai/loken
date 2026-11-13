@@ -176,19 +176,64 @@ pub(crate) struct ClusterPrefillRequest {
 
 /// Read a prompt for another instance serving the same model and answer its KV cache, which
 /// that instance imports and decodes from.
+/// An instance that accepts the streamed answer hears the reading as it goes, then the cache.
 pub(crate) async fn cluster_prefill(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ClusterPrefillRequest>,
 ) -> Result<axum::response::Response, ApiError> {
+    use crate::distributed::prefill_stream::{self, Record};
     validate_model_id(&req.model)?;
     let name = normalize_model_id(&req.model);
-    let bytes = state
-        .read_prompt_for_peer(&name, &req.prompt)
-        .await
-        .map_err(ApiError::Internal)?;
+    let streamed = headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(prefill_stream::accepted);
+    if !streamed {
+        let bytes = state
+            .read_prompt_for_peer(&name, &req.prompt, None)
+            .await
+            .map_err(ApiError::Internal)?;
+        return axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+            .body(axum::body::Body::from(bytes))
+            .map_err(|e| ApiError::Internal(e.to_string()));
+    }
+    let probe = Arc::new(crate::request_metrics::RequestProbe::default());
+    let heard = Arc::clone(&probe);
+    let body = async_stream::stream! {
+        let read = state.read_prompt_for_peer(&name, &req.prompt, Some(heard));
+        tokio::pin!(read);
+        let mut tick = tokio::time::interval(crate::api::request_figures::PREFILL_REPORT_PERIOD);
+        let mut told = (0, 0);
+        let last = loop {
+            let read = tokio::select! {
+                read = &mut read => Some(read),
+                _ = tick.tick() => None,
+            };
+            if let Some(read) = read {
+                break read;
+            }
+            let (done, total) = probe.prefill();
+            if total > 0 && (done, total) != told {
+                told = (done, total);
+                let record = Record::Progress { done, total };
+                yield Ok::<_, std::io::Error>(prefill_stream::line(&record));
+            }
+        };
+        match last {
+            Ok(bytes) => {
+                let handover = bytes.len() as u64;
+                yield Ok(prefill_stream::line(&Record::Handover { handover }));
+                yield Ok(bytes);
+            }
+            Err(error) => yield Ok(prefill_stream::line(&Record::Error { error })),
+        }
+    };
     axum::response::Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
-        .body(axum::body::Body::from(bytes))
+        .header(axum::http::header::CONTENT_TYPE, prefill_stream::MEDIA_TYPE)
+        .body(axum::body::Body::from_stream(body))
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 

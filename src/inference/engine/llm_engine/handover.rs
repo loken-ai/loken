@@ -6,11 +6,17 @@ use super::*;
 impl LlmEngine {
     /// Reads `prompt` and answers the KV cache it leaves, the rows of the prompt's tokens, as the
     /// bytes of a handover (see `distributed::kv_handover`).
-    pub async fn read_prompt_for_peer(&self, prompt: &str) -> AnyResult<Vec<u8>> {
+    /// `probe` hears the reading as it goes.
+    pub async fn read_prompt_for_peer(
+        &self,
+        prompt: &str,
+        probe: Option<std::sync::Arc<crate::request_metrics::RequestProbe>>,
+    ) -> AnyResult<Vec<u8>> {
         let params = GenerationParams {
             max_tokens: Some(1),
             temperature: Some(0.0),
             for_peer: true,
+            probe,
             ..Default::default()
         };
         self.generate(prompt, params)
@@ -103,6 +109,7 @@ pub(super) fn pull_prompt_from_peer(
     peer: &str,
 ) -> Option<usize> {
     use crate::distributed::kv_handover::decode;
+    use crate::distributed::prefill_stream;
     let carries_state = model.handover_carries_state();
     if !carries_state && (model.kv_layout().is_none() || !model.capabilities().trim_kv) {
         return None;
@@ -121,6 +128,9 @@ pub(super) fn pull_prompt_from_peer(
     if !super::handover_rate::peer_reads(peer, prompt_tokens.len(), prompt_tokens.len() - held) {
         return None;
     }
+    // The request's probe hears that its prompt is being read while the peer reads it.
+    let total = prompt_tokens.len() - held;
+    crate::request_metrics::note_prefill(0, total);
     let started = std::time::Instant::now();
     // A long prompt takes the peer as long as it takes: the request has no deadline of its own.
     let reply = reqwest::blocking::Client::builder()
@@ -132,11 +142,31 @@ pub(super) fn pull_prompt_from_peer(
                     "{}/api/cluster/prefill",
                     peer.trim_end_matches('/')
                 ))
+                .header(
+                    reqwest::header::ACCEPT,
+                    format!("{}, application/octet-stream", prefill_stream::MEDIA_TYPE),
+                )
                 .json(&serde_json::json!({ "model": model_name, "prompt": prompt }))
                 .send()
         })
         .and_then(|r| r.error_for_status())
-        .and_then(|r| r.bytes());
+        .map_err(|e| e.to_string())
+        .and_then(|r| {
+            let streamed = r
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(prefill_stream::accepted);
+            if !streamed {
+                // A peer without the streamed answer sends the handover alone.
+                return r.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string());
+            }
+            // The tokens the peer has left to read are the ones this request has left.
+            prefill_stream::read(std::io::BufReader::new(r), |done, of| {
+                let left = of.saturating_sub(done) as usize;
+                crate::request_metrics::relay_prefill(total.saturating_sub(left), total);
+            })
+        });
     let bytes = match reply {
         Ok(b) => b,
         Err(e) => {

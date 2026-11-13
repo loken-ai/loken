@@ -16,6 +16,7 @@ pub mod layer_scheduler;
 pub mod link_matrix;
 pub mod membership;
 pub mod network;
+pub mod prefill_stream;
 pub mod protocol;
 pub mod rate_meter;
 pub mod replay;
@@ -56,7 +57,7 @@ mod wiring_gate {
     ///
     /// One table, not two: a module that appears in neither list is the case a pair of tables
     /// lets through.
-    const MODULES: [(&str, &str, bool); 21] = [
+    const MODULES: [(&str, &str, bool); 22] = [
         ("auto_tune", "auto_distribution", true),
         ("cluster", "distributed::cluster::", true),
         ("cluster_runtime", "cluster_runtime::", true),
@@ -70,6 +71,7 @@ mod wiring_gate {
         ("link_matrix", "LinkMatrix", false),
         ("membership", "membership::", true),
         ("network", "NetworkClient", false),
+        ("prefill_stream", "prefill_stream::", true),
         ("protocol", "protocol::", true),
         ("rate_meter", "rate_meter::", true),
         ("replay", "ResumePoint", false),

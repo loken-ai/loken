@@ -2306,10 +2306,12 @@ impl APIServer {
 
     /// `prompt` read by `model_id`, loaded if it is not, and the KV cache it leaves as the bytes
     /// of a handover for the instance that asked.
+    /// `probe` hears the reading as it goes.
     pub(crate) async fn read_prompt_for_peer(
         &self,
         model_id: &str,
         prompt: &str,
+        probe: Option<Arc<crate::request_metrics::RequestProbe>>,
     ) -> Result<Vec<u8>, String> {
         self.ensure_loaded(model_id, DEFAULT_KEEP_ALIVE_MINUTES)
             .await?;
@@ -2318,7 +2320,7 @@ impl APIServer {
             .await
             .map_err(|e| format!("{e:?}"))?;
         engine
-            .read_prompt_for_peer(prompt)
+            .read_prompt_for_peer(prompt, probe)
             .await
             .map_err(|e| e.to_string())
     }

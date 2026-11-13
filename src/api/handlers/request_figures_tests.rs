@@ -24,7 +24,7 @@ const SLOW_PREFILL_PERIODS: u32 = 3;
 const PREFILL_COMMENT: &str = ": loken-prefill ";
 
 /// The route tests run one at a time: the slowed prefill is process-wide.
-static ROUTES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::request_metrics::PREFILL_PAUSE_LOCK as ROUTES;
 
 /// A server serving the tiny checkpoint as [`MODEL`], with a word-level vocabulary of its
 /// size, and the scratch directory it was copied to.
@@ -115,6 +115,30 @@ fn prefill_comments(sse: &str) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// The prefill comment lines of a short prompt's stream that took `took` from its request to
+/// its last line.
+///
+/// A comment is sent only once the reading of the prompt has run for a report period.
+/// A stream that took less sends none.
+/// A slower stream may send some.
+/// Each says what is read of the same whole, short of it, in the order read.
+fn assert_short_prompt_comments(sse: &str, took: std::time::Duration) {
+    let comments = prefill_comments(sse);
+    if took < PREFILL_REPORT_PERIOD {
+        assert!(comments.is_empty(), "{sse}");
+        return;
+    }
+    let total = comments.first().map_or(0, |&(_, total)| total);
+    assert!(
+        comments.iter().all(|&(done, t)| t == total && done < total),
+        "{comments:?}"
+    );
+    assert!(
+        comments.windows(2).all(|w| w[0].0 <= w[1].0),
+        "{comments:?}"
+    );
+}
+
 /// The object carries the request's times, none negative, and a cache place that fits the
 /// cache when the backend reports one.
 fn assert_loken(usage: &Value) {
@@ -178,7 +202,8 @@ async fn anthropic(state: &APIServer, words: usize, vocab_size: usize, stream: b
 }
 
 /// The OpenAI route puts the object in the usage of a whole answer and in the usage chunk of
-/// a stream, with the speculation's counts beside it; a short prompt sends no comment line.
+/// a stream, with the speculation's counts beside it; a short prompt read within a report
+/// period sends no comment line.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_openai_route_reports_each_answer() {
     let _one = ROUTES.lock().await;
@@ -193,19 +218,21 @@ async fn the_openai_route_reports_each_answer() {
     assert!(details["accepted_prediction_tokens"].is_i64(), "{details}");
     assert!(details["rejected_prediction_tokens"].is_i64(), "{details}");
 
+    let asked = std::time::Instant::now();
     let sse = body_text(openai(&state, SHORT_PROMPT_WORDS, vocab, true).await).await;
+    let took = asked.elapsed();
     let usage = data_lines(&sse)
         .into_iter()
         .rev()
         .find(|c| c["usage"].is_object())
         .unwrap_or_else(|| panic!("no usage chunk in {sse}"));
     assert_loken(&usage["usage"]);
-    assert!(prefill_comments(&sse).is_empty(), "{sse}");
+    assert_short_prompt_comments(&sse, took);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The Anthropic route puts the object in the usage of a whole answer and in the usage of
-/// its `message_delta`; a short prompt sends no comment line.
+/// its `message_delta`; a short prompt read within a report period sends no comment line.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_anthropic_route_reports_each_answer() {
     let _one = ROUTES.lock().await;
@@ -217,13 +244,15 @@ async fn the_anthropic_route_reports_each_answer() {
     .unwrap();
     assert_loken(&whole["usage"]);
 
+    let asked = std::time::Instant::now();
     let sse = body_text(anthropic(&state, SHORT_PROMPT_WORDS, vocab, true).await).await;
+    let took = asked.elapsed();
     let delta = data_lines(&sse)
         .into_iter()
         .find(|e| e["type"] == "message_delta")
         .unwrap_or_else(|| panic!("no message_delta in {sse}"));
     assert_loken(&delta["usage"]);
-    assert!(prefill_comments(&sse).is_empty(), "{sse}");
+    assert_short_prompt_comments(&sse, took);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -266,6 +295,52 @@ async fn a_slow_prompt_is_reported_as_it_is_read() {
         prefill_ms >= pause.as_millis() as f64,
         "prefill_ms {prefill_ms}"
     );
+}
+
+/// A long prompt with token rules, read slowly on the sequential path, is reported as it is read,
+/// and the answer's figures are in its usage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_prompt_with_token_rules_is_reported_as_it_is_read() {
+    let _one = ROUTES.lock().await;
+    let (state, dir, vocab) = server_with_tiny_model().await;
+    let pause = PREFILL_REPORT_PERIOD * SLOW_PREFILL_PERIODS;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(pause.as_millis() as u64, Ordering::Relaxed);
+    let request = serde_json::from_value(json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt(LONG_PROMPT_WORDS, vocab, 2)}],
+        "max_tokens": MAX_TOKENS,
+        "min_tokens": 1,
+        "temperature": 0,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    }))
+    .unwrap();
+    let response = super::openai::chat_completion_at(
+        state.clone(),
+        axum::http::HeaderMap::new(),
+        request,
+        crate::api::gate::Priority::Interactive,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the chat completion is served: {e:?}"));
+    let sse = body_text(response).await;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(0, Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let comments = prefill_comments(&sse);
+    assert!(!comments.is_empty(), "no prefill comment in {sse}");
+    assert!(
+        comments
+            .iter()
+            .all(|&(done, total)| total > 0 && done < total),
+        "{comments:?}"
+    );
+    let usage = data_lines(&sse)
+        .into_iter()
+        .rev()
+        .find(|c| c["usage"].is_object())
+        .unwrap_or_else(|| panic!("no usage chunk in {sse}"));
+    assert_loken(&usage["usage"]);
 }
 
 /// Words of the prompt a request repeats.

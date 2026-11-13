@@ -637,6 +637,7 @@ impl GenericHeteroTransformer {
                 tier.hold_stacks(false)?;
             }
             outcome?;
+            crate::request_metrics::note_layers(seq_len, layer + 1, self.layers.len());
         }
         // The draft head reads the prompt chunk by chunk, in order, from the last layer's rows.
         if self.capture_feature && self.draft.is_some() {
@@ -3080,6 +3081,8 @@ impl GenericHeteroTransformer {
         let mut on_cuda = !hidden.device().is_cpu();
         self.vulkan.clear_logits();
         self.opencl.clear_logits();
+        // A forward through every layer reports the share of its rows its layers done stand for.
+        let reports = from == 0 && upto == self.layers.len();
 
         // -- Layer-by-layer with segment-based transfers -------------------
         let mut seg_start = from;
@@ -3375,6 +3378,9 @@ impl GenericHeteroTransformer {
                     )?;
                 }
                 note_if_non_finite(&format!("layer {layer_idx}"), &hidden);
+                if reports {
+                    crate::request_metrics::note_layers(seq_len, layer_idx + 1, upto);
+                }
             }
 
             seg_start = seg_end;

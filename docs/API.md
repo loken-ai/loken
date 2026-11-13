@@ -426,10 +426,13 @@ A streamed answer whose prompt is still being read after 250 ms reports the read
 ```
 
 `done` is the prompt tokens read so far and `total` the tokens to read, the cached prefix left out.
-The serial path and the batch worker both read a long prompt a prefill chunk at a time, and `done` moves at each chunk.
+The serial path and the paged batch worker read a long prompt a prefill chunk at a time, and `done` moves at each chunk.
+The batch worker of a model that keeps a state per sequence reads a prompt in the forwards its model cuts it into, and `done` moves at each forward.
+Inside a forward over prompt rows, `done` moves with each layer of the model: it adds the share of the forward's rows that the layers done stand for.
+A prompt the prefill peer reads reports the peer's reading of the whole prompt until the peer hands it over, then the rest read here.
+A peer of an earlier version reports nothing while it reads, and `done` stays at 0 until its handover.
 
 A prompt read in under 250 ms sends no comment line.
-Neither does a model served by continuous batching, whose worker reads several prompts at once.
 
 A client that follows the SSE specification ignores comment lines.
 
@@ -458,6 +461,6 @@ A client that follows the SSE specification ignores comment lines.
 | `GET /api/cluster/state`, `GET /api/cluster/peers` | What a node publishes about itself, and who it sees. |
 | `POST /api/pipeline/tail` | Run this node as 1 segment of a pipeline: layers `from` to `to` of `model`, relaying to `next`. Answers the wire port the upstream connects to. The head calls it, not an operator. |
 | `POST /api/cluster/measure` | Measure what a layer of `model` costs on this node and publish it. A head asks a peer with no cost for the model before it plans the cut of a dense model. |
-| `POST /api/cluster/prefill` | Read a `prompt` for a peer serving the same model and answer its KV cache as `application/octet-stream`. |
+| `POST /api/cluster/prefill` | Read a `prompt` for a peer serving the same model and answer its KV cache as `application/octet-stream`. A node that accepts `application/vnd.loken.prefill-stream` gets the reading as it goes, then the KV cache. |
 | `POST /api/cluster/prefix` | How much of a prompt this node already holds in its KV. |
 <!-- site: end -->

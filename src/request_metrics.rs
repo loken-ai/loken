@@ -6,7 +6,7 @@
 //! metrics endpoint reads them as histograms. A request that carries a [`RequestProbe`] also
 //! gets its own figures back through it. Nothing here measures.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -262,24 +262,32 @@ impl RequestProbe {
 thread_local! {
     /// The probe of the request whose prompt this thread reads.
     static PREFILL_PROBE: RefCell<Option<Arc<RequestProbe>>> = const { RefCell::new(None) };
+    /// The prompt rows read and to read that this thread last reported to its probe.
+    static PREFILL_READ: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// Binds `probe` to this thread until the guard drops: the chunked prefill run on the thread
 /// reports its progress to it.
 pub fn bind_prefill(probe: Option<Arc<RequestProbe>>) -> PrefillBinding {
     let previous = PREFILL_PROBE.with(|p| p.replace(probe));
-    PrefillBinding { previous }
+    let previous_read = PREFILL_READ.replace((0, 0));
+    PrefillBinding {
+        previous,
+        previous_read,
+    }
 }
 
 /// Restores the thread's previous probe when dropped.
 pub struct PrefillBinding {
     previous: Option<Arc<RequestProbe>>,
+    previous_read: (u64, u64),
 }
 
 impl Drop for PrefillBinding {
     fn drop(&mut self) {
         let previous = self.previous.take();
         PREFILL_PROBE.with(|p| *p.borrow_mut() = previous);
+        PREFILL_READ.set(self.previous_read);
     }
 }
 
@@ -288,17 +296,66 @@ impl Drop for PrefillBinding {
 #[cfg(test)]
 pub static PREFILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Milliseconds a forward reporting to a bound probe pauses after each layer short of its last:
+/// a slow forward for the tests of the reading inside a forward.
+#[cfg(test)]
+pub static LAYER_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Held by each test that sets [`PREFILL_PAUSE_MS`] or [`LAYER_PAUSE_MS`], or that a pause
+/// would fail.
+#[cfg(test)]
+pub static PREFILL_PAUSE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Reports `done` of `total` prompt tokens read to the probe bound to this thread, if any.
 pub fn note_prefill(done: usize, total: usize) {
     PREFILL_PROBE.with(|p| {
         if let Some(probe) = p.borrow().as_ref() {
             probe.note_prefill(done as u64, total as u64);
+            PREFILL_READ.set((done as u64, total as u64));
             #[cfg(test)]
             if done < total {
                 std::thread::sleep(Duration::from_millis(
                     PREFILL_PAUSE_MS.load(Ordering::Relaxed),
                 ));
             }
+        }
+    });
+}
+
+/// Reports to the probe bound to this thread that `layers_done` of the `layers` layers of a
+/// forward over `rows` prompt rows have run.
+///
+/// The rows read are those the thread last reported and the share of the forward's rows that
+/// its layers done stand for.
+/// A forward of 1 row reports nothing.
+/// Neither does a forward whose rows run past the prompt the thread last reported.
+pub fn note_layers(rows: usize, layers_done: usize, layers: usize) {
+    if rows < 2 || layers_done == 0 || layers_done >= layers {
+        return;
+    }
+    PREFILL_PROBE.with(|p| {
+        let Some(probe) = p.borrow().as_ref().cloned() else {
+            return;
+        };
+        let (done, total) = PREFILL_READ.get();
+        let rows = rows as u64;
+        if done.saturating_add(rows) > total {
+            return;
+        }
+        probe.note_prefill(done + rows * layers_done as u64 / layers as u64, total);
+        #[cfg(test)]
+        std::thread::sleep(Duration::from_millis(
+            LAYER_PAUSE_MS.load(Ordering::Relaxed),
+        ));
+    });
+}
+
+/// Reports `done` of `total` prompt tokens that another instance has read for the request to the
+/// probe bound to this thread, if any.
+pub fn relay_prefill(done: usize, total: usize) {
+    PREFILL_PROBE.with(|p| {
+        if let Some(probe) = p.borrow().as_ref() {
+            probe.note_prefill(done as u64, total as u64);
         }
     });
 }
@@ -470,5 +527,33 @@ mod tests {
         record_outcome("request-metrics-test-probe", Some(&probe), outcome);
         assert_eq!(probe.outcome(), Some(outcome));
         assert_eq!(KvPlace::of(Some(12), None), None);
+    }
+
+    /// The layers of a forward report its rows' share from the rows reported before it.
+    /// A forward of 1 row, a forward past the prompt and a thread with no probe report nothing.
+    #[test]
+    fn the_layers_of_a_forward_report_their_share_of_its_rows() {
+        let probe = Arc::new(RequestProbe::default());
+        note_layers(8, 1, 4);
+        {
+            let _bound = bind_prefill(Some(probe.clone()));
+            note_layers(8, 1, 4);
+            assert_eq!(probe.prefill(), (0, 0));
+            note_prefill(4, 20);
+            note_layers(8, 1, 4);
+            assert_eq!(probe.prefill(), (6, 20));
+            note_layers(8, 3, 4);
+            assert_eq!(probe.prefill(), (10, 20));
+            note_layers(8, 4, 4);
+            assert_eq!(probe.prefill(), (10, 20));
+            note_layers(1, 1, 2);
+            note_layers(17, 1, 2);
+            assert_eq!(probe.prefill(), (10, 20));
+            note_prefill(20, 20);
+            note_layers(3, 1, 2);
+            assert_eq!(probe.prefill(), (20, 20));
+        }
+        note_layers(8, 2, 4);
+        assert_eq!(probe.prefill(), (20, 20));
     }
 }

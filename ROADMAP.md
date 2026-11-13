@@ -44,7 +44,7 @@ Smaller, by state then by priority:
 | Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Done |
 | Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the rate at which the queue of the engine starts to grow without bound. | Done |
 | Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Partial |
-| Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Partial |
+| Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Done |
 | Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
 | Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a seal that shows any change. | Done |
 | Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |

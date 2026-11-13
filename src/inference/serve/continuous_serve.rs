@@ -671,10 +671,14 @@ fn report_read(probe: &Arc<RequestProbe>, done: usize, total: usize) {
 /// cache holds.
 /// With a state cache on the model, the prompt starts from the longest stored state it extends.
 /// The states its prefill passes and the state a finished sequence stands in are kept.
+/// A prompt is read in the forwards the model's own prefill cuts it into.
+/// Its probe hears of each forward.
 /// The decode items of a step run as 1 batch across their sequences.
 pub(crate) struct SequenceBatched {
     model: GenericHeteroTransformer,
     seqs: HashMap<SeqId, Sequence>,
+    /// The probes of the prompts not read yet, by sequence.
+    probes: HashMap<SeqId, Arc<RequestProbe>>,
 }
 
 /// What [`SequenceBatched`] keeps for 1 sequence.
@@ -693,12 +697,16 @@ impl SequenceBatched {
         Ok(Self {
             model,
             seqs: HashMap::new(),
+            probes: HashMap::new(),
         })
     }
 
     /// The logits of the last row of `tokens` read from position 0 over `seq`, `[1, vocab]`, and
     /// the tokens a stored state covered.
     ///
+    /// The rows a stored state does not cover are 1 forward, cut only where the state cache
+    /// keeps a state.
+    /// The probe bound to the thread hears of each forward.
     /// Without a state cache on the model, the prompt is 1 forward and covers none.
     fn prefill(
         &mut self,
@@ -706,7 +714,10 @@ impl SequenceBatched {
         seq: &mut SequenceMixers,
     ) -> crate::tensor::Result<(Tensor, usize)> {
         let Some(cache) = self.model.state_cache().filter(|_| tokens.len() > 1) else {
-            return Ok((self.model.prefill_sequence(tokens, seq)?, 0));
+            crate::request_metrics::note_prefill(0, tokens.len());
+            let logits = self.model.prefill_sequence(tokens, seq)?;
+            crate::request_metrics::note_prefill(tokens.len(), tokens.len());
+            return Ok((logits, 0));
         };
         self.model.with_sequence(seq, |model| {
             let covered = cache.restore(model, tokens);
@@ -731,6 +742,7 @@ impl BatchedModel for SequenceBatched {
     fn step(&mut self, items: &[StepItem]) -> crate::tensor::Result<Vec<u32>> {
         let mut out = vec![0u32; items.len()];
         for (i, it) in items.iter().enumerate().filter(|(_, it)| it.is_prefill) {
+            let _bound = crate::request_metrics::bind_prefill(self.probes.remove(&it.seq));
             let mut mixers = self.model.sequence_mixers()?;
             // A prompt that runs out of card memory runs again once the lent card room is given
             // back.
@@ -795,9 +807,14 @@ impl BatchedModel for SequenceBatched {
         self.seqs.get(&seq).map(|s| s.covered)
     }
 
+    fn watch(&mut self, seq: SeqId, probe: Arc<RequestProbe>) {
+        self.probes.insert(seq, probe);
+    }
+
     /// The state the sequence stands in is kept when the model has a state cache.
     /// The cache refuses a state whose layers do not all stand after the fed tokens.
     fn release(&mut self, seq: SeqId) {
+        self.probes.remove(&seq);
         let Some(mut s) = self.seqs.remove(&seq) else {
             return;
         };
@@ -1271,6 +1288,7 @@ impl ContinuousServer {
         let adapter = SequenceBatched {
             model,
             seqs: HashMap::new(),
+            probes: HashMap::new(),
         };
         let block_size = CB_BLOCK_SIZE;
         let num_blocks = max_running.max(1) * context_length.max(1).div_ceil(block_size);

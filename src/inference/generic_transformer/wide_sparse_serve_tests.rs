@@ -234,6 +234,198 @@ fn a_model_without_sequence_state_is_handed_back() {
     super::tiny_model::remove(&path);
 }
 
+/// Prompt rows the scheduler of the worker admits a step in the cut test.
+const BUDGET: usize = 4;
+
+/// Tokens of the prompt of the cut test: 2 budgets and a part.
+const LONG_PROMPT: usize = 2 * BUDGET + BUDGET / 2;
+
+/// Tokens the answer to the long prompt holds.
+const ANSWER: usize = 4;
+
+/// Milliseconds the prefill pauses after each report short of the whole prompt, and after each
+/// layer of a forward short of its last.
+const PAUSE_MS: u64 = 20;
+
+/// The readings of a prompt of `total` rows read in 1 forward through `layers` layers.
+///
+/// The reading starts at 0.
+/// Each layer short of the last adds its share of the rows.
+/// The reading ends with the whole prompt.
+fn one_forward(total: u64, layers: usize) -> Vec<(u64, u64)> {
+    let mut readings = vec![(0, total)];
+    for done in (1..layers).map(|l| total * l as u64 / layers as u64) {
+        if readings.last() != Some(&(done, total)) {
+            readings.push((done, total));
+        }
+    }
+    readings.push((total, total));
+    readings
+}
+
+/// Sets the pauses of the prefill and of the layers of a forward to `ms`.
+fn pause(ms: u64) {
+    use std::sync::atomic::Ordering;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(ms, Ordering::Relaxed);
+    crate::request_metrics::LAYER_PAUSE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The tokens a server over `model` whose scheduler admits `budget` prompt rows a step gives
+/// `prompt`, and each reading of the request's probe seen until its first token.
+fn served_watched(
+    model: GenericHeteroTransformer,
+    prompt: &[u32],
+    budget: usize,
+) -> (Vec<u32>, Vec<(u64, u64)>) {
+    use crate::inference::serve::continuous_batch::SamplingParams;
+    use crate::request_metrics::RequestProbe;
+    use std::sync::mpsc::RecvTimeoutError;
+    let server =
+        ContinuousServer::spawn_sequences(model, Vec::new(), prompt.len() + ANSWER, 2, budget)
+            .map_err(|(_, e)| e)
+            .unwrap();
+    let probe = std::sync::Arc::new(RequestProbe::default());
+    let rx = server.submit_watched(
+        prompt.to_vec(),
+        ANSWER,
+        SamplingParams::greedy(),
+        Some(std::sync::Arc::clone(&probe)),
+    );
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    let mut got = Stream::default();
+    while got.tokens.is_empty() && !got.ended {
+        match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+            Ok(CbToken::Tok(t)) => got.tokens.push(t),
+            Ok(CbToken::Admitted { .. }) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(CbToken::Done(_)) | Err(RecvTimeoutError::Disconnected) => got.ended = true,
+        }
+        let reading = probe.prefill();
+        if seen.last() != Some(&reading) {
+            seen.push(reading);
+        }
+    }
+    read(&rx, &mut got, usize::MAX);
+    let _ = server.stop();
+    (got.tokens, seen)
+}
+
+/// The model of layout `layout` for the cut test, with a fresh state cache when `cached`.
+fn cut_model(layout: usize, cached: bool) -> GenericHeteroTransformer {
+    let (ratios, kv_src, index_src) = LAYOUTS[layout];
+    let mut model = generic(ratios, kv_src, index_src);
+    if cached {
+        let store = Arc::new(StateStore::in_memory(1 << 26, BLOCK));
+        let identity = crate::inference::cache::state_disk::identity(&[b"cut states"]);
+        assert!(model.attach_state_cache(store, identity), "{ratios:?}");
+    }
+    model
+}
+
+/// For both layouts on the host, with and without a state cache, a prompt longer than the
+/// worker's prefill budget is read in the forwards the model's own prefill cuts it into.
+///
+/// The cut does not follow the budget.
+/// The prompt gives the tokens it gives under a budget that holds it whole.
+/// The request's probe hears that the prompt starts, then each layer of the forward, then that
+/// the prompt is read whole.
+#[test]
+fn a_long_prompt_is_cut_by_the_model_and_not_by_the_budget() {
+    let paused = crate::request_metrics::PREFILL_PAUSE_LOCK.blocking_lock();
+    pause(PAUSE_MS);
+    let prompt: Vec<u32> = (0..LONG_PROMPT as u32)
+        .map(|i| (i * 3 + 1) % VOCAB as u32)
+        .collect();
+    let total = LONG_PROMPT as u64;
+    let mut runs = Vec::new();
+    for layout in 0..LAYOUTS.len() {
+        for cached in [false, true] {
+            let layers = cut_model(layout, cached).layers.len();
+            let whole = served_watched(cut_model(layout, cached), &prompt, LONG_PROMPT);
+            let budgeted = served_watched(cut_model(layout, cached), &prompt, BUDGET);
+            runs.push((layout, cached, layers, whole, budgeted));
+        }
+    }
+    pause(0);
+    drop(paused);
+    for (layout, cached, layers, whole, budgeted) in runs {
+        let model_cut = one_forward(total, layers);
+        let what = format!("layout {layout}, state cache {cached}");
+        assert_eq!(whole.0.len(), ANSWER, "{what}: the whole read ended early");
+        assert_eq!(
+            budgeted.0, whole.0,
+            "{what}: the budgeted read gave other tokens"
+        );
+        let of_prompt = |seen: &[(u64, u64)]| -> Vec<(u64, u64)> {
+            seen.iter().copied().filter(|&(_, t)| t == total).collect()
+        };
+        assert_eq!(of_prompt(&whole.1), model_cut, "{what}: {:?}", whole.1);
+        assert_eq!(
+            of_prompt(&budgeted.1),
+            model_cut,
+            "{what}: {:?}",
+            budgeted.1
+        );
+    }
+}
+
+/// For both layouts on the host, a prompt read in 1 forward on the serial path reports each
+/// layer of the forward.
+///
+/// A reading strictly between 0 and the whole prompt is seen before the prompt is read whole.
+/// The readings never go back.
+#[test]
+fn a_slowed_serial_forward_reports_its_layers() {
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+    use crate::request_metrics::RequestProbe;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let paused = crate::request_metrics::PREFILL_PAUSE_LOCK.blocking_lock();
+    pause(PAUSE_MS);
+    let prompt: Vec<u32> = (0..LONG_PROMPT as u32)
+        .map(|i| (i * 3 + 1) % VOCAB as u32)
+        .collect();
+    let total = LONG_PROMPT as u64;
+    let mut runs = Vec::new();
+    for layout in 0..LAYOUTS.len() {
+        let mut backend = GenericBackend(cut_model(layout, false));
+        let probe = Arc::new(RequestProbe::default());
+        let read = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (probe, read) = (Arc::clone(&probe), Arc::clone(&read));
+            std::thread::spawn(move || {
+                let mut seen: Vec<(u64, u64)> = Vec::new();
+                while !read.load(Ordering::Relaxed) {
+                    let reading = probe.prefill();
+                    if seen.last() != Some(&reading) {
+                        seen.push(reading);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                seen
+            })
+        };
+        {
+            let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(&probe)));
+            backend.forward_prefill_chunked(&ids(&prompt), 0).unwrap();
+        }
+        read.store(true, Ordering::Relaxed);
+        runs.push((layout, watcher.join().unwrap(), probe.prefill()));
+    }
+    pause(0);
+    drop(paused);
+    for (layout, seen, last) in runs {
+        assert_eq!(last, (total, total), "layout {layout}");
+        assert!(
+            seen.iter()
+                .any(|&(done, t)| t == total && done > 0 && done < total),
+            "layout {layout}: {seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0].0 <= w[1].0),
+            "layout {layout}: {seen:?}"
+        );
+    }
+}
+
 /// Tokens per block of the stored states, as the V4.1 batch worker test cuts them.
 const BLOCK: usize = 8;
 
