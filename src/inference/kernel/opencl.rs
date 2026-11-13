@@ -705,13 +705,13 @@ pub fn offered_memory(device_id: opencl3::types::cl_device_id) -> u64 {
     }
 }
 
-/// Enumerate OpenCL GPU devices (non-NVIDIA, non-CPU).
-/// Returns device IDs in enumeration order; index i corresponds to the i-th OpenCL GPU found.
+/// Every OpenCL GPU device, in enumeration order: index i of a `DeviceKind::OpenCL` is the
+/// i-th of them.
 ///
-/// The vendor rule lives in `opencl_probe`; this returns the raw ids that only a caller
-/// building kernels can use, and skips the whole stack when it has been found unresponsive.
+/// Returns the raw ids that only a caller building kernels can use.
+/// Empty when the stack has been found unresponsive.
 #[cfg(feature = "opencl")]
-pub fn enumerate_opencl_devices() -> Vec<opencl3::types::cl_device_id> {
+pub fn layer_devices() -> Vec<opencl3::types::cl_device_id> {
     use opencl3::device::CL_DEVICE_TYPE_GPU;
     use opencl3::platform::get_platforms;
 
@@ -722,20 +722,23 @@ pub fn enumerate_opencl_devices() -> Vec<opencl3::types::cl_device_id> {
     if let Ok(platforms) = get_platforms() {
         for platform in platforms {
             if let Ok(device_ids) = platform.get_devices(CL_DEVICE_TYPE_GPU) {
-                for device_id in device_ids {
-                    let device = Device::new(device_id);
-                    // NVIDIA belongs to CUDA: counting a card on both paths plans onto it twice.
-                    if let Ok(vendor) = device.vendor() {
-                        if vendor.to_lowercase().contains("nvidia") {
-                            continue;
-                        }
-                    }
-                    devices.push(device_id);
-                }
+                devices.extend(device_ids);
             }
         }
     }
     devices
+}
+
+/// The OpenCL GPU devices that no native runtime of the build drives, in enumeration order.
+///
+/// The rule lives in `opencl_probe`: a card a native runtime drives is planned there, never
+/// twice.
+#[cfg(feature = "opencl")]
+pub fn enumerate_opencl_devices() -> Vec<opencl3::types::cl_device_id> {
+    layer_devices()
+        .into_iter()
+        .filter(|&id| crate::inference::kernel::opencl_probe::offered(&Device::new(id)))
+        .collect()
 }
 
 /// The `rms_norm` kernel on a real device, against a host reference.

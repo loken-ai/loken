@@ -745,10 +745,13 @@ pub(crate) async fn list_devices(
     #[cfg(feature = "opencl")]
     let devices = {
         let mut devices = devices;
-        for (i, id) in crate::inference::kernel::opencl::enumerate_opencl_devices()
+        for (i, id) in crate::inference::kernel::opencl::layer_devices()
             .into_iter()
             .enumerate()
-            .filter(|(_, id)| crate::inference::kernel::opencl_stack::runs_layers(*id))
+            .filter(|(_, id)| {
+                crate::inference::kernel::opencl_probe::offered(&opencl3::device::Device::new(*id))
+                    && crate::inference::kernel::opencl_stack::runs_layers(*id)
+            })
         {
             let name = opencl3::device::Device::new(id).name().unwrap_or_default();
             if devices.iter().any(|d| d["name"] == name.as_str()) {

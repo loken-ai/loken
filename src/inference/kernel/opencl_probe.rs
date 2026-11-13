@@ -55,12 +55,139 @@ pub fn responsive() -> bool {
     false
 }
 
-/// The non-CUDA GPUs OpenCL exposes, as `(name, bytes of memory)` in enumeration order.
-///
-/// NVIDIA cards are skipped here and nowhere else: they are CUDA's, and a card counted by both
-/// paths would be planned onto twice. Keeping that rule in ONE place is the point of this
-/// function - it was written twice before, and two copies of a filter is one filter that will
-/// eventually disagree with itself.
+/// The slot of a card on the PCI bus.
+#[cfg(any(feature = "opencl", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciAddress {
+    /// The domain, when the reading gives one.
+    pub domain: Option<u32>,
+    pub bus: u32,
+    pub device: u32,
+    pub function: u32,
+}
+
+#[cfg(any(feature = "opencl", test))]
+impl PciAddress {
+    /// The address a native runtime writes as `domain:bus:device.function`, in hexadecimal.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (head, function) = text.trim().rsplit_once('.')?;
+        let mut parts = head.rsplit(':');
+        let device = parts.next()?;
+        let bus = parts.next()?;
+        let domain = parts.next();
+        let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+        Some(Self {
+            domain: match domain {
+                Some(d) => Some(hex(d)?),
+                None => None,
+            },
+            bus: hex(bus)?,
+            device: hex(device)?,
+            function: hex(function)?,
+        })
+    }
+
+    /// Whether both name the same slot.
+    /// A domain that only one of them gives is not compared.
+    pub fn same_slot(&self, other: &Self) -> bool {
+        (self.bus, self.device, self.function) == (other.bus, other.device, other.function)
+            && match (self.domain, other.domain) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+}
+
+/// The PCI address `device` reports: through `cl_khr_pci_bus_info`, else through the topology
+/// of `cl_amd_device_attribute_query`.
+/// `None` when it exposes neither.
+#[cfg(feature = "opencl")]
+pub fn opencl_address(device: &opencl3::device::Device) -> Option<PciAddress> {
+    let extensions = device.extensions().unwrap_or_default();
+    let has = |name: &str| extensions.split_whitespace().any(|e| e == name);
+    if has("cl_khr_pci_bus_info") {
+        if let Ok(p) = device.pcibusinfokhr_intel() {
+            return Some(PciAddress {
+                domain: Some(p.pci_domain),
+                bus: p.pci_bus,
+                device: p.pci_device,
+                function: p.pci_function,
+            });
+        }
+    }
+    if has("cl_amd_device_attribute_query") {
+        if let Ok(t) = device.topology_amd() {
+            return Some(PciAddress {
+                domain: None,
+                bus: t.bus as u32,
+                device: t.device as u32,
+                function: t.function as u32,
+            });
+        }
+    }
+    None
+}
+
+/// The PCI addresses of the cards the native runtimes of the build drive, CUDA and ROCm.
+/// Read once.
+/// Empty in a build without them, or when their libraries do not open.
+#[cfg(feature = "opencl")]
+pub fn native_addresses() -> &'static [PciAddress] {
+    static READ: std::sync::OnceLock<Vec<PciAddress>> = std::sync::OnceLock::new();
+    READ.get_or_init(|| {
+        #[cfg(feature = "gpu")]
+        {
+            use crate::tensor::gpu_runtime::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
+            if !crate::tensor::cuda::runtime::usable() {
+                return Vec::new();
+            }
+            let _ = crate::tensor::gpu_runtime::driver::result::init();
+            let n = crate::tensor::gpu_runtime::driver::result::device::get_count().unwrap_or(0);
+            (0..n)
+                .filter_map(|ordinal| {
+                    let mut id = [0 as std::os::raw::c_char; 64];
+                    let ok =
+                        unsafe { cuDeviceGetPCIBusId(id.as_mut_ptr(), id.len() as i32, ordinal) }
+                            == cudaError_enum::CUDA_SUCCESS;
+                    if !ok {
+                        return None;
+                    }
+                    let bytes: Vec<u8> = id
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8)
+                        .collect();
+                    PciAddress::parse(&String::from_utf8_lossy(&bytes))
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "gpu"))]
+        Vec::new()
+    })
+}
+
+/// Whether placement may offer an OpenCL device at `address`, against the cards at `native`
+/// that a native runtime drives.
+/// A device at the address of a native card is that card: it is not offered twice.
+/// A device that reports no address is offered only when no native runtime drives a card.
+#[cfg(any(feature = "opencl", test))]
+pub fn offered_beside(address: Option<PciAddress>, native: &[PciAddress]) -> bool {
+    match address {
+        Some(a) => !native.iter().any(|n| n.same_slot(&a)),
+        None => native.is_empty(),
+    }
+}
+
+/// Whether placement may offer OpenCL device `device`: it is no card a native runtime of the
+/// build drives.
+#[cfg(feature = "opencl")]
+pub fn offered(device: &opencl3::device::Device) -> bool {
+    offered_beside(opencl_address(device), native_addresses())
+}
+
+/// The GPUs OpenCL exposes beside the native cards, as `(name, bytes of memory)` in
+/// enumeration order.
+/// A card a native runtime of the build drives is skipped, as [`offered`] says.
 #[cfg(feature = "opencl")]
 pub fn non_cuda_devices() -> Vec<(String, u64)> {
     use opencl3::device::{Device, CL_DEVICE_TYPE_GPU};
@@ -78,11 +205,7 @@ pub fn non_cuda_devices() -> Vec<(String, u64)> {
         };
         for id in ids {
             let d = Device::new(id);
-            if d.vendor()
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains("nvidia")
-            {
+            if !offered(&d) {
                 continue;
             }
             let name = d.name().unwrap_or_else(|_| "unknown".to_string());
@@ -111,15 +234,62 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// Whatever it finds, it must never claim an NVIDIA card: those belong to CUDA, and a card
-    /// offered to both planners is a card planned onto twice.
+    use super::{offered_beside, PciAddress};
+
+    fn at(text: &str) -> PciAddress {
+        PciAddress::parse(text).unwrap()
+    }
+
+    /// The forms a native runtime writes, and a domain that only one reading gives.
     #[test]
-    fn nvidia_is_never_offered_through_the_opencl_path() {
-        for (name, _) in super::non_cuda_devices() {
-            assert!(
-                !name.to_lowercase().contains("nvidia"),
-                "an NVIDIA card came back through the OpenCL path: {name}"
-            );
+    fn addresses_read_and_compare() {
+        let a = at("0000:05:00.0");
+        assert_eq!((a.domain, a.bus, a.device, a.function), (Some(0), 5, 0, 0));
+        let b = at("0001:2a:1f.7");
+        assert_eq!(
+            (b.domain, b.bus, b.device, b.function),
+            (Some(1), 0x2a, 0x1f, 7)
+        );
+        let c = at("05:00.0");
+        assert_eq!(c.domain, None);
+        assert!(c.same_slot(&a));
+        assert!(!at("0001:05:00.0").same_slot(&a));
+        assert!(!at("0000:06:00.0").same_slot(&a));
+        assert!(PciAddress::parse("card").is_none());
+    }
+
+    /// A device at a native card's address is never offered, and a device of unknown address
+    /// is offered only where no native runtime drives a card.
+    #[test]
+    fn a_native_card_is_never_offered_twice() {
+        let native = [at("0000:05:00.0")];
+        assert!(!offered_beside(Some(at("0000:05:00.0")), &native));
+        assert!(!offered_beside(Some(at("05:00.0")), &native));
+        assert!(offered_beside(Some(at("0000:03:00.0")), &native));
+        assert!(!offered_beside(None, &native));
+        assert!(offered_beside(None, &[]));
+        assert!(offered_beside(Some(at("0000:05:00.0")), &[]));
+    }
+
+    /// No card the native runtimes of the build drive comes back through the OpenCL path.
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn no_native_card_is_offered_through_the_opencl_path() {
+        use opencl3::device::{Device, CL_DEVICE_TYPE_GPU};
+        if !super::responsive() {
+            return;
+        }
+        let native = super::native_addresses();
+        for platform in opencl3::platform::get_platforms().unwrap_or_default() {
+            for id in platform.get_devices(CL_DEVICE_TYPE_GPU).unwrap_or_default() {
+                let d = Device::new(id);
+                let name = d.name().unwrap_or_default();
+                let address = super::opencl_address(&d);
+                println!("{name}: {address:?}, native cards {native:?}");
+                if address.is_some_and(|a| native.iter().any(|n| n.same_slot(&a))) {
+                    assert!(!super::offered(&d), "{name} is a native card");
+                }
+            }
         }
     }
 }

@@ -633,7 +633,7 @@ impl OpenClStack {
         if !heads_grouped(spec.n_head, spec.n_kv) {
             bail!("{} heads in {} groups", spec.n_head, spec.n_kv);
         }
-        let ids = super::opencl::enumerate_opencl_devices();
+        let ids = super::opencl::layer_devices();
         let id = *ids
             .get(device)
             .ok_or_else(|| anyhow!("no OpenCL device {device}"))?;
@@ -1549,7 +1549,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn memory_bandwidth() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -1724,7 +1724,7 @@ mod tests {
     #[ignore = "needs an OpenCL device"]
     fn quantiser_matches_the_host() {
         use crate::tensor::quant_cpu::{BlockFormat, BlockQ8_0};
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -1791,7 +1791,7 @@ mod tests {
         let halves: Vec<u32> = (0..=u16::MAX as u32)
             .filter(|h| h & 0x7c00 != 0x7c00)
             .collect();
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -1845,7 +1845,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn mat_vec_matches_the_dequantised_weights() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -1905,7 +1905,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn mat_vec_rates() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -1989,7 +1989,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn chunk_mat_vec_rates() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -2054,7 +2054,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn launch_costs() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -2112,7 +2112,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn the_layers_are_offered_only_where_they_run() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {
@@ -2125,7 +2125,7 @@ mod tests {
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn grid_barrier() {
-        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+        for (i, id) in super::super::opencl::layer_devices()
             .into_iter()
             .enumerate()
         {

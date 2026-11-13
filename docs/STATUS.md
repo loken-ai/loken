@@ -214,6 +214,7 @@ The layers of a language model run on an Intel GPU through Intel's OpenCL runtim
 On the laptop's processor they are slower than the host: 51 tokens per second against 74.
 
 Devices of Mesa's OpenCL platform are not offered for layers, because the layers measured wrong on them.
+A card that CUDA or ROCm drives is told by its PCI address and is not offered for OpenCL layers.
 A device that reports its memory as the host's offers a placement no more than the host can spare.
 A Z-Image block runs through Intel's OpenCL runtime and gives the host's output within 1% on average.
 On the laptop's processor, at 512 by 512, a block takes 1.7 s through OpenCL against 3.1 s on the host.

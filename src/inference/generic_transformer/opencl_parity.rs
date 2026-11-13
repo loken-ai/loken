@@ -489,9 +489,10 @@ fn opencl_long_prompt_matches_the_host() {
     }
 }
 
-/// The OpenCL GPUs the loader lists, as `(index, name)`.
+/// Every OpenCL GPU, as `(index, name)`.
+/// A card a native runtime also drives is one of them: the tests compare both on it.
 fn devices() -> Vec<(usize, String)> {
-    let found: Vec<(usize, String)> = crate::inference::kernel::opencl::enumerate_opencl_devices()
+    let found: Vec<(usize, String)> = crate::inference::kernel::opencl::layer_devices()
         .into_iter()
         .enumerate()
         .map(|(i, id)| {

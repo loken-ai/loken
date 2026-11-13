@@ -465,10 +465,13 @@ pub fn cards_for(owner: &str, reserve: u64) -> Vec<(usize, u64)> {
 pub fn accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
     #[cfg(feature = "opencl")]
     {
-        crate::inference::kernel::opencl::enumerate_opencl_devices()
+        crate::inference::kernel::opencl::layer_devices()
             .into_iter()
             .enumerate()
-            .filter(|(_, id)| crate::inference::kernel::opencl_stack::runs_layers(*id))
+            .filter(|(_, id)| {
+                crate::inference::kernel::opencl_probe::offered(&opencl3::device::Device::new(*id))
+                    && crate::inference::kernel::opencl_stack::runs_layers(*id)
+            })
             .map(|(i, id)| {
                 let mem = crate::inference::kernel::opencl::offered_memory(id);
                 (DeviceKind::OpenCL(i), mem.saturating_sub(reserve))
