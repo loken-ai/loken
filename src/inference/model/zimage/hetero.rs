@@ -65,6 +65,9 @@ pub struct HeteroZImage {
     // OpenCL blocks (indexed by layer number, only populated for OpenCL segments)
     #[cfg(feature = "opencl")]
     ocl_blocks: Vec<Option<OpenCLZImageBlock>>,
+    // The noise refiner on OpenCL, filled when the main stack starts on OpenCL.
+    #[cfg(feature = "opencl")]
+    ocl_noise_refiner: Vec<OpenCLZImageBlock>,
     // Sized by the longest sequence seen, rebuilt larger when a request needs it.
     #[cfg(feature = "opencl")]
     ocl_scratch: std::sync::Mutex<Option<OclZImageScratch>>,
@@ -399,6 +402,54 @@ impl HeteroZImage {
             }
         }
 
+        // 3b. The noise refiner runs where the main stack starts.
+        // It reads the image tokens of every step, so on OpenCL it follows the stack there.
+        #[cfg(feature = "opencl")]
+        let ocl_noise_refiner = match (
+            plan.segments.first().map(|s| s.kind),
+            ocl_pipelines.as_ref(),
+            raw_st_data.as_ref(),
+        ) {
+            (Some(DeviceKind::OpenCL(_)), Some(pipelines), Some(st_data)) => {
+                let shards = st_data
+                    .iter()
+                    .map(|data| safetensors::SafeTensors::deserialize(data))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        crate::tensor::Error::msg(format!("SafeTensors deserialize: {}", e))
+                    })?;
+                let adaln_dim = shards
+                    .iter()
+                    .find_map(|sh| sh.tensor("noise_refiner.0.adaLN_modulation.0.weight").ok())
+                    .and_then(|t| t.shape().get(1).copied())
+                    .ok_or_else(|| {
+                        crate::tensor::Error::msg("zimage: no noise_refiner.0.adaLN_modulation.0")
+                    })?;
+                info!("  Noise refiner: {} blocks on OpenCL", cfg.n_refiner_layers);
+                (0..cfg.n_refiner_layers)
+                    .map(|i| {
+                        OpenCLZImageBlock::from_safetensors(
+                            &shards,
+                            &format!("noise_refiner.{i}"),
+                            cfg.dim,
+                            cfg.hidden_dim(),
+                            cfg.n_heads,
+                            cfg.n_kv_heads,
+                            cfg.head_dim(),
+                            cfg.norm_eps,
+                            true,
+                            adaln_dim,
+                            pipelines,
+                        )
+                        .map_err(|e| {
+                            crate::tensor::Error::msg(format!("OpenCL noise refiner {i}: {e}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            _ => Vec::new(),
+        };
+
         // 4. The OpenCL scratch buffers are built on the first request, from its length
         #[cfg(feature = "opencl")]
         let ocl_scratch = std::sync::Mutex::new(None);
@@ -427,6 +478,8 @@ impl HeteroZImage {
             main_layers,
             #[cfg(feature = "opencl")]
             ocl_blocks,
+            #[cfg(feature = "opencl")]
+            ocl_noise_refiner,
             #[cfg(feature = "opencl")]
             ocl_scratch,
             #[cfg(feature = "opencl")]
@@ -674,8 +727,21 @@ impl HeteroZImage {
         // attention spent on (m-1)*1e9 + broadcast_add without
         // triggering the broken flash-attn fallback path.
         let _ = &x_attn_mask;
-        for db in &self.noise_refiner {
-            x_emb = db.forward(&x_emb, None, &x_cos, &x_sin, Some(&adaln_input))?;
+        #[cfg(feature = "opencl")]
+        let refined_on_opencl = !self.ocl_noise_refiner.is_empty();
+        #[cfg(not(feature = "opencl"))]
+        let refined_on_opencl = false;
+        if refined_on_opencl {
+            #[cfg(feature = "opencl")]
+            {
+                let blocks: Vec<(Option<usize>, &OpenCLZImageBlock)> =
+                    self.ocl_noise_refiner.iter().map(|b| (None, b)).collect();
+                x_emb = self.run_opencl_blocks(x_emb, &blocks, &x_cos, &x_sin, &adaln_input)?;
+            }
+        } else {
+            for db in &self.noise_refiner {
+                x_emb = db.forward(&x_emb, None, &x_cos, &x_sin, Some(&adaln_input))?;
+            }
         }
 
         // 8. (cached) Context refiner output already in `cap`.
@@ -787,9 +853,6 @@ impl HeteroZImage {
     }
 
     /// Forward pass for an OpenCL segment.
-    ///
-    /// The inputs are wrapped as CL_MEM_USE_HOST_PTR buffers, which an integrated GPU with
-    /// shared memory may read without a copy; the result is read back explicitly.
     #[cfg(feature = "opencl")]
     fn forward_opencl_segment(
         &self,
@@ -798,6 +861,36 @@ impl HeteroZImage {
         unified_cos: &Tensor,
         unified_sin: &Tensor,
         _unified_attn_mask: &Tensor,
+        adaln_input: &Tensor,
+    ) -> Result<Tensor> {
+        let blocks = (seg.start..seg.end)
+            .map(|i| {
+                self.ocl_blocks[i]
+                    .as_ref()
+                    .map(|b| (Some(i), b))
+                    .ok_or_else(|| {
+                        crate::tensor::Error::msg(format!(
+                            "OpenCL block {} not loaded but segment expects it",
+                            i
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.run_opencl_blocks(unified, &blocks, unified_cos, unified_sin, adaln_input)
+    }
+
+    /// Runs `blocks` in order through OpenCL over a `[1, seq, dim]` tensor.
+    ///
+    /// A block with a main layer index is timed as that layer.
+    /// The inputs are wrapped as CL_MEM_USE_HOST_PTR buffers, which an integrated GPU with
+    /// shared memory may read without a copy; the result is read back explicitly.
+    #[cfg(feature = "opencl")]
+    fn run_opencl_blocks(
+        &self,
+        unified: Tensor,
+        blocks: &[(Option<usize>, &OpenCLZImageBlock)],
+        unified_cos: &Tensor,
+        unified_sin: &Tensor,
         adaln_input: &Tensor,
     ) -> Result<Tensor> {
         use opencl3::memory::{CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_USE_HOST_PTR};
@@ -902,30 +995,24 @@ impl HeteroZImage {
         };
 
         // Run each OpenCL block - x_buf is read and written in place on the device
-        for i in seg.start..seg.end {
-            let _timer =
-                crate::inference::place::layer_perf::LayerTimer::start_for(i, "z-image-turbo");
-            if let Some(ref ocl_block) = self.ocl_blocks[i] {
-                ocl_block
-                    .forward(
-                        &x_buf,
-                        seq_len,
-                        &cos_buf,
-                        &sin_buf,
-                        Some(&adaln_ocl_buf),
-                        None, // mask not used for main layers with AdaLN
-                        scratch,
-                        pipelines,
-                    )
-                    .map_err(|e| {
-                        crate::tensor::Error::msg(format!("OpenCL block {} forward: {}", i, e))
-                    })?;
-            } else {
-                return Err(crate::tensor::Error::msg(format!(
-                    "OpenCL block {} not loaded but segment expects it",
-                    i
-                )));
-            }
+        for &(layer, ocl_block) in blocks {
+            let _timer = layer.map(|i| {
+                crate::inference::place::layer_perf::LayerTimer::start_for(i, "z-image-turbo")
+            });
+            ocl_block
+                .forward(
+                    &x_buf,
+                    seq_len,
+                    &cos_buf,
+                    &sin_buf,
+                    Some(&adaln_ocl_buf),
+                    None, // mask not used for modulated blocks
+                    scratch,
+                    pipelines,
+                )
+                .map_err(|e| {
+                    crate::tensor::Error::msg(format!("OpenCL block {:?} forward: {}", layer, e))
+                })?;
         }
 
         // Ensure all kernels complete before reading CPU memory

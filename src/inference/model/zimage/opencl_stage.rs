@@ -6,11 +6,15 @@
 //! dimensions - which `zimage-trim.safetensors` in the working directory holds. The cost of a
 //! block is the difference between a stack of `LAYERS` and a stack of one.
 //!
+//! The GPU is the first one that shares the host's memory, else the first one listed.
+//!
 //! Ignored by default: it needs that file and an OpenCL device.
 
 use super::dit::Config;
 use super::hetero::HeteroZImage;
-use crate::inference::kernel::opencl::{enumerate_opencl_devices, OpenCLPipelines};
+use crate::inference::kernel::opencl::{
+    enumerate_opencl_devices, shares_host_memory, OpenCLPipelines,
+};
 use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan, HeteroSegment};
 use crate::tensor::{DType, Device, Tensor};
 use std::sync::Arc;
@@ -23,6 +27,17 @@ const LATENT: usize = 64;
 
 /// Tokens of caption.
 const CAPTION: usize = 32;
+
+/// The first listed GPU that shares the host's memory, else the first one listed.
+fn device() -> opencl3::types::cl_device_id {
+    let devices = enumerate_opencl_devices();
+    assert!(!devices.is_empty(), "no OpenCL device");
+    devices
+        .iter()
+        .copied()
+        .find(|&d| shares_host_memory(d))
+        .unwrap_or(devices[0])
+}
 
 fn plan(kind: DeviceKind, layers: usize) -> HeteroPlan {
     HeteroPlan {
@@ -111,9 +126,7 @@ fn host_vec(t: &Tensor) -> Vec<f32> {
 #[test]
 #[ignore = "needs zimage-trim.safetensors in the working directory and an OpenCL device"]
 fn a_denoising_step_on_opencl_matches_the_host() {
-    let devices = enumerate_opencl_devices();
-    assert!(!devices.is_empty(), "no OpenCL device");
-    let pipelines = Arc::new(OpenCLPipelines::new(devices[0]).unwrap());
+    let pipelines = Arc::new(OpenCLPipelines::new(device()).unwrap());
     let mut rows = Vec::new();
     for layers in [1, LAYERS] {
         let host = build(layers, DeviceKind::Cpu, None);
@@ -152,8 +165,7 @@ fn a_denoising_step_on_opencl_matches_the_host() {
 #[test]
 #[ignore = "needs zimage-trim.safetensors in the working directory and an OpenCL device"]
 fn where_the_opencl_block_departs() {
-    let devices = enumerate_opencl_devices();
-    let pipelines = Arc::new(OpenCLPipelines::new(devices[0]).unwrap());
+    let pipelines = Arc::new(OpenCLPipelines::new(device()).unwrap());
     let host = build(1, DeviceKind::Cpu, None);
     let ocl = build(1, DeviceKind::OpenCL(0), Some(pipelines));
     for (name, sx, sc) in [

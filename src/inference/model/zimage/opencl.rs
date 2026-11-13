@@ -175,6 +175,22 @@ impl OclZImageScratch {
 
 // ==================== Weight Loading ====================
 
+/// Work-items along each side of a tiled GEMM work-group: `GEMM_TS` in `f32_matmul.cl`.
+const GEMM_TS: usize = 16;
+
+/// Rows and columns of C one tiled GEMM work-group computes: `GEMM_BT` in `f32_matmul.cl`.
+const GEMM_BT: usize = 64;
+
+/// The global size of a tiled GEMM writing `C[m, n]`.
+///
+/// Dimension 0 covers the columns and dimension 1 the rows, `GEMM_TS` work-items per block.
+fn gemm_global(m: u32, n: u32) -> [usize; 2] {
+    [
+        (n as usize).div_ceil(GEMM_BT) * GEMM_TS,
+        (m as usize).div_ceil(GEMM_BT) * GEMM_TS,
+    ]
+}
+
 /// Convert BF16 bytes to F32 bytes
 fn bf16_to_f32(data: &[u8]) -> Vec<u8> {
     let n = data.len() / 2;
@@ -958,9 +974,6 @@ impl OpenCLZImageBlock {
         k: u32,
         p: &OpenCLPipelines,
     ) -> Result<()> {
-        let ts = 16usize;
-        let gm = (m as usize).div_ceil(ts) * ts;
-        let gn = (n as usize).div_ceil(ts) * ts;
         unsafe {
             ExecuteKernel::new(kernel)
                 .set_arg(a)
@@ -969,8 +982,8 @@ impl OpenCLZImageBlock {
                 .set_arg(&m)
                 .set_arg(&n)
                 .set_arg(&k)
-                .set_global_work_sizes(&[gm, gn])
-                .set_local_work_sizes(&[ts, ts])
+                .set_global_work_sizes(&gemm_global(m, n))
+                .set_local_work_sizes(&[GEMM_TS, GEMM_TS])
                 .enqueue_nd_range(&p.queue)?;
         }
         Ok(())
@@ -1120,9 +1133,6 @@ impl OpenCLZImageBlock {
         let n_hidden = self.hidden_dim as u32;
 
         // Fused tiled gate_up_silu: ffn_act = silu(input x w1^T) * (input x w3^T)
-        let ts = 16usize;
-        let gm = (m as usize).div_ceil(ts) * ts;
-        let gn = (n_hidden as usize).div_ceil(ts) * ts;
         unsafe {
             ExecuteKernel::new(&p.f32_tiled_gate_up_silu)
                 .set_arg(&self.ffn.w1.buf)
@@ -1132,8 +1142,8 @@ impl OpenCLZImageBlock {
                 .set_arg(&m)
                 .set_arg(&n_hidden)
                 .set_arg(&k_in)
-                .set_global_work_sizes(&[gm, gn])
-                .set_local_work_sizes(&[ts, ts])
+                .set_global_work_sizes(&gemm_global(m, n_hidden))
+                .set_local_work_sizes(&[GEMM_TS, GEMM_TS])
                 .enqueue_nd_range(&p.queue)?;
         }
 
@@ -1228,4 +1238,113 @@ pub unsafe fn write_buffer_raw_pub(
     data: &[u8],
 ) -> Result<()> {
     write_buffer_raw(queue, dst, data)
+}
+
+/// The tiled GEMMs on a real device, against a host reference.
+///
+/// The shape leaves a partial block on every edge of the output.
+#[cfg(test)]
+mod tiled_gemm_on_device {
+    use super::*;
+    use crate::inference::kernel::opencl::enumerate_opencl_devices;
+
+    const M: usize = 70;
+    const N: usize = 130;
+    const K: usize = 48;
+
+    fn values(len: usize, step: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * step % 41) as f32 - 20.0) * 0.05)
+            .collect()
+    }
+
+    fn host_product(a: &[f32], b: &[f32]) -> Vec<f32> {
+        let mut c = vec![0f32; M * N];
+        for r in 0..M {
+            for n in 0..N {
+                c[r * N + n] = (0..K).fold(0f32, |acc, k| a[r * K + k].mul_add(b[n * K + k], acc));
+            }
+        }
+        c
+    }
+
+    fn upload(p: &OpenCLPipelines, v: &[f32]) -> Buffer<u8> {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        upload_f32(&bytes, p).expect("upload")
+    }
+
+    fn read(p: &OpenCLPipelines, buf: &Buffer<u8>, len: usize) -> Vec<f32> {
+        let mut bytes = vec![0u8; len * 4];
+        unsafe {
+            p.queue
+                .enqueue_read_buffer(buf, CL_BLOCKING, 0, &mut bytes, &[])
+        }
+        .expect("read");
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "{what}: element {i} (row {}, column {}): device {g}, host {w}",
+                i / N,
+                i % N
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an OpenCL device"]
+    fn the_tiled_products_match_the_host() {
+        let devices = enumerate_opencl_devices();
+        assert!(!devices.is_empty(), "no OpenCL device");
+        let (a, gate, up) = (values(M * K, 7), values(N * K, 11), values(N * K, 13));
+        let want_gate = host_product(&a, &gate);
+        let want_up = host_product(&a, &up);
+        let want_act: Vec<f32> = want_gate
+            .iter()
+            .zip(&want_up)
+            .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        for dev in devices {
+            let p = OpenCLPipelines::new(dev).expect("pipelines");
+            let (a_buf, g_buf, u_buf) = (upload(&p, &a), upload(&p, &gate), upload(&p, &up));
+            let c_buf = unsafe {
+                Buffer::<u8>::create(&p.context, CL_MEM_READ_WRITE, M * N * 4, null_mut())
+            }
+            .expect("alloc");
+            let (m, n, k) = (M as u32, N as u32, K as u32);
+            OpenCLZImageBlock::dispatch_tiled_matmul(
+                &p.f32_tiled_matmul,
+                &a_buf,
+                &g_buf,
+                &c_buf,
+                m,
+                n,
+                k,
+                &p,
+            )
+            .expect("product");
+            assert_close(&read(&p, &c_buf, M * N), &want_gate, "product");
+            unsafe {
+                ExecuteKernel::new(&p.f32_tiled_gate_up_silu)
+                    .set_arg(&g_buf)
+                    .set_arg(&u_buf)
+                    .set_arg(&a_buf)
+                    .set_arg(&c_buf)
+                    .set_arg(&m)
+                    .set_arg(&n)
+                    .set_arg(&k)
+                    .set_global_work_sizes(&gemm_global(m, n))
+                    .set_local_work_sizes(&[GEMM_TS, GEMM_TS])
+                    .enqueue_nd_range(&p.queue)
+                    .expect("gate and up");
+            }
+            assert_close(&read(&p, &c_buf, M * N), &want_act, "gate and up");
+        }
+    }
 }

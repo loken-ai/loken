@@ -1919,6 +1919,9 @@ mod zimage_primary_overhead_tests {
 #[cfg(test)]
 mod zimage_placement_tests;
 
+#[cfg(all(test, feature = "opencl"))]
+mod zimage_opencl_image;
+
 mod load_flux;
 mod load_others;
 mod render;

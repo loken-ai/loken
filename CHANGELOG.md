@@ -50,6 +50,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: read the prompts that hit the prefix cache together in 1 pass.
 - Serving: keep an AWQ model's activations in f16 between its projections.
 - Serving: batch a burst from its first request and draft for a lone request.
+- OpenCL: run the Z-Image projections faster than the host on an Intel GPU.
 - OpenCL: read a prompt and decode faster on a GPU.
 - Vulkan: decode at pace on an idle host and read a prompt in larger steps, experts included.
 - Experts: split a mixture that 1 card holds across cards when the measured links make that faster.
