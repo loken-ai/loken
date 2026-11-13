@@ -87,6 +87,12 @@ impl PrefillShape {
     }
 }
 
+/// The chunk an earlier prefill shrank to, held between the smallest chunk and `chunk`.
+/// A `chunk` under the smallest chunk is a prompt shorter than it: the chunk is then the prompt.
+fn remembered_chunk(remembered: usize, chunk: usize) -> usize {
+    remembered.clamp(PREFILL_CHUNK_TOKENS_MIN.min(chunk), chunk)
+}
+
 /// The chunk a prefill starts at: `chunk` unless an earlier prefill had to shrink to a smaller
 /// one, which stands until the cards hold more than when it shrank by what the larger chunk
 /// needs on top of it, at `per_token` bytes a row.
@@ -95,7 +101,7 @@ fn start_chunk(chunk: usize, per_token: usize, free_now: usize) -> usize {
     match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
         0 => chunk,
         remembered => {
-            let remembered = remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk);
+            let remembered = remembered_chunk(remembered, chunk);
             let gain = free_now.saturating_sub(ADAPTIVE_PREFILL_FREE.load(Ordering::Relaxed));
             if gain >= (chunk - remembered) * per_token.max(1) {
                 ADAPTIVE_PREFILL_CHUNK.store(0, Ordering::Relaxed);
@@ -358,6 +364,12 @@ pub(crate) trait ModelBackend: Send {
     /// back.
     fn finish_prefill(&mut self) {}
 
+    /// The most rows a forward of a serial prefill of `rows` rows takes, before a card runs out
+    /// of memory, from the prefill's `sizing`.
+    fn serial_prefill_rows(&self, _rows: usize, sizing: PrefillSizing) -> usize {
+        sizing.chunk
+    }
+
     fn forward_prefill_chunks(
         &mut self,
         x: &Tensor,
@@ -365,7 +377,7 @@ pub(crate) trait ModelBackend: Send {
     ) -> crate::tensor::Result<Tensor> {
         let (_, seq_len) = x.dims2()?;
         let sizing = prefill_sizing(self.prefill_shape());
-        let chunk_start = sizing.chunk;
+        let chunk_start = self.serial_prefill_rows(seq_len, sizing);
         // A prompt that fits one chunk runs as one forward; a longer one starts from the last
         // chunk that fit this model, clamped into [MIN, default]. Each out-of-memory failure
         // halves the chunk down to the floor, which shrinks the activation peak, the attention
@@ -1394,7 +1406,8 @@ impl GenericBackend {
         // The rest of the prompt is prefilled here: the card's memory lent to the caches is
         // taken back for it, as for any prefill.
         self.prepare_prefill(covered, prompt.len() - covered);
-        let chunk = adaptive_prefill_chunk(self.prefill_shape());
+        let chunk =
+            self.serial_prefill_rows(prompt.len() - covered, prefill_sizing(self.prefill_shape()));
         // A recurrent state that failed part way through the new tokens cannot be rewound, so
         // a failure ends in the caller prefilling the whole prompt from position 0 instead,
         // which starts a fresh state; a card running out of memory is answered first by the
@@ -1656,6 +1669,25 @@ impl ModelBackend for GenericBackend {
 
     fn reclaim_prefill_room(&mut self, need: u64) -> bool {
         self.reclaim_for_chunk(need)
+    }
+
+    /// A model whose forwards read routed experts that no card keeps takes the rows the cards
+    /// afford, at most `rows`, as the batch worker does.
+    /// It takes all `rows` when no card is measured.
+    /// Any other model takes the sized chunk.
+    fn serial_prefill_rows(&self, rows: usize, sizing: PrefillSizing) -> usize {
+        if !self.0.wide_forwards_read_experts() {
+            return sizing.chunk;
+        }
+        let afforded = sizing.tightest_free.map_or(usize::MAX, |free| {
+            affordable_rows(free as usize, &self.prefill_shape()).max(sizing.chunk)
+        });
+        let chunk = afforded.min(rows).max(1);
+        tracing::info!(
+            "serial prefill of {rows} rows: forwards of {chunk} rows, the forwards read routed \
+             experts no card keeps"
+        );
+        chunk
     }
 
     fn prepare_prefill(&mut self, from: usize, tokens: usize) {
@@ -2748,6 +2780,28 @@ mod prefill_chunk_memo_tests {
         let a = super::adaptive_prefill_chunk(super::PrefillShape::from_widest_ffn(14336));
         let b = super::adaptive_prefill_chunk(super::PrefillShape::from_widest_ffn(14336));
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod remembered_chunk_tests {
+    use super::{remembered_chunk, PREFILL_CHUNK_TOKENS_MIN};
+
+    /// A remembered chunk stays between the smallest chunk and the chunk asked for.
+    #[test]
+    fn a_remembered_chunk_stays_within_the_chunk_asked_for() {
+        let chunk = PREFILL_CHUNK_TOKENS_MIN * 8;
+        assert_eq!(remembered_chunk(1, chunk), PREFILL_CHUNK_TOKENS_MIN);
+        assert_eq!(remembered_chunk(chunk * 2, chunk), chunk);
+        assert_eq!(remembered_chunk(chunk / 2, chunk), chunk / 2);
+    }
+
+    /// A prompt shorter than the smallest chunk is read whole after an earlier prefill shrank.
+    #[test]
+    fn a_prompt_under_the_smallest_chunk_is_read_whole() {
+        let chunk = PREFILL_CHUNK_TOKENS_MIN - 8;
+        assert_eq!(remembered_chunk(PREFILL_CHUNK_TOKENS_MIN, chunk), chunk);
+        assert_eq!(remembered_chunk(1, chunk), chunk);
     }
 }
 

@@ -139,6 +139,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - State cache: load when the disk probe measures no rate.
 - MoE: drop and read ahead the expert pages of a model loaded from 1 file.
 - Vulkan: give each block of 32 activations of a product its own scale.
+- Serving: read a long prompt on the serial path in the rows the cards afford.
 - Speculation: judge a prompt lookup trial after a hold on its own cost.
 
 ### Removed

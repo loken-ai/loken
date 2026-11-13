@@ -485,6 +485,128 @@ fn the_server_restores_a_stored_prefix_and_streams_the_same_tokens() {
     }
 }
 
+/// Tokens of the prompt the serial path reads in the serial cut tests.
+///
+/// It is longer than the chunk the serial path takes for a model whose forwards read no routed
+/// expert from the host, when no card is measured.
+const SERIAL_PROMPT: usize = crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS + 2 * BLOCK;
+
+/// The greedy token the serial path gives `prompt` on `model`, and each reading of the probe
+/// seen until the prompt is read.
+///
+/// A model with a state cache reads the prompt through the restore of a stored prefix.
+/// A model without one reads it through the chunked prefill.
+fn serial_watched(model: GenericHeteroTransformer, prompt: &[u32]) -> (u32, Vec<(u64, u64)>) {
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+    use crate::request_metrics::RequestProbe;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cached = model.state_cache().is_some();
+    let mut backend = GenericBackend(model);
+    let probe = Arc::new(RequestProbe::default());
+    let read = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (probe, read) = (Arc::clone(&probe), Arc::clone(&read));
+        std::thread::spawn(move || {
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            while !read.load(Ordering::Relaxed) {
+                let reading = probe.prefill();
+                if seen.last() != Some(&reading) {
+                    seen.push(reading);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            seen
+        })
+    };
+    let logits = {
+        let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(&probe)));
+        match cached {
+            true => backend.try_restore_prefix(prompt).unwrap(),
+            false => Some(backend.forward_prefill_chunked(&ids(prompt), 0).unwrap()),
+        }
+    };
+    read.store(true, Ordering::Relaxed);
+    let logits = logits.expect("a model with a state cache reads the prompt");
+    // The reading of the whole prompt comes without a pause, and may come after the watcher.
+    let mut seen = watcher.join().unwrap();
+    let last = probe.prefill();
+    if seen.last() != Some(&last) {
+        seen.push(last);
+    }
+    (greedy(&logits), seen)
+}
+
+/// For both layouts on the host, with and without a state cache, the serial path cuts a long
+/// prompt where the batch worker cuts it, for a model whose forwards read routed experts that
+/// no card keeps.
+///
+/// The probe sees the same readings on both paths.
+/// Both read the prompt in 1 forward and give the same first token.
+#[test]
+fn the_serial_path_cuts_a_long_prompt_as_the_worker_does() {
+    let paused = crate::request_metrics::PREFILL_PAUSE_LOCK.blocking_lock();
+    crate::inference::engine::llm_engine::reset_adaptive_prefill_chunk();
+    pause(PAUSE_MS);
+    let prompt: Vec<u32> = (0..SERIAL_PROMPT as u32)
+        .map(|i| (i * 5 + 2) % VOCAB as u32)
+        .collect();
+    let total = SERIAL_PROMPT as u64;
+    let mut runs = Vec::new();
+    for layout in 0..LAYOUTS.len() {
+        for cached in [false, true] {
+            let model = cut_model(layout, cached);
+            assert!(model.wide_forwards_read_experts(), "layout {layout}");
+            let layers = model.layers.len();
+            let serial = serial_watched(model, &prompt);
+            let worker = served_watched(cut_model(layout, cached), &prompt, BUDGET);
+            runs.push((layout, cached, layers, serial, worker));
+        }
+    }
+    pause(0);
+    drop(paused);
+    let of_prompt = |seen: &[(u64, u64)]| -> Vec<(u64, u64)> {
+        seen.iter().copied().filter(|&(_, t)| t == total).collect()
+    };
+    for (layout, cached, layers, serial, worker) in runs {
+        let what = format!("layout {layout}, state cache {cached}");
+        assert_eq!(
+            of_prompt(&serial.1),
+            of_prompt(&worker.1),
+            "{what}: the serial cut"
+        );
+        assert_eq!(of_prompt(&serial.1), one_forward(total, layers), "{what}");
+        assert_eq!(Some(&serial.0), worker.0.first(), "{what}");
+    }
+}
+
+/// For both layouts on the host, with and without a state cache, a serial read whose forward
+/// does not fit the card is read again in forwards of half the rows.
+///
+/// It gives the first token of a read that fits.
+#[test]
+fn a_serial_forward_that_does_not_fit_is_read_in_halves() {
+    use crate::inference::engine::llm_engine::ADAPTIVE_PREFILL_CHUNK;
+    use crate::inference::engine::model_backend::FORCED_CHUNK_ROWS;
+    use std::sync::atomic::Ordering;
+    let paused = crate::request_metrics::PREFILL_PAUSE_LOCK.blocking_lock();
+    let prompt: Vec<u32> = (0..SERIAL_PROMPT as u32)
+        .map(|i| (i * 5 + 2) % VOCAB as u32)
+        .collect();
+    for (layout, cached) in (0..LAYOUTS.len()).flat_map(|l| [(l, false), (l, true)]) {
+        let what = format!("layout {layout}, state cache {cached}");
+        crate::inference::engine::llm_engine::reset_adaptive_prefill_chunk();
+        let (fits, _) = serial_watched(cut_model(layout, cached), &prompt);
+        FORCED_CHUNK_ROWS.with(|c| c.set(SERIAL_PROMPT - 1));
+        let (halved, _) = serial_watched(cut_model(layout, cached), &prompt);
+        FORCED_CHUNK_ROWS.with(|c| c.set(usize::MAX));
+        let used = ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed);
+        crate::inference::engine::llm_engine::reset_adaptive_prefill_chunk();
+        assert_eq!(used, SERIAL_PROMPT / 2, "{what}: the rung");
+        assert_eq!(halved, fits, "{what}");
+    }
+    drop(paused);
+}
+
 /// On the released file on the host, 1, 4 and 16 sequences served together each get the
 /// greedy tokens they get alone.
 ///

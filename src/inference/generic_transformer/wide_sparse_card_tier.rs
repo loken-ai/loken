@@ -230,6 +230,16 @@ impl GenericHeteroTransformer {
             .sum()
     }
 
+    /// Whether a held layer has routed experts that no card keeps.
+    ///
+    /// A forward reads their bytes from the host's memory, or from the disk, each time.
+    pub fn wide_forwards_read_experts(&self) -> bool {
+        self.layers
+            .iter()
+            .filter_map(|l| l.sinkhorn.as_ref())
+            .any(|b| b.ffn.card.count() < b.ffn.experts.len())
+    }
+
     /// Places the weights every token reads, then the routed experts: the cards that pay keep
     /// the hottest, each expert reads the variant `choice` gives it, and the host tier keeps the
     /// hottest of the others (`keep_wide_host_experts`).

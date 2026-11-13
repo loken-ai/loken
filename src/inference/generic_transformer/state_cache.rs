@@ -1530,6 +1530,15 @@ impl GenericHeteroTransformer {
             let end = boundary.min(prompt.len());
             while pos < end {
                 let n = chunk.min(end - pos);
+                #[cfg(test)]
+                if n > crate::inference::engine::model_backend::FORCED_CHUNK_ROWS.with(|c| c.get())
+                {
+                    // A card with room for fewer rows than asked.
+                    return Err(crate::tensor::Error::msg(
+                        "alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+                            .to_string(),
+                    ));
+                }
                 let x = Tensor::new(&prompt[pos..pos + n], &Device::Cpu)?.unsqueeze(0)?;
                 last = Some(self.forward(&x, pos)?);
                 pos += n;
