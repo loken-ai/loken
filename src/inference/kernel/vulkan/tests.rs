@@ -1,7 +1,7 @@
 //! The mat-vec kernels against the host's dequantised weights, on every Vulkan device listed.
 //! A machine without one passes them without running anything.
 
-use super::stack::{matvec_probe, RawTensor};
+use super::stack::{grouped_probe, matvec_probe, RawTensor};
 use crate::tensor::quantized::{GgmlDType, QTensor};
 use crate::tensor::{Device, Tensor};
 
@@ -188,6 +188,75 @@ fn coop_f16() {
 #[test]
 fn matmat_f16() {
     check(GgmlDType::F16, 40, false);
+}
+
+/// The grouped expert kernel of `dtype` against the per-pair kernel on the same routes, with
+/// the activations of the tokens, or with `by_pair` of the pairs.
+///
+/// Expert 0 has more pairs than a tile holds.
+/// Expert 2 has a single pair.
+/// Expert 3 has none.
+fn grouped(dtype: GgmlDType, by_pair: bool) {
+    let (experts, rows, cols, used, tokens) = (4, 70, 512, 2, 40);
+    let w = Tensor::from_vec(
+        values(experts * rows * cols, 7),
+        (experts * rows, cols),
+        &Device::Cpu,
+    )
+    .unwrap();
+    let q = QTensor::quantize(&w, dtype).unwrap();
+    let raw = RawTensor {
+        dtype,
+        rows: experts * rows,
+        cols,
+        bytes: q.data().unwrap(),
+    };
+    let chosen: Vec<u32> = (0..tokens)
+        .flat_map(|t| [0, if t == 7 { 2 } else { 1 }])
+        .collect();
+    let xrows = if by_pair { chosen.len() } else { tokens };
+    let x = values(xrows * cols, 11);
+    for d in super::devices() {
+        let (got, want, shared) =
+            grouped_probe(d.index, &raw, experts, &x, &chosen, used, by_pair).unwrap();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let err = got
+            .iter()
+            .zip(&want)
+            .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
+        println!(
+            "{} grouped on {}: max error {err:.2e} of {scale:.2e}, {shared} values a scale",
+            dtype.gguf_name(),
+            d.name
+        );
+        assert!(got.iter().all(|v| v.is_finite()), "{}", d.name);
+        assert!(
+            err <= scale * 1e-4,
+            "{} on {}: error {err} of {scale}",
+            dtype.gguf_name(),
+            d.name
+        );
+    }
+}
+
+#[test]
+fn grouped_q4k() {
+    grouped(GgmlDType::Q4K, false);
+}
+
+#[test]
+fn grouped_q6k() {
+    grouped(GgmlDType::Q6K, true);
+}
+
+#[test]
+fn grouped_q8_0() {
+    grouped(GgmlDType::Q8_0, false);
+}
+
+#[test]
+fn grouped_q5_0() {
+    grouped(GgmlDType::Q5_0, true);
 }
 
 /// The cache store keeps each key and value at the f16 nearest to it, ties to even.

@@ -598,6 +598,11 @@ impl Context {
     }
 
     /// Submits a recorded command buffer and waits for it.
+    ///
+    /// The host polls the fence until the device signals it.
+    /// Between 2 polls the waiting thread yields its core and stays runnable.
+    /// Its core keeps its clock up while the step runs.
+    /// Another runnable thread may take the core between 2 polls.
     pub(crate) fn run(&self, cmd: vk::CommandBuffer) -> anyhow::Result<()> {
         let fence = unsafe {
             self.device
@@ -609,7 +614,13 @@ impl Context {
             let queue = self.queue.lock().unwrap();
             self.device
                 .queue_submit(*queue, &submit, fence)
-                .and_then(|_| self.device.wait_for_fences(&[fence], true, u64::MAX))
+                .and_then(|_| loop {
+                    match self.device.get_fence_status(fence) {
+                        Ok(true) => break Ok(()),
+                        Ok(false) => std::thread::yield_now(),
+                        Err(e) => break Err(e),
+                    }
+                })
         };
         unsafe { self.device.destroy_fence(fence, None) };
         result.map_err(|e| anyhow::anyhow!("vulkan: submit: {e}"))

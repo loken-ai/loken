@@ -12,8 +12,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Rows of the residual stream one step carries.
-pub const MAX_TOKENS: usize = 128;
+/// Rows of the residual stream one step carries: the engine's prefill chunk.
+pub const MAX_TOKENS: usize = crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS;
 /// Rows a mat-vec dispatch carries; more rows go through the mat-mat kernels.
 pub const MV_TOKENS: usize = 8;
 /// Rows and tokens of a mat-mat workgroup's tile.
@@ -57,13 +57,34 @@ fn mat_mat_for(w: &Matrix, tokens: usize) -> Option<(&'static str, (u32, u32))> 
 /// single activation scale.
 /// Without flag 2 every block of 32 has its own scale.
 fn quant_flags(ws: &[&Matrix], tokens: usize) -> u32 {
+    reader_flags(ws, |w| mat_mat_for(w, tokens).map(|(k, _)| k))
+}
+
+/// [`quant_flags`] for products whose mat-mat kernel `mat_mat` names, none for a mat-vec.
+fn reader_flags(ws: &[&Matrix], mat_mat: impl Fn(&Matrix) -> Option<&'static str>) -> u32 {
     let f32_copy = ws
         .iter()
         .any(|w| matches!(w.kernel, "mv_f16" | "mv_bf16" | "mv_f32"));
     let wide = ws
         .iter()
-        .any(|w| matches!(mat_mat_for(w, tokens), Some(("mm_q4k" | "mm_q6k", _))));
+        .any(|w| matches!(mat_mat(w), Some("mm_q4k" | "mm_q6k" | "ex_q4k" | "ex_q6k")));
     u32::from(f32_copy) | (u32::from(wide) << 1)
+}
+
+/// The grouped expert kernel the experts of `w` run on a step of `tokens` rows; none where
+/// each pair runs the mat-vec.
+///
+/// The grouped kernel runs where the pairs an expert expects pass the rows a mat-vec takes.
+fn grouped_for(w: &Matrix, s: &DenseSpec, tokens: usize) -> Option<&'static str> {
+    w.mat_mat
+        .filter(|_| tokens * s.used / s.experts.max(1) > MV_TOKENS)
+        .and_then(super::shaders::grouped_kernel)
+}
+
+/// Most tiles `pairs` pairs over `experts` experts fill: each expert with a pair rounds up its
+/// last tile.
+fn max_tiles(pairs: usize, experts: usize) -> usize {
+    pairs.div_ceil(MM_TOKENS as usize) + experts.min(pairs)
 }
 
 /// The shape of the decoder: what every layer of the stack shares.
@@ -386,6 +407,9 @@ pub struct VulkanStack {
     moe_down: Buffer,
     /// The experts chosen for each token and their weights.
     route: Buffer,
+    /// The pairs grouped by expert and the tiles of the grouped expert kernels.
+    order: Buffer,
+    tiles: Buffer,
     part: Buffer,
     io: Buffer,
     step: Buffer,
@@ -533,6 +557,8 @@ impl VulkanStack {
             moe_up: card(pairs * s.expert_ffn + 4)?,
             moe_down: card(pairs * s.hidden + 4)?,
             route: ctx.buffer((pairs.max(1) * 8) as u64, false)?,
+            order: card(pairs.max(1))?,
+            tiles: card(1 + 3 * max_tiles(pairs, s.experts))?,
             part: card(MV_TOKENS * s.n_head * MAX_SPLITS * (s.head_dim + 2))?,
             io: ctx.buffer((t * s.hidden * 4) as u64, true)?,
             step: ctx.buffer(16, true)?,
@@ -734,9 +760,13 @@ impl VulkanStack {
         };
         let s = &self.spec;
         let pairs = (tokens * s.used) as u32;
+        let grouped = |w: &Matrix| grouped_for(w, s, tokens);
         // The router reads the f32 copy.
-        // The experts run mat-vecs, which read a scale to each block.
-        ops.push(self.opening_quant(l.ffn_norm.as_ref(), tokens, 1));
+        ops.push(self.opening_quant(
+            l.ffn_norm.as_ref(),
+            tokens,
+            1 | reader_flags(&[gate, up], grouped),
+        ));
         let mut a = [0u32; 16];
         a[..6].copy_from_slice(&[
             tokens as u32,
@@ -758,6 +788,18 @@ impl VulkanStack {
             [tokens as u32, 1, 1],
             true,
         ));
+        if [gate, up, down].iter().any(|&w| grouped(w).is_some()) {
+            let mut a = [0u32; 16];
+            a[..3].copy_from_slice(&[pairs, s.experts as u32, MM_TOKENS]);
+            ops.push(self.op(
+                "route_tiles",
+                &[&self.route, &self.order, &self.tiles],
+                a,
+                [1, 1, 1],
+                true,
+            ));
+        }
+        let tiles = max_tiles(pairs as usize, s.experts) as u32;
         let rows_per = s.expert_ffn;
         let product = |w: &Matrix,
                        y: &Buffer,
@@ -776,6 +818,24 @@ impl VulkanStack {
                 xmode,
                 rows as u32,
             ]);
+            if let Some(kernel) = grouped(w) {
+                return self.op(
+                    kernel,
+                    &[
+                        &w.buf,
+                        &self.xq,
+                        y,
+                        bias.unwrap_or(&self.dummy),
+                        &self.xm,
+                        &self.xn,
+                        &self.order,
+                        &self.tiles,
+                    ],
+                    a,
+                    [(rows as u32).div_ceil(MM_ROWS), tiles, 1],
+                    barrier,
+                );
+            }
             let mut groups = matvec_groups(w.kernel, rows as u32, self.ctx.workgroup);
             groups[2] = pairs;
             self.op(
@@ -822,7 +882,7 @@ impl VulkanStack {
             pairs as usize,
             rows_per,
             0,
-            quant_flags(&[down], 1),
+            reader_flags(&[down], grouped),
         );
         if let Some((alpha, limit)) = s.swiglu_clamp {
             act.args[6] = alpha.to_bits();
@@ -1775,4 +1835,176 @@ pub(super) fn matvec_probe(
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     Ok((ys, shared))
+}
+
+/// The products of the experts of `w`, `experts` matrices stacked by rows, on routed pairs:
+/// through the grouped expert kernel, then through the per-pair kernel, on device `device`.
+///
+/// `chosen` holds the expert of each pair, `used` pairs a token.
+/// `x` holds a row a token, or with `by_pair`, a row a pair.
+/// Both kernels read the activations quantised as the grouped kernel wants them.
+/// The last value is the count of values that share a scale.
+#[cfg(test)]
+pub(super) fn grouped_probe(
+    device: usize,
+    w: &RawTensor,
+    experts: usize,
+    x: &[f32],
+    chosen: &[u32],
+    used: usize,
+    by_pair: bool,
+) -> anyhow::Result<(Vec<f32>, Vec<f32>, usize)> {
+    let ctx = super::context(device)?;
+    let m = Matrix::upload(&ctx, w, false)?;
+    let kernel = m
+        .mat_mat
+        .and_then(super::shaders::grouped_kernel)
+        .ok_or_else(|| anyhow::anyhow!("vulkan: no grouped kernel for {}", m.kernel))?;
+    let rows = m.rows / experts;
+    let pairs = chosen.len();
+    let xrows = x.len() / m.cols;
+    let tiles = max_tiles(pairs, experts);
+    let flags = 1 | reader_flags(&[&m], |_| Some(kernel));
+    let route: Vec<u8> = chosen
+        .iter()
+        .flat_map(|&e| [e, 0])
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let xb = ctx.upload(&f32_bytes(x))?;
+    let rb = ctx.upload(&route)?;
+    let order = ctx.buffer((pairs * 4) as u64, false)?;
+    let tb = ctx.buffer(((1 + 3 * tiles) * 4) as u64, false)?;
+    let dummy = ctx.buffer(16, false)?;
+    let xq = ctx.buffer((xrows * m.cols) as u64, false)?;
+    let xm = ctx.buffer((xrows * m.cols / 2) as u64, false)?;
+    let xn = ctx.buffer((xrows * m.cols * 4) as u64, false)?;
+    let grouped_y = ctx.buffer((pairs * rows * 4) as u64, true)?;
+    let pair_y = ctx.buffer((pairs * rows * 4) as u64, true)?;
+    let args = |a: &[u32]| {
+        let mut all = [0u32; 16];
+        all[..a.len()].copy_from_slice(a);
+        all
+    };
+    let (r, k, u, mode) = (rows as u32, m.cols as u32, used as u32, u32::from(by_pair));
+    let mut per_pair = matvec_groups(m.kernel, r, ctx.workgroup);
+    per_pair[2] = pairs as u32;
+    let d = &dummy;
+    let dispatches: [(&'static str, [&Buffer; 8], [u32; 16], [u32; 3]); 4] = [
+        (
+            "quant",
+            [&xb, d, d, &xq, &xm, &xn, d, d],
+            args(&[xrows as u32, k, 0, 0, flags, 0]),
+            [xrows as u32, 1, 1],
+        ),
+        (
+            "route_tiles",
+            [&rb, &order, &tb, d, d, d, d, d],
+            args(&[pairs as u32, experts as u32, MM_TOKENS]),
+            [1, 1, 1],
+        ),
+        (
+            kernel,
+            [&m.buf, &xq, &grouped_y, d, &xm, &xn, &order, &tb],
+            args(&[r, k, u, 0, 0, 0, mode]),
+            [r.div_ceil(MM_ROWS), tiles as u32, 1],
+        ),
+        (
+            super::shaders::expert_kernel(m.kernel),
+            [&m.buf, &xq, &pair_y, d, &xm, &xn, &rb, d],
+            args(&[r, k, u, 0, 0, 0, mode, r]),
+            per_pair,
+        ),
+    ];
+    let dev = ctx.device();
+    let n = dispatches.len() as u32;
+    let sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(n * super::BINDINGS)];
+    let pool = unsafe {
+        dev.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(n)
+                .pool_sizes(&sizes),
+            None,
+        )?
+    };
+    let layouts = vec![ctx.set_layout(); n as usize];
+    let sets = unsafe {
+        dev.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts),
+        )?
+    };
+    let mut pipes = Vec::new();
+    for (&(name, bufs, _, _), &set) in dispatches.iter().zip(&sets) {
+        pipes.push(ctx.pipeline(name)?);
+        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = bufs
+            .iter()
+            .map(|b| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(b.buf)
+                    .range(vk::WHOLE_SIZE)]
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info)
+            })
+            .collect();
+        unsafe { dev.update_descriptor_sets(&writes, &[]) };
+    }
+    ctx.submit_once(|cmd| unsafe {
+        let barrier = |dst: vk::AccessFlags, to: vk::PipelineStageFlags| {
+            let mb = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(dst)];
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                to,
+                vk::DependencyFlags::empty(),
+                &mb,
+                &[],
+                &[],
+            );
+        };
+        for (((_, _, a, g), &set), &pipe) in dispatches.iter().zip(&sets).zip(&pipes) {
+            barrier(
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+            );
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
+            dev.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                ctx.pipeline_layout(),
+                0,
+                &[set],
+                &[],
+            );
+            let words: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+            dev.cmd_push_constants(
+                cmd,
+                ctx.pipeline_layout(),
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                &words,
+            );
+            dev.cmd_dispatch(cmd, g[0], g[1], g[2]);
+        }
+        barrier(vk::AccessFlags::HOST_READ, vk::PipelineStageFlags::HOST);
+    })?;
+    unsafe { dev.destroy_descriptor_pool(pool, None) };
+    let (mut got, mut want) = (Vec::new(), Vec::new());
+    grouped_y.read_f32s(pairs * rows, &mut got);
+    pair_y.read_f32s(pairs * rows, &mut want);
+    let shared = if flags & 2 != 0 { 128 } else { 32 };
+    Ok((got, want, shared))
 }

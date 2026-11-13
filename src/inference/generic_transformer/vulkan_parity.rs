@@ -247,7 +247,12 @@ fn reference_layer0(fx: &Fixture, x: &[f32], tokens: usize) -> Vec<f32> {
 }
 
 fn prompt() -> Vec<u32> {
-    (0..24u32).map(|i| 1000 + (i * 37) % 20000).collect()
+    prompt_of(24)
+}
+
+/// A prompt of `n` tokens.
+fn prompt_of(n: usize) -> Vec<u32> {
+    (0..n as u32).map(|i| 1000 + (i * 37) % 20000).collect()
 }
 
 fn ids(t: &[u32]) -> Tensor {
@@ -654,13 +659,21 @@ fn long_prompt_matches(tag: &str, repeats: usize) {
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
-    let text = TEXT.repeat(repeats);
-    let prompt = tokenizer
-        .encode(text.as_str(), false)
-        .unwrap()
-        .get_ids()
-        .to_vec();
-    assert!(prompt.len() > 2 * 128, "{} tokens", prompt.len());
+    // The text repeats in runs of `repeats` until the prompt spans more than 2 chunks of a step.
+    let chunk = crate::inference::kernel::vulkan::stack::MAX_TOKENS;
+    let mut runs = 1;
+    let prompt = loop {
+        let text = TEXT.repeat(repeats * runs);
+        let prompt = tokenizer
+            .encode(text.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        if prompt.len() > 2 * chunk {
+            break prompt;
+        }
+        runs += 1;
+    };
     let host = host_rows(&fx, &prompt, 8);
     let mut picks = Vec::new();
     for d in crate::inference::kernel::vulkan::devices() {
@@ -719,11 +732,20 @@ fn first_layers_match(tag: &str, layers: usize, tolerance: f32) {
 
 /// The experts' share of the first layer: the rows after attention and after the experts on
 /// Vulkan, against the host's experts fed the rows after attention.
+///
+/// A short prompt runs each routed pair on its own.
+/// A prompt of a whole step runs the pairs grouped by expert.
 fn experts_match(tag: &str) {
     let fx = Fixture::open_tag(tag);
-    let prompt = prompt();
     let mut host = fx.build(&fx.host());
-    let (h, _) = host.embed_stage(&ids(&prompt), 0).unwrap();
+    let step = crate::inference::kernel::vulkan::stack::MAX_TOKENS;
+    for prompt in [prompt(), prompt_of(step)] {
+        experts_match_on(&fx, &mut host, tag, &prompt);
+    }
+}
+
+fn experts_match_on(fx: &Fixture, host: &mut GenericHeteroTransformer, tag: &str, prompt: &[u32]) {
+    let (h, _) = host.embed_stage(&ids(prompt), 0).unwrap();
     let rows = host_vec(&h);
     let hidden = rows.len() / prompt.len();
     for d in crate::inference::kernel::vulkan::devices() {
@@ -761,7 +783,8 @@ fn experts_match(tag: &str) {
             .zip(&got)
             .fold(0f32, |m, (w, g)| m.max((w - g).abs()));
         println!(
-            "{tag} experts on {}: max error {err:.3e} of {scale:.3e}",
+            "{tag} experts of {} tokens on {}: max error {err:.3e} of {scale:.3e}",
+            prompt.len(),
             d.name
         );
         assert!(err <= 0.01 * scale, "{}: {err} of {scale}", d.name);
@@ -930,6 +953,20 @@ mod olmoe {
     #[ignore = "needs the model in the store and a Vulkan device"]
     fn logit_noise() {
         super::logit_noise(TAG, 2.5, false);
+    }
+
+    /// [`super::vulkan_decode_profile`] for a model whose layers route to experts.
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn decode_profile() {
+        super::decode_profile(TAG);
+    }
+
+    /// [`super::vulkan_prompt_wall`] for a model whose layers route to experts.
+    #[test]
+    #[ignore = "needs the model in the store and a Vulkan device"]
+    fn prompt_wall_profile() {
+        super::prompt_wall(TAG);
     }
 }
 
@@ -1138,7 +1175,8 @@ fn decode_profile(tag: &str) {
         while warm.elapsed() < std::time::Duration::from_secs(2) {
             m.vulkan.profile(128, prompt.len());
         }
-        for tokens in [1, 32, 128] {
+        let chunk = crate::inference::kernel::vulkan::stack::MAX_TOKENS;
+        for tokens in [1, 32, 128, chunk] {
             // The card's clock wanders: the fastest of several runs is the kernels' own time.
             let total_of =
                 |by: &Vec<Vec<(&'static str, f64)>>| by[0].iter().map(|(_, us)| us).sum::<f64>();
@@ -1155,6 +1193,74 @@ fn decode_profile(tag: &str) {
                     .map(|(k, us)| format!("{k} {us:.0}"))
                     .collect::<Vec<_>>()
             );
+        }
+    }
+}
+
+/// The wall of a whole prompt on each Vulkan device against the kernel times of its steps.
+///
+/// Warm walls follow sustained work.
+/// Cold walls follow an idle pause.
+#[test]
+#[ignore = "needs the model in the store and a Vulkan device"]
+fn vulkan_prompt_wall() {
+    prompt_wall(TAG);
+}
+
+fn prompt_wall(tag: &str) {
+    const WALL_PROMPT: usize = 1106;
+    const WALL_RUNS: usize = 3;
+    let pause = std::time::Duration::from_secs(2);
+    let prompt: Vec<u32> = (0..WALL_PROMPT as u32)
+        .map(|i| 1000 + (i * 37) % 20000)
+        .collect();
+    let fx = Fixture::open_tag(tag);
+    let chunk = crate::inference::kernel::vulkan::stack::MAX_TOKENS;
+    for d in crate::inference::kernel::vulkan::devices() {
+        // A card too small for the model has nothing to time.
+        if d.total < 8 << 30 {
+            continue;
+        }
+        let mut m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
+        m.forward(&ids(&prompt), 0).unwrap();
+        let wall = |m: &mut GenericHeteroTransformer| {
+            let start = std::time::Instant::now();
+            m.forward(&ids(&prompt), 0).unwrap();
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        let warm_up = |m: &GenericHeteroTransformer| {
+            let start = std::time::Instant::now();
+            while start.elapsed() < pause {
+                m.vulkan.profile(128, prompt.len());
+            }
+        };
+        warm_up(&m);
+        for run in 0..WALL_RUNS {
+            println!("{}: warm wall {run}: {:.1} ms", d.name, wall(&mut m));
+        }
+        warm_up(&m);
+        let mut sum = 0.0;
+        for start in (0..prompt.len()).step_by(chunk) {
+            let rows = (prompt.len() - start).min(chunk);
+            let totals: Vec<f64> = (0..WALL_RUNS)
+                .map(|_| {
+                    m.vulkan.profile(rows, start)[0]
+                        .iter()
+                        .map(|(_, us)| us)
+                        .sum::<f64>()
+                })
+                .collect();
+            let best = totals.iter().copied().fold(f64::INFINITY, f64::min);
+            sum += best;
+            println!(
+                "{}: kernels of {rows} rows at {start}: {totals:.0?} us",
+                d.name
+            );
+        }
+        println!("{}: kernel sum: {:.1} ms", d.name, sum / 1e3);
+        for run in 0..WALL_RUNS {
+            std::thread::sleep(pause);
+            println!("{}: cold wall {run}: {:.1} ms", d.name, wall(&mut m));
         }
     }
 }

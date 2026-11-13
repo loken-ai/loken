@@ -29,7 +29,7 @@ Major, by state then by priority:
 | DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Planned |
 | Qwen3.8 IQ1_M on 1 card at the reference | Performance | Qwen3.8 IQ1_M on 1 card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
 | Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
-| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Planned |
+| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Partial |
 | Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Partial |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |

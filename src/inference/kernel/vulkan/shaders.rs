@@ -268,6 +268,87 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 }
 "#;
 
+/// The routed pairs of a step grouped by expert, for the grouped expert kernels. One workgroup
+/// of 256 lanes, a lane an expert.
+///
+/// `order` lists the pairs expert by expert, each expert's in the order of `route`.
+/// `tiles[0]` is the tile count.
+/// Tile `i` is `tiles[1 + 3 i ..]`: its expert, its first slot in `order`, its pair count.
+/// A tile holds up to `arg(2)` pairs of one expert.
+///
+/// The experts of the routes pass through `ch` in chunks of 1024, 4 pairs a word.
+/// A pair past the last one reads as an expert no lane has.
+/// Args: pairs, experts, pairs a tile.
+const ROUTE_TILES: &str = r#"
+@group(0) @binding(0) var<storage, read> route: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read_write> order: array<u32>;
+@group(0) @binding(2) var<storage, read_write> tiles: array<u32>;
+var<workgroup> cnt: array<u32, 256>;
+var<workgroup> start: array<u32, 256>;
+var<workgroup> ch: array<vec4<u32>, 256>;
+fn stage(c: u32, li: u32, pairs: u32) {
+    var v = vec4<u32>(256u);
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        let i = c + 4u * li + j;
+        if (i < pairs) { v[j] = route[i].x; }
+    }
+    ch[li] = v;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+    let pairs = arg(0u);
+    let ne = arg(1u);
+    let per = arg(2u);
+    let me = vec4<u32>(li);
+    var n = 0u;
+    for (var c = 0u; c < pairs; c = c + 1024u) {
+        workgroupBarrier();
+        stage(c, li, pairs);
+        workgroupBarrier();
+        for (var j = 0u; j < 256u; j = j + 1u) {
+            let hit = select(vec4<u32>(0u), vec4<u32>(1u), ch[j] == me);
+            n = n + hit.x + hit.y + hit.z + hit.w;
+        }
+    }
+    cnt[li] = n;
+    workgroupBarrier();
+    if (li == 0u) {
+        var at = 0u;
+        var tile = 0u;
+        for (var e = 0u; e < ne; e = e + 1u) {
+            start[e] = at;
+            let c = cnt[e];
+            for (var j = 0u; j * per < c; j = j + 1u) {
+                tiles[1u + 3u * tile] = e;
+                tiles[2u + 3u * tile] = at + j * per;
+                tiles[3u + 3u * tile] = min(per, c - j * per);
+                tile = tile + 1u;
+            }
+            at = at + c;
+        }
+        tiles[0] = tile;
+    }
+    workgroupBarrier();
+    var at = start[li];
+    for (var c = 0u; c < pairs; c = c + 1024u) {
+        workgroupBarrier();
+        stage(c, li, pairs);
+        workgroupBarrier();
+        if (li < ne) {
+            for (var j = 0u; j < 256u; j = j + 1u) {
+                let v = ch[j];
+                for (var q = 0u; q < 4u; q = q + 1u) {
+                    if (v[q] == li) {
+                        order[at] = c + 4u * j + q;
+                        at = at + 1u;
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+
 /// The mat-vec frame: `y[t, r] (+)= s * (sum_k W[r, k] x[t, k] (+ bias[r]))` for up to `MAXT`
 /// tokens, `s` being 1 without flag 4. Args: m, k, tokens, first token, y_off, flags
 /// (1 accumulate, 2 bias, 4 scale), s, y_stride. A workgroup is one
@@ -1398,6 +1479,61 @@ pub(super) fn expert_kernel(mv: &str) -> &'static str {
     }
 }
 
+/// The grouped expert version of mat-mat kernel `mm`, when the format has one.
+pub(super) fn grouped_kernel(mm: &str) -> Option<&'static str> {
+    match mm {
+        "mm_q4k" => Some("ex_q4k"),
+        "mm_q6k" => Some("ex_q6k"),
+        "mm_q8_0" => Some("ex_q8_0"),
+        "mm_q5_0" => Some("ex_q5_0"),
+        _ => None,
+    }
+}
+
+/// The mat-mat frame `mm` as a grouped expert kernel: workgroup row `y` takes tile `y` of
+/// `route_tiles`, and a token slot of the tile is a pair.
+///
+/// The weights are the rows of the tile's expert.
+/// Gate and up read the pair's token, down reads the pair (arg 6 is 1).
+/// The output of a pair is row `pair` of `m` values, as the per-pair kernels write it.
+/// A workgroup past the tile count runs no step and writes nothing.
+/// Args: m, k, experts a token uses, -, -, flags (2: bias), x mode.
+fn grouped(mm: String) -> String {
+    mm.replace(
+        "@group(0) @binding(4) var<storage, read> xm: array<vec4<f32>>;",
+        "@group(0) @binding(4) var<storage, read> xm: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> order: array<u32>;
+@group(0) @binding(7) var<storage, read> tiles: array<u32>;
+fn xrow(slot: u32) -> u32 {
+    let pr = order[slot];
+    return select(pr / arg(2u), pr, arg(6u) == 1u);
+}",
+    )
+    .replace(
+        "let nt = arg(2u);",
+        "let live = wid.y < tiles[0];
+    let ex = select(0u, tiles[1u + 3u * wid.y], live);
+    let first = tiles[2u + 3u * wid.y];
+    let nt = select(0u, tiles[3u + 3u * wid.y], live);",
+    )
+    .replace(
+        &format!("let tok0 = wid.y * {MM_TOKENS}u;"),
+        "let tok0 = 0u;",
+    )
+    .replace("kk < k;", "kk < select(0u, k, live);")
+    .replace("xq[(tok0 + tk) *", "xq[xrow(first + tk) *")
+    .replace("xm[(tok0 + tk) *", "xm[xrow(first + tk) *")
+    .replace(
+        "let gr = min(row0 + row, m - 1u);",
+        "let gr = ex * m + min(row0 + row, m - 1u);",
+    )
+    .replace("bias[row]", "bias[ex * m + row]")
+    .replace(
+        "let at = arg(4u) + tk * arg(7u) + row;",
+        "let at = order[first + tk] * m + row;",
+    )
+}
+
 /// The WGSL of kernel `name` for workgroups of `wg` lanes.
 fn source(name: &str, wg: u32) -> anyhow::Result<String> {
     let lanes = lanes_per_row(name);
@@ -1490,6 +1626,11 @@ fn source(name: &str, wg: u32) -> anyhow::Result<String> {
         "mm_q6k" => matmat(Q6K_LOAD),
         "mm_q8_0" => matmat(Q8_0_LOAD),
         "mm_q5_0" => matmat(Q5_0_LOAD),
+        "ex_q4k" => grouped(matmat(Q4K_LOAD)),
+        "ex_q6k" => grouped(matmat(Q6K_LOAD)),
+        "ex_q8_0" => grouped(matmat(Q8_0_LOAD)),
+        "ex_q5_0" => grouped(matmat(Q5_0_LOAD)),
+        "route_tiles" => ROUTE_TILES.to_string(),
         "mm_f16" => MATMAT_F16.to_string(),
         "attn_tiled" => attention_tiled(128),
         "attn_tiled_wide" => attention_tiled(256),
