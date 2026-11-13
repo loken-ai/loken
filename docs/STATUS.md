@@ -215,7 +215,7 @@ On the laptop's processor they are slower than the host: 51 tokens per second ag
 
 Devices of Mesa's OpenCL platform are not offered for layers, because the layers measured wrong on them.
 A device that reports its memory as the host's offers a placement no more than the host can spare.
-The image models' OpenCL block still differs from the host's by 15% on a block, and is not shipped.
+A Z-Image block runs through Intel's OpenCL runtime and gives the host's output within 1% on average.
 
 ## Forecasting
 

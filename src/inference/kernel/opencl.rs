@@ -881,6 +881,62 @@ mod rms_norm_on_device {
     }
 }
 
+/// Which kernel source of the pipelines a device's compiler refuses.
+///
+/// Each source is built alone, then the sources are built joined up to it, in the order the
+/// pipelines join them.
+#[cfg(test)]
+mod pipeline_sources {
+    const SOURCES: [(&str, &str); 14] = [
+        ("q4_matmul", include_str!("../../kernels/q4_matmul.cl")),
+        ("q4k_matmul", include_str!("../../kernels/q4k_matmul.cl")),
+        ("q6k_matmul", include_str!("../../kernels/q6k_matmul.cl")),
+        ("rms_norm", include_str!("../../kernels/rms_norm.cl")),
+        ("rope", include_str!("../../kernels/rope.cl")),
+        ("attention", include_str!("../../kernels/attention.cl")),
+        ("silu_mul", include_str!("../../kernels/silu_mul.cl")),
+        ("add", include_str!("../../kernels/add.cl")),
+        ("append_kv", include_str!("../../kernels/append_kv.cl")),
+        ("f32_matmul", include_str!("../../kernels/f32_matmul.cl")),
+        (
+            "image_attention",
+            include_str!("../../kernels/image_attention.cl"),
+        ),
+        ("adaln", include_str!("../../kernels/adaln.cl")),
+        ("layer_norm", include_str!("../../kernels/layer_norm.cl")),
+        ("gelu", include_str!("../../kernels/gelu.cl")),
+    ];
+
+    /// Every kernel source of the pipelines is plain ASCII, comments included.
+    #[test]
+    fn every_pipeline_source_is_ascii() {
+        for (name, src) in SOURCES {
+            assert!(src.is_ascii(), "{name}.cl holds a character outside ASCII");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an OpenCL device"]
+    fn each_pipeline_source_builds() {
+        use opencl3::context::Context;
+        use opencl3::device::Device;
+        use opencl3::program::Program;
+        for id in super::enumerate_opencl_devices() {
+            let context = Context::from_device(&Device::new(id)).expect("context");
+            let build = |src: &str| match Program::create_and_build_from_source(&context, src, "") {
+                Ok(_) => "builds".to_string(),
+                Err(e) => format!("fails: {}", e.chars().take(240).collect::<String>()),
+            };
+            let mut joined = String::new();
+            for (name, src) in SOURCES {
+                joined.push_str(src);
+                joined.push('\n');
+                println!("{name}: alone {}, joined {}", build(src), build(&joined));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod offered_memory {
     /// A device offers no more than its global memory.
