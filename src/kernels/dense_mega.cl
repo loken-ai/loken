@@ -45,12 +45,10 @@ inline void grid_sync(volatile __global atomic_uint* ctr, uint n, __global uint*
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 }
 
-// The activation row in local memory: floats, q8_K and q8_0 codes and their scales.
+// The activation row in local memory: floats, q8_0 codes, their scales and their sums.
 typedef struct {
     __local float* xf;
-    __local char* qk;
     __local char* qz;
-    __local float* dk;
     __local int* sk;
     __local float* dz;
     __local float* red;
@@ -85,7 +83,8 @@ inline void prep_x(__global const float* src, __global const float* nw, uint use
         for (uint i = t; i < n; i += NT) m.xf[i] = use_norm ? src[i] * scale * nw[i] : src[i];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // q8_0: a scale per 32, the largest magnitude over 127, rounded to half.
+    // q8_0: a scale per 32, the largest magnitude over 127, rounded to half, and the sum of the
+    // codes.
     uint nb32 = n / 32;
     for (uint b = t; b < nb32; b += NT) {
         float amax = 0;
@@ -95,45 +94,13 @@ inline void prep_x(__global const float* src, __global const float* nw, uint use
         vstore_half(d32, 0, (__private half*)&hh);
         m.dz[b] = vload_half(0, (__private half*)&hh);
         float inv = d32 != 0.0f ? 1.0f / d32 : 0.0f;
-        for (uint j = 0; j < 32; j++) m.qz[b * 32 + j] = convert_char_sat(round(XVAL(b * 32 + j) * inv));
-    }
-
-    // q8_K, for rows of whole blocks of 256: eight threads find each block's extreme (the
-    // value of largest magnitude, the first of equals), which maps to -127.
-    uint nb256 = n / 256;
-    if (n % 256 == 0 && nb256 > 0) {
-        // red[t] holds the part's extreme; the combined extreme and its scale follow.
-        if (t < nb256 * 8) {
-            uint b = t / 8, p = t % 8;
-            float e = 0;
-            for (uint j = 0; j < 32; j++) {
-                float v = XVAL(b * 256 + p * 32 + j);
-                if (fabs(v) > fabs(e)) e = v;
-            }
-            m.red[t] = e;
+        int s = 0;
+        for (uint j = 0; j < 32; j++) {
+            char c = convert_char_sat(round(XVAL(b * 32 + j) * inv));
+            m.qz[b * 32 + j] = c;
+            s += c;
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (t < nb256) {
-            float e = 0;
-            for (uint p = 0; p < 8; p++) {
-                float v = m.red[t * 8 + p];
-                if (fabs(v) > fabs(e)) e = v;
-            }
-            float invk = e != 0.0f ? -127.0f / e : 0.0f;
-            m.dk[nb256 + t] = invk;
-            m.dk[t] = e != 0.0f ? 1.0f / invk : 0.0f;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (uint i = t; i < n; i += NT) {
-            float invk = m.dk[nb256 + i / 256];
-            m.qk[i] = invk != 0.0f ? convert_char_sat(min((int)rint(invk * XVAL(i)), 127)) : 0;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (uint b = t; b < nb32; b += NT) {
-            int s = 0;
-            for (uint j = 0; j < 32; j++) s += (int)m.qk[b * 32 + j];
-            m.sk[b] = s;
-        }
+        m.sk[b] = s;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 }
@@ -143,7 +110,7 @@ inline void prep_x(__global const float* src, __global const float* nw, uint use
 inline void row_partial(uint fmt, __global const uchar* wa, __global const uchar* wb, uint use_b,
                         ulong total, uint row, uint cols, uint lane, uint slice, Smem m,
                         float* accA, float* accB) {
-    XQ xq = {m.qk, m.qz, m.dk, m.sk, m.dz, m.xf};
+    XQ xq = {m.qz, m.sk, m.dz, m.xf};
     uint nb = cols / 32, ng = (nb + 7) / 8;
     for (uint g = slice; g < ng; g += SLICES) {
         ulong blk0 = (ulong)row * nb + 8 * g;
@@ -152,10 +119,10 @@ inline void row_partial(uint fmt, __global const uchar* wa, __global const uchar
         const uint* xw = 0;
         const float* xs = 0;
         const float4* xc = 0;
-#define CALL(GRP) GRP(wa, wb, use_b, total, blk0, nsub, lane, g, nb, (__global const float*)0, xq, xw, xs, 0.0f, cols, 1, accA, accB)
+#define CALL(GRP) GRP(wa, wb, use_b, total, blk0, nsub, lane, g, nb, (__global const float*)0, xq, xw, xs, xs, cols, 1, accA, accB)
         switch (fmt) {
-            case F_F16: grp_f16(wa, wb, use_b, total, blk0, nsub, lane, g, nb, (__global const float*)0, xq, xw, xs, 0.0f, cols, 1, accA, accB, xc); break;
-            case F_F32: grp_f32(wa, wb, use_b, total, blk0, nsub, lane, g, nb, (__global const float*)0, xq, xw, xs, 0.0f, cols, 1, accA, accB, xc); break;
+            case F_F16: grp_f16(wa, wb, use_b, total, blk0, nsub, lane, g, nb, (__global const float*)0, xq, xw, xs, xs, cols, 1, accA, accB, xc); break;
+            case F_F32: grp_f32(wa, wb, use_b, total, blk0, nsub, lane, g, nb, (__global const float*)0, xq, xw, xs, xs, cols, 1, accA, accB, xc); break;
             case F_Q4_K: CALL(grp_q4_k); break;
             case F_Q6_K: CALL(grp_q6_k); break;
             case F_Q8_0: CALL(grp_q8_0); break;
@@ -202,16 +169,14 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     __global float* att_parts) {
     volatile __global atomic_uint* ctr = counters + slot_no * 8;
     __local float xf[MAXH];
-    __local char qk[MAXC];
     __local char qz[MAXC];
-    __local float dk[MAXC / 256 + 1 + MAXC / 256 + 1];
     __local int sk[MAXC / 32];
     __local float dz[MAXC / 32];
     __local float red[NT];
     __local float part[NT];
     __local float partb[NT];
     __local float scratch[2 * NT];
-    Smem m = {xf, qk, qz, dk, sk, dz, red};
+    Smem m = {xf, qz, sk, dz, red};
 
     uint t = get_local_id(0), wg_id = get_group_id(0), nwg = get_num_groups(0);
     uint lane = t % LANES, slice = (t / LANES) % SLICES, slot = t / SL_LANES;
@@ -456,14 +421,12 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void head_step(
     __global const float* xin, __global const float* norm, __global const uchar* w, __global float* logits,
     uint fmt, ulong total, uint rows, uint hidden, float eps) {
     __local float xf[MAXH];
-    __local char qk[MAXC];
     __local char qz[MAXC];
-    __local float dk[MAXC / 256 + 1 + MAXC / 256 + 1];
     __local int sk[MAXC / 32];
     __local float dz[MAXC / 32];
     __local float red[NT];
     __local float part[NT];
-    Smem m = {xf, qk, qz, dk, sk, dz, red};
+    Smem m = {xf, qz, sk, dz, red};
     uint t = get_local_id(0);
     uint lane = t % LANES, slice = (t / LANES) % SLICES, slot = t / SL_LANES, sl = t % SL_LANES;
     prep_x(xin, norm, 1, 1, hidden, eps, m);

@@ -443,9 +443,7 @@ impl Mega {
 /// An activation row quantised for the integer formats: the codes and scales the kernels read,
 /// for up to `CHUNK` rows of `cols` values.
 struct Quant {
-    qk: Buffer<u8>,
     qz: Buffer<u8>,
-    dk: Buffer<f32>,
     /// Integer sums, held in float-sized words.
     sk: Buffer<f32>,
     dz: Buffer<f32>,
@@ -465,9 +463,7 @@ impl Quant {
             }
         };
         Ok(Self {
-            qk: bytes(rows * cols)?,
             qz: bytes(rows * cols)?,
-            dk: scratch(ctx, rows * cols.div_ceil(256))?,
             sk: scratch(ctx, rows * cols.div_ceil(32))?,
             dz: scratch(ctx, rows * cols.div_ceil(32))?,
         })
@@ -574,9 +570,7 @@ fn launch_quant(
     unsafe {
         Ok(ExecuteKernel::new(kernels.get("quant_rows"))
             .set_arg(x)
-            .set_arg(&q.qk)
             .set_arg(&q.qz)
-            .set_arg(&q.dk)
             .set_arg(&q.sk)
             .set_arg(&q.dz)
             .set_arg(&(cols as u32))
@@ -607,9 +601,7 @@ fn launch_mat_vec(
         Ok(ExecuteKernel::new(kernels.get(m.fmt.mat_vec()))
             .set_arg(&m.buf)
             .set_arg(x.f)
-            .set_arg(&x.q.qk)
             .set_arg(&x.q.qz)
-            .set_arg(&x.q.dk)
             .set_arg(&x.q.sk)
             .set_arg(&x.q.dz)
             .set_arg(out)
@@ -1192,9 +1184,7 @@ impl OpenClStack {
                     .set_arg(&l.gate.buf)
                     .set_arg(&l.up.buf)
                     .set_arg(&self.xn)
-                    .set_arg(&self.qn.qk)
                     .set_arg(&self.qn.qz)
-                    .set_arg(&self.qn.dk)
                     .set_arg(&self.qn.sk)
                     .set_arg(&self.qn.dz)
                     .set_arg(&self.act)
@@ -1710,21 +1700,12 @@ mod tests {
         )
     }
 
-    /// The activation rows as the host sees them in a dot product with weights of `dtype`:
-    /// quantised the way the host quantises them, then read back.
+    /// The activation rows as a dot product with weights of `dtype` reads them: as floats for
+    /// the float formats, else in q8_0 blocks of 32 values read back.
     fn host_quantised(dtype: GgmlDType, x: &[f32], cols: usize) -> Vec<f32> {
-        use crate::tensor::quant_cpu::{BlockFormat, BlockQ8K, BlockQ8_0};
+        use crate::tensor::quant_cpu::{BlockFormat, BlockQ8_0};
         match dtype {
             GgmlDType::F16 | GgmlDType::F32 => x.to_vec(),
-            GgmlDType::Q4K | GgmlDType::Q6K => {
-                let mut out = vec![0f32; x.len()];
-                for (row, o) in x.chunks(cols).zip(out.chunks_mut(cols)) {
-                    let mut blocks = vec![BlockQ8K::zeros(); cols / 256];
-                    BlockQ8K::quantize(row, &mut blocks);
-                    BlockQ8K::dequantize(&blocks, o);
-                }
-                out
-            }
             _ => {
                 let mut out = vec![0f32; x.len()];
                 for (row, o) in x.chunks(cols).zip(out.chunks_mut(cols)) {
@@ -1737,11 +1718,12 @@ mod tests {
         }
     }
 
-    /// The device quantiser makes the host's codes and scales.
+    /// The device quantiser makes the host's q8_0 codes and scales, and the sum of each
+    /// block's codes.
     #[test]
     #[ignore = "needs an OpenCL device"]
     fn quantiser_matches_the_host() {
-        use crate::tensor::quant_cpu::{BlockFormat, BlockQ8K, BlockQ8_0};
+        use crate::tensor::quant_cpu::{BlockFormat, BlockQ8_0};
         for (i, id) in super::super::opencl::enumerate_opencl_devices()
             .into_iter()
             .enumerate()
@@ -1751,7 +1733,7 @@ mod tests {
             #[allow(deprecated)]
             let queue = CommandQueue::create_default(&ctx, 0).unwrap();
             let kernels = Kernels::build(&ctx, 1).unwrap();
-            // Four blocks of 256 and a ragged end: the k-quant half covers the first four.
+            // Four blocks of 256 and a ragged end.
             let (rows, cols) = (3usize, 1056usize);
             let x: Vec<f32> = (0..rows * cols)
                 .map(|k| (((k * 7919 % 1013) as f32) / 1013.0 - 0.5) * (1.0 + (k % 9) as f32))
@@ -1761,22 +1743,14 @@ mod tests {
             launch_quant(&queue, &kernels, &xb, &q, rows, cols).unwrap();
             queue.finish().unwrap();
             let mut qz = vec![0u8; rows * cols];
-            let mut qk = vec![0u8; rows * cols];
             let mut dz = vec![0f32; rows * cols / 32];
-            let mut dk = vec![0f32; rows * (cols / 256)];
             let mut sk = vec![0f32; rows * cols / 32];
             unsafe {
                 queue
                     .enqueue_read_buffer(&q.qz, CL_BLOCKING, 0, &mut qz, &[])
                     .unwrap();
                 queue
-                    .enqueue_read_buffer(&q.qk, CL_BLOCKING, 0, &mut qk, &[])
-                    .unwrap();
-                queue
                     .enqueue_read_buffer(&q.dz, CL_BLOCKING, 0, &mut dz, &[])
-                    .unwrap();
-                queue
-                    .enqueue_read_buffer(&q.dk, CL_BLOCKING, 0, &mut dk, &[])
                     .unwrap();
                 queue
                     .enqueue_read_buffer(&q.sk, CL_BLOCKING, 0, &mut sk, &[])
@@ -1788,39 +1762,15 @@ mod tests {
                 let mut z = vec![BlockQ8_0::zeros(); cols / 32];
                 BlockQ8_0::quantize(row, &mut z);
                 for (b, blk) in z.iter().enumerate() {
-                    assert_eq!(
-                        blk.d.to_f32(),
-                        dz[r * (cols / 32) + b],
-                        "q8_0 scale {r}/{b}"
-                    );
-                    for (j, &c) in blk.qs.iter().enumerate() {
+                    let at = r * (cols / 32) + b;
+                    assert_eq!(blk.d.to_f32(), dz[at], "q8_0 scale {r}/{b}");
+                    let codes = &qz[r * cols + b * 32..][..32];
+                    for (&got, &c) in codes.iter().zip(&blk.qs) {
                         total += 1;
-                        flips += (qz[r * cols + b * 32 + j] as i8 != c) as usize;
+                        flips += (got as i8 != c) as usize;
                     }
-                }
-                let full = cols / 256;
-                let mut kb = vec![BlockQ8K::zeros(); full];
-                BlockQ8K::quantize(&row[..full * 256], &mut kb);
-                for (b, blk) in kb.iter().enumerate() {
-                    let got = dk[r * full + b];
-                    assert!(
-                        (blk.d - got).abs() <= blk.d.abs() * 4e-7,
-                        "q8_K scale {r}/{b}: {} against {got}",
-                        blk.d
-                    );
-                    for (j, &c) in blk.qs.iter().enumerate() {
-                        total += 1;
-                        flips += (qk[r * cols + b * 256 + j] as i8 != c) as usize;
-                    }
-                    for s in 0..8 {
-                        let want: i32 =
-                            blk.qs[s * 32..(s + 1) * 32].iter().map(|&c| c as i32).sum();
-                        assert_eq!(
-                            want,
-                            sk[r * (cols / 32) + b * 8 + s].to_bits() as i32,
-                            "q8_K sum {r}/{b}/{s}"
-                        );
-                    }
+                    let sum: i32 = codes.iter().map(|&c| c as i8 as i32).sum();
+                    assert_eq!(sum, sk[at].to_bits() as i32, "q8_0 sum {r}/{b}");
                 }
             }
             println!("device {i}: {flips} of {total} codes differ from the host's");
