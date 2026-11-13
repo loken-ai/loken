@@ -82,6 +82,15 @@ const NATIVE: &[&str] = &["params.json", "consolidated.safetensors"];
 /// The folder's checkpoint in `files`, copied to a scratch directory with an empty tokenizer,
 /// built as the server builds a dense safetensors checkpoint on a host-only plan.
 fn load_files(name: &str, files: &[&str]) -> GenericHeteroTransformer {
+    load_files_on(name, files, &HashMap::new())
+}
+
+/// [`load_files`] with every layer on card 0 of `cards`, on the host when `cards` is empty.
+fn load_files_on(
+    name: &str,
+    files: &[&str],
+    cards: &HashMap<usize, Device>,
+) -> GenericHeteroTransformer {
     use crate::inference::load::awq_loader as awql;
     let src = vectors_root().join(name);
     let dir = scratch(name);
@@ -98,13 +107,17 @@ fn load_files(name: &str, files: &[&str]) -> GenericHeteroTransformer {
         let layers = awql::parse_config_json(&dir_str)
             .map_err(|e| crate::tensor::Error::msg(e.to_string()))?
             .n_layers;
+        let plan = match cards.is_empty() {
+            true => HeteroPlan::calculate_with_kv(layers, 1 << 20, &[], &[], 1.0, 0),
+            false => HeteroPlan::forced_gpu(layers, layers, 0),
+        };
         GenericWeights::Awq {
             dir: &dir_str,
             shards: &shards,
         }
         .build(
-            &HashMap::new(),
-            &HeteroPlan::calculate_with_kv(layers, 1 << 20, &[], &[], 1.0, 0),
+            cards,
+            &plan,
             crate::inference::engine::llm_engine::KvQuant::Off,
             None,
             false,
@@ -474,4 +487,237 @@ fn every_reference_folder_has_a_test() {
     let mut listed: Vec<String> = FOLDERS.iter().map(|s| s.to_string()).collect();
     listed.sort();
     assert_eq!(found, listed, "the folders and the tests that read them");
+}
+
+/// The folder's checkpoint on `cards` at the `reference` level when `narrows` is false, at the
+/// level that narrows values otherwise.
+fn load_at_level(
+    name: &str,
+    cards: &HashMap<usize, Device>,
+    narrows: bool,
+) -> GenericHeteroTransformer {
+    use crate::inference::engine::llm_engine::FloatWeights;
+    use crate::inference::generic_transformer::{set_float_weights, set_narrows};
+    set_float_weights(FloatWeights::AsStored);
+    set_narrows(narrows);
+    let model = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        load_files_on(name, COMPOSITE, cards)
+    }));
+    set_narrows(true);
+    set_float_weights(FloatWeights::ByPlan);
+    model.unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+/// The dtypes of the caches the card layers of the folder's model hold after its prompt and 1
+/// decoded token.
+#[cfg(feature = "gpu")]
+fn card_cache_dtypes(name: &str, cards: &HashMap<usize, Device>, narrows: bool) -> Vec<DType> {
+    let reference = reference_of(name);
+    let (prompt, next) = prompt_and_next(&reference);
+    let mut model = load_at_level(name, cards, narrows);
+    logits(&mut model, &prompt, 0);
+    logits(&mut model, &next[..1], prompt.len());
+    model
+        .layers
+        .iter()
+        .filter(|l| l.attn_output.device().is_cuda())
+        .filter_map(|l| l.kv_cache.current_kv().map(|(k, _)| k.dtype()))
+        .collect()
+}
+
+/// At `reference` a card holds the cache of a layer with attention sinks, and of an architecture
+/// whose quantised cache degrades, at the width the layer computes in.
+/// At the other levels those caches are F16 on a card.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_card_at_reference_keeps_the_cache_at_full_width() {
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("skipping: no card");
+        return;
+    };
+    let cards: HashMap<usize, Device> = [(0usize, card)].into_iter().collect();
+    for name in ["gptoss", "gemma4"] {
+        let narrowed = card_cache_dtypes(name, &cards, true);
+        let full = card_cache_dtypes(name, &cards, false);
+        eprintln!("{name}: card caches {narrowed:?} when narrowed, {full:?} at reference");
+        assert!(
+            !narrowed.is_empty() && narrowed.iter().all(|d| *d == DType::F16),
+            "{name}: the card caches when narrowed are {narrowed:?}"
+        );
+        assert!(
+            full.len() == narrowed.len() && full.iter().all(|d| *d == DType::F32),
+            "{name}: the card caches at reference are {full:?}"
+        );
+    }
+}
+
+/// The largest distance of the model's logits from the reference's over the prompt and every
+/// next token, the reference's greedy ids fed back in turn, and the count of steps whose
+/// argmax is the reference's id.
+fn distance_and_hits(name: &str, model: &mut GenericHeteroTransformer) -> (f32, usize) {
+    let reference = reference_of(name);
+    let (prompt, next) = prompt_and_next(&reference);
+    let mut distance = 0f32;
+    let mut hits = 0;
+    for (i, want) in reference["step_logits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let want: Vec<f32> = want
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        let got = match i {
+            0 => logits(model, &prompt, 0),
+            _ => logits(model, &[next[i - 1]], prompt.len() + i - 1),
+        };
+        distance = got
+            .iter()
+            .zip(&want)
+            .fold(distance, |m, (a, b)| m.max((a - b).abs()));
+        hits += usize::from(argmax(&got) as u32 == next[i]);
+    }
+    (distance, hits)
+}
+
+/// How far 2 runs of the folder's model may sit apart when they sum the same products in
+/// another order.
+///
+/// A float sum of `n` products moves by at most `n` times the unit roundoff times the sum of
+/// their magnitudes when its order changes.
+/// `n` is the hidden width, the length of the head's dot products.
+/// The sum of the magnitudes is taken as the largest reference logit.
+fn order_of(name: &str, width: usize) -> f32 {
+    let largest = reference_of(name)["step_logits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s.as_array().unwrap().iter())
+        .fold(0f32, |a, v| a.max(v.as_f64().unwrap().abs() as f32));
+    width as f32 * f32::EPSILON * largest
+}
+
+/// The conversion a card load at `reference` may still declare: a float expert stack, which no
+/// card expert kernel reads, rebuilt in Q8_0.
+/// The docs list it among the trades no level makes yet.
+fn open_at_reference(c: &crate::tensor::conversion::Conversion) -> bool {
+    c.class == "experts"
+        && ["f32", "f16", "bf16"].contains(&c.from.as_str())
+        && c.to == "q8_0"
+        && c.reason == "no expert kernel reads the stored format on this device"
+}
+
+/// At `reference` the host keeps the cache of a layer with attention sinks, and of an
+/// architecture whose quantised cache degrades, at the width it computes in: no F16 store.
+/// Its logits are no farther from the reference's than with the F16 store, and it finds as
+/// many of its greedy ids.
+#[test]
+fn the_host_at_reference_keeps_no_f16_store() {
+    for name in ["gptoss", "gemma4"] {
+        let mut narrowed = load_at_level(name, &HashMap::new(), true);
+        let (narrowed_distance, narrowed_hits) = distance_and_hits(name, &mut narrowed);
+        let stores = narrowed
+            .layers
+            .iter()
+            .filter(|l| l.cpu_f16_kv.is_some())
+            .count();
+        drop(narrowed);
+        let mut model = load_at_level(name, &HashMap::new(), false);
+        let (distance, hits) = distance_and_hits(name, &mut model);
+        let width = model.config.embedding_length;
+        let caches: Vec<DType> = model
+            .layers
+            .iter()
+            .filter_map(|l| l.kv_cache.current_kv().map(|(k, _)| k.dtype()))
+            .collect();
+        eprintln!(
+            "{name}: host off the reference by {distance} at reference, {narrowed_distance} \
+             with {stores} F16 stores; reference ids found {hits}, {narrowed_hits}; caches \
+             {caches:?}"
+        );
+        assert!(stores > 0, "{name}: the narrowed host keeps no F16 store");
+        assert!(
+            model.layers.iter().all(|l| l.cpu_f16_kv.is_none()),
+            "{name}: the host at reference keeps an F16 store"
+        );
+        assert!(
+            !caches.is_empty() && caches.iter().all(|d| *d == DType::F32),
+            "{name}: the host caches at reference are {caches:?}"
+        );
+        assert!(
+            distance <= narrowed_distance + order_of(name, width),
+            "{name}: the host at reference is off by {distance}, with the store by \
+             {narrowed_distance}"
+        );
+        assert!(
+            hits >= narrowed_hits,
+            "{name}: {hits} ids, {narrowed_hits} with the store"
+        );
+    }
+}
+
+/// At `reference` a card holds a float output head in its stored format, the load declares no
+/// conversion of the head, and the card is no farther from the reference's logits than the
+/// host at `reference` and finds at least as many of its greedy ids.
+///
+/// The card sums in another order than the host: equal is equal within [`order_of`].
+/// A card load that declares a conversion fails, unless it is one [`open_at_reference`] names.
+/// Then the card holds a weight narrower than stored, and the distance is printed only.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_card_at_reference_is_no_farther_from_the_reference_than_the_host() {
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("skipping: no card");
+        return;
+    };
+    let cards: HashMap<usize, Device> = [(0usize, card)].into_iter().collect();
+    for name in ["gptoss", "gemma4", "qwen3"] {
+        let mut host = load_at_level(name, &HashMap::new(), false);
+        let (host_distance, host_hits) = distance_and_hits(name, &mut host);
+        let width = host.config.embedding_length;
+        drop(host);
+        let mut narrowed = load_at_level(name, &cards, true);
+        let (narrowed_distance, narrowed_hits) = distance_and_hits(name, &mut narrowed);
+        drop(narrowed);
+        crate::tensor::conversion::open();
+        let mut model = load_at_level(name, &cards, false);
+        let converted = crate::tensor::conversion::entries();
+        let head: Vec<_> = converted.iter().filter(|e| e.class == "output").collect();
+        assert!(head.is_empty(), "{name}: the head is converted: {head:?}");
+        assert!(
+            model.output_proj_cuda.is_none()
+                && model
+                    .output_proj_cuda_qmm
+                    .as_ref()
+                    .is_some_and(|q| q.float_format().is_some()),
+            "{name}: the card does not hold the float head as stored"
+        );
+        let (distance, hits) = distance_and_hits(name, &mut model);
+        eprintln!(
+            "{name}: off the reference by {distance} on the card at reference, \
+             {narrowed_distance} narrowed, {host_distance} on the host; reference ids found \
+             {hits}, {narrowed_hits}, {host_hits}"
+        );
+        let unlisted: Vec<_> = converted.iter().filter(|c| !open_at_reference(c)).collect();
+        assert!(
+            unlisted.is_empty(),
+            "{name}: the card load at reference declares {unlisted:?}"
+        );
+        if !converted.is_empty() {
+            eprintln!("{name}: the card load declares {converted:?}");
+            continue;
+        }
+        assert!(
+            distance <= host_distance + order_of(name, width),
+            "{name}: the card is off the reference by {distance}, the host by {host_distance}"
+        );
+        assert!(
+            hits >= host_hits,
+            "{name}: the card finds {hits} reference ids, the host {host_hits}"
+        );
+    }
 }

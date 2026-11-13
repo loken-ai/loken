@@ -1494,6 +1494,50 @@ fn float_weights() -> FloatWeights {
     *FLOAT_WEIGHTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether the next loads may hold values narrower than the model computes them.
+/// It is set from the configuration's fidelity level before each load.
+/// It allows them until set.
+static NARROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Say whether the next loads may hold values narrower than the model computes them.
+/// A half matrix over several rows on a card reads the rows in its own format where it does.
+pub fn set_narrows(allowed: bool) {
+    NARROWS.store(allowed, std::sync::atomic::Ordering::Relaxed);
+    crate::tensor::quantized::set_half_rows(allowed);
+}
+
+/// Whether the next loads may hold values narrower than the model computes them.
+pub(crate) fn narrows() -> bool {
+    NARROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The float head `qt` held on `dev` in its stored format: F32, F16 or BF16.
+fn stored_float_head(
+    qt: &crate::tensor::quantized::QTensor,
+    dev: &Device,
+) -> Result<crate::tensor::quantized::QMatMul> {
+    use crate::tensor::quantized::{GgmlDType, QMatMul};
+    match qt.dtype() {
+        GgmlDType::BF16 => QMatMul::bf16_onto(qt, dev),
+        GgmlDType::F16 => QMatMul::f16_onto(qt, dev),
+        // CONVERSION: none of value: the decode of F32 blocks is the F32 tensor itself.
+        GgmlDType::F32 => Ok(QMatMul::Tensor(qt.dequantize(dev)?)),
+        other => crate::tensor::bail!("a float head stored as {other:?}"),
+    }
+}
+
+/// The float head `w` of a checkpoint held on `dev` in its stored format: F32, F16 or BF16.
+fn stored_float_head_tensor(w: &Tensor, dev: &Device) -> Result<crate::tensor::quantized::QMatMul> {
+    use crate::tensor::quantized::QMatMul;
+    let on = w.to_device(dev)?;
+    match w.dtype() {
+        DType::BF16 => Ok(QMatMul::Bf16(on)),
+        DType::F16 => Ok(QMatMul::TensorF16(on)),
+        DType::F32 => Ok(QMatMul::Tensor(on)),
+        other => crate::tensor::bail!("a float head stored as {other:?}"),
+    }
+}
+
 /// The format float projections run in, `None` for their stored format. The fidelity level
 /// chooses: `AsStored` keeps every float projection as stored, `FourBit` rebuilds them in four
 /// bits wherever they are, and `ByPlan` lets the placement decide. By the plan, a float
@@ -2845,6 +2889,8 @@ fn build_generic_layer(
             config.kv_quant,
             crate::inference::engine::llm_engine::KvQuant::Off
         ),
+        // A load that keeps values at the model's width keeps no F16 store on the host.
+        host_f16_kv: narrows(),
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,
@@ -2917,12 +2963,14 @@ fn build_generic_layer(
         // An unquantised cache on a card stores F16 when the architecture keeps its cache
         // unquantised: the half-width read stands in for the quantised one it cannot take.
         // A sink layer stores F16 too: its card decode attention reads F16 K/V.
+        // A load that keeps values at the model's width stores the cache in the model's width.
         kv_f16: {
             use crate::inference::engine::llm_engine::KvQuant;
             (crate::inference::model_facts::facts_or_default(&config.arch).quantized_kv_degrades
                 || has_sinks)
                 && matches!(config.kv_quant, KvQuant::Off)
                 && device.is_cuda()
+                && narrows()
         },
         padded_mask: None,
         graph_q_buffer: None,
@@ -3425,6 +3473,8 @@ fn build_awq_layer(
             config.kv_quant,
             crate::inference::engine::llm_engine::KvQuant::Off
         ),
+        // A load that keeps values at the model's width keeps no F16 store on the host.
+        host_f16_kv: narrows(),
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,
@@ -5075,6 +5125,8 @@ impl GenericHeteroTransformer {
             // A quantised head runs as a quantised matmul; a float head (F32, F16, BF16) is
             // held once, in F16, for the dense matmul the card paths take without one. The
             // float head is widened on the host, so the card receives only the F16 copy.
+            // A load that keeps values at the model's width holds a float head as stored, and
+            // its product sums in F32.
             let placed = norm_weight_cpu.to_device(cuda_dev).and_then(|norm_w| {
                 let dense = content
                     .tensor_infos
@@ -5087,7 +5139,14 @@ impl GenericHeteroTransformer {
                                 | crate::tensor::quantized::GgmlDType::BF16
                         )
                     });
-                let head = if dense {
+                let head = if dense && !narrows() {
+                    let qt = source.read(output_weight_name, &Device::Cpu)?;
+                    info!(
+                        "  Output projection runs as stored on the card: {}",
+                        qt.dtype().gguf_name()
+                    );
+                    (Some(stored_float_head(&qt, cuda_dev)?), None)
+                } else if dense {
                     let qt = source.read(output_weight_name, &Device::Cpu)?;
                     let from = qt.dtype();
                     if from != crate::tensor::quantized::GgmlDType::F16 {
@@ -5760,13 +5819,19 @@ impl GenericHeteroTransformer {
         } else {
             None
         };
-        let (output_proj_cuda, output_proj_dev) = if card_head {
-            (
-                Some(head_stored.to_dtype(DType::F16)?.to_device(&device)?),
+        // A load that keeps values at the model's width holds the head as stored on the card.
+        let (output_proj_cuda, output_proj_cuda_qmm, output_proj_dev) = match card_head {
+            true if !narrows() => (
+                None,
+                Some(stored_float_head_tensor(&head_stored, &device)?),
                 Some(device.clone()),
-            )
-        } else {
-            (None, None)
+            ),
+            true => (
+                Some(head_stored.to_dtype(DType::F16)?.to_device(&device)?),
+                None,
+                Some(device.clone()),
+            ),
+            false => (None, None, None),
         };
 
         let flags = Arc::new(config.flags.clone());
@@ -5933,7 +5998,7 @@ impl GenericHeteroTransformer {
             spec_recording: false,
             output_proj_cuda,
             output_norm_cuda_weight,
-            output_proj_cuda_qmm: None,
+            output_proj_cuda_qmm,
             head_share: 0.0,
             output_proj_dev,
             cuda_devices: cuda_devices.clone(),

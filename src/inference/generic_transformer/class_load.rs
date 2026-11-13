@@ -173,9 +173,10 @@ fn demand_of(
             .ok_or_else(|| Error::msg(format!("{class}: no tensor layout reads the checkpoint")))?;
     let head_dim = cfg.head_dim.unwrap_or(cfg.hidden_size / cfg.n_head.max(1));
     // An unquantised cache holds F16 keys and values on a card for an architecture that
-    // keeps its cache unquantised, and F32 otherwise.
+    // keeps its cache unquantised where the level narrows it, and F32 otherwise.
     let width = match crate::inference::model_facts::facts_or_default(&cfg.gguf_arch)
         .quantized_kv_degrades
+        && super::loader::narrows()
     {
         true => std::mem::size_of::<half::f16>(),
         false => std::mem::size_of::<f32>(),

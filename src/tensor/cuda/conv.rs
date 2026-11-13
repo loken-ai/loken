@@ -202,9 +202,10 @@ pub fn rope_f32(
 //
 // Mirrors the reference per-dtype reduced-precision GEMM flags EXACTLY
 // default OFF (f32 gemm = COMPUTE_32F,
-// f16 gemm = f32 accumulation, bf16 gemm = COMPUTE_32F); when the engine
-// enables them (cuda_ext::set_gemm_reduced_precision(true) at model load),
-// f32 -> COMPUTE_32F_FAST_TF32, f16 -> COMPUTE_16F, bf16 -> COMPUTE_32F_FAST_16BF.
+// f16 gemm = f32 accumulation, bf16 gemm = COMPUTE_32F).
+// The server sets the process's level at start (cuda_ext::set_gemm_reduced_precision).
+// A thread under a GemmScope runs at the scope's choice instead.
+// Reduced: f32 -> COMPUTE_32F_FAST_TF32, f16 -> COMPUTE_16F, bf16 -> COMPUTE_32F_FAST_16BF.
 // Every gemm goes through gemm_strided_batched_ex with
 // CUBLAS_GEMM_DEFAULT_TENSOR_OP - so the substrate picks
 // the same cuBLAS kernels per-dtype as the facade for any flag state.

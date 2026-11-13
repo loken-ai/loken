@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 /// The tiny checkpoint the instances serve.
 const CHECKPOINT: &str = "tests/vectors/hf/llama";
 /// The name the instances know it by, a hub name resolved under their models directory.
-const MODEL: &str = "test/handover";
+pub(super) const MODEL: &str = "test/handover";
 /// Tokens each answer may write.
 const MAX_TOKENS: u64 = 4;
 /// Words of a long prompt: more than the largest prefill chunk a model starts at.
@@ -28,7 +28,7 @@ const CONTEXT: usize = 4096;
 
 /// The scratch directory of a test, with the checkpoint copied as the hub snapshot of
 /// [`MODEL`], its context widened to [`CONTEXT`], and a word-level vocabulary of its size.
-fn models_dir() -> (std::path::PathBuf, usize) {
+pub(super) fn models_dir() -> (std::path::PathBuf, usize) {
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

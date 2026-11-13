@@ -5,6 +5,22 @@
 
 use super::*;
 
+/// Whether a product of an F16 or BF16 matrix over several rows on a card may read the rows in
+/// the matrix's format.
+/// The server sets it from its fidelity level at start and before each load.
+/// It allows it until set.
+static HALF_ROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Say whether a product of an F16 or BF16 matrix over several rows on a card may read the rows
+/// in the matrix's format.
+pub fn set_half_rows(allowed: bool) {
+    HALF_ROWS.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn half_rows() -> bool {
+    HALF_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A projection over a quantised weight, or a dense one.
 #[derive(Debug, Clone)]
 pub enum QMatMul {
@@ -145,6 +161,28 @@ impl QMatMul {
         y.reshape(odims)?.to_dtype(out_dtype)
     }
 
+    /// `x @ w^T` for the F32 rows `x` `[rows, k]` and a half matrix `w` `[n, k]`, the rows read in
+    /// F32 and the products summed in F32.
+    /// The matrix is widened to F32 a slice of its rows at a time.
+    /// A widened slice takes no more memory than the product's output.
+    fn widened_product(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        let (rows, n, k) = (x.dims()[0], w.dims()[0], w.dims()[1]);
+        let slice = (rows * n / k.max(1)).clamp(1, n);
+        let mut parts = Vec::with_capacity(n.div_ceil(slice));
+        let mut at = 0;
+        while at < n {
+            let m = slice.min(n - at);
+            // CONVERSION: none of value: a half matrix widens to F32 exactly.
+            let wide = w.narrow(0, at, m)?.to_dtype(crate::tensor::DType::F32)?;
+            parts.push(x.matmul_t(&wide)?);
+            at += m;
+        }
+        match parts.len() {
+            1 => Ok(parts.remove(0)),
+            _ => Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1),
+        }
+    }
+
     /// `x @ w^T` on the host for a weight held as stored in F16 or BF16: the activation read as
     /// F32, the weight widened row by row inside the product, summed in F32.
     fn host_half(x: &Tensor, w: &Tensor) -> Result<Tensor> {
@@ -188,7 +226,7 @@ impl QMatMul {
             Self::TensorF16(w) => {
                 // One row takes the F16-weight product summed in F32; more, the library's F16
                 // product with the activation rounded to F16, summed in F32 where the card
-                // offers it.
+                // offers it, where the level allows it.
                 let k = *x
                     .dims()
                     .last()
@@ -201,6 +239,14 @@ impl QMatMul {
                         return y.reshape(odims)?.to_dtype(x.dtype());
                     }
                 }
+                // Where rows may not be read in F16, they stay F32 as the single row does.
+                if !half_rows() {
+                    let rows = x
+                        .to_dtype(crate::tensor::DType::F32)?
+                        .reshape((x.elem_count() / k, k))?;
+                    let y = Self::widened_product(&rows, w)?;
+                    return y.reshape(odims)?.to_dtype(x.dtype());
+                }
                 let xf = x.to_dtype(crate::tensor::DType::F16)?;
                 let rows = xf.reshape((x.elem_count() / k, k))?;
                 if let Some(y) = rows.matmul_t_f16_f32(w)? {
@@ -211,7 +257,7 @@ impl QMatMul {
             Self::Bf16(w) => {
                 // A few rows take the BF16 product summed in F32, the decode's and a verify's
                 // rows alike; more, the library's BF16 product with the activation rounded to
-                // BF16, summed in F32.
+                // BF16, summed in F32, where the level allows it.
                 let dims = x.dims().to_vec();
                 let k = *dims
                     .last()
@@ -220,6 +266,10 @@ impl QMatMul {
                 let x2 = x.reshape((rows, k))?;
                 let y = match crate::inference::moe_cuda::bf16_matvec(&x2, w)? {
                     Some(y) => y,
+                    // Where rows may not be read in BF16, they stay F32 as a few rows do.
+                    None if !half_rows() => {
+                        Self::widened_product(&x2.to_dtype(crate::tensor::DType::F32)?, w)?
+                    }
                     None => {
                         #[cfg(feature = "gpu")]
                         let y = x2

@@ -221,6 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             info!("");
 
+            // The products on a card run at the level's precision from the start.
+            // No load and no render changes it for the other models.
+            let fidelity = inference_config.fidelity;
+            loken::tensor::cuda_ext::set_gemm_reduced_precision(fidelity.reduces_gemm());
+            loken::tensor::quantized::set_half_rows(fidelity.narrows());
+
             // Initialize NVML and detect GPUs
             info!("🔧 Initializing NVML (NVIDIA Management Library)...");
             let gpu_manager = GPUManagerImpl::new();

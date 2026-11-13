@@ -83,6 +83,15 @@ impl Fidelity {
         self != Fidelity::Reference
     }
 
+    /// Whether a load may hold values narrower than the model computes them.
+    /// At `reference` a card keeps its cache at the model's width.
+    /// At `reference` the host keeps the cache of a sink or gemma4 layer at the model's width.
+    /// At `reference` a half matrix over several rows on a card reads the rows in F32.
+    /// At `reference` a card keeps a float output head in its stored format.
+    pub fn narrows(self) -> bool {
+        self != Fidelity::Reference
+    }
+
     /// Whether float GEMMs on a card reduce in TF32 and fast BF16 rather than in IEEE F32.
     pub fn reduces_gemm(self) -> bool {
         self != Fidelity::Reference

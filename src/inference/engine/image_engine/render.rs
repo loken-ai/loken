@@ -30,6 +30,7 @@ impl ImageEngine {
         let model_state = self.model_state.clone();
         let prompt = prompt.to_string();
         let seed = params.resolve_seed();
+        let fidelity = self.fidelity;
 
         let result = tokio::task::spawn_blocking(move || -> AnyResult<String> {
             let mut guard = model_state.blocking_lock();
@@ -38,6 +39,7 @@ impl ImageEngine {
                 .ok_or_else(|| anyhow!("Image model not loaded"))?;
             render_on(
                 state,
+                fidelity,
                 &prompt,
                 &params,
                 seed,
@@ -66,6 +68,7 @@ impl ImageEngine {
         let seeds: Vec<u64> = jobs.iter_mut().map(|(_, p)| p.resolve_seed()).collect();
         let model_state = self.model_state.clone();
         let presence = self.presence_cell();
+        let fidelity = self.fidelity;
         let result =
             tokio::task::spawn_blocking(move || -> AnyResult<Option<Vec<BatchedImage>>> {
                 let mut guard = model_state.blocking_lock();
@@ -81,7 +84,7 @@ impl ImageEngine {
                     return Ok(None);
                 }
                 let _precision = crate::inference::media::precision::GemmPrecision::pin(
-                    family_wants_reduced_precision(&state.model),
+                    render_reduces(&state.model, fidelity),
                 );
                 let LoadedImageModel::Sdxl(pipe) = &mut state.model else {
                     return Ok(None);
@@ -108,6 +111,7 @@ impl ImageEngine {
         let presence = self.presence_cell();
         let prompt = prompt.to_string();
         let seed = params.resolve_seed();
+        let fidelity = self.fidelity;
         // Channel size sized to a comfortable HD-mode (Z-Image 18 steps,
         // Flux schnell HD 8 steps) plus a buffer for late receivers.
         // 64 is well above any sane num_steps and keeps the producer
@@ -129,7 +133,7 @@ impl ImageEngine {
             let progress = |completed, total| {
                 let _ = tx.blocking_send(ImageStreamEvent::Progress { completed, total });
             };
-            match render_on(state, &prompt, &params, seed, &progress) {
+            match render_on(state, fidelity, &prompt, &params, seed, &progress) {
                 Ok(base64_png) => {
                     let _ = tx.blocking_send(ImageStreamEvent::Complete {
                         image_base64: base64_png,
@@ -150,8 +154,10 @@ impl ImageEngine {
 ///
 /// Every family draws its noise from `seed` and reports its denoise steps to `on_step`,
 /// so a streaming caller sees the same progress whichever family is resident.
+/// The render's GEMMs run at the precision `fidelity` and the family allow.
 fn render_on(
     state: &mut LoadedImageModelState,
+    fidelity: crate::inference::engine::llm_engine::Fidelity,
     prompt: &str,
     params: &ImageGenParams,
     seed: u64,
@@ -162,9 +168,10 @@ fn render_on(
         .map_err(anyhow::Error::new)?;
     state.device.set_seed(seed)?;
 
-    let _precision = crate::inference::media::precision::GemmPrecision::pin(
-        family_wants_reduced_precision(&state.model),
-    );
+    let _precision = crate::inference::media::precision::GemmPrecision::pin(render_reduces(
+        &state.model,
+        fidelity,
+    ));
 
     match &mut state.model {
         LoadedImageModel::Flux(flux_state) => generate_flux_image(

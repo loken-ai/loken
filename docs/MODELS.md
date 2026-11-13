@@ -310,7 +310,7 @@ A checkpoint that does not fit is rebuilt once at load, in the widest format tha
 | 3 | `Q4_K` | `Q6_K` |
 
 The load log says which rung runs, and `/api/ps` reports it as `details.running_format`.  
-A float output head on a card runs in `F16`, and the load log says so.
+A float output head on a card runs in `F16` at `balanced` and `fast`, and as stored at `reference`. The load log says which.
 A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, or in `Q4_K` when its stack spills to the host.
 
 | Backend | Float matrix behaviour |

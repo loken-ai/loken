@@ -360,6 +360,7 @@ impl LlmEngine {
         let quality = self.config.quality;
         let fidelity = self.config.fidelity;
         crate::inference::generic_transformer::set_float_weights(fidelity.float_weights());
+        crate::inference::generic_transformer::set_narrows(fidelity.narrows());
         let state_cache = self.state_cache.clone();
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
@@ -867,14 +868,6 @@ impl LlmEngine {
 
             debug!("✓ Using device: {:?}", device);
 
-            // Float GEMMs on CUDA reduce in TF32 and fast BF16, except at the `reference` level,
-            // which keeps IEEE F32 reductions.
-            #[cfg(feature = "gpu")]
-            if matches!(device, Device::Cuda(_)) {
-                crate::tensor::cuda_ext::set_gemm_reduced_precision(fidelity.reduces_gemm());
-                debug!("reduced precision GEMM (TF32/BF16): {}", fidelity.reduces_gemm());
-            }
-
             // --- 5. Load model weights based on architecture ---
             debug!("⚖️  Architecture: {}, Device: {:?}", arch, device);
             let weights_t = std::time::Instant::now();
@@ -924,12 +917,6 @@ impl LlmEngine {
                     )
                     .inspect_err(|e| error!("{e}"))?;
                     info!("Vision model loaded (Moondream v2) on {:?}", built_on.location());
-                    #[cfg(feature = "gpu")]
-                    if built_on.is_cuda() {
-                        crate::tensor::cuda_ext::set_gemm_reduced_precision(
-                            fidelity.reduces_gemm(),
-                        );
-                    }
                     device = built_on;
                     Box::new(MoondreamBackend(model))
                 }
@@ -972,8 +959,15 @@ impl LlmEngine {
                     // intermediate score tensors aren't free either.
                     // Bytes per element from the cache the layers will build: the block
                     // geometry of a quantised cache, F16 for an unquantised card cache of an
-                    // architecture that keeps it so (or one with sinks), else F32.
-                    let native_kv_bytes: u64 = if quantized_kv_degrades || has_attn_sinks { 2 } else { 4 };
+                    // architecture that keeps it so (or one with sinks) where the level narrows
+                    // it, else F32.
+                    let native_kv_bytes: u64 = if (quantized_kv_degrades || has_attn_sinks)
+                        && fidelity.narrows()
+                    {
+                        2
+                    } else {
+                        4
+                    };
                     // For models with sliding-window attention (gemma3/4),
                     // most layers cap their KV at sliding_window. With a
                     // pattern like [SWA,SWA,SWA,SWA,SWA,Global,...] the

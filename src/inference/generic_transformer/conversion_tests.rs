@@ -616,6 +616,82 @@ fn a_float_checkpoint_on_a_card_runs_as_stored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The rows of a product over an F16 or BF16 matrix on a card, at the `reference` level, are
+/// read in F32: each output is within the rounding of an F32 sum of the exact products.
+/// That rounding is the row's length times the unit roundoff times the sum of the magnitudes of
+/// its products.
+/// Where the level narrows, the rows are read in the matrix's format and land farther.
+#[cfg(feature = "gpu")]
+#[test]
+fn half_matrix_rows_are_read_in_f32_at_reference() {
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("skipping: no card");
+        return;
+    };
+    // More rows than the few the BF16 matrix-vector kernel takes.
+    let (rows, n) = (64usize, 3 * HIDDEN + 5);
+    let x = values(rows * HIDDEN, 7, 1.0);
+    let w = values(n * HIDDEN, 8, 1.0 / (HIDDEN as f32).sqrt());
+    for dtype in [DType::F16, DType::BF16] {
+        let wt = Tensor::from_vec(w.clone(), (n, HIDDEN), &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let held: Vec<f32> = wt
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let on_card = wt.to_device(&card).unwrap();
+        let qmm = match dtype {
+            DType::F16 => crate::tensor::quantized::QMatMul::TensorF16(on_card),
+            _ => crate::tensor::quantized::QMatMul::Bf16(on_card),
+        };
+        let xt = Tensor::from_vec(x.clone(), (rows, HIDDEN), &card).unwrap();
+        let run = |allowed: bool| -> Vec<f32> {
+            crate::tensor::quantized::set_half_rows(allowed);
+            let y = qmm.forward(&xt);
+            crate::tensor::quantized::set_half_rows(true);
+            y.unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let (strict, narrowed) = (run(false), run(true));
+        let (mut over, mut strict_err, mut narrowed_err) = (0usize, 0f64, 0f64);
+        for r in 0..rows {
+            for c in 0..n {
+                let terms =
+                    (0..HIDDEN).map(|i| x[r * HIDDEN + i] as f64 * held[c * HIDDEN + i] as f64);
+                let (exact, magnitude) = terms.fold((0f64, 0f64), |(s, m), t| (s + t, m + t.abs()));
+                let bound = HIDDEN as f64 * f32::EPSILON as f64 * magnitude;
+                let err = (strict[r * n + c] as f64 - exact).abs();
+                over += usize::from(err > bound);
+                strict_err = strict_err.max(err);
+                narrowed_err = narrowed_err.max((narrowed[r * n + c] as f64 - exact).abs());
+            }
+        }
+        eprintln!(
+            "{dtype:?}: rows off the exact product by {strict_err} in F32, {narrowed_err} narrowed"
+        );
+        assert_eq!(
+            over, 0,
+            "{dtype:?}: {over} outputs outside the F32 rounding of their sum"
+        );
+        assert!(
+            strict_err <= narrowed_err,
+            "{dtype:?}: {strict_err} in F32, {narrowed_err} narrowed"
+        );
+    }
+}
+
 /// A float projection rebuilt to fit is rebuilt onto the card that runs it, in the block
 /// format asked, and the ledger records it.
 #[cfg(feature = "gpu")]

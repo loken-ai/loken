@@ -74,13 +74,6 @@ impl ImageEngine {
             // where each component goes is decided below, once its size is known.
             let cards = crate::inference::place::ladder::cards(0);
 
-            // Enable TF32/reduced-precision for TensorCore acceleration (~10-15% matmul speedup).
-            // F32 (TF32) and BF16 reduced precision are safe here - wide enough exponent to
-            // accumulate 512 products. F16 is left at COMPUTE_32F by the switch itself.
-            if !cards.is_empty() {
-                crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
-            }
-
             let gpu_dtype = if cards.is_empty() { DType::F32 } else { DType::BF16 };
             info!("Flux: {} card(s), gpu_dtype: {:?}", cards.len(), gpu_dtype);
 

@@ -894,6 +894,7 @@ impl GenericHeteroTransformer {
                 kv_cache: SpecKvCache::new(config.effective_max_context()),
                 cpu_q8_kv: None,
                 host_q8_kv: false,
+                host_f16_kv: false,
                 cpu_f16_kv: None,
                 cpu_decode_arena: None,
                 cpu_norm_cache: None,

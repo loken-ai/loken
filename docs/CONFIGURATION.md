@@ -87,8 +87,12 @@ What each level chooses:
 | Choice | `reference` | `balanced` | `fast` |
 |---|---|---|---|
 | Float projections of an F32, F16 or BF16 checkpoint | As stored | Q8_0 when the stack sits on one kind of memory, Q4_K (Q6_K for the feed-forward output) when it is split between cards and host | Q4_K (Q6_K for the feed-forward output) |
-| KV cache format | Full width | Q8 for a model the quantised kernels serve | Q8 for a model the quantised kernels serve |
+| KV cache format | Full width, on the cards and on the host, attention sinks and gemma4 included | Q8 for a model the quantised kernels serve. F16 on a card and on the host for attention sinks and gemma4 | Q8 for a model the quantised kernels serve. F16 on a card and on the host for attention sinks and gemma4 |
+| Float output head on a card | As stored | F16 | F16 |
 | Float GEMMs on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 | TF32 and fast BF16 |
+| Float GEMMs of an image render on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 for FLUX, IEEE F32 reduction for the other families | TF32 and fast BF16 for FLUX, IEEE F32 reduction for the other families |
+| Float GEMMs of a music, sound or video render on a CUDA card | IEEE F32 reduction | IEEE F32 reduction | IEEE F32 reduction |
+| Rows of a product over an F16 or BF16 matrix on a card | Read in F32, as a single row is | Rounded to the matrix's format above 1 row for F16, above a few for BF16 | Rounded to the matrix's format above 1 row for F16, above a few for BF16 |
 | Parler-TTS decoder on a CUDA card | F32, as stored | F16 | F16 |
 | Context shift | Off | On | On |
 | Drafts verified in recorded windows | No | No | Yes |
@@ -98,6 +102,8 @@ What each level chooses:
 
 The level decides these choices alone.
 The file names none of them.
+A render's precision holds for the render alone.
+Loading or rendering a model never changes the precision of another model's products.
 
 A quantised checkpoint (Q4_K, Q8_0 and the like) is read as stored at every level.
 Its products quantise the activation to 8 bits, as llama.cpp does.
@@ -110,7 +116,8 @@ The level does not choose these, which are the same at all 3:
 | A prompt longer than the window | Refused with an error on every route. A cut prompt could lose its system prompt or tool instructions and still read as a plausible answer. |
 | Batched serving of overlapping requests | Runs the residual stream in F16 on the cards. No level turns it off. |
 | Approximate kernels (fast exp, fused attention in F16 with F32 sums) | Built into the kernels, within float rounding of their precise forms. |
-| Float output head on a card | Held F16, whatever the file stores. The load log names it. |
+| Cache of a layer that selects its tokens, on a card | Held F16. |
+| Float experts of a mixture, on a card | Rebuilt in Q8_0: no card expert kernel reads F32, F16 or BF16. The load log names it. |
 
 ### Decided by loken
 
@@ -126,7 +133,7 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 | Card a model loads on | The fastest card that holds it, from the probe. |
 | Memory each card offers | The measured free memory. The load keeps its own runtime reserve and backs off after an out-of-memory. |
 | Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
-| KV cache format | Q8 for every model whose head shape the quantised kernels serve, at `balanced` and `fast`. Full width at `reference`, for a head shape they do not cover, and for capped attention scores (Gemma2), attention sinks and gemma4. |
+| KV cache format | Q8 for every model whose head shape the quantised kernels serve, at `balanced` and `fast`. Full width at `reference`, for a head shape they do not cover, and for capped attention scores (Gemma2), attention sinks and gemma4. At `balanced` and `fast` the cache of attention sinks and gemma4 is F16 on a card and on the host. |
 | Conversation snapshots | Each finished sequence is copied aside, a quantised cache in its packed form, so a later request on it resumes from its own KV. The count kept is bounded by the free device memory, leaving the cache its working window and the next prefill the memory it sizes its chunk from. A handed-over cache is kept in the same packed form. Before a kept snapshot is dropped for room, the work queued on the cards runs and the pools hand back their free blocks, and the room counts the blocks a pool still holds free. A copy that would not fit is not taken. |
 | Batched serving | Requests that overlap on a model on cards share its paged worker. The worker takes a mixture whose experts the card holds, attention sinks, layers that read a sliding window, and a rotation stretched or over part of each head. It decodes those models without its captured decode graph. The worker runs every layer whole on one card. It reads a prompt longer than a prefill chunk alone, a chunk at a time. Its chunk is the one the serial prefill sizes from the card before the pool takes its room, and the pool leaves that chunk's memory free. A model whose layers sit on several cards, or are split across them, decodes serially. A lone request takes the path that serves it sooner: serial decode, which drafts and takes a prompt from a prefill peer, or the worker, which does neither. The time counts the prompt of the latest lone request at the path's prompt rate, then its answer at the path's decode rate. Each path is measured on the lone requests it serves, and a path not yet measured takes the next one, the worker first. A prompt rate comes from a request that read at least a prefill chunk. A request that arrives while a lone request decodes serially moves that request into the worker at its next token. The model keeps the worker's paged pool while it serves serially, so the worker starts again at its first size. A serial prefill or a hand-over that needs more than its card has free gives that pool back, and the next worker sizes a new one. A hand-over then takes the room of the kept snapshots too. The time the arriving requests wait for that move counts against the serial path. A grammar, token rules or prompt embeddings take the model back to serial decode until the next overlap. |
 | Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target. The draft length is learned from measured acceptance and cycle time. On a model whose experts stream, it also counts the experts a longer draft adds that no card holds, from the routing and the measured copy and host pace. A cycle that recorded a verify window, or the drafter's step, counts its acceptance alone. The drafter's decode step is recorded where the model allows it and kept between requests while nothing it reads has moved. A drafter with a recurrent state keeps the state before each draft and returns to it, then takes in only the tokens the target kept. A model held on the cards gets no drafter. `POST /api/draft/attach` attaches one by hand. |

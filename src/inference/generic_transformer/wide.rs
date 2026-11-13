@@ -1097,10 +1097,7 @@ impl GenericTransformerLayer {
         let live_scores = SCORE_COPIES * n_head * kv_len * std::mem::size_of::<f32>();
         let block = (SCORE_BUDGET_BYTES / live_scores.max(1)).clamp(1, hyper::mixer_block_rows());
         let mut parts = Vec::with_capacity(seq.div_ceil(block));
-        // The scores and the sums over the cache's F16 keys and values run on the tensor cores:
-        // the operands carry no more than their ten bits, and the sums are F32.
-        #[cfg(feature = "gpu")]
-        let _tf32 = crate::tensor::cuda::Tf32Scope::enter();
+        // The scores and the sums over the cache run at the precision of the fidelity level.
         // The rank of a position in the union of what a block keeps, `u32::MAX` for a position
         // outside it.
         let mut rank = vec![u32::MAX; kv_len];

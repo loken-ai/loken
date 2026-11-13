@@ -63,7 +63,7 @@ mod dense;
 mod dense_layouts;
 mod draft_head;
 pub use draft_head::set_probe_dir;
-pub use loader::set_float_weights;
+pub use loader::{set_float_weights, set_narrows};
 mod context_parallel;
 #[cfg(test)]
 mod conversation_tests;
@@ -351,6 +351,9 @@ pub struct GenericTransformerLayer {
     /// quantised cache. Unset, the host decode attends over the F-dtype `kv_cache`, the
     /// precision the configuration names.
     pub host_q8_kv: bool,
+    /// Whether the host keeps `cpu_f16_kv` for a gemma4 or sink layer.
+    /// Unset, the host decode of such a layer attends over the F-dtype `kv_cache`.
+    pub host_f16_kv: bool,
     /// gemma4 F16 windowed KV (Q8 degenerate at hd512). Per-layer window.
     pub cpu_f16_kv: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     /// Persistent zero-alloc decode scratch (lazily built, reused/token).

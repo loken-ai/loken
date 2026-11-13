@@ -88,6 +88,8 @@ pub(crate) type PresenceCell = Arc<std::sync::Mutex<Option<Presence>>>;
 pub struct ImageEngine {
     model_state: Arc<Mutex<Option<LoadedImageModelState>>>,
     presence: PresenceCell,
+    /// The server's fidelity level, which bounds the precision a render reduces at.
+    fidelity: crate::inference::engine::llm_engine::Fidelity,
 }
 
 /// Record what `state` is, for the readers that must not wait on its lock.
@@ -175,15 +177,17 @@ fn describe(state: &LoadedImageModelState) -> Presence {
 
 impl Default for ImageEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(Default::default())
     }
 }
 
 impl ImageEngine {
-    pub fn new() -> Self {
+    /// An engine whose renders run at most at the precision `fidelity` allows.
+    pub fn new(fidelity: crate::inference::engine::llm_engine::Fidelity) -> Self {
         Self {
             model_state: Arc::new(Mutex::new(None)),
             presence: Arc::new(std::sync::Mutex::new(None)),
+            fidelity,
         }
     }
 
@@ -567,11 +571,27 @@ fn gpu_index_of(dev: &Device) -> Option<usize> {
     }
 }
 
-/// Whether this family renders with the tensor-core (reduced-precision) GEMM paths.
+/// Whether a render of `model` runs the tensor-core (reduced-precision) GEMM paths at
+/// `fidelity`.
+/// The level allows them below `reference`.
+/// The family then decides.
+/// The dispatcher pins the answer on the rendering thread for the length of the render.
+pub(crate) fn render_reduces(
+    model: &LoadedImageModel,
+    fidelity: crate::inference::engine::llm_engine::Fidelity,
+) -> bool {
+    reduces_at(fidelity, family_wants_reduced_precision(model))
+}
+
+/// Whether a family that `wants` the reduced paths runs them at `fidelity`.
+fn reduces_at(fidelity: crate::inference::engine::llm_engine::Fidelity, wants: bool) -> bool {
+    fidelity.reduces_gemm() && wants
+}
+
+/// Whether this family renders with the tensor-core (reduced-precision) GEMM paths where the
+/// level allows them.
 ///
-/// Declared per family and pinned by the dispatcher for the length of the render, because
-/// the cuBLAS flags are process-wide. Matching on the variant means a new family cannot be
-/// added without deciding.
+/// Matching on the variant means a new family cannot be added without deciding.
 fn family_wants_reduced_precision(model: &LoadedImageModel) -> bool {
     match model {
         // Measured and tuned with the tensor-core paths on.

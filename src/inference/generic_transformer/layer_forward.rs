@@ -941,6 +941,7 @@ impl GenericTransformerLayer {
             || x.len() != arena.hidden
             || arena.ffn != self.flags.intermediate_size
             || (!f16_store && !self.host_q8_kv)
+            || (f16_store && !self.host_f16_kv)
         {
             return Ok(false);
         }

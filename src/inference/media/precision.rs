@@ -1,16 +1,16 @@
 //! The GEMM precision a media render runs at, held for exactly the length of the render.
 //!
-//! The cuBLAS reduced-precision flags are process-wide atomics. A render that does not set
-//! them inherits whatever the last model load or render left, so the same seed can produce
-//! different output depending on what ran before it. Every media render pins the precision
-//! it needs with [`GemmPrecision`] and the previous state comes back when it ends.
+//! A render pins the precision it needs with [`GemmPrecision`] on the thread that renders.
+//! The choice ends with the render.
+//! The products of another thread, a language model's among them, keep their own level.
 
-/// Pins the process-wide GEMM precision flags for a scope; the previous flags are restored
-/// on drop. Without CUDA there is nothing to pin and the guard is inert.
+/// Pins the GEMM precision of this thread for a scope.
+/// The previous choice of the thread comes back on drop.
+/// Without CUDA there is nothing to pin and the guard is inert.
 #[must_use = "the precision is restored when the guard drops"]
 pub struct GemmPrecision {
     #[cfg(feature = "gpu")]
-    was: (bool, bool, bool),
+    _scope: crate::tensor::cuda::GemmScope,
 }
 
 impl GemmPrecision {
@@ -19,19 +19,14 @@ impl GemmPrecision {
         Self::pin(false)
     }
 
-    /// `reduced` selects the tensor-core paths (TF32 for f32, fast bf16 accumulation);
-    /// f16 accumulates in f32 either way, as `cuda_ext::set_gemm_reduced_precision` sets it.
+    /// `reduced` selects the tensor-core paths (TF32 for f32, fast bf16 accumulation).
+    /// F16 accumulates in f32 either way.
     pub fn pin(reduced: bool) -> Self {
         #[cfg(feature = "gpu")]
         {
-            use crate::tensor::cuda as c;
-            let was = (
-                c::gemm_reduced_precision_f32(),
-                c::gemm_reduced_precision_bf16(),
-                c::gemm_reduced_precision_f16(),
-            );
-            crate::tensor::cuda_ext::set_gemm_reduced_precision(reduced);
-            Self { was }
+            Self {
+                _scope: crate::tensor::cuda::GemmScope::enter(reduced),
+            }
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -41,35 +36,27 @@ impl GemmPrecision {
     }
 }
 
-impl Drop for GemmPrecision {
-    fn drop(&mut self) {
-        #[cfg(feature = "gpu")]
-        {
-            use crate::tensor::cuda as c;
-            let (f32_reduced, bf16_reduced, f16_reduced) = self.was;
-            c::set_gemm_reduced_precision_f32(f32_reduced);
-            c::set_gemm_reduced_precision_bf16(bf16_reduced);
-            c::set_gemm_reduced_precision_f16(f16_reduced);
-        }
-    }
-}
-
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
     use crate::tensor::cuda as c;
 
-    #[test]
-    fn a_render_scope_sets_the_precision_and_gives_the_old_one_back() {
-        let before = (
+    fn levels() -> (bool, bool, bool) {
+        (
             c::gemm_reduced_precision_f32(),
             c::gemm_reduced_precision_bf16(),
             c::gemm_reduced_precision_f16(),
-        );
+        )
+    }
+
+    #[test]
+    fn a_render_scope_sets_the_precision_and_gives_the_old_one_back() {
+        let before = levels();
         {
             let _reduced = GemmPrecision::pin(true);
             assert!(c::gemm_reduced_precision_f32());
             assert!(c::gemm_reduced_precision_bf16());
+            assert!(!c::gemm_reduced_precision_f16());
             {
                 let _full = GemmPrecision::full();
                 assert!(!c::gemm_reduced_precision_f32());
@@ -80,11 +67,15 @@ mod tests {
                 "inner scope did not restore"
             );
         }
-        let after = (
-            c::gemm_reduced_precision_f32(),
-            c::gemm_reduced_precision_bf16(),
-            c::gemm_reduced_precision_f16(),
-        );
-        assert_eq!(before, after);
+        assert_eq!(before, levels());
+    }
+
+    /// A render's choice holds on its own thread only.
+    #[test]
+    fn a_render_scope_leaves_the_other_threads_at_their_level() {
+        let process = std::thread::spawn(levels).join().unwrap();
+        let _reduced = GemmPrecision::pin(!process.0);
+        assert_eq!(c::gemm_reduced_precision_f32(), !process.0);
+        assert_eq!(std::thread::spawn(levels).join().unwrap(), process);
     }
 }

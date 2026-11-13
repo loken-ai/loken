@@ -5,48 +5,63 @@
 use super::*;
 
 pub fn gemm_reduced_precision_f32() -> bool {
-    MM_F32_REDUCED.load(std::sync::atomic::Ordering::Relaxed)
-        || TF32_SCOPE.with(std::cell::Cell::get)
+    GEMM_SCOPE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| MM_F32_REDUCED.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 thread_local! {
-    static TF32_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the float GEMMs of this thread reduce in TF32 and fast BF16.
+    /// `None` leaves them to the process's level.
+    static GEMM_SCOPE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// While alive, the F32 matmuls of this thread run with TF32 tensor-core math: inputs rounded to
-/// ten mantissa bits, sums in F32. For products whose operands are already that precise, such as
-/// the scores of an attention over an F16 cache, where the global switch would also touch the
-/// projections around them.
-pub struct Tf32Scope {
-    previous: bool,
+/// While alive, the float GEMMs of this thread reduce as `reduced` says, whatever the process's
+/// level.
+/// F32 reduces in TF32 and BF16 in fast BF16 when `reduced`.
+/// F16 accumulates in F32 either way.
+/// Another thread keeps its own level.
+/// The previous choice of this thread comes back on drop.
+#[must_use = "the choice ends when the scope drops"]
+pub struct GemmScope {
+    previous: Option<bool>,
+    /// The scope belongs to the thread that entered it.
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
-impl Tf32Scope {
-    pub fn enter() -> Self {
+impl GemmScope {
+    pub fn enter(reduced: bool) -> Self {
         Self {
-            previous: TF32_SCOPE.with(|s| s.replace(true)),
+            previous: GEMM_SCOPE.with(|s| s.replace(Some(reduced))),
+            _thread: std::marker::PhantomData,
         }
     }
 }
 
-impl Drop for Tf32Scope {
+impl Drop for GemmScope {
     fn drop(&mut self) {
-        TF32_SCOPE.with(|s| s.set(self.previous));
+        GEMM_SCOPE.with(|s| s.set(self.previous));
     }
 }
+
 /// API-compat: allow fp16 accumulation in f16 GEMMs.
 pub fn set_gemm_reduced_precision_f16(b: bool) {
     MM_F16_REDUCED.store(b, std::sync::atomic::Ordering::Relaxed)
 }
 pub fn gemm_reduced_precision_f16() -> bool {
-    MM_F16_REDUCED.load(std::sync::atomic::Ordering::Relaxed)
+    match GEMM_SCOPE.with(std::cell::Cell::get) {
+        Some(_) => false,
+        None => MM_F16_REDUCED.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 /// API-compat: allow bf16 (FAST_16BF) reductions in bf16 GEMMs.
 pub fn set_gemm_reduced_precision_bf16(b: bool) {
     MM_BF16_REDUCED.store(b, std::sync::atomic::Ordering::Relaxed)
 }
 pub fn gemm_reduced_precision_bf16() -> bool {
-    MM_BF16_REDUCED.load(std::sync::atomic::Ordering::Relaxed)
+    GEMM_SCOPE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| MM_BF16_REDUCED.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Batched row-major matmul via cuBLAS: `[b, m, k] x [b, k, n] -> [b, m, n]`.

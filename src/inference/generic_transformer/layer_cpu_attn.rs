@@ -41,8 +41,9 @@ impl GenericTransformerLayer {
         // gemma4 (V-norm) uses the F16 windowed store (Q8 degenerate at hd512), and so
         // does a sink layer, whose host decode scan folds the sink in; other dense GQA
         // arches use the Q8 store.
+        // A layer whose host keeps no F16 store attends over the F-dtype cache.
         let is_gemma = self.attn_v_norm_ones.is_some();
-        let f16_store = is_gemma || self.attn_sinks.is_some();
+        let f16_store = (is_gemma || self.attn_sinks.is_some()) && self.host_f16_kv;
         // The Q8 store attends over the whole history; a windowed layer keeps the F16 store,
         // and a layer whose configured cache is unquantised keeps no Q8 store.
         let eligible = !is_shared
@@ -436,11 +437,16 @@ impl GenericTransformerLayer {
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
         let window = self.sliding_window.filter(|&w| w > 0);
         let host = matches!(q.device(), crate::tensor::Device::Cpu);
-        // A card decode runs one split-K launch over the whole buffers, the key count read
-        // on the device in the graph's step and given here otherwise; the split count
-        // follows the buffers' capacity, so both sum alike.
+        // A card decode over an F16 cache runs one split-K launch over the whole buffers, the
+        // key count read on the device in the graph's step and given here otherwise; the split
+        // count follows the buffers' capacity, so both sum alike.
+        // A cache at the model's width attends below in its own width.
         #[cfg(feature = "gpu")]
-        if seq == 1 && mask.is_none() && q.device().is_cuda() {
+        if seq == 1
+            && mask.is_none()
+            && q.device().is_cuda()
+            && k.dtype() == crate::tensor::DType::F16
+        {
             let pos = match self.graph_step() {
                 true => self.graph_pos_i32.as_ref(),
                 false => None,

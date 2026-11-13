@@ -19,7 +19,7 @@ fn already_abandoned() -> crate::inference::serve::cancel::CancelToken {
 
 #[tokio::test]
 async fn an_abandoned_z_image_load_never_starts() {
-    let engine = ImageEngine::new();
+    let engine = ImageEngine::default();
     let err = engine
         .load_z_image_turbo_cancellable(
             ModelRequest::new(
@@ -45,7 +45,7 @@ async fn an_abandoned_z_image_load_never_starts() {
 
 #[tokio::test]
 async fn an_abandoned_sdxl_load_never_opens_its_checkpoint() {
-    let engine = ImageEngine::new();
+    let engine = ImageEngine::default();
     // Paths that do not exist: reaching the pipeline at all would fail on them, so a
     // cancellation message proves the load stopped BEFORE the checkpoint was read -
     // which is the whole point, the checkpoint being the multi-gigabyte part.
@@ -340,4 +340,55 @@ fn a_named_seed_is_kept_and_a_missing_one_is_drawn_once() {
         drawn,
         "a second read must not redraw"
     );
+}
+
+/// A render reduces only below `reference`, and only for a family that asks.
+#[test]
+fn a_render_reduces_only_below_reference_and_where_its_family_asks() {
+    use crate::inference::engine::llm_engine::Fidelity;
+    for wants in [false, true] {
+        assert!(!reduces_at(Fidelity::Reference, wants));
+    }
+    for level in [Fidelity::Balanced, Fidelity::Fast] {
+        assert!(reduces_at(level, true));
+        assert!(!reduces_at(level, false));
+    }
+}
+
+/// A FLUX load at `reference` leaves the products of every thread at the process's level.
+/// The checkpoint is not a GGUF: the load stops at its header, once the cards are known.
+#[cfg(feature = "gpu")]
+#[tokio::test]
+async fn a_flux_load_at_reference_leaves_the_products_exact() {
+    use crate::inference::engine::llm_engine::Fidelity;
+    use crate::tensor::cuda as c;
+    let levels = || {
+        std::thread::spawn(|| {
+            (
+                c::gemm_reduced_precision_f32(),
+                c::gemm_reduced_precision_bf16(),
+            )
+        })
+        .join()
+        .unwrap()
+    };
+    let before = levels();
+    let dir = std::env::temp_dir().join(format!("loken-flux-level-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gguf = dir.join("flux1-schnell.gguf");
+    std::fs::write(&gguf, b"not a checkpoint").unwrap();
+    let engine = ImageEngine::new(Fidelity::Reference);
+    let loaded = engine
+        .load_flux_schnell(
+            ModelRequest::new(dir.to_string_lossy(), "flux-schnell"),
+            Some(gguf),
+            crate::inference::place::runtime_demand::RequestGeometry::new(1024, 1024),
+            None,
+            None,
+        )
+        .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(loaded.is_err(), "a file that is not a checkpoint loaded");
+    assert_eq!(levels(), before, "the load changed the process's level");
+    assert_eq!(before, (false, false), "the process does not start exact");
 }

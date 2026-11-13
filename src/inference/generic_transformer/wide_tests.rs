@@ -885,6 +885,58 @@ fn host_attention(layer: &mut GenericTransformerLayer, x: &Tensor, pos: usize) -
     layer.attend_selected(x, pos, &selection).unwrap()
 }
 
+/// The selected attention of a prompt chunk on a card reduces at the precision of its level.
+/// Over an F16 cache on both, the reference level gives what the host gives, to the rounding of
+/// IEEE F32 sums.
+/// The reduced level gives it to the rounding of TF32 products.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_prompt_on_the_card_attends_at_the_precision_of_its_level() {
+    if crate::inference::place::device_probe::card_count() == 0 {
+        return;
+    }
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let n = ids(&v, "b.ids").len();
+    let mixed = f32s(&v, "b.layer3_attn_hc_mixed");
+    let width = mixed.len() / n;
+    // Each row keeps the even positions before it, and itself.
+    let selection: Vec<Vec<u32>> = (0..n as u32)
+        .map(|i| (0..=i).filter(|t| t % 2 == 0 || *t == i).collect())
+        .collect();
+    let attend = |ordinal: Option<usize>, reduced: Option<bool>| -> Vec<f32> {
+        let mut model = toy_with(ordinal, KvQuant::Off);
+        model.layers[3].kv_f16 = true;
+        let dev = model.layers[0].cos.device();
+        let x = Tensor::from_vec(mixed.clone(), (1, n, width), &dev).unwrap();
+        let _level = reduced.map(crate::tensor::cuda::GemmScope::enter);
+        model.layers[3]
+            .attend_selected(&x, 0, &selection)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let host = attend(None, None);
+    let exact = attend(Some(0), Some(false));
+    let reduced = attend(Some(0), Some(true));
+    let scale = scale_of(&host);
+    let (d_exact, d_reduced) = (max_diff(&exact, &host), max_diff(&reduced, &host));
+    assert!(
+        d_exact < 1e-5 * scale,
+        "the reference level differs from the host by {d_exact} on a scale of {scale}"
+    );
+    assert!(
+        d_reduced < 1e-2 * scale,
+        "the reduced level differs from the host by {d_reduced} on a scale of {scale}"
+    );
+}
+
 /// A decoded token of an indexed layer on a card runs on the card, eagerly: it gives what the host's
 /// selected attention gives at every position, and leaves the host's counters where the host's
 /// own steps would.

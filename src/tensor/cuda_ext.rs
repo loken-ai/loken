@@ -242,15 +242,14 @@ mod cuda {
         }
     }
 
-    /// Reduced-precision GEMM switch, plumbed into the substrate's cuBLAS
-    /// wrappers: TF32 for F32 and 16BF accumulation for BF16, both default-off.
+    /// The process's level of the float GEMMs on a card: TF32 for F32 and fast BF16 for BF16
+    /// when `enable`, IEEE F32 reductions otherwise, the default.
+    /// The server sets it once at start from its fidelity level.
+    /// A thread under a `tensor::cuda::GemmScope` runs at the scope's choice instead.
     ///
-    /// F16 is deliberately left alone. Accumulating an F16 GEMM in F16 overflows the
-    /// wide attention matmuls: the image path's own note says it turns a VAE mid block
-    /// into NaN and a black image, and on a text model it loses the tail of an attention
-    /// sum over a long context, which reads as a model that has started to misspell. The
-    /// switch is process-wide and no caller ever puts it back, so one render would have
-    /// carried that into every generation after it.
+    /// F16 accumulates in F32 at every level.
+    /// Accumulating an F16 GEMM in F16 turns a VAE mid block into NaN.
+    /// On a text model it loses the tail of an attention sum over a long context.
     pub fn set_gemm_reduced_precision(enable: bool) {
         tensor::cuda::set_gemm_reduced_precision_f32(enable);
         tensor::cuda::set_gemm_reduced_precision_bf16(enable);

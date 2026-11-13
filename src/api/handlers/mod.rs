@@ -1543,7 +1543,7 @@ impl APIServer {
         let default_keep_alive = get_default_keep_alive();
         info!("Default keep_alive: {} minutes", default_keep_alive);
 
-        #[cfg(feature = "audio")]
+        #[cfg(any(feature = "audio", feature = "image"))]
         let fidelity = inference_config.fidelity;
         let request_gate = crate::api::gate::RequestGate::new(1);
         let server = Self {
@@ -1560,7 +1560,7 @@ impl APIServer {
             default_keep_alive: keep_alive_minutes,
             default_inference_config: inference_config,
             #[cfg(feature = "image")]
-            image_engine: Arc::new(ImageEngine::new()),
+            image_engine: Arc::new(ImageEngine::new(fidelity)),
             #[cfg(feature = "audio")]
             audio_engine: Arc::new(AudioEngine::new()),
             #[cfg(feature = "audio")]
@@ -3653,6 +3653,8 @@ mod panic_isolation_gate {
 
 #[cfg(test)]
 mod handover_route_tests;
+#[cfg(all(test, feature = "gpu"))]
+mod level_tests;
 #[cfg(test)]
 mod request_figures_tests;
 #[cfg(test)]
