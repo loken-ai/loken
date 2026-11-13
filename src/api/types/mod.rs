@@ -1704,7 +1704,7 @@ impl Usage {
     }
 
     /// Adds what the request reported about itself: the speculation's kept and refused
-    /// proposals, and the `loken` object.
+    /// proposals, the prompt tokens served from the cache, and the `loken` object.
     pub fn with_request(
         mut self,
         outcome: Option<&crate::request_metrics::RequestOutcome>,
@@ -1714,6 +1714,9 @@ impl Usage {
         if let Some(d) = self.completion_tokens_details.as_mut() {
             d.accepted_prediction_tokens = accepted as i32;
             d.rejected_prediction_tokens = rejected as i32;
+        }
+        if let (Some(o), Some(d)) = (outcome, self.prompt_tokens_details.as_mut()) {
+            d.cached_tokens = d.cached_tokens.max(o.figures.cached_prompt_tokens as i32);
         }
         self.loken = Some(crate::api::request_figures::LokenUsage::new(
             outcome, energy,
@@ -2151,6 +2154,25 @@ mod thinking_field_tests {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    /// An answer whose engine published no counts still reports the cached share its
+    /// request recorded, and a count the engine did publish is kept.
+    #[test]
+    fn the_request_outcome_supplies_the_cached_share() {
+        let outcome = crate::request_metrics::RequestOutcome {
+            figures: crate::request_metrics::RequestFigures {
+                cached_prompt_tokens: 12,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let u = Usage::new(30, 5).with_request(Some(&outcome), None);
+        assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 12);
+        let u = Usage::from_counts(10, 20, 5).with_request(Some(&outcome), None);
+        assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 20);
+        let u = Usage::new(30, 5).with_request(None, None);
+        assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 0);
+    }
 
     /// The prompt count includes what the cache served, and the served share is reported
     /// as cached: the figure a stream and a whole answer both carry.

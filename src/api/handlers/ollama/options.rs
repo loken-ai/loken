@@ -398,6 +398,9 @@ pub(crate) async fn ollama_chat(
     // Check if streaming is requested
     if request.stream {
         let max_tokens_cap = params.max_tokens;
+        // The request's own counts come back through its probe.
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        params.probe = Some(probe.clone());
         // Use streaming generation (NDJSON format, matching Ollama's API)
         match engine.generate_stream(&prompt, params.clone()).await {
             Ok(mut rx) => {
@@ -530,10 +533,17 @@ pub(crate) async fn ollama_chat(
                                 s.total_duration_ns,
                                 Some(s.finish_reason.ollama()),
                             ),
+                            // A path that writes no stats recorded the request's own
+                            // counts in its probe.
                             None => (
-                                chunk_count as u64,
+                                probe
+                                    .outcome()
+                                    .map_or(chunk_count as u64, |o| o.figures.generated_tokens),
                                 wall_total_ns,
-                                estimate_token_count(&prompt_clone),
+                                probe.outcome().map_or_else(
+                                    || estimate_token_count(&prompt_clone),
+                                    |o| o.figures.prompt_read(),
+                                ),
                                 0u64,
                                 wall_total_ns,
                                 None,
@@ -1118,6 +1128,9 @@ pub(crate) async fn ollama_generate(
     // Check if streaming is requested
     if request.stream {
         let max_tokens_cap_gen = params.max_tokens;
+        // The request's own counts come back through its probe.
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        params.probe = Some(probe.clone());
         // Use streaming generation (NDJSON format, matching Ollama's API)
         match engine
             .generate_stream(&effective_prompt, params.clone())
@@ -1253,10 +1266,17 @@ pub(crate) async fn ollama_generate(
                                 s.prompt_eval_duration_ns,
                                 s.total_duration_ns,
                             ),
+                            // A path that writes no stats recorded the request's own
+                            // counts in its probe.
                             None => (
-                                chunk_count as u64,
+                                probe
+                                    .outcome()
+                                    .map_or(chunk_count as u64, |o| o.figures.generated_tokens),
                                 wall_total_ns,
-                                estimate_token_count(&prompt_clone),
+                                probe.outcome().map_or_else(
+                                    || estimate_token_count(&prompt_clone),
+                                    |o| o.figures.prompt_read(),
+                                ),
                                 0u64,
                                 wall_total_ns,
                             ),

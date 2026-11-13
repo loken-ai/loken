@@ -150,10 +150,12 @@ impl LlmEngine {
         let admitted = self.active.load(std::sync::atomic::Ordering::Acquire) > 0;
         if self.is_continuous().await || (admitted && self.hands_over_to_worker().await) {
             let t0 = std::time::Instant::now();
-            // Word-based prompt-token estimate (≈ the handler's estimate_token_count;
-            // the precise count lives behind the tokenizer the worker owns).
-            let prompt_eval_count =
-                ((prompt.split_whitespace().count() as f64) * 1.3).ceil() as u64;
+            // The request's own probe receives its counts from the path that serves it.
+            let probe = params.probe.clone().unwrap_or_default();
+            let params = GenerationParams {
+                probe: Some(probe.clone()),
+                ..params
+            };
             let mut rx = self.generate_stream_once(prompt, params).await?;
             let mut text = String::new();
             let mut chunks: u64 = 0;
@@ -171,19 +173,18 @@ impl LlmEngine {
                 }
             }
             let ttft = first.unwrap_or_default();
-            // The serial path leaves its counts for the request that streamed: taken here, they
-            // count this answer and no later request reads them.
-            let eval_count = self
-                .take_last_stream_stats()
-                .map_or(chunks, |s| s.eval_count);
+            // The serial path leaves its counts for the request that streamed: taken here, no
+            // later request reads them.
+            let _ = self.take_last_stream_stats();
+            let counts = WorkerCounts::of(probe.outcome().as_ref(), chunks);
             return Ok(GenerationResult {
                 text,
                 tokens: Vec::new(),
-                prompt_eval_count,
+                prompt_eval_count: counts.prompt_eval_count,
                 prompt_eval_duration: ttft.as_nanos() as u64,
-                eval_count,
+                eval_count: counts.eval_count,
                 eval_duration: t0.elapsed().saturating_sub(ttft).as_nanos() as u64,
-                cached_prompt_tokens: 0,
+                cached_prompt_tokens: counts.cached_prompt_tokens,
                 finish_reason: FinishReason::Eos,
                 logprobs: Vec::new(),
             });
@@ -423,7 +424,6 @@ impl LlmEngine {
 
 
             // Batched prefill (all prompt tokens in one forward pass)
-            let mut prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
             // Where the prompt stops being the same in the conversation's next turn: a model
             // that cannot rewind its state keeps the state there.
             let boundary = if audio_split.is_none() && state.qwen35_vision.is_empty() {
@@ -450,6 +450,8 @@ impl LlmEngine {
             // path (or plain text).
             let qwen35_items = std::mem::take(&mut state.qwen35_vision);
             let mut prefill_skipped = false;
+            // The rows an image takes in the cache beyond the prompt's tokens.
+            let mut vision_positions = 0usize;
             let (vision_prefix_len, mut logits, qwen35_pos) = if let Some(ref a) = audio_split {
                 // The embeddings were encoded for this request; the sequence they make is as
                 // long as the prefill says, which is where decoding continues.
@@ -459,6 +461,7 @@ impl LlmEngine {
                 (None, lg, Some(total))
             } else if !qwen35_items.is_empty() {
                 let (lg, next_pos) = state.model.forward_qwen35_vision(&prompt_tokens, &qwen35_items, device)?;
+                vision_positions = qwen35_vision_extra_kv(&qwen35_items);
                 (None, lg, Some(next_pos))
             } else if let Some(image_embeds) = state
                 .image_embeds
@@ -469,6 +472,7 @@ impl LlmEngine {
                 // the method returns the true total length -> decode position.
                 let image_embeds = image_embeds.clone();
                 let (lg, total) = state.model.forward_pixtral_spliced(&prompt_tokens, &image_embeds, device)?;
+                vision_positions = total.saturating_sub(prompt_tokens.len());
                 (None, lg, Some(total))
             } else {
                 let vpl = if let (true, Some(ref image_embeds)) = (state.model.is_vision_model(), &state.image_embeds) {
@@ -476,6 +480,7 @@ impl LlmEngine {
                     // moondream) get spliced ahead of the text tokens.
                     Some(1 + image_embeds.dim(1)?)
                 } else { None };
+                vision_positions = vpl.unwrap_or(0);
                 let lg = if vpl.is_some() {
                     let image_embeds = state.image_embeds.as_ref().unwrap();
                     let bos_token = Tensor::new(&[state.eos_token_id], device)?.unsqueeze(0)?;
@@ -523,9 +528,12 @@ impl LlmEngine {
             };
             // A conversation state restored from an earlier turn is prompt not read again.
             let cached_tokens = cache_session_start.max(state.model.prefix_covered());
-            if cached_tokens > cache_session_start {
-                prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cached_tokens, audio_positions);
-            }
+            // The rows of an image are known once the prefill wrote them.
+            let prompt_token_count = prompt_eval_positions(
+                prompt_tokens.len(),
+                cached_tokens,
+                audio_positions + vision_positions,
+            );
             // Decode position must account for the vision prefix written into
             // KV alongside the text tokens (moondream: +image_patches), or the
             // qwen35 mRoPE next-position (image compresses positions).
@@ -2169,7 +2177,8 @@ impl LlmEngine {
                         queue_s,
                         prefill_s: prompt_eval_duration as f64 / 1e9,
                         decode_s: eval_duration as f64 / 1e9,
-                        prompt_tokens: prompt_tokens.len() as u64,
+                        prompt_tokens: (prompt_tokens.len() + audio_positions + vision_positions)
+                            as u64,
                         cached_prompt_tokens: cached_tokens as u64,
                         generated_tokens: eval_count,
                     },

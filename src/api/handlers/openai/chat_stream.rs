@@ -304,13 +304,20 @@ where
         // whatever margin the estimate was wrong - on source code, nearly
         // double.
         // The cached share is reported as the whole answer reports it.
-        let mut usage = match stats.as_ref() {
-            Some(s) => Usage::from_counts(
+        // The request's own outcome holds its prompt counts on every path.
+        let outcome = probe.outcome();
+        let mut usage = match (outcome.as_ref(), stats.as_ref()) {
+            (Some(o), _) => Usage::from_counts(
+                o.figures.prompt_read(),
+                o.figures.cached_prompt_tokens,
+                o.figures.generated_tokens,
+            ),
+            (None, Some(s)) => Usage::from_counts(
                 s.prompt_eval_count,
                 s.cached_prompt_tokens,
                 s.eval_count,
             ),
-            None => Usage::new(prompt_tokens, token_count),
+            (None, None) => Usage::new(prompt_tokens, token_count),
         }
         .with_request(probe.outcome().as_ref(), energy.as_ref());
         let (in_tokens, out_tokens) = (usage.prompt_tokens, usage.completion_tokens);
@@ -341,7 +348,10 @@ where
         let total_ms = stream_started.elapsed().as_millis();
         let ttft_ms = time_to_first_token_ms(stream_started, first_token_at);
         let rate = decode_rate_suffix(first_token_at, token_count as u64);
-        let cached = stats.as_ref().map_or(0, |s| s.cached_prompt_tokens);
+        let cached = match (outcome.as_ref(), stats.as_ref()) {
+            (Some(o), _) => o.figures.cached_prompt_tokens,
+            (None, s) => s.map_or(0, |s| s.cached_prompt_tokens),
+        };
         let prefill_ms = stats
             .as_ref()
             .map_or(0, |s| s.prompt_eval_duration_ns / 1_000_000);

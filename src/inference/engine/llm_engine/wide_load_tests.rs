@@ -450,6 +450,30 @@ async fn a_wide_model_with_its_mixers_on_a_card_streams_through_the_batch_server
     assert_eq!(collect(engine, prompt, NEW).await, want.text);
 }
 
+/// A whole answer the batch worker writes counts the prompt and the answer the serial path
+/// counts.
+#[cfg(feature = "gpu")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_answer_from_the_worker_counts_its_prompt() {
+    use crate::inference::generic_transformer::card_mixer_tests::generic_on_card;
+
+    let (ratios, kv_src, index_src) = LAYOUTS[0];
+    let (engine, prompt) = engine_of(generic_on_card(ratios, kv_src, index_src)).await;
+    let serial = run(&engine, &prompt, NEW).await;
+    engine.serve_batched().await;
+    assert!(
+        engine.is_continuous().await,
+        "the model joined the batch server"
+    );
+    let batched = run(&engine, &prompt, NEW).await;
+    assert_eq!(
+        batched.prompt_eval_count + batched.cached_prompt_tokens,
+        serial.prompt_eval_count + serial.cached_prompt_tokens,
+        "the prompt count"
+    );
+    assert_eq!(batched.eval_count, serial.eval_count, "the answer count");
+}
+
 /// A lone request on the serial path moves into the batch worker when another request is
 /// admitted, and its answer is the one it gives alone.
 /// The other request then streams through the worker the same answer.

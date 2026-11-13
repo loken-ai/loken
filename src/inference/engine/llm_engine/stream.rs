@@ -342,6 +342,9 @@ impl LlmEngine {
                     break;
                 }
                 gen.push(t);
+                if let Some(p) = probe.as_deref() {
+                    p.note_decoded(gen.len() as u64);
+                }
                 let Some(text) = settled(&gen) else { continue };
                 if text.len() <= emitted.len() || !text.starts_with(&emitted) {
                     continue;
@@ -406,20 +409,34 @@ impl LlmEngine {
                 }
             }
             if let Some((at, cached)) = admitted {
-                let first = first_token.unwrap_or(done);
-                // The worker speculates and keeps the cache on its own: neither is reported.
+                // The same line the serial path logs for its prompt.
+                info!(
+                    "prompt: {} tokens, {} already read, {} read now in {} ms",
+                    prompt_len,
+                    cached,
+                    prompt_len.saturating_sub(cached),
+                    first_token
+                        .unwrap_or(done)
+                        .saturating_duration_since(at)
+                        .as_millis()
+                );
+                // The worker does not speculate and the cache place is its shared pool:
+                // neither is reported.
                 crate::request_metrics::record_outcome(
                     &model_id,
                     probe.as_deref(),
                     crate::request_metrics::RequestOutcome {
-                        figures: crate::request_metrics::RequestFigures {
-                            queue_s: at.saturating_duration_since(submitted).as_secs_f64(),
-                            prefill_s: first.saturating_duration_since(at).as_secs_f64(),
-                            decode_s: done.saturating_duration_since(first).as_secs_f64(),
-                            prompt_tokens: prompt_len as u64,
-                            cached_prompt_tokens: cached as u64,
-                            generated_tokens: gen.len() as u64,
-                        },
+                        figures: crate::request_metrics::RequestFigures::batched(
+                            &crate::request_metrics::BatchedTimeline {
+                                submitted,
+                                admitted: at,
+                                first_token,
+                                done,
+                            },
+                            prompt_len as u64,
+                            cached as u64,
+                            gen.len() as u64,
+                        ),
                         ..Default::default()
                     },
                 );
@@ -600,6 +617,8 @@ impl LlmEngine {
             // leave that much room at the next request.
             let decode_free_start: Option<u64>;
             let audio_positions: usize;
+            // The rows an image takes in the cache beyond the prompt's tokens.
+            let mut vision_positions = 0usize;
             // Whether the model's own draft head reads this request's prompt and decode steps.
             let head_capable: bool;
             let (
@@ -1119,6 +1138,9 @@ impl LlmEngine {
                     {
                         Ok((l, np)) => {
                             qwen35_next_pos = Some(np);
+                            vision_positions = qwen35_vision_extra_kv(&items);
+                            // The spliced prefill writes every row from the first.
+                            reused_prompt_tokens = 0;
                             l
                         }
                         Err(e) => {
@@ -1140,6 +1162,9 @@ impl LlmEngine {
                     ) {
                         Ok((l, total)) => {
                             qwen35_next_pos = Some(total);
+                            vision_positions = total.saturating_sub(prompt_tokens.len());
+                            // The spliced prefill writes every row from the first.
+                            reused_prompt_tokens = 0;
                             l
                         }
                         Err(e) => {
@@ -1156,6 +1181,7 @@ impl LlmEngine {
                     // text tokens. Just prefill the new text-token delta at
                     // index_pos = session_start. NO image-embed re-prefill.
                     debug!("Vision prefix reuse: forward text-only at pos {} (image prefix already in cache)", session_start);
+                    vision_positions = cur_image_prefix_len;
                     match state.model.forward_prefill_chunked(&x, session_start) {
                         Ok(l) => l,
                         Err(e) => {
@@ -1184,6 +1210,7 @@ impl LlmEngine {
                         image_embeds.shape(),
                         x.shape()
                     );
+                    vision_positions = cur_image_prefix_len;
                     match state.model.forward_with_img(&bos_token, &x, image_embeds) {
                         Ok(l) => l,
                         Err(e) => {
@@ -3459,7 +3486,8 @@ impl LlmEngine {
                             end.saturating_duration_since(locked).as_secs_f64()
                         }),
                         decode_s: compute_ns as f64 / 1e9,
-                        prompt_tokens: prompt_tokens.len() as u64,
+                        prompt_tokens: (prompt_tokens.len() + audio_positions + vision_positions)
+                            as u64,
                         cached_prompt_tokens: reused_prompt_tokens as u64,
                         generated_tokens: token_count as u64,
                     },
@@ -3513,7 +3541,7 @@ impl LlmEngine {
                         } else {
                             reused_prompt_tokens
                         },
-                        audio_positions,
+                        audio_positions + vision_positions,
                     ),
                     prompt_eval_duration_ns,
                     total_duration_ns,

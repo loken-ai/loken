@@ -103,9 +103,39 @@ fn decode_sequential(
 
     let prefill_start = std::time::Instant::now();
     let x = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
-    let mut logits = state.model.forward_prefill_chunked(&x, 0)?;
+    // An image is prefilled with the prompt as the other paths prefill it.
+    // `media` counts the rows it takes beyond the prompt's tokens.
+    // `pos` is the rotary position of the next token.
+    let qwen35_items = std::mem::take(&mut state.qwen35_vision);
+    let pixtral = state
+        .image_embeds
+        .clone()
+        .filter(|_| state.model.is_pixtral_vision());
+    let prepended = state
+        .image_embeds
+        .clone()
+        .filter(|_| state.model.is_vision_model());
+    let (mut logits, mut pos, media) = if !qwen35_items.is_empty() {
+        let (lg, next_pos) =
+            state
+                .model
+                .forward_qwen35_vision(&prompt_tokens, &qwen35_items, &device)?;
+        (lg, next_pos, qwen35_vision_extra_kv(&qwen35_items))
+    } else if let Some(embeds) = pixtral {
+        let (lg, total) = state
+            .model
+            .forward_pixtral_spliced(&prompt_tokens, &embeds, &device)?;
+        (lg, total, total.saturating_sub(prompt_tokens.len()))
+    } else if let Some(embeds) = prepended {
+        let bos = Tensor::new(&[state.eos_token_id], &device)?.unsqueeze(0)?;
+        let lg = state.model.forward_with_img(&bos, &x, &embeds)?;
+        let rows = 1 + embeds.dim(1)?;
+        (lg, prompt_tokens.len() + rows, rows)
+    } else {
+        let lg = state.model.forward_prefill_chunked(&x, 0)?;
+        (lg, prompt_tokens.len(), 0)
+    };
     let prompt_eval_duration = prefill_start.elapsed().as_nanos() as u64;
-    let mut pos = prompt_tokens.len();
 
     let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -202,7 +232,7 @@ fn decode_sequential(
     Ok(GenerationResult {
         text,
         tokens,
-        prompt_eval_count: prompt_tokens.len() as u64,
+        prompt_eval_count: (prompt_tokens.len() + media) as u64,
         prompt_eval_duration,
         eval_count: generated.len() as u64,
         eval_duration,

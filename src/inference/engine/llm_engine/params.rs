@@ -789,15 +789,84 @@ fn whole_prompt_embeds(
     })
 }
 
-/// The positions a prefill evaluated: the prompt's tokens less those the cache held, plus the
-/// positions a clip's embeddings take beyond the one placeholder token they replace.
-pub(super) fn prompt_eval_positions(tokens: usize, reused: usize, audio_extra: usize) -> u64 {
-    (tokens.saturating_sub(reused) + audio_extra) as u64
+/// The positions a prefill evaluated: the rows the prompt holds in the cache less those the
+/// cache held before.
+///
+/// `media_extra` is the rows an image, a clip or a video takes beyond the tokens of the
+/// prompt, audio and vision summed.
+/// `reused` counts the rows the cache held, media rows included.
+pub(super) fn prompt_eval_positions(tokens: usize, reused: usize, media_extra: usize) -> u64 {
+    (tokens + media_extra).saturating_sub(reused) as u64
+}
+
+/// The counts of a whole answer collected from a streamed generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkerCounts {
+    /// Prompt positions the model read for the request.
+    pub prompt_eval_count: u64,
+    /// Prompt positions served from the cache instead of read.
+    pub cached_prompt_tokens: u64,
+    /// Tokens of the answer.
+    pub eval_count: u64,
+}
+
+impl WorkerCounts {
+    /// The counts the serving path recorded in the request's own outcome.
+    ///
+    /// Without an outcome the answer counts its `chunks` and no prompt.
+    pub(super) fn of(
+        outcome: Option<&crate::request_metrics::RequestOutcome>,
+        chunks: u64,
+    ) -> Self {
+        match outcome {
+            Some(o) => Self {
+                prompt_eval_count: o.figures.prompt_read(),
+                cached_prompt_tokens: o.figures.cached_prompt_tokens,
+                eval_count: o.figures.generated_tokens,
+            },
+            None => Self {
+                prompt_eval_count: 0,
+                cached_prompt_tokens: 0,
+                eval_count: chunks,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod rule_tests {
     use super::*;
+
+    /// A whole answer collected from a stream counts the prompt its outcome recorded, and its
+    /// chunks without one.
+    #[test]
+    fn a_collected_answer_counts_what_its_outcome_recorded() {
+        let outcome = crate::request_metrics::RequestOutcome {
+            figures: crate::request_metrics::RequestFigures {
+                prompt_tokens: 24,
+                cached_prompt_tokens: 16,
+                generated_tokens: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            WorkerCounts::of(Some(&outcome), 9),
+            WorkerCounts {
+                prompt_eval_count: 8,
+                cached_prompt_tokens: 16,
+                eval_count: 7,
+            }
+        );
+        assert_eq!(
+            WorkerCounts::of(None, 9),
+            WorkerCounts {
+                prompt_eval_count: 0,
+                cached_prompt_tokens: 0,
+                eval_count: 9,
+            }
+        );
+    }
 
     /// The model's end tokens end a request unless it ignores them; its stop tokens always do.
     #[test]
@@ -950,6 +1019,18 @@ mod audio_position_tests {
     fn a_clip_counts_as_its_embeddings_less_the_placeholder() {
         assert_eq!(prompt_eval_positions(20, 0, 375 - 1), 394);
         assert_eq!(prompt_eval_positions(20, 5, 0), 15);
+    }
+
+    /// An image counts the rows it takes: a cold prompt counts its tokens and the image rows,
+    /// a prompt whose image rows were reused counts only the rows read now.
+    #[test]
+    fn an_image_counts_its_rows_in_the_prompt() {
+        // 12 tokens, 1 of them a sentinel the image's 768 rows replace.
+        assert_eq!(prompt_eval_positions(12, 0, 768 - 1), 779);
+        // 10 text tokens behind an image of 1 BOS row and 729 patch rows.
+        assert_eq!(prompt_eval_positions(10, 0, 730), 740);
+        // The cache held the image rows and 4 text tokens.
+        assert_eq!(prompt_eval_positions(10, 734, 730), 6);
     }
 
     /// Splitting around the placeholder keeps every other token and one stand-in.

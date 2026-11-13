@@ -1332,6 +1332,12 @@ pub(crate) async fn text_completions_at(
         let max_tokens_cap = params.max_tokens;
         let engine_for_stats = engine.clone();
         let stream_started = std::time::Instant::now();
+        // The request's own counts come back through its probe.
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        let params = GenerationParams {
+            probe: Some(probe.clone()),
+            ..params
+        };
         let rx = engine
             .generate_stream(&prompt, params.clone())
             .await
@@ -1448,9 +1454,15 @@ pub(crate) async fn text_completions_at(
             }
             // What the engine counted, the estimate only where it said nothing; the
             // cached share as the whole answer reports it.
-            let usage = match stats.as_ref() {
-                Some(s) => Usage::from_counts(s.prompt_eval_count, s.cached_prompt_tokens, s.eval_count),
-                None => Usage::new(prompt_tokens_est as i32, tokens as i32),
+            // A path that writes no stats recorded the request's own counts in its probe.
+            let usage = match (stats.as_ref(), probe.outcome()) {
+                (Some(s), _) => Usage::from_counts(s.prompt_eval_count, s.cached_prompt_tokens, s.eval_count),
+                (None, Some(o)) => Usage::from_counts(
+                    o.figures.prompt_read(),
+                    o.figures.cached_prompt_tokens,
+                    o.figures.generated_tokens,
+                ),
+                (None, None) => Usage::new(prompt_tokens_est as i32, tokens as i32),
             };
             if include_usage {
                 let usage = serde_json::json!({

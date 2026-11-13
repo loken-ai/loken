@@ -100,6 +100,11 @@ fn qwen35_vision_extra_kv_counts_merged_grid_minus_sentinel() {
         qwen35_vision_extra_kv(&[(px.clone(), (64, 48))]),
         32 * 24 - 1
     );
+    // A prompt of 9 tokens, the sentinel one of them, counts the merged grid less the sentinel.
+    assert_eq!(
+        prompt_eval_positions(9, 0, qwen35_vision_extra_kv(&[(px.clone(), (64, 48))])),
+        9 + 32 * 24 - 1
+    );
     assert_eq!(qwen35_vision_extra_kv(&[]), 0);
     // Degenerate 2x2 grid -> 1 merged token -> sentinel covers it -> 0 extra.
     assert_eq!(qwen35_vision_extra_kv(&[(px.clone(), (2, 2))]), 0);

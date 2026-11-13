@@ -347,6 +347,8 @@ Another key never finds it, so the time to a first token and the count of cached
 
 ## Per-request figures
 
+`prompt_tokens`, `input_tokens` and `prompt_eval_count` count the context rows an image, a video frame or a clip takes, as well as the prompt's tokens.
+
 A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figures in a `loken` object inside its final usage:
 
 | Route | Where |

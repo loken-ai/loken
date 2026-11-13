@@ -549,7 +549,7 @@ pub(crate) async fn anthropic_messages_at(
                     let energy = crate::energy_report::end_share(energy, "text", "[/v1/messages]");
                     // What the engine counted; the chunk count and the prompt estimate only
                     // where it published nothing.
-                    let (stop_seq, hit_max, usage) = match stats.as_ref() {
+                    let (stop_seq, hit_max, mut usage) = match stats.as_ref() {
                         Some(s) => {
                             let (kind, seq) = s.finish_reason.anthropic();
                             (
@@ -572,6 +572,14 @@ pub(crate) async fn anthropic_messages_at(
                             },
                         ),
                     };
+                    // The request's own outcome holds its counts on every path.
+                    if let Some(o) = probe.outcome() {
+                        usage = anthropic::MessageUsage::from_counts(
+                            o.figures.prompt_read(),
+                            o.figures.cached_prompt_tokens,
+                            o.figures.generated_tokens,
+                        );
+                    }
                     let mut delta = anthropic::sse::message_delta(
                         used_tools,
                         hit_max,

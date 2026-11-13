@@ -1708,6 +1708,8 @@ pub(crate) mod quality;
 #[cfg(test)]
 mod sampling_tests;
 #[cfg(test)]
+mod vision_count_tests;
+#[cfg(test)]
 mod wide_load_tests;
 #[cfg(test)]
 mod wide_pipeline_tests;

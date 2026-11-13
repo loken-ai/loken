@@ -38,6 +38,50 @@ pub struct RequestFigures {
     pub generated_tokens: u64,
 }
 
+/// The instants a request served by the batch worker passed, seen from its client.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchedTimeline {
+    /// The request was handed to the worker.
+    pub submitted: Instant,
+    /// The worker started its prompt.
+    pub admitted: Instant,
+    /// The first token reached the client; `None` for an answer with no token.
+    pub first_token: Option<Instant>,
+    /// The answer ended.
+    pub done: Instant,
+}
+
+impl RequestFigures {
+    /// Tokens of its prompt read, the share served from the cache left out.
+    pub fn prompt_read(&self) -> u64 {
+        self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)
+    }
+
+    /// The figures of a request served by the batch worker: the wait from submission to
+    /// admission, the prompt from admission to the first token, the answer from the first
+    /// token to its end. An answer with no token reads its prompt until it ends.
+    /// An instant that precedes the one before it counts as equal to it.
+    pub fn batched(
+        t: &BatchedTimeline,
+        prompt_tokens: u64,
+        cached_prompt_tokens: u64,
+        generated_tokens: u64,
+    ) -> Self {
+        let first = t.first_token.unwrap_or(t.done);
+        Self {
+            queue_s: t
+                .admitted
+                .saturating_duration_since(t.submitted)
+                .as_secs_f64(),
+            prefill_s: first.saturating_duration_since(t.admitted).as_secs_f64(),
+            decode_s: t.done.saturating_duration_since(first).as_secs_f64(),
+            prompt_tokens,
+            cached_prompt_tokens,
+            generated_tokens,
+        }
+    }
+}
+
 /// Observations in buckets with upper bounds `bounds`, the last bucket open.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Histogram {
@@ -316,6 +360,56 @@ mod tests {
         assert_eq!(c[h.bounds.len() - 1], 2);
         assert_eq!(*c.last().unwrap(), 3);
         assert_eq!(h.count, 3);
+    }
+
+    /// The 3 times of a batched request are the gaps between its 4 instants.
+    #[test]
+    fn a_batched_request_splits_its_time_at_admission_and_first_token() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let timeline = BatchedTimeline {
+            submitted: t0,
+            admitted: at(20),
+            first_token: Some(at(120)),
+            done: at(620),
+        };
+        let f = RequestFigures::batched(&timeline, 40, 16, 7);
+        assert!((f.queue_s - 0.020).abs() < 1e-9);
+        assert!((f.prefill_s - 0.100).abs() < 1e-9);
+        assert!((f.decode_s - 0.500).abs() < 1e-9);
+        assert_eq!(
+            (f.prompt_tokens, f.cached_prompt_tokens, f.generated_tokens),
+            (40, 16, 7)
+        );
+    }
+
+    /// An answer with no token spends its time reading the prompt and decodes for none.
+    #[test]
+    fn a_batched_request_without_a_token_has_no_decode_time() {
+        let t0 = Instant::now();
+        let timeline = BatchedTimeline {
+            submitted: t0,
+            admitted: t0 + Duration::from_millis(5),
+            first_token: None,
+            done: t0 + Duration::from_millis(30),
+        };
+        let f = RequestFigures::batched(&timeline, 8, 0, 0);
+        assert!((f.prefill_s - 0.025).abs() < 1e-9);
+        assert_eq!(f.decode_s, 0.0);
+    }
+
+    /// An instant that precedes the previous one yields a zero gap, never a negative one.
+    #[test]
+    fn a_batched_request_never_reports_a_negative_time() {
+        let t0 = Instant::now();
+        let timeline = BatchedTimeline {
+            submitted: t0 + Duration::from_millis(10),
+            admitted: t0,
+            first_token: Some(t0),
+            done: t0,
+        };
+        let f = RequestFigures::batched(&timeline, 1, 0, 1);
+        assert_eq!((f.queue_s, f.prefill_s, f.decode_s), (0.0, 0.0, 0.0));
     }
 
     /// A figure that is not a number is counted as zero, so the sum stays a number.

@@ -14,6 +14,7 @@ backend GenericVisionBackend
 backend PipelineHeadBackend
 backend ContinuousBackend
 backend TakenBackend
+backend SplicedToy
 debt-backend MoondreamBackend
 family acestep
 family audio_in
