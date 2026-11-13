@@ -502,7 +502,8 @@ pub struct GenerationResult {
     pub tokens: Vec<u32>,
     /// The generated text
     pub text: String,
-    /// Number of prompt tokens actually processed by the tokenizer
+    /// Prompt positions the model read for the request.
+    /// The positions the cache served are in `cached_prompt_tokens`.
     pub prompt_eval_count: u64,
     /// Time spent evaluating the prompt (nanoseconds)
     pub prompt_eval_duration: u64,

@@ -349,6 +349,23 @@ Another key never finds it, so the time to a first token and the count of cached
 
 `prompt_tokens`, `input_tokens` and `prompt_eval_count` count the context rows an image, a video frame or a clip takes, as well as the prompt's tokens.
 
+The prompt counts of an answer:
+
+| Field | Routes | Holds |
+|---|---|---|
+| `prompt_eval_count` | `/api/generate`, `/api/chat` | Every prompt position, read or served from the cache. |
+| `prompt_eval_cached_count` | `/api/generate`, `/api/chat` | The prompt positions served from the cache. |
+| `usage.prompt_tokens` | `/v1/chat/completions`, `/v1/completions` | Every prompt position, read or served from the cache. |
+| `usage.prompt_tokens_details.cached_tokens` | `/v1/chat/completions`, `/v1/completions` | The prompt positions served from the cache. |
+| `usage.input_tokens` | `/v1/responses` | Every prompt position, read or served from the cache. |
+| `usage.input_tokens_details.cached_tokens` | `/v1/responses` | The prompt positions served from the cache. |
+| `usage.input_tokens` | `/v1/messages` | The prompt positions read. |
+| `usage.cache_read_input_tokens` | `/v1/messages` | The prompt positions served from the cache. |
+
+A whole answer and a streamed one report the same counts when the cache serves them the same positions.
+A prompt sent again as it was can be served whole from the cache.
+Its cached count is then the whole prompt, and no position is read.
+
 A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figures in a `loken` object inside its final usage:
 
 | Route | Where |

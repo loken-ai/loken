@@ -267,3 +267,109 @@ async fn a_slow_prompt_is_reported_as_it_is_read() {
         "prefill_ms {prefill_ms}"
     );
 }
+
+/// Words of the prompt a request repeats.
+const REPEATED_PROMPT_WORDS: usize = 8;
+
+/// The prompt figures of an Ollama generate answer: every prompt position, then the cached
+/// ones.
+async fn ollama_counts(state: &APIServer, vocab_size: usize, stream: bool) -> (u64, u64) {
+    let mut request = OllamaGenerateRequest::new(
+        MODEL.to_string(),
+        prompt(REPEATED_PROMPT_WORDS, vocab_size, 2),
+    );
+    request.stream = stream;
+    request.options = Some(json!({"temperature": 0, "num_predict": MAX_TOKENS}));
+    let response = super::ollama_generate(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        OllamaJson(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the generate request is served: {e:?}"));
+    let text = body_text(response).await;
+    let last: Value = text
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str(l).ok())
+        .unwrap_or_else(|| panic!("no answer in {text}"));
+    let field = |name: &str| {
+        last[name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{name} in {last}"))
+    };
+    (
+        field("prompt_eval_count"),
+        field("prompt_eval_cached_count"),
+    )
+}
+
+/// The prompt figures of an OpenAI chat answer: every prompt position, then the cached ones.
+async fn openai_counts(state: &APIServer, vocab_size: usize, stream: bool) -> (u64, u64) {
+    let text = body_text(openai(state, REPEATED_PROMPT_WORDS, vocab_size, stream).await).await;
+    let usage = if stream {
+        data_lines(&text)
+            .into_iter()
+            .rev()
+            .find(|c| c["usage"].is_object())
+            .unwrap_or_else(|| panic!("no usage chunk in {text}"))["usage"]
+            .clone()
+    } else {
+        serde_json::from_str::<Value>(&text).unwrap()["usage"].clone()
+    };
+    (
+        usage["prompt_tokens"].as_u64().unwrap(),
+        usage["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap(),
+    )
+}
+
+/// A prompt asked once then twice again, whole then streamed, on the Ollama generate route
+/// and on the OpenAI chat route.
+/// The two repeats report the same figures, and every answer counts the whole prompt.
+///
+/// Returns whether the requests ran in the batch worker.
+async fn a_repeated_request_reports_the_same_counts(batched: bool) -> bool {
+    let _one = ROUTES.lock().await;
+    let (state, dir, vocab) = server_with_tiny_model().await;
+    let engine = state.engines.read().await[0].engine.clone();
+    engine.hold_lone_requests_on(batched);
+
+    let first = ollama_counts(&state, vocab, false).await;
+    let whole = ollama_counts(&state, vocab, false).await;
+    let streamed = ollama_counts(&state, vocab, true).await;
+    let in_worker = engine.is_continuous().await;
+    assert_eq!(whole, streamed, "the repeated generate request");
+    assert_eq!(whole.0, first.0, "every prompt position is counted");
+    assert!(whole.1 <= whole.0, "{whole:?}");
+
+    let first = openai_counts(&state, vocab, false).await;
+    let whole = openai_counts(&state, vocab, false).await;
+    let streamed = openai_counts(&state, vocab, true).await;
+    assert_eq!(whole, streamed, "the repeated chat request");
+    assert_eq!(whole.0, first.0, "every prompt position is counted");
+    assert!(whole.1 <= whole.0, "{whole:?}");
+    assert_eq!(
+        engine.is_continuous().await,
+        in_worker,
+        "the requests kept their path"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    in_worker
+}
+
+/// [`a_repeated_request_reports_the_same_counts`] on the serial path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_request_reports_the_same_counts_on_the_serial_path() {
+    assert!(!a_repeated_request_reports_the_same_counts(false).await);
+}
+
+/// [`a_repeated_request_reports_the_same_counts`] through the batch worker of a card.
+#[cfg(feature = "gpu")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_request_reports_the_same_counts_through_the_worker() {
+    if !a_repeated_request_reports_the_same_counts(true).await {
+        eprintln!("no card took the batch worker; the worker's counts are NOT covered by this run");
+    }
+}

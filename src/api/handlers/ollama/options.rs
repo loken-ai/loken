@@ -521,14 +521,18 @@ pub(crate) async fn ollama_chat(
                             yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
                         }
                         let wall_total_ns = start_time.elapsed().as_nanos() as u64;
+                        let (prompt_eval_count, prompt_eval_cached_count) = streamed_prompt_counts(
+                            probe.outcome().as_ref(),
+                            stats.as_ref(),
+                            estimate_token_count(&prompt_clone),
+                        );
                         let (
-                            eval_count, eval_duration, prompt_eval_count,
+                            eval_count, eval_duration,
                             prompt_eval_duration, total_duration, done_from_engine,
                         ) = match stats {
                             Some(s) => (
                                 s.eval_count,
                                 s.eval_duration_ns,
-                                s.prompt_eval_count,
                                 s.prompt_eval_duration_ns,
                                 s.total_duration_ns,
                                 Some(s.finish_reason.ollama()),
@@ -540,10 +544,6 @@ pub(crate) async fn ollama_chat(
                                     .outcome()
                                     .map_or(chunk_count as u64, |o| o.figures.generated_tokens),
                                 wall_total_ns,
-                                probe.outcome().map_or_else(
-                                    || estimate_token_count(&prompt_clone),
-                                    |o| o.figures.prompt_read(),
-                                ),
                                 0u64,
                                 wall_total_ns,
                                 None,
@@ -604,6 +604,7 @@ pub(crate) async fn ollama_chat(
                             "total_duration": total_duration,
                             "load_duration": load_duration,
                             "prompt_eval_count": prompt_eval_count,
+                            "prompt_eval_cached_count": prompt_eval_cached_count,
                             "prompt_eval_duration": prompt_eval_duration,
                             "eval_count": eval_count,
                             "eval_duration": eval_duration
@@ -693,7 +694,10 @@ pub(crate) async fn ollama_chat(
                     total_duration
                         .saturating_sub(result.prompt_eval_duration + result.eval_duration),
                 );
-                response.prompt_eval_count = Some(result.prompt_eval_count);
+                let (prompt_eval_count, prompt_eval_cached_count) =
+                    ollama_prompt_counts(result.prompt_eval_count, result.cached_prompt_tokens);
+                response.prompt_eval_count = Some(prompt_eval_count);
+                response.prompt_eval_cached_count = Some(prompt_eval_cached_count);
                 response.prompt_eval_duration = Some(result.prompt_eval_duration);
                 response.eval_count = Some(result.eval_count);
                 response.eval_duration = Some(result.eval_duration);
@@ -815,6 +819,30 @@ pub(crate) async fn generate_prompt(
 }
 
 /// Whether the request carries an image.
+/// The prompt figures of an Ollama reply, from the positions read and those the cache served:
+/// every prompt position, then the cached ones.
+pub(super) fn ollama_prompt_counts(read: u64, cached: u64) -> (u64, u64) {
+    (read + cached, cached)
+}
+
+/// The prompt figures of a streamed Ollama reply.
+///
+/// The request's own outcome holds them on every path.
+/// The engine's counts stand in where no outcome was recorded, then the prompt's estimate.
+fn streamed_prompt_counts(
+    outcome: Option<&crate::request_metrics::RequestOutcome>,
+    stats: Option<&crate::inference::engine::llm_engine::StreamStats>,
+    estimate: u64,
+) -> (u64, u64) {
+    match (outcome, stats) {
+        (Some(o), _) => {
+            ollama_prompt_counts(o.figures.prompt_read(), o.figures.cached_prompt_tokens)
+        }
+        (None, Some(s)) => ollama_prompt_counts(s.prompt_eval_count, s.cached_prompt_tokens),
+        (None, None) => ollama_prompt_counts(estimate, 0),
+    }
+}
+
 fn carries_images(request: &OllamaGenerateRequest) -> bool {
     request.images.as_ref().is_some_and(|i| !i.is_empty())
 }
@@ -1282,14 +1310,18 @@ pub(crate) async fn ollama_generate(
                             None => (None, Vec::new()),
                         };
                         let done_reason = done_from_engine.unwrap_or(done_reason);
+                        let (prompt_eval_count, prompt_eval_cached_count) = streamed_prompt_counts(
+                            probe.outcome().as_ref(),
+                            stats.as_ref(),
+                            estimate_token_count(&prompt_clone),
+                        );
                         let (
-                            eval_count, eval_duration, prompt_eval_count,
+                            eval_count, eval_duration,
                             prompt_eval_duration, total_duration,
                         ) = match stats {
                             Some(s) => (
                                 s.eval_count,
                                 s.eval_duration_ns,
-                                s.prompt_eval_count,
                                 s.prompt_eval_duration_ns,
                                 s.total_duration_ns,
                             ),
@@ -1300,10 +1332,6 @@ pub(crate) async fn ollama_generate(
                                     .outcome()
                                     .map_or(chunk_count as u64, |o| o.figures.generated_tokens),
                                 wall_total_ns,
-                                probe.outcome().map_or_else(
-                                    || estimate_token_count(&prompt_clone),
-                                    |o| o.figures.prompt_read(),
-                                ),
                                 0u64,
                                 wall_total_ns,
                             ),
@@ -1318,6 +1346,7 @@ pub(crate) async fn ollama_generate(
                             "done_reason": done_reason,
                             "total_duration": total_duration,
                             "prompt_eval_count": prompt_eval_count,
+                            "prompt_eval_cached_count": prompt_eval_cached_count,
                             "prompt_eval_duration": prompt_eval_duration,
                             "eval_count": eval_count,
                             "eval_duration": eval_duration
@@ -1388,7 +1417,10 @@ pub(crate) async fn ollama_generate(
                 if !result.tokens.is_empty() {
                     response.context = Some(result.tokens.iter().map(|&t| t as i32).collect());
                 }
-                response.prompt_eval_count = Some(result.prompt_eval_count);
+                let (prompt_eval_count, prompt_eval_cached_count) =
+                    ollama_prompt_counts(result.prompt_eval_count, result.cached_prompt_tokens);
+                response.prompt_eval_count = Some(prompt_eval_count);
+                response.prompt_eval_cached_count = Some(prompt_eval_cached_count);
                 response.prompt_eval_duration = Some(result.prompt_eval_duration);
                 response.eval_count = Some(result.eval_count);
                 response.eval_duration = Some(result.eval_duration);

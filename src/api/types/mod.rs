@@ -347,8 +347,12 @@ pub struct OllamaChatResponse {
     pub total_duration: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_duration: Option<u64>,
+    /// Every prompt position, those read and those the cache served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_eval_count: Option<u64>,
+    /// The prompt positions the cache served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_cached_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_eval_duration: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,6 +387,7 @@ impl OllamaChatResponse {
             total_duration: None,
             load_duration: None,
             prompt_eval_count: None,
+            prompt_eval_cached_count: None,
             prompt_eval_duration: None,
             eval_count: None,
             eval_duration: None,
@@ -546,8 +551,12 @@ pub struct OllamaGenerateResponse {
     pub total_duration: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_duration: Option<u64>,
+    /// Every prompt position, those read and those the cache served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_eval_count: Option<u64>,
+    /// The prompt positions the cache served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_cached_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_eval_duration: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -592,6 +601,7 @@ impl OllamaGenerateResponse {
             total_duration: None,
             load_duration: None,
             prompt_eval_count: None,
+            prompt_eval_cached_count: None,
             prompt_eval_duration: None,
             eval_count: None,
             eval_duration: None,

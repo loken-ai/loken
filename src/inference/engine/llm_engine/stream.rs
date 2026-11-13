@@ -107,6 +107,27 @@ impl LlmEngine {
         }
     }
 
+    /// Keeps lone requests on one path: the batch worker when `batched`, the serial path
+    /// otherwise.
+    /// The other path is recorded as the slowest decode a rate can say.
+    #[cfg(test)]
+    pub(crate) fn hold_lone_requests_on(&self, batched: bool) {
+        use super::batching::{LoneDecode, LonePath};
+        let decode = |rate: f64| LoneDecode {
+            tokens: 1,
+            rate,
+            drafted: 0.0,
+            lookup: 1.0,
+        };
+        let (held, other) = match batched {
+            true => (LonePath::Batched, LonePath::Serial),
+            false => (LonePath::Serial, LonePath::Batched),
+        };
+        let mut signal = self.batching.lock().unwrap_or_else(|e| e.into_inner());
+        signal.record(held, decode(f64::MAX));
+        signal.record(other, decode(f64::MIN_POSITIVE));
+    }
+
     /// Moves the model into its batch worker. Called by a request that holds the serial gate,
     /// so no serial generation is running. Says whether the model serves from its worker.
     pub async fn serve_batched(&self) -> bool {
@@ -610,9 +631,6 @@ impl LlmEngine {
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
             let mut reused_prompt_tokens: usize;
-            // Whether the whole prompt came back from the cache: its tokens are still the
-            // prompt the client sent, so they stay in the count it is shown.
-            let repeated_prompt: bool;
             // What the decode takes of a card beyond the request's start: the snapshots
             // leave that much room at the next request.
             let decode_free_start: Option<u64>;
@@ -803,7 +821,6 @@ impl LlmEngine {
                     state.exact_prefill = None;
                     None
                 };
-                repeated_prompt = exact_logits.is_some();
                 let session_start: usize = if exact_logits.is_some() {
                     // The prompt is the one the resident KV holds: nothing is left to prefill.
                     prompt_tokens.len()
@@ -3547,11 +3564,7 @@ impl LlmEngine {
                     eval_duration_ns: compute_ns,
                     prompt_eval_count: prompt_eval_positions(
                         prompt_tokens.len(),
-                        if repeated_prompt {
-                            0
-                        } else {
-                            reused_prompt_tokens
-                        },
+                        reused_prompt_tokens,
                         audio_positions + vision_positions,
                     ),
                     prompt_eval_duration_ns,

@@ -204,6 +204,8 @@ impl LoadedModelState {
 pub struct StreamStats {
     pub eval_count: u64,
     pub eval_duration_ns: u64,
+    /// Prompt positions the model read for the request.
+    /// The positions the cache served are in `cached_prompt_tokens`.
     pub prompt_eval_count: u64,
     pub prompt_eval_duration_ns: u64,
     pub total_duration_ns: u64,

@@ -1,5 +1,5 @@
-//! The prompt count of a request whose image rows are spliced over a placeholder token, through
-//! the engine on the small generic model.
+//! The prompt count of a request, through the engine on the small generic model: a repeated text
+//! prompt, and a request whose image rows are spliced over a placeholder token.
 //!
 //! The toy backend expands each placeholder to the merged grid of its item and prefills the
 //! expanded ids, so the cache holds the rows a vision tower would write.
@@ -125,6 +125,39 @@ async fn a_text_prompt_counts_its_tokens() {
     let engine = engine().await;
     let whole = engine.generate(PROMPT, params(3)).await.unwrap();
     assert_eq!(whole.prompt_eval_count + whole.cached_prompt_tokens, 6);
+}
+
+/// A text prompt streamed twice is read once.
+/// The repeat counts each position once, as served from the cache, in its own counts and in
+/// the request's figures alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_prompt_counts_each_position_once() {
+    let (file, _) = toy_files(LAYOUT, false);
+    let (engine, _) = super::block_draft_tests::engine_of(generic_of(file)).await;
+    let mut counts = Vec::new();
+    for _ in 0..2 {
+        let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
+        let params = GenerationParams {
+            probe: Some(probe.clone()),
+            ..params(3)
+        };
+        let mut rx = engine.generate_stream(PROMPT, params).await.unwrap();
+        while let Some(chunk) = rx.recv().await {
+            chunk.unwrap();
+        }
+        let stats = engine.take_last_stream_stats().unwrap();
+        let figures = probe.outcome().unwrap().figures;
+        counts.push((
+            (stats.prompt_eval_count, stats.cached_prompt_tokens),
+            (figures.prompt_read(), figures.cached_prompt_tokens),
+        ));
+    }
+    assert_eq!(
+        counts[0],
+        ((6, 0), (6, 0)),
+        "the first request reads its prompt"
+    );
+    assert_eq!(counts[1], ((0, 6), (0, 6)), "the repeat reads nothing");
 }
 
 /// The request's own figures count the prompt the answer reports, image rows included, on the
