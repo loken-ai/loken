@@ -773,9 +773,16 @@ pub struct BooguTransformer2DModel {
     double_stream_layers: Vec<BooguDoubleStreamBlock>,
     single_stream_layers: Vec<OmniGen2Block>,
     norm_out: LuminaLayerNormContinuous,
+    /// The formats its matrices are held in, joined with `+`.
+    running_format: Option<String>,
 }
 
 impl BooguTransformer2DModel {
+    /// The formats its matrices are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.running_format.clone()
+    }
+
     /// Latent channel count (FLUX VAE = 16).
     pub fn in_channels(&self) -> usize {
         self.cfg.in_channels
@@ -907,6 +914,7 @@ impl BooguTransformer2DModel {
             norm_out: LuminaLayerNormContinuous::load(&vb, idev, "norm_out", 1e-6, true)?,
             cfg,
             input_device: input_device.clone(),
+            running_format: vb.matrix_formats(),
         })
     }
 

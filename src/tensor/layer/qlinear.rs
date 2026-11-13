@@ -81,14 +81,16 @@ pub struct QLinear {
 
 impl QLinear {
     pub fn new(weight: Weight, bias: Option<Tensor>, in_dim: usize, out_dim: usize) -> Self {
-        Self {
+        let q = Self {
             weight,
             bias,
             lora: Vec::new(),
             fused: None,
             in_dim,
             out_dim,
-        }
+        };
+        super::held::note(&q.held_format());
+        q
     }
 
     pub fn weight(&self) -> &Weight {

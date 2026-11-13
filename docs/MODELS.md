@@ -333,6 +333,9 @@ A narrower form than the stored one goes in the conversion ledger.
 A projection merged with an adapter is held in the form of its stored values, rounded once, and the ledger says so.
 The load log names the formats the blocks run in.
 
+A safetensors checkpoint of Flux, FLUX.2, Qwen-Image or Boogu is rebuilt in a block format at every load.
+Each rebuilt matrix goes in the conversion ledger, and the load log names the stored and the running formats.
+
 A layer on Vulkan or OpenCL runs its projections in the format the rung and the fidelity level give every layer.
 
 The expert stacks of a mixture-of-experts checkpoint follow the kernels instead.
@@ -340,6 +343,9 @@ A stack runs as stored where a kernel of its device reads that format.
 
 On the host that includes `F32`, through the dense expert product, which copies the stack on each call and is slow for a large one.
 `F16` and `BF16` stacks are rebuilt in `Q8_0`.
+
+A rebuilt stack goes in the conversion ledger, and the load log sums the ledger.
+`/api/ps` names the formats of the expert stacks after those of the other projections.
 
 ### Embeddings and reranking
 

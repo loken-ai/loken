@@ -175,6 +175,22 @@ impl QVarBuilder {
         }
     }
 
+    /// The formats the matrices of this builder are held in, distinct, sorted, joined with `+`.
+    ///
+    /// `None` when it holds no matrix.
+    pub fn matrix_formats(&self) -> Option<String> {
+        let mut formats: Vec<String> = self
+            .inner
+            .tensors
+            .values()
+            .filter(|t| t.dims.len() == 2)
+            .map(|t| format!("{:?}", t.dtype).to_lowercase())
+            .collect();
+        formats.sort();
+        formats.dedup();
+        (!formats.is_empty()).then(|| formats.join("+"))
+    }
+
     /// Total host bytes held by the underlying tensors (cache accounting).
     pub fn host_bytes(&self) -> u64 {
         self.inner

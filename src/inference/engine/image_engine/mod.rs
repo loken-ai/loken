@@ -169,7 +169,14 @@ fn describe(state: &LoadedImageModelState) -> Presence {
             ZImageVariant::NativeSingle(model) => model.running_format(),
             ZImageVariant::Hetero(hetero) => hetero.running_format(),
         },
-        _ => None,
+        LoadedImageModel::Flux(f) => match &f.flux {
+            FluxVariant::Whole(flux) | FluxVariant::Hetero(flux) => flux.running_format(),
+        },
+        LoadedImageModel::QwenImage(q) => q.running_format(),
+        LoadedImageModel::Flux2(f2) => f2.running_format(),
+        LoadedImageModel::Boogu(b) => b.running_format(),
+        // The UNet is held in the dtype the state names.
+        LoadedImageModel::Sdxl(_) => Some(state.dtype.as_str().to_string()),
     };
     Presence {
         family: family_of(state),

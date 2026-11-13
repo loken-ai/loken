@@ -253,7 +253,7 @@ pub(crate) async fn ollama_ps(
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,
-                running_format: None,
+                running_format: asr_info.running_format.clone(),
             },
             expires_at: "never".to_string(),
             size_vram: asr_info.resident_bytes,
@@ -266,6 +266,7 @@ pub(crate) async fn ollama_ps(
     if let Some(tts_name) = state.tts_engine.loaded_name().await {
         // Measured across the load, as for the image and ASR engines.
         let tts_vram = state.tts_engine.resident_bytes().await;
+        let tts_format = state.tts_engine.running_format().await;
         models.push(OllamaPsModel {
             name: tts_name.clone(),
             model: tts_name.clone(),
@@ -281,7 +282,7 @@ pub(crate) async fn ollama_ps(
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,
-                running_format: None,
+                running_format: tts_format,
             },
             expires_at: "never".to_string(),
             size_vram: tts_vram,

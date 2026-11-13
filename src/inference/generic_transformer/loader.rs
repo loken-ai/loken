@@ -2339,6 +2339,25 @@ fn build_generic_layer(
                         crate::tensor::quantized::GgmlDType::Q8_0,
                         device,
                     )?;
+                    // Both fused stacks are built beside the stored gate and up stacks.
+                    let elems = fused.elem_count() as u64;
+                    let q8 = crate::tensor::quantized::GgmlDType::Q8_0;
+                    crate::tensor::conversion::record_kept(
+                        "experts",
+                        ge.dtype().gguf_name(),
+                        q8.gguf_name(),
+                        0,
+                        elems * q8.type_size() as u64 / q8.block_size() as u64,
+                        "the GELU expert kernels read a fused gate and up stack",
+                    );
+                    crate::tensor::conversion::record_kept(
+                        "experts",
+                        ge.dtype().gguf_name(),
+                        crate::tensor::DType::F32.as_str(),
+                        0,
+                        elems * crate::tensor::DType::F32.size_in_bytes() as u64,
+                        "the host expert loop reads a fused gate and up stack in f32",
+                    );
                     // Keep the separate gate/up experts quantized on-device for the
                     // GPU SiLU kernel; the exact F32 fused feeds the CPU cache.
                     let gate_q = std::sync::Arc::new(coerce_moe_weight(ge, device)?);

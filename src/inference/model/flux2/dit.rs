@@ -451,9 +451,16 @@ pub struct Model {
     rope: Flux2Rope,
     cfg: Config,
     input_device: Device,
+    /// The formats its matrices are held in, joined with `+`.
+    running_format: Option<String>,
 }
 
 impl Model {
+    /// The formats its matrices are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.running_format.clone()
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -728,6 +735,7 @@ impl Model {
             rope,
             cfg,
             input_device,
+            running_format: vb.matrix_formats(),
         })
     }
 }

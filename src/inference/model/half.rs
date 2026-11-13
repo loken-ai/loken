@@ -78,8 +78,13 @@ pub fn half_matmul_pays(dev: &Device, rows: usize, width: usize) -> Result<bool>
         return Ok(pays);
     }
     let weight = Tensor::zeros((width, width), DType::F32)?;
-    let full = Linear::new(weight.to_device(dev)?, None)?;
-    let half = linear(&weight, None, dev)?;
+    // The probe's projections are dropped once timed: they are not noted as held.
+    let (full, half) = crate::tensor::layer::held::aside(|| -> Result<(Linear, Linear)> {
+        Ok((
+            Linear::new(weight.to_device(dev)?, None)?,
+            linear(&weight, None, dev)?,
+        ))
+    })?;
     let x = Tensor::zeros_on((1, rows, width), DType::F32, dev)?;
     let fastest = |l: &Linear| -> Result<std::time::Duration> {
         l.forward(&x)?;
@@ -141,6 +146,29 @@ mod tests {
             .to_dtype(DType::BF16)
             .unwrap();
         assert_eq!(to_resident(&t).unwrap().dtype(), DType::F16);
+    }
+
+    /// The formats a load collects are those its projections are held in: F32 on the host, the
+    /// half form on a card, and nothing from the probe that times the two.
+    #[test]
+    fn a_load_collects_the_format_each_projection_is_held_in() {
+        let weights = |dev: &Device| {
+            let w = Tensor::from_vec_f32(vec![0.5; 4], (2usize, 2usize)).unwrap();
+            let map = std::collections::HashMap::from([("p.weight".to_string(), w)]);
+            crate::tensor::VarBuilder::from_tensors(map, DType::F32, dev)
+        };
+        let held = crate::tensor::layer::held::collect();
+        projection(2, 2, false, true, &weights(&Device::Cpu).pp("p")).unwrap();
+        assert_eq!(held.formats().as_deref(), Some("f32"));
+        drop(held);
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping the card half: no card");
+            return;
+        };
+        let held = crate::tensor::layer::held::collect();
+        half_matmul_pays(&card, 2, 2).unwrap();
+        projection(2, 2, false, true, &weights(&card).pp("p")).unwrap();
+        assert_eq!(held.formats().as_deref(), Some("f16"));
     }
 
     #[test]

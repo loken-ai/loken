@@ -170,6 +170,11 @@ fn dev_label(d: &Device) -> String {
 }
 
 impl QwenImageModelState {
+    /// The formats the matrices of the DiT are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.dit.running_format()
+    }
+
     /// True when the DiT blocks span several devices (see `Model::is_split`).
     pub fn dit_is_split(&self) -> bool {
         self.dit.is_split()

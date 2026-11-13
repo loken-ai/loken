@@ -134,20 +134,30 @@ async fn watched_load<T: Send + 'static>(
     what: &'static str,
     watch: LoadWatch,
     f: impl FnOnce() -> AnyResult<T> + Send + 'static,
-) -> AnyResult<T> {
+) -> AnyResult<(T, Option<String>)> {
     let token = watch.cancel.unwrap_or_default();
     let guard = crate::inference::serve::cancel::CancelGuard::new(token.clone());
     let report = watch.report;
-    let joined = tokio::task::spawn_blocking(move || -> AnyResult<T> {
+    let joined = tokio::task::spawn_blocking(move || -> AnyResult<(T, Option<String>)> {
         let _stop = crate::inference::serve::cancel::scoped::publish(&token);
         let _counts = report.map(crate::inference::serve::progress::scoped::publish);
-        f()
+        let held = crate::tensor::layer::held::collect();
+        f().map(|loaded| (loaded, held.formats()))
     })
     .await;
     guard.disarm();
     joined
         .map_err(|e| anyhow!("{what} load join: {e:#}"))?
+        .inspect(|(_, formats)| log_running_format(what, formats.as_deref()))
         .inspect_err(|e| crate::inference::engine::log_engine_error("tts", "load", e))
+}
+
+/// Logs the formats the projections of the speech model `what` run in.
+pub(crate) fn log_running_format(what: &str, formats: Option<&str>) {
+    info!(
+        "{what}: the projections run in {}",
+        formats.unwrap_or("no format a projection notes")
+    );
 }
 
 /// Parler-TTS backend state (HF autoregressive codec model + DAC vocoder).
@@ -247,6 +257,8 @@ pub struct TtsEngine {
     name: Arc<Mutex<Option<String>>>,
     /// GPU bytes the load took, measured. `/api/ps` published 0 here.
     resident_bytes: Arc<Mutex<u64>>,
+    /// The formats the projections of the resident model are held in, joined with `+`.
+    running_format: Arc<Mutex<Option<String>>>,
     /// The server's fidelity level, which decides the precision a decoder is held in.
     fidelity: Fidelity,
 }
@@ -257,6 +269,7 @@ impl TtsEngine {
             fidelity,
             model_state: Arc::new(Mutex::new(None)),
             resident_bytes: Arc::new(Mutex::new(0)),
+            running_format: Arc::new(Mutex::new(None)),
             name: Arc::new(Mutex::new(None)),
         }
     }
@@ -277,6 +290,11 @@ impl TtsEngine {
 
     pub async fn loaded_name(&self) -> Option<String> {
         self.name.lock().await.clone()
+    }
+
+    /// The formats the projections of the resident voice model are held in, joined with `+`.
+    pub async fn running_format(&self) -> Option<String> {
+        self.running_format.lock().await.clone()
     }
 
     /// Sample rate of the loaded parler checkpoint, or `None` when no
@@ -373,6 +391,7 @@ impl TtsEngine {
             *g = None;
             let mut n = self.name.lock().await;
             let label = n.take().unwrap_or_else(|| "<unknown>".to_string());
+            *self.running_format.lock().await = None;
             info!("Unloaded TTS model: {label}");
         }
     }
@@ -395,7 +414,7 @@ impl TtsEngine {
         info!("Loading TTS model: {model_id}");
         let model_id_clone = model_id.clone();
         let fidelity = self.fidelity;
-        let state = watched_load("tts", watch, move || {
+        let (state, running_format) = watched_load("tts", watch, move || {
             load_parler_blocking(&model_id_clone, fidelity)
         })
         .await?;
@@ -405,6 +424,7 @@ impl TtsEngine {
         let mut guard = self.model_state.lock().await;
         *guard = Some(state);
         *self.name.lock().await = Some(model_id);
+        *self.running_format.lock().await = running_format;
         *self.resident_bytes.lock().await = resident;
         Ok(())
     }
@@ -436,13 +456,15 @@ impl TtsEngine {
     ) -> AnyResult<()> {
         let free_before_load = crate::inference::place::vram_manager::free_total();
         info!("Loading TTS model: {canonical_name} ({onnx_path:?})");
-        let state = watched_load("piper", watch, move || load_piper_blocking(&onnx_path)).await?;
+        let (state, running_format) =
+            watched_load("piper", watch, move || load_piper_blocking(&onnx_path)).await?;
 
         let resident =
             free_before_load.saturating_sub(crate::inference::place::vram_manager::free_total());
         let mut guard = self.model_state.lock().await;
         *guard = Some(state);
         *self.name.lock().await = Some(canonical_name);
+        *self.running_format.lock().await = running_format;
         *self.resident_bytes.lock().await = resident;
         Ok(())
     }
@@ -467,13 +489,14 @@ impl TtsEngine {
         watch: LoadWatch,
     ) -> AnyResult<()> {
         info!("Loading TTS model: {canonical_name} (voice {voice_wav:?})");
-        let state = watched_load("pocket-tts", watch, move || {
+        let (state, running_format) = watched_load("pocket-tts", watch, move || {
             load_pocket_tts_blocking(&voice_wav)
         })
         .await?;
         let mut guard = self.model_state.lock().await;
         *guard = Some(state);
         *self.name.lock().await = Some(canonical_name);
+        *self.running_format.lock().await = running_format;
         Ok(())
     }
 
@@ -497,13 +520,14 @@ impl TtsEngine {
         watch: LoadWatch,
     ) -> AnyResult<()> {
         info!("Loading TTS model: {canonical_name} (voice {voice_name:?})");
-        let state = watched_load("kyutai", watch, move || {
+        let (state, running_format) = watched_load("kyutai", watch, move || {
             load_kyutai_blocking(voice_name.as_deref())
         })
         .await?;
         let mut guard = self.model_state.lock().await;
         *guard = Some(state);
         *self.name.lock().await = Some(canonical_name);
+        *self.running_format.lock().await = running_format;
         Ok(())
     }
 
@@ -517,12 +541,14 @@ impl TtsEngine {
     ) -> AnyResult<()> {
         info!("Loading TTS model: {canonical_name} ({dir:?})");
         let free_before_load = crate::inference::place::vram_manager::free_total();
-        let state = watched_load("qwen3-tts", watch, move || load_qwen3_tts_blocking(&dir)).await?;
+        let (state, running_format) =
+            watched_load("qwen3-tts", watch, move || load_qwen3_tts_blocking(&dir)).await?;
         let resident =
             free_before_load.saturating_sub(crate::inference::place::vram_manager::free_total());
         let mut guard = self.model_state.lock().await;
         *guard = Some(state);
         *self.name.lock().await = Some(canonical_name);
+        *self.running_format.lock().await = running_format;
         *self.resident_bytes.lock().await = resident;
         Ok(())
     }
@@ -1519,6 +1545,20 @@ mod tests {
         // reporter left behind would send its counts into a channel that belongs to nobody.
         assert!(crate::inference::serve::progress::scoped::current().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A watched load hands back the formats the projections it built are held in.
+    #[tokio::test]
+    async fn a_watched_load_names_the_formats_of_its_projections() {
+        use crate::tensor::{layer::Linear, DType, Tensor};
+        let (_, formats) = watched_load("test", LoadWatch::default(), || {
+            Linear::new(Tensor::zeros((2, 2), DType::F16)?, None)?;
+            Linear::new(Tensor::zeros((2, 2), DType::F32)?, None)?;
+            Ok(())
+        })
+        .await
+        .expect("a nominal load succeeds");
+        assert_eq!(formats.as_deref(), Some("f16+f32"));
     }
 
     /// A client that leaves during a load must not leave the checkpoint arriving for

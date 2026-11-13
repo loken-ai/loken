@@ -206,6 +206,8 @@ pub struct AudioModelInfo {
     /// why this is measured rather than derived. `/api/ps` published 0 here, which a
     /// dashboard reads as "this model costs nothing".
     pub resident_bytes: u64,
+    /// The formats the projections of the model are held in, joined with `+`.
+    pub running_format: Option<String>,
 }
 
 pub struct AudioEngine {
@@ -213,6 +215,8 @@ pub struct AudioEngine {
     name: Arc<Mutex<Option<String>>>,
     /// "CUDA" or "CPU", kept apart from the state so a listing never waits on a transcription.
     device_kind: Arc<Mutex<Option<String>>>,
+    /// The formats the projections of the resident model are held in, joined with `+`.
+    running_format: Arc<Mutex<Option<String>>>,
     resident_bytes: Arc<Mutex<u64>>,
     /// What one more audio window takes beside the others in an encoder pass, for the
     /// resident model.
@@ -236,6 +240,7 @@ impl AudioEngine {
             model_state: Arc::new(Mutex::new(None)),
             name: Arc::new(Mutex::new(None)),
             device_kind: Arc::new(Mutex::new(None)),
+            running_format: Arc::new(Mutex::new(None)),
             resident_bytes: Arc::new(Mutex::new(0)),
             window_bytes: Arc::new(Mutex::new(0)),
             gather: TranscribeGather::default(),
@@ -257,6 +262,7 @@ impl AudioEngine {
             name,
             model_type: "whisper".to_string(),
             resident_bytes: *self.resident_bytes.lock().await,
+            running_format: self.running_format.lock().await.clone(),
         })
     }
 
@@ -296,6 +302,7 @@ impl AudioEngine {
             let mut name_guard = self.name.lock().await;
             let name = name_guard.take().unwrap_or_else(|| "<unknown>".to_string());
             *self.device_kind.lock().await = None;
+            *self.running_format.lock().await = None;
             info!("Unloaded audio model: {name}");
         }
     }
@@ -310,11 +317,16 @@ impl AudioEngine {
         // hf-hub is sync. Do the I/O on a blocking thread so we don't stall
         // the tokio runtime.
         let model_id_clone = model_id.clone();
-        let state = tokio::task::spawn_blocking(move || -> AnyResult<WhisperModelState> {
-            load_whisper_blocking(&model_id_clone)
+        let (state, running_format) = tokio::task::spawn_blocking(move || {
+            let held = crate::tensor::layer::held::collect();
+            load_whisper_blocking(&model_id_clone).map(|state| (state, held.formats()))
         })
         .await
         .map_err(|e| anyhow!("whisper load join: {e}"))??;
+        crate::inference::engine::tts_engine::log_running_format(
+            "whisper",
+            running_format.as_deref(),
+        );
 
         let free_after_load = crate::inference::place::vram_manager::free_total();
         let kind = if state.device.is_cuda() {
@@ -327,6 +339,7 @@ impl AudioEngine {
         *guard = Some(state);
         *self.name.lock().await = Some(model_id);
         *self.device_kind.lock().await = Some(kind.to_string());
+        *self.running_format.lock().await = running_format;
         *self.resident_bytes.lock().await = free_before_load.saturating_sub(free_after_load);
         Ok(())
     }

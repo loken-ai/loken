@@ -817,6 +817,12 @@ pub fn load_planned<T, E: std::fmt::Display + Refusal>(
     cancelled: impl Fn() -> bool,
     mut build: impl FnMut(&HeteroPlan) -> Result<T, E>,
 ) -> Result<T, E> {
+    // Each rung builds afresh: the formats a failed build noted are dropped.
+    let start = crate::tensor::layer::held::mark();
+    let mut build = |plan: &HeteroPlan| {
+        crate::tensor::layer::held::rewind(start);
+        build(plan)
+    };
     let first_plan = beside_host(first_plan, demand, accelerators);
     let first = if host_refused(&first_plan) {
         E::refusal(HOST_REFUSED.to_string())
@@ -999,6 +1005,12 @@ pub fn load_stages<T, E: std::fmt::Display + Refusal>(
     reserve: u64,
     mut build: impl FnMut(&[Device]) -> Result<T, E>,
 ) -> Result<T, E> {
+    // Each rung builds afresh: the formats a failed build noted are dropped.
+    let start = crate::tensor::layer::held::mark();
+    let mut build = |devices: &[Device]| {
+        crate::tensor::layer::held::rewind(start);
+        build(devices)
+    };
     let cards = cards(reserve);
     let devices: Vec<Device> = cards
         .iter()

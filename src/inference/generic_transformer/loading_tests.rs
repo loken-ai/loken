@@ -709,6 +709,30 @@ fn build_gguf_with(
     built
 }
 
+/// An `F16` expert stack the host rebuilds in `Q8_0` is named in the running formats, after
+/// the other projections, and goes in the conversion ledger.
+#[test]
+fn a_rebuilt_expert_stack_is_named_and_declared() {
+    let recipe = dense("qwen3moe").qk().moe();
+    let mut replaced = Replaced::new();
+    for (name, dims) in recipe.tensors() {
+        if name.ends_with("_exps.weight") {
+            let data = values(&name, &dims, 1)
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect();
+            replaced.insert(name, (GgmlDType::F16, data));
+        }
+    }
+    let model = build_gguf_with(&recipe, None, &replaced).unwrap();
+    let declared = crate::tensor::conversion::entries()
+        .iter()
+        .any(|e| e.class == "experts" && e.from == "f16" && e.to == "q8_0");
+    assert!(declared, "the rebuilt expert stack is not in the ledger");
+    let format = model.running_format().unwrap();
+    assert!(format.ends_with("+q8_0"), "{format}");
+}
+
 /// The wide-residual architecture, whose indexer, n-gram features, delta-rule blocks and
 /// routed mixture a recipe does not write, loaded from its seeded toy file.
 #[test]

@@ -300,6 +300,11 @@ impl HeteroSingleBlock {
 }
 
 impl HeteroFlux {
+    /// The formats the matrices of the checkpoint are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.running_format.clone()
+    }
+
     /// Attach an adapter to every projection in the split DiT that it names.
     ///
     /// Blocks are numbered within their own kind, as the adapter files key them:
@@ -965,6 +970,8 @@ pub struct HeteroFlux {
     /// would arrive WITHOUT them and render its share of the steps as a different model.
     /// Repatriation stands down while any is attached rather than produce that silently.
     adapters_attached: usize,
+    /// The formats the matrices of the checkpoint are held in, joined with `+`.
+    running_format: Option<String>,
     /// What the render in flight still needs free on a card, beyond the weights. Set by
     /// the engine from the same demand its placement used, because a block uploaded
     /// between two steps has to leave the NEXT step's activations room to allocate.
@@ -1101,6 +1108,7 @@ impl HeteroFlux {
         // Load GGUF to CPU (always needed for CPU segments and embeddings)
         let cpu_vb = VarBuilder::from_gguf(gguf_path, &Device::Cpu)
             .map_err(|e| anyhow::anyhow!("GGUF load to CPU: {e}"))?;
+        let running_format = cpu_vb.matrix_formats();
 
         // One VarBuilder PER CARD the plan actually uses. Building them lazily from the
         // plan's own ordinals is what makes the placement real: a block assigned to
@@ -1407,6 +1415,7 @@ impl HeteroFlux {
                 .map(|m| m.len() / total_blocks.max(1) as u64)
                 .unwrap_or(0),
             adapters_attached: 0,
+            running_format,
             render_headroom: 0,
             repatriate_backoff: 0,
             unique_devices,
@@ -1538,6 +1547,7 @@ impl HeteroFlux {
             cuda_devices,
             bytes_per_block: 0,
             adapters_attached: 0,
+            running_format: vb.matrix_formats(),
             render_headroom: 0,
             repatriate_backoff: 0,
             unique_devices,

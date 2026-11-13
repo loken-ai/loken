@@ -728,9 +728,16 @@ pub struct Model {
     /// First block's device: img_in/txt_in/time/norm_out/proj_out live here, the forward starts and
     /// ends here (output_device == input_device).
     input_device: crate::tensor::Device,
+    /// The formats its matrices are held in, joined with `+`.
+    running_format: Option<String>,
 }
 
 impl Model {
+    /// The formats its matrices are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.running_format.clone()
+    }
+
     /// Keeps the first `n` blocks, so a test can run the real weights at a real image size on
     /// the host in minutes.
     #[cfg(test)]
@@ -961,6 +968,7 @@ impl Model {
             cfg,
             rope,
             input_device,
+            running_format: vb.matrix_formats(),
         })
     }
 
@@ -1202,6 +1210,7 @@ mod tests {
             cfg: c.clone(),
             rope,
             input_device: crate::tensor::Device::Cpu,
+            running_format: None,
         };
         let (f, h, w, st) = (1usize, 4usize, 6usize, 3usize);
         let img = NT::from_vec_f32(
@@ -1521,6 +1530,7 @@ mod tests {
                 cfg: c.clone(),
                 rope: rope(),
                 input_device: Device::Cpu,
+                running_format: None,
             };
             let card = Model {
                 img_in: img_in_c,
@@ -1534,6 +1544,7 @@ mod tests {
                 cfg: c.clone(),
                 rope: rope(),
                 input_device: dev.clone(),
+                running_format: None,
             };
             let want = host.forward(&img, &txt, 0.6, f, h, w).unwrap().to_vec_f32();
             // On memory left full of NaN, a kernel that skips part of its output shows.

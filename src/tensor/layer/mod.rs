@@ -13,6 +13,7 @@ use super::{DType, Device, Dim, Error, Result, Tensor, VarBuilder, D};
 
 mod conv;
 mod embedding;
+pub mod held;
 mod linear;
 mod norm;
 pub mod qlinear;

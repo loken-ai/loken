@@ -40,6 +40,11 @@ pub struct Flux2ModelState {
 }
 
 impl Flux2ModelState {
+    /// The formats the matrices of the DiT are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.dit.running_format()
+    }
+
     /// The resident DiT's config, for callers reporting what is loaded.
     pub fn config(&self) -> &DitConfig {
         &self.cfg

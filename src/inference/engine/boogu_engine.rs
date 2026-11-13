@@ -61,6 +61,11 @@ pub struct BooguModelState {
 }
 
 impl BooguModelState {
+    /// The formats the matrices of the DiT are held in, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        self.dit.running_format()
+    }
+
     /// Whether the DiT is running split across devices - see
     /// [`BooguTransformer2DModel::is_split`].
     pub fn dit_is_split(&self) -> bool {

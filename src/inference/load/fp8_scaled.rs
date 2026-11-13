@@ -325,6 +325,7 @@ pub unsafe fn load_qvarbuilder_cancellable<P: AsRef<std::path::Path>>(
     device: &Device,
     cancel: Option<&crate::inference::serve::cancel::CancelToken>,
 ) -> Result<QVarBuilder> {
+    declare_requantised(&unsafe { SafeTensorsLoader::multi(paths) }?, weight_dtype);
     // Sidecar cache: the fp8 decode + block quantize is a one-time conversion, yet it used to
     // run at full parallelism on EVERY load (minutes of all-core work per model swap). Persist
     // the converted tensors as a GGUF next to the checkpoint on first load; later loads read
@@ -384,6 +385,50 @@ pub unsafe fn load_qvarbuilder_cancellable<P: AsRef<std::path::Path>>(
     QVarBuilder::from_named_tensors(tensors, weight_dtype, device)
 }
 
+/// Whether a tensor of `dims` is held in `weight_dtype`: a matrix whose rows tile in its blocks.
+///
+/// Every other tensor is held in F32.
+fn requantised(dims: &[usize], weight_dtype: GgmlDType) -> bool {
+    let block = weight_dtype.block_size();
+    dims.len() == 2 && weight_dtype != GgmlDType::F32 && block > 0 && dims[1].is_multiple_of(block)
+}
+
+/// Declare in the conversion ledger and the log each matrix of `loader` held in `weight_dtype`.
+///
+/// The bytes come from the headers alone.
+fn declare_requantised(loader: &SafeTensorsLoader, weight_dtype: GgmlDType) {
+    let mut count = 0usize;
+    let mut stored_forms: Vec<String> = Vec::new();
+    for raw in loader.names() {
+        let (Some(dims), Some((stored, width))) = (loader.shape_of(raw), loader.stored_format(raw))
+        else {
+            continue;
+        };
+        if raw.ends_with(SCALE_SUFFIX) || !requantised(&dims, weight_dtype) {
+            continue;
+        }
+        let elems: usize = dims.iter().product();
+        let held = elems / weight_dtype.block_size() * weight_dtype.type_size();
+        if !stored_forms.contains(&stored) {
+            stored_forms.push(stored.clone());
+        }
+        crate::tensor::conversion::record_kept(
+            "projection",
+            stored,
+            format!("{weight_dtype:?}").to_lowercase(),
+            (elems * width) as u64,
+            held as u64,
+            "the image products of this family read block formats",
+        );
+        count += 1;
+    }
+    tracing::info!(
+        "safetensors bridge: {count} projections stored in {} run in {}",
+        stored_forms.join("+"),
+        format!("{weight_dtype:?}").to_lowercase()
+    );
+}
+
 /// Free bytes on the filesystem holding `path`'s parent (0 when the query fails, which
 /// disables the sidecar write rather than risking filling the model disk).
 fn fs_available_bytes(path: &std::path::Path) -> u64 {
@@ -422,6 +467,7 @@ pub fn ensure_sidecar<P: AsRef<std::path::Path>>(
     let sidecar = sidecar_for(p, weight_dtype)
         .ok_or_else(|| crate::tensor::Error::msg("fp8: no sidecar path for this checkpoint"))?;
     if sidecar_fresh(&sidecar, &[p]) {
+        declare_requantised(&unsafe { SafeTensorsLoader::multi(&[p]) }?, weight_dtype);
         return Ok(sidecar);
     }
     // Converting on the CPU writes the sidecar as a side effect; the returned
@@ -492,12 +538,7 @@ fn quantized_entries(
             let t = load_folded(loader, raw)?;
             let dims = t.dims().to_vec();
             let f32s = t.flatten_all()?.to_vec1::<f32>()?;
-            let block = weight_dtype.block_size();
-            let use_weight_dtype = dims.len() == 2
-                && weight_dtype != GgmlDType::F32
-                && block > 0
-                && dims[1] % block == 0;
-            let dtype = if use_weight_dtype {
+            let dtype = if requantised(&dims, weight_dtype) {
                 weight_dtype
             } else {
                 GgmlDType::F32

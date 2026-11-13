@@ -104,6 +104,7 @@ impl Linear {
     /// `weight` in the file layout `[out, in]`.
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         let (out_dim, in_dim) = weight.shape().dims2()?;
+        super::held::note(weight.dtype().as_str());
         let wt = weight.transpose(0, 1)?;
         Ok(Self {
             held: Held::Transposed(wt),
@@ -124,6 +125,7 @@ impl Linear {
     /// model that retention starved the device (z-image 1024² OOM).
     pub fn from_transposed(wt: Tensor, bias: Option<Tensor>) -> Result<Self> {
         let (in_dim, out_dim) = wt.shape().dims2()?;
+        super::held::note(wt.dtype().as_str());
         Ok(Self {
             held: Held::Transposed(wt),
             bias,
@@ -314,6 +316,7 @@ impl Linear {
     /// transposed copy per tensor.
     pub fn from_published(w: Tensor, bias: Option<Tensor>) -> Result<Self> {
         let (out_dim, in_dim) = w.shape().dims2()?;
+        super::held::note(w.dtype().as_str());
         Ok(Self {
             held: Held::Published(w),
             bias,

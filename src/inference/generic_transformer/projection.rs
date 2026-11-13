@@ -988,10 +988,12 @@ impl Module for Mlp {
 }
 
 impl super::GenericHeteroTransformer {
-    /// The formats the per-layer projections run in, as [`QMatMul::formats_of`] names them: the
-    /// attention's and, in a layer that has one, the dense feed-forward's.
+    /// The formats the per-layer projections run in: the attention's, in a layer that has one
+    /// the dense feed-forward's, then the expert stacks'.
+    ///
+    /// The formats are distinct, in the order first met, joined with `+`.
     pub fn running_format(&self) -> Option<String> {
-        QMatMul::formats_of(self.layers.iter().flat_map(|l| {
+        let dense = self.layers.iter().flat_map(|l| {
             let attention = [
                 l.attn_q.as_ref(),
                 l.attn_k.as_ref(),
@@ -1002,7 +1004,29 @@ impl super::GenericHeteroTransformer {
             let ffn = [l.ffn_gate.as_ref(), Some(&l.ffn_up), Some(&l.ffn_down)];
             let ffn = ffn.into_iter().filter(|_| l.has_ffn);
             attention.into_iter().chain(ffn).flatten()
-        }))
+        });
+        let experts = self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref())
+            .flat_map(|m| {
+                [
+                    m.gate_up_exps.as_deref(),
+                    m.gate_exps_sep.as_deref(),
+                    m.up_exps_sep.as_deref(),
+                    Some(&*m.down_exps),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|q| q.dtype().gguf_name())
+            });
+        let mut seen: Vec<&'static str> = Vec::new();
+        for f in dense.map(QMatMul::format_name).chain(experts) {
+            if !seen.contains(&f) {
+                seen.push(f);
+            }
+        }
+        (!seen.is_empty()).then(|| seen.join("+"))
     }
 }
 
