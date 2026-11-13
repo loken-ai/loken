@@ -470,7 +470,7 @@ pub fn accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
             .enumerate()
             .filter(|(_, id)| crate::inference::kernel::opencl_stack::runs_layers(*id))
             .map(|(i, id)| {
-                let mem = crate::inference::kernel::opencl::get_opencl_device_memory(id);
+                let mem = crate::inference::kernel::opencl::offered_memory(id);
                 (DeviceKind::OpenCL(i), mem.saturating_sub(reserve))
             })
             .filter(|(_, free)| *free > 0)

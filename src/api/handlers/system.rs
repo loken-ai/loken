@@ -710,6 +710,7 @@ pub(crate) async fn list_devices(
                 continue;
             }
             let total = crate::inference::kernel::opencl::get_opencl_device_memory(id);
+            let offered = crate::inference::kernel::opencl::offered_memory(id);
             devices.push(serde_json::json!({
                 "id": i,
                 "type": "OpenCL",
@@ -717,7 +718,7 @@ pub(crate) async fn list_devices(
                 "name": name,
                 "memory_gb": total as f64 / (1024.0 * 1024.0 * 1024.0),
                 "memory_bytes": total,
-                "free_bytes": total,
+                "free_bytes": offered,
                 "utilization_gpu_percent": null,
                 "utilization_memory_percent": null,
                 "temperature_c": null,
@@ -727,7 +728,7 @@ pub(crate) async fn list_devices(
                 "status": "available",
                 "reason": null,
                 "suggestion": null,
-                "usable_memory_gb": total as f64 / (1024.0 * 1024.0 * 1024.0),
+                "usable_memory_gb": offered as f64 / (1024.0 * 1024.0 * 1024.0),
             }));
         }
         devices

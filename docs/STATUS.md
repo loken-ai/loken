@@ -214,6 +214,7 @@ The layers of a language model run on an Intel GPU through Intel's OpenCL runtim
 On the laptop's processor they are slower than the host: 51 tokens per second against 74.
 
 Devices of Mesa's OpenCL platform are not offered for layers, because the layers measured wrong on them.
+A device that reports its memory as the host's offers a placement no more than the host can spare.
 The image models' OpenCL block still differs from the host's by 15% on a block, and is not shipped.
 
 ## Forecasting

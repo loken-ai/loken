@@ -31,7 +31,7 @@ Major, by state then by priority:
 | Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
 | Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Partial |
 | Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Partial |
-| OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Planned |
+| OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Started |
 | Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
 | Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Started |
 

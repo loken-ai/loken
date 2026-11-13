@@ -678,14 +678,37 @@ impl OpenCLPipelines {
     }
 }
 
-/// Get total global memory for an OpenCL device (bytes).
 unsafe impl Send for OpenCLPipelines {}
 unsafe impl Sync for OpenCLPipelines {}
 
+/// Get total global memory for an OpenCL device (bytes).
 #[cfg(feature = "opencl")]
 pub fn get_opencl_device_memory(device_id: opencl3::types::cl_device_id) -> u64 {
     let device = Device::new(device_id);
     device.global_mem_size().unwrap_or(0)
+}
+
+/// Whether the device's memory is the host's, as the device reports it.
+/// What such a device holds is taken from the host's RAM.
+#[cfg(feature = "opencl")]
+#[allow(deprecated)]
+pub fn shares_host_memory(device_id: opencl3::types::cl_device_id) -> bool {
+    Device::new(device_id)
+        .host_unified_memory()
+        .unwrap_or(false)
+}
+
+/// The bytes a placement may put on the device.
+/// A device with memory of its own offers its global memory.
+/// A device whose memory is the host's offers no more than the host can spare now.
+#[cfg(feature = "opencl")]
+pub fn offered_memory(device_id: opencl3::types::cl_device_id) -> u64 {
+    let global = get_opencl_device_memory(device_id);
+    if shares_host_memory(device_id) {
+        global.min(crate::inference::place::layer_executor::host_spill_budget_bytes())
+    } else {
+        global
+    }
 }
 
 /// Enumerate OpenCL GPU devices (non-NVIDIA, non-CPU).
@@ -854,6 +877,17 @@ mod rms_norm_on_device {
                     i % HEAD_DIM
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod offered_memory {
+    /// A device offers no more than its global memory.
+    #[test]
+    fn a_device_offers_no_more_than_it_has() {
+        for id in super::enumerate_opencl_devices() {
+            assert!(super::offered_memory(id) <= super::get_opencl_device_memory(id));
         }
     }
 }
