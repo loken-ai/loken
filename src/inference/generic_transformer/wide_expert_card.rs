@@ -783,8 +783,10 @@ impl CardExperts {
             // The outputs of a card's kept experts, once their kernels end.
             let finish = |ordinal: usize, launched: Option<(usize, u64, Result<gpu::Launched>)>| {
                 let started = std::time::Instant::now();
+                // A prompt forward's outputs come down through the readers of the card's transit.
+                let through = self.transit.iter().find(|t| prompt && t.ordinal == ordinal);
                 let outs = launched.and_then(|(pairs, bytes, launched)| {
-                    match launched.and_then(gpu::Launched::finish) {
+                    match launched.and_then(|l| l.finish_through(through.map(|t| &**t))) {
                         Ok(ys) => {
                             self.ran
                                 .fetch_add(pairs as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1138,6 +1140,12 @@ pub(super) mod gpu {
     impl Launched {
         /// The outputs of each expert, once the run ends.
         pub(crate) fn finish(self) -> Result<Vec<Vec<f32>>> {
+            self.finish_through(None)
+        }
+
+        /// [`Self::finish`], the outputs brought down through the page-locked buffers of
+        /// `through` when it has them open.
+        pub(crate) fn finish_through(self, through: Option<&Transit>) -> Result<Vec<Vec<f32>>> {
             let Some((_xq, _h, y)) = &self.held else {
                 return Ok(vec![Vec::new(); self.lens.len()]);
             };
@@ -1148,6 +1156,11 @@ pub(super) mod gpu {
                 let since = std::time::Instant::now();
                 let _ = stream.synchronize();
                 card_stage(ordinal, "experts: kept wait", since);
+            }
+            let since = std::time::Instant::now();
+            if let Some(outs) = through.and_then(|t| t.download(stream, y, &self.lens)) {
+                card_stage(ordinal, "experts: kept down", since);
+                return Ok(outs);
             }
             let since = std::time::Instant::now();
             let flat = stream
@@ -1418,6 +1431,103 @@ pub(super) mod gpu {
             }
             if off {
                 *state = Reader::Off;
+            }
+        }
+
+        /// The outputs `y` of a run on `stream`, `lens[i]` values for its expert `i` in order.
+        ///
+        /// They come down through the page-locked buffers of the direct readers, 1 thread a
+        /// reader, each copying its chunks out while the next ones come down.
+        /// `None` when the readers are not open or a copy fails: the caller brings `y` down
+        /// itself.
+        pub(crate) fn download(
+            &self,
+            stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+            y: &CudaSlice<f32>,
+            lens: &[usize],
+        ) -> Option<Vec<Vec<f32>>> {
+            #[cfg(target_os = "linux")]
+            {
+                use crate::tensor::gpu_runtime::driver::DevicePtr;
+                use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+                let f32s = std::mem::size_of::<f32>();
+                let total: usize = lens.iter().sum();
+                if y.len() < total {
+                    return None;
+                }
+                let mut state = self.bounce.lock().unwrap_or_else(|e| e.into_inner());
+                let Reader::Open(readers) = &mut *state else {
+                    return None;
+                };
+                if readers.is_empty() {
+                    return None;
+                }
+                let mut outs: Vec<Vec<f32>> = lens.iter().map(|&n| vec![0f32; n]).collect();
+                // Per expert, the byte its outputs start at in `y`, and where they go.
+                let mut starts = Vec::with_capacity(outs.len());
+                let mut at = 0;
+                for o in &outs {
+                    starts.push(at);
+                    at += o.len() * f32s;
+                }
+                let dsts: Vec<(usize, usize)> = outs
+                    .iter_mut()
+                    .map(|o| (o.as_mut_ptr() as usize, o.len() * f32s))
+                    .collect();
+                // Writes the bytes from `off` of `y` to the outputs they belong to.
+                let put = |off: usize, bytes: &[u8]| {
+                    let mut e = starts.partition_point(|&s| s <= off).saturating_sub(1);
+                    let mut done = 0;
+                    while done < bytes.len() && e < dsts.len() {
+                        let (ptr, cap) = dsts[e];
+                        let inside = off + done - starts[e];
+                        let n = (cap - inside).min(bytes.len() - done);
+                        // Safety: each byte of each output is written by 1 chunk alone, and
+                        // `outs` outlives the threads.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                bytes.as_ptr().add(done),
+                                (ptr as *mut u8).add(inside),
+                                n,
+                            )
+                        };
+                        done += n;
+                        e += 1;
+                    }
+                };
+                let src = {
+                    let (src, _sync) = y.device_ptr(stream);
+                    src
+                };
+                let next = AtomicUsize::new(0);
+                let failed = AtomicBool::new(false);
+                std::thread::scope(|scope| {
+                    for reader in readers.iter_mut() {
+                        let (next, failed, put) = (&next, &failed, &put);
+                        scope.spawn(move || {
+                            if self.dev.context().bind_to_thread().is_err() {
+                                failed.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            let len = total * f32s;
+                            if let Some(e) = reader.download(src, len, next, stream, put) {
+                                failed.store(true, Ordering::Relaxed);
+                                tracing::warn!(
+                                    "card {}: expert outputs not brought down through the \
+                                     readers: {e}",
+                                    self.ordinal
+                                );
+                            }
+                        });
+                    }
+                });
+                // A reader that does not fail hands out chunks until none is left.
+                (!failed.load(Ordering::Relaxed)).then_some(outs)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (stream, y, lens);
+                None
             }
         }
 
@@ -1730,9 +1840,19 @@ pub(super) mod gpu {
                 self.prof("experts: transit run", launched);
             }
             let down = std::time::Instant::now();
-            let flat = stream
-                .clone_dtoh(&y)
-                .map_err(|e| Error::msg(format!("expert outputs in transit: {e}")))?;
+            let dim = self.dims.0;
+            let lens: Vec<usize> = experts.iter().map(|(_, r)| r.len() * dim).collect();
+            // A prompt forward's outputs come down through the readers' buffers.
+            let through = match prompt {
+                true => self.download(stream, &y, &lens),
+                false => None,
+            };
+            let flat = match through {
+                Some(_) => Vec::new(),
+                None => stream
+                    .clone_dtoh(&y)
+                    .map_err(|e| Error::msg(format!("expert outputs in transit: {e}")))?,
+            };
             self.prof("experts: transit down", down);
             let tiles: usize = experts
                 .iter()
@@ -1740,13 +1860,14 @@ pub(super) mod gpu {
                 .sum();
             self.add(2, started.elapsed().as_nanos() as u64, tiles as u64, prompt);
             self.count("experts: transit tiles", tiles as u64);
+            if let Some(outs) = through {
+                return Ok(outs);
+            }
             let split = std::time::Instant::now();
-            let dim = self.dims.0;
             let mut at = 0;
-            let outs = experts
+            let outs = lens
                 .iter()
-                .map(|(_, r)| {
-                    let n = r.len() * dim;
+                .map(|&n| {
                     let part = flat[at..at + n].to_vec();
                     at += n;
                     part

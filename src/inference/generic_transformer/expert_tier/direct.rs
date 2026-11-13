@@ -178,6 +178,84 @@ impl Bounce {
         }
         (done, None)
     }
+
+    /// Brings down the chunks of the `len` bytes at `src` on the card that `next` hands out.
+    ///
+    /// Chunk `k` holds the bytes from `k` times the buffer's payload.
+    /// Each chunk is copied on `stream` into a buffer, then given to `put` with its offset.
+    /// The 2 buffers alternate: a chunk comes down while the one before is given to `put`.
+    /// Answers the error that stopped the copies, if any.
+    /// Every copy queued has landed when it returns.
+    pub(crate) fn download(
+        &mut self,
+        src: u64,
+        len: usize,
+        next: &std::sync::atomic::AtomicUsize,
+        stream: &crate::tensor::gpu_runtime::driver::CudaStream,
+        put: &(dyn Fn(usize, &[u8]) + Sync),
+    ) -> Option<String> {
+        use crate::tensor::gpu_runtime::driver::{sys, CudaEvent};
+        let chunk = self.payload;
+        let count = len.div_ceil(chunk);
+        let mut pending: [Option<(usize, CudaEvent)>; 2] = [None, None];
+        let mut handed = false;
+        let mut failed = None;
+        loop {
+            let i = self.next;
+            self.next ^= 1;
+            // The last copy into or out of this buffer has to land before it is reused.
+            if let Some(ev) = self.events[i].take() {
+                if let Err(e) = ev.synchronize() {
+                    failed.get_or_insert(format!("bounce wait: {e:?}"));
+                }
+            }
+            if let Some((k, ev)) = pending[i].take() {
+                match ev.synchronize() {
+                    Ok(()) if failed.is_none() => {
+                        let at = k * chunk;
+                        let n = chunk.min(len - at);
+                        put(at, unsafe { std::slice::from_raw_parts(self.bufs[i], n) });
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        failed.get_or_insert(format!("bounce wait: {e:?}"));
+                    }
+                }
+            }
+            if !handed && failed.is_none() {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match k < count {
+                    true => {
+                        let at = k * chunk;
+                        let n = chunk.min(len - at);
+                        let r = unsafe {
+                            sys::cuMemcpyDtoHAsync_v2(
+                                self.bufs[i] as *mut std::ffi::c_void,
+                                src + at as u64,
+                                n,
+                                stream.cu_stream(),
+                            )
+                        };
+                        if r != sys::cudaError_enum::CUDA_SUCCESS {
+                            failed = Some(format!("stage to bounce: {r:?}"));
+                        } else {
+                            match stream.record_event(None) {
+                                Ok(ev) => pending[i] = Some((k, ev)),
+                                Err(e) => {
+                                    let _ = stream.synchronize();
+                                    failed = Some(format!("bounce record: {e:?}"));
+                                }
+                            }
+                        }
+                    }
+                    false => handed = true,
+                }
+            }
+            if (handed || failed.is_some()) && pending.iter().all(Option::is_none) {
+                return failed;
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -206,6 +284,50 @@ mod tests {
         assert!(skip + 5000 <= len);
         assert_eq!(aligned_cover(8192, 4096, 4096), (8192, 4096, 0));
         assert_eq!(aligned_cover(8191, 2, 4096), (4096, 8192, 4095));
+    }
+
+    /// Values on a card come down through the bounce buffers of 2 readers whole and in place,
+    /// in chunks of a page.
+    #[cfg(all(target_os = "linux", feature = "gpu"))]
+    #[test]
+    fn the_card_brings_values_down_through_the_bounce_buffers() {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        use std::sync::atomic::AtomicUsize;
+        let Ok(dev) = crate::tensor::cuda::CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the bounce download is NOT covered by this run");
+            return;
+        };
+        let page = crate::tensor::mapped::page_size().unwrap_or(4096);
+        let exe = Arc::new(File::open(std::env::current_exe().unwrap()).unwrap());
+        let mut readers: Vec<Bounce> = (0..2)
+            .map(|_| Bounce::open(&exe, page, page).unwrap())
+            .collect();
+        let values: Vec<f32> = (0..(5 * page + 123))
+            .map(|i| (i as f32) * 0.37 - 9.0)
+            .collect();
+        let stream = dev.stream();
+        let up = stream.clone_htod(&values).unwrap();
+        let src = {
+            let (src, _sync) = up.device_ptr(stream);
+            src
+        };
+        let len = values.len() * std::mem::size_of::<f32>();
+        let got = std::sync::Mutex::new(vec![0u8; len]);
+        let put = |at: usize, bytes: &[u8]| {
+            got.lock().unwrap()[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for reader in readers.iter_mut() {
+                let (next, put, dev) = (&next, &put, &dev);
+                scope.spawn(move || {
+                    dev.stream().context().bind_to_thread().unwrap();
+                    assert_eq!(reader.download(src, len, next, dev.stream(), put), None);
+                });
+            }
+        });
+        let want: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        assert_eq!(got.into_inner().unwrap(), want);
     }
 
     #[test]
