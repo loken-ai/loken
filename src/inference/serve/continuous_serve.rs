@@ -60,6 +60,8 @@ pub struct ParkedPool {
     block_size: usize,
     max_running: usize,
     max_prefill_tokens: usize,
+    /// The most rows 1 forward of a lone long prompt reads.
+    prompt_chunk: usize,
 }
 
 // The stores are touched by one thread at a time: the worker that owns them, or none while
@@ -100,7 +102,7 @@ struct GhBatched {
     #[cfg(feature = "gpu")]
     graph_failed: bool,
     pace: StepPace,
-    /// The most prompt rows 1 forward reads.
+    /// The most rows 1 forward of a lone long prompt reads.
     chunk: usize,
     /// The probes of the prompts not read yet, by sequence.
     probes: HashMap<SeqId, Arc<RequestProbe>>,
@@ -1124,6 +1126,7 @@ fn launch<M: Served + 'static>(
     block_size: usize,
     max_running: usize,
     max_prefill_tokens: usize,
+    prompt_chunk: usize,
 ) -> std::result::Result<(Sender<Submission>, Worker), (M, crate::tensor::Error)> {
     let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
     let (hand_tx, hand_rx) = mpsc::channel::<SendWrap<M>>();
@@ -1151,6 +1154,7 @@ fn launch<M: Served + 'static>(
                 block_size,
                 max_running,
                 max_prefill_tokens,
+                prompt_chunk,
             });
             SendWrap((model, parked))
         });
@@ -1176,6 +1180,8 @@ impl ContinuousServer {
     /// Spawn the worker. `model` is moved in and owned for the worker's lifetime;
     /// `eos` terminates a sequence; `num_blocks`/`block_size` size the paged KV
     /// pool; `max_running` caps the concurrent decode batch width.
+    /// A step admits `max_prefill_tokens` prompt rows.
+    /// A prompt longer than `prompt_chunk` rows is read alone, `prompt_chunk` rows a forward.
     pub fn spawn(
         model: Arc<GenericHeteroTransformer>,
         eos: Vec<u32>,
@@ -1183,6 +1189,7 @@ impl ContinuousServer {
         block_size: usize,
         max_running: usize,
         max_prefill_tokens: usize,
+        prompt_chunk: usize,
     ) -> crate::tensor::Result<Self> {
         let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
         let cdev = model.compute_device();
@@ -1203,6 +1210,7 @@ impl ContinuousServer {
                 block_size,
                 max_running,
                 max_prefill_tokens,
+                prompt_chunk,
             },
         )
     }
@@ -1219,6 +1227,7 @@ impl ContinuousServer {
             block_size,
             max_running,
             max_prefill_tokens,
+            prompt_chunk,
         } = pool;
         let cdev = model.compute_device();
         // Pin a cuBLAS workspace so the batched-decode GEMMs stop allocating a
@@ -1246,7 +1255,7 @@ impl ContinuousServer {
             #[cfg(feature = "gpu")]
             graph_failed: false,
             pace: StepPace::default(),
-            chunk: max_prefill_tokens.max(1),
+            chunk: prompt_chunk.max(1),
             probes: HashMap::new(),
         };
         let (submit_tx, worker) = launch(
@@ -1256,6 +1265,7 @@ impl ContinuousServer {
             block_size,
             max_running,
             max_prefill_tokens,
+            prompt_chunk,
         )
         .map_err(|(_, e)| e)?;
 
@@ -1298,6 +1308,7 @@ impl ContinuousServer {
             num_blocks,
             block_size,
             max_running,
+            max_prefill_tokens,
             max_prefill_tokens,
         ) {
             Ok((submit_tx, worker)) => Ok(Self {

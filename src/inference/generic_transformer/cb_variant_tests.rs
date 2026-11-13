@@ -289,7 +289,7 @@ fn served_alone_and_beside_agree_on(load: &dyn Fn() -> GenericHeteroTransformer)
     let serve = |which: &[usize]| -> Vec<Vec<u32>> {
         let model = Arc::new(load());
         let server =
-            ContinuousServer::spawn(model, Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096).unwrap();
+            ContinuousServer::spawn(model, Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096, 4096).unwrap();
         let receivers: Vec<_> = which
             .iter()
             .map(|&s| server.submit(prompts[s].clone(), STEPS))
@@ -325,8 +325,9 @@ fn served_alone_and_beside_agree_on(load: &dyn Fn() -> GenericHeteroTransformer)
 /// Tokens of the prompt the server reads in chunks: 2 chunks and a part.
 const CHUNKED_PROMPT: usize = 2 * CB_BLOCK_SIZE + CB_BLOCK_SIZE / 2;
 
-/// The server reads a prompt longer than its chunk a chunk at a time, to the tokens it gives
-/// that prompt read in 1 forward, and the request's probe ends with the whole prompt read.
+/// The server reads a prompt longer than its prompt chunk a chunk at a time, whatever rows a
+/// step admits, to the tokens it gives that prompt read in 1 forward, and the request's probe
+/// ends with the whole prompt read.
 fn a_long_prompt_reads_in_chunks_on(load: &dyn Fn() -> GenericHeteroTransformer, vocab: u32) {
     use crate::inference::serve::continuous_batch::SamplingParams;
     use crate::request_metrics::RequestProbe;
@@ -334,9 +335,16 @@ fn a_long_prompt_reads_in_chunks_on(load: &dyn Fn() -> GenericHeteroTransformer,
         .map(|i| (i * 3 + 1) % vocab)
         .collect();
     let serve = |chunk: usize| {
-        let server =
-            ContinuousServer::spawn(Arc::new(load()), Vec::new(), 64, CB_BLOCK_SIZE, 8, chunk)
-                .unwrap();
+        let server = ContinuousServer::spawn(
+            Arc::new(load()),
+            Vec::new(),
+            64,
+            CB_BLOCK_SIZE,
+            8,
+            4096,
+            chunk,
+        )
+        .unwrap();
         let probe = Arc::new(RequestProbe::default());
         let rx = server.submit_watched(
             prompt.clone(),
@@ -565,8 +573,16 @@ fn a_batched_model_names_the_format_it_runs_in() {
     let model = tiny_model::load(&path, LAYERS);
     let format = model.running_format();
     assert!(format.is_some(), "the serial model names no format");
-    let server =
-        ContinuousServer::spawn(Arc::new(model), Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096).unwrap();
+    let server = ContinuousServer::spawn(
+        Arc::new(model),
+        Vec::new(),
+        64,
+        CB_BLOCK_SIZE,
+        8,
+        4096,
+        4096,
+    )
+    .unwrap();
     let batched: BoxedModelBackend = Box::new(ContinuousBackend(Arc::new(server), format.clone()));
     assert_eq!(batched.running_format(), format);
     let Ok(serial) = batched.into_serial() else {
@@ -803,7 +819,7 @@ mod on_a_card {
         );
         let model = Arc::new(tiny_model::load_on_card(&path, LAYERS));
         let server =
-            ContinuousServer::spawn(model, Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096).unwrap();
+            ContinuousServer::spawn(model, Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096, 4096).unwrap();
         let receivers: Vec<_> = prompts
             .iter()
             .map(|p| server.submit(p.clone(), STEPS))

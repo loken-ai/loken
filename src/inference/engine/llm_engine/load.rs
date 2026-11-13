@@ -938,7 +938,7 @@ pub(super) fn try_spawn_continuous(
     let block_bytes = (2 * n_kv * hd * 2 * n_layers * block_size) as u64;
     let hidden = model.hidden_size();
     let ffn = model.widest_ffn();
-    let shape = paged::PagedShape {
+    let shape_for = |chunk: usize| paged::PagedShape {
         block_bytes,
         block_size,
         // A lane is sure of one prompt chunk; longer contexts share the rest of the pool.
@@ -946,20 +946,33 @@ pub(super) fn try_spawn_continuous(
         lane_step_bytes: paged::lane_step_bytes(n_layers, hidden, ffn),
         // The activations of a prompt chunk, and the scores its attention keeps over the
         // keys of the whole context.
-        work_reserve: runtime_demand::llm_work_reserve(hidden.max(ffn), PREFILL_CHUNK_TOKENS)
-            .saturating_add(model.prompt_attention_bytes(PREFILL_CHUNK_TOKENS, context_length)),
+        work_reserve: runtime_demand::llm_work_reserve(hidden.max(ffn), chunk)
+            .saturating_add(model.prompt_attention_bytes(chunk, context_length)),
     };
-    let Some(plan) = paged::plan(&model.compute_device(), &shape) else {
+    // A lone long prompt reads in the chunk the prefill sizing gives the card before the pool
+    // takes its room.
+    // The work reserve keeps that chunk's memory beside the pool.
+    // A card that then holds fewer than two lanes keeps the reserve of a step's prompt rows.
+    let sized =
+        crate::inference::engine::model_backend::adaptive_prefill_chunk(model.prefill_shape())
+            .max(PREFILL_CHUNK_TOKENS);
+    let planned = paged::plan(&model.compute_device(), &shape_for(sized))
+        .map(|plan| (plan, sized))
+        .or_else(|| {
+            paged::plan(&model.compute_device(), &shape_for(PREFILL_CHUNK_TOKENS))
+                .map(|plan| (plan, PREFILL_CHUNK_TOKENS))
+        });
+    let Some((plan, prompt_chunk)) = planned else {
         warn!(
             "CB serve: the card holds fewer than two lanes of {} tokens - staying serial",
-            shape.window
+            context_length.min(PREFILL_CHUNK_TOKENS)
         );
         return Err(model);
     };
     let (num_blocks, max_running) = (plan.blocks, plan.lanes);
     info!(
         "CB serve: ContinuousServer - {num_blocks} blocks x {block_size} = {} KV slots, \
-           max_running {max_running}, pool {} MB",
+           max_running {max_running}, pool {} MB, prompt chunk {prompt_chunk}",
         num_blocks * block_size,
         (num_blocks as u64 * block_bytes) >> 20
     );
@@ -971,8 +984,10 @@ pub(super) fn try_spawn_continuous(
         num_blocks,
         block_size,
         max_running,
-        // The prompt tokens one step prefills: the rows the work reserve was sized for.
+        // The prompt tokens one step prefills.
         PREFILL_CHUNK_TOKENS,
+        // The rows the work reserve was sized for.
+        prompt_chunk,
     );
     info!(
         "CB serve: worker spawned in {:.0} ms",
