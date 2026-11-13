@@ -574,7 +574,9 @@ impl CompressedBand {
             )));
         }
         let (device, dtype) = (x.device(), x.dtype());
-        let x2 = host_rows(x, seq, hidden)?;
+        let x2 = staged("token mixer: rows in", &Device::Cpu, false, || {
+            host_rows(x, seq, hidden)
+        })?;
         // A failed forward leaves no state, so the next one must start at position 0.
         let mut state = self.state.take().unwrap_or_default();
         // The state before the forward and the state after it each have a name.
@@ -587,9 +589,11 @@ impl CompressedBand {
         self.state = Some(state);
         // A card that runs the layer's output projection gives rows of the hidden width.
         let width = out.elem_count() / seq.max(1);
-        out.reshape((1, seq, width))?
-            .to_device(&device)?
-            .to_dtype(dtype)
+        staged("token mixer: rows out", &Device::Cpu, false, || {
+            out.reshape((1, seq, width))?
+                .to_device(&device)?
+                .to_dtype(dtype)
+        })
     }
 
     /// The rows `x2` `[seq, hidden]` at positions `base..base + seq` at once.
@@ -619,16 +623,22 @@ impl CompressedBand {
         // The window: the kept rows, then this forward's. Row `old_rows + i` is query `i`'s own.
         let kv = &front.kv;
         let old_rows = state.window.window.len() / hd;
-        let mut keys = std::mem::take(&mut state.window.window);
-        keys.extend_from_slice(kv);
-        let kept = (old_rows + seq).min(d.window) * hd;
-        state.window.window = keys[keys.len() - kept..].to_vec();
+        let mut keys = staged("token mixer: window", &Device::Cpu, false, || {
+            let mut keys = std::mem::take(&mut state.window.window);
+            keys.extend_from_slice(kv);
+            let kept = (old_rows + seq).min(d.window) * hd;
+            state.window.window = keys[keys.len() - kept..].to_vec();
+            Ok(keys)
+        })?;
         state.window.len += seq;
 
         // The groups this forward completes, from the rows still filling and this forward's.
         let held_groups = state.groups;
         let mut pooled_x = std::mem::take(&mut state.filling);
-        pooled_x.extend_from_slice(&x2.flatten_all()?.to_vec1::<f32>()?);
+        staged("token mixer: group rows", &Device::Cpu, false, || {
+            pooled_x.extend_from_slice(&x2.flatten_all()?.to_vec1::<f32>()?);
+            Ok(())
+        })?;
         let groups = pooled_x.len() / hidden / ratio;
         let latent = match (&self.compressor, groups) {
             (Some(c), g) if g > 0 => Some(pool(c, &pooled_x, hidden, ratio, hd, d.eps)?),
@@ -670,7 +680,8 @@ impl CompressedBand {
 
         // A kv-source's compressed rows: the held ones, then this forward's groups rotated and
         // rounded to fp4.
-        let compressed = match &self.compressor {
+        let name = "token mixer: compressed";
+        let compressed = staged(name, &Device::Cpu, false, || match &self.compressor {
             Some(_) => {
                 let mut all = std::mem::take(&mut state.compressed);
                 if let Some(latent) = &latent {
@@ -687,14 +698,15 @@ impl CompressedBand {
                     state.index_keys = k;
                 }
                 state.filling = pooled_x.split_off(groups * ratio * hidden);
-                all
+                Ok(all)
             }
             None => {
-                self.cell
-                    .with(|p| read(&p.compressed, at, "compressed rows"))?
-                    .rows
+                let held = self
+                    .cell
+                    .with(|p| read(&p.compressed, at, "compressed rows"))?;
+                Ok(held.rows)
             }
-        };
+        })?;
 
         // Per query, the window rows it sees, then its picked compressed rows.
         let (win, itopk) = (d.window, band.index_topk);
@@ -705,18 +717,21 @@ impl CompressedBand {
             )));
         }
         let width = win + itopk;
-        let mut slots = vec![-1i32; seq * width];
-        for (i, row) in slots.chunks_exact_mut(width).enumerate() {
-            let iq = old_rows + i;
-            let lo = iq.saturating_sub(win - 1);
-            for (k, slot) in row.iter_mut().take(win.min(old_rows + seq)).enumerate() {
-                if lo + k <= iq {
-                    *slot = (lo + k) as i32;
+        let slots = staged("token mixer: slots", &Device::Cpu, false, || {
+            let mut slots = vec![-1i32; seq * width];
+            for (i, row) in slots.chunks_exact_mut(width).enumerate() {
+                let iq = old_rows + i;
+                let lo = iq.saturating_sub(win - 1);
+                for (k, slot) in row.iter_mut().take(win.min(old_rows + seq)).enumerate() {
+                    if lo + k <= iq {
+                        *slot = (lo + k) as i32;
+                    }
                 }
+                row[win..].copy_from_slice(&picks[i * itopk..(i + 1) * itopk]);
             }
-            row[win..].copy_from_slice(&picks[i * itopk..(i + 1) * itopk]);
-        }
-        keys.extend_from_slice(&compressed);
+            keys.extend_from_slice(&compressed);
+            Ok(slots)
+        })?;
         #[cfg(feature = "gpu")]
         if let (Some(card), Some(cf)) = (&m.card, &front.card) {
             return card.attend_rows(m, cf, &keys, &slots, width, seq);

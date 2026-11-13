@@ -419,7 +419,9 @@ impl CardLatent {
         let seq = x2.dim(0)?;
         let hd = m.dims.head_dim;
         let q_rank = self.wq_a.out();
+        let mut since = std::time::Instant::now();
         let card = self.front_dev(m, FrontRows::Host(x2), cos, sin)?;
+        mark(dev, "token mixer: front products", &mut since);
         let qr = match need_qr {
             true => download(dev, &card.qr, seq * q_rank)?,
             false => Vec::new(),
@@ -658,8 +660,10 @@ impl CardLatent {
     ) -> Result<Tensor> {
         let dev: &CudaDevice = &self.dev;
         let d = m.dims;
+        let mut since = std::time::Instant::now();
         let kd = upload_f32(dev, "mixer keys", keys)?;
         let idx = upload_i32(dev, "mixer slots", slots)?;
+        mark(dev, "token mixer: attend upload", &mut since);
         let o = slots_attention(
             dev,
             &f.q,
@@ -669,7 +673,9 @@ impl CardLatent {
             (seq, d.heads, d.head_dim, width),
             m.scale(),
         )?;
+        mark(dev, "token mixer: attend slots", &mut since);
         let wide = self.project_dev(m, o, f, seq)?;
+        mark(dev, "token mixer: attend projection", &mut since);
         let width = self.width(&d);
         Tensor::from_vec(
             download(dev, &wide, seq * width)?,
@@ -977,5 +983,15 @@ impl LatentMqa {
         let out = card.attend_rows(self, cf, &keys, &slots, d.window, seq)?;
         self.state = Some(state);
         Ok(out)
+    }
+}
+
+/// Under the stage profile, waits for the card's work and records the time since `since` under
+/// `name`, then restarts `since`.
+fn mark(dev: &CudaDevice, name: &'static str, since: &mut std::time::Instant) {
+    if crate::inference::stage_prof::stage_prof_enabled() {
+        let _ = dev.stream().synchronize();
+        crate::inference::stage_prof::prof_record(name, since.elapsed().as_nanos() as u64);
+        *since = std::time::Instant::now();
     }
 }

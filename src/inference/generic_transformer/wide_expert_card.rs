@@ -625,6 +625,12 @@ impl CardExperts {
             }
             // The shared expert's card stands first.
             work.sort_by_key(|w| Some(w.0) != shared.map(|s| s.ordinal()));
+            let card_prof = |ordinal: usize, stage: &'static str, since: std::time::Instant| {
+                crate::inference::stage_prof::prof_record(
+                    crate::inference::stage_prof::on_card(ordinal, stage),
+                    since.elapsed().as_nanos() as u64,
+                );
+            };
             // A card's experts in transit, after its kept ones.
             let transit = |ordinal: usize| -> Vec<(usize, Vec<Option<Vec<f32>>>)> {
                 let Some(t) = self.transit.iter().find(|t| t.ordinal == ordinal) else {
@@ -646,6 +652,7 @@ impl CardExperts {
                             true => t.run(&given, &cached, x, dim, limit),
                             false => vec![None; m.len()],
                         };
+                        card_prof(ordinal, "experts: transit", started);
                         crate::inference::stage_prof::prof_record(
                             "experts: transit",
                             started.elapsed().as_nanos() as u64,
@@ -665,6 +672,7 @@ impl CardExperts {
             };
             let transit = &transit;
             let kept_one = |(ordinal, set, mine): &(usize, Option<&gpu::CardSet>, Vec<usize>)| {
+                let started = std::time::Instant::now();
                 let shared_out = shared.filter(|s| s.ordinal() == *ordinal).and_then(|s| {
                     match s.run(x, n, limit) {
                         Ok(y) => Some(y),
@@ -676,11 +684,17 @@ impl CardExperts {
                         }
                     }
                 });
+                card_prof(*ordinal, "experts: shared", started);
+                let started = std::time::Instant::now();
                 let outs = set.and_then(|set| {
                     let ids_here: Vec<usize> = mine.iter().map(|&i| ids[i]).collect();
                     let rows_here: Vec<Vec<usize>> =
                         mine.iter().map(|&i| rows[i].clone()).collect();
                     let pairs: usize = rows_here.iter().map(Vec::len).sum();
+                    crate::inference::stage_prof::prof_count(
+                        crate::inference::stage_prof::on_card(*ordinal, "experts: kept pairs"),
+                        pairs as u64,
+                    );
                     match set.run(&ids_here, &rows_here, x, dim, limit) {
                         Ok(ys) => {
                             self.ran
@@ -696,12 +710,16 @@ impl CardExperts {
                         }
                     }
                 });
+                card_prof(*ordinal, "experts: kept", started);
                 (shared_out, outs)
             };
             let kept_one = &kept_one;
             let one = |w: &(usize, Option<&gpu::CardSet>, Vec<usize>)| {
+                let started = std::time::Instant::now();
                 let (shared_out, outs) = kept_one(w);
-                (shared_out, outs, transit(w.0))
+                let carried = transit(w.0);
+                card_prof(w.0, "experts: thread", started);
+                (shared_out, outs, carried)
             };
             let one = &one;
             type Ran = (
@@ -1306,7 +1324,10 @@ pub(super) mod gpu {
                 return out;
             }
             let (kept, _) = crate::tensor::cuda::pool_use(self.ordinal);
-            let xq = match q8k32_rows_to_card(&self.dev, x) {
+            let rows_up = std::time::Instant::now();
+            let xq = q8k32_rows_to_card(&self.dev, x);
+            self.prof("experts: transit rows up", rows_up);
+            let xq = match xq {
                 Ok(xq) => xq,
                 Err(e) => {
                     tracing::warn!(
@@ -1347,12 +1368,31 @@ pub(super) mod gpu {
                         end - i
                     ),
                 }
+                let trim = std::time::Instant::now();
                 self.give_back(kept);
+                self.prof("experts: transit trim", trim);
                 i = end;
             }
             drop(xq);
+            let trim = std::time::Instant::now();
             self.give_back(kept);
+            self.prof("experts: transit trim", trim);
             out
+        }
+
+        /// Records the time since `since` as stage `stage` of this card.
+        fn prof(&self, stage: &'static str, since: std::time::Instant) {
+            use crate::inference::stage_prof::{on_card, prof_record};
+            prof_record(
+                on_card(self.ordinal, stage),
+                since.elapsed().as_nanos() as u64,
+            );
+        }
+
+        /// Records `count` as stage `stage` of this card.
+        fn count(&self, stage: &'static str, count: u64) {
+            use crate::inference::stage_prof::{on_card, prof_count};
+            prof_count(on_card(self.ordinal, stage), count);
         }
 
         /// The outputs of `experts` over their rows of `xq`, their blocks moved up for the run.
@@ -1377,6 +1417,7 @@ pub(super) mod gpu {
             let through: Vec<bool> = (0..parts.len())
                 .map(|p| cached.get(p / 3).copied().unwrap_or(false))
                 .collect();
+            let direct_before = self.bytes_read_direct();
             let mut up = self.upload(&parts, &through)?.into_iter();
             let mut held: Vec<[CudaSlice<u8>; 3]> = Vec::with_capacity(experts.len());
             while let (Some(g), Some(u), Some(d)) = (up.next(), up.next(), up.next()) {
@@ -1384,7 +1425,29 @@ pub(super) mod gpu {
             }
             let bytes: u64 = experts.iter().map(|(e, _)| expert_bytes(e)).sum();
             self.add(0, started.elapsed().as_nanos() as u64, bytes);
+            self.prof("experts: transit read", started);
+            let profiled = crate::inference::stage_prof::stage_prof_enabled();
+            if profiled {
+                let cached: u64 = parts
+                    .iter()
+                    .zip(&through)
+                    .filter(|(_, t)| **t)
+                    .map(|(p, _)| p.len() as u64)
+                    .sum();
+                let direct = self.bytes_read_direct() - direct_before;
+                self.count("experts: transit kB", bytes / 1000);
+                self.count("experts: transit kB direct", direct / 1000);
+                self.count("experts: transit kB through the cache", cached / 1000);
+                self.count("experts: transit experts", experts.len() as u64);
+                let pairs: usize = experts.iter().map(|(_, r)| r.len()).sum();
+                self.count("experts: transit pairs", pairs as u64);
+            }
             let started = std::time::Instant::now();
+            if profiled {
+                let _ = stream.synchronize();
+                self.prof("experts: transit copy tail", started);
+            }
+            let launched = std::time::Instant::now();
             let weights: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> =
                 held.iter().map(|[g, u, d]| (g, u, d)).collect();
             // Instances of 1 expert stand together, its rows in row order.
@@ -1402,17 +1465,25 @@ pub(super) mod gpu {
                 &instances,
                 limit,
             )?;
+            if profiled {
+                let _ = stream.synchronize();
+                self.prof("experts: transit run", launched);
+            }
+            let down = std::time::Instant::now();
             let flat = stream
                 .clone_dtoh(&y)
                 .map_err(|e| Error::msg(format!("expert outputs in transit: {e}")))?;
+            self.prof("experts: transit down", down);
             let tiles: usize = experts
                 .iter()
                 .map(|(_, r)| r.len().div_ceil(crate::tensor::cuda::EXACT_TILE))
                 .sum();
             self.add(2, started.elapsed().as_nanos() as u64, tiles as u64);
+            self.count("experts: transit tiles", tiles as u64);
+            let split = std::time::Instant::now();
             let dim = self.dims.0;
             let mut at = 0;
-            Ok(experts
+            let outs = experts
                 .iter()
                 .map(|(_, r)| {
                     let n = r.len() * dim;
@@ -1420,7 +1491,9 @@ pub(super) mod gpu {
                     at += n;
                     part
                 })
-                .collect())
+                .collect();
+            self.prof("experts: transit split", split);
+            Ok(outs)
         }
     }
 

@@ -654,7 +654,10 @@ impl RoutedFfn {
                         .iter()
                         .map(|&e| (e, assign[e].len(), self.expert_bytes(e)))
                         .collect();
-                    schedule_transit(&costs, &busy, &candidates, rayon::current_num_threads())
+                    let (moving, left) =
+                        schedule_transit(&costs, &busy, &candidates, rayon::current_num_threads());
+                    note_schedule(&costs, &busy, &candidates, &moving, &left);
+                    (moving, left)
                 }
                 false => (Vec::new(), on_host.clone()),
             };
@@ -825,6 +828,41 @@ impl RoutedFfn {
                 .and_then(|h| h.join().ok())
                 .unwrap_or_else(|| (None, vec![None; on_card.len()], none_moved()));
             crate::inference::stage_prof::prof_record("experts: host", ran.as_nanos() as u64);
+            crate::inference::stage_prof::prof_record(
+                "experts: cards and host",
+                started.elapsed().as_nanos() as u64,
+            );
+            if crate::inference::stage_prof::stage_prof_enabled() && n > 1 {
+                use crate::inference::stage_prof::prof_count;
+                let pairs: usize = host_now.iter().map(|&e| assign[e].len()).sum();
+                prof_count("experts: host pairs", pairs as u64);
+                prof_count("experts: host experts", host_now.len() as u64);
+                let held: Vec<bool> = host_now
+                    .iter()
+                    .map(|e| {
+                        on_host
+                            .iter()
+                            .position(|h| h == e)
+                            .is_some_and(|i| kept.get(i).copied().unwrap_or(false))
+                    })
+                    .collect();
+                prof_count(
+                    "experts: host experts the tier holds",
+                    held.iter().filter(|&&h| h).count() as u64,
+                );
+                let read: u64 = host_now
+                    .iter()
+                    .zip(&held)
+                    .filter(|(_, h)| !**h)
+                    .map(|(&e, _)| self.expert_bytes(e))
+                    .sum();
+                prof_count("experts: host kB not held", read / 1000);
+                prof_count("experts: active", active.len() as u64);
+                prof_count("experts: kept on the cards", on_card.len() as u64);
+                prof_count("experts: moved", moved.len() as u64);
+                let kb: u64 = active.iter().map(|&e| self.expert_bytes(e)).sum::<u64>() / 1000;
+                prof_count("experts: active kB", kb);
+            }
             crate::inference::stage_prof::prof_record(
                 "experts: card wait",
                 (started.elapsed() - ran).as_nanos() as u64,
@@ -1725,4 +1763,39 @@ pub(super) fn exchange_state(mixer: &mut mixer::Mixer, held: &mut mixer::MixerSt
         _ => crate::tensor::bail!("a sequence's state is not of its layer's mixer kind"),
     }
     Ok(())
+}
+
+/// Records per card and for the host the seconds the schedule expects each to take.
+fn note_schedule(
+    costs: &[(usize, super::wide_expert_card::TransitCost)],
+    busy: &[f64],
+    candidates: &[(usize, usize, u64)],
+    moving: &[(usize, Vec<usize>)],
+    left: &[usize],
+) {
+    use crate::inference::stage_prof::{on_card, prof_record, stage_prof_enabled};
+    if !stage_prof_enabled() {
+        return;
+    }
+    let of = |e: usize| candidates.iter().find(|c| c.0 == e).copied();
+    for (k, (o, c)) in costs.iter().enumerate() {
+        let mine = moving
+            .iter()
+            .find(|m| m.0 == *o)
+            .map_or(&[][..], |m| &m.1[..]);
+        let secs = busy.get(k).copied().unwrap_or(0.0)
+            + mine
+                .iter()
+                .filter_map(|&e| of(e))
+                .map(|(_, rows, bytes)| c.card_secs(bytes, rows))
+                .sum::<f64>();
+        prof_record(on_card(*o, "experts: expected"), (secs * 1e9) as u64);
+    }
+    let pair = costs
+        .iter()
+        .map(|(_, c)| c.host_secs_per_pair)
+        .fold(f64::INFINITY, f64::min);
+    let rows: usize = left.iter().filter_map(|&e| of(e)).map(|c| c.1).sum();
+    let secs = rows as f64 * pair / rayon::current_num_threads().max(1) as f64;
+    prof_record("experts: host expected", (secs * 1e9) as u64);
 }

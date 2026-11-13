@@ -37,6 +37,22 @@ pub fn prof_record(stage: &'static str, ns: u64) {
     }
 }
 
+/// The name stage `stage` of card `ordinal` is reported under.
+pub fn on_card(ordinal: usize, stage: &'static str) -> &'static str {
+    static NAMES: Mutex<BTreeMap<(usize, &'static str), &'static str>> =
+        Mutex::new(BTreeMap::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    names
+        .entry((ordinal, stage))
+        .or_insert_with(|| Box::leak(format!("card {ordinal}: {stage}").into_boxed_str()))
+}
+
+/// Add `count` to stage `stage` as thousandths of a microsecond, so its total in microseconds
+/// reads as the count.
+pub fn prof_count(stage: &'static str, count: u64) {
+    prof_record(stage, count.saturating_mul(1000));
+}
+
 /// A stage recorded into a graph: the events at its two ends, which the card stamps each time
 /// the graph runs.
 #[cfg(feature = "gpu")]

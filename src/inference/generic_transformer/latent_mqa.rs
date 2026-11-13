@@ -351,11 +351,13 @@ impl LatentMqa {
         let d = self.dims;
         #[cfg(feature = "gpu")]
         if let Some(card) = self.card.clone() {
-            return self
-                .forward_card(&x2, index_pos)?
-                .reshape((1, seq, card.width(&d)))?
-                .to_device(&device)?
-                .to_dtype(dtype);
+            let name = "token mixer: window layer";
+            return super::wide::staged(name, &Device::Cpu, false, || {
+                self.forward_card(&x2, index_pos)?
+                    .reshape((1, seq, card.width(&d)))?
+                    .to_device(&device)?
+                    .to_dtype(dtype)
+            });
         }
         let (nh, hd) = (d.heads, d.head_dim);
         let (cos, sin) = phases(&self.inv_freq, index_pos..index_pos + seq);
