@@ -1555,19 +1555,20 @@ impl GenericBackend {
     /// first, until it fits or none is left. A kept state is a convenience; a prefill that runs
     /// out of memory costs a reload.
     fn make_room_for_prefill(&mut self, tokens: usize) {
+        let shape = self.prefill_shape();
+        let rows = tokens.min(shape.target_chunk.max(2048));
+        let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
+            .saturating_mul(shape.share.max(1) as u64);
+        // The prompt's rows join the cache beside the chunk's work.
+        self.give_back_kept_pool(need.saturating_add(self.kv_rows_bytes(tokens)));
         let held = self.0.kv_snapshot_bytes();
         // Without a card the kept states sit in host memory, which a prefill does not take.
         if held == 0 || self.0.free_device_memory().is_none() {
             return;
         }
-        let shape = self.prefill_shape();
-        let rows = tokens.min(shape.target_chunk.max(2048));
-        let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
-            .saturating_mul(shape.share.max(1) as u64);
         // The tightest free memory of the model's own cards, read from the driver after the
         // pools are handed back, without enumerating every card of the machine.
-        #[cfg(feature = "gpu")]
-        crate::inference::engine::llm_engine::trim_cuda_pools();
+        self.0.hand_back_pools();
         let free = self.0.free_device_memory().unwrap_or(0);
         tracing::debug!(
             "prefill of {tokens} rows: {} MB of kept states, {} MB free, {} MB wanted",
@@ -1592,6 +1593,10 @@ impl GenericBackend {
     /// Gives back card memory that only serves later requests - the kept conversation states -
     /// until `need` bytes are free or none is left; true when anything was given back.
     fn reclaim_for_chunk(&mut self, need: u64) -> bool {
+        // A pass that ran out of memory takes the kept pool first, whatever the cards read.
+        if self.give_back_kept_pool(u64::MAX) {
+            return true;
+        }
         let free = crate::inference::place::vram_manager::tightest_free_on_cards(
             self.prefill_shape().cards,
         );
@@ -1603,6 +1608,44 @@ impl GenericBackend {
             .drop_kv_snapshots_for(need.saturating_sub(free).max(1));
         crate::inference::place::vram_manager::residency_changed();
         self.0.kv_snapshot_bytes() < before
+    }
+
+    /// The bytes `rows` rows of this model's cache take at full width, K and V of every layer.
+    fn kv_rows_bytes(&self, rows: usize) -> u64 {
+        let (layers, n_kv, head_dim) = self.0.kv_layout();
+        (rows * layers * 2 * n_kv * head_dim * crate::tensor::DType::F16.size_in_bytes()) as u64
+    }
+
+    /// Gives back the paged pool a batch worker left with the model when the model's cards have
+    /// less than `need` bytes free.
+    /// The serial path then takes that room, and the next worker sizes a new pool.
+    /// True when a pool was given back.
+    fn give_back_kept_pool(&mut self, need: u64) -> bool {
+        #[cfg(feature = "gpu")]
+        if let Some(pool) = self.0.take_parked_pool() {
+            // The pools the driver does not count as free are handed back before a second read.
+            let mut free = self.0.free_device_memory().unwrap_or(0);
+            if free < need {
+                self.0.hand_back_pools();
+                free = self.0.free_device_memory().unwrap_or(0);
+            }
+            if free >= need {
+                self.0.park_pool(pool);
+                return false;
+            }
+            let (blocks, _) = pool.size();
+            drop(pool);
+            self.0.hand_back_pools();
+            crate::inference::place::vram_manager::residency_changed();
+            tracing::info!(
+                "serial path: {} MB free on its cards; the batch worker's kept pool of {blocks} \
+                 blocks is given back",
+                free >> 20
+            );
+            return true;
+        }
+        let _ = need;
+        false
     }
 }
 
@@ -2031,6 +2074,21 @@ impl ModelBackend for GenericBackend {
         rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
         dtype_code: u8,
     ) -> crate::tensor::Result<()> {
+        // The snapshot is built on the cards, and its restore copies it into the cache.
+        let need = self.kv_rows_bytes(kv_len).saturating_mul(2);
+        self.give_back_kept_pool(need);
+        // The kept snapshots serve later requests: the request that asked for this one
+        // takes their room first.
+        if let Some(free) = self.0.free_device_memory() {
+            if free < need && self.0.kv_snapshot_bytes() > 0 {
+                self.0.hand_back_pools();
+                let free = self.0.free_device_memory().unwrap_or(0);
+                if free < need {
+                    self.0.drop_kv_snapshots_for(need - free);
+                    crate::inference::place::vram_manager::residency_changed();
+                }
+            }
+        }
         self.0.import_kv_snapshot(tokens, kv_len, rows, dtype_code)
     }
     fn kv_snapshot_dtype(&self, index: usize) -> Option<u8> {

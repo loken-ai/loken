@@ -124,6 +124,27 @@ impl QuantKv {
         })
     }
 
+    /// `k` and `v`, `[1, n_kv, n, head_dim]` rows on the cache's card, in the packed form of
+    /// this cache's precision, as [`Self::snapshot_raw`] copies it; `None` when `n` is 0.
+    /// The rows are packed in a fresh cache of `n` positions, dropped once copied.
+    pub fn snapshot_of_rows(&self, k: &Tensor, v: &Tensor) -> Result<Option<QuantKvSnapshot>> {
+        let n = k.dims().get(2).copied().unwrap_or(0);
+        if n == 0 {
+            return Ok(None);
+        }
+        let device = k.device();
+        let mut fresh = match self {
+            QuantKv::Q8(c) => {
+                QuantKv::Q8(Q8KvCache::new(n, c.n_kv_heads(), c.head_dim(), &device)?)
+            }
+            QuantKv::Q4(c) => {
+                QuantKv::Q4(Q4KvCache::new(n, c.n_kv_heads(), c.head_dim(), &device)?)
+            }
+        };
+        fresh.append(k, v)?;
+        fresh.snapshot_raw()
+    }
+
     /// Makes `snap` the whole content of the cache, bit for bit; an error when it was taken
     /// from a cache of another precision.
     pub fn restore_raw(&mut self, snap: &QuantKvSnapshot) -> Result<()> {

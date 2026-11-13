@@ -1705,6 +1705,8 @@ fn _assert_generate_future_send(e: &LlmEngine, prompt: &str, params: GenerationP
 
 #[cfg(test)]
 mod block_draft_tests;
+#[cfg(all(test, feature = "gpu"))]
+mod kept_pool_tests;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod quality;
 #[cfg(test)]

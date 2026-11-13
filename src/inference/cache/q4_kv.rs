@@ -315,6 +315,16 @@ pub struct Q4KvCache {
 }
 
 impl Q4KvCache {
+    /// The kv heads of a position.
+    pub fn n_kv_heads(&self) -> usize {
+        self.n_kv_heads
+    }
+
+    /// The width of a head.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     pub fn new(
         max_seq_len: usize,
         n_kv_heads: usize,

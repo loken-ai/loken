@@ -2170,7 +2170,7 @@ impl GenericHeteroTransformer {
         }
         if freed > 0 {
             tracing::debug!("kv snapshots: {freed} bytes dropped for a prefill chunk");
-            crate::inference::place::ladder::release_pools();
+            self.hand_back_pools();
         }
     }
 
@@ -2190,12 +2190,19 @@ impl GenericHeteroTransformer {
 
     fn enforce_kv_snapshot_budget(&mut self) {
         let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
-        let budget = match self.free_device_memory() {
-            Some(free) => (free + held).saturating_sub(self.snapshot_reserve()),
+        let reserve = self.snapshot_reserve();
+        let budget_at = |free: Option<u64>| match free {
+            Some(free) => (free + held).saturating_sub(reserve),
             // No card: the snapshots live in host memory, bounded by what the host can spare.
             None => held
                 .saturating_add(crate::inference::place::layer_executor::host_spill_budget_bytes()),
         };
+        let mut budget = budget_at(self.snapshot_room());
+        // The pools' cached blocks are handed back before a snapshot is dropped for room.
+        if held > budget {
+            self.hand_back_pools();
+            budget = budget_at(self.snapshot_room());
+        }
         let mut held = held;
         while held > budget && !self.kv_snapshots.is_empty() {
             let i = self
@@ -2214,6 +2221,45 @@ impl GenericHeteroTransformer {
             );
             self.kv_snapshots.clear();
         }
+    }
+
+    /// Hands the pools' cached blocks back to the driver once the work queued on the model's
+    /// cards has run.
+    /// A buffer dropped while that work runs is freed in the stream's order: before it has run,
+    /// the pool keeps the buffer and the driver does not count it as free.
+    /// Each card's pool is trimmed whatever release threshold a recorded graph set on it.
+    pub fn hand_back_pools(&self) {
+        #[cfg(feature = "gpu")]
+        for d in self.cuda_devices.values() {
+            if let Err(e) = d.synchronize() {
+                tracing::warn!("pools not handed back: {e}");
+                return;
+            }
+            if let Ok(cd) = d.as_cuda_device() {
+                crate::tensor::cuda::trim_pool(cd.0.ordinal());
+            }
+        }
+        crate::inference::place::ladder::release_pools();
+    }
+
+    /// The memory each of the model's cards has for snapshots, the least over the cards.
+    /// It is what the driver has free and what the card's pool holds free.
+    /// A pool keeps a block that holds a live buffer, and serves this process's next
+    /// allocations from the rest of it.
+    fn snapshot_room(&self) -> Option<u64> {
+        #[cfg(feature = "gpu")]
+        return self
+            .cuda_devices
+            .values()
+            .filter_map(|d| {
+                let free = crate::inference::place::room::free_now(d)?;
+                let ordinal = d.as_cuda_device().ok()?.0.ordinal();
+                let (reserved, used) = crate::tensor::cuda::pool_use(ordinal);
+                Some(free + reserved.saturating_sub(used))
+            })
+            .min();
+        #[cfg(not(feature = "gpu"))]
+        self.free_device_memory()
     }
 
     /// Free memory on the device holding the first layer, when it is a card.
@@ -3035,6 +3081,26 @@ pub(super) fn layer_snapshot_from_rows(
 ) -> crate::tensor::Result<super::LayerKvSnapshot> {
     let (n_kv, hd) = (l.n_kv_head, l.head_dim);
     let n = k.len() / (n_kv * hd);
+    // A quantised cache's rows are kept in its own packed form, as its own snapshots are.
+    #[cfg(feature = "gpu")]
+    if let Some(q) = l.quant_kv.as_ref() {
+        let dev = l.cos.device();
+        let rows = |r: &[f32]| -> crate::tensor::Result<crate::tensor::Tensor> {
+            crate::tensor::Tensor::from_vec(r.to_vec(), (1, n, n_kv, hd), &dev)?
+                .permute((0, 2, 1, 3))?
+                .contiguous()
+        };
+        let quant = q
+            .snapshot_of_rows(&rows(k)?, &rows(v)?)
+            .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+        return Ok(super::LayerKvSnapshot {
+            spec: None,
+            quant,
+            cpu_f16: None,
+            mixer: None,
+            shards: Vec::new(),
+        });
+    }
     let spec_like = if let Some(buf) = l.kv_cache.k_buffer() {
         Some(buf)
     } else if l.cpu_f16_kv.is_none() {
