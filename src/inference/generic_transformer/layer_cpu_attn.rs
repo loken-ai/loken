@@ -501,7 +501,7 @@ impl GenericTransformerLayer {
                 );
             }
         }
-        sink_attention_matmul(q, k, v, mask, sinks, scale, self.n_kv_head, window)
+        sink_attention_matmul(q, k, v, mask, Some(sinks), scale, self.n_kv_head, window)
     }
 
     pub(super) fn standard_attention(
@@ -1104,18 +1104,20 @@ pub(super) const F16_DECODE_KEYS_PER_SPLIT: usize = 128;
 pub(super) const F16_DECODE_MIN_SPLITS: usize = 32;
 pub(super) const F16_DECODE_MAX_SPLITS: usize = 128;
 
-/// Attention with per-head sinks over materialised scores: `q` `[b, n_head, seq, hd]`,
+/// Attention over materialised scores: `q` `[b, n_head, seq, hd]`,
 /// `k`/`v` `[b, n_kv_head, kv, hd]`, `mask` `[seq, kv]` u8 with 1 where a key is hidden.
-/// With no mask and one query row, `window` keeps the last `window` keys. Scores and the
-/// sink softmax run in F32; the query rows are tiled so the scores stay within the
-/// budget `standard_attention` uses. Returns `[b, n_head, seq, hd]` in `q`'s dtype.
+/// With no mask and one query row, `window` keeps the last `window` keys.
+/// Each head's sink joins its softmax denominator when `sinks` is given.
+/// Scores and the softmax run in F32.
+/// The query rows are tiled so the scores stay within the budget `standard_attention` uses.
+/// Returns `[b, n_head, seq, hd]` in `q`'s dtype.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sink_attention_matmul(
     q: &Tensor,
     k: Tensor,
     v: Tensor,
     mask: Option<&Tensor>,
-    sinks: &Tensor,
+    sinks: Option<&Tensor>,
     scale: f64,
     n_kv_head: usize,
     window: Option<usize>,
@@ -1136,7 +1138,7 @@ pub(super) fn sink_attention_matmul(
     let kv_dt = k.dtype();
     let kt = k.t()?;
     let v = v.contiguous()?;
-    let sinks = sinks.to_dtype(DType::F32)?;
+    let sinks = sinks.map(|s| s.to_dtype(DType::F32)).transpose()?;
     let neg_inf = Tensor::new(f32::NEG_INFINITY, &q.device())?;
     // Each step drops the scores it read.
     // At most `SINK_SCORES_LIVE_COPIES` copies of a tile's scores are alive at once.
@@ -1159,7 +1161,12 @@ pub(super) fn sink_attention_matmul(
                 .broadcast_as(scores.shape())?
                 .where_cond(&neg_inf.broadcast_as(scores.dims())?, &scores)?;
         }
-        let probs = crate::tensor::ops::softmax_last_dim_with_sinks(&scores, None, &sinks, scale)?;
+        let probs = match sinks.as_ref() {
+            Some(sinks) => {
+                crate::tensor::ops::softmax_last_dim_with_sinks(&scores, None, sinks, scale)?
+            }
+            None => crate::tensor::ops::softmax_last_dim(&(&scores * scale)?)?,
+        };
         drop(scores);
         let weights = probs.to_dtype(v.dtype())?;
         drop(probs);
@@ -1313,13 +1320,21 @@ mod sink_attention_tests {
             let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
             let sinks = Tensor::from_vec(sv.clone(), (nh,), &dev).unwrap();
             let mask = causal_mask(seq, base, window);
-            let got =
-                sink_attention_matmul(&q, k, v, Some(&mask), &sinks, scale as f64, nkv, window)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
+            let got = sink_attention_matmul(
+                &q,
+                k,
+                v,
+                Some(&mask),
+                Some(&sinks),
+                scale as f64,
+                nkv,
+                window,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
             let want = reference(
                 &qv,
                 &kvv,
@@ -1384,7 +1399,7 @@ mod sink_attention_tests {
         let k = Tensor::from_vec(kvv.clone(), (1, nkv, kv, hd), &dev).unwrap();
         let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
         let sinks = Tensor::from_vec(sv.clone(), (nh,), &dev).unwrap();
-        let got = sink_attention_matmul(&q, k, v, None, &sinks, scale as f64, nkv, Some(3))
+        let got = sink_attention_matmul(&q, k, v, None, Some(&sinks), scale as f64, nkv, Some(3))
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -1401,6 +1416,41 @@ mod sink_attention_tests {
             scale,
         );
         assert!(max_diff(&got, &want) < 1e-5);
+    }
+
+    /// Without sinks a prompt and a decoded row read the keys of their window alone.
+    #[test]
+    fn a_window_without_sinks_attends_the_last_keys_alone() {
+        let (nh, nkv, hd) = SHAPE;
+        let dev = Device::Cpu;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let no_sink = vec![f32::NEG_INFINITY; nh];
+        for (seq, base) in [(6usize, 3usize), (1, 8)] {
+            let kv = base + seq;
+            let (qv, kvv, vv, _) = inputs(seq, kv);
+            let q = Tensor::from_vec(qv.clone(), (1, nh, seq, hd), &dev).unwrap();
+            let k = Tensor::from_vec(kvv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+            let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+            let mask = (seq > 1).then(|| causal_mask(seq, base, Some(3)));
+            let got =
+                sink_attention_matmul(&q, k, v, mask.as_ref(), None, scale as f64, nkv, Some(3))
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+            let want = reference(
+                &qv,
+                &kvv,
+                &vv,
+                &no_sink,
+                (nh, nkv, seq, kv, hd),
+                base,
+                Some(3),
+                scale,
+            );
+            assert!(max_diff(&got, &want) < 1e-5, "{seq} rows after {base} keys");
+        }
     }
 
     /// A short prompt's scores are counted whole.

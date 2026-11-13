@@ -98,6 +98,14 @@ fn sink_or_window_shape(
     )
 }
 
+/// Whether a card serves the attention of `layer` over materialised scores: its softmax holds
+/// a sink or a window bounds its keys.
+///
+/// A layer with neither runs the paged attention kernels.
+fn card_scores_attention(layer: &GenericTransformerLayer) -> bool {
+    layer.attn_sinks.is_some() || layer.sliding_window.is_some_and(|w| w > 0)
+}
+
 /// The rows of `t` as host F32.
 fn host_f32(t: &Tensor) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
@@ -847,12 +855,12 @@ impl GenericHeteroTransformer {
     /// Card bytes the attention of a prompt of `rows` rows over `keys` keys keeps alive beside
     /// the activations of the step.
     ///
-    /// A layer with sinks materialises its scores on a card.
+    /// A layer with sinks or a window materialises its scores on a card.
     /// Any other attention and the host keep no scores beyond the activations.
     pub fn prompt_attention_bytes(&self, rows: usize, keys: usize) -> u64 {
-        let sinks_on_a_card =
-            !self.compute_device().is_cpu() && self.layers.iter().any(|l| l.attn_sinks.is_some());
-        match sinks_on_a_card {
+        let scores_on_a_card =
+            !self.compute_device().is_cpu() && self.layers.iter().any(card_scores_attention);
+        match scores_on_a_card {
             true => super::layer_cpu_attn::sink_scores_bytes(self.config.n_head, rows, keys),
             false => 0,
         }
@@ -970,14 +978,14 @@ impl GenericHeteroTransformer {
 
     /// Whether the captured decode graph serves this model.
     ///
-    /// The graph rotates at the plain base, attends without a sink and runs a dense
-    /// feed-forward in every layer.
+    /// The graph rotates at the plain base, attends without a sink or a window and runs a
+    /// dense feed-forward in every layer.
     pub fn cb_graph_serves(&self) -> bool {
         !self.cb_rope_from_tables()
             && self
                 .layers
                 .iter()
-                .all(|l| l.attn_sinks.is_none() && l.moe.is_none())
+                .all(|l| !card_scores_attention(l) && l.moe.is_none())
     }
 
     /// Every layer and the batched forward's device are the host.
@@ -1466,8 +1474,8 @@ impl GenericHeteroTransformer {
                     ));
                 }
                 Tensor::from_vec(rows, &[b, nh * hd][..], &dev)?
-            } else if let Some(sinks) = layer.attn_sinks.as_ref().filter(|_| !dev.is_cpu()) {
-                // Each sequence reads its own keys, its sinks in the softmax.
+            } else if !dev.is_cpu() && card_scores_attention(layer) {
+                // Each sequence reads its own keys within its window, its sinks in the softmax.
                 let window = layer.sliding_window.filter(|&w| w > 0);
                 let mut rows = Vec::with_capacity(b);
                 for bi in 0..b {
@@ -1484,7 +1492,7 @@ impl GenericHeteroTransformer {
                         heads(kg)?,
                         heads(vg)?,
                         None,
-                        sinks,
+                        layer.attn_sinks.as_ref(),
                         scale as f64,
                         nkv,
                         window,
@@ -2258,8 +2266,9 @@ impl GenericHeteroTransformer {
                 nkv,
             );
             let mut q_head_major = false;
-            // The fused stages rotate at the plain base and feed the attention without a sink.
-            let plain_stage = !table_rope && layer.attn_sinks.is_none();
+            // The fused stages rotate at the plain base and feed the attention without a sink
+            // or a window.
+            let plain_stage = !table_rope && !card_scores_attention(layer);
             let staged = match slot_dev.as_ref().zip(slots_i32.as_deref()) {
                 Some((slot_dev, slots_i32)) if want_head_major && plain_stage => {
                     let rows =
@@ -2396,9 +2405,9 @@ impl GenericHeteroTransformer {
                     ));
                 }
                 parts.push(Tensor::from_vec(rows, &[t, row][..], &dev)?.to_dtype(cdt)?);
-            } else if let Some(sinks) = layer.attn_sinks.as_ref() {
-                // On a card each prompt reads its own keys, its sinks in the softmax, and a
-                // prompt whose prefix the cache holds reads that prefix first.
+            } else if card_scores_attention(layer) {
+                // On a card each prompt reads its own keys within its window, its sinks in the
+                // softmax, and a prompt whose prefix the cache holds reads that prefix first.
                 let window = layer.sliding_window.filter(|&w| w > 0);
                 for (i, (&start, &n)) in starts.iter().zip(&lens).enumerate() {
                     let fresh_k = k_rot.narrow(0, start, n)?;
@@ -2438,7 +2447,7 @@ impl GenericHeteroTransformer {
                         heads(keys, nkv)?,
                         heads(values, nkv)?,
                         Some(&mask),
-                        sinks,
+                        layer.attn_sinks.as_ref(),
                         scale as f64,
                         nkv,
                         window,
@@ -2482,7 +2491,7 @@ impl GenericHeteroTransformer {
             // A prompt whose prefix the cache holds attends over that prefix, gathered from the
             // store, then over its own suffix.
             let mut at = plain_rows;
-            let suffixes = match host_shape.is_some() || layer.attn_sinks.is_some() {
+            let suffixes = match host_shape.is_some() || card_scores_attention(layer) {
                 true => &[][..],
                 false => cached,
             };

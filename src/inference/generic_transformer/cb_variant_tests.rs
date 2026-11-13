@@ -584,13 +584,35 @@ mod on_a_card {
         ]
     }
 
-    /// The header keys that window the first layer of the quantised toy to its last 4 keys.
+    /// Keys a windowed layer of the quantised toy reads.
+    const WINDOW: usize = 4;
+
+    /// The header keys that window the first layer of the quantised toy to its last
+    /// [`WINDOW`] keys.
     fn windowed() -> Vec<(String, Value)> {
         vec![
-            ("qwen3.attention.sliding_window".into(), Value::U32(4)),
+            (
+                "qwen3.attention.sliding_window".into(),
+                Value::U32(WINDOW as u32),
+            ),
             (
                 "qwen3.attention.sliding_window_pattern".into(),
                 Value::Array(vec![Value::U32(1), Value::U32(0)]),
+            ),
+        ]
+    }
+
+    /// The header keys that window every layer of the quantised toy to its last [`WINDOW`]
+    /// keys.
+    fn windowed_everywhere() -> Vec<(String, Value)> {
+        vec![
+            (
+                "qwen3.attention.sliding_window".into(),
+                Value::U32(WINDOW as u32),
+            ),
+            (
+                "qwen3.attention.sliding_window_pattern".into(),
+                Value::Array(vec![Value::U32(1); LAYERS]),
             ),
         ]
     }
@@ -645,6 +667,109 @@ mod on_a_card {
         };
         let path = quant("cb-card-sinks", extras);
         alone_and_batched_agree_on_a_card(&path);
+        tiny_model::remove(&path);
+    }
+
+    /// A layer without sinks windowed to its last [`WINDOW`] keys reads those keys alone in
+    /// the batched paths and in the server on a card, as the serial forward does.
+    ///
+    /// Both layers are windowed, so a row reads the tokens of its last `reach` positions.
+    /// 2 prompts that differ only before those give the same logits from their last row on.
+    #[test]
+    fn a_window_without_sinks_batches_on_a_card() {
+        if !card() {
+            return;
+        }
+        let extras = tiny_model::QuantExtras {
+            keys: windowed_everywhere(),
+            ..Default::default()
+        };
+        let path = quant("cb-card-window", extras);
+        let model = tiny_model::load_on_card(&path, LAYERS);
+        assert!(model
+            .layers
+            .iter()
+            .all(|l| l.sliding_window == Some(WINDOW) && l.attn_sinks.is_none()));
+        assert!(model.cb_eligible(), "{:?}", model.cb_unsupported_reason());
+        let reach = LAYERS * (WINDOW - 1) + 1;
+        let vocab = tiny_model::QUANT_VOCAB as u32;
+        let tail: Vec<u32> = (0..reach as u32).map(|i| (i * 5 + 2) % vocab).collect();
+        let prompts: Vec<Vec<u32>> = [1u32, 9]
+            .iter()
+            .map(|&s| {
+                (0..WINDOW as u32)
+                    .map(|i| (i * 7 + s) % vocab)
+                    .chain(tail.clone())
+                    .collect()
+            })
+            .collect();
+        assert_ne!(prompts[0], prompts[1]);
+        let flat = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let serial: Vec<Vec<f32>> = prompts
+            .iter()
+            .map(|p| {
+                flat(
+                    tiny_model::load_on_card(&path, LAYERS)
+                        .forward(&ids(p), 0)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let serial_gap = share(&serial[0], &serial[1]);
+        let runs = run_batched(&model, &prompts, &[0, 1]);
+        drop(model);
+        let batched_gap = runs[0]
+            .1
+            .iter()
+            .zip(&runs[1].1)
+            .map(|(a, b)| share(a, b))
+            .fold(0f32, f32::max);
+        eprintln!(
+            "prompts differing before the reach: serial gap {serial_gap:.3e}, batched gap \
+             {batched_gap:.3e}, batched against serial {:.3e} of the range",
+            share(&serial[0], &runs[0].1[0])
+        );
+        assert!(
+            serial_gap <= SHARE,
+            "the serial forward read past its window"
+        );
+        assert_eq!(
+            runs[0].0, runs[1].0,
+            "the batched paths read past the window"
+        );
+        assert!(
+            batched_gap <= SHARE,
+            "the batched logits moved by {batched_gap} of their range past the window"
+        );
+        let model = Arc::new(tiny_model::load_on_card(&path, LAYERS));
+        let server =
+            ContinuousServer::spawn(model, Vec::new(), 64, CB_BLOCK_SIZE, 8, 4096).unwrap();
+        let receivers: Vec<_> = prompts
+            .iter()
+            .map(|p| server.submit(p.clone(), STEPS))
+            .collect();
+        let served: Vec<Vec<u32>> = receivers
+            .into_iter()
+            .map(|rx| {
+                rx.iter()
+                    .take_while(|t| !matches!(t, CbToken::Done(_)))
+                    .filter_map(|t| match t {
+                        CbToken::Tok(t) => Some(t),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        let _ = server.stop();
+        assert_eq!(served[0].len(), STEPS);
+        assert_eq!(served[0], served[1], "the server read past the window");
         tiny_model::remove(&path);
     }
 
