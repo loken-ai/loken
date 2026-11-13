@@ -16,7 +16,7 @@ use opencl3::{
     kernel::{ExecuteKernel, Kernel},
     memory::{Buffer, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE},
     program::Program,
-    types::{cl_device_id, CL_BLOCKING},
+    types::{cl_device_id, CL_BLOCKING, CL_NON_BLOCKING},
 };
 use std::collections::HashMap;
 use std::ptr::null_mut;
@@ -257,10 +257,10 @@ impl Matrix {
         let fmt = format_of(t.dtype)
             .ok_or_else(|| anyhow!("OpenCL mat-vec does not read {}", t.dtype.gguf_name()))?;
         let block = t.dtype.block_size();
-        if t.cols % block != 0 || t.cols % fmt.unit_elems() != 0 {
+        if !t.cols.is_multiple_of(block) || !t.cols.is_multiple_of(fmt.unit_elems()) {
             bail!("a {} matrix of {} columns", t.dtype.gguf_name(), t.cols);
         }
-        if matches!(fmt, Fmt::Q4K | Fmt::Q6K) && t.cols % 256 != 0 {
+        if matches!(fmt, Fmt::Q4K | Fmt::Q6K) && !t.cols.is_multiple_of(256) {
             bail!("a {} matrix of {} columns", t.dtype.gguf_name(), t.cols);
         }
         let total = t.rows * t.cols / block;
@@ -362,6 +362,9 @@ struct Mega {
     /// Arrival counters, eight words to a layer, and the count of barriers given up on.
     counters: Buffer<f32>,
     fail: Buffer<f32>,
+    /// The value sums of the slices of each head's keys, then each slice's maximum and sum,
+    /// for the largest grid.
+    att_parts: Buffer<f32>,
     groups: usize,
 }
 
@@ -373,8 +376,8 @@ impl Mega {
         let widest = spec.hidden.max(q_dim).max(spec.ffn).div_ceil(256) * 256;
         if widest > 8192
             || spec.head_dim > 256
-            || spec.hidden % 32 != 0
-            || spec.n_head % spec.n_kv != 0
+            || !spec.hidden.is_multiple_of(32)
+            || !spec.n_head.is_multiple_of(spec.n_kv)
         {
             bail!("the shape of the layers");
         }
@@ -406,6 +409,7 @@ impl Mega {
             head: Kernel::create(&program, "head_step")?,
             counters: scratch(ctx, (layers.len() + 1) * 8)?,
             fail: scratch(ctx, 4)?,
+            att_parts: scratch(ctx, spec.n_head * MEGA_GROUPS[0] * (spec.head_dim + 2))?,
             groups: MEGA_GROUPS[0],
         })
     }
@@ -535,6 +539,21 @@ pub struct OpenClStack {
     /// The single-launch decode layer, where the device runs it, and whether it is in use.
     mega: Option<Mega>,
     mega_on: bool,
+    /// Whether a prompt chunk runs the gate and up projections in their fused kernel.
+    fused_chunk: bool,
+    /// The time of each stage, while a test traces the stack.
+    #[cfg(test)]
+    trace: std::sync::Mutex<Option<Trace>>,
+}
+
+/// The stages a traced run went through: each stage waits for the device, then takes the time
+/// since the stage before it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Trace {
+    last: Option<std::time::Instant>,
+    /// Name, microseconds and passes of each stage, in the order first met.
+    pub stages: Vec<(&'static str, f64, usize)>,
 }
 
 // The handles are raw pointers into a driver that serialises access through the one queue,
@@ -630,10 +649,10 @@ impl OpenClStack {
         let max_alloc = dev.max_mem_alloc_size().unwrap_or(0) as usize;
         let ctx = Context::from_device(&dev)?;
         let queue = CommandQueue::create_default(&ctx, 0)?;
-        if spec.head_dim > 256 || spec.head_dim % 4 != 0 {
+        if spec.head_dim > 256 || !spec.head_dim.is_multiple_of(4) {
             bail!("a head of {} lanes", spec.head_dim);
         }
-        if half == 0 || cos.len() != sin.len() || cos.len() % half != 0 {
+        if half == 0 || cos.len() != sin.len() || !cos.len().is_multiple_of(half) {
             bail!("RoPE tables of {} values, {half} per position", cos.len());
         }
         let wide = Kernels::wide(&ctx)?;
@@ -682,6 +701,7 @@ impl OpenClStack {
         let mut stack = Self {
             mega_on: mega.is_some(),
             mega,
+            fused_chunk: true,
             cos: upload_f32(&ctx, cos)?,
             sin: upload_f32(&ctx, sin)?,
             table_positions: cos.len() / half,
@@ -707,8 +727,11 @@ impl OpenClStack {
             narrow,
             spec,
             layers: out,
+            #[cfg(test)]
+            trace: std::sync::Mutex::new(None),
         };
         stack.settle_grid();
+        stack.settle_gate_up()?;
         if let Some(m) = &stack.mega {
             tracing::debug!(
                 "single-launch layer: {} workgroups of {MEGA_THREADS}, {} bytes of local memory",
@@ -777,6 +800,48 @@ impl OpenClStack {
         self.layers.is_empty()
     }
 
+    /// Ends stage `name` of a traced run: waits for the device and adds the time since the
+    /// stage before. Does nothing outside a trace.
+    fn stage(&self, name: &'static str) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut guard = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = guard.as_mut() {
+                self.queue.finish()?;
+                let now = std::time::Instant::now();
+                let us = t.last.map_or(0.0, |l| (now - l).as_secs_f64() * 1e6);
+                t.last = Some(now);
+                match t.stages.iter_mut().find(|s| s.0 == name) {
+                    Some(s) => {
+                        s.1 += us;
+                        s.2 += 1;
+                    }
+                    None => t.stages.push((name, us, 1)),
+                }
+            }
+        }
+        #[cfg(not(test))]
+        let _ = name;
+        Ok(())
+    }
+
+    /// Starts tracing the stages of the runs that follow.
+    #[cfg(test)]
+    pub(crate) fn start_trace(&mut self) {
+        *self.trace.lock().unwrap_or_else(|e| e.into_inner()) = Some(Trace::default());
+    }
+
+    /// The stages traced since [`start_trace`](Self::start_trace), and the end of the trace.
+    #[cfg(test)]
+    pub(crate) fn take_trace(&mut self) -> Vec<(&'static str, f64, usize)> {
+        self.trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|t| t.stages)
+            .unwrap_or_default()
+    }
+
     /// Runs `rows` (`n * hidden` values, the first at `index_pos`) through layers `[from, to)`
     /// and returns the rows after them.
     pub fn forward(
@@ -813,7 +878,11 @@ impl OpenClStack {
         logits: bool,
     ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
         let hidden = self.spec.hidden;
-        if to > self.layers.len() || from > to || rows.len() % hidden != 0 || rows.is_empty() {
+        if to > self.layers.len()
+            || from > to
+            || !rows.len().is_multiple_of(hidden)
+            || rows.is_empty()
+        {
             bail!("rows {} layers {from}..{to}", rows.len());
         }
         let n = rows.len() / hidden;
@@ -821,9 +890,11 @@ impl OpenClStack {
         if need > self.spec.ctx || need > self.table_positions {
             bail!("position {need} is past the context of {}", self.spec.ctx);
         }
+        self.stage("host between runs")?;
         for li in from..to {
             self.ensure_cache(li, need)?;
         }
+        self.stage("cache growth")?;
         let mut out = vec![0f32; rows.len()];
         let mut last_logits = None;
         let mut done = 0;
@@ -831,14 +902,17 @@ impl OpenClStack {
             let c = CHUNK.min(n - done);
             let chunk = &rows[done * hidden..(done + c) * hidden];
             let mut single = c == 1 && self.mega_on && self.mega.is_some();
-            // Layers alternate their input between the two buffers.
-            let mut in_a;
+            let head = logits && done + c == n && to == self.layers.len();
             loop {
+                // The rows go in, the step runs and its results come back with one wait for
+                // the device at the end.
                 unsafe {
                     self.queue
-                        .enqueue_write_buffer(&mut self.a, CL_BLOCKING, 0, chunk, &[])?;
+                        .enqueue_write_buffer(&mut self.a, CL_NON_BLOCKING, 0, chunk, &[])?;
                 }
-                in_a = true;
+                self.stage("write rows")?;
+                // Layers alternate their input between the two buffers.
+                let mut in_a = true;
                 if single {
                     if let Some(mega) = self.mega.as_mut() {
                         mega.clear(&self.queue, to - from)?;
@@ -847,56 +921,68 @@ impl OpenClStack {
                 for li in from..to {
                     if single {
                         self.layer_single(li, from, index_pos + done, in_a)?;
+                        self.stage("layer in one launch")?;
                     } else {
                         self.layer(li, c, index_pos + done, in_a)?;
                     }
                     in_a = !in_a;
                 }
-                if !single {
-                    break;
+                let cur = if in_a { &self.a } else { &self.b };
+                let mut l = Vec::new();
+                if head {
+                    if single {
+                        self.head_single(cur)?;
+                    } else {
+                        self.head_logits(cur, c)?;
+                    }
+                    self.stage("head")?;
+                }
+                let mut failed = [0f32; 1];
+                unsafe {
+                    if let (true, Some(m)) = (single, self.mega.as_ref()) {
+                        self.queue.enqueue_read_buffer(
+                            &m.fail,
+                            CL_NON_BLOCKING,
+                            0,
+                            &mut failed,
+                            &[],
+                        )?;
+                    }
+                    if let (true, Some(h)) = (head, self.head.as_ref()) {
+                        l = vec![0f32; h.proj.rows];
+                        self.queue.enqueue_read_buffer(
+                            &h.logits,
+                            CL_NON_BLOCKING,
+                            0,
+                            &mut l,
+                            &[],
+                        )?;
+                    }
+                    self.queue.enqueue_read_buffer(
+                        cur,
+                        CL_NON_BLOCKING,
+                        0,
+                        &mut out[done * hidden..(done + c) * hidden],
+                        &[],
+                    )?;
+                }
+                self.queue.finish()?;
+                self.stage("read back")?;
+                if head {
+                    if l.is_empty() {
+                        bail!("no output head");
+                    }
+                    last_logits = Some(l);
                 }
                 // A grid that was not resident gave up at a barrier: the step runs again, a
                 // launch to a phase from here on.
-                self.queue.finish()?;
-                let failed = self
-                    .mega
-                    .as_ref()
-                    .map_or(0, |m| m.failures(&self.queue).unwrap_or(1));
-                if failed == 0 {
+                let failed = failed[0].to_bits();
+                if !single || failed == 0 {
                     break;
                 }
                 tracing::warn!("the single-launch layer was not resident ({failed} barriers given up); running a launch to a phase");
                 self.mega_on = false;
                 single = false;
-            }
-            let last_chunk = done + c == n;
-            let cur = if in_a { &self.a } else { &self.b };
-            if logits && last_chunk && to == self.layers.len() {
-                if single {
-                    self.head_single(cur)?;
-                } else {
-                    self.head_logits(cur, c)?;
-                }
-                let h = self
-                    .head
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("no output head"))?;
-                let mut l = vec![0f32; h.proj.rows];
-                unsafe {
-                    self.queue
-                        .enqueue_read_buffer(&h.logits, CL_BLOCKING, 0, &mut l, &[])?;
-                }
-                last_logits = Some(l);
-            }
-            let cur = if in_a { &self.a } else { &self.b };
-            unsafe {
-                self.queue.enqueue_read_buffer(
-                    cur,
-                    CL_BLOCKING,
-                    0,
-                    &mut out[done * hidden..(done + c) * hidden],
-                    &[],
-                )?;
             }
             done += c;
         }
@@ -1011,10 +1097,13 @@ impl OpenClStack {
             q: &self.qn,
         };
         self.rms_norm(cur, &l.attn_norm, &self.xn, c, 0, c)?;
+        self.stage("norms")?;
         self.quantize(&self.xn, &self.qn, c, s.hidden)?;
+        self.stage("quantise")?;
         self.mat_vec(&l.q, xn, &self.q, c, l.q_bias.as_ref(), None)?;
         self.mat_vec(&l.k, xn, &self.k, c, l.k_bias.as_ref(), None)?;
         self.mat_vec(&l.v, xn, &self.v, c, l.v_bias.as_ref(), None)?;
+        self.stage("q k v")?;
         unsafe {
             ExecuteKernel::new(kern.get("qkv_post"))
                 .set_arg(&self.q)
@@ -1039,6 +1128,9 @@ impl OpenClStack {
                 .set_global_work_size(c * (s.n_head + 2 * s.n_kv) * 128)
                 .set_local_work_size(128)
                 .enqueue_nd_range(&self.queue)?;
+        }
+        self.stage("qkv post")?;
+        unsafe {
             ExecuteKernel::new(kern.get("attention_rows"))
                 .set_arg(&self.q)
                 .set_arg(&l.cache_k)
@@ -1053,15 +1145,47 @@ impl OpenClStack {
                 .set_local_work_size(128)
                 .enqueue_nd_range(&self.queue)?;
         }
+        self.stage("attention")?;
         self.quantize(&self.att, &self.qa, c, s.n_head * s.head_dim)?;
+        self.stage("quantise")?;
         let att = Act {
             f: &self.att,
             q: &self.qa,
         };
         self.mat_vec(&l.o, att, nxt, c, None, Some(cur))?;
+        self.stage("o")?;
         self.rms_norm(nxt, &l.ffn_norm, &self.xn, c, 0, c)?;
+        self.stage("norms")?;
         self.quantize(&self.xn, &self.qn, c, s.hidden)?;
-        if l.gate.fmt == l.up.fmt {
+        self.stage("quantise")?;
+        self.gate_up(
+            li,
+            c,
+            l.gate.fmt == l.up.fmt && (c == 1 || self.fused_chunk),
+        )?;
+        self.stage("gate up")?;
+        self.quantize(&self.act, &self.qf, c, s.ffn)?;
+        self.stage("quantise")?;
+        let act = Act {
+            f: &self.act,
+            q: &self.qf,
+        };
+        self.mat_vec(&l.down, act, nxt, c, None, Some(nxt))?;
+        self.stage("down")
+    }
+
+    /// The gate and up projections of layer `li` over `c` rows, with the SiLU, into `act`: in
+    /// the one kernel that reads both when `fused`, else in a launch for each and one for the
+    /// SiLU.
+    fn gate_up(&self, li: usize, c: usize, fused: bool) -> Result<()> {
+        let s = &self.spec;
+        let l = &self.layers[li];
+        let kern = self.kernels(c);
+        let xn = Act {
+            f: &self.xn,
+            q: &self.qn,
+        };
+        if fused {
             let groups = l.gate.rows.div_ceil(kern.rows_per_group);
             unsafe {
                 ExecuteKernel::new(kern.get(l.gate.fmt.gate_up()))
@@ -1097,12 +1221,35 @@ impl OpenClStack {
                     .enqueue_nd_range(&self.queue)?;
             }
         }
-        self.quantize(&self.act, &self.qf, c, s.ffn)?;
-        let act = Act {
-            f: &self.act,
-            q: &self.qf,
+        Ok(())
+    }
+
+    /// Chooses how a prompt chunk runs the gate and up projections: their fused kernel and the
+    /// separate ones are timed on the first layer over a full chunk, and the faster is kept.
+    fn settle_gate_up(&mut self) -> Result<()> {
+        let Some(l) = self.layers.first() else {
+            return Ok(());
         };
-        self.mat_vec(&l.down, act, nxt, c, None, Some(nxt))?;
+        if l.gate.fmt != l.up.fmt {
+            return Ok(());
+        }
+        let time = |fused: bool| -> Result<f64> {
+            let start = std::time::Instant::now();
+            self.gate_up(0, CHUNK, fused)?;
+            self.queue.finish()?;
+            Ok(start.elapsed().as_secs_f64())
+        };
+        // The first run of each builds and loads its kernels.
+        time(true)?;
+        time(false)?;
+        let (fused, apart) = (time(true)?, time(false)?);
+        self.fused_chunk = fused <= apart;
+        tracing::debug!(
+            "OpenCL prompt chunk: gate and up {}, {:.0} us fused against {:.0} us apart",
+            if self.fused_chunk { "fused" } else { "apart" },
+            fused * 1e6,
+            apart * 1e6
+        );
         Ok(())
     }
 
@@ -1116,6 +1263,27 @@ impl OpenClStack {
         self.mega_on
     }
 
+    /// What the device reports of the single-launch layer kernel: its workgroup size multiple,
+    /// its local and private memory and its largest workgroup, then the device's local memory
+    /// and compute units.
+    #[cfg(test)]
+    pub(crate) fn single_launch_facts(&self) -> String {
+        let Some(m) = self.mega.as_ref() else {
+            return "none".into();
+        };
+        let id = self.queue.device().unwrap_or(null_mut());
+        let dev = Device::new(id);
+        format!(
+            "multiple {:?}, local {:?} bytes, private {:?} bytes, largest group {:?}, device local {:?} bytes, compute units {:?}",
+            m.layer.get_work_group_size_multiple(id),
+            m.layer.get_local_mem_size(id),
+            m.layer.get_private_mem_size(id),
+            m.layer.get_work_group_size(id),
+            dev.local_mem_size(),
+            dev.max_compute_units(),
+        )
+    }
+
     /// The workgroups of a single-launch layer, and a way to ask for another count.
     pub fn single_launch_groups(&self) -> usize {
         self.mega.as_ref().map_or(0, |m| m.groups)
@@ -1123,7 +1291,7 @@ impl OpenClStack {
 
     pub fn set_single_launch_groups(&mut self, groups: usize) {
         if let Some(m) = self.mega.as_mut() {
-            m.groups = groups;
+            m.groups = groups.min(MEGA_GROUPS[0]);
         }
     }
 
@@ -1203,6 +1371,7 @@ impl OpenClStack {
             e.set_arg(&mega.counters)
                 .set_arg(&((li - first) as u32))
                 .set_arg(&mega.fail)
+                .set_arg(&mega.att_parts)
                 .set_global_work_size(mega.groups * MEGA_THREADS)
                 .set_local_work_size(MEGA_THREADS)
                 .enqueue_nd_range(&self.queue)?;
@@ -1812,6 +1981,72 @@ mod tests {
         }
     }
 
+    /// Time per launch of the prompt program's mat-vec over a full chunk, against the decode
+    /// program's mat-vec over one row, on the shapes of a small model's layer.
+    #[test]
+    #[ignore = "needs an OpenCL device"]
+    fn chunk_mat_vec_rates() {
+        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+            .into_iter()
+            .enumerate()
+        {
+            let dev = Device::new(id);
+            let ctx = Context::from_device(&dev).unwrap();
+            #[allow(deprecated)]
+            let queue = CommandQueue::create_default(&ctx, 0).unwrap();
+            let narrow = Kernels::build(&ctx, 1).unwrap();
+            let wide = Kernels::wide(&ctx).unwrap();
+            let unused = scratch(&ctx, 4).unwrap();
+            let cases = [
+                (GgmlDType::Q4K, 2048, 1024),
+                (GgmlDType::Q4K, 3072, 1024),
+                (GgmlDType::Q6K, 1024, 3072),
+                (GgmlDType::Q8_0, 3072, 1024),
+            ];
+            for (dtype, rows, cols) in cases {
+                let (raw, _) = random_matrix(dtype, rows, cols);
+                let m = Matrix::upload(&ctx, &raw, usize::MAX).unwrap();
+                let x: Vec<f32> = (0..CHUNK * cols).map(|k| (k % 7) as f32 - 3.0).collect();
+                let xb = upload_f32(&ctx, &x).unwrap();
+                let qx = Quant::new(&ctx, cols).unwrap();
+                let out = scratch(&ctx, CHUNK * rows).unwrap();
+                for (label, kernels, n) in [("one row", &narrow, 1), ("a chunk", &wide, CHUNK)] {
+                    launch_quant(&queue, kernels, &xb, &qx, n, cols).unwrap();
+                    let go = |reps: usize| {
+                        for _ in 0..reps {
+                            launch_mat_vec(
+                                &queue,
+                                kernels,
+                                &unused,
+                                &m,
+                                Act { f: &xb, q: &qx },
+                                &out,
+                                n,
+                                None,
+                                None,
+                            )
+                            .unwrap();
+                        }
+                        queue.finish().unwrap();
+                    };
+                    let warm = std::time::Instant::now();
+                    while warm.elapsed().as_millis() < 400 {
+                        go(10);
+                    }
+                    let reps = 100;
+                    let start = std::time::Instant::now();
+                    go(reps);
+                    let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                    println!(
+                        "device {i}: {} {rows}x{cols}, {label}: {us:.1} us per launch, {:.1} us per row",
+                        dtype.gguf_name(),
+                        us / n as f64
+                    );
+                }
+            }
+        }
+    }
+
     /// What a launch costs on its own, and one that reads what the last one wrote.
     #[test]
     #[ignore = "needs an OpenCL device"]
@@ -1924,7 +2159,7 @@ mod tests {
                             &mut c,
                             CL_BLOCKING,
                             0,
-                            &zero.map(|v| f32::from_bits(v)),
+                            &zero.map(f32::from_bits),
                             &[],
                         )
                         .unwrap();
@@ -1933,7 +2168,7 @@ mod tests {
                             &mut f,
                             CL_BLOCKING,
                             0,
-                            &zero.map(|v| f32::from_bits(v)),
+                            &zero.map(f32::from_bits),
                             &[],
                         )
                         .unwrap();

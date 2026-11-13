@@ -198,7 +198,8 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     __global const float* cosv, __global const float* sinv,
     uint hidden, uint n_head, uint n_kv, uint head_dim, uint ffn, uint rope_dim, uint half_tab,
     uint flags, float eps, float attn_scale, uint pos,
-    volatile __global atomic_uint* counters, uint slot_no, __global uint* fail) {
+    volatile __global atomic_uint* counters, uint slot_no, __global uint* fail,
+    __global float* att_parts) {
     volatile __global atomic_uint* ctr = counters + slot_no * 8;
     __local float xf[MAXH];
     __local char qk[MAXC];
@@ -252,9 +253,19 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     }
     grid_sync(ctr, ++barrier_no, fail, SPIN_LIMIT);
 
-    // ---- Phase 2: attention. Workgroup h takes head h; the current key and value come from
-    // the projections, not from the cache, so no workgroup waits for another's cache write.
-    for (uint h = wg_id; h < n_head; h += nwg) {
+    // ---- Phase 2: attention. The keys of a head are cut into `ns` slices of whole tiles, so
+    // that the heads and their slices fill the grid.
+    // Workgroup w takes slice w % ns of head w / ns.
+    // The current key and value come from the projections, not from the cache, so no workgroup
+    // waits for another's cache write.
+    uint tiles = (pos + NT) / NT;
+    uint want = max(1u, min(nwg / n_head, tiles));
+    uint per = (tiles + want - 1) / want;
+    uint ns = (tiles + per - 1) / per;
+    // A slice's value sums, then the running maximum and sum of each slice.
+    __global float* part_ml = att_parts + (ulong)n_head * nwg * head_dim;
+    for (uint w = wg_id; w < n_head * ns; w += nwg) {
+        uint h = w / ns, sidx = w % ns;
         uint kvh = h / (n_head / n_kv);
         __local float* ql = scratch;               // the head's query, rotated
         __local float* kc = scratch + 256;         // the current key, rotated
@@ -300,7 +311,7 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
             barrier(CLK_LOCAL_MEM_FENCE);
         }
         // The cache takes the current key and value, once per key-value head.
-        if (h % (n_head / n_kv) == 0) {
+        if (sidx == 0 && h % (n_head / n_kv) == 0) {
             for (uint i = t; i < head_dim; i += NT) {
                 cache_k[((ulong)pos * n_kv + kvh) * head_dim + i] = kc[i];
                 cache_v[((ulong)pos * n_kv + kvh) * head_dim + i] = vbuf[kvh * head_dim + i];
@@ -311,7 +322,8 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
         uint d = t % head_dim, part_id = t / head_dim;
         float acc = 0, mx = -INFINITY, l = 0;
         uint len = pos;                              // cached keys
-        for (uint t0 = 0; t0 < len + 1; t0 += NT) {
+        uint end = min((sidx + 1) * per * NT, len + 1);
+        for (uint t0 = sidx * per * NT; t0 < end; t0 += NT) {
             uint kp = t0 + t;
             float sc = -INFINITY;
             if (kp < len) {
@@ -364,11 +376,37 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
         if (t < head_dim) {
             float s = 0;
             for (uint q = 0; q < split; q++) s += scratch[q * head_dim + t];
-            attbuf[h * head_dim + t] = s / l;
+            if (ns == 1) {
+                attbuf[h * head_dim + t] = s / l;
+            } else {
+                att_parts[(ulong)w * head_dim + t] = s;
+                if (t == 0) {
+                    part_ml[2 * w] = mx;
+                    part_ml[2 * w + 1] = l;
+                }
+            }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     grid_sync(ctr, ++barrier_no, fail, SPIN_LIMIT);
+    // The slices of a head merge their sums under the largest of their maxima.
+    if (ns > 1) {
+        for (uint h = wg_id; h < n_head; h += nwg) {
+            if (t < head_dim) {
+                float mm = -INFINITY;
+                for (uint q = 0; q < ns; q++) mm = fmax(mm, part_ml[2 * (h * ns + q)]);
+                float num = 0, den = 0;
+                for (uint q = 0; q < ns; q++) {
+                    uint w = h * ns + q;
+                    float c = exp(part_ml[2 * w] - mm);
+                    den += part_ml[2 * w + 1] * c;
+                    num += att_parts[(ulong)w * head_dim + t] * c;
+                }
+                attbuf[h * head_dim + t] = num / den;
+            }
+        }
+        grid_sync(ctr, ++barrier_no, fail, SPIN_LIMIT);
+    }
 
     // ---- Phase 3: output projection and the residual.
     prep_x(attbuf, (__global const float*)0, 0, 0, q_dim, eps, m);

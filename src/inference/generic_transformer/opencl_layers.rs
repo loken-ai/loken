@@ -155,10 +155,37 @@ impl OpenClLayers {
         }
     }
 
+    /// What the device of each segment reports of its single-launch layer kernel.
+    #[cfg(all(test, feature = "opencl"))]
+    pub(crate) fn single_launch_facts(&self) -> String {
+        self.segments
+            .iter()
+            .map(|s| s.stack.single_launch_facts())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// Whether every segment runs decode steps with one launch to a layer.
     #[cfg(all(test, feature = "opencl"))]
     pub(crate) fn single_launch(&self) -> bool {
         self.segments.iter().all(|s| s.stack.single_launch())
+    }
+
+    /// Starts tracing the stages of every segment.
+    #[cfg(all(test, feature = "opencl"))]
+    pub(crate) fn start_trace(&mut self) {
+        for s in &mut self.segments {
+            s.stack.start_trace();
+        }
+    }
+
+    /// The stages every segment traced, and the end of the trace.
+    #[cfg(all(test, feature = "opencl"))]
+    pub(crate) fn take_trace(&mut self) -> Vec<(&'static str, f64, usize)> {
+        self.segments
+            .iter_mut()
+            .flat_map(|s| s.stack.take_trace())
+            .collect()
     }
 
     /// Forgets the logits of an earlier step.

@@ -513,16 +513,27 @@ fn bench(label: &str, m: &mut GenericHeteroTransformer, prompt: &[u32]) {
     let mut next = argmax(&m.forward(&ids(prompt), 0).unwrap());
     let prefill = start.elapsed().as_secs_f64();
     let steps = 64;
+    let cpu = cpu_seconds();
     let start = std::time::Instant::now();
     for i in 0..steps {
         next = argmax(&m.forward(&ids(&[next]), prompt.len() + i).unwrap());
     }
     let rate = steps as f64 / start.elapsed().as_secs_f64();
+    let cpu_ms = (cpu_seconds() - cpu) * 1e3 / steps as f64;
     println!(
-        "{label}: prefill {} tokens {:.1} tok/s, decode {rate:.1} tok/s",
+        "{label}: prefill {} tokens {:.1} tok/s, decode {rate:.1} tok/s, {cpu_ms:.1} ms of CPU a token",
         prompt.len(),
         prompt.len() as f64 / prefill
     );
+}
+
+/// The CPU time the process has used, every thread counted, in seconds.
+fn cpu_seconds() -> f64 {
+    // SAFETY: getrusage fills the zeroed struct it is given.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 * 1e-6;
+    t(u.ru_utime) + t(u.ru_stime)
 }
 
 /// A decode step with one launch to a layer gives the logits of the launches it replaces.
@@ -536,10 +547,11 @@ fn single_launch_against_launches(tag: &str) {
         let mut one = fx.build(&fx.on_opencl(d.0, fx.n_layers));
         let mut many = fx.build(&fx.on_opencl(d.0, fx.n_layers));
         println!(
-            "{tag} on {}: single launch available: {}, {} workgroups",
+            "{tag} on {}: single launch available: {}, {} workgroups, {}",
             d.1,
             one.opencl.single_launch(),
-            one.opencl.single_launch_groups()
+            one.opencl.single_launch_groups(),
+            one.opencl.single_launch_facts()
         );
         if !one.opencl.single_launch() {
             continue;
@@ -607,12 +619,18 @@ fn bench_tag(tag: &str) {
                     &prompt,
                 );
                 m.opencl.set_single_launch(true);
-                let mut m2 = fx.build(&fx.on_opencl(d.0, fx.n_layers));
-                bench(
-                    &format!("{tag} opencl {}, a launch to a layer", d.1),
-                    &mut m2,
-                    &prompt,
-                );
+                for _ in 0..2 {
+                    let mut m2 = fx.build(&fx.on_opencl(d.0, fx.n_layers));
+                    bench(
+                        &format!(
+                            "{tag} opencl {}, a launch to a layer of {} workgroups",
+                            d.1,
+                            m2.opencl.single_launch_groups()
+                        ),
+                        &mut m2,
+                        &prompt,
+                    );
+                }
             } else {
                 bench(&format!("{tag} opencl {}", d.1), &mut m, &prompt);
             }
@@ -706,6 +724,49 @@ fn opencl_single_launch_layer_by_layer() {
                 .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
             let scale = b.iter().fold(0f32, |m, y| m.max(y.abs()));
             println!("after {upto} layers: largest difference {gap:.3e} of {scale:.3e}");
+        }
+    }
+}
+
+/// Where the time of a prompt goes on each OpenCL device: each stage of the stack waits for the
+/// device and takes its time, against the same prompt untraced.
+#[test]
+#[ignore = "speed bench"]
+fn opencl_prompt_trace() {
+    let fx = Fixture::open();
+    let tokenizer =
+        crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
+            .unwrap();
+    let text = TEXT.repeat(24);
+    let prompt = tokenizer
+        .encode(text.as_str(), false)
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    for d in devices() {
+        let mut m = fx.build(&fx.on_opencl(d.0, fx.n_layers));
+        m.forward(&ids(&prompt), 0).unwrap();
+        let start = std::time::Instant::now();
+        m.forward(&ids(&prompt), 0).unwrap();
+        let plain = start.elapsed().as_secs_f64();
+        m.opencl.start_trace();
+        let start = std::time::Instant::now();
+        m.forward(&ids(&prompt), 0).unwrap();
+        let traced = start.elapsed().as_secs_f64() * 1e3;
+        let stages = m.opencl.take_trace();
+        let in_stack = stages.iter().map(|s| s.1).sum::<f64>() / 1e3;
+        println!(
+            "{TAG} on {}: {} tokens, {:.1} tok/s untraced; traced {traced:.0} ms, {in_stack:.0} ms in the stack",
+            d.1,
+            prompt.len(),
+            prompt.len() as f64 / plain
+        );
+        for (name, us, n) in stages {
+            println!(
+                "  {name:<20} {:>9.1} ms {n:>6} passes {:>9.1} us a pass",
+                us / 1e3,
+                us / n as f64
+            );
         }
     }
 }
