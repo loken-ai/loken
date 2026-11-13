@@ -21,7 +21,7 @@ Major, by state then by priority:
 |---|---|---|---|
 | Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10% of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
 | Expert parallelism | Parallelism | A MoE model's experts are spread across cards when that is faster. | Done |
-| Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Partial |
+| Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Done |
 | Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on 1 and 2 cards. | Partial |
 | Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Done |

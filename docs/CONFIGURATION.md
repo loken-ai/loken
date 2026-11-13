@@ -164,6 +164,9 @@ Both speeds are measured by the instance itself, the first from its hand-overs a
 A peer never measured is asked once.
 A peer measured slow is asked again after the local prefill has run as long as its last hand-over took.
 
+2 instances may each be the prefill peer of the other.
+A prompt read for a peer is read there and never handed over again.
+
 A model with recurrent or windowed layers hands over its whole decode state instead of rows.
 
 The decode state holds every recurrent state, the windowed layers' rows, the global layers' rows and the logits to resume from.

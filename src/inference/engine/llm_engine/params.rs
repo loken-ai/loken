@@ -581,6 +581,8 @@ pub struct GenerationParams {
     pub rules: RequestRules,
     /// Hears the prompt's reading and the request's own figures, when the handler reports them.
     pub probe: Option<std::sync::Arc<crate::request_metrics::RequestProbe>>,
+    /// The prompt is read for the prefill peer that asked for it: it is never handed over.
+    pub for_peer: bool,
 }
 
 /// Which end of a prompt a cut to `truncate_prompt_tokens` keeps.

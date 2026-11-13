@@ -3650,6 +3650,8 @@ mod panic_isolation_gate {
 }
 
 #[cfg(test)]
+mod handover_route_tests;
+#[cfg(test)]
 mod request_figures_tests;
 #[cfg(test)]
 mod tests;

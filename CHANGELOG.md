@@ -71,6 +71,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Speech: speak a long text with pocket-tts in its reference's chunks, the voice held across them.
+- Cluster: let 2 instances each be the prefill peer of the other.
 - API: answer about an image sent to the generate route of a Qwen vision model.
 - API: count images, cached tokens and batched answers in the prompt tokens of every route.
 - Placement: keep a model on 1 card when an unasked context would spread it.

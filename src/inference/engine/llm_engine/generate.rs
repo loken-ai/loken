@@ -209,7 +209,12 @@ impl LlmEngine {
         let sessions = self.sessions.clone();
         // Owned: the meter is fed from inside the blocking closure, which cannot borrow self.
         let metered_model = self.config.model_id.clone();
-        let prefill_peer = self.config.prefill_peer.clone();
+        // A prompt read for a peer is not handed over: the peer that asked waits for it.
+        let prefill_peer = self
+            .config
+            .prefill_peer
+            .clone()
+            .filter(|_| !params.for_peer);
         let cache_scope = params.cache_scope;
         let probe = params.probe.clone();
 

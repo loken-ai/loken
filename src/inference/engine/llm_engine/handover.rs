@@ -10,6 +10,7 @@ impl LlmEngine {
         let params = GenerationParams {
             max_tokens: Some(1),
             temperature: Some(0.0),
+            for_peer: true,
             ..Default::default()
         };
         self.generate(prompt, params)

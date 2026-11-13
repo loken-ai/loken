@@ -417,6 +417,7 @@ impl SamplingRequest {
             cancel: None,
             rules: self.rules,
             probe: None,
+            for_peer: false,
         }
     }
 }
