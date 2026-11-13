@@ -3392,18 +3392,15 @@ extern "C" __global__ void index_scores_heads_f32(
 
 // The keys of each query of a chunk gathered: row `k` of query `i` is `kv[idxs[(start + i) * topk + k]]`,
 // zeros for an empty slot. The output is [count, topk, d].
+// The threads stride over the output's values, so neighbouring threads copy neighbouring values.
 extern "C" __global__ void gather_slots_f32(
         const float * __restrict__ kv, const int * __restrict__ idxs, float * __restrict__ out,
         const long start, const long count, const long topk, const long d) {
-    const long idx = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
-    if (idx >= count * topk) return;
-    const long slot = idxs[start * topk + idx];
-    float * o = out + idx * d;
-    if (slot < 0) {
-        for (long t = 0; t < d; t++) o[t] = 0.0f;
-    } else {
-        const float * k = kv + slot * d;
-        for (long t = 0; t < d; t++) o[t] = k[t];
+    const long total = count * topk * d;
+    const long stride = (long) gridDim.x * (long) blockDim.x;
+    for (long e = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x; e < total; e += stride) {
+        const long slot = idxs[start * topk + e / d];
+        out[e] = slot < 0 ? 0.0f : kv[slot * d + e % d];
     }
 }
 

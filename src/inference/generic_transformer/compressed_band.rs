@@ -26,6 +26,7 @@
 use super::latent_mqa::{
     fresh_stamp, host_rows, phases, pow2_ceil, rotate_tails, LatentMqa, LatentMqaState, SCALE_FLOOR,
 };
+use super::wide::staged;
 use super::wide_sparse_config::{LayerKind, WideSparseMeta};
 use crate::tensor::blockscaled::projection::Projection;
 use crate::tensor::ops::rms_norm;
@@ -617,7 +618,9 @@ impl CompressedBand {
         let (hd, ratio) = (d.head_dim, band.ratio);
         let at = (base, seq);
         let (cos, sin) = phases(&m.inv_freq, base..base + seq);
-        let front = m.front(x2, &cos, &sin, self.indexer.is_some())?;
+        let front = staged("token mixer: front", &Device::Cpu, false, || {
+            m.front(x2, &cos, &sin, self.indexer.is_some())
+        })?;
         let qr = &front.qr;
 
         // The window: the kept rows, then this forward's. Row `old_rows + i` is query `i`'s own.
@@ -633,15 +636,25 @@ impl CompressedBand {
         state.window.len += seq;
 
         // The groups this forward completes, from the rows still filling and this forward's.
+        // Only a kv-source keeps rows to pool.
         let held_groups = state.groups;
         let mut pooled_x = std::mem::take(&mut state.filling);
-        staged("token mixer: group rows", &Device::Cpu, false, || {
-            pooled_x.extend_from_slice(&x2.flatten_all()?.to_vec1::<f32>()?);
-            Ok(())
-        })?;
+        if self.compressor.is_some() {
+            staged("token mixer: group rows", &Device::Cpu, false, || {
+                match x2.cpu_f32_data() {
+                    Ok(rows) => pooled_x.extend_from_slice(rows),
+                    Err(_) => pooled_x.extend(x2.flatten_all()?.to_vec1::<f32>()?),
+                }
+                Ok(())
+            })?;
+        }
         let groups = pooled_x.len() / hidden / ratio;
         let latent = match (&self.compressor, groups) {
-            (Some(c), g) if g > 0 => Some(pool(c, &pooled_x, hidden, ratio, hd, d.eps)?),
+            (Some(c), g) if g > 0 => {
+                Some(staged("token mixer: pool", &Device::Cpu, false, || {
+                    pool(c, &pooled_x, hidden, ratio, hd, d.eps)
+                })?)
+            }
             _ => None,
         };
         // A group's rows turn at the group's first position.
@@ -653,7 +666,9 @@ impl CompressedBand {
             (Some(ix), true) => {
                 let mut all = std::mem::take(&mut state.index_keys);
                 if let Some(latent) = &latent {
-                    let fresh = self.index_keys_of(ix, latent, groups, &gcos, &gsin, false)?;
+                    let fresh = staged("token mixer: index keys", &Device::Cpu, false, || {
+                        self.index_keys_of(ix, latent, groups, &gcos, &gsin, false)
+                    })?;
                     Arc::make_mut(&mut all).extend(fresh);
                 }
                 let published = shared(&all);
@@ -732,21 +747,23 @@ impl CompressedBand {
             keys.extend_from_slice(&compressed);
             Ok(slots)
         })?;
-        #[cfg(feature = "gpu")]
-        if let (Some(card), Some(cf)) = (&m.card, &front.card) {
-            return card.attend_rows(m, cf, &keys, &slots, width, seq);
-        }
-        let q = m.queries(qr, &cos, &sin)?;
-        let o = attend_slots(
-            &q,
-            &keys,
-            &m.w.sink,
-            &slots,
-            width,
-            (d.heads, hd),
-            m.scale(),
-        );
-        m.project_out(o, &cos, &sin, seq)
+        staged("token mixer: attend", &Device::Cpu, false, || {
+            #[cfg(feature = "gpu")]
+            if let (Some(card), Some(cf)) = (&m.card, &front.card) {
+                return card.attend_rows(m, cf, &keys, &slots, width, seq);
+            }
+            let q = m.queries(qr, &cos, &sin)?;
+            let o = attend_slots(
+                &q,
+                &keys,
+                &m.w.sink,
+                &slots,
+                width,
+                (d.heads, hd),
+                m.scale(),
+            );
+            m.project_out(o, &cos, &sin, seq)
+        })
     }
 
     /// The row `x2` `[1, hidden]` at position `pos`, after the rows the state holds.
@@ -930,39 +947,52 @@ impl CompressedBand {
             self.cell.with(|p| put(&mut p.picks, at, published));
             return Ok(out);
         }
-        let q = self.index_queries(ix, qr, cos, sin)?;
+        let (q, weights) = staged("token mixer: index queries", &Device::Cpu, false, || {
+            let q = self.index_queries(ix, qr, cos, sin)?;
+            let weights = linear(x2, &ix.weights_proj)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            Ok((q, weights))
+        })?;
         let scale = (ihd as f32).powf(-0.5) * (nh as f32).powf(-0.5);
-        let weights = linear(x2, &ix.weights_proj)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
         let reach = |i: usize| (base + i + 1) / ratio;
 
         // The score of every reachable compressed row, `-inf` beyond.
-        let mut scores = vec![f32::NEG_INFINITY; seq * gtot];
-        for (i, row) in scores.chunks_exact_mut(gtot).enumerate() {
-            let (qi, wi) = (
-                &q[i * nh * ihd..(i + 1) * nh * ihd],
-                &weights[i * nh..(i + 1) * nh],
-            );
-            for (t, s) in row.iter_mut().enumerate().take(reach(i).min(gtot)) {
-                *s = index_score(qi, &index_keys[t * ihd..(t + 1) * ihd], wi, scale);
-            }
-        }
+        // The queries are scored on all the cores, 1 query a task.
+        // A task scores the rows in blocks, a lane per row.
+        let mut scores = staged("token mixer: scores", &Device::Cpu, false, || {
+            let mut scores = vec![f32::NEG_INFINITY; seq * gtot];
+            let lanes = key_lanes(index_keys, ihd);
+            scores
+                .par_chunks_exact_mut(gtot)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    let qi = &q[i * nh * ihd..(i + 1) * nh * ihd];
+                    let wi = &weights[i * nh..(i + 1) * nh];
+                    let reached = &mut row[..reach(i).min(gtot)];
+                    index_scores(qi, &lanes, ihd, wi, scale, reached);
+                });
+            Ok(scores)
+        })?;
         let reaches: Vec<usize> = (0..seq).map(reach).collect();
-        if band.candidate_source {
-            let (blocks, size) = (band.candidate_blocks, band.candidate_block_size);
-            let mask = select_candidate_blocks(&scores, seq, gtot, &reaches, blocks, size);
-            self.cell.with(|p| put(&mut p.candidates, at, mask));
-        } else if band.uses_candidates {
-            let mask = self
-                .cell
-                .with(|p| read(&p.candidates, at, "candidate blocks"))?;
-            scores = apply_candidate_mask(&scores, &mask);
-        }
+        staged("token mixer: candidates", &Device::Cpu, false, || {
+            if band.candidate_source {
+                let (blocks, size) = (band.candidate_blocks, band.candidate_block_size);
+                let mask = select_candidate_blocks(&scores, seq, gtot, &reaches, blocks, size);
+                self.cell.with(|p| put(&mut p.candidates, at, mask));
+            } else if band.uses_candidates {
+                let mask = self
+                    .cell
+                    .with(|p| read(&p.candidates, at, "candidate blocks"))?;
+                scores = apply_candidate_mask(&scores, &mask);
+            }
+            Ok(())
+        })?;
 
         // The best `index_topk` reachable rows by score, ties to the lower row, compacted.
         let topk = itopk.min(gtot);
         let mut out = vec![-1i32; seq * itopk];
+        let top = std::time::Instant::now();
         out.par_chunks_mut(itopk)
             .enumerate()
             .for_each(|(qi, slots)| {
@@ -980,6 +1010,10 @@ impl CompressedBand {
                     *slot = (t + offset) as i32;
                 }
             });
+        if crate::inference::stage_prof::stage_prof_enabled() {
+            let ns = top.elapsed().as_nanos() as u64;
+            crate::inference::stage_prof::prof_record("token mixer: top rows", ns);
+        }
         let published = out.clone();
         self.cell.with(|p| put(&mut p.picks, at, published));
         Ok(out)
@@ -1115,6 +1149,49 @@ fn index_score(q: &[f32], key: &[f32], weights: &[f32], scale: f32) -> f32 {
     acc
 }
 
+/// Rows [`index_scores`] scores together, a lane each.
+const SCORE_LANES: usize = 16;
+
+/// `keys` `[rows, hd]` in blocks of [`SCORE_LANES`] rows, each block input-major.
+///
+/// Value `k` of row `j` of block `b` is at `(b * hd + k) * SCORE_LANES + j`.
+/// The lanes past the last row are zero.
+fn key_lanes(keys: &[f32], hd: usize) -> Vec<f32> {
+    let rows = keys.len() / hd.max(1);
+    let mut out = vec![0f32; rows.div_ceil(SCORE_LANES) * hd * SCORE_LANES];
+    for (r, key) in keys.chunks_exact(hd.max(1)).enumerate() {
+        let (b, j) = (r / SCORE_LANES, r % SCORE_LANES);
+        for (k, &v) in key.iter().enumerate() {
+            out[(b * hd + k) * SCORE_LANES + j] = v;
+        }
+    }
+    out
+}
+
+/// The index scores of the first `out.len()` rows of `lanes`, laid out by [`key_lanes`], against
+/// the query `q` `[heads * hd]`.
+///
+/// Each is the value [`index_score`] gives the row, by the same steps in the same order.
+fn index_scores(q: &[f32], lanes: &[f32], hd: usize, weights: &[f32], scale: f32, out: &mut [f32]) {
+    let block = hd * SCORE_LANES;
+    for (b, scores) in out.chunks_mut(SCORE_LANES).enumerate() {
+        let keys = &lanes[b * block..(b + 1) * block];
+        let mut acc = [0f32; SCORE_LANES];
+        for (qh, &w) in q.chunks_exact(hd).zip(weights) {
+            let mut dot = [0f32; SCORE_LANES];
+            for (kv, &a) in keys.chunks_exact(SCORE_LANES).zip(qh) {
+                for (d, &k) in dot.iter_mut().zip(kv) {
+                    *d += a * k;
+                }
+            }
+            for (s, d) in acc.iter_mut().zip(dot) {
+                *s += d.max(0.0) * w * scale;
+            }
+        }
+        scores.copy_from_slice(&acc[..scores.len()]);
+    }
+}
+
 /// Every query head of `q` `[n, heads * hd]` against the rows of `keys` `[rows, hd]` its row's
 /// `width` slots name, `-1` naming none. The rows are the values too. The sink logit of the head
 /// takes softmax mass and adds no value. Returns `[n, heads * hd]`.
@@ -1207,35 +1284,41 @@ pub fn select_candidate_blocks(
 ) -> Vec<bool> {
     let num_blocks = width.div_ceil(block_size);
     let mut out = vec![false; n_queries * width];
-    for q in 0..n_queries {
-        let mut bscore = vec![f32::NEG_INFINITY; num_blocks];
-        for (j, bs) in bscore.iter_mut().enumerate() {
-            for p in j * block_size..((j + 1) * block_size).min(width) {
-                *bs = bs.max(logits[q * width + p]);
-            }
-        }
-        let last = (compress_lens[q].saturating_sub(1)) / block_size;
-        if last < num_blocks {
-            bscore[last] = f32::INFINITY;
-        }
-        let k = topk_blocks.min(num_blocks);
-        let mut order: Vec<usize> = (0..num_blocks).collect();
-        order.sort_by(|&a, &c| bscore[c].partial_cmp(&bscore[a]).unwrap());
-        for &j in order.iter().take(k) {
-            if bscore[j] > f32::NEG_INFINITY {
+    if width == 0 {
+        return out;
+    }
+    // The queries are taken on all the cores, 1 query a task.
+    out.par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(q, row)| {
+            let mut bscore = vec![f32::NEG_INFINITY; num_blocks];
+            for (j, bs) in bscore.iter_mut().enumerate() {
                 for p in j * block_size..((j + 1) * block_size).min(width) {
-                    out[q * width + p] = true;
+                    *bs = bs.max(logits[q * width + p]);
                 }
             }
-        }
-    }
+            let last = (compress_lens[q].saturating_sub(1)) / block_size;
+            if last < num_blocks {
+                bscore[last] = f32::INFINITY;
+            }
+            let k = topk_blocks.min(num_blocks);
+            let mut order: Vec<usize> = (0..num_blocks).collect();
+            order.sort_by(|&a, &c| bscore[c].partial_cmp(&bscore[a]).unwrap());
+            for &j in order.iter().take(k) {
+                if bscore[j] > f32::NEG_INFINITY {
+                    for kept in &mut row[j * block_size..((j + 1) * block_size).min(width)] {
+                        *kept = true;
+                    }
+                }
+            }
+        });
     out
 }
 
 /// The second level: every score outside the mask of the first level set to `-inf`.
 pub fn apply_candidate_mask(score: &[f32], mask: &[bool]) -> Vec<f32> {
     score
-        .iter()
+        .par_iter()
         .zip(mask)
         .map(|(&s, &keep)| if keep { s } else { f32::NEG_INFINITY })
         .collect()
@@ -1599,6 +1682,26 @@ mod tests {
         assert_eq!(e2m1_round(2.6), 3.0);
         assert_eq!(e2m1_round(5.0), 4.0);
         assert_eq!(e2m1_round(FP4_MAX), FP4_MAX);
+    }
+
+    /// Rows scored in blocks give, bit for bit, each row scored alone.
+    #[test]
+    fn index_rows_scored_in_blocks_give_each_row_alone() {
+        let (heads, hd) = (3, 40);
+        for rows in [1usize, 16, 37] {
+            let keys = values(rows * hd, 21, 1.5);
+            let q = values(heads * hd, 22, 1.0);
+            let w = values(heads, 23, 1.0);
+            let lanes = key_lanes(&keys, hd);
+            for reach in [0, rows / 2, rows] {
+                let mut got = vec![f32::NEG_INFINITY; reach];
+                index_scores(&q, &lanes, hd, &w, 0.3, &mut got);
+                for (t, s) in got.iter().enumerate() {
+                    let alone = index_score(&q, &keys[t * hd..(t + 1) * hd], &w, 0.3);
+                    assert_eq!(s.to_bits(), alone.to_bits(), "row {t} of {rows}");
+                }
+            }
+        }
     }
 
     #[test]

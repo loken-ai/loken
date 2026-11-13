@@ -355,6 +355,36 @@ fn matmul_matches_oracle() {
 }
 
 #[test]
+fn a_large_f32_product_gives_each_output_its_ordered_fold() {
+    // Narrow and wide outputs, rows past a multiple of 4, a zero input and several k blocks.
+    for (m, k, n) in [
+        (37usize, 300usize, 100usize),
+        (37, 300, 1100),
+        (3, 600, 700),
+    ] {
+        let mut a = data(m * k, 11);
+        a[5] = 0.0;
+        let b = data(k * n, 12);
+        assert!(m * k * n >= 1 << 20, "{m}x{k}x{n} is too small to be split");
+        let mut out = vec![f32::NAN; m * n];
+        gemm_f32_cpu(&a, &b, m, k, n, &mut out);
+        for i in 0..m {
+            for j in 0..n {
+                let mut want = 0f32;
+                for kk in 0..k {
+                    want += a[i * k + kk] * b[kk * n + j];
+                }
+                assert_eq!(
+                    out[i * n + j].to_bits(),
+                    want.to_bits(),
+                    "row {i} column {j}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn softmax_matches_oracle() {
     let x = data(2 * 3 * 17, 3);
     let nt = Tensor::from_vec_f32(x.clone(), vec![2, 3, 17])

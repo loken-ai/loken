@@ -815,15 +815,17 @@ pub(super) fn gemm_nt_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize
 }
 
 /// Blocked, rayon-parallel row-major f32 gemm: `out[m,n] = a[m,k] . b[k,n]`
-/// (`out` fully overwritten). Threads own disjoint column stripes through a
-/// local tile, and the k loop is blocked so each streamed B stripe stays
+/// (`out` fully overwritten). Threads own disjoint column stripes and row
+/// blocks through a local tile, and the k loop is blocked so each streamed B stripe stays
 /// cache-resident - the naive row-rescan pattern re-reads B from DRAM
 /// `m` times and collapses on megapixel conv/attention shapes.
 pub(super) fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) {
     const NT: usize = 512; // column-stripe width
     const KB: usize = 256; // k block: B k-tile = KB*NT*4B = 512 KB, L2-resident
 
-    let compute_tile = |j0: usize| -> (usize, Vec<f32>) {
+    // A tile holds rows `r0..r0 + m` of the stripe at `j0`.
+    let compute_tile = |j0: usize, r0: usize, m: usize| -> (usize, usize, Vec<f32>) {
+        let a = &a[r0 * k..(r0 + m) * k];
         let nt = NT.min(n - j0);
         let mut tile = vec![0f32; m * nt];
         let mut kb = 0;
@@ -870,22 +872,34 @@ pub(super) fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, o
             }
             kb += kbl;
         }
-        (j0, tile)
+        (j0, r0, tile)
     };
 
-    let tiles: Vec<(usize, Vec<f32>)> = if m * k * n >= (1 << 20) && n > NT {
+    // Each output is the fold of its own row and column over `k` in order.
+    // So any split of the rows gives the same bits.
+    //
+    // A block of rows holds a multiple of 4 rows.
+    // So every row takes the path it takes when all the rows go together.
+    let stripes = n.div_ceil(NT);
+    let blocks = (rayon::current_num_threads() / stripes.max(1)).clamp(1, m.div_ceil(4).max(1));
+    let rows = m.div_ceil(blocks).next_multiple_of(4).max(4);
+    let blocks = m.div_ceil(rows).max(1);
+    let tiles: Vec<(usize, usize, Vec<f32>)> = if m * k * n >= (1 << 20) && stripes * blocks > 1 {
         use rayon::prelude::*;
-        (0..n.div_ceil(NT))
+        (0..stripes * blocks)
             .into_par_iter()
-            .map(|t| compute_tile(t * NT))
+            .map(|t| {
+                let r0 = (t % blocks) * rows;
+                compute_tile((t / blocks) * NT, r0, rows.min(m - r0))
+            })
             .collect()
     } else {
-        (0..n.div_ceil(NT)).map(|t| compute_tile(t * NT)).collect()
+        (0..stripes).map(|t| compute_tile(t * NT, 0, m)).collect()
     };
-    for (j0, tile) in tiles {
-        let nt = tile.len() / m.max(1);
-        for i in 0..m {
-            out[i * n + j0..][..nt].copy_from_slice(&tile[i * nt..][..nt]);
+    for (j0, r0, tile) in tiles {
+        let nt = NT.min(n - j0);
+        for (i, row) in tile.chunks_exact(nt).enumerate() {
+            out[(r0 + i) * n + j0..][..nt].copy_from_slice(row);
         }
     }
 }

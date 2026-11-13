@@ -1035,6 +1035,47 @@ mod tests {
         dev.stream().clone_dtoh(s).unwrap()
     }
 
+    /// The gather of a chunk's slots gives the rows they name, zeros for an empty slot, when
+    /// fewer threads run than values are gathered.
+    #[test]
+    fn the_card_gathers_the_rows_its_slots_name() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card gather is NOT covered by this run");
+            return;
+        };
+        let (rows, d, topk, start, count) = (9usize, 40usize, 5usize, 1usize, 3usize);
+        let kv = wave(rows * d, 0.31, 2.0);
+        let idxs: Vec<i32> = (0..(start + count) * topk)
+            .map(|i| match i % 4 {
+                3 => -1,
+                _ => ((i * 7) % rows) as i32,
+            })
+            .collect();
+        let mut want = vec![0f32; count * topk * d];
+        for (k, row) in want.chunks_exact_mut(d).enumerate() {
+            if let Ok(slot) = usize::try_from(idxs[start * topk + k]) {
+                row.copy_from_slice(&kv[slot * d..(slot + 1) * d]);
+            }
+        }
+        let kvd = upload_f32(&dev, "t", &kv).unwrap();
+        let idd = upload_i32(&dev, "t", &idxs).unwrap();
+        let out = upload_f32(&dev, "t", &vec![f32::NAN; count * topk * d]).unwrap();
+        let func = dev.quantized_fn("gather_slots_f32").unwrap();
+        let (start_i, count_i, topk_i, d_i) = (start as i64, count as i64, topk as i64, d as i64);
+        let mut g = dev.stream().launch_builder(&func);
+        g.arg(&kvd);
+        g.arg(&idd);
+        g.arg(&out);
+        g.arg(&start_i);
+        g.arg(&count_i);
+        g.arg(&topk_i);
+        g.arg(&d_i);
+        // 1 block, fewer threads than gathered values.
+        unsafe { g.launch(grid_for(THREADS)) }.unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(bits(&download(&dev, &out)), bits(&want));
+    }
+
     /// The card's fp8 and fp4 round trips give the host's bits on rows of varied magnitude.
     #[test]
     fn the_card_rounds_as_the_host_does() {
