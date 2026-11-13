@@ -151,7 +151,9 @@ fn engram_table(source: &TensorSource<'_>, name: &str) -> Result<EngramTable> {
     }
     let qt = source.read(name, &Device::Cpu)?;
     if crate::tensor::quant_view::native_view_supported(qt.dtype()) {
-        return Ok(EngramTable::Streamed(Arc::new(qt)));
+        let table = EngramTable::Streamed(Arc::new(qt));
+        table.advise_random();
+        return Ok(table);
     }
     // CONVERSION: a table no host kernel reads in place is held dense F32.
     Ok(EngramTable::Resident(

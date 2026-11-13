@@ -404,11 +404,23 @@ impl EngramTable {
         }
     }
 
-    /// Ask the kernel to read the fp8 rows at random: a lookup reads a few dozen bytes.
+    /// Ask the kernel to read the rows of a table read in place at random: a lookup reads a
+    /// few hundred bytes.
+    ///
+    /// A fault then reads the pages of the row alone, not a window of rows around it.
     pub fn advise_random(&self) {
-        if let Self::Fp8Rows { bytes, scales, .. } = self {
-            bytes.advise_random();
-            scales.advise_random();
+        match self {
+            Self::Fp8Rows { bytes, scales, .. } => {
+                bytes.advise_random();
+                scales.advise_random();
+            }
+            #[cfg(unix)]
+            Self::Streamed(t) => crate::tensor::mapped::advise_bytes(
+                t.native_qtensor().data(),
+                libc::MADV_RANDOM,
+                true,
+            ),
+            _ => {}
         }
     }
 
@@ -894,6 +906,22 @@ mod tests {
                 frozen::expect_f32("units", &key("out"), &out);
                 assert_ne!(bits(&got), bits(&r), "the layer adds nothing");
                 history.advance(&m, part);
+            }
+        }
+    }
+
+    /// A table advised random reads the rows it read before, from each table storage.
+    #[test]
+    fn a_table_advised_random_reads_the_same_rows() {
+        let rows = 64usize;
+        for kind in 0..3 {
+            let table = tables(kind, rows);
+            let before: Vec<Vec<f32>> = (0..rows as u64).map(|r| table.row(r).unwrap()).collect();
+            table.advise_random();
+            for (r, want) in before.iter().enumerate() {
+                let got = table.row(r as u64).unwrap();
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(want), "table {kind} row {r}");
             }
         }
     }

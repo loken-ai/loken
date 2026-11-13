@@ -63,6 +63,27 @@ pub struct SinkhornMixes {
     pub comb: Vec<Vec<Vec<f32>>>,
 }
 
+/// The pre, post and comb coefficients of 1 token.
+type Coefficients = (Vec<f32>, Vec<f32>, Vec<Vec<f32>>);
+
+impl SinkhornMixes {
+    /// The coefficients of every token, in the order given.
+    fn of(per_token: Vec<Coefficients>) -> Self {
+        let n = per_token.len();
+        let mut mixes = Self {
+            pre: Vec::with_capacity(n),
+            post: Vec::with_capacity(n),
+            comb: Vec::with_capacity(n),
+        };
+        for (p, q, c) in per_token {
+            mixes.pre.push(p);
+            mixes.post.push(q);
+            mixes.comb.push(c);
+        }
+        mixes
+    }
+}
+
 /// One mixer of the Sinkhorn wide residual: the coefficient projection, its 3 scales and its
 /// biases.
 pub struct SinkhornMixer {
@@ -207,10 +228,8 @@ impl SinkhornMixer {
                 .collect()
         };
 
-        let (scale, base) = (&self.scale, &self.base);
-        let (iters, hc_eps, norm_eps) = (self.meta.iterations, self.meta.eps, self.norm_eps);
         // Tokens are independent: each is computed in the order a single token would be.
-        let per_token: Vec<(Vec<f32>, Vec<f32>, Vec<Vec<f32>>)> = (0..n)
+        let per_token: Vec<Coefficients> = (0..n)
             .into_par_iter()
             .map(|t| {
                 let row = &rows[t * flat..(t + 1) * flat];
@@ -219,36 +238,100 @@ impl SinkhornMixer {
                 } else {
                     row.iter().map(|v| v * v).sum()
                 };
-                let rsqrt = 1.0 / (ss / flat as f32 + norm_eps).sqrt();
-                let m: Vec<f32> = mixes[t * mix_hc..(t + 1) * mix_hc]
-                    .iter()
-                    .map(|v| v * rsqrt)
-                    .collect();
-                let pre_t: Vec<f32> = (0..hc)
-                    .map(|c| sigmoid(m[c] * scale[0] + base[c]) + hc_eps)
-                    .collect();
-                let post_t: Vec<f32> = (0..hc)
-                    .map(|c| 2.0 * sigmoid(m[hc + c] * scale[1] + base[hc + c]))
-                    .collect();
-                let mut cm = vec![vec![0f32; hc]; hc];
-                for i in 0..hc {
-                    for j in 0..hc {
-                        cm[i][j] = m[2 * hc + i * hc + j] * scale[2] + base[2 * hc + i * hc + j];
-                    }
-                }
-                sinkhorn(&mut cm, iters, hc_eps);
-                (pre_t, post_t, cm)
+                self.coefficients(&mixes[t * mix_hc..(t + 1) * mix_hc], ss)
             })
             .collect();
-        let mut pre = Vec::with_capacity(n);
-        let mut post = Vec::with_capacity(n);
-        let mut comb = Vec::with_capacity(n);
-        for (p, q, c) in per_token {
-            pre.push(p);
-            post.push(q);
-            comb.push(c);
+        Ok(SinkhornMixes::of(per_token))
+    }
+
+    /// The pre, post and comb coefficients of 1 token from its projection `dots` and the sum
+    /// of the squares of its residual row `ss`.
+    fn coefficients(&self, dots: &[f32], ss: f32) -> Coefficients {
+        let hc = self.meta.streams;
+        let flat = hc * self.dim;
+        let (scale, base) = (&self.scale, &self.base);
+        let (iters, hc_eps, norm_eps) = (self.meta.iterations, self.meta.eps, self.norm_eps);
+        let rsqrt = 1.0 / (ss / flat as f32 + norm_eps).sqrt();
+        let m: Vec<f32> = dots.iter().map(|v| v * rsqrt).collect();
+        let pre_t: Vec<f32> = (0..hc)
+            .map(|c| sigmoid(m[c] * scale[0] + base[c]) + hc_eps)
+            .collect();
+        let post_t: Vec<f32> = (0..hc)
+            .map(|c| 2.0 * sigmoid(m[hc + c] * scale[1] + base[hc + c]))
+            .collect();
+        let mut cm = vec![vec![0f32; hc]; hc];
+        for i in 0..hc {
+            for j in 0..hc {
+                cm[i][j] = m[2 * hc + i * hc + j] * scale[2] + base[2 * hc + i * hc + j];
+            }
         }
-        Ok(SinkhornMixes { pre, post, comb })
+        sinkhorn(&mut cm, iters, hc_eps);
+        (pre_t, post_t, cm)
+    }
+
+    /// The coefficients of every row of `r` `[b, seq, streams * dim]` and the sublayer input
+    /// `[b, seq, dim]`: the streams summed by the pre mix `pre`, then normalised by `norm`
+    /// `[dim]` with `eps`.
+    ///
+    /// The result holds the bits of [`Self::mixes`], then [`Self::pre`], then the host's RMS
+    /// norm.
+    /// With several tokens, each residual row is read once for all 3.
+    /// The tokens run across the cores.
+    pub fn mixes_and_input(
+        &self,
+        r: &Tensor,
+        pre: &[Vec<f32>],
+        norm: &Tensor,
+        eps: f32,
+    ) -> Result<(SinkhornMixes, Tensor)> {
+        use rayon::prelude::*;
+        let (hc, d) = (self.meta.streams, self.dim);
+        let flat = hc * d;
+        let (b, s, wide) = r.dims3()?;
+        let n = b * s;
+        let host_norm = matches!(norm.device(), Device::Cpu)
+            && norm.dtype() == DType::F32
+            && norm.dims() == [d];
+        if n < 2 || !host_norm || wide != flat || pre.len() < n {
+            let mixes = self.mixes(r)?;
+            let input = crate::tensor::ops::rms_norm(&self.pre(r, pre)?, norm, eps)?;
+            return Ok((mixes, input));
+        }
+        let xf = r.reshape((n, flat))?;
+        let rows = dense_f32(&xf)?;
+        let w = dense_f32(&self.func)?;
+        let gamma = norm.to_vec1::<f32>()?;
+        let mix_hc = self.meta.mix_rows();
+        let mut input = vec![0f32; n * d];
+        let per_token: Vec<Coefficients> = input
+            .par_chunks_mut(d)
+            .enumerate()
+            .map(|(t, o)| {
+                let row = &rows[t * flat..(t + 1) * flat];
+                let dots: Vec<f32> = (0..mix_hc)
+                    .map(|m| dot8(row, &w[m * flat..(m + 1) * flat]))
+                    .collect();
+                let coefficients = self.coefficients(&dots, dot8(row, row));
+                for c in 0..hc {
+                    let wc = pre[t][c];
+                    let base = c * d;
+                    for k in 0..d {
+                        o[k] += wc * row[base + k];
+                    }
+                }
+                let mut ss = 0f32;
+                for &v in o.iter() {
+                    ss += v * v;
+                }
+                let denom = (ss / d as f32 + eps).sqrt();
+                for (v, &g) in o.iter_mut().zip(gamma.iter()) {
+                    *v = (*v / denom) * g;
+                }
+                coefficients
+            })
+            .collect();
+        let input = Tensor::from_vec(input, (b, s, d), &Device::Cpu)?;
+        Ok((SinkhornMixes::of(per_token), input))
     }
 
     /// The sublayer input `[b, seq, dim]`: the streams of `r` `[b, seq, streams * dim]` summed,
@@ -483,6 +566,41 @@ mod tests {
             let next = m.post(&out, &r, &got.post, &got.comb).unwrap();
             assert_eq!(next.dims(), [1, seq, HC * DIM]);
             frozen::expect_f32("units", &key("next"), &flat(&next));
+        }
+    }
+
+    /// The coefficients and the normalised input read in 1 pass over the rows have the bits of
+    /// the coefficients, the pre mix and the host's RMS norm taken apart, for a batch and for a
+    /// single token.
+    #[test]
+    fn the_mixes_and_input_in_one_pass_keep_the_bits_of_the_3_steps() {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (seq, seed) in [(7usize, 31u64), (1, 37)] {
+            let m = mixer(seed);
+            let r = Tensor::from_vec(
+                noise(seq * HC * DIM, seed + 2),
+                (1, seq, HC * DIM),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let pre: Vec<Vec<f32>> = (0..seq).map(|t| noise(HC, seed + 10 + t as u64)).collect();
+            let gamma = Tensor::from_vec(noise(DIM, seed + 4), DIM, &Device::Cpu).unwrap();
+            let want_mixes = m.mixes(&r).unwrap();
+            let summed = m.pre(&r, &pre).unwrap();
+            let want = crate::tensor::ops::rms_norm(&summed, &gamma, NORM_EPS).unwrap();
+            let (got_mixes, got) = m.mixes_and_input(&r, &pre, &gamma, NORM_EPS).unwrap();
+            assert_eq!(got.dims(), [1, seq, DIM]);
+            assert_eq!(bits(&flat(&got)), bits(&flat(&want)), "{seq} rows: input");
+            for (a, b) in [
+                (got_mixes.pre.concat(), want_mixes.pre.concat()),
+                (got_mixes.post.concat(), want_mixes.post.concat()),
+                (
+                    got_mixes.comb.concat().concat(),
+                    want_mixes.comb.concat().concat(),
+                ),
+            ] {
+                assert_eq!(bits(&a), bits(&b), "{seq} rows: coefficients");
+            }
         }
     }
 

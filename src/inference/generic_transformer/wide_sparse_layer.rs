@@ -960,9 +960,9 @@ pub(super) fn attention_half(
 ) -> Result<(Tensor, Vec<Vec<f32>>, Tensor)> {
     let host = Device::Cpu;
     let (mixes, input) = staged("mix_token", &host, false, || {
-        let mixes = block.attn_mix.mixes(r)?;
-        let input = rms_norm(&block.attn_mix.pre(r, pre)?, &block.attn_norm, block.eps)?;
-        Ok((mixes, input))
+        block
+            .attn_mix
+            .mixes_and_input(r, pre, &block.attn_norm, block.eps)
     })?;
     let out = token_mixer_out(block, mixer, &input, pos)?;
     let next = staged("combine", &host, false, || {
@@ -1101,12 +1101,11 @@ impl GenericTransformerLayer {
             .sinkhorn
             .as_ref()
             .ok_or_else(|| crate::tensor::Error::msg("a Sinkhorn layer without its block"))?;
-        let mixes = block.ffn_mix.mixes(&mid)?;
-        let input = rms_norm(
-            &block.ffn_mix.pre(&mid, &attn_pre)?,
-            &block.ffn_norm,
-            block.eps,
-        )?;
+        let (mixes, input) = staged("mix_ffn", &Device::Cpu, false, || {
+            block
+                .ffn_mix
+                .mixes_and_input(&mid, &attn_pre, &block.ffn_norm, block.eps)
+        })?;
         let out = staged("experts", &Device::Cpu, false, || block.ffn.forward(&input))?;
         let next = block.ffn_mix.post(&out, &mid, &mixes.post, &mixes.comb)?;
         block.carry.put(index_pos, seq, mixes.pre);
