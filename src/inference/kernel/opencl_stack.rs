@@ -1310,7 +1310,13 @@ fn barrier_probe_holds(device: cl_device_id) -> bool {
     {
         return held;
     }
-    let held = probe_grid_barrier(device).unwrap_or(false);
+    let held = match probe_grid_barrier(device) {
+        Ok(held) => held,
+        Err(e) => {
+            tracing::warn!("an OpenCL device cannot run the barrier probe: {e:#}");
+            false
+        }
+    };
     if !held {
         tracing::warn!(
             "an OpenCL device fails the device-wide barrier the layers rely on; it is not used for layers"
