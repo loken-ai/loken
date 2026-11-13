@@ -118,6 +118,8 @@ impl LlmEngine {
             rate,
             drafted: 0.0,
             lookup: 1.0,
+            prompt_tokens: 0,
+            prompt_rate: None,
         };
         let (held, other) = match batched {
             true => (LonePath::Batched, LonePath::Serial),
@@ -420,11 +422,25 @@ impl LlmEngine {
                 if let Some(rate) = first_token
                     .and_then(|at| lone_rate(gen.len(), done.duration_since(at).as_secs_f64()))
                 {
+                    let (prompt_read, prompt_s) = admitted.map_or((0, 0.0), |(at, cached)| {
+                        (
+                            super::handover_rate::tokens_read(prompt_len, cached, false),
+                            first_token
+                                .map_or(0.0, |t| t.saturating_duration_since(at).as_secs_f64()),
+                        )
+                    });
                     let decode = super::batching::LoneDecode {
                         tokens: gen.len(),
                         rate,
                         drafted: 0.0,
                         lookup: super::batching::lookup_share(&prompt_tokens, &gen),
+                        prompt_tokens: prompt_read,
+                        // The worker reads a prompt a chunk of this size at a time.
+                        prompt_rate: super::batching::LoneDecode::prompt_rate(
+                            prompt_read,
+                            super::PREFILL_CHUNK_TOKENS,
+                            prompt_s,
+                        ),
                     };
                     batching
                         .lock()
@@ -638,6 +654,11 @@ impl LlmEngine {
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
             let mut reused_prompt_tokens: usize;
+            // The prompt tokens the cache held before a prefill peer handed the prompt over.
+            let mut held_before_handover: Option<usize> = None;
+            // The prompt tokens the request had to read when it arrived, and the model's
+            // prefill chunk.
+            let mut arrival_read = (0usize, usize::MAX);
             // What the decode takes of a card beyond the request's start: the snapshots
             // leave that much room at the next request.
             let decode_free_start: Option<u64>;
@@ -922,7 +943,7 @@ impl LlmEngine {
                     // The resident KV serves only the caller that wrote it.
                     state.model.set_cache_scope(cache_scope);
                     if let Some(peer) = config.prefill_peer.as_deref() {
-                        super::handover::pull_prompt_from_peer(
+                        held_before_handover = super::handover::pull_prompt_from_peer(
                             state.model.as_mut(),
                             &state.name,
                             prompt.as_str(),
@@ -1307,17 +1328,22 @@ impl LlmEngine {
                 };
                 debug!("STREAMING PREFILL: Forward pass complete");
                 if !is_vision {
+                    let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(
+                        state.model.prefill_shape(),
+                    );
+                    let read = super::handover_rate::tokens_read(
+                        prompt_tokens.len(),
+                        reused_prompt_tokens,
+                        prefill_skipped,
+                    );
                     super::handover_rate::note_local_prefill(
-                        super::handover_rate::tokens_read(
-                            prompt_tokens.len(),
-                            reused_prompt_tokens,
-                            prefill_skipped,
-                        ),
-                        crate::inference::engine::model_backend::adaptive_prefill_chunk(
-                            state.model.prefill_shape(),
-                        ),
+                        read,
+                        chunk,
                         prefill_began.elapsed().as_secs_f64(),
                     );
+                    let at_arrival = held_before_handover
+                        .map_or(read, |held| prompt_tokens.len().saturating_sub(held));
+                    arrival_read = (at_arrival, chunk);
                 }
                 // The first compute window is NOT opened here. Sampling the first token and
                 // reaching the loop happen before that token reaches the client, so charging
@@ -3545,6 +3571,11 @@ impl LlmEngine {
                         .and_then(|at| lone_rate(token_count, at.elapsed().as_secs_f64()))
                     {
                         let accepted = spec_accepted + copy_accepted + pld_stats_accepted;
+                        // The prompt's time runs from the lock to the first token, a hand-over
+                        // included.
+                        let prompt_s = prefill_end.map_or(0.0, |end| {
+                            end.saturating_duration_since(locked).as_secs_f64()
+                        });
                         let decode = super::batching::LoneDecode {
                             tokens: token_count,
                             rate,
@@ -3552,6 +3583,12 @@ impl LlmEngine {
                             lookup: super::batching::lookup_share(
                                 &prompt_tokens,
                                 &generated_token_ids,
+                            ),
+                            prompt_tokens: arrival_read.0,
+                            prompt_rate: super::batching::LoneDecode::prompt_rate(
+                                arrival_read.0,
+                                arrival_read.1,
+                                prompt_s,
                             ),
                         };
                         spec_engine

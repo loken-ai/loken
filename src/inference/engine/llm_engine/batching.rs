@@ -1,7 +1,9 @@
 //! When a model serves requests one at a time and when it batches them.
 //!
 //! Requests that overlap are served by the batch worker.
-//! A lone request takes the path whose measured decode rate is higher.
+//! A lone request takes the path that serves a request like the latest lone one sooner: its
+//! prompt at the path's measured prompt rate, then its answer at the path's measured decode
+//! rate.
 //! The serial path drafts (prompt lookup, a draft head, a drafter model) and takes a prompt
 //! from a prefill peer.
 //! The batch worker does neither.
@@ -40,6 +42,20 @@ pub struct LoneDecode {
     /// Share of the generated tokens that a prompt lookup over the prompt and the answer
     /// would have drafted right.
     pub lookup: f64,
+    /// Prompt tokens the request had to read when it arrived: the prompt less what the cache
+    /// held before any hand-over.
+    pub prompt_tokens: usize,
+    /// Those tokens per second, from the start of the prompt to the first generated token.
+    /// A hand-over from a prefill peer is inside that time.
+    /// `None` when the request read less than a prefill chunk: a short read says nothing.
+    pub prompt_rate: Option<f64>,
+}
+
+impl LoneDecode {
+    /// The prompt rate of `tokens` read in `secs`, when they make at least a prefill `chunk`.
+    pub fn prompt_rate(tokens: usize, chunk: usize, secs: f64) -> Option<f64> {
+        (tokens >= chunk.max(1) && secs > 0.0 && secs.is_finite()).then(|| tokens as f64 / secs)
+    }
 }
 
 /// The measured decode of lone requests on each path, for the loaded model.
@@ -51,6 +67,12 @@ pub struct PathRates {
     pub latest_lookup: Option<f64>,
     /// Generated tokens of the latest lone request, on either path.
     pub latest_tokens: usize,
+    /// Prompt rate of the last lone request on the serial path that read a prefill chunk.
+    pub serial_prompt_rate: Option<f64>,
+    /// Prompt rate of the last lone request in the worker that read a prefill chunk.
+    pub batched_prompt_rate: Option<f64>,
+    /// Prompt tokens the latest lone request had to read, on either path.
+    pub latest_prompt_tokens: usize,
 }
 
 /// The path a lone request takes.
@@ -61,11 +83,13 @@ pub enum LonePath {
 }
 
 impl PathRates {
-    /// The path with the shorter expected decode for the next lone request, which writes as
-    /// many tokens as the latest lone request did.
-    /// `serial_charge` seconds are added to the serial decode.
+    /// The path that serves the next lone request sooner.
+    /// That request reads as many prompt tokens and writes as many tokens as the latest lone
+    /// request did.
+    /// `serial_charge` seconds are added to the serial path.
     ///
     /// A path without a measure is taken first, the worker before the serial path.
+    /// A path without a prompt rate counts no time for the prompt.
     /// The serial rate is turned into a rate per forward with the share its drafts gave.
     /// That share scales with the prompt lookup share of the latest lone request.
     pub fn choose(&self, serial_charge: f64) -> LonePath {
@@ -76,8 +100,13 @@ impl PathRates {
             return LonePath::Serial;
         };
         let tokens = self.latest_tokens.max(1) as f64;
-        let serial_s = tokens / self.expected_serial_rate(&serial) + serial_charge;
-        if serial_s < tokens / batched.rate {
+        let prompt_s =
+            |rate: Option<f64>| rate.map_or(0.0, |r| self.latest_prompt_tokens as f64 / r);
+        let serial_s = prompt_s(self.serial_prompt_rate)
+            + tokens / self.expected_serial_rate(&serial)
+            + serial_charge;
+        let batched_s = prompt_s(self.batched_prompt_rate) + tokens / batched.rate;
+        if serial_s < batched_s {
             LonePath::Serial
         } else {
             LonePath::Batched
@@ -163,17 +192,25 @@ impl BatchingSignal {
         self.serial_needed
     }
 
-    /// Records the decode of a lone request on one path.
+    /// Records a lone request served on one path.
     pub fn record(&mut self, path: LonePath, decode: LoneDecode) {
-        match path {
+        let prompt_rate = match path {
             LonePath::Serial => {
                 self.rates.serial = Some(decode);
                 self.serial_done += 1;
+                &mut self.rates.serial_prompt_rate
             }
-            LonePath::Batched => self.rates.batched = Some(decode),
+            LonePath::Batched => {
+                self.rates.batched = Some(decode);
+                &mut self.rates.batched_prompt_rate
+            }
+        };
+        if decode.prompt_rate.is_some() {
+            *prompt_rate = decode.prompt_rate;
         }
         self.rates.latest_lookup = Some(decode.lookup);
         self.rates.latest_tokens = decode.tokens;
+        self.rates.latest_prompt_tokens = decode.prompt_tokens;
     }
 
     /// Records a lone serial request moved into the worker.
@@ -373,7 +410,72 @@ mod tests {
             rate,
             drafted,
             lookup,
+            prompt_tokens: 0,
+            prompt_rate: None,
         }
+    }
+
+    /// A plain decode at `rate` after a prompt of `prompt_tokens` read at `prompt_rate`.
+    fn request(rate: f64, prompt_tokens: usize, prompt_rate: f64) -> LoneDecode {
+        LoneDecode {
+            prompt_tokens,
+            prompt_rate: Some(prompt_rate),
+            ..decode(rate, 0.0, 0.0)
+        }
+    }
+
+    /// A serial path that decodes slower but reads the prompt much faster, as with a prefill
+    /// peer on a faster card, wins a long prompt and loses a short one.
+    #[test]
+    fn a_path_that_reads_the_prompt_faster_wins_a_long_prompt() {
+        let mut s = BatchingSignal::default();
+        s.record(LonePath::Batched, request(120.0, 8000, 2000.0));
+        s.record(LonePath::Serial, request(100.0, 8000, 20000.0));
+        assert_eq!(s.arrive(0, true), Switch::ToSerial);
+        // A short prompt reads no chunk: it keeps the rates and moves only the size.
+        s.record(
+            LonePath::Serial,
+            LoneDecode {
+                prompt_tokens: 50,
+                ..decode(100.0, 0.0, 0.0)
+            },
+        );
+        assert_eq!(s.arrive(0, false), Switch::ToBatched);
+    }
+
+    /// Equal prompt rates give the choice of the decode rates alone, and so does a path whose
+    /// prompt rate is not measured yet.
+    #[test]
+    fn equal_prompt_rates_leave_the_decode_choice() {
+        for (serial, batched) in [(180.0, 100.0), (90.0, 100.0)] {
+            let mut by_decode = BatchingSignal::default();
+            by_decode.record(LonePath::Batched, decode(batched, 0.0, 0.0));
+            by_decode.record(LonePath::Serial, decode(serial, 0.0, 0.0));
+            let mut by_request = BatchingSignal::default();
+            by_request.record(LonePath::Batched, request(batched, 4000, 3000.0));
+            by_request.record(LonePath::Serial, request(serial, 4000, 3000.0));
+            let mut unmeasured = BatchingSignal::default();
+            unmeasured.record(LonePath::Batched, decode(batched, 0.0, 0.0));
+            unmeasured.record(LonePath::Serial, request(serial, 4000, 3000.0));
+            assert_eq!(
+                by_request.rates.choose(0.0),
+                by_decode.rates.choose(0.0),
+                "{serial} against {batched}"
+            );
+            assert_eq!(
+                unmeasured.rates.choose(0.0),
+                LonePath::Batched,
+                "a path that counts no prompt time is the sooner"
+            );
+        }
+    }
+
+    /// Only a read of at least a chunk gives a prompt rate.
+    #[test]
+    fn a_short_read_gives_no_prompt_rate() {
+        assert_eq!(LoneDecode::prompt_rate(100, 512, 1.0), None);
+        assert_eq!(LoneDecode::prompt_rate(1024, 512, 2.0), Some(512.0));
+        assert_eq!(LoneDecode::prompt_rate(1024, 512, 0.0), None);
     }
 
     #[test]
@@ -419,6 +521,7 @@ mod tests {
             batched: Some(decode(150.0, 0.0, 0.5)),
             latest_lookup: Some(0.5),
             latest_tokens: 200,
+            ..PathRates::default()
         };
         assert_eq!(rates.choose(0.0), LonePath::Serial);
     }

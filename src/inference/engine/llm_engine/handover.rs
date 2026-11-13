@@ -92,17 +92,19 @@ fn handover_of(
 /// Has the instance at `peer` read `prompt` when the cache here is at least a prefill chunk short
 /// of the whole and handing the prompt over is measured to take no longer than reading the rest here.
 /// Imports what it hands back as a snapshot that the prefix reuse then restores. Anything that goes wrong leaves the prompt to be read here.
+/// Returns the prompt tokens the cache here held before the hand-over, when the peer's prompt
+/// was imported.
 pub(super) fn pull_prompt_from_peer(
     model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
     model_name: &str,
     prompt: &str,
     prompt_tokens: &[u32],
     peer: &str,
-) {
+) -> Option<usize> {
     use crate::distributed::kv_handover::decode;
     let carries_state = model.handover_carries_state();
     if !carries_state && (model.kv_layout().is_none() || !model.capabilities().trim_kv) {
-        return;
+        return None;
     }
     // The chunk the model's own prefill runs at, from the same sizing.
     let chunk =
@@ -113,10 +115,10 @@ pub(super) fn pull_prompt_from_peer(
         model.best_kv_snapshot(prompt_tokens).map_or(0, |(_, c)| c)
     };
     if prompt_tokens.len() < held + chunk {
-        return;
+        return None;
     }
     if !super::handover_rate::peer_reads(peer, prompt_tokens.len(), prompt_tokens.len() - held) {
-        return;
+        return None;
     }
     let started = std::time::Instant::now();
     // A long prompt takes the peer as long as it takes: the request has no deadline of its own.
@@ -138,35 +140,35 @@ pub(super) fn pull_prompt_from_peer(
         Ok(b) => b,
         Err(e) => {
             warn!("prefill peer {peer}: {e}; the prompt is read here");
-            return;
+            return None;
         }
     };
     let handover = match decode(&bytes) {
         Ok(h) => h,
         Err(e) => {
             warn!("prefill peer {peer}: {e}; the prompt is read here");
-            return;
+            return None;
         }
     };
     let header = &handover.header;
     if header.layout != kv_layout_id(model) {
         warn!("prefill peer {peer}: its cache has another shape; the prompt is read here");
-        return;
+        return None;
     }
     if !prompt_tokens.starts_with(&header.tokens) {
         warn!(
             "prefill peer {peer}: it read other tokens than this prompt's; the prompt is read here"
         );
-        return;
+        return None;
     }
     if carries_state != (header.state_len > 0) {
         warn!("prefill peer {peer}: it handed over another kind of state; the prompt is read here");
-        return;
+        return None;
     }
     let (n, dtype, kv_len) = (header.tokens.len(), header.dtype, header.kv_len);
     if kv_len != n {
         warn!("prefill peer {peer}: its cache covers other positions than its tokens; the prompt is read here");
-        return;
+        return None;
     }
     let imported = if carries_state {
         model.import_state_handover(handover.header.tokens, &handover.state)
@@ -180,8 +182,12 @@ pub(super) fn pull_prompt_from_peer(
                 "prompt read by {peer}: {n} tokens, {:.1} MB handed over in {:.0} ms",
                 bytes.len() as f64 / 1e6,
                 started.elapsed().as_secs_f64() * 1e3
-            )
+            );
+            Some(held)
         }
-        Err(e) => warn!("prefill peer {peer}: import: {e}; the prompt is read here"),
+        Err(e) => {
+            warn!("prefill peer {peer}: import: {e}; the prompt is read here");
+            None
+        }
     }
 }
