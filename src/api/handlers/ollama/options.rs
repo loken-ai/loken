@@ -759,12 +759,21 @@ pub(crate) async fn templated_prompt(
 /// as given; anything else is rendered in the model's chat template, which a chat-tuned
 /// model needs or it can answer EOS first. The thinking preference is applied as on the
 /// chat route.
+///
+/// With no engine (the model is not loaded here) the vision placeholder is left out: only a
+/// loaded model says whether it reads one.
 pub(crate) async fn generate_prompt(
     state: &APIServer,
     model_name: &str,
+    engine: Option<&LlmEngine>,
     request: &OllamaGenerateRequest,
 ) -> String {
     let suffix = request.suffix.as_deref().filter(|s| !s.is_empty());
+    let vision = match engine {
+        Some(e) if carries_images(request) => e.is_qwen35_vision().await,
+        _ => false,
+    };
+    let text = generate_user_text(&request.prompt, vision);
     let mut prompt = if let Some(suffix) = suffix {
         format!(
             "<|fim_prefix|>{}<|fim_suffix|>{suffix}<|fim_middle|>",
@@ -774,19 +783,19 @@ pub(crate) async fn generate_prompt(
         || request.raw.unwrap_or(false)
         || request.prompt.is_empty()
     {
-        request.prompt.clone()
+        text
     } else if request
         .template
         .as_deref()
         .is_none_or(|t| t.trim().is_empty())
         && state.chat_format_for(model_name).await.bare_package
     {
-        bare_package_prompt(request.system.as_deref(), &request.prompt)
+        bare_package_prompt(request.system.as_deref(), &text)
     } else {
         templated_prompt(
             state,
             model_name,
-            &request.prompt,
+            &text,
             request.system.as_deref(),
             request.template.as_deref(),
             request.thinking_preference() == Some("disabled"),
@@ -803,6 +812,23 @@ pub(crate) async fn generate_prompt(
         template.as_deref(),
     );
     prompt
+}
+
+/// Whether the request carries an image.
+fn carries_images(request: &OllamaGenerateRequest) -> bool {
+    request.images.as_ref().is_some_and(|i| !i.is_empty())
+}
+
+/// The text of the user turn `/api/generate` renders.
+/// The vision placeholder goes in front of `prompt` when `vision` holds.
+/// A prompt that already holds the placeholder is taken as given.
+pub(crate) fn generate_user_text(prompt: &str, vision: bool) -> String {
+    let sentinel = crate::api::handlers::chat_prompt::QWEN35_IMAGE_SENTINEL;
+    if vision && !prompt.contains(sentinel) {
+        format!("{sentinel}{prompt}")
+    } else {
+        prompt.to_string()
+    }
 }
 
 /// The prompt sent for a package with no template layer.
@@ -886,7 +912,7 @@ pub(crate) async fn ollama_generate(
                 &state,
                 &headers,
                 &model_name,
-                &generate_prompt(&state, &model_name, &request).await,
+                &generate_prompt(&state, &model_name, None, &request).await,
                 max_tokens,
                 &crate::api::handlers::OLLAMA_GENERATE,
                 &body,
@@ -1053,7 +1079,8 @@ pub(crate) async fn ollama_generate(
 
     // Ollama parity: the model's chat template unless the caller set `raw: true` or the
     // prompt is already templated, the sentinels for FIM, and the thinking preference.
-    let effective_prompt = generate_prompt(&state, &model_name, &request).await;
+    let effective_prompt =
+        generate_prompt(&state, &model_name, Some(engine.as_ref()), &request).await;
     let thinking_opened = crate::api::thinking::prompt_opens_thinking(&effective_prompt);
 
     // Extract generation options

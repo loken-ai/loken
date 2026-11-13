@@ -26,7 +26,7 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 | `POST /api/copy` | Copy a manifest under a new name. Blobs are shared. |
 | `DELETE /api/delete` | Remove a manifest and every blob no manifest names. |
 | `POST /api/chat` | Chat. Takes `tools`, `tool_choice`, `think`, `format`, `logprobs`, `top_logprobs`, images, and `audios` (base64 clips) on a user message for a model with the `audio` capability. Returns `thinking` apart from `content`, `done_reason` and the engine's timings. |
-| `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix`, returns `context`. A package with no template layer gets the prompt as given, as in Ollama. |
+| `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix` and `images`, returns `context`. The images go before the prompt, as on `/api/chat`. A package with no template layer gets the prompt as given, as in Ollama. |
 | `POST /api/embed` | Embeddings. Honours `dimensions` and `truncate`. |
 | `POST /api/embeddings` | The legacy 1-prompt shape. |
 <!-- site: end -->

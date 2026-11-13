@@ -273,7 +273,7 @@ pub(crate) struct PreparedPrompt {
 
 /// The token a Qwen3-VL prompt carries where the vision encoder's output is spliced; the
 /// engine expands it to the image's patch count at prefill.
-const QWEN35_IMAGE_SENTINEL: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+pub(crate) const QWEN35_IMAGE_SENTINEL: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 /// `thinking` from OpenAI's `reasoning_effort`: `none` and `minimal` switch thinking
 /// off, the levels pass through, anything else leaves it on.

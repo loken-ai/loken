@@ -560,13 +560,13 @@ async fn generate_sends_a_prompt_as_given_to_a_package_without_a_template() {
     let request =
         OllamaGenerateRequest::new("bare".to_string(), "Moby Dick, chapter one".to_string());
     assert_eq!(
-        generate_prompt(&state, "bare", &request).await,
+        generate_prompt(&state, "bare", None, &request).await,
         "Moby Dick, chapter one"
     );
     let mut with_system = request.clone();
     with_system.system = Some("You are Ishmael.".to_string());
     assert_eq!(
-        generate_prompt(&state, "bare", &with_system).await,
+        generate_prompt(&state, "bare", None, &with_system).await,
         "You are Ishmael.\n\nMoby Dick, chapter one"
     );
     let packaged = store_with_package("packaged", Some("{{ .Prompt }} [END]"));
@@ -704,4 +704,16 @@ fn ps_carries_the_format_a_model_runs_in() {
     entry.details.running_format = Some("bf16".to_string());
     let json = serde_json::to_value(&entry).unwrap();
     assert_eq!(json["details"]["running_format"], "bf16");
+}
+
+/// The vision placeholder goes once in front of the prompt of a request whose images the model
+/// splices over it.
+/// A prompt that already places it, and a model that splices none, keep the prompt as given.
+#[test]
+fn the_generate_prompt_places_the_image_in_front() {
+    let s = crate::api::handlers::chat_prompt::QWEN35_IMAGE_SENTINEL;
+    assert_eq!(generate_user_text("describe", true), format!("{s}describe"));
+    let placed = format!("look {s} here");
+    assert_eq!(generate_user_text(&placed, true), placed);
+    assert_eq!(generate_user_text("describe", false), "describe");
 }
