@@ -110,6 +110,10 @@ Each card runs its experts on a thread of its own, beside the host's cores.
 In a forward of several rows, a card the load measured faster also runs experts it does not keep, after its own.
 Their blocks go up from the host's memory, run over all their rows and are dropped.
 The load's measure gives the cost of each side: the upload rate, the card's product and a host core's product.
+In a prompt forward, each cost then follows the last prompt forward that measured it.
+In a prompt forward, a card whose reads end before its own experts reads while those run.
+A card whose reads outlast its own experts reads after them.
+A verify forward of drafted tokens prices each cost by its average since the load, and reads after the card's own experts.
 The experts go, the most rows first, to the card or the host core that finishes them soonest.
 A batch in transit takes what the card has free at that moment.
 An expert a card read from the file past the page cache does not join the experts the host keeps.

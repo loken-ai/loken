@@ -20,6 +20,8 @@
 //! are dropped once their outputs are down.
 //! Each card runs its kept experts first, then its transit, in batches that fit what it has
 //! free at that moment.
+//! The blocks of the transit go up on a stream of their own.
+//! A card whose reads end before its kept experts, by the schedule, reads while they run.
 //! An expert that does not fit, or whose batch fails, answers `None`: the host runs it.
 
 use super::block_scaled_experts::BlockScaledExpert;
@@ -52,11 +54,6 @@ impl TransitCost {
         (fine(cost.secs_per_byte) && fine(cost.secs_per_tile) && fine(cost.host_secs_per_pair))
             .then_some(cost)
     }
-
-    /// Seconds the card takes for an expert of `bytes` over `rows` rows, its blocks moved up.
-    pub fn card_secs(&self, bytes: u64, rows: usize) -> f64 {
-        bytes as f64 * self.secs_per_byte + rows.div_ceil(tile_rows()) as f64 * self.secs_per_tile
-    }
 }
 
 /// Rows of 1 expert that the card kernels run over 1 read of its blocks.
@@ -75,31 +72,65 @@ pub fn router_rows_bytes(inp: usize, out: usize, group: usize) -> usize {
     group * (inp + out) * std::mem::size_of::<f32>()
 }
 
+/// The seconds a card takes for its kept experts, `kept`, and for experts in transit whose reads
+/// take `reads` and whose runs take `runs`.
+///
+/// The reads go on while the kept experts run when they end before them.
+/// The kernels then bound the card, and the runs follow the kept experts.
+/// Reads that outlast the kept experts start after them: the disk bounds the card.
+pub fn card_finish(kept: f64, reads: f64, runs: f64) -> f64 {
+    match reads <= kept {
+        true => kept + runs,
+        false => kept + reads + runs,
+    }
+}
+
+/// How a schedule splits the experts no card keeps between the cards and the host's cores.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TransitSchedule {
+    /// Per card that takes experts in transit, its ordinal and the experts, in the order taken.
+    pub moving: Vec<(usize, Vec<usize>)>,
+    /// The experts left to the host's cores.
+    pub left: Vec<usize>,
+    /// The ordinals of the cards that read their experts in transit while their kept experts
+    /// run.
+    pub beside_kept: Vec<usize>,
+    /// Per card of the costs, its ordinal and the seconds the schedule expects it to take.
+    pub expected: Vec<(usize, f64)>,
+}
+
 /// Splits the experts no card keeps between the cards in transit and the host's cores.
 ///
 /// `candidates` are (expert, rows, bytes).
-/// `busy[k]` is the seconds card `costs[k]` spends on its kept experts first.
+/// `busy[k]` is the seconds card `costs[k]` spends on its kept experts.
 /// Each queue is a card or a host core.
-/// A card's expert costs [`TransitCost::card_secs`], a core's its rows times the host's seconds
-/// per pair: the least the cards measured.
+/// With `beside`, a card finishes by [`card_finish`] over its kept experts and the reads and
+/// runs of its transit.
+/// Without it, a card finishes at its kept experts plus the reads and runs of each expert of its
+/// transit, one after the other, and no card reads beside its kept experts.
+/// A core's expert costs its rows times the host's seconds per pair: the least the cards
+/// measured.
 /// The experts go, the most rows first, each to the queue that finishes it soonest.
-/// Answers per card the experts it takes, in that order, and the experts left to the host.
 pub fn schedule_transit(
     costs: &[(usize, TransitCost)],
     busy: &[f64],
     candidates: &[(usize, usize, u64)],
     cores: usize,
-) -> (Vec<(usize, Vec<usize>)>, Vec<usize>) {
+    beside: bool,
+) -> TransitSchedule {
     let mut order: Vec<&(usize, usize, u64)> = candidates.iter().collect();
     order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let host_pair = costs
         .iter()
         .map(|(_, c)| c.host_secs_per_pair)
         .fold(f64::INFINITY, f64::min);
-    let mut cards: Vec<(usize, f64, Vec<usize>)> = costs
+    let kept = |k: usize| busy.get(k).copied().unwrap_or(0.0);
+    // Per card: its ordinal, its seconds of reads, its seconds of runs, the experts it takes
+    // and the time it finishes without reading beside its kept experts.
+    let mut cards: Vec<(usize, f64, f64, Vec<usize>, f64)> = costs
         .iter()
         .enumerate()
-        .map(|(k, (o, _))| (*o, busy.get(k).copied().unwrap_or(0.0), Vec::new()))
+        .map(|(k, (o, _))| (*o, 0.0, 0.0, Vec::new(), kept(k)))
         .collect();
     let mut host: Vec<f64> = vec![0.0; cores.max(1)];
     let mut left = Vec::new();
@@ -109,12 +140,25 @@ pub fn schedule_transit(
             .unwrap_or(0);
         let on_core = host[core] + rows as f64 * host_pair;
         let card = (0..cards.len())
-            .map(|k| (k, cards[k].1 + costs[k].1.card_secs(bytes, rows)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
+            .map(|k| {
+                let c = &costs[k].1;
+                let read = bytes as f64 * c.secs_per_byte;
+                let run = rows.div_ceil(tile_rows()) as f64 * c.secs_per_tile;
+                let (reads, runs) = (cards[k].1 + read, cards[k].2 + run);
+                let after = cards[k].4 + (read + run);
+                let done = match beside {
+                    true => card_finish(kept(k), reads, runs),
+                    false => after,
+                };
+                (k, reads, runs, after, done)
+            })
+            .min_by(|a, b| a.4.total_cmp(&b.4));
         match card {
-            Some((k, done)) if done < on_core => {
-                cards[k].1 = done;
-                cards[k].2.push(e);
+            Some((k, reads, runs, after, done)) if done < on_core => {
+                cards[k].1 = reads;
+                cards[k].2 = runs;
+                cards[k].3.push(e);
+                cards[k].4 = after;
             }
             _ => {
                 host[core] = on_core;
@@ -122,12 +166,31 @@ pub fn schedule_transit(
             }
         }
     }
+    let expected = cards
+        .iter()
+        .enumerate()
+        .map(|(k, c)| match beside {
+            true => (c.0, card_finish(kept(k), c.1, c.2)),
+            false => (c.0, c.4),
+        })
+        .collect();
+    let beside_kept = cards
+        .iter()
+        .enumerate()
+        .filter(|(k, c)| beside && !c.3.is_empty() && c.1 <= kept(*k))
+        .map(|(_, c)| c.0)
+        .collect();
     let moving = cards
         .into_iter()
-        .filter(|c| !c.2.is_empty())
-        .map(|(o, _, ids)| (o, ids))
+        .filter(|c| !c.3.is_empty())
+        .map(|(o, _, _, ids, _)| (o, ids))
         .collect();
-    (moving, left)
+    TransitSchedule {
+        moving,
+        left,
+        beside_kept,
+        expected,
+    }
 }
 
 /// The routed experts of 1 layer that the cards keep, by expert id, and the layer's shared
@@ -341,12 +404,14 @@ impl CardExperts {
     }
 
     /// Notes, on every card that may run experts it does not keep, `ns` nanoseconds of host
-    /// cores spent on `pairs` (expert, row) pairs.
-    pub fn note_host(&self, ns: u64, pairs: u64) {
+    /// cores spent on `pairs` (expert, row) pairs in a forward, of a prompt when `prompt`.
+    pub fn note_host(&self, ns: u64, pairs: u64, prompt: bool) {
         #[cfg(feature = "gpu")]
-        self.transit.iter().for_each(|t| t.note_host(ns, pairs));
+        self.transit
+            .iter()
+            .for_each(|t| t.note_host(ns, pairs, prompt));
         #[cfg(not(feature = "gpu"))]
-        let _ = (ns, pairs);
+        let _ = (ns, pairs, prompt);
     }
 
     /// Whether every card that may run experts it does not keep reads them from their file
@@ -370,14 +435,21 @@ impl CardExperts {
         0
     }
 
-    /// Per card that may run experts it does not keep, its ordinal and its costs now.
-    pub fn transit_costs(&self) -> Vec<(usize, TransitCost)> {
+    /// Per card that may run experts it does not keep, its ordinal and its costs now, for a
+    /// forward of a prompt when `prompt`.
+    pub fn transit_costs(&self, prompt: bool) -> Vec<(usize, TransitCost)> {
         #[cfg(feature = "gpu")]
         {
-            self.transit.iter().map(|t| (t.ordinal, t.cost())).collect()
+            self.transit
+                .iter()
+                .map(|t| (t.ordinal, t.cost(prompt)))
+                .collect()
         }
         #[cfg(not(feature = "gpu"))]
-        Vec::new()
+        {
+            let _ = prompt;
+            Vec::new()
+        }
     }
 
     /// Per card ordinal, the bytes of experts kept there, with the shared expert and the router.
@@ -568,13 +640,16 @@ impl CardExperts {
         shared: bool,
     ) -> (Option<Vec<f32>>, Vec<Option<Vec<f32>>>) {
         let (shared, kept, _) =
-            self.run_cards_moving(ids, rows, x, dim, limit, shared, &[], &[], &[]);
+            self.run_cards_moving(ids, rows, x, dim, limit, shared, &[], &[], false, &[], &[]);
         (shared, kept)
     }
 
     /// [`Self::run_cards`], and on each card of `moving`, after its kept experts, the experts
     /// it takes in transit, read from `experts` by id.
     ///
+    /// A card of `beside_kept` reads its experts in transit while its kept experts run.
+    /// `prompt` says the forward reads a prompt: its transit then measures the costs of the next
+    /// prompt forward.
     /// The blocks of an expert of `through_cache` go up through the page cache.
     /// Answers per entry of `moving`, per expert it gives, its outputs `[rows, dim]` row-major.
     /// An expert in transit that did not run answers `None`: the caller runs it on the host.
@@ -588,6 +663,8 @@ impl CardExperts {
         limit: f32,
         shared: bool,
         moving: &[(usize, Vec<(usize, Vec<usize>)>)],
+        beside_kept: &[usize],
+        prompt: bool,
         through_cache: &[usize],
         experts: &[BlockScaledExpert],
     ) -> (
@@ -649,7 +726,7 @@ impl CardExperts {
                             m.iter().map(|(e, _)| through_cache.contains(e)).collect();
                         let started = std::time::Instant::now();
                         let outs = match given.len() == m.len() {
-                            true => t.run(&given, &cached, x, dim, limit),
+                            true => t.run(&given, &cached, x, dim, limit, prompt),
                             false => vec![None; m.len()],
                         };
                         card_prof(ordinal, "experts: transit", started);
@@ -686,7 +763,8 @@ impl CardExperts {
                 });
                 card_prof(*ordinal, "experts: shared", started);
                 let started = std::time::Instant::now();
-                let outs = set.and_then(|set| {
+                // The kept experts' kernels are queued on the card's stream.
+                let launched = set.map(|set| {
                     let ids_here: Vec<usize> = mine.iter().map(|&i| ids[i]).collect();
                     let rows_here: Vec<Vec<usize>> =
                         mine.iter().map(|&i| rows[i].clone()).collect();
@@ -695,7 +773,18 @@ impl CardExperts {
                         crate::inference::stage_prof::on_card(*ordinal, "experts: kept pairs"),
                         pairs as u64,
                     );
-                    match set.run(&ids_here, &rows_here, x, dim, limit) {
+                    let launched = set.launch(&ids_here, &rows_here, x, dim, limit);
+                    (pairs, set.run_bytes(pairs, n), launched)
+                });
+                card_prof(*ordinal, "experts: kept launch", started);
+                (shared_out, launched)
+            };
+            let kept_one = &kept_one;
+            // The outputs of a card's kept experts, once their kernels end.
+            let finish = |ordinal: usize, launched: Option<(usize, u64, Result<gpu::Launched>)>| {
+                let started = std::time::Instant::now();
+                let outs = launched.and_then(|(pairs, bytes, launched)| {
+                    match launched.and_then(gpu::Launched::finish) {
                         Ok(ys) => {
                             self.ran
                                 .fetch_add(pairs as u64, std::sync::atomic::Ordering::Relaxed);
@@ -705,19 +794,29 @@ impl CardExperts {
                             tracing::warn!(
                                 "card {ordinal}: routed experts not run, the host runs them: {e}"
                             );
-                            self.note_short(*ordinal, set.run_bytes(pairs, n));
+                            self.note_short(ordinal, bytes);
                             None
                         }
                     }
                 });
-                card_prof(*ordinal, "experts: kept", started);
-                (shared_out, outs)
+                card_prof(ordinal, "experts: kept finish", started);
+                outs
             };
-            let kept_one = &kept_one;
+            let finish = &finish;
+            // A card of `beside_kept` reads its transit before its kept experts end.
             let one = |w: &(usize, Option<&gpu::CardSet>, Vec<usize>)| {
                 let started = std::time::Instant::now();
-                let (shared_out, outs) = kept_one(w);
-                let carried = transit(w.0);
+                let (shared_out, launched) = kept_one(w);
+                let (outs, carried) = match beside_kept.contains(&w.0) {
+                    true => {
+                        let carried = transit(w.0);
+                        (finish(w.0, launched), carried)
+                    }
+                    false => {
+                        let outs = finish(w.0, launched);
+                        (outs, transit(w.0))
+                    }
+                };
                 card_prof(w.0, "experts: thread", started);
                 (shared_out, outs, carried)
             };
@@ -760,7 +859,17 @@ impl CardExperts {
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (rows, x, dim, limit, shared, through_cache, experts);
+            let _ = (
+                rows,
+                x,
+                dim,
+                limit,
+                shared,
+                beside_kept,
+                prompt,
+                through_cache,
+                experts,
+            );
             (
                 None,
                 vec![None; ids.len()],
@@ -949,6 +1058,20 @@ pub(super) mod gpu {
             dim: usize,
             limit: f32,
         ) -> Result<Vec<Vec<f32>>> {
+            self.launch(ids, rows, x, dim, limit)?.finish()
+        }
+
+        /// [`Self::run`] queued on the card's stream.
+        ///
+        /// The outputs come down with [`Launched::finish`].
+        pub(crate) fn launch(
+            &self,
+            ids: &[usize],
+            rows: &[Vec<usize>],
+            x: &[f32],
+            dim: usize,
+            limit: f32,
+        ) -> Result<Launched> {
             if dim != self.dims.0 {
                 return Err(Error::msg(format!(
                     "rows of {dim} for experts of {}",
@@ -970,11 +1093,16 @@ pub(super) mod gpu {
                 .enumerate()
                 .flat_map(|(i, r)| r.iter().map(move |&t| (i, t)))
                 .collect();
+            let lens: Vec<usize> = rows.iter().map(|r| r.len() * dim).collect();
             if instances.is_empty() {
-                return Ok(vec![Vec::new(); ids.len()]);
+                return Ok(Launched {
+                    dev: self.dev.clone(),
+                    lens,
+                    held: None,
+                });
             }
             let xq = q8k32_rows_to_card(&self.dev, x)?;
-            let (_h, y) = gpu_experts_exact(
+            let (h, y) = gpu_experts_exact(
                 &self.dev,
                 &weights,
                 &self.tables,
@@ -983,16 +1111,40 @@ pub(super) mod gpu {
                 &instances,
                 limit,
             )?;
+            Ok(Launched {
+                dev: self.dev.clone(),
+                lens,
+                held: Some((xq, h, y)),
+            })
+        }
+    }
+
+    /// A run of kept experts queued on a card's stream.
+    pub(crate) struct Launched {
+        dev: Arc<CudaDevice>,
+        /// Per expert, the length of its outputs.
+        lens: Vec<usize>,
+        /// The rows, the down projection's inputs and the outputs, on the card until the run
+        /// ends.
+        held: Option<(CudaSlice<u8>, CudaSlice<f32>, CudaSlice<f32>)>,
+    }
+
+    impl Launched {
+        /// The outputs of each expert, once the run ends.
+        pub(crate) fn finish(self) -> Result<Vec<Vec<f32>>> {
+            let Some((_xq, _h, y)) = &self.held else {
+                return Ok(vec![Vec::new(); self.lens.len()]);
+            };
             let flat = self
                 .dev
                 .stream()
-                .clone_dtoh(&y)
+                .clone_dtoh(y)
                 .map_err(|e| Error::msg(format!("card expert outputs: {e}")))?;
             let mut at = 0;
-            Ok(rows
+            Ok(self
+                .lens
                 .iter()
-                .map(|r| {
-                    let n = r.len() * dim;
+                .map(|&n| {
                     let part = flat[at..at + n].to_vec();
                     at += n;
                     part
@@ -1014,12 +1166,18 @@ pub(super) mod gpu {
         /// Totals measured since the load: nanoseconds of uploads and their bytes, nanoseconds
         /// of runs and their tiles, host core nanoseconds and their pairs.
         totals: [std::sync::atomic::AtomicU64; 6],
+        /// The same measures over the last prompt forward that took experts in transit.
+        last: [std::sync::atomic::AtomicU64; 6],
+        /// The reads and runs of the prompt forward under way, summed over its batches.
+        forward: [std::sync::atomic::AtomicU64; 4],
         /// Bytes of the largest weight of an expert: what 1 direct read carries.
         unit: usize,
         /// The direct reader of the experts' file.
         bounce: std::sync::Mutex<Reader>,
         /// Bytes read past the page cache since the load.
         direct: std::sync::atomic::AtomicU64,
+        /// The stream the blocks go up on, beside the kernels of the card's stream.
+        copy: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     }
 
     /// The state of a transit's direct reader.
@@ -1047,6 +1205,10 @@ pub(super) mod gpu {
                 return Err(Error::msg("experts in transit need a CUDA device"));
             };
             let tables = expert_tables(&dev, format)?;
+            let copy = dev
+                .context()
+                .new_stream()
+                .map_err(|e| Error::msg(format!("expert copy stream: {e}")))?;
             let dims = like.gate.dims();
             let unit = like
                 .gate
@@ -1061,9 +1223,12 @@ pub(super) mod gpu {
                 dims: (dims[1], dims[0]),
                 measured: cost,
                 totals: Default::default(),
+                last: Default::default(),
+                forward: Default::default(),
                 unit,
                 bounce: std::sync::Mutex::new(Reader::Closed),
                 direct: Default::default(),
+                copy,
             })
         }
 
@@ -1078,17 +1243,31 @@ pub(super) mod gpu {
             cfg!(target_os = "linux") && !matches!(*state, Reader::Off)
         }
 
-        /// The blocks `parts` on the card, in their order.
+        /// The stream the blocks and rows of a transit go up on: the copy stream in a prompt
+        /// forward, the card's stream in any other.
+        fn up_stream(&self, prompt: bool) -> &Arc<crate::tensor::gpu_runtime::driver::CudaStream> {
+            match prompt {
+                true => &self.copy,
+                false => self.dev.stream(),
+            }
+        }
+
+        /// The blocks `parts` on the card, in their order, on the stream of [`Self::up_stream`].
         ///
         /// Blocks a mapped file holds and the page cache does not are read past the cache into
-        /// page-locked memory by the reader threads, each queueing its copies on the card's
-        /// stream while it reads the next ones.
+        /// page-locked memory by the reader threads, each queueing its copies on that stream
+        /// while it reads the next ones.
         /// The reader threads read a block of `through` through the page cache instead.
         /// Other blocks, and those of a direct read that fails, go up from where they lie.
-        fn upload(&self, parts: &[&[u8]], through: &[bool]) -> Result<Vec<CudaSlice<u8>>> {
+        fn upload(
+            &self,
+            parts: &[&[u8]],
+            through: &[bool],
+            prompt: bool,
+        ) -> Result<Vec<CudaSlice<u8>>> {
             let mut on_card: Vec<Option<CudaSlice<u8>>> = parts.iter().map(|_| None).collect();
             #[cfg(target_os = "linux")]
-            self.upload_direct(parts, through, &mut on_card);
+            self.upload_direct(parts, through, prompt, &mut on_card);
             #[cfg(not(target_os = "linux"))]
             let _ = through;
             parts
@@ -1097,8 +1276,7 @@ pub(super) mod gpu {
                 .map(|(b, up)| match up {
                     Some(up) => Ok(up),
                     None => self
-                        .dev
-                        .stream()
+                        .up_stream(prompt)
                         .clone_htod(*b)
                         .map_err(|err| Error::msg(format!("expert upload in transit: {err}"))),
                 })
@@ -1114,6 +1292,7 @@ pub(super) mod gpu {
             &self,
             parts: &[&[u8]],
             through: &[bool],
+            prompt: bool,
             on_card: &mut [Option<CudaSlice<u8>>],
         ) {
             use super::super::expert_tier::direct::{residency, Bounce};
@@ -1167,7 +1346,7 @@ pub(super) mod gpu {
             let Reader::Open(readers) = &mut *state else {
                 return;
             };
-            let stream = self.dev.stream();
+            let stream = self.up_stream(prompt);
             // Every byte is written by the copies the readers queue before a kernel reads it.
             let jobs: Vec<(usize, u64, CudaSlice<u8>)> = wanted
                 .iter()
@@ -1225,10 +1404,16 @@ pub(super) mod gpu {
             }
         }
 
-        /// The costs now: each the ratio of its totals since the load once it has some, the
-        /// load's measure before.
-        pub(crate) fn cost(&self) -> super::TransitCost {
-            let at = |i: usize| self.totals[i].load(std::sync::atomic::Ordering::Relaxed);
+        /// The costs now, the load's measure before any.
+        ///
+        /// For a prompt forward, each is the ratio of the last prompt forward's measure.
+        /// For any other forward, each is the ratio of its totals since the load.
+        pub(crate) fn cost(&self, prompt: bool) -> super::TransitCost {
+            let of = match prompt {
+                true => &self.last,
+                false => &self.totals,
+            };
+            let at = |i: usize| of[i].load(std::sync::atomic::Ordering::Relaxed);
             let ratio = |ns: usize, of: usize, load: f64| match at(of) {
                 0 => load,
                 n => at(ns) as f64 * 1e-9 / n as f64,
@@ -1240,16 +1425,41 @@ pub(super) mod gpu {
             }
         }
 
-        /// Adds `ns` nanoseconds over `count` to the totals at `at` and the one after it.
-        fn add(&self, at: usize, ns: u64, count: u64) {
+        /// Adds `ns` nanoseconds over `count` to the totals at `at` and the one after it, and
+        /// to the prompt forward's sums when `prompt`.
+        fn add(&self, at: usize, ns: u64, count: u64, prompt: bool) {
             use std::sync::atomic::Ordering::Relaxed;
             self.totals[at].fetch_add(ns, Relaxed);
             self.totals[at + 1].fetch_add(count, Relaxed);
+            if prompt {
+                self.forward[at].fetch_add(ns, Relaxed);
+                self.forward[at + 1].fetch_add(count, Relaxed);
+            }
         }
 
-        /// Notes `ns` nanoseconds of host cores spent on `pairs` (expert, row) pairs.
-        pub(crate) fn note_host(&self, ns: u64, pairs: u64) {
-            self.add(4, ns, pairs);
+        /// Makes the prompt forward's sums the last measure, each pair that counted something.
+        fn close_forward(&self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            for at in [0, 2] {
+                let ns = self.forward[at].swap(0, Relaxed);
+                let count = self.forward[at + 1].swap(0, Relaxed);
+                if count > 0 {
+                    self.last[at].store(ns, Relaxed);
+                    self.last[at + 1].store(count, Relaxed);
+                }
+            }
+        }
+
+        /// Notes `ns` nanoseconds of host cores spent on `pairs` (expert, row) pairs in a
+        /// forward, of a prompt when `prompt`.
+        pub(crate) fn note_host(&self, ns: u64, pairs: u64, prompt: bool) {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.totals[4].fetch_add(ns, Relaxed);
+            self.totals[5].fetch_add(pairs, Relaxed);
+            if prompt && pairs > 0 {
+                self.last[4].store(ns, Relaxed);
+                self.last[5].store(pairs, Relaxed);
+            }
         }
 
         /// Bytes a batch in transit may take now: what the driver has free.
@@ -1260,11 +1470,22 @@ pub(super) mod gpu {
             crate::inference::place::vram_manager::free_now(&self.device).unwrap_or(0)
         }
 
+        /// The rows `x` as q8_K blocks on the card, on the stream of [`Self::up_stream`].
+        fn rows_up(&self, x: &[f32], prompt: bool) -> Result<CudaSlice<u8>> {
+            self.up_stream(prompt)
+                .clone_htod(&crate::tensor::quant_cpu::format::q8k32_bytes(x))
+                .map_err(|e| Error::msg(format!("expert rows in transit: {e}")))
+        }
+
         /// Gives the driver back what the pool reserved beyond `kept` for a batch.
         ///
-        /// The batch's frees run on the stream first.
-        fn give_back(&self, kept: u64) {
+        /// The batch's frees run on the card's stream first, and on the copy stream in a prompt
+        /// forward.
+        fn give_back(&self, kept: u64, prompt: bool) {
             let _ = self.dev.stream().synchronize();
+            if prompt {
+                let _ = self.copy.synchronize();
+            }
             crate::tensor::cuda::trim_pool_to(self.ordinal, kept);
         }
 
@@ -1294,6 +1515,8 @@ pub(super) mod gpu {
         /// An expert of another format or shape, one that does not fit alone, and those of a
         /// batch that fails answer `None`.
         /// The blocks of `experts[i]` go up through the page cache when `cached[i]` holds.
+        /// `prompt` says the forward reads a prompt: its measures then feed the next prompt
+        /// forward's costs, and its blocks go up on the copy stream.
         pub(crate) fn run(
             &self,
             experts: &[(&BlockScaledExpert, &[usize])],
@@ -1301,11 +1524,13 @@ pub(super) mod gpu {
             x: &[f32],
             dim: usize,
             limit: f32,
+            prompt: bool,
         ) -> Vec<Option<Vec<f32>>> {
-            self.run_within(experts, cached, x, dim, limit, || self.room_now())
+            self.run_within(experts, cached, x, dim, limit, prompt, || self.room_now())
         }
 
         /// [`Self::run`] with each batch's room read from `room`.
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn run_within(
             &self,
             experts: &[(&BlockScaledExpert, &[usize])],
@@ -1313,6 +1538,7 @@ pub(super) mod gpu {
             x: &[f32],
             dim: usize,
             limit: f32,
+            prompt: bool,
             room: impl Fn() -> u64,
         ) -> Vec<Option<Vec<f32>>> {
             let mut out: Vec<Option<Vec<f32>>> = vec![None; experts.len()];
@@ -1325,7 +1551,7 @@ pub(super) mod gpu {
             }
             let (kept, _) = crate::tensor::cuda::pool_use(self.ordinal);
             let rows_up = std::time::Instant::now();
-            let xq = q8k32_rows_to_card(&self.dev, x);
+            let xq = self.rows_up(x, prompt);
             self.prof("experts: transit rows up", rows_up);
             let xq = match xq {
                 Ok(xq) => xq,
@@ -1356,7 +1582,7 @@ pub(super) mod gpu {
                     continue;
                 }
                 let through = cached.get(i..end).unwrap_or(&[]);
-                match self.run_batch(&experts[i..end], through, &xq, limit) {
+                match self.run_batch(&experts[i..end], through, &xq, limit, prompt) {
                     Ok(ys) => {
                         for (k, y) in ys.into_iter().enumerate() {
                             out[i + k] = Some(y);
@@ -1369,14 +1595,17 @@ pub(super) mod gpu {
                     ),
                 }
                 let trim = std::time::Instant::now();
-                self.give_back(kept);
+                self.give_back(kept, prompt);
                 self.prof("experts: transit trim", trim);
                 i = end;
             }
             drop(xq);
             let trim = std::time::Instant::now();
-            self.give_back(kept);
+            self.give_back(kept, prompt);
             self.prof("experts: transit trim", trim);
+            if prompt {
+                self.close_forward();
+            }
             out
         }
 
@@ -1398,12 +1627,15 @@ pub(super) mod gpu {
         /// The outputs of `experts` over their rows of `xq`, their blocks moved up for the run.
         ///
         /// The blocks of `experts[i]` go up through the page cache when `cached[i]` holds.
+        /// In a prompt forward they go up on the copy stream, and the run is measured from the
+        /// end of the copies and of the kernels queued before them.
         fn run_batch(
             &self,
             experts: &[(&BlockScaledExpert, &[usize])],
             cached: &[bool],
             xq: &CudaSlice<u8>,
             limit: f32,
+            prompt: bool,
         ) -> Result<Vec<Vec<f32>>> {
             let stream = self.dev.stream();
             let started = std::time::Instant::now();
@@ -1418,13 +1650,19 @@ pub(super) mod gpu {
                 .map(|p| cached.get(p / 3).copied().unwrap_or(false))
                 .collect();
             let direct_before = self.bytes_read_direct();
-            let mut up = self.upload(&parts, &through)?.into_iter();
+            let mut up = self.upload(&parts, &through, prompt)?.into_iter();
+            // The kernels wait on the card for the copies queued so far.
+            if prompt {
+                stream
+                    .join(&self.copy)
+                    .map_err(|e| Error::msg(format!("expert copies in transit: {e}")))?;
+            }
             let mut held: Vec<[CudaSlice<u8>; 3]> = Vec::with_capacity(experts.len());
             while let (Some(g), Some(u), Some(d)) = (up.next(), up.next(), up.next()) {
                 held.push([g, u, d]);
             }
             let bytes: u64 = experts.iter().map(|(e, _)| expert_bytes(e)).sum();
-            self.add(0, started.elapsed().as_nanos() as u64, bytes);
+            self.add(0, started.elapsed().as_nanos() as u64, bytes, prompt);
             self.prof("experts: transit read", started);
             let profiled = crate::inference::stage_prof::stage_prof_enabled();
             if profiled {
@@ -1443,10 +1681,15 @@ pub(super) mod gpu {
                 self.count("experts: transit pairs", pairs as u64);
             }
             let started = std::time::Instant::now();
-            if profiled {
+            if prompt || profiled {
                 let _ = stream.synchronize();
                 self.prof("experts: transit copy tail", started);
             }
+            // The run of a prompt forward is measured from the end of the copies.
+            let started = match prompt {
+                true => std::time::Instant::now(),
+                false => started,
+            };
             let launched = std::time::Instant::now();
             let weights: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> =
                 held.iter().map(|[g, u, d]| (g, u, d)).collect();
@@ -1478,7 +1721,7 @@ pub(super) mod gpu {
                 .iter()
                 .map(|(_, r)| r.len().div_ceil(crate::tensor::cuda::EXACT_TILE))
                 .sum();
-            self.add(2, started.elapsed().as_nanos() as u64, tiles as u64);
+            self.add(2, started.elapsed().as_nanos() as u64, tiles as u64, prompt);
             self.count("experts: transit tiles", tiles as u64);
             let split = std::time::Instant::now();
             let dim = self.dims.0;

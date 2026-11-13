@@ -172,25 +172,63 @@ fn the_transit_schedule_moves_only_what_a_card_finishes_sooner() {
     };
     let tile = tile_rows();
     // An expert of 1 row costs a core 1 s and the card 2 s: it stays on the host.
-    let (moving, left) = schedule_transit(&[(0, cost)], &[0.0], &[(5, 1, 2000)], 4);
-    assert!(moving.is_empty());
-    assert_eq!(left, vec![5]);
+    let plan = schedule_transit(&[(0, cost)], &[0.0], &[(5, 1, 2000)], 4, true);
+    assert!(plan.moving.is_empty());
+    assert_eq!(plan.left, vec![5]);
     // Experts of many rows go to the card while it finishes them sooner than a core.
     let many = 8 * tile;
     let candidates: Vec<(usize, usize, u64)> = (0..6).map(|e| (e, many - e, 10)).collect();
-    let (moving, left) = schedule_transit(&[(0, cost)], &[0.0], &candidates, 1);
-    assert_eq!(moving.len(), 1);
-    assert_eq!(moving[0].0, 0);
-    assert_eq!(moving[0].1, vec![0, 1, 2, 3, 4, 5]);
-    assert!(left.is_empty());
+    let plan = schedule_transit(&[(0, cost)], &[0.0], &candidates, 1, true);
+    assert_eq!(plan.moving.len(), 1);
+    assert_eq!(plan.moving[0].0, 0);
+    assert_eq!(plan.moving[0].1, vec![0, 1, 2, 3, 4, 5]);
+    assert!(plan.left.is_empty());
     // A card busy past what the host needs takes nothing.
-    let (moving, left) = schedule_transit(&[(1, cost)], &[1e9], &candidates, 1);
-    assert!(moving.is_empty());
-    assert_eq!(left.len(), candidates.len());
+    let plan = schedule_transit(&[(1, cost)], &[1e9], &candidates, 1, true);
+    assert!(plan.moving.is_empty());
+    assert_eq!(plan.left.len(), candidates.len());
     // Without a card everything stays on the host.
-    let (moving, left) = schedule_transit(&[], &[], &candidates, 2);
-    assert!(moving.is_empty());
-    assert_eq!(left.len(), candidates.len());
+    let plan = schedule_transit(&[], &[], &candidates, 2, true);
+    assert!(plan.moving.is_empty());
+    assert_eq!(plan.left.len(), candidates.len());
+}
+
+/// A card reads its transit while its kept experts run only in a prompt forward, and only when
+/// the reads end first.
+///
+/// Reads that outlast the kept experts follow them, and the card's expected time counts them.
+#[test]
+fn a_card_reads_beside_its_kept_experts_only_when_its_kernels_bound_it() {
+    use super::wide_expert_card::{card_finish, schedule_transit, tile_rows, TransitCost};
+    assert_eq!(card_finish(2.0, 1.0, 0.5), 2.5);
+    assert_eq!(card_finish(1.0, 2.0, 0.5), 3.5);
+    let cost = TransitCost {
+        secs_per_byte: 1e-3,
+        secs_per_tile: 1e-3,
+        host_secs_per_pair: 1.0,
+    };
+    let many = 8 * tile_rows();
+    // 6 experts of 10 bytes: 0.06 s of reads.
+    let candidates: Vec<(usize, usize, u64)> = (0..6).map(|e| (e, many - e, 10)).collect();
+    let runs: f64 = candidates
+        .iter()
+        .map(|c| c.1.div_ceil(tile_rows()) as f64 * cost.secs_per_tile)
+        .sum();
+    // Kept experts of 1 s hide the reads.
+    let plan = schedule_transit(&[(0, cost)], &[1.0], &candidates, 1, true);
+    assert_eq!(plan.moving[0].1.len(), candidates.len());
+    assert_eq!(plan.beside_kept, vec![0]);
+    assert!((plan.expected[0].1 - (1.0 + runs)).abs() < 1e-9);
+    // Kept experts of 0.01 s end before the reads: the reads follow them.
+    let plan = schedule_transit(&[(0, cost)], &[0.01], &candidates, 1, true);
+    assert_eq!(plan.moving[0].1.len(), candidates.len());
+    assert!(plan.beside_kept.is_empty());
+    assert!((plan.expected[0].1 - (0.01 + 0.06 + runs)).abs() < 1e-9);
+    // Outside a prompt no card reads beside its kept experts, whatever they take.
+    let plan = schedule_transit(&[(0, cost)], &[1.0], &candidates, 1, false);
+    assert_eq!(plan.moving[0].1.len(), candidates.len());
+    assert!(plan.beside_kept.is_empty());
+    assert!((plan.expected[0].1 - (1.0 + 0.06 + runs)).abs() < 1e-9);
 }
 
 /// A build without cards measures no card: the rooms are dropped and no expert is kept.
@@ -1192,7 +1230,7 @@ fn a_transit_batch_takes_only_its_room_and_keeps_the_hosts_bits() {
     );
     let one = transit.need(given[0].0, n);
     let batches = std::cell::Cell::new(0);
-    let outs = transit.run_within(&given, &[], &x, dim, limit, || {
+    let outs = transit.run_within(&given, &[], &x, dim, limit, true, || {
         batches.set(batches.get() + 1);
         one + one / 2
     });
@@ -1201,11 +1239,16 @@ fn a_transit_batch_takes_only_its_room_and_keeps_the_hosts_bits() {
     for (k, w) in want.iter().enumerate() {
         assert_eq!(got[k].as_ref(), Some(w), "expert {k} in a room for 1");
     }
-    let outs = transit.run_within(&given, &[], &x, dim, limit, || one - 1);
+    let outs = transit.run_within(&given, &[], &x, dim, limit, true, || one - 1);
     assert!(outs.iter().all(Option::is_none), "a room short of 1 expert");
-    let got = transit_bits(&transit.run(&given, &[], &x, dim, limit));
+    let got = transit_bits(&transit.run(&given, &[], &x, dim, limit, true));
     for (k, w) in want.iter().enumerate() {
         assert_eq!(got[k].as_ref(), Some(w), "expert {k} in the card's room");
+    }
+    // Outside a prompt forward the blocks go up on the card's stream, to the same bits.
+    let got = transit_bits(&transit.run(&given, &[], &x, dim, limit, false));
+    for (k, w) in want.iter().enumerate() {
+        assert_eq!(got[k].as_ref(), Some(w), "expert {k} outside a prompt");
     }
     drop(model);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1253,7 +1296,7 @@ fn experts_read_past_the_page_cache_give_the_mapped_bits() {
     // Safety: a valid descriptor; advice only.
     let advised = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     assert_eq!(advised, 0, "the page cache drops the file");
-    let direct = transit_bits(&transit.run(&given, &[], &x, dim, limit));
+    let direct = transit_bits(&transit.run(&given, &[], &x, dim, limit, true));
     let read = transit.bytes_read_direct();
     assert!(read > 0, "no block was read past the page cache");
     // The host reads the experts through the mapping: the page cache holds them again.
@@ -1263,7 +1306,7 @@ fn experts_read_past_the_page_cache_give_the_mapped_bits() {
         dim,
         limit,
     );
-    let mapped = transit_bits(&transit.run(&given, &[], &x, dim, limit));
+    let mapped = transit_bits(&transit.run(&given, &[], &x, dim, limit, true));
     assert_eq!(
         transit.bytes_read_direct(),
         read,

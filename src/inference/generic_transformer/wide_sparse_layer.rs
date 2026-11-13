@@ -634,9 +634,12 @@ impl RoutedFfn {
             .partition(|&&e| watch.is_none() && self.card.holds(e));
         let tier = self.host.as_deref();
         // In a forward of several rows, the cards take in transit the experts they finish
-        // sooner than the host's cores, by the load's measures.
-        let costs = self.card.transit_costs();
-        let (moving, host_now): (Vec<(usize, Vec<usize>)>, Vec<usize>) =
+        // sooner than the host's cores, by the last forward's measures.
+        // A forward of several rows outside a verify reads a prompt.
+        // Only a prompt forward reads beside the kept experts and prices by the last prompt.
+        let prompt = !crate::tensor::quantized::DecodeOrder::active();
+        let costs = self.card.transit_costs(prompt);
+        let (moving, host_now, beside_kept): (Vec<(usize, Vec<usize>)>, Vec<usize>, Vec<usize>) =
             match n > 1 && watch.is_none() && !costs.is_empty() {
                 true => {
                     let busy: Vec<f64> = costs
@@ -654,12 +657,12 @@ impl RoutedFfn {
                         .iter()
                         .map(|&e| (e, assign[e].len(), self.expert_bytes(e)))
                         .collect();
-                    let (moving, left) =
-                        schedule_transit(&costs, &busy, &candidates, rayon::current_num_threads());
-                    note_schedule(&costs, &busy, &candidates, &moving, &left);
-                    (moving, left)
+                    let cores = rayon::current_num_threads();
+                    let plan = schedule_transit(&costs, &busy, &candidates, cores, prompt);
+                    note_schedule(&costs, &candidates, &plan);
+                    (plan.moving, plan.left, plan.beside_kept)
                 }
-                false => (Vec::new(), on_host.clone()),
+                false => (Vec::new(), on_host.clone(), Vec::new()),
             };
         let moved: Vec<usize> = moving.iter().flat_map(|(_, ids)| ids.clone()).collect();
         // Every host expert's bytes are asked for at once, on the tier's reader threads where it
@@ -809,6 +812,8 @@ impl RoutedFfn {
                         self.limit,
                         shared_on_card,
                         &given,
+                        &beside_kept,
+                        prompt,
                         &through_cache,
                         &self.experts,
                     )
@@ -822,7 +827,7 @@ impl RoutedFfn {
                 let cores = rayon::current_num_threads().min(host_now.len()) as u64;
                 let pairs: usize = host_now.iter().map(|&e| assign[e].len()).sum();
                 self.card
-                    .note_host(ran.as_nanos() as u64 * cores, pairs as u64);
+                    .note_host(ran.as_nanos() as u64 * cores, pairs as u64, prompt);
             }
             let (shared, experts, carried) = card
                 .and_then(|h| h.join().ok())
@@ -1766,36 +1771,28 @@ pub(super) fn exchange_state(mixer: &mut mixer::Mixer, held: &mut mixer::MixerSt
 }
 
 /// Records per card and for the host the seconds the schedule expects each to take.
+///
+/// Counts per card the forwards in which it reads its transit while its kept experts run.
 fn note_schedule(
     costs: &[(usize, super::wide_expert_card::TransitCost)],
-    busy: &[f64],
     candidates: &[(usize, usize, u64)],
-    moving: &[(usize, Vec<usize>)],
-    left: &[usize],
+    plan: &super::wide_expert_card::TransitSchedule,
 ) {
-    use crate::inference::stage_prof::{on_card, prof_record, stage_prof_enabled};
+    use crate::inference::stage_prof::{on_card, prof_count, prof_record, stage_prof_enabled};
     if !stage_prof_enabled() {
         return;
     }
     let of = |e: usize| candidates.iter().find(|c| c.0 == e).copied();
-    for (k, (o, c)) in costs.iter().enumerate() {
-        let mine = moving
-            .iter()
-            .find(|m| m.0 == *o)
-            .map_or(&[][..], |m| &m.1[..]);
-        let secs = busy.get(k).copied().unwrap_or(0.0)
-            + mine
-                .iter()
-                .filter_map(|&e| of(e))
-                .map(|(_, rows, bytes)| c.card_secs(bytes, rows))
-                .sum::<f64>();
-        prof_record(on_card(*o, "experts: expected"), (secs * 1e9) as u64);
+    for &(o, secs) in &plan.expected {
+        prof_record(on_card(o, "experts: expected"), (secs * 1e9) as u64);
+        let beside = plan.beside_kept.contains(&o) as u64;
+        prof_count(on_card(o, "experts: reads beside kept"), beside);
     }
     let pair = costs
         .iter()
         .map(|(_, c)| c.host_secs_per_pair)
         .fold(f64::INFINITY, f64::min);
-    let rows: usize = left.iter().filter_map(|&e| of(e)).map(|c| c.1).sum();
+    let rows: usize = plan.left.iter().filter_map(|&e| of(e)).map(|c| c.1).sum();
     let secs = rows as f64 * pair / rayon::current_num_threads().max(1) as f64;
     prof_record("experts: host expected", (secs * 1e9) as u64);
 }
