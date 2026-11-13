@@ -2269,7 +2269,7 @@ impl LlmEngine {
 /// A spliced vision prefill returns `next_pos`, the position past every rotated one.
 /// An image run of `h x w` tokens advances that position by `max(h, w)` only.
 /// A cache length unknown to the model counts as behind.
-fn rope_runs_behind_cache(
+pub(super) fn rope_runs_behind_cache(
     spliced: bool,
     next_pos: Option<usize>,
     cache_len: Option<usize>,

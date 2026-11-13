@@ -260,7 +260,7 @@ Across machines, the model splits into runs of layers as a dense stack does, see
 
 A Qwen vision prompt gives the tokens of an image or of a frame of a clip the positions of their grid.
 The position of the next token then runs behind the cache length.
-Such a request decodes one step at a time, without the recorded step and without drafts.
+Such a request decodes one step at a time, streamed or not, without the recorded step and without drafts.
 
 A model whose files carry a speech tower lists `audio` among its capabilities.
 The tower comes from one of 2 sources:

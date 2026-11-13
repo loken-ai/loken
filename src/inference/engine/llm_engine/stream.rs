@@ -619,6 +619,10 @@ impl LlmEngine {
             let audio_positions: usize;
             // The rows an image takes in the cache beyond the prompt's tokens.
             let mut vision_positions = 0usize;
+            // A spliced vision prompt leaves the rotary position behind the cache length.
+            // The recorded step and every draft verify place a token at the cache length.
+            // Such a request decodes one eager step at a time, each step rotated at `pos`.
+            let mut rope_behind_cache = false;
             // Whether the model's own draft head reads this request's prompt and decode steps.
             let head_capable: bool;
             let (
@@ -1139,6 +1143,11 @@ impl LlmEngine {
                         Ok((l, np)) => {
                             qwen35_next_pos = Some(np);
                             vision_positions = qwen35_vision_extra_kv(&items);
+                            rope_behind_cache = super::generate::rope_runs_behind_cache(
+                                true,
+                                Some(np),
+                                state.model.kv_len(),
+                            );
                             // The spliced prefill writes every row from the first.
                             reused_prompt_tokens = 0;
                             l
@@ -1468,13 +1477,14 @@ impl LlmEngine {
             // Each step replays the captured graph, unless the n-gram cache has a draft to
             // verify: that step runs eagerly over the draft, and the next one replays again.
             #[cfg(feature = "gpu")]
-            let graph_ok = graph_eligible && graph_stream.is_some();
+            let graph_ok = graph_eligible && graph_stream.is_some() && !rope_behind_cache;
             // The graphs kept from the last request are taken when the prefill moved none of
             // the buffers they read; stale ones are dropped with the graph state.
             #[cfg(feature = "gpu")]
             let kept = model_state.blocking_lock().as_mut().and_then(|s| {
                 let had = !s.kept_graphs.is_empty();
-                match s.kept_graphs.take_current(s.model.graph_generation()) {
+                let current = s.kept_graphs.take_current(s.model.graph_generation());
+                match current.filter(|_| !rope_behind_cache) {
                     Some((g, at)) => {
                         s.model.resume_graph_captured();
                         Some((g, at))
@@ -1540,7 +1550,7 @@ impl LlmEngine {
             };
 
             // -- PLD (Prompt-Lookup Decoding) ---------------------------
-            let pld_enabled = pld_capable;
+            let pld_enabled = pld_capable && !rope_behind_cache;
             // The buffer holds the prompt and the whole reply: a copy is found anywhere in them.
             let mut pld_cache =
                 crate::inference::serve::prompt_lookup::NgramDraftCache::new_cascade(
@@ -1560,12 +1570,13 @@ impl LlmEngine {
             // are then timed so the comparison stays current.
             let spec_drafter_on = spec_rt.block_on(spec_engine.ensure_draft_loaded());
             let drafting = spec_drafter_on && spec_engine.draft_length() > 0;
-            let mut spec_on = drafting && spec_engine.draft_prefill(&prompt_tokens);
+            let mut spec_on =
+                drafting && !rope_behind_cache && spec_engine.draft_prefill(&prompt_tokens);
             let mut time_plain = spec_drafter_on && !drafting;
             // The model's own draft head drafts when no drafter model does and its cycles are
             // not known to lose to plain decoding; the tokens it reads next start as the one
             // the prefill sampled.
-            let mut head_on = head_capable && !spec_on;
+            let mut head_on = head_capable && !spec_on && !rope_behind_cache;
             if head_capable && !head_on {
                 if let Some(s) = model_state.blocking_lock().as_mut() {
                     s.model.draft_head_capture(false);
@@ -1577,7 +1588,7 @@ impl LlmEngine {
                 .blocking_lock()
                 .as_ref()
                 .is_some_and(|s| s.model.capabilities().native_draft);
-            let native_on = native_cap && !spec_on && !head_on;
+            let native_on = native_cap && !spec_on && !head_on && !rope_behind_cache;
             if let Some(s) = model_state.blocking_lock().as_ref() {
                 s.model.settle_hot_experts();
             }
