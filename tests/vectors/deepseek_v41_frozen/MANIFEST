@@ -3,6 +3,8 @@ Records of the retired DeepSeek V4.1 path, read by the tests of the generic rout
 Written by the V4.1 code of commit 208378d4, the last commit that holds it.
 Each record is a value that code gave: the old side of a comparison the tests made before.
 The same run asserted the generic route gave the same value.
+The `truncated` records of units.txt are the generic route's own.
+Its truncated choice keeps the order of the router, where the V4.1 code sorted the slots by weight.
 `src/inference/generic_transformer/wide_sparse_frozen.rs` reads the files.
 
 A line is a key, a tab and a value.

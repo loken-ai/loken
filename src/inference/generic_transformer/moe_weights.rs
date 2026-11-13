@@ -517,9 +517,12 @@ impl Truncation {
 /// The `k` experts of the highest biased score are chosen first.
 /// A light chosen expert that is not `resident` gives its slot and its score to the best-ranked
 /// resident expert beyond the choice, or is dropped with `miss_drops`.
-/// The slots are then ordered heaviest first, `keep` cuts the lightest, and `drop_mass` drops
-/// the lightest while their share stays under it.
+/// `keep` then removes the lightest slots, the later one first among equals.
+/// `drop_mass` removes the lightest slots while their share stays under it.
+/// The kept slots stay in the order of the biased score, a replaced slot in the place of the
+/// expert it replaces.
 /// The weights are the kept slots' scores, normalised as the plain choice normalises them.
+/// A truncation that removes and replaces nothing gives the plain choice, bit for bit.
 ///
 /// A saved slot is one of an expert that is not resident and that the truncation removed or
 /// replaced.
@@ -574,33 +577,45 @@ pub(crate) fn sqrt_softplus_truncated_choice(
         }
         slots = out;
     }
-    slots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    if truncation.keep > 0 && truncation.keep < slots.len() {
-        saved += slots[truncation.keep..]
+    // Slot indices heaviest first, the earlier first among equals.
+    let mut by_weight: Vec<usize> = (0..slots.len()).collect();
+    by_weight.sort_by(|&a, &b| {
+        slots[b]
+            .1
+            .partial_cmp(&slots[a].1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // The slots of `by_weight[..kept]` stay.
+    let mut kept = by_weight.len();
+    if truncation.keep > 0 && truncation.keep < kept {
+        saved += by_weight[truncation.keep..]
             .iter()
-            .filter(|s| !resident(s.0))
+            .filter(|&&i| !resident(slots[i].0))
             .count() as u64;
-        slots.truncate(truncation.keep);
+        kept = truncation.keep;
     }
     if truncation.drop_mass > 0.0 {
-        let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
+        let total: f32 =
+            by_weight[..kept].iter().map(|&i| slots[i].1).sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
         let mut dropped = 0f32;
-        while slots.len() > 1 && (dropped + slots[slots.len() - 1].1) / total < truncation.drop_mass
-        {
-            if let Some(gone) = slots.pop() {
-                dropped += gone.1;
-                saved += !resident(gone.0) as u64;
-            }
+        while kept > 1 && (dropped + slots[by_weight[kept - 1]].1) / total < truncation.drop_mass {
+            kept -= 1;
+            let gone = slots[by_weight[kept]];
+            dropped += gone.1;
+            saved += !resident(gone.0) as u64;
         }
     }
-    let ids: Vec<usize> = slots.iter().map(|s| s.0).collect();
-    let mut w: Vec<f32> = slots.iter().map(|s| s.1).collect();
-    if normalize && k > 1 {
-        let s: f32 = w.iter().sum::<f32>() + SQRT_SOFTPLUS_SUM_EPS;
-        for wi in w.iter_mut() {
-            *wi /= s;
-        }
+    let mut stays = vec![false; slots.len()];
+    for &i in &by_weight[..kept] {
+        stays[i] = true;
     }
+    let (ids, w): (Vec<usize>, Vec<f32>) = slots
+        .iter()
+        .zip(&stays)
+        .filter(|(_, &stay)| stay)
+        .map(|(&slot, _)| slot)
+        .unzip();
+    let w = normalised(w, k, normalize);
     (ids, w, saved)
 }
 
@@ -3571,8 +3586,7 @@ mod sqrt_softplus_router_tests {
     }
 
     /// The routing of the 4-expert case under `truncation`, with `resident` the experts in
-    /// memory, from the generic truncated choice, asserted to be the one the block's own gate
-    /// gave.
+    /// memory, from the generic truncated choice, asserted to be the recorded one.
     ///
     /// Returns, per token, the experts and the bits of their scaled weights, then the slots
     /// saved.
@@ -3632,8 +3646,8 @@ mod sqrt_softplus_router_tests {
     }
 
     /// Off, the truncated choice routes as the plain one does. Keeping 1 expert leaves each
-    /// token the heaviest, alone, with the whole route scale. Each case gives the experts, the
-    /// weight bits and the saved slots of the block's own gate.
+    /// token the heaviest, alone, with the whole route scale. Each case gives the recorded
+    /// experts, weight bits and saved slots.
     #[test]
     fn truncation_keeps_the_heaviest_and_weights_it_whole() {
         let none = std::collections::HashSet::new();
@@ -3673,8 +3687,8 @@ mod sqrt_softplus_router_tests {
     }
 
     /// A light expert that is not resident gives its slot to a resident one, or is dropped.
-    /// The heaviest of a token is never touched. Each case gives the experts, the weight bits
-    /// and the saved slots of the block's own gate.
+    /// The heaviest of a token is never touched. Each case gives the recorded experts, weight
+    /// bits and saved slots.
     #[test]
     fn a_missed_light_expert_is_replaced_by_a_resident_one() {
         let none = std::collections::HashSet::new();
@@ -3707,10 +3721,10 @@ mod sqrt_softplus_router_tests {
         }
     }
 
-    /// Shares a quality calibration tries, a dropped mass, and both at once give the experts,
-    /// the weight bits and the saved slots of the block's own gate.
+    /// Shares a quality calibration tries, a dropped mass, and both at once give the recorded
+    /// experts, weight bits and saved slots.
     #[test]
-    fn every_truncation_routes_as_the_blocks_own_gate() {
+    fn every_truncation_routes_as_recorded() {
         let resident: std::collections::HashSet<usize> = (0..ROUTED).step_by(2).collect();
         let cases = [
             Truncation {
@@ -3734,6 +3748,97 @@ mod sqrt_softplus_router_tests {
         ];
         for t in cases {
             truncated_both(t, &resident);
+        }
+    }
+
+    /// The drawn rows of the 4-expert case, the case and its selection bias.
+    fn truncation_rows() -> (Case, Vec<Vec<f32>>, Vec<f32>) {
+        let case = Case {
+            used: 4,
+            temperature: 1.0,
+            route_scale: 1.5,
+            norm_topk: true,
+            gate_amp: 0.2,
+            bias_amp: 0.1,
+        };
+        let (logits, bias) = gate(&case);
+        let logits = logits.to_vec2::<f32>().unwrap();
+        let bias = bias.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        (case, logits, bias)
+    }
+
+    /// With no expert in memory, each miss share a calibration tries replaces nothing and gives
+    /// the plain choice: the same experts in the same order, the same weight bits.
+    #[test]
+    fn a_truncation_that_gives_up_nothing_is_the_plain_choice() {
+        let (case, rows, bias) = truncation_rows();
+        let none_resident = |_: usize| false;
+        let misses = super::super::routing_calibration::candidates(case.used)
+            .into_iter()
+            .filter(|t| t.miss_below > 0.0);
+        let mut reordered = false;
+        for t in misses {
+            for row in &rows {
+                let (plain, plain_w) =
+                    sqrt_softplus_choice(row, Some(&bias), case.used, case.temperature, true);
+                let (ids, w, saved) = sqrt_softplus_truncated_choice(
+                    row,
+                    Some(&bias),
+                    case.used,
+                    case.temperature,
+                    true,
+                    t,
+                    &none_resident,
+                );
+                assert_eq!(saved, 0, "{t:?}");
+                assert_eq!(ids, plain, "{t:?}");
+                let bits = |w: &[f32]| w.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&w), bits(&plain_w), "{t:?}");
+                // The bias puts a lighter expert before a heavier one.
+                reordered |= plain_w.windows(2).any(|p| p[0] < p[1]);
+            }
+        }
+        assert!(reordered, "the bias reorders no row");
+    }
+
+    /// `keep` removes the same experts as cutting the slots sorted heaviest first, the earlier
+    /// first among equals.
+    #[test]
+    fn keep_removes_the_lightest_experts() {
+        let (case, rows, bias) = truncation_rows();
+        let none_resident = |_: usize| false;
+        for keep in 1..case.used {
+            let t = Truncation {
+                keep,
+                ..Default::default()
+            };
+            for row in &rows {
+                let (plain, plain_w) =
+                    sqrt_softplus_choice(row, Some(&bias), case.used, case.temperature, true);
+                let mut by_weight: Vec<(usize, f32)> =
+                    plain.iter().copied().zip(plain_w.iter().copied()).collect();
+                by_weight.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let mut want: Vec<usize> = by_weight[..keep].iter().map(|s| s.0).collect();
+                let (mut ids, _, saved) = sqrt_softplus_truncated_choice(
+                    row,
+                    Some(&bias),
+                    case.used,
+                    case.temperature,
+                    true,
+                    t,
+                    &none_resident,
+                );
+                // The kept experts stay in the plain choice's order.
+                let ranks: Vec<usize> = ids
+                    .iter()
+                    .map(|e| plain.iter().position(|p| p == e).unwrap())
+                    .collect();
+                assert!(ranks.windows(2).all(|r| r[0] < r[1]), "{keep}: {ranks:?}");
+                assert_eq!(saved, (case.used - keep) as u64);
+                ids.sort_unstable();
+                want.sort_unstable();
+                assert_eq!(ids, want, "keep {keep}");
+            }
         }
     }
 }
