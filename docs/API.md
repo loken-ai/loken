@@ -408,6 +408,7 @@ The energy drawn meanwhile goes to the next reading, so a request's figure can m
 A field loken does not measure is left out.  
 `energy` is absent when no domain is read.  
 `kv` is absent when the backend does not report its cache.
+A request served by the batch worker reports its sequence in the worker's paged pool, and the tokens of that pool.
 
 An answer that gathers several generations (`n` above 1) reports the sum of their figures.
 Times and energy are added, `share` is `work` when any generation shared its energy, and `kv` is the place after the last generation.
@@ -425,6 +426,7 @@ A streamed answer whose prompt is still being read after 250 ms reports the read
 ```
 
 `done` is the prompt tokens read so far and `total` the tokens to read, the cached prefix left out.
+The serial path and the batch worker both read a long prompt a prefill chunk at a time, and `done` moves at each chunk.
 
 A prompt read in under 250 ms sends no comment line.
 Neither does a model served by continuous batching, whose worker reads several prompts at once.

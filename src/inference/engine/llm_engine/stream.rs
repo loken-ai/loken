@@ -305,7 +305,10 @@ impl LlmEngine {
             Some(r) => (Some(r.prior), Some(r.serial), Vec::new()),
             None => (None, None, tokens.clone()),
         };
-        let cb_rx = server.submit_cb(tokens, max_new, sampling);
+        let cache_tokens = server.cache_tokens();
+        // A resumed answer reported its prompt on the serial path.
+        let watch = probe.clone().filter(|_| prior.is_none());
+        let cb_rx = server.submit_cb(tokens, max_new, sampling, watch);
         std::thread::spawn(move || {
             let resumed = prior.is_some();
             let mut gen: Vec<u32> = prior.unwrap_or_default();
@@ -441,8 +444,8 @@ impl LlmEngine {
                         .saturating_duration_since(at)
                         .as_millis()
                 );
-                // The worker does not speculate and the cache place is its shared pool:
-                // neither is reported.
+                // The worker does not speculate: no draft is reported.
+                // The request's place is its sequence in the worker's shared pool.
                 crate::request_metrics::record_outcome(
                     &model_id,
                     probe.as_deref(),
@@ -457,6 +460,10 @@ impl LlmEngine {
                             prompt_len as u64,
                             cached as u64,
                             gen.len() as u64,
+                        ),
+                        kv: crate::request_metrics::KvPlace::of(
+                            Some(prompt_len + gen.len()),
+                            Some(cache_tokens),
                         ),
                         ..Default::default()
                     },

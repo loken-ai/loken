@@ -115,6 +115,10 @@ pub trait BatchedModel {
     /// Drops what the model keeps for `seq` beside the paged store: the sequence finished or
     /// was aborted.
     fn release(&mut self, _seq: SeqId) {}
+
+    /// Gives the model the probe the prompt of `seq` reports its reading to.
+    fn watch(&mut self, _seq: SeqId, _probe: std::sync::Arc<crate::request_metrics::RequestProbe>) {
+    }
 }
 
 /// A generation request.
@@ -201,6 +205,15 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
     /// its tokens the prefix cache served.
     pub fn take_admitted(&mut self) -> Vec<(SeqId, std::time::Instant, usize)> {
         std::mem::take(&mut self.admitted)
+    }
+
+    /// Gives the model the probe the prompt of `seq` reports its reading to.
+    pub fn watch(
+        &mut self,
+        seq: SeqId,
+        probe: std::sync::Arc<crate::request_metrics::RequestProbe>,
+    ) {
+        self.model.watch(seq, probe);
     }
 
     pub fn is_idle(&self) -> bool {

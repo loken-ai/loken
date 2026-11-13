@@ -322,6 +322,59 @@ fn served_alone_and_beside_agree_on(load: &dyn Fn() -> GenericHeteroTransformer)
     }
 }
 
+/// Tokens of the prompt the server reads in chunks: 2 chunks and a part.
+const CHUNKED_PROMPT: usize = 2 * CB_BLOCK_SIZE + CB_BLOCK_SIZE / 2;
+
+/// The server reads a prompt longer than its chunk a chunk at a time, to the tokens it gives
+/// that prompt read in 1 forward, and the request's probe ends with the whole prompt read.
+fn a_long_prompt_reads_in_chunks_on(load: &dyn Fn() -> GenericHeteroTransformer, vocab: u32) {
+    use crate::inference::serve::continuous_batch::SamplingParams;
+    use crate::request_metrics::RequestProbe;
+    let prompt: Vec<u32> = (0..CHUNKED_PROMPT as u32)
+        .map(|i| (i * 3 + 1) % vocab)
+        .collect();
+    let serve = |chunk: usize| {
+        let server =
+            ContinuousServer::spawn(Arc::new(load()), Vec::new(), 64, CB_BLOCK_SIZE, 8, chunk)
+                .unwrap();
+        let probe = Arc::new(RequestProbe::default());
+        let rx = server.submit_watched(
+            prompt.clone(),
+            STEPS,
+            SamplingParams::greedy(),
+            Some(Arc::clone(&probe)),
+        );
+        let mut tokens = Vec::new();
+        for token in rx.iter() {
+            match token {
+                CbToken::Tok(t) => tokens.push(t),
+                CbToken::Done(_) => break,
+                CbToken::Admitted { .. } => {}
+            }
+        }
+        let _ = server.stop();
+        (tokens, probe.prefill())
+    };
+    let whole = serve(CHUNKED_PROMPT);
+    let chunked = serve(CB_BLOCK_SIZE);
+    let read = (CHUNKED_PROMPT as u64, CHUNKED_PROMPT as u64);
+    assert_eq!(whole.0.len(), STEPS, "the whole read ended early");
+    assert_eq!(chunked.0, whole.0, "the chunked read gave other tokens");
+    assert_eq!(whole.1, read);
+    assert_eq!(chunked.1, read);
+}
+
+/// [`a_long_prompt_reads_in_chunks_on`] on the host.
+#[test]
+fn a_long_prompt_reads_in_chunks_to_the_tokens_it_gives_whole() {
+    let path = tiny_model::write("cb-chunked", LAYERS);
+    a_long_prompt_reads_in_chunks_on(
+        &|| tiny_model::load(&path, LAYERS),
+        tiny_model::VOCAB as u32,
+    );
+    tiny_model::remove(&path);
+}
+
 /// A stretched rotation is served by the batched paths on the host, from each layer's tables.
 #[test]
 fn a_stretched_rotation_decodes_to_the_same_tokens_alone_and_inside_a_batch() {
@@ -917,6 +970,20 @@ mod on_a_card {
         assert!(
             worst <= SHARE,
             "the split logits moved by {worst} of their range"
+        );
+        tiny_model::remove(&path);
+    }
+
+    /// [`a_long_prompt_reads_in_chunks_on`] on card 0.
+    #[test]
+    fn a_long_prompt_reads_in_chunks_on_a_card() {
+        if !card() {
+            return;
+        }
+        let path = quant("cb-card-chunked", tiny_model::QuantExtras::default());
+        a_long_prompt_reads_in_chunks_on(
+            &|| tiny_model::load_on_card(&path, LAYERS),
+            tiny_model::QUANT_VOCAB as u32,
         );
         tiny_model::remove(&path);
     }

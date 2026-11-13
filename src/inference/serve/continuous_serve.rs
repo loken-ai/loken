@@ -22,6 +22,7 @@ use crate::inference::serve::continuous_batch::{
     BatchedModel, ContinuousBatchEngine, GenReq, SamplingParams, StepItem,
 };
 use crate::inference::serve::scheduler::FinishReason;
+use crate::request_metrics::RequestProbe;
 use crate::tensor::{DType, Tensor, D};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -45,6 +46,8 @@ struct Submission {
     max_new: usize,
     sampling: SamplingParams,
     tx: Sender<CbToken>,
+    /// The probe the prompt reports its reading to.
+    probe: Option<Arc<RequestProbe>>,
 }
 
 /// The paged KV pool of a stopped worker, kept for its next start.
@@ -78,6 +81,8 @@ pub struct ContinuousServer {
     /// The served model when the worker shares it; `stop` takes it back once the worker ends.
     /// `None` when the worker owns it.
     model: Option<Arc<GenericHeteroTransformer>>,
+    /// The tokens the paged pool holds.
+    cache_tokens: usize,
 }
 
 /// The model-side adapter: decode items run in ONE batched `batched_paged_decode`
@@ -95,6 +100,10 @@ struct GhBatched {
     #[cfg(feature = "gpu")]
     graph_failed: bool,
     pace: StepPace,
+    /// The most prompt rows 1 forward reads.
+    chunk: usize,
+    /// The probes of the prompts not read yet, by sequence.
+    probes: HashMap<SeqId, Arc<RequestProbe>>,
 }
 
 /// The time the batched steps of the last second took, logged once a second while the
@@ -535,7 +544,8 @@ impl BatchedModel for GhBatched {
             self.pace.decode += decode_start.elapsed();
         }
         // -- prefills: every prompt in ONE forward, the weights read once. A prompt whose prefix
-        // the cache holds computes only its suffix. --
+        // the cache holds computes only its suffix. A prompt longer than a chunk reads alone,
+        // a chunk at a time. --
         let prefill_start = std::time::Instant::now();
         let mut plain = Vec::new();
         let mut cached = Vec::new();
@@ -545,13 +555,26 @@ impl BatchedModel for GhBatched {
             }
             self.pace.prompts += 1;
             self.pace.prompt_tokens += it.tokens.len() as u32;
-            if it.cached_len == 0 {
+            if it.tokens.len() - it.cached_len > self.chunk && !it.block_table.is_empty() {
+                out[i] = self.prefill_in_chunks(it)?;
+            } else if it.cached_len == 0 {
                 plain.push(i);
             } else {
                 cached.push(i);
             }
         }
         if !plain.is_empty() || !cached.is_empty() {
+            let probes: Vec<(Arc<RequestProbe>, usize)> = plain
+                .iter()
+                .chain(cached.iter())
+                .filter_map(|&i| {
+                    let rows = items[i].tokens.len() - items[i].cached_len;
+                    self.probes.remove(&items[i].seq).map(|p| (p, rows))
+                })
+                .collect();
+            for (probe, rows) in &probes {
+                report_read(probe, 0, *rows);
+            }
             let plain_seqs: Vec<(&[u32], &[usize])> = plain
                 .iter()
                 .map(|&i| (items[i].tokens.as_slice(), items[i].slots.as_slice()))
@@ -571,11 +594,71 @@ impl BatchedModel for GhBatched {
             for (row, &i) in plain.iter().chain(cached.iter()).enumerate() {
                 out[i] = sample_row(&l, row, &items[i].sampling, &items[i].recent_tokens)?;
             }
+            for (probe, rows) in &probes {
+                report_read(probe, *rows, *rows);
+            }
         }
         self.pace.prefill += prefill_start.elapsed();
         self.pace.report_each_second();
         Ok(out)
     }
+
+    fn watch(&mut self, seq: SeqId, probe: Arc<RequestProbe>) {
+        self.probes.insert(seq, probe);
+    }
+
+    fn release(&mut self, seq: SeqId) {
+        self.probes.remove(&seq);
+    }
+}
+
+impl GhBatched {
+    /// Reads the prompt of `it` a chunk of rows at a time and samples its first token.
+    ///
+    /// Each chunk after the first reads the rows before it from the paged store.
+    /// The request's probe hears of each chunk before it is read, and of the whole prompt.
+    fn prefill_in_chunks(&mut self, it: &StepItem) -> crate::tensor::Result<u32> {
+        use crate::inference::generic_transformer::CachedPrompt;
+        let probe = self.probes.remove(&it.seq);
+        let total = it.tokens.len() - it.cached_len;
+        let mut off = it.cached_len;
+        let mut logits = None;
+        while off < it.tokens.len() {
+            if let Some(p) = probe.as_ref() {
+                report_read(p, off - it.cached_len, total);
+            }
+            let n = self.chunk.min(it.tokens.len() - off);
+            let slots = &it.slots[off - it.cached_len..off - it.cached_len + n];
+            let prefix = CachedPrompt {
+                tokens: &it.tokens[..off + n],
+                suffix_slots: slots,
+                cached_len: off,
+                block_table: &it.block_table,
+            };
+            logits = Some(if off == 0 {
+                self.model.paged_prefill_mixed(
+                    &[(&it.tokens[..n], slots)],
+                    &[],
+                    &mut self.stores,
+                )?
+            } else {
+                self.model
+                    .paged_prefill_mixed(&[], &[prefix], &mut self.stores)?
+            });
+            off += n;
+        }
+        if let Some(p) = probe.as_ref() {
+            report_read(p, total, total);
+        }
+        let logits = logits.ok_or_else(|| crate::tensor::Error::msg("empty prefill"))?;
+        sample_row(&logits, 0, &it.sampling, &it.recent_tokens)
+    }
+}
+
+/// Tells `probe` that `done` of the `total` prompt rows to read are read.
+fn report_read(probe: &Arc<RequestProbe>, done: usize, total: usize) {
+    let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(probe)));
+    crate::request_metrics::note_prefill(done, total);
 }
 
 /// The model-side adapter of a model whose layers keep each sequence's state beside the paged
@@ -1146,6 +1229,8 @@ impl ContinuousServer {
             #[cfg(feature = "gpu")]
             graph_failed: false,
             pace: StepPace::default(),
+            chunk: max_prefill_tokens.max(1),
+            probes: HashMap::new(),
         };
         let (submit_tx, worker) = launch(
             adapter,
@@ -1161,6 +1246,7 @@ impl ContinuousServer {
             submit_tx,
             worker,
             model: Some(served),
+            cache_tokens: num_blocks * block_size,
         })
     }
 
@@ -1200,6 +1286,7 @@ impl ContinuousServer {
                 submit_tx,
                 worker,
                 model: None,
+                cache_tokens: num_blocks * block_size,
             }),
             Err((adapter, e)) => Err((adapter.model, e)),
         }
@@ -1220,6 +1307,7 @@ impl ContinuousServer {
             submit_tx,
             worker,
             model,
+            ..
         } = self;
         drop(submit_tx);
         let SendWrap((owned, parked)) = worker
@@ -1249,6 +1337,17 @@ impl ContinuousServer {
         max_new: usize,
         sampling: SamplingParams,
     ) -> Receiver<CbToken> {
+        self.submit_watched(prompt, max_new, sampling, None)
+    }
+
+    /// [`Self::submit_sampled`] with the probe the prompt reports its reading to.
+    pub fn submit_watched(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: SamplingParams,
+        probe: Option<Arc<RequestProbe>>,
+    ) -> Receiver<CbToken> {
         let (tx, rx) = mpsc::channel();
         // If the worker is gone, the receiver just yields nothing.
         let _ = self.submit_tx.send(Submission {
@@ -1256,6 +1355,7 @@ impl ContinuousServer {
             max_new,
             sampling,
             tx,
+            probe,
         });
         rx
     }
@@ -1266,12 +1366,17 @@ impl ContinuousServer {
 /// continuous-batch server and the DeepSeek batch worker implement it, so the serving path has one
 /// route, not one per model.
 pub trait BatchedServer: Send + Sync {
+    /// Submits a request whose prompt reports its reading to `probe`.
     fn submit_cb(
         &self,
         prompt: Vec<u32>,
         max_new: usize,
         sampling: SamplingParams,
+        probe: Option<Arc<RequestProbe>>,
     ) -> Receiver<CbToken>;
+
+    /// The tokens the cache of the worker holds, its sequences together.
+    fn cache_tokens(&self) -> usize;
 }
 
 impl BatchedServer for ContinuousServer {
@@ -1280,8 +1385,13 @@ impl BatchedServer for ContinuousServer {
         prompt: Vec<u32>,
         max_new: usize,
         sampling: SamplingParams,
+        probe: Option<Arc<RequestProbe>>,
     ) -> Receiver<CbToken> {
-        self.submit_sampled(prompt, max_new, sampling)
+        self.submit_watched(prompt, max_new, sampling, probe)
+    }
+
+    fn cache_tokens(&self) -> usize {
+        self.cache_tokens
     }
 }
 
@@ -1345,6 +1455,9 @@ fn worker_loop<M: BatchedModel>(
                 Ok(sub) => {
                     let id = next_id;
                     next_id += 1;
+                    if let Some(probe) = sub.probe {
+                        engine.watch(id, probe);
+                    }
                     engine.submit(GenReq {
                         id,
                         prompt: sub.prompt,
@@ -1370,6 +1483,9 @@ fn worker_loop<M: BatchedModel>(
                 Ok(sub) => {
                     let id = next_id;
                     next_id += 1;
+                    if let Some(probe) = sub.probe {
+                        engine.watch(id, probe);
+                    }
                     engine.submit(GenReq {
                         id,
                         prompt: sub.prompt,
