@@ -47,8 +47,12 @@ inline int dp_ss(uint a, uint b, int c) {
 #endif
 
 // Half to float by arithmetic, so that the weights can be read as aligned words.
+// A subnormal half becomes a normal float, so a device that flushes subnormal floats reads it
+// whole.
 inline float h2f(uint h) {
-    return as_float(((h & 0x8000u) << 16) | ((h & 0x7fffu) << 13)) * 0x1p112f;
+    float mag = (h & 0x7c00u) != 0 ? as_float(((h & 0x7fffu) << 13) + 0x38000000u)
+                                   : (float)(h & 0x3ffu) * 0x1p-24f;
+    return as_float(as_uint(mag) | ((h & 0x8000u) << 16));
 }
 
 // The four bytes of a word as floats.

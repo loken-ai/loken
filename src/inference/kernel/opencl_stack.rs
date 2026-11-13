@@ -1778,6 +1778,59 @@ mod tests {
         }
     }
 
+    /// Every finite half the kernels read, the subnormal ones included, comes out as its value
+    /// on a device built to flush subnormal floats.
+    #[test]
+    #[ignore = "needs an OpenCL device"]
+    fn halves_read_whole_where_subnormal_floats_flush() {
+        let source = format!(
+            "{}\n__kernel void halves(__global const uint* h, __global float* out) {{\n    \
+             uint i = get_global_id(0);\n    out[i] = h2f(h[i]);\n}}\n",
+            include_str!("../../kernels/dense_stack.cl")
+        );
+        let halves: Vec<u32> = (0..=u16::MAX as u32)
+            .filter(|h| h & 0x7c00 != 0x7c00)
+            .collect();
+        for (i, id) in super::super::opencl::enumerate_opencl_devices()
+            .into_iter()
+            .enumerate()
+        {
+            let dev = Device::new(id);
+            let ctx = Context::from_device(&dev).unwrap();
+            #[allow(deprecated)]
+            let queue = CommandQueue::create_default(&ctx, 0).unwrap();
+            let program = Program::create_and_build_from_source(
+                &ctx,
+                &source,
+                &format!("-DR=1 -DSLICES={SLICES} -DRB=1 -cl-denorms-are-zero"),
+            )
+            .unwrap();
+            let kernel = Kernel::create(&program, "halves").unwrap();
+            let bits: Vec<f32> = halves.iter().map(|&h| f32::from_bits(h)).collect();
+            let input = upload_f32(&ctx, &bits).unwrap();
+            let out = scratch(&ctx, halves.len()).unwrap();
+            let mut got = vec![0f32; halves.len()];
+            unsafe {
+                ExecuteKernel::new(&kernel)
+                    .set_arg(&input)
+                    .set_arg(&out)
+                    .set_global_work_size(halves.len())
+                    .enqueue_nd_range(&queue)
+                    .unwrap();
+                queue
+                    .enqueue_read_buffer(&out, CL_BLOCKING, 0, &mut got, &[])
+                    .unwrap();
+            }
+            let wrong = halves
+                .iter()
+                .zip(&got)
+                .filter(|(&h, &g)| half::f16::from_bits(h as u16).to_f32().to_bits() != g.to_bits())
+                .count();
+            println!("device {i}: {wrong} of {} halves read wrong", halves.len());
+            assert_eq!(wrong, 0);
+        }
+    }
+
     const FORMATS: [GgmlDType; 7] = [
         GgmlDType::Q8_0,
         GgmlDType::Q4_0,
