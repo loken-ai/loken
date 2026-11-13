@@ -14,6 +14,21 @@ const SCORES_SHARES_OF_FREE: usize = 4;
 /// copy derived from them.
 const SINK_SCORES_LIVE_COPIES: usize = 2;
 
+/// The additive form of `mask` (1 hides a key) in `dtype`: minus infinity where it hides a key,
+/// 0 elsewhere.
+/// Added to the scores, it hides the same keys as a select does.
+/// It has the mask's shape, so masking a tile of scores makes no copy of the tile's size beside
+/// its result.
+fn mask_bias(mask: &Tensor, dtype: crate::tensor::DType) -> Result<Tensor> {
+    let device = mask.device();
+    let fill = |v: f32| -> Result<Tensor> {
+        Tensor::new(v, &device)?
+            .to_dtype(dtype)?
+            .broadcast_as(mask.dims())
+    };
+    mask.where_cond(&fill(f32::NEG_INFINITY)?, &fill(0.0)?)
+}
+
 /// Card bytes the materialised sink attention keeps alive for a prompt of `rows` rows over
 /// `keys` keys with `n_head` query heads, at batch 1.
 ///
@@ -675,13 +690,7 @@ impl GenericTransformerLayer {
                         } else {
                             m.narrow(qdim, q_off, tlen)?
                         };
-                        let mb = mt.broadcast_as(att.shape())?;
-                        let neg = if kv_dt == crate::tensor::DType::F32 {
-                            self.neg_inf.clone()
-                        } else {
-                            self.neg_inf.to_dtype(kv_dt)?
-                        };
-                        mb.where_cond(&neg.broadcast_as(att.dims())?, &att)?
+                        att.broadcast_add(&mask_bias(&mt, kv_dt)?)?
                     }
                 };
                 att = if kv_dt == crate::tensor::DType::F32 {
@@ -1145,7 +1154,6 @@ pub(super) fn sink_attention_matmul(
     let kt = k.t()?;
     let v = v.contiguous()?;
     let sinks = sinks.map(|s| s.to_dtype(DType::F32)).transpose()?;
-    let neg_inf = Tensor::new(f32::NEG_INFINITY, &q.device())?;
     // Each step drops the scores it read.
     // At most `SINK_SCORES_LIVE_COPIES` copies of a tile's scores are alive at once.
     let attend = |qt: &Tensor, off: usize| -> Result<Tensor> {
@@ -1163,9 +1171,7 @@ pub(super) fn sink_attention_matmul(
             } else {
                 m.narrow(qdim, off, t)?
             };
-            scores = mt
-                .broadcast_as(scores.shape())?
-                .where_cond(&neg_inf.broadcast_as(scores.dims())?, &scores)?;
+            scores = scores.broadcast_add(&mask_bias(&mt, DType::F32)?)?;
         }
         let probs = match sinks.as_ref() {
             Some(sinks) => {

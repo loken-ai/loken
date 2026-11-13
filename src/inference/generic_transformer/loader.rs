@@ -2178,8 +2178,6 @@ fn build_generic_layer(
         sin.to_device(device)?
     };
 
-    let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
-
     // Per-layer head_dim: derive from Q weight output dim if available.
     // Gemma4 has per-layer varying head_dim (SWA=256, full=512).
     let head_dim = match raw.q_out_dim {
@@ -3018,7 +3016,6 @@ fn build_generic_layer(
         graph_alive_tensors: Vec::new(),
         cos,
         sin,
-        neg_inf,
         // Proportional RoPE: only for global layers (head_dim matches config).
         rope_freq_factors: if head_dim == config.head_dim {
             rope_freq_factors.map(|t| t.to_device(device)).transpose()?
@@ -3404,7 +3401,6 @@ fn build_awq_layer(
         "post_attention_layernorm.weight",
     )?));
 
-    let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
     let head_dim = config.head_dim;
     let cos = if cos.device().same_device(device) {
         cos.clone()
@@ -3540,7 +3536,6 @@ fn build_awq_layer(
         graph_alive_tensors: Vec::new(),
         cos,
         sin,
-        neg_inf,
         rope_freq_factors: None,
         rope_factored_freqs: None,
         n_head: config.n_head,

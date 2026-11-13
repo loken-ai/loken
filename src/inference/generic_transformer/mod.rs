@@ -522,7 +522,6 @@ pub struct GenericTransformerLayer {
     pub graph_alive_tensors: Vec<Tensor>,
     pub cos: Tensor,
     pub sin: Tensor,
-    pub neg_inf: Tensor,
     /// Gemma4 global layers: per-dimension RoPE frequency factors (proportional RoPE)
     pub rope_freq_factors: Option<Tensor>,
     /// Pre-computed inverse-frequency table with `rope_freq_factors`

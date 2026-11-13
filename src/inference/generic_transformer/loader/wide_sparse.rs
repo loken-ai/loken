@@ -943,7 +943,6 @@ impl GenericHeteroTransformer {
                 graph_alive_tensors: Vec::new(),
                 cos: unused_table.clone(),
                 sin: unused_table,
-                neg_inf: Tensor::new(f32::NEG_INFINITY, &Device::Cpu)?,
                 rope_freq_factors: None,
                 rope_factored_freqs: None,
                 n_head: meta.heads,
