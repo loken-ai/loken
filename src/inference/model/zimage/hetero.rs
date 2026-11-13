@@ -9,8 +9,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::inference::model::zimage::dit::{
-    create_coordinate_grid, patch_grid, patchify, stem, unpatchify, Config, FinalLayer,
-    RopeEmbedder, TimestepEmbedder, Vb, ZImageTransformerBlock,
+    create_coordinate_grid, patch_grid, patchify, refiner_stack, stem, unpatchify, Config,
+    FinalLayer, RopeEmbedder, TimestepEmbedder, Vb, ZImageTransformerBlock,
 };
 use crate::tensor::layer::RmsNorm;
 use crate::tensor::layer::{linear, rms_norm, Linear};
@@ -60,7 +60,8 @@ pub struct HeteroZImage {
     // Blocks with per-device assignment (the substrate path)
     noise_refiner: Vec<ZImageTransformerBlock>,
     context_refiner: Vec<ZImageTransformerBlock>,
-    main_layers: Vec<ZImageTransformerBlock>,
+    // Indexed by layer: a block run through OpenCL has no host copy.
+    main_layers: Vec<Option<ZImageTransformerBlock>>,
 
     // OpenCL blocks (indexed by layer number, only populated for OpenCL segments)
     #[cfg(feature = "opencl")]
@@ -233,7 +234,24 @@ impl HeteroZImage {
 
         // 2. Build refiners on primary device
         info!("HeteroZImage: building refiners on {:?}", primary_device);
-        let (noise_refiner, context_refiner) = stem::refiners(cfg, &stem_vb)?;
+        // The noise refiner runs through OpenCL when the main stack starts there.
+        // The host then holds no copy of it.
+        #[cfg(feature = "opencl")]
+        let noise_on_opencl = ocl_pipelines.is_some()
+            && matches!(
+                plan.segments.first().map(|s| s.kind),
+                Some(DeviceKind::OpenCL(_))
+            );
+        #[cfg(not(feature = "opencl"))]
+        let noise_on_opencl = false;
+        let (noise_refiner, context_refiner) = if noise_on_opencl {
+            (
+                Vec::new(),
+                refiner_stack(cfg, false, &stem_vb.pp("context_refiner"))?,
+            )
+        } else {
+            stem::refiners(cfg, &stem_vb)?
+        };
 
         // 3. Build main layers on their assigned devices per plan
         info!(
@@ -248,18 +266,21 @@ impl HeteroZImage {
         let mut ocl_blocks: Vec<Option<OpenCLZImageBlock>> =
             (0..total_main).map(|_| None).collect();
 
-        // For OpenCL segments, we need raw safetensors access
+        // The OpenCL blocks read their tensors from the shards mapped, never read whole.
+        // The maps are dropped at the end of the load.
         #[cfg(feature = "opencl")]
-        let raw_st_data: Option<Vec<Vec<u8>>> = if ocl_pipelines.is_some() {
-            // Read all safetensors files for direct raw loading
-            let mut data = Vec::new();
+        let raw_st_data: Option<Vec<memmap2::Mmap>> = if ocl_pipelines.is_some() {
+            let mut maps = Vec::new();
             for f in safetensors_files {
-                data.push(
-                    std::fs::read(f)
-                        .map_err(|e| crate::tensor::Error::msg(format!("Read {}: {}", f, e)))?,
+                let file = std::fs::File::open(f)
+                    .map_err(|e| crate::tensor::Error::msg(format!("Open {}: {}", f, e)))?;
+                // SAFETY: the checkpoint is only read, and nothing in this process writes it.
+                maps.push(
+                    unsafe { memmap2::Mmap::map(&file) }
+                        .map_err(|e| crate::tensor::Error::msg(format!("Map {}: {}", f, e)))?,
                 );
             }
-            Some(data)
+            Some(maps)
         } else {
             None
         };
@@ -321,16 +342,8 @@ impl HeteroZImage {
                     }
                 }
 
-                // A placeholder block for the main_layers vec (never called for OpenCL segments)
-                // We need the vec to be the right size, but OpenCL segments use ocl_blocks instead
-                let dummy_vb = vb_cpu.as_ref().unwrap_or(&vb_primary);
-                for i in seg.layer_start..seg.layer_end {
-                    main_layers.push(ZImageTransformerBlock::new(
-                        cfg,
-                        true,
-                        Vb::Dense(dummy_vb.pp("layers").pp(i)),
-                    )?);
-                }
+                // The host holds no copy of a block that runs through OpenCL.
+                main_layers.extend((seg.layer_start..seg.layer_end).map(|_| None));
 
                 main_segments.push(ZImageSegment {
                     device: Device::Cpu, // placeholder, not used for OpenCL
@@ -394,11 +407,11 @@ impl HeteroZImage {
             });
 
             for i in seg.layer_start..seg.layer_end {
-                main_layers.push(ZImageTransformerBlock::new(
+                main_layers.push(Some(ZImageTransformerBlock::new(
                     cfg,
                     true,
                     Vb::Dense(seg_vb.pp("layers").pp(i)),
-                )?);
+                )?));
             }
         }
 
@@ -597,7 +610,10 @@ impl HeteroZImage {
         for i in span {
             let _timer =
                 crate::inference::place::layer_perf::LayerTimer::start_for(i, "z-image-turbo");
-            unified = self.main_layers[i].forward(&unified, mask, cos, sin, Some(adaln))?;
+            let block = self.main_layers[i].as_ref().ok_or_else(|| {
+                crate::tensor::Error::msg(format!("main layer {i} has no host block"))
+            })?;
+            unified = block.forward(&unified, mask, cos, sin, Some(adaln))?;
             if let Some(dev) = sync {
                 let _ = dev.synchronize();
             }
@@ -1013,6 +1029,12 @@ impl HeteroZImage {
                 .map_err(|e| {
                     crate::tensor::Error::msg(format!("OpenCL block {:?} forward: {}", layer, e))
                 })?;
+            // The queue holds one block of work at a time.
+            // A driver may cancel work queued behind a long chain of earlier work.
+            pipelines
+                .queue
+                .finish()
+                .map_err(|e| crate::tensor::Error::msg(format!("OpenCL finish: {}", e)))?;
         }
 
         // Ensure all kernels complete before reading CPU memory

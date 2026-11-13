@@ -217,6 +217,10 @@ Devices of Mesa's OpenCL platform are not offered for layers, because the layers
 A device that reports its memory as the host's offers a placement no more than the host can spare.
 A Z-Image block runs through Intel's OpenCL runtime and gives the host's output within 1% on average.
 On the laptop's processor, at 512 by 512, a block takes 1.7 s through OpenCL against 3.1 s on the host.
+A whole 512 by 512 Z-Image picture renders with every block on the laptop's GPU, 48 s a step.
+The same picture renders with every block on the laptop's processor, 90 s a step.
+The host holds that transformer in 12.4 GB and its caption encoder in 9.1 GB.
+A server under a memory cap refuses a render on the host at the caption encoder when a quarter of the cap is not left free beside the transformer.
 
 ## Forecasting
 

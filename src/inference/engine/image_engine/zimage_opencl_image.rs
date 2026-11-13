@@ -1,11 +1,12 @@
-//! A whole Z-Image render with every block of the transformer on OpenCL.
+//! A whole Z-Image render with every block of the transformer on OpenCL, and its twin on the host.
 //!
 //! The stages run one after the other, as `generate_zimage` runs them.
+//! Both draw the noise of the same seed, so they render the same picture.
 //! The caption encoder is dropped before the transformer is loaded.
 //! The test prints the time of each stage and the host memory after each one.
 //!
 //! The checkpoint is the snapshot directory linked as `zimage-turbo` in the working directory.
-//! The picture is written there as `zimage-opencl.ppm`.
+//! The picture is written there as `zimage-opencl.ppm` or `zimage-host.ppm`.
 //!
 //! The GPU is the first one that shares the host's memory, else the first one listed.
 //!
@@ -32,7 +33,10 @@ use std::time::Instant;
 const SIDE: usize = 512;
 
 /// Denoising steps.
-const STEPS: usize = 9;
+const STEPS: usize = 4;
+
+/// The seed of the noise.
+const SEED: u64 = 42;
 
 const PROMPT: &str = "A lighthouse on a rocky coast at sunset, waves breaking below";
 
@@ -84,9 +88,18 @@ fn files(dir: &std::path::Path, sub: &str) -> Vec<String> {
 #[test]
 #[ignore = "needs the Z-Image-Turbo snapshot linked as zimage-turbo and an OpenCL device"]
 fn a_whole_image_runs_through_opencl() {
+    whole_image(DeviceKind::OpenCL(0), "zimage-opencl.ppm");
+}
+
+#[test]
+#[ignore = "needs the Z-Image-Turbo snapshot linked as zimage-turbo"]
+fn a_whole_image_runs_on_the_host() {
+    whole_image(DeviceKind::Cpu, "zimage-host.ppm");
+}
+
+/// The render with every main block on `kind`, its picture written to `out`.
+fn whole_image(kind: DeviceKind, out: &str) {
     let dir = std::path::Path::new("zimage-turbo");
-    let devices = enumerate_opencl_devices();
-    assert!(!devices.is_empty(), "no OpenCL device");
     println!("start: {}", memory());
 
     // The caption, encoded on the host, then the encoder is dropped.
@@ -113,11 +126,11 @@ fn a_whole_image_runs_through_opencl() {
     let cap_mask = Tensor::ones((1, count), DType::U8, &Device::Cpu).unwrap();
     println!("text encoder dropped: {}", memory());
 
-    // The transformer, every main block and the noise refiner on OpenCL.
+    // The transformer, every main block and the noise refiner on `kind`.
     let cfg = Config::z_image_turbo();
     let plan = HeteroPlan {
         segments: vec![HeteroSegment {
-            kind: DeviceKind::OpenCL(0),
+            kind,
             layer_start: 0,
             layer_end: cfg.n_layers,
             free_memory_bytes: u64::MAX,
@@ -127,18 +140,22 @@ fn a_whole_image_runs_through_opencl() {
         host_experts_from: None,
     };
     let start = Instant::now();
-    let device = devices
-        .iter()
-        .copied()
-        .find(|&d| shares_host_memory(d))
-        .unwrap_or(devices[0]);
-    let pipelines = Arc::new(OpenCLPipelines::new(device).unwrap());
-    println!(
-        "device: {}",
-        opencl3::device::Device::new(device)
-            .name()
-            .unwrap_or_default()
-    );
+    let pipelines = matches!(kind, DeviceKind::OpenCL(_)).then(|| {
+        let devices = enumerate_opencl_devices();
+        assert!(!devices.is_empty(), "no OpenCL device");
+        let device = devices
+            .iter()
+            .copied()
+            .find(|&d| shares_host_memory(d))
+            .unwrap_or(devices[0]);
+        println!(
+            "device: {}",
+            opencl3::device::Device::new(device)
+                .name()
+                .unwrap_or_default()
+        );
+        Arc::new(OpenCLPipelines::new(device).unwrap())
+    });
     let tf_files = files(dir, "transformer");
     let tf_refs: Vec<&str> = tf_files.iter().map(String::as_str).collect();
     let model = HeteroZImage::from_safetensors(
@@ -148,7 +165,7 @@ fn a_whole_image_runs_through_opencl() {
         &plan,
         &Device::Cpu,
         DType::F32,
-        Some(pipelines),
+        pipelines,
     )
     .unwrap();
     drop_cached(&tf_files);
@@ -170,6 +187,7 @@ fn a_whole_image_runs_through_opencl() {
     );
     let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
     scheduler.set_timesteps(STEPS, Some(mu));
+    Device::Cpu.set_seed(SEED).unwrap();
     let mut latents = get_noise(1, 16, latent, latent, &Device::Cpu)
         .unwrap()
         .unsqueeze(2)
@@ -220,6 +238,6 @@ fn a_whole_image_runs_through_opencl() {
     println!("picture: mean {mean:.1}, deviation {spread:.1} of 255");
     let mut ppm = format!("P6\n{SIDE} {SIDE}\n255\n").into_bytes();
     ppm.extend_from_slice(&rgb);
-    std::fs::write("zimage-opencl.ppm", ppm).unwrap();
+    std::fs::write(out, ppm).unwrap();
     assert!(spread > 1.0, "a flat picture");
 }

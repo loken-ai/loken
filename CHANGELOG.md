@@ -73,6 +73,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Speech: speak a long text with pocket-tts in its reference's chunks, the voice held across them.
+- OpenCL: load and render Z-Image on an Intel GPU without host copies or a stalled queue.
 - OpenCL: build the image kernels with Intel's OpenCL runtime.
 - Cluster: let 2 instances each be the prefill peer of the other.
 - API: answer about an image sent to the generate route of a Qwen vision model.
