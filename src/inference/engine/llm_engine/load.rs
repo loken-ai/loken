@@ -746,10 +746,6 @@ pub(super) fn try_wrap_with_vision(
                 device.location()
             );
             if spliced.is_some() {
-                // The spliced tower runs on a card.
-                if device.is_cpu() {
-                    return Err(anyhow!("no card holds the tower"));
-                }
                 let mut file = std::fs::File::open(blob)?;
                 let content = crate::tensor::quantized::gguf_file::read_mapped_file(&file)
                     .map_err(|e| anyhow!("{e}"))?;
@@ -1972,5 +1968,91 @@ mod session_count_tests {
             .await
             .insert(GLOBAL_PROMPT_CACHE_KEY.to_string(), resident(vec![1, 2, 3]));
         assert_eq!(engine.session_count().await, 1);
+    }
+}
+
+#[cfg(test)]
+mod tower_tests {
+    use super::*;
+    use crate::inference::generic_transformer::block_draft_tests::{generic_of, toy_files};
+    use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+    use crate::tensor::quantized::gguf_file::Value;
+    use crate::tensor::quantized::GgmlDType;
+
+    /// The band layout of the small text file.
+    const LAYOUT: (&[u32], &[u32], &[u32]) = (&[0, 2, 0], &[1], &[1]);
+
+    /// The width of the toy tower.
+    const HIDDEN: usize = 8;
+
+    /// The placeholder the toy tower splices at, and its id in the toy vocabulary.
+    const PLACEHOLDER: (&str, u32) = ("<|image_pad|>", 5);
+
+    /// A tensor of `dims` stored as F32, filled with small values.
+    fn entry(name: &str, dims: &[usize]) -> GgufEntry {
+        let n: usize = dims.iter().product();
+        GgufEntry {
+            name: name.to_string(),
+            dims: dims.to_vec(),
+            dtype: GgmlDType::F32,
+            data: (0..n)
+                .flat_map(|i| ((i % 7) as f32 * 0.01).to_le_bytes())
+                .collect(),
+        }
+    }
+
+    /// Writes at `path` a projector of one block for a text model `text_hidden` wide.
+    fn write_projector(path: &std::path::Path, text_hidden: usize) {
+        let h = HIDDEN;
+        let s = |v: &str| Value::String(v.to_string());
+        let metadata = [
+            ("general.architecture", s("clip")),
+            ("clip.projector_type", s("qwen3vl_merger")),
+            ("clip.vision.block_count", Value::U32(1)),
+            ("clip.vision.embedding_length", Value::U32(h as u32)),
+            ("clip.vision.attention.head_count", Value::U32(2)),
+        ]
+        .map(|(k, v)| (k.to_string(), v));
+        let entries = [
+            entry("v.patch_embd.weight", &[h, 768]),
+            entry("v.patch_embd.weight.1", &[h, 768]),
+            entry("v.patch_embd.bias", &[h]),
+            entry("v.position_embd.weight", &[16, h]),
+            entry("v.blk.0.attn_qkv.weight", &[3 * h, h]),
+            entry("v.blk.0.attn_qkv.bias", &[3 * h]),
+            entry("v.blk.0.attn_out.weight", &[h, h]),
+            entry("v.blk.0.attn_out.bias", &[h]),
+            entry("v.blk.0.ln1.weight", &[h]),
+            entry("v.blk.0.ln1.bias", &[h]),
+            entry("v.blk.0.ln2.weight", &[h]),
+            entry("v.blk.0.ln2.bias", &[h]),
+            entry("v.blk.0.ffn_up.weight", &[2 * h, h]),
+            entry("v.blk.0.ffn_up.bias", &[2 * h]),
+            entry("v.blk.0.ffn_down.weight", &[h, 2 * h]),
+            entry("v.blk.0.ffn_down.bias", &[h]),
+            entry("v.post_ln.weight", &[h]),
+            entry("v.post_ln.bias", &[h]),
+            entry("mm.0.weight", &[4 * h, 4 * h]),
+            entry("mm.0.bias", &[4 * h]),
+            entry("mm.2.weight", &[text_hidden, 4 * h]),
+            entry("mm.2.bias", &[text_hidden]),
+        ];
+        write_gguf_with_metadata(path, &metadata, &entries).unwrap();
+    }
+
+    /// A spliced tower that no card holds loads on the host, and the model reads images.
+    #[test]
+    fn a_spliced_tower_no_card_holds_loads_on_the_host() {
+        let (file, _) = toy_files(LAYOUT, false);
+        let text = generic_of(file);
+        let dir = std::env::temp_dir().join(format!("loken-host-tower-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mmproj.gguf");
+        write_projector(&path, text.hidden_size());
+        let model = try_wrap_with_vision(text, Some(&path), 0, &[PLACEHOLDER]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let model = model.unwrap();
+        assert!(model.is_qwen35_vision(), "the model reads images");
+        assert_eq!(model.qwen35_image_token(), Some(PLACEHOLDER.1));
     }
 }
