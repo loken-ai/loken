@@ -4,6 +4,7 @@
 //! Ignored by default: it needs the model in the store and a Vulkan device. Run with
 //!   cargo test --features vulkan --profile gate vulkan_ -- --ignored --test-threads=2
 
+use super::native_judge::*;
 use super::*;
 use crate::inference::place::layer_executor::{DeviceKind, HeteroSegment};
 
@@ -13,95 +14,7 @@ const TAG: &str = "qwen3:0.6b";
 /// The tokens the greedy answer runs for.
 const STEPS: usize = 32;
 
-fn model_blob(tag: &str) -> std::path::PathBuf {
-    let store = crate::config::Config::load_test().get_ollama_models_dir();
-    let (name, tag) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let m = crate::inference::load::ollama_manager::OllamaManager::new(store.clone());
-    let manifest = m
-        .read_manifest_json(name, tag)
-        .expect("manifest in the store");
-    let digest = manifest["layers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|l| l["mediaType"] == "application/vnd.ollama.image.model")
-        .and_then(|l| l["digest"].as_str())
-        .expect("a model layer")
-        .replace(':', "-");
-    store.join("blobs").join(digest)
-}
-
-fn host_vec(t: &Tensor) -> Vec<f32> {
-    t.to_device(&Device::Cpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-}
-
-fn argmax(t: &Tensor) -> u32 {
-    host_vec(t)
-        .iter()
-        .enumerate()
-        .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-            if x > bv {
-                (i, x)
-            } else {
-                (bi, bv)
-            }
-        })
-        .0 as u32
-}
-
-struct Fixture {
-    mmap: std::sync::Arc<memmap2::Mmap>,
-    n_layers: usize,
-}
-
 impl Fixture {
-    fn open() -> Self {
-        Self::open_tag(TAG)
-    }
-
-    fn open_tag(tag: &str) -> Self {
-        let path = model_blob(tag);
-        let file = std::fs::File::open(&path).unwrap();
-        let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
-        let c = self_content(&mmap);
-        let arch = c.metadata["general.architecture"]
-            .to_string()
-            .unwrap()
-            .clone();
-        let n_layers = GenericTransformerConfig::from_gguf(&c, &arch)
-            .unwrap()
-            .n_layers;
-        Self { mmap, n_layers }
-    }
-
-    fn build(&self, plan: &HeteroPlan) -> GenericHeteroTransformer {
-        self.try_build(plan).unwrap()
-    }
-
-    fn try_build(
-        &self,
-        plan: &HeteroPlan,
-    ) -> std::result::Result<GenericHeteroTransformer, String> {
-        GenericHeteroTransformer::from_gguf(
-            self_content(&self.mmap),
-            &self.mmap[..],
-            &HashMap::new(),
-            plan,
-        )
-        .map_err(|e| e.to_string())
-    }
-
-    fn host(&self) -> HeteroPlan {
-        HeteroPlan::forced_gpu(self.n_layers, 0, 0)
-    }
-
     /// Layers `[0, upto)` on Vulkan device `device`, the rest on the host.
     fn on_vulkan(&self, device: usize, upto: usize) -> HeteroPlan {
         let segment = |kind, layer_start, layer_end| HeteroSegment {
@@ -121,10 +34,6 @@ impl Fixture {
             host_experts_from: None,
         }
     }
-}
-
-fn self_content(mmap: &std::sync::Arc<memmap2::Mmap>) -> gguf_file::Content {
-    gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone()).unwrap()
 }
 
 /// Layer 0 of the model in plain f32 over the file's dequantised weights: the reference the
@@ -255,10 +164,6 @@ fn prompt_of(n: usize) -> Vec<u32> {
     (0..n as u32).map(|i| 1000 + (i * 37) % 20000).collect()
 }
 
-fn ids(t: &[u32]) -> Tensor {
-    Tensor::new(t, &Device::Cpu).unwrap().unsqueeze(0).unwrap()
-}
-
 /// The greedy continuation of the prompt, and the decode rate in tokens per second.
 fn greedy(m: &mut GenericHeteroTransformer, prompt: &[u32]) -> (Vec<u32>, f64) {
     let mut tokens = vec![argmax(&m.forward(&ids(prompt), 0).unwrap())];
@@ -274,7 +179,7 @@ fn greedy(m: &mut GenericHeteroTransformer, prompt: &[u32]) -> (Vec<u32>, f64) {
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_first_layer_matches_the_host() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let prompt = prompt();
     let mut host = fx.build(&fx.host());
     let (h, _) = host.embed_stage(&ids(&prompt), 0).unwrap();
@@ -299,22 +204,7 @@ fn vulkan_first_layer_matches_the_host() {
     println!("{TAG} layer 0 on the host: max error {host_err:.3e} of a change {delta:.3e}");
     // The native runtime of the card, where the build has one, sets the bound.
     // Without it, the host sets it: it reads the same quantised weights.
-    let bound = match native_card() {
-        Some(card) => {
-            let mut native = try_on_native(&fx, &card, 1).unwrap();
-            let (got, _) = native
-                .run_layers_in(h.clone(), None, 0, prompt.len(), 0, 1)
-                .unwrap();
-            let err = max_err(&host_vec(&got));
-            println!(
-                "{TAG} layer 0 on the native card: max error {err:.3e} of a change {delta:.3e}"
-            );
-            drop(native);
-            release_native(&card);
-            err
-        }
-        None => host_err,
-    };
+    let bound = fx.first_layer_bound(TAG, &h, prompt.len(), host_err, max_err);
     for d in crate::inference::kernel::vulkan::devices() {
         let mut m = fx.build(&fx.on_vulkan(d.index, 1));
         let (got, _) = m
@@ -359,7 +249,7 @@ fn sci(errors: &[f64]) -> String {
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_decode_step_matches_the_host() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let tokens = prompt();
     let mut host = fx.build(&fx.host());
     let (rows, _) = host.embed_stage(&ids(&tokens), 0).unwrap();
@@ -398,7 +288,7 @@ fn vulkan_decode_step_matches_the_host() {
     }
     // The native copy loads once every Vulkan copy is freed.
     if let Some(card) = native_card() {
-        let mut native = try_on_native(&fx, &card, fx.n_layers).unwrap();
+        let mut native = fx.try_on_native(&card, fx.n_layers).unwrap();
         let err = errors(&mut native);
         drop(native);
         release_native(&card);
@@ -420,163 +310,6 @@ fn vulkan_decode_step_matches_the_host() {
 /// The chat prompt the text tests answer.
 const TEXT: &str =
     "<|im_start|>user\nExplain in two sentences why the sky is blue.<|im_end|>\n<|im_start|>assistant\n";
-
-/// The native card of the build, CUDA or ROCm.
-/// `None` when the build has no native runtime or no card answers.
-fn native_card() -> Option<Device> {
-    #[cfg(feature = "gpu")]
-    {
-        Device::new_cuda(0).ok()
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        None
-    }
-}
-
-/// Gives the card back the memory the native runtime keeps cached for the copies already freed.
-fn release_native(card: &Device) {
-    #[cfg(feature = "gpu")]
-    if let Device::Cuda(cd) = card {
-        crate::tensor::cuda::reclaim_pool(cd);
-    }
-    #[cfg(not(feature = "gpu"))]
-    let _ = card;
-}
-
-/// The model with its first `layers` layers on the native card `card`.
-fn try_on_native(
-    fx: &Fixture,
-    card: &Device,
-    layers: usize,
-) -> std::result::Result<GenericHeteroTransformer, String> {
-    let cards: HashMap<usize, Device> = [(0, card.clone())].into_iter().collect();
-    GenericHeteroTransformer::from_gguf(
-        self_content(&fx.mmap),
-        &fx.mmap[..],
-        &cards,
-        &HeteroPlan::forced_gpu(fx.n_layers, layers, 0),
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// Whether the error `why` says a device ran out of memory.
-fn out_of_memory(why: &str) -> bool {
-    why.contains("out of memory") || why.contains("[oom]")
-}
-
-/// The host's logit rows at the prompt's last row and after each of its own greedy tokens.
-fn host_rows(fx: &Fixture, prompt: &[u32], steps: usize) -> Vec<Vec<f32>> {
-    let mut host = fx.build(&fx.host());
-    let mut rows = vec![host_vec(&host.forward(&ids(prompt), 0).unwrap())];
-    for i in 0..steps - 1 {
-        let t = [top2(&rows[i]).0 as u32];
-        rows.push(host_vec(&host.forward(&ids(&t), prompt.len() + i).unwrap()));
-    }
-    rows
-}
-
-/// The picks of `m` at the rows of `host`, fed the host's tokens.
-fn forced_picks(m: &mut GenericHeteroTransformer, prompt: &[u32], host: &[Vec<f32>]) -> Vec<usize> {
-    try_forced_picks(m, prompt, host).unwrap()
-}
-
-/// [`forced_picks`], or the error of the first step that fails.
-fn try_forced_picks(
-    m: &mut GenericHeteroTransformer,
-    prompt: &[u32],
-    host: &[Vec<f32>],
-) -> std::result::Result<Vec<usize>, String> {
-    let first = m.forward(&ids(prompt), 0).map_err(|e| e.to_string())?;
-    let mut picks = vec![top2(&host_vec(&first)).0];
-    for (i, row) in host[..host.len() - 1].iter().enumerate() {
-        let t = [top2(row).0 as u32];
-        let next = m
-            .forward(&ids(&t), prompt.len() + i)
-            .map_err(|e| e.to_string())?;
-        picks.push(top2(&host_vec(&next)).0);
-    }
-    Ok(picks)
-}
-
-/// What the native card of the build says at the steps of a run.
-enum Native {
-    /// Its picks, fed the host's tokens.
-    Picks(Vec<usize>),
-    /// The build has no native runtime, or no card answers.
-    Absent,
-    /// The model does not fit the native card: why.
-    NoRoom(String),
-}
-
-/// The picks of the native card of the build at the rows of `host`, fed the host's tokens.
-/// The caller frees every Vulkan copy first.
-/// The native copy is freed, and its cached memory given back, before this returns.
-fn native_picks(fx: &Fixture, prompt: &[u32], host: &[Vec<f32>]) -> Native {
-    let Some(card) = native_card() else {
-        return Native::Absent;
-    };
-    let picks = try_on_native(fx, &card, fx.n_layers)
-        .and_then(|mut m| try_forced_picks(&mut m, prompt, host));
-    release_native(&card);
-    match picks {
-        Ok(picks) => Native::Picks(picks),
-        Err(why) if out_of_memory(&why) => Native::NoRoom(why),
-        Err(why) => panic!("the native card: {why}"),
-    }
-}
-
-/// Fails on each step where the Vulkan pick leaves the host's while the native pick keeps it.
-/// Without a native runtime, a Vulkan pick that leaves the host's passes only on an exact tie.
-/// When the model does not fit the native card, a step where the picks part is reported
-/// unjudged.
-fn judge_picks(at: &str, host: &[Vec<f32>], native: &Native, got: &[usize]) {
-    if let Native::NoRoom(why) = native {
-        println!("{at}: the native card has no room for the model, its comparison skipped: {why}");
-    }
-    let mut gaps = Vec::new();
-    for (step, (row, &v)) in host.iter().zip(got).enumerate() {
-        let h = top2(row).0;
-        if v == h {
-            continue;
-        }
-        let margin = row[h] - row[v];
-        let n = match native {
-            Native::Picks(n) => Some(n[step]),
-            _ => None,
-        };
-        println!("{at}: step {step}: Vulkan picks {v}, the host {h} by {margin:.3}, native {n:?}");
-        let held = match (native, n) {
-            (_, Some(n)) => n != h,
-            (Native::NoRoom(_), _) => {
-                println!("{at}: step {step}: unjudged");
-                true
-            }
-            _ => margin == 0.0,
-        };
-        if !held {
-            gaps.push(format!(
-                "step {step}: Vulkan picks {v}, the host {h} by {margin}, native {n:?}"
-            ));
-        }
-    }
-    assert!(gaps.is_empty(), "{at}: {}", gaps.join("; "));
-}
-
-fn top2(l: &[f32]) -> (usize, usize) {
-    let mut best = (0, 1);
-    if l[1] > l[0] {
-        best = (1, 0);
-    }
-    for (i, &v) in l.iter().enumerate().skip(2) {
-        if v > l[best.0] {
-            best = (i, best.0);
-        } else if v > l[best.1] {
-            best = (best.0, i);
-        }
-    }
-    best
-}
 
 /// The host's greedy answer and, fed the same tokens, the Vulkan one: at every step the Vulkan
 /// argmax is the host's, or the native card's leaves the host's too.
@@ -616,7 +349,7 @@ fn greedy_text_matches(tag: &str) {
     let decode = |t: &[u32]| tokenizer.decode(t, false).unwrap_or_default();
     let (want, host_rate) = greedy(&mut fx.build(&fx.host()), &prompt);
     println!("{tag}: host {host_rate:.1} tok/s {:?}", decode(&want));
-    let host = host_rows(&fx, &prompt, STEPS);
+    let host = fx.host_rows(&prompt, STEPS);
     let mut picks = Vec::new();
     for d in crate::inference::kernel::vulkan::devices() {
         let Some(mut whole) = whole_on(&fx, tag, &d) else {
@@ -639,7 +372,7 @@ fn greedy_text_matches(tag: &str) {
         return;
     }
     // The native copy loads once every Vulkan copy is freed.
-    let native = native_picks(&fx, &prompt, &host);
+    let native = fx.native_picks(&prompt, &host);
     for (at, got) in picks {
         judge_picks(&at, &host, &native, &got);
     }
@@ -674,7 +407,7 @@ fn long_prompt_matches(tag: &str, repeats: usize) {
         }
         runs += 1;
     };
-    let host = host_rows(&fx, &prompt, 8);
+    let host = fx.host_rows(&prompt, 8);
     let mut picks = Vec::new();
     for d in crate::inference::kernel::vulkan::devices() {
         let Some(mut m) = whole_on(&fx, tag, &d) else {
@@ -690,7 +423,7 @@ fn long_prompt_matches(tag: &str, repeats: usize) {
         return;
     }
     // The native copy loads once every Vulkan copy is freed.
-    let native = native_picks(&fx, &prompt, &host);
+    let native = fx.native_picks(&prompt, &host);
     for (at, got) in picks {
         judge_picks(&at, &host, &native, &got);
         println!("{at}: ok");
@@ -1095,7 +828,7 @@ fn logit_noise(tag: &str, limit: f64, with_cuda: bool) {
 #[test]
 #[ignore = "needs the model in the store and a Vulkan device"]
 fn vulkan_layers_are_reported_on_their_device() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     for d in crate::inference::kernel::vulkan::devices() {
         let m = fx.build(&fx.on_vulkan(d.index, fx.n_layers));
         assert_eq!(
@@ -1113,7 +846,7 @@ fn vulkan_layers_are_reported_on_their_device() {
 #[test]
 #[ignore = "needs the model in the store and an NVIDIA card"]
 fn vulkan_reference_on_cuda() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();

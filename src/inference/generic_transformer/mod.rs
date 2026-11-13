@@ -125,6 +125,8 @@ pub mod mixer;
 pub mod mla;
 pub mod mla_config;
 mod moe_weights;
+#[cfg(all(test, any(feature = "vulkan", feature = "opencl")))]
+mod native_judge;
 pub mod ngram;
 mod opencl_layers;
 #[cfg(all(test, feature = "opencl"))]

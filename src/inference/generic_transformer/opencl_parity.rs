@@ -4,8 +4,10 @@
 //! Ignored by default: it needs the model in the store and an OpenCL device. Run with
 //!   cargo test --lib --features opencl --profile gate opencl_ -- --ignored --test-threads=2
 
+use super::native_judge::*;
 use super::*;
 use crate::inference::place::layer_executor::{DeviceKind, HeteroSegment};
+use crate::tensor::quantized::GgmlDType;
 
 /// The model the tests read from the store.
 const TAG: &str = "qwen3:0.6b";
@@ -13,88 +15,7 @@ const TAG: &str = "qwen3:0.6b";
 /// The tokens the greedy answer runs for.
 const STEPS: usize = 32;
 
-fn model_blob(tag: &str) -> std::path::PathBuf {
-    let store = crate::config::Config::load_test().get_ollama_models_dir();
-    let (name, tag) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let m = crate::inference::load::ollama_manager::OllamaManager::new(store.clone());
-    let manifest = m
-        .read_manifest_json(name, tag)
-        .expect("manifest in the store");
-    let digest = manifest["layers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|l| l["mediaType"] == "application/vnd.ollama.image.model")
-        .and_then(|l| l["digest"].as_str())
-        .expect("a model layer")
-        .replace(':', "-");
-    store.join("blobs").join(digest)
-}
-
-fn host_vec(t: &Tensor) -> Vec<f32> {
-    t.to_device(&Device::Cpu)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-}
-
-fn argmax(t: &Tensor) -> u32 {
-    host_vec(t)
-        .iter()
-        .enumerate()
-        .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-            if x > bv {
-                (i, x)
-            } else {
-                (bi, bv)
-            }
-        })
-        .0 as u32
-}
-
-struct Fixture {
-    mmap: std::sync::Arc<memmap2::Mmap>,
-    n_layers: usize,
-}
-
 impl Fixture {
-    fn open() -> Self {
-        Self::open_tag(TAG)
-    }
-
-    fn open_tag(tag: &str) -> Self {
-        let path = model_blob(tag);
-        let file = std::fs::File::open(&path).unwrap();
-        let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
-        let c = self_content(&mmap);
-        let arch = c.metadata["general.architecture"]
-            .to_string()
-            .unwrap()
-            .clone();
-        let n_layers = GenericTransformerConfig::from_gguf(&c, &arch)
-            .unwrap()
-            .n_layers;
-        Self { mmap, n_layers }
-    }
-
-    fn build(&self, plan: &HeteroPlan) -> GenericHeteroTransformer {
-        GenericHeteroTransformer::from_gguf(
-            self_content(&self.mmap),
-            &self.mmap[..],
-            &HashMap::new(),
-            plan,
-        )
-        .unwrap()
-    }
-
-    fn host(&self) -> HeteroPlan {
-        HeteroPlan::forced_gpu(self.n_layers, 0, 0)
-    }
-
     /// Layers `[0, upto)` on OpenCL device `device`, the rest on the host.
     fn on_opencl(&self, device: usize, upto: usize) -> HeteroPlan {
         let segment = |kind, layer_start, layer_end| HeteroSegment {
@@ -116,13 +37,33 @@ impl Fixture {
     }
 }
 
-fn self_content(mmap: &std::sync::Arc<memmap2::Mmap>) -> gguf_file::Content {
-    gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone()).unwrap()
+/// How a product reads its activation rows, from its weights' type and the rows' length.
+type Read = fn(GgmlDType, &[f32], usize) -> Vec<f32>;
+
+/// Activation rows read as they are, for the products in plain f32.
+fn exact(_: GgmlDType, x: &[f32], _: usize) -> Vec<f32> {
+    x.to_vec()
 }
 
-/// Layers `[0, layers)` of the model in plain f32 over the file's dequantised weights: the
-/// reference the OpenCL layers are held to, free of the host's quantised activations.
-fn reference_layers(fx: &Fixture, x: &[f32], tokens: usize, layers: usize) -> Vec<f32> {
+/// Activation rows read as the OpenCL products read them.
+const CARD: Read = crate::inference::kernel::opencl_stack::host_quantised;
+
+/// Layers `[0, layers)` of the model in f32 over dequantised weights, each product reading its
+/// activations through `read`.
+/// The weights are the file's, or, with `held`, each in the format the layers of that built
+/// model give it, as a device that reads the file holds it.
+/// With [`exact`] and the file's weights it is the reference the OpenCL layers are held to,
+/// free of the host's quantised activations.
+/// With [`CARD`] and a model built for an OpenCL device it is that device's arithmetic,
+/// computed on the host.
+fn reference_layers(
+    fx: &Fixture,
+    x: &[f32],
+    tokens: usize,
+    layers: usize,
+    read: Read,
+    held: Option<&GenericHeteroTransformer>,
+) -> Vec<f32> {
     let c = self_content(&fx.mmap);
     let arch = c.metadata["general.architecture"]
         .to_string()
@@ -149,16 +90,27 @@ fn reference_layers(fx: &Fixture, x: &[f32], tokens: usize, layers: usize) -> Ve
         let r = 1.0 / (v.iter().map(|a| a * a).sum::<f32>() / v.len() as f32 + eps).sqrt();
         v.iter().zip(g).map(|(a, b)| a * r * b).collect()
     };
-    let mm = |x: &[f32], wt: &[f32], rows: usize, bias: Option<&[f32]>| -> Vec<f32> {
+    let mm = |x: &[f32], name: &str, rows: usize, bias: Option<&[f32]>| -> Vec<f32> {
         let cols = x.len() / tokens;
-        (0..tokens)
-            .flat_map(|t| {
-                (0..rows).map(move |r| {
-                    (0..cols)
-                        .map(|k| wt[r * cols + k] as f64 * x[t * cols + k] as f64)
-                        .sum::<f64>() as f32
-                        + bias.map_or(0.0, |b| b[r])
-                })
+        let (wt, dtype) = match held {
+            Some(m) => {
+                let stored = c
+                    .tensor(&mut std::io::Cursor::new(&fx.mmap[..]), name, &Device::Cpu)
+                    .unwrap();
+                let q = super::loader::in_layer_format(&m.layers, name, stored).unwrap();
+                (host_vec(&q.dequantize(&Device::Cpu).unwrap()), q.dtype())
+            }
+            None => (w(name), c.tensor_infos[name].ggml_dtype),
+        };
+        let x = read(dtype, x, cols);
+        (0..tokens * rows)
+            .into_par_iter()
+            .map(|i| {
+                let (t, r) = (i / rows, i % rows);
+                (0..cols)
+                    .map(|k| wt[r * cols + k] as f64 * x[t * cols + k] as f64)
+                    .sum::<f64>() as f32
+                    + bias.map_or(0.0, |b| b[r])
             })
             .collect()
     };
@@ -185,19 +137,19 @@ fn reference_layers(fx: &Fixture, x: &[f32], tokens: usize, layers: usize) -> Ve
         let xn: Vec<f32> = x.chunks(h).flat_map(|r| rms(r, &an)).collect();
         let mut q = mm(
             &xn,
-            &w(&format!("{p}.attn_q.weight")),
+            &format!("{p}.attn_q.weight"),
             nh * hd,
             bias("attn_q.bias").as_deref(),
         );
         let mut k = mm(
             &xn,
-            &w(&format!("{p}.attn_k.weight")),
+            &format!("{p}.attn_k.weight"),
             nkv * hd,
             bias("attn_k.bias").as_deref(),
         );
         let v = mm(
             &xn,
-            &w(&format!("{p}.attn_v.weight")),
+            &format!("{p}.attn_v.weight"),
             nkv * hd,
             bias("attn_v.bias").as_deref(),
         );
@@ -244,18 +196,18 @@ fn reference_layers(fx: &Fixture, x: &[f32], tokens: usize, layers: usize) -> Ve
                 }
             }
         }
-        let o = mm(&attn, &w(&format!("{p}.attn_output.weight")), h, None);
+        let o = mm(&attn, &format!("{p}.attn_output.weight"), h, None);
         let x1: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
         let fnw = w(&format!("{p}.ffn_norm.weight"));
         let xn2: Vec<f32> = x1.chunks(h).flat_map(|r| rms(r, &fnw)).collect();
-        let gate = mm(&xn2, &w(&format!("{p}.ffn_gate.weight")), cfg.ffn_dim, None);
-        let up = mm(&xn2, &w(&format!("{p}.ffn_up.weight")), cfg.ffn_dim, None);
+        let gate = mm(&xn2, &format!("{p}.ffn_gate.weight"), cfg.ffn_dim, None);
+        let up = mm(&xn2, &format!("{p}.ffn_up.weight"), cfg.ffn_dim, None);
         let act: Vec<f32> = gate
             .iter()
             .zip(&up)
             .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
             .collect();
-        let down = mm(&act, &w(&format!("{p}.ffn_down.weight")), h, None);
+        let down = mm(&act, &format!("{p}.ffn_down.weight"), h, None);
         x = x1.iter().zip(&down).map(|(a, b)| a + b).collect();
     }
     x
@@ -263,6 +215,18 @@ fn reference_layers(fx: &Fixture, x: &[f32], tokens: usize, layers: usize) -> Ve
 
 /// The logits of the last row after all layers, in plain f32.
 fn reference_logits(fx: &Fixture, tokens: &[u32]) -> Vec<f32> {
+    reference_rows(fx, tokens, tokens.len() - 1, exact, None).remove(0)
+}
+
+/// The logits of rows `[from, tokens.len())` after all layers, each product reading its
+/// activations through `read` and its weights as [`reference_layers`] does.
+fn reference_rows(
+    fx: &Fixture,
+    tokens: &[u32],
+    from: usize,
+    read: Read,
+    held: Option<&GenericHeteroTransformer>,
+) -> Vec<Vec<f32>> {
     let c = self_content(&fx.mmap);
     let cfg = GenericTransformerConfig::from_gguf(
         &c,
@@ -286,37 +250,59 @@ fn reference_logits(fx: &Fixture, tokens: &[u32]) -> Vec<f32> {
         .iter()
         .flat_map(|&t| embed[t as usize * h..(t as usize + 1) * h].to_vec())
         .collect();
-    let out = reference_layers(fx, &x, tokens.len(), fx.n_layers);
-    let last = &out[(tokens.len() - 1) * h..];
+    drop(embed);
+    let out = reference_layers(fx, &x, tokens.len(), fx.n_layers, read, held);
     let g = w("output_norm.weight");
-    let r =
-        1.0 / (last.iter().map(|a| a * a).sum::<f32>() / h as f32 + cfg.rms_norm_eps as f32).sqrt();
-    let normed: Vec<f32> = last.iter().zip(&g).map(|(a, b)| a * r * b).collect();
-    let head = if c.tensor_infos.contains_key("output.weight") {
-        w("output.weight")
+    let head_name = if c.tensor_infos.contains_key("output.weight") {
+        "output.weight"
     } else {
-        embed
+        "token_embd.weight"
     };
-    head.chunks(h)
-        .map(|row| {
-            row.iter()
-                .zip(&normed)
-                .map(|(a, b)| *a as f64 * *b as f64)
-                .sum::<f64>() as f32
+    let head = w(head_name);
+    out[from * h..]
+        .chunks(h)
+        .map(|last| {
+            let r = 1.0
+                / (last.iter().map(|a| a * a).sum::<f32>() / h as f32 + cfg.rms_norm_eps as f32)
+                    .sqrt();
+            let normed: Vec<f32> = last.iter().zip(&g).map(|(a, b)| a * r * b).collect();
+            let normed = read(c.tensor_infos[head_name].ggml_dtype, &normed, h);
+            head.par_chunks(h)
+                .map(|row| {
+                    row.iter()
+                        .zip(&normed)
+                        .map(|(a, b)| *a as f64 * *b as f64)
+                        .sum::<f64>() as f32
+                })
+                .collect()
         })
         .collect()
 }
 
-fn reference_layer0(fx: &Fixture, x: &[f32], tokens: usize) -> Vec<f32> {
-    reference_layers(fx, x, tokens, 1)
+/// The picks of the OpenCL arithmetic computed on the host at the rows of `host`, fed the
+/// host's tokens, with the weights of the model placed whole on OpenCL device `device`.
+fn card_picks(fx: &Fixture, device: usize, prompt: &[u32], host: &[Vec<f32>]) -> Vec<usize> {
+    let m = fx.build(&fx.on_opencl(device, fx.n_layers));
+    let mut tokens = prompt.to_vec();
+    tokens.extend(host[..host.len() - 1].iter().map(|row| top2(row).0 as u32));
+    reference_rows(fx, &tokens, prompt.len() - 1, CARD, Some(&m))
+        .iter()
+        .map(|row| top2(row).0)
+        .collect()
+}
+
+fn reference_layer0(
+    fx: &Fixture,
+    x: &[f32],
+    tokens: usize,
+    read: Read,
+    held: Option<&GenericHeteroTransformer>,
+) -> Vec<f32> {
+    reference_layers(fx, x, tokens, 1, read, held)
 }
 
 fn prompt() -> Vec<u32> {
     (0..24u32).map(|i| 1000 + (i * 37) % 20000).collect()
-}
-
-fn ids(t: &[u32]) -> Tensor {
-    Tensor::new(t, &Device::Cpu).unwrap().unsqueeze(0).unwrap()
 }
 
 /// The greedy continuation of the prompt, and the decode rate in tokens per second.
@@ -334,7 +320,7 @@ fn greedy(m: &mut GenericHeteroTransformer, prompt: &[u32]) -> (Vec<u32>, f64) {
 #[test]
 #[ignore = "needs the model in the store and an OpenCL device"]
 fn opencl_first_layer_matches_the_host() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let prompt = prompt();
     let mut host = fx.build(&fx.host());
     let (h, _) = host.embed_stage(&ids(&prompt), 0).unwrap();
@@ -343,7 +329,7 @@ fn opencl_first_layer_matches_the_host() {
         .unwrap();
     let host_rows = host_vec(&want);
     let embed = host_vec(&h);
-    let reference = reference_layer0(&fx, &embed, prompt.len());
+    let reference = reference_layer0(&fx, &embed, prompt.len(), exact, None);
     // The layer's own contribution, against which an error is measured: the residual it adds
     // to is exact everywhere.
     let delta: f32 = reference
@@ -359,54 +345,54 @@ fn opencl_first_layer_matches_the_host() {
         "{TAG} layer 0 on the host: max error {:.3e} of a change {delta:.3e}",
         max_err(&host_rows)
     );
+    let mut beyond = Vec::new();
     for d in devices() {
         let mut m = fx.build(&fx.on_opencl(d.0, 1));
         let (got, _) = m
             .run_layers_in(h.clone(), None, 0, prompt.len(), 0, 1)
             .unwrap();
-        let err = max_err(&host_vec(&got));
+        let got = host_vec(&got);
+        // The device's arithmetic computed on the host: the error its own products give.
+        let card = reference_layer0(&fx, &embed, prompt.len(), CARD, Some(&m));
+        let card_err = max_err(&card);
         println!(
-            "{TAG} layer 0 on {}: max error {err:.3e} of a change {delta:.3e}",
+            "{TAG} layer 0 in the arithmetic of {} on the host: max error {card_err:.3e}",
             d.1
         );
-        assert!(
-            err <= max_err(&host_rows),
-            "{}: layer 0 differs from the f32 reference by {err} against a change of {delta}",
+        // The native runtime of the card, where the build has one, sets the bound.
+        // Without it, the device's arithmetic computed on the host sets it.
+        let bound = fx.first_layer_bound(TAG, &h, prompt.len(), card_err, max_err);
+        let err = max_err(&got);
+        let off = got
+            .iter()
+            .zip(&card)
+            .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
+        println!(
+            "{TAG} layer 0 on {}: max error {err:.3e} of a change {delta:.3e}, {off:.3e} from its arithmetic on the host",
             d.1
         );
+        if err > bound {
+            beyond.push(format!("{}: error {err}, bound {bound}", d.1));
+        }
     }
+    assert!(
+        beyond.is_empty(),
+        "layer 0 differs from the f32 reference beyond its bound on {}",
+        beyond.join("; ")
+    );
 }
 
 /// The chat prompt the text tests answer.
 const TEXT: &str =
     "<|im_start|>user\nExplain in two sentences why the sky is blue.<|im_end|>\n<|im_start|>assistant\n";
 
-/// Logits closer than this between the host's two best tokens are a tie: which one a backend
-/// picks there is rounding, not a fault.
-const TIE: f32 = 0.1;
-
-fn top2(l: &[f32]) -> (usize, usize) {
-    let mut best = (0, 1);
-    if l[1] > l[0] {
-        best = (1, 0);
-    }
-    for (i, &v) in l.iter().enumerate().skip(2) {
-        if v > l[best.0] {
-            best = (i, best.0);
-        } else if v > l[best.1] {
-            best = (best.0, i);
-        }
-    }
-    best
-}
-
 /// The host's greedy answer and, fed the same tokens, the OpenCL one: at every step the
-/// OpenCL argmax is the host's, unless the host's two best tokens tie. The free-running answers
-/// and the decode rates are printed beside.
+/// OpenCL argmax is the host's, or the native card's leaves the host's too. The free-running
+/// answers and the decode rates are printed beside.
 #[test]
 #[ignore = "needs the model in the store and an OpenCL device"]
 fn opencl_greedy_text_matches_the_host() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
@@ -414,46 +400,31 @@ fn opencl_greedy_text_matches_the_host() {
     let decode = |t: &[u32]| tokenizer.decode(t, false).unwrap_or_default();
     let (want, host_rate) = greedy(&mut fx.build(&fx.host()), &prompt);
     println!("{TAG}: host {host_rate:.1} tok/s {:?}", decode(&want));
+    let host = fx.host_rows(&prompt, STEPS);
+    let mut picks = Vec::new();
     for d in devices() {
-        let plan = fx.on_opencl(d.0, fx.n_layers);
-        let (got, rate) = greedy(&mut fx.build(&plan), &prompt);
+        let mut whole = fx.build(&fx.on_opencl(d.0, fx.n_layers));
+        // One copy serves both runs.
+        // The teacher-forced run comes first, on the fresh copy, fed the host's tokens.
+        picks.push((
+            format!("{TAG} opencl {}", d.1),
+            forced_picks(&mut whole, &prompt, &host),
+        ));
+        let (got, rate) = greedy(&mut whole, &prompt);
         println!("{TAG}: opencl {}: {rate:.1} tok/s {:?}", d.1, decode(&got));
-        // Teacher-forced: fresh models both fed the host's tokens.
-        let mut host = fx.build(&fx.host());
-        let mut m = fx.build(&plan);
-        let mut fed = prompt.clone();
-        let mut h = host_vec(&host.forward(&ids(&prompt), 0).unwrap());
-        let mut v = host_vec(&m.forward(&ids(&prompt), 0).unwrap());
-        for step in 0..STEPS {
-            let (h1, h2) = top2(&h);
-            let (v1, _) = top2(&v);
-            let margin = h[h1] - h[h2];
-            assert!(
-                v1 == h1 || margin < TIE,
-                "{}: step {step}: OpenCL picks {v1}, the host {h1} by {margin}",
-                d.1
-            );
-            if v1 != h1 {
-                println!(
-                    "{}: step {step}: a tie ({margin:.3}) broken the other way",
-                    d.1
-                );
-            }
-            fed.push(h1 as u32);
-            let t = [h1 as u32];
-            h = host_vec(&host.forward(&ids(&t), fed.len() - 1).unwrap());
-            v = host_vec(&m.forward(&ids(&t), fed.len() - 1).unwrap());
-        }
     }
+    // The native copy loads once every OpenCL copy is freed.
+    let native = native_or_card(&fx, &prompt, &host);
+    judge_devices(&host, &native, &picks);
 }
 
 /// A prompt that crosses the chunk a step carries and several tiles of keys: the OpenCL argmax
-/// is the host's at the prompt's last row and at the steps that follow, unless the host's two
-/// best tokens tie.
+/// is the host's at the prompt's last row and at the steps that follow, or the native card's
+/// leaves the host's too.
 #[test]
 #[ignore = "needs the model in the store and an OpenCL device"]
 fn opencl_long_prompt_matches_the_host() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
@@ -464,29 +435,41 @@ fn opencl_long_prompt_matches_the_host() {
         .get_ids()
         .to_vec();
     assert!(prompt.len() > 2 * 128, "{} tokens", prompt.len());
+    let host = fx.host_rows(&prompt, 8);
+    let mut picks = Vec::new();
     for d in devices() {
-        let mut host = fx.build(&fx.host());
         let mut m = fx.build(&fx.on_opencl(d.0, fx.n_layers));
-        let mut fed = prompt.clone();
-        let mut h = host_vec(&host.forward(&ids(&prompt), 0).unwrap());
-        let mut v = host_vec(&m.forward(&ids(&prompt), 0).unwrap());
-        for step in 0..8 {
-            let (h1, h2) = top2(&h);
-            let (v1, _) = top2(&v);
-            let margin = h[h1] - h[h2];
-            assert!(
-                v1 == h1 || margin < TIE,
-                "{}: step {step} of {} tokens: OpenCL picks {v1}, the host {h1} by {margin}",
-                d.1,
-                prompt.len()
-            );
-            fed.push(h1 as u32);
-            let t = [h1 as u32];
-            h = host_vec(&host.forward(&ids(&t), fed.len() - 1).unwrap());
-            v = host_vec(&m.forward(&ids(&t), fed.len() - 1).unwrap());
-        }
-        println!("{}: {} tokens: ok", d.1, prompt.len());
+        picks.push((
+            format!("{TAG} opencl {} with {} tokens", d.1, prompt.len()),
+            forced_picks(&mut m, &prompt, &host),
+        ));
     }
+    // The native copy loads once every OpenCL copy is freed.
+    let native = native_or_card(&fx, &prompt, &host);
+    judge_devices(&host, &native, &picks);
+}
+
+/// The native card's picks at the rows of `host`.
+/// Without a native card, the picks of the OpenCL arithmetic computed on the host, with the
+/// weights of the model placed whole on the first OpenCL device.
+fn native_or_card(fx: &Fixture, prompt: &[u32], host: &[Vec<f32>]) -> Native {
+    match fx.native_picks(prompt, host) {
+        Native::Absent => Native::Arithmetic(card_picks(fx, devices()[0].0, prompt, host)),
+        n => n,
+    }
+}
+
+/// Judges the picks of every device, and fails naming each device whose picks do not hold.
+fn judge_devices(host: &[Vec<f32>], native: &Native, picks: &[(String, Vec<usize>)]) {
+    let failed: Vec<String> = picks
+        .iter()
+        .filter_map(|(at, got)| {
+            let gaps = pick_gaps(at, host, native, got);
+            println!("{at}: {}", if gaps.is_empty() { "ok" } else { "fails" });
+            (!gaps.is_empty()).then(|| format!("{at}: {}", gaps.join("; ")))
+        })
+        .collect();
+    assert!(failed.is_empty(), "{}", failed.join(" | "));
 }
 
 /// Every OpenCL GPU, as `(index, name)`.
@@ -567,8 +550,8 @@ fn single_launch_against_launches(tag: &str) {
                 .zip(&b)
                 .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
             println!("{tag} step {step}: largest logit difference {gap:.2e}");
-            // Both quantise the activations as the host does, so a rounding that lands on the
-            // other side of a boundary moves a logit by about what the host's own does.
+            // Both quantise the activations alike, so a rounding that lands on the other side
+            // of a boundary moves a logit by about what one quantised product does.
             let (b1, b2) = top2(&b);
             let (a1, _) = top2(&a);
             assert!(gap < 4.0, "step {step}: {gap}");
@@ -734,7 +717,7 @@ fn opencl_single_launch_layer_by_layer() {
 #[test]
 #[ignore = "speed bench"]
 fn opencl_prompt_trace() {
-    let fx = Fixture::open();
+    let fx = Fixture::open_tag(TAG);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();

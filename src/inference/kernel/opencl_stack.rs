@@ -1531,6 +1531,25 @@ fn heads_grouped(n_head: usize, n_kv: usize) -> bool {
     n_kv != 0 && n_head.is_multiple_of(n_kv)
 }
 
+/// The activation rows as a dot product with weights of `dtype` reads them: as floats for
+/// the float formats, else in q8_0 blocks of 32 values read back.
+#[cfg(test)]
+pub(crate) fn host_quantised(dtype: GgmlDType, x: &[f32], cols: usize) -> Vec<f32> {
+    use crate::tensor::quant_cpu::{BlockFormat, BlockQ8_0};
+    match dtype {
+        GgmlDType::F16 | GgmlDType::F32 => x.to_vec(),
+        _ => {
+            let mut out = vec![0f32; x.len()];
+            for (row, o) in x.chunks(cols).zip(out.chunks_mut(cols)) {
+                let mut blocks = vec![BlockQ8_0::zeros(); cols / 32];
+                BlockQ8_0::quantize(row, &mut blocks);
+                BlockQ8_0::dequantize(&blocks, o);
+            }
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,24 +1717,6 @@ mod tests {
             },
             deq,
         )
-    }
-
-    /// The activation rows as a dot product with weights of `dtype` reads them: as floats for
-    /// the float formats, else in q8_0 blocks of 32 values read back.
-    fn host_quantised(dtype: GgmlDType, x: &[f32], cols: usize) -> Vec<f32> {
-        use crate::tensor::quant_cpu::{BlockFormat, BlockQ8_0};
-        match dtype {
-            GgmlDType::F16 | GgmlDType::F32 => x.to_vec(),
-            _ => {
-                let mut out = vec![0f32; x.len()];
-                for (row, o) in x.chunks(cols).zip(out.chunks_mut(cols)) {
-                    let mut blocks = vec![BlockQ8_0::zeros(); cols / 32];
-                    BlockQ8_0::quantize(row, &mut blocks);
-                    BlockQ8_0::dequantize(&blocks, o);
-                }
-                out
-            }
-        }
     }
 
     /// The device quantiser makes the host's q8_0 codes and scales, and the sum of each
